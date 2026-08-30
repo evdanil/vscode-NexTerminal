@@ -20,7 +20,7 @@ import type { ExtensionMessage, FormDefinition, FormMessage, FormValues } from "
  * file input's baseline `readonly`).
  * ──────────────────────────────────────────────────────────────────────── */
 
-type DomEvent = { preventDefault: () => void; target?: StubElement };
+type DomEvent = { preventDefault: () => void; target?: StubElement; key?: string };
 type DomListener = (event?: DomEvent) => void;
 
 export class StubElement {
@@ -28,6 +28,11 @@ export class StubElement {
   public parentElement: StubElement | undefined;
   public readonly dataset: Record<string, string | undefined> = {};
   public readonly style: Record<string, string> = {};
+  /** Plain attributes set through `setAttribute` — today only the Save button's
+   *  `aria-busy`. `data-*` deliberately does NOT live here: the scripts under
+   *  test reach those through `dataset`, and two stores for one attribute
+   *  would disagree the moment anything wrote through the other one. */
+  private readonly attributes = new Map<string, string>();
   public value = "";
   public checked = false;
   public required = false;
@@ -113,6 +118,21 @@ export class StubElement {
     };
   }
 
+  public setAttribute(name: string, value: string): void {
+    if (name.startsWith("data-")) {
+      throw new Error(`setAttribute("${name}") — this stub keeps data-* in \`dataset\`, write it there`);
+    }
+    this.attributes.set(name, value);
+  }
+
+  public getAttribute(name: string): string | null {
+    return this.attributes.get(name) ?? null;
+  }
+
+  public removeAttribute(name: string): void {
+    this.attributes.delete(name);
+  }
+
   public append(child: StubElement): StubElement {
     child.parentElement = this;
     this.children.push(child);
@@ -165,10 +185,25 @@ export class StubElement {
     this.listeners.set(type, existing);
   }
 
-  public dispatch(type: string): void {
+  /**
+   * `event` is optional because most of what this stub fires — "input",
+   * "change" — is read by listeners that take no argument at all, and passing
+   * one would say something about the event object those listeners never look
+   * at. A keyboard listener does look (`event.key`), so callers that fire one
+   * supply it; `dispatchKey` below is the only spelling of that in use, and a
+   * bare `dispatch("keydown")` deliberately throws inside such a listener
+   * rather than quietly behaving like a key that is not Enter.
+   */
+  public dispatch(type: string, event?: DomEvent): void {
     for (const listener of this.listeners.get(type) ?? []) {
-      listener();
+      listener(event);
     }
+  }
+
+  /** A keyboard event carrying `key`, the property the scripts under test read
+   *  (`event.key === "Enter"`) — never `keyCode`, which nothing here uses. */
+  public dispatchKey(type: string, key: string): void {
+    this.dispatch(type, { key, target: this, preventDefault: () => {} });
   }
 
   /**
@@ -211,7 +246,7 @@ function readAttribute(el: StubElement, name: string): string | undefined {
   if (name === "name") {
     return el.name;
   }
-  return undefined;
+  return el.getAttribute(name) ?? undefined;
 }
 
 /** Supports exactly the selector shapes the rendered script uses. */
@@ -406,6 +441,11 @@ function buildFormDom(definition: FormDefinition): FormDom {
           const scan = group.append(new StubElement("BUTTON", ["scan-btn"]));
           scan.dataset.key = field.key;
         }
+        // Mirrors `renderField`'s opt-in `data-autofill="true"` on a text input,
+        // which is what the script's `input[data-autofill="true"]` sweep finds.
+        if (field.type === "text" && field.autofill) {
+          input.dataset.autofill = "true";
+        }
         register(field.key, input);
         controls.push(input);
         break;
@@ -417,6 +457,9 @@ function buildFormDom(definition: FormDefinition): FormDom {
   const actions = form.append(new StubElement("DIV", ["actions"]));
   const saveBtn = actions.append(new StubElement("BUTTON"));
   saveBtn.type = "submit";
+  // Mirrors the rendered `id="save-btn"`, which the script MARKS (class +
+  // aria-busy, never `disabled`) while an autofill round trip is outstanding.
+  byId.set("save-btn", saveBtn);
   const cancelBtn = actions.append(new StubElement("BUTTON"));
   byId.set("cancel-btn", cancelBtn);
   if (definition.testable) {
@@ -489,11 +532,96 @@ export interface FormHarness {
   choose: (key: string, value: string) => void;
   deliver: (msg: ExtensionMessage) => void;
   submit: () => FormValues;
+  /**
+   * Submits without insisting that anything was posted — the shape needed to
+   * observe a Save the script HELD because an autofill was still in flight.
+   * Returns the submitted values, or `undefined` when the attempt posted
+   * nothing.
+   *
+   * This is the ENTER-KEY path: a form submits on Enter in a text field
+   * whatever the buttons look like, and no macrotask can interleave — the
+   * submission is the keydown's default action and runs in the same task. For
+   * the pointer path use `clickSave`.
+   */
+  attemptSubmit: () => FormValues | undefined;
+  /**
+   * The POINTER path: a real click on the Save button.
+   *
+   * It models two things `attemptSubmit` cannot, and both are the ground the
+   * "Save clicked while the CIDR row was still committing" defect was fought
+   * over:
+   *   * a browser refuses to dispatch a click on a control whose native
+   *     `disabled` is set — no click, and therefore no `submit` event for the
+   *     form's handler to defer. The script under test no longer sets that
+   *     property at all, so this never fires today; it is kept because it is
+   *     the TRIPWIRE. Bring the disable back and every pointer test here goes
+   *     red on a Save that was swallowed rather than held;
+   *   * a physical press is not instantaneous. Any macrotask the script queued
+   *     during the blur-driven "change" runs before the click is dispatched
+   *     whenever the user holds the button down longer than one tick, which no
+   *     API bounds — so queued tasks are drained FIRST, which is exactly the
+   *     timing the fifth review finding is about. The script queues none any
+   *     more; a reintroduced `setTimeout(disable, 0)` would land here.
+   *
+   * Returns the submitted values, or `undefined` when the click was suppressed
+   * or the submit handler held it.
+   */
+  clickSave: () => FormValues | undefined;
+  /**
+   * Whether the Save button carries the "an autofill round trip is outstanding"
+   * mark — the `save-held` class and `aria-busy`, which are appearance and
+   * assistive semantics only and cannot suppress an event.
+   *
+   * Throws if the two disagree: they are one state with two spellings, and a
+   * button that looks held to the eye but not to a screen reader (or the
+   * reverse) is a defect this should not be able to hide.
+   */
+  saveHeld: () => boolean;
+  /**
+   * Whether the Save button's NATIVE `disabled` property is set — which the
+   * script must never do, because it makes the browser swallow the click that
+   * carries the user's Save instead of letting the form's handler defer it.
+   * Exposed so one test can state that invariant outright rather than leaving
+   * it to be inferred from a click that happened to get through.
+   */
+  saveNativelyDisabled: () => boolean;
+  /** The `requestId` the script stamped on its most recent `autofill` post —
+   *  what an answer must echo back to release that request. */
+  lastAutofillRequestId: () => number | undefined;
   value: (key: string) => string;
   locked: (key: string) => boolean;
   selectLabel: (key: string) => string;
-  /** Types into a field, refusing if the form has it locked. */
+  /** Types into a field AND leaves it, refusing if the form has it locked —
+   *  "input" then "change", which is the pair a browser delivers for an edit
+   *  the user then blurs away from. */
   type: (key: string, value: string) => void;
+  /**
+   * Types into a field and LEAVES THE CARET IN IT: "input" only, no "change".
+   *
+   * That is the state a text control is actually in while the user is still
+   * looking at it, and `type` cannot represent it — "change" is a blur-time
+   * event, so a test that always fires it can never see a handler that only
+   * runs on blur. It is also the shape a PASTE has (paste fires "input" and
+   * nothing else until focus moves), so the two are the same fixture.
+   */
+  typeFocused: (key: string, value: string) => void;
+  /** The "change" a real blur produces, with no accompanying edit — for
+   *  observing what a commit does when the value was already committed by
+   *  another gesture. */
+  blur: (key: string) => void;
+  /**
+   * Presses Enter on a specific field: a "keydown" carrying `key: "Enter"`.
+   *
+   * Deliberately does NOT submit. In a browser the submission is the DEFAULT
+   * ACTION of this event and therefore runs after every listener has returned,
+   * so a test spells the two halves out in that order — `pressEnter(...)`, then
+   * `attemptSubmit()` for the implicit submission it causes — and can assert on
+   * what the form had already done in between.
+   */
+  pressEnter: (key: string) => void;
+  /** `pressEnter` for any other key — what a mid-edit keystroke looks like, so
+   *  a handler can be shown to ignore one. */
+  pressKey: (key: string, keyName: string) => void;
   /** The Browse dialog's answer — the only way to change a file field. */
   browseResult: (key: string, path: string) => void;
 }
@@ -533,6 +661,17 @@ export function openForm(definition: FormDefinition): FormHarness {
     }
   };
 
+  // The script's macrotask queue, owned by the test rather than by the runtime.
+  // `setTimeout` is passed in as a parameter so it SHADOWS the Node global
+  // inside the script's scope — anything the script queues lands here instead
+  // of on a real timer that a synchronous test would never see fire.
+  //
+  // The script queues NOTHING today: the Save-button hold used to be deferred
+  // by one macrotask and no longer is. The queue is kept anyway, drained by
+  // `clickSave`, so that a reintroduced timer is observed rather than silently
+  // dropped — see the note on `clickSave`.
+  const timers: Array<() => void> = [];
+
   const factory = new Function(
     "document",
     "window",
@@ -540,6 +679,7 @@ export function openForm(definition: FormDefinition): FormHarness {
     "selectCustomOption",
     "initCustomSelects",
     "initCustomComboboxes",
+    "setTimeout",
     source
   ) as (
     document: unknown,
@@ -547,7 +687,8 @@ export function openForm(definition: FormDefinition): FormHarness {
     acquireVsCodeApi: () => { postMessage: (msg: FormMessage) => void },
     selectCustomOption: (wrapper: StubElement, value: string) => void,
     initCustomSelects: (cb: (wrapper: StubElement, option: StubElement) => void) => void,
-    initCustomComboboxes: () => void
+    initCustomComboboxes: () => void,
+    setTimeout: (fn: () => void, delay?: number) => void
   ) => void;
 
   factory(
@@ -558,13 +699,33 @@ export function openForm(definition: FormDefinition): FormHarness {
     (cb) => {
       optionClick = cb;
     },
-    () => {}
+    () => {},
+    (fn) => {
+      timers.push(fn);
+    }
   );
+
+  /** Drained rather than iterated: a queued task may queue another. */
+  const runQueuedTasks = (): void => {
+    while (timers.length > 0) {
+      timers.shift()!();
+    }
+  };
 
   const control = (key: string): StubElement => {
     const el = dom.form.elements?.[key];
     if (!el || typeof el === "number") {
       throw new Error(`no control named ${key}`);
+    }
+    return el;
+  };
+
+  /** A control the user could actually have put a value into — shared by every
+   *  editing gesture so none of them can fake input into a locked field. */
+  const editable = (key: string): StubElement => {
+    const el = control(key);
+    if (el.readOnly) {
+      throw new Error(`field ${key} is read-only — the user could not have typed this`);
     }
     return el;
   };
@@ -594,6 +755,45 @@ export function openForm(definition: FormDefinition): FormHarness {
       }
       return last.values;
     },
+    attemptSubmit: () => {
+      const before = posted.length;
+      dom.submit();
+      const last = posted[posted.length - 1];
+      return posted.length > before && last?.type === "submit" ? last.values : undefined;
+    },
+    clickSave: () => {
+      // The press is held long enough for the queue to drain before the click
+      // is dispatched — legal, unbounded, and the timing the fifth review
+      // finding is about.
+      runQueuedTasks();
+      // What a browser does with a click on a disabled control: nothing. No
+      // click event, and so no `submit` event either — the form's handler is
+      // never reached, which is why a Save held that way cannot even be
+      // deferred.
+      if (dom.byId.get("save-btn")?.disabled === true) {
+        return undefined;
+      }
+      const before = posted.length;
+      dom.submit();
+      const last = posted[posted.length - 1];
+      return posted.length > before && last?.type === "submit" ? last.values : undefined;
+    },
+    saveHeld: () => {
+      const button = dom.byId.get("save-btn");
+      const marked = button?.classList.contains("save-held") === true;
+      const announced = button?.getAttribute("aria-busy") === "true";
+      if (marked !== announced) {
+        throw new Error(
+          `Save button's visual hold (${marked}) and aria-busy (${announced}) disagree — they are one state`
+        );
+      }
+      return marked;
+    },
+    saveNativelyDisabled: () => dom.byId.get("save-btn")?.disabled === true,
+    lastAutofillRequestId: () => {
+      const message = [...posted].reverse().find((entry) => entry.type === "autofill");
+      return message?.type === "autofill" ? message.requestId : undefined;
+    },
     value: (key) => control(key).value,
     locked: (key) => {
       const el = dom.byId.get(`field-${key}`);
@@ -611,14 +811,19 @@ export function openForm(definition: FormDefinition): FormHarness {
     },
     selectLabel: (key) => dom.byId.get(`field-${key}`)?.querySelector(".custom-select-text")?.textContent ?? "",
     type: (key, value) => {
-      const el = control(key);
-      if (el.readOnly) {
-        throw new Error(`field ${key} is read-only — the user could not have typed this`);
-      }
+      const el = editable(key);
       el.value = value;
       el.dispatch("input");
       el.dispatch("change");
     },
+    typeFocused: (key, value) => {
+      const el = editable(key);
+      el.value = value;
+      el.dispatch("input");
+    },
+    blur: (key) => control(key).dispatch("change"),
+    pressEnter: (key) => control(key).dispatchKey("keydown", "Enter"),
+    pressKey: (key, keyName) => control(key).dispatchKey("keydown", keyName),
     browseResult: (key, path) => dom.deliverMessage({ type: "browseResult", key, path })
   };
 }

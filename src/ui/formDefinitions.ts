@@ -4,6 +4,11 @@ import type { NetworkServerKind } from "../models/networkServer";
 import type { DhcpAdapterConfig, TftpAdapterConfig } from "../services/networkServers/core/index";
 import { DEFAULTS as DHCP_DEFAULTS } from "../services/networkServers/dhcp/engine/dhcpConstants";
 import { computePoolSize } from "../services/networkServers/dhcp/engine/dhcpNetworkUtils";
+// Same direction `networkServerTreeProvider.ts` already reads these from: the
+// network-server editors' shared plumbing lives beside the commands that write
+// the settings, and both surfaces seed themselves from it rather than each
+// re-deriving a CIDR out of a mask.
+import { DHCP_CIDR_FIELD_KEY, dhcpCurrentCidr } from "../commands/networkServerSettings";
 import type { InventoryConfigField, InventoryProvider, InventorySourceConfig, InventorySourceValues, TemplateRule } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
@@ -1931,8 +1936,13 @@ export interface NetworkServerFormOptions {
    * `networkInterfaceBindOptions()`. Omitted (tests, defensive callers) leaves
    * the picker offering the all-interfaces choice plus whatever the setting
    * already holds, so no configured address is ever silently dropped.
+   *
+   * `description` is passed straight through to the option row. The DHCP caller
+   * runs the list through `dhcpInterfaceChoices()` first so the NICs already on
+   * the pool's subnet say so; that comparison stays in the command layer
+   * because this file describes forms and does not do IPv4 arithmetic.
    */
-  interfaceOptions?: Array<{ label: string; value: string }>;
+  interfaceOptions?: Array<{ label: string; value: string; description?: string }>;
 }
 
 const ALL_INTERFACES_OPTION = { label: "All interfaces (0.0.0.0)", value: "" };
@@ -1951,7 +1961,13 @@ const ALL_INTERFACES_OPTION = { label: "All interfaces (0.0.0.0)", value: "" };
 function bindInterfaceField(
   configured: string | undefined,
   options: NetworkServerFormOptions | undefined,
-  hint: string
+  hint: string,
+  /**
+   * DHCP only: picking a NIC derives the whole network it is on (see
+   * `dhcpFormAutofillFields`). TFTP has no pool to derive, so its picker stays
+   * a plain select and posts nothing.
+   */
+  autofill = false
 ): FormFieldDescriptor {
   const trimmed = (configured ?? "").trim();
   const value = trimmed === "0.0.0.0" ? "" : trimmed;
@@ -1964,6 +1980,7 @@ function bindInterfaceField(
       ? known
       : [...known, { label: `${value} — not currently available`, value }],
     value,
+    ...(autofill ? { autofill: true } : {}),
     hint
   };
 }
@@ -2041,9 +2058,28 @@ function dhcpServerFields(current: DhcpServerFormSeed, options?: NetworkServerFo
     bindInterfaceField(
       current.bindAddress,
       options,
-      "Which NIC serves DHCP. This is what stops a lab DHCP server from answering DISCOVERs arriving on the corporate LAN. The port is always UDP 67."
+      "Which NIC serves DHCP. This is what stops a lab DHCP server from answering DISCOVERs arriving on the corporate LAN. The port is always UDP 67. Picking one fills in the network it is on.",
+      true
     ),
+    {
+      type: "checkbox",
+      key: "allowRelayAgents",
+      label: "Serve relayed requests",
+      value: current.allowRelayAgents ?? false,
+      hint: "Answer requests naming a relay agent in giaddr (RFC 2131 §4.1). Leave off unless this server really sits behind a relay: nothing authenticates that field, so with it on any device on the network can have a full configuration sent to an address of its choosing. It also turns off the off-subnet warnings below, since serving a subnet this machine is not on is then the point. Honoured by the Rust engine only."
+    },
     { type: "section", label: "Address Pool" },
+    {
+      type: "text",
+      key: DHCP_CIDR_FIELD_KEY,
+      label: "Network (CIDR)",
+      placeholder: "192.168.2.0/24",
+      // Reverse-derived from the settings that already exist, so an untouched
+      // config shows its network with nothing having been migrated.
+      value: dhcpCurrentCidr(current.rangeStart, current.subnet),
+      autofill: true,
+      hint: "The whole network in one go. Not stored as such — leaving this field fills in the subnet mask, the pool and the gateway that follow from it. A gateway you typed yourself is kept."
+    },
     {
       type: "text",
       key: "rangeStart",

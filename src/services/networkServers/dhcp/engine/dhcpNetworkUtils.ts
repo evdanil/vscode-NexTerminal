@@ -109,6 +109,114 @@ export function isIpInPool(ip: string, rangeStart: string, rangeEnd: string): bo
 }
 
 /**
+ * The CIDR prefix length a dotted-quad mask describes.
+ *
+ * Counting set bits is not enough: `255.0.255.0` has sixteen of them and is not
+ * a subnet at all, so it has no prefix to report. {@link isContiguousMask} is
+ * the same predicate the editors already refuse input with, reused here rather
+ * than restated, and the arithmetic is unsigned (`>>> 0`) so a mask whose top
+ * bit is set does not go negative on the way through.
+ *
+ * @returns `0`–`32`, or `undefined` when the mask does not parse or its set bits
+ *   are not contiguous from the top.
+ */
+export function maskToPrefix(mask: string): number | undefined {
+  if (!isValidIpv4(mask) || !isContiguousMask(mask)) return undefined;
+  const value = ipToInt(mask) >>> 0;
+  let prefix = 0;
+  for (let bit = 31; bit >= 0; bit -= 1) {
+    if (((value >>> bit) & 1) === 0) break;
+    prefix += 1;
+  }
+  return prefix;
+}
+
+/**
+ * The dotted-quad mask a CIDR prefix length describes — the inverse of
+ * {@link maskToPrefix}.
+ *
+ * `0` is special-cased because JavaScript's shift operators take the count
+ * modulo 32: `0xffffffff << 32` is `0xffffffff`, i.e. `/0` would otherwise
+ * produce the `/32` mask.
+ *
+ * @returns `undefined` outside `0`–`32`, or for a non-integer prefix.
+ */
+export function prefixToMask(prefix: number): string | undefined {
+  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 32) return undefined;
+  const value = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+  return intToIp(value);
+}
+
+/**
+ * The network address of `ip` under `mask` (`ip & mask`).
+ *
+ * @returns Dotted-quad network address. Either argument failing to parse yields
+ *   `0.0.0.0` by way of {@link ipToInt}'s lenient parse — callers that care
+ *   about the difference check the inputs first.
+ */
+export function networkAddress(ip: string, mask: string): string {
+  return intToIp((((ipToInt(ip) >>> 0) & (ipToInt(mask) >>> 0)) >>> 0));
+}
+
+/**
+ * Whether two addresses share a network under one mask.
+ *
+ * The mask is an argument rather than something derived per address on purpose:
+ * the question this answers is "is this NIC on the *pool's* subnet", and a NIC
+ * carrying a wider mask of its own would answer "yes" to a pool it cannot
+ * actually serve.
+ *
+ * Both sides are masked unsigned (`>>> 0`). {@link ipToInt} is signed, so a pair
+ * straddling `127.255.255.255`/`128.0.0.0` — the boundary where the signed
+ * conversion flips — would otherwise be compared as a negative against a
+ * positive.
+ *
+ * @returns `false` when any of the three arguments is not a dotted-quad, which
+ *   keeps a malformed setting from reading as a match.
+ */
+export function isSameSubnet(a: string, b: string, mask: string): boolean {
+  if (!isValidIpv4(a) || !isValidIpv4(b) || !isValidIpv4(mask)) return false;
+  const m = ipToInt(mask) >>> 0;
+  return (((ipToInt(a) >>> 0) & m) >>> 0) === (((ipToInt(b) >>> 0) & m) >>> 0);
+}
+
+/** A network in CIDR form, normalized to its network address. */
+export interface ParsedCidr {
+  /** `text`'s address with the host bits cleared. */
+  readonly network: string;
+  readonly prefix: number;
+}
+
+/**
+ * Parses `10.0.0.0/24` — or `10.0.0.5/24`, whose host bits are simply dropped.
+ *
+ * Accepting a host address is deliberate: `ipconfig`/`ip addr` print the machine's
+ * own address with its prefix, and making the user clear the host bits by hand
+ * before pasting would be the exact arithmetic this parser exists to avoid.
+ *
+ * This is CIDR *syntax* only. `/31` and `/32` parse fine here — they are legal
+ * networks — and whether a prefix leaves a usable DHCP pool is a question for
+ * the caller that is building one.
+ *
+ * @returns `undefined` for anything that is not `<dotted-quad>/<1..32>`.
+ */
+export function parseCidr(text: string): ParsedCidr | undefined {
+  const parts = text.trim().split('/');
+  if (parts.length !== 2) return undefined;
+  const address = parts[0].trim();
+  const prefixText = parts[1].trim();
+  if (!isValidIpv4(address)) return undefined;
+  // A digits-only test first: `Number('')`, `Number(' 24 ')` and `Number('0x18')`
+  // are all numbers, and none of them is a prefix length someone typed.
+  if (!/^[0-9]{1,2}$/.test(prefixText)) return undefined;
+  const prefix = Number(prefixText);
+  if (prefix < 1 || prefix > 32) return undefined;
+  const mask = prefixToMask(prefix);
+  if (mask === undefined) return undefined;
+  return { network: networkAddress(address, mask), prefix };
+}
+
+/**
  * Calculates the broadcast address from the gateway and netmask
  * (`broadcast = (gateway & mask) | ~mask`).
  *

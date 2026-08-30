@@ -95,7 +95,14 @@ describe("WebviewFormPanel submit handling", () => {
 
     await Promise.resolve(messageHandler!({ type: "autofill", key: "authProfileId", value: "ap1" }));
 
-    expect(onAutofill).toHaveBeenCalledWith("authProfileId", "ap1");
+    // The third argument is the form's own value snapshot. A message that
+    // carries none forwards `undefined` rather than an empty object, so a
+    // handler can tell "the webview sent nothing" from "the form is empty".
+    //
+    // The fourth is what the field held immediately BEFORE this change, which
+    // only a select sends (see the previousValue note in formTypes.ts). Same
+    // rule: absent means absent, never invented here.
+    expect(onAutofill).toHaveBeenCalledWith("authProfileId", "ap1", undefined, undefined);
     // `key` echoes the request: the webview tracks which managed fields the
     // AUTH PROFILE select filled, and must not read another autofill-capable
     // select's answer as the profile's (kills dropping the echo).
@@ -115,6 +122,81 @@ describe("WebviewFormPanel submit handling", () => {
     });
   });
 
+  it("echoes the request's id on BOTH answers, without the handler ever seeing it (kills stamping only the fill, or only the terminator: the webview correlates on the id, so an answer without one releases nothing and Save stays held for the life of the panel)", async () => {
+    const onSubmit = vi.fn();
+    const onAutofill = vi.fn().mockResolvedValue({ subnet: "255.255.255.0" });
+
+    WebviewFormPanel.open("panel-autofill-id", { title: "Autofill", fields: [] }, { onSubmit, onAutofill });
+    await Promise.resolve(
+      messageHandler!({ type: "autofill", key: "cidr", value: "10.0.0.0/24", requestId: 7 })
+    );
+
+    // The id is the webview's own correlation handle: two requests can carry the
+    // same key and value (a network typed, changed and retyped), so key/value
+    // cannot say WHICH request an answer settles.
+    expect(postMessage).toHaveBeenCalledWith({
+      type: "fillFields",
+      key: "cidr",
+      value: "10.0.0.0/24",
+      values: { subnet: "255.255.255.0" },
+      requestId: 7
+    });
+    expect(postMessage).toHaveBeenCalledWith({
+      type: "autofillSettled",
+      key: "cidr",
+      value: "10.0.0.0/24",
+      requestId: 7
+    });
+    // The handler is never told about it — no onAutofill implementation has any
+    // reason to know which request it is answering.
+    expect(onAutofill).toHaveBeenCalledWith("cidr", "10.0.0.0/24", undefined, undefined);
+  });
+
+  it("forwards the value the field held before the change, which a SELECT is the only sender of (kills dropping previousValue at this layer: the snapshot already carries the NEW option under that key, so the DHCP editor's previous-network gate would resolve the NIC that was just selected on both sides)", async () => {
+    const onSubmit = vi.fn();
+    const onAutofill = vi.fn().mockResolvedValue({ serverId: "10.0.0.6" });
+
+    WebviewFormPanel.open("panel-autofill-prev", { title: "Autofill", fields: [] }, { onSubmit, onAutofill });
+    await Promise.resolve(
+      messageHandler!({
+        type: "autofill",
+        key: "interface",
+        value: "10.0.0.6",
+        previousValue: "10.0.0.5",
+        // Exactly the shape the webview posts: the selection is applied to the
+        // DOM before the message goes out, so the snapshot says .6 too and the
+        // replaced address survives in no other field of this message.
+        values: { interface: "10.0.0.6", serverId: "10.0.0.5" }
+      })
+    );
+
+    expect(onAutofill).toHaveBeenCalledWith(
+      "interface",
+      "10.0.0.6",
+      { interface: "10.0.0.6", serverId: "10.0.0.5" },
+      "10.0.0.5"
+    );
+  });
+
+  it("echoes the request's id on the terminator even when the handler THROWS", async () => {
+    const onSubmit = vi.fn();
+    const onAutofill = vi.fn().mockRejectedValue(new Error("vault read failed"));
+
+    WebviewFormPanel.open("panel-autofill-id-throws", { title: "Autofill", fields: [] }, { onSubmit, onAutofill });
+    await expect(
+      Promise.resolve(messageHandler!({ type: "autofill", key: "cidr", value: "10.0.0.0/24", requestId: 11 }))
+    ).rejects.toThrow("vault read failed");
+
+    // A failed round trip is still a round trip that ended, and an unstamped
+    // terminator would leave its request outstanding for ever.
+    expect(postMessage).toHaveBeenCalledWith({
+      type: "autofillSettled",
+      key: "cidr",
+      value: "10.0.0.0/24",
+      requestId: 11
+    });
+  });
+
   it("does not post fillFields when autofill returns undefined", async () => {
     const onSubmit = vi.fn();
     const onAutofill = vi.fn().mockResolvedValue(undefined);
@@ -124,8 +206,96 @@ describe("WebviewFormPanel submit handling", () => {
 
     await Promise.resolve(messageHandler!({ type: "autofill", key: "authProfileId", value: "ap1" }));
 
-    expect(onAutofill).toHaveBeenCalledWith("authProfileId", "ap1");
+    expect(onAutofill).toHaveBeenCalledWith("authProfileId", "ap1", undefined, undefined);
     expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "fillFields" }));
+    // REVIEW FINDING (P1) — but the request IS answered. The webview disables
+    // Save for the length of the round trip, and an answer that fills nothing
+    // (a /32, a profile that supplies no usable value) is still the end of that
+    // round trip. Without this terminator the button stays disabled for the
+    // life of the panel, because no fillFields is coming.
+    expect(postMessage).toHaveBeenCalledWith({
+      type: "autofillSettled",
+      key: "authProfileId",
+      value: "ap1"
+    });
+  });
+
+  it("answers an autofill whose handler THROWS, so a failed round trip cannot leave Save disabled forever", async () => {
+    const onSubmit = vi.fn();
+    const onAutofill = vi.fn().mockRejectedValue(new Error("vault read failed"));
+
+    WebviewFormPanel.open("panel-autofill-throws", { title: "Autofill", fields: [] }, { onSubmit, onAutofill });
+    expect(messageHandler).toBeDefined();
+
+    await expect(
+      Promise.resolve(messageHandler!({ type: "autofill", key: "cidr", value: "10.0.0.0/24" }))
+    ).rejects.toThrow("vault read failed");
+
+    // The rejection still propagates (that is unchanged), but the terminator
+    // goes out first — a `finally`, not a success-path post.
+    expect(postMessage).toHaveBeenCalledWith({ type: "autofillSettled", key: "cidr", value: "10.0.0.0/24" });
+  });
+
+  it("answers an autofill on a panel that wired no onAutofill at all", async () => {
+    const onSubmit = vi.fn();
+
+    WebviewFormPanel.open("panel-autofill-unwired", { title: "Autofill", fields: [] }, { onSubmit });
+    expect(messageHandler).toBeDefined();
+
+    await Promise.resolve(messageHandler!({ type: "autofill", key: "cidr", value: "10.0.0.0/24" }));
+
+    // No form does this today, but the failure mode if one ever did is a Save
+    // button that never comes back — silent, and only in that one form.
+    expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "fillFields" }));
+    expect(postMessage).toHaveBeenCalledWith({ type: "autofillSettled", key: "cidr", value: "10.0.0.0/24" });
+  });
+
+  it("posts the terminator AFTER the fill it accompanies", async () => {
+    const onSubmit = vi.fn();
+    const onAutofill = vi.fn().mockResolvedValue({ subnet: "255.255.255.0" });
+
+    WebviewFormPanel.open("panel-autofill-order", { title: "Autofill", fields: [] }, { onSubmit, onAutofill });
+    await Promise.resolve(messageHandler!({ type: "autofill", key: "cidr", value: "10.0.0.0/24" }));
+
+    // Order is the whole point: a submit the webview deferred is flushed by the
+    // terminator, and must be collected over the FILLED fields. Reversed, the
+    // held Save would go out carrying the values the fill was about to replace
+    // — the exact loss the hold exists to prevent.
+    // `postMessage` is declared with no parameters (it only ever needs to
+    // resolve), so read the recorded arguments through `unknown`.
+    const types = (postMessage.mock.calls as unknown as Array<[{ type: string }]>).map((call) => call[0].type);
+    expect(types.indexOf("fillFields")).toBeGreaterThan(-1);
+    expect(types.indexOf("autofillSettled")).toBeGreaterThan(types.indexOf("fillFields"));
+  });
+
+  it("forwards the autofill message's form-value snapshot to the handler", async () => {
+    const onSubmit = vi.fn();
+    const onAutofill = vi.fn().mockResolvedValue({ subnet: "255.255.255.0" });
+
+    WebviewFormPanel.open("panel-autofill-values", { title: "Autofill", fields: [] }, { onSubmit, onAutofill });
+    expect(messageHandler).toBeDefined();
+
+    // The DHCP editor's CIDR row cannot decide what it may overwrite without
+    // this: a gateway the user typed has to survive, and only one a previous
+    // derivation wrote may be replaced. Dropping `values` on the floor here
+    // makes every such answer look like it is filling a blank form, which is
+    // precisely the "clobber a hand-set value" bug the payload exists to stop.
+    await Promise.resolve(
+      messageHandler!({
+        type: "autofill",
+        key: "cidr",
+        value: "10.0.0.0/24",
+        values: { gateway: "10.0.0.9", rangeStart: "192.168.2.10" }
+      })
+    );
+
+    expect(onAutofill).toHaveBeenCalledWith(
+      "cidr",
+      "10.0.0.0/24",
+      { gateway: "10.0.0.9", rangeStart: "192.168.2.10" },
+      // A CIDR commit sends no previous value — it changes only its own row.
+      undefined
+    );
   });
 
   it("REVIEW FINDING 2 (P2) — a rejecting onTest is caught and shown as 'Test failed: ...' instead of escaping as an unhandled rejection (kills the uncaught onTest await)", async () => {

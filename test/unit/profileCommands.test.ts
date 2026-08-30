@@ -212,6 +212,65 @@ describe("openUnifiedForm test action", () => {
 });
 
 /**
+ * The webview posts the form's WHOLE current value snapshot with every
+ * `autofill` message (`FormMessage`'s optional `values`, forwarded as the third
+ * argument by `WebviewFormPanel`). The unified profile form has password inputs
+ * on it — the SOCKS5 and HTTP proxy passwords — so that snapshot carries
+ * whatever is typed into them, saved or not.
+ *
+ * That is safe only because this form's handler answers from the chosen auth
+ * profile id and never looks at the snapshot, and nothing in the type system
+ * says so: the parameter is optional, so a future handler can start reading it
+ * with no compile error. This pins the arity that makes the claim true, and
+ * checks that nothing out of the snapshot reaches the credential mirror.
+ * Change the handler to `async (_key, value, values) => …` and the first
+ * expectation goes red; pass any part of the snapshot onward and the last one
+ * does. The twin of this test lives in `serverCommands.test.ts` for the server
+ * edit form, the other password-bearing form with an autofill handler.
+ */
+describe("unified profile form autofill — the values snapshot is never read (password-bearing form)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetConfiguration.mockReturnValue({ get: (_key: string, fallback: unknown) => fallback });
+    mockWebviewOpen.mockReturnValue({ dispose: vi.fn() });
+  });
+
+  it("takes only (key, value), and hands the credential mirror nothing but the resolved profile", async () => {
+    const profile = { id: "ap1", name: "Prod Auth", username: "root", authType: "password" };
+    const ctx = {
+      core: {
+        getSnapshot: vi.fn(() => ({ servers: [], authProfiles: [profile] })),
+        getAuthProfile: vi.fn((id: string) => (id === profile.id ? profile : undefined)),
+        addOrUpdateServer: vi.fn(),
+        addOrUpdateSerialProfile: vi.fn(),
+        addOrUpdateLocalShellProfile: vi.fn()
+      },
+      secretVault: { get: vi.fn(), store: vi.fn(), delete: vi.fn() }
+    } as any;
+
+    openUnifiedForm(ctx);
+    const handlers = mockWebviewOpen.mock.calls.at(-1)![2] as {
+      onAutofill: (...args: unknown[]) => Promise<unknown>;
+    };
+
+    expect(
+      handlers.onAutofill.length,
+      "the unified profile form's onAutofill declared a third parameter — see the values safety note in formTypes.ts"
+    ).toBe(2);
+
+    await handlers.onAutofill("authProfileId", "ap1", {
+      proxySocks5Password: "leak-sentinel-socks5",
+      proxyHttpPassword: "leak-sentinel-http",
+      username: "typed-by-hand"
+    });
+
+    expect(mockAuthProfileCredentialMirror).toHaveBeenCalledTimes(1);
+    expect(mockAuthProfileCredentialMirror.mock.calls[0]).toEqual([profile]);
+    expect(JSON.stringify(mockAuthProfileCredentialMirror.mock.calls)).not.toContain("leak-sentinel");
+  });
+});
+
+/**
  * NODE CONTROL (Phase 4, task #28) — M5. The row-click Profile Actions quick-pick
  * gates entries by state, but node power (the headline EVE-row capability) was
  * right-click-only. It now conditionally appends Start Node (EVE + stopped) /

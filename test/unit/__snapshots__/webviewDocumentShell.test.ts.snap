@@ -1498,6 +1498,18 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
     .actions button[data-visible-when].field-visible {
       display: inline-flex;
     }
+    /* Save while an autofill round trip is outstanding. APPEARANCE ONLY — the
+       button stays natively clickable and its click is deferred, not dropped
+       (see "SAVE MUST NOT OUTRUN AN AUTOFILL ROUND TRIP" in the script below).
+       Dimmed like the shared \`:disabled\` rules so it reads as held, and
+       \`progress\` rather than \`not-allowed\` because the Save is coming. */
+    .actions button.save-held {
+      opacity: 0.5;
+      cursor: progress;
+    }
+    .actions button.save-held:hover {
+      background: var(--vscode-button-background);
+    }
   </style>
 </head>
 <body>
@@ -1509,7 +1521,7 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
   <div class="field-error" id="error-name"></div>
 </div>
     <div class="actions">
-      <button type="submit" class="btn-primary">Save</button>
+      <button type="submit" class="btn-primary" id="save-btn">Save</button>
       
       <button type="button" class="btn-secondary" id="cancel-btn">Cancel</button>
     </div>
@@ -2049,6 +2061,11 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
        * and by the echoed value so an answer for an option the user has since
        * moved away from is discarded rather than applied
        * (fillAnswersCurrentSelection).
+       *
+       * REVIEW FINDING (P2) — and, for the DHCP path, scoped by the SNAPSHOT
+       * the request carried, so a target field hand-edited while the answer was
+       * in flight keeps the user's edit — see autofillSnapshot and the note on
+       * pendingAutofills.
        */
       function applyFillFields(msg) {
         // Stale answers are dropped whole — values, ownership and all. A
@@ -2060,7 +2077,19 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
         var fillValues = msg.values;
         var isProfileFill = msg.key === "authProfileId";
         var nextFilledKeys = isProfileFill ? filledKeysFromValues(fillValues) : null;
+        // Read once, not per key: collecting inside the loop would compare the
+        // later keys against a form this very loop has already been writing to.
+        var requestSnapshot = isProfileFill ? undefined : autofillSnapshot(msg.requestId);
+        var liveValues = requestSnapshot ? collectFormValues() : undefined;
         for (var fk in fillValues) {
+          if (!isProfileFill && requestSnapshot && liveValues[fk] !== requestSnapshot[fk]) {
+            // Hand-edited since this request went out. The host decided what it
+            // was allowed to overwrite from the snapshot above, so its answer
+            // for THIS key is reasoning about a value that no longer exists —
+            // every other key in the same answer is still good and still
+            // applied.
+            continue;
+          }
           if (isProfileFill) {
             // A key supplied BLANK owns nothing (filledKeysFromValues), so
             // writing it would replace the user's own value with one nothing
@@ -2192,8 +2221,17 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
         })(defaultsTargets[di]);
       }
 
-      form.addEventListener("submit", function(e) {
-        e.preventDefault();
+      /**
+       * Everything this form would submit right now, in the shape the
+       * extension host reads (FormValues). One definition rather than the
+       * four near-identical copies this script used to carry: submit, Test
+       * Connection, the inline-create snapshot and — new — the autofill
+       * payload all need exactly the same collection, and a fifth copy is how
+       * they drift apart. Disabled controls are skipped because a hidden
+       * field's value is not part of the form's answer (updateVisibility
+       * disables what it hides).
+       */
+      function collectFormValues() {
         var values = {};
         for (var i = 0; i < form.elements.length; i++) {
           var el = form.elements[i];
@@ -2207,7 +2245,322 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
             values[el.name] = el.value;
           }
         }
-        vscode.postMessage({ type: "submit", values: values });
+        return values;
+      }
+
+      /**
+       * ── SAVE MUST NOT OUTRUN AN AUTOFILL ROUND TRIP ────────────────────
+       * REVIEW FINDING (P1) — an autofill is a round trip through the
+       * extension host, and a Save clicked while one is in flight submits the
+       * fields as they were BEFORE the answer landed. For the DHCP editor's
+       * CIDR row that is silent data loss in both directions: the old subnet,
+       * pool and gateway are saved as though nothing had been typed, and the
+       * network that WAS typed is discarded with them, because "cidr" is an
+       * input shape the settings layer deliberately never writes (see
+       * DHCP_CIDR_FIELD_KEY). The user sees a network go in and a save go
+       * through, and gets neither.
+       *
+       * Racing faster is not available — the answer is asynchronous by
+       * construction — so Save is held instead. Requests are tracked one by
+       * one rather than by a flag, because several can be outstanding at once:
+       * committing the CIDR row and then picking a NIC posts two, and a flag
+       * would re-open Save on the first answer with the second still in the
+       * air — the same race, one round trip later.
+       *
+       * REVIEW FINDING (P2) — each request is identified by a REQUEST ID this
+       * script mints, not by the key and value it asked about. Key and value
+       * do not identify anything: the same pair can be asked twice before
+       * either answer returns (type a network, change it, change it back), and
+       * two identical tokens in the pending list are indistinguishable. Each
+       * request is answered TWICE in the usual case (fillFields, then the
+       * terminator), so the first request's pair of answers would release BOTH
+       * of those entries — retiring an outstanding request that has not been
+       * answered at all, and letting a deferred Save fire over a snapshot its
+       * own answer was about to correct. Ids are unique per request whatever
+       * was asked, so an answer can only ever release the request it answers.
+       * Key and value still travel with the answer for a different job — they
+       * decide whether the FILL is still about the option now selected (see
+       * fillAnswersCurrentSelection) — and both are echoed on both answers.
+       *
+       * A submit attempted meanwhile is DEFERRED, not dropped, and ONE check
+       * does that: pendingAutofills non-empty at the top of the form's own
+       * "submit" handler means remember the intent and fire it when the last
+       * answer lands, over values collected then — which is exactly what the
+       * user meant by Save. Every route into a submission arrives at that one
+       * handler: Enter in a text field, a click on Save, and the click that
+       * fired this round trip in the first place and is still in flight when it
+       * is posted. Nothing else may stand in front of it.
+       *
+       * REVIEW FINDING (P1, fifth round) — HOLDING SAVE IS NOT THE BUTTON'S
+       * JOB. The Save button is marked held VISUALLY and only visually (the
+       * save-held class plus aria-busy, applied in postAutofill and cleared in
+       * autofillSettled); its native \`disabled\` property is never set. Two
+       * rounds were spent trying to make \`disabled\` safe, and both are recorded
+       * here as ABANDONED so a third attempt is not made.
+       *
+       * \`disabled\` on a type="submit" button does not merely grey it: the
+       * browser then refuses to dispatch click, and therefore submit, on that
+       * button at all. That makes it a second gate in front of the deferral
+       * above — one that SWALLOWS a submit instead of deferring it, which is
+       * precisely the silent loss this whole block exists to prevent. Both
+       * timings failed for the same reason:
+       *   * disabling synchronously from the "change" that posts the request
+       *     lands mid-gesture. Clicking Save while the CIDR row still has focus
+       *     delivers mousedown on the button, then the blur-driven "change" —
+       *     which is what calls postAutofill — then mouseup, then click. The
+       *     button is disabled by the time the browser weighs that click, so no
+       *     click, no "submit" event, and the user's Save is simply gone;
+       *   * deferring the disable by one macrotask (setTimeout(fn, 0)) only
+       *     narrows that window. A macrotask runs when the queue next drains,
+       *     which is not when the user's finger comes up: hold the button down
+       *     longer than one tick — a duration no API bounds and no pointer
+       *     hardware promises — and the disable still lands between mousedown
+       *     and mouseup, with the same swallowed click.
+       * There is no third timing to try, because the events being raced are the
+       * user's own. So the mechanism is gone rather than re-tuned: a class and
+       * an ARIA attribute cannot suppress a dispatch, every submit the user
+       * makes reaches the deferral, and nothing about the hold depends on
+       * elapsed time any more.
+       *
+       * The cost is that Save can be clicked repeatedly while a round trip is
+       * out, and that is deliberately not de-duplicated: each attempt sets the
+       * same deferredSubmit flag, and postSubmit fires once, when the last
+       * answer lands.
+       *
+       * REVIEW FINDING (P1) — the submit handler's deferral only works if
+       * something is PENDING by the time submit is dispatched, and a commit
+       * does not only happen on blur. The round trip is started from "change"
+       * on purpose (deriving a
+       * whole pool from 192.168.2.0/2 on the way to /24 would overwrite the
+       * fields the user is about to see filled correctly), and "change" on a
+       * text input is a blur-time event. Enter does NOT blur: it is the
+       * browser's implicit submission, and the input still holds focus while the
+       * form submits. So the deferral was reached with pendingAutofills empty —
+       * nothing in flight because nothing had been committed — and the submit
+       * went straight out over the network the user had just replaced, with the
+       * replacement discarded. Same silent loss as the P1 above, one event
+       * earlier: "cidr" is never persisted (DHCP_CIDR_FIELD_KEY), so the typed
+       * network survives nowhere else.
+       *
+       * The commit is therefore ALSO fired from "keydown" on Enter, and no
+       * preventDefault goes with it. Submission is the DEFAULT ACTION of that
+       * key event, and a default action runs only after every listener for the
+       * event has returned; postAutofill is synchronous, so the pending entry
+       * exists before the form's own "submit" is dispatched and the deferral
+       * above sees it — exactly as it does for the click path. Cancelling the
+       * event instead would mean re-submitting the form by hand, which is more
+       * machinery for the same result.
+       *
+       * Both listeners call ONE commit, gated on the field having actually been
+       * edited (an "input" event since the last commit). The gate is not
+       * tidiness:
+       *   * whichever listener fires first clears it, so if this engine also
+       *     fires "change" for an Enter-driven submission the second one posts
+       *     nothing. A duplicate round trip would be harmless — ids make
+       *     concurrent requests independent (P2 above) — but one that cannot be
+       *     minted needs no de-duplication at all;
+       *   * "change" already means "the user edited this", and Enter does not.
+       *     Enter in an untouched CIDR row is plain "save", and deriving from it
+       *     would be destructive rather than merely wasteful: dhcpCidrFormFills
+       *     writes subnet, rangeStart and poolCount UNCONDITIONALLY (they are
+       *     what the network says, not suggestions the host may decline), so a
+       *     hand-typed pool start would be replaced by the network's first host
+       *     on the way out — and the snapshot guard below cannot catch it,
+       *     because the snapshot is taken after that edit and the field still
+       *     agrees with it;
+       *   * a value written back BY an answer (applyFillFields → setFieldValue)
+       *     dispatches no "input" and so is not an edit — the normalised CIDR
+       *     the host echoes does not ask to be derived a second time.
+       *
+       * The pointer path is unchanged and is still the blur-driven "change".
+       * The two gestures reach the same hazard through different events and each
+       * needs its own listener: a click blurs the field and never produces a
+       * keydown, an Enter produces a keydown and never blurs the field.
+       *
+       * A request is released by whichever of its two answers arrives:
+       * fillFields when there were values to fill, and the unconditional
+       * autofillSettled that follows it. The terminator is what makes this
+       * safe rather than merely usual — a derivation that fills nothing (a
+       * /32, a network that describes no pool) sends no fillFields at all, and
+       * releasing on fillFields alone would leave Save dead until the form was
+       * reopened.
+       *
+       * REVIEW FINDING (P2) — each pending request also KEEPS the values
+       * snapshot it was sent with, because the host's decision about what it
+       * may overwrite is made against that snapshot and the user can edit a
+       * target field after it was taken.
+       *
+       * The host gates gateway, broadcast, serverId and dns on isAutoFillable
+       * against the snapshot the request carried: blank, or still holding what
+       * the PREVIOUS network derived. Commit a CIDR, then — while the round
+       * trip is out — hand-type a gateway, and that gating is answering a
+       * question about a value the field no longer holds. fillAnswersCurrentSelection
+       * cannot catch it: it asks only whether the field the request was ABOUT
+       * (msg.key, the CIDR row) still holds the value it was about, and it
+       * does. The initiating row is untouched; it is the TARGET that moved.
+       *
+       * So the answer is re-checked field by field against the snapshot before
+       * anything is written (applyFillFields): a target still holding what it
+       * held at request time is filled as before, one that has since diverged
+       * is left alone, and the rest of the same answer still lands. Skipping
+       * the whole answer instead would throw away the mask and pool the user
+       * asked for over one edited gateway.
+       *
+       * An answer whose requestId matches no pending entry is applied
+       * unconditionally, exactly as before — same leniency as
+       * fillAnswersCurrentSelection's "a control this form does not render is
+       * applied as before". There is no snapshot to judge it against, and the
+       * only things that reach that state are a hand-built message and an
+       * answer that arrived after its own terminator.
+       */
+      var pendingAutofills = [];
+      var deferredSubmit = false;
+      var nextAutofillRequestId = 1;
+      var saveBtn = document.getElementById("save-btn");
+
+      /* The "a round trip is outstanding" mark on Save: appearance and
+         assistive semantics, never behaviour — see "HOLDING SAVE IS NOT THE
+         BUTTON'S JOB" above for why the native disabled property is not touched
+         here. aria-busy rather than aria-disabled: the click IS honoured, just
+         not yet, and telling a screen reader the control is unavailable would
+         be the same lie the disabled attribute used to tell the browser. */
+      function markSaveHeld(held) {
+        if (!saveBtn) return;
+        saveBtn.classList.toggle("save-held", held);
+        if (held) {
+          saveBtn.setAttribute("aria-busy", "true");
+        } else {
+          saveBtn.removeAttribute("aria-busy");
+        }
+      }
+
+      /**
+       * REVIEW FINDING (P1) — previousValue is what THIS FIELD held immediately
+       * before the gesture being reported, and it exists because for a SELECT
+       * the snapshot cannot say. A select is applied to the DOM before the
+       * round trip is posted (selectCustomOption runs first, so the trigger and
+       * the hidden input already show the new option), which means the
+       * snapshot's entry for this key is the NEW value on both sides of the
+       * change. A host that needs the pre-selection value — the DHCP editor's
+       * bind address, whose option 54 gate asks "what would this fill have
+       * written BEFORE the NIC moved" — cannot recover it from the snapshot,
+       * and reusing the new one silently answers that question with the new
+       * NIC. Two NICs on one subnet is where that shows: switching 10.0.0.5 to
+       * 10.0.0.6 leaves a server identifier of .5 looking hand-set, and the
+       * DHCP socket then answers from .6 while telling clients to renew at .5.
+       *
+       * Sent only when the caller has one to send. A TEXT field's commit
+       * changes only itself and never moves the bind address, so the CIDR row
+       * passes nothing and the host keeps its existing "same address either
+       * side" reading for that trigger.
+       */
+      function postAutofill(key, value, previousValue) {
+        var requestId = nextAutofillRequestId++;
+        // Collected ONCE and used twice — the payload the host reasons over and
+        // the copy this script judges the answer against have to be the same
+        // object, or the two ends are comparing different forms.
+        var snapshot = collectFormValues();
+        pendingAutofills.push({ id: requestId, snapshot: snapshot });
+        /* Marked in the same breath as the push, with no timer between them,
+           because nothing about event DISPATCH depends on this any more — the
+           deferral in the submit handler is what actually holds Save. The
+           macrotask that used to sit here was protecting an in-flight click
+           from the disabled attribute; with the attribute gone there is nothing
+           left for it to protect. */
+        markSaveHeld(true);
+        var request = { type: 'autofill', key: key, value: value, values: snapshot, requestId: requestId };
+        if (previousValue !== undefined) request.previousValue = previousValue;
+        vscode.postMessage(request);
+      }
+
+      /** The values snapshot the still-pending request was sent with, or
+       *  undefined when nothing pending matches — see the note on
+       *  pendingAutofills for why that case applies the answer as before.
+       *  Always read BEFORE autofillSettled retires the entry, which is why the
+       *  message handler applies the fill first and settles second. */
+      function autofillSnapshot(requestId) {
+        if (requestId === undefined) return undefined;
+        for (var pi = 0; pi < pendingAutofills.length; pi++) {
+          if (pendingAutofills[pi].id === requestId) return pendingAutofills[pi].snapshot;
+        }
+        return undefined;
+      }
+
+      /** One answer — a fill, an empty answer, or a failure — has come back.
+       *  Idempotent per request: the first of the two answers releases it and
+       *  the second finds nothing to release, so an answer can never pay off
+       *  a DIFFERENT request that is still outstanding. An answer for a
+       *  request this form never made (another panel's shape, a hand-built
+       *  test message) carries an id this script never minted, matches
+       *  nothing, and is ignored. */
+      function autofillSettled(requestId) {
+        if (requestId === undefined) return;
+        var index = -1;
+        for (var si = 0; si < pendingAutofills.length; si++) {
+          if (pendingAutofills[si].id === requestId) {
+            index = si;
+            break;
+          }
+        }
+        if (index === -1) return;
+        pendingAutofills.splice(index, 1);
+        if (pendingAutofills.length > 0) return;
+        markSaveHeld(false);
+        if (deferredSubmit) {
+          deferredSubmit = false;
+          postSubmit();
+        }
+      }
+
+      function postSubmit() {
+        vscode.postMessage({ type: "submit", values: collectFormValues() });
+      }
+
+      /* An autofill-capable TEXT field — the DHCP editor's Network (CIDR) row.
+         The same round trip the autofill-capable SELECT below already makes,
+         fired on COMMIT rather than on "input": a network is only meaningful
+         once it is committed, and deriving a whole pool from 192.168.2.0/2 on
+         the way to /24 would overwrite the very fields the user is about to
+         see filled correctly. The values snapshot rides along because the
+         answer decides what it may overwrite — a hand-typed gateway survives,
+         a stale derived one does not. Fields that did not opt in carry no
+         data-autofill attribute and are not touched by this loop.
+
+         A commit is EITHER of the two gestures that end an edit: blur, which
+         is what "change" is, and Enter, which submits the form without
+         blurring anything. See the fourth REVIEW FINDING on pendingAutofills
+         for why both are needed, why one shared commit rather than two, why
+         the "edited" gate is load-bearing and why no preventDefault. */
+      var autofillInputs = document.querySelectorAll('input[data-autofill="true"]');
+      for (var afi = 0; afi < autofillInputs.length; afi++) {
+        (function(input) {
+          /* Set by the user's own editing — typing, pasting, dropping text,
+             undo — and cleared by the commit it belongs to. A programmatic
+             write (setFieldValue, and so applyFillFields) dispatches no "input"
+             event and is deliberately not an edit. */
+          var edited = false;
+          function commitAutofill() {
+            if (!edited) return;
+            edited = false;
+            postAutofill(input.name, input.value);
+          }
+          input.addEventListener("input", function() {
+            edited = true;
+          });
+          input.addEventListener("change", commitAutofill);
+          input.addEventListener("keydown", function(event) {
+            if (event.key === "Enter") commitAutofill();
+          });
+        })(autofillInputs[afi]);
+      }
+
+      form.addEventListener("submit", function(e) {
+        e.preventDefault();
+        if (pendingAutofills.length > 0) {
+          deferredSubmit = true;
+          return;
+        }
+        postSubmit();
       });
 
       document.getElementById("cancel-btn").addEventListener("click", function() {
@@ -2217,20 +2570,7 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
       var testBtn = document.getElementById("test-btn");
       if (testBtn) {
         testBtn.addEventListener("click", function() {
-          var values = {};
-          for (var i = 0; i < form.elements.length; i++) {
-            var el = form.elements[i];
-            if (el.disabled) continue;
-            if (!el.name) continue;
-            if (el.type === "checkbox") {
-              values[el.name] = el.checked;
-            } else if (el.type === "number") {
-              values[el.name] = el.value === "" ? undefined : Number(el.value);
-            } else {
-              values[el.name] = el.value;
-            }
-          }
-          vscode.postMessage({ type: "test", values: values });
+          vscode.postMessage({ type: "test", values: collectFormValues() });
         });
       }
 
@@ -2344,22 +2684,19 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
           // what the user has typed (issue #48 PR-E: "Save current filter as…"
           // needs the current Device Filter text). Same collection the submit
           // handler uses.
-          var createValues = {};
-          for (var cvi = 0; cvi < form.elements.length; cvi++) {
-            var cvEl = form.elements[cvi];
-            if (cvEl.disabled) continue;
-            if (!cvEl.name) continue;
-            if (cvEl.type === "checkbox") {
-              createValues[cvEl.name] = cvEl.checked;
-            } else if (cvEl.type === "number") {
-              createValues[cvEl.name] = cvEl.value === "" ? undefined : Number(cvEl.value);
-            } else {
-              createValues[cvEl.name] = cvEl.value;
-            }
-          }
-          vscode.postMessage({ type: 'createInline', key: wrapper.dataset.name, values: createValues });
+          vscode.postMessage({ type: 'createInline', key: wrapper.dataset.name, values: collectFormValues() });
           return;
         }
+        // Read BEFORE selectCustomOption writes the new option into the hidden
+        // input this reads through: after that call the control holds the NEW
+        // value and the old one is gone from the DOM entirely. dataset.prev is
+        // NOT the place to get it — it is written here and at the
+        // addSelectOption path below but read nowhere and seeded nowhere, so on
+        // the first selection after the form opens it is simply undefined,
+        // exactly when the configured value is the one a host would need.
+        // fieldValue reads the control the render seeded, so the very first
+        // change reports the value the form opened with.
+        var previousValue = fieldValue(wrapper.dataset.name);
         selectCustomOption(wrapper, value);
         wrapper.dataset.prev = value;
         // FIX B (PR #64 Codex round 2) — a fillTarget select fills its target
@@ -2376,7 +2713,15 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
           setFieldValue(wrapper.dataset.fillTarget, opt.dataset.fillValue);
         }
         if (wrapper.dataset.autofill === 'true' && value) {
-          vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: value });
+          // The values snapshot rides along for the same reason the text
+          // autofill above carries it: an answer may have to keep what the
+          // user typed. The auth-profile mirror ignores it; the DHCP interface
+          // picker derives a whole pool from the chosen NIC and cannot
+          // without it. previousValue rides along for what the snapshot CANNOT
+          // say (see postAutofill): this selection is already in the DOM, so
+          // the snapshot's copy of this key is the new option on both sides of
+          // the change.
+          postAutofill(wrapper.dataset.name, value, previousValue);
         }
         if (wrapper.dataset.name === 'authProfileId') {
           // The newly chosen profile has supplied nothing yet — the previous
@@ -2456,6 +2801,15 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
                 dropdown.appendChild(newOpt);
               }
             }
+            // Captured before the selection lands, for the same reason and in
+            // the same order as the user-click path above. The DHCP interface
+            // picker cannot reach here (it renders no inline-create row, and
+            // the DHCP form wires no onCreateInline, so nothing ever posts
+            // addSelectOption for it) — but the auth profile select IS both
+            // autofill-capable and inline-creatable, and leaving one of the two
+            // selection paths reporting nothing is how the next autofill host
+            // that needs a pre-selection value finds it only half wired.
+            var previousValue = fieldValue(wrapper.dataset.name);
             selectCustomOption(wrapper, msg.value);
             wrapper.dataset.prev = msg.value;
             // FIX B — mirror the user-click path's synchronous fill for a
@@ -2470,7 +2824,7 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
             // inline-created auth profile is selected but never mirrors its
             // username into the managed field, and never locks it.
             if (wrapper.dataset.autofill === 'true' && msg.value) {
-              vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: msg.value });
+              postAutofill(wrapper.dataset.name, msg.value, previousValue);
             }
             if (wrapper.dataset.name === 'authProfileId') {
               // Same release as the user-click path above — an inline-created
@@ -2481,7 +2835,13 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
           }
         }
         if (msg.type === "fillFields") {
+          // Released AFTER the fill is applied, so a submit this answer frees
+          // is collected over the filled fields rather than the stale ones.
           applyFillFields(msg);
+          autofillSettled(msg.requestId);
+        }
+        if (msg.type === "autofillSettled") {
+          autofillSettled(msg.requestId);
         }
         if (msg.type === "validationError") {
           var errEls = document.querySelectorAll(".field-error");
@@ -2993,6 +3353,18 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
     .actions button[data-visible-when].field-visible {
       display: inline-flex;
     }
+    /* Save while an autofill round trip is outstanding. APPEARANCE ONLY — the
+       button stays natively clickable and its click is deferred, not dropped
+       (see "SAVE MUST NOT OUTRUN AN AUTOFILL ROUND TRIP" in the script below).
+       Dimmed like the shared \`:disabled\` rules so it reads as held, and
+       \`progress\` rather than \`not-allowed\` because the Save is coming. */
+    .actions button.save-held {
+      opacity: 0.5;
+      cursor: progress;
+    }
+    .actions button.save-held:hover {
+      background: var(--vscode-button-background);
+    }
   </style>
 </head>
 <body>
@@ -3004,7 +3376,7 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
   <div class="field-error" id="error-name"></div>
 </div>
     <div class="actions">
-      <button type="submit" class="btn-primary">Save</button>
+      <button type="submit" class="btn-primary" id="save-btn">Save</button>
       
       <button type="button" class="btn-secondary" id="cancel-btn">Cancel</button>
     </div>
@@ -3544,6 +3916,11 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
        * and by the echoed value so an answer for an option the user has since
        * moved away from is discarded rather than applied
        * (fillAnswersCurrentSelection).
+       *
+       * REVIEW FINDING (P2) — and, for the DHCP path, scoped by the SNAPSHOT
+       * the request carried, so a target field hand-edited while the answer was
+       * in flight keeps the user's edit — see autofillSnapshot and the note on
+       * pendingAutofills.
        */
       function applyFillFields(msg) {
         // Stale answers are dropped whole — values, ownership and all. A
@@ -3555,7 +3932,19 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
         var fillValues = msg.values;
         var isProfileFill = msg.key === "authProfileId";
         var nextFilledKeys = isProfileFill ? filledKeysFromValues(fillValues) : null;
+        // Read once, not per key: collecting inside the loop would compare the
+        // later keys against a form this very loop has already been writing to.
+        var requestSnapshot = isProfileFill ? undefined : autofillSnapshot(msg.requestId);
+        var liveValues = requestSnapshot ? collectFormValues() : undefined;
         for (var fk in fillValues) {
+          if (!isProfileFill && requestSnapshot && liveValues[fk] !== requestSnapshot[fk]) {
+            // Hand-edited since this request went out. The host decided what it
+            // was allowed to overwrite from the snapshot above, so its answer
+            // for THIS key is reasoning about a value that no longer exists —
+            // every other key in the same answer is still good and still
+            // applied.
+            continue;
+          }
           if (isProfileFill) {
             // A key supplied BLANK owns nothing (filledKeysFromValues), so
             // writing it would replace the user's own value with one nothing
@@ -3687,8 +4076,17 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
         })(defaultsTargets[di]);
       }
 
-      form.addEventListener("submit", function(e) {
-        e.preventDefault();
+      /**
+       * Everything this form would submit right now, in the shape the
+       * extension host reads (FormValues). One definition rather than the
+       * four near-identical copies this script used to carry: submit, Test
+       * Connection, the inline-create snapshot and — new — the autofill
+       * payload all need exactly the same collection, and a fifth copy is how
+       * they drift apart. Disabled controls are skipped because a hidden
+       * field's value is not part of the form's answer (updateVisibility
+       * disables what it hides).
+       */
+      function collectFormValues() {
         var values = {};
         for (var i = 0; i < form.elements.length; i++) {
           var el = form.elements[i];
@@ -3702,7 +4100,322 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
             values[el.name] = el.value;
           }
         }
-        vscode.postMessage({ type: "submit", values: values });
+        return values;
+      }
+
+      /**
+       * ── SAVE MUST NOT OUTRUN AN AUTOFILL ROUND TRIP ────────────────────
+       * REVIEW FINDING (P1) — an autofill is a round trip through the
+       * extension host, and a Save clicked while one is in flight submits the
+       * fields as they were BEFORE the answer landed. For the DHCP editor's
+       * CIDR row that is silent data loss in both directions: the old subnet,
+       * pool and gateway are saved as though nothing had been typed, and the
+       * network that WAS typed is discarded with them, because "cidr" is an
+       * input shape the settings layer deliberately never writes (see
+       * DHCP_CIDR_FIELD_KEY). The user sees a network go in and a save go
+       * through, and gets neither.
+       *
+       * Racing faster is not available — the answer is asynchronous by
+       * construction — so Save is held instead. Requests are tracked one by
+       * one rather than by a flag, because several can be outstanding at once:
+       * committing the CIDR row and then picking a NIC posts two, and a flag
+       * would re-open Save on the first answer with the second still in the
+       * air — the same race, one round trip later.
+       *
+       * REVIEW FINDING (P2) — each request is identified by a REQUEST ID this
+       * script mints, not by the key and value it asked about. Key and value
+       * do not identify anything: the same pair can be asked twice before
+       * either answer returns (type a network, change it, change it back), and
+       * two identical tokens in the pending list are indistinguishable. Each
+       * request is answered TWICE in the usual case (fillFields, then the
+       * terminator), so the first request's pair of answers would release BOTH
+       * of those entries — retiring an outstanding request that has not been
+       * answered at all, and letting a deferred Save fire over a snapshot its
+       * own answer was about to correct. Ids are unique per request whatever
+       * was asked, so an answer can only ever release the request it answers.
+       * Key and value still travel with the answer for a different job — they
+       * decide whether the FILL is still about the option now selected (see
+       * fillAnswersCurrentSelection) — and both are echoed on both answers.
+       *
+       * A submit attempted meanwhile is DEFERRED, not dropped, and ONE check
+       * does that: pendingAutofills non-empty at the top of the form's own
+       * "submit" handler means remember the intent and fire it when the last
+       * answer lands, over values collected then — which is exactly what the
+       * user meant by Save. Every route into a submission arrives at that one
+       * handler: Enter in a text field, a click on Save, and the click that
+       * fired this round trip in the first place and is still in flight when it
+       * is posted. Nothing else may stand in front of it.
+       *
+       * REVIEW FINDING (P1, fifth round) — HOLDING SAVE IS NOT THE BUTTON'S
+       * JOB. The Save button is marked held VISUALLY and only visually (the
+       * save-held class plus aria-busy, applied in postAutofill and cleared in
+       * autofillSettled); its native \`disabled\` property is never set. Two
+       * rounds were spent trying to make \`disabled\` safe, and both are recorded
+       * here as ABANDONED so a third attempt is not made.
+       *
+       * \`disabled\` on a type="submit" button does not merely grey it: the
+       * browser then refuses to dispatch click, and therefore submit, on that
+       * button at all. That makes it a second gate in front of the deferral
+       * above — one that SWALLOWS a submit instead of deferring it, which is
+       * precisely the silent loss this whole block exists to prevent. Both
+       * timings failed for the same reason:
+       *   * disabling synchronously from the "change" that posts the request
+       *     lands mid-gesture. Clicking Save while the CIDR row still has focus
+       *     delivers mousedown on the button, then the blur-driven "change" —
+       *     which is what calls postAutofill — then mouseup, then click. The
+       *     button is disabled by the time the browser weighs that click, so no
+       *     click, no "submit" event, and the user's Save is simply gone;
+       *   * deferring the disable by one macrotask (setTimeout(fn, 0)) only
+       *     narrows that window. A macrotask runs when the queue next drains,
+       *     which is not when the user's finger comes up: hold the button down
+       *     longer than one tick — a duration no API bounds and no pointer
+       *     hardware promises — and the disable still lands between mousedown
+       *     and mouseup, with the same swallowed click.
+       * There is no third timing to try, because the events being raced are the
+       * user's own. So the mechanism is gone rather than re-tuned: a class and
+       * an ARIA attribute cannot suppress a dispatch, every submit the user
+       * makes reaches the deferral, and nothing about the hold depends on
+       * elapsed time any more.
+       *
+       * The cost is that Save can be clicked repeatedly while a round trip is
+       * out, and that is deliberately not de-duplicated: each attempt sets the
+       * same deferredSubmit flag, and postSubmit fires once, when the last
+       * answer lands.
+       *
+       * REVIEW FINDING (P1) — the submit handler's deferral only works if
+       * something is PENDING by the time submit is dispatched, and a commit
+       * does not only happen on blur. The round trip is started from "change"
+       * on purpose (deriving a
+       * whole pool from 192.168.2.0/2 on the way to /24 would overwrite the
+       * fields the user is about to see filled correctly), and "change" on a
+       * text input is a blur-time event. Enter does NOT blur: it is the
+       * browser's implicit submission, and the input still holds focus while the
+       * form submits. So the deferral was reached with pendingAutofills empty —
+       * nothing in flight because nothing had been committed — and the submit
+       * went straight out over the network the user had just replaced, with the
+       * replacement discarded. Same silent loss as the P1 above, one event
+       * earlier: "cidr" is never persisted (DHCP_CIDR_FIELD_KEY), so the typed
+       * network survives nowhere else.
+       *
+       * The commit is therefore ALSO fired from "keydown" on Enter, and no
+       * preventDefault goes with it. Submission is the DEFAULT ACTION of that
+       * key event, and a default action runs only after every listener for the
+       * event has returned; postAutofill is synchronous, so the pending entry
+       * exists before the form's own "submit" is dispatched and the deferral
+       * above sees it — exactly as it does for the click path. Cancelling the
+       * event instead would mean re-submitting the form by hand, which is more
+       * machinery for the same result.
+       *
+       * Both listeners call ONE commit, gated on the field having actually been
+       * edited (an "input" event since the last commit). The gate is not
+       * tidiness:
+       *   * whichever listener fires first clears it, so if this engine also
+       *     fires "change" for an Enter-driven submission the second one posts
+       *     nothing. A duplicate round trip would be harmless — ids make
+       *     concurrent requests independent (P2 above) — but one that cannot be
+       *     minted needs no de-duplication at all;
+       *   * "change" already means "the user edited this", and Enter does not.
+       *     Enter in an untouched CIDR row is plain "save", and deriving from it
+       *     would be destructive rather than merely wasteful: dhcpCidrFormFills
+       *     writes subnet, rangeStart and poolCount UNCONDITIONALLY (they are
+       *     what the network says, not suggestions the host may decline), so a
+       *     hand-typed pool start would be replaced by the network's first host
+       *     on the way out — and the snapshot guard below cannot catch it,
+       *     because the snapshot is taken after that edit and the field still
+       *     agrees with it;
+       *   * a value written back BY an answer (applyFillFields → setFieldValue)
+       *     dispatches no "input" and so is not an edit — the normalised CIDR
+       *     the host echoes does not ask to be derived a second time.
+       *
+       * The pointer path is unchanged and is still the blur-driven "change".
+       * The two gestures reach the same hazard through different events and each
+       * needs its own listener: a click blurs the field and never produces a
+       * keydown, an Enter produces a keydown and never blurs the field.
+       *
+       * A request is released by whichever of its two answers arrives:
+       * fillFields when there were values to fill, and the unconditional
+       * autofillSettled that follows it. The terminator is what makes this
+       * safe rather than merely usual — a derivation that fills nothing (a
+       * /32, a network that describes no pool) sends no fillFields at all, and
+       * releasing on fillFields alone would leave Save dead until the form was
+       * reopened.
+       *
+       * REVIEW FINDING (P2) — each pending request also KEEPS the values
+       * snapshot it was sent with, because the host's decision about what it
+       * may overwrite is made against that snapshot and the user can edit a
+       * target field after it was taken.
+       *
+       * The host gates gateway, broadcast, serverId and dns on isAutoFillable
+       * against the snapshot the request carried: blank, or still holding what
+       * the PREVIOUS network derived. Commit a CIDR, then — while the round
+       * trip is out — hand-type a gateway, and that gating is answering a
+       * question about a value the field no longer holds. fillAnswersCurrentSelection
+       * cannot catch it: it asks only whether the field the request was ABOUT
+       * (msg.key, the CIDR row) still holds the value it was about, and it
+       * does. The initiating row is untouched; it is the TARGET that moved.
+       *
+       * So the answer is re-checked field by field against the snapshot before
+       * anything is written (applyFillFields): a target still holding what it
+       * held at request time is filled as before, one that has since diverged
+       * is left alone, and the rest of the same answer still lands. Skipping
+       * the whole answer instead would throw away the mask and pool the user
+       * asked for over one edited gateway.
+       *
+       * An answer whose requestId matches no pending entry is applied
+       * unconditionally, exactly as before — same leniency as
+       * fillAnswersCurrentSelection's "a control this form does not render is
+       * applied as before". There is no snapshot to judge it against, and the
+       * only things that reach that state are a hand-built message and an
+       * answer that arrived after its own terminator.
+       */
+      var pendingAutofills = [];
+      var deferredSubmit = false;
+      var nextAutofillRequestId = 1;
+      var saveBtn = document.getElementById("save-btn");
+
+      /* The "a round trip is outstanding" mark on Save: appearance and
+         assistive semantics, never behaviour — see "HOLDING SAVE IS NOT THE
+         BUTTON'S JOB" above for why the native disabled property is not touched
+         here. aria-busy rather than aria-disabled: the click IS honoured, just
+         not yet, and telling a screen reader the control is unavailable would
+         be the same lie the disabled attribute used to tell the browser. */
+      function markSaveHeld(held) {
+        if (!saveBtn) return;
+        saveBtn.classList.toggle("save-held", held);
+        if (held) {
+          saveBtn.setAttribute("aria-busy", "true");
+        } else {
+          saveBtn.removeAttribute("aria-busy");
+        }
+      }
+
+      /**
+       * REVIEW FINDING (P1) — previousValue is what THIS FIELD held immediately
+       * before the gesture being reported, and it exists because for a SELECT
+       * the snapshot cannot say. A select is applied to the DOM before the
+       * round trip is posted (selectCustomOption runs first, so the trigger and
+       * the hidden input already show the new option), which means the
+       * snapshot's entry for this key is the NEW value on both sides of the
+       * change. A host that needs the pre-selection value — the DHCP editor's
+       * bind address, whose option 54 gate asks "what would this fill have
+       * written BEFORE the NIC moved" — cannot recover it from the snapshot,
+       * and reusing the new one silently answers that question with the new
+       * NIC. Two NICs on one subnet is where that shows: switching 10.0.0.5 to
+       * 10.0.0.6 leaves a server identifier of .5 looking hand-set, and the
+       * DHCP socket then answers from .6 while telling clients to renew at .5.
+       *
+       * Sent only when the caller has one to send. A TEXT field's commit
+       * changes only itself and never moves the bind address, so the CIDR row
+       * passes nothing and the host keeps its existing "same address either
+       * side" reading for that trigger.
+       */
+      function postAutofill(key, value, previousValue) {
+        var requestId = nextAutofillRequestId++;
+        // Collected ONCE and used twice — the payload the host reasons over and
+        // the copy this script judges the answer against have to be the same
+        // object, or the two ends are comparing different forms.
+        var snapshot = collectFormValues();
+        pendingAutofills.push({ id: requestId, snapshot: snapshot });
+        /* Marked in the same breath as the push, with no timer between them,
+           because nothing about event DISPATCH depends on this any more — the
+           deferral in the submit handler is what actually holds Save. The
+           macrotask that used to sit here was protecting an in-flight click
+           from the disabled attribute; with the attribute gone there is nothing
+           left for it to protect. */
+        markSaveHeld(true);
+        var request = { type: 'autofill', key: key, value: value, values: snapshot, requestId: requestId };
+        if (previousValue !== undefined) request.previousValue = previousValue;
+        vscode.postMessage(request);
+      }
+
+      /** The values snapshot the still-pending request was sent with, or
+       *  undefined when nothing pending matches — see the note on
+       *  pendingAutofills for why that case applies the answer as before.
+       *  Always read BEFORE autofillSettled retires the entry, which is why the
+       *  message handler applies the fill first and settles second. */
+      function autofillSnapshot(requestId) {
+        if (requestId === undefined) return undefined;
+        for (var pi = 0; pi < pendingAutofills.length; pi++) {
+          if (pendingAutofills[pi].id === requestId) return pendingAutofills[pi].snapshot;
+        }
+        return undefined;
+      }
+
+      /** One answer — a fill, an empty answer, or a failure — has come back.
+       *  Idempotent per request: the first of the two answers releases it and
+       *  the second finds nothing to release, so an answer can never pay off
+       *  a DIFFERENT request that is still outstanding. An answer for a
+       *  request this form never made (another panel's shape, a hand-built
+       *  test message) carries an id this script never minted, matches
+       *  nothing, and is ignored. */
+      function autofillSettled(requestId) {
+        if (requestId === undefined) return;
+        var index = -1;
+        for (var si = 0; si < pendingAutofills.length; si++) {
+          if (pendingAutofills[si].id === requestId) {
+            index = si;
+            break;
+          }
+        }
+        if (index === -1) return;
+        pendingAutofills.splice(index, 1);
+        if (pendingAutofills.length > 0) return;
+        markSaveHeld(false);
+        if (deferredSubmit) {
+          deferredSubmit = false;
+          postSubmit();
+        }
+      }
+
+      function postSubmit() {
+        vscode.postMessage({ type: "submit", values: collectFormValues() });
+      }
+
+      /* An autofill-capable TEXT field — the DHCP editor's Network (CIDR) row.
+         The same round trip the autofill-capable SELECT below already makes,
+         fired on COMMIT rather than on "input": a network is only meaningful
+         once it is committed, and deriving a whole pool from 192.168.2.0/2 on
+         the way to /24 would overwrite the very fields the user is about to
+         see filled correctly. The values snapshot rides along because the
+         answer decides what it may overwrite — a hand-typed gateway survives,
+         a stale derived one does not. Fields that did not opt in carry no
+         data-autofill attribute and are not touched by this loop.
+
+         A commit is EITHER of the two gestures that end an edit: blur, which
+         is what "change" is, and Enter, which submits the form without
+         blurring anything. See the fourth REVIEW FINDING on pendingAutofills
+         for why both are needed, why one shared commit rather than two, why
+         the "edited" gate is load-bearing and why no preventDefault. */
+      var autofillInputs = document.querySelectorAll('input[data-autofill="true"]');
+      for (var afi = 0; afi < autofillInputs.length; afi++) {
+        (function(input) {
+          /* Set by the user's own editing — typing, pasting, dropping text,
+             undo — and cleared by the commit it belongs to. A programmatic
+             write (setFieldValue, and so applyFillFields) dispatches no "input"
+             event and is deliberately not an edit. */
+          var edited = false;
+          function commitAutofill() {
+            if (!edited) return;
+            edited = false;
+            postAutofill(input.name, input.value);
+          }
+          input.addEventListener("input", function() {
+            edited = true;
+          });
+          input.addEventListener("change", commitAutofill);
+          input.addEventListener("keydown", function(event) {
+            if (event.key === "Enter") commitAutofill();
+          });
+        })(autofillInputs[afi]);
+      }
+
+      form.addEventListener("submit", function(e) {
+        e.preventDefault();
+        if (pendingAutofills.length > 0) {
+          deferredSubmit = true;
+          return;
+        }
+        postSubmit();
       });
 
       document.getElementById("cancel-btn").addEventListener("click", function() {
@@ -3712,20 +4425,7 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
       var testBtn = document.getElementById("test-btn");
       if (testBtn) {
         testBtn.addEventListener("click", function() {
-          var values = {};
-          for (var i = 0; i < form.elements.length; i++) {
-            var el = form.elements[i];
-            if (el.disabled) continue;
-            if (!el.name) continue;
-            if (el.type === "checkbox") {
-              values[el.name] = el.checked;
-            } else if (el.type === "number") {
-              values[el.name] = el.value === "" ? undefined : Number(el.value);
-            } else {
-              values[el.name] = el.value;
-            }
-          }
-          vscode.postMessage({ type: "test", values: values });
+          vscode.postMessage({ type: "test", values: collectFormValues() });
         });
       }
 
@@ -3839,22 +4539,19 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
           // what the user has typed (issue #48 PR-E: "Save current filter as…"
           // needs the current Device Filter text). Same collection the submit
           // handler uses.
-          var createValues = {};
-          for (var cvi = 0; cvi < form.elements.length; cvi++) {
-            var cvEl = form.elements[cvi];
-            if (cvEl.disabled) continue;
-            if (!cvEl.name) continue;
-            if (cvEl.type === "checkbox") {
-              createValues[cvEl.name] = cvEl.checked;
-            } else if (cvEl.type === "number") {
-              createValues[cvEl.name] = cvEl.value === "" ? undefined : Number(cvEl.value);
-            } else {
-              createValues[cvEl.name] = cvEl.value;
-            }
-          }
-          vscode.postMessage({ type: 'createInline', key: wrapper.dataset.name, values: createValues });
+          vscode.postMessage({ type: 'createInline', key: wrapper.dataset.name, values: collectFormValues() });
           return;
         }
+        // Read BEFORE selectCustomOption writes the new option into the hidden
+        // input this reads through: after that call the control holds the NEW
+        // value and the old one is gone from the DOM entirely. dataset.prev is
+        // NOT the place to get it — it is written here and at the
+        // addSelectOption path below but read nowhere and seeded nowhere, so on
+        // the first selection after the form opens it is simply undefined,
+        // exactly when the configured value is the one a host would need.
+        // fieldValue reads the control the render seeded, so the very first
+        // change reports the value the form opened with.
+        var previousValue = fieldValue(wrapper.dataset.name);
         selectCustomOption(wrapper, value);
         wrapper.dataset.prev = value;
         // FIX B (PR #64 Codex round 2) — a fillTarget select fills its target
@@ -3871,7 +4568,15 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
           setFieldValue(wrapper.dataset.fillTarget, opt.dataset.fillValue);
         }
         if (wrapper.dataset.autofill === 'true' && value) {
-          vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: value });
+          // The values snapshot rides along for the same reason the text
+          // autofill above carries it: an answer may have to keep what the
+          // user typed. The auth-profile mirror ignores it; the DHCP interface
+          // picker derives a whole pool from the chosen NIC and cannot
+          // without it. previousValue rides along for what the snapshot CANNOT
+          // say (see postAutofill): this selection is already in the DOM, so
+          // the snapshot's copy of this key is the new option on both sides of
+          // the change.
+          postAutofill(wrapper.dataset.name, value, previousValue);
         }
         if (wrapper.dataset.name === 'authProfileId') {
           // The newly chosen profile has supplied nothing yet — the previous
@@ -3951,6 +4656,15 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
                 dropdown.appendChild(newOpt);
               }
             }
+            // Captured before the selection lands, for the same reason and in
+            // the same order as the user-click path above. The DHCP interface
+            // picker cannot reach here (it renders no inline-create row, and
+            // the DHCP form wires no onCreateInline, so nothing ever posts
+            // addSelectOption for it) — but the auth profile select IS both
+            // autofill-capable and inline-creatable, and leaving one of the two
+            // selection paths reporting nothing is how the next autofill host
+            // that needs a pre-selection value finds it only half wired.
+            var previousValue = fieldValue(wrapper.dataset.name);
             selectCustomOption(wrapper, msg.value);
             wrapper.dataset.prev = msg.value;
             // FIX B — mirror the user-click path's synchronous fill for a
@@ -3965,7 +4679,7 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
             // inline-created auth profile is selected but never mirrors its
             // username into the managed field, and never locks it.
             if (wrapper.dataset.autofill === 'true' && msg.value) {
-              vscode.postMessage({ type: 'autofill', key: wrapper.dataset.name, value: msg.value });
+              postAutofill(wrapper.dataset.name, msg.value, previousValue);
             }
             if (wrapper.dataset.name === 'authProfileId') {
               // Same release as the user-click path above — an inline-created
@@ -3976,7 +4690,13 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
           }
         }
         if (msg.type === "fillFields") {
+          // Released AFTER the fill is applied, so a submit this answer frees
+          // is collected over the filled fields rather than the stale ones.
           applyFillFields(msg);
+          autofillSettled(msg.requestId);
+        }
+        if (msg.type === "autofillSettled") {
+          autofillSettled(msg.requestId);
         }
         if (msg.type === "validationError") {
           var errEls = document.querySelectorAll(".field-error");

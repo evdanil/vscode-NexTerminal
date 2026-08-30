@@ -34,6 +34,8 @@ import { networkInterfaceBindOptions } from "./networkInterfaceOptions";
 import { openNetworkServerQuickAdjust } from "./networkServerQuickAdjust";
 import { loadNetworkServerProfile, saveCurrentNetworkServerProfile } from "./networkServerProfileCommands";
 import {
+  dhcpFormAutofillFields,
+  dhcpInterfaceChoices,
   dhcpRangeEndForCount,
   readSettingBoolean,
   readSettingNumber,
@@ -173,6 +175,7 @@ function networkServerSettingUpdates(kind: NetworkServerKind, values: FormValues
     ["tftpServerAddresses", parseCommaList(values.tftpServerAddresses)],
     ["vendorClassId", readSettingString(values.vendorClassId)],
     ["vendorSpecificOptions", parseVendorSpecificOptions(values.vendorSpecificOptions)],
+    ["allowRelayAgents", readSettingBoolean(values.allowRelayAgents)],
     ["autoLinkTftp", readSettingBoolean(values.autoLinkTftp)]
   ];
 }
@@ -204,10 +207,51 @@ export function registerNetworkServerCommands(
       kind === "dhcp" ? dhcpFormSeed(manager.readConfig(kind) as DhcpAdapterConfig) : manager.readConfig(kind);
     // Enumerated per open, never cached: a VPN coming up or a dock being
     // unplugged changes the answer between one Edit and the next.
-    const form = networkServerFormDefinition(kind, seed, { interfaceOptions: networkInterfaceBindOptions() });
+    const interfaces = networkInterfaceBindOptions();
+    const dhcpSeed = kind === "dhcp" ? (seed as DhcpServerFormSeed) : undefined;
+    const form = networkServerFormDefinition(kind, seed, {
+      // The "matches the pool subnet" annotations are worked out here, against
+      // the pool the form OPENS on. They do not follow a network typed into the
+      // form afterwards — the same snapshot-per-open rule the quick editor
+      // applies, and the CIDR row's own fill covers the moved-pool case by
+      // offering the NIC that serves it.
+      // The pool's own END goes with its start: a NIC only has to be on-link for
+      // the addresses the pool actually hands out, so a manually narrowed range
+      // inside a wider advertised subnet is served fine by a NIC that covers the
+      // range but not the subnet — annotating it as a non-match would send the
+      // user hunting for a NIC that does not need to exist.
+      interfaceOptions: dhcpSeed
+        ? dhcpInterfaceChoices(interfaces, dhcpSeed.rangeStart, dhcpSeed.subnet, dhcpSeed.rangeEnd)
+        : interfaces
+    });
     WebviewFormPanel.open(`network-server-edit-${kind}`, form, {
+      // DHCP only, and synchronous underneath: deriving a pool from a network
+      // is arithmetic, so the round trip exists to keep that arithmetic out of
+      // the webview, not because anything here has to wait.
+      //
+      // `previousValue` is the fourth parameter for the Interface picker alone:
+      // the webview applies a selection to the DOM before it posts, so the
+      // `values` snapshot names the NEW NIC on both sides of the change and the
+      // one it replaced reaches the derivation only here. Forwarded rather than
+      // interpreted — `dhcpFormAutofillFields` decides which trigger it means
+      // anything for.
+      onAutofill:
+        kind === "dhcp"
+          ? (key, value, values, previousValue) =>
+              Promise.resolve(dhcpFormAutofillFields(key, value, values, interfaces, previousValue))
+          : undefined,
       onSubmit: async (values) => {
-        const problem = kind === "dhcp" ? validateDhcpValues(values) : validateTftpFormInput(values);
+        // The same NIC list the autofill derives against, from the same
+        // per-open enumeration: a CIDR the autofill could fill nothing for
+        // because this machine holds every poolable address must not then save
+        // as if the row had been left blank.
+        const problem =
+          kind === "dhcp"
+            ? validateDhcpValues(
+                values,
+                interfaces.map((option) => option.value)
+              )
+            : validateTftpFormInput(values);
         if (problem) {
           // Thrown, not reported here: WebviewFormPanel turns this into a
           // "Save failed" message and leaves the panel open with the input.

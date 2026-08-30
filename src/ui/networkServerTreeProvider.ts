@@ -21,6 +21,8 @@ import type {
   NetworkServerTransferHistoryEntry,
   NetworkServerTransferSummary
 } from "../models/networkServer";
+import { networkInterfaceBindOptions } from "../commands/networkInterfaceOptions";
+import { dhcpCurrentCidr, dhcpInterfaceSubnetStatus } from "../commands/networkServerSettings";
 import {
   NETWORK_SERVER_KINDS,
   readDhcpConfig,
@@ -300,15 +302,37 @@ export class NetworkServerTreeProvider implements vscode.TreeDataProvider<Networ
     const detail = root.session?.detail;
     const config = readDhcpConfig();
     const leaseTimeSec = config.leaseTimeSec ?? 86_400;
+    const offSubnet = this.dhcpBindMismatch(config);
+    const tooltip = [
+      `Subnet: ${config.subnet ?? "255.255.255.0"}`,
+      `Gateway: ${config.gateway ?? "192.168.2.1"}`,
+      `DNS: ${config.dns?.join(", ") ?? "8.8.8.8, 8.8.4.4"}`
+    ];
+    if (offSubnet) {
+      const network = offSubnet.cidr ? ` (${offSubnet.cidr})` : "";
+      tooltip.push(
+        "",
+        ...(offSubnet.bindAddress === undefined
+          ? [
+              `⚠ No interface on this machine is on this pool's subnet${network}.`,
+              "The service is listening on every interface, but none of them is on the wire these addresses belong to, so no client request can reach it. Change the pool to a network this machine is on — or turn on Serve relayed requests, if a relay agent forwards them here."
+            ]
+          : [
+              `⚠ The service is bound to ${offSubnet.bindAddress}, which is not on this pool's subnet${network}.`,
+              "Clients on the bound wire will be offered addresses they cannot use. Change the Interface setting, or the pool, so the two agree."
+            ])
+      );
+    }
+    const offSubnetNote = !offSubnet
+      ? ""
+      : offSubnet.bindAddress === undefined
+        ? " · ⚠ no NIC is on this subnet"
+        : " · ⚠ bound NIC is not on this subnet";
     const rows: NetworkServerDetailTreeItem[] = [
       new NetworkServerDetailTreeItem("networkServer:dhcp:pool", "DHCP Pool", {
-        description: `${config.rangeStart ?? "192.168.2.10"} → ${config.rangeEnd ?? "192.168.2.199"}`,
+        description: `${config.rangeStart ?? "192.168.2.10"} → ${config.rangeEnd ?? "192.168.2.199"}${offSubnetNote}`,
         icon: "globe",
-        tooltip: [
-          `Subnet: ${config.subnet ?? "255.255.255.0"}`,
-          `Gateway: ${config.gateway ?? "192.168.2.1"}`,
-          `DNS: ${config.dns?.join(", ") ?? "8.8.8.8, 8.8.4.4"}`
-        ].join("\n")
+        tooltip: tooltip.join("\n")
       }),
       new NetworkServerDetailTreeItem("networkServer:dhcp:lease", "Lease Time", {
         description: this.leaseUtilizationDescription(leaseTimeSec, detail),
@@ -333,6 +357,54 @@ export class NetworkServerTreeProvider implements vscode.TreeDataProvider<Networ
 
     rows.push(this.staticLeasesGroup(config.static));
     return rows;
+  }
+
+  /**
+   * Whether the NIC the service binds is off the subnet the pool hands out.
+   *
+   * Advisory only — nothing here gates starting the service. The configuration
+   * is legal, it is even correct behind a relay agent (which is why
+   * `allowRelayAgents` suppresses the row entirely), and the daemon is the wrong
+   * place to be second-guessed from a tree view. But a lab that binds
+   * `192.168.1.x` and offers `10.0.0.x` leases looks perfectly configured in
+   * every individual row, so the pair is worth naming where the pool is shown.
+   *
+   * The NIC list is a snapshot taken as the row renders — the tree already
+   * refreshes on every core change, and a watcher for NIC arrivals would be a
+   * subscription paying for a case the next refresh covers anyway.
+   *
+   * An all-interfaces bind is warned about too, and reports `bindAddress:
+   * undefined`: there is no bound address to name, but "listening everywhere"
+   * is not "reachable everywhere" — with no NIC on the pool's wire the service
+   * is as unreachable as one bound to the wrong NIC, and this row was silent
+   * about it.
+   */
+  private dhcpBindMismatch(
+    config: ReturnType<typeof readDhcpConfig>
+  ): { bindAddress: string | undefined; cidr: string | undefined } | undefined {
+    const bindAddress = config.bindAddress;
+    // The pool's configured END is passed too, so the row asks about the
+    // addresses this pool really hands out rather than about the whole
+    // advertised subnet. A pool deliberately confined to part of its subnet —
+    // `10.0.0.130`–`10.0.0.200` inside a `/24` — is entirely reachable from a
+    // `10.0.0.254/25` NIC, and warning about that arrangement sent the user
+    // looking for a fault that was not there.
+    const status = dhcpInterfaceSubnetStatus(
+      bindAddress,
+      config.subnet,
+      config.rangeStart,
+      networkInterfaceBindOptions(),
+      config.allowRelayAgents === true,
+      config.rangeEnd
+    );
+    if (status === "all-interfaces-off-subnet") {
+      return { bindAddress: undefined, cidr: dhcpCurrentCidr(config.rangeStart, config.subnet) };
+    }
+    // `!bindAddress` stays: "mismatch" is only ever answered for an address the
+    // machine actually holds, but the row's own sentence names it, so a status
+    // reached without one would render a warning about nothing.
+    if (status !== "mismatch" || !bindAddress) return undefined;
+    return { bindAddress, cidr: dhcpCurrentCidr(config.rangeStart, config.subnet) };
   }
 
   private leaseUtilizationDescription(leaseTimeSec: number, detail: NetworkServerRuntimeDetail | undefined): string {

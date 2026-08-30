@@ -1444,6 +1444,58 @@ describe("authProfileCredentialMirror", () => {
   });
 });
 
+/**
+ * The webview posts the form's WHOLE current value snapshot with every
+ * `autofill` message (`FormMessage`'s optional `values`, forwarded as the third
+ * argument by `WebviewFormPanel`). The server edit form has password inputs on
+ * it — the SOCKS5 and HTTP proxy passwords — so that snapshot carries whatever
+ * is typed into them, saved or not.
+ *
+ * That is safe only because this form's handler answers from the chosen auth
+ * profile id and never looks at the snapshot, and nothing in the type system
+ * says so: the parameter is optional, so a future handler can start reading it
+ * with no compile error. This pins the arity that makes the claim true. Change
+ * the handler to `async (_key, value, values) => …` and the first expectation
+ * goes red; have it echo anything out of the snapshot and the last one does.
+ *
+ * The arity check does not catch a handler reaching for `arguments` or a rest
+ * parameter. That is deliberate — those are conspicuous in review in a way an
+ * innocuous-looking third parameter is not.
+ */
+describe("server edit form autofill — the values snapshot is never read (password-bearing form)", () => {
+  it("takes only (key, value), and answers identically with or without a snapshot carrying typed passwords", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewFormPanelOpen.mockReset();
+    mockWebviewFormPanelOpen.mockReturnValue({ dispose: vi.fn(), onDidDispose: vi.fn() });
+    const profile: AuthProfile = { id: "ap-1", name: "Prod", username: "root", authType: "password" };
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], authProfiles: [profile] });
+
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.edit")!("srv-1");
+    const options = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as {
+      onAutofill: (...args: unknown[]) => Promise<Record<string, string> | undefined>;
+    };
+
+    expect(
+      options.onAutofill.length,
+      "the server edit form's onAutofill declared a third parameter — see the values safety note in formTypes.ts"
+    ).toBe(2);
+
+    const typedSecrets = {
+      proxySocks5Password: "leak-sentinel-socks5",
+      proxyHttpPassword: "leak-sentinel-http",
+      username: "typed-by-hand"
+    };
+    const withSnapshot = await options.onAutofill("authProfileId", "ap-1", typedSecrets);
+    const withoutSnapshot = await options.onAutofill("authProfileId", "ap-1");
+
+    expect(withSnapshot).toEqual({ username: "root", authType: "password" });
+    expect(withSnapshot).toEqual(withoutSnapshot);
+    expect(JSON.stringify(withSnapshot)).not.toContain("leak-sentinel");
+  });
+});
+
 describe("formValuesToServer group normalization", () => {
   it("normalizes valid group values", () => {
     const server = formValuesToServer({

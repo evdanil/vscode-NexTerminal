@@ -74,6 +74,20 @@ vi.mock("../../../src/ui/formDefinitions", () => ({
   networkServerFormDefinition: vi.fn((kind: string) => ({ title: `${kind} form`, fields: [] }))
 }));
 
+// The NIC list the form enumerates on open now reaches the submit check too, so
+// it has to be this machine's *fixture* NICs rather than whatever the test
+// runner's host happens to hold.
+const networkInterfaces = vi.hoisted(() => vi.fn(() => ({}) as Record<string, unknown>));
+
+vi.mock("node:os", () => ({ networkInterfaces }));
+
+/** One external IPv4, shaped as `os.networkInterfaces()` reports it. */
+function machineOn(address: string): void {
+  networkInterfaces.mockReturnValue({
+    eth0: [{ address, family: "IPv4", internal: false, netmask: "255.255.255.0" }]
+  });
+}
+
 import * as vscode from "vscode";
 import { registerNetworkServerCommands } from "../../../src/commands/networkServerCommands";
 
@@ -115,6 +129,8 @@ beforeEach(() => {
   registeredCommands.clear();
   configUpdates.length = 0;
   formPanelOpens.length = 0;
+  // No external IPv4 unless a test says otherwise, so the exclusion is inert.
+  networkInterfaces.mockReturnValue({});
 });
 
 describe("DHCP submit validation — accepted input", () => {
@@ -262,6 +278,68 @@ describe("DHCP submit validation — rejected input", () => {
     await registeredCommands.get("nexus.networkServer.edit")!("dhcp");
     await expect(formPanelOpens[0].handlers.onSubmit({ gateway: "not-an-ip" })).rejects.toThrow();
     expect(vscode.window.showInformationMessage).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * REVIEW FINDING (P2) — a typed network that leaves this machine no room must
+ * fail the save, not pass it silently.
+ *
+ * The CIDR row's autofill derives with this machine's own addresses excluded,
+ * so such a network fills nothing at all: the subnet, pool and gateway rows keep
+ * whatever they held. The submit check used to ask only whether the NETWORK
+ * described a pool — `10.0.0.0/30` does — so Save then wrote the OLD pool and
+ * reported success, and the user's network vanished without a message anywhere.
+ * The quick editor warns for exactly this case; the form has to as well.
+ *
+ * The old settings being written is the tell, which is why the fixture keeps a
+ * complete 192.168.2.0/24 pool alongside the rejected 10.0.0.0/30: a bug that
+ * "does nothing" here is a bug that persists a pool on a different network.
+ */
+describe("DHCP submit validation — a network this machine leaves no room in", () => {
+  const CIDR_FULLY_TAKEN =
+    "10.0.0.0/30 leaves no pool once this machine's own addresses on it are kept out — every address it could hand out is already taken here.";
+
+  it("rejects the network instead of saving the pool the form still held", async () => {
+    // A /30 has one poolable address (.1 — .2 is the gateway) and this machine
+    // is on it, so the autofill filled nothing and these rows are the ones the
+    // form opened with, on a different network entirely.
+    machineOn("10.0.0.1");
+    await expect(submitDhcp({ ...VALID, cidr: "10.0.0.0/30" })).rejects.toThrow(CIDR_FULLY_TAKEN);
+    // Nothing at all reaches settings — not the stale 192.168.2.0/24 pool the
+    // silent path used to write, not anything else on the form.
+    expect(configUpdates).toEqual([]);
+  });
+
+  it("never offers a restart for it either", async () => {
+    machineOn("10.0.0.1");
+    await expect(submitDhcp({ ...VALID, cidr: "10.0.0.0/30" })).rejects.toThrow();
+    expect(vscode.window.showInformationMessage).not.toHaveBeenCalled();
+  });
+
+  it("saves the same network when this machine is not on its pool", async () => {
+    // The gateway is not poolable, so holding it refuses nothing: same CIDR,
+    // same form, and the write goes through.
+    machineOn("10.0.0.2");
+    await expect(submitDhcp({ ...VALID, cidr: "10.0.0.0/30" })).resolves.toBeUndefined();
+    expect(configUpdates.find((entry) => entry.key === "rangeStart")?.value).toBe("192.168.2.10");
+  });
+
+  it("saves a network with room to spare once this machine is kept out", async () => {
+    machineOn("192.168.2.10");
+    await expect(submitDhcp({ ...VALID, cidr: "192.168.2.0/24" })).resolves.toBeUndefined();
+    expect(configUpdates.find((entry) => entry.key === "subnet")?.value).toBe("255.255.255.0");
+  });
+
+  it("still reports the network's own problems ahead of this machine's occupancy", async () => {
+    machineOn("10.0.0.1");
+    await expect(submitDhcp({ ...VALID, cidr: "10.0.0.0/31" })).rejects.toThrow("RFC 3021");
+    await expect(submitDhcp({ ...VALID, cidr: "10.0.0.0" })).rejects.toThrow("CIDR form");
+  });
+
+  it("leaves a blank CIDR row meaning 'leave the pool alone', whatever this machine holds", async () => {
+    machineOn("10.0.0.1");
+    await expect(submitDhcp({ ...VALID, cidr: "  " })).resolves.toBeUndefined();
   });
 });
 
