@@ -17,11 +17,14 @@ export interface NetworkInterfaceOption {
   /**
    * The NIC's own netmask, as `os.networkInterfaces()` reports it.
    *
-   * Carried for the callers that describe an interface, not for the ones that
-   * compare it against a DHCP pool — that comparison has to run under the
-   * *pool's* mask, because a NIC on a wider one would claim a subnet it cannot
-   * actually serve. Absent for the all-interfaces choice, which is not one NIC,
-   * and for any address reported without a mask.
+   * It never replaces the pool's mask in a NIC ↔ pool comparison — that has to
+   * run under the *pool's* mask, because a NIC on a wider one would otherwise
+   * claim a subnet it is not on. It is a second, independent condition: the
+   * NIC's own subnet must also COVER the pool's, or the host routes part of the
+   * pool away from the serving interface (see `nicCoversPool` in
+   * `networkServerSettings.ts`). Absent for the all-interfaces choice, which is
+   * not one NIC, and for any address reported without a mask — a case those
+   * comparisons treat as "unverifiable", never as a match.
    */
   readonly netmask?: string;
 }

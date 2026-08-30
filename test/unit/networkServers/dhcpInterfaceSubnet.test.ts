@@ -155,6 +155,101 @@ describe("dhcpInterfaceSubnetStatus — a bound NIC", () => {
   });
 });
 
+/**
+ * REVIEW FINDING (P2) — masking under the pool's mask alone is only half the
+ * question. A NIC on a NARROWER mask than the pool passes that check while its
+ * own routing table disagrees: `10.0.0.254/25` is on `10.0.0.128`–`10.0.0.255`,
+ * so a client leased `10.0.0.10` out of a `10.0.0.0/24` pool is, to this host,
+ * not on the serving link at all. The broadcast DISCOVER still arrives, which is
+ * why the arrangement looks configured; the unicast REQUEST/ACK renewal does not
+ * come back off that interface.
+ */
+describe("dhcpInterfaceSubnetStatus — the NIC's own mask has to cover the pool", () => {
+  it("flags a NIC on a narrower mask than the pool it would serve", () => {
+    // 10.0.0.254 masks into 10.0.0.0/24 exactly as a legitimate NIC would, so
+    // the address-only comparison this replaces called it a match.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("10.0.0.254", "255.255.255.128")] });
+    expect(dhcpInterfaceSubnetStatus("10.0.0.254", "255.255.255.0", "10.0.0.10", options())).toBe("mismatch");
+    // Narrow the POOL to the NIC's own /25 and the same pair is fine — the
+    // fixture discriminates on the masks, not on the address.
+    expect(dhcpInterfaceSubnetStatus("10.0.0.254", "255.255.255.128", "10.0.0.200", options())).toBe("match");
+  });
+
+  it("does not let a narrower NIC vouch for the pool under an all-interfaces bind either", () => {
+    // The list-wide half of the same defect: nothing here can serve the /24, so
+    // binding everything is as off-subnet as binding that one NIC by name.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("10.0.0.254", "255.255.255.128")] });
+    expect(dhcpInterfaceSubnetStatus("", "255.255.255.0", "10.0.0.10", options())).toBe("all-interfaces-off-subnet");
+  });
+
+  it("still matches a NIC whose own mask is WIDER than the pool's", () => {
+    // 10.0.0.5/16's own link contains every address a 10.0.0.0/24 pool could
+    // ever lease, so this machine really is on-link for all of it. Guards
+    // against a fix that demanded the two masks be equal.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("10.0.0.5", "255.255.0.0")] });
+    expect(dhcpInterfaceSubnetStatus("10.0.0.5", "255.255.255.0", "10.0.0.10", options())).toBe("match");
+    expect(dhcpInterfaceSubnetStatus("", "255.255.255.0", "10.0.0.10", options())).toBe("all-interfaces");
+  });
+
+  it("still matches the flat single-subnet case, where the two masks are equal", () => {
+    // The overwhelming majority of real setups. A stricter-than-intended check
+    // would break every one of them.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("10.0.0.5", "255.255.255.0")] });
+    expect(dhcpInterfaceSubnetStatus("10.0.0.5", "255.255.255.0", "10.0.0.10", options())).toBe("match");
+  });
+
+  it("refuses to call a NIC reported without a netmask a match, rather than assuming one", () => {
+    // The address alone would say yes. There is nothing to verify the coverage
+    // with, and this file does not guess about a bind — same restraint as
+    // suggestBindAddressForPool's refusal to fall back to an arbitrary NIC.
+    networkInterfaces.mockReturnValue({ eth0: [{ address: "10.0.0.5", family: "IPv4", internal: false }] });
+    expect(dhcpInterfaceSubnetStatus("10.0.0.5", "255.255.255.0", "10.0.0.10", options())).toBe("mismatch");
+    expect(dhcpInterfaceSubnetStatus("", "255.255.255.0", "10.0.0.10", options())).toBe("all-interfaces-off-subnet");
+  });
+
+  it("refuses one whose reported mask is non-contiguous", () => {
+    // A mask that cannot be turned into a prefix length is as unverifiable as a
+    // missing one; the pool's own bad mask is reported separately as unusable.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("10.0.0.5", "255.0.255.0")] });
+    expect(dhcpInterfaceSubnetStatus("10.0.0.5", "255.255.255.0", "10.0.0.10", options())).toBe("mismatch");
+  });
+});
+
+describe("suggestBindAddressForPool — the NIC's own mask has to cover the pool", () => {
+  it("never offers a NIC on a narrower mask than the pool", () => {
+    // The suggestion has to agree with the status above, or the warning fires
+    // on a pool the picker is happy to auto-select an address for.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("10.0.0.254", "255.255.255.128")] });
+    expect(suggestBindAddressForPool("10.0.0.10", "255.255.255.0", options())).toBeUndefined();
+    // The same NIC IS the answer for a pool it actually covers.
+    expect(suggestBindAddressForPool("10.0.0.200", "255.255.255.128", options())).toEqual({
+      address: "10.0.0.254",
+      ambiguous: false
+    });
+  });
+
+  it("stops a narrower NIC from making a genuine one look ambiguous", () => {
+    // eth1 is the only NIC that can serve this /24. Counting eth0 as a second
+    // match would report a coin toss and suppress the auto-selection entirely.
+    networkInterfaces.mockReturnValue({
+      eth0: [ipv4("10.0.0.254", "255.255.255.128")],
+      eth1: [ipv4("10.0.0.5", "255.255.255.0")]
+    });
+    expect(suggestBindAddressForPool("10.0.0.10", "255.255.255.0", options())).toEqual({
+      address: "10.0.0.5",
+      ambiguous: false
+    });
+  });
+
+  it("offers a NIC on a wider mask, and none at all for one reported without a mask", () => {
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("10.0.0.5", "255.255.0.0")] });
+    expect(suggestBindAddressForPool("10.0.0.10", "255.255.255.0", options())?.address).toBe("10.0.0.5");
+
+    networkInterfaces.mockReturnValue({ eth0: [{ address: "10.0.0.5", family: "IPv4", internal: false }] });
+    expect(suggestBindAddressForPool("10.0.0.10", "255.255.255.0", options())).toBeUndefined();
+  });
+});
+
 describe("dhcpInterfaceSubnetStatus — the cases that must stay quiet", () => {
   it("says nothing about a subnet when relay agents are allowed, with a bind that IS off-subnet", () => {
     // The fixture is genuinely off-subnet: a same-subnet one would read as a

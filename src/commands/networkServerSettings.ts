@@ -506,6 +506,12 @@ function poolNetwork(
  * configured and serves nothing. Nothing else in the settings catches it: every
  * individual field is valid, and only the pair is wrong.
  *
+ * "On the pool's subnet" is two conditions, not one. The NIC's address masking
+ * into the pool's network under the *pool's* mask is necessary but not
+ * sufficient: the NIC's OWN mask has to be wide enough to cover the whole pool
+ * as well, or part of the range is off-link from this host's point of view. Both
+ * are checked by {@link nicCoversPool}, which every branch below goes through.
+ *
  * - `all-interfaces` — the bind address is unset or `0.0.0.0`, and at least one
  *   of this machine's NICs is on the pool's subnet. Every NIC is listening, so
  *   the one that serves this pool is among them.
@@ -562,26 +568,68 @@ export function dhcpInterfaceSubnetStatus(
     // to the whole filtered list instead of to one address.
     return interfacesOnPoolSubnet(interfaces, pool).length > 0 ? "all-interfaces" : "all-interfaces-off-subnet";
   }
-  if (!isValidIpv4(address) || !interfaces.some((option) => option.value === address)) return "unknown-address";
-  return isSameSubnet(address, pool.start, pool.mask) ? "match" : "mismatch";
+  if (!isValidIpv4(address)) return "unknown-address";
+  // Found by identity rather than tested with `.some`, because the verdict needs
+  // the option's own reported netmask, not just the fact that it exists.
+  const bound = interfaces.find((option) => option.value === address);
+  if (!bound) return "unknown-address";
+  return nicCoversPool(bound, pool) ? "match" : "mismatch";
 }
 
 /**
- * The NICs from the already-filtered list that sit on the pool's own subnet.
+ * The NICs from the already-filtered list that can actually serve the pool.
  *
  * Shared by the all-interfaces branch above and {@link suggestBindAddressForPool}
  * so the two cannot drift: "is anything here on that subnet" and "which one
  * would I suggest" have to be the same question, or the status warns about a
- * pool the suggestion is happy to serve. The all-interfaces row is excluded —
- * its empty address masks to 0.0.0.0 and would match a 0.0.0.0 pool network.
+ * pool the suggestion is happy to serve.
+ *
+ * Membership is {@link nicCoversPool}'s two conditions, not just the address
+ * one: sitting in the pool's network is necessary but not sufficient, because a
+ * NIC whose own mask is narrower than the pool's is off-link for part of the
+ * range it would be handing out. The all-interfaces row is excluded there too.
  */
 function interfacesOnPoolSubnet(
   interfaces: readonly NetworkInterfaceOption[],
   pool: { start: string; mask: string }
 ): NetworkInterfaceOption[] {
-  return interfaces.filter(
-    (option) => !isAllInterfaces(option.value) && isSameSubnet(option.value, pool.start, pool.mask)
-  );
+  return interfaces.filter((option) => nicCoversPool(option, pool));
+}
+
+/**
+ * Whether one NIC is on-link for *every* address the pool could hand out.
+ *
+ * Two conditions, and the second is the one an address-only comparison misses.
+ * The NIC's address has to mask into the pool's network under the POOL's mask —
+ * necessary, but not sufficient — and the NIC's OWN mask has to be equal or
+ * wider than the pool's, i.e. a numerically smaller-or-equal prefix length.
+ *
+ * Worked example: `10.0.0.254/25` masks into `10.0.0.0/24` exactly as a
+ * legitimate NIC would, so the address test passes. But this host's own subnet
+ * for that NIC is `10.0.0.128/25` — the pool's lower half is not on-link at all.
+ * The broadcast DISCOVER still arrives, which is precisely why the arrangement
+ * looks configured; the unicast REQUEST/ACK of a renewal for `10.0.0.10` does
+ * not route back out of that interface.
+ *
+ * A NIC mask that cannot be verified — absent, not a dotted quad, or
+ * non-contiguous — is never a match. `maskToPrefix` already refuses the last
+ * two, so `undefined` covers every unverifiable case in one check, and refusing
+ * follows this file's standing rule that a wrong answer about a bind is worse
+ * than none (see {@link suggestBindAddressForPool}).
+ *
+ * The all-interfaces pseudo-option is excluded here rather than at the call
+ * sites: it is not one NIC, and its empty address masks to `0.0.0.0`, which
+ * would falsely match a `0.0.0.0` pool network.
+ */
+function nicCoversPool(option: NetworkInterfaceOption, pool: { start: string; mask: string }): boolean {
+  if (isAllInterfaces(option.value)) return false;
+  if (!isSameSubnet(option.value, pool.start, pool.mask)) return false;
+  // `maskToPrefix` already refuses a non-dotted-quad and a non-contiguous mask,
+  // so an undefined answer covers every unverifiable case in one check.
+  const nicPrefix = option.netmask === undefined ? undefined : maskToPrefix(option.netmask);
+  const poolPrefix = maskToPrefix(pool.mask);
+  if (nicPrefix === undefined || poolPrefix === undefined) return false;
+  return nicPrefix <= poolPrefix;
 }
 
 /** A NIC that could serve the configured pool. */
@@ -598,6 +646,9 @@ export interface BindAddressSuggestion {
  * nothing matches. Binding a DHCP server to an arbitrary NIC is how a bench
  * service ends up answering DISCOVERs on an office network, and a suggestion
  * that is wrong is worse than no suggestion — the user still has the picker.
+ * By the same rule, "on the pool's subnet" here means {@link nicCoversPool}: a
+ * NIC whose own mask is narrower than the pool's, or is unverifiable, is not
+ * offered at all — and does not count towards `ambiguous` either.
  *
  * @param interfaces The already-filtered list from `networkInterfaceBindOptions()`,
  *   for the same reason {@link dhcpInterfaceSubnetStatus} needs it: virtual NICs
