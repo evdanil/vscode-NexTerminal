@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.8.210] — 2026-08-30
+
+### Added
+
+- **DHCP: a Network (CIDR) row that takes the whole network in one go.** In both Quick Settings and the full form, type `192.168.2.0/24` and the subnet mask, pool range, gateway and DNS that follow from it are filled in — Quick Settings shows exactly what it would write and asks first, and the shorthand itself is not stored: `subnet`/`rangeStart`/`rangeEnd`/`gateway`/`dns` remain the real keys, so a `settings.json` reader sees no difference. Prefixes that describe no pool are refused as they are typed (`/32` is a single address, `/31` is point-to-point, `/0` is not a subnet), and what is *offered* is capped at 254 addresses however wide the network is — a `/16` typed in means "this is my network", not "hand out sixty thousand leases".
+
+- **DHCP: the bind address and the pool are now checked against each other.** A server bound to a NIC on `192.168.1.x` while its pool hands out `10.0.0.x` looks correct in every individual field and serves nothing usable — only the pair is wrong, and nothing else caught it. The sidebar's DHCP Pool row appends `⚠ bound NIC is not on this subnet` when they disagree, Quick Settings and the full form carry the same note, and when exactly one NIC on this machine is on the pool's subnet it is offered — lifted out in the interface picker, and alongside the CIDR fill — so the one that is certainly right is not found by reading addresses octet by octet. All advisory: nothing refuses to start, and the warnings step aside when **Serve relayed requests** is on, where being off the pool's subnet is the point.
+
+### Fixed
+
+- **DHCP: the Node engine no longer rejects its own configuration when relay-agent serving is on.** `allowRelayAgents` was missing from the configuration validator's allowlist, and the host sends it on every configuration — so under `nexus.networkServers.engine: "node"` the daemon refused its spawn-time configuration and answered every subsequent `configure` with "Malformed RPC request", serving packaged defaults while the sidebar showed the settings actually entered. The Rust engine, the packaged default, was unaffected. Both engines now accept the setting, the checkbox the full form was missing is added, and configuration profiles save and restore it in both directions.
+
+### Changed
+
+- **Internal: the agent instructions were consolidated into a single `AGENTS.md`** that `CLAUDE.md` imports, dropping duplicated and stale copies of the same rules. Nothing about the extension changes.
+
 ## [2.8.208] — 2026-08-25
 
 ### Fixed
