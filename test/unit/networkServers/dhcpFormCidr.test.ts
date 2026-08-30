@@ -593,3 +593,117 @@ describe("dhcpInterfaceChoices — the picker's pool-subnet annotations", () => 
     expect(choices.every((choice) => choice.description === undefined)).toBe(true);
   });
 });
+
+/**
+ * REVIEW FINDING (P1, carried over from #111) — the two rules above are correct
+ * on their own and were wrong together. "Keeps a gateway the user typed" means
+ * that address stays in force on the new network; the pool was derived without
+ * knowing it, so it could span it. A hand-set gateway of 10.0.0.1 with
+ * 10.0.0.0/24 typed in produced a pool of 10.0.0.1-10.0.0.253 AND kept the
+ * gateway, so the server could lease the router's address to a client.
+ */
+describe("dhcpCidrFormFills — a preserved gateway or DNS is not poolable either", () => {
+  /** No NIC on 10.0.0.x, so only the preserved values can move the pool. */
+  const ELSEWHERE: readonly NetworkInterfaceOption[] = [
+    { label: "All interfaces (0.0.0.0)", value: "" },
+    { label: "eth0 — 192.168.9.5", value: "192.168.9.5", netmask: "255.255.255.0" }
+  ];
+
+  it("builds the pool around a gateway it has just decided to keep", () => {
+    const values: FormValues = { ...UNTOUCHED, gateway: "10.0.0.1" };
+    const fills = dhcpCidrFormFills("10.0.0.0/24", values, ELSEWHERE)!;
+    // The gateway survives, as it must...
+    expect(fills).not.toHaveProperty("gateway");
+    // ...so the pool has to start above it rather than on it.
+    expect(fills.rangeStart).toBe("10.0.0.2");
+  });
+
+  it("stops the pool below a preserved DNS server in the middle of it", () => {
+    const values: FormValues = { ...UNTOUCHED, dns: "10.0.0.40" };
+    const fills = dhcpCidrFormFills("10.0.0.0/24", values, ELSEWHERE)!;
+    expect(fills).not.toHaveProperty("dns");
+    expect(fills.rangeStart).toBe("10.0.0.1");
+    expect(fills.poolCount).toBe("39");
+  });
+
+  it("leaves the pool alone when the gateway is one it is about to replace", () => {
+    // 192.168.2.254 is the previous network's own derived gateway, so it is
+    // overwritten and is not an address on the new wire at all. Reserving it
+    // would shrink the pool for no reason.
+    const values: FormValues = { ...UNTOUCHED, gateway: "192.168.2.254" };
+    const fills = dhcpCidrFormFills("10.0.0.0/24", values, ELSEWHERE)!;
+    expect(fills.gateway).toBe("10.0.0.254");
+    expect(fills.rangeStart).toBe("10.0.0.1");
+    expect(fills.poolCount).toBe("253");
+  });
+
+  it("fills nothing when the preserved addresses leave no pool", () => {
+    const values: FormValues = { ...UNTOUCHED, gateway: "10.0.0.1" };
+    // /30: .1 is the only poolable address and the kept gateway is on it.
+    expect(dhcpCidrFormFills("10.0.0.0/30", values, ELSEWHERE)).toBeUndefined();
+  });
+});
+
+/**
+ * REVIEW FINDING (P1, carried over from #111) — with a relay agent in front of
+ * the service the pool is deliberately a subnet this machine is NOT on, but
+ * picking a bind NIC still ran the full CIDR derivation over that NIC's own
+ * local network. Rebinding a server relaying 10.0.0.0/24 from one local address
+ * to another silently replaced the relayed pool with the local one.
+ */
+describe("dhcpFormAutofillFields — an interface change under relay mode", () => {
+  /**
+   * Two local NICs on the same wire, because the identifier gate compares what
+   * each BIND resolves to: a previous address this machine does not hold
+   * resolves to nothing, and every refresh below would abstain for that reason
+   * rather than for the one under test.
+   */
+  const RELAY_NICS: readonly NetworkInterfaceOption[] = [
+    ...INTERFACES,
+    { label: "eth0:1 — 192.168.9.6", value: "192.168.9.6", netmask: "255.255.255.0" }
+  ];
+
+  /** Relaying 10.0.0.0/24 while bound to a local 192.168.9.x NIC. */
+  const RELAYED: FormValues = {
+    rangeStart: "10.0.0.10",
+    subnet: "255.255.255.0",
+    poolCount: 20,
+    allowRelayAgents: true,
+    interface: "192.168.9.6"
+  };
+
+  it("does not touch the relayed pool, mask, gateway, broadcast or DNS", () => {
+    const fills = dhcpFormAutofillFields("interface", "192.168.9.5", RELAYED, RELAY_NICS, "192.168.9.6") ?? {};
+    for (const key of ["subnet", "rangeStart", "poolCount", "gateway", "broadcast", "dns", "cidr"]) {
+      expect(fills).not.toHaveProperty(key);
+    }
+  });
+
+  it("still moves an auto-filled Server Identifier onto the new bind address", () => {
+    // Option 54 names the address clients reach THIS machine on, which the
+    // relay does not change — so a stale one still has to be refreshed.
+    const values: FormValues = { ...RELAYED, serverId: "192.168.9.6" };
+    const fills = dhcpFormAutofillFields("interface", "192.168.9.5", values, RELAY_NICS, "192.168.9.6")!;
+    expect(fills.serverId).toBe("192.168.9.5");
+  });
+
+  it("leaves a Server Identifier the user typed alone", () => {
+    const values: FormValues = { ...RELAYED, serverId: "172.16.4.4" };
+    expect(dhcpFormAutofillFields("interface", "192.168.9.5", values, RELAY_NICS, "192.168.9.6")).toBeUndefined();
+  });
+
+  it("still derives the whole network from the CIDR row, which relay does not change", () => {
+    // Typing a network under relay is the user naming the client subnet to
+    // serve — the one gesture that is MEANT to move the pool.
+    const fills = dhcpFormAutofillFields("cidr", "172.16.0.0/24", RELAYED, RELAY_NICS)!;
+    expect(fills.subnet).toBe("255.255.255.0");
+    expect(fills.rangeStart).toBe("172.16.0.1");
+  });
+
+  it("derives the NIC's network as before when relay mode is off", () => {
+    const direct: FormValues = { ...RELAYED, allowRelayAgents: false };
+    const fills = dhcpFormAutofillFields("interface", "10.0.0.5", direct, RELAY_NICS, "192.168.9.6")!;
+    expect(fills.subnet).toBe("255.255.255.0");
+    expect(fills.rangeStart).toBe("10.0.0.1");
+  });
+});

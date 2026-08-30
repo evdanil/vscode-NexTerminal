@@ -24,7 +24,8 @@ import {
   dhcpCidrDerivation,
   dhcpCidrProblem,
   dhcpCurrentCidr,
-  dhcpDerivedAddresses
+  dhcpDerivedAddresses,
+  preservedInfrastructureAddresses
 } from "../../../src/commands/networkServerSettings";
 import { SUGGESTED_CIDR_POOL_CAP } from "../../../src/services/networkServers/networkServerConfigValidation";
 
@@ -344,5 +345,95 @@ describe("dhcpCidrProblem — this machine's own addresses", () => {
     expect(dhcpCidrProblem("10.0.0.0/30")).toBeUndefined();
     expect(dhcpCidrProblem("10.0.0.0/29")).toBeUndefined();
     expect(dhcpCidrProblem("10.0.0.0/24")).toBeUndefined();
+  });
+});
+
+/**
+ * REVIEW FINDING (P1, carried over from #111) — the derivation excluded only
+ * the addresses this machine holds, and the fill that consumes it PRESERVES a
+ * gateway or DNS server the user set by hand. So the two together produced a
+ * pool spanning the very addresses the fill had just decided to keep: a manual
+ * gateway of 10.0.0.1 under a typed 10.0.0.0/24 derived 10.0.0.1-10.0.0.253,
+ * and the service could hand a client the router's own address.
+ *
+ * The pool is one contiguous range with no way to express a hole, so these
+ * assert the same two remedies `excludeOwnAddresses` already applies to a local
+ * NIC - step the start over it, or stop the range below it.
+ */
+describe("dhcpCidrDerivation — reserved infrastructure addresses stay out of the pool", () => {
+  it("steps the start over a preserved gateway sitting on the first host address", () => {
+    const derived = dhcpCidrDerivation("10.0.0.0/24", [], ["10.0.0.1"])!;
+    expect(derived.rangeStart).toBe("10.0.0.2");
+    expect(derived.rangeEnd).toBe("10.0.0.253");
+    // The network is untouched: only the pool moved, exactly as for a local NIC.
+    expect(derived.subnet).toBe("255.255.255.0");
+    expect(derived.gateway).toBe("10.0.0.254");
+  });
+
+  it("stops the pool below a preserved DNS server inside it", () => {
+    const derived = dhcpCidrDerivation("10.0.0.0/24", [], ["10.0.0.50"])!;
+    expect(derived.rangeStart).toBe("10.0.0.1");
+    expect(derived.rangeEnd).toBe("10.0.0.49");
+  });
+
+  it("keeps both kinds out at once, whichever comes first", () => {
+    // A local NIC at .1 and a hand-set gateway at .20: the start steps over the
+    // NIC and the range still has to stop below the gateway.
+    const derived = dhcpCidrDerivation("10.0.0.0/24", ["10.0.0.1"], ["10.0.0.20"])!;
+    expect(derived.rangeStart).toBe("10.0.0.2");
+    expect(derived.rangeEnd).toBe("10.0.0.19");
+  });
+
+  it("derives nothing when the reserved addresses leave no pool at all", () => {
+    // A /30 offers exactly one poolable address and the user's own gateway is
+    // on it. Same answer as a local NIC occupying it.
+    expect(dhcpCidrDerivation("10.0.0.0/30", [], ["10.0.0.1"])).toBeUndefined();
+  });
+
+  it("is inert for addresses on another network, blanks and junk", () => {
+    const plain = dhcpCidrDerivation("10.0.0.0/24");
+    expect(dhcpCidrDerivation("10.0.0.0/24", [], ["192.168.9.1", "", "not-an-ip"])).toEqual(plain);
+    // Omitted entirely is the shape every existing caller and test relies on.
+    expect(dhcpCidrDerivation("10.0.0.0/24", [], [])).toEqual(plain);
+  });
+});
+
+describe("preservedInfrastructureAddresses — which values the fill will leave alone", () => {
+  const previous = { gateway: "192.168.2.254", dns: ["192.168.2.254"] };
+
+  it("reserves a gateway the user typed, because the fill will not overwrite it", () => {
+    expect(preservedInfrastructureAddresses({ gateway: "10.0.0.1", dns: [], previous })).toEqual(["10.0.0.1"]);
+  });
+
+  it("reserves nothing when the values are this fill's own stale suggestions", () => {
+    // Auto-fillable means they are about to be REPLACED, so they are not
+    // addresses the new pool has to be built around.
+    expect(
+      preservedInfrastructureAddresses({ gateway: "192.168.2.254", dns: ["192.168.2.254"], previous })
+    ).toEqual([]);
+  });
+
+  it("reserves nothing for a blank gateway, the codebase's no-opinion signal", () => {
+    expect(preservedInfrastructureAddresses({ gateway: undefined, dns: [], previous })).toEqual([]);
+  });
+
+  it("reserves hand-set DNS servers, all of them", () => {
+    expect(
+      preservedInfrastructureAddresses({ gateway: undefined, dns: ["10.0.0.2", "10.0.0.3"], previous })
+    ).toEqual(["10.0.0.2", "10.0.0.3"]);
+  });
+
+  it("keeps everything when the previous network derived nothing to compare against", () => {
+    // No baseline means no value can be shown to be a stale suggestion, so
+    // none may be treated as one.
+    expect(
+      preservedInfrastructureAddresses({ gateway: "10.0.0.1", dns: ["10.0.0.2"], previous: undefined })
+    ).toEqual(["10.0.0.1", "10.0.0.2"]);
+  });
+
+  it("drops anything that is not a dotted quad rather than passing it on", () => {
+    expect(
+      preservedInfrastructureAddresses({ gateway: "not-an-ip", dns: ["also junk"], previous })
+    ).toEqual([]);
   });
 });

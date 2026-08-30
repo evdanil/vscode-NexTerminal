@@ -33,6 +33,7 @@ import {
   isContiguousMask,
   isDnsAutoFillable,
   isValidIpv4,
+  preservedInfrastructureAddresses,
   refreshDhcpServerIdentifier,
   suggestBindAddressForPool
 } from "./networkServerSettings";
@@ -778,31 +779,47 @@ async function editNetworkCidr(
   // pool that grew inconsistent with it gets straightened out, and the offer
   // costs an Escape — the row writes nothing without the confirmation below,
   // so browsing it still cannot mark the service as needing a restart.
-  // Same NIC enumeration `offSubnetInterfaceWrite` reads, and for the same
-  // reason it is filtered rather than taken raw from `os.networkInterfaces()`:
-  // a WSL or Docker address has no business shaping a pool for a real wire.
+  // Same NIC enumeration `offSubnetInterfaceWrite` reads, so one edit cannot
+  // see two different sets of interfaces. Every address it holds is kept out of
+  // the pool, virtual adapters included: a Docker bridge address is still an
+  // address in use on this machine, and the flag those carry governs which NIC
+  // may be SUGGESTED, not which addresses are occupied.
   const interfaces = networkInterfaceBindOptions();
   const ownAddresses = interfaces.map((option) => option.value);
-  const derived = dhcpCidrDerivation(entered, ownAddresses);
+  const section = settingsSection("dhcp");
+  const previous = dhcpDerivedAddresses(rangeStart ?? DEFAULTS.rangeStart, subnet);
+  const dns = readDnsSetting(section);
+  // Resolved before the derivation, because a gateway or DNS server the user
+  // set by hand survives this offer and so has to be kept out of the pool it
+  // builds — see `preservedInfrastructureAddresses`.
+  const reserved = preservedInfrastructureAddresses({
+    gateway: rawString(section, "gateway"),
+    dns,
+    previous
+  });
+  const derived = dhcpCidrDerivation(entered, ownAddresses, reserved);
   if (!derived) {
     // A blank box, or anything the validator already refused, is silent — blank
     // means "leave it alone" and the box itself said the rest. The one case
     // worth a word is the network that IS usable in the abstract and only this
-    // machine has no room in: the validator passes it (it asks about the
+    // configuration has no room in: the validator passes it (it asks about the
     // network, not about this host), so an unexplained Enter-does-nothing is
-    // the alternative.
+    // the alternative. Which of the two crowded it out is named, because the
+    // remedies are opposite ones — a different network, or a gateway/DNS entry
+    // this offer was told to keep.
     if (dhcpCidrDerivation(entered)) {
+      const culprit =
+        dhcpCidrDerivation(entered, ownAddresses) === undefined
+          ? "this machine's own addresses on it are kept out"
+          : "the gateway and DNS addresses you set by hand are kept out";
       await vscode.window.showWarningMessage(
-        `${entered.trim()} leaves no pool once this machine's own addresses on it are kept out — every address it could hand out is already taken here.`
+        `${entered.trim()} leaves no pool once ${culprit} — every address it could hand out is already spoken for.`
       );
     }
     return "unchanged";
   }
 
-  const section = settingsSection("dhcp");
-  const previous = dhcpDerivedAddresses(rangeStart ?? DEFAULTS.rangeStart, subnet);
   const allowRelayAgents = section.get<boolean>("allowRelayAgents", false) === true;
-  const dns = readDnsSetting(section);
 
   const writes: AutoFillWrite[] = [];
   if (rawString(section, "subnet") !== derived.subnet) writes.push({ key: "subnet", value: derived.subnet });
