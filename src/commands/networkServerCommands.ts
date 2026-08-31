@@ -37,6 +37,7 @@ import {
   dhcpFormAutofillFields,
   dhcpInterfaceChoices,
   dhcpRangeEndForCount,
+  effectiveDhcpRangeEnd,
   readSettingBoolean,
   readSettingNumber,
   readSettingString,
@@ -220,8 +221,17 @@ export function registerNetworkServerCommands(
       // inside a wider advertised subnet is served fine by a NIC that covers the
       // range but not the subnet — annotating it as a non-match would send the
       // user hunting for a NIC that does not need to exist.
+      // The seed carries the raw setting, so a blank end is resolved to the one
+      // the service really runs with first: left raw it widened the question to
+      // `start`–subnet-broadcast and dropped the annotation from the very NICs
+      // that serve the effective pool (see `effectiveDhcpRangeEnd`).
       interfaceOptions: dhcpSeed
-        ? dhcpInterfaceChoices(interfaces, dhcpSeed.rangeStart, dhcpSeed.subnet, dhcpSeed.rangeEnd)
+        ? dhcpInterfaceChoices(
+            interfaces,
+            dhcpSeed.rangeStart,
+            dhcpSeed.subnet,
+            effectiveDhcpRangeEnd(dhcpSeed.rangeEnd)
+          )
         : interfaces
     });
     WebviewFormPanel.open(`network-server-edit-${kind}`, form, {

@@ -108,6 +108,44 @@ export function dhcpRangeEndForCount(rangeStart: string | undefined, count: numb
 }
 
 /**
+ * The pool end the running service actually uses, once a blank setting has been
+ * resolved.
+ *
+ * A blank `rangeEnd` is not an unknown end. Both engines resolve it the same
+ * flat way — `DhcpEngine.rangeEnd` is `this._cfg.rangeEnd ?? DEFAULTS.rangeEnd`
+ * and the Rust daemon's `EngineOptions::default()` uses `DEFAULT_RANGE_END`
+ * verbatim — so the value is known, concrete, and (this is the part that trips
+ * callers up) INDEPENDENT of whatever `rangeStart` is set to. The packaged end
+ * is not re-derived from a start the user did set.
+ *
+ * That distinction matters because {@link poolNetwork} treats an absent end as
+ * genuinely unknown and widens the window to the subnet broadcast. That is the
+ * right conservative answer for a caller that has no end yet — an in-progress
+ * form derivation, say — but the wrong one for a caller reading the settings as
+ * they stand: with `rangeStart` `192.168.2.10` and a `/16` mask, the effective
+ * pool is `192.168.2.10`–`192.168.2.199`, which a `192.168.2.x/24` NIC serves
+ * completely, yet the widened window tests through `192.168.255.255` and reports
+ * that NIC as a mismatch. The visible costs are a false sidebar warning, a
+ * vanished bind-address suggestion, and — because
+ * {@link refreshDhcpServerIdentifier} cannot resolve either side — an option 54
+ * left pointing at the NIC the socket has stopped answering on.
+ *
+ * So every settings-backed caller asking "does this NIC serve the pool as
+ * CONFIGURED" resolves the blank here first; only a caller that truly has no end
+ * to speak of leaves it out and gets `poolNetwork`'s conservative fallback.
+ *
+ * Note that the substitution can still describe a window the pool cannot use —
+ * a packaged `192.168.2.199` under a `rangeStart` of `10.0.0.50` is exactly the
+ * empty/invalid pool the daemon refuses to start on. `poolNetwork` bounds an end
+ * that is below the start or above the subnet broadcast back to the conservative
+ * fallback, so a nonsense pair lands on the same answer it did before rather
+ * than widening any comparison on the strength of it.
+ */
+export function effectiveDhcpRangeEnd(rangeEnd: string | undefined): string {
+  return rangeEnd ?? DEFAULTS.rangeEnd;
+}
+
+/**
  * Why a `rangeStart` + count pool is unusable, or `undefined` if it is fine.
  *
  * Contiguity with the subnet is the check worth having: a pool that runs past
@@ -1186,8 +1224,13 @@ export function dhcpCidrFormFills(
   // from a field that does not exist — letting the previous-state resolution
   // fall back to the conservative `start`–subnet-broadcast window while the next
   // one is asked about a narrow one would compare two different questions'
-  // answers through the gate.
-  const previousRangeEnd = dhcpRangeEndForCount(previousRangeStart, readSettingNumber(values.poolCount));
+  // answers through the gate. A blank count is itself the same "no rangeEnd
+  // setting" case `effectiveDhcpRangeEnd` exists for — clearing the count field
+  // clears the key, so the packaged end is what the previous state actually
+  // ran with, not an unknown one.
+  const previousRangeEnd = effectiveDhcpRangeEnd(
+    dhcpRangeEndForCount(previousRangeStart, readSettingNumber(values.poolCount))
+  );
   const fills: Record<string, string> = {
     // Normalised: a pool start typed as the CIDR host part (192.168.2.55/24)
     // is echoed back as the network it names, matching what dhcpCurrentCidr

@@ -22,7 +22,7 @@ import type {
   NetworkServerTransferSummary
 } from "../models/networkServer";
 import { networkInterfaceBindOptions } from "../commands/networkInterfaceOptions";
-import { dhcpCurrentCidr, dhcpInterfaceSubnetStatus } from "../commands/networkServerSettings";
+import { dhcpCurrentCidr, dhcpInterfaceSubnetStatus, effectiveDhcpRangeEnd } from "../commands/networkServerSettings";
 import {
   NETWORK_SERVER_KINDS,
   readDhcpConfig,
@@ -389,13 +389,21 @@ export class NetworkServerTreeProvider implements vscode.TreeDataProvider<Networ
     // `10.0.0.130`–`10.0.0.200` inside a `/24` — is entirely reachable from a
     // `10.0.0.254/25` NIC, and warning about that arrangement sent the user
     // looking for a fault that was not there.
+    //
+    // `readDhcpConfig` reports a blank `rangeEnd` setting as `undefined`, which
+    // is what is persisted but not what runs: the service resolves it to the
+    // packaged end. Passing the raw `undefined` made this row ask about
+    // `start`–subnet-broadcast — under a `/16` that is the whole
+    // `192.168.0.0/16`, so a `192.168.2.x/24` NIC serving the effective
+    // `192.168.2.10`–`192.168.2.199` pool was warned about for addresses the
+    // pool never hands out. See `effectiveDhcpRangeEnd`.
     const status = dhcpInterfaceSubnetStatus(
       bindAddress,
       config.subnet,
       config.rangeStart,
       networkInterfaceBindOptions(),
       config.allowRelayAgents === true,
-      config.rangeEnd
+      effectiveDhcpRangeEnd(config.rangeEnd)
     );
     if (status === "all-interfaces-off-subnet") {
       return { bindAddress: undefined, cidr: dhcpCurrentCidr(config.rangeStart, config.subnet) };

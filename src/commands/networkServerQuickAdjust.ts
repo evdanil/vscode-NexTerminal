@@ -29,6 +29,7 @@ import {
   dhcpInterfaceSubnetStatus,
   dhcpPoolProblem,
   dhcpRangeEndForCount,
+  effectiveDhcpRangeEnd,
   isAutoFillable,
   isContiguousMask,
   isDnsAutoFillable,
@@ -190,8 +191,12 @@ interface PoolSubnetContext {
    * confined to part of its subnet by hand — `10.0.0.130`–`10.0.0.200` inside a
    * `/24` — is served perfectly by a `10.0.0.254/25` NIC, and demanding whole-
    * subnet coverage reported that as a mismatch.
+   *
+   * Always concrete, never `undefined`: a blank `rangeEnd` setting has a known
+   * runtime value (`effectiveDhcpRangeEnd`), and every consumer of this context
+   * is asking about the pool as it will actually run.
    */
-  readonly rangeEnd: string | undefined;
+  readonly rangeEnd: string;
   /**
    * With a relay agent in front of it, serving a subnet this machine is not on
    * is the point, so none of the off-subnet reporting applies.
@@ -203,7 +208,10 @@ function dhcpPoolSubnetContext(section: vscode.WorkspaceConfiguration): PoolSubn
   return {
     rangeStart: rawString(section, "rangeStart"),
     subnet: rawString(section, "subnet"),
-    rangeEnd: rawString(section, "rangeEnd"),
+    // Resolved rather than passed through raw: a blank setting is the packaged
+    // end, not an unknown one, and the widened `start`–subnet-broadcast window
+    // an unknown gets warns about NICs that serve the running pool completely.
+    rangeEnd: effectiveDhcpRangeEnd(rawString(section, "rangeEnd")),
     allowRelayAgents: section.get<boolean>("allowRelayAgents", false) === true
   };
 }
@@ -691,7 +699,14 @@ async function offerPoolAutoFill(
   if (!derived) return;
   const previous = previousStart ? dhcpDerivedAddresses(previousStart, subnet) : undefined;
   const rangeEnd = dhcpRangeEndForCount(rangeStart, count);
-  const previousRangeEnd = previousStart ? dhcpRangeEndForCount(previousStart, count) : undefined;
+  // Not gated on `previousStart` being set, unlike the `previous` derivation
+  // above. `count` already came from `currentPoolCount`, which resolves both
+  // blank pool settings to their packaged values, and `dhcpRangeEndForCount`
+  // resolves a blank start the same way `poolNetwork` does — so an unset
+  // previous start reconstructs exactly the `192.168.2.10`-based window that was
+  // really in force, where the gate used to ask the widened
+  // `start`–subnet-broadcast question and resolve the previous side to nothing.
+  const previousRangeEnd = dhcpRangeEndForCount(previousStart, count);
 
   const section = settingsSection("dhcp");
   const dns = readDnsSetting(section);
@@ -870,12 +885,25 @@ async function editNetworkCidr(
   // Both windows are the ones really in force on their own side: the CIDR
   // derivation carries the pool end it is about to write, and the previous side
   // reads the `rangeEnd` setting as it stands — the pool this row is replacing.
-  // The packaged end is substituted only when the start is packaged too, since
-  // the two defaults are one pool; pinning the packaged end to a start the user
-  // did set would describe a window neither of them means, and an unset end with
-  // a set start falls back to the conservative `start`–subnet-broadcast question
-  // instead.
-  const previousRangeEnd = rawString(section, "rangeEnd") ?? (rangeStart === undefined ? DEFAULTS.rangeEnd : undefined);
+  //
+  // REVIEW FINDING — that substitution used to be conditional on the START also
+  // being unset, on the reasoning that the two packaged values are one pool and
+  // that pinning the packaged end to a start the user did set would describe a
+  // window neither of them means. The premise is wrong about the service: both
+  // engines resolve a blank end to the packaged one flatly, with no reference to
+  // `rangeStart` at all (see `effectiveDhcpRangeEnd`), so a set start with a
+  // blank end runs `rangeStart`–`192.168.2.199` and the conditional described
+  // the one window that is NOT in force. The concern behind it is met anyway,
+  // and by the caller it belongs to: `poolNetwork` bounds an end below the start
+  // or above the subnet broadcast back to the conservative fallback, so the
+  // genuinely mismatched pairing that comment worried about (`10.0.0.50` with a
+  // packaged `192.168.2.199`) still lands on `start`–subnet-broadcast. What the
+  // conditional additionally suppressed was the case where the packaged end IS
+  // inside the configured start's subnet — `192.168.2.10` under a `/16` — and
+  // there it widened the previous-side question to the whole `192.168.0.0/16`,
+  // so a `192.168.2.x/24` NIC resolved to nothing and the stale server
+  // identifier survived the gate.
+  const previousRangeEnd = effectiveDhcpRangeEnd(rawString(section, "rangeEnd"));
   const resolvedServerId = refreshDhcpServerIdentifier({
     next: {
       rangeStart: derived.rangeStart,

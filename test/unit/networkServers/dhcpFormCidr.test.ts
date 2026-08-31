@@ -336,6 +336,49 @@ describe("dhcpCidrFormFills — what counts as a stale server identifier", () =>
 });
 
 /**
+ * REVIEW FINDING (P1) — the form renders Pool COUNT, not an end, so the
+ * previous window's `rangeEnd` is reconstructed from the previous count
+ * ({@link dhcpRangeEndForCount}) rather than read from a field that does not
+ * exist. That helper returns `undefined` for a blank count — which is not a
+ * "the previous end is unknown" case, it is the same "no rangeEnd setting"
+ * case `effectiveDhcpRangeEnd` exists for: clearing the count field clears
+ * the key, and the previous state really ran with the packaged end, not with
+ * whatever `poolNetwork` widens to when it is handed nothing at all.
+ *
+ * The previous network sits on the packaged octets (192.168.2.x) precisely so
+ * the packaged end (192.168.2.199) lands inside it — the fixture that makes
+ * the difference observable, not an arbitrary choice: a previous network on
+ * unrelated octets (`ON_PREVIOUS` above, 192.168.9.x) can't be moved by this
+ * fix at all, because `poolNetwork`'s own out-of-subnet guard discards a
+ * substituted end that doesn't belong to the subnet being asked about and
+ * falls back to the subnet's own broadcast regardless — which is exactly why
+ * every `ON_PREVIOUS` test above stays green under this fix.
+ */
+describe("dhcpCidrFormFills — a blank Pool Count still has a known previous end", () => {
+  it("resolves the previous network's held NIC instead of finding nothing on it", () => {
+    // A /16 so the whole-subnet fallback (192.168.255.255) and the packaged
+    // end (192.168.2.199) ask genuinely different questions: eth2 covers the
+    // pool up to .199 (its own broadcast is .2.255) but not up to .255.255.
+    const values: FormValues = {
+      rangeStart: "192.168.2.10",
+      subnet: "255.255.0.0",
+      serverId: "192.168.2.5"
+    };
+    const interfaces = [
+      ...INTERFACES,
+      { label: "eth2 — 192.168.2.5", value: "192.168.2.5", netmask: "255.255.255.0" }
+    ];
+    const fills = dhcpCidrFormFills("10.0.0.0/24", values, interfaces)!;
+    // 192.168.2.5 is exactly what the previous fill would have written under
+    // the packaged end — leaving it behind is a server identifier naming the
+    // old wire. Under the whole-subnet fallback, no NIC on this machine
+    // reaches 192.168.255.255, so the previous resolution finds nothing,
+    // "192.168.2.5" is read as hand-set, and this assertion fails.
+    expect(fills.serverId).toBe("10.0.0.5");
+  });
+});
+
+/**
  * REVIEW FINDING (P1) — the form's own derivation must exclude the addresses
  * this machine holds, not just the quick editor's. Both write the same settings.
  */

@@ -622,6 +622,78 @@ describe("applying a CIDR — what counts as a stale server identifier", () => {
     expect(written("serverId")).toBe("192.168.2.1");
     expect(written("rangeStart")).toBe("10.0.0.1");
   });
+
+  /**
+   * REVIEW FINDING — every fixture above sets `rangeEnd` explicitly, so none of
+   * them could see how a BLANK one was resolved for the previous side. It used
+   * to be substituted with the packaged end only when `rangeStart` was blank
+   * too, on the reasoning that the two packaged values are one pool. The service
+   * disagrees: it resolves a blank end to `192.168.2.199` with no reference to
+   * the start at all, so a set start with a blank end ran
+   * `rangeStart`–`192.168.2.199` while this gate asked about
+   * `rangeStart`–subnet-broadcast.
+   *
+   * Under the `/16` below those are `192.168.2.199` and `192.168.255.255`, and
+   * the old NIC's `/24` covers only the first. The previous resolution therefore
+   * came back `undefined`, the gate read a serverId this editor had itself
+   * written as hand-set, and applying a new network left option 54 — and the
+   * BOOTP `siaddr` a ZTP client boots from — naming the old wire.
+   *
+   * The concern behind the old conditional is met by `poolNetwork`, not by the
+   * conditional: a packaged end outside the configured start's subnet is bounded
+   * back to the conservative window, which the last test here pins.
+   */
+  it("recognises its own stale identifier when the pool END is blank and the start is not", async () => {
+    // eth0's /24 serves the effective 192.168.2.10–192.168.2.199 pool completely
+    // and covers none of the rest of the advertised /16.
+    networkInterfaces.mockReturnValue({
+      eth0: [ipv4("192.168.2.5", "255.255.255.0")],
+      eth1: [ipv4("10.0.0.5")]
+    });
+    seed({ rangeStart: "192.168.2.10", subnet: "255.255.0.0", interface: "192.168.2.5", serverId: "192.168.2.5" });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("serverId")).toBe("10.0.0.5");
+    expect(written("rangeStart")).toBe("10.0.0.1");
+  });
+
+  it("still keeps a hand-set identifier when the pool end is blank", async () => {
+    // The gate has to survive the substitution: one address apart from the test
+    // above, and 192.168.2.9 is not what the old bind would have resolved to.
+    // Kills "a blank end means write the new address unconditionally".
+    networkInterfaces.mockReturnValue({
+      eth0: [ipv4("192.168.2.5", "255.255.255.0")],
+      eth1: [ipv4("10.0.0.5")]
+    });
+    seed({ rangeStart: "192.168.2.10", subnet: "255.255.0.0", interface: "192.168.2.5", serverId: "192.168.2.9" });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("serverId")).toBe("192.168.2.9");
+    expect(written("rangeStart")).toBe("10.0.0.1");
+  });
+
+  it("abstains when the blank end names a window the configured start cannot reach", async () => {
+    // The old conditional's actual worry, and the case it was written to avoid:
+    // a start on 172.20.0.0/24 with the packaged 192.168.2.199 is not a pool at
+    // all. `poolNetwork` bounds an end past the subnet broadcast back to the
+    // conservative question, so eth0 — which is on neither network — resolves
+    // nothing on the previous side and the configured identifier stands.
+    networkInterfaces.mockReturnValue({
+      eth0: [ipv4("192.168.2.5", "255.255.255.0")],
+      eth1: [ipv4("10.0.0.5")]
+    });
+    seed({ rangeStart: "172.20.0.10", interface: "192.168.2.5", serverId: "192.168.2.5" });
+    quickPickScript = [pickRow("Network (CIDR)"), answerAutoFill(true), dismiss];
+    inputScript = ["10.0.0.0/24"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("serverId")).toBe("192.168.2.5");
+    expect(written("rangeStart")).toBe("10.0.0.1");
+  });
 });
 
 describe("the NIC that goes with the new network", () => {
@@ -752,6 +824,44 @@ describe("the Interface row", () => {
     expect(bindPicker.find((entry) => entry.label.startsWith("eth0"))?.description).toContain(
       "matches the pool subnet"
     );
+  });
+
+  /**
+   * REVIEW FINDING — `PoolSubnetContext` carried the `rangeEnd` SETTING, and a
+   * blank one reached the comparison as "no end known", which widens the window
+   * to the subnet's broadcast. A blank end is not unknown: the service resolves
+   * it to the packaged `192.168.2.199` regardless of `rangeStart`. Under a `/16`
+   * that gap is the whole difference between `192.168.2.199` and
+   * `192.168.255.255`, so both surfaces this row drives — the detail line and
+   * the picker's annotation — disowned the very NIC serving the running pool.
+   */
+  it("stays quiet for a blank pool end whose packaged pool the bound NIC does serve", async () => {
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.2.5", "255.255.255.0")] });
+    seed({ rangeStart: "192.168.2.10", subnet: "255.255.0.0", interface: "192.168.2.5" });
+    quickPickScript = [pickRow("Interface"), dismiss, dismiss];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    const row = quickPickCalls[0].find((entry) => entry.label.includes("Interface"));
+    expect(row?.detail).not.toContain("not on the pool's subnet");
+    const bindPicker = quickPickCalls[1] as Array<{ label: string; description?: string }>;
+    expect(bindPicker.find((entry) => entry.label.startsWith("eth0"))?.description).toContain(
+      "matches the pool subnet"
+    );
+  });
+
+  it("still flags it when the pool end is SET past the bound NIC's link", async () => {
+    // One setting apart from the fixture above — an end the user actually typed,
+    // inside the advertised /16 but outside this NIC's /24. The packaged end
+    // stands in for a blank setting, never for a configured one.
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.2.5", "255.255.255.0")] });
+    seed({ rangeStart: "192.168.2.10", rangeEnd: "192.168.5.5", subnet: "255.255.0.0", interface: "192.168.2.5" });
+    quickPickScript = [pickRow("Interface"), dismiss, dismiss];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    const row = quickPickCalls[0].find((entry) => entry.label.includes("Interface"));
+    expect(row?.detail).toContain("not on the pool's subnet (192.168.0.0/16)");
+    const bindPicker = quickPickCalls[1] as Array<{ label: string; description?: string }>;
+    expect(bindPicker.find((entry) => entry.label.startsWith("eth0"))?.description).toBe("current");
   });
 
   it("still flags that NIC when the pool reaches past its link", async () => {
@@ -1052,6 +1162,60 @@ describe("the Interface row — the server identifier follows the rebind", () =>
     expect(written("serverId")).toBe("10.0.0.140");
   });
 
+  /**
+   * REVIEW FINDING — the fixture above supplies a concrete `rangeEnd`, so it
+   * only pins that the SAME window reaches both endpoints. It says nothing about
+   * what that window is when the setting is blank, and blank was resolved as
+   * "unknown" — the widened `start`–subnet-broadcast question — rather than as
+   * the packaged end the service actually runs with.
+   *
+   * Both NICs below are /24s inside an advertised /16, so the two readings
+   * disagree about them: the effective 192.168.2.10–192.168.2.199 pool is inside
+   * each NIC's link, the widened 192.168.2.10–192.168.255.255 one is not. Left
+   * raw, BOTH resolutions come back `undefined`, the gate reads the configured
+   * identifier as hand-set, and 192.168.2.130 survives a rebind that just moved
+   * the socket to 192.168.2.140 — which is the exact fault this row exists to
+   * prevent, now reachable through nothing worse than never setting a pool end.
+   */
+  it("carries the identifier across a rebind when the pool END is left blank", async () => {
+    networkInterfaces.mockReturnValue({
+      eth1: [ipv4("192.168.2.130", "255.255.255.0")],
+      eth2: [ipv4("192.168.2.140", "255.255.255.0")]
+    });
+    seed({
+      rangeStart: "192.168.2.10",
+      subnet: "255.255.0.0",
+      interface: "192.168.2.130",
+      serverId: "192.168.2.130"
+    });
+    quickPickScript = [pickRow("Interface"), pickRow("eth2"), dismiss];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("interface")).toBe("192.168.2.140");
+    expect(written("serverId")).toBe("192.168.2.140");
+  });
+
+  it("still leaves a hand-set identifier alone when the pool end is blank", async () => {
+    // One address apart from the fixture above: 192.168.2.1 is not what the old
+    // bind resolved to, so someone typed it. Kills "a blank end means write the
+    // newly picked address unconditionally".
+    networkInterfaces.mockReturnValue({
+      eth1: [ipv4("192.168.2.130", "255.255.255.0")],
+      eth2: [ipv4("192.168.2.140", "255.255.255.0")]
+    });
+    seed({
+      rangeStart: "192.168.2.10",
+      subnet: "255.255.0.0",
+      interface: "192.168.2.130",
+      serverId: "192.168.2.1"
+    });
+    quickPickScript = [pickRow("Interface"), pickRow("eth2"), dismiss];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("interface")).toBe("192.168.2.140");
+    expect(written("serverId")).toBe("192.168.2.1");
+  });
+
   it("writes neither setting when the picker is dismissed", async () => {
     threeNics();
     seed({ rangeStart: "10.0.0.10", rangeEnd: "10.0.0.99", interface: "10.0.0.5", serverId: "10.0.0.5" });
@@ -1178,5 +1342,59 @@ describe("the Pool Start row — the server identifier follows the rebind", () =
     // The rest of the offer still applied over it, so the batch did run.
     expect(written("rangeStart")).toBe("10.0.0.20");
     expect(written("gateway")).toBe("10.0.0.254");
+  });
+
+  /**
+   * REVIEW FINDING — this row reconstructs both windows from the surviving pool
+   * COUNT, which is the right shape, but the previous one was gated on the old
+   * `rangeStart` being SET: an unset start produced no previous end at all and
+   * the gate fell back to the widened `start`–subnet-broadcast question. That
+   * gate is asymmetric for no reason — `previous.rangeStart` is itself handed
+   * over unset and resolved to the packaged start by `poolNetwork`, and
+   * `dhcpRangeEndForCount` resolves a blank start exactly the same way, so the
+   * count reconstructs the window that was really in force.
+   *
+   * The `/16` below makes the two readings disagree: eth0's `/24` covers the
+   * packaged `192.168.2.10`–`192.168.2.199` pool completely and none of the rest
+   * of the advertised subnet. Left ungated the previous side resolves to
+   * `192.168.2.5`, the identifier is recognised as this editor's own and follows
+   * the move; gated, it resolves to nothing, the gate reads a hand-set value and
+   * option 54 keeps naming the wire the socket just left.
+   */
+  it("recognises its own identifier on a move away from a pool start that was never set", async () => {
+    networkInterfaces.mockReturnValue({
+      eth0: [ipv4("192.168.2.5", "255.255.255.0")],
+      eth1: [ipv4("192.168.20.5", "255.255.255.0")]
+    });
+    // No rangeStart and no rangeEnd: the packaged 192.168.2.10–192.168.2.199 pool.
+    seed({ subnet: "255.255.0.0", interface: "192.168.2.5", serverId: "192.168.2.5" });
+    quickPickScript = [pickRow("Pool Start"), answerAutoFill(true), dismiss];
+    inputScript = ["192.168.20.10"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    // The pool moved and kept its packaged 190-address size.
+    expect(written("rangeStart")).toBe("192.168.20.10");
+    expect(written("rangeEnd")).toBe("192.168.20.199");
+    // The move took the pool off eth0, so the batch rebinds — and option 54 has
+    // to name the NIC the socket will actually answer on.
+    expect(written("interface")).toBe("192.168.20.5");
+    expect(written("serverId")).toBe("192.168.20.5");
+  });
+
+  it("still leaves a hand-set identifier alone on that same move", async () => {
+    // One address apart from the fixture above: 192.168.2.9 is not what the pool
+    // as it stood resolved to, so someone typed it. Kills "an unset previous
+    // start means write the new address unconditionally".
+    networkInterfaces.mockReturnValue({
+      eth0: [ipv4("192.168.2.5", "255.255.255.0")],
+      eth1: [ipv4("192.168.20.5", "255.255.255.0")]
+    });
+    seed({ subnet: "255.255.0.0", interface: "192.168.2.5", serverId: "192.168.2.9" });
+    quickPickScript = [pickRow("Pool Start"), answerAutoFill(true), dismiss];
+    inputScript = ["192.168.20.10"];
+    await openNetworkServerQuickAdjust("dhcp", deps());
+
+    expect(written("interface")).toBe("192.168.20.5");
+    expect(written("serverId")).toBe("192.168.2.9");
   });
 });
