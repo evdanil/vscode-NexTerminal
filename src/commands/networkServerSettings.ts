@@ -1497,6 +1497,92 @@ export function networkServerProfileSettingUpdates(
 }
 
 /**
+ * Why the NIC the form is bound to cannot itself host the pool, phrased for the
+ * submit check — the Interface picker's counterpart to {@link dhcpCidrProblem}.
+ *
+ * Picking a NIC is the form's second way of naming a network: the fill derives
+ * the NIC's own CIDR and moves the whole pool onto it
+ * ({@link dhcpFormAutofillFields}). When that derivation produces nothing the
+ * fill returns nothing, and the webview has ALREADY applied the selection to
+ * the DOM before it posts — so the bind address moves, every pool row keeps the
+ * previous network's values, and without this check Save persists the new bind
+ * beside a pool on a network no client of it is on. The CIDR row's own check
+ * closes the identical hole for the typed shorthand; this closes it for the
+ * picked one, and asks the same question with the same exclusions so the two
+ * cannot answer differently for the same network.
+ *
+ * The gap is one step earlier than for the CIDR row, incidentally: for an
+ * unusable netmask or an unheld address the interface trigger short-circuits in
+ * {@link dhcpInterfaceCidr} before {@link dhcpCidrFormFills} is reached. Those
+ * are not this check's business either way — an unheld or malformed bind is
+ * reported by the shared parser under its own field label, and the
+ * all-interfaces choice is not one NIC and so names no network to validate.
+ *
+ * Refusing the save is right for a NON-relayed service specifically, and not
+ * merely because that is where the silent fill lives: without a relay agent the
+ * only clients that can reach the service are the ones broadcasting on the wire
+ * it is bound to, so the pool has to live on that wire's own network. A bound
+ * NIC whose network can host no pool at all is therefore a service that can
+ * serve nobody, whatever the pool rows say.
+ *
+ * That reasoning is exactly why relay mode is carved out rather than left to
+ * fall through. Structurally the failure is already unreachable there —
+ * {@link dhcpFormAutofillFields} sends a relayed NIC pick to
+ * {@link dhcpRelayBindFills}, which resolves the Server Identifier and never
+ * touches the pool — but running the check anyway would not be redundant, it
+ * would be wrong: a relayed pool is on the CLIENT subnet by definition, and the
+ * local bind is free to sit on a `/30` point-to-point uplink that could never
+ * host a pool of its own. Same distinction {@link dhcpInterfaceChoices} draws
+ * from the other side — it is the *comparison* a relay agent makes irrelevant,
+ * not the fact.
+ *
+ * @returns `undefined` when there is no concrete NIC to ask about, when relay
+ *   agents are allowed, when the bind names no network this machine holds, and
+ *   when the network it does name can still produce a pool.
+ */
+function dhcpInterfaceNetworkProblem(
+  values: FormValues,
+  interfaces: readonly NetworkInterfaceOption[],
+  ownAddresses: readonly string[] | undefined,
+  reservedAddresses: readonly string[]
+): string | undefined {
+  if (readSettingBoolean(values.allowRelayAgents)) return undefined;
+  const bindAddress = readSettingString(values.interface);
+  if (bindAddress === undefined || isAllInterfaces(bindAddress)) return undefined;
+  const cidr = dhcpInterfaceCidr(bindAddress, interfaces);
+  if (cidr === undefined) {
+    // `dhcpInterfaceCidr` collapses two different situations into one
+    // `undefined`: an address this machine no longer holds — which the
+    // picker deliberately keeps selectable (see `suggestBindAddressForPool`'s
+    // own "no fallback to the first available interface" doc comment) — and
+    // a NIC this machine DOES hold right now, live in the dropdown the user
+    // just chose from, whose reported netmask this function cannot use. The
+    // first case is a known, accepted gap this check leaves alone; silently
+    // saying nothing about the second would leave exactly the stale-bind,
+    // stale-pool pairing this whole check exists to catch, just for a NIC
+    // the platform failed to describe fully rather than one this machine
+    // has stopped holding.
+    const held = interfaces.some((option) => option.value === bindAddress);
+    if (!held) return undefined;
+    return `The interface you picked (${bindAddress}) does not report a usable subnet mask, so its network can't be confirmed — with no mask to derive one from, there is nothing here to check a pool against.`;
+  }
+  const preface = `The interface you picked (${bindAddress}) is on ${cidr}, which`;
+  // One message per cause, in the order `dhcpCidrProblem` uses for the same
+  // three: what the network is, then the occupancy the user cannot edit, then
+  // the settings of theirs that they can.
+  if (!dhcpCidrDerivation(cidr)) {
+    return `${preface} does not describe a usable DHCP subnet — a /31 or /32 NIC has no host range for a pool to hand out.`;
+  }
+  if (ownAddresses && !dhcpCidrDerivation(cidr, ownAddresses)) {
+    return `${preface} leaves no pool once this machine's own addresses on it are kept out — every address it could hand out is already taken here.`;
+  }
+  if (!dhcpCidrDerivation(cidr, ownAddresses, reservedAddresses)) {
+    return `${preface} leaves no pool once the gateway and DNS addresses you set by hand are kept out — every address it could hand out is already spoken for.`;
+  }
+  return undefined;
+}
+
+/**
  * Sanity checks run before any setting is written, returning the first problem
  * as a message.
  *
@@ -1506,8 +1592,17 @@ export function networkServerProfileSettingUpdates(
  * `onSubmit` reports the reason and leaves the panel open with the user's input
  * intact. Only non-blank values are checked — blank means "clear the key and
  * use the packaged default", which is always valid.
+ *
+ * @param interfaces The NICs the form enumerated when it opened, for the
+ *   Interface picker's own network check. Defaults to an empty list, under
+ *   which no bind address can resolve to a NIC and that check is inert — the
+ *   behaviour every caller that does not know about the picker already had.
  */
-export function validateDhcpValues(values: FormValues, ownAddresses?: readonly string[]): string | undefined {
+export function validateDhcpValues(
+  values: FormValues,
+  ownAddresses?: readonly string[],
+  interfaces: readonly NetworkInterfaceOption[] = []
+): string | undefined {
   // The reserved addresses are worked out here rather than taken as a
   // parameter, from the same fields and by the same helper `dhcpCidrFormFills`
   // uses, because the two have to agree by construction. Threading them from
@@ -1539,6 +1634,14 @@ export function validateDhcpValues(values: FormValues, ownAddresses?: readonly s
       ? dhcpCidrProblem(values[DHCP_CIDR_FIELD_KEY], ownAddresses, reservedAddresses)
       : undefined;
   if (cidrProblem) return cidrProblem;
+  // Second, because the Interface picker is the form's OTHER way of naming the
+  // network — same silent-fill hole, same exclusions, so it belongs beside the
+  // row it mirrors rather than after the per-field parser. The typed row keeps
+  // precedence when both would refuse: a CIDR is a thing the user just wrote
+  // out in full, and complaining about the network a NIC merely implies would
+  // answer a question they did not ask.
+  const interfaceProblem = dhcpInterfaceNetworkProblem(values, interfaces, ownAddresses, reservedAddresses);
+  if (interfaceProblem) return interfaceProblem;
   const parserProblem = validateDhcpFormInput(values);
   if (parserProblem) return parserProblem;
   const rangeStart = readSettingString(values.rangeStart);

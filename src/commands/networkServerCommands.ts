@@ -255,11 +255,16 @@ export function registerNetworkServerCommands(
         // per-open enumeration: a CIDR the autofill could fill nothing for
         // because this machine holds every poolable address must not then save
         // as if the row had been left blank.
+        // The options themselves go with the addresses, because the Interface
+        // picker has the same hole and its check needs the NETMASKS to find the
+        // network a chosen NIC is on — a bind the fill could derive no pool for
+        // must not save the previous network's pool beside the new address.
         const problem =
           kind === "dhcp"
             ? validateDhcpValues(
                 values,
-                interfaces.map((option) => option.value)
+                interfaces.map((option) => option.value),
+                interfaces
               )
             : validateTftpFormInput(values);
         if (problem) {
