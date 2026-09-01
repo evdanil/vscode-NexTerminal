@@ -87,19 +87,32 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
         if (!profile) {
           return;
         }
-        await ctx.core.addOrUpdateSerialProfile(profile);
+        // #108/#84 FOLLOW-UP (serialization audit) — the SSH branch below was
+        // wrapped and these three siblings were missed, even though this form
+        // is the most exposed of the four call sites: it can sit open
+        // indefinitely, so its submission commits against a collection
+        // snapshot of unbounded age. `addOrUpdate*` persists the WHOLE
+        // collection, so a create landing mid-flight through a lock-holding
+        // section (replace-mode import, folder rename, removeFolderCascade)
+        // drops that section's writes. A fresh id means no existing record is
+        // at risk — `formValuesToSerial` is called with no `existing`, so this
+        // path only ever creates — making this a plain serialization wrap, not
+        // a re-resolve fix, the same shape as nexus.serial.duplicate.
+        await configMutationLock.runExclusive(() => ctx.core.addOrUpdateSerialProfile(profile));
       } else if (values.profileType === "localShell") {
         const profile = formValuesToLocalShell(values);
         if (!profile) {
           throw new Error("Fill in the required local shell fields before saving.");
         }
-        await ctx.core.addOrUpdateLocalShellProfile(profile);
+        // Same reasoning, and the same create-only shape, as the serial branch above.
+        await configMutationLock.runExclusive(() => ctx.core.addOrUpdateLocalShellProfile(profile));
       } else if (values.profileType === "localServer") {
         const config = formValuesToLocalServer(values);
         if (!config) {
           throw new Error("Fill in the required local server fields (Name, Executable) before saving.");
         }
-        await ctx.core.addOrUpdateLocalServerConfig(config);
+        // Same reasoning, and the same create-only shape, as the serial branch above.
+        await configMutationLock.runExclusive(() => ctx.core.addOrUpdateLocalServerConfig(config));
       } else {
         const builtServer = formValuesToServer(values);
         if (!builtServer) {
