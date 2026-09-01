@@ -88,16 +88,19 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
           return;
         }
         // #108/#84 FOLLOW-UP (serialization audit) — the SSH branch below was
-        // wrapped and these three siblings were missed, even though this form
-        // is the most exposed of the four call sites: it can sit open
-        // indefinitely, so its submission commits against a collection
-        // snapshot of unbounded age. `addOrUpdate*` persists the WHOLE
-        // collection, so a create landing mid-flight through a lock-holding
-        // section (replace-mode import, folder rename, removeFolderCascade)
-        // drops that section's writes. A fresh id means no existing record is
-        // at risk — `formValuesToSerial` is called with no `existing`, so this
-        // path only ever creates — making this a plain serialization wrap, not
-        // a re-resolve fix, the same shape as nexus.serial.duplicate.
+        // wrapped and these three siblings were missed. The loss does NOT run
+        // in the direction the form's age suggests: `addOrUpdate*` snapshots
+        // the LIVE collection at write time, so a submission from a long-open
+        // form carries no stale list of its own. It runs the other way. A
+        // lock-holding section (removeFolderCascade, folder rename,
+        // replace-mode import) builds its persist arrays synchronously and
+        // then awaits them, so a create landing inside that await is written
+        // and then ERASED when those older arrays — assembled before the
+        // record existed — settle last. The unbounded pause just makes this
+        // the widest of the four windows. A fresh id means no existing record
+        // is at risk — `formValuesToSerial` is called with no `existing`, so
+        // this path only ever creates — making this a plain serialization
+        // wrap, not a re-resolve fix, the same shape as nexus.serial.duplicate.
         await configMutationLock.runExclusive(() => ctx.core.addOrUpdateSerialProfile(profile));
       } else if (values.profileType === "localShell") {
         const profile = formValuesToLocalShell(values);
