@@ -1497,8 +1497,9 @@ export function networkServerProfileSettingUpdates(
 }
 
 /**
- * Why the NIC the form is bound to cannot itself host the pool, phrased for the
- * submit check — the Interface picker's counterpart to {@link dhcpCidrProblem}.
+ * Why the pool this Save is about to write cannot be served by the interface it
+ * is bound to, phrased for the submit check — the Interface picker's
+ * counterpart to {@link dhcpCidrProblem}.
  *
  * Picking a NIC is the form's second way of naming a network: the fill derives
  * the NIC's own CIDR and moves the whole pool onto it
@@ -1508,22 +1509,45 @@ export function networkServerProfileSettingUpdates(
  * previous network's values, and without this check Save persists the new bind
  * beside a pool on a network no client of it is on. The CIDR row's own check
  * closes the identical hole for the typed shorthand; this closes it for the
- * picked one, and asks the same question with the same exclusions so the two
- * cannot answer differently for the same network.
+ * picked one.
  *
- * The gap is one step earlier than for the CIDR row, incidentally: for an
- * unusable netmask or an unheld address the interface trigger short-circuits in
- * {@link dhcpInterfaceCidr} before {@link dhcpCidrFormFills} is reached. Those
- * are not this check's business either way — an unheld or malformed bind is
- * reported by the shared parser under its own field label, and the
- * all-interfaces choice is not one NIC and so names no network to validate.
+ * The question it asks is COHERENCE OF THE SUBMITTED PAIR, not feasibility of a
+ * fresh derivation. That distinction is the whole contract, and getting it
+ * wrong is what an earlier pass did: it ran {@link dhcpCidrDerivation} over the
+ * NIC's own network and refused the save whenever no FRESH pool could be built
+ * there, regardless of what the form was actually submitting. Two working, and
+ * previously savable, configurations were refused by that:
+ *
+ *  - a `/30` point-to-point bind — this machine on `10.0.0.1`, handing its one
+ *    peer `10.0.0.2`. The pool is perfectly coherent with the bind; it is
+ *    excluded only by the derivation's own gateway-at-the-top convention
+ *    (`poolTop` is the gateway minus one), which has no authority over a pool
+ *    the user built by hand.
+ *  - a held NIC the platform reports without a netmask, carrying a complete
+ *    hand-typed pool for its own wire. Nothing was picked, so there was no
+ *    stale pairing to catch — yet every save was refused, permanently, with no
+ *    way out.
+ *
+ * So the verdict comes from {@link dhcpInterfaceSubnetStatus}, the same
+ * already-tested predicate the sidebar annotation, the bind suggestion and the
+ * server-identifier resolution all go through, asked about the pool AS THIS
+ * SAVE WILL WRITE IT. A pool the bind already covers is accepted however it was
+ * built. Only `mismatch` — the bind genuinely not on-link for the range the
+ * pool hands out — is the stale pairing this check exists for, and only then is
+ * the derivation consulted, to say whether the fill could have closed the gap.
+ *
+ * The other statuses are deliberately silent. `unknown-address` is an address
+ * this machine no longer holds, which the picker keeps selectable on purpose
+ * (see {@link suggestBindAddressForPool}) and which is reported where the
+ * address is shown; `unusable-mask` is a malformed `subnet` or `rangeStart`,
+ * which is {@link validateDhcpFormInput}'s field-labelled job — two messages
+ * for one typo is worse than one. The all-interfaces choice names no single
+ * NIC and returns above.
  *
  * Refusing the save is right for a NON-relayed service specifically, and not
  * merely because that is where the silent fill lives: without a relay agent the
  * only clients that can reach the service are the ones broadcasting on the wire
- * it is bound to, so the pool has to live on that wire's own network. A bound
- * NIC whose network can host no pool at all is therefore a service that can
- * serve nobody, whatever the pool rows say.
+ * it is bound to, so the pool has to live on that wire's own network.
  *
  * That reasoning is exactly why relay mode is carved out rather than left to
  * fall through. Structurally the failure is already unreachable there —
@@ -1537,10 +1561,11 @@ export function networkServerProfileSettingUpdates(
  * not the fact.
  *
  * @returns `undefined` when there is no concrete NIC to ask about, when relay
- *   agents are allowed, when the bind names no network this machine holds, and
- *   when the network it does name can still produce a pool.
+ *   agents are allowed, when the submitted pool is one the bind already covers,
+ *   and when nothing here can honestly decide — an address this machine does
+ *   not hold, or a pool whose own subnet does not parse.
  */
-function dhcpInterfaceNetworkProblem(
+function dhcpInterfacePairingProblem(
   values: FormValues,
   interfaces: readonly NetworkInterfaceOption[],
   ownAddresses: readonly string[] | undefined,
@@ -1549,35 +1574,54 @@ function dhcpInterfaceNetworkProblem(
   if (readSettingBoolean(values.allowRelayAgents)) return undefined;
   const bindAddress = readSettingString(values.interface);
   if (bindAddress === undefined || isAllInterfaces(bindAddress)) return undefined;
+  const rangeStart = readSettingString(values.rangeStart);
+  const subnet = readSettingString(values.subnet);
+  // The window this submission will really hand out. The form renders a pool
+  // COUNT and `networkServerSettingUpdates` derives the `rangeEnd` setting from
+  // it, so the end is reconstructed the same way rather than read from a field
+  // the form does not have — exactly as `dhcpCidrFormFills` reconstructs the
+  // previous state's end, and through `effectiveDhcpRangeEnd` for the same
+  // reason: a blank count is a cleared key, and a cleared key runs on the
+  // packaged end, not on the conservative whole-subnet fallback.
+  const rangeEnd = effectiveDhcpRangeEnd(dhcpRangeEndForCount(rangeStart, readSettingNumber(values.poolCount)));
+  if (dhcpInterfaceSubnetStatus(bindAddress, subnet, rangeStart, interfaces, false, rangeEnd) !== "mismatch") {
+    return undefined;
+  }
+  const poolCidr = dhcpCurrentCidr(rangeStart, subnet);
+  // Unreachable: `mismatch` is only reached once `poolNetwork` has resolved a
+  // usable mask and a parseable start, which is precisely what this needs. Kept
+  // as a silent bail rather than an assertion — a complaint that cannot name
+  // the network it is about would be worse than saying nothing.
+  if (poolCidr === undefined) return undefined;
   const cidr = dhcpInterfaceCidr(bindAddress, interfaces);
   if (cidr === undefined) {
-    // `dhcpInterfaceCidr` collapses two different situations into one
-    // `undefined`: an address this machine no longer holds — which the
-    // picker deliberately keeps selectable (see `suggestBindAddressForPool`'s
-    // own "no fallback to the first available interface" doc comment) — and
-    // a NIC this machine DOES hold right now, live in the dropdown the user
-    // just chose from, whose reported netmask this function cannot use. The
-    // first case is a known, accepted gap this check leaves alone; silently
-    // saying nothing about the second would leave exactly the stale-bind,
-    // stale-pool pairing this whole check exists to catch, just for a NIC
-    // the platform failed to describe fully rather than one this machine
-    // has stopped holding.
-    const held = interfaces.some((option) => option.value === bindAddress);
-    if (!held) return undefined;
-    return `The interface you picked (${bindAddress}) does not report a usable subnet mask, so its network can't be confirmed — with no mask to derive one from, there is nothing here to check a pool against.`;
+    // Held (an unheld address answered `unknown-address` above) but with no
+    // usable netmask to its name. Only one fact about it needs no mask: whether
+    // the bind sits in the pool's own network. If it does, the pairing cannot be
+    // proven wrong — a NIC the platform failed to describe is not evidence
+    // against a pool — and a check that refuses on the strength of missing
+    // information locks the user out of a config that works. If it does not,
+    // the pairing IS decidably wrong, and it is the stale one: picking such a
+    // NIC fills nothing, so a pool off its network was never moved to match it.
+    const pool = poolNetwork(rangeStart, subnet, rangeEnd);
+    if (pool === undefined || isSameSubnet(bindAddress, pool.start, pool.mask)) return undefined;
+    return `The interface you picked (${bindAddress}) is not on ${poolCidr}, the network the pool below serves, and the platform reports no usable subnet mask for it — so there is no network to derive a pool from here either. Set a pool for the network that interface is on, or pick a different interface.`;
   }
-  const preface = `The interface you picked (${bindAddress}) is on ${cidr}, which`;
+  // A masked NIC genuinely off the pool's network. What the derivation adds is
+  // only whether the fill COULD have moved the pool here — never a claim that
+  // an address is occupied, which is a thing the convention below cannot know.
   // One message per cause, in the order `dhcpCidrProblem` uses for the same
   // three: what the network is, then the occupancy the user cannot edit, then
   // the settings of theirs that they can.
+  const preface = `The interface you picked (${bindAddress}) is on ${cidr}, and the pool below is on ${poolCidr} — no client on that interface's wire would be offered a lease. The pool cannot be moved onto ${cidr} for you either:`;
   if (!dhcpCidrDerivation(cidr)) {
-    return `${preface} does not describe a usable DHCP subnet — a /31 or /32 NIC has no host range for a pool to hand out.`;
+    return `${preface} a /31 or /32 has no host range for a pool to hand out. Pick a different interface.`;
   }
   if (ownAddresses && !dhcpCidrDerivation(cidr, ownAddresses)) {
-    return `${preface} leaves no pool once this machine's own addresses on it are kept out — every address it could hand out is already taken here.`;
+    return `${preface} keeping this machine's own addresses on it clear of the pool leaves no room to derive one. Set a pool for ${cidr} by hand, or pick a different interface.`;
   }
   if (!dhcpCidrDerivation(cidr, ownAddresses, reservedAddresses)) {
-    return `${preface} leaves no pool once the gateway and DNS addresses you set by hand are kept out — every address it could hand out is already spoken for.`;
+    return `${preface} keeping the gateway and DNS addresses you set by hand clear of the pool leaves no room to derive one. Set a pool for ${cidr} by hand, or pick a different interface.`;
   }
   return undefined;
 }
@@ -1635,12 +1679,20 @@ export function validateDhcpValues(
       : undefined;
   if (cidrProblem) return cidrProblem;
   // Second, because the Interface picker is the form's OTHER way of naming the
-  // network — same silent-fill hole, same exclusions, so it belongs beside the
-  // row it mirrors rather than after the per-field parser. The typed row keeps
-  // precedence when both would refuse: a CIDR is a thing the user just wrote
-  // out in full, and complaining about the network a NIC merely implies would
-  // answer a question they did not ask.
-  const interfaceProblem = dhcpInterfaceNetworkProblem(values, interfaces, ownAddresses, reservedAddresses);
+  // network — same silent-fill hole, so it belongs beside the row it mirrors
+  // rather than after the per-field parser. The typed row keeps precedence when
+  // both would refuse: a CIDR is a thing the user just wrote out in full, and
+  // complaining about the network a NIC merely implies would answer a question
+  // they did not ask.
+  //
+  // It asks a different question from the row above, though, and the difference
+  // is deliberate: the CIDR row is checked for whether a pool can be DERIVED
+  // from what was typed, while the bind is checked for whether the pool being
+  // SUBMITTED is coherent with it. A hand-built pool the picked NIC already
+  // serves is not the fill's business and is not refused here, however it came
+  // to exist — see `dhcpInterfacePairingProblem` for the two working configs an
+  // earlier "could a fresh pool be derived on this NIC" spelling rejected.
+  const interfaceProblem = dhcpInterfacePairingProblem(values, interfaces, ownAddresses, reservedAddresses);
   if (interfaceProblem) return interfaceProblem;
   const parserProblem = validateDhcpFormInput(values);
   if (parserProblem) return parserProblem;

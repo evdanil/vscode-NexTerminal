@@ -1045,10 +1045,10 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
        * them, and a rollback would have to invent what the form should hold
        * instead. The case that matters there — a NIC whose own network fills
        * nothing at all — is caught where it can be answered properly, at the
-       * Save the pairing would otherwise reach: dhcpInterfaceNetworkProblem
-       * refuses a submission whose picked interface implies an unfillable
-       * network rather than letting a new bind persist beside an unrelated pool
-       * (networkServerSettings.ts).
+       * Save the pairing would otherwise reach: dhcpInterfacePairingProblem
+       * refuses a submission whose picked interface cannot serve the pool being
+       * written, rather than letting a new bind persist beside an unrelated
+       * pool (networkServerSettings.ts).
        *
        * Holding Save is untouched by any of it. A suppressed WRITE does not
        * retire a REQUEST: each answer still releases its own id and only its
