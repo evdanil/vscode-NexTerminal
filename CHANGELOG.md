@@ -10,6 +10,12 @@
 
 - **Two auto-fills in flight are settled by the order you asked for them, not the order they come back.** Committing the Network (CIDR) row and then picking a different interface before either answer lands posts two round trips that both derive the subnet, pool start and pool count, from two different networks. Whichever returned first won, and the answer arriving second read the fields it found as hand-edited and skipped them — leaving the form bound to the NIC picked *last*, serving the pool of the network typed *first*, and a held Save persisting exactly that. Each answer now records what it wrote, so a later answer can tell an edit of yours (which always wins) from an older request's write (which it supersedes), field by field — the older answer still lands on everything the newer one leaves alone, which matters under Serve relayed requests, where a NIC pick fills only the Server Identifier.
 
+## [2.8.212] — 2026-09-01
+
+### Fixed
+
+- **Moving a serial profile, local shell profile or local server into a folder no longer undoes itself.** Those three rows saved the move immediately, without waiting for anything else that was already rewriting your saved profiles — removing a folder and everything in it, renaming a folder, or replacing your configuration from a backup. Each of those reads the profiles it is about to change and then writes the whole set back, so a row dropped into a folder while one of them was running was overwritten a moment later by the copy read before you dragged. The row sat in its new folder on screen and was back in the old one after the next reload. Creating a serial profile, local shell profile or local server from the Add form had a matching gap: the form can sit open for as long as you like, and saving it while one of those operations was already under way wrote the new profile and then let that operation — which had read your profiles before the new one existed — write them back out without it. The profile appeared in the list and was gone after the next reload. All of them now take their turn — as network device profiles already did — and a move is applied to the profile as it currently stands rather than to the copy held when the drag began.
+
 ## [2.8.211] — 2026-08-30
 
 ### Fixed

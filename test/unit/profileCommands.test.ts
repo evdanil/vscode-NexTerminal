@@ -1180,3 +1180,193 @@ describe("openUnifiedForm SSH submit — create rollback on secret-storage failu
     expect(servers.get("srv-b")?.openFileExplorerOnFirstConnect).toBeUndefined();
   });
 });
+
+/**
+ * #108/#84 FOLLOW-UP (serialization audit) — the unified Add form's SSH branch
+ * commits under `configMutationLock`; its serial / localShell / localServer
+ * siblings were missed and committed lock-free. They are the most exposed of
+ * the four: the webview pause ahead of them is unbounded, so a submission
+ * commits against a collection snapshot of arbitrary age, and every
+ * `addOrUpdate*` persists the WHOLE collection.
+ *
+ * The fixture below is the shape that actually loses data, not a proxy for it:
+ * a lock-holding section (removeFolderCascade, replace-mode import, folder
+ * rename) captures its collection snapshot SYNCHRONOUSLY and then awaits its
+ * multi-collection write. A create landing inside that await settles first,
+ * the section's pre-create snapshot settles last, and the new profile is gone
+ * from storage while still sitting in memory. Serialized, the create simply
+ * runs after the section and survives — which is why each test asserts both
+ * the ordering AND the surviving record: ordering alone would still pass if
+ * the write were merely delayed, and survival alone would still pass if the
+ * section happened to be quick.
+ */
+describe("openUnifiedForm submit — the non-SSH create branches serialize on configMutationLock (#108/#84 follow-up)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetConfiguration.mockReturnValue({
+      get: vi.fn((_key: string, fallback: unknown) => fallback)
+    });
+    mockShowQuickPick.mockReset();
+    mockWebviewOpen.mockReturnValue({ dispose: vi.fn() });
+  });
+
+  /**
+   * Same call-ordering spy as the SSH sibling above and
+   * test/unit/configMutationLockRace.test.ts — logs when each acquirer's body
+   * actually starts/finishes RUNNING against the REAL AsyncMutex, never a
+   * bypassed double.
+   */
+  function labelAcquisitions(events: string[], labels: readonly string[]): void {
+    let nextLabel = 0;
+    const realRunExclusive = AsyncMutex.prototype.runExclusive;
+    vi.spyOn(configMutationLock, "runExclusive").mockImplementation(function (
+      this: AsyncMutex,
+      fn: () => Promise<unknown>
+    ) {
+      const label = labels[nextLabel] ?? `call-${nextLabel}`;
+      nextLabel++;
+      return realRunExclusive.call(this, async () => {
+        events.push(`${label}:start`);
+        try {
+          return await fn();
+        } finally {
+          events.push(`${label}:end`);
+        }
+      });
+    } as typeof configMutationLock.runExclusive);
+  }
+
+  interface Record {
+    id: string;
+    name: string;
+  }
+
+  async function runCreateAgainstAnInFlightCascade(options: {
+    collection: Map<string, Record>;
+    ctx: unknown;
+    values: FormValues;
+    writeCall: () => ReturnType<typeof vi.fn>;
+  }): Promise<{ events: string[]; created: Record | undefined }> {
+    const { collection } = options;
+    const events: string[] = [];
+    labelAcquisitions(events, ["cascade", "submit"]);
+
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    // Stand-in for removeFolderCascade: snapshot taken synchronously, then an
+    // awaited write that puts the snapshot back.
+    const cascadePromise = configMutationLock.runExclusive(async () => {
+      const snapshot = [...collection.values()];
+      await gate;
+      collection.clear();
+      for (const record of snapshot) {
+        collection.set(record.id, record);
+      }
+      events.push("cascade:persisted");
+    });
+
+    await delay(10);
+    expect(events).toEqual(["cascade:start"]);
+
+    openUnifiedForm(options.ctx as never);
+    const { onSubmit } = latestFormOptions();
+    const submitPromise = onSubmit(options.values);
+
+    // Long enough for the submit's UI-free body to reach its own acquisition.
+    // Unserialized, the create has already landed by now.
+    await delay(10);
+    expect(events).toEqual(["cascade:start"]);
+
+    releaseGate();
+    await cascadePromise;
+    await submitPromise;
+
+    const created = options.writeCall().mock.calls.at(-1)?.[0] as Record | undefined;
+    return { events, created: created ? collection.get(created.id) : undefined };
+  }
+
+  it("queues a serial-profile create behind an in-flight cascade, so the cascade's pre-create snapshot cannot drop it", async () => {
+    const profiles = new Map<string, Record>([["ser-existing", { id: "ser-existing", name: "Console" }]]);
+    const addOrUpdateSerialProfile = vi.fn(async (profile: Record) => {
+      profiles.set(profile.id, profile);
+    });
+    mockFormValuesToSerial.mockReturnValue({ id: "ser-new", name: "New Console" });
+
+    const { events, created } = await runCreateAgainstAnInFlightCascade({
+      collection: profiles,
+      ctx: {
+        core: {
+          getSnapshot: vi.fn(() => ({ servers: [], authProfiles: [] })),
+          getAuthProfile: vi.fn(),
+          addOrUpdateServer: vi.fn(),
+          addOrUpdateSerialProfile,
+          addOrUpdateLocalShellProfile: vi.fn(),
+          addOrUpdateLocalServerConfig: vi.fn()
+        }
+      },
+      values: { profileType: "serial", name: "New Console", path: "/dev/ttyUSB0" },
+      writeCall: () => addOrUpdateSerialProfile
+    });
+
+    expect(events).toEqual(["cascade:start", "cascade:persisted", "cascade:end", "submit:start", "submit:end"]);
+    expect(created).toEqual({ id: "ser-new", name: "New Console" });
+  });
+
+  it("queues a local-shell-profile create behind an in-flight cascade, so the cascade's pre-create snapshot cannot drop it", async () => {
+    const profiles = new Map<string, Record>([["ls-existing", { id: "ls-existing", name: "bash" }]]);
+    const addOrUpdateLocalShellProfile = vi.fn(async (profile: Record) => {
+      profiles.set(profile.id, profile);
+    });
+    mockFormValuesToLocalShell.mockReturnValue({ id: "ls-new", name: "New Shell" });
+
+    const { events, created } = await runCreateAgainstAnInFlightCascade({
+      collection: profiles,
+      ctx: {
+        core: {
+          getSnapshot: vi.fn(() => ({ servers: [], authProfiles: [] })),
+          getAuthProfile: vi.fn(),
+          addOrUpdateServer: vi.fn(),
+          addOrUpdateSerialProfile: vi.fn(),
+          addOrUpdateLocalShellProfile,
+          addOrUpdateLocalServerConfig: vi.fn()
+        }
+      },
+      values: { profileType: "localShell", name: "New Shell", launchMode: "custom", shellPath: "/bin/bash" },
+      writeCall: () => addOrUpdateLocalShellProfile
+    });
+
+    expect(events).toEqual(["cascade:start", "cascade:persisted", "cascade:end", "submit:start", "submit:end"]);
+    expect(created).toEqual({ id: "ls-new", name: "New Shell" });
+  });
+
+  it("queues a local-server create behind an in-flight cascade, so the cascade's pre-create snapshot cannot drop it", async () => {
+    // formValuesToLocalServer is the REAL function here (this file mocks only
+    // its serial/localShell twins), so the id is minted inside it — read the
+    // record back from the write instead of asserting a fixed one.
+    const configs = new Map<string, Record>([["srv-existing", { id: "srv-existing", name: "API" }]]);
+    const addOrUpdateLocalServerConfig = vi.fn(async (config: Record) => {
+      configs.set(config.id, config);
+    });
+
+    const { events, created } = await runCreateAgainstAnInFlightCascade({
+      collection: configs,
+      ctx: {
+        core: {
+          getSnapshot: vi.fn(() => ({ servers: [], authProfiles: [] })),
+          getAuthProfile: vi.fn(),
+          addOrUpdateServer: vi.fn(),
+          addOrUpdateSerialProfile: vi.fn(),
+          addOrUpdateLocalShellProfile: vi.fn(),
+          addOrUpdateLocalServerConfig
+        }
+      },
+      values: { profileType: "localServer", name: "Mock API", executable: "/usr/bin/node" },
+      writeCall: () => addOrUpdateLocalServerConfig
+    });
+
+    expect(events).toEqual(["cascade:start", "cascade:persisted", "cascade:end", "submit:start", "submit:end"]);
+    expect(created?.name).toBe("Mock API");
+  });
+});
