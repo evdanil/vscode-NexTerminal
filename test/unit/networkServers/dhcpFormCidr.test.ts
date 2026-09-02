@@ -339,11 +339,13 @@ describe("dhcpCidrFormFills — what counts as a stale server identifier", () =>
  * REVIEW FINDING (P1) — the form renders Pool COUNT, not an end, so the
  * previous window's `rangeEnd` is reconstructed from the previous count
  * ({@link dhcpRangeEndForCount}) rather than read from a field that does not
- * exist. That helper returns `undefined` for a blank count — which is not a
- * "the previous end is unknown" case, it is the same "no rangeEnd setting"
- * case `effectiveDhcpRangeEnd` exists for: clearing the count field clears
- * the key, and the previous state really ran with the packaged end, not with
- * whatever `poolNetwork` widens to when it is handed nothing at all.
+ * exist. That helper returns `undefined` for a blank count, which resolves
+ * through `effectiveDhcpRangeEnd` to the packaged end. `FormValues` cannot say
+ * whether the blank means the count was just cleared or was never set — the two
+ * read identically from it — but the answer is the same either way: the
+ * packaged end is the right previous state in both cases, because the
+ * alternative is whatever `poolNetwork` widens to when handed nothing at all,
+ * which would ask the two sides of the comparison different questions.
  *
  * The previous network sits on the packaged octets (192.168.2.x) precisely so
  * the packaged end (192.168.2.199) lands inside it — the fixture that makes

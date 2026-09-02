@@ -1224,10 +1224,14 @@ export function dhcpCidrFormFills(
   // from a field that does not exist — letting the previous-state resolution
   // fall back to the conservative `start`–subnet-broadcast window while the next
   // one is asked about a narrow one would compare two different questions'
-  // answers through the gate. A blank count is itself the same "no rangeEnd
-  // setting" case `effectiveDhcpRangeEnd` exists for — clearing the count field
-  // clears the key, so the packaged end is what the previous state actually
-  // ran with, not an unknown one.
+  // answers through the gate. A blank count resolves through
+  // `effectiveDhcpRangeEnd` to the packaged end. `FormValues` cannot say
+  // whether that blank means the count was just cleared or was never set —
+  // both read identically here, and nothing in this function can tell them
+  // apart — but it does not need to: the packaged end is the right previous
+  // state either way, because the alternative is `poolNetwork`'s conservative
+  // subnet-broadcast widening, which would ask the two sides of the comparison
+  // different questions.
   const previousRangeEnd = effectiveDhcpRangeEnd(
     dhcpRangeEndForCount(previousRangeStart, readSettingNumber(values.poolCount))
   );
