@@ -2066,6 +2066,11 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
        * the request carried, so a target field hand-edited while the answer was
        * in flight keeps the user's edit — see autofillSnapshot and the note on
        * pendingAutofills.
+       *
+       * REVIEW FINDING (P1) — and, where two requests want the SAME field,
+       * ranked by the order the user made the gestures in rather than the order
+       * the answers came back in (mayFillOver, and the sixth finding on
+       * pendingAutofills).
        */
       function applyFillFields(msg) {
         // Stale answers are dropped whole — values, ownership and all. A
@@ -2081,13 +2086,17 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
         // later keys against a form this very loop has already been writing to.
         var requestSnapshot = isProfileFill ? undefined : autofillSnapshot(msg.requestId);
         var liveValues = requestSnapshot ? collectFormValues() : undefined;
+        // The keys this answer actually wrote, so the ownership record it takes
+        // over below covers exactly those and not the ones it was refused.
+        var writtenKeys = [];
         for (var fk in fillValues) {
-          if (!isProfileFill && requestSnapshot && liveValues[fk] !== requestSnapshot[fk]) {
-            // Hand-edited since this request went out. The host decided what it
-            // was allowed to overwrite from the snapshot above, so its answer
-            // for THIS key is reasoning about a value that no longer exists —
-            // every other key in the same answer is still good and still
-            // applied.
+          if (!isProfileFill && requestSnapshot && !mayFillOver(fk, msg.requestId, liveValues, requestSnapshot)) {
+            // Either hand-edited since this request went out — the host decided
+            // what it was allowed to overwrite from the snapshot above, so its
+            // answer for THIS key is reasoning about a value that no longer
+            // exists — or claimed by a request the user made LATER, whose own
+            // answer outranks this one. Every other key in the same answer is
+            // still good and still applied.
             continue;
           }
           if (isProfileFill) {
@@ -2102,12 +2111,69 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
             rememberDisplacedValue(fk);
           }
           setFieldValue(fk, fillValues[fk]);
+          writtenKeys.push(fk);
         }
         if (isProfileFill) {
           profileFilledKeys = nextFilledKeys;
         }
         updateVisibility();
         updateProfileManagedFields();
+        if (!isProfileFill) {
+          // After updateVisibility, not before: hiding a group disables its
+          // controls and collectFormValues skips disabled ones, so recording
+          // earlier would store a value for a field the next comparison will
+          // not even see.
+          rememberAutofillWrites(writtenKeys, msg.requestId);
+        }
+      }
+
+      /**
+       * May request \`requestId\`'s answer write \`key\`? Three questions in
+       * precedence order — see the sixth REVIEW FINDING on pendingAutofills for
+       * the race this exists to settle and why provenance rather than value is
+       * what separates a hand edit from an older answer's write.
+       */
+      function mayFillOver(key, requestId, liveValues, requestSnapshot) {
+        var owner = autofillFieldOwners[key];
+        // A gesture the user made AFTER this one has already had its answer
+        // write this field. It outranks this one whatever the snapshot says,
+        // including the case where the field still agrees with this request's
+        // snapshot and no hand-edit test would object.
+        if (owner && owner.id > requestId) {
+          return false;
+        }
+        // Untouched since this request went out: the host reasoned about the
+        // value that is still there, and its answer stands as it always has.
+        if (liveValues[key] === requestSnapshot[key]) {
+          return true;
+        }
+        // Moved. That is the user's own edit — which wins — UNLESS what is
+        // sitting there is exactly what an OLDER request's answer put there and
+        // nothing has touched it since, in which case this later gesture's
+        // answer supersedes it.
+        return !!owner && owner.id < requestId && owner.value === liveValues[key];
+      }
+
+      /**
+       * Records this answer as the last autofill to have written each of these
+       * fields, and WHAT it left there — the value read back off the form
+       * rather than taken from the fill payload, so it is in the same shape the
+       * comparison in mayFillOver will meet it in (a pool count is filled as a
+       * string and collected as a Number).
+       *
+       * Never recorded for a profile fill: that path has its own ownership
+       * record (profileFilledKeys / profileDisplacedValues), carries no request
+       * snapshot to rank against, and no form renders both an authProfileId
+       * select and a DHCP autofill row.
+       */
+      function rememberAutofillWrites(keys, requestId) {
+        if (requestId === undefined || keys.length === 0) {
+          return;
+        }
+        var settled = collectFormValues();
+        for (var wi = 0; wi < keys.length; wi++) {
+          autofillFieldOwners[keys[wi]] = { id: requestId, value: settled[keys[wi]] };
+        }
       }
 
       function parseVisibleWhen(raw) {
@@ -2250,6 +2316,21 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
 
       /**
        * ── SAVE MUST NOT OUTRUN AN AUTOFILL ROUND TRIP ────────────────────
+       * Six findings have landed on this one mechanism, and they are recorded
+       * in the order they were made. What each of them settles, so a reader
+       * after the seventh can find the one they need:
+       *   1. Save is HELD for the round trip, request by request (P1).
+       *   2. A request is identified by a minted id, never by the key/value it
+       *      asked about (P2).
+       *   3. The hold is visual only — the native \`disabled\` property swallows
+       *      the very click it was meant to postpone (P1, ABANDONED twice).
+       *   4. The commit fires on Enter as well as on blur, or nothing is
+       *      pending when the implicit submission arrives (P1).
+       *   5. Each request keeps its own values snapshot, so a target field
+       *      hand-edited while the answer was in flight survives it (P2).
+       *   6. Where two outstanding requests want the same field, the NEWER
+       *      gesture's answer wins it — whichever answer arrives first (P1).
+       *
        * REVIEW FINDING (P1) — an autofill is a round trip through the
        * extension host, and a Save clicked while one is in flight submits the
        * fields as they were BEFORE the answer landed. For the DHCP editor's
@@ -2412,8 +2493,82 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
        * applied as before". There is no snapshot to judge it against, and the
        * only things that reach that state are a hand-built message and an
        * answer that arrived after its own terminator.
+       *
+       * REVIEW FINDING (P1, sixth round) — WHEN TWO REQUESTS OVERLAP, ARRIVAL
+       * ORDER IS NOT INTENT. Everything above makes concurrent requests
+       * INDEPENDENT; none of it RANKS them. Commit the CIDR row and then pick a
+       * different NIC before either answer lands, and both requests derive the
+       * same fields from two different networks — subnet, rangeStart and
+       * poolCount are written unconditionally by dhcpCidrFormFills whichever
+       * trigger reached it. The per-request snapshot check then settles them by
+       * luck: the CIDR answer lands first and fills its network, and the NIC
+       * answer that follows finds those targets no longer holding what ITS
+       * snapshot took, reads that as a hand edit (finding 5) and skips them.
+       * The form is left bound to the NIC the user picked LAST holding the pool
+       * of the network they typed FIRST, and a deferred Save persists exactly
+       * that pairing.
+       *
+       * A hand edit and an older answer's write cannot be told apart by value,
+       * so they are told apart by PROVENANCE: every answer records, for each
+       * field it wrote, its own request id and the value it left there
+       * (autofillFieldOwners, rememberAutofillWrites). A later answer meeting a
+       * target that has moved then asks WHO moved it — the user, or a request
+       * older than itself — and supersedes only the second. The other direction
+       * is ranked off the same record: an older answer never writes over a
+       * field a NEWER request's answer has already claimed, even where the
+       * field still agrees with the older request's own snapshot and the
+       * hand-edit test would have waved it through (mayFillOver).
+       *
+       * Ranking by ID rather than by ARRIVAL is the whole point. Ids are minted
+       * in gesture order (postAutofill), and gesture order is what the user
+       * meant; the order two round trips happen to return in is the extension
+       * host's scheduling and says nothing about intent.
+       *
+       * Per FIELD, not per answer. "Suppress an older answer entirely while a
+       * newer request is outstanding" was the other way to close this, and it
+       * is wrong here because the two fill sets are not the same set: under a
+       * relay agent a NIC pick fills the server identifier ALONE
+       * (dhcpRelayBindFills), so dropping the CIDR answer wholesale would throw
+       * away the subnet and pool the user typed with nothing arriving to
+       * replace them — and \`cidr\` is never persisted (DHCP_CIDR_FIELD_KEY), so
+       * the typed network would survive nowhere. That is the same silent loss
+       * the first finding in this block exists to prevent, one round trip
+       * later. The newer gesture wins the fields it actually claims; the older
+       * answer still lands on every field the newer one leaves alone.
+       *
+       * What this deliberately does NOT do is un-write an older answer whose
+       * fields the newer request never mentions: nothing arrives to replace
+       * them, and a rollback would have to invent what the form should hold
+       * instead. The case that matters there — a NIC whose own network fills
+       * nothing at all — is caught where it can be answered properly, at the
+       * Save the pairing would otherwise reach: dhcpInterfacePairingProblem
+       * refuses a submission whose picked interface cannot serve the pool being
+       * written, rather than letting a new bind persist beside an unrelated
+       * pool (networkServerSettings.ts).
+       *
+       * Holding Save is untouched by any of it. A suppressed WRITE does not
+       * retire a REQUEST: each answer still releases its own id and only its
+       * own (autofillSettled), so a deferred Save keeps waiting for the newer
+       * request too and fires over the values that request's own answer leaves
+       * behind.
+       *
+       * A narrow, accepted gap: provenance is tracked by VALUE, not by a
+       * separate "the user touched this" flag, so a hand edit that happens to
+       * retype exactly what an older answer had already written there reads
+       * identically to that older write never having been touched at all —
+       * mayFillOver's third rule lets the newer answer supersede it, same as
+       * it would the older answer's own untouched field. The two are, in that
+       * one case, genuinely indistinguishable from what the DOM alone can
+       * show; closing it needs a real edit flag independent of value, which
+       * is more machinery than a coincidence this specific is worth. The
+       * ordinary case — a hand edit to anything OTHER than the older
+       * answer's own value — is unaffected and still wins.
        */
       var pendingAutofills = [];
+      /** Field name → { id, value }: the last autofill answer to have written
+       *  that field, and what it left in it. Ownership of a field for ranking
+       *  purposes, nothing else — see the sixth finding above. */
+      var autofillFieldOwners = {};
       var deferredSubmit = false;
       var nextAutofillRequestId = 1;
       var saveBtn = document.getElementById("save-btn");
@@ -3921,6 +4076,11 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
        * the request carried, so a target field hand-edited while the answer was
        * in flight keeps the user's edit — see autofillSnapshot and the note on
        * pendingAutofills.
+       *
+       * REVIEW FINDING (P1) — and, where two requests want the SAME field,
+       * ranked by the order the user made the gestures in rather than the order
+       * the answers came back in (mayFillOver, and the sixth finding on
+       * pendingAutofills).
        */
       function applyFillFields(msg) {
         // Stale answers are dropped whole — values, ownership and all. A
@@ -3936,13 +4096,17 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
         // later keys against a form this very loop has already been writing to.
         var requestSnapshot = isProfileFill ? undefined : autofillSnapshot(msg.requestId);
         var liveValues = requestSnapshot ? collectFormValues() : undefined;
+        // The keys this answer actually wrote, so the ownership record it takes
+        // over below covers exactly those and not the ones it was refused.
+        var writtenKeys = [];
         for (var fk in fillValues) {
-          if (!isProfileFill && requestSnapshot && liveValues[fk] !== requestSnapshot[fk]) {
-            // Hand-edited since this request went out. The host decided what it
-            // was allowed to overwrite from the snapshot above, so its answer
-            // for THIS key is reasoning about a value that no longer exists —
-            // every other key in the same answer is still good and still
-            // applied.
+          if (!isProfileFill && requestSnapshot && !mayFillOver(fk, msg.requestId, liveValues, requestSnapshot)) {
+            // Either hand-edited since this request went out — the host decided
+            // what it was allowed to overwrite from the snapshot above, so its
+            // answer for THIS key is reasoning about a value that no longer
+            // exists — or claimed by a request the user made LATER, whose own
+            // answer outranks this one. Every other key in the same answer is
+            // still good and still applied.
             continue;
           }
           if (isProfileFill) {
@@ -3957,12 +4121,69 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
             rememberDisplacedValue(fk);
           }
           setFieldValue(fk, fillValues[fk]);
+          writtenKeys.push(fk);
         }
         if (isProfileFill) {
           profileFilledKeys = nextFilledKeys;
         }
         updateVisibility();
         updateProfileManagedFields();
+        if (!isProfileFill) {
+          // After updateVisibility, not before: hiding a group disables its
+          // controls and collectFormValues skips disabled ones, so recording
+          // earlier would store a value for a field the next comparison will
+          // not even see.
+          rememberAutofillWrites(writtenKeys, msg.requestId);
+        }
+      }
+
+      /**
+       * May request \`requestId\`'s answer write \`key\`? Three questions in
+       * precedence order — see the sixth REVIEW FINDING on pendingAutofills for
+       * the race this exists to settle and why provenance rather than value is
+       * what separates a hand edit from an older answer's write.
+       */
+      function mayFillOver(key, requestId, liveValues, requestSnapshot) {
+        var owner = autofillFieldOwners[key];
+        // A gesture the user made AFTER this one has already had its answer
+        // write this field. It outranks this one whatever the snapshot says,
+        // including the case where the field still agrees with this request's
+        // snapshot and no hand-edit test would object.
+        if (owner && owner.id > requestId) {
+          return false;
+        }
+        // Untouched since this request went out: the host reasoned about the
+        // value that is still there, and its answer stands as it always has.
+        if (liveValues[key] === requestSnapshot[key]) {
+          return true;
+        }
+        // Moved. That is the user's own edit — which wins — UNLESS what is
+        // sitting there is exactly what an OLDER request's answer put there and
+        // nothing has touched it since, in which case this later gesture's
+        // answer supersedes it.
+        return !!owner && owner.id < requestId && owner.value === liveValues[key];
+      }
+
+      /**
+       * Records this answer as the last autofill to have written each of these
+       * fields, and WHAT it left there — the value read back off the form
+       * rather than taken from the fill payload, so it is in the same shape the
+       * comparison in mayFillOver will meet it in (a pool count is filled as a
+       * string and collected as a Number).
+       *
+       * Never recorded for a profile fill: that path has its own ownership
+       * record (profileFilledKeys / profileDisplacedValues), carries no request
+       * snapshot to rank against, and no form renders both an authProfileId
+       * select and a DHCP autofill row.
+       */
+      function rememberAutofillWrites(keys, requestId) {
+        if (requestId === undefined || keys.length === 0) {
+          return;
+        }
+        var settled = collectFormValues();
+        for (var wi = 0; wi < keys.length; wi++) {
+          autofillFieldOwners[keys[wi]] = { id: requestId, value: settled[keys[wi]] };
+        }
       }
 
       function parseVisibleWhen(raw) {
@@ -4105,6 +4326,21 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
 
       /**
        * ── SAVE MUST NOT OUTRUN AN AUTOFILL ROUND TRIP ────────────────────
+       * Six findings have landed on this one mechanism, and they are recorded
+       * in the order they were made. What each of them settles, so a reader
+       * after the seventh can find the one they need:
+       *   1. Save is HELD for the round trip, request by request (P1).
+       *   2. A request is identified by a minted id, never by the key/value it
+       *      asked about (P2).
+       *   3. The hold is visual only — the native \`disabled\` property swallows
+       *      the very click it was meant to postpone (P1, ABANDONED twice).
+       *   4. The commit fires on Enter as well as on blur, or nothing is
+       *      pending when the implicit submission arrives (P1).
+       *   5. Each request keeps its own values snapshot, so a target field
+       *      hand-edited while the answer was in flight survives it (P2).
+       *   6. Where two outstanding requests want the same field, the NEWER
+       *      gesture's answer wins it — whichever answer arrives first (P1).
+       *
        * REVIEW FINDING (P1) — an autofill is a round trip through the
        * extension host, and a Save clicked while one is in flight submits the
        * fields as they were BEFORE the answer landed. For the DHCP editor's
@@ -4267,8 +4503,82 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
        * applied as before". There is no snapshot to judge it against, and the
        * only things that reach that state are a hand-built message and an
        * answer that arrived after its own terminator.
+       *
+       * REVIEW FINDING (P1, sixth round) — WHEN TWO REQUESTS OVERLAP, ARRIVAL
+       * ORDER IS NOT INTENT. Everything above makes concurrent requests
+       * INDEPENDENT; none of it RANKS them. Commit the CIDR row and then pick a
+       * different NIC before either answer lands, and both requests derive the
+       * same fields from two different networks — subnet, rangeStart and
+       * poolCount are written unconditionally by dhcpCidrFormFills whichever
+       * trigger reached it. The per-request snapshot check then settles them by
+       * luck: the CIDR answer lands first and fills its network, and the NIC
+       * answer that follows finds those targets no longer holding what ITS
+       * snapshot took, reads that as a hand edit (finding 5) and skips them.
+       * The form is left bound to the NIC the user picked LAST holding the pool
+       * of the network they typed FIRST, and a deferred Save persists exactly
+       * that pairing.
+       *
+       * A hand edit and an older answer's write cannot be told apart by value,
+       * so they are told apart by PROVENANCE: every answer records, for each
+       * field it wrote, its own request id and the value it left there
+       * (autofillFieldOwners, rememberAutofillWrites). A later answer meeting a
+       * target that has moved then asks WHO moved it — the user, or a request
+       * older than itself — and supersedes only the second. The other direction
+       * is ranked off the same record: an older answer never writes over a
+       * field a NEWER request's answer has already claimed, even where the
+       * field still agrees with the older request's own snapshot and the
+       * hand-edit test would have waved it through (mayFillOver).
+       *
+       * Ranking by ID rather than by ARRIVAL is the whole point. Ids are minted
+       * in gesture order (postAutofill), and gesture order is what the user
+       * meant; the order two round trips happen to return in is the extension
+       * host's scheduling and says nothing about intent.
+       *
+       * Per FIELD, not per answer. "Suppress an older answer entirely while a
+       * newer request is outstanding" was the other way to close this, and it
+       * is wrong here because the two fill sets are not the same set: under a
+       * relay agent a NIC pick fills the server identifier ALONE
+       * (dhcpRelayBindFills), so dropping the CIDR answer wholesale would throw
+       * away the subnet and pool the user typed with nothing arriving to
+       * replace them — and \`cidr\` is never persisted (DHCP_CIDR_FIELD_KEY), so
+       * the typed network would survive nowhere. That is the same silent loss
+       * the first finding in this block exists to prevent, one round trip
+       * later. The newer gesture wins the fields it actually claims; the older
+       * answer still lands on every field the newer one leaves alone.
+       *
+       * What this deliberately does NOT do is un-write an older answer whose
+       * fields the newer request never mentions: nothing arrives to replace
+       * them, and a rollback would have to invent what the form should hold
+       * instead. The case that matters there — a NIC whose own network fills
+       * nothing at all — is caught where it can be answered properly, at the
+       * Save the pairing would otherwise reach: dhcpInterfacePairingProblem
+       * refuses a submission whose picked interface cannot serve the pool being
+       * written, rather than letting a new bind persist beside an unrelated
+       * pool (networkServerSettings.ts).
+       *
+       * Holding Save is untouched by any of it. A suppressed WRITE does not
+       * retire a REQUEST: each answer still releases its own id and only its
+       * own (autofillSettled), so a deferred Save keeps waiting for the newer
+       * request too and fires over the values that request's own answer leaves
+       * behind.
+       *
+       * A narrow, accepted gap: provenance is tracked by VALUE, not by a
+       * separate "the user touched this" flag, so a hand edit that happens to
+       * retype exactly what an older answer had already written there reads
+       * identically to that older write never having been touched at all —
+       * mayFillOver's third rule lets the newer answer supersede it, same as
+       * it would the older answer's own untouched field. The two are, in that
+       * one case, genuinely indistinguishable from what the DOM alone can
+       * show; closing it needs a real edit flag independent of value, which
+       * is more machinery than a coincidence this specific is worth. The
+       * ordinary case — a hand edit to anything OTHER than the older
+       * answer's own value — is unaffected and still wins.
        */
       var pendingAutofills = [];
+      /** Field name → { id, value }: the last autofill answer to have written
+       *  that field, and what it left in it. Ownership of a field for ranking
+       *  purposes, nothing else — see the sixth finding above. */
+      var autofillFieldOwners = {};
       var deferredSubmit = false;
       var nextAutofillRequestId = 1;
       var saveBtn = document.getElementById("save-btn");

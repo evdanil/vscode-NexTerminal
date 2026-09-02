@@ -29,6 +29,7 @@ vi.mock("node:os", () => ({ networkInterfaces }));
 import { networkInterfaceBindOptions } from "../../../src/commands/networkInterfaceOptions";
 import {
   dhcpInterfaceSubnetStatus,
+  effectiveDhcpRangeEnd,
   refreshDhcpServerIdentifier,
   resolveDhcpServerIdentifier,
   suggestBindAddressForPool
@@ -373,6 +374,106 @@ describe("suggestBindAddressForPool — the pool's configured range, not the who
     });
     expect(suggestBindAddressForPool("10.0.0.130", "255.255.255.0", options(), false, "10.0.0.200")).toBeUndefined();
     expect(suggestBindAddressForPool("10.0.0.130", "255.255.255.0", options())).toBeUndefined();
+  });
+});
+
+/**
+ * REVIEW FINDING — the conservative `start`–subnet-broadcast fallback above is
+ * the right answer for a caller that genuinely does not know the pool's end. It
+ * is the wrong answer for a caller reading the settings, because a BLANK
+ * `rangeEnd` setting is not an unknown end: both engines resolve it to the
+ * packaged `192.168.2.199` flatly, with no reference to `rangeStart`
+ * (`DhcpEngine.rangeEnd` is `this._cfg.rangeEnd ?? DEFAULTS.rangeEnd`; the Rust
+ * daemon's `EngineOptions::default()` uses `DEFAULT_RANGE_END` verbatim).
+ *
+ * The fixture below is the arrangement the report named: the effective pool
+ * `192.168.2.10`–`192.168.2.199` advertised on a `/16`, served by a
+ * `192.168.2.x/24` NIC that covers every address it hands out. Passing the raw
+ * `undefined` tested that NIC through `192.168.255.255` — the whole `/16`'s
+ * broadcast, an address the pool cannot reach — and rejected it, costing a false
+ * sidebar warning, the bind-address suggestion, and (see the gate below) the
+ * server identifier on a rebind.
+ *
+ * `poolNetwork`'s own contract is untouched, and the case that keeps this
+ * substitution honest — a packaged end that lands outside the configured start's
+ * subnet — is already pinned above ("refuses an end that is valid and ordered
+ * but sits OUTSIDE the advertised subnet"): it is bounded back to the
+ * conservative window rather than demanding coverage no NIC could have.
+ */
+describe("effectiveDhcpRangeEnd — a blank Pool End is a known end, not an unknown one", () => {
+  /** One NIC on 192.168.2.0/24, inside the /16 the pool advertises. */
+  function quarterOfTheSixteen(): void {
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.2.5", "255.255.255.0")] });
+  }
+
+  it("resolves a blank end to the packaged one and leaves a configured end alone", () => {
+    expect(effectiveDhcpRangeEnd(undefined)).toBe("192.168.2.199");
+    expect(effectiveDhcpRangeEnd("10.0.0.200")).toBe("10.0.0.200");
+  });
+
+  it("turns the NIC that serves the effective pool from a mismatch into a match", () => {
+    quarterOfTheSixteen();
+    // The raw settings-shaped question — the bug: no end, so the window runs to
+    // 192.168.255.255 and this NIC's /24 link cannot cover it.
+    expect(dhcpInterfaceSubnetStatus("192.168.2.5", "255.255.0.0", "192.168.2.10", options())).toBe("mismatch");
+    // The same settings asked about the pool that will really run.
+    expect(
+      dhcpInterfaceSubnetStatus(
+        "192.168.2.5",
+        "255.255.0.0",
+        "192.168.2.10",
+        options(),
+        false,
+        effectiveDhcpRangeEnd(undefined)
+      )
+    ).toBe("match");
+    // Not a fixture that answers "match" whatever it is handed: an end the user
+    // really did configure past this NIC's link is still a mismatch, so the
+    // substitution is not a blanket widening of the comparison.
+    expect(
+      dhcpInterfaceSubnetStatus("192.168.2.5", "255.255.0.0", "192.168.2.10", options(), false, "192.168.5.5")
+    ).toBe("mismatch");
+  });
+
+  it("brings the bind-address suggestion back with it", () => {
+    // The status and the suggestion have to agree, or the sidebar warns about a
+    // pool the picker is happy to offer an address for.
+    quarterOfTheSixteen();
+    expect(suggestBindAddressForPool("192.168.2.10", "255.255.0.0", options())).toBeUndefined();
+    expect(
+      suggestBindAddressForPool("192.168.2.10", "255.255.0.0", options(), false, effectiveDhcpRangeEnd(undefined))
+    ).toEqual({ address: "192.168.2.5", ambiguous: false });
+  });
+
+  it("lets a rebind between two such NICs move the server identifier", () => {
+    // Both NICs are on 192.168.2.0/24 and both serve the effective pool; neither
+    // covers the /16 the settings advertise. Left raw, BOTH resolutions come back
+    // `undefined`, the gate reads the configured identifier as hand-set, and
+    // option 54 keeps naming the address the socket has stopped answering on.
+    networkInterfaces.mockReturnValue({
+      eth1: [ipv4("192.168.2.130", "255.255.255.0")],
+      eth2: [ipv4("192.168.2.140", "255.255.255.0")]
+    });
+    const pool = { rangeStart: "192.168.2.10", subnet: "255.255.0.0" };
+    const shared = {
+      interfaces: options(),
+      allowRelayAgents: false,
+      configuredServerId: "192.168.2.130"
+    };
+    expect(
+      refreshDhcpServerIdentifier({
+        next: { ...pool, bindAddress: "192.168.2.140" },
+        previous: { ...pool, bindAddress: "192.168.2.130" },
+        ...shared
+      })
+    ).toBeUndefined();
+    expect(
+      refreshDhcpServerIdentifier({
+        next: { ...pool, bindAddress: "192.168.2.140", rangeEnd: effectiveDhcpRangeEnd(undefined) },
+        previous: { ...pool, bindAddress: "192.168.2.130", rangeEnd: effectiveDhcpRangeEnd(undefined) },
+        ...shared
+      })
+    ).toBe("192.168.2.140");
   });
 });
 

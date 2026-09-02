@@ -210,6 +210,63 @@ describe("DHCP Pool row — a range narrower than the subnet it advertises", () 
   });
 });
 
+/**
+ * REVIEW FINDING — `readDhcpConfig` reports a blank `rangeEnd` setting as
+ * `undefined`, which is what is persisted but not what runs. Both engines
+ * resolve a blank end to the packaged `192.168.2.199`, flatly and with no
+ * reference to `rangeStart`. Passing the raw `undefined` down made this row ask
+ * about `start`–subnet-broadcast instead, so a config advertising a `/16` was
+ * tested through `192.168.255.255` and the `192.168.2.x/24` NIC that serves its
+ * effective `192.168.2.10`–`192.168.2.199` pool completely was reported as being
+ * on the wrong wire.
+ *
+ * The fixtures move the mask and the end, never the NIC, so the widened window
+ * is the only thing that can change the verdict.
+ */
+describe("DHCP Pool row — a blank Pool End", () => {
+  /** One NIC on 192.168.2.0/24 — a quarter of the /16 the pool advertises. */
+  function quarterOfTheSixteen(): void {
+    networkInterfaces.mockReturnValue({ eth0: [ipv4("192.168.2.5", "255.255.255.0")] });
+  }
+
+  /** A /16 config that leaves the pool end unset, so the packaged one applies. */
+  const SIXTEEN = { rangeStart: "192.168.2.10", subnet: "255.255.0.0", gateway: "192.168.2.1" };
+
+  it("stays quiet for the bound NIC that serves the effective pool", () => {
+    quarterOfTheSixteen();
+    const row = poolRow({ ...SIXTEEN, bindAddress: "192.168.2.5" });
+    // The row already showed the packaged end; only the comparison was blind to it.
+    expect(row.description).toBe("192.168.2.10 → 192.168.2.199");
+    expect(String(row.tooltip)).not.toContain("⚠");
+  });
+
+  it("stays quiet for an all-interfaces bind over the same config", () => {
+    quarterOfTheSixteen();
+    expect(poolRow({ ...SIXTEEN }).description).not.toContain("⚠");
+  });
+
+  it("still warns when a CONFIGURED end really does run past the NIC's link", () => {
+    // One setting apart from the first fixture: an end the user actually typed,
+    // outside this NIC's /24 but inside the advertised /16. The packaged end is
+    // substituted for a BLANK setting, never for a set one.
+    quarterOfTheSixteen();
+    expect(
+      poolRow({ ...SIXTEEN, rangeEnd: "192.168.5.5", bindAddress: "192.168.2.5" }).description
+    ).toContain("⚠ bound NIC is not on this subnet");
+  });
+
+  it("still warns when the blank end's own pool is off the bound NIC's wire", () => {
+    // The packaged end applies to a start on another network too, so the pool is
+    // 10.0.0.10 → 192.168.2.199 — nonsense the daemon refuses to start on, and
+    // `poolNetwork` bounds it back to the conservative window rather than
+    // widening on it. eth0 is nowhere near either way.
+    quarterOfTheSixteen();
+    expect(
+      poolRow({ rangeStart: "10.0.0.10", subnet: "255.255.255.0", bindAddress: "192.168.2.5" }).description
+    ).toContain("⚠ bound NIC is not on this subnet");
+  });
+});
+
 describe("DHCP Pool row — when no warning is due", () => {
   it("stays quiet for a NIC on the pool's subnet", () => {
     const row = poolRow({ ...POOL, bindAddress: "10.0.0.5" });

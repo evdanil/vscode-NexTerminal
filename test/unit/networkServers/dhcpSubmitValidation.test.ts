@@ -88,6 +88,22 @@ function machineOn(address: string): void {
   });
 }
 
+/**
+ * Several external IPv4s with masks of their own, for the cases where the
+ * NETWORK a NIC is on is the thing under test — `machineOn` hard-codes a /24,
+ * which is exactly the mask that always has room.
+ */
+function machineNics(...entries: ReadonlyArray<{ address: string; netmask: string }>): void {
+  networkInterfaces.mockReturnValue(
+    Object.fromEntries(
+      entries.map((entry, index) => [
+        `eth${String(index)}`,
+        [{ address: entry.address, family: "IPv4", internal: false, netmask: entry.netmask }]
+      ])
+    )
+  );
+}
+
 import * as vscode from "vscode";
 import { registerNetworkServerCommands } from "../../../src/commands/networkServerCommands";
 
@@ -393,6 +409,276 @@ describe("DHCP submit validation — a network the preserved settings leave no r
     await expect(submitDhcp({ ...VALID, gateway: "10.0.0.1", cidr: "10.0.0.0/30" })).rejects.toThrow(
       "this machine's own addresses"
     );
+  });
+});
+
+/**
+ * REVIEW FINDING (#111, still open after the 2.8.211 follow-up) — the two blocks
+ * above close the silent-discard hole for the network TYPED into the CIDR row.
+ * The Interface picker is the form's other way of naming a network and had the
+ * same hole, one step earlier: picking a NIC derives that NIC's own CIDR and
+ * moves the whole pool onto it, so a NIC whose network can host no pool fills
+ * NOTHING — and the webview has already applied the selection to the DOM before
+ * it posts. The bind address moves, every pool row keeps the previous network's
+ * values, and Save used to persist the new bind beside the old, unrelated pool.
+ *
+ * The fixtures keep the complete 192.168.2.0/24 pool from `VALID` for the same
+ * reason the CIDR blocks do: the bug does not "do nothing", it writes a pool on
+ * a network no client of the new bind is on.
+ */
+describe("DHCP submit validation — a NIC whose own network leaves no room", () => {
+  const NIC_FULLY_TAKEN =
+    "The interface you picked (10.0.0.1) is on 10.0.0.0/30, and the pool below is on 192.168.2.0/24 — no client on that interface's wire would be offered a lease. The pool cannot be moved onto 10.0.0.0/30 for you either: keeping this machine's own addresses on it clear of the pool leaves no room to derive one. Set a pool for 10.0.0.0/30 by hand, or pick a different interface.";
+
+  it("rejects the bind instead of saving the pool the form still held", async () => {
+    // A /30 has one poolable address (.1 — .2 is the gateway) and the NIC being
+    // bound to holds it, so the pick filled nothing and every pool row below is
+    // still the 192.168.2.0/24 one the form opened with.
+    machineNics({ address: "10.0.0.1", netmask: "255.255.255.252" });
+    await expect(submitDhcp({ ...VALID, interface: "10.0.0.1" })).rejects.toThrow(NIC_FULLY_TAKEN);
+    expect(configUpdates).toEqual([]);
+  });
+
+  it("never offers a restart for it either", async () => {
+    machineNics({ address: "10.0.0.1", netmask: "255.255.255.252" });
+    await expect(submitDhcp({ ...VALID, interface: "10.0.0.1" })).rejects.toThrow();
+    expect(vscode.window.showInformationMessage).not.toHaveBeenCalled();
+  });
+
+  it("saves the same bind when the NIC's own network has room to spare", async () => {
+    // Same address, same form, a /24 instead of a /30: the pick derives a pool
+    // fine, so nothing here is refused.
+    machineNics({ address: "10.0.0.1", netmask: "255.255.255.0" });
+    await expect(submitDhcp({ ...VALID, interface: "10.0.0.1" })).resolves.toBeUndefined();
+    expect(configUpdates.find((entry) => entry.key === "interface")?.value).toBe("10.0.0.1");
+  });
+
+  it("refuses a NIC on a /31, which is CIDR but describes no pool at all", async () => {
+    machineNics({ address: "10.0.0.1", netmask: "255.255.255.254" });
+    await expect(submitDhcp({ ...VALID, interface: "10.0.0.1" })).rejects.toThrow(
+      "The interface you picked (10.0.0.1) is on 10.0.0.0/31, and the pool below is on 192.168.2.0/24 — no client on that interface's wire would be offered a lease. The pool cannot be moved onto 10.0.0.0/31 for you either: a /31 or /32 has no host range for a pool to hand out. Pick a different interface."
+    );
+  });
+
+  it("says nothing about the all-interfaces bind, which names no one network", async () => {
+    machineNics({ address: "10.0.0.1", netmask: "255.255.255.252" });
+    await expect(submitDhcp({ ...VALID, interface: "" })).resolves.toBeUndefined();
+    await expect(submitDhcp({ ...VALID, interface: "   " })).resolves.toBeUndefined();
+    await expect(submitDhcp({ ...VALID, interface: "0.0.0.0" })).resolves.toBeUndefined();
+  });
+
+  it("says nothing about an address this machine does not hold", async () => {
+    // A different failure mode with a different remedy — the shared parser
+    // reports a malformed bind under its own field label, and an address that
+    // is simply gone is not something a pool check can speak to. Guessing a
+    // mask for it is the thing `dhcpInterfaceCidr` exists to refuse.
+    machineNics({ address: "10.0.0.1", netmask: "255.255.255.252" });
+    await expect(submitDhcp({ ...VALID, interface: "172.16.5.5" })).resolves.toBeUndefined();
+    expect(configUpdates.find((entry) => entry.key === "interface")?.value).toBe("172.16.5.5");
+  });
+
+  it("refuses a NIC this machine still holds but cannot mask, unlike one it no longer holds", async () => {
+    // The two failure modes `dhcpInterfaceCidr` collapses into one `undefined`
+    // look identical from the outside — no CIDR comes back either way — but
+    // they are not the same fact: an address gone from the machine altogether
+    // is the case above, which the picker deliberately keeps selectable and
+    // this check leaves alone. A NIC still live in that same list, reported
+    // with no netmask (or an unusable one), and carrying a pool that is not
+    // even on its own network, is exactly the "bind moved, pool didn't, nobody
+    // said anything" defect this whole check exists to close — just for a NIC
+    // the platform failed to describe fully rather than one gone missing. That
+    // 10.0.0.1 is not on the form's 192.168.2.0/24 pool is decidable without
+    // any mask at all, which is what makes it refusable here. Omitting
+    // `netmask` entirely is how `os.networkInterfaces()` reports this for real;
+    // `networkInterfaceBindOptions()` collapses a blank string to the same
+    // `undefined`.
+    networkInterfaces.mockReturnValue({
+      eth0: [{ address: "10.0.0.1", family: "IPv4", internal: false }]
+    });
+    await expect(submitDhcp({ ...VALID, interface: "10.0.0.1" })).rejects.toThrow(
+      "The interface you picked (10.0.0.1) is not on 192.168.2.0/24, the network the pool below serves, and the platform reports no usable subnet mask for it — so there is no network to derive a pool from here either. Set a pool for the network that interface is on, or pick a different interface."
+    );
+    expect(configUpdates).toEqual([]);
+  });
+
+  it("leaves a relayed service alone, whatever its local bind is on", async () => {
+    // The carve-out, and not merely a redundant one: with a relay agent in
+    // front, the pool is on the CLIENT subnet and the bind is free to sit on a
+    // /30 point-to-point uplink that could never host a pool of its own.
+    machineNics({ address: "10.0.0.1", netmask: "255.255.255.252" });
+    await expect(
+      submitDhcp({ ...VALID, interface: "10.0.0.1", allowRelayAgents: true })
+    ).resolves.toBeUndefined();
+    expect(configUpdates.find((entry) => entry.key === "interface")?.value).toBe("10.0.0.1");
+  });
+
+  it("reports the typed CIDR row's own problem ahead of the NIC's", async () => {
+    // The row the user just wrote out in full wins: complaining about the
+    // network a NIC merely implies answers a question they did not ask.
+    machineNics({ address: "10.0.0.1", netmask: "255.255.255.252" });
+    await expect(submitDhcp({ ...VALID, interface: "10.0.0.1", cidr: "172.16.0.0/31" })).rejects.toThrow(
+      "RFC 3021"
+    );
+  });
+});
+
+/**
+ * The same hole reached from the other side, mirroring the CIDR row's own
+ * preserved-settings block: the NIC pick derives with a hand-set gateway or DNS
+ * server excluded too, so the submit check has to exclude the same set or a
+ * network they crowd out fills nothing and saves cleanly.
+ *
+ * The NIC here is the /30's GATEWAY address, which is not poolable and so
+ * refuses nothing on its own — only the preserved gateway can take the one
+ * address left. That is what makes these fail against a check that asks about
+ * own addresses alone.
+ */
+describe("DHCP submit validation — a NIC whose network the preserved settings leave no room in", () => {
+  const NIC_RESERVED_TAKEN =
+    "The interface you picked (10.0.0.2) is on 10.0.0.0/30, and the pool below is on 192.168.2.0/24 — no client on that interface's wire would be offered a lease. The pool cannot be moved onto 10.0.0.0/30 for you either: keeping the gateway and DNS addresses you set by hand clear of the pool leaves no room to derive one. Set a pool for 10.0.0.0/30 by hand, or pick a different interface.";
+
+  it("rejects the bind instead of saving the pool the form still held", async () => {
+    machineNics({ address: "10.0.0.2", netmask: "255.255.255.252" });
+    await expect(
+      submitDhcp({ ...VALID, interface: "10.0.0.2", gateway: "10.0.0.1" })
+    ).rejects.toThrow(NIC_RESERVED_TAKEN);
+    expect(configUpdates).toEqual([]);
+  });
+
+  it("applies the same rule to a hand-set DNS server", async () => {
+    machineNics({ address: "10.0.0.2", netmask: "255.255.255.252" });
+    await expect(
+      submitDhcp({ ...VALID, interface: "10.0.0.2", dns: "10.0.0.1" })
+    ).rejects.toThrow(NIC_RESERVED_TAKEN);
+  });
+
+  it("saves the same bind when nothing preserved lands on the NIC's network", async () => {
+    // VALID's gateway is preserved too — it is just on 192.168.2.0/24, so it
+    // takes nothing away from 10.0.0.0/30 and the /30's own .1 stays poolable.
+    machineNics({ address: "10.0.0.2", netmask: "255.255.255.252" });
+    await expect(submitDhcp({ ...VALID, interface: "10.0.0.2" })).resolves.toBeUndefined();
+    expect(configUpdates.find((entry) => entry.key === "interface")?.value).toBe("10.0.0.2");
+  });
+
+  it("names this machine's own occupancy first when both would refuse it", async () => {
+    // One message per cause, and the one the user cannot edit comes first —
+    // same order the CIDR row uses.
+    machineNics({ address: "10.0.0.1", netmask: "255.255.255.252" });
+    await expect(
+      submitDhcp({ ...VALID, interface: "10.0.0.1", gateway: "10.0.0.1" })
+    ).rejects.toThrow("this machine's own addresses");
+  });
+});
+
+/**
+ * REVIEW FINDING (maintainer + Codex, on the branch that added the two blocks
+ * above) — the interface check asked the WRONG QUESTION. It ran the CIDR
+ * derivation over the picked NIC's own network and refused the save whenever no
+ * FRESH pool could be built there, without ever looking at the pool the form was
+ * actually submitting. Two working configurations were refused by that, both of
+ * which had saved fine before the check existed:
+ *
+ *  - a /30 point-to-point bind, this machine handing its one peer the single
+ *    address on the wire. The pool is exactly what the bind serves; it is
+ *    excluded only by the derivation's own gateway-at-the-top convention, which
+ *    has no say over a pool built by hand.
+ *  - a held NIC the platform reports without a netmask, carrying a complete
+ *    hand-typed pool for its own wire. Nothing was picked, so there was no stale
+ *    pairing to catch — yet EVERY save was refused, permanently.
+ *
+ * The verdict now comes from `dhcpInterfaceSubnetStatus`, asked about the pool
+ * as this Save will really write it (start + count, with a blank count resolved
+ * to the packaged end), so a pool the bind already covers is accepted however it
+ * was built. The persisted values are asserted rather than just the absence of a
+ * throw: "saves" has to mean the submitted pool reached settings, not that a
+ * different one was written quietly.
+ */
+describe("DHCP submit validation — a pool that already fits the picked NIC", () => {
+  it("saves a /30 point-to-point bind whose pool is its single peer", async () => {
+    // 10.0.0.1/30 serving 10.0.0.2 — one address, the only one the wire has for
+    // a client. The old check derived 10.0.0.0/30 from scratch, found .1 held
+    // and .2 reserved as the gateway by its own convention, and refused with
+    // "every address it could hand out is already taken here" — about the very
+    // address the pool hands out.
+    machineNics({ address: "10.0.0.1", netmask: "255.255.255.252" });
+    await expect(
+      submitDhcp({
+        interface: "10.0.0.1",
+        subnet: "255.255.255.252",
+        rangeStart: "10.0.0.2",
+        poolCount: "1",
+        gateway: "10.0.0.1"
+      })
+    ).resolves.toBeUndefined();
+    const byKey = (key: string) => configUpdates.find((entry) => entry.key === key)?.value;
+    expect(byKey("interface")).toBe("10.0.0.1");
+    expect(byKey("rangeStart")).toBe("10.0.0.2");
+    expect(byKey("rangeEnd")).toBe("10.0.0.2");
+  });
+
+  it("saves a held NIC with no reported netmask when the pool is on its own network", async () => {
+    // Nothing was picked here — this is a config that has been sitting in
+    // settings.json — and there is no mask to disprove it with, so refusing it
+    // locked the user out of their own working setup with no way back.
+    networkInterfaces.mockReturnValue({
+      eth0: [{ address: "10.0.0.1", family: "IPv4", internal: false }]
+    });
+    await expect(
+      submitDhcp({
+        interface: "10.0.0.1",
+        subnet: "255.255.255.0",
+        rangeStart: "10.0.0.50",
+        poolCount: "20",
+        gateway: "10.0.0.1"
+      })
+    ).resolves.toBeUndefined();
+    const byKey = (key: string) => configUpdates.find((entry) => entry.key === key)?.value;
+    expect(byKey("interface")).toBe("10.0.0.1");
+    expect(byKey("rangeStart")).toBe("10.0.0.50");
+    expect(byKey("rangeEnd")).toBe("10.0.0.69");
+  });
+
+  it("still refuses a maskless NIC whose pool is on some other network", async () => {
+    // The other half of the same fix: no mask is a reason not to CONVICT on the
+    // mask, not a blanket amnesty. Whether the bind sits in the pool's own
+    // network needs no mask of the NIC's at all, and when it plainly does not,
+    // that is the stale bind-beside-unrelated-pool pairing the check exists for.
+    networkInterfaces.mockReturnValue({
+      eth0: [{ address: "10.0.0.1", family: "IPv4", internal: false }]
+    });
+    await expect(
+      submitDhcp({
+        interface: "10.0.0.1",
+        subnet: "255.255.255.0",
+        rangeStart: "172.16.0.10",
+        poolCount: "20"
+      })
+    ).rejects.toThrow(
+      "The interface you picked (10.0.0.1) is not on 172.16.0.0/24, the network the pool below serves, and the platform reports no usable subnet mask for it"
+    );
+    expect(configUpdates).toEqual([]);
+  });
+
+  it("saves a pool narrowed to less than the subnet it advertises", async () => {
+    // `nicCoversPool` matches on RANGE containment, not on the NIC covering the
+    // whole advertised subnet: a 10.0.0.4/30 link serves a one-address pool at
+    // 10.0.0.6 completely, even though the pool advertises a /24. The old check
+    // never asked — it derived 10.0.0.4/30 fresh, found this machine's own .5 on
+    // it and the convention's gateway at .6, and refused.
+    machineNics({ address: "10.0.0.5", netmask: "255.255.255.252" });
+    await expect(
+      submitDhcp({
+        interface: "10.0.0.5",
+        subnet: "255.255.255.0",
+        rangeStart: "10.0.0.6",
+        poolCount: "1",
+        gateway: "10.0.0.5"
+      })
+    ).resolves.toBeUndefined();
+    const byKey = (key: string) => configUpdates.find((entry) => entry.key === key)?.value;
+    expect(byKey("interface")).toBe("10.0.0.5");
+    expect(byKey("rangeStart")).toBe("10.0.0.6");
+    expect(byKey("rangeEnd")).toBe("10.0.0.6");
   });
 });
 
