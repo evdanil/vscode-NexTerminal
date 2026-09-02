@@ -854,20 +854,38 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
           }
         });
       } else if (itemType === "serial") {
-        const profile = core.getSerialProfile(itemId);
-        if (profile) {
-          await core.addOrUpdateSerialProfile({ ...profile, group: newGroup });
-        }
+        // #108/#84 FOLLOW-UP (serialization audit) — the three branches below
+        // were missed when the `server` branch above was wrapped, and they
+        // carry the identical hazard on their own collections. Concretely:
+        // removeFolderCascade captures its collection snapshots synchronously
+        // and then awaits a multi-collection write; a drag landing while that
+        // await is in flight used to commit first, so the cascade's pre-drag
+        // snapshot settled last and silently reverted the move, leaving memory
+        // and storage disagreeing until reload. Same discipline as the
+        // `server` branch: serialize, RE-READ the live record inside the lock,
+        // apply ONLY the group.
+        await configMutationLock.runExclusive(async () => {
+          const live = core.getSerialProfile(itemId);
+          if (live) {
+            await core.addOrUpdateSerialProfile({ ...live, group: newGroup });
+          }
+        });
       } else if (itemType === "localShell") {
-        const profile = core.getLocalShellProfile(itemId);
-        if (profile) {
-          await core.addOrUpdateLocalShellProfile({ ...profile, group: newGroup });
-        }
+        // Same reasoning as the serial branch above.
+        await configMutationLock.runExclusive(async () => {
+          const live = core.getLocalShellProfile(itemId);
+          if (live) {
+            await core.addOrUpdateLocalShellProfile({ ...live, group: newGroup });
+          }
+        });
       } else if (itemType === "localServer") {
-        const config = core.getLocalServer(itemId);
-        if (config) {
-          await core.addOrUpdateLocalServerConfig({ ...config, group: newGroup });
-        }
+        // Same reasoning as the serial branch above.
+        await configMutationLock.runExclusive(async () => {
+          const live = core.getLocalServer(itemId);
+          if (live) {
+            await core.addOrUpdateLocalServerConfig({ ...live, group: newGroup });
+          }
+        });
       }
     },
     async onFolderMoved(oldPath, newParentPath) {
