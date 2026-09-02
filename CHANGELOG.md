@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.214] — 2026-09-02
+
+### Security
+
+- **A dependency update closes four high-severity advisories in the packaging toolchain.** `fast-uri` (3.1.5 → 3.1.7) fixes authority injection via an unvalidated port in `serialize()`, host confusion via unbalanced or misplaced IP-literal brackets, host confusion via skipped IDN canonicalization on scheme-relative references, and server-side request forgery via repeated hostname percent-decoding. It reaches this repository only through `@vscode/vsce`, via `@secretlint`'s `ajv` — build-time only, never shipped in the VSIX, never processes untrusted input. No extension code changed; the lockfile is the only edit.
+
 ## [2.8.213] — 2026-09-02
 
 ### Fixed
