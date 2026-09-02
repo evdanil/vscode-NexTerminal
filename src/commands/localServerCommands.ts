@@ -24,22 +24,26 @@
  *                                   same as nexus.macro.slot
  *   nexus.localServer.inspectLogs — focus/reveal a running server's terminal
  *
- * rename, moveToFolder, moveToRoot and edit each re-read the live record under
- * configMutationLock before writing (#108): all four capture their config
- * before an interactive pause — the rename input box, moveToFolder's
+ * rename, moveToFolder, moveToRoot, edit and duplicate each re-read the live
+ * record under configMutationLock before writing (#108): all five capture their
+ * config before an interactive pause — the rename input box, moveToFolder's
  * destination picker, the edit form itself, or, on the palette path,
  * pickLocalServer's own quick pick — and each writes ONLY what it owns, bailing
  * out if the record was removed, already holds the target value, or was
  * concurrently changed to some other value while the prompt was open.
  *
- * duplicate takes the lock too, but only for serialization: it writes a fresh
- * id, so no existing record is at risk of being clobbered.
+ * duplicate is the one exception to the "bail on divergence" half of that: a
+ * fresh id means it clobbers no existing record, and it owns no destination
+ * field a concurrent write could contradict, so the newest live state is simply
+ * what gets copied. It still has to RE-READ, because the copy's other fields
+ * were otherwise spread off a pre-prompt snapshot — the actual defect, not the
+ * serialization the lock also buys.
  *
  * The manager is injected via ctx (set up in extension.ts). Commands never
  * write persisted config directly: they route through NexusCore methods that
  * themselves serialize through ConfigRepository, while configMutationLock
  * guards the destructive "remove" entry point, and edit/rename/moveToFolder/
- * moveToRoot's stale-capture re-reads, against concurrent writes.
+ * moveToRoot/duplicate's stale-capture re-reads, against concurrent writes.
  */
 
 import { randomUUID } from "node:crypto";
@@ -645,14 +649,37 @@ export function registerLocalServerCommands(
     vscode.commands.registerCommand("nexus.localServer.duplicate", async (arg?: unknown) => {
       const config = toLocalServerFromArg(ctx.core, arg) ?? (await pickLocalServer(ctx.core, "Duplicate Local Server"));
       if (!config) return;
-      const copy = { ...config, id: randomUUID(), name: `${config.name} (copy)` };
-      // #108 (serialization audit) — a fresh id means no existing record is at
-      // risk, so this is a plain serialization wrap for consistency with #84,
-      // not a re-resolve fix. It still matters: addOrUpdateLocalServerConfig
+      // #108 FOLLOW-UP — the fresh id does mean no EXISTING record can be
+      // clobbered by this write, but that was never the whole risk: `config`
+      // is captured BEFORE the tree item's or the quick pick's interactive
+      // pause, and every OTHER field of the copy was being spread off that
+      // stale snapshot. Rename the folder "Backend" to "Platform" while the
+      // picker sits open and the copy landed back in a folder that no longer
+      // exists; the same applies to a concurrent rename or edit of any field.
+      //
+      // So this is a re-resolve, like rename / moveToFolder / moveToRoot
+      // above — only simpler. Those own a single destination field a
+      // concurrent write could overwrite, so they bail when the live value
+      // diverged to some OTHER value. duplicate owns no such field: it makes
+      // no decision about the source record at all, it only copies it. The
+      // newest live state is therefore always the right thing to copy, and
+      // the only bail is the source having been removed outright.
+      //
+      // Serialization still matters on its own: addOrUpdateLocalServerConfig
       // persists the whole collection, so an unserialized copy racing a
       // lock-holding section (replace-mode import, folder cascade) can commit
       // against a stale collection snapshot and drop that section's writes.
-      await configMutationLock.runExclusive(() => ctx.core.addOrUpdateLocalServerConfig(copy));
+      await configMutationLock.runExclusive(async () => {
+        const live = ctx.core.getLocalServer(config.id);
+        if (!live) {
+          return; // removed while the prompt was open — nothing left to copy
+        }
+        await ctx.core.addOrUpdateLocalServerConfig({
+          ...live,
+          id: randomUUID(),
+          name: `${live.name} (copy)`
+        });
+      });
     }),
 
     vscode.commands.registerCommand("nexus.localServer.copyInfo", async (arg?: unknown) => {

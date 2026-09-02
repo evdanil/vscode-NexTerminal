@@ -1206,9 +1206,9 @@ describe("nexus.localServer.edit re-resolves under the lock (issue #108 followup
  * nexus.localServer.duplicate writes a FRESH id, so no existing record is at
  * risk of being clobbered — but addOrUpdateLocalServerConfig persists the whole
  * collection, so an unserialized copy racing a lock-holding section commits
- * against a stale collection snapshot and can drop that section's writes. Same
- * plain serialization wrap the sibling duplicate handlers already carry
- * (localShellCommands, serialCommands, tunnelCommands).
+ * against a stale collection snapshot and can drop that section's writes. This
+ * block covers that ordering half only; what the copy is built FROM is the
+ * separate re-resolve concern covered by the block below.
  */
 describe("nexus.localServer.duplicate serializes under the lock (issue #108)", () => {
   function duplicate(arg: unknown): Promise<unknown> {
@@ -1248,4 +1248,120 @@ describe("nexus.localServer.duplicate serializes under the lock (issue #108)", (
   // prevent, which is exactly the vacuous shape this repo's testing standard
   // rules out. The gated case above is where duplicate's serialization is
   // actually observable.
+});
+
+/**
+ * The #108 audit read duplicate's fresh id as proof that nothing was at risk,
+ * and wrapped it in the lock for ordering alone. The id only ever settled the
+ * question of clobbering an EXISTING record. Every OTHER field of the copy was
+ * still spread off `config`, captured BEFORE the interactive pause — the tree
+ * item's embedded snapshot, or pickLocalServer's quick pick, which the user can
+ * sit on indefinitely. A folder rename, a rename, a cascade or an edit landing
+ * in that window produced a copy of a record that no longer existed in that
+ * shape: duplicate "Backend/Dev Server" while the folder is renamed to
+ * "Platform" and the copy is filed under a folder nobody has any more.
+ *
+ * duplicate re-resolves the live record inside the lock, like rename /
+ * moveToFolder / moveToRoot — but with no "bail on divergence" arm. Those own a
+ * destination field a concurrent write could contradict; duplicate makes no
+ * decision about the source at all, so the newest state is always what to copy.
+ * The only bail is the source having been removed outright.
+ *
+ * Every concurrent change below is driven through addOrUpdateLocalServerConfig
+ * or the rename command, NOT through renameFolder / removeFolderCascade: those
+ * two rewrite `.group` IN PLACE on the very object getLocalServer hands back,
+ * so a captured "stale" reference would already read the new value and the test
+ * would pass against the broken implementation too.
+ */
+describe("nexus.localServer.duplicate re-resolves under the lock (issue #108 followups)", () => {
+  function duplicateViaPicker(): {
+    duplicating: Promise<unknown>;
+    pick: Deferred<{ config: LocalServerConfig } | undefined>;
+  } {
+    const pick = deferred<{ config: LocalServerConfig } | undefined>();
+    vi.mocked(vscode.window.showQuickPick).mockReturnValue(pick.promise as never);
+    const cmd = registeredCommands.get("nexus.localServer.duplicate");
+    expect(cmd).toBeDefined();
+    // No arg — the palette path, so pickLocalServer's quick pick is the pause.
+    return { duplicating: Promise.resolve(cmd!(undefined)), pick };
+  }
+
+  beforeEach(() => {
+    vi.mocked(vscode.window.showQuickPick).mockReset();
+    vi.mocked(vscode.window.showInputBox).mockReset();
+  });
+
+  it("copies the record as it is NOW, not as the picker captured it", async () => {
+    // THE BUG. The picker embedded the record while it sat in "Backend" running
+    // node. While the user thought about it, an edit moved it to "Platform" and
+    // switched it to python. Building the copy from the picker's snapshot files
+    // the duplicate under a folder that may no longer exist and resurrects the
+    // superseded executable.
+    const { core, repo } = await fixture([
+      makeLocalServerConfig({ group: "Backend", executable: "node" })
+    ]);
+    const stale = core.getLocalServer("ls1")!;
+
+    const { duplicating, pick } = duplicateViaPicker();
+    await core.addOrUpdateLocalServerConfig({
+      ...core.getLocalServer("ls1")!,
+      group: "Platform",
+      executable: "python"
+    });
+
+    pick.resolve({ config: stale });
+    await duplicating;
+
+    const copy = (await repo.getLocalServers()).find((c) => c.name === "Dev Server (copy)");
+    expect(copy).toBeDefined();
+    // Load-bearing: "Backend" / "node" here mean the copy was built from the
+    // pre-picker snapshot instead of the live record.
+    expect(copy!.group).toBe("Platform");
+    expect(copy!.executable).toBe("python");
+    expect(copy!.id).not.toBe("ls1");
+  });
+
+  it("names the copy after a concurrent rename, not the pre-picker name", async () => {
+    // nexus.localServer.rename is its own lock-protected, live-rereading
+    // command running independently of this picker. If it lands while the
+    // picker is open, `${config.name} (copy)` off the snapshot names the
+    // duplicate after a name that no longer exists anywhere.
+    const { core, repo } = await fixture([makeLocalServerConfig({ name: "Dev Server" })]);
+    const stale = core.getLocalServer("ls1")!;
+
+    const { duplicating, pick } = duplicateViaPicker();
+
+    vi.mocked(vscode.window.showInputBox).mockResolvedValueOnce("Build Server");
+    const renameCmd = registeredCommands.get("nexus.localServer.rename");
+    expect(renameCmd).toBeDefined();
+    await renameCmd!("ls1");
+    expect(core.getLocalServer("ls1")!.name).toBe("Build Server");
+
+    pick.resolve({ config: stale });
+    await duplicating;
+
+    // Load-bearing: "Dev Server (copy)" here means the stale name was copied.
+    expect((await repo.getLocalServers()).map((c) => c.name).sort()).toEqual([
+      "Build Server",
+      "Build Server (copy)"
+    ]);
+  });
+
+  it("does not resurrect a config removed while the picker was open", async () => {
+    // The one bail duplicate needs: the source is gone, so there is nothing to
+    // copy. Spreading the snapshot writes a fresh-id revival of a record the
+    // user deliberately removed — under a NEW id, so removing it again means
+    // finding a row nobody knowingly created.
+    const { core, repo } = await fixture([makeLocalServerConfig()]);
+    const stale = core.getLocalServer("ls1")!;
+
+    const { duplicating, pick } = duplicateViaPicker();
+    await core.removeLocalServerConfig("ls1");
+
+    pick.resolve({ config: stale });
+    await duplicating;
+
+    expect(await repo.getLocalServers()).toEqual([]);
+    expect(core.getSnapshot().localServers).toEqual([]);
+  });
 });
