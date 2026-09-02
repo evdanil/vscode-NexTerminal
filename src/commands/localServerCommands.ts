@@ -170,11 +170,18 @@ export function formValuesToLocalServer(values: FormValues, existing?: Partial<L
 /**
  * Compare two `group` values as folders rather than as raw strings.
  *
- * "no folder" reaches this record by two spellings — `undefined` (what
- * moveToRoot and the removal cascade write) and `""` (what an empty form field
- * can normalize to) — and a raw `!==` between them reads as a folder CHANGE,
- * which would make the edit form's untouched-group guard fire on a record that
- * never moved.
+ * "no folder" can reach this record by two spellings — `undefined`, which is
+ * what moveToRoot, the removal cascade and `normalizeOptionalFolderPath` all
+ * write, and a literal `""`. Nothing in the current code path produces the
+ * second: `normalizeOptionalFolderPath` maps blank AND non-string input to
+ * `undefined`, never to `""`. A `""` group therefore only survives in a record
+ * that predates the current normalizer, or one hand-imported or hand-edited
+ * straight into settings, and the coercion below exists for that legacy shape
+ * alone — not for anything the form can still submit.
+ *
+ * It is kept because a raw `!==` between the two spellings reads as a folder
+ * CHANGE, which would make the edit form's untouched-group guard fire on a
+ * record that never moved.
  */
 function sameFolder(a: string | undefined, b: string | undefined): boolean {
   return (a || undefined) === (b || undefined);
@@ -507,13 +514,18 @@ export function registerLocalServerCommands(
           if (normalizeOptionalFolderPath(values.group) === null) {
             throw new Error(INVALID_FOLDER_PATH_MESSAGE);
           }
-          // #108 FOLLOW-UP — this was the last lock-free write to the
-          // localServers collection, and the only one whose interactive pause
-          // is UNBOUNDED: a webview form the user can leave open for hours.
+          // #108 FOLLOW-UP — this was one of SEVERAL lock-free writes to the
+          // localServers collection that the #108 audit missed; the drag-to-
+          // folder handler and the unified Add Profile form's local-server
+          // branch are the others, both outside this file and both tracked
+          // separately. What singles this one out is the length of its
+          // interactive pause: a webview form the user can leave open for
+          // hours, against an input box or a picker measured in seconds.
           // addOrUpdateLocalServerConfig persists the WHOLE collection on
           // every call (read-modify-write of the full array), which is exactly
           // what configMutationLock exists to serialize — rename,
-          // moveToFolder, moveToRoot and remove in this same file already do.
+          // moveToFolder, moveToRoot, duplicate and remove in this same file
+          // already do.
           //
           // Re-resolve the LIVE record inside the lock rather than building
           // from the pre-form snapshot, the same shape nexus.localShell.edit

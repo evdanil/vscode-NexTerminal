@@ -1021,11 +1021,14 @@ function gatedLockedWrite(
 }
 
 /**
- * nexus.localServer.edit was the LAST lock-free write to the localServers
- * collection, and the one with the longest interactive pause of them all: a
- * webview form the user can leave open indefinitely. Every other handler in
- * this file (rename / moveToFolder / moveToRoot / remove) already re-reads the
- * live record under configMutationLock.
+ * nexus.localServer.edit was one of SEVERAL lock-free writes to the
+ * localServers collection that the #108 audit missed — the drag-to-folder
+ * handler and the unified Add Profile form's local-server branch are the
+ * others, both outside this file and both tracked separately. What singles
+ * this one out is the length of its interactive pause: a webview form the user
+ * can leave open indefinitely. Every other handler in this file (rename /
+ * moveToFolder / moveToRoot / duplicate / remove) already re-reads the live
+ * record under configMutationLock.
  *
  * The form renders `group` from a snapshot taken when it OPENED, so a folder
  * rename or a removeFolderCascade — both of which rewrite each affected
