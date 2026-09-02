@@ -261,6 +261,96 @@ describe("SshConnectionPool", () => {
     expect(conn.dispose).toHaveBeenCalled();
   });
 
+  it("invalidate during an in-flight connect keeps the stale connection out of the pool", async () => {
+    // The connection whose handshake is already running when the user saves new
+    // credentials — it authenticated with the OLD ones.
+    const staleConn = createMockConnection();
+    const freshConn = createMockConnection();
+    let resolveFirstHandshake: ((conn: SshConnection) => void) | undefined;
+    let connectCalls = 0;
+    const f: SshFactory = {
+      connect: vi.fn(() => {
+        connectCalls++;
+        if (connectCalls === 1) {
+          return new Promise<SshConnection>((resolve) => { resolveFirstHandshake = resolve; });
+        }
+        return Promise.resolve(freshConn);
+      })
+    };
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 5000 });
+
+    const events: PoolEvent[] = [];
+    p.onDidChange((event) => events.push(event));
+
+    const inFlight = p.connect(testServer);
+    // Auth profile edited + saved while the handshake is still running.
+    p.invalidate(testServer.id);
+    // Handshake now completes, using the superseded credentials.
+    resolveFirstHandshake!(staleConn);
+    const staleLease = await inFlight;
+    expect(staleLease).toBeDefined();
+
+    // The stale connection was never announced as pooled.
+    expect(events).not.toContainEqual({ type: "connected", serverId: testServer.id });
+
+    // A subsequent consumer must get a genuinely fresh handshake, not the
+    // connection that was in flight across the invalidate.
+    const nextLease = await p.connect(testServer);
+    expect(f.connect).toHaveBeenCalledTimes(2);
+    await nextLease.openShell();
+    expect(freshConn.openShell).toHaveBeenCalled();
+    expect(staleConn.openShell).not.toHaveBeenCalled();
+
+    // Once its pre-invalidation lease is released the stale connection is torn
+    // down rather than lingering in the pool for the idle timeout.
+    staleLease.dispose();
+    expect(staleConn.dispose).toHaveBeenCalled();
+    expect(freshConn.dispose).not.toHaveBeenCalled();
+  });
+
+  it("a connect started after invalidate does not join the pre-invalidation handshake, and the stale one cannot clobber it", async () => {
+    const staleConn = createMockConnection();
+    const freshConn = createMockConnection();
+    let resolveFirstHandshake: ((conn: SshConnection) => void) | undefined;
+    let connectCalls = 0;
+    const f: SshFactory = {
+      connect: vi.fn(() => {
+        connectCalls++;
+        if (connectCalls === 1) {
+          return new Promise<SshConnection>((resolve) => { resolveFirstHandshake = resolve; });
+        }
+        return Promise.resolve(freshConn);
+      })
+    };
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 5000 });
+
+    const inFlight = p.connect(testServer);
+    p.invalidate(testServer.id);
+
+    // Arrives while the first handshake is STILL running — must not join it.
+    // Asserted before the first handshake settles, so a caller that joined it
+    // shows up as a missing second factory call rather than as a hang.
+    const joiner = p.connect(testServer);
+    expect(f.connect).toHaveBeenCalledTimes(2);
+
+    // The pre-invalidation handshake settles last; it must not overwrite the
+    // post-invalidation pooled entry.
+    resolveFirstHandshake!(staleConn);
+    const [joinerLease, staleLease] = await Promise.all([joiner, inFlight]);
+
+    const laterLease = await p.connect(testServer);
+    expect(f.connect).toHaveBeenCalledTimes(2); // reused the fresh entry
+    await laterLease.openShell();
+    expect(freshConn.openShell).toHaveBeenCalled();
+    expect(staleConn.openShell).not.toHaveBeenCalled();
+
+    staleLease.dispose();
+    expect(staleConn.dispose).toHaveBeenCalled();
+    expect(freshConn.dispose).not.toHaveBeenCalled();
+    joinerLease.dispose();
+    laterLease.dispose();
+  });
+
   it("disabled mode bypasses pool (factory called each time)", async () => {
     const f = createMockFactory();
     const p = new SshConnectionPool(f, { enabled: false, idleTimeoutMs: 5000 });

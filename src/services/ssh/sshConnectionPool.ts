@@ -11,6 +11,7 @@ import type {
   TcpConnectionInfo
 } from "./contracts";
 import { hasContextAwareConnect } from "./contracts";
+import { isStaleConnectionError, shouldFallbackForChannelLimit } from "./channelErrors";
 
 export interface PoolOptions {
   enabled: boolean;
@@ -30,68 +31,6 @@ interface PoolEntry {
 }
 
 const MAX_IDLE_TIMEOUT_MS = 3_600_000;
-const SSH_OPEN_ADMINISTRATIVELY_PROHIBITED = 1;
-const SSH_OPEN_CONNECT_FAILED = 2;
-const SSH_OPEN_UNKNOWN_CHANNEL_TYPE = 3;
-const SSH_OPEN_RESOURCE_SHORTAGE = 4;
-
-const FALLBACK_ALLOW_HINTS = [
-  "administratively prohibited",
-  "resource shortage",
-  "too many sessions",
-  "maxsessions",
-  "channel limit",
-  "no more sessions"
-] as const;
-
-const FALLBACK_DENY_HINTS = [
-  "connection refused",
-  "connect failed",
-  "unknown channel type"
-] as const;
-
-function hasAnyNeedle(text: string, needles: readonly string[]): boolean {
-  return needles.some((needle) => text.includes(needle));
-}
-
-function isStaleConnectionError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-  return message.toLowerCase().includes("not connected");
-}
-
-function shouldFallbackForChannelLimit(error: unknown): boolean {
-  const reason = typeof error === "object" && error !== null
-    ? (error as { reason?: unknown }).reason
-    : undefined;
-
-  if (typeof reason === "number") {
-    if (reason === SSH_OPEN_ADMINISTRATIVELY_PROHIBITED || reason === SSH_OPEN_RESOURCE_SHORTAGE) {
-      return true;
-    }
-    if (reason === SSH_OPEN_CONNECT_FAILED || reason === SSH_OPEN_UNKNOWN_CHANNEL_TYPE) {
-      return false;
-    }
-  }
-
-  if (typeof reason === "string") {
-    const normalizedReason = reason.toLowerCase();
-    if (hasAnyNeedle(normalizedReason, FALLBACK_DENY_HINTS)) {
-      return false;
-    }
-    if (hasAnyNeedle(normalizedReason, FALLBACK_ALLOW_HINTS)) {
-      return true;
-    }
-  }
-
-  const message = (error instanceof Error ? error.message : typeof error === "string" ? error : "").toLowerCase();
-  if (!message) {
-    return false;
-  }
-  if (hasAnyNeedle(message, FALLBACK_DENY_HINTS)) {
-    return false;
-  }
-  return hasAnyNeedle(message, FALLBACK_ALLOW_HINTS);
-}
 
 class PooledSshConnection implements SshConnection {
   private disposed = false;
@@ -268,6 +207,12 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
   private readonly entries = new Map<string, PoolEntry>();
   private readonly pending = new Map<string, Promise<PoolEntry>>();
   private readonly listeners = new Set<(event: PoolEvent) => void>();
+  // Per-server invalidation counter. A connect captures the value at handshake
+  // start and re-checks it once the handshake settles; a bump in between means
+  // the credentials/settings it authenticated with have since been replaced, so
+  // the resulting connection must never be pooled. Bounded by the number of
+  // configured servers.
+  private readonly invalidationEpochs = new Map<string, number>();
   private disposed = false;
 
   public constructor(
@@ -342,6 +287,19 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
   }
 
   public invalidate(serverId: string): void {
+    // Bump the epoch first: a connect that is currently mid-handshake captured
+    // the previous value and will see the mismatch when it settles, refusing to
+    // install itself into `entries`. Without this, an invalidate that lands
+    // during a slow handshake (2FA, proxy dial) is a silent no-op and the
+    // connection authenticated with the now-superseded credentials becomes the
+    // pooled, shared connection for every later terminal/tunnel/SFTP session —
+    // callers of invalidate() (extension.ts deletes the stale proxy secret at
+    // this point) assume the opposite.
+    this.invalidationEpochs.set(serverId, this.invalidationEpoch(serverId) + 1);
+    // Drop the in-flight connect from the join point so callers arriving from
+    // now on start a fresh handshake instead of joining the stale one.
+    this.pending.delete(serverId);
+
     const entry = this.entries.get(serverId);
     if (!entry) {
       return;
@@ -362,6 +320,7 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
     }
     this.entries.clear();
     this.pending.clear();
+    this.invalidationEpochs.clear();
     this.listeners.clear();
   }
 
@@ -384,14 +343,23 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
       return pendingPromise;
     }
 
-    const promise = this.createEntry(server, context).finally(() => {
-      this.pending.delete(server.id);
+    const promise: Promise<PoolEntry> = this.createEntry(server, context).finally(() => {
+      // Only clear the slot if it is still ours: invalidate() may have dropped
+      // this connect from `pending` and a newer handshake may already hold it.
+      if (this.pending.get(server.id) === promise) {
+        this.pending.delete(server.id);
+      }
     });
     this.pending.set(server.id, promise);
     return promise;
   }
 
+  private invalidationEpoch(serverId: string): number {
+    return this.invalidationEpochs.get(serverId) ?? 0;
+  }
+
   private async createEntry(server: ServerConfig, context?: SshConnectContext): Promise<PoolEntry> {
+    const epochAtStart = this.invalidationEpoch(server.id);
     const connection = await this.connectInner(server, context);
 
     if (this.disposed) {
@@ -405,6 +373,19 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
       healthy: true,
       closeUnsubscribe: () => {}
     };
+
+    if (this.invalidationEpoch(server.id) !== epochAtStart) {
+      // invalidate() fired while this handshake was in flight, so the
+      // connection carries pre-invalidation credentials/settings. Callers
+      // already awaiting this promise still receive it — an in-flight request
+      // cannot be retroactively failed without breaking them — but it is never
+      // installed in `entries` and never announced as "connected", so no new
+      // consumer can be handed it. It stays unhealthy and orphaned: the release
+      // path in connectWithContext disposes the underlying connection as soon
+      // as the last pre-invalidation lease is released.
+      entry.healthy = false;
+      return entry;
+    }
 
     entry.closeUnsubscribe = connection.onClose(() => {
       entry.healthy = false;

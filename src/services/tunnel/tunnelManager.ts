@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { ActiveTunnel, ResolvedTunnelConnectionMode, ServerConfig, TunnelProfile, TunnelType } from "../../models/config";
 import { resolveTunnelType } from "../../models/config";
 import { normalizeBoundedNumber } from "../../utils/helpers";
+import { isFatalToSshConnection } from "../ssh/channelErrors";
 import type { SshConnection, SshFactory } from "../ssh/contracts";
 import { handleSocks5Handshake, sendSocks5Failure, sendSocks5Success, Socks5HandshakeAbortedError } from "./socks5";
 
@@ -271,7 +272,16 @@ export class TunnelManager {
       if (sshConnection && shouldDisposeConnection) {
         runtime.sshConnections.delete(sshConnection);
       }
-      if (useSharedConnection && sshConnection && runtime.sharedConnection === sshConnection) {
+      // Only a dead transport justifies tearing down the shared connection. A
+      // channel-open refusal means the remote could not reach THIS destination;
+      // disposing on it would kill every other stream currently multiplexed on
+      // the tunnel and force the next request to re-authenticate (password/2FA).
+      if (
+        useSharedConnection
+        && sshConnection
+        && runtime.sharedConnection === sshConnection
+        && isFatalToSshConnection(error)
+      ) {
         runtime.sharedConnection = undefined;
         runtime.sshConnections.delete(sshConnection);
         sshConnection.dispose();
@@ -514,7 +524,15 @@ export class TunnelManager {
       if (sshConnection && shouldDisposeConnection) {
         runtime.sshConnections.delete(sshConnection);
       }
-      if (useSharedConnection && sshConnection && runtime.sharedConnection === sshConnection) {
+      // Same rule as the local-forward path: one browser tab asking for an
+      // unreachable host must not disconnect every other tab proxied through
+      // this SOCKS5 tunnel. See `isFatalToSshConnection`.
+      if (
+        useSharedConnection
+        && sshConnection
+        && runtime.sharedConnection === sshConnection
+        && isFatalToSshConnection(error)
+      ) {
         runtime.sharedConnection = undefined;
         runtime.sshConnections.delete(sshConnection);
         sshConnection.dispose();

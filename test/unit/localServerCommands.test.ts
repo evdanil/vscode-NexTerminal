@@ -52,9 +52,9 @@ vi.mock("vscode", () => ({
   ConfigurationTarget: { Global: 1 }
 }));
 
-vi.mock("../../src/services/configMutationLock", () => ({
-  configMutationLock: { runExclusive: <T>(fn: () => Promise<T>) => fn() }
-}));
+// NOT mocked — the real AsyncMutex is what the #108 serialization tests below
+// exercise (a pass-through stub runs every section immediately and so cannot
+// tell a locked write from a lock-free one).
 
 vi.mock("../../src/services/local/localServerManager", () => ({
   LocalServerManager: class {},
@@ -62,8 +62,12 @@ vi.mock("../../src/services/local/localServerManager", () => ({
   localServerRemovalDisclosure: (c: unknown) => String(c)
 }));
 
+const mockWebviewFormPanelOpen = vi.fn();
+
 vi.mock("../../src/ui/webviewFormPanel", () => ({
-  WebviewFormPanel: class { public static open() { return Promise.resolve(undefined); } }
+  WebviewFormPanel: {
+    open: (...args: unknown[]) => mockWebviewFormPanelOpen(...args)
+  }
 }));
 
 vi.mock("../../src/ui/formDefinitions", () => ({ localServerFormDefinition: () => ({ title: "", fields: [] }) }));
@@ -73,19 +77,13 @@ vi.mock("../../src/ui/nexusTreeProvider", () => ({
   LocalServerSessionTreeItem: class { public constructor(public readonly session: unknown) {} }
 }));
 
-vi.mock("../../src/utils/folderPaths", async () => {
-  const actual = await import("../../src/utils/folderPaths");
-  return {
-    ...actual,
-    normalizeOptionalFolderPath: (value: unknown) => {
-      if (value === undefined || value === null || value === "") return "";
-      if (typeof value !== "string") return null;
-      const trimmed = value.trim();
-      if (trimmed.startsWith("/not/a/relative/path")) return null;
-      return actual.normalizeOptionalFolderPath(value);
-    }
-  };
-});
+// folderPaths is deliberately NOT mocked. It used to be, with a local
+// reimplementation of normalizeOptionalFolderPath that returned "" for blank
+// input and null for non-string input — the opposite of the real function,
+// which maps BOTH to undefined and reserves null for a non-empty path that
+// fails validation. Nothing here depended on the divergence (no assertion ever
+// expected "" or null for a group), but it was the source of a comment in
+// localServerCommands.ts claiming "" was a value the form could produce.
 
 vi.mock("../../src/utils/naturalCompare", () => ({ naturalCompare: (a: string, b: string) => a.localeCompare(b) }));
 
@@ -99,9 +97,11 @@ import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import type { CommandContext } from "../../src/commands/types";
 import type { LocalServerManager } from "../../src/services/local/localServerManager";
+import { configMutationLock } from "../../src/services/configMutationLock";
 
 beforeEach(() => {
   registeredCommands.clear();
+  mockWebviewFormPanelOpen.mockReset();
 });
 
 function baseValues(): FormValues {
@@ -149,8 +149,13 @@ describe("formValuesToLocalServer", () => {
   });
 
   it("returns undefined when group contains an invalid folder path", () => {
-    // normalizeOptionalFolderPath returns null for leading slashes with no root
-    const values: FormValues = { ...baseValues(), group: "/not/a/relative/path" };
+    // A REAL rejection from the real normalizer: ".." as a segment is refused
+    // outright. The previous fixture used "/not/a/relative/path", which the
+    // real normalizer ACCEPTS — the leading slash produces an empty segment
+    // that is filtered out, yielding "not/a/relative/path" — so the rejection
+    // only ever came from the local mock that has now been removed, and the
+    // test proved nothing about the path the SUT actually takes.
+    const values: FormValues = { ...baseValues(), group: "../escape" };
     expect(formValuesToLocalServer(values)).toBeUndefined();
   });
 
@@ -718,7 +723,9 @@ function makeLocalServerConfig(overrides: Partial<LocalServerConfig> = {}): Loca
   };
 }
 
-async function fixture(configs: LocalServerConfig[]): Promise<{ core: NexusCore }> {
+async function fixture(
+  configs: LocalServerConfig[]
+): Promise<{ core: NexusCore; repo: InMemoryConfigRepository }> {
   const repo = new InMemoryConfigRepository([], [], [], [], [], [], configs);
   const core = new NexusCore(repo);
   await core.initialize();
@@ -728,7 +735,12 @@ async function fixture(configs: LocalServerConfig[]): Promise<{ core: NexusCore 
     localServerManager: {}
   } as unknown as CommandContext & { localServerManager: LocalServerManager };
   registerLocalServerCommands(ctx);
-  return { core };
+  return { core, repo };
+}
+
+async function settle(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 interface Deferred<T> {
@@ -987,5 +999,371 @@ describe("nexus.localServer.moveToFolder re-resolves under the lock (issue #108)
     const after = core.getLocalServer("ls1")!;
     expect(after.group).toBeUndefined();
     expect(after.executable).toBe("python");
+  });
+});
+
+/**
+ * Parks INSIDE the lock until released — the "already in the critical section,
+ * still awaiting its I/O" phase these races need to be pinned against rather
+ * than raced for (copied from test/unit/localShellCommands.test.ts).
+ */
+function gatedLockedWrite(
+  lock: { runExclusive: <T>(fn: () => Promise<T>) => Promise<T> },
+  write: () => Promise<void>
+): { done: Promise<void>; release: () => void } {
+  const gate = deferred<void>();
+  const done = lock.runExclusive(async () => {
+    await gate.promise;
+    await write();
+  });
+  return { done, release: () => gate.resolve() };
+}
+
+/**
+ * nexus.localServer.edit was one of SEVERAL lock-free writes to the
+ * localServers collection that the #108 audit missed — the drag-to-folder
+ * handler and the unified Add Profile form's local-server branch are the
+ * others, both outside this file and both tracked separately. What singles
+ * this one out is the length of its interactive pause: a webview form the user
+ * can leave open indefinitely. Every other handler in this file (rename /
+ * moveToFolder / moveToRoot / duplicate / remove) already re-reads the live
+ * record under configMutationLock.
+ *
+ * The form renders `group` from a snapshot taken when it OPENED, so a folder
+ * rename or a removeFolderCascade — both of which rewrite each affected
+ * record's `group` IN PLACE, and both of which are themselves lock-protected —
+ * landing while the form sat open was silently reverted the moment the user
+ * clicked Save, potentially stranding the record in a folder that no longer
+ * exists.
+ */
+describe("nexus.localServer.edit re-resolves under the lock (issue #108 followups)", () => {
+  /**
+   * Drives the edit form open, then hands back the onSubmit callback the real
+   * WebviewFormPanel would invoke on Save. WebviewFormPanel itself is mocked
+   * (module-level `mockWebviewFormPanelOpen`) — its real implementation talks
+   * to `vscode.window.createWebviewPanel`, which this file's vscode mock does
+   * not provide.
+   */
+  async function editLocalServer(arg: unknown): Promise<(values: FormValues) => Promise<void>> {
+    const cmd = registeredCommands.get("nexus.localServer.edit");
+    expect(cmd).toBeDefined();
+    await cmd!(arg);
+    const call = mockWebviewFormPanelOpen.mock.calls.at(-1);
+    expect(call).toBeDefined();
+    const options = call![2] as { onSubmit: (values: FormValues) => Promise<void> };
+    return options.onSubmit;
+  }
+
+  /** What the form hands back on Save, echoing the record it was rendered from. */
+  function submittedValues(overrides: Record<string, string> = {}): FormValues {
+    return {
+      name: "Dev Server",
+      executable: "node",
+      group: "Backend",
+      ...overrides
+    } as unknown as FormValues;
+  }
+
+  it("does not revert a folder RENAME that landed while the form was open", async () => {
+    // THE BUG. The form opened while the record sat in "Backend" and its group
+    // field still reads "Backend". Meanwhile the folder was renamed to
+    // "Platform", which rewrote this record's group in place. Saving the form's
+    // pre-rename value puts the record back in a folder nobody has any more.
+    const { core } = await fixture([makeLocalServerConfig({ group: "Backend", executable: "node" })]);
+
+    const onSubmit = await editLocalServer("ls1");
+
+    await core.renameFolder("Backend", "Platform");
+    expect(core.getLocalServer("ls1")!.group).toBe("Platform");
+
+    // The user edited the executable and never touched the folder field.
+    await onSubmit(submittedValues({ executable: "python" }));
+
+    const after = core.getLocalServer("ls1")!;
+    // Load-bearing: "Backend" here means the Save reverted the folder rename.
+    expect(after.group).toBe("Platform");
+    // The edit the user actually made still lands.
+    expect(after.executable).toBe("python");
+  });
+
+  it("does not strand the record in a folder removeFolderCascade deleted while the form was open", async () => {
+    // Reparenting cascade: "Backend" is removed and its contents move up to the
+    // root. Saving the form's stale "Backend" would re-file the record under a
+    // folder that no longer exists — invisible in the tree until someone
+    // notices the row never came back to the root.
+    const { core } = await fixture([makeLocalServerConfig({ group: "Backend" })]);
+
+    const onSubmit = await editLocalServer("ls1");
+
+    await core.removeFolderCascade("Backend", false);
+    expect(core.getLocalServer("ls1")!.group).toBeUndefined();
+
+    await onSubmit(submittedValues({ description: "edited while unfiled" }));
+
+    // Load-bearing: "Backend" here means the Save resurrected the dead folder.
+    expect(core.getLocalServer("ls1")!.group).toBeUndefined();
+  });
+
+  it("still applies a folder the user DID pick in the form, even against a concurrent cascade", async () => {
+    // The mirror image, and the reason the guard keys off "did the form field
+    // change" rather than bailing outright the way rename/moveToFolder do: the
+    // edit form is the primary editing surface, and a user who deliberately
+    // retyped the folder has expressed an intent that must win. Deferring to
+    // the live record here would silently discard their choice.
+    const { core } = await fixture([makeLocalServerConfig({ group: "Backend" })]);
+
+    const onSubmit = await editLocalServer("ls1");
+
+    await core.renameFolder("Backend", "Platform");
+
+    await onSubmit(submittedValues({ group: "Archive" }));
+
+    expect(core.getLocalServer("ls1")!.group).toBe("Archive");
+  });
+
+  it("does not revert a nexus.localServer.rename that landed while the form was open", async () => {
+    // Same shape as the folder-rename race above, but for `name`: rename is a
+    // SEPARATE lock-protected command with its own live re-read, running
+    // independently of this form. The form's `values.name` still reflects
+    // "Dev Server" from when it opened; saving it after a concurrent rename to
+    // "Build Server" must not silently undo that rename.
+    const { core } = await fixture([makeLocalServerConfig({ name: "Dev Server", executable: "node" })]);
+
+    const onSubmit = await editLocalServer("ls1");
+
+    vi.mocked(vscode.window.showInputBox).mockResolvedValueOnce("Build Server");
+    const renameCmd = registeredCommands.get("nexus.localServer.rename");
+    expect(renameCmd).toBeDefined();
+    await renameCmd!("ls1");
+    expect(core.getLocalServer("ls1")!.name).toBe("Build Server");
+
+    // The user edited the executable and never touched the Name field.
+    await onSubmit(submittedValues({ executable: "python" }));
+
+    const after = core.getLocalServer("ls1")!;
+    // Load-bearing: "Dev Server" here means the Save reverted the rename.
+    expect(after.name).toBe("Build Server");
+    expect(after.executable).toBe("python");
+  });
+
+  it("still applies a name the user DID retype in the form, even against a concurrent rename", async () => {
+    // Mirror image: a deliberate edit to the Name field must win over a
+    // concurrent rename, the same way a deliberately retyped folder does.
+    const { core } = await fixture([makeLocalServerConfig({ name: "Dev Server" })]);
+
+    const onSubmit = await editLocalServer("ls1");
+
+    vi.mocked(vscode.window.showInputBox).mockResolvedValueOnce("Build Server");
+    const renameCmd = registeredCommands.get("nexus.localServer.rename");
+    await renameCmd!("ls1");
+
+    await onSubmit(submittedValues({ name: "Prod Server" }));
+
+    expect(core.getLocalServer("ls1")!.name).toBe("Prod Server");
+  });
+
+  it("throws and saves nothing when the record was removed while the form was open", async () => {
+    const { core, repo } = await fixture([makeLocalServerConfig()]);
+
+    const onSubmit = await editLocalServer("ls1");
+
+    await core.removeLocalServerConfig("ls1");
+
+    await expect(onSubmit(submittedValues())).rejects.toThrow(
+      'Local server "Dev Server" was removed while this form was open. Nothing was saved.'
+    );
+
+    expect(core.getLocalServer("ls1")).toBeUndefined();
+    expect(await repo.getLocalServers()).toEqual([]);
+  });
+
+  it("queues its write behind an in-flight locked section (kills the lock-free save)", async () => {
+    const { core } = await fixture([makeLocalServerConfig({ group: "Backend" })]);
+
+    const onSubmit = await editLocalServer("ls1");
+
+    // A folder cascade / replace-mode import stand-in: already inside the lock,
+    // still awaiting its own I/O.
+    const gated = gatedLockedWrite(configMutationLock, () => core.renameFolder("Backend", "Platform"));
+    await settle();
+
+    const saving = onSubmit(submittedValues({ executable: "python" }));
+    await settle();
+
+    // THE KILL. A lock-free save has already committed by now — before the
+    // holder it should be queued behind has even started its body.
+    expect(core.getLocalServer("ls1")!.executable).toBe("node");
+
+    gated.release();
+    await gated.done;
+    await saving;
+
+    const after = core.getLocalServer("ls1")!;
+    expect(after.executable).toBe("python");
+    expect(after.group).toBe("Platform");
+  });
+});
+
+/**
+ * nexus.localServer.duplicate writes a FRESH id, so no existing record is at
+ * risk of being clobbered — but addOrUpdateLocalServerConfig persists the whole
+ * collection, so an unserialized copy racing a lock-holding section commits
+ * against a stale collection snapshot and can drop that section's writes. This
+ * block covers that ordering half only; what the copy is built FROM is the
+ * separate re-resolve concern covered by the block below.
+ */
+describe("nexus.localServer.duplicate serializes under the lock (issue #108)", () => {
+  function duplicate(arg: unknown): Promise<unknown> {
+    const cmd = registeredCommands.get("nexus.localServer.duplicate");
+    expect(cmd).toBeDefined();
+    return Promise.resolve(cmd!(arg));
+  }
+
+  it("queues behind an in-flight locked section instead of committing over it", async () => {
+    const { core, repo } = await fixture([makeLocalServerConfig({ group: "Backend" })]);
+
+    const gated = gatedLockedWrite(configMutationLock, () => core.renameFolder("Backend", "Platform"));
+    await settle();
+
+    const duplicating = duplicate({ config: { id: "ls1" } });
+    await settle();
+
+    // THE KILL. Lock-free, the copy is already persisted here — ahead of the
+    // section it is supposed to queue behind.
+    expect((await repo.getLocalServers()).map((c) => c.name)).toEqual(["Dev Server"]);
+
+    gated.release();
+    await gated.done;
+    await duplicating;
+
+    const stored = await repo.getLocalServers();
+    expect(stored.map((c) => c.name).sort()).toEqual(["Dev Server", "Dev Server (copy)"]);
+    // Both writes survive — the whole point of serializing.
+    expect(stored.find((c) => c.name === "Dev Server")!.group).toBe("Platform");
+  });
+
+  // NO back-to-back "two rapid duplicates both land" test here, deliberately.
+  // addOrUpdateLocalServerConfig mutates the in-memory Map SYNCHRONOUSLY before
+  // it awaits the repository, so the second call's persisted array already
+  // contains the first copy whether or not the lock is held — such a test
+  // passes identically against the lock-free implementation it would exist to
+  // prevent, which is exactly the vacuous shape this repo's testing standard
+  // rules out. The gated case above is where duplicate's serialization is
+  // actually observable.
+});
+
+/**
+ * The #108 audit read duplicate's fresh id as proof that nothing was at risk,
+ * and wrapped it in the lock for ordering alone. The id only ever settled the
+ * question of clobbering an EXISTING record. Every OTHER field of the copy was
+ * still spread off `config`, captured BEFORE the interactive pause — the tree
+ * item's embedded snapshot, or pickLocalServer's quick pick, which the user can
+ * sit on indefinitely. A folder rename, a rename, a cascade or an edit landing
+ * in that window produced a copy of a record that no longer existed in that
+ * shape: duplicate "Backend/Dev Server" while the folder is renamed to
+ * "Platform" and the copy is filed under a folder nobody has any more.
+ *
+ * duplicate re-resolves the live record inside the lock, like rename /
+ * moveToFolder / moveToRoot — but with no "bail on divergence" arm. Those own a
+ * destination field a concurrent write could contradict; duplicate makes no
+ * decision about the source at all, so the newest state is always what to copy.
+ * The only bail is the source having been removed outright.
+ *
+ * Every concurrent change below is driven through addOrUpdateLocalServerConfig
+ * or the rename command, NOT through renameFolder / removeFolderCascade: those
+ * two rewrite `.group` IN PLACE on the very object getLocalServer hands back,
+ * so a captured "stale" reference would already read the new value and the test
+ * would pass against the broken implementation too.
+ */
+describe("nexus.localServer.duplicate re-resolves under the lock (issue #108 followups)", () => {
+  function duplicateViaPicker(): {
+    duplicating: Promise<unknown>;
+    pick: Deferred<{ config: LocalServerConfig } | undefined>;
+  } {
+    const pick = deferred<{ config: LocalServerConfig } | undefined>();
+    vi.mocked(vscode.window.showQuickPick).mockReturnValue(pick.promise as never);
+    const cmd = registeredCommands.get("nexus.localServer.duplicate");
+    expect(cmd).toBeDefined();
+    // No arg — the palette path, so pickLocalServer's quick pick is the pause.
+    return { duplicating: Promise.resolve(cmd!(undefined)), pick };
+  }
+
+  beforeEach(() => {
+    vi.mocked(vscode.window.showQuickPick).mockReset();
+    vi.mocked(vscode.window.showInputBox).mockReset();
+  });
+
+  it("copies the record as it is NOW, not as the picker captured it", async () => {
+    // THE BUG. The picker embedded the record while it sat in "Backend" running
+    // node. While the user thought about it, an edit moved it to "Platform" and
+    // switched it to python. Building the copy from the picker's snapshot files
+    // the duplicate under a folder that may no longer exist and resurrects the
+    // superseded executable.
+    const { core, repo } = await fixture([
+      makeLocalServerConfig({ group: "Backend", executable: "node" })
+    ]);
+    const stale = core.getLocalServer("ls1")!;
+
+    const { duplicating, pick } = duplicateViaPicker();
+    await core.addOrUpdateLocalServerConfig({
+      ...core.getLocalServer("ls1")!,
+      group: "Platform",
+      executable: "python"
+    });
+
+    pick.resolve({ config: stale });
+    await duplicating;
+
+    const copy = (await repo.getLocalServers()).find((c) => c.name === "Dev Server (copy)");
+    expect(copy).toBeDefined();
+    // Load-bearing: "Backend" / "node" here mean the copy was built from the
+    // pre-picker snapshot instead of the live record.
+    expect(copy!.group).toBe("Platform");
+    expect(copy!.executable).toBe("python");
+    expect(copy!.id).not.toBe("ls1");
+  });
+
+  it("names the copy after a concurrent rename, not the pre-picker name", async () => {
+    // nexus.localServer.rename is its own lock-protected, live-rereading
+    // command running independently of this picker. If it lands while the
+    // picker is open, `${config.name} (copy)` off the snapshot names the
+    // duplicate after a name that no longer exists anywhere.
+    const { core, repo } = await fixture([makeLocalServerConfig({ name: "Dev Server" })]);
+    const stale = core.getLocalServer("ls1")!;
+
+    const { duplicating, pick } = duplicateViaPicker();
+
+    vi.mocked(vscode.window.showInputBox).mockResolvedValueOnce("Build Server");
+    const renameCmd = registeredCommands.get("nexus.localServer.rename");
+    expect(renameCmd).toBeDefined();
+    await renameCmd!("ls1");
+    expect(core.getLocalServer("ls1")!.name).toBe("Build Server");
+
+    pick.resolve({ config: stale });
+    await duplicating;
+
+    // Load-bearing: "Dev Server (copy)" here means the stale name was copied.
+    expect((await repo.getLocalServers()).map((c) => c.name).sort()).toEqual([
+      "Build Server",
+      "Build Server (copy)"
+    ]);
+  });
+
+  it("does not resurrect a config removed while the picker was open", async () => {
+    // The one bail duplicate needs: the source is gone, so there is nothing to
+    // copy. Spreading the snapshot writes a fresh-id revival of a record the
+    // user deliberately removed — under a NEW id, so removing it again means
+    // finding a row nobody knowingly created.
+    const { core, repo } = await fixture([makeLocalServerConfig()]);
+    const stale = core.getLocalServer("ls1")!;
+
+    const { duplicating, pick } = duplicateViaPicker();
+    await core.removeLocalServerConfig("ls1");
+
+    pick.resolve({ config: stale });
+    await duplicating;
+
+    expect(await repo.getLocalServers()).toEqual([]);
+    expect(core.getSnapshot().localServers).toEqual([]);
   });
 });

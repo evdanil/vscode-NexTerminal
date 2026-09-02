@@ -24,19 +24,26 @@
  *                                   same as nexus.macro.slot
  *   nexus.localServer.inspectLogs — focus/reveal a running server's terminal
  *
- * rename, moveToFolder, and moveToRoot each re-read the live record under
- * configMutationLock before writing (#108): all three capture their config
- * before an interactive pause — the rename input box, moveToFolder's
- * destination picker, or, on the palette path, pickLocalServer's own quick
- * pick — and each writes ONLY the field it owns, bailing out if the record was
- * removed, already holds the target value, or was concurrently changed to some
- * other value while the prompt was open.
+ * rename, moveToFolder, moveToRoot, edit and duplicate each re-read the live
+ * record under configMutationLock before writing (#108): all five capture their
+ * config before an interactive pause — the rename input box, moveToFolder's
+ * destination picker, the edit form itself, or, on the palette path,
+ * pickLocalServer's own quick pick — and each writes ONLY what it owns, bailing
+ * out if the record was removed, already holds the target value, or was
+ * concurrently changed to some other value while the prompt was open.
+ *
+ * duplicate is the one exception to the "bail on divergence" half of that: a
+ * fresh id means it clobbers no existing record, and it owns no destination
+ * field a concurrent write could contradict, so the newest live state is simply
+ * what gets copied. It still has to RE-READ, because the copy's other fields
+ * were otherwise spread off a pre-prompt snapshot — the actual defect, not the
+ * serialization the lock also buys.
  *
  * The manager is injected via ctx (set up in extension.ts). Commands never
  * write persisted config directly: they route through NexusCore methods that
  * themselves serialize through ConfigRepository, while configMutationLock
- * guards the destructive "remove" entry point, and rename/moveToFolder/
- * moveToRoot's stale-capture re-reads, against concurrent writes.
+ * guards the destructive "remove" entry point, and edit/rename/moveToFolder/
+ * moveToRoot/duplicate's stale-capture re-reads, against concurrent writes.
  */
 
 import { randomUUID } from "node:crypto";
@@ -158,6 +165,26 @@ export function formValuesToLocalServer(values: FormValues, existing?: Partial<L
     description: description || undefined,
     group: normalizedGroup
   };
+}
+
+/**
+ * Compare two `group` values as folders rather than as raw strings.
+ *
+ * "no folder" can reach this record by two spellings — `undefined`, which is
+ * what moveToRoot, the removal cascade and `normalizeOptionalFolderPath` all
+ * write, and a literal `""`. Nothing in the current code path produces the
+ * second: `normalizeOptionalFolderPath` maps blank AND non-string input to
+ * `undefined`, never to `""`. A `""` group therefore only survives in a record
+ * that predates the current normalizer, or one hand-imported or hand-edited
+ * straight into settings, and the coercion below exists for that legacy shape
+ * alone — not for anything the form can still submit.
+ *
+ * It is kept because a raw `!==` between the two spellings reads as a folder
+ * CHANGE, which would make the edit form's untouched-group guard fire on a
+ * record that never moved.
+ */
+function sameFolder(a: string | undefined, b: string | undefined): boolean {
+  return (a || undefined) === (b || undefined);
 }
 
 function toLocalServerFromArg(
@@ -472,16 +499,80 @@ export function registerLocalServerCommands(
     vscode.commands.registerCommand("nexus.localServer.edit", async (arg?: unknown) => {
       const existing = toLocalServerFromArg(ctx.core, arg) ?? (await pickLocalServer(ctx.core, "Edit Local Server"));
       if (!existing) return;
+      // Sampled as PRIMITIVES, before the form opens, and deliberately not read
+      // off `existing` later. `toLocalServerFromArg` hands back NexusCore's own
+      // live record object, and `_renameFolderPath` / `removeFolderCascade`
+      // rewrite `.group` on that very object IN PLACE — so by submit time
+      // `existing.group` already reads the post-cascade value and comparing
+      // against it would find no change to defer to. These three are what the
+      // form was actually rendered from.
+      const editedId = existing.id;
+      const editedName = existing.name;
+      const groupWhenFormOpened = existing.group;
       WebviewFormPanel.open("local-server-edit", localServerFormDefinition(existing, collectGroups(ctx)), {
         onSubmit: async (values) => {
           if (normalizeOptionalFolderPath(values.group) === null) {
             throw new Error(INVALID_FOLDER_PATH_MESSAGE);
           }
-          const updated = formValuesToLocalServer(values, existing);
-          if (!updated) {
-            throw new Error("Fill in the required local server fields before saving.");
-          }
-          await ctx.core.addOrUpdateLocalServerConfig(updated);
+          // #108 FOLLOW-UP — this was one of SEVERAL lock-free writes to the
+          // localServers collection that the #108 audit missed; the drag-to-
+          // folder handler and the unified Add Profile form's local-server
+          // branch are the others, both outside this file and both tracked
+          // separately. What singles this one out is the length of its
+          // interactive pause: a webview form the user can leave open for
+          // hours, against an input box or a picker measured in seconds.
+          // addOrUpdateLocalServerConfig persists the WHOLE collection on
+          // every call (read-modify-write of the full array), which is exactly
+          // what configMutationLock exists to serialize — rename,
+          // moveToFolder, moveToRoot, duplicate and remove in this same file
+          // already do.
+          //
+          // Re-resolve the LIVE record inside the lock rather than building
+          // from the pre-form snapshot, the same shape nexus.localShell.edit
+          // uses: form-backed fields still come from `values` and win as
+          // before, but anything the form does not carry sources from the
+          // current record instead of being reverted to what it was when the
+          // form opened.
+          await configMutationLock.runExclusive(async () => {
+            const live = ctx.core.getLocalServer(editedId);
+            if (!live) {
+              throw new Error(`Local server "${editedName}" was removed while this form was open. Nothing was saved.`);
+            }
+            const updated = formValuesToLocalServer(values, live);
+            if (!updated) {
+              throw new Error("Fill in the required local server fields before saving.");
+            }
+            // `group` IS a form field, so `values` always carries a value for
+            // it — including when the user never touched it. That makes the
+            // folder-cascade race invisible to the re-resolve above: a folder
+            // rename or removeFolderCascade (both lock-protected, both rewrite
+            // each affected record's `group` IN PLACE) landing while the form
+            // sat open would be silently reverted by the form's pre-cascade
+            // value on Save, potentially stranding the record in a folder that
+            // no longer exists.
+            //
+            // So `group` is only taken from the form when the user actually
+            // CHANGED it — an explicit choice still wins, as it must. An
+            // untouched field expresses no intent, and deferring to the live
+            // record there is the #84 P2-1 bail applied to the one field this
+            // form shares with the move commands.
+            if (
+              sameFolder(updated.group, groupWhenFormOpened) &&
+              !sameFolder(live.group, groupWhenFormOpened)
+            ) {
+              updated.group = live.group;
+            }
+            // `name` has the same shape of race via a DIFFERENT command:
+            // nexus.localServer.rename is its own lock-protected, live-reread
+            // handler for exactly this field, running independently of this
+            // form. If it lands while this form sits open, the form's stale
+            // `values.name` would otherwise silently revert it on Save even
+            // though the user never touched the Name field here.
+            if (updated.name === editedName && live.name !== editedName) {
+              updated.name = live.name;
+            }
+            await ctx.core.addOrUpdateLocalServerConfig(updated);
+          });
         }
       });
     }),
@@ -570,7 +661,37 @@ export function registerLocalServerCommands(
     vscode.commands.registerCommand("nexus.localServer.duplicate", async (arg?: unknown) => {
       const config = toLocalServerFromArg(ctx.core, arg) ?? (await pickLocalServer(ctx.core, "Duplicate Local Server"));
       if (!config) return;
-      await ctx.core.addOrUpdateLocalServerConfig({ ...config, id: randomUUID(), name: `${config.name} (copy)` });
+      // #108 FOLLOW-UP — the fresh id does mean no EXISTING record can be
+      // clobbered by this write, but that was never the whole risk: `config`
+      // is captured BEFORE the tree item's or the quick pick's interactive
+      // pause, and every OTHER field of the copy was being spread off that
+      // stale snapshot. Rename the folder "Backend" to "Platform" while the
+      // picker sits open and the copy landed back in a folder that no longer
+      // exists; the same applies to a concurrent rename or edit of any field.
+      //
+      // So this is a re-resolve, like rename / moveToFolder / moveToRoot
+      // above — only simpler. Those own a single destination field a
+      // concurrent write could overwrite, so they bail when the live value
+      // diverged to some OTHER value. duplicate owns no such field: it makes
+      // no decision about the source record at all, it only copies it. The
+      // newest live state is therefore always the right thing to copy, and
+      // the only bail is the source having been removed outright.
+      //
+      // Serialization still matters on its own: addOrUpdateLocalServerConfig
+      // persists the whole collection, so an unserialized copy racing a
+      // lock-holding section (replace-mode import, folder cascade) can commit
+      // against a stale collection snapshot and drop that section's writes.
+      await configMutationLock.runExclusive(async () => {
+        const live = ctx.core.getLocalServer(config.id);
+        if (!live) {
+          return; // removed while the prompt was open — nothing left to copy
+        }
+        await ctx.core.addOrUpdateLocalServerConfig({
+          ...live,
+          id: randomUUID(),
+          name: `${live.name} (copy)`
+        });
+      });
     }),
 
     vscode.commands.registerCommand("nexus.localServer.copyInfo", async (arg?: unknown) => {

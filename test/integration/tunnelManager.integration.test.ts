@@ -131,6 +131,140 @@ class DirectTcpSshFactory implements SshFactory {
   }
 }
 
+/**
+ * A shared SSH connection whose `openDirectTcp` can be scripted to reject a
+ * given number of times before behaving normally, and which counts its own
+ * disposals. Used to prove that a per-channel refusal does not take the shared
+ * connection down with it.
+ */
+class ScriptedSshConnection extends DirectTcpSshConnection {
+  public disposeCount = 0;
+  public readonly pendingFailures: unknown[] = [];
+
+  public override async openDirectTcp(remoteIP: string, remotePort: number): Promise<net.Socket> {
+    if (this.pendingFailures.length > 0) {
+      throw this.pendingFailures.shift();
+    }
+    return super.openDirectTcp(remoteIP, remotePort);
+  }
+
+  public override dispose(): void {
+    this.disposeCount += 1;
+    super.dispose();
+  }
+}
+
+class ScriptedSshFactory implements SshFactory {
+  public connectCount = 0;
+  public readonly connections: ScriptedSshConnection[] = [];
+
+  public async connect(_server: ServerConfig): Promise<SshConnection> {
+    this.connectCount += 1;
+    const conn = new ScriptedSshConnection();
+    this.connections.push(conn);
+    return conn;
+  }
+}
+
+/**
+ * The error ssh2 produces for SSH_MSG_CHANNEL_OPEN_FAILURE: the server answered
+ * our channel request — over a perfectly healthy transport — and refused it
+ * because the requested destination is unreachable.
+ * (`node_modules/ssh2/lib/utils.js:onChannelOpenFailure`, reason 2 =
+ * CONNECT_FAILED.)
+ */
+function channelOpenFailure(): Error {
+  const error = new Error("(SSH) Channel open failure: Connection refused");
+  (error as Error & { reason: number }).reason = 2;
+  return error;
+}
+
+/** What ssh2's `Client` throws when the transport itself is gone. */
+function transportFailure(): Error {
+  return new Error("Not connected");
+}
+
+/** Connect, send a probe, and resolve once the tunnel closes us without data. */
+async function expectRefusedConnection(port: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const client = net.createConnection({ host: "127.0.0.1", port }, () => {
+      client.write("probe");
+    });
+    client.once("data", () => {
+      client.destroy();
+      reject(new Error("Expected the tunnel to refuse the connection, but data came back"));
+    });
+    client.once("error", () => resolve());
+    client.once("close", () => resolve());
+  });
+}
+
+/** Read exactly `count` bytes. Only safe when no further bytes can be in flight. */
+function readBytes(socket: net.Socket, count: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    let buf = Buffer.alloc(0);
+    const cleanup = (): void => {
+      socket.off("data", onData);
+      socket.off("error", onError);
+      socket.off("close", onClose);
+    };
+    const onData = (chunk: Buffer): void => {
+      buf = Buffer.concat([buf, chunk]);
+      if (buf.length >= count) {
+        cleanup();
+        resolve(buf.subarray(0, count));
+      }
+    };
+    const onError = (error: Error): void => {
+      cleanup();
+      reject(error);
+    };
+    const onClose = (): void => {
+      cleanup();
+      reject(new Error(`Socket closed after ${buf.length} of ${count} bytes`));
+    };
+    socket.on("data", onData);
+    socket.once("error", onError);
+    socket.once("close", onClose);
+  });
+}
+
+/**
+ * Drive a full SOCKS5 CONNECT against the proxy. Returns the reply code and,
+ * when the request succeeded and a payload was given, whatever echoed back.
+ */
+async function socks5Request(
+  proxyPort: number,
+  destPort: number,
+  payload?: string
+): Promise<{ reply: number; echo?: string }> {
+  const client = net.createConnection({ host: "127.0.0.1", port: proxyPort });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      client.once("connect", () => resolve());
+      client.once("error", reject);
+    });
+    client.write(Buffer.from([0x05, 0x01, 0x00]));
+    const greeting = await readBytes(client, 2);
+    expect(greeting[0]).toBe(0x05);
+    expect(greeting[1]).toBe(0x00);
+
+    const portBuf = Buffer.alloc(2);
+    portBuf.writeUInt16BE(destPort, 0);
+    client.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1]), portBuf]));
+    const reply = await readBytes(client, 10);
+    if (reply[1] !== 0x00 || payload === undefined) {
+      return { reply: reply[1] };
+    }
+
+    client.write(payload);
+    const echo = await readBytes(client, Buffer.byteLength(payload));
+    return { reply: reply[1], echo: echo.toString("utf8") };
+  } finally {
+    client.destroy();
+  }
+}
+
 async function waitForTraffic(events: TunnelEvent[], timeoutMs = 1000): Promise<TunnelEvent | undefined> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -384,5 +518,153 @@ describe("TunnelManager integration", () => {
     expect(errorEvents).toHaveLength(0);
 
     await manager.stopAll();
+  });
+
+  it("keeps the shared connection alive when a channel open is refused (local)", async () => {
+    const remotePort = await getFreePort();
+    echoServer = await startEchoServer(remotePort);
+    const localPort = await getFreePort();
+
+    const profile: TunnelProfile = {
+      id: "tunnel-channel-refusal",
+      name: "Channel Refusal Tunnel",
+      localPort,
+      remoteIP: "127.0.0.1",
+      remotePort,
+      autoStart: false,
+      connectionMode: "shared"
+    };
+
+    const sshFactory = new ScriptedSshFactory();
+    manager = new TunnelManager(sshFactory, sshFactory);
+    const events: TunnelEvent[] = [];
+    manager.onDidChange((event) => events.push(event));
+
+    const activeTunnel = await manager.start(profile, testServer, { connectionMode: "shared" });
+    const shared = sshFactory.connections[0];
+    expect(shared).toBeDefined();
+
+    // One client asks for a destination the remote cannot reach.
+    shared.pendingFailures.push(channelOpenFailure());
+    await expectRefusedConnection(localPort);
+
+    // The transport is untouched, so the next client rides the same connection.
+    const second = await exchangeMessage(localPort, "beta");
+    expect(second).toBe("beta");
+    expect(shared.disposeCount).toBe(0);
+    expect(sshFactory.connectCount).toBe(1);
+    expect(
+      events.some((e) => e.type === "error" && e.message.includes("Shared SSH connection closed"))
+    ).toBe(false);
+
+    await manager.stop(activeTunnel.id);
+  });
+
+  it("tears down the shared connection when the SSH transport itself fails (local)", async () => {
+    const remotePort = await getFreePort();
+    echoServer = await startEchoServer(remotePort);
+    const localPort = await getFreePort();
+
+    const profile: TunnelProfile = {
+      id: "tunnel-transport-failure",
+      name: "Transport Failure Tunnel",
+      localPort,
+      remoteIP: "127.0.0.1",
+      remotePort,
+      autoStart: false,
+      connectionMode: "shared"
+    };
+
+    const sshFactory = new ScriptedSshFactory();
+    manager = new TunnelManager(sshFactory, sshFactory);
+    manager.onDidChange(() => {});
+
+    const activeTunnel = await manager.start(profile, testServer, { connectionMode: "shared" });
+    const shared = sshFactory.connections[0];
+
+    shared.pendingFailures.push(transportFailure());
+    await expectRefusedConnection(localPort);
+
+    expect(shared.disposeCount).toBe(1);
+
+    // The dead connection was cleared, so the next client gets a fresh one.
+    const second = await exchangeMessage(localPort, "beta");
+    expect(second).toBe("beta");
+    expect(sshFactory.connectCount).toBe(2);
+
+    await manager.stop(activeTunnel.id);
+  });
+
+  it("keeps the shared connection alive when a SOCKS5 destination is refused (dynamic)", async () => {
+    const remotePort = await getFreePort();
+    echoServer = await startEchoServer(remotePort);
+    const localPort = await getFreePort();
+
+    const profile: TunnelProfile = {
+      id: "tunnel-socks-refusal",
+      name: "SOCKS5 Refusal Proxy",
+      localPort,
+      remoteIP: "0.0.0.0",
+      remotePort: 0,
+      autoStart: false,
+      tunnelType: "dynamic",
+      connectionMode: "shared"
+    };
+
+    const sshFactory = new ScriptedSshFactory();
+    manager = new TunnelManager(sshFactory, sshFactory);
+    manager.onDidChange(() => {});
+
+    const activeTunnel = await manager.start(profile, testServer, { connectionMode: "shared" });
+    const shared = sshFactory.connections[0];
+
+    // One browser tab requests an unreachable host.
+    shared.pendingFailures.push(channelOpenFailure());
+    const refused = await socks5Request(localPort, remotePort);
+    expect(refused.reply).toBe(0x01);
+
+    // Every other tab must still be proxied over the same SSH connection.
+    const ok = await socks5Request(localPort, remotePort, "socks5-echo");
+    expect(ok.reply).toBe(0x00);
+    expect(ok.echo).toBe("socks5-echo");
+    expect(shared.disposeCount).toBe(0);
+    expect(sshFactory.connectCount).toBe(1);
+
+    await manager.stop(activeTunnel.id);
+  });
+
+  it("tears down the shared connection when the SSH transport fails (dynamic)", async () => {
+    const remotePort = await getFreePort();
+    echoServer = await startEchoServer(remotePort);
+    const localPort = await getFreePort();
+
+    const profile: TunnelProfile = {
+      id: "tunnel-socks-transport-failure",
+      name: "SOCKS5 Transport Failure Proxy",
+      localPort,
+      remoteIP: "0.0.0.0",
+      remotePort: 0,
+      autoStart: false,
+      tunnelType: "dynamic",
+      connectionMode: "shared"
+    };
+
+    const sshFactory = new ScriptedSshFactory();
+    manager = new TunnelManager(sshFactory, sshFactory);
+    manager.onDidChange(() => {});
+
+    const activeTunnel = await manager.start(profile, testServer, { connectionMode: "shared" });
+    const shared = sshFactory.connections[0];
+
+    shared.pendingFailures.push(transportFailure());
+    const refused = await socks5Request(localPort, remotePort);
+    expect(refused.reply).toBe(0x01);
+    expect(shared.disposeCount).toBe(1);
+
+    const ok = await socks5Request(localPort, remotePort, "socks5-echo");
+    expect(ok.reply).toBe(0x00);
+    expect(sshFactory.connectCount).toBe(2);
+
+    await manager.stop(activeTunnel.id);
   });
 });
