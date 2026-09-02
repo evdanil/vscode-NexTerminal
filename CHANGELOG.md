@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **A DHCP pool with no end address set is no longer compared against a network far wider than the one it serves.** Leaving Pool Count (and so the stored `rangeEnd`) blank means the service runs on the packaged end, `192.168.2.199` — a fixed address, not one re-derived from the pool start. Several places instead treated a blank end as unknown and widened the question to the whole subnet's broadcast: a pool on `192.168.2.x` with a `/16` mask was checked for NIC coverage all the way through `192.168.255.255`. The visible costs were a subnet-mismatch warning in the sidebar about a pool that was fine, a matching-NIC suggestion that vanished, and a Server Identifier that quietly failed to follow a rebind between two NICs that both served the real, narrower pool. Every place that reads the stored end now resolves the blank the same way the service does.
+
+- **Save now refuses a bind paired with an unrelated pool — and only that.** Picking an interface derives that NIC's own network and moves the pool onto it, but a NIC the derivation can produce nothing for fills nothing, and the selection has already been applied by then: the bind moved, the pool rows kept the previous network's values, and Save wrote the pairing without a word. That is now refused, with the reason. The refusal is scoped to the pairing the fill could not close: a pool that already fits the interface you picked saves however it was built, including a `/30` point-to-point bind whose pool is its single peer, a range narrowed inside a wider advertised subnet, and a NIC the platform reports without a netmask whose pool is on its own wire. Working setups of each kind were briefly rejected while the check asked whether a *fresh* pool could be derived rather than whether the one being saved fit; the message no longer claims an address the pool hands out is "already taken", and it names the way out.
+
+- **Two auto-fills in flight are settled by the order you asked for them, not the order they come back.** Committing the Network (CIDR) row and then picking a different interface before either answer lands posts two round trips that both derive the subnet, pool start and pool count, from two different networks. Whichever returned first won, and the answer arriving second read the fields it found as hand-edited and skipped them — leaving the form bound to the NIC picked *last*, serving the pool of the network typed *first*, and a held Save persisting exactly that. Each answer now records what it wrote, so a later answer can tell an edit of yours (which always wins) from an older request's write (which it supersedes), field by field — the older answer still lands on everything the newer one leaves alone, which matters under Serve relayed requests, where a NIC pick fills only the Server Identifier.
+
 ## [2.8.211] — 2026-08-30
 
 ### Fixed
