@@ -77,19 +77,13 @@ vi.mock("../../src/ui/nexusTreeProvider", () => ({
   LocalServerSessionTreeItem: class { public constructor(public readonly session: unknown) {} }
 }));
 
-vi.mock("../../src/utils/folderPaths", async () => {
-  const actual = await import("../../src/utils/folderPaths");
-  return {
-    ...actual,
-    normalizeOptionalFolderPath: (value: unknown) => {
-      if (value === undefined || value === null || value === "") return "";
-      if (typeof value !== "string") return null;
-      const trimmed = value.trim();
-      if (trimmed.startsWith("/not/a/relative/path")) return null;
-      return actual.normalizeOptionalFolderPath(value);
-    }
-  };
-});
+// folderPaths is deliberately NOT mocked. It used to be, with a local
+// reimplementation of normalizeOptionalFolderPath that returned "" for blank
+// input and null for non-string input — the opposite of the real function,
+// which maps BOTH to undefined and reserves null for a non-empty path that
+// fails validation. Nothing here depended on the divergence (no assertion ever
+// expected "" or null for a group), but it was the source of a comment in
+// localServerCommands.ts claiming "" was a value the form could produce.
 
 vi.mock("../../src/utils/naturalCompare", () => ({ naturalCompare: (a: string, b: string) => a.localeCompare(b) }));
 
@@ -155,8 +149,13 @@ describe("formValuesToLocalServer", () => {
   });
 
   it("returns undefined when group contains an invalid folder path", () => {
-    // normalizeOptionalFolderPath returns null for leading slashes with no root
-    const values: FormValues = { ...baseValues(), group: "/not/a/relative/path" };
+    // A REAL rejection from the real normalizer: ".." as a segment is refused
+    // outright. The previous fixture used "/not/a/relative/path", which the
+    // real normalizer ACCEPTS — the leading slash produces an empty segment
+    // that is filtered out, yielding "not/a/relative/path" — so the rejection
+    // only ever came from the local mock that has now been removed, and the
+    // test proved nothing about the path the SUT actually takes.
+    const values: FormValues = { ...baseValues(), group: "../escape" };
     expect(formValuesToLocalServer(values)).toBeUndefined();
   });
 
