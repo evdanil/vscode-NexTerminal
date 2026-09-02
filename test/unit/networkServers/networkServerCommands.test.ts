@@ -24,6 +24,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { NetworkServerError } from "../../../src/models/networkServer";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
+const networkInterfaces = vi.hoisted(() => vi.fn(() => ({}) as Record<string, unknown>));
+
+// Only `networkInterfaces` is replaced — everything else in `node:os` is left
+// real, because plenty of the import graph below reaches for `tmpdir`/`homedir`.
+vi.mock("node:os", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:os")>()),
+  networkInterfaces
+}));
+
 const configUpdates = vi.hoisted(() => [] as Array<{ section: string; key: string; value: unknown; target: unknown }>);
 const formPanelOpens = vi.hoisted(
   () =>
@@ -88,6 +97,7 @@ vi.mock("../../../src/ui/formDefinitions", () => ({
 
 import * as vscode from "vscode";
 import { registerNetworkServerCommands } from "../../../src/commands/networkServerCommands";
+import { networkServerFormDefinition } from "../../../src/ui/formDefinitions";
 
 function fakeManager(overrides: Record<string, unknown> = {}) {
   return {
@@ -117,6 +127,9 @@ beforeEach(() => {
   registeredCommands.clear();
   configUpdates.length = 0;
   formPanelOpens.length = 0;
+  networkInterfaces.mockReset();
+  networkInterfaces.mockReturnValue({});
+  vi.mocked(networkServerFormDefinition).mockClear();
   vi.mocked(vscode.window.showQuickPick).mockReset();
   vi.mocked(vscode.window.showErrorMessage).mockReset();
   vi.mocked(vscode.window.showInformationMessage).mockReset();
@@ -234,6 +247,45 @@ describe("registerNetworkServerCommands — failure surfacing", () => {
     const cmd = register(fakeContext(manager));
     await cmd("nexus.networkServer.restart")("tftp");
     expect(vscode.window.showErrorMessage).toHaveBeenCalledWith("Failed to restart network server: boom");
+  });
+});
+
+/**
+ * REVIEW FINDING — the DHCP form's bind-address picker annotates the NICs that
+ * are on the pool's subnet, and the seed it is asked about carries the RAW
+ * `rangeEnd` setting. A blank one reached `dhcpInterfaceChoices` as "no end
+ * known", widening the question to `start`–subnet-broadcast; the service instead
+ * resolves a blank end to the packaged `192.168.2.199`, with no reference to
+ * `rangeStart`. Under the `/16` below the two windows disagree, so the picker
+ * dropped the annotation from the one NIC that serves the running pool.
+ */
+describe("registerNetworkServerCommands — edit, the DHCP bind-address annotations", () => {
+  /** The `interfaceOptions` the form definition was built with. */
+  function pickerRows(): Array<{ label: string; value: string; description?: string }> {
+    const call = vi.mocked(networkServerFormDefinition).mock.calls.at(-1)!;
+    return (call[2] as { interfaceOptions: Array<{ label: string; value: string; description?: string }> })
+      .interfaceOptions;
+  }
+
+  async function openDhcpFormFor(config: Record<string, unknown>): Promise<void> {
+    networkInterfaces.mockReturnValue({
+      eth0: [{ address: "192.168.2.5", netmask: "255.255.255.0", family: "IPv4", internal: false }]
+    });
+    const manager = fakeManager({ readConfig: vi.fn(() => config) });
+    const cmd = register(fakeContext(manager));
+    await cmd("nexus.networkServer.edit")("dhcp");
+  }
+
+  it("annotates the NIC that serves the pool a blank end really implies", async () => {
+    await openDhcpFormFor({ rangeStart: "192.168.2.10", subnet: "255.255.0.0" });
+    expect(pickerRows().find((row) => row.value === "192.168.2.5")?.description).toBe("matches the pool subnet");
+  });
+
+  it("still declines to annotate it when the end is SET past that NIC's link", async () => {
+    // One field apart from the fixture above — an end the user really typed,
+    // inside the advertised /16 but outside this NIC's /24.
+    await openDhcpFormFor({ rangeStart: "192.168.2.10", rangeEnd: "192.168.5.5", subnet: "255.255.0.0" });
+    expect(pickerRows().find((row) => row.value === "192.168.2.5")?.description).toBeUndefined();
   });
 });
 

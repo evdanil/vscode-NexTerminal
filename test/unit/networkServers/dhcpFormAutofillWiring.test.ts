@@ -337,6 +337,197 @@ describe("DHCP form — switching between two NICs on the SAME subnet", () => {
 });
 
 /**
+ * REVIEW FINDING (P1, sixth round) — two requests outstanding over the SAME
+ * fields, and the answers coming back in the wrong order.
+ *
+ * Commit the CIDR row and then pick a NIC on a different network before either
+ * answer lands, and both requests derive subnet, rangeStart, gateway,
+ * broadcast, the server identifier and the CIDR row itself — from two
+ * different networks. Each request judges its answer against ITS OWN snapshot
+ * alone (the fifth finding), which is a hand-edit test and nothing more, so the
+ * outcome falls out of arrival order: let the CIDR answer land first and the
+ * NIC answer that follows finds those targets no longer holding what its
+ * snapshot took, reads that as the user's own typing and leaves them. The form
+ * is left bound to the NIC picked LAST holding the pool of the network typed
+ * FIRST, and the Save that was deferred through both round trips persists
+ * exactly that pairing.
+ *
+ * The gesture order is the user's intent; the order two round trips return in
+ * is the extension host's scheduling. So the script ranks by the request id it
+ * minted, and tells an older answer's write apart from a hand edit by
+ * remembering which request wrote each field and what it left there.
+ */
+describe("DHCP form — a CIDR commit and a NIC pick outstanding at once", () => {
+  /** The pair of requests the two gestures post, in the order they were made. */
+  function twoGestures(harness: ReturnType<typeof openForm>) {
+    const requests = harness.posted.filter((message) => message.type === "autofill");
+    expect(requests).toHaveLength(2);
+    const [older, newer] = requests as Array<Extract<FormMessage, { type: "autofill" }>>;
+    // The ranking this whole block rests on: ids are minted in gesture order.
+    expect(newer.requestId).toBeGreaterThan(older.requestId!);
+    return { older, newer };
+  }
+
+  /**
+   * Both answers as the host would compose them — each from the snapshot ITS
+   * OWN request carried, which is the whole point: the NIC request went out
+   * before the CIDR answer had touched anything, so its snapshot still
+   * describes the 192.168.2.x form and its answer cannot describe what the CIDR
+   * answer is about to write.
+   */
+  function bothAnswers(harness: ReturnType<typeof openForm>) {
+    const { older, newer } = twoGestures(harness);
+    return {
+      older,
+      newer,
+      olderFills: dhcpFormAutofillFields(older.key, older.value, older.values, INTERFACES, older.previousValue)!,
+      newerFills: dhcpFormAutofillFields(newer.key, newer.value, newer.values, INTERFACES, newer.previousValue)!
+    };
+  }
+
+  function deliverAnswer(
+    harness: ReturnType<typeof openForm>,
+    request: Extract<FormMessage, { type: "autofill" }>,
+    fills: Record<string, string>
+  ): void {
+    harness.deliver({ type: "fillFields", key: request.key, value: request.value, values: fills, requestId: request.requestId });
+    harness.deliver({ type: "autofillSettled", key: request.key, value: request.value, requestId: request.requestId });
+  }
+
+  /** Types a network, then picks a NIC on a DIFFERENT one, answering neither. */
+  function typedThenPicked() {
+    const harness = openForm(dhcpForm({ rangeStart: "192.168.2.10", subnet: "255.255.255.0" }));
+    harness.type("cidr", "10.0.0.0/24");
+    harness.choose("interface", "192.168.9.5");
+    return harness;
+  }
+
+  it("lets the NIC picked LAST win the fields both answers fill, even though the CIDR answer landed first (kills judging each answer against its own snapshot alone: the earlier answer's write reads as a hand edit to the later one, so the newest gesture is skipped and the form keeps the pool of the network the user has already moved past)", () => {
+    const harness = typedThenPicked();
+    const { older, newer, olderFills, newerFills } = bothAnswers(harness);
+    expect(olderFills.rangeStart).toBe("10.0.0.1");
+    expect(newerFills.rangeStart).toBe("192.168.9.1");
+
+    // The CIDR round trip returns first and fills its network in full.
+    deliverAnswer(harness, older, olderFills);
+    expect(harness.value("rangeStart")).toBe("10.0.0.1");
+    expect(harness.value("gateway")).toBe("10.0.0.254");
+
+    // …and only then the NIC's, which is the LATER gesture and must supersede
+    // it on every field they share.
+    deliverAnswer(harness, newer, newerFills);
+
+    const values = harness.submit();
+    expect(values.interface).toBe("192.168.9.5");
+    expect(values.cidr).toBe("192.168.9.0/24");
+    expect(values.rangeStart).toBe("192.168.9.1");
+    expect(values.gateway).toBe("192.168.9.254");
+    expect(values.broadcast).toBe("192.168.9.255");
+    expect(values.dns).toBe("192.168.9.254");
+    // Option 54 is the address the socket will answer from — the NIC just
+    // picked, not the one the earlier network implied.
+    expect(values.serverId).toBe("192.168.9.5");
+  });
+
+  it("still lets the NIC win when its answer arrives FIRST and the CIDR answer follows", () => {
+    // The chronologically tidy case, which worked before the ranking existed —
+    // the older answer is dropped whole by the stale-answer guard, because the
+    // newer one rewrote the very CIDR row it echoes. It is asserted so the
+    // ranking cannot be built at its expense.
+    const harness = typedThenPicked();
+    const { older, newer, olderFills, newerFills } = bothAnswers(harness);
+
+    deliverAnswer(harness, newer, newerFills);
+    deliverAnswer(harness, older, olderFills);
+
+    const values = harness.submit();
+    expect(values.interface).toBe("192.168.9.5");
+    expect(values.cidr).toBe("192.168.9.0/24");
+    expect(values.rangeStart).toBe("192.168.9.1");
+    expect(values.gateway).toBe("192.168.9.254");
+    expect(values.serverId).toBe("192.168.9.5");
+  });
+
+  it("holds a Save through BOTH round trips and submits over the later gesture's network", () => {
+    // A suppressed WRITE must not retire a REQUEST: each answer releases its
+    // own id and only its own, so the deferral keeps waiting for the NIC round
+    // trip after the CIDR one has been answered and partly overruled.
+    const harness = typedThenPicked();
+    const { older, newer, olderFills, newerFills } = bothAnswers(harness);
+
+    expect(harness.saveHeld()).toBe(true);
+    expect(harness.attemptSubmit()).toBeUndefined();
+
+    deliverAnswer(harness, older, olderFills);
+    expect(harness.saveHeld()).toBe(true);
+    expect(harness.posted.some((message) => message.type === "submit")).toBe(false);
+
+    deliverAnswer(harness, newer, newerFills);
+    expect(harness.saveHeld()).toBe(false);
+    const submitted = harness.posted.filter((message) => message.type === "submit");
+    expect(submitted).toHaveLength(1);
+    const values = submitted[0].type === "submit" ? submitted[0].values : {};
+    expect(values.interface).toBe("192.168.9.5");
+    expect(values.rangeStart).toBe("192.168.9.1");
+    expect(values.gateway).toBe("192.168.9.254");
+  });
+
+  it("refuses an older answer a field a NEWER request's answer has already written, even where the older request's own snapshot still agrees with it (kills ranking by the hand-edit test alone: a newer answer that re-affirms the value a field already held leaves the older one's snapshot check with nothing to object to)", () => {
+    // Both fills are composed here rather than derived, because the real
+    // derivation cannot reach this shape: every answer echoes the CIDR row and
+    // the bind address, so a genuinely stale one is normally dropped whole by
+    // fillAnswersCurrentSelection before any field is weighed. What is under
+    // test is the per-field ranking underneath that — a newer answer that
+    // leaves a field exactly as it found it still OWNS it.
+    const harness = openForm(dhcpForm({ rangeStart: "192.168.2.10", subnet: "255.255.255.0" }));
+    harness.choose("interface", "192.168.9.5");
+    harness.type("cidr", "172.16.0.0/16");
+    const { older, newer } = twoGestures(harness);
+
+    // The later gesture's answer re-affirms the mask the form already had.
+    deliverAnswer(harness, newer, { subnet: "255.255.255.0" });
+    expect(harness.value("subnet")).toBe("255.255.255.0");
+
+    // The earlier gesture's answer, wanting a different one, arrives after.
+    // Its own snapshot took the mask before either answer landed, so it still
+    // agrees — a hand-edit test alone has no grounds to refuse this write.
+    expect(older.values?.subnet).toBe("255.255.255.0");
+    deliverAnswer(harness, older, { subnet: "255.255.0.0" });
+
+    expect(harness.value("subnet")).toBe("255.255.255.0");
+    expect(harness.submit().subnet).toBe("255.255.255.0");
+  });
+
+  it("keeps a target the user hand-edited OVER the older answer's write, and still lets the newer gesture have the rest (kills superseding on the owning request's id alone: the field is owned by the older answer either way, and only the value it left there says whether that write is still what is sitting in it)", () => {
+    // The ranking must not swallow the fifth finding. An older answer's write
+    // is superseded by a newer gesture; the USER's own edit is superseded by
+    // neither — including when the value they edited was itself put there by
+    // the older answer moments before, which is the only fixture where the two
+    // rules can be told apart at all.
+    const harness = typedThenPicked();
+    const { older, newer, olderFills, newerFills } = bothAnswers(harness);
+    expect(olderFills.gateway).toBe("10.0.0.254");
+    expect(newerFills.gateway).toBe("192.168.9.254");
+
+    // The CIDR answer lands and fills its gateway…
+    deliverAnswer(harness, older, olderFills);
+    expect(harness.value("gateway")).toBe("10.0.0.254");
+    // …the user types over it, with the NIC round trip still outstanding…
+    harness.type("gateway", "10.0.0.99");
+    // …and the NIC answer must not treat their typing as the older answer's
+    // own write and roll it forward to its network.
+    deliverAnswer(harness, newer, newerFills);
+
+    const values = harness.submit();
+    expect(values.gateway).toBe("10.0.0.99");
+    // …while everything they did NOT touch is the later gesture's network.
+    expect(values.rangeStart).toBe("192.168.9.1");
+    expect(values.cidr).toBe("192.168.9.0/24");
+    expect(values.broadcast).toBe("192.168.9.255");
+  });
+});
+
+/**
  * REVIEW FINDING (P1) — Save against an autofill still in flight.
  *
  * The submission is collected synchronously from the DOM, and the fill that is
