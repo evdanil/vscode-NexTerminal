@@ -1044,7 +1044,8 @@ function dhcpQuickItems(): QuickAdjustItem[] {
       label: "$(list-ordered) Pool Count",
       // The end address is the thing actually stored, so it is shown too —
       // otherwise a count-only row hides what a peer reading settings.json sees.
-      description: count > 0 ? `${String(count)} addresses → ${rangeEnd ?? DEFAULTS.rangeEnd}` : "pool range is invalid",
+      description:
+        count > 0 ? `${String(count)} addresses → ${effectiveDhcpRangeEnd(rangeEnd)}` : "pool range is invalid",
       run: () => editPoolCount(rangeStart, count, subnet)
     },
     {

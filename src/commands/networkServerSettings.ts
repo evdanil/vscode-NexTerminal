@@ -89,7 +89,7 @@ export { compareIpv4, isContiguousMask, isValidIpv4 };
  * that is anything but empty.
  */
 export function currentPoolCount(rangeStart: string | undefined, rangeEnd: string | undefined): number {
-  return computePoolSize(rangeStart ?? DEFAULTS.rangeStart, rangeEnd ?? DEFAULTS.rangeEnd);
+  return computePoolSize(rangeStart ?? DEFAULTS.rangeStart, effectiveDhcpRangeEnd(rangeEnd));
 }
 
 /**
