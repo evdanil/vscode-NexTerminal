@@ -343,7 +343,30 @@ export class LocalServerSessionTreeItem extends vscode.TreeItem {
   }
 }
 
-type NexusTreeItem = FolderTreeItem | ServerTreeItem | SessionTreeItem | SerialProfileTreeItem | SerialSessionTreeItem | LocalShellProfileTreeItem | LocalShellSessionTreeItem | LocalServerConfigTreeItem | LocalServerSessionTreeItem;
+// The root-level "No matches found" row. It exists so VS Code's viewsWelcome
+// onboarding ("Start by adding a connection profile…") does not render when an
+// active filter merely matches nothing: that welcome view shows whenever the
+// tree has ZERO root children, with no notion of why — so a filtered-empty hub
+// would otherwise invite the user to add profiles they already have. Emitting
+// one inert row suppresses the welcome view for the filtered case only. The
+// root-branch guard is what keeps this class out of the genuinely-empty case
+// (it emits the marker only when the unfiltered tree has something to hide),
+// so a hub with no profiles at all — filter or no filter — still shows its
+// onboarding.
+export class NoMatchesTreeItem extends vscode.TreeItem {
+  public constructor() {
+    super("No matches found", vscode.TreeItemCollapsibleState.None);
+    this.id = "no-matches";
+    this.iconPath = new vscode.ThemeIcon("filter");
+    this.tooltip = "Nothing matches the active filter. Run \u201CNexus: Filter Connectivity Hub\u201D and clear the query to see all profiles.";
+    // Deliberately no contextValue and no command: no context-menu entry can
+    // attach to the row (menus are gated on the /^nexus\./ contextValue
+    // prefix), and handleDrag/handleDrop only act on the concrete item types
+    // above — so the marker cannot be dragged, dropped onto, or activated.
+  }
+}
+
+type NexusTreeItem = FolderTreeItem | ServerTreeItem | SessionTreeItem | SerialProfileTreeItem | SerialSessionTreeItem | LocalShellProfileTreeItem | LocalShellSessionTreeItem | LocalServerConfigTreeItem | LocalServerSessionTreeItem | NoMatchesTreeItem;
 
 export interface NexusTreeCallbacks {
   onTunnelDropped(serverId: string, tunnelProfileId: string): Promise<void>;
@@ -489,7 +512,41 @@ export class NexusTreeProvider
 
   public getChildren(element?: NexusTreeItem): vscode.ProviderResult<NexusTreeItem[]> {
     if (!element) {
-      return this.getFolderChildren(undefined);
+      const root = this.getFolderChildren(undefined);
+      // A filter that matches nothing must surface as the marker row, not as
+      // zero children — zero children is indistinguishable from "no profiles
+      // at all" and would render the viewsWelcome onboarding (see
+      // NoMatchesTreeItem). But the converse is not "filter ⇒ marker": an
+      // empty hub under a filter is still a genuinely empty hub, and its
+      // onboarding is the honest view. The state is reachable WITHOUT any
+      // wipe path — the Filter action is offered unconditionally (title bar
+      // and palette), so a user with zero profiles can submit a query — and
+      // the wipe-path clearing in completeReset/import-replace cannot close
+      // it (Codex P2, e79045d round). So the guard answers the question
+      // directly: re-read the root with the filter lifted (reusing
+      // getFolderChildren itself, not a second copy of the folder/profile
+      // rules); only a hub that HAS something gets the marker. Only the root
+      // branch does this: nested folder calls can't be empty-while-filtered,
+      // because folderHasMatchingDescendant prunes non-matching folders
+      // before they are rendered.
+      if (this.filterText && root.length === 0) {
+        const savedFilter = this.filterText;
+        try {
+          this.filterText = "";
+          const unfiltered = this.getFolderChildren(undefined);
+          if (unfiltered.length === 0) {
+            return [];
+          }
+          return [new NoMatchesTreeItem()];
+        } finally {
+          // Exception-safe restore: a transient throw while materializing the
+          // unfiltered read must not strand filterText at "" (the tree would
+          // silently flip unfiltered while the nexus.filterActive context can
+          // still claim otherwise).
+          this.filterText = savedFilter;
+        }
+      }
+      return root;
     }
     if (element instanceof FolderTreeItem) {
       return this.getFolderChildren(element.folderPath);

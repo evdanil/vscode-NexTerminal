@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.217] — 2026-09-11
+
+### Changed
+
+- **The Connectivity Hub says "No matches found" when an active filter matches nothing.** The Hub's filter narrows the tree by name or hostname, and until now a filter with no hits emptied it completely — and an empty tree is exactly what VS Code answers with the view's welcome content, so the Hub told the user to "Start by adding a connection profile — or import the servers you already have" while they were looking at a tree full of profiles that merely didn't match. A filter that finds nothing now renders a single inert "No matches found" row (no context menu, no click action, no drag-and-drop) in place of the onboarding. The row appears only when there is something to hide: the guard re-reads the tree unfiltered before emitting it, so a hub that is genuinely empty (no profiles at all — whatever the filter box holds) keeps its onboarding. Bulk wipes go one step further: Complete Reset and replace-mode imports clear the Hub filter outright, so neither the marker nor the title-bar filter icon lingers over a wiped config.
+
 ## [2.8.216] — 2026-09-11
 
 ### Fixed

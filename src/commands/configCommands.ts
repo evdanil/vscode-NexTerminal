@@ -3204,6 +3204,15 @@ export function registerConfigCommands(
     const restoredFileNote = fileRestoreResult.restoredFiles > 0 || fileRestoreResult.skippedExistingFiles > 0
       ? `; restored ${plural(fileRestoreResult.restoredFiles, "backup file")}${fileRestoreResult.skippedExistingFiles > 0 ? `, skipped ${plural(fileRestoreResult.skippedExistingFiles, "existing file")}` : ""}`
       : "";
+    // A replace-mode import rewrites the whole config — a payload carrying no
+    // profiles empties the tree, and a filter left set would render the "No
+    // matches found" row over a genuinely empty hub instead of the first-run
+    // onboarding. Same contract as Complete Reset: bulk wipes clear the Hub
+    // filter (via the command, so the nexus.filterActive title-bar icon swaps
+    // back). Merge mode only unions and leaves the filter alone.
+    if (mode === "replace") {
+      await vscode.commands.executeCommand("nexus.filter.clear");
+    }
     void vscode.window.showInformationMessage(
       `Imported ${plural(imported, "profile")}${mode === "replace" ? " (replaced existing)" : ""}${skipNote}${restoredFileNote}.`
     );
@@ -3302,6 +3311,13 @@ export function registerConfigCommands(
         recordNexusConfigWrite(`${section}.${key}`, undefined, Date.now());
         await config.update(key, undefined, vscode.ConfigurationTarget.Global);
       }
+
+      // Reset the Hub filter too — it is view state that outlives the config
+      // it filtered, and a wipe that leaves it set would empty the tree under
+      // an active filter, rendering the "No matches found" row over a
+      // genuinely empty hub instead of the first-run onboarding. Via the
+      // command so the title-bar icon (nexus.filterActive) swaps back as well.
+      await vscode.commands.executeCommand("nexus.filter.clear");
     });
 
     void vscode.window.showInformationMessage("All Nexus data has been deleted.");
