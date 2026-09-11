@@ -477,6 +477,23 @@ describe("config import command (legacy)", () => {
     );
   });
 
+  it("replace mode resets the Hub filter; merge mode leaves it alone", async () => {
+    await core.addOrUpdateServer(makeServer({ id: "existing", name: "Old" }));
+    mockExecuteCommand.mockClear();
+
+    // Replace rewrites the whole config: a payload with no profiles empties
+    // the tree, and a filter left set would render "No matches found" over a
+    // genuinely empty hub instead of the first-run onboarding. Same contract
+    // as Complete Reset. Merge only unions — the pre-existing hub is
+    // untouched, so its filter stays meaningful.
+    await runImport(makeExportData(), "replace");
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.filter.clear");
+
+    mockExecuteCommand.mockClear();
+    await runImport(makeExportData({ servers: [makeServer({ id: "s9", name: "New" })] }), "merge");
+    expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.filter.clear");
+  });
+
   it("replace mode deletes existing auth-profile password and passphrase secrets", async () => {
     await core.addOrUpdateAuthProfile(makeAuthProfile({ id: "existing-ap", authType: "key", keyPath: "/keys/id_ed25519" }));
     await vault.store("auth-profile-password-existing-ap", "old-password");
@@ -5981,6 +5998,22 @@ describe("complete reset", () => {
 
     expect(getMacros()).toEqual([]);
     expect(secretMap.has(macroSecretKey("sec-id"))).toBe(false);
+  });
+
+  it("resets the Hub filter to the empty state so a wiped hub renders its onboarding", async () => {
+    // The filter is view state that outlives the config it filtered. A reset
+    // that left it set would empty the tree under an active filter, and the
+    // Hub would answer with the "No matches found" row instead of the
+    // first-run onboarding — telling a user with zero profiles that their
+    // filter matched nothing. Clearing through the command also swaps the
+    // title-bar icon back (nexus.filterActive context).
+    mockShowWarningMessage.mockResolvedValue("Delete Everything");
+    mockShowInputBox.mockResolvedValue("DELETE");
+
+    const resetCmd = registeredCommands.get("nexus.config.completeReset")!;
+    await resetCmd();
+
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.filter.clear");
   });
 });
 

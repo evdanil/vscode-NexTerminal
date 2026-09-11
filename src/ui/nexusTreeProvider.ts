@@ -348,8 +348,10 @@ export class LocalServerSessionTreeItem extends vscode.TreeItem {
 // active filter merely matches nothing: that welcome view shows whenever the
 // tree has ZERO root children, with no notion of why — so a filtered-empty hub
 // would otherwise invite the user to add profiles they already have. Emitting
-// one inert row suppresses the welcome view for the filtered case only; a
-// genuinely empty hub still returns zero rows and keeps its onboarding.
+// one inert row suppresses the welcome view for the filtered case only. The
+// genuinely-empty hub is kept out of this class's reach by contract (the wipe
+// paths clear the filter when they empty the hub — see completeReset), so a
+// hub with no profiles at all still shows its onboarding.
 export class NoMatchesTreeItem extends vscode.TreeItem {
   public constructor() {
     super("No matches found", vscode.TreeItemCollapsibleState.None);
@@ -513,9 +515,15 @@ export class NexusTreeProvider
       // A filter that matches nothing must surface as the marker row, not as
       // zero children — zero children is indistinguishable from "no profiles
       // at all" and would render the viewsWelcome onboarding (see
-      // NoMatchesTreeItem). Only the root branch emits it: nested folder
-      // calls can't be empty-while-filtered, because folderHasMatchingDescendant
-      // prunes non-matching folders before they are rendered.
+      // NoMatchesTreeItem). The genuinely-empty hub never reaches this branch
+      // by contract: the wipe paths (Complete Reset) clear the filter when
+      // they empty the hub, so a tree with nothing in it never carries a
+      // filter. Residual accepted edge: hand-deleting the very last profile
+      // while a filter is active shows the marker until the filter is
+      // cleared — one click on the title-bar's Clear Filter icon. Only the
+      // root branch emits the marker: nested folder calls can't be
+      // empty-while-filtered, because folderHasMatchingDescendant prunes
+      // non-matching folders before they are rendered.
       if (this.filterText && root.length === 0) {
         return [new NoMatchesTreeItem()];
       }
