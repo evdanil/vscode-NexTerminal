@@ -531,13 +531,20 @@ export class NexusTreeProvider
       // before they are rendered.
       if (this.filterText && root.length === 0) {
         const savedFilter = this.filterText;
-        this.filterText = "";
-        const unfiltered = this.getFolderChildren(undefined);
-        this.filterText = savedFilter;
-        if (unfiltered.length === 0) {
-          return [];
+        try {
+          this.filterText = "";
+          const unfiltered = this.getFolderChildren(undefined);
+          if (unfiltered.length === 0) {
+            return [];
+          }
+          return [new NoMatchesTreeItem()];
+        } finally {
+          // Exception-safe restore: a transient throw while materializing the
+          // unfiltered read must not strand filterText at "" (the tree would
+          // silently flip unfiltered while the nexus.filterActive context can
+          // still claim otherwise).
+          this.filterText = savedFilter;
         }
-        return [new NoMatchesTreeItem()];
       }
       return root;
     }

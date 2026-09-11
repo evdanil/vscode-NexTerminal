@@ -501,6 +501,33 @@ describe("NexusTreeProvider folder contexts and filtering", () => {
     provider.setSnapshot({ ...emptySnapshot() });
     expect(provider.getChildren(undefined)).toEqual([]);
   });
+
+  it("restores the filter even when the unfiltered re-read throws", () => {
+    // The temporary filter lift in the guard must be exception-safe: a
+    // transient throw while materializing the unfiltered read would otherwise
+    // strand filterText at "" — the tree silently flips unfiltered,
+    // getFilterText() loses the query, and the independently maintained
+    // nexus.filterActive context can still show the Clear Filter icon.
+    const provider = new NexusTreeProvider(callbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      servers: [makeServer({ id: "s1", name: "Prod API" })]
+    });
+    provider.setFilter("zzz-no-match");
+
+    const original = provider["getFolderChildren"].bind(provider);
+    let calls = 0;
+    provider["getFolderChildren"] = (parentPath?: string) => {
+      calls += 1;
+      if (calls >= 2) {
+        throw new Error("transient read failure");
+      }
+      return original(parentPath);
+    };
+
+    expect(() => provider.getChildren(undefined)).toThrow("transient read failure");
+    expect(provider.getFilterText()).toBe("zzz-no-match");
+  });
 });
 
 function makeSerial(overrides: Partial<SerialProfile> = {}): SerialProfile {
