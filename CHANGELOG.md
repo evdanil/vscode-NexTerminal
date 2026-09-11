@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.215] — 2026-09-11
+
+### Security
+
+- **A dependency update closes one high- and two moderate-severity advisories in the packaging toolchain.** `js-yaml` (4.3.1 → 4.3.2) fixes a CPU denial of service via empty merge sources bypassing `maxTotalMergeKeys` (GHSA-2883-xcg3-v3hh), and `qs` (6.15.3 → 6.16.0) fixes an array-limit bypass via bracket-key comma parsing (GHSA-x5fp-wj9c-mxmx) and a denial of service via attacker-controlled `isBuffer` (GHSA-4mjr-xmp4-gh2g). Both reach this repository only through `@vscode/vsce` — `js-yaml` via `@secretlint`'s config loader, `qs` via `typed-rest-client` — build-time only, never shipped in the VSIX, never processing untrusted input. No extension code changed; the lockfile is the only edit.
+
 ## [2.8.214] — 2026-09-02
 
 ### Security
