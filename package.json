@@ -4525,6 +4525,6 @@
     "patch-package": "8.0.1",
     "rimraf": "^6.0.1",
     "typescript": "^5.8.2",
-    "vitest": "^4.1.9"
+    "vitest": "^4.1.11"
   }
 }
