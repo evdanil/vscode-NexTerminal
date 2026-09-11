@@ -480,6 +480,27 @@ describe("NexusTreeProvider folder contexts and filtering", () => {
 
     expect(provider.getChildren(undefined)).toEqual([]);
   });
+
+  it("keeps the welcome view when the hub is genuinely empty even with a filter set", () => {
+    // The state is reachable without any wipe path: the Filter action is
+    // offered unconditionally (package.json title bar and palette), so a user
+    // with zero profiles can submit a query and set the filter over an empty
+    // hub. The filter is then hiding nothing that exists — the onboarding is
+    // the honest view. The guard answers by re-reading the root with the
+    // filter lifted: only a hub with SOMETHING gets the marker row.
+    const provider = new NexusTreeProvider(callbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      servers: [makeServer({ id: "s1", name: "Prod API" })]
+    });
+    provider.setFilter("zzz-no-match");
+    expect(provider.getChildren(undefined).some((c) => c instanceof NoMatchesTreeItem)).toBe(true);
+
+    // Config emptied underneath the still-set filter (delete-all, a complete
+    // reset that predates the wipe-path clearing, an import replace).
+    provider.setSnapshot({ ...emptySnapshot() });
+    expect(provider.getChildren(undefined)).toEqual([]);
+  });
 });
 
 function makeSerial(overrides: Partial<SerialProfile> = {}): SerialProfile {
