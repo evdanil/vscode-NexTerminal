@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as vscode from "vscode";
-import { FolderTreeItem, LocalShellProfileTreeItem, LocalShellSessionTreeItem, NexusTreeProvider, SerialProfileTreeItem, SerialSessionTreeItem, ServerTreeItem, SessionTreeItem } from "../../src/ui/nexusTreeProvider";
+import { FolderTreeItem, LocalShellProfileTreeItem, LocalShellSessionTreeItem, NexusTreeProvider, NoMatchesTreeItem, SerialProfileTreeItem, SerialSessionTreeItem, ServerTreeItem, SessionTreeItem } from "../../src/ui/nexusTreeProvider";
 import { TUNNEL_DRAG_MIME } from "../../src/ui/dndMimeTypes";
 import type { LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile } from "../../src/models/config";
 
@@ -11,6 +11,7 @@ vi.mock("vscode", () => ({
     public description?: string;
     public contextValue?: string;
     public iconPath?: unknown;
+    public command?: unknown;
     public constructor(
       public readonly label: string,
       public readonly collapsibleState?: number
@@ -416,6 +417,68 @@ describe("NexusTreeProvider folder contexts and filtering", () => {
       .filter((c): c is FolderTreeItem => c instanceof FolderTreeItem)
       .map((c) => c.folderPath);
     expect(folderPaths).toEqual(["Site2", "Site10"]);
+  });
+
+  it("shows a single inert no-matches row when an active filter matches nothing", () => {
+    const provider = new NexusTreeProvider(callbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      servers: [makeServer({ id: "s1", name: "Prod API", host: "prod.example" })]
+    });
+
+    provider.setFilter("zzz-no-match");
+
+    const rootChildren = provider.getChildren(undefined);
+    expect(rootChildren).toHaveLength(1);
+    const marker = rootChildren[0] as NoMatchesTreeItem;
+    expect(marker).toBeInstanceOf(NoMatchesTreeItem);
+    expect(marker.label).toBe("No matches found");
+    // Inert by construction: no contextValue (no context-menu entries can
+    // attach), no command, not expandable.
+    expect(marker.contextValue).toBeUndefined();
+    expect(marker.command).toBeUndefined();
+    expect(marker.collapsibleState).toBe(vscode.TreeItemCollapsibleState.None);
+  });
+
+  it("shows no no-matches row while the filter still matches", () => {
+    const provider = new NexusTreeProvider(callbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      servers: [makeServer({ id: "s1", name: "Prod API" })]
+    });
+
+    provider.setFilter("prod");
+
+    const rootChildren = provider.getChildren(undefined);
+    expect(rootChildren.some((c) => c instanceof NoMatchesTreeItem)).toBe(false);
+    expect(rootChildren.length).toBeGreaterThan(0);
+  });
+
+  it("clearing a no-match filter removes the no-matches row", () => {
+    const provider = new NexusTreeProvider(callbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      servers: [makeServer({ id: "s1", name: "Prod API" })]
+    });
+
+    provider.setFilter("zzz-no-match");
+    expect(provider.getChildren(undefined).some((c) => c instanceof NoMatchesTreeItem)).toBe(true);
+
+    provider.clearFilter();
+    // The unfiltered view is restored: the real profile is back, the marker is gone.
+    const restored = provider.getChildren(undefined);
+    expect(restored.some((c) => c instanceof NoMatchesTreeItem)).toBe(false);
+    expect(restored).toHaveLength(1);
+  });
+
+  it("keeps a genuinely empty hub at zero rows so the welcome view still renders", () => {
+    // No filter, no profiles at all: zero root children is what makes VS Code
+    // show the viewsWelcome onboarding ("Start by adding a connection
+    // profile…") — the marker row must never appear in its place.
+    const provider = new NexusTreeProvider(callbacks);
+    provider.setSnapshot({ ...emptySnapshot() });
+
+    expect(provider.getChildren(undefined)).toEqual([]);
   });
 });
 

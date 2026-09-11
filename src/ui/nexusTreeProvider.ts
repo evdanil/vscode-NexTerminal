@@ -343,7 +343,27 @@ export class LocalServerSessionTreeItem extends vscode.TreeItem {
   }
 }
 
-type NexusTreeItem = FolderTreeItem | ServerTreeItem | SessionTreeItem | SerialProfileTreeItem | SerialSessionTreeItem | LocalShellProfileTreeItem | LocalShellSessionTreeItem | LocalServerConfigTreeItem | LocalServerSessionTreeItem;
+// The root-level "No matches found" row. It exists so VS Code's viewsWelcome
+// onboarding ("Start by adding a connection profile…") does not render when an
+// active filter merely matches nothing: that welcome view shows whenever the
+// tree has ZERO root children, with no notion of why — so a filtered-empty hub
+// would otherwise invite the user to add profiles they already have. Emitting
+// one inert row suppresses the welcome view for the filtered case only; a
+// genuinely empty hub still returns zero rows and keeps its onboarding.
+export class NoMatchesTreeItem extends vscode.TreeItem {
+  public constructor() {
+    super("No matches found", vscode.TreeItemCollapsibleState.None);
+    this.id = "no-matches";
+    this.iconPath = new vscode.ThemeIcon("filter");
+    this.tooltip = "Nothing matches the active filter. Run \u201CNexus: Filter Connectivity Hub\u201D and clear the query to see all profiles.";
+    // Deliberately no contextValue and no command: no context-menu entry can
+    // attach to the row (menus are gated on the /^nexus\./ contextValue
+    // prefix), and handleDrag/handleDrop only act on the concrete item types
+    // above — so the marker cannot be dragged, dropped onto, or activated.
+  }
+}
+
+type NexusTreeItem = FolderTreeItem | ServerTreeItem | SessionTreeItem | SerialProfileTreeItem | SerialSessionTreeItem | LocalShellProfileTreeItem | LocalShellSessionTreeItem | LocalServerConfigTreeItem | LocalServerSessionTreeItem | NoMatchesTreeItem;
 
 export interface NexusTreeCallbacks {
   onTunnelDropped(serverId: string, tunnelProfileId: string): Promise<void>;
@@ -489,7 +509,17 @@ export class NexusTreeProvider
 
   public getChildren(element?: NexusTreeItem): vscode.ProviderResult<NexusTreeItem[]> {
     if (!element) {
-      return this.getFolderChildren(undefined);
+      const root = this.getFolderChildren(undefined);
+      // A filter that matches nothing must surface as the marker row, not as
+      // zero children — zero children is indistinguishable from "no profiles
+      // at all" and would render the viewsWelcome onboarding (see
+      // NoMatchesTreeItem). Only the root branch emits it: nested folder
+      // calls can't be empty-while-filtered, because folderHasMatchingDescendant
+      // prunes non-matching folders before they are rendered.
+      if (this.filterText && root.length === 0) {
+        return [new NoMatchesTreeItem()];
+      }
+      return root;
     }
     if (element instanceof FolderTreeItem) {
       return this.getFolderChildren(element.folderPath);
