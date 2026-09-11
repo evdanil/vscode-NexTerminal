@@ -61,12 +61,14 @@ export class SilentAuthSshFactory implements SshFactory {
     passwordKey: string;
     passphraseKey: string;
     legacyServerPassphraseKey?: string;
+    profileScoped: boolean;
   } {
     if (!server.authProfileId || !this.authProfileLookup) {
       return {
         resolved: server,
         passwordKey: passwordSecretKey(server.id),
-        passphraseKey: passphraseSecretKey(server.id)
+        passphraseKey: passphraseSecretKey(server.id),
+        profileScoped: false
       };
     }
     const profile = this.authProfileLookup(server.authProfileId);
@@ -74,7 +76,8 @@ export class SilentAuthSshFactory implements SshFactory {
       return {
         resolved: server,
         passwordKey: passwordSecretKey(server.id),
-        passphraseKey: passphraseSecretKey(server.id)
+        passphraseKey: passphraseSecretKey(server.id),
+        profileScoped: false
       };
     }
     // REVIEW FINDING (P2) — only the fields the profile actually SUPPLIES are
@@ -91,7 +94,12 @@ export class SilentAuthSshFactory implements SshFactory {
       resolved,
       passwordKey: resolved.authType === "password" ? authProfilePasswordSecretKey(profile.id) : passwordSecretKey(server.id),
       passphraseKey: resolved.authType === "key" ? authProfilePassphraseSecretKey(profile.id) : passphraseSecretKey(server.id),
-      legacyServerPassphraseKey: resolved.authType === "key" ? passphraseSecretKey(server.id) : undefined
+      legacyServerPassphraseKey: resolved.authType === "key" ? passphraseSecretKey(server.id) : undefined,
+      // The active credential key (the one matching the resolved authType) is
+      // shared by EVERY server linked to this profile. A rejection on one
+      // server must not erase what the others still authenticate with, so
+      // deletion sites consult this flag — see the catch blocks in connect().
+      profileScoped: true
     };
   }
 
@@ -162,7 +170,7 @@ export class SilentAuthSshFactory implements SshFactory {
     server: ServerConfig,
     options?: { sockFactory?: () => Promise<Duplex>; onAuthMessage?: (text: string) => void }
   ): Promise<SshConnection> {
-    const { resolved, passwordKey, passphraseKey, legacyServerPassphraseKey } = this.resolveServer(server);
+    const { resolved, passwordKey, passphraseKey, legacyServerPassphraseKey, profileScoped } = this.resolveServer(server);
 
     if (resolved.authType === "key") {
       const handler = this.buildKeyboardInteractiveHandler(undefined, options?.onAuthMessage);
@@ -182,8 +190,12 @@ export class SilentAuthSshFactory implements SshFactory {
         if (!isPassphraseError(error)) {
           throw error;
         }
-        // Saved passphrase was wrong — clear it.
-        if (savedPassphrase) {
+        // Saved passphrase was wrong — clear it. A profile-scoped passphrase
+        // is shared by every linked server, and a rejection on this one does
+        // not prove the others are wrong too, so it stays: the next attempt
+        // on this server retries it once and prompts, while the rest of the
+        // fleet keeps authenticating silently.
+        if (savedPassphrase && !profileScoped) {
           await this.vault.delete(passphraseKey);
         }
       }
@@ -230,7 +242,12 @@ export class SilentAuthSshFactory implements SshFactory {
           if (legacyServerPassphraseKey && legacyServerPassphraseKey !== passphraseKey) {
             await this.vault.delete(legacyServerPassphraseKey);
           }
-        } else {
+        } else if (!profileScoped) {
+          // Declining to save replaces the stored credential for a server —
+          // but a profile-scoped passphrase belongs to the whole fleet, and
+          // "don't save this one" must not erase what other servers still
+          // authenticate with. Clearing a profile passphrase is done through
+          // the profile editor, not here.
           await this.vault.delete(passphraseKey);
         }
       } catch (vaultErr) {
@@ -275,7 +292,15 @@ export class SilentAuthSshFactory implements SshFactory {
         if (!isAuthError(error)) {
           throw error;
         }
-        await this.vault.delete(passwordKey);
+        // Saved password was wrong for this server — clear it so the next
+        // attempt prompts instead of retrying a rejected credential. A
+        // profile-scoped password is shared by every linked server, and this
+        // server's rejection does not prove the others are wrong too, so it
+        // stays: this server retries it once and prompts, while the rest of
+        // the fleet keeps authenticating silently.
+        if (!profileScoped) {
+          await this.vault.delete(passwordKey);
+        }
       }
     }
 
@@ -311,7 +336,12 @@ export class SilentAuthSshFactory implements SshFactory {
     try {
       if (promptResult.save) {
         await this.vault.store(passwordKey, promptResult.password);
-      } else {
+      } else if (!profileScoped) {
+        // Declining to save replaces the stored credential for a server —
+        // but a profile-scoped password belongs to the whole fleet, and
+        // "don't save this one" must not erase what other servers still
+        // authenticate with. Clearing a profile password is done through the
+        // profile editor, not here.
         await this.vault.delete(passwordKey);
       }
     } catch (vaultErr) {

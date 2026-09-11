@@ -354,6 +354,162 @@ describe("SilentAuthSshFactory", () => {
   });
 });
 
+describe("SilentAuthSshFactory profile-scoped credential preservation", () => {
+  // Every server linked to an auth profile shares ONE vault key
+  // (auth-profile-password-{id} / auth-profile-passphrase-{id}). A device that
+  // rejects the saved credential must not erase it for the rest of the fleet:
+  // the credential is only replaced when a device actually authenticates.
+  const profile: AuthProfile = {
+    id: "prof-fleet",
+    name: "Fleet",
+    username: "root",
+    authType: "password"
+  };
+  const lookup = (id: string) => (id === "prof-fleet" ? profile : undefined);
+
+  function profileServer(id: string, name: string): ServerConfig {
+    return { ...baseServer, id, name, authProfileId: "prof-fleet" };
+  }
+
+  it("keeps the profile password when another profile-linked server fails authentication", async () => {
+    const serverB = profileServer("srv-b", "Misconfigured");
+    const profileKey = authProfilePasswordSecretKey("prof-fleet");
+    // Device B rejects the saved password and then rejects the prompted retry
+    // too — it never authenticates (the reported misconfigured-device case).
+    const connector: SshConnector = {
+      connect: vi.fn()
+        .mockRejectedValueOnce(new Error("All configured authentication methods failed"))
+        .mockRejectedValueOnce(new Error("All configured authentication methods failed"))
+    };
+    const vault = createVault({ [profileKey]: "saved-pass" });
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async () => ({ password: "typed-on-b", save: true }))
+    };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, lookup);
+
+    await expect(factory.connect(serverB)).rejects.toThrow();
+
+    // B's failure must leave the profile credential intact...
+    await expect(vault.get(profileKey)).resolves.toBe("saved-pass");
+    expect(vault.delete).not.toHaveBeenCalledWith(profileKey);
+
+    // ...so device A still authenticates silently with it.
+    const serverA = profileServer("srv-a", "Working");
+    await factory.connect(serverA);
+    expect(prompt.prompt).toHaveBeenCalledOnce(); // only for B's attempt
+    expect(connector.connect).toHaveBeenLastCalledWith(
+      expect.objectContaining({ id: "srv-a" }),
+      expect.objectContaining({ password: "saved-pass" })
+    );
+  });
+
+  it("keeps the profile passphrase when a profile-linked server rejects it", async () => {
+    const keyProfile: AuthProfile = {
+      id: "prof-key-fleet",
+      name: "Key Fleet",
+      username: "root",
+      authType: "key",
+      keyPath: "/keys/id_ed25519"
+    };
+    const keyLookup = (id: string) => (id === "prof-key-fleet" ? keyProfile : undefined);
+    const serverB: ServerConfig = {
+      ...baseServer,
+      id: "srv-key-b",
+      name: "Key B",
+      authProfileId: "prof-key-fleet"
+    };
+    const profilePassKey = authProfilePassphraseSecretKey("prof-key-fleet");
+
+    // Rejects only device B's saved-passphrase attempt; device A (same
+    // profile passphrase) authenticates with it.
+    const connector: SshConnector = {
+      connect: vi.fn()
+        .mockRejectedValueOnce(new Error("Encrypted private key requires passphrase"))
+        .mockResolvedValue(fakeConnection)
+    };
+    const vault = createVault({ [profilePassKey]: "shared-passphrase" });
+    // The user cancels the passphrase prompt for B — B never authenticates.
+    const prompt: PasswordPrompt = { prompt: vi.fn(async () => undefined) };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, keyLookup);
+
+    await expect(factory.connect(serverB)).rejects.toThrow("Passphrase entry canceled");
+
+    await expect(vault.get(profilePassKey)).resolves.toBe("shared-passphrase");
+    expect(vault.delete).not.toHaveBeenCalledWith(profilePassKey);
+
+    const serverA: ServerConfig = {
+      ...baseServer,
+      id: "srv-key-a",
+      name: "Key A",
+      authProfileId: "prof-key-fleet"
+    };
+    await factory.connect(serverA);
+    expect(connector.connect).toHaveBeenLastCalledWith(
+      expect.objectContaining({ id: "srv-key-a" }),
+      expect.objectContaining({ passphrase: "shared-passphrase" })
+    );
+  });
+
+  it("keeps the profile password when a linked server authenticates but save is declined", async () => {
+    const serverB = profileServer("srv-b2", "New Device");
+    const profileKey = authProfilePasswordSecretKey("prof-fleet");
+    // A stale-but-still-valid profile password is rejected by B; the user
+    // types B's working password and answers No to saving it.
+    const connector: SshConnector = {
+      connect: vi.fn()
+        .mockRejectedValueOnce(new Error("All configured authentication methods failed"))
+        .mockResolvedValueOnce(fakeConnection)
+    };
+    const vault = createVault({ [profileKey]: "stale-pass" });
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async () => ({ password: "good-pass", save: false }))
+    };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, lookup);
+
+    await factory.connect(serverB);
+
+    // Declining to save must not wipe the profile-wide credential...
+    await expect(vault.get(profileKey)).resolves.toBe("stale-pass");
+    expect(vault.delete).not.toHaveBeenCalledWith(profileKey);
+
+    // ...and device A still authenticates with the password the profile holds.
+    const serverA = profileServer("srv-a2", "Existing");
+    await factory.connect(serverA);
+    expect(connector.connect).toHaveBeenLastCalledWith(
+      expect.objectContaining({ id: "srv-a2" }),
+      expect.objectContaining({ password: "stale-pass" })
+    );
+  });
+
+  it("updates the profile password when a linked server authenticates with save accepted", async () => {
+    const serverB = profileServer("srv-b3", "Rotated");
+    const profileKey = authProfilePasswordSecretKey("prof-fleet");
+    const connector: SshConnector = {
+      connect: vi.fn()
+        .mockRejectedValueOnce(new Error("All configured authentication methods failed"))
+        .mockResolvedValueOnce(fakeConnection)
+    };
+    const vault = createVault({ [profileKey]: "old-pass" });
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async () => ({ password: "rotated-pass", save: true }))
+    };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, lookup);
+
+    await factory.connect(serverB);
+
+    expect(vault.store).toHaveBeenCalledWith(profileKey, "rotated-pass");
+    await expect(vault.get(profileKey)).resolves.toBe("rotated-pass");
+
+    // The rest of the fleet picks up the updated credential.
+    const serverA = profileServer("srv-a3", "Fleet Member");
+    await factory.connect(serverA);
+    expect(connector.connect).toHaveBeenLastCalledWith(
+      expect.objectContaining({ id: "srv-a3" }),
+      expect.objectContaining({ password: "rotated-pass" })
+    );
+  });
+});
+
 describe("SilentAuthSshFactory onAuthMessage (MFA banner surfacing)", () => {
   it("keyboard-interactive handler emits name then instructions via onAuthMessage before prompting", async () => {
     let handler: KeyboardInteractiveHandler | undefined;
@@ -744,12 +900,10 @@ describe("SilentAuthSshFactory vault-failure isolation (Stage B)", () => {
     };
     // Seed the vault with an old profile passphrase (wrong) so the first attempt fails.
     const vault = createVault({ [profilePassKey]: "old-passphrase" });
-    // vault.delete is called first to clear old profile passphrase, then in Stage B:
-    //   - vault.store(profilePassKey) succeeds (default mock)
-    //   - vault.delete(legacyKey) throws
-    (vault.delete as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce(undefined)          // clear old profile passphrase on auth error
-      .mockRejectedValueOnce(new Error("vault locked")); // Stage B: legacy delete
+    // A profile-scoped passphrase survives a rejection (the auth-error path
+    // no longer deletes it), so the ONLY vault.delete in this flow is the
+    // Stage B legacy cleanup — which is the one that throws.
+    (vault.delete as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("vault locked"));
 
     const prompt: PasswordPrompt = {
       prompt: vi.fn(async () => ({ password: "new-passphrase", save: true }))

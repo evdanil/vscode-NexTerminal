@@ -62,8 +62,8 @@ Nexus Terminal provides one operational surface in VS Code for:
 ### 4.2 Silent Auth (Password mode)
 1. Lookup in secret vault.
 2. Attempt login.
-3. On auth reject, delete stored secret.
-4. Prompt user for new password and optional save.
+3. On auth reject, delete the stored secret — **server-scoped secrets only**. A secret stored under an auth profile (`auth-profile-password-{id}` / `auth-profile-passphrase-{id}`) is shared by every server linked to that profile, so one server's rejection never erases it: the failing server falls through to the prompt while the rest of the fleet keeps authenticating silently. A profile credential changes only when a server actually authenticates with a new one (and save is accepted), or through the profile editor.
+4. Prompt user for new password and optional save. Answering **No** to save replaces the stored secret for a server-scoped credential, but leaves a profile-scoped one untouched for the same reason.
 5. Retry with new secret.
 
 ### 4.3 SSH Authentication
