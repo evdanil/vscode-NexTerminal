@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.216] — 2026-09-11
+
+### Fixed
+
+- **A device that rejects a saved auth-profile password no longer erases it for every other device on that profile.** Servers linked to an auth profile share one stored credential, and until now a failed login on any one of them deleted that shared password on the spot. Apply a profile to a rack, sign in on the first device and save the password, then reach a misconfigured second device that rejects it — one that never authenticates at all — and the first device's working saved credential was gone with it: the next connect prompted as if nothing had ever been saved. A rejection on one device says nothing about the rest — the device itself may simply be broken — so the profile credential now survives any number of failed attempts and is replaced only when a device actually authenticates with a new one (and save is accepted). The same protection covers key passphrases and the **No** answer on the save prompt, which also wiped the shared credential before; clearing a profile credential deliberately remains the profile editor's job. Credentials saved on a single server without a profile still clear on a rejected attempt, exactly as before.
+
 ## [2.8.215] — 2026-09-11
 
 ### Security
