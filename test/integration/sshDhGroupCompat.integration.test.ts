@@ -73,6 +73,13 @@ describe("SSH diffie-hellman-group1-sha1 on an Electron-like runtime", () => {
     const connectorModule = await import("../../src/services/ssh/ssh2Connector");
     const ssh2 = await import("ssh2");
 
+    // The connector body must restore the shared crypto export once ssh2 has
+    // captured the wrapper: the extension-host process is shared with other
+    // extensions, and a permanent monkey-patch would change behavior for every
+    // consumer that comes after us. The handshake below must STILL work — ssh2
+    // holds the wrapper in its own closure, not via the module property.
+    expect(cryptoCjs.createDiffieHellmanGroup).toBe(brokenLikeBoringSsl);
+
     const { privateKey } = cryptoCjs.generateKeyPairSync("rsa", { modulusLength: 2048 });
     const hostKeyPem = privateKey.export({ type: "pkcs1", format: "pem" });
 
@@ -194,6 +201,46 @@ describe("installSshDhGroupCompat", () => {
     };
     expect(installSshDhGroupCompat(target)).toBe(true);
     expect(installSshDhGroupCompat(target)).toBe(false);
+  });
+
+  it("uninstall restores the original export once ssh2 has captured the wrapper", async () => {
+    const { installSshDhGroupCompat, uninstallSshDhGroupCompat } = await import("../../src/services/ssh/sshDhGroupCompat");
+    const original = (): string => "native";
+    const target: { createDiffieHellmanGroup(name: string): unknown } = {
+      createDiffieHellmanGroup: original
+    };
+    installSshDhGroupCompat(target);
+    expect(target.createDiffieHellmanGroup).not.toBe(original);
+
+    expect(uninstallSshDhGroupCompat(target)).toBe(true);
+    expect(target.createDiffieHellmanGroup).toBe(original);
+
+    // ssh2 captured the wrapper by closure at ITS load time; a fresh install
+    // after the restore must still work for the next consumer.
+    expect(installSshDhGroupCompat(target)).toBe(true);
+  });
+
+  it("uninstall is a no-op when nothing is installed", async () => {
+    const { uninstallSshDhGroupCompat } = await import("../../src/services/ssh/sshDhGroupCompat");
+    const target: { createDiffieHellmanGroup(name: string): string } = {
+      createDiffieHellmanGroup: () => "native"
+    };
+    expect(uninstallSshDhGroupCompat(target)).toBe(false);
+  });
+
+  it("uninstall never clobbers a third-party patch installed after ours", async () => {
+    const { installSshDhGroupCompat, uninstallSshDhGroupCompat } = await import("../../src/services/ssh/sshDhGroupCompat");
+    const original = (): string => "native";
+    const target: { createDiffieHellmanGroup(name: string): unknown } = {
+      createDiffieHellmanGroup: original
+    };
+    installSshDhGroupCompat(target);
+    const thirdParty = (): string => "someone-elses-wrapper";
+    target.createDiffieHellmanGroup = thirdParty;
+
+    // The current export is not ours anymore — leave it alone.
+    expect(uninstallSshDhGroupCompat(target)).toBe(false);
+    expect(target.createDiffieHellmanGroup).toBe(thirdParty);
   });
 });
 

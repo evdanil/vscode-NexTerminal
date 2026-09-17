@@ -48,6 +48,7 @@ const MODP_GROUP_PRIMES: Record<string, string> = {
 };
 
 const INSTALL_MARKER = "__nexusDhGroupCompat";
+const ORIGINAL_MARKER = "__nexusDhGroupCompatOriginal";
 
 function buildFallback(name: string): unknown {
   const primeHex = MODP_GROUP_PRIMES[name];
@@ -82,7 +83,10 @@ export function installSshDhGroupCompat(
       return fallback;
     }
   };
-  (wrapped as { [INSTALL_MARKER]?: boolean })[INSTALL_MARKER] = true;
+  const markers = wrapped as { [INSTALL_MARKER]?: boolean; [ORIGINAL_MARKER]?: DiffieHellmanGroupFn };
+  markers[INSTALL_MARKER] = true;
+  // Kept so uninstallSshDhGroupCompat can put the exact original back.
+  markers[ORIGINAL_MARKER] = original;
 
   try {
     target.createDiffieHellmanGroup = wrapped;
@@ -90,6 +94,38 @@ export function installSshDhGroupCompat(
     // The property may be read-only on some runtimes; force it.
     Object.defineProperty(target, "createDiffieHellmanGroup", {
       value: wrapped,
+      configurable: true,
+      writable: true
+    });
+  }
+  return true;
+}
+
+/**
+ * Restore `target.createDiffieHellmanGroup` to the function it had before
+ * installSshDhGroupCompat wrapped it. Callers do this once ssh2 has loaded:
+ * ssh2 captured the wrapper in its own module closure, so it keeps using it,
+ * while the shared crypto export returns to whatever the runtime (or a later
+ * third-party patch) provided. Returns true if a wrapper of ours was removed,
+ * false when there was nothing of ours to remove — a property that was
+ * replaced by someone else after our install is left untouched.
+ */
+export function uninstallSshDhGroupCompat(
+  target: { createDiffieHellmanGroup?: DiffieHellmanGroupFn } = cryptoCjs
+): boolean {
+  const current = target.createDiffieHellmanGroup as
+    | { [INSTALL_MARKER]?: boolean; [ORIGINAL_MARKER]?: DiffieHellmanGroupFn }
+    | undefined;
+  if (typeof current !== "function" || !current[INSTALL_MARKER] || current[ORIGINAL_MARKER] === undefined) {
+    return false;
+  }
+
+  const original = current[ORIGINAL_MARKER];
+  try {
+    target.createDiffieHellmanGroup = original;
+  } catch {
+    Object.defineProperty(target, "createDiffieHellmanGroup", {
+      value: original,
       configurable: true,
       writable: true
     });
