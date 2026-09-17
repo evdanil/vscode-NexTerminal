@@ -1,5 +1,12 @@
 import { readFile } from "node:fs/promises";
 import type { Duplex } from "node:stream";
+
+// MUST stay above the ssh2 import: ssh2 destructures
+// createDiffieHellmanGroup from node:crypto at module load, and this shim
+// (needed for diffie-hellman-group1-sha1 on Electron) has to wrap it first.
+// See sshDhGroupCompat.ts for the full story.
+import "./sshDhGroupCompat";
+
 import { Client, type Algorithms, type ConnectConfig, type SFTPWrapper, type VerifyCallback } from "ssh2";
 import type { ServerConfig } from "../../models/config";
 import { normalizeBoundedNumber as normalizeTimeout } from "../../utils/helpers";

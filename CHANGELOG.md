@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.218] — 2026-09-17
+
+### Fixed
+
+- **Legacy SSH connections to old Cisco devices no longer die with "Connect failed Unknown DH group".** Connect to a WS-C6509-era switch with the server's **Enable legacy SSH algorithms** box ticked, and the handshake still failed before a single credential was offered: the device's only mutually supported key exchange is `diffie-hellman-group1-sha1` (ssh2's own Cisco compat already strips group-exchange for the `Cisco-1.25` banner, and these IOS builds advertise no newer group), and building that exchange calls `crypto.createDiffieHellmanGroup("modp2")` — the 1024-bit Oakley Group 2. VS Code's extension host runs on Electron, whose crypto cannot resolve that group **by name**, so the call threw `ERR_CRYPTO_UNKNOWN_DH_GROUP` and the connector surfaced it verbatim as the connect failure. No algorithm-list change could ever fix it: the toggle did its job, and the failure sat one layer deeper, in a runtime crypto primitive the extension host simply lacks. The fix installs a compatibility shim on `crypto.createDiffieHellmanGroup` before ssh2 loads (imported first by the SSH connector): when the runtime refuses a group by name, it falls back to `createDiffieHellman()` built from the group's well-known RFC 2409 prime — a byte-identical key exchange to the named group. On OpenSSL runtimes the named lookup succeeds and the fallback never runs, so plain-Node behavior is unchanged; groups the shim has no prime for still throw the original error. An integration test stands up a real group1-sha1-only server under a simulated Electron crypto and requires the handshake to reach `ready`, so removing the wiring fails exactly the way the field did.
+
 ## [2.8.217] — 2026-09-11
 
 ### Changed
