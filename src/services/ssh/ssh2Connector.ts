@@ -1,6 +1,20 @@
 import { readFile } from "node:fs/promises";
 import type { Duplex } from "node:stream";
+
+// MUST stay above the ssh2 import: ssh2 destructures
+// createDiffieHellmanGroup from node:crypto at module load, and this shim
+// (needed for diffie-hellman-group1-sha1 on Electron) has to wrap it first.
+// See sshDhGroupCompat.ts for the full story.
+import { uninstallSshDhGroupCompat } from "./sshDhGroupCompat";
+
 import { Client, type Algorithms, type ConnectConfig, type SFTPWrapper, type VerifyCallback } from "ssh2";
+
+// ssh2 captured the shim-wrapped function in its own module closure during the
+// import above, so the wrapper keeps serving our connections — restore the
+// shared crypto export now so other extensions in this extension-host process
+// are not left with a permanent monkey-patch on node:crypto.
+uninstallSshDhGroupCompat();
+
 import type { ServerConfig } from "../../models/config";
 import { normalizeBoundedNumber as normalizeTimeout } from "../../utils/helpers";
 import type {
