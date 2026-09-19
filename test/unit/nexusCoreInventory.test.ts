@@ -4843,9 +4843,11 @@ describe("NexusCore inventory status", () => {
     await core.addServersBatch([a]);
 
     // Constructed DIRECTLY, not through validateInventoryStatusReport — the
-    // validator rejects a report carrying one id in BOTH members, so this can
-    // only arrive from a caller that bypassed it, which is exactly what the
-    // engine must survive.
+    // validator checks each member's shape independently and would ACCEPT this
+    // overlapping report (mutual exclusion is provider-side construction), so
+    // it can arrive from a caller that bypassed that construction, which is
+    // exactly what the engine must survive: the present status must win over
+    // the cleared id on a complete report.
     core.applyInventoryStatus("source-1", {
       contractVersion: 1,
       statuses: { "dev#1": { state: "running" } },
