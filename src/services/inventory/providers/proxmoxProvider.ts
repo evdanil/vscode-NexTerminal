@@ -1191,11 +1191,11 @@ async function fetchClusterStatus(
  * row (§Spec).
  *
  * The status poll routes template rows through its OWN branch (see
- * fetchStatusImpl's loop — reported as stopped when the opt-in is on) and
- * passes `includeTemplates` FALSE for the guest rows it does send here; the
- * argument gates only `template === 1` rows, so the value is inert for them
- * and kept false so the filter can never accidentally admit a template on the
- * poll path. The sync honors the opt-in through this same filter. The poll
+ * fetchStatusImpl's loop — never status-reported; the vmid is collected into
+ * the report's `clearedExternalIds` instead) and passes `includeTemplates`
+ * FALSE for the guest rows it does send here; the argument gates only
+ * `template === 1` rows, so the value is inert for them and kept false so the
+ * filter can never accidentally admit a template on the poll path. The sync honors the opt-in through this same filter. The poll
  * also pins `includeStopped` TRUE for its rows — status reports reality, and
  * the device-set preference belongs to the sync — so the shared rules (type
  * and template gating) stay single-sourced here while the reporting path
@@ -1316,8 +1316,8 @@ async function fetchInventoryImpl(
     // when opted in. The type/template/includeStopped gates are the SHARED
     // `isImportableGuestRow`, so the status poll's guest rows track the device
     // set this loop produces (template rows are the one divergence — the poll
-    // reports them as stopped whenever the opt-in is on, and an apply ignores
-    // a status matching no device; see fetchStatusImpl's template branch).
+    // never status-reports one and collects its vmid into `clearedExternalIds`
+    // instead; see fetchStatusImpl's template branch).
     if (!isImportableGuestRow(row, includeStopped, includeTemplates)) {
       continue;
     }
@@ -1458,12 +1458,12 @@ async function fetchInventoryImpl(
  * decoration is DROPPED and its highlight stays gone until a poll reports it
  * again — the honest price for a state nobody knows. Retaining prior state
  * for absent entries is a property of TRUNCATED reports only. The sync's
- * guest filters apply to guest rows (`isImportableGuestRow`), with ONE
- * deliberate divergence: template rows bypass the filter when the opt-in is
- * on and are reported as `{ state: "stopped" }`, read from no row field — a
- * template cannot run, and that constant is what keeps a guest converted into
- * a template from carrying a stale "running" through every merging report.
- * The full truthfulness/merge argument and the Start/Stop residual sit on the
+ * guest filters apply to guest rows (`isImportableGuestRow`); template rows
+ * route through their OWN branch and are NEVER status-reported — their vmids
+ * are collected into the report's `clearedExternalIds` instead, EVERY template
+ * row regardless of the opt-in (which governs only the SYNC device set), so a
+ * guest converted into a template loses its stale decoration explicitly even
+ * under a merging report. The full truthfulness/merge argument sits on the
  * loop's template branch. The SYNC path is unchanged: templates still import
  * as addressless placeholders when includeTemplates is on. NO console fields:
  * the listing rows carry nothing to fill them with, and the console-heal path
@@ -1499,18 +1499,20 @@ async function fetchStatusImpl(
   const transport = selectProxmoxTransport(transports, config);
   const baseUrl = normalizeBaseUrl(String(config.baseUrl ?? ""));
   const token = secrets.apiToken ?? "";
-  // The opt-ins read with the same strictness as the sync: only `=== true`
+  // The opt-in reads with the same strictness as the sync: only `=== true`
   // turns the node join on (a restored backup's "true" string must not switch
-  // a request on), and only `=== true` turns the template opt-in on.
-  // includeStopped is deliberately NOT read here — see the guest branch below.
-  const includeTemplates = config.includeTemplates === true;
+  // a request on). includeStopped is deliberately NOT read here — see the
+  // guest branch below — and includeTemplates is not read EITHER: a template
+  // row is never status-reported and always clears, whatever the sync opt-in
+  // says (see the template branch below).
 
   // The sync's fail-closed listing read, shared: on the poll path the throw is
   // what protects the decorations — see fetchResources's doc comment.
   const rows = await fetchResources(transport, baseUrl, token, FETCH_TIMEOUT_MS);
 
   const statuses: Record<string, InventoryDeviceStatus> = {};
-  let statusCount = 0;
+  const clearedExternalIds: string[] = [];
+  let entryCount = 0;
   let capTripped = false;
   // The /cluster/status join, when node import is on, can fail (403 without
   // Sys.Audit, network, non-array payload) — see the branch below.
@@ -1526,34 +1528,30 @@ async function fetchStatusImpl(
       continue;
     }
     const row = raw as Record<string, unknown>;
-    // Templates are decided by the opt-in ALONE, before the shared filter: when
-    // includeTemplates is on, a `template === 1` row is reported as
-    // `{ state: "stopped" }` — unconditionally, read from no row field, because
-    // a template cannot run and PVE's own status for one is stopped. WHY the
-    // old never-report rule died: a guest CONVERTED into a template keeps its
-    // prior "running" decoration unless some report replaces it. A COMPLETE
-    // report would (clear-then-apply), but a TRUNCATED one — a failed
-    // /cluster/status join, the cap — is applied under MERGE, and merge
-    // retains prior state only for entries the report OMITS. The template row
-    // comes from the same listing as every guest, so it is present and
-    // applied; omitting it would freeze a startable-looking "running" on a
-    // target Proxmox refuses to start. Reported regardless of includeStopped,
-    // like every guest row here (see the guest branch below): a status whose
-    // externalId matches no device is ignored by the apply, so the entry
-    // cannot light anything. RESIDUAL, documented rather than fixable: the template's
-    // bare-numeric vmid still passes canControlNode, so with includeTemplates
-    // on the Start/Stop menu appears; acting on it surfaces PVE's own verdict
-    // ("VM is a template") through the existing exitstatus surfacing — an
-    // honest, specific error. The SYNC path is unchanged:
-    // isImportableGuestRow still honors includeTemplates there, and template
-    // rows with the opt-in off are omitted here exactly as before (they are
-    // not in the device set).
+    // Templates are decided by the row ALONE, before the shared filter, and
+    // are NEVER status-reported. WHY round 2's `{ state: "stopped" }` rule
+    // died: per-vmid template-ness is invisible to the apply's control gate —
+    // a template's bare numeric vmid passes canControlNode — so a KNOWN status
+    // on a template row lights the Start/Stop menu that PVE refuses to serve.
+    // A template therefore carries no status at all, and the never-act-blind
+    // rule keeps every control menu off its row. What replaces the constant is
+    // the report's `clearedExternalIds`: EVERY template row's vmid — regardless
+    // of includeTemplates, which governs only the SYNC device set, because the
+    // template need not be in it for the server it was synced as to still
+    // exist — is collected here, and applyInventoryStatus removes that id's
+    // entry even under a MERGING (truncated) report, where a merely-omitted
+    // entry is retained. That is the converted-guest case: a VM turned into a
+    // template keeps its prior "running" decoration on every merging report
+    // unless the report names the vmid as explicitly gone. The apply ignores
+    // ids matching no owned server, so an unsynced template's cleared id
+    // cannot light anything. Cleared entries share the ONE hard-cap budget
+    // with statuses — a template beyond the cap keeps its stale highlight
+    // exactly as long as a guest beyond it does, the same partial-report
+    // honesty. RESIDUAL, none: with no status the Start/Stop menu never
+    // appears for a template. The SYNC path is unchanged:
+    // isImportableGuestRow still honors includeTemplates there.
     const isTemplate = row.template === 1;
-    if (isTemplate) {
-      if (!includeTemplates) {
-        continue;
-      }
-    } else if (!isImportableGuestRow(row, true, false)) {
+    if (!isTemplate && !isImportableGuestRow(row, true, false)) {
       // includeStopped is pinned TRUE — on the STATUS call only; the sync
       // keeps honoring the config. WHY: status reports reality (EVE-NG's
       // precedent: all nodes are reported; the tree decides), and
@@ -1564,7 +1562,7 @@ async function fetchStatusImpl(
       // reporting a guest the sync skipped cannot light anything.
       continue;
     }
-    if (statusCount >= HARD_CAP) {
+    if (entryCount >= HARD_CAP) {
       capTripped = true;
       continue;
     }
@@ -1575,9 +1573,7 @@ async function fetchStatusImpl(
       continue;
     }
     if (isTemplate) {
-      // The state is the truthful constant, decided above — the row's own
-      // status field is never read for a template.
-      statuses[String(row.vmid)] = { state: "stopped" };
+      clearedExternalIds.push(String(row.vmid));
     } else {
       // A guest row's status field is trusted only when it names a real
       // state; "unknown" (before RRD data exists) invents nothing.
@@ -1586,7 +1582,7 @@ async function fetchStatusImpl(
       }
       statuses[String(row.vmid)] = { state: row.status };
     }
-    statusCount++;
+    entryCount++;
   }
 
   // Node statuses ride the SAME opt-in as the node import, gated with the same
@@ -1617,16 +1613,16 @@ async function fetchStatusImpl(
       if (e.type !== "node" || !name) {
         continue;
       }
-      if (statusCount >= HARD_CAP) {
+      if (entryCount >= HARD_CAP) {
         capTripped = true;
         break;
       }
       if (e.online === 1) {
         statuses[`node/${name}`] = { state: "running" };
-        statusCount++;
+        entryCount++;
       } else if (e.online === 0) {
         statuses[`node/${name}`] = { state: "stopped" };
-        statusCount++;
+        entryCount++;
       }
     }
   }
@@ -1637,6 +1633,11 @@ async function fetchStatusImpl(
   // degrade the whole poll to "no update". (The sync TREE's validator instead
   // tolerates a present-but-undefined key, so the idiom is safe there.)
   const report: InventoryStatusReport = { contractVersion: 1, statuses };
+  // Same omission idiom for the cleared list: absent ⇒ a no-op downstream, and
+  // an empty list asserts nothing an absent one doesn't.
+  if (clearedExternalIds.length > 0) {
+    report.clearedExternalIds = clearedExternalIds;
+  }
   if (capTripped || joinFailed) {
     report.truncated = true;
   }

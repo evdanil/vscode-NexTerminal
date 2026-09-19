@@ -1558,35 +1558,51 @@ describe("createProxmoxProvider", () => {
       expect(stoppedOff.report.statuses).toEqual({ "105": { state: "stopped" }, "106": { state: "running" } });
     });
 
-    it("status-reports template rows as STOPPED when includeTemplates is on — a template cannot run, so the constant is read from no row field (kills the old never-report rule, under which a guest converted into a template was omitted from every report and a merged one kept its stale 'running' forever)", async () => {
-      const { report } = await pollStatus(
+    it("carries every template vmid in `clearedExternalIds` and NONE in `statuses` — with includeTemplates ON and OFF (Codex round-4 controller ruling, superseding round 2's reported-as-stopped: per-vmid template-ness is invisible to the apply's control gate, a bare numeric vmid passes canControlNode, so a known status on a template row lights the Start/Stop menu PVE refuses to serve — a template never carries a status, and its id is explicitly cleared so a MERGING report cannot retain a converted guest's stale decoration; the cleared list rides the report regardless of the opt-in because the template need not be in the current sync set for its old server to still exist) (kills the round-2 stopped-reporting that exposed the menu)", async () => {
+      const on = await pollStatus(
         {
           [RESOURCES]: {
             body: {
               data: [
-                guestRow({ template: 1, name: "gold-image", status: "stopped" }),
-                // The row's own status is NOT consulted for a template — even
-                // one lying about "running" must read as the truthful stopped.
-                guestRow({ vmid: 107, name: "odd", template: 1, status: "running" }),
-                guestRow({ vmid: 106, name: "up" })
+                // The row's own status is NEVER consulted for a template — even
+                // one lying about "running" is only cleared, never reported.
+                guestRow({ vmid: 106, name: "gold-image", template: 1, status: "running" }),
+                guestRow()
               ]
             }
           }
         },
         { baseUrl: BASE, includeTemplates: true }
       );
-      expect(report.statuses).toEqual({
-        "105": { state: "stopped" },
-        "107": { state: "stopped" },
-        "106": { state: "running" }
-      });
+      expect(on.report.statuses).toEqual({ "105": { state: "running" } });
+      expect(on.report.clearedExternalIds).toEqual(["106"]);
+      // The REAL downstream gate accepts the new member.
+      expect(validateInventoryStatusReport(on.report)).toBeDefined();
+
+      const off = await pollStatus(
+        {
+          [RESOURCES]: {
+            body: {
+              data: [
+                guestRow({ vmid: 106, name: "gold-image", template: 1, status: "stopped" }),
+                guestRow({ vmid: 107, name: "second-gold", template: 1, status: "stopped" }),
+                guestRow()
+              ]
+            }
+          }
+        },
+        { baseUrl: BASE }
+      );
+      expect(off.report.statuses).toEqual({ "105": { state: "running" } });
+      expect(off.report.clearedExternalIds).toEqual(["106", "107"]);
+      expect(validateInventoryStatusReport(off.report)).toBeDefined();
     });
 
-    it("reports the converted template as stopped even in a TRUNCATED (join-failure) report — the row comes from the same listing as every guest, so a merging apply APPLIES it instead of retaining the pre-conversion state (kills the merge-retains-stale hole codex flagged: omitting the template freezes a startable-looking 'running' on a target PVE refuses to start; the join failure's protection belongs to the NODE statuses, which stay absent here)", async () => {
+    it("clears the converted template in a TRUNCATED (join-failure) report — the vmid rides `clearedExternalIds` so the MERGING apply removes the pre-conversion 'running' instead of retaining it, while the node statuses stay absent-and-retained (the Task-5 ruling: merge protects only what the report OMITS — an explicitly cleared entry is not omitted, it is asserted gone; the engine-side proof that the apply removes the stale status lives in nexusCoreInventory.test.ts) (kills the round-2 stopped-reporting shape, whose template entry is gone from statuses here)", async () => {
       const { report, calls } = await pollStatus(
         {
           [RESOURCES]: {
-            body: { data: [guestRow({ template: 1, name: "gold-image", status: "stopped" }), guestRow({ vmid: 106, name: "up" }), nodeRow()] }
+            body: { data: [guestRow({ vmid: 106, name: "gold-image", template: 1, status: "stopped" }), guestRow(), nodeRow()] }
           },
           [STATUS]: { status: 403, body: "" }
         },
@@ -1595,9 +1611,13 @@ describe("createProxmoxProvider", () => {
       // The join failed — the report is partial and the apply MERGES.
       expect(calls).toHaveLength(2);
       expect(report.truncated).toBe(true);
-      // Present entries are still applied under merge; what merge protects is
-      // only what the report OMITS (the node statuses — the Task-5 ruling).
-      expect(report.statuses).toEqual({ "105": { state: "stopped" }, "106": { state: "running" } });
+      // The template is NOT status-reported (the round-2 rule reverted)...
+      expect(report.statuses).toEqual({ "105": { state: "running" } });
+      // ...and its vmid is explicitly cleared, which is what removes the
+      // stale "running" the server carried before its conversion.
+      expect(report.clearedExternalIds).toEqual(["106"]);
+      // Node statuses are ABSENT here (the join failed) — retained by the
+      // merging apply, per the Task-5 ruling pin above.
     });
 
     it("stops collecting at the hard cap and flags truncated — a partial report MERGES on apply (prior state retained for the entries never reached), never clears (kills an uncapped report whose apply would clear-then-set over a cluster the poll never finished reading)", async () => {

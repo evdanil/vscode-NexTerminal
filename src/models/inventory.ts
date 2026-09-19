@@ -163,6 +163,18 @@ export interface InventoryStatusReport {
   // the merge above leaves the unreached nodes showing stale (or `unknown`) state
   // and nothing else on screen would say so. The poll path stays silent.
   truncated?: boolean;
+  // EXPLICIT CLEARS (Codex round 4, P2) — externalIds the provider asserts have
+  // NO status any more, honored by `applyInventoryStatus` even when the report
+  // is TRUNCATED: a merge retains an entry that is merely ABSENT (the provider
+  // may simply not have reached it), but an entry listed here was SEEN and is
+  // asserted gone, so it is removed for this source's servers regardless.
+  // Absent ⇒ a no-op. Never contains an id the report also carries in
+  // `statuses` — the two are mutually exclusive by construction (an id either
+  // has a known status or is asserted to have none), and the validator rejects
+  // a report that is malformed about it. Proxmox uses the member to clear every
+  // template row's vmid (§4.12.8): a guest converted into a template must lose
+  // its stale decoration even on a report that merges.
+  clearedExternalIds?: string[];
 }
 
 export type InventoryConfigFieldType = "string" | "password" | "number" | "boolean" | "select";
@@ -492,6 +504,23 @@ export function validateInventoryStatusReport(raw: unknown): InventoryStatusRepo
   if (Object.prototype.hasOwnProperty.call(obj, "truncated") && typeof obj.truncated !== "boolean") {
     return undefined;
   }
+  // EXPLICIT CLEARS — optional; when present it MUST be an array whose every
+  // element is a non-empty string. A present non-array (or a non-string /
+  // empty-string element) is a shape the apply never agreed to, so the whole
+  // report is rejected — the same fail-closed rule as `truncated` above: a
+  // cleared list is trusted to REMOVE state, and trusting a malformed one is
+  // worse than dropping the poll.
+  if (Object.prototype.hasOwnProperty.call(obj, "clearedExternalIds")) {
+    const cleared = obj.clearedExternalIds;
+    if (!Array.isArray(cleared)) {
+      return undefined;
+    }
+    for (const id of cleared) {
+      if (typeof id !== "string" || id.length === 0) {
+        return undefined;
+      }
+    }
+  }
   const statuses = obj.statuses;
   // A plain object, not an array (Array is typeof "object") and not null.
   if (typeof statuses !== "object" || statuses === null || Array.isArray(statuses)) {
@@ -535,6 +564,12 @@ export function validateInventoryStatusReport(raw: unknown): InventoryStatusRepo
   // Preserve an explicit boolean (true OR false); never invent the key when absent.
   if (typeof obj.truncated === "boolean") {
     result.truncated = obj.truncated;
+  }
+  // Preserve the cleared list only when present and valid (checked above); an
+  // empty array is preserved as-is — a present-but-empty clear asserts nothing
+  // and is a no-op downstream, same as an absent field.
+  if (Array.isArray(obj.clearedExternalIds)) {
+    result.clearedExternalIds = obj.clearedExternalIds as string[];
   }
   return result;
 }

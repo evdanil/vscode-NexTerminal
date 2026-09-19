@@ -113,6 +113,41 @@ describe("validateInventoryStatusReport", () => {
     expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {}, truncated: null })).toBeUndefined();
   });
 
+  // Codex round 4 (P2) — `clearedExternalIds`: externalIds the provider asserts
+  // have NO status any more, honored by applyInventoryStatus even under a
+  // TRUNCATED (merging) report, because a merge retains merely-absent entries
+  // while a cleared one is explicitly asserted gone (Proxmox sends every
+  // template vmid here so a converted guest loses its stale "running").
+  it("accepts an optional string-array `clearedExternalIds` and preserves it; a report without it is unchanged (⊘ stripping the field would silently drop the one member a merging apply needs to remove a converted template's stale status)", () => {
+    const report: InventoryStatusReport = {
+      contractVersion: 1,
+      statuses: { "106": { state: "running" } },
+      truncated: true,
+      clearedExternalIds: ["105", "107"]
+    };
+    expect(validateInventoryStatusReport(report)).toEqual(report);
+    // Absent is fine and does not invent the field.
+    const noClear = validateInventoryStatusReport({ contractVersion: 1, statuses: {} });
+    expect(Object.prototype.hasOwnProperty.call(noClear!, "clearedExternalIds")).toBe(false);
+  });
+
+  it("rejects a present non-array `clearedExternalIds` (⊘ a non-array would be read as undefined/throw downstream — same fail-closed shape as the truncated flag)", () => {
+    expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {}, clearedExternalIds: "105" })).toBeUndefined();
+    expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {}, clearedExternalIds: 105 })).toBeUndefined();
+    expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {}, clearedExternalIds: true })).toBeUndefined();
+    expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {}, clearedExternalIds: {} })).toBeUndefined();
+    expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {}, clearedExternalIds: null })).toBeUndefined();
+  });
+
+  it("rejects a non-string or empty-string element (⊘ an id that cannot name a device would either clear nothing or, worse, survive validation and let the apply trust a list this contract never agreed to)", () => {
+    expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {}, clearedExternalIds: [105] })).toBeUndefined();
+    expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {}, clearedExternalIds: [null] })).toBeUndefined();
+    expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {}, clearedExternalIds: [{}] })).toBeUndefined();
+    expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {}, clearedExternalIds: ["105", ""] })).toBeUndefined();
+    // One bad element poisons the whole report — the same first-bad-entry rule as statuses.
+    expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {}, clearedExternalIds: ["105", 42] })).toBeUndefined();
+  });
+
   it("is prototype-pollution-safe AND preserves a __proto__ own key as real data (⊘ writing into a plain `{}` triggers the inherited setter — the entry is silently dropped and `state` leaks onto Object.prototype)", () => {
     const raw = JSON.parse('{"contractVersion":1,"statuses":{"__proto__":{"state":"running"},"real":{"state":"stopped"}}}');
     const result = validateInventoryStatusReport(raw);
