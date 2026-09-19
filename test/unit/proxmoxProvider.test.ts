@@ -1175,4 +1175,164 @@ describe("createProxmoxProvider", () => {
       });
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // CLUSTER NODE IMPORT (includeNodes) — the /cluster/resources payload's node
+  // rows carry NO `ip` and NO `name` (verified live shape: {id, node, type,
+  // status: "online"|"offline"|"unknown"}), so they establish EXISTENCE only;
+  // name and address come from a SECOND call, GET /cluster/status (Sys.Audit),
+  // the only endpoint carrying node `ip` and numeric `online`. Fixtures are the
+  // verified shapes, sanitized.
+  // ---------------------------------------------------------------------------
+
+  describe("fetchInventory — cluster node import (includeNodes)", () => {
+    const BASE = "https://pve.example.com:8006";
+    const SECRETS = { apiToken: "root@pam!test=secret" };
+    const RESOURCES = "/api2/json/cluster/resources";
+    const STATUS = "/api2/json/cluster/status";
+
+    /** The verified /cluster/resources node row: existence only, no name/ip members. */
+    const nodeRow = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+      id: "node/pve",
+      node: "pve",
+      type: "node",
+      status: "online",
+      ...overrides
+    });
+
+    /** The verified /cluster/status node entry: the ONLY source of node name, ip and numeric online. */
+    const statusEntry = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+      type: "node",
+      name: "pve",
+      nodeid: 0,
+      online: 1,
+      ip: "192.0.2.240",
+      id: "node/pve",
+      ...overrides
+    });
+
+    type RouteMap = Record<string, { status?: number; body: unknown }>;
+
+    /** Sync a routed world; unrouted paths answer 500 so an unexpected request shows in both the call log and the devices. */
+    async function syncNodes(routes: RouteMap, config: InventorySourceValues) {
+      const calls: { url: string; auth?: string }[] = [];
+      const impl = async (input: string | URL, init?: { headers?: Record<string, string> }): Promise<unknown> => {
+        const url = String(input);
+        calls.push({ url, auth: init?.headers?.Authorization });
+        const hit = routes[new URL(url).pathname];
+        if (!hit) {
+          return makeResponse(500, { data: null, message: `no test route for ${new URL(url).pathname}` });
+        }
+        return makeResponse(hit.status ?? 200, hit.body);
+      };
+      const provider = createProxmoxProvider(impl as unknown as typeof fetch, impl as unknown as typeof fetch);
+      const tree = await provider.fetchInventory(config, SECRETS);
+      return { tree, calls };
+    }
+
+    it("imports the node from a SECOND /cluster/status call joined by name — exactly two fetches, ssh endpoint at the entry's ip, running from online:1, and NO folderPath (kills an ssh endpoint invented from /cluster/resources node rows, which carry no ip, and a single-call implementation)", async () => {
+      const { tree, calls } = await syncNodes(
+        { [RESOURCES]: { body: { data: [nodeRow()] } }, [STATUS]: { body: { data: [statusEntry()] } } },
+        { baseUrl: BASE, includeNodes: true }
+      );
+      // Exactly TWO calls: the resources listing plus the node join. No guests,
+      // so no address crawl can pad the count.
+      expect(calls).toHaveLength(2);
+      expect(calls[1]?.url).toBe(`${BASE}/api2/json/cluster/status`);
+      expect(calls[1]?.auth).toBe("PVEAPIToken=root@pam!test=secret");
+      expect(tree.devices).toEqual([
+        {
+          externalId: "node/pve",
+          name: "pve",
+          // toEqual reads an undefined folderPath as absent — "at targetFolder
+          // root" either way; a RENDERED folder (the guest template's "pve")
+          // would fail this equality.
+          endpoints: [{ kind: "ssh", host: "192.0.2.240", port: 22 }],
+          attributes: { type: ["node"], node: ["pve"], status: ["running"] }
+        }
+      ]);
+    });
+
+    it("maps online 0 to stopped WITH the endpoint still emitted — a stopped node still has a management IP — and omits the status attribute entirely when online is absent (kills an invented state, the same rule as a guest row's status 'unknown')", async () => {
+      const stopped = await syncNodes(
+        { [RESOURCES]: { body: { data: [nodeRow()] } }, [STATUS]: { body: { data: [statusEntry({ online: 0 })] } } },
+        { baseUrl: BASE, includeNodes: true }
+      );
+      expect(stopped.tree.devices[0].attributes).toEqual({ type: ["node"], node: ["pve"], status: ["stopped"] });
+      expect(stopped.tree.devices[0].endpoints).toEqual([{ kind: "ssh", host: "192.0.2.240", port: 22 }]);
+
+      const noOnline = statusEntry();
+      delete noOnline.online;
+      const unknownState = await syncNodes(
+        { [RESOURCES]: { body: { data: [nodeRow()] } }, [STATUS]: { body: { data: [noOnline] } } },
+        { baseUrl: BASE, includeNodes: true }
+      );
+      expect(unknownState.tree.devices[0].attributes).toEqual({ type: ["node"], node: ["pve"] });
+      expect(unknownState.tree.devices[0].endpoints).toEqual([{ kind: "ssh", host: "192.0.2.240", port: 22 }]);
+    });
+
+    it("emits a node /cluster/status knows nothing about — absent entry, a 403 without Sys.Audit, or a non-array payload — as addressless with no status, and the sync CONTINUES (kills a node fetch failure that aborts the whole sync)", async () => {
+      const expectDegraded = async (statusRoute: { status?: number; body: unknown }): Promise<void> => {
+        const { tree } = await syncNodes(
+          { [RESOURCES]: { body: { data: [nodeRow()] } }, [STATUS]: statusRoute },
+          { baseUrl: BASE, includeNodes: true }
+        );
+        expect(tree.devices).toEqual([
+          {
+            externalId: "node/pve",
+            name: "pve",
+            endpoints: [],
+            attributes: { type: ["node"], node: ["pve"] }
+          }
+        ]);
+      };
+      // Listed in status, but under another node's name — the join misses.
+      await expectDegraded({ body: { data: [statusEntry({ name: "pve2", id: "node/pve2" })] } });
+      // The token has the guest vocabulary only: Sys.Audit refused.
+      await expectDegraded({ status: 403, body: "" });
+      // Corruption reads as "no joins available", not as a protocol abort.
+      await expectDegraded({ body: { data: {} } });
+    });
+
+    it("makes NO /cluster/status call and ignores node rows when includeNodes is absent or false — exactly ONE fetch (kills an unconditional second request, and a mapper that turns the nameless resources rows into devices)", async () => {
+      for (const includeNodes of [undefined, false]) {
+        const { tree, calls } = await syncNodes(
+          { [RESOURCES]: { body: { data: [nodeRow()] } } },
+          includeNodes === undefined ? { baseUrl: BASE } : { baseUrl: BASE, includeNodes }
+        );
+        expect(tree.devices).toEqual([]);
+        expect(calls).toHaveLength(1);
+        expect(calls[0]?.url).toBe(`${BASE}/api2/json/cluster/resources`);
+      }
+    });
+
+    it("emits a node whose /cluster/status entry carries no ip — addressless, still present (kills dropping the node because its address could not be read)", async () => {
+      const noIp = statusEntry();
+      delete noIp.ip;
+      const { tree } = await syncNodes(
+        { [RESOURCES]: { body: { data: [nodeRow()] } }, [STATUS]: { body: { data: [noIp] } } },
+        { baseUrl: BASE, includeNodes: true }
+      );
+      expect(tree.devices).toEqual([
+        {
+          externalId: "node/pve",
+          name: "pve",
+          endpoints: [],
+          attributes: { type: ["node"], node: ["pve"], status: ["running"] }
+        }
+      ]);
+    });
+
+    it("never collides a node externalId with a vmid — 'node/pve' against guest '105' in one tree (trivial, but pins the prefix that keeps the two identities apart)", async () => {
+      // The guest is STOPPED so the call count stays at the two listing calls.
+      const guest = { vmid: 105, name: "clawdbot", node: "pve", type: "qemu", status: "stopped", template: 0 };
+      const { tree, calls } = await syncNodes(
+        { [RESOURCES]: { body: { data: [nodeRow(), guest] } }, [STATUS]: { body: { data: [statusEntry()] } } },
+        { baseUrl: BASE, includeNodes: true }
+      );
+      expect(calls).toHaveLength(2);
+      expect(tree.devices.map((d) => d.externalId)).toEqual(["105", "node/pve"]);
+      expect(tree.devices.map((d) => d.externalId)).not.toContain("pve");
+    });
+  });
 });

@@ -1029,10 +1029,55 @@ function mapGuest(
 }
 
 /**
+ * One node row + its joined /cluster/status entry → one InventoryDevice.
+ *
+ * The resources row carries ONLY existence — its verified shape is
+ * `{id: "node/pve", node: "pve", type: "node", status: "online"|"offline"|"unknown"}`,
+ * with no `name` and no `ip` member — so everything the device shows comes from
+ * the joined entry, and every part of that join is optional: no entry (the
+ * Sys.Audit call failed or never listed this node) and no `ip` on the entry
+ * each mean an ADDRESSLESS device, because a node exists whether or not this
+ * token may read its address. `status` maps the entry's NUMERIC `online` 1/0 to
+ * running/stopped; anything else — absent, or a malformed payload's string —
+ * invents no state, the same rule as a guest row's status "unknown".
+ *
+ * NO folderPath: a node lands at the source's targetFolder root. PVE's
+ * node-named folders belong to GUESTS (the default `{node}` template); nesting
+ * a node device under a folder named after itself would be the tree citing
+ * itself as its own parent.
+ *
+ * A row without a usable node name is skipped rather than thrown: unlike a
+ * guest's missing vmid, no server can ever be keyed to a name the API never
+ * sent (`"node/"` would be a wholly fabricated identity), so a skip strands
+ * nothing for the prune phase to reap.
+ */
+function mapNode(row: Record<string, unknown>, status?: Record<string, unknown>): InventoryDevice | undefined {
+  const name = str(row.node);
+  if (!name) {
+    return undefined;
+  }
+  const attributes: Record<string, string[]> = { type: ["node"], node: [name] };
+  if (status !== undefined) {
+    if (status.online === 1) {
+      attributes.status = ["running"];
+    } else if (status.online === 0) {
+      attributes.status = ["stopped"];
+    }
+  }
+  const ip = status === undefined ? "" : str(status.ip);
+  return {
+    externalId: `node/${name}`,
+    name,
+    endpoints: ip ? [{ kind: "ssh", host: ip, port: 22 }] : [],
+    attributes
+  };
+}
+
+/**
  * ONE call for the whole guest listing: /cluster/resources WITHOUT a type
  * parameter returns guests and nodes in one payload — node rows are filtered
- * below (and, when node import arrives, re-sourced from /cluster/status, which
- * is the only endpoint carrying their name and address), so no per-type
+ * below (and, when node import is opted into, re-sourced from /cluster/status,
+ * which is the only endpoint carrying their name and address), so no per-type
  * request fan-out exists on this path.
  *
  * Fail closed on shape: the success envelope is `{"data": [...]}`. A payload
@@ -1083,6 +1128,27 @@ async function tryGetJson(transport: ProxmoxTransport, url: URL, token: string, 
     }
     throw err;
   }
+}
+
+/**
+ * ONE /cluster/status GET, best-effort: the parsed `data` array on a healthy
+ * answer, `undefined` on ANY failure — non-2xx (403 without Sys.Audit is the
+ * EXPECTED answer for a token granted only the guest vocabulary), network,
+ * non-JSON, or a `data` that is not an array. Node import degrades over this to
+ * addressless, status-less devices — it never aborts the sync: the nodes'
+ * existence is already established by the resources payload, and a cluster the
+ * token may list but not join addresses for must still sync its guests.
+ */
+async function fetchClusterStatus(
+  transport: ProxmoxTransport,
+  baseUrl: string,
+  token: string,
+  timeoutMs: number
+): Promise<unknown[] | undefined> {
+  const url = new URL(`${baseUrl}${PROXMOX_API_BASE}/cluster/status`);
+  const payload = await tryGetJson(transport, url, token, timeoutMs);
+  const data = (payload as { data?: unknown } | null | undefined)?.data;
+  return Array.isArray(data) ? data : undefined;
 }
 
 /**
@@ -1211,6 +1277,42 @@ async function fetchInventoryImpl(
   }
   if (truncated) {
     warnings.push(`Truncated at ${HARD_CAP} guests — narrow the source.`);
+  }
+
+  // NODE IMPORT (§Fetch) — strictly `=== true`, never a truthiness test: the
+  // form stores a real boolean, and an absent field must read as off (the same
+  // strictness the insecure-TLS opt-in is pinned to; a restored backup's "true"
+  // string must not switch a second request on). The resources payload's node
+  // rows establish existence only; names and addresses come from ONE
+  // /cluster/status call joined by node name, because those rows carry neither
+  // member. Any /cluster/status failure degrades the nodes to addressless and
+  // status-less rather than aborting — the guests above must still sync.
+  if (config.includeNodes === true) {
+    const statusEntries = await fetchClusterStatus(transport, baseUrl, token, FETCH_TIMEOUT_MS);
+    const byName = new Map<string, Record<string, unknown>>();
+    for (const entry of statusEntries ?? []) {
+      if (typeof entry !== "object" || entry === null) {
+        continue;
+      }
+      const e = entry as Record<string, unknown>;
+      const name = str(e.name);
+      if (e.type === "node" && name) {
+        byName.set(name, e);
+      }
+    }
+    for (const raw of rows) {
+      if (typeof raw !== "object" || raw === null) {
+        continue;
+      }
+      const row = raw as Record<string, unknown>;
+      if (row.type !== "node") {
+        continue;
+      }
+      const device = mapNode(row, byName.get(str(row.node)));
+      if (device) {
+        devices.push(device);
+      }
+    }
   }
 
   // GUEST ADDRESS CRAWL (§IP selection) — running, non-template guests only,
