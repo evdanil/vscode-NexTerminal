@@ -2464,7 +2464,7 @@ export class NexusCore {
         this.serverStatusSource.set(serverId, sourceId);
       }
     }
-    // EXPLICIT CLEARS (Codex round 4, P2) — under MERGE an ABSENT entry is
+    // EXPLICIT CLEARS — under MERGE an ABSENT entry is
     // retained (the provider may simply not have reached it), but an id the
     // provider EXPLICITLY names here was seen and is asserted to have NO
     // status, so it is removed even from a partial report: Proxmox sends every

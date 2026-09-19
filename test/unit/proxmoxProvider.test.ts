@@ -1563,7 +1563,7 @@ describe("createProxmoxProvider", () => {
       expect(stoppedOff.report.statuses).toEqual({ "105": { state: "stopped" }, "106": { state: "running" } });
     });
 
-    it("carries every template vmid in `clearedExternalIds` and NONE in `statuses` — with includeTemplates ON and OFF (Codex round-4 controller ruling, superseding round 2's reported-as-stopped: per-vmid template-ness is invisible to the apply's control gate, a bare numeric vmid passes canControlNode, so a known status on a template row lights the Start/Stop menu PVE refuses to serve — a template never carries a status, and its id is explicitly cleared so a MERGING report cannot retain a converted guest's stale decoration; the cleared list rides the report regardless of the opt-in because the template need not be in the current sync set for its old server to still exist) (kills the round-2 stopped-reporting that exposed the menu)", async () => {
+    it("carries every template vmid in `clearedExternalIds` and NONE in `statuses` — with includeTemplates ON and OFF (superseding the intermediate reported-as-stopped design: per-vmid template-ness is invisible to the apply's control gate, a bare numeric vmid passes canControlNode, so a known status on a template row lights the Start/Stop menu PVE refuses to serve — a template never carries a status, and its id is explicitly cleared so a MERGING report cannot retain a converted guest's stale decoration; the cleared list rides the report regardless of the opt-in because the template need not be in the current sync set for its old server to still exist) (kills the reported-as-stopped design that exposed the menu)", async () => {
       const on = await pollStatus(
         {
           [RESOURCES]: {
@@ -1625,7 +1625,7 @@ describe("createProxmoxProvider", () => {
       // merging apply, per the Task-5 ruling pin above.
     });
 
-    it("clears an OBSERVED guest whose row now carries status 'unknown' in a TRUNCATED (join-failure) report — the row was seen and genuinely has no state, the same class as a converted template, so its vmid rides `clearedExternalIds` and the MERGING apply drops the guest's stale running/stopped (and the Start/Stop menu riding it) instead of retaining it indefinitely while Sys.Audit stays unavailable (Codex round 5) (kills the plain omission, which let a previously-status-bearing guest keep its stale decoration on every merging report)", async () => {
+    it("clears an OBSERVED guest whose row now carries status 'unknown' in a TRUNCATED (join-failure) report — the row was seen and genuinely has no state, the same class as a converted template, so its vmid rides `clearedExternalIds` and the MERGING apply drops the guest's stale running/stopped (and the Start/Stop menu riding it) instead of retaining it indefinitely while Sys.Audit stays unavailable (kills the plain omission, which let a previously-status-bearing guest keep its stale decoration on every merging report)", async () => {
       const { report, calls } = await pollStatus(
         {
           [RESOURCES]: {

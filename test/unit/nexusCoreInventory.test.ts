@@ -4799,7 +4799,7 @@ describe("NexusCore inventory status", () => {
     expect(snap.serverStatus.get(b.id)).toBe("stopped");
   });
 
-  // Codex round 4 (P2) — `clearedExternalIds`. A merge retains an entry that is
+  // EXPLICIT CLEARS — `clearedExternalIds`. A merge retains an entry that is
   // merely ABSENT from a truncated report, but an id the provider EXPLICITLY
   // names as gone was seen and is asserted status-less — Proxmox puts every
   // template vmid there, so a guest converted into a template must lose the

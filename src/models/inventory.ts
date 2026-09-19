@@ -163,13 +163,12 @@ export interface InventoryStatusReport {
   // the merge above leaves the unreached nodes showing stale (or `unknown`) state
   // and nothing else on screen would say so. The poll path stays silent.
   truncated?: boolean;
-  // EXPLICIT CLEARS (Codex round 4, P2) — externalIds the provider asserts have
+  // EXPLICIT CLEARS — externalIds the provider asserts have
   // NO status any more, honored by `applyInventoryStatus` even when the report
   // is TRUNCATED: a merge retains an entry that is merely ABSENT (the provider
   // may simply not have reached it), but an entry listed here was SEEN and is
   // asserted gone, so it is removed for this source's servers regardless.
-  // Absent ⇒ a no-op. Three facts state the member's real contract (Codex
-  // round 5, P2):
+  // Absent ⇒ a no-op. Three facts state the member's real contract:
   // 1. VALIDATION — `validateInventoryStatusReport` checks each member's shape
   //    independently and does NOT enforce mutual exclusion: a report carrying
   //    an id in BOTH members still validates.
