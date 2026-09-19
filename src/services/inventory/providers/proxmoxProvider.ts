@@ -512,7 +512,18 @@ function selectProxmoxTransport(transports: ProxmoxTransports, config: Inventory
     : { fetch: transports.standard };
 }
 
-async function rawGet(transport: ProxmoxTransport, url: URL, token: string, timeoutMs: number): Promise<RawResponse> {
+/**
+ * ONE request path for BOTH verbs. GET keeps the platform-default init (no
+ * explicit `method` member — pinned by the smoke-test's request shape), so the
+ * spread is conditional rather than unconditional.
+ */
+async function rawRequest(
+  transport: ProxmoxTransport,
+  method: "GET" | "POST",
+  url: URL,
+  token: string,
+  timeoutMs: number
+): Promise<RawResponse> {
   let res: Response;
   try {
     res = await transport.fetch(url.toString(), {
@@ -524,6 +535,7 @@ async function rawGet(transport: ProxmoxTransport, url: URL, token: string, time
       // so the standard path's `init` stays byte-identical to what a plain
       // fetch would send, rather than gaining an explicit `redirect: undefined`.
       ...(transport.redirect ? { redirect: transport.redirect } : {}),
+      ...(method === "GET" ? {} : { method }),
       signal: AbortSignal.timeout(timeoutMs)
     });
   } catch (err) {
@@ -541,6 +553,15 @@ async function rawGet(transport: ProxmoxTransport, url: URL, token: string, time
   const headers = res.headers as unknown as { get?: (name: string) => string | null } | undefined;
   const location = (typeof headers?.get === "function" ? headers.get("location") : null) ?? undefined;
   return { status: res.status, text, redirectNotFollowed: transport.redirect === "manual", location };
+}
+
+function rawGet(transport: ProxmoxTransport, url: URL, token: string, timeoutMs: number): Promise<RawResponse> {
+  return rawRequest(transport, "GET", url, token, timeoutMs);
+}
+
+/** The one POST the provider makes — a start/stop mutation (see `controlNodeImpl`). */
+function rawPost(transport: ProxmoxTransport, url: URL, token: string, timeoutMs: number): Promise<RawResponse> {
+  return rawRequest(transport, "POST", url, token, timeoutMs);
 }
 
 async function testConnectionImpl(transport: ProxmoxTransport, baseUrl: string, token: string): Promise<void> {
@@ -1558,6 +1579,136 @@ async function fetchStatusImpl(
   return report;
 }
 
+/** The control poll's cadence beat. A `setTimeout` promise, so tests drive it with fake timers. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * NODE CONTROL (§Control) — start or stop ONE guest, keyed by the bare vmid
+ * externalId `fetchInventory`/`fetchStatus` emit. Unlike `fetchStatusImpl`,
+ * failures PROPAGATE (contract note, models/inventory.ts:346-355): the caller
+ * issued a mutation and must learn when it did not happen.
+ *
+ * The shape this walks, verified live: the vmid alone does not name node+type,
+ * so a fresh `?type=vm` lookup resolves them (a guest can migrate between
+ * syncs — the last tree is never trusted); the POST answers HTTP 200
+ * IMMEDIATELY with `{"data":"UPID:…"}`, and the task's verdict is visible ONLY
+ * by polling the task endpoint — a POST 200 says nothing about success ("VM 105
+ * already running" travels as a stopped task with a non-OK `exitstatus`, and a
+ * success task carries `exitstatus: "OK"`). Nodes (`"node/<name>"` externalIds)
+ * are refused before any HTTP call: PVE nodes are not start/stop targets from
+ * Nexus. A deadline expiry reports honestly — the task continues server-side.
+ */
+async function controlNodeImpl(
+  transports: ProxmoxTransports,
+  config: InventorySourceValues,
+  secrets: InventorySourceSecrets,
+  externalId: string,
+  action: "start" | "stop"
+): Promise<void> {
+  if (externalId.startsWith("node/")) {
+    throw new InventoryProviderError(
+      "protocol",
+      `Nodes cannot be started or stopped from Nexus ("${externalId}" is a Proxmox node).`
+    );
+  }
+  const transport = selectProxmoxTransport(transports, config);
+  const baseUrl = normalizeBaseUrl(String(config.baseUrl ?? ""));
+  const token = secrets.apiToken ?? "";
+
+  const lookupUrl = new URL(`${baseUrl}${PROXMOX_API_BASE}/cluster/resources?type=vm`);
+  const lookupRaw = await rawGet(transport, lookupUrl, token, FETCH_TIMEOUT_MS);
+  if (lookupRaw.status < 200 || lookupRaw.status >= 300) {
+    throwForStatus(lookupRaw, lookupUrl);
+  }
+  // Fail-closed like the sync's listing read (fetchResources): a mangled
+  // payload must not read as "the guest is gone".
+  const lookupParsed = parseJsonOrThrow(lookupRaw.text, lookupUrl);
+  const rows = (lookupParsed as { data?: unknown }).data;
+  if (!Array.isArray(rows)) {
+    throw new InventoryProviderError("protocol", `Response from ${lookupUrl} has no resource list ("data" is not an array).`);
+  }
+  let target: { node: string; kind: "qemu" | "lxc" } | undefined;
+  for (const raw of rows) {
+    if (typeof raw !== "object" || raw === null) {
+      continue;
+    }
+    const row = raw as Record<string, unknown>;
+    if (String(row.vmid) !== externalId) {
+      continue;
+    }
+    // A row matching the vmid but carrying an unusable node/type folds into
+    // "not found" — nothing actionable could be built from it either way.
+    if ((row.type === "qemu" || row.type === "lxc") && str(row.node)) {
+      target = { node: row.node as string, kind: row.type };
+      break;
+    }
+  }
+  if (!target) {
+    throw new InventoryProviderError(
+      "protocol",
+      `Guest ${externalId} is no longer present in the Proxmox cluster — re-sync the source and try again.`
+    );
+  }
+
+  const actionUrl = new URL(
+    `${baseUrl}${PROXMOX_API_BASE}/nodes/${encodeURIComponent(target.node)}/${target.kind}/${encodeURIComponent(externalId)}/status/${action}`
+  );
+  const actionRaw = await rawPost(transport, actionUrl, token, FETCH_TIMEOUT_MS);
+  if (actionRaw.status < 200 || actionRaw.status >= 300) {
+    // 401/403 surface as auth errors here — the mapping is the SAME one every
+    // path uses; control just does not swallow the result.
+    throwForStatus(actionRaw, actionUrl);
+  }
+  const actionParsed = parseJsonOrThrow(actionRaw.text, actionUrl);
+  const upid = (actionParsed as { data?: unknown }).data;
+  if (typeof upid !== "string" || !upid.startsWith("UPID:")) {
+    throw new InventoryProviderError(
+      "protocol",
+      `Proxmox did not return a task id for the ${action} of guest ${externalId} — the request cannot be tracked.`
+    );
+  }
+
+  const taskUrl = new URL(
+    `${baseUrl}${PROXMOX_API_BASE}/nodes/${encodeURIComponent(target.node)}/tasks/${encodeURIComponent(upid)}/status`
+  );
+  // Wall-clock deadline, not a poll counter: a slow poll path must not stretch
+  // the wait past what the user was told. The sleep helper uses setTimeout, so
+  // under vitest fake timers the clock and the cadence advance together.
+  const deadline = Date.now() + CONTROL_DEADLINE_MS;
+  while (true) {
+    await sleep(CONTROL_POLL_INTERVAL_MS);
+    const taskRaw = await rawGet(transport, taskUrl, token, FETCH_TIMEOUT_MS);
+    if (taskRaw.status < 200 || taskRaw.status >= 300) {
+      throwForStatus(taskRaw, taskUrl);
+    }
+    const taskParsed = parseJsonOrThrow(taskRaw.text, taskUrl);
+    const task = (taskParsed as { data?: unknown }).data;
+    if (typeof task !== "object" || task === null) {
+      throw new InventoryProviderError("protocol", `Task status response from ${taskUrl} carries no task payload.`);
+    }
+    const t = task as Record<string, unknown>;
+    if (t.status === "stopped") {
+      if (t.exitstatus === "OK") {
+        return;
+      }
+      // The task's own message is the only truthful explanation available —
+      // carry it verbatim (verified live: "VM 105 already running").
+      throw new InventoryProviderError(
+        "protocol",
+        `Proxmox ${action} of guest ${externalId} failed: ${str(t.exitstatus) || "the task finished without an exit status"}.`
+      );
+    }
+    if (Date.now() >= deadline) {
+      throw new InventoryProviderError(
+        "protocol",
+        `Proxmox ${action} of guest ${externalId} is still running after ${CONTROL_DEADLINE_MS / 1000}s — the task continues on the PVE node; check its task log there.`
+      );
+    }
+  }
+}
+
 /**
  * INSECURE TLS — the insecure transport is a SECOND injectable so a test can
  * assert which one a given config selects, rather than inferring it. Default
@@ -1599,6 +1750,18 @@ export function createProxmoxProvider(
     // The optional status member (§Status) — the poll path's one-call report.
     fetchStatus(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<InventoryStatusReport> {
       return fetchStatusImpl(transports, config, secrets);
+    },
+    // The optional control member (§Control) — and the deliberate contrast
+    // with fetchStatus above: this MUTATES the source, so a failure propagates
+    // to the user (models/inventory.ts:346-355) rather than degrading to a
+    // no-op the way a poll's failure does.
+    controlNode(
+      config: InventorySourceValues,
+      secrets: InventorySourceSecrets,
+      externalId: string,
+      action: "start" | "stop"
+    ): Promise<void> {
+      return controlNodeImpl(transports, config, secrets, externalId, action);
     }
   };
 }

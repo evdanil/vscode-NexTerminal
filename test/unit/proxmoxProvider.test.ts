@@ -1540,4 +1540,179 @@ describe("createProxmoxProvider", () => {
       }
     });
   });
+
+  // -----------------------------------------------------------------------------
+  // NODE CONTROL — start/stop one guest via a UPID task. The verified live
+  // shape: the POST answers 200 IMMEDIATELY with `{"data":"UPID:…"}`; the task's
+  // verdict (`exitstatus`) is only visible by polling the task endpoint, so a
+  // 200 on the POST says nothing about success. Unlike fetchStatus, control
+  // PROPAGATES failures (contract note, models/inventory.ts:346-355).
+  // -----------------------------------------------------------------------------
+
+  describe("controlNode", () => {
+    const BASE = "https://pve.example.com:8006";
+    const SECRETS = { apiToken: "root@pam!test=secret" };
+    // Sanitized UPID shape: UPID:<node>:<pid>:<pstart>:<starttime>:<type>:<vmid>:<user>:
+    const UPID = "UPID:pve:00123D:00000000:68C00000:qmstart:105:root@pam:";
+    const UPID_ENC = encodeURIComponent(UPID);
+    const TASK_PATH = `/api2/json/nodes/pve/tasks/${UPID_ENC}/status`;
+    // The brief's pinned budgets (module-internal constants): 2s cadence, 120s
+    // deadline — 60 polls before giving up.
+    const DEADLINE_MS = 120_000;
+
+    type RouteMap = Record<string, { status?: number; body: unknown }>;
+
+    /** Routed world like pollStatus's, but recording the METHOD and headers too — the POST is the whole point here. */
+    function controlFetch(routes: RouteMap) {
+      const calls: Array<{ url: string; method: string; headers?: Record<string, string> }> = [];
+      const impl = async (input: string | URL, init?: { method?: string; headers?: Record<string, string> }): Promise<unknown> => {
+        const url = String(input);
+        calls.push({ url, method: init?.method ?? "GET", headers: init?.headers });
+        const hit = routes[new URL(url).pathname];
+        if (!hit) {
+          return makeResponse(500, { data: null, message: `no test route for ${new URL(url).pathname}` });
+        }
+        return makeResponse(hit.status ?? 200, hit.body);
+      };
+      return { calls, fetchImpl: impl as unknown as typeof fetch };
+    }
+
+    const qemuRow = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+      vmid: 105,
+      node: "pve",
+      type: "qemu",
+      ...overrides
+    });
+
+    it("resolves node and type with a fresh ?type=vm lookup BEFORE the POST — the bare vmid externalId does not name node+type, and a guest can migrate between syncs (kills a control that assumes node/type from thin air or reuses the last tree)", async () => {
+      const { calls, fetchImpl } = controlFetch({
+        "/api2/json/cluster/resources": { body: { data: [qemuRow()] } },
+        "/api2/json/nodes/pve/qemu/105/status/start": { body: { data: UPID } },
+        [TASK_PATH]: { body: { data: { status: "stopped", exitstatus: "OK" } } }
+      });
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      await expect(provider.controlNode!({ baseUrl: BASE }, SECRETS, "105", "start")).resolves.toBeUndefined();
+      expect(calls.map((c) => `${c.method} ${c.url}`)).toEqual([
+        `GET ${BASE}/api2/json/cluster/resources?type=vm`,
+        `POST ${BASE}/api2/json/nodes/pve/qemu/105/status/start`,
+        `GET ${BASE}${TASK_PATH}`
+      ]);
+      // The POST is a fresh request path — it must carry the same PVEAPIToken
+      // credential the GETs do (kills a header that exists only on rawGet).
+      const post = calls[1];
+      expect(post.method).toBe("POST");
+      expect(post.headers).toMatchObject({ Authorization: "PVEAPIToken=root@pam!test=secret" });
+    });
+
+    it("polls the URL-ENCODED UPID task endpoint and resolves once the task reports stopped/OK — a raw-colon UPID path is not the URL PVE serves (kills an unencoded task id, and a control that returns on the POST's 200 without ever checking the task's verdict)", async () => {
+      const { calls, fetchImpl } = controlFetch({
+        "/api2/json/cluster/resources": { body: { data: [qemuRow()] } },
+        "/api2/json/nodes/pve/qemu/105/status/start": { body: { data: UPID } },
+        [TASK_PATH]: { body: { data: { status: "stopped", exitstatus: "OK" } } }
+      });
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      await expect(provider.controlNode!({ baseUrl: BASE }, SECRETS, "105", "start")).resolves.toBeUndefined();
+      expect(calls[2].url).toBe(`${BASE}/api2/json/nodes/pve/tasks/${UPID_ENC}/status`);
+      expect(calls[2].url).not.toContain("UPID:pve");
+    });
+
+    it("REJECTS with the task's own message when it finished with a non-OK exitstatus — the POST's HTTP 200 said nothing (verified live: task `exitstatus: 'VM 105 already running'`; kills swallowing a failed task because the transport answered 200)", async () => {
+      const { fetchImpl } = controlFetch({
+        "/api2/json/cluster/resources": { body: { data: [qemuRow()] } },
+        "/api2/json/nodes/pve/qemu/105/status/start": { body: { data: UPID } },
+        [TASK_PATH]: { body: { data: { status: "stopped", exitstatus: "VM 105 already running" } } }
+      });
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      const err = await provider.controlNode!({ baseUrl: BASE }, SECRETS, "105", "start").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind).toBe("protocol");
+      expect((err as Error).message).toContain("VM 105 already running");
+    });
+
+    it("gives up at the deadline when the task is still running and STOPS polling — the task continues server-side, so the error points at the PVE task log (kills an unbounded poll that never reports)", async () => {
+      vi.useFakeTimers();
+      try {
+        const { calls, fetchImpl } = controlFetch({
+          "/api2/json/cluster/resources": { body: { data: [qemuRow()] } },
+          "/api2/json/nodes/pve/qemu/105/status/start": { body: { data: UPID } },
+          [TASK_PATH]: { body: { data: { status: "running" } } }
+        });
+        const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+        const pending = provider.controlNode!({ baseUrl: BASE }, SECRETS, "105", "start");
+        const settled = expect(pending).rejects.toThrow(/still running/);
+        await vi.advanceTimersByTimeAsync(DEADLINE_MS);
+        await settled;
+        // 1 lookup + 1 POST + exactly 60 polls at the 2s cadence — no call more.
+        expect(calls.filter((c) => c.url.includes("/tasks/"))).toHaveLength(60);
+        expect(calls).toHaveLength(62);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("rejects with a re-sync hint when the vmid is no longer in the cluster listing (kills an error that names neither the guest nor the way out)", async () => {
+      const { calls, fetchImpl } = controlFetch({
+        "/api2/json/cluster/resources": { body: { data: [] } }
+      });
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      const err = await provider.controlNode!({ baseUrl: BASE }, SECRETS, "105", "start").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind).toBe("protocol");
+      expect((err as Error).message).toContain("105");
+      expect((err as Error).message).toMatch(/re-sync/i);
+      // The lookup answered — nothing further was attempted.
+      expect(calls).toHaveLength(1);
+    });
+
+    it("rejects a node externalId immediately, WITHOUT any HTTP call — PVE nodes are not start/stop targets from Nexus (kills a control that POSTs to /nodes/<name>/status)", async () => {
+      const { calls, fetchImpl } = controlFetch({});
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      const err = await provider.controlNode!({ baseUrl: BASE }, SECRETS, "node/pve", "start").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind).toBe("protocol");
+      expect((err as Error).message).toMatch(/cannot be started or stopped/i);
+      expect(calls).toHaveLength(0);
+    });
+
+    it("rejects a POST response whose data is not a UPID string — absent, null, a number, or not 'UPID:'-prefixed (kills a control that polls a task id it never validated — the garbage poll must never fire and the error must name the tracking failure, not a downstream HTTP status)", async () => {
+      for (const body of [{}, { data: null }, { data: 42 }, { data: "not-a-upid" }]) {
+        const { calls, fetchImpl } = controlFetch({
+          "/api2/json/cluster/resources": { body: { data: [qemuRow()] } },
+          "/api2/json/nodes/pve/qemu/105/status/start": { body }
+        });
+        const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+        const err = await provider.controlNode!({ baseUrl: BASE }, SECRETS, "105", "start").catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(InventoryProviderError);
+        expect((err as InventoryProviderError).kind).toBe("protocol");
+        expect((err as Error).message).toMatch(/task id/i);
+        expect(calls.filter((c) => c.url.includes("/tasks/"))).toHaveLength(0);
+      }
+    });
+
+    it("routes an lxc stop through /nodes/pve/lxc/114/status/stop (kills a qemu-only control path)", async () => {
+      const { calls, fetchImpl } = controlFetch({
+        "/api2/json/cluster/resources": { body: { data: [qemuRow({ vmid: 114, type: "lxc" })] } },
+        "/api2/json/nodes/pve/lxc/114/status/stop": { body: { data: "UPID:pve:00123E:00000000:68C00000:vzstop:114:root@pam:" } },
+        "/api2/json/nodes/pve/tasks/UPID%3Apve%3A00123E%3A00000000%3A68C00000%3Avzstop%3A114%3Aroot%40pam%3A/status": {
+          body: { data: { status: "stopped", exitstatus: "OK" } }
+        }
+      });
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      await expect(provider.controlNode!({ baseUrl: BASE }, SECRETS, "114", "stop")).resolves.toBeUndefined();
+      expect(calls[1]).toMatchObject({ method: "POST", url: `${BASE}/api2/json/nodes/pve/lxc/114/status/stop` });
+    });
+
+    it("propagates a 403 on the POST as an AUTH error — unlike the status path, control deliberately does NOT degrade a failed mutation into a no-op (contract, models/inventory.ts:346-355; kills a swallow on the control path)", async () => {
+      const { calls, fetchImpl } = controlFetch({
+        "/api2/json/cluster/resources": { body: { data: [qemuRow()] } },
+        "/api2/json/nodes/pve/qemu/105/status/start": { status: 403, body: "" }
+      });
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      const err = await provider.controlNode!({ baseUrl: BASE }, SECRETS, "105", "start").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind).toBe("auth");
+      // The POST was attempted and refused — no task poll could follow.
+      expect(calls).toHaveLength(2);
+    });
+  });
 });
