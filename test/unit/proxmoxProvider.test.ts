@@ -205,7 +205,7 @@ describe("createProxmoxProvider", () => {
       });
     });
 
-    it("carries PVE's own message from a {\"data\":null,\"message\":…} failure body, newline trimmed (kills echoing raw JSON — or an empty tail where a message should be — at the user)", async () => {
+    it("carries PVE's own message from a {\"data\":null,\"message\":…} failure body, newline trimmed (kills echoing raw JSON — the message must be extracted, not the envelope sliced — or an empty tail where a message should be)", async () => {
       const fetchImpl = vi.fn(async () => makeResponse(500, { data: null, message: "QEMU guest agent is not running\n" }));
       const provider = createProxmoxProvider(fetchImpl as unknown as typeof fetch);
 
@@ -214,6 +214,9 @@ describe("createProxmoxProvider", () => {
         .catch((e: unknown) => e);
       expect(err).toMatchObject({ kind: "protocol" });
       expect((err as Error).message).toContain("QEMU guest agent is not running");
+      // The message is a substring of the raw envelope, so `toContain` alone
+      // would pass a body-echo implementation. The JSON scaffolding must not.
+      expect((err as Error).message).not.toContain('"data"');
     });
 
     function failsWith(code: string, viaCause = false): typeof fetch {

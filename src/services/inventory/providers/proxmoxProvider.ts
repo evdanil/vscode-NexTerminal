@@ -12,12 +12,15 @@ import {
 
 export const PROXMOX_PROVIDER_ID = "proxmox";
 /**
- * The plain `{node}` template: PVE's own primary grouping, and the folder tree a
- * cluster sync produces before a user customises anything. A bare "node" (not
- * "{node}") is deliberate — the template is set-valued per segment already, and
- * there is nothing else to prepend.
+ * The default template is exactly the `{node}` placeholder: every guest lands in
+ * a folder named after the PVE node that runs it — PVE's own primary grouping,
+ * and the tree a cluster sync produces before a user customises anything. It
+ * must carry the braces: the folder renderer substitutes `{token}` placeholders
+ * only, so a bare `node` would render a folder literally named "node" under
+ * every guest. Composition (`{pool}/{node}`, `{tag}`) is the user's opt-in
+ * through the Folder Template field.
  */
-export const DEFAULT_FOLDER_TEMPLATE = "node";
+export const DEFAULT_FOLDER_TEMPLATE = "{node}";
 
 // REQUEST AND CRAWL BUDGETS. One place, so the numbers cannot drift between the
 // paths that have to agree: the per-request timeouts bound every single call,
