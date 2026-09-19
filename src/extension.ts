@@ -897,7 +897,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
       // configMutationLock (it reads/mutates the live map inside the lock).
       await configMutationLock.runExclusive(() => core.moveFolder(oldPath, newParentPath));
     }
-  });
+  },
+  // NODE CONTROL (Task 9) — the tree cannot import the provider registry (UI
+  // layering), so "does this origin's provider implement `controlNode`?"
+  // crosses as a predicate. The `.eveRunning`/`.eveStopped` marker names stay
+  // as EVE-NG named them: every server-menu `when` regex already tolerates
+  // them, and Proxmox inherits the mechanism unchanged.
+  (providerId) => inventoryProviderRegistry.get(providerId)?.controlNode !== undefined);
   const tunnelTreeProvider = new TunnelTreeProvider();
   const networkServerTreeProvider = new NetworkServerTreeProvider();
   // Core + registry so the Settings tree can render one row per inventory

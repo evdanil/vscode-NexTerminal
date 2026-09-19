@@ -5221,7 +5221,8 @@ export function registerInventoryCommands(
       return refreshStatus(resolveSourceIdArg(arg), { manual: !isPoll });
     }),
     vscode.commands.registerCommand("nexus.inventory.manage", manageSources),
-    // NODE CONTROL (Phase 4) — gated in package.json to EVE-origin servers by
+    // NODE CONTROL (Phase 4) — gated in package.json to servers whose origin
+    // source's provider implements controlNode (the tree stamps the marker) by
     // running/stopped state; the handler re-guards on the provider capability.
     vscode.commands.registerCommand("nexus.inventory.startNode", (arg?: unknown) => controlNode(arg, "start")),
     vscode.commands.registerCommand("nexus.inventory.stopNode", (arg?: unknown) => controlNode(arg, "stop"))
