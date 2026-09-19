@@ -1080,12 +1080,19 @@ function mapNode(row: Record<string, unknown>, status?: Record<string, unknown>)
  * parameter returns guests and nodes in one payload — node rows are filtered
  * below (and, when node import is opted into, re-sourced from /cluster/status,
  * which is the only endpoint carrying their name and address), so no per-type
- * request fan-out exists on this path.
+ * request fan-out exists on this path. The STATUS poll (`fetchStatusImpl`)
+ * reads through this same function.
  *
  * Fail closed on shape: the success envelope is `{"data": [...]}`. A payload
- * whose `data` is not an array is corruption — iterating a truthy object (or
- * reading null as empty) would present a mangled answer as "the source
- * legitimately has no devices", and the prune phase would act on exactly that.
+ * whose `data` is not an array is corruption, and on BOTH paths an
+ * empty-but-valid reading of it would act on devices that were never really
+ * gone: the sync's prune phase would delete the servers a mangled listing
+ * "no longer has", and a complete status report is applied clear-then-apply
+ * (`applyInventoryStatus`), so one mangled 200 body would DELETE every
+ * live-state decoration the source has until the next healthy poll. Throwing
+ * is the safe answer for each caller: the sync aborts (prune skipped), and
+ * `fetchProviderStatus` degrades a poll throw to "no update", retaining
+ * decorations.
  */
 async function fetchResources(
   transport: ProxmoxTransport,
@@ -1101,10 +1108,7 @@ async function fetchResources(
   const parsed = parseJsonOrThrow(raw.text, url);
   const data = (parsed as { data?: unknown }).data;
   if (!Array.isArray(data)) {
-    throw new InventoryProviderError(
-      "protocol",
-      `Response from ${url} has no resource list ("data" is not an array) — refusing to sync.`
-    );
+    throw new InventoryProviderError("protocol", `Response from ${url} has no resource list ("data" is not an array).`);
   }
   return data;
 }
@@ -1399,34 +1403,6 @@ async function fetchInventoryImpl(
 }
 
 /**
- * The status path's read of /cluster/resources — the sync's `fetchResources`
- * with the opposite corruption posture. The sync FAILS CLOSED on a payload it
- * cannot read, because a silently missing device reads as "gone at the source"
- * and the prune phase acts on exactly that; a status report has no such
- * downside — an entry it omits keeps its prior state (merge semantics) — so a
- * mangled answer degrades to "no statuses this poll" instead of throwing: a
- * body that is not JSON and a `data` that is not an array both read as an
- * empty listing. Non-2xx and network failures still throw their mapped errors;
- * `fetchProviderStatus`, the only sanctioned caller, degrades every throw to
- * "no update" — but an unreachable cluster and an unreadable answer are
- * different failures, and only one of them is this provider's to soften.
- */
-async function fetchResourcesForStatus(transport: ProxmoxTransport, baseUrl: string, token: string): Promise<unknown[]> {
-  const url = new URL(`${baseUrl}${PROXMOX_API_BASE}/cluster/resources`);
-  const raw = await rawGet(transport, url, token, FETCH_TIMEOUT_MS);
-  if (raw.status < 200 || raw.status >= 300) {
-    throwForStatus(raw, url);
-  }
-  try {
-    const parsed: unknown = JSON.parse(raw.text);
-    const data = (parsed as { data?: unknown }).data;
-    return Array.isArray(data) ? data : [];
-  } catch {
-    return [];
-  }
-}
-
-/**
  * LIVE STATUS (§Status) — the running/stopped state of everything the source
  * can see, keyed by the SAME externalIds `fetchInventory` uses (bare vmid for
  * guests, `node/<name>` for nodes), so each status maps onto the server it
@@ -1440,12 +1416,17 @@ async function fetchResourcesForStatus(transport: ProxmoxTransport, baseUrl: str
  * fan-out exists to find ADDRESSES, which a status report never carries.
  *
  * Guests: `status` maps running/stopped; a row with status "unknown" (PVE
- * emits it before RRD data exists) is OMITTED — absent means the engine keeps
- * the server's prior state, the honest answer for a state nobody knows. The
- * sync's guest filters apply identically (`isImportableGuestRow`), so a device
- * the sync never created gets no status either. NO console fields: the listing
- * rows carry nothing to fill them with, and the console-heal path those fields
- * feed exists for providers whose consoles actually move (EVE-NG's telnet).
+ * emits it before RRD data exists) is OMITTED rather than given an invented
+ * state. The cost is stated plainly: on a COMPLETE report the apply is
+ * clear-then-apply (`applyInventoryStatus`), so the omitted guest's prior
+ * decoration is DROPPED and its highlight stays gone until a poll reports it
+ * again — the honest price for a state nobody knows. Retaining prior state
+ * for absent entries is a property of TRUNCATED reports only. The sync's
+ * guest filters apply identically (`isImportableGuestRow`), so a device the
+ * sync never created gets no status either. NO console fields: the listing
+ * rows carry nothing to fill them with, and the console-heal path those
+ * fields feed exists for providers whose consoles actually move (EVE-NG's
+ * telnet).
  *
  * Nodes: `online` 1/0 from the /cluster/status join — the ONLY endpoint
  * carrying the numeric flag. The resources payload's node-row `status`
@@ -1456,8 +1437,11 @@ async function fetchResourcesForStatus(transport: ProxmoxTransport, baseUrl: str
  * TRUNCATION: the same HARD_CAP as the sync, in the same order (guests first,
  * then nodes) — entries beyond it are simply not collected, and `truncated`
  * makes applyInventoryStatus MERGE the report, retaining prior state for
- * whatever it never reached. There is deliberately NO wall-clock deadline:
- * the path makes at most two sequential requests, each bounded by its own
+ * whatever it never reached. A COMPLETE report is the opposite —
+ * authoritative, clear-then-apply — which is exactly why a mangled payload
+ * must fail closed through `fetchResources` rather than degrade to an
+ * empty-but-valid report. There is deliberately NO wall-clock deadline: the
+ * path makes at most two sequential requests, each bounded by its own
  * timeout, so a stall surfaces as a thrown network error (degraded by the
  * sanctioned caller to "no update") rather than as a partial report — there
  * is no fan-out whose partial progress a deadline would salvage.
@@ -1476,15 +1460,20 @@ async function fetchStatusImpl(
   const includeStopped = config.includeStopped !== false;
   const includeTemplates = config.includeTemplates === true;
 
-  const rows = await fetchResourcesForStatus(transport, baseUrl, token);
+  // The sync's fail-closed listing read, shared: on the poll path the throw is
+  // what protects the decorations — see fetchResources's doc comment.
+  const rows = await fetchResources(transport, baseUrl, token, FETCH_TIMEOUT_MS);
 
   const statuses: Record<string, InventoryDeviceStatus> = {};
   let statusCount = 0;
   let capTripped = false;
   for (const raw of rows) {
-    // A corrupted row is SKIPPED here where the sync throws: with no usable
-    // vmid there is no identity to key, and the entry's absence just keeps
-    // prior state — absence is the status path's currency, not corruption.
+    // A corrupted row is SKIPPED here where the sync throws. The asymmetry is
+    // bounded loss: a sync skip would drop a device from the engine's present
+    // set and the prune phase would delete its server, so the sync fails
+    // closed; here a skip costs only this entry's decoration, and only on a
+    // COMPLETE report (clear-then-apply) — one garbage row must not blind a
+    // poll that successfully read a thousand good ones.
     if (typeof raw !== "object" || raw === null) {
       continue;
     }
@@ -1512,7 +1501,9 @@ async function fetchStatusImpl(
   // Node statuses ride the SAME opt-in as the node import, gated with the same
   // `=== true` strictness, and the join call is the same best-effort
   // fetchClusterStatus the sync uses — a 403 without Sys.Audit degrades to no
-  // node statuses, never a failed poll.
+  // node statuses rather than failing the poll. On a COMPLETE report that
+  // omission is applied clear-then-apply: the nodes' prior decorations drop
+  // until the join answers again.
   if (config.includeNodes === true) {
     const entries = await fetchClusterStatus(transport, baseUrl, token, FETCH_TIMEOUT_MS);
     for (const entry of entries ?? []) {

@@ -1441,7 +1441,7 @@ describe("createProxmoxProvider", () => {
       expect(report.contractVersion).toBe(1);
     });
 
-    it("keys guest statuses by the BARE vmid externalId — running/stopped map through, status 'unknown' rows are OMITTED so the engine keeps prior state, and no entry ever carries console fields (kills an invented mapping for unknown rows, a `${type}/${vmid}` key the apply cannot resolve, and console fields the listing rows never carried)", async () => {
+    it("keys guest statuses by the BARE vmid externalId — running/stopped map through, status 'unknown' rows are OMITTED, and no entry ever carries console fields (kills an invented mapping for unknown rows, a `${type}/${vmid}` key the apply cannot resolve, and console fields the listing rows never carried; the omission's price is stated honestly below — a COMPLETE report is applied clear-then-apply, so the omitted guest's decoration drops until a poll reports it again)", async () => {
       const { report } = await pollStatus(
         {
           [RESOURCES]: {
@@ -1456,9 +1456,16 @@ describe("createProxmoxProvider", () => {
         },
         { baseUrl: BASE }
       );
-      // Exact shape: "116" absent (absent = the engine keeps prior state), and
-      // no consoleHost/consolePort anywhere — toEqual fails on either.
+      // Exact shape: "116" absent — on a COMPLETE report the apply is
+      // clear-then-apply, so the omitted unknown row's prior decoration is
+      // DROPPED until a poll reports it again (the honest price of a state
+      // nobody knows) — and no consoleHost/consolePort anywhere; toEqual
+      // fails on either.
       expect(report.statuses).toEqual({ "105": { state: "running" }, "114": { state: "stopped" } });
+      // Valid per the REAL downstream gate, which rejects any report carrying
+      // a present-but-non-boolean `truncated` key — pins the key's omission
+      // on a complete report.
+      expect(validateInventoryStatusReport(report)).toBeDefined();
     });
 
     it("joins node statuses from a SECOND /cluster/status call only when includeNodes is set — online 1/0 become running/stopped — and without it neither the call nor any node status exists (kills a node-status path that invents state from the resources payload's 'online' string or fires the request uninvited)", async () => {
@@ -1509,13 +1516,13 @@ describe("createProxmoxProvider", () => {
       expect(calls).toHaveLength(1);
     });
 
-    it("degrades an unusable payload to an empty-but-valid report instead of throwing — absence keeps prior state, and validateInventoryStatusReport downstream guards the shape anyway (kills a status path that lets a mangled answer abort a poll the sanctioned caller would have degraded to 'no update')", async () => {
+    it("fails closed on a mangled payload — the poll THROWS instead of answering, because a complete report is applied clear-then-apply and an empty-but-valid one would DELETE every live-state decoration the source has until the next healthy poll (kills an empty-report degrade, which hands the apply a legitimate-looking 'nothing to report' answer built from one mangled 200 body)", async () => {
       for (const body of ["<html>gateway error</html>", "not json", "", { data: {} }, { data: null }]) {
-        const { report } = await pollStatus({ [RESOURCES]: { status: 200, body } }, { baseUrl: BASE });
-        expect(report).toEqual({ contractVersion: 1, statuses: {} });
-        // "Valid" per the REAL downstream gate, not just shape-shaped: the
-        // exact validator `fetchProviderStatus` runs on every poll answer.
-        expect(validateInventoryStatusReport(report)).toBeDefined();
+        const fetchImpl = vi.fn(async () => makeResponse(200, body));
+        const provider = createProxmoxProvider(fetchImpl as unknown as typeof fetch, fetchImpl as unknown as typeof fetch);
+        const err = await provider.fetchStatus!({ baseUrl: BASE }, SECRETS).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(InventoryProviderError);
+        expect((err as InventoryProviderError).kind).toBe("protocol");
       }
     });
   });
