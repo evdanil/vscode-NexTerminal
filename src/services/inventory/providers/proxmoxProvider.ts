@@ -5,9 +5,11 @@ import {
   InventoryProviderError,
   type InventoryConfigField,
   type InventoryDevice,
+  type InventoryDeviceStatus,
   type InventoryProvider,
   type InventorySourceSecrets,
   type InventorySourceValues,
+  type InventoryStatusReport,
   type InventoryTree
 } from "../../../models/inventory";
 
@@ -1152,6 +1154,26 @@ async function fetchClusterStatus(
 }
 
 /**
+ * THE guest-row filter, shared by the sync and the status poll — one function,
+ * so the two paths can never drift: a device the sync never created must not
+ * get a status, and the poll must not report a guest the sync would have
+ * dropped. Guests are `qemu`/`lxc` rows only (node rows share the payload but
+ * carry neither name nor address in it); template rows are excluded unless
+ * `includeTemplates`; and `includeStopped` gates everything that is not
+ * running — including status "unknown", which PVE emits before RRD data exists
+ * and which follows the same gate as a stopped row (§Spec).
+ */
+function isImportableGuestRow(row: Record<string, unknown>, includeStopped: boolean, includeTemplates: boolean): boolean {
+  if (row.type !== "qemu" && row.type !== "lxc") {
+    return false;
+  }
+  if (row.template === 1 && !includeTemplates) {
+    return false;
+  }
+  return includeStopped || row.status === "running";
+}
+
+/**
  * The two per-guest address fetches (§IP selection): the guest config (NIC
  * MACs, for the §3 interface ordering) and the type's IP endpoint (qemu agent
  * / lxc interfaces). Both best-effort, in this order — the config informs how
@@ -1251,19 +1273,12 @@ async function fetchInventoryImpl(
       );
     }
     const row = raw as Record<string, unknown>;
-    // Guests only: qemu VMs and lxc containers. Node rows share this payload
-    // but carry neither name nor address in it — they are ignored here (node
-    // import sources them from /cluster/status when opted in), as are storage
-    // and the other non-guest types the endpoint mixes in.
-    if (row.type !== "qemu" && row.type !== "lxc") {
-      continue;
-    }
-    if (row.template === 1 && !includeTemplates) {
-      continue;
-    }
-    // includeStopped gates everything that is not running — including status
-    // "unknown", which follows the same gate as a stopped row (§Spec).
-    if (!includeStopped && row.status !== "running") {
+    // Node rows (and storage and the other non-guest types the endpoint mixes
+    // in) are ignored here — node import sources them from /cluster/status
+    // when opted in. The type/template/includeStopped gates are the SHARED
+    // `isImportableGuestRow`, so the status poll can never disagree with the
+    // device set this loop produces.
+    if (!isImportableGuestRow(row, includeStopped, includeTemplates)) {
       continue;
     }
     // HARD CAP, client-side, counted over EMITTED DEVICES — guests here, plus
@@ -1384,6 +1399,158 @@ async function fetchInventoryImpl(
 }
 
 /**
+ * The status path's read of /cluster/resources — the sync's `fetchResources`
+ * with the opposite corruption posture. The sync FAILS CLOSED on a payload it
+ * cannot read, because a silently missing device reads as "gone at the source"
+ * and the prune phase acts on exactly that; a status report has no such
+ * downside — an entry it omits keeps its prior state (merge semantics) — so a
+ * mangled answer degrades to "no statuses this poll" instead of throwing: a
+ * body that is not JSON and a `data` that is not an array both read as an
+ * empty listing. Non-2xx and network failures still throw their mapped errors;
+ * `fetchProviderStatus`, the only sanctioned caller, degrades every throw to
+ * "no update" — but an unreachable cluster and an unreadable answer are
+ * different failures, and only one of them is this provider's to soften.
+ */
+async function fetchResourcesForStatus(transport: ProxmoxTransport, baseUrl: string, token: string): Promise<unknown[]> {
+  const url = new URL(`${baseUrl}${PROXMOX_API_BASE}/cluster/resources`);
+  const raw = await rawGet(transport, url, token, FETCH_TIMEOUT_MS);
+  if (raw.status < 200 || raw.status >= 300) {
+    throwForStatus(raw, url);
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw.text);
+    const data = (parsed as { data?: unknown }).data;
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * LIVE STATUS (§Status) — the running/stopped state of everything the source
+ * can see, keyed by the SAME externalIds `fetchInventory` uses (bare vmid for
+ * guests, `node/<name>` for nodes), so each status maps onto the server it
+ * belongs to.
+ *
+ * ONE /cluster/resources call for the guests and — only when node import is
+ * opted into — ONE /cluster/status for the nodes. There is deliberately NO
+ * per-guest crawl here: the poll runs while the Command Center is visible,
+ * against a cluster that may be answering for a hundred guests, and every
+ * state it needs already sits on the listing rows. The crawl's config/agent
+ * fan-out exists to find ADDRESSES, which a status report never carries.
+ *
+ * Guests: `status` maps running/stopped; a row with status "unknown" (PVE
+ * emits it before RRD data exists) is OMITTED — absent means the engine keeps
+ * the server's prior state, the honest answer for a state nobody knows. The
+ * sync's guest filters apply identically (`isImportableGuestRow`), so a device
+ * the sync never created gets no status either. NO console fields: the listing
+ * rows carry nothing to fill them with, and the console-heal path those fields
+ * feed exists for providers whose consoles actually move (EVE-NG's telnet).
+ *
+ * Nodes: `online` 1/0 from the /cluster/status join — the ONLY endpoint
+ * carrying the numeric flag. The resources payload's node-row `status`
+ * ("online"/"offline" strings) is a degraded, version-dependent shape and is
+ * never read here; an entry whose `online` is absent or unrecognizable
+ * invents no state and is omitted, the same rule as a guest's "unknown".
+ *
+ * TRUNCATION: the same HARD_CAP as the sync, in the same order (guests first,
+ * then nodes) — entries beyond it are simply not collected, and `truncated`
+ * makes applyInventoryStatus MERGE the report, retaining prior state for
+ * whatever it never reached. There is deliberately NO wall-clock deadline:
+ * the path makes at most two sequential requests, each bounded by its own
+ * timeout, so a stall surfaces as a thrown network error (degraded by the
+ * sanctioned caller to "no update") rather than as a partial report — there
+ * is no fan-out whose partial progress a deadline would salvage.
+ */
+async function fetchStatusImpl(
+  transports: ProxmoxTransports,
+  config: InventorySourceValues,
+  secrets: InventorySourceSecrets
+): Promise<InventoryStatusReport> {
+  const transport = selectProxmoxTransport(transports, config);
+  const baseUrl = normalizeBaseUrl(String(config.baseUrl ?? ""));
+  const token = secrets.apiToken ?? "";
+  // Same filter defaults as the sync, read with the same strictness: only an
+  // explicit false turns includeStopped off, only `=== true` turns the node
+  // join on (a restored backup's "true" string must not switch a request on).
+  const includeStopped = config.includeStopped !== false;
+  const includeTemplates = config.includeTemplates === true;
+
+  const rows = await fetchResourcesForStatus(transport, baseUrl, token);
+
+  const statuses: Record<string, InventoryDeviceStatus> = {};
+  let statusCount = 0;
+  let capTripped = false;
+  for (const raw of rows) {
+    // A corrupted row is SKIPPED here where the sync throws: with no usable
+    // vmid there is no identity to key, and the entry's absence just keeps
+    // prior state — absence is the status path's currency, not corruption.
+    if (typeof raw !== "object" || raw === null) {
+      continue;
+    }
+    const row = raw as Record<string, unknown>;
+    if (!isImportableGuestRow(row, includeStopped, includeTemplates)) {
+      continue;
+    }
+    if (statusCount >= HARD_CAP) {
+      capTripped = true;
+      continue;
+    }
+    const hasUsableVmid =
+      (typeof row.vmid === "number" && Number.isFinite(row.vmid)) ||
+      (typeof row.vmid === "string" && row.vmid.length > 0);
+    if (!hasUsableVmid) {
+      continue;
+    }
+    if (row.status !== "running" && row.status !== "stopped") {
+      continue;
+    }
+    statuses[String(row.vmid)] = { state: row.status };
+    statusCount++;
+  }
+
+  // Node statuses ride the SAME opt-in as the node import, gated with the same
+  // `=== true` strictness, and the join call is the same best-effort
+  // fetchClusterStatus the sync uses — a 403 without Sys.Audit degrades to no
+  // node statuses, never a failed poll.
+  if (config.includeNodes === true) {
+    const entries = await fetchClusterStatus(transport, baseUrl, token, FETCH_TIMEOUT_MS);
+    for (const entry of entries ?? []) {
+      if (typeof entry !== "object" || entry === null) {
+        continue;
+      }
+      const e = entry as Record<string, unknown>;
+      const name = str(e.name);
+      if (e.type !== "node" || !name) {
+        continue;
+      }
+      if (statusCount >= HARD_CAP) {
+        capTripped = true;
+        break;
+      }
+      if (e.online === 1) {
+        statuses[`node/${name}`] = { state: "running" };
+        statusCount++;
+      } else if (e.online === 0) {
+        statuses[`node/${name}`] = { state: "stopped" };
+        statusCount++;
+      }
+    }
+  }
+
+  // The key is OMITTED when complete rather than the sync's `|| undefined`
+  // idiom: the downstream validator rejects ANY report carrying a non-boolean
+  // `truncated` — including one present with the value undefined — and would
+  // degrade the whole poll to "no update". (The sync TREE's validator instead
+  // tolerates a present-but-undefined key, so the idiom is safe there.)
+  const report: InventoryStatusReport = { contractVersion: 1, statuses };
+  if (capTripped) {
+    report.truncated = true;
+  }
+  return report;
+}
+
+/**
  * INSECURE TLS — the insecure transport is a SECOND injectable so a test can
  * assert which one a given config selects, rather than inferring it. Default
  * construction does no I/O and opens no socket, so building it eagerly here
@@ -1420,6 +1587,10 @@ export function createProxmoxProvider(
     // devices" and the prune phase would act on that.
     fetchInventory(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<InventoryTree> {
       return fetchInventoryImpl(transports, config, secrets);
+    },
+    // The optional status member (§Status) — the poll path's one-call report.
+    fetchStatus(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<InventoryStatusReport> {
+      return fetchStatusImpl(transports, config, secrets);
     }
   };
 }

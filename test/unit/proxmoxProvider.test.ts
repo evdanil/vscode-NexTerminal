@@ -16,7 +16,11 @@ import {
   readProxmoxStatusPollSeconds
 } from "../../src/services/inventory/providers/proxmoxProvider";
 import { validateProviderShape } from "../../src/services/inventory/providerRegistry";
-import { InventoryProviderError, type InventorySourceValues } from "../../src/models/inventory";
+import {
+  InventoryProviderError,
+  validateInventoryStatusReport,
+  type InventorySourceValues
+} from "../../src/models/inventory";
 import { ADVANCED_SECTION_LABEL } from "../../src/ui/formTypes";
 
 function makeResponse(status: number, body: unknown): { status: number; text: () => Promise<string> } {
@@ -1363,6 +1367,156 @@ describe("createProxmoxProvider", () => {
       expect(tree.devices.some((d) => d.externalId === "node/n3")).toBe(false);
       expect(tree.truncated).toBe(true);
       expect(tree.warnings).toEqual(["Truncated at 10000 devices — narrow the source."]);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // LIVE STATUS (fetchStatus) — the poll path. ONE /cluster/resources call for
+  // the guests (+ ONE /cluster/status only when includeNodes is on), no
+  // per-guest fan-out, merge semantics on truncation. Fixtures reuse the
+  // sanitized verified shapes from the sync tests above.
+  // ---------------------------------------------------------------------------
+
+  describe("fetchStatus", () => {
+    const BASE = "https://pve.example.com:8006";
+    const SECRETS = { apiToken: "root@pam!test=secret" };
+    const RESOURCES = "/api2/json/cluster/resources";
+    const STATUS = "/api2/json/cluster/status";
+
+    const guestRow = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+      vmid: 105,
+      name: "clawdbot",
+      node: "pve",
+      type: "qemu",
+      status: "running",
+      template: 0,
+      ...overrides
+    });
+
+    /** The verified /cluster/resources node row — its "online" is a STRING no status may ever be read from. */
+    const nodeRow = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+      id: "node/pve",
+      node: "pve",
+      type: "node",
+      status: "online",
+      ...overrides
+    });
+
+    /** The verified /cluster/status node entry — the ONLY source of a node's numeric `online`. */
+    const statusEntry = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+      type: "node",
+      name: "pve",
+      nodeid: 0,
+      online: 1,
+      ip: "192.0.2.240",
+      id: "node/pve",
+      ...overrides
+    });
+
+    type RouteMap = Record<string, { status?: number; body: unknown }>;
+
+    /** Poll a routed world; unrouted paths answer 500 so an unexpected request shows in the call log. */
+    async function pollStatus(routes: RouteMap, config: InventorySourceValues) {
+      const calls: string[] = [];
+      const impl = async (input: string | URL): Promise<unknown> => {
+        const url = String(input);
+        calls.push(url);
+        const hit = routes[new URL(url).pathname];
+        if (!hit) {
+          return makeResponse(500, { data: null, message: `no test route for ${new URL(url).pathname}` });
+        }
+        return makeResponse(hit.status ?? 200, hit.body);
+      };
+      const provider = createProxmoxProvider(impl as unknown as typeof fetch, impl as unknown as typeof fetch);
+      const report = (await provider.fetchStatus?.(config, SECRETS))!;
+      return { report, calls };
+    }
+
+    it("answers the guest poll with exactly ONE HTTP call when includeNodes is off — no per-guest address crawl on the status path (the provider's efficiency headline: every state the poll needs sits on the listing rows, and a crawl over a hundred running guests would turn a visible-panel poll into the sync's fan-out)", async () => {
+      const { report, calls } = await pollStatus(
+        { [RESOURCES]: { body: { data: [guestRow(), guestRow({ vmid: 106, name: "second" })] } } },
+        { baseUrl: BASE }
+      );
+      expect(calls).toEqual([`${BASE}/api2/json/cluster/resources`]);
+      expect(report.contractVersion).toBe(1);
+    });
+
+    it("keys guest statuses by the BARE vmid externalId — running/stopped map through, status 'unknown' rows are OMITTED so the engine keeps prior state, and no entry ever carries console fields (kills an invented mapping for unknown rows, a `${type}/${vmid}` key the apply cannot resolve, and console fields the listing rows never carried)", async () => {
+      const { report } = await pollStatus(
+        {
+          [RESOURCES]: {
+            body: {
+              data: [
+                guestRow(),
+                guestRow({ vmid: 114, name: "dns", type: "lxc", status: "stopped" }),
+                guestRow({ vmid: 116, name: "fresh", status: "unknown" })
+              ]
+            }
+          }
+        },
+        { baseUrl: BASE }
+      );
+      // Exact shape: "116" absent (absent = the engine keeps prior state), and
+      // no consoleHost/consolePort anywhere — toEqual fails on either.
+      expect(report.statuses).toEqual({ "105": { state: "running" }, "114": { state: "stopped" } });
+    });
+
+    it("joins node statuses from a SECOND /cluster/status call only when includeNodes is set — online 1/0 become running/stopped — and without it neither the call nor any node status exists (kills a node-status path that invents state from the resources payload's 'online' string or fires the request uninvited)", async () => {
+      const withNodes = await pollStatus(
+        {
+          [RESOURCES]: { body: { data: [guestRow(), nodeRow()] } },
+          [STATUS]: {
+            body: { data: [statusEntry(), statusEntry({ name: "pve2", id: "node/pve2", nodeid: 1, online: 0 })] }
+          }
+        },
+        { baseUrl: BASE, includeNodes: true }
+      );
+      expect(withNodes.calls).toHaveLength(2);
+      expect(withNodes.calls[1]).toBe(`${BASE}/api2/json/cluster/status`);
+      expect(withNodes.report.statuses).toEqual({
+        "105": { state: "running" },
+        "node/pve": { state: "running" },
+        "node/pve2": { state: "stopped" }
+      });
+
+      // The SAME resources payload carries the node row with its "online"
+      // STRING — which must invent no status and must not trigger the join.
+      const withoutNodes = await pollStatus({ [RESOURCES]: { body: { data: [guestRow(), nodeRow()] } } }, { baseUrl: BASE });
+      expect(withoutNodes.calls).toHaveLength(1);
+      expect(withoutNodes.report.statuses).toEqual({ "105": { state: "running" } });
+    });
+
+    it("applies the sync's guest filters to the status set — template rows are dropped and, with includeStopped off, stopped rows too — so a device the sync never created gets no status either (the apply would ignore it, but the provider stays consistent with its own device set)", async () => {
+      const templates = await pollStatus(
+        { [RESOURCES]: { body: { data: [guestRow({ template: 1, name: "gold-image" }), guestRow()] } } },
+        { baseUrl: BASE }
+      );
+      expect(templates.report.statuses).toEqual({ "105": { state: "running" } });
+
+      const stoppedOff = await pollStatus(
+        { [RESOURCES]: { body: { data: [guestRow({ status: "stopped" }), guestRow({ vmid: 106, name: "up" })] } } },
+        { baseUrl: BASE, includeStopped: false }
+      );
+      expect(stoppedOff.report.statuses).toEqual({ "106": { state: "running" } });
+    });
+
+    it("stops collecting at the hard cap and flags truncated — a partial report MERGES on apply (prior state retained for the entries never reached), never clears (kills an uncapped report whose apply would clear-then-set over a cluster the poll never finished reading)", async () => {
+      const rows = Array.from({ length: 10_001 }, (_, i) => guestRow({ vmid: i + 1, name: `guest-${i + 1}` }));
+      const { report, calls } = await pollStatus({ [RESOURCES]: { body: { data: rows } } }, { baseUrl: BASE });
+      expect(Object.keys(report.statuses)).toHaveLength(10_000);
+      expect(report.truncated).toBe(true);
+      // The cap needs no fan-out — the poll stays ONE call even at 10k guests.
+      expect(calls).toHaveLength(1);
+    });
+
+    it("degrades an unusable payload to an empty-but-valid report instead of throwing — absence keeps prior state, and validateInventoryStatusReport downstream guards the shape anyway (kills a status path that lets a mangled answer abort a poll the sanctioned caller would have degraded to 'no update')", async () => {
+      for (const body of ["<html>gateway error</html>", "not json", "", { data: {} }, { data: null }]) {
+        const { report } = await pollStatus({ [RESOURCES]: { status: 200, body } }, { baseUrl: BASE });
+        expect(report).toEqual({ contractVersion: 1, statuses: {} });
+        // "Valid" per the REAL downstream gate, not just shape-shaped: the
+        // exact validator `fetchProviderStatus` runs on every poll answer.
+        expect(validateInventoryStatusReport(report)).toBeDefined();
+      }
     });
   });
 });
