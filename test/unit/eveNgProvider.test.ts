@@ -2365,20 +2365,23 @@ describe("createEveNgProvider — testConnection", () => {
 describe("activation wiring", () => {
   const source = readFileSync(path.resolve(__dirname, "..", "..", "src", "extension.ts"), "utf8");
 
-  it("registers BOTH built-in providers in activate() (⊘ the import line alone satisfies a name check, so a version that imports the factory and never calls it would pass)", () => {
+  it("registers all THREE built-in providers in activate() (⊘ the import line alone satisfies a name check, so a version that imports the factory and never calls it would pass)", () => {
     expect(source).toMatch(/inventoryProviderRegistry\.register\(createNetboxProvider\(\)\);/);
     expect(source).toMatch(/inventoryProviderRegistry\.register\(createEveNgProvider\(\)\);/);
+    expect(source).toMatch(/inventoryProviderRegistry\.register\(createProxmoxProvider\(\)\);/);
   });
 
   it("hands the Settings tree the core and the provider registry, without which its per-source rows are empty and never refresh", () => {
     expect(source).toMatch(/new SettingsTreeProvider\(core, inventoryProviderRegistry\)/);
   });
 
-  it("imports the EVE-NG factory from the provider module", () => {
-    // The import also carries the per-source poll's field reader and provider
-    // id, which is why this matches the members rather than the exact line.
+  it("imports the EVE-NG factory from the provider module and hands the poll the shared source mapper", () => {
+    // The per-source poll's field reader and provider id moved into
+    // statusPollSources.ts together with the mapping itself (its behavior is
+    // pinned by statusPollSources.test.ts), so extension.ts names only the
+    // factory here — and delegates the poll's getSources to the mapper.
     expect(source).toMatch(/import \{[^}]*\bcreateEveNgProvider\b[^}]*\} from "\.\/services\/inventory\/providers\/eveNgProvider";/);
-    expect(source).toMatch(/import \{[^}]*\breadEveNgStatusPollSeconds\b[^}]*\} from "\.\/services\/inventory\/providers\/eveNgProvider";/);
+    expect(source).toMatch(/getSources: \(\) => statusPollSources\(core\.getSnapshot\(\)\.inventorySources\)/);
   });
 });
 

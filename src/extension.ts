@@ -84,7 +84,9 @@ import { registerSavedFilterCommands } from "./commands/savedFilterCommands";
 import { registerInventoryCommands, type InventoryRuntimeTeardown } from "./commands/inventoryCommands";
 import { InventoryProviderRegistry } from "./services/inventory/providerRegistry";
 import { createNetboxProvider } from "./services/inventory/providers/netboxProvider";
-import { EVE_NG_PROVIDER_ID, createEveNgProvider, readEveNgStatusPollSeconds } from "./services/inventory/providers/eveNgProvider";
+import { createEveNgProvider } from "./services/inventory/providers/eveNgProvider";
+import { createProxmoxProvider } from "./services/inventory/providers/proxmoxProvider";
+import { statusPollSources } from "./services/inventory/statusPollSources";
 import { createNexusExtensionApi, type NexusExtensionApi } from "./services/inventory/publicApi";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
 import { MacroTreeItem, MacroTreeProvider } from "./ui/macroTreeProvider";
@@ -384,6 +386,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const inventoryProviderRegistry = new InventoryProviderRegistry();
   inventoryProviderRegistry.register(createNetboxProvider());
   inventoryProviderRegistry.register(createEveNgProvider());
+  inventoryProviderRegistry.register(createProxmoxProvider());
 
   const macroStore = new VscodeMacroStore(context);
   await macroStore.initialize();
@@ -1439,34 +1442,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // Registered BEFORE the poll is created: the poll's arm fire runs
   // `nexus.inventory.refreshStatus`, so that command must exist first.
   const inventoryDisposables = registerInventoryCommands(core, inventoryProviderRegistry, secretVault, inventoryTeardown);
-  // LIVE STATUS — opt-in poll of EVE-NG lab running status, gated on the Command
+  // LIVE STATUS — opt-in poll of lab running status, gated on the Command
   // Center being visible and on the SOURCE's own Lab Status Poll Interval field
   // being > 0. Seeds from commandCenterView.visible up front (createTreeView
   // never fires the visibility event at registration), re-arms/stops whenever a
   // source is added, edited or removed, and is disposed with the extension.
   //
-  // Only EVE-NG sources are offered: it is the only built-in provider that
-  // implements `fetchStatus`, and the interval field is declared on it. A source
-  // of any other provider simply never appears in this list.
+  // The polled providers are those that declare a poll-interval reader in
+  // statusPollSources.ts (currently EVE-NG and Proxmox — the built-ins with a
+  // `fetchStatus`); the mapping itself lives there so it stays unit-testable.
   const inventoryStatusPoll = startInventoryStatusPoll({
     view: commandCenterView,
-    getSources: () =>
-      core
-        .getSnapshot()
-        .inventorySources.filter((source) => source.providerId === EVE_NG_PROVIDER_ID)
-        .map((source) => ({
-          id: source.id,
-          intervalSeconds: readEveNgStatusPollSeconds(source.config),
-          // WHICH INCARNATION of the record this is (review G1). `revision` is
-          // minted afresh by `addOrUpdateInventorySource` on every write and is
-          // assigned nowhere else, so it changes exactly when the record is
-          // replaced — a remove-and-recreate under the same id, or an Edit
-          // Source save — and not when a routine sync merely stamps it. That
-          // is what lets the scheduler tell a source that came back from one
-          // that was only hidden, and it is the same value `refreshStatus`
-          // compares before applying a report.
-          incarnation: source.revision
-        })),
+    getSources: () => statusPollSources(core.getSnapshot().inventorySources),
     // NexusCore's own change event covers every way the set or its intervals can
     // move — add/edit/remove a source, a backup import, the one-time migration
     // of the retired global setting — so no separate configuration listener is
