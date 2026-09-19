@@ -3,9 +3,17 @@ import {
   DEFAULT_FOLDER_TEMPLATE,
   PROXMOX_INSECURE_TLS_WARNING,
   PROXMOX_PROVIDER_ID,
+  PROXMOX_STATUS_POLL_FIELD_ID,
   createProxmoxProvider,
+  ifaceOrder,
+  isGlobalAddress,
+  parseLxcIfaces,
+  parseNetMacs,
   parsePrimaryIpFamily,
-  proxmoxInstanceKey
+  parseQemuAgentIfaces,
+  pickAddress,
+  proxmoxInstanceKey,
+  readProxmoxStatusPollSeconds
 } from "../../src/services/inventory/providers/proxmoxProvider";
 import { validateProviderShape } from "../../src/services/inventory/providerRegistry";
 import { InventoryProviderError, type InventorySourceValues } from "../../src/models/inventory";
@@ -104,6 +112,195 @@ describe("parsePrimaryIpFamily", () => {
     for (const raw of [undefined, "auto", "", "ipv4", "AUTO", 4, true, {}]) {
       expect(parsePrimaryIpFamily(raw)).toBe("auto");
     }
+  });
+});
+
+// -----------------------------------------------------------------------------
+// GUEST ADDRESS RESOLUTION — pure parsing/selection pieces. Fixtures are the
+// VERIFIED live API shapes (sanitized): the QEMU agent endpoint nests its
+// interfaces under an extra `result` member; the LXC endpoint reports
+// inet/inet6 CIDR strings; config netN property strings carry the NIC MACs.
+// -----------------------------------------------------------------------------
+
+describe("guest interface parsing", () => {
+  it("parses the QEMU agent shape — the extra `result` nesting, the hardware-address MAC, and addresses kept in reported order (kills a flat-data read that finds no interfaces, and a parser that drops the loopback the global filter is supposed to judge)", () => {
+    const payload = {
+      data: {
+        result: [
+          {
+            name: "lo",
+            "hardware-address": "00:00:00:00:00:00",
+            "ip-addresses": [{ "ip-address": "127.0.0.1", "ip-address-type": "ipv4", prefix: 8 }]
+          },
+          {
+            name: "enp6s18",
+            "hardware-address": "BC:24:11:50:85:FA",
+            "ip-addresses": [
+              { "ip-address": "192.0.2.194", "ip-address-type": "ipv4", prefix: 24 },
+              { "ip-address": "fe80::be24:11ff:fe50:85fa", "ip-address-type": "ipv6", prefix: 64 }
+            ]
+          }
+        ]
+      }
+    };
+    const ifaces = parseQemuAgentIfaces(payload);
+    expect(ifaces).toEqual([
+      { name: "lo", mac: "00:00:00:00:00:00", addresses: ["127.0.0.1"] },
+      { name: "enp6s18", mac: "bc:24:11:50:85:fa", addresses: ["192.0.2.194", "fe80::be24:11ff:fe50:85fa"] }
+    ]);
+    // The global filter, applied to what the parser normalized: enp6s18 carries
+    // exactly one usable host address — the link-local is dropped; the loopback
+    // interface carries none.
+    expect(ifaces[1].addresses.filter(isGlobalAddress)).toEqual(["192.0.2.194"]);
+    expect(ifaces[0].addresses.filter(isGlobalAddress)).toEqual([]);
+  });
+
+  it("classifies agent addresses by SHAPE, never by the ip-address-type vocabulary — LXC's `inet` spelling shows up on the QEMU endpoint too (kills type-string classification, which drops or misroutes every address once the two endpoints' vocabularies drift)", () => {
+    const payload = {
+      data: {
+        result: [
+          {
+            name: "eth0",
+            "hardware-address": "BC:24:11:00:00:02",
+            "ip-addresses": [
+              { "ip-address": "192.0.2.5", "ip-address-type": "inet", prefix: 24 },
+              { "ip-address": "2001:db8::5", "ip-address-type": "inet", prefix: 64 }
+            ]
+          }
+        ]
+      }
+    };
+    const [iface] = parseQemuAgentIfaces(payload);
+    expect(iface.addresses.filter(isGlobalAddress)).toEqual(["192.0.2.5", "2001:db8::5"]);
+    expect(pickAddress(iface.addresses, "prefer-ipv4")).toBe("192.0.2.5");
+    expect(pickAddress(iface.addresses, "prefer-ipv6")).toBe("2001:db8::5");
+  });
+
+  it("parses the LXC interfaces shape — inet/inet6 CIDR strings read as addresses, hwaddr lowercased — and reads a stopped container's {\"data\":null} as NO interfaces, not an error (kills a null-read-as-error that would have every stopped CT's crawl blow up)", () => {
+    const payload = {
+      data: [
+        { name: "lo", inet: "127.0.0.1/8" },
+        { name: "eth0", hwaddr: "BC:24:11:6F:19:87", inet: "192.0.2.10/24", inet6: "2001:db8::10/64" }
+      ]
+    };
+    expect(parseLxcIfaces(payload)).toEqual([
+      { name: "lo", mac: "", addresses: ["127.0.0.1/8"] },
+      { name: "eth0", mac: "bc:24:11:6f:19:87", addresses: ["192.0.2.10/24", "2001:db8::10/64"] }
+    ]);
+    expect(parseLxcIfaces({ data: null })).toEqual([]);
+    // CIDR is stripped LATER — at the endpoint/attribute layer — so the parse
+    // keeps what the API reported and the global filter still reads it.
+    const eth0 = parseLxcIfaces(payload)[1];
+    expect(isGlobalAddress("192.0.2.10/24")).toBe(true);
+    expect(pickAddress(eth0.addresses, "auto")).toBe("192.0.2.10");
+    expect(pickAddress(eth0.addresses, "prefer-ipv6")).toBe("2001:db8::10");
+  });
+
+  it("parses config netN property strings — model-agnostic MAC segment match, case-folded, NUMERIC index sort (kills lexical net10 < net2 ordering, which would rank the eleventh NIC above the third, and a qemu-only <model>=<MAC> first-segment read that misses lxc's hwaddr=)", () => {
+    const qemu = {
+      data: {
+        net0: "virtio=BC:24:11:50:85:FA,bridge=vmbr0,firewall=1",
+        net1: "e1000=BC:24:11:00:00:01,bridge=vmbr1"
+      }
+    };
+    expect(parseNetMacs(qemu)).toEqual([
+      { index: 0, mac: "bc:24:11:50:85:fa" },
+      { index: 1, mac: "bc:24:11:00:00:01" }
+    ]);
+    // NUMERIC sort: net10 sorts after net2, never lexically between net1 and net2.
+    const wide = {
+      data: {
+        net10: "virtio=BC:24:11:00:00:0A,bridge=vmbr0",
+        net2: "virtio=BC:24:11:00:00:02,bridge=vmbr0"
+      }
+    };
+    expect(parseNetMacs(wide)).toEqual([
+      { index: 2, mac: "bc:24:11:00:00:02" },
+      { index: 10, mac: "bc:24:11:00:00:0a" }
+    ]);
+    // LXC spells the MAC as a hwaddr= segment of the same comma-separated string.
+    const lxc = { data: { net0: "name=eth0,bridge=vmbr0,hwaddr=BC:24:11:6F:19:87,ip=192.0.2.10/24" } };
+    expect(parseNetMacs(lxc)).toEqual([{ index: 0, mac: "bc:24:11:6f:19:87" }]);
+    // Non-MAC segments (bridge, firewall, name, ip) and non-netN keys are ignored.
+    expect(parseNetMacs({ data: { net0: "bridge=vmbr0,firewall=1" } })).toEqual([]);
+    expect(parseNetMacs({ data: { net0: "virtio=BC:24:11:50:85:FA", description: "ignored" } })).toEqual([
+      { index: 0, mac: "bc:24:11:50:85:fa" }
+    ]);
+    // Defensive shapes: a missing/absent config payload reads as no MACs.
+    expect(parseNetMacs({ data: null })).toEqual([]);
+    expect(parseNetMacs(undefined)).toEqual([]);
+  });
+
+  it("isGlobalAddress — keeps documentation-range hosts of both families, drops loopback, link-local, unspecified, multicast/reserved and unparseable addresses, and reads CIDR suffixes (kills a filter that only knows one family's special ranges)", () => {
+    for (const addr of ["192.0.2.1", "198.51.100.7", "203.0.113.9/24", "2001:db8::1", "fd00::1", "2001:db8::5/64"]) {
+      expect(isGlobalAddress(addr)).toBe(true);
+    }
+    for (const addr of [
+      "127.0.0.1",
+      "127.8.8.8/8", // v4 loopback 127/8
+      "169.254.3.4", // v4 link-local 169.254/16
+      "0.0.0.0", // unspecified
+      "224.0.0.1",
+      "239.1.2.3",
+      "255.255.255.255", // multicast and reserved, 224/4 and up
+      "300.1.1.1",
+      "not-an-address", // unparseable v4 — never a usable host
+      "::1",
+      "::", // v6 loopback and unspecified
+      "fe80::1",
+      "febf::1",
+      "fe80::be24:11ff:fe50:85fa/64", // fe80::/10 spans fe80..febf
+      "ff02::1",
+      "ff05::1:3", // ff00::/8 multicast
+      "2001:db8::1%eth0" // scoped — not a usable host address
+    ]) {
+      expect(isGlobalAddress(addr)).toBe(false);
+    }
+  });
+
+  it("pickAddress — auto takes the first global in reported order, prefer-* takes that family first and FALLS BACK to the other, CIDR stripped (kills a family preference that yields an addressless device when the chosen interface has none of that family)", () => {
+    const both = ["192.0.2.10/24", "2001:db8::10/64", "fe80::1/64", "127.0.0.1"];
+    expect(pickAddress(both, "auto")).toBe("192.0.2.10");
+    expect(pickAddress(both, "prefer-ipv4")).toBe("192.0.2.10");
+    expect(pickAddress(both, "prefer-ipv6")).toBe("2001:db8::10");
+    expect(pickAddress(["2001:db8::10"], "prefer-ipv4")).toBe("2001:db8::10");
+    expect(pickAddress(["192.0.2.10"], "prefer-ipv6")).toBe("192.0.2.10");
+    expect(pickAddress(["127.0.0.1", "fe80::1"], "auto")).toBeUndefined();
+    expect(pickAddress([], "auto")).toBeUndefined();
+  });
+
+  it("ifaceOrder — config-MAC matches first by numeric netN index, then unmatched interfaces in enumeration order, comparing MACs case-insensitively (kills agent-order-only selection, which picks an in-guest docker bridge over the NIC PVE knows)", () => {
+    const docker0 = { name: "docker0", mac: "aa:bb:cc:dd:ee:01", addresses: [] };
+    const enp = { name: "enp6s18", mac: "bc:24:11:50:85:fa", addresses: [] };
+    // The config side keeps the case PVE reported; the match must not care.
+    expect(ifaceOrder([docker0, enp], [{ index: 0, mac: "BC:24:11:50:85:FA" }])).toEqual([enp, docker0]);
+    // Both matched ⇒ net0 before net1 even when enumeration says otherwise.
+    const eth1 = { name: "if1", mac: "bc:24:11:00:00:01", addresses: [] };
+    const eth0 = { name: "if0", mac: "bc:24:11:00:00:00", addresses: [] };
+    const two = [
+      { index: 1, mac: "bc:24:11:00:00:01" },
+      { index: 0, mac: "bc:24:11:00:00:00" }
+    ];
+    expect(ifaceOrder([eth1, eth0], two)).toEqual([eth0, eth1]);
+    // No config (empty MACs) ⇒ enumeration order survives untouched — the
+    // degrade path keeps yielding addresses.
+    expect(ifaceOrder([docker0, enp], [])).toEqual([docker0, enp]);
+  });
+});
+
+describe("readProxmoxStatusPollSeconds", () => {
+  it("clamps and floors exactly like EVE-NG's reader but reads the PROXMOX field id — absent, non-numeric, negative, fractional and out-of-range values all land on an armable period (kills a reader wired to the wrong provider's field, and an unclamped read that would arm a millisecond-period timer against the cluster)", () => {
+    expect(PROXMOX_STATUS_POLL_FIELD_ID).toBe("statusPollSeconds");
+    const config = (v: unknown): Record<string, unknown> => ({ baseUrl: "https://pve.example.com:8006", [PROXMOX_STATUS_POLL_FIELD_ID]: v });
+    expect(readProxmoxStatusPollSeconds(config(60) as never)).toBe(60);
+    expect(readProxmoxStatusPollSeconds(config(9999) as never)).toBe(3600);
+    expect(readProxmoxStatusPollSeconds(config(1.9) as never)).toBe(1);
+    expect(readProxmoxStatusPollSeconds(config(0) as never)).toBe(0);
+    expect(readProxmoxStatusPollSeconds(config(-5) as never)).toBe(0);
+    expect(readProxmoxStatusPollSeconds(config(undefined) as never)).toBe(0);
+    expect(readProxmoxStatusPollSeconds(config("60") as never)).toBe(0);
+    expect(readProxmoxStatusPollSeconds(config(Number.NaN) as never)).toBe(0);
+    expect(readProxmoxStatusPollSeconds({} as never)).toBe(0);
   });
 });
 
@@ -366,9 +563,14 @@ describe("createProxmoxProvider", () => {
 
     it("maps one running qemu guest from the default template into its node folder — addressless, with the API call pinned to GET /cluster/resources and the PVEAPIToken header (kills a wrong endpoint, a missing unwrap of the {data:…} envelope, and a provider that invents endpoints before the address work exists)", async () => {
       const fetchImpl = vi.fn(async (url: string, init?: { headers?: Record<string, string> }) => {
-        expect(String(url)).toBe(`${BASE}/api2/json/cluster/resources`);
         expect(init?.headers).toMatchObject({ Authorization: "PVEAPIToken=root@pam!test=secret" });
-        return makeResponse(200, { data: [guestRow()] });
+        if (String(url) === `${BASE}/api2/json/cluster/resources`) {
+          return makeResponse(200, { data: [guestRow()] });
+        }
+        // The running guest now triggers the per-guest address crawl (config +
+        // agent GETs); this test pins the LIST call, so the crawl's requests are
+        // answered with the "no data" shape and the guest stays addressless.
+        return makeResponse(200, { data: null });
       });
       const provider = createProxmoxProvider(fetchImpl as unknown as typeof fetch, fetchImpl as unknown as typeof fetch);
       const tree = await provider.fetchInventory({ baseUrl: BASE }, SECRETS);
@@ -473,8 +675,8 @@ describe("createProxmoxProvider", () => {
       expect(tree.devices[0].endpoints).toEqual([]);
     });
 
-    it("stops at the hard cap — 10_001 rows yield exactly 10_000 devices, truncated: true and one warning (kills an uncapped mapper, which would stream an unbounded cluster into one tree and one sync plan)", async () => {
-      const rows = Array.from({ length: 10_001 }, (_, i) => guestRow({ vmid: i + 1, name: `guest-${i + 1}` }));
+    it("stops at the hard cap — 10_001 rows yield exactly 10_000 devices, truncated: true and one warning (kills an uncapped mapper, which would stream an unbounded cluster into one tree and one sync plan). Rows are STOPPED so the row-cap pin stays single-call: running guests would fan out into the address crawl, whose own caps are pinned separately below", async () => {
+      const rows = Array.from({ length: 10_001 }, (_, i) => guestRow({ vmid: i + 1, name: `guest-${i + 1}`, status: "stopped" }));
       const { tree } = await syncRows(rows);
       expect(tree.devices).toHaveLength(10_000);
       expect(tree.truncated).toBe(true);
@@ -513,18 +715,464 @@ describe("createProxmoxProvider", () => {
       expect(quiet.tree.warnings).toEqual([]);
     });
 
-    it("ignores node rows in the payload while includeNodes is absent, making no second request (kills a mapper that turns /cluster/resources node rows — which carry no ip and no name — into devices, and one that fetches /cluster/status uninvited)", async () => {
+    it("ignores node rows in the payload while includeNodes is absent, making no /cluster/status request (kills a mapper that turns /cluster/resources node rows — which carry no ip and no name — into devices, and one that fetches /cluster/status uninvited; the running guest's own address-crawl calls are expected and answered by the shared mock)", async () => {
       const { tree, fetchImpl } = await syncRows([
         { id: "node/pve", node: "pve", type: "node", status: "online" },
         guestRow()
       ]);
       expect(tree.devices.map((d) => d.externalId)).toEqual(["105"]);
-      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      expect(fetchImpl.mock.calls.every(([u]) => !String(u).includes("/cluster/status"))).toBe(true);
     });
 
     it("stamps contractVersion 1 on the tree (kills an unversioned or re-versioned tree the engine's validator rejects)", async () => {
       const { tree } = await syncRows([guestRow()]);
       expect(tree.contractVersion).toBe(1);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // GUEST ADDRESS RESOLUTION — the per-running-guest crawl. Two GETs per guest
+  // (config for the NIC MACs, the type's IP endpoint), both best-effort, within
+  // a shared wall-clock deadline and a MAX_IP_GUESTS cap. Fixtures carry
+  // documentation-range addresses (192.0.2.x, 2001:db8::) and synthetic MACs.
+  // ---------------------------------------------------------------------------
+
+  describe("fetchInventory — guest address resolution", () => {
+    const BASE = "https://pve.example.com:8006";
+    const SECRETS = { apiToken: "root@pam!test=secret" };
+    const RESOURCES = "/api2/json/cluster/resources";
+    const qemuConfigPath = (vmid: number | string) => `/api2/json/nodes/pve/qemu/${vmid}/config`;
+    const qemuAgentPath = (vmid: number | string) => `/api2/json/nodes/pve/qemu/${vmid}/agent/network-get-interfaces`;
+    const lxcConfigPath = (vmid: number | string) => `/api2/json/nodes/pve/lxc/${vmid}/config`;
+    const lxcIfacesPath = (vmid: number | string) => `/api2/json/nodes/pve/lxc/${vmid}/interfaces`;
+
+    const NET0 = "BC:24:11:50:85:FA";
+    const NET1 = "BC:24:11:00:00:01";
+    const row = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+      vmid: 105,
+      name: "clawdbot",
+      node: "pve",
+      type: "qemu",
+      status: "running",
+      template: 0,
+      ...overrides
+    });
+    const ok = (body: unknown): { body: unknown } => ({ body });
+    const fail = (status: number, body: unknown = null): { status: number; body: unknown } => ({ status, body });
+    type RouteMap = Record<string, { status?: number; body: unknown }>;
+
+    /** The qemu config of the default fixture guest: one NIC, net0. */
+    const qemuConfig = { data: { net0: `virtio=${NET0},bridge=vmbr0,firewall=1` } };
+    /** A two-NIC config, net0 + net1. */
+    const qemuConfigTwo = { data: { net0: `virtio=${NET0},bridge=vmbr0`, net1: `e1000=${NET1},bridge=vmbr1` } };
+    /** The verified agent shape for the net0 NIC: loopback + one global v4 + one link-local v6. */
+    const agentEnp = {
+      data: {
+        result: [
+          {
+            name: "lo",
+            "hardware-address": "00:00:00:00:00:00",
+            "ip-addresses": [{ "ip-address": "127.0.0.1", "ip-address-type": "ipv4", prefix: 8 }]
+          },
+          {
+            name: "enp6s18",
+            "hardware-address": NET0,
+            "ip-addresses": [
+              { "ip-address": "192.0.2.194", "ip-address-type": "ipv4", prefix: 24 },
+              { "ip-address": "fe80::be24:11ff:fe50:85fa", "ip-address-type": "ipv6", prefix: 64 }
+            ]
+          }
+        ]
+      }
+    };
+    /** A single dual-stack interface carrying the net0 MAC. */
+    const agentDual = (v4: string, v6: string): unknown => ({
+      data: {
+        result: [
+          {
+            name: "enp6s18",
+            "hardware-address": NET0,
+            "ip-addresses": [
+              { "ip-address": v4, "ip-address-type": "ipv4", prefix: 24 },
+              { "ip-address": v6, "ip-address-type": "ipv6", prefix: 64 }
+            ]
+          }
+        ]
+      }
+    });
+    /** The verified LXC interfaces shape for the running "dns" container. */
+    const lxcIfaces = {
+      data: [
+        { name: "lo", inet: "127.0.0.1/8" },
+        { name: "eth0", hwaddr: "BC:24:11:6F:19:87", inet: "192.0.2.10/24", inet6: "2001:db8::10/64" }
+      ]
+    };
+    const lxcConfig = { data: { net0: "name=eth0,bridge=vmbr0,hwaddr=BC:24:11:6F:19:87" } };
+
+    /**
+     * Sync one routed world: responses keyed by URL path, call log returned for
+     * call-count assertions. An unrouted path answers 500 — a crawl that goes
+     * where the test did not plan shows up as a tolerated-addressless device
+     * AND as an unexpected call, so both assertion styles can catch it.
+     */
+    async function syncRoutes(routes: RouteMap, config: InventorySourceValues = { baseUrl: BASE }) {
+      const calls: string[] = [];
+      const impl = async (input: string | URL): Promise<unknown> => {
+        const url = String(input);
+        calls.push(url);
+        const hit = routes[new URL(url).pathname];
+        if (!hit) {
+          return makeResponse(500, { data: null, message: `no test route for ${new URL(url).pathname}` });
+        }
+        return makeResponse(hit.status ?? 200, hit.body);
+      };
+      const provider = createProxmoxProvider(impl as unknown as typeof fetch, impl as unknown as typeof fetch);
+      const tree = await provider.fetchInventory(config, SECRETS);
+      return { tree, calls };
+    }
+
+    it("chooses the config-MAC-matched interface over an earlier unmatched one — docker0 reporting first still loses to enp6s18 (kills agent-order-only selection, which puts an in-guest docker bridge where the guest's real NIC belongs)", async () => {
+      const { tree } = await syncRoutes({
+        [RESOURCES]: ok({ data: [row()] }),
+        [qemuConfigPath(105)]: ok(qemuConfig),
+        [qemuAgentPath(105)]: ok({
+          data: {
+            result: [
+              {
+                name: "docker0",
+                "hardware-address": "AA:BB:CC:DD:EE:01",
+                "ip-addresses": [{ "ip-address": "192.0.2.99", "ip-address-type": "ipv4", prefix: 16 }]
+              },
+              {
+                name: "enp6s18",
+                "hardware-address": NET0,
+                "ip-addresses": [{ "ip-address": "192.0.2.194", "ip-address-type": "ipv4", prefix: 24 }]
+              }
+            ]
+          }
+        })
+      });
+      expect(tree.devices[0].endpoints).toEqual([{ kind: "ssh", host: "192.0.2.194", port: 22 }]);
+    });
+
+    it("orders two matched interfaces by netN index — net0 wins over net1 even when the agent reported net1 first (kills index-blind matching, which takes whichever interface the agent happened to list first)", async () => {
+      const { tree } = await syncRoutes({
+        [RESOURCES]: ok({ data: [row()] }),
+        [qemuConfigPath(105)]: ok(qemuConfigTwo),
+        [qemuAgentPath(105)]: ok({
+          data: {
+            result: [
+              {
+                name: "eth1",
+                "hardware-address": NET1,
+                "ip-addresses": [{ "ip-address": "192.0.2.2", "ip-address-type": "ipv4", prefix: 24 }]
+              },
+              {
+                name: "eth0",
+                "hardware-address": NET0,
+                "ip-addresses": [{ "ip-address": "192.0.2.1", "ip-address-type": "ipv4", prefix: 24 }]
+              }
+            ]
+          }
+        })
+      });
+      expect(tree.devices[0].endpoints).toEqual([{ kind: "ssh", host: "192.0.2.1", port: 22 }]);
+    });
+
+    it("degrades when the config fetch fails — agent order still yields an address (kills dropping a device's only usable interface because its MAC could not be matched against a config that never arrived)", async () => {
+      const { tree } = await syncRoutes({
+        [RESOURCES]: ok({ data: [row()] }),
+        [qemuConfigPath(105)]: fail(500, { data: null, message: "boom" }),
+        [qemuAgentPath(105)]: ok({
+          data: {
+            result: [
+              {
+                name: "docker0",
+                "hardware-address": "AA:BB:CC:DD:EE:01",
+                "ip-addresses": [{ "ip-address": "192.0.2.99", "ip-address-type": "ipv4", prefix: 16 }]
+              },
+              {
+                name: "enp6s18",
+                "hardware-address": NET0,
+                "ip-addresses": [{ "ip-address": "192.0.2.194", "ip-address-type": "ipv4", prefix: 24 }]
+              }
+            ]
+          }
+        })
+      });
+      expect(tree.devices[0].endpoints).toEqual([{ kind: "ssh", host: "192.0.2.99", port: 22 }]);
+    });
+
+    it("resolves a running LXC container — inet/inet6 CIDR stripped into bare hosts (kills an endpoint host carrying a '/24' suffix)", async () => {
+      const { tree } = await syncRoutes({
+        [RESOURCES]: ok({ data: [row({ vmid: 114, name: "dns", type: "lxc" })] }),
+        [lxcConfigPath(114)]: ok(lxcConfig),
+        [lxcIfacesPath(114)]: ok(lxcIfaces)
+      });
+      expect(tree.devices[0].endpoints).toEqual([
+        { kind: "ssh", host: "192.0.2.10", port: 22 },
+        { kind: "ssh", host: "2001:db8::10", port: 22 }
+      ]);
+      expect(tree.devices[0].attributes).toMatchObject({ ip: ["192.0.2.10"], ip6: ["2001:db8::10"] });
+    });
+
+    it("applies the family preference to the chosen interface and emits the other family as the SECOND ssh endpoint; a family with no address falls back and emits NO alternate (kills an addressless device from a family preference, and a duplicate-address alternate)", async () => {
+      const run = async (routes: RouteMap, config: InventorySourceValues) => (await syncRoutes(routes, config)).tree.devices[0].endpoints;
+      const dualRoutes: RouteMap = {
+        [RESOURCES]: ok({ data: [row()] }),
+        [qemuConfigPath(105)]: ok(qemuConfig),
+        [qemuAgentPath(105)]: ok(agentDual("192.0.2.10", "2001:db8::10"))
+      };
+      // auto: first global in reported order, with the other family as alternate.
+      expect(await run(dualRoutes, { baseUrl: BASE })).toEqual([
+        { kind: "ssh", host: "192.0.2.10", port: 22 },
+        { kind: "ssh", host: "2001:db8::10", port: 22 }
+      ]);
+      expect(await run(dualRoutes, { baseUrl: BASE, primaryIpFamily: "prefer-ipv4" })).toEqual([
+        { kind: "ssh", host: "192.0.2.10", port: 22 },
+        { kind: "ssh", host: "2001:db8::10", port: 22 }
+      ]);
+      expect(await run(dualRoutes, { baseUrl: BASE, primaryIpFamily: "prefer-ipv6" })).toEqual([
+        { kind: "ssh", host: "2001:db8::10", port: 22 },
+        { kind: "ssh", host: "192.0.2.10", port: 22 }
+      ]);
+      // Only v4 exists: prefer-ipv6 falls back to the v4 primary — the device
+      // must NOT go addressless — and there is no v6 alternate to add.
+      const v4OnlyRoutes: RouteMap = {
+        [RESOURCES]: ok({ data: [row()] }),
+        [qemuConfigPath(105)]: ok(qemuConfig),
+        [qemuAgentPath(105)]: ok({
+          data: {
+            result: [
+              {
+                name: "enp6s18",
+                "hardware-address": NET0,
+                "ip-addresses": [{ "ip-address": "192.0.2.10", "ip-address-type": "ipv4", prefix: 24 }]
+              }
+            ]
+          }
+        })
+      };
+      expect(await run(v4OnlyRoutes, { baseUrl: BASE, primaryIpFamily: "prefer-ipv6" })).toEqual([
+        { kind: "ssh", host: "192.0.2.10", port: 22 }
+      ]);
+      expect(await run(v4OnlyRoutes, { baseUrl: BASE, primaryIpFamily: "prefer-ipv4" })).toEqual([
+        { kind: "ssh", host: "192.0.2.10", port: 22 }
+      ]);
+    });
+
+    it("emits ssh endpoints at port 22, and a guest with no global address anywhere still ships as an addressless device with NO provider warning (kills a warning-per-addressless-guest flood — the engine owns that disclosure)", async () => {
+      const { tree } = await syncRoutes({
+        [RESOURCES]: ok({ data: [row()] }),
+        [qemuConfigPath(105)]: ok(qemuConfig),
+        [qemuAgentPath(105)]: ok({
+          data: {
+            result: [
+              {
+                name: "lo",
+                "hardware-address": "00:00:00:00:00:00",
+                "ip-addresses": [{ "ip-address": "127.0.0.1", "ip-address-type": "ipv4", prefix: 8 }]
+              },
+              {
+                name: "enp6s18",
+                "hardware-address": NET0,
+                "ip-addresses": [{ "ip-address": "fe80::be24:11ff:fe50:85fa", "ip-address-type": "ipv6", prefix: 64 }]
+              }
+            ]
+          }
+        })
+      });
+      expect(tree.devices).toHaveLength(1);
+      expect(tree.devices[0].endpoints).toEqual([]);
+      // The MACs are still disclosed — "all MACs across ALL interfaces" is a
+      // property of what the guest REPORTED, not of what filled Host.
+      expect(tree.devices[0].attributes).toEqual({
+        type: ["qemu"],
+        node: ["pve"],
+        status: ["running"],
+        mac: ["00:00:00:00:00:00", "bc:24:11:50:85:fa"]
+      });
+      expect(tree.warnings).toEqual([]);
+    });
+
+    it("tolerates a per-guest agent failure and keeps crawling — guest 105's agent 500 leaves 105 addressless while guest 106 still gets its address; a 403 degrades the same way (kills a first-failure-aborts-the-crawl)", async () => {
+      const rows = [row(), row({ vmid: 106, name: "up" })];
+      const syncWithAgentFailure = async (status: number, body: unknown) => {
+        const routes: RouteMap = {
+          [RESOURCES]: ok({ data: rows }),
+          [qemuConfigPath(105)]: ok(qemuConfig),
+          [qemuConfigPath(106)]: ok(qemuConfig),
+          [qemuAgentPath(105)]: fail(status, body),
+          [qemuAgentPath(106)]: ok(agentEnp)
+        };
+        return syncRoutes(routes);
+      };
+      // The verified agent-missing failure shape.
+      const failed500 = await syncWithAgentFailure(500, { data: null, message: "QEMU guest agent is not running\n" });
+      const [d105, d106] = failed500.tree.devices;
+      expect(d105.endpoints).toEqual([]);
+      expect(d105.attributes).not.toHaveProperty("ip");
+      expect(d106.endpoints).toEqual([{ kind: "ssh", host: "192.0.2.194", port: 22 }]);
+      // A permissions failure on one guest's agent is the same tolerated case.
+      const failed403 = await syncWithAgentFailure(403, "");
+      expect(failed403.tree.devices[0].endpoints).toEqual([]);
+      expect(failed403.tree.devices[1].endpoints).toEqual([{ kind: "ssh", host: "192.0.2.194", port: 22 }]);
+    });
+
+    it("caps the address crawl at MAX_IP_GUESTS — guests beyond the cap stay addressless with truncated: true and a warning naming the cap (kills an unbounded per-guest crawl that would pin a big cluster for minutes)", async () => {
+      const rows = Array.from({ length: 1001 }, (_, i) => row({ vmid: i + 1, name: `guest-${i + 1}` }));
+      const calls: string[] = [];
+      const impl = async (input: string | URL): Promise<unknown> => {
+        const url = String(input);
+        calls.push(url);
+        const path = new URL(url).pathname;
+        if (path === RESOURCES) return makeResponse(200, { data: rows });
+        if (/^\/api2\/json\/nodes\/pve\/qemu\/\d+\/config$/.test(path)) return makeResponse(200, qemuConfig);
+        if (/^\/api2\/json\/nodes\/pve\/qemu\/\d+\/agent\/network-get-interfaces$/.test(path)) {
+          return makeResponse(200, agentEnp);
+        }
+        return makeResponse(500, { data: null, message: `no test route for ${path}` });
+      };
+      const provider = createProxmoxProvider(impl as unknown as typeof fetch, impl as unknown as typeof fetch);
+      const tree = await provider.fetchInventory({ baseUrl: BASE }, SECRETS);
+      expect(tree.devices).toHaveLength(1001);
+      // The first 1000 guests were crawled; the 1001st never was.
+      expect(calls.filter((c) => c.includes("/agent/"))).toHaveLength(1000);
+      expect(calls.some((c) => c.includes("/1001/"))).toBe(false);
+      expect(tree.devices[999].endpoints).toEqual([{ kind: "ssh", host: "192.0.2.194", port: 22 }]);
+      expect(tree.devices[1000].endpoints).toEqual([]);
+      expect(tree.truncated).toBe(true);
+      expect(tree.warnings).toContain("Truncated at 1000 guest address lookups — narrow the source.");
+    });
+
+    it("trips the shared crawl deadline — the next guest makes no fetch, truncated: true and a deadline warning (kills an unbounded crawl against a slow cluster; the clock seam is a Date.now spy advanced by the fetch, the same idiom EVE-NG's deadline tests use)", async () => {
+      let clock = 1_000_000_000;
+      const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => clock);
+      try {
+        const calls: string[] = [];
+        const impl = async (input: string | URL): Promise<unknown> => {
+          const url = String(input);
+          calls.push(url);
+          const path = new URL(url).pathname;
+          // The FIRST guest's agent call eats the entire budget: a cluster this
+          // slow must never see a second guest's requests.
+          if (path === qemuAgentPath(105)) {
+            clock += 130_000;
+            return makeResponse(200, agentEnp);
+          }
+          if (path === RESOURCES) return makeResponse(200, { data: [row(), row({ vmid: 106, name: "up" })] });
+          if (path === qemuConfigPath(105)) return makeResponse(200, qemuConfig);
+          return makeResponse(500, { data: null, message: `no test route for ${path}` });
+        };
+        const provider = createProxmoxProvider(impl as unknown as typeof fetch, impl as unknown as typeof fetch);
+        const tree = await provider.fetchInventory({ baseUrl: BASE }, SECRETS);
+        expect(tree.truncated).toBe(true);
+        expect(tree.warnings).toContain(
+          "Stopped after 120s — the Proxmox address crawl exceeded its time limit and some guests were imported addressless."
+        );
+        expect(calls.some((c) => c.includes("/106/"))).toBe(false);
+        // Guest 105 completed before the trip and keeps its address.
+        expect(tree.devices.find((d) => d.externalId === "105")?.endpoints).toEqual([
+          { kind: "ssh", host: "192.0.2.194", port: 22 }
+        ]);
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
+    it("only RUNNING, non-template guests trigger address fetches — stopped guests and included templates make no config/agent calls (kills a crawl that burns two requests per guest the API cannot answer)", async () => {
+      const rows = [
+        row(),
+        row({ vmid: 114, name: "dns", type: "lxc", status: "stopped" }),
+        row({ vmid: 116, name: "gold-image", template: 1 })
+      ];
+      const calls: string[] = [];
+      const impl = async (input: string | URL): Promise<unknown> => {
+        const url = String(input);
+        calls.push(url);
+        const path = new URL(url).pathname;
+        if (path === RESOURCES) return makeResponse(200, { data: rows });
+        if (/^\/api2\/json\/nodes\/pve\/qemu\/\d+\/config$/.test(path)) return makeResponse(200, qemuConfig);
+        if (/^\/api2\/json\/nodes\/pve\/qemu\/\d+\/agent\/network-get-interfaces$/.test(path)) {
+          return makeResponse(200, agentEnp);
+        }
+        return makeResponse(500, { data: null, message: `no test route for ${path}` });
+      };
+      const provider = createProxmoxProvider(impl as unknown as typeof fetch, impl as unknown as typeof fetch);
+      const tree = await provider.fetchInventory({ baseUrl: BASE, includeTemplates: true }, SECRETS);
+      expect(tree.devices.map((d) => d.externalId)).toEqual(["105", "114", "116"]);
+      expect(calls).toHaveLength(3); // resources + 105's config + 105's agent
+      expect(calls.some((c) => c.includes("/114/"))).toBe(false);
+      expect(calls.some((c) => c.includes("/116/"))).toBe(false);
+    });
+
+    it("composes truncation — a payload over the row cap whose guests then exhaust the IP cap sets truncated from EITHER budget and pushes both warnings (kills an IP-cap flag that overwrites the row-cap flag)", async () => {
+      const rows = Array.from({ length: 10_001 }, (_, i) => row({ vmid: i + 1, name: `guest-${i + 1}` }));
+      const calls: string[] = [];
+      const impl = async (input: string | URL): Promise<unknown> => {
+        const url = String(input);
+        calls.push(url);
+        const path = new URL(url).pathname;
+        if (path === RESOURCES) return makeResponse(200, { data: rows });
+        if (/^\/api2\/json\/nodes\/pve\/qemu\/\d+\/config$/.test(path)) return makeResponse(200, qemuConfig);
+        if (/^\/api2\/json\/nodes\/pve\/qemu\/\d+\/agent\/network-get-interfaces$/.test(path)) {
+          return makeResponse(200, agentEnp);
+        }
+        return makeResponse(500, { data: null, message: `no test route for ${path}` });
+      };
+      const provider = createProxmoxProvider(impl as unknown as typeof fetch, impl as unknown as typeof fetch);
+      const tree = await provider.fetchInventory({ baseUrl: BASE }, SECRETS);
+      expect(tree.devices).toHaveLength(10_000);
+      // The crawl ran its own budget to exhaustion inside the row-capped list.
+      expect(calls.filter((c) => c.includes("/agent/"))).toHaveLength(1000);
+      expect(tree.truncated).toBe(true);
+      expect(tree.warnings).toContain("Truncated at 10000 guests — narrow the source.");
+      expect(tree.warnings).toContain("Truncated at 1000 guest address lookups — narrow the source.");
+    });
+
+    it("collects ALL interfaces' globals into the ip/ip6 sets plus lowercased MACs and global-holding interface names, omitting the empty sets (kills attribute sets that only mirror the chosen interface, and empty-set keys a template filter could match)", async () => {
+      const { tree } = await syncRoutes({
+        [RESOURCES]: ok({ data: [row()] }),
+        [qemuConfigPath(105)]: ok(qemuConfig),
+        [qemuAgentPath(105)]: ok({
+          data: {
+            result: [
+              {
+                name: "lo",
+                "hardware-address": "00:00:00:00:00:00",
+                "ip-addresses": [{ "ip-address": "127.0.0.1", "ip-address-type": "ipv4", prefix: 8 }]
+              },
+              {
+                name: "enp6s18",
+                "hardware-address": NET0,
+                "ip-addresses": [
+                  { "ip-address": "192.0.2.194", "ip-address-type": "ipv4", prefix: 24 },
+                  { "ip-address": "2001:db8::194", "ip-address-type": "ipv6", prefix: 64 },
+                  { "ip-address": "fe80::be24:11ff:fe50:85fa", "ip-address-type": "ipv6", prefix: 64 }
+                ]
+              },
+              {
+                name: "docker0",
+                "hardware-address": "AA:BB:CC:DD:EE:01",
+                "ip-addresses": [{ "ip-address": "192.0.2.99", "ip-address-type": "ipv4", prefix: 16 }]
+              }
+            ]
+          }
+        })
+      });
+      expect(tree.devices[0].endpoints).toEqual([
+        { kind: "ssh", host: "192.0.2.194", port: 22 },
+        { kind: "ssh", host: "2001:db8::194", port: 22 }
+      ]);
+      expect(tree.devices[0].attributes).toEqual({
+        type: ["qemu"],
+        node: ["pve"],
+        status: ["running"],
+        ip: ["192.0.2.194", "192.0.2.99"],
+        ip6: ["2001:db8::194"],
+        mac: ["00:00:00:00:00:00", "bc:24:11:50:85:fa", "aa:bb:cc:dd:ee:01"],
+        ifname: ["enp6s18", "docker0"]
+      });
     });
   });
 });

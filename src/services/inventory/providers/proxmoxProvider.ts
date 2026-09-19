@@ -211,6 +211,40 @@ const PROXMOX_CONFIG_FIELDS: InventoryConfigField[] = [
 /** PRIMARY-IP FAMILY PREFERENCE — the address family a source prefers. */
 type PrimaryIpFamily = "auto" | "prefer-ipv4" | "prefer-ipv6";
 
+/**
+ * PER-SOURCE STATUS POLL — the field id and reader the Command Center's poll
+ * uses to arm this source's interval (the poll map in the wiring imports both).
+ *
+ * DELIBERATE DUPLICATION of EVE-NG's `readEveNgStatusPollSeconds`
+ * (eveNgProvider.ts), not a shared helper: the field id, its form bounds and
+ * its absent-value semantics are provider-local — each provider's config-field
+ * list is part of its fingerprint — and a reader keyed off one provider's
+ * constant would couple two fingerprints to one module. EVE-NG's export stays
+ * untouched for its own tests. The copied clamp/floor body keeps the two
+ * sources behaving identically: absent, non-numeric, negative, fractional and
+ * out-of-range values all resolve to something a timer can be armed with. The
+ * form bounds the value on the way IN, but a source restored from a
+ * hand-edited backup never went through the form, and an unclamped read there
+ * would arm a millisecond-period timer against the cluster (or a `NaN` period,
+ * which reports itself as running and never fires).
+ */
+export const PROXMOX_STATUS_POLL_FIELD_ID = "statusPollSeconds";
+export const PROXMOX_STATUS_POLL_MIN_SECONDS = 0;
+export const PROXMOX_STATUS_POLL_MAX_SECONDS = 3600;
+
+export function readProxmoxStatusPollSeconds(config: InventorySourceValues): number {
+  const raw = config[PROXMOX_STATUS_POLL_FIELD_ID];
+  if (typeof raw !== "number" || Number.isNaN(raw)) {
+    // Includes the ABSENT case (every source that predates the field) and a
+    // numeric STRING, which the form never stores but a backup could carry.
+    return PROXMOX_STATUS_POLL_MIN_SECONDS;
+  }
+  const clamped = Math.min(Math.max(raw, PROXMOX_STATUS_POLL_MIN_SECONDS), PROXMOX_STATUS_POLL_MAX_SECONDS);
+  // Floor rather than round: a value between 0 and 1 must land on OFF, not on a
+  // sub-second period, and no user typing "1.9" meant "poll twice as often".
+  return Math.floor(clamped);
+}
+
 /** Coerce a stored config value to a known preference; anything else is `auto`,
  *  so an absent field or a hand-mangled value is zero behaviour change
  *  bit-for-bit. */
@@ -577,17 +611,376 @@ function renderGuestVars(row: Record<string, unknown>): Record<string, string> {
   };
 }
 
+// ---------------------------------------------------------------------------
+// GUEST ADDRESS RESOLUTION (§IP selection) — the pure pieces. Everything here
+// is normalization or selection over the two VERIFIED endpoint shapes; no
+// request is made below. The QEMU agent endpoint reports bare addresses and
+// `"hardware-address"`; the LXC endpoint reports inet/inet6 CIDR strings and
+// `hwaddr`. Both are normalized into the same {name, mac, addresses} shape so
+// the selection algorithm never learns which endpoint an interface came from.
+// ---------------------------------------------------------------------------
+
+/** One guest interface, normalized. `mac` is lowercased or "" when unreported. */
+export interface ProxmoxGuestIface {
+  name: string;
+  mac: string;
+  /** As reported — LXC's inet/inet6 strings keep their CIDR suffix until pick/attribute time. */
+  addresses: string[];
+}
+
+/** One config `netN` NIC: the property's numeric index and its lowercased MAC. */
+export interface ProxmoxNetMac {
+  index: number;
+  mac: string;
+}
+
+/** "192.0.2.10/24" -> "192.0.2.10"; "2001:db8::10/64" -> "2001:db8::10". */
+export function stripCidr(address: string): string {
+  const slash = address.lastIndexOf("/");
+  return slash === -1 ? address : address.slice(0, slash);
+}
+
 /**
- * One guest row → one InventoryDevice, ADDRESSLESS: endpoints are filled by
- * the per-guest address crawl in a later change, and until then an empty array
- * is the honest answer. Same defensive rule as netbox's `mapEntry`: a row
- * without a usable vmid has no stable externalId, and emitting a fabricated
- * one (`"undefined"`) would poison the adoption identity every kept server
- * carries — so the row aborts the sync loudly instead of quietly vanishing
- * (a silently skipped row reads as "gone at the source" and gets its server
- * pruned).
+ * Is this a usable host address? Classification is by SHAPE (`:` ⇒ IPv6), never
+ * by the `ip-address-type` vocabulary — the two endpoints use different words
+ * (`ipv4/ipv6` vs `inet/inet6`), and the LXC vocabulary has been observed on
+ * the agent endpoint, so any type-string read is wrong somewhere.
+ *
+ * Dropped, per spec: IPv4 loopback 127/8, link-local 169.254/16, the
+ * unspecified 0.0.0.0, and everything from multicast/reserved 224/4 up; IPv6
+ * loopback ::1, link-local fe80::/10 and multicast ff00::/8. Two defensive
+ * additions beyond the spec list, both "not a host address" rather than
+ * policy: the unspecified :: (the agent reports it on tentative interfaces)
+ * and anything unparseable — a garbage string must not become an endpoint
+ * host. CIDR suffixes are stripped before testing, so both endpoint shapes
+ * read the same.
  */
-function mapGuest(row: Record<string, unknown>, template: string): InventoryDevice {
+export function isGlobalAddress(raw: string): boolean {
+  const addr = stripCidr(raw).toLowerCase();
+  if (addr.includes(":")) {
+    if (addr === "::1" || addr === "::") {
+      return false;
+    }
+    // Hex digits, colons and v4-mapped dots only — a zone suffix or any other
+    // decoration is not something we can connect to.
+    if (!/^[0-9a-f:.]+$/.test(addr)) {
+      return false;
+    }
+    // fe80::/10 spans fe80..febf — first TWO hex digits "fe", third in 8-b.
+    if (/^fe[89ab]/.test(addr)) {
+      return false;
+    }
+    if (addr.startsWith("ff")) {
+      return false;
+    }
+    return true;
+  }
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(addr);
+  if (!match) {
+    return false;
+  }
+  const octets = [Number(match[1]), Number(match[2]), Number(match[3]), Number(match[4])];
+  if (octets.some((o) => o > 255)) {
+    return false;
+  }
+  if (octets[0] === 127) {
+    return false;
+  }
+  if (octets[0] === 169 && octets[1] === 254) {
+    return false;
+  }
+  if (octets[0] === 0 && octets[1] === 0 && octets[2] === 0 && octets[3] === 0) {
+    return false;
+  }
+  return octets[0] < 224;
+}
+
+/**
+ * The QEMU agent's interface list. VERIFIED live shape: the interfaces hide
+ * behind an extra `result` member (`{"data":{"result":[…]}}`) — reading `data`
+ * as the array finds nothing on a healthy agent. Addresses are taken verbatim
+ * in reported order (deduped); classification happens later, by shape.
+ */
+export function parseQemuAgentIfaces(payload: unknown): ProxmoxGuestIface[] {
+  const result = (payload as { data?: { result?: unknown } } | null | undefined)?.data?.result;
+  if (!Array.isArray(result)) {
+    return [];
+  }
+  const ifaces: ProxmoxGuestIface[] = [];
+  for (const raw of result) {
+    if (typeof raw !== "object" || raw === null) {
+      continue;
+    }
+    const entry = raw as { name?: unknown; "hardware-address"?: unknown; "ip-addresses"?: unknown };
+    const addresses: string[] = [];
+    if (Array.isArray(entry["ip-addresses"])) {
+      for (const item of entry["ip-addresses"]) {
+        const addr = typeof item === "object" && item !== null ? (item as { "ip-address"?: unknown })["ip-address"] : undefined;
+        if (typeof addr === "string" && addr.length > 0 && !addresses.includes(addr)) {
+          addresses.push(addr);
+        }
+      }
+    }
+    const macRaw = entry["hardware-address"];
+    ifaces.push({
+      name: typeof entry.name === "string" ? entry.name : "",
+      mac: typeof macRaw === "string" ? macRaw.toLowerCase() : "",
+      addresses
+    });
+  }
+  return ifaces;
+}
+
+/**
+ * The LXC interfaces list. VERIFIED live shape: `{"data":[{name, hwaddr,
+ * inet: "a.b.c.d/24", inet6: "…", ip-addresses: […]}]}`. inet/inet6 are
+ * whitespace-split (PVE can pack several addresses in one string) and read
+ * FIRST, then any `ip-addresses` entries not already seen — a healthy
+ * container repeats itself between the two forms, and duplicates would churn
+ * the set-valued attributes. `{"data":null}` is the VERIFIED stopped-container
+ * answer (HTTP 200): "no addresses", not a malformed response.
+ */
+export function parseLxcIfaces(payload: unknown): ProxmoxGuestIface[] {
+  const data = (payload as { data?: unknown } | null | undefined)?.data;
+  if (!Array.isArray(data)) {
+    return [];
+  }
+  const ifaces: ProxmoxGuestIface[] = [];
+  for (const raw of data) {
+    if (typeof raw !== "object" || raw === null) {
+      continue;
+    }
+    const entry = raw as { name?: unknown; hwaddr?: unknown; inet?: unknown; inet6?: unknown; "ip-addresses"?: unknown };
+    const addresses: string[] = [];
+    const pushTokens = (value: unknown): void => {
+      if (typeof value !== "string") {
+        return;
+      }
+      for (const token of value.split(/\s+/)) {
+        if (token.length > 0 && !addresses.includes(token)) {
+          addresses.push(token);
+        }
+      }
+    };
+    pushTokens(entry.inet);
+    pushTokens(entry.inet6);
+    if (Array.isArray(entry["ip-addresses"])) {
+      for (const item of entry["ip-addresses"]) {
+        const addr = typeof item === "object" && item !== null ? (item as { "ip-address"?: unknown })["ip-address"] : undefined;
+        if (typeof addr === "string" && addr.length > 0 && !addresses.includes(addr)) {
+          addresses.push(addr);
+        }
+      }
+    }
+    const macRaw = entry.hwaddr;
+    ifaces.push({
+      name: typeof entry.name === "string" ? entry.name : "",
+      mac: typeof macRaw === "string" ? macRaw.toLowerCase() : "",
+      addresses
+    });
+  }
+  return ifaces;
+}
+
+const NET_KEY = /^net(\d+)$/;
+const MAC_SEGMENT = /^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$/i;
+
+/**
+ * The NIC MACs from a guest config (`{"data":{"net0":"virtio=BC:…,…",…}}`).
+ * qemu writes `<model>=<MAC>` as the first segment; lxc writes `hwaddr=<MAC>`
+ * wherever the property string pleases — so the MAC is matched by SHAPE in any
+ * `k=v` part of any segment, never by key or position. `bridge=`, `firewall=`,
+ * `name=`, `ip=` and friends never match the shape and are ignored. Keys that
+ * are not `netN` are ignored outright. NUMERIC index sort: the entries arrive
+ * in object order, and a ten-NIC guest would otherwise sort net10 before net2
+ * lexically and rank its eleventh interface above its third.
+ */
+export function parseNetMacs(configPayload: unknown): ProxmoxNetMac[] {
+  const data = (configPayload as { data?: unknown } | null | undefined)?.data;
+  if (typeof data !== "object" || data === null) {
+    return [];
+  }
+  const macs: ProxmoxNetMac[] = [];
+  for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
+    const keyMatch = NET_KEY.exec(key);
+    if (!keyMatch || typeof value !== "string") {
+      continue;
+    }
+    for (const segment of value.split(",")) {
+      let found: string | undefined;
+      for (const part of segment.split("=")) {
+        const candidate = part.trim();
+        // Shape match only — case-folded after, so `BC:24:…` and `bc:24:…` are
+        // the same MAC to every consumer downstream.
+        if (MAC_SEGMENT.test(candidate)) {
+          found = candidate.toLowerCase();
+          break;
+        }
+      }
+      if (found) {
+        macs.push({ index: Number.parseInt(keyMatch[1], 10), mac: found });
+        break;
+      }
+    }
+  }
+  return macs.sort((a, b) => a.index - b.index);
+}
+
+/**
+ * The PRIMARY address off one interface's addresses (§IP selection 4): `auto`
+ * takes the first global in reported order; a `prefer-*` family takes its
+ * first global, FALLING BACK to the other family when the interface has none —
+ * a family preference must never manufacture an addressless device. Returns
+ * the CIDR-stripped host, or undefined when the interface holds no global.
+ */
+export function pickAddress(addresses: string[], family: PrimaryIpFamily): string | undefined {
+  const globals = addresses.filter(isGlobalAddress).map(stripCidr).filter((host) => host.length > 0);
+  const v6 = (host: string): boolean => host.includes(":");
+  if (family === "prefer-ipv4") {
+    return globals.find((host) => !v6(host)) ?? globals.find(v6);
+  }
+  if (family === "prefer-ipv6") {
+    return globals.find(v6) ?? globals.find((host) => !v6(host));
+  }
+  return globals[0];
+}
+
+/**
+ * The §IP selection 3 order: interfaces whose MAC matches a config `netN` MAC
+ * first — ascending numeric netN index, net0 being PVE's own primary-NIC
+ * notion — then unmatched interfaces in enumeration order. This is how "prefer
+ * real NICs over in-guest virtual ones" works WITHOUT name parsing: docker
+ * bridges and ZeroTier taps carry MACs PVE has never seen, so they always sort
+ * behind the guest's known NICs. MAC comparison is case-insensitive (the
+ * parsers already lowercase; this re-folds defensively so a caller passing
+ * PVE-cased config MACs still matches).
+ */
+export function ifaceOrder(ifaces: ProxmoxGuestIface[], macs: ProxmoxNetMac[]): ProxmoxGuestIface[] {
+  const configIndex = new Map<string, number>();
+  for (const { index, mac } of macs) {
+    if (!configIndex.has(mac.toLowerCase())) {
+      configIndex.set(mac.toLowerCase(), index);
+    }
+  }
+  const matched: { iface: ProxmoxGuestIface; order: number; position: number }[] = [];
+  const unmatched: ProxmoxGuestIface[] = [];
+  ifaces.forEach((iface, position) => {
+    const order = iface.mac ? configIndex.get(iface.mac.toLowerCase()) : undefined;
+    if (order === undefined) {
+      unmatched.push(iface);
+    } else {
+      matched.push({ iface, order, position });
+    }
+  });
+  // Two interfaces sharing one config MAC (a malformed config) keep their
+  // reported order — the tiebreak, not the rule.
+  matched.sort((a, b) => a.order - b.order || a.position - b.position);
+  return [...matched.map((m) => m.iface), ...unmatched];
+}
+
+/** What the per-guest crawl hands back: MACs from config, ifaces from the IP endpoint. */
+interface GuestAddressData {
+  macs: ProxmoxNetMac[];
+  ifaces: ProxmoxGuestIface[];
+}
+
+/**
+ * Fills one mapped guest's endpoints and IP attributes from its crawled
+ * addresses (§IP selection). ATTRIBUTES cover ALL interfaces regardless of
+ * which one filled Host: every global address (ip/ip6 sets), every reported
+ * MAC (lowercased) and every interface name that holds a global (ifname) —
+ * the chosen interface is a routing decision, not a disclosure filter. Empty
+ * sets are omitted: an empty key would read as a matchable value to template
+ * filters.
+ *
+ * ENDPOINTS follow the netbox convention: the FIRST `kind: "ssh"` endpoint is
+ * the primary host (`selectSshEndpoint` → `ServerConfig.host`), the SECOND is
+ * the alternate (`selectAltEndpoint` → `altHost`) — the chosen interface's
+ * other-family global, only when present and DISTINCT from the primary. The
+ * chosen interface is the first in §3 order holding at least one global, and
+ * the primary never goes missing under a family preference (pickAddress falls
+ * back across families). A NAMELESS guest still gains the attributes but keeps
+ * NO endpoint — it cannot become a server, so an address on it would only
+ * invite a half-mapped placeholder (netbox convention).
+ */
+function fillGuestEndpoints(device: InventoryDevice, data: GuestAddressData, family: PrimaryIpFamily): void {
+  const ip = new Set<string>();
+  const ip6 = new Set<string>();
+  const macs = new Set<string>();
+  const ifnames = new Set<string>();
+  for (const iface of data.ifaces) {
+    let holdsGlobal = false;
+    for (const raw of iface.addresses) {
+      if (!isGlobalAddress(raw)) {
+        continue;
+      }
+      const host = stripCidr(raw);
+      if (host.length === 0) {
+        continue;
+      }
+      (host.includes(":") ? ip6 : ip).add(host);
+      holdsGlobal = true;
+    }
+    if (holdsGlobal) {
+      ifnames.add(iface.name);
+    }
+    if (iface.mac) {
+      macs.add(iface.mac);
+    }
+  }
+  const attrs: Record<string, string[]> = {};
+  if (ip.size > 0) {
+    attrs.ip = [...ip];
+  }
+  if (ip6.size > 0) {
+    attrs.ip6 = [...ip6];
+  }
+  if (macs.size > 0) {
+    attrs.mac = [...macs];
+  }
+  if (ifnames.size > 0) {
+    attrs.ifname = [...ifnames];
+  }
+  if (Object.keys(attrs).length > 0) {
+    device.attributes = { ...device.attributes, ...attrs };
+  }
+
+  const chosen = ifaceOrder(data.ifaces, data.macs).find((iface) => iface.addresses.some(isGlobalAddress));
+  if (!chosen || !device.name) {
+    return;
+  }
+  const primary = pickAddress(chosen.addresses, family);
+  if (!primary) {
+    return;
+  }
+  const endpoints: InventoryDevice["endpoints"] = [{ kind: "ssh", host: primary, port: 22 }];
+  const chosenGlobals = chosen.addresses.filter(isGlobalAddress).map(stripCidr);
+  const otherFamily = primary.includes(":") ? chosenGlobals.filter((host) => !host.includes(":")) : chosenGlobals.filter((host) => host.includes(":"));
+  const alternate = otherFamily.find((host) => host !== primary);
+  if (alternate) {
+    endpoints.push({ kind: "ssh", host: alternate, port: 22 });
+  }
+  device.endpoints = endpoints;
+}
+
+/**
+ * One guest row → one InventoryDevice. Endpoints and IP attributes are filled
+ * from `data` when the per-guest address crawl ran (see
+ * `fillGuestEndpoints`); without it — a stopped guest, a template, a crawl
+ * capped before this guest — the device stays addressless, which is the honest
+ * answer and the engine's cue for its own addressless disclosure. Same
+ * defensive rule as netbox's `mapEntry`: a row without a usable vmid has no
+ * stable externalId, and emitting a fabricated one (`"undefined"`) would
+ * poison the adoption identity every kept server carries — so the row aborts
+ * the sync loudly instead of quietly vanishing (a silently skipped row reads
+ * as "gone at the source" and gets its server pruned).
+ */
+function mapGuest(
+  row: Record<string, unknown>,
+  template: string,
+  data?: GuestAddressData,
+  family: PrimaryIpFamily = "auto"
+): InventoryDevice {
   const hasUsableVmid =
     (typeof row.vmid === "number" && Number.isFinite(row.vmid)) ||
     (typeof row.vmid === "string" && row.vmid.length > 0);
@@ -619,16 +1012,20 @@ function mapGuest(row: Record<string, unknown>, template: string): InventoryDevi
   // status poll immediately contradicts — so no status attribute at all.
   const status = row.status === "running" || row.status === "stopped" ? str(row.status) : "";
   put("status", status ? [status] : []);
-  return {
+  const device: InventoryDevice = {
     externalId: String(row.vmid),
     name,
     folderPath: renderFolderTemplate(template, renderGuestVars(row)),
-    // Endpoints arrive with the address crawl. A NAMELESS guest must keep no
-    // endpoint even then (netbox convention): it cannot become a server, so an
-    // address on it would only invite a half-mapped placeholder.
+    // Endpoints are filled in below ONLY from the crawl's data; a NAMELESS
+    // guest keeps none even then (netbox convention): it cannot become a
+    // server, so an address on it would only invite a half-mapped placeholder.
     endpoints: [],
     attributes: Object.keys(attrs).length > 0 ? attrs : undefined
   };
+  if (data) {
+    fillGuestEndpoints(device, data, family);
+  }
+  return device;
 }
 
 /**
@@ -665,6 +1062,74 @@ async function fetchResources(
   return data;
 }
 
+/**
+ * ONE per-guest GET, best-effort: resolves the parsed envelope on a 2xx answer
+ * and `undefined` on ANY failure (non-2xx, network, non-JSON). Per-guest
+ * failures are TOLERATED, never surfaced — a guest whose agent is not running
+ * (the COMMON case, a verified 500) or whose config the token cannot read must
+ * degrade to addressless, not abort a crawl over hundreds of healthy guests.
+ * Only an unexpected error shape (a bug, not an API answer) still throws.
+ */
+async function tryGetJson(transport: ProxmoxTransport, url: URL, token: string, timeoutMs: number): Promise<unknown | undefined> {
+  try {
+    const raw = await rawGet(transport, url, token, timeoutMs);
+    if (raw.status < 200 || raw.status >= 300) {
+      return undefined;
+    }
+    return parseJsonOrThrow(raw.text, url);
+  } catch (err) {
+    if (err instanceof InventoryProviderError) {
+      return undefined;
+    }
+    throw err;
+  }
+}
+
+/**
+ * The two per-guest address fetches (§IP selection): the guest config (NIC
+ * MACs, for the §3 interface ordering) and the type's IP endpoint (qemu agent
+ * / lxc interfaces). Both best-effort, in this order — the config informs how
+ * the agent's interfaces are RANKED, so it must land first. `deadline` is the
+ * crawl's shared wall-clock budget; each request's timeout is the
+ * FETCH_TIMEOUT ceiling capped by the deadline's REMAINING slice (EVE-NG
+ * idiom), so a request issued near the deadline aborts when the budget hits
+ * zero instead of running its full 20s past it.
+ */
+async function resolveGuestIps(
+  transport: ProxmoxTransport,
+  baseUrl: string,
+  token: string,
+  row: Record<string, unknown>,
+  deadline: number
+): Promise<GuestAddressData> {
+  const node = encodeURIComponent(str(row.node));
+  const kind = row.type === "qemu" || row.type === "lxc" ? row.type : "";
+  const vmid = encodeURIComponent(String(row.vmid));
+  if (!node || !kind) {
+    return { macs: [], ifaces: [] };
+  }
+  const budget = (): number => Math.min(FETCH_TIMEOUT_MS, Math.max(0, deadline - Date.now()));
+  const macs: ProxmoxNetMac[] = [];
+  const configUrl = new URL(`${baseUrl}${PROXMOX_API_BASE}/nodes/${node}/${kind}/${vmid}/config`);
+  const configPayload = await tryGetJson(transport, configUrl, token, budget());
+  if (configPayload !== undefined) {
+    macs.push(...parseNetMacs(configPayload));
+  }
+  // The budget can be spent by the config call; issuing the second request on
+  // a zero slice would only burn an instant abort. What is collected stays.
+  if (budget() <= 0) {
+    return { macs, ifaces: [] };
+  }
+  const ipUrl = new URL(
+    kind === "qemu"
+      ? `${baseUrl}${PROXMOX_API_BASE}/nodes/${node}/qemu/${vmid}/agent/network-get-interfaces`
+      : `${baseUrl}${PROXMOX_API_BASE}/nodes/${node}/lxc/${vmid}/interfaces`
+  );
+  const ipPayload = await tryGetJson(transport, ipUrl, token, budget());
+  const ifaces = ipPayload === undefined ? [] : kind === "qemu" ? parseQemuAgentIfaces(ipPayload) : parseLxcIfaces(ipPayload);
+  return { macs, ifaces };
+}
+
 async function fetchInventoryImpl(
   transports: ProxmoxTransports,
   config: InventorySourceValues,
@@ -682,6 +1147,9 @@ async function fetchInventoryImpl(
   // protective default and a stored non-boolean cannot silently drop guests.
   const includeStopped = config.includeStopped !== false;
   const includeTemplates = config.includeTemplates === true;
+  // Which family the primary ssh endpoint prefers — read ONCE, here, so every
+  // guest of the sync answers to the same preference.
+  const family = parsePrimaryIpFamily(config.primaryIpFamily);
 
   const warnings: string[] = [];
   // INSECURE TLS — this sync ran with certificate verification OFF, so it says
@@ -695,6 +1163,11 @@ async function fetchInventoryImpl(
   const rows = await fetchResources(transport, baseUrl, token, FETCH_TIMEOUT_MS);
 
   const devices: InventoryDevice[] = [];
+  // Running, non-template guests awaiting their address crawl. Templates never
+  // crawl (no agent ever answers for one) and stopped guests cannot answer —
+  // the crawl is the only per-guest fan-out this provider makes, so it is
+  // gated twice over.
+  const crawl: { row: Record<string, unknown>; device: InventoryDevice }[] = [];
   let truncated = false;
   for (let index = 0; index < rows.length; index++) {
     const raw = rows[index];
@@ -730,10 +1203,58 @@ async function fetchInventoryImpl(
       truncated = true;
       continue;
     }
-    devices.push(mapGuest(row, template));
+    const device = mapGuest(row, template);
+    devices.push(device);
+    if (row.status === "running" && row.template !== 1) {
+      crawl.push({ row, device });
+    }
   }
   if (truncated) {
     warnings.push(`Truncated at ${HARD_CAP} guests — narrow the source.`);
+  }
+
+  // GUEST ADDRESS CRAWL (§IP selection) — running, non-template guests only,
+  // under TWO budgets that compose with the row cap's `truncated` above:
+  // MAX_IP_GUESTS caps the request fan-out and a shared wall-clock deadline
+  // caps the crawl's time (EVE-NG idiom). Either budget stopping the crawl
+  // leaves the untouched guests ADDRESSLESS — never dropped — and flags
+  // `truncated`, so the engine skips pruning over the partial picture (a
+  // capped fetch must never read as "these guests no longer exist").
+  if (crawl.length > 0) {
+    const deadline = Date.now() + CRAWL_DEADLINE_MS;
+    let crawled = 0;
+    let ipCapped = false;
+    let deadlineHit = false;
+    for (const guest of crawl) {
+      if (crawled >= MAX_IP_GUESTS) {
+        ipCapped = true;
+        break;
+      }
+      if (Date.now() > deadline) {
+        deadlineHit = true;
+        break;
+      }
+      crawled++;
+      const data = await resolveGuestIps(transport, baseUrl, token, guest.row, deadline);
+      fillGuestEndpoints(guest.device, data, family);
+      // A guest whose requests stalled to the deadline is already addressless;
+      // the clock check here (not only at the loop top) keeps the LAST guest's
+      // stall from going unnoticed.
+      if (Date.now() > deadline) {
+        deadlineHit = true;
+        break;
+      }
+    }
+    if (ipCapped) {
+      truncated = true;
+      warnings.push(`Truncated at ${MAX_IP_GUESTS} guest address lookups — narrow the source.`);
+    }
+    if (deadlineHit) {
+      truncated = true;
+      warnings.push(
+        `Stopped after ${Math.round(CRAWL_DEADLINE_MS / 1000)}s — the Proxmox address crawl exceeded its time limit and some guests were imported addressless.`
+      );
+    }
   }
 
   return { contractVersion: 1, devices, warnings, truncated: truncated || undefined };
@@ -758,8 +1279,9 @@ export function createProxmoxProvider(
     // `attributeKeys` contract on `InventoryProvider`. `tag` is the filter key;
     // the attribute is `tags` (the shared parser aliases them), and `name` is
     // the provider-agnostic reserved key. The `ip*`/`mac`/`ifname` sets are
-    // declared even though the address work arrives later: a key nobody filters
-    // on warns nobody, and the vocabulary stays in one place.
+    // filled by the guest address crawl (running guests only), so a filter on
+    // them matches nothing on a stopped guest — the vocabulary stays declared
+    // in one place regardless.
     attributeKeys: ["type", "node", "pool", "tag", "status", "ip", "ip6", "mac", "ifname", "name"],
     instanceKey(config: InventorySourceValues): string | undefined {
       return proxmoxInstanceKey(config);
