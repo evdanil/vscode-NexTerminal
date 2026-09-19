@@ -4836,6 +4836,46 @@ describe("NexusCore inventory status", () => {
     expect(snap.serverStatus.size).toBe(1);
   });
 
+  // Codex round 5 (P2) — the unknown-guest clear. A Proxmox guest whose row
+  // carries `status: "unknown"` (PVE's word for a guest it OBSERVED whose RRD
+  // data has not caught up) is the same class as a converted template: the
+  // provider omits it from `statuses` and names its vmid in
+  // `clearedExternalIds` (that report shape is pinned in
+  // proxmoxProvider.test.ts), so a merging report must drop the guest's stale
+  // running/stopped — and the Start/Stop menu riding it — rather than retain
+  // it indefinitely while the Sys.Audit join keeps failing. ExternalId "105"
+  // mirrors the provider's bare-vmid shape.
+  it("P2 (round 5): a TRUNCATED report drops a previously-status-bearing guest whose row now reads status 'unknown' — the observed-but-stateless row is explicitly cleared while guests that still report update and merely-absent ones are retained (⊘ omitting an unknown row without clearing it leaves the guest's stale 'running' and its Start/Stop menu standing on every merging report, potentially indefinitely)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const unknownGuest = makeSyncedServer("u", "source-1", "105");
+    const stillReporting = makeSyncedServer("v", "source-1", "114");
+    const absentNeighbor = makeSyncedServer("r", "source-1", "dev#2");
+    await core.addServersBatch([unknownGuest, stillReporting, absentNeighbor]);
+
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "105": { state: "running" }, "114": { state: "running" }, "dev#2": { state: "running" } }
+    });
+    expect(core.getSnapshot().serverStatus.get(unknownGuest.id)).toBe("running");
+
+    // The report shape the provider now emits for a poll whose node join
+    // failed while guest 105's row reads "unknown": guest 114 still reports,
+    // 105 is absent from statuses and explicitly cleared, and the join
+    // failure makes the report a merge.
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "114": { state: "stopped" } },
+      truncated: true,
+      clearedExternalIds: ["105"]
+    });
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.get(stillReporting.id)).toBe("stopped"); // present entry applied
+    expect(snap.serverStatus.has(unknownGuest.id)).toBe(false); // cleared, not retained
+    expect(snap.serverStatus.get(absentNeighbor.id)).toBe("running"); // absent ⇒ retained
+  });
+
   it("P2 (round 4): a COMPLETE report ignores clearedExternalIds — the clear-then-apply pass already removed everything this source owns, so the list must never delete a status the same report just applied (the statuses/cleared pair is impossible through the validator; the engine is the last line against a hostile or buggy caller) (⊘ running the cleared pass unconditionally would clobber a present status)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();

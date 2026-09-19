@@ -1451,13 +1451,17 @@ async function fetchInventoryImpl(
  * state it needs already sits on the listing rows. The crawl's config/agent
  * fan-out exists to find ADDRESSES, which a status report never carries.
  *
- * Guests: `status` maps running/stopped; a row with status "unknown" (PVE
- * emits it before RRD data exists) is OMITTED rather than given an invented
- * state. The cost is stated plainly: on a COMPLETE report the apply is
- * clear-then-apply (`applyInventoryStatus`), so the omitted guest's prior
- * decoration is DROPPED and its highlight stays gone until a poll reports it
- * again — the honest price for a state nobody knows. Retaining prior state
- * for absent entries is a property of TRUNCATED reports only. The sync's
+  * Guests: `status` maps running/stopped; a row with status "unknown" (PVE
+  * emits it for a guest it OBSERVED, before RRD data exists) is OMITTED rather
+  * than given an invented state, and its vmid is explicitly CLEARED — the row
+  * was seen and genuinely has no state, the same class as a converted
+  * template, so a previously status-bearing guest loses its stale decoration
+  * even under a merging report, where a plain omission would retain it (its
+  * Start/Stop menu included) for as long as the report keeps merging. On a
+  * COMPLETE report the apply is clear-then-apply (`applyInventoryStatus`),
+  * which drops that decoration anyway; the explicit clear keeps the two report
+  * shapes consistent. Retaining prior state for absent entries is a property
+  * of TRUNCATED reports only. The sync's
  * guest filters apply to guest rows (`isImportableGuestRow`); template rows
  * route through their OWN branch and are NEVER status-reported — their vmids
  * are collected into the report's `clearedExternalIds` instead, EVERY template
@@ -1574,9 +1578,24 @@ async function fetchStatusImpl(
     }
     if (isTemplate) {
       clearedExternalIds.push(String(row.vmid));
+    } else if (row.status === "unknown") {
+      // Round 5 (P2) — "unknown" is what PVE reports for a row it OBSERVED
+      // (the guest is listed; only its RRD data has not caught up), so this
+      // row is the same class as a converted template: seen, explicitly
+      // stateless. Merely omitting it left a previously status-bearing guest
+      // holding its stale running/stopped — and the Start/Stop menu riding
+      // it — on every MERGING report (e.g. for as long as the Sys.Audit join
+      // keeps failing), potentially indefinitely; so its vmid is cleared
+      // explicitly, the template branch's mechanism, under the same shared
+      // cap budget (beyond the cap the check above has already skipped it,
+      // the same partial-report honesty as any unobserved row). Any OTHER
+      // unusable status stays a plain skip: PVE emits only
+      // running/stopped/unknown, so anything else is a payload shape we
+      // cannot vouch for, not an observed state.
+      clearedExternalIds.push(String(row.vmid));
     } else {
       // A guest row's status field is trusted only when it names a real
-      // state; "unknown" (before RRD data exists) invents nothing.
+      // state; "unknown" (handled above) invents nothing.
       if (row.status !== "running" && row.status !== "stopped") {
         continue;
       }

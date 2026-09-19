@@ -1463,7 +1463,7 @@ describe("createProxmoxProvider", () => {
       expect(report.contractVersion).toBe(1);
     });
 
-    it("keys guest statuses by the BARE vmid externalId — running/stopped map through, status 'unknown' rows are OMITTED, and no entry ever carries console fields (kills an invented mapping for unknown rows, a `${type}/${vmid}` key the apply cannot resolve, and console fields the listing rows never carried; the omission's price is stated honestly below — a COMPLETE report is applied clear-then-apply, so the omitted guest's decoration drops until a poll reports it again)", async () => {
+    it("keys guest statuses by the BARE vmid externalId — running/stopped map through, status 'unknown' rows are OMITTED from statuses and their vmids CLEARED, and no entry ever carries console fields (kills an invented mapping for unknown rows, a `${type}/${vmid}` key the apply cannot resolve, and console fields the listing rows never carried — and kills omitting an unknown row WITHOUT clearing it, which left a previously-status-bearing guest's stale decoration standing on every merging report; the complete report's clear-then-apply drops that decoration anyway, so this pin is the consistency half of the round-5 fix)", async () => {
       const { report } = await pollStatus(
         {
           [RESOURCES]: {
@@ -1484,6 +1484,11 @@ describe("createProxmoxProvider", () => {
       // nobody knows) — and no consoleHost/consolePort anywhere; toEqual
       // fails on either.
       expect(report.statuses).toEqual({ "105": { state: "running" }, "114": { state: "stopped" } });
+      // Round 5 (P2): the row was OBSERVED and has genuinely no state, so its
+      // vmid is explicitly cleared — the same treatment a complete report
+      // gives as a truncated one, where the clear is what drops the stale
+      // decoration at all (the truncated report pins it below).
+      expect(report.clearedExternalIds).toEqual(["116"]);
       // Valid per the REAL downstream gate, which rejects any report carrying
       // a present-but-non-boolean `truncated` key — pins the key's omission
       // on a complete report.
@@ -1618,6 +1623,28 @@ describe("createProxmoxProvider", () => {
       expect(report.clearedExternalIds).toEqual(["106"]);
       // Node statuses are ABSENT here (the join failed) — retained by the
       // merging apply, per the Task-5 ruling pin above.
+    });
+
+    it("clears an OBSERVED guest whose row now carries status 'unknown' in a TRUNCATED (join-failure) report — the row was seen and genuinely has no state, the same class as a converted template, so its vmid rides `clearedExternalIds` and the MERGING apply drops the guest's stale running/stopped (and the Start/Stop menu riding it) instead of retaining it indefinitely while Sys.Audit stays unavailable (Codex round 5) (kills the plain omission, which let a previously-status-bearing guest keep its stale decoration on every merging report)", async () => {
+      const { report, calls } = await pollStatus(
+        {
+          [RESOURCES]: {
+            body: { data: [guestRow({ vmid: 116, name: "rrd-lagging", status: "unknown" }), guestRow(), nodeRow()] }
+          },
+          [STATUS]: { status: 403, body: "" }
+        },
+        { baseUrl: BASE, includeNodes: true }
+      );
+      // The join failed — the report is partial and the apply MERGES.
+      expect(calls).toHaveLength(2);
+      expect(report.truncated).toBe(true);
+      // The observed-but-stateless row is NOT status-reported (the
+      // round-1..4 shape kept this half)...
+      expect(report.statuses).toEqual({ "105": { state: "running" } });
+      // ...but its vmid is now explicitly cleared — the template branch's
+      // mechanism — which is what removes the stale "running" the server
+      // carried from earlier polls. Node statuses stay absent-and-retained.
+      expect(report.clearedExternalIds).toEqual(["116"]);
     });
 
     it("stops collecting at the hard cap and flags truncated — a partial report MERGES on apply (prior state retained for the entries never reached), never clears (kills an uncapped report whose apply would clear-then-set over a cluster the poll never finished reading)", async () => {

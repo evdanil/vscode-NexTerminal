@@ -168,12 +168,24 @@ export interface InventoryStatusReport {
   // is TRUNCATED: a merge retains an entry that is merely ABSENT (the provider
   // may simply not have reached it), but an entry listed here was SEEN and is
   // asserted gone, so it is removed for this source's servers regardless.
-  // Absent ⇒ a no-op. Never contains an id the report also carries in
-  // `statuses` — the two are mutually exclusive by construction (an id either
-  // has a known status or is asserted to have none), and the validator rejects
-  // a report that is malformed about it. Proxmox uses the member to clear every
-  // template row's vmid (§4.12.8): a guest converted into a template must lose
-  // its stale decoration even on a report that merges.
+  // Absent ⇒ a no-op. Three facts state the member's real contract (Codex
+  // round 5, P2):
+  // 1. VALIDATION — `validateInventoryStatusReport` checks each member's shape
+  //    independently and does NOT enforce mutual exclusion: a report carrying
+  //    an id in BOTH members still validates.
+  // 2. CONSTRUCTION — every provider must emit an id in at most ONE member
+  //    (an id either has a known status or is asserted to have none): mutual
+  //    exclusion by construction, not by validation.
+  // 3. PRECEDENCE if a caller bypasses that construction — under a TRUNCATED
+  //    report the cleared pass runs AFTER the statuses loop, so
+  //    `clearedExternalIds` WINS (the status is set, then removed); under a
+  //    COMPLETE report the clear pass is skipped entirely, so a present status
+  //    WINS. nexusCoreInventory.test.ts pins the complete-report case ("a
+  //    COMPLETE report ignores clearedExternalIds").
+  // Proxmox uses the member to clear every template row's vmid (§4.12.8) and
+  // every observed-but-stateless "unknown" guest row: a converted template,
+  // like a guest whose state PVE no longer reports, must lose its stale
+  // decoration even on a report that merges.
   clearedExternalIds?: string[];
 }
 
