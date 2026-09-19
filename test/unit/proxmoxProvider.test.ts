@@ -1493,6 +1493,20 @@ describe("createProxmoxProvider", () => {
       expect(withoutNodes.report.statuses).toEqual({ "105": { state: "running" } });
     });
 
+    it("marks the report PARTIAL when the /cluster/status join fails — truncated: true with the guest statuses still present, so the apply MERGES (guest updates applied, nodes' prior decorations retained) instead of a complete report's clear-then-apply dropping every node highlight over one failed Sys.Audit (kills a complete-without-nodes report)", async () => {
+      const { report, calls } = await pollStatus(
+        { [RESOURCES]: { body: { data: [guestRow(), nodeRow()] } }, [STATUS]: { status: 403, body: "" } },
+        { baseUrl: BASE, includeNodes: true }
+      );
+      // Both requests were attempted — the join failure is not a skipped call.
+      expect(calls).toHaveLength(2);
+      expect(calls[1]).toBe(`${BASE}/api2/json/cluster/status`);
+      // The guests the poll DID reach are still applied...
+      expect(report.statuses).toEqual({ "105": { state: "running" } });
+      // ...but the report is partial, so merge retains the nodes' prior state.
+      expect(report.truncated).toBe(true);
+    });
+
     it("applies the sync's guest filters to the status set — template rows are dropped and, with includeStopped off, stopped rows too — so a device the sync never created gets no status either (the apply would ignore it, but the provider stays consistent with its own device set)", async () => {
       const templates = await pollStatus(
         { [RESOURCES]: { body: { data: [guestRow({ template: 1, name: "gold-image" }), guestRow()] } } },

@@ -1434,17 +1434,20 @@ async function fetchInventoryImpl(
  * never read here; an entry whose `online` is absent or unrecognizable
  * invents no state and is omitted, the same rule as a guest's "unknown".
  *
- * TRUNCATION: the same HARD_CAP as the sync, in the same order (guests first,
- * then nodes) — entries beyond it are simply not collected, and `truncated`
- * makes applyInventoryStatus MERGE the report, retaining prior state for
- * whatever it never reached. A COMPLETE report is the opposite —
- * authoritative, clear-then-apply — which is exactly why a mangled payload
- * must fail closed through `fetchResources` rather than degrade to an
- * empty-but-valid report. There is deliberately NO wall-clock deadline: the
- * path makes at most two sequential requests, each bounded by its own
- * timeout, so a stall surfaces as a thrown network error (degraded by the
- * sanctioned caller to "no update") rather than as a partial report — there
- * is no fan-out whose partial progress a deadline would salvage.
+ * TRUNCATION: two sources. The same HARD_CAP as the sync, in the same order
+ * (guests first, then nodes) — entries beyond it are simply not collected;
+ * and, when node import is on, a FAILED /cluster/status join — the poll
+ * reached the guests but not the nodes, so the report is partial. Either
+ * flag makes applyInventoryStatus MERGE, retaining prior state for whatever
+ * the report omits while still applying the entries it carries. A COMPLETE
+ * report is the opposite — authoritative, clear-then-apply — which is
+ * exactly why a mangled payload must fail closed through `fetchResources`
+ * rather than degrade to an empty-but-valid report. There is deliberately NO
+ * wall-clock deadline: the path makes at most two sequential requests, each
+ * bounded by its own timeout, so a stall surfaces as a thrown network error
+ * (degraded by the sanctioned caller to "no update") rather than as a
+ * partial report — there is no fan-out whose partial progress a deadline
+ * would salvage.
  */
 async function fetchStatusImpl(
   transports: ProxmoxTransports,
@@ -1467,6 +1470,9 @@ async function fetchStatusImpl(
   const statuses: Record<string, InventoryDeviceStatus> = {};
   let statusCount = 0;
   let capTripped = false;
+  // The /cluster/status join, when node import is on, can fail (403 without
+  // Sys.Audit, network, non-array payload) — see the branch below.
+  let joinFailed = false;
   for (const raw of rows) {
     // A corrupted row is SKIPPED here where the sync throws. The asymmetry is
     // bounded loss: a sync skip would drop a device from the engine's present
@@ -1500,12 +1506,23 @@ async function fetchStatusImpl(
 
   // Node statuses ride the SAME opt-in as the node import, gated with the same
   // `=== true` strictness, and the join call is the same best-effort
-  // fetchClusterStatus the sync uses — a 403 without Sys.Audit degrades to no
-  // node statuses rather than failing the poll. On a COMPLETE report that
-  // omission is applied clear-then-apply: the nodes' prior decorations drop
-  // until the join answers again.
+  // fetchClusterStatus the sync uses — a 403 without Sys.Audit fails the join,
+  // not the poll. But a failed join makes the report PARTIAL, not complete
+  // (controller ruling): we reached the guests and not the nodes, and a
+  // complete report is applied clear-then-apply, which would drop every
+  // node's decoration until the join answered again. Flagging `truncated`
+  // makes applyInventoryStatus MERGE instead — guest updates still apply,
+  // and the nodes' prior state is retained for the entries the report omits.
+  // A PRESENT entry with no usable `online` still invents nothing: it is
+  // omitted, the same rule as a guest's "unknown".
   if (config.includeNodes === true) {
     const entries = await fetchClusterStatus(transport, baseUrl, token, FETCH_TIMEOUT_MS);
+    // fetchClusterStatus's `undefined` is its failure sentinel (non-2xx,
+    // network, non-JSON, non-array data); a healthy EMPTY array is a real
+    // answer, not a failure.
+    if (entries === undefined) {
+      joinFailed = true;
+    }
     for (const entry of entries ?? []) {
       if (typeof entry !== "object" || entry === null) {
         continue;
@@ -1535,7 +1552,7 @@ async function fetchStatusImpl(
   // degrade the whole poll to "no update". (The sync TREE's validator instead
   // tolerates a present-but-undefined key, so the idiom is safe there.)
   const report: InventoryStatusReport = { contractVersion: 1, statuses };
-  if (capTripped) {
+  if (capTripped || joinFailed) {
     report.truncated = true;
   }
   return report;
