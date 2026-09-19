@@ -1062,8 +1062,10 @@ function mapGuest(
  * Sys.Audit call failed or never listed this node) and no `ip` on the entry
  * each mean an ADDRESSLESS device, because a node exists whether or not this
  * token may read its address. `status` maps the entry's NUMERIC `online` 1/0 to
- * running/stopped; anything else — absent, or a malformed payload's string —
- * invents no state, the same rule as a guest row's status "unknown".
+  * running/stopped; anything else — absent, or a malformed payload's string —
+  * invents no state, the omit-only rule (a guest's "unknown" also CLEARS the
+  * id, because a guest row is observed per fetch; a node entry here may not
+  * correspond to any guest row at all — see the status path's cleared list).
  *
  * NO folderPath: a node lands at the source's targetFolder root. PVE's
  * node-named folders belong to GUESTS (the default `{node}` template); nesting
@@ -1477,8 +1479,10 @@ async function fetchInventoryImpl(
  * Nodes: `online` 1/0 from the /cluster/status join — the ONLY endpoint
  * carrying the numeric flag. The resources payload's node-row `status`
  * ("online"/"offline" strings) is a degraded, version-dependent shape and is
- * never read here; an entry whose `online` is absent or unrecognizable
- * invents no state and is omitted, the same rule as a guest's "unknown".
+  * never read here; an entry whose `online` is absent or unrecognizable
+  * invents no state and is omitted — the omit-only half of the guest
+  * "unknown" rule (a node entry is not an observed guest row, so it does not
+  * join the cleared list).
  *
  * TRUNCATION: two sources. The same HARD_CAP as the sync, in the same order
  * (guests first, then nodes) — entries beyond it are simply not collected;
@@ -1614,7 +1618,8 @@ async function fetchStatusImpl(
   // makes applyInventoryStatus MERGE instead — guest updates still apply,
   // and the nodes' prior state is retained for the entries the report omits.
   // A PRESENT entry with no usable `online` still invents nothing: it is
-  // omitted, the same rule as a guest's "unknown".
+  // omitted — omit-only, unlike an unknown guest row (observed, so cleared):
+  // a node entry here is not a guest row and may match no guest at all.
   if (config.includeNodes === true) {
     const entries = await fetchClusterStatus(transport, baseUrl, token, FETCH_TIMEOUT_MS);
     // fetchClusterStatus's `undefined` is its failure sentinel (non-2xx,
