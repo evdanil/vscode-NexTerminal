@@ -1235,6 +1235,10 @@ async function fetchInventoryImpl(
   // gated twice over.
   const crawl: { row: Record<string, unknown>; device: InventoryDevice }[] = [];
   let truncated = false;
+  // The DEVICE cap's trip, tracked apart from `truncated`: the crawl below sets
+  // `truncated` for its own budgets (with its own warnings), and the cap's ONE
+  // warning must fire once, after both mapping loops have run.
+  let capTripped = false;
   for (let index = 0; index < rows.length; index++) {
     const raw = rows[index];
     // Fail closed on a corrupted row rather than skipping it: a silently
@@ -1262,11 +1266,14 @@ async function fetchInventoryImpl(
     if (!includeStopped && row.status !== "running") {
       continue;
     }
-    // HARD CAP, client-side. Beyond the cap guests are simply not mapped, and
-    // `truncated` makes the engine skip pruning: a capped fetch must never be
-    // read as "these guests no longer exist at the source".
+    // HARD CAP, client-side, counted over EMITTED DEVICES — guests here, plus
+    // the node branch below when includeNodes is on (controller ruling): a cap
+    // that only counted guests would let node devices append past it. Beyond
+    // the cap rows are simply not mapped, and `truncated` makes the engine skip
+    // pruning: a capped fetch must never be read as "these devices no longer
+    // exist at the source".
     if (devices.length >= HARD_CAP) {
-      truncated = true;
+      capTripped = true;
       continue;
     }
     const device = mapGuest(row, template);
@@ -1274,9 +1281,6 @@ async function fetchInventoryImpl(
     if (row.status === "running" && row.template !== 1) {
       crawl.push({ row, device });
     }
-  }
-  if (truncated) {
-    warnings.push(`Truncated at ${HARD_CAP} guests — narrow the source.`);
   }
 
   // NODE IMPORT (§Fetch) — strictly `=== true`, never a truthiness test: the
@@ -1308,6 +1312,13 @@ async function fetchInventoryImpl(
       if (row.type !== "node") {
         continue;
       }
+      // Same cap the guest loop enforces, over the SAME devices array: nodes
+      // only fill the room the guests left, and once it is spent the remaining
+      // nodes must read as TRUNCATED (never pruned), not as vanished.
+      if (devices.length >= HARD_CAP) {
+        capTripped = true;
+        break;
+      }
       const device = mapNode(row, byName.get(str(row.node)));
       if (device) {
         devices.push(device);
@@ -1315,8 +1326,18 @@ async function fetchInventoryImpl(
     }
   }
 
+  // ONE warning for the device cap, whichever loop tripped it. It names
+  // DEVICES because that is what the cap counts (guests, plus nodes when
+  // includeNodes is on) — a "guests" wording would misreport the mixed case —
+  // and the node loop breaks on the check above rather than pushing its own
+  // line, so a guest-side trip can never produce two warnings.
+  if (capTripped) {
+    truncated = true;
+    warnings.push(`Truncated at ${HARD_CAP} devices — narrow the source.`);
+  }
+
   // GUEST ADDRESS CRAWL (§IP selection) — running, non-template guests only,
-  // under TWO budgets that compose with the row cap's `truncated` above:
+  // under TWO budgets that compose with the device cap's `truncated` above:
   // MAX_IP_GUESTS caps the request fan-out and a shared wall-clock deadline
   // caps the crawl's time (EVE-NG idiom). Either budget stopping the crawl
   // leaves the untouched guests ADDRESSLESS — never dropped — and flags

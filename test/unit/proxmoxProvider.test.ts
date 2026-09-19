@@ -680,7 +680,7 @@ describe("createProxmoxProvider", () => {
       const { tree } = await syncRows(rows);
       expect(tree.devices).toHaveLength(10_000);
       expect(tree.truncated).toBe(true);
-      expect(tree.warnings).toContain("Truncated at 10000 guests — narrow the source.");
+      expect(tree.warnings).toContain("Truncated at 10000 devices — narrow the source.");
     });
 
     it("refuses the whole sync when a row is not a JSON object — fail closed, never read-as-empty (kills a lenient mapper that skips corruption, under which the skipped row's server falls out of the engine's present set and gets pruned)", async () => {
@@ -1126,7 +1126,7 @@ describe("createProxmoxProvider", () => {
       // The crawl ran its own budget to exhaustion inside the row-capped list.
       expect(calls.filter((c) => c.includes("/agent/"))).toHaveLength(1000);
       expect(tree.truncated).toBe(true);
-      expect(tree.warnings).toContain("Truncated at 10000 guests — narrow the source.");
+      expect(tree.warnings).toContain("Truncated at 10000 devices — narrow the source.");
       expect(tree.warnings).toContain("Truncated at 1000 guest address lookups — narrow the source.");
     });
 
@@ -1294,8 +1294,8 @@ describe("createProxmoxProvider", () => {
       await expectDegraded({ body: { data: {} } });
     });
 
-    it("makes NO /cluster/status call and ignores node rows when includeNodes is absent or false — exactly ONE fetch (kills an unconditional second request, and a mapper that turns the nameless resources rows into devices)", async () => {
-      for (const includeNodes of [undefined, false]) {
+    it("makes NO /cluster/status call and ignores node rows when includeNodes is absent, false, or a truthy STRING — exactly ONE fetch (kills an unconditional second request, a truthiness gate that a restored backup's \"true\" switches on, and a mapper that turns the nameless resources rows into devices)", async () => {
+      for (const includeNodes of [undefined, false, "true"]) {
         const { tree, calls } = await syncNodes(
           { [RESOURCES]: { body: { data: [nodeRow()] } } },
           includeNodes === undefined ? { baseUrl: BASE } : { baseUrl: BASE, includeNodes }
@@ -1333,6 +1333,36 @@ describe("createProxmoxProvider", () => {
       expect(calls).toHaveLength(2);
       expect(tree.devices.map((d) => d.externalId)).toEqual(["105", "node/pve"]);
       expect(tree.devices.map((d) => d.externalId)).not.toContain("pve");
+    });
+
+    it("counts node devices against the hard cap — 9,998 guests leave room for exactly two nodes, the dropped remainder sets truncated with ONE devices warning (kills a node branch that appends past the cap, and a second warning line when both loops trip)", async () => {
+      // Stopped guests: no address crawl, so the call count stays at the two
+      // listing calls and the only warning is the cap's.
+      const guests = Array.from({ length: 9_998 }, (_, i) => ({
+        vmid: i + 1,
+        name: `guest-${i + 1}`,
+        node: "pve",
+        type: "qemu",
+        status: "stopped",
+        template: 0
+      }));
+      const nodeRows = [1, 2, 3, 4, 5].map((n) => nodeRow({ id: `node/n${n}`, node: `n${n}` }));
+      const { tree, calls } = await syncNodes(
+        {
+          [RESOURCES]: { body: { data: [...nodeRows, ...guests] } },
+          [STATUS]: { body: { data: nodeRows.map((r) => statusEntry({ name: r.node, id: r.id })) } }
+        },
+        { baseUrl: BASE, includeNodes: true }
+      );
+      expect(calls).toHaveLength(2);
+      expect(tree.devices).toHaveLength(10_000);
+      // Guests first, then the two nodes that still fit under the cap.
+      expect(tree.devices[9_997]?.externalId).toBe("9998");
+      expect(tree.devices[9_998]?.externalId).toBe("node/n1");
+      expect(tree.devices[9_999]?.externalId).toBe("node/n2");
+      expect(tree.devices.some((d) => d.externalId === "node/n3")).toBe(false);
+      expect(tree.truncated).toBe(true);
+      expect(tree.warnings).toEqual(["Truncated at 10000 devices — narrow the source."]);
     });
   });
 });
