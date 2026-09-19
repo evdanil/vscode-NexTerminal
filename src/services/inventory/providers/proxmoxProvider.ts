@@ -1189,10 +1189,12 @@ async function fetchClusterStatus(
  * emits before RRD data exists and which follows the same gate as a stopped
  * row (§Spec).
  *
- * The ONE deliberate divergence: the status poll passes `includeTemplates`
- * FALSE unconditionally (see fetchStatusImpl — a template is never startable,
- * so its permanent "stopped" is never reported), while the sync honors the
- * opt-in. A synced template therefore legitimately has no status.
+ * The status poll routes template rows through its OWN branch (see
+ * fetchStatusImpl's loop — reported as stopped when the opt-in is on) and
+ * passes `includeTemplates` FALSE for the guest rows it does send here; the
+ * argument gates only `template === 1` rows, so the value is inert for them
+ * and kept false so the filter can never accidentally admit a template on the
+ * poll path. The sync honors the opt-in through this same filter.
  */
 function isImportableGuestRow(row: Record<string, unknown>, includeStopped: boolean, includeTemplates: boolean): boolean {
   if (row.type !== "qemu" && row.type !== "lxc") {
@@ -1307,8 +1309,10 @@ async function fetchInventoryImpl(
     // Node rows (and storage and the other non-guest types the endpoint mixes
     // in) are ignored here — node import sources them from /cluster/status
     // when opted in. The type/template/includeStopped gates are the SHARED
-    // `isImportableGuestRow`, so the status poll can never disagree with the
-    // device set this loop produces.
+    // `isImportableGuestRow`, so the status poll's guest rows track the device
+    // set this loop produces (template rows are the one divergence — the poll
+    // reports them as stopped whenever the opt-in is on, and an apply ignores
+    // a status matching no device; see fetchStatusImpl's template branch).
     if (!isImportableGuestRow(row, includeStopped, includeTemplates)) {
       continue;
     }
@@ -1449,19 +1453,17 @@ async function fetchInventoryImpl(
  * decoration is DROPPED and its highlight stays gone until a poll reports it
  * again — the honest price for a state nobody knows. Retaining prior state
  * for absent entries is a property of TRUNCATED reports only. The sync's
- * guest filters apply identically (`isImportableGuestRow`), so a device the
- * sync never created gets no status either — with ONE deliberate divergence:
- * template rows are never status-reported, `includeTemplates`
- * notwithstanding. A template cannot be started (a start task on one fails),
- * so its permanent `status: "stopped"` carries no information — and a KNOWN
- * status is exactly what unlocks the Start/Stop menu, so reporting one would
- * offer an action PVE refuses forever, on a value that never changes. Absent
- * status keeps the menu away (never-act-blind), and a complete report's
- * clear-then-apply removes any stale highlight a pre-change poll left. The
- * SYNC path is unchanged: templates still import as addressless placeholders
- * when includeTemplates is on. NO console fields: the listing rows carry
- * nothing to fill them with, and the console-heal path those fields feed
- * exists for providers whose consoles actually move (EVE-NG's telnet).
+ * guest filters apply to guest rows (`isImportableGuestRow`), with ONE
+ * deliberate divergence: template rows bypass the filter when the opt-in is
+ * on and are reported as `{ state: "stopped" }`, read from no row field — a
+ * template cannot run, and that constant is what keeps a guest converted into
+ * a template from carrying a stale "running" through every merging report.
+ * The full truthfulness/merge argument and the Start/Stop residual sit on the
+ * loop's template branch. The SYNC path is unchanged: templates still import
+ * as addressless placeholders when includeTemplates is on. NO console fields:
+ * the listing rows carry nothing to fill them with, and the console-heal path
+ * those fields feed exists for providers whose consoles actually move
+ * (EVE-NG's telnet).
  *
  * Nodes: `online` 1/0 from the /cluster/status join — the ONLY endpoint
  * carrying the numeric flag. The resources payload's node-row `status`
@@ -1494,10 +1496,10 @@ async function fetchStatusImpl(
   const token = secrets.apiToken ?? "";
   // Same filter defaults as the sync, read with the same strictness: only an
   // explicit false turns includeStopped off, only `=== true` turns the node
-  // join on (a restored backup's "true" string must not switch a request on).
-  // includeTemplates is deliberately NOT read here — the filter below is
-  // handed `false` unconditionally (see the loop).
+  // join on (a restored backup's "true" string must not switch a request on),
+  // and only `=== true` turns the template opt-in on.
   const includeStopped = config.includeStopped !== false;
+  const includeTemplates = config.includeTemplates === true;
 
   // The sync's fail-closed listing read, shared: on the poll path the throw is
   // what protects the decorations — see fetchResources's doc comment.
@@ -1520,16 +1522,34 @@ async function fetchStatusImpl(
       continue;
     }
     const row = raw as Record<string, unknown>;
-    // Templates are NEVER status-reported — includeTemplates is not honored on
-    // this path. A template cannot be started, so its permanent "stopped" is
-    // not a startable state but permanent noise; a known status is what
-    // unlocks the Start/Stop menu, and never-act-blind keeps that menu away
-    // when no status exists. Passing `false` through the SHARED filter (rather
-    // than a local skip) keeps the sync and poll verdicts on one function; the
-    // sync itself still honors includeTemplates, so its template imports are
-    // untouched. On a COMPLETE report clear-then-apply also removes any stale
-    // highlight a pre-change poll left behind.
-    if (!isImportableGuestRow(row, includeStopped, false)) {
+    // Templates are decided by the opt-in ALONE, before the shared filter: when
+    // includeTemplates is on, a `template === 1` row is reported as
+    // `{ state: "stopped" }` — unconditionally, read from no row field, because
+    // a template cannot run and PVE's own status for one is stopped. WHY the
+    // old never-report rule died: a guest CONVERTED into a template keeps its
+    // prior "running" decoration unless some report replaces it. A COMPLETE
+    // report would (clear-then-apply), but a TRUNCATED one — a failed
+    // /cluster/status join, the cap — is applied under MERGE, and merge
+    // retains prior state only for entries the report OMITS. The template row
+    // comes from the same listing as every guest, so it is present and
+    // applied; omitting it would freeze a startable-looking "running" on a
+    // target Proxmox refuses to start. Reported regardless of includeStopped:
+    // a status whose externalId matches no device (the sync skips stopped
+    // guests) is ignored by the apply, so the extra entry cannot light
+    // anything. RESIDUAL, documented rather than fixable: the template's
+    // bare-numeric vmid still passes canControlNode, so with includeTemplates
+    // on the Start/Stop menu appears; acting on it surfaces PVE's own verdict
+    // ("VM is a template") through the existing exitstatus surfacing — an
+    // honest, specific error. The SYNC path is unchanged:
+    // isImportableGuestRow still honors includeTemplates there, and template
+    // rows with the opt-in off are omitted here exactly as before (they are
+    // not in the device set).
+    const isTemplate = row.template === 1;
+    if (isTemplate) {
+      if (!includeTemplates) {
+        continue;
+      }
+    } else if (!isImportableGuestRow(row, includeStopped, false)) {
       continue;
     }
     if (statusCount >= HARD_CAP) {
@@ -1542,10 +1562,18 @@ async function fetchStatusImpl(
     if (!hasUsableVmid) {
       continue;
     }
-    if (row.status !== "running" && row.status !== "stopped") {
-      continue;
+    if (isTemplate) {
+      // The state is the truthful constant, decided above — the row's own
+      // status field is never read for a template.
+      statuses[String(row.vmid)] = { state: "stopped" };
+    } else {
+      // A guest row's status field is trusted only when it names a real
+      // state; "unknown" (before RRD data exists) invents nothing.
+      if (row.status !== "running" && row.status !== "stopped") {
+        continue;
+      }
+      statuses[String(row.vmid)] = { state: row.status };
     }
-    statuses[String(row.vmid)] = { state: row.status };
     statusCount++;
   }
 
@@ -1698,12 +1726,26 @@ async function controlNodeImpl(
     `${baseUrl}${PROXMOX_API_BASE}/nodes/${encodeURIComponent(target.node)}/tasks/${encodeURIComponent(upid)}/status`
   );
   // Wall-clock deadline, not a poll counter: a slow poll path must not stretch
-  // the wait past what the user was told. The sleep helper uses setTimeout, so
-  // under vitest fake timers the clock and the cadence advance together.
+  // the wait past what the user was told. The deadline is checked BEFORE each
+  // request and the request's timeout is capped by the remaining budget (the
+  // address crawl's min(timeout, remaining) idiom): a poll issued near the
+  // limit must abort with the budget instead of running its full 20s past the
+  // deadline, and a spent budget ends the poll without another request. The
+  // sleep helper uses setTimeout, so under vitest fake timers the clock and
+  // the cadence advance together.
   const deadline = Date.now() + CONTROL_DEADLINE_MS;
+  const deadlineError = () =>
+    new InventoryProviderError(
+      "protocol",
+      `Proxmox ${action} of guest ${externalId} is still running after ${CONTROL_DEADLINE_MS / 1000}s — the task continues on the PVE node; check its task log there.`
+    );
   while (true) {
     await sleep(CONTROL_POLL_INTERVAL_MS);
-    const taskRaw = await rawGet(transport, taskUrl, token, FETCH_TIMEOUT_MS);
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw deadlineError();
+    }
+    const taskRaw = await rawGet(transport, taskUrl, token, Math.min(FETCH_TIMEOUT_MS, remaining));
     if (taskRaw.status < 200 || taskRaw.status >= 300) {
       throwForStatus(taskRaw, taskUrl);
     }
@@ -1724,11 +1766,11 @@ async function controlNodeImpl(
         `Proxmox ${action} of guest ${externalId} failed: ${str(t.exitstatus) || "the task finished without an exit status"}.`
       );
     }
+    // A response that consumed the whole remaining budget reports at the
+    // deadline, not a cadence beat later — the pre-request check above cannot
+    // see budget an in-flight request spends.
     if (Date.now() >= deadline) {
-      throw new InventoryProviderError(
-        "protocol",
-        `Proxmox ${action} of guest ${externalId} is still running after ${CONTROL_DEADLINE_MS / 1000}s — the task continues on the PVE node; check its task log there.`
-      );
+      throw deadlineError();
     }
   }
 }

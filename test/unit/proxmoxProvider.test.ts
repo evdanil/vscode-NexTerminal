@@ -1513,7 +1513,7 @@ describe("createProxmoxProvider", () => {
       expect(report.truncated).toBe(true);
     });
 
-    it("applies the sync's guest filters to the status set — template rows are dropped and, with includeStopped off, stopped rows too — so a device the sync never created gets no status either (the apply would ignore it, but the provider stays consistent with its own device set)", async () => {
+    it("applies the sync's guest filters to the status set — with the includeTemplates opt-in OFF, template rows are dropped and, with includeStopped off, stopped rows too — so a device the sync never created gets no status either (the apply would ignore it, but the provider stays consistent with its own device set)", async () => {
       const templates = await pollStatus(
         { [RESOURCES]: { body: { data: [guestRow({ template: 1, name: "gold-image" }), guestRow()] } } },
         { baseUrl: BASE }
@@ -1527,16 +1527,46 @@ describe("createProxmoxProvider", () => {
       expect(stoppedOff.report.statuses).toEqual({ "106": { state: "running" } });
     });
 
-    it("NEVER status-reports a template, even with includeTemplates on — a template cannot be started and its permanent 'stopped' carries no information, so a known status would only light a Start/Stop menu PVE refuses forever (kills a status path that hands templates a state and, with it, a menu; the SYNC path still imports them — the includeTemplates pins above keep passing)", async () => {
+    it("status-reports template rows as STOPPED when includeTemplates is on — a template cannot run, so the constant is read from no row field (kills the old never-report rule, under which a guest converted into a template was omitted from every report and a merged one kept its stale 'running' forever)", async () => {
       const { report } = await pollStatus(
         {
           [RESOURCES]: {
-            body: { data: [guestRow({ template: 1, name: "gold-image", status: "stopped" }), guestRow({ vmid: 106, name: "up" })] }
+            body: {
+              data: [
+                guestRow({ template: 1, name: "gold-image", status: "stopped" }),
+                // The row's own status is NOT consulted for a template — even
+                // one lying about "running" must read as the truthful stopped.
+                guestRow({ vmid: 107, name: "odd", template: 1, status: "running" }),
+                guestRow({ vmid: 106, name: "up" })
+              ]
+            }
           }
         },
         { baseUrl: BASE, includeTemplates: true }
       );
-      expect(report.statuses).toEqual({ "106": { state: "running" } });
+      expect(report.statuses).toEqual({
+        "105": { state: "stopped" },
+        "107": { state: "stopped" },
+        "106": { state: "running" }
+      });
+    });
+
+    it("reports the converted template as stopped even in a TRUNCATED (join-failure) report — the row comes from the same listing as every guest, so a merging apply APPLIES it instead of retaining the pre-conversion state (kills the merge-retains-stale hole codex flagged: omitting the template freezes a startable-looking 'running' on a target PVE refuses to start; the join failure's protection belongs to the NODE statuses, which stay absent here)", async () => {
+      const { report, calls } = await pollStatus(
+        {
+          [RESOURCES]: {
+            body: { data: [guestRow({ template: 1, name: "gold-image", status: "stopped" }), guestRow({ vmid: 106, name: "up" }), nodeRow()] }
+          },
+          [STATUS]: { status: 403, body: "" }
+        },
+        { baseUrl: BASE, includeNodes: true, includeTemplates: true }
+      );
+      // The join failed — the report is partial and the apply MERGES.
+      expect(calls).toHaveLength(2);
+      expect(report.truncated).toBe(true);
+      // Present entries are still applied under merge; what merge protects is
+      // only what the report OMITS (the node statuses — the Task-5 ruling).
+      expect(report.statuses).toEqual({ "105": { state: "stopped" }, "106": { state: "running" } });
     });
 
     it("stops collecting at the hard cap and flags truncated — a partial report MERGES on apply (prior state retained for the entries never reached), never clears (kills an uncapped report whose apply would clear-then-set over a cluster the poll never finished reading)", async () => {
@@ -1580,12 +1610,17 @@ describe("createProxmoxProvider", () => {
 
     type RouteMap = Record<string, { status?: number; body: unknown }>;
 
-    /** Routed world like pollStatus's, but recording the METHOD and headers too — the POST is the whole point here. */
-    function controlFetch(routes: RouteMap) {
+    /**
+     * Routed world like pollStatus's, but recording the METHOD and headers too — the POST is the whole point here.
+     * The optional `onCall` hook fires after a request is recorded and before its answer resolves, so a test can
+     * move the fake clock by the latency each route simulates.
+     */
+    function controlFetch(routes: RouteMap, onCall?: (url: string) => void) {
       const calls: Array<{ url: string; method: string; headers?: Record<string, string> }> = [];
       const impl = async (input: string | URL, init?: { method?: string; headers?: Record<string, string> }): Promise<unknown> => {
         const url = String(input);
         calls.push({ url, method: init?.method ?? "GET", headers: init?.headers });
+        onCall?.(url);
         const hit = routes[new URL(url).pathname];
         if (!hit) {
           return makeResponse(500, { data: null, message: `no test route for ${new URL(url).pathname}` });
@@ -1660,9 +1695,81 @@ describe("createProxmoxProvider", () => {
         const settled = expect(pending).rejects.toThrow(/still running/);
         await vi.advanceTimersByTimeAsync(DEADLINE_MS);
         await settled;
-        // 1 lookup + 1 POST + exactly 60 polls at the 2s cadence — no call more.
-        expect(calls.filter((c) => c.url.includes("/tasks/"))).toHaveLength(60);
-        expect(calls).toHaveLength(62);
+        // 1 lookup + 1 POST + 59 polls at the 2s cadence — every poll issued
+        // STRICTLY before the 120s deadline (the pre-request check refuses one
+        // that would start at or after it, so no request can run past the wait
+        // the user was told), and the error still names the task log.
+        expect(calls.filter((c) => c.url.includes("/tasks/"))).toHaveLength(59);
+        expect(calls).toHaveLength(61);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("caps each task poll by the REMAINING deadline — a request issued near 120s must not carry the full 20s fetch timeout (the crawl's min(timeout, remaining) idiom; kills a poll whose every request gets the full budget, leaving the progress notification blocked up to 20s past the deadline the user was told)", async () => {
+      vi.useFakeTimers();
+      const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+      try {
+        // Every task answer takes 19s of clock: each poll burns nearly its
+        // whole budget, so the 6th is issued with 13s left and must be capped
+        // to it (polls 1–5 still fit under the 20s ceiling).
+        const { calls, fetchImpl } = controlFetch(
+          {
+            "/api2/json/cluster/resources": { body: { data: [qemuRow()] } },
+            "/api2/json/nodes/pve/qemu/105/status/start": { body: { data: UPID } },
+            [TASK_PATH]: { body: { data: { status: "running" } } }
+          },
+          (url) => {
+            if (url.includes("/tasks/")) {
+              vi.setSystemTime(Date.now() + 19_000);
+            }
+          }
+        );
+        // rawGet hands its timeout to the transport as `AbortSignal.timeout(ms)`
+        // — the spy reads the duration each request actually asked for, in the
+        // same chronological order the fetch mock records them.
+        const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+        const pending = provider.controlNode!({ baseUrl: BASE }, SECRETS, "105", "start");
+        const settled = expect(pending).rejects.toThrow(/still running/);
+        await vi.advanceTimersByTimeAsync(300_000);
+        await settled;
+        // lookup + POST + the six polls that fit before the deadline — no more.
+        expect(calls.filter((c) => c.url.includes("/tasks/"))).toHaveLength(6);
+        // Drop the lookup's and the POST's durations; the six polls follow.
+        const durations = timeoutSpy.mock.calls.map((c) => c[0]).slice(2);
+        expect(durations).toEqual([20_000, 20_000, 20_000, 20_000, 20_000, 13_000]);
+      } finally {
+        timeoutSpy.mockRestore();
+        vi.useRealTimers();
+      }
+    });
+
+    it("checks the deadline BEFORE each poll — once the budget is spent the 'still running' error fires without issuing another HTTP request (kills a deadline checked only after the response returns, which sends one more request past the deadline every time)", async () => {
+      vi.useFakeTimers();
+      try {
+        // The first answer takes 117s of clock: the loop top after it sits 1s
+        // past the deadline, so the SECOND poll must never be issued.
+        const { calls, fetchImpl } = controlFetch(
+          {
+            "/api2/json/cluster/resources": { body: { data: [qemuRow()] } },
+            "/api2/json/nodes/pve/qemu/105/status/start": { body: { data: UPID } },
+            [TASK_PATH]: { body: { data: { status: "running" } } }
+          },
+          (url) => {
+            if (url.includes("/tasks/")) {
+              vi.setSystemTime(Date.now() + 117_000);
+            }
+          }
+        );
+        const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+        const pending = provider.controlNode!({ baseUrl: BASE }, SECRETS, "105", "start");
+        const settled = expect(pending).rejects.toThrow(/still running/);
+        await vi.advanceTimersByTimeAsync(300_000);
+        await settled;
+        // lookup + POST + the ONE poll that fit inside the budget — the
+        // deadline's expiry stops the poll before the next request.
+        expect(calls.filter((c) => c.url.includes("/tasks/"))).toHaveLength(1);
+        expect(calls).toHaveLength(3);
       } finally {
         vi.useRealTimers();
       }
