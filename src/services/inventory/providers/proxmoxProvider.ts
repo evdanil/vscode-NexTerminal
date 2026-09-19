@@ -255,14 +255,15 @@ export function parsePrimaryIpFamily(raw: unknown): PrimaryIpFamily {
 }
 
 function normalizeBaseUrl(raw: string): string {
-  let url = raw.trim().replace(/\/+$/, "");
-  // The /api strip is NetBox baggage kept on purpose: nothing in PVE's URL
-  // space ends in a bare "/api" (the API root is /api2/json), so the strip is
-  // inert here — and a stray "/api" suffix pasted onto a PVE host folds onto
-  // the same instance key and the same request spelling as the bare host
-  // instead of fragmenting into a deployment of its own.
-  url = url.replace(/\/api$/i, "");
-  return url.replace(/\/+$/, "");
+  // Trailing-slash trimming ONLY. The netbox copy this was taken from also
+  // strips a trailing "/api"; that strip is deliberately ABSENT here: NetBox's
+  // API lives under /api, so a pasted UI root gets trimmed there, but PVE's
+  // API root is /api2/json and a "/api" mount prefix is a legitimate
+  // reverse-proxy path (https://gateway.example/api) that must survive into
+  // every request. Consequence: https://pve.example/api and
+  // https://pve.example are DIFFERENT deployments (different instanceKeys) —
+  // correct, they are different mounts.
+  return raw.trim().replace(/\/+$/, "");
 }
 
 /**
@@ -1194,7 +1195,11 @@ async function fetchClusterStatus(
  * passes `includeTemplates` FALSE for the guest rows it does send here; the
  * argument gates only `template === 1` rows, so the value is inert for them
  * and kept false so the filter can never accidentally admit a template on the
- * poll path. The sync honors the opt-in through this same filter.
+ * poll path. The sync honors the opt-in through this same filter. The poll
+ * also pins `includeStopped` TRUE for its rows — status reports reality, and
+ * the device-set preference belongs to the sync — so the shared rules (type
+ * and template gating) stay single-sourced here while the reporting path
+ * never omits a guest the device set may still hold.
  */
 function isImportableGuestRow(row: Record<string, unknown>, includeStopped: boolean, includeTemplates: boolean): boolean {
   if (row.type !== "qemu" && row.type !== "lxc") {
@@ -1494,11 +1499,10 @@ async function fetchStatusImpl(
   const transport = selectProxmoxTransport(transports, config);
   const baseUrl = normalizeBaseUrl(String(config.baseUrl ?? ""));
   const token = secrets.apiToken ?? "";
-  // Same filter defaults as the sync, read with the same strictness: only an
-  // explicit false turns includeStopped off, only `=== true` turns the node
-  // join on (a restored backup's "true" string must not switch a request on),
-  // and only `=== true` turns the template opt-in on.
-  const includeStopped = config.includeStopped !== false;
+  // The opt-ins read with the same strictness as the sync: only `=== true`
+  // turns the node join on (a restored backup's "true" string must not switch
+  // a request on), and only `=== true` turns the template opt-in on.
+  // includeStopped is deliberately NOT read here — see the guest branch below.
   const includeTemplates = config.includeTemplates === true;
 
   // The sync's fail-closed listing read, shared: on the poll path the throw is
@@ -1533,10 +1537,10 @@ async function fetchStatusImpl(
     // retains prior state only for entries the report OMITS. The template row
     // comes from the same listing as every guest, so it is present and
     // applied; omitting it would freeze a startable-looking "running" on a
-    // target Proxmox refuses to start. Reported regardless of includeStopped:
-    // a status whose externalId matches no device (the sync skips stopped
-    // guests) is ignored by the apply, so the extra entry cannot light
-    // anything. RESIDUAL, documented rather than fixable: the template's
+    // target Proxmox refuses to start. Reported regardless of includeStopped,
+    // like every guest row here (see the guest branch below): a status whose
+    // externalId matches no device is ignored by the apply, so the entry
+    // cannot light anything. RESIDUAL, documented rather than fixable: the template's
     // bare-numeric vmid still passes canControlNode, so with includeTemplates
     // on the Start/Stop menu appears; acting on it surfaces PVE's own verdict
     // ("VM is a template") through the existing exitstatus surfacing — an
@@ -1549,7 +1553,15 @@ async function fetchStatusImpl(
       if (!includeTemplates) {
         continue;
       }
-    } else if (!isImportableGuestRow(row, includeStopped, false)) {
+    } else if (!isImportableGuestRow(row, true, false)) {
+      // includeStopped is pinned TRUE — on the STATUS call only; the sync
+      // keeps honoring the config. WHY: status reports reality (EVE-NG's
+      // precedent: all nodes are reported; the tree decides), and
+      // includeStopped is a SYNC device-set preference, not a reporting
+      // filter. With the orphan/keep prune policies a retained stopped server
+      // must show truthful stopped + Start; with delete the apply ignores
+      // statuses for unmatched servers (engine-side gate in nexusCore), so
+      // reporting a guest the sync skipped cannot light anything.
       continue;
     }
     if (statusCount >= HARD_CAP) {

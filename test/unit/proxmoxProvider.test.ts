@@ -37,14 +37,12 @@ function makeResponse(status: number, body: unknown): { status: number; text: ()
  * the re-add this whole feature exists for.
  */
 describe("proxmoxInstanceKey", () => {
-  it("collapses every spelling of ONE deployment onto ONE key — trailing slashes, an /api suffix, host case, and whitespace (kills a raw-string key, which fragments one instance into five and refuses the re-add it is supposed to allow)", () => {
+  it("collapses every spelling of ONE deployment onto ONE key — trailing slashes, host case, and whitespace (kills a raw-string key, which fragments one instance into five and refuses the re-add it is supposed to allow)", () => {
     const canonical = "https://pve.example.com";
     for (const spelling of [
       "https://pve.example.com",
       "https://pve.example.com/",
       "https://pve.example.com///",
-      "https://pve.example.com/api",
-      "https://pve.example.com/api/",
       "https://PVE.Example.COM",
       "  https://pve.example.com  ",
       "https://pve.example.com?foo=bar",
@@ -52,6 +50,9 @@ describe("proxmoxInstanceKey", () => {
     ]) {
       expect(proxmoxInstanceKey({ baseUrl: spelling })).toBe(canonical);
     }
+    // The netbox collapse list included `/api` spellings; on PVE a `/api`
+    // suffix is a legitimate mount prefix and names a DIFFERENT deployment —
+    // pinned by the mount-prefix tests below, not folded away here.
   });
 
   it("KEEPS PVE's :8006 — it is not any scheme's default port, so https://pve.example.com:8006 and https://pve.example.com are DIFFERENT deployments (kills a default-port rule copied from netbox by reflex: dropping every :port would merge a PVE API on :8006 with whatever else answers on :443)", () => {
@@ -102,7 +103,10 @@ describe("proxmoxInstanceKey", () => {
   it("is exposed ON the provider, since that is the only way the engine ever reaches it (kills an implementation that exists but is never wired up)", () => {
     const provider = createProxmoxProvider(vi.fn() as unknown as typeof fetch);
     expect(typeof provider.instanceKey).toBe("function");
-    expect(provider.instanceKey?.({ baseUrl: "https://pve.example.com:8006/api/" })).toBe("https://pve.example.com:8006");
+    // A `/api` mount prefix SURVIVES into the key — unlike netbox, whose strip
+    // this normalizer deliberately dropped (see normalizeBaseUrl): PVE's API
+    // root is /api2/json, so `/api` is a reverse-proxy path, not the API root.
+    expect(provider.instanceKey?.({ baseUrl: "https://pve.example.com:8006/api/" })).toBe("https://pve.example.com:8006/api");
   });
 });
 
@@ -389,6 +393,18 @@ describe("createProxmoxProvider", () => {
 
       await expect(provider.testConnection({ baseUrl: "https://pve.example.com:8006" }, SECRETS)).resolves.toBeUndefined();
       expect(fetchImpl).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps a base URL's /api MOUNT PREFIX — the request goes under it, not at the origin (kills the netbox-style /api-suffix strip copied into normalizeBaseUrl, which rewrote https://gateway.example/api onto the origin so Test Connection and sync could never reach a deployment mounted there — PVE's API root is /api2/json, so a trailing /api is a legitimate reverse-proxy path, not the API root)", async () => {
+      const calls: string[] = [];
+      const fetchImpl = vi.fn(async (url: string) => {
+        calls.push(String(url));
+        return makeResponse(200, { data: { version: "9.2.11", release: "9.2" } });
+      });
+      const provider = createProxmoxProvider(fetchImpl as unknown as typeof fetch);
+
+      await expect(provider.testConnection({ baseUrl: "https://gateway.example/api" }, SECRETS)).resolves.toBeUndefined();
+      expect(calls).toEqual(["https://gateway.example/api/api2/json/version"]);
     });
 
     it("maps an unauthenticated 401 to an auth error THAT NAMES THE TOKEN — PVE answers an empty body with the reason in the status line (kills a body-required parse that reports 'failed with HTTP 401: ' and nothing else)", async () => {
@@ -1513,7 +1529,22 @@ describe("createProxmoxProvider", () => {
       expect(report.truncated).toBe(true);
     });
 
-    it("applies the sync's guest filters to the status set — with the includeTemplates opt-in OFF, template rows are dropped and, with includeStopped off, stopped rows too — so a device the sync never created gets no status either (the apply would ignore it, but the provider stays consistent with its own device set)", async () => {
+    it("status-reports a STOPPED guest even with includeStopped FALSE (kills the includeStopped-filtered status path: a previously synced running guest that stops was omitted from the report, so a COMPLETE report cleared its old running state instead of replacing it with stopped — the retained server ended up with unknown status and no Start action)", async () => {
+      const { report } = await pollStatus(
+        { [RESOURCES]: { body: { data: [guestRow({ status: "stopped" })] } } },
+        { baseUrl: BASE, includeStopped: false }
+      );
+      expect(report.statuses).toEqual({ "105": { state: "stopped" } });
+
+      // The running case is unchanged: includeStopped=false still reports it.
+      const running = await pollStatus(
+        { [RESOURCES]: { body: { data: [guestRow({ vmid: 106, name: "up" })] } } },
+        { baseUrl: BASE, includeStopped: false }
+      );
+      expect(running.report.statuses).toEqual({ "106": { state: "running" } });
+    });
+
+    it("keeps the sync's template gate on the status set — with the includeTemplates opt-in OFF, template rows are dropped — while every guest is reported REGARDLESS of includeStopped (CONTROLLER RULING amending §Spec's 'Same filters as the sync device set': status reports all guests and includeStopped governs only the SYNC device set — this test previously pinned the includeStopped-off omission on the STATUS path; that assertion was the amended spec, not a defect guard, and is updated here, because with orphan/keep prune policies a retained stopped server must show truthful stopped + Start, and with delete the apply ignores statuses for unmatched servers anyway)", async () => {
       const templates = await pollStatus(
         { [RESOURCES]: { body: { data: [guestRow({ template: 1, name: "gold-image" }), guestRow()] } } },
         { baseUrl: BASE }
@@ -1524,7 +1555,7 @@ describe("createProxmoxProvider", () => {
         { [RESOURCES]: { body: { data: [guestRow({ status: "stopped" }), guestRow({ vmid: 106, name: "up" })] } } },
         { baseUrl: BASE, includeStopped: false }
       );
-      expect(stoppedOff.report.statuses).toEqual({ "106": { state: "running" } });
+      expect(stoppedOff.report.statuses).toEqual({ "105": { state: "stopped" }, "106": { state: "running" } });
     });
 
     it("status-reports template rows as STOPPED when includeTemplates is on — a template cannot run, so the constant is read from no row field (kills the old never-report rule, under which a guest converted into a template was omitted from every report and a merged one kept its stale 'running' forever)", async () => {
