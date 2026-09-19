@@ -1180,13 +1180,19 @@ async function fetchClusterStatus(
 
 /**
  * THE guest-row filter, shared by the sync and the status poll — one function,
- * so the two paths can never drift: a device the sync never created must not
- * get a status, and the poll must not report a guest the sync would have
- * dropped. Guests are `qemu`/`lxc` rows only (node rows share the payload but
- * carry neither name nor address in it); template rows are excluded unless
- * `includeTemplates`; and `includeStopped` gates everything that is not
- * running — including status "unknown", which PVE emits before RRD data exists
- * and which follows the same gate as a stopped row (§Spec).
+ * so the two paths can never drift on their shared rules: a device the sync
+ * never created must not get a status, and the poll must not report a guest
+ * the sync would have dropped. Guests are `qemu`/`lxc` rows only (node rows
+ * share the payload but carry neither name nor address in it); template rows
+ * are excluded unless `includeTemplates`; and `includeStopped` gates
+ * everything that is not running — including status "unknown", which PVE
+ * emits before RRD data exists and which follows the same gate as a stopped
+ * row (§Spec).
+ *
+ * The ONE deliberate divergence: the status poll passes `includeTemplates`
+ * FALSE unconditionally (see fetchStatusImpl — a template is never startable,
+ * so its permanent "stopped" is never reported), while the sync honors the
+ * opt-in. A synced template therefore legitimately has no status.
  */
 function isImportableGuestRow(row: Record<string, unknown>, includeStopped: boolean, includeTemplates: boolean): boolean {
   if (row.type !== "qemu" && row.type !== "lxc") {
@@ -1444,10 +1450,18 @@ async function fetchInventoryImpl(
  * again — the honest price for a state nobody knows. Retaining prior state
  * for absent entries is a property of TRUNCATED reports only. The sync's
  * guest filters apply identically (`isImportableGuestRow`), so a device the
- * sync never created gets no status either. NO console fields: the listing
- * rows carry nothing to fill them with, and the console-heal path those
- * fields feed exists for providers whose consoles actually move (EVE-NG's
- * telnet).
+ * sync never created gets no status either — with ONE deliberate divergence:
+ * template rows are never status-reported, `includeTemplates`
+ * notwithstanding. A template cannot be started (a start task on one fails),
+ * so its permanent `status: "stopped"` carries no information — and a KNOWN
+ * status is exactly what unlocks the Start/Stop menu, so reporting one would
+ * offer an action PVE refuses forever, on a value that never changes. Absent
+ * status keeps the menu away (never-act-blind), and a complete report's
+ * clear-then-apply removes any stale highlight a pre-change poll left. The
+ * SYNC path is unchanged: templates still import as addressless placeholders
+ * when includeTemplates is on. NO console fields: the listing rows carry
+ * nothing to fill them with, and the console-heal path those fields feed
+ * exists for providers whose consoles actually move (EVE-NG's telnet).
  *
  * Nodes: `online` 1/0 from the /cluster/status join — the ONLY endpoint
  * carrying the numeric flag. The resources payload's node-row `status`
@@ -1481,8 +1495,9 @@ async function fetchStatusImpl(
   // Same filter defaults as the sync, read with the same strictness: only an
   // explicit false turns includeStopped off, only `=== true` turns the node
   // join on (a restored backup's "true" string must not switch a request on).
+  // includeTemplates is deliberately NOT read here — the filter below is
+  // handed `false` unconditionally (see the loop).
   const includeStopped = config.includeStopped !== false;
-  const includeTemplates = config.includeTemplates === true;
 
   // The sync's fail-closed listing read, shared: on the poll path the throw is
   // what protects the decorations — see fetchResources's doc comment.
@@ -1505,7 +1520,16 @@ async function fetchStatusImpl(
       continue;
     }
     const row = raw as Record<string, unknown>;
-    if (!isImportableGuestRow(row, includeStopped, includeTemplates)) {
+    // Templates are NEVER status-reported — includeTemplates is not honored on
+    // this path. A template cannot be started, so its permanent "stopped" is
+    // not a startable state but permanent noise; a known status is what
+    // unlocks the Start/Stop menu, and never-act-blind keeps that menu away
+    // when no status exists. Passing `false` through the SHARED filter (rather
+    // than a local skip) keeps the sync and poll verdicts on one function; the
+    // sync itself still honors includeTemplates, so its template imports are
+    // untouched. On a COMPLETE report clear-then-apply also removes any stale
+    // highlight a pre-change poll left behind.
+    if (!isImportableGuestRow(row, includeStopped, false)) {
       continue;
     }
     if (statusCount >= HARD_CAP) {
@@ -1762,6 +1786,14 @@ export function createProxmoxProvider(
       action: "start" | "stop"
     ): Promise<void> {
       return controlNodeImpl(transports, config, secrets, externalId, action);
+    },
+    // The device-aware control gate (§Control, P2 review fix) — bare vmids
+    // only: controlNodeImpl refuses `node/<name>` externalIds with a protocol
+    // error before any HTTP call, and the menu must never offer what the
+    // implementation rejects. An imported cluster node keeps its
+    // running/offline decoration; it just never gets a Start/Stop entry.
+    canControlNode(externalId: string): boolean {
+      return /^\d+$/.test(externalId);
     }
   };
 }

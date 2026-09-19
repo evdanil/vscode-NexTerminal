@@ -313,6 +313,12 @@ describe("createProxmoxProvider", () => {
     expect(() => validateProviderShape(createProxmoxProvider())).not.toThrow();
   });
 
+  it("declares canControlNode — bare vmids only, so a cluster node's node/<name> externalId is refused by the menu gate exactly where controlNodeImpl refuses it on the wire (⊘ a device-blind gate offers Start/Stop on a hypervisor node, an action the provider's own controlNode always fails)", () => {
+    const provider = createProxmoxProvider();
+    expect(provider.canControlNode?.("105")).toBe(true);
+    expect(provider.canControlNode?.("node/pve")).toBe(false);
+  });
+
   it("carries the Proxmox identity and the attribute vocabulary its devices report (kills an id that drifts from the registered one, and a filter key the devices can never match)", () => {
     const provider = createProxmoxProvider();
     expect(provider.id).toBe(PROXMOX_PROVIDER_ID);
@@ -1519,6 +1525,18 @@ describe("createProxmoxProvider", () => {
         { baseUrl: BASE, includeStopped: false }
       );
       expect(stoppedOff.report.statuses).toEqual({ "106": { state: "running" } });
+    });
+
+    it("NEVER status-reports a template, even with includeTemplates on — a template cannot be started and its permanent 'stopped' carries no information, so a known status would only light a Start/Stop menu PVE refuses forever (kills a status path that hands templates a state and, with it, a menu; the SYNC path still imports them — the includeTemplates pins above keep passing)", async () => {
+      const { report } = await pollStatus(
+        {
+          [RESOURCES]: {
+            body: { data: [guestRow({ template: 1, name: "gold-image", status: "stopped" }), guestRow({ vmid: 106, name: "up" })] }
+          }
+        },
+        { baseUrl: BASE, includeTemplates: true }
+      );
+      expect(report.statuses).toEqual({ "106": { state: "running" } });
     });
 
     it("stops collecting at the hard cap and flags truncated — a partial report MERGES on apply (prior state retained for the entries never reached), never clears (kills an uncapped report whose apply would clear-then-set over a cluster the poll never finished reading)", async () => {

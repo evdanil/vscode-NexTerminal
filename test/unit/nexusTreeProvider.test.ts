@@ -1448,6 +1448,9 @@ describe("ServerTreeItem node-control contextValue marker", () => {
  *     loses its marker → Start/Stop dead in the UI for every non-EVE provider),
  *   - the gate ignoring the predicate (any synced origin, e.g. NetBox, lights
  *     up node control it does not support),
+ *   - the gate ignoring the DEVICE half of the predicate (a Proxmox-origin
+ *     `node/<name>` externalId lights up Start/Stop — an action the provider's
+ *     own controlNode always refuses),
  *   - the fail-closed default flipped (a tree built without the predicate
  *     offers node control everywhere, acting blind),
  *   - the predicate/constructor arg dropped at the ServerTreeItem call
@@ -1458,7 +1461,7 @@ describe("NexusTreeProvider node-control marker — end-to-end snapshot wiring",
     servers: ServerConfig[],
     inventorySources: Array<{ id: string; providerId: string; name: string }>,
     serverStatus: Map<string, "running" | "stopped">,
-    originHasNodeControl?: (providerId: string) => boolean
+    originHasNodeControl?: (providerId: string, externalId: string) => boolean
   ): NexusTreeProvider {
     const provider = new NexusTreeProvider(noopCallbacks, originHasNodeControl);
     provider.setSnapshot({
@@ -1517,6 +1520,23 @@ describe("NexusTreeProvider node-control marker — end-to-end snapshot wiring",
     // The tooltip's Lab status line follows the same predicate (Task 9) — a
     // Proxmox guest gets the identical line an EVE node has always had.
     expect(serverItemById(provider, "pve-run").tooltip).toContain("Lab status: running");
+  });
+
+  it("gates the marker DEVICE-AWARE within one provider: a Proxmox-origin cluster node (externalId node/pve) with a KNOWN status gets NO marker while a bare-vmid guest with the same status does (⊘ a capability-only gate stamps Start/Stop onto a hypervisor node — the provider's own controlNode refuses node/<name> with a protocol error — and the node keeps its running/offline decoration, which the status description and icon drive independently of the marker)", () => {
+    const provider = providerWith(
+      [
+        makeServer({ id: "pve-node", name: "pve", origin: { sourceId: "pve-src", externalId: "node/pve", syncedAt: 1 } }),
+        makeServer({ id: "pve-guest", name: "VM 105", origin: { sourceId: "pve-src", externalId: "105", syncedAt: 1 } })
+      ],
+      [{ id: "pve-src", providerId: "proxmox", name: "My PVE" }],
+      new Map<string, "running" | "stopped">([
+        ["pve-node", "running"],
+        ["pve-guest", "running"]
+      ]),
+      (providerId, externalId) => providerId === "proxmox" && /^\d+$/.test(externalId)
+    );
+    expect(serverItemById(provider, "pve-node").contextValue).toBe("nexus.server");
+    expect(serverItemById(provider, "pve-guest").contextValue).toBe("nexus.server.eveRunning");
   });
 
   it("emits NO marker for a control-capable origin whose status is UNKNOWN (⊘ the never-act-blind rule must survive the generalization)", () => {

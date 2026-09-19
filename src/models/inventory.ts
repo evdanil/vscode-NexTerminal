@@ -359,6 +359,25 @@ export interface InventoryProvider {
     externalId: string,
     action: "start" | "stop"
   ): Promise<void>;
+  /**
+   * DEVICE-AWARE CONTROL GATE (P2 review fix) — OPTIONAL. Which of this
+   * provider's synced devices `controlNode` can actually act on, keyed by the
+   * same `externalId` the other members use. A provider whose device set
+   * includes records `controlNode` refuses — e.g. Proxmox cluster nodes, which
+   * its own implementation rejects with a protocol error — must be able to
+   * keep those out of the Start/Stop menu WITHOUT losing their status
+   * decoration: the tree's marker gate consults this before stamping
+   * `.eveRunning`/`.eveStopped`, so a refused device keeps its running/offline
+   * dot and description (both driven by the status, not the marker) but
+   * carries no menu. OPTIONAL — absent means EVERY device is controllable, so
+   * a provider whose whole device set is controllable (EVE-NG) implements
+   * nothing and behaves byte-identically. Must be pure and synchronous, must
+   * not throw, and must AGREE with `controlNode`'s own refusals — the menu
+   * must never offer what the implementation rejects. The ONLY consumer is the
+   * tree's marker gate, called through the predicate injected at the
+   * `NexusTreeProvider` constructor; nothing on the command path reads it.
+   */
+  canControlNode?(externalId: string): boolean;
 }
 
 /**

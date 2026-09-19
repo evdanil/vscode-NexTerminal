@@ -421,11 +421,15 @@ export class NexusTreeProvider
   public constructor(
     private readonly callbacks: NexusTreeCallbacks,
     // NODE CONTROL (Task 9) — answers "does this providerId's provider
-    // implement `controlNode`?", injected from extension.ts because this UI
-    // module cannot import the provider registry (layering). Optional and
-    // FAIL-CLOSED: a tree built without it offers node control nowhere — never
-    // somewhere it is not backed by the capability.
-    private readonly originHasNodeControl?: (providerId: string) => boolean
+    // implement `controlNode`, and can it control THIS device?", injected
+    // from extension.ts because this UI module cannot import the provider
+    // registry (layering). The second argument is the server's origin
+    // externalId (P2 review fix), so a provider whose device set includes
+    // records its own controlNode refuses — Proxmox cluster nodes — can keep
+    // them out of the Start/Stop menu without losing their status decoration.
+    // Optional and FAIL-CLOSED: a tree built without it offers node control
+    // nowhere — never somewhere it is not backed by the capability.
+    private readonly originHasNodeControl?: (providerId: string, externalId: string) => boolean
   ) {}
 
   public readonly onDidChangeTreeData: vscode.Event<NexusTreeItem | undefined> =
@@ -920,14 +924,17 @@ export class NexusTreeProvider
     // (a live ServerOrigin carries no providerId — Phase 4 gotcha #1).
     // `hasNodeControl` gates the `.eveRunning`/`.eveStopped` contextValue
     // marker: the injected predicate answers whether the source's provider
-    // implements `controlNode` — capability, not a hard-coded provider id, so
-    // EVE-NG nodes and Proxmox guests (and any future controlNode provider)
-    // get the same Start/Stop menu.
+    // implements `controlNode` AND can control THIS device (the origin's
+    // externalId) — capability plus device, not a hard-coded provider id, so
+    // EVE-NG nodes and Proxmox guests get the same Start/Stop menu while a
+    // Proxmox cluster node (`node/<name>`) keeps its decoration but no menu.
     const originSource = server.origin
       ? this.snapshot.inventorySources.find((source) => source.id === server.origin!.sourceId)
       : undefined;
     const syncedSourceName = originSource?.name;
-    const hasNodeControl = originSource !== undefined && (this.originHasNodeControl?.(originSource.providerId) ?? false);
+    const hasNodeControl =
+      originSource !== undefined &&
+      (this.originHasNodeControl?.(originSource.providerId, server.origin?.externalId ?? "") ?? false);
     // REVIEW FINDING (P2) — the username shown is the one a connection will
     // actually use, resolved through the shared ownership rule
     // (`authProfileOwnedCredentials`, models/config.ts). Reading
