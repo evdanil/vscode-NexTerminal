@@ -170,9 +170,12 @@ describe("createProxmoxProvider", () => {
     const SECRETS = { apiToken: "root@pam!test=secret" };
 
     it("smoke-tests GET {base}/api2/json/version with the PVEAPIToken header and resolves on 200 (kills a Token- or Bearer-prefixed header PVE would reject)", async () => {
-      const fetchImpl = vi.fn(async (url: string, init?: { headers?: Record<string, string> }) => {
+      const fetchImpl = vi.fn(async (url: string, init?: { headers?: Record<string, string>; method?: string }) => {
         expect(String(url)).toBe("https://pve.example.com:8006/api2/json/version");
         expect(init?.headers).toMatchObject({ Authorization: "PVEAPIToken=root@pam!test=secret" });
+        // rawGet sends no `method` member — GET is the platform default. Pin it
+        // so a POST (a start/stop-style call) can never drift into the smoke test.
+        expect(init?.method ?? "GET").toBe("GET");
         return makeResponse(200, { data: { version: "9.2.11", release: "9.2" } });
       });
       const provider = createProxmoxProvider(fetchImpl as unknown as typeof fetch);
