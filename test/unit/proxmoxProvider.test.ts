@@ -8,7 +8,7 @@ import {
   proxmoxInstanceKey
 } from "../../src/services/inventory/providers/proxmoxProvider";
 import { validateProviderShape } from "../../src/services/inventory/providerRegistry";
-import { InventoryProviderError } from "../../src/models/inventory";
+import { InventoryProviderError, type InventorySourceValues } from "../../src/models/inventory";
 import { ADVANCED_SECTION_LABEL } from "../../src/ui/formTypes";
 
 function makeResponse(status: number, body: unknown): { status: number; text: () => Promise<string> } {
@@ -331,6 +331,200 @@ describe("createProxmoxProvider", () => {
       await provider.testConnection({ baseUrl: "HTTPS://pve.example.com:8006", allowInsecureTls: true }, SECRETS);
       expect(insecure.calls.length).toBeGreaterThan(0);
       expect(standard.calls).toHaveLength(0);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // FETCH INVENTORY — guests from ONE /cluster/resources call. Fixtures are
+  // synthetic rows shaped exactly like the verified live rows: guest rows are
+  // `{vmid, name?, node, type: "qemu"|"lxc", status, template, tags?, pool?}`;
+  // node rows share the payload but carry no `ip` and no `name`. Addresses are
+  // a later change — every device here is addressless by design.
+  // ---------------------------------------------------------------------------
+
+  describe("fetchInventory", () => {
+    const BASE = "https://pve.example.com:8006";
+    const SECRETS = { apiToken: "root@pam!test=secret" };
+
+    /** A synthetic guest row shaped exactly like a verified live /cluster/resources row. */
+    function guestRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+      return { vmid: 105, name: "clawdbot", node: "pve", type: "qemu", status: "running", template: 0, ...overrides };
+    }
+
+    /**
+     * Sync one mocked /cluster/resources payload. BOTH injected transports are
+     * the same mock: unit tests never touch the network, and which transport a
+     * config selects is Task 1's pinned territory — these tests only need every
+     * request to land somewhere observable.
+     */
+    async function syncRows(rows: unknown[], config: InventorySourceValues = { baseUrl: BASE }) {
+      const fetchImpl = vi.fn(async () => makeResponse(200, { data: rows }));
+      const provider = createProxmoxProvider(fetchImpl as unknown as typeof fetch, fetchImpl as unknown as typeof fetch);
+      const tree = await provider.fetchInventory(config, SECRETS);
+      return { tree, fetchImpl };
+    }
+
+    it("maps one running qemu guest from the default template into its node folder — addressless, with the API call pinned to GET /cluster/resources and the PVEAPIToken header (kills a wrong endpoint, a missing unwrap of the {data:…} envelope, and a provider that invents endpoints before the address work exists)", async () => {
+      const fetchImpl = vi.fn(async (url: string, init?: { headers?: Record<string, string> }) => {
+        expect(String(url)).toBe(`${BASE}/api2/json/cluster/resources`);
+        expect(init?.headers).toMatchObject({ Authorization: "PVEAPIToken=root@pam!test=secret" });
+        return makeResponse(200, { data: [guestRow()] });
+      });
+      const provider = createProxmoxProvider(fetchImpl as unknown as typeof fetch, fetchImpl as unknown as typeof fetch);
+      const tree = await provider.fetchInventory({ baseUrl: BASE }, SECRETS);
+      expect(tree.devices).toEqual([
+        {
+          externalId: "105",
+          name: "clawdbot",
+          folderPath: "pve",
+          endpoints: [],
+          attributes: { type: ["qemu"], node: ["pve"], status: ["running"] }
+        }
+      ]);
+      // The engine owns the addressless disclosure (ONE-ADDRESSLESS-LINE rule):
+      // a clean sync of addressable-looking guests says NOTHING.
+      expect(tree.warnings).toEqual([]);
+    });
+
+    it("keys every guest by its BARE vmid as a string — qemu and lxc alike (kills a `${type}/${vmid}` identity, which orphans every kept server the first time a guest's type spelling changes and breaks cross-source adoption)", async () => {
+      const { tree } = await syncRows([
+        guestRow({ vmid: 105, name: "clawdbot" }),
+        guestRow({ vmid: 114, name: "dns", type: "lxc", status: "stopped" })
+      ]);
+      expect(tree.devices.map((d) => d.externalId)).toEqual(["105", "114"]);
+    });
+
+    it("keeps stopped guests by default — includeStopped ships ON — as addressless stopped placeholders (kills a default-OFF gate, under which a merely powered-off guest drops out of every sync and a delete-prune policy takes its server and stored credentials with it)", async () => {
+      const { tree } = await syncRows([guestRow({ status: "stopped" })]);
+      expect(tree.devices).toHaveLength(1);
+      expect(tree.devices[0].attributes).toMatchObject({ status: ["stopped"] });
+      expect(tree.devices[0].endpoints).toEqual([]);
+    });
+
+    it("drops stopped guests ENTIRELY when includeStopped is false, keeping the running ones (kills a filter that only stops mapping but still emits, and one that drops running guests too)", async () => {
+      const { tree } = await syncRows([guestRow({ status: "stopped" }), guestRow({ vmid: 106, name: "up" })], {
+        baseUrl: BASE,
+        includeStopped: false
+      });
+      expect(tree.devices.map((d) => d.name)).toEqual(["up"]);
+    });
+
+    it("treats status 'unknown' — what PVE emits before RRD data exists — as the includeStopped gate's stopped case but invents NO status attribute for it (kills an invented 'unknown'/'running' state the status poll would immediately contradict)", async () => {
+      const kept = await syncRows([guestRow({ status: "unknown" })]);
+      expect(kept.tree.devices).toHaveLength(1);
+      expect(kept.tree.devices[0].attributes).toEqual({ type: ["qemu"], node: ["pve"] });
+      const gated = await syncRows([guestRow({ status: "unknown" })], { baseUrl: BASE, includeStopped: false });
+      expect(gated.tree.devices).toEqual([]);
+    });
+
+    it("excludes template rows unless includeTemplates is on — a template cannot be started and the agent never answers for it (kills importing uninstantiable gold images by default)", async () => {
+      const excluded = await syncRows([guestRow({ template: 1, name: "gold-image" })]);
+      expect(excluded.tree.devices).toEqual([]);
+      const included = await syncRows([guestRow({ template: 1, name: "gold-image" })], {
+        baseUrl: BASE,
+        includeTemplates: true
+      });
+      expect(included.tree.devices.map((d) => d.externalId)).toEqual(["105"]);
+    });
+
+    it("renders the folder template with PVE's variables — pool, node, type, and the SORTED-FIRST tag — dropping empty and unknown segments (kills an unsorted-first tag policy, which reshuffles folders when the user reorders tags in PVE, and a dangling '/' from an absent pool)", async () => {
+      const cases: { template: string; row: Record<string, unknown>; expected: string }[] = [
+        { template: "{pool}/{node}", row: guestRow({ pool: "prod" }), expected: "prod/pve" },
+        { template: "{pool}/{node}", row: guestRow(), expected: "pve" },
+        { template: "{tag}", row: guestRow({ tags: "zeta;alpha;mid" }), expected: "alpha" },
+        { template: "{tag}", row: guestRow(), expected: "" },
+        { template: "{type}", row: guestRow(), expected: "qemu" },
+        { template: "{bogus}/{node}", row: guestRow(), expected: "pve" }
+      ];
+      for (const c of cases) {
+        const { tree } = await syncRows([c.row], { baseUrl: BASE, folderTemplate: c.template });
+        expect(tree.devices[0].folderPath).toBe(c.expected);
+      }
+    });
+
+    it("splits the ';'-joined tag string into a set-valued tags attribute, dropping empty segments, and omits the key when the row has no tags (kills an attribute that leaks an empty array and one that keeps raw 'a;b' as a single value)", async () => {
+      const tagged = await syncRows([guestRow({ tags: "managed-by-eve-ng-deploy;ops" })]);
+      expect(tagged.tree.devices[0].attributes).toMatchObject({ tags: ["managed-by-eve-ng-deploy", "ops"] });
+      const gapped = await syncRows([guestRow({ tags: "ops;;managed" })]);
+      expect(gapped.tree.devices[0].attributes).toMatchObject({ tags: ["ops", "managed"] });
+      const untagged = await syncRows([guestRow()]);
+      expect(untagged.tree.devices[0].attributes).not.toHaveProperty("tags");
+    });
+
+    it("carries ONLY the documented attributes — the row's other API fields (cpu, mem, maxdisk, netin, id, uptime…) never leak in, and pool appears only when the row has one (kills a passthrough of the row object, which would churn matching attributes on every PVE stats update)", async () => {
+      const loaded = await syncRows([
+        guestRow({ cpu: 0.01, mem: 1024, maxdisk: 34359738368, netin: 100, netout: 200, id: "qemu/105", uptime: 99 })
+      ]);
+      expect(loaded.tree.devices[0].attributes).toEqual({ type: ["qemu"], node: ["pve"], status: ["running"] });
+      const pooled = await syncRows([guestRow({ pool: "prod" })]);
+      expect(pooled.tree.devices[0].attributes).toEqual({
+        type: ["qemu"],
+        node: ["pve"],
+        status: ["running"],
+        pool: ["prod"]
+      });
+    });
+
+    it("emits a nameless guest with an empty name and NO endpoints — it cannot become a server, so an address on it would invite a half-mapped placeholder (kills an endpoint on a nameless device — the netbox convention)", async () => {
+      const { tree } = await syncRows([guestRow({ vmid: 106, name: undefined })]);
+      expect(tree.devices).toHaveLength(1);
+      expect(tree.devices[0].externalId).toBe("106");
+      expect(tree.devices[0].name).toBe("");
+      expect(tree.devices[0].endpoints).toEqual([]);
+    });
+
+    it("stops at the hard cap — 10_001 rows yield exactly 10_000 devices, truncated: true and one warning (kills an uncapped mapper, which would stream an unbounded cluster into one tree and one sync plan)", async () => {
+      const rows = Array.from({ length: 10_001 }, (_, i) => guestRow({ vmid: i + 1, name: `guest-${i + 1}` }));
+      const { tree } = await syncRows(rows);
+      expect(tree.devices).toHaveLength(10_000);
+      expect(tree.truncated).toBe(true);
+      expect(tree.warnings).toContain("Truncated at 10000 guests — narrow the source.");
+    });
+
+    it("refuses the whole sync when a row is not a JSON object — fail closed, never read-as-empty (kills a lenient mapper that skips corruption, under which the skipped row's server falls out of the engine's present set and gets pruned)", async () => {
+      const err = await syncRows([guestRow(), "corrupted"]).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind).toBe("protocol");
+      expect((err as Error).message).toContain("not a JSON object");
+    });
+
+    it("refuses a payload whose data is not an array — a truthy object is corruption, not an empty source (kills iterating a truthy object, which would present a mangled answer as 'the source legitimately has no devices' and prune everything)", async () => {
+      const fetchImpl = vi.fn(async () => makeResponse(200, { data: {} }));
+      const provider = createProxmoxProvider(fetchImpl as unknown as typeof fetch, fetchImpl as unknown as typeof fetch);
+      const err = await provider.fetchInventory({ baseUrl: BASE }, SECRETS).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind).toBe("protocol");
+      expect((err as Error).message).toContain('"data" is not an array');
+    });
+
+    it("refuses a guest row without a usable vmid — no stable externalId, no safe identity, and fabricating one would poison adoption (kills a mapper that emits externalId 'undefined' for a corrupted row)", async () => {
+      const err = await syncRows([{ name: "orphan", node: "pve", type: "qemu", status: "running", template: 0 }]).catch(
+        (e: unknown) => e
+      );
+      expect(err).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind).toBe("protocol");
+      expect((err as Error).message).toContain("vmid");
+    });
+
+    it("warns exactly once about an insecure sync, and only when the transport actually ran unverified — https with the opt-in warns, http with the same opt-in stays silent (kills a warning that disagrees with the selected transport, and one that fires twice)", async () => {
+      const warned = await syncRows([guestRow()], { baseUrl: BASE, allowInsecureTls: true });
+      expect(warned.tree.warnings).toEqual([PROXMOX_INSECURE_TLS_WARNING]);
+      const quiet = await syncRows([guestRow()], { baseUrl: "http://pve.example.com", allowInsecureTls: true });
+      expect(quiet.tree.warnings).toEqual([]);
+    });
+
+    it("ignores node rows in the payload while includeNodes is absent, making no second request (kills a mapper that turns /cluster/resources node rows — which carry no ip and no name — into devices, and one that fetches /cluster/status uninvited)", async () => {
+      const { tree, fetchImpl } = await syncRows([
+        { id: "node/pve", node: "pve", type: "node", status: "online" },
+        guestRow()
+      ]);
+      expect(tree.devices.map((d) => d.externalId)).toEqual(["105"]);
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    });
+
+    it("stamps contractVersion 1 on the tree (kills an unversioned or re-versioned tree the engine's validator rejects)", async () => {
+      const { tree } = await syncRows([guestRow()]);
+      expect(tree.contractVersion).toBe(1);
     });
   });
 });

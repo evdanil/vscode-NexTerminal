@@ -4,6 +4,7 @@ import { createInsecureHttpsFetch } from "../insecureFetch";
 import {
   InventoryProviderError,
   type InventoryConfigField,
+  type InventoryDevice,
   type InventoryProvider,
   type InventorySourceSecrets,
   type InventorySourceValues,
@@ -520,6 +521,224 @@ async function testConnectionImpl(transport: ProxmoxTransport, baseUrl: string, 
   throwForStatus(raw, versionUrl);
 }
 
+/** Coerce a row member to the string the mapping wants; anything but a string reads as absent. */
+function str(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+/**
+ * PVE tags arrive as ONE ";-joined string on the row (`tags: "ops;managed"`).
+ * Split, trim, drop empties — the set-valued `tags` attribute and the `{tag}`
+ * folder variable both read from this one parser, so they can never disagree
+ * about what a guest's tags are.
+ */
+function parseNetTags(raw: unknown): string[] {
+  if (typeof raw !== "string") {
+    return [];
+  }
+  return raw
+    .split(";")
+    .map((tag) => tag.trim())
+    .filter((tag) => tag.length > 0);
+}
+
+/**
+ * Copied verbatim from netboxProvider's `renderFolderTemplate` — one renderer,
+ * one semantics ("split on '/', substitute unknown/empty to '', trim, drop
+ * empty segments, rejoin"), so `{pool}/{node}` on a PVE source folds exactly
+ * the way it does on a NetBox one and no template quirk is fixed in one place
+ * only.
+ */
+function renderFolderTemplate(template: string, vars: Record<string, string>): string {
+  return template
+    .split("/")
+    .map((segment) => segment.replace(/\{([a-zA-Z0-9_]+)\}/g, (_match, key: string) => vars[key] ?? ""))
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0)
+    .join("/");
+}
+
+/**
+ * The folder variables a guest row offers — PVE's own grouping vocabulary.
+ * `{tag}` is the FIRST TAG IN SORTED (lexicographic) order of the guest's tags,
+ * deliberately: it is the one deterministic pick, so a guest carrying several
+ * tags syncs under the same folder every sync. Taking the tags in reported
+ * order instead would reshuffle folders whenever the user reorders tags in
+ * PVE, and folders that reshuffle churn the tree and rewrite the sync plan.
+ * An absent pool or tag renders "", which the renderer drops as an empty
+ * segment rather than leaving a dangling "/".
+ */
+function renderGuestVars(row: Record<string, unknown>): Record<string, string> {
+  return {
+    node: str(row.node),
+    pool: str(row.pool),
+    type: str(row.type),
+    tag: parseNetTags(row.tags).sort()[0] ?? ""
+  };
+}
+
+/**
+ * One guest row → one InventoryDevice, ADDRESSLESS: endpoints are filled by
+ * the per-guest address crawl in a later change, and until then an empty array
+ * is the honest answer. Same defensive rule as netbox's `mapEntry`: a row
+ * without a usable vmid has no stable externalId, and emitting a fabricated
+ * one (`"undefined"`) would poison the adoption identity every kept server
+ * carries — so the row aborts the sync loudly instead of quietly vanishing
+ * (a silently skipped row reads as "gone at the source" and gets its server
+ * pruned).
+ */
+function mapGuest(row: Record<string, unknown>, template: string): InventoryDevice {
+  const hasUsableVmid =
+    (typeof row.vmid === "number" && Number.isFinite(row.vmid)) ||
+    (typeof row.vmid === "string" && row.vmid.length > 0);
+  if (!hasUsableVmid) {
+    throw new InventoryProviderError("protocol", `guest row has no usable vmid — refusing to sync.`);
+  }
+  const name = str(row.name);
+  // Set-valued `put` idiom (netbox's deviceAttributes): a key appears only when
+  // it has content, so a row without pool/tags never carries an empty entry
+  // that a template filter could match against. ONLY the documented keys — the
+  // row's other members (cpu, mem, maxdisk, netin, …) are PVE statistics that
+  // change constantly and must not churn matching attributes.
+  const attrs: Record<string, string[]> = {};
+  const put = (key: string, values: string[]): void => {
+    if (values.length > 0) {
+      attrs[key] = values;
+    }
+  };
+  // `put` expects PRE-FILTERED values (netbox's pairValues/tagValues strip
+  // empties before calling it); `one` does that for a single-valued member, so
+  // an absent pool reads as "no pool" rather than as a set holding "".
+  const one = (value: string): string[] => (value.length > 0 ? [value] : []);
+  put("type", one(str(row.type)));
+  put("node", one(str(row.node)));
+  put("pool", one(str(row.pool)));
+  put("tags", parseNetTags(row.tags));
+  // running/stopped only. PVE also emits "unknown" (before RRD data exists);
+  // the state is genuinely unknown, and inventing one would be a lie the live
+  // status poll immediately contradicts — so no status attribute at all.
+  const status = row.status === "running" || row.status === "stopped" ? str(row.status) : "";
+  put("status", status ? [status] : []);
+  return {
+    externalId: String(row.vmid),
+    name,
+    folderPath: renderFolderTemplate(template, renderGuestVars(row)),
+    // Endpoints arrive with the address crawl. A NAMELESS guest must keep no
+    // endpoint even then (netbox convention): it cannot become a server, so an
+    // address on it would only invite a half-mapped placeholder.
+    endpoints: [],
+    attributes: Object.keys(attrs).length > 0 ? attrs : undefined
+  };
+}
+
+/**
+ * ONE call for the whole guest listing: /cluster/resources WITHOUT a type
+ * parameter returns guests and nodes in one payload — node rows are filtered
+ * below (and, when node import arrives, re-sourced from /cluster/status, which
+ * is the only endpoint carrying their name and address), so no per-type
+ * request fan-out exists on this path.
+ *
+ * Fail closed on shape: the success envelope is `{"data": [...]}`. A payload
+ * whose `data` is not an array is corruption — iterating a truthy object (or
+ * reading null as empty) would present a mangled answer as "the source
+ * legitimately has no devices", and the prune phase would act on exactly that.
+ */
+async function fetchResources(
+  transport: ProxmoxTransport,
+  baseUrl: string,
+  token: string,
+  timeoutMs: number
+): Promise<unknown[]> {
+  const url = new URL(`${baseUrl}${PROXMOX_API_BASE}/cluster/resources`);
+  const raw = await rawGet(transport, url, token, timeoutMs);
+  if (raw.status < 200 || raw.status >= 300) {
+    throwForStatus(raw, url);
+  }
+  const parsed = parseJsonOrThrow(raw.text, url);
+  const data = (parsed as { data?: unknown }).data;
+  if (!Array.isArray(data)) {
+    throw new InventoryProviderError(
+      "protocol",
+      `Response from ${url} has no resource list ("data" is not an array) — refusing to sync.`
+    );
+  }
+  return data;
+}
+
+async function fetchInventoryImpl(
+  transports: ProxmoxTransports,
+  config: InventorySourceValues,
+  secrets: InventorySourceSecrets
+): Promise<InventoryTree> {
+  const transport = selectProxmoxTransport(transports, config);
+  const baseUrl = normalizeBaseUrl(String(config.baseUrl ?? ""));
+  const token = secrets.apiToken ?? "";
+  const template =
+    typeof config.folderTemplate === "string" && config.folderTemplate.trim()
+      ? config.folderTemplate
+      : DEFAULT_FOLDER_TEMPLATE;
+  // DEFAULT ON (the field's own comment says why): only an explicit false —
+  // never a truthiness test — turns it off, so an absent field keeps the
+  // protective default and a stored non-boolean cannot silently drop guests.
+  const includeStopped = config.includeStopped !== false;
+  const includeTemplates = config.includeTemplates === true;
+
+  const warnings: string[] = [];
+  // INSECURE TLS — this sync ran with certificate verification OFF, so it says
+  // so, on the same channel as everything else the user needs to know about the
+  // run. Read from the SAME predicate the transport was chosen with, so the
+  // disclosure can never disagree with what actually happened on the wire.
+  if (proxmoxRunsWithoutCertificateVerification(config)) {
+    warnings.push(PROXMOX_INSECURE_TLS_WARNING);
+  }
+
+  const rows = await fetchResources(transport, baseUrl, token, FETCH_TIMEOUT_MS);
+
+  const devices: InventoryDevice[] = [];
+  let truncated = false;
+  for (let index = 0; index < rows.length; index++) {
+    const raw = rows[index];
+    // Fail closed on a corrupted row rather than skipping it: a silently
+    // skipped row would make its server fall out of the engine's present set
+    // and be pruned — the same hazard netbox's mapEntry refuses to risk.
+    if (typeof raw !== "object" || raw === null) {
+      throw new InventoryProviderError(
+        "protocol",
+        `row ${index} of ${PROXMOX_API_BASE}/cluster/resources is not a JSON object — refusing to sync.`
+      );
+    }
+    const row = raw as Record<string, unknown>;
+    // Guests only: qemu VMs and lxc containers. Node rows share this payload
+    // but carry neither name nor address in it — they are ignored here (node
+    // import sources them from /cluster/status when opted in), as are storage
+    // and the other non-guest types the endpoint mixes in.
+    if (row.type !== "qemu" && row.type !== "lxc") {
+      continue;
+    }
+    if (row.template === 1 && !includeTemplates) {
+      continue;
+    }
+    // includeStopped gates everything that is not running — including status
+    // "unknown", which follows the same gate as a stopped row (§Spec).
+    if (!includeStopped && row.status !== "running") {
+      continue;
+    }
+    // HARD CAP, client-side. Beyond the cap guests are simply not mapped, and
+    // `truncated` makes the engine skip pruning: a capped fetch must never be
+    // read as "these guests no longer exist at the source".
+    if (devices.length >= HARD_CAP) {
+      truncated = true;
+      continue;
+    }
+    devices.push(mapGuest(row, template));
+  }
+  if (truncated) {
+    warnings.push(`Truncated at ${HARD_CAP} guests — narrow the source.`);
+  }
+
+  return { contractVersion: 1, devices, warnings, truncated: truncated || undefined };
+}
+
 /**
  * INSECURE TLS — the insecure transport is a SECOND injectable so a test can
  * assert which one a given config selects, rather than inferring it. Default
@@ -550,15 +769,12 @@ export function createProxmoxProvider(
       const token = secrets.apiToken ?? "";
       await testConnectionImpl(selectProxmoxTransport(transports, config), baseUrl, token);
     },
-    // The contract REQUIRES this member (`validateProviderShape` rejects a
-    // provider without it), so it is present from the start — but the guest
-    // fetch is not built yet, and a stub that RETURNED anything would be
-    // dangerous: an empty tree reads as "the source legitimately has no
-    // devices", and the prune phase would act on that, taking kept servers
-    // with it under a delete policy. Throw a protocol error instead, so a
-    // premature sync fails loudly rather than quietly emptying the tree.
-    fetchInventory(): Promise<InventoryTree> {
-      throw new InventoryProviderError("protocol", "Proxmox guest fetch is implemented in a later change.");
+    // The contract REQUIRES this member; the implementation fail-closes on
+    // corrupted payloads and on its own hard cap (see `fetchInventoryImpl`) —
+    // an empty tree would otherwise read as "the source legitimately has no
+    // devices" and the prune phase would act on that.
+    fetchInventory(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<InventoryTree> {
+      return fetchInventoryImpl(transports, config, secrets);
     }
   };
 }
