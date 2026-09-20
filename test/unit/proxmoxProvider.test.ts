@@ -276,6 +276,23 @@ describe("guest interface parsing", () => {
     }
   });
 
+  it("isGlobalAddress — applies the range exclusions to the CANONICAL IPv6 literal, so expanded, IPv4-mapped and IPv4-compatible spellings of excluded ranges are refused (kills literal-string comparisons that recognized one spelling only — net.isIPv6 accepts `0:0:0:0:0:0:0:1` but the `=== \"::1\"` check never saw it)", () => {
+    for (const addr of [
+      "0:0:0:0:0:0:0:1", // expanded loopback — canonicalizes to ::1
+      "0:0:0:0:0:0:0:0", // expanded unspecified — canonicalizes to ::
+      "::ffff:127.0.0.1", // IPv4-mapped loopback ⇒ canonical ::ffff:7f00:1
+      "::7f00:1", // IPv4-compatible loopback (::/96 — deprecated but real)
+      "::ffff:169.254.9.9", // mapped link-local 169.254/16
+      "::ffff:224.0.0.1" // mapped multicast-range v4 (≥224)
+    ]) {
+      expect(isGlobalAddress(addr)).toBe(false);
+    }
+    // The plain-global mapped form stays usable: the embedded octets are a
+    // documentation-range host, so the mapped spelling must not be excluded
+    // with the special ranges.
+    expect(isGlobalAddress("::ffff:192.0.2.7")).toBe(true);
+  });
+
   it("pickAddress — auto takes the first global in reported order, prefer-* takes that family first and FALLS BACK to the other, CIDR stripped (kills a family preference that yields an addressless device when the chosen interface has none of that family)", () => {
     const both = ["192.0.2.10/24", "2001:db8::10/64", "fe80::1/64", "127.0.0.1"];
     expect(pickAddress(both, "auto")).toBe("192.0.2.10");
@@ -1120,7 +1137,7 @@ describe("createProxmoxProvider", () => {
       expect(failed403.tree.devices[1].endpoints).toEqual([{ kind: "ssh", host: "192.0.2.194", port: 22 }]);
     });
 
-    it("caps the address crawl at MAX_IP_GUESTS — guests beyond the cap stay addressless with truncated: true and a warning naming the cap (kills an unbounded per-guest crawl that would pin a big cluster for minutes)", async () => {
+    it("caps the address crawl at MAX_IP_GUESTS — guests beyond the cap stay ADDRESSLESS but EMITTED, the tree is NOT truncated, and a warning names the cap (kills an unbounded per-guest crawl that would pin a big cluster for minutes, and a budget trip that read as an incomplete device listing and froze pruning on every sync of a large cluster)", async () => {
       const rows = Array.from({ length: 1001 }, (_, i) => row({ vmid: i + 1, name: `guest-${i + 1}` }));
       const calls: string[] = [];
       const impl = async (input: string | URL): Promise<unknown> => {
@@ -1142,11 +1159,17 @@ describe("createProxmoxProvider", () => {
       expect(calls.some((c) => c.includes("/1001/"))).toBe(false);
       expect(tree.devices[999].endpoints).toEqual([{ kind: "ssh", host: "192.0.2.194", port: 22 }]);
       expect(tree.devices[1000].endpoints).toEqual([]);
-      expect(tree.truncated).toBe(true);
-      expect(tree.warnings).toContain("Truncated at 1000 guest address lookups — narrow the source.");
+      // The device listing itself is complete — only the address crawl stopped
+      // — so the tree must NOT claim truncation: that would skip pruning on
+      // every sync of a cluster over the crawl budget, keeping removed guests
+      // forever.
+      expect(tree.truncated).toBeUndefined();
+      expect(tree.warnings).toContain(
+        "Address crawl stopped at 1000 guests — the remaining guests arrived without addresses and will pick them up on a later sync."
+      );
     });
 
-    it("trips the shared crawl deadline — the next guest makes no fetch, truncated: true and a deadline warning (kills an unbounded crawl against a slow cluster; the clock seam is a Date.now spy advanced by the fetch, the same idiom EVE-NG's deadline tests use)", async () => {
+    it("trips the shared crawl deadline — the next guest makes no fetch, the tree stays UNtruncated and a deadline warning names the budget (kills an unbounded crawl against a slow cluster; the clock seam is a Date.now spy advanced by the fetch, the same idiom EVE-NG's deadline tests use)", async () => {
       let clock = 1_000_000_000;
       const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => clock);
       try {
@@ -1167,9 +1190,9 @@ describe("createProxmoxProvider", () => {
         };
         const provider = createProxmoxProvider(impl as unknown as typeof fetch, impl as unknown as typeof fetch);
         const tree = await provider.fetchInventory({ baseUrl: BASE }, SECRETS);
-        expect(tree.truncated).toBe(true);
+        expect(tree.truncated).toBeUndefined();
         expect(tree.warnings).toContain(
-          "Stopped after 120s — the Proxmox address crawl exceeded its time limit and some guests were imported addressless."
+          "Address crawl stopped after 120s — the remaining guests arrived without addresses and will pick them up on a later sync."
         );
         expect(calls.some((c) => c.includes("/106/"))).toBe(false);
         // Guest 105 completed before the trip and keeps its address.
@@ -1207,7 +1230,7 @@ describe("createProxmoxProvider", () => {
       expect(calls.some((c) => c.includes("/116/"))).toBe(false);
     });
 
-    it("composes truncation — a payload over the row cap whose guests then exhaust the IP cap sets truncated from EITHER budget and pushes both warnings (kills an IP-cap flag that overwrites the row-cap flag)", async () => {
+    it("composes truncation — a payload over the row cap whose guests then exhaust the IP cap keeps `truncated` from the ROW cap alone (device rows were omitted) and pushes both warnings (kills an IP-cap flag that overwrote the row-cap flag, and a row cap that loses its flag when the crawl also stops short)", async () => {
       const rows = Array.from({ length: 10_001 }, (_, i) => row({ vmid: i + 1, name: `guest-${i + 1}` }));
       const calls: string[] = [];
       const impl = async (input: string | URL): Promise<unknown> => {
@@ -1228,7 +1251,9 @@ describe("createProxmoxProvider", () => {
       expect(calls.filter((c) => c.includes("/agent/"))).toHaveLength(1000);
       expect(tree.truncated).toBe(true);
       expect(tree.warnings).toContain("Truncated at 10000 devices — narrow the source.");
-      expect(tree.warnings).toContain("Truncated at 1000 guest address lookups — narrow the source.");
+      expect(tree.warnings).toContain(
+        "Address crawl stopped at 1000 guests — the remaining guests arrived without addresses and will pick them up on a later sync."
+      );
     });
 
     it("collects ALL interfaces' globals into the ip/ip6 sets plus lowercased MACs and global-holding interface names, omitting the empty sets (kills attribute sets that only mirror the chosen interface, and empty-set keys a template filter could match)", async () => {

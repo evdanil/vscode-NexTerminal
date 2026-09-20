@@ -688,7 +688,8 @@ export function stripCidr(address: string): string {
  * `::ffff:192.0.2.7`), and save this file from owning a second, weaker IPv6
  * parser beside the one `profileTokens.isIpv6Literal` already guards its own
  * boundary with. The range exclusions below are policy and stay here, applied
- * to the parsed literal.
+ * to the CANONICALIZED literal — a guest may report the same address in any
+ * RFC 4291 spelling, and the exclusions are literal comparisons.
  */
 export function isGlobalAddress(raw: string): boolean {
   const addr = stripCidr(raw).toLowerCase();
@@ -703,14 +704,40 @@ export function isGlobalAddress(raw: string): boolean {
     if (!isIPv6(addr)) {
       return false;
     }
-    if (addr === "::1" || addr === "::") {
+    // The exclusions below compare against CANONICAL spellings, so they must
+    // run on the canonical form: `net.isIPv6` accepts spellings the literals
+    // would never match — `0:0:0:0:0:0:0:1` is `::1`, and `::ffff:127.0.0.1`
+    // serializes to `::ffff:7f00:1`. The WHATWG URL parser canonicalizes any
+    // literal `isIPv6` accepted, emitting the RFC 5952 hex form (compressed,
+    // lowercase, never a leading zero — so the prefix tests below are sound);
+    // `hostname` wraps IPv6 hosts in brackets, which are stripped here. A
+    // throw on input that already passed the syntax check means something
+    // exotic we will not connect to.
+    let canonical: string;
+    try {
+      canonical = new URL(`http://[${addr}]/`).hostname.slice(1, -1);
+    } catch {
       return false;
+    }
+    if (canonical === "::1" || canonical === "::") {
+      return false;
+    }
+    // IPv4-EMBEDDED canonical shapes — `::ffff:h:h` (mapped, ::ffff:0:0/96)
+    // and `::h:h` (compatible, ::/96; deprecated but real) — carry an IPv4
+    // address in their last two 16-bit groups, and the SAME exclusions as the
+    // dotted branch apply to those bytes: `::ffff:127.0.0.1` is loopback, not
+    // an endpoint, whatever spelling the guest reported.
+    const embedded = /^::(?:ffff:)?([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(canonical);
+    if (embedded) {
+      const h1 = parseInt(embedded[1], 16);
+      const h2 = parseInt(embedded[2], 16);
+      return !excludedIpv4([h1 >> 8, h1 & 255, h2 >> 8, h2 & 255]);
     }
     // fe80::/10 spans fe80..febf — first TWO hex digits "fe", third in 8-b.
-    if (/^fe[89ab]/.test(addr)) {
+    if (/^fe[89ab]/.test(canonical)) {
       return false;
     }
-    if (addr.startsWith("ff")) {
+    if (canonical.startsWith("ff")) {
       return false;
     }
     return true;
@@ -722,16 +749,23 @@ export function isGlobalAddress(raw: string): boolean {
   if (octets.some((o) => o > 255)) {
     return false;
   }
+  return !excludedIpv4(octets);
+}
+
+// The IPv4 range policy, shared by the dotted branch above and the
+// IPv4-EMBEDDED IPv6 forms — ONE definition, so the two families can never
+// disagree about which embedded v4 addresses are special.
+function excludedIpv4(octets: number[]): boolean {
   if (octets[0] === 127) {
-    return false;
+    return true;
   }
   if (octets[0] === 169 && octets[1] === 254) {
-    return false;
+    return true;
   }
   if (octets[0] === 0 && octets[1] === 0 && octets[2] === 0 && octets[3] === 0) {
-    return false;
+    return true;
   }
-  return octets[0] < 224;
+  return octets[0] >= 224;
 }
 
 /**
@@ -1316,10 +1350,10 @@ async function fetchInventoryImpl(
   // the crawl is the only per-guest fan-out this provider makes, so it is
   // gated twice over.
   const crawl: { row: Record<string, unknown>; device: InventoryDevice }[] = [];
-  let truncated = false;
-  // The DEVICE cap's trip, tracked apart from `truncated`: the crawl below sets
-  // `truncated` for its own budgets (with its own warnings), and the cap's ONE
-  // warning must fire once, after both mapping loops have run.
+  // The DEVICE cap's trip — the ONLY thing that can mark the tree `truncated`
+  // (the crawl budgets below warn but never truncate; see the tree
+  // composition below) — and the cap's ONE warning must fire once, after both
+  // mapping loops have run.
   let capTripped = false;
   for (let index = 0; index < rows.length; index++) {
     const raw = rows[index];
@@ -1435,17 +1469,16 @@ async function fetchInventoryImpl(
   // and the node loop breaks on the check above rather than pushing its own
   // line, so a guest-side trip can never produce two warnings.
   if (capTripped) {
-    truncated = true;
     warnings.push(`Truncated at ${HARD_CAP} devices — narrow the source.`);
   }
 
   // GUEST ADDRESS CRAWL (§IP selection) — running, non-template guests only,
-  // under TWO budgets that compose with the device cap's `truncated` above:
-  // MAX_IP_GUESTS caps the request fan-out and a shared wall-clock deadline
-  // caps the crawl's time (EVE-NG idiom). Either budget stopping the crawl
-  // leaves the untouched guests ADDRESSLESS — never dropped — and flags
-  // `truncated`, so the engine skips pruning over the partial picture (a
-  // capped fetch must never read as "these guests no longer exist").
+  // under TWO budgets: MAX_IP_GUESTS caps the request fan-out and a shared
+  // wall-clock deadline caps the crawl's time (EVE-NG idiom). Either budget
+  // stopping the crawl leaves the untouched guests ADDRESSLESS — never
+  // dropped — but sets NO tree flag: the device listing above is complete
+  // either way, so pruning over it stays correct (see the tree composition
+  // below). Only the warning says what happened.
   if (crawl.length > 0) {
     const deadline = Date.now() + CRAWL_DEADLINE_MS;
     let crawled = 0;
@@ -1472,13 +1505,13 @@ async function fetchInventoryImpl(
       }
     }
     if (ipCapped) {
-      truncated = true;
-      warnings.push(`Truncated at ${MAX_IP_GUESTS} guest address lookups — narrow the source.`);
+      warnings.push(
+        `Address crawl stopped at ${MAX_IP_GUESTS} guests — the remaining guests arrived without addresses and will pick them up on a later sync.`
+      );
     }
     if (deadlineHit) {
-      truncated = true;
       warnings.push(
-        `Stopped after ${Math.round(CRAWL_DEADLINE_MS / 1000)}s — the Proxmox address crawl exceeded its time limit and some guests were imported addressless.`
+        `Address crawl stopped after ${Math.round(CRAWL_DEADLINE_MS / 1000)}s — the remaining guests arrived without addresses and will pick them up on a later sync.`
       );
     }
   }
@@ -1499,7 +1532,20 @@ async function fetchInventoryImpl(
   // `statusAppliedGeneration` invalidation (inventoryCommands.ts), it never
   // warns, so there is nothing here to silence. The engine needs no change —
   // `applyInventoryStatus` already honors cleared lists under merge.
-  const tree: InventoryTree = { contractVersion: 1, devices, warnings, truncated: truncated || undefined };
+  // `truncated` is DEVICE-LEVEL ONLY: it claims device ROWS were omitted from
+  // the tree, and only the hard cap can omit rows — the device listing is ONE
+  // complete /cluster/resources call, and the crawl budgets bound address
+  // RESOLUTION, not device OBSERVATION. computeSyncPlan reads `truncated` as
+  // "the device listing is incomplete" and skips the prune phase over it;
+  // pruning compares against the complete listing, so it is safe (and
+  // correct) to prune after a crawl-limited sync.
+  //
+  // NOT the same flag as `fetchStatusImpl`'s `truncated` (device cap /
+  // node-join failure ⇒ merge semantics) or the clear-only report's
+  // `status.truncated` built just below (merge semantics for
+  // observed-but-stateless rows): those are STATUS-report flags with
+  // different meanings — do not unify them with this one.
+  const tree: InventoryTree = { contractVersion: 1, devices, warnings, truncated: capTripped || undefined };
   if (clearedExternalIds.length > 0) {
     tree.status = { contractVersion: 1, statuses: {}, truncated: true, clearedExternalIds };
   }
