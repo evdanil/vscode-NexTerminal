@@ -7,6 +7,7 @@ import {
   planDetailDrift,
   planWarningsBuffer,
   registerInventoryCommands,
+  NODE_CONTROL_STATUS_RECHECK_MS,
   type InventoryRuntimeTeardown
 } from "../../src/commands/inventoryCommands";
 import { InventorySourceRemovalMismatchError, NexusCore } from "../../src/core/nexusCore";
@@ -8351,6 +8352,8 @@ describe("inventoryCommands", () => {
    * is refused with a message rather than offered an action that can only fail.
    */
   describe("nexus.inventory.startNode / stopNode", () => {
+    const trackedDisposables: Array<{ dispose: () => void }> = [];
+
     async function setup(
       opts: {
         withControl?: boolean;
@@ -8360,9 +8363,15 @@ describe("inventoryCommands", () => {
         secretFieldIds?: string[];
         secrets?: Record<string, string>;
         providerFingerprint?: string;
+        withStatus?: boolean;
       } = {}
     ) {
       const withControl = opts.withControl ?? true;
+      // BOTH built-in node-control providers implement `fetchStatus`, so that is
+      // the default shape here. `withStatus: false` builds the OTHER legal
+      // combination the interface allows — a provider that controls nodes but
+      // reports state only through the tree its sync returns.
+      const withStatus = opts.withStatus ?? true;
       const server = makeServer({
         id: "eve-1",
         name: "R1",
@@ -8374,10 +8383,16 @@ describe("inventoryCommands", () => {
       await core.initialize();
       const registry = new InventoryProviderRegistry();
       const controlSpy = vi.fn(async () => {});
-      const provider = makeProvider(withControl ? { controlNode: opts.controlNode ?? controlSpy } : {});
+      const provider = makeProvider({
+        ...(withControl ? { controlNode: opts.controlNode ?? controlSpy } : {}),
+        ...(withStatus
+          ? { fetchStatus: vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} })) }
+          : {})
+      });
       registry.register(provider);
       const vault = makeVault(opts.secrets ?? {});
-      registerInventoryCommands(core, registry, vault, makeTeardown());
+      const disposables = registerInventoryCommands(core, registry, vault, makeTeardown());
+      trackedDisposables.push(...disposables);
       await core.addOrUpdateInventorySource(
         makeSource({
           id: "src-1",
@@ -8387,7 +8402,24 @@ describe("inventoryCommands", () => {
       );
       const start = registeredCommands.get("nexus.inventory.startNode")!;
       const stop = registeredCommands.get("nexus.inventory.stopNode")!;
-      return { core, registry, vault, provider, controlSpy, server, start, stop };
+      return { core, registry, vault, provider, controlSpy, server, start, stop, disposables };
+    }
+
+    /**
+     * Every `setup()` leaves live command disposables behind, and one of them
+     * owns the pending post-control status re-check. Disposing them here stops a
+     * timer armed by one test from firing a refresh into the next one's
+     * expectations.
+     */
+    afterEach(() => {
+      while (trackedDisposables.length > 0) {
+        trackedDisposables.pop()!.dispose();
+      }
+    });
+
+    /** The `nexus.inventory.refreshStatus` invocations so far, in order, by argument. */
+    function statusRefreshArgs(): unknown[] {
+      return mockExecuteCommand.mock.calls.filter((call) => call[0] === "nexus.inventory.refreshStatus").map((call) => call[1]);
     }
 
     it("registers both startNode and stopNode command handlers", async () => {
@@ -8464,8 +8496,164 @@ describe("inventoryCommands", () => {
       const { start, server } = await setup();
       await start({ server });
       const info = mockShowInformationMessage.mock.calls.map((c) => String(c[0])).join("\n");
-      expect(info).toMatch(/sent/i);
-      expect(info).toMatch(/refresh lab status/i);
+      expect(info).toBe('Start sent to "R1" — it takes a few seconds to take effect, and Nexus re-checks the status after that.');
+    });
+
+    /**
+     * WHAT THE TOAST PROMISES MUST ACTUALLY HAPPEN. The per-source status poll is
+     * OFF unless someone turned it on — both providers' readers resolve an absent
+     * interval to 0 — so in the DEFAULT configuration the immediate refresh fired
+     * beside the toast is the only automatic re-ask, and it goes out the instant
+     * the API returned, while the device is still transitioning. A toast that says
+     * the status is re-checked afterwards is only true if a SECOND refresh
+     * actually fires. It goes out in the poll's silent form because nobody is
+     * waiting on it: the manual form warns when a refresh fails, and a warning
+     * arriving seconds after a successful Start is a nag about something the user
+     * did not ask for.
+     */
+    it("RE-CHECKS the status a few seconds after the dispatch — a second, silent refresh in the poll's own form (⊘ with the poll off, which is the DEFAULT, the immediate refresh observes the pre-transition state and the row stays stale until the user acts — so the toast's promise is false)", async () => {
+      vi.useFakeTimers();
+      try {
+        const { start, server } = await setup();
+        await start({ server });
+        expect(statusRefreshArgs()).toEqual(["src-1"]);
+        await vi.advanceTimersByTimeAsync(NODE_CONTROL_STATUS_RECHECK_MS - 1);
+        expect(statusRefreshArgs()).toEqual(["src-1"]);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(statusRefreshArgs()).toEqual(["src-1", { sourceId: "src-1", __poll: true }]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    /**
+     * `controlNode` and `fetchStatus` are INDEPENDENTLY optional on
+     * `InventoryProvider`, and `refreshStatus` skips any provider that does not
+     * implement `fetchStatus`. A third-party provider can therefore control nodes
+     * while reporting state only through the tree its sync returns — its rows
+     * carry known state, so Start/Stop are offered — and for it NEITHER refresh
+     * can run. Telling that user the status is re-checked is the empty promise
+     * this message already had to shed once, so the sentence is conditioned on
+     * the capability and no timer is armed that could do nothing.
+     */
+    it("a provider that controls nodes but CANNOT report status is told what will actually update the row, and gets no refresh and no armed timer (⊘ promising a re-check that `refreshStatus` skips for want of `fetchStatus` is the same empty promise, and arming a timer for it wastes a wakeup)", async () => {
+      vi.useFakeTimers();
+      try {
+        const { start, server } = await setup({ withStatus: false });
+        await start({ server });
+        const info = mockShowInformationMessage.mock.calls.map((c) => String(c[0])).join("\n");
+        expect(info).toBe('Start sent to "R1" — it takes a few seconds to take effect. This source reports node state only when it syncs, so the row updates on its next sync.');
+        expect(info).not.toMatch(/re-check/i);
+        await vi.advanceTimersByTimeAsync(NODE_CONTROL_STATUS_RECHECK_MS * 4);
+        expect(statusRefreshArgs()).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("the re-check delay is a FEW seconds — what the toast says (⊘ a minute-scale delay makes the sentence a lie in the other direction)", () => {
+      expect(NODE_CONTROL_STATUS_RECHECK_MS).toBeGreaterThan(1000);
+      expect(NODE_CONTROL_STATUS_RECHECK_MS).toBeLessThanOrEqual(15_000);
+    });
+
+    it("the re-check does NOT stack — repeated Start/Stop on one source leaves exactly ONE pending re-check (⊘ a timer per click hammers the lab box once for every impatient double-click)", async () => {
+      vi.useFakeTimers();
+      try {
+        const { start, stop, server } = await setup();
+        await start({ server });
+        await stop({ server });
+        await start({ server });
+        await vi.advanceTimersByTimeAsync(NODE_CONTROL_STATUS_RECHECK_MS * 4);
+        const rechecks = statusRefreshArgs().filter((arg) => typeof arg === "object");
+        expect(rechecks).toEqual([{ sourceId: "src-1", __poll: true }]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a pending re-check is DROPPED when its source is gone by the time it fires (⊘ refreshing a removed source asks the registry to work for a record that no longer exists)", async () => {
+      vi.useFakeTimers();
+      try {
+        const { start, server, core } = await setup();
+        await start({ server });
+        await core.removeInventorySource("src-1");
+        await vi.advanceTimersByTimeAsync(NODE_CONTROL_STATUS_RECHECK_MS * 4);
+        expect(statusRefreshArgs().filter((arg) => typeof arg === "object")).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    /**
+     * AN ID IS NOT AN IDENTITY. A replace-mode restore (backup import, reset)
+     * removes and recreates a source under the SAME id, and those paths are
+     * global — they serialize on `configMutationLock` and bypass the command's
+     * per-source claim entirely, so nothing stops one landing inside the
+     * re-check's window. An existence-only guard accepts the replacement and
+     * refreshes status under a different deployment's configuration and
+     * credentials. `revision` is the codebase's own incarnation marker (minted
+     * fresh on EVERY write through `addOrUpdateInventorySource`, which is what
+     * the restore paths call) and is what the node-control capture already
+     * compares under the lock; the pending re-check compares it too.
+     */
+    it("a pending re-check is DROPPED when its source was REPLACED under the same id in the meantime (⊘ an existence-only guard sees the recreated record, accepts it, and refreshes status against a different deployment's config and credentials)", async () => {
+      vi.useFakeTimers();
+      try {
+        const { start, server, core } = await setup();
+        await start({ server });
+        const controlledRevision = core.getInventorySource("src-1")!.revision;
+        await core.removeInventorySource("src-1");
+        await core.addOrUpdateInventorySource(makeSource({ id: "src-1", secretFieldIds: [] }));
+        // The premise of the guard: a recreated record is a NEW incarnation.
+        expect(core.getInventorySource("src-1")!.revision).not.toBe(controlledRevision);
+        await vi.advanceTimersByTimeAsync(NODE_CONTROL_STATUS_RECHECK_MS * 4);
+        expect(statusRefreshArgs().filter((arg) => typeof arg === "object")).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("DISPOSING the commands cancels a pending re-check, so no timer outlives the extension host (⊘ a stray timer wakes up after deactivate and fires a command into a disposed extension)", async () => {
+      vi.useFakeTimers();
+      try {
+        const { start, server, disposables } = await setup();
+        await start({ server });
+        for (const disposable of disposables) {
+          disposable.dispose();
+        }
+        await vi.advanceTimersByTimeAsync(NODE_CONTROL_STATUS_RECHECK_MS * 4);
+        expect(statusRefreshArgs().filter((arg) => typeof arg === "object")).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    /**
+     * THE SAME TOAST FIRES ON A PROXMOX GUEST. `controlNode` is provider-general,
+     * so this one string is what a PVE guest's Start/Stop shows — and "lab" is
+     * EVE-NG's word, untrue of a cluster. It also used to send the user to run
+     * **Refresh Lab Status**, the very command the handler fires itself four
+     * lines later. Both faults are pinned here, not just the new wording: a
+     * reworded string that still names the command, or that reintroduces "lab",
+     * is the regression this test exists to stop.
+     */
+    it("the success toast names NO command and carries no EVE-NG 'lab' vocabulary — it is the toast a PROXMOX guest sees too (⊘ 'lab status will catch up on the next Refresh Lab Status' is EVE-NG wording on a PVE guest, and points at the refresh this handler already fired)", async () => {
+      const { stop, server } = await setup();
+      await stop({ server });
+      const info = mockShowInformationMessage.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(info).toContain("Stop sent");
+      expect(info).not.toMatch(/refresh lab status/i);
+      expect(info).not.toMatch(/\blabs?\b/i);
+    });
+
+    it("the 'nothing to control' refusal is provider-neutral — the same Start/Stop entries sit on Proxmox guests (⊘ \"Select a synced EVE-NG node\" names the wrong product on a PVE row)", async () => {
+      const { start, controlSpy } = await setup();
+      await start({ server: { id: "gone-since-the-tree-painted" } });
+      const msg = String(mockShowErrorMessage.mock.calls[0]?.[0] ?? "");
+      expect(msg).toMatch(/select/i);
+      expect(msg).not.toMatch(/EVE-NG/i);
+      expect(msg).not.toMatch(/\blabs?\b/i);
+      expect(controlSpy).not.toHaveBeenCalled();
     });
 
     it("M2 — a classified InventoryProviderError surfaces through describeInventoryError, so the failure toast carries the classified prefix (⊘ a bare err.message drops the 'Authentication failed:' classification every other inventory failure shows)", async () => {
