@@ -784,6 +784,21 @@ describe("createProxmoxProvider", () => {
       expect(Object.keys(tree.status?.statuses ?? {})).toHaveLength(10_000);
     });
 
+    it("WARNS on the tree when the report's own cap trips without the tree's — syncNow shows tree warnings but never warns about a status report's own truncation, so a status-only cap would retain stale states (and Start/Stop menus) with nothing on screen saying the collection was partial (kills a silent status-only cap)", async () => {
+      const rows = Array.from({ length: 10_001 }, (_, i) => guestRow({ vmid: i + 1, name: `guest-${i + 1}`, status: "stopped" }));
+      const { tree } = await syncRows(rows, { baseUrl: BASE, includeStopped: false });
+      expect(tree.truncated).toBeUndefined();
+      expect(tree.warnings?.some((w) => w.includes("Status collection stopped at 10000"))).toBe(true);
+      // ...and the two caps are independent: when the ROW cap trips, the
+      // status-collection warning must NOT also fire (the device warning
+      // channel stays honest about WHICH collection was partial). Stopped
+      // rows keep the IP crawl out of this scenario.
+      const rowsTree = Array.from({ length: 10_001 }, (_, i) => guestRow({ vmid: i + 1, name: `guest-${i + 1}`, status: "stopped" }));
+      const { tree: tree2 } = await syncRows(rowsTree);
+      expect(tree2.truncated).toBe(true);
+      expect(tree2.warnings?.some((w) => w.includes("Status collection stopped"))).toBe(false);
+    }, 20_000);
+
     it("clears a guest whose row reads status 'unknown' on the sync path too — omitted from statuses, vmid in clearedExternalIds, the same observed-but-stateless class the poll clears, even when includeStopped keeps the row out of the device set (kills a sync-side clear list that covers only templates)", async () => {
       const { tree } = await syncRows([guestRow({ vmid: 118, status: "unknown" })]);
       expect(tree.status).toEqual({

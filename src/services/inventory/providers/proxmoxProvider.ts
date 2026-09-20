@@ -1644,6 +1644,19 @@ async function fetchInventoryImpl(
   if (capTripped || statusCapped || joinFailed) {
     statusReport.truncated = true;
   }
+  // A status-ONLY cap (the tree's device set is complete, but the report's
+  // entry budget ran out — reachable with Include Stopped Guests off over a
+  // cluster listing more stopped guests than the cap) is invisible to the
+  // user on this path: syncNow never warns about a status report's OWN
+  // `truncated` (only the refresh path does), so the merge semantics would
+  // retain stale running/stopped states — and their Start/Stop menus — with
+  // nothing on screen saying the collection was partial. The tree-warnings
+  // channel is the one surface the sync plan shows; use it.
+  if (statusCapped && !capTripped) {
+    warnings.push(
+      `Status collection stopped at ${HARD_CAP} entries — guests beyond it may show stale state. Run Refresh Lab Status to complete it.`
+    );
+  }
   tree.status = statusReport;
   return tree;
 }
