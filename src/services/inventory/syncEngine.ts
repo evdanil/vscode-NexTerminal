@@ -1,7 +1,7 @@
 import type { AuthProfile, DetachedServerOrigin, ServerConfig, ServerOrigin, ServerProtocol } from "../../models/config";
 import { authProfileNeedsServerKeyPath, proxyConfigsEqual, serverOriginStampsEqual, templatedHasAnyStamp } from "../../models/config";
 import type { InventoryDevice, InventoryEndpoint, InventorySourceConfig, InventoryTree } from "../../models/inventory";
-import { normalizeNotSyncableReasons } from "../../models/inventory";
+import { flattenProviderText, normalizeNotSyncableReasons, sanitizeProviderNotice } from "../../models/inventory";
 import type { DeviceTemplateProfile } from "../../models/deviceTemplate";
 import type { InventorySyncApplication } from "../../core/nexusCore";
 import { normalizeFolderPath } from "../../utils/folderPaths";
@@ -181,7 +181,12 @@ export interface InventorySyncPlan {
   >;
   unchangedCount: number;
   folders: string[]; // every folder any add/update/orphan lands in, plus targetFolder itself
-  warnings: string[]; // duplicate externalIds, invalid folders, id collisions, provider warnings
+  // Duplicate externalIds, invalid folders, id collisions, provider notices.
+  // INERT by construction — see the `warnings` key computeSyncPlan returns: no
+  // entry carries a control, bidi or invisible formatting character, and an
+  // engine-composed entry is exactly one line. Uncapped: this is read in a
+  // scrollable document, not a dialog.
+  warnings: string[];
   hiddenPruneCount: number; // F22: how many entries in `prunes` are hidden servers
   /**
    * FIX 3: how many planned adds collided by host:port with a manual server.
@@ -796,7 +801,18 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   const adoptKeptServers = input.adoptionChoice === "adopt";
   /** REVIEW FINDING (P1) — see `ComputeSyncPlanInput.providerInstanceKey` and `sameProviderInstance`. */
   const providerInstanceKey = input.providerInstanceKey;
-  const warnings: string[] = [...(tree.warnings ?? [])];
+  // PROVIDER NOTICES vs THE ENGINE'S OWN WARNINGS — two different trust shapes,
+  // so they are sanitized under two different rules and only joined at the
+  // return (which keeps the order users see: notices, then the auth warning
+  // spliced in at `authWarningIndex`, then per-device warnings).
+  //
+  // A NOTICE is provider text end to end; the engine frames none of it, and the
+  // `string[]` member already hands a provider one line per entry. So it keeps
+  // its line breaks and loses only what no auditable text may carry — see
+  // `sanitizeProviderNotice`. An entry left with nothing visible is dropped
+  // rather than printed as a blank line and counted in "N warnings".
+  const providerNotices = (tree.warnings ?? []).map(sanitizeProviderNotice).filter((notice) => notice.length > 0);
+  const warnings: string[] = [];
 
   // AUTH 1 — the source names a profile by id; the caller supplies the profile
   // it resolved to. The engine only accepts the pair when the two agree.
@@ -865,8 +881,9 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // AFTER both rollback passes, because its closing sentences have to state how
   // many servers this sync actually unlinked and how many it deliberately left
   // linked — numbers only those passes produce. It is then SPLICED back to this
-  // position rather than appended, so the ordering users see is unchanged: tree
-  // warnings, this one, then per-device warnings.
+  // position rather than appended, so the ordering users see is unchanged: the
+  // provider's notices (prepended at the return), this one, then per-device
+  // warnings.
   const authWarningIndex = warnings.length;
   const emitAuthWarning = source.authProfileId !== undefined && resolvedProfileId === undefined;
 
@@ -4593,7 +4610,24 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     prunes,
     unchangedCount,
     folders: [...folderSet],
-    warnings,
+    // THE CHOKE POINT for everything this function pushed above. Each of those
+    // warnings is a sentence the ENGINE composed, with provider strings —
+    // device names, ids, folder paths, addresses, template and profile names —
+    // interpolated into it, and the reader of the Show Warnings document takes
+    // such a line as something this codebase wrote. So each is flattened to the
+    // one line it was written to be: a newline in an interpolated name would
+    // otherwise split the engine's own sentence and hand the provider a line of
+    // its own, and a bidi override would reorder the rest of the sentence around
+    // it. Applied HERE, once, rather than at the forty-odd `warnings.push` sites
+    // — the same reason `normalizeNotSyncableReasons` sanitizes at its one
+    // shared path: a site that has to remember is a site that will forget.
+    //
+    // NO LENGTH CAP and no trailing-punctuation rule, unlike the confirmation
+    // modal's treatment of the same strings. This buffer is a scrollable
+    // document the user opens to inspect the plan exhaustively — truncating the
+    // name they are looking for is the one failure it cannot afford — and
+    // nothing here frames a value as a sentence fragment.
+    warnings: [...providerNotices, ...warnings.map(flattenProviderText)],
     hiddenPruneCount,
     manualDuplicateCount,
     adoptionCandidates

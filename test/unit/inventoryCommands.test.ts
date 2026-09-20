@@ -11256,3 +11256,80 @@ describe("describePlanDetail — pruned servers whose device is still at the sou
     expect(detail).not.toContain("still at the source");
   });
 });
+
+describe("planWarningsBuffer — provider text in the audit lists", () => {
+  /** A kept record and the device reclaiming it — the adoption pair shape the buffer lists. */
+  function adoptionPair(deviceName: string, overrides: Partial<ServerConfig> = {}): { before: ServerConfig; after: ServerConfig } {
+    const before = makeServer({ id: "kept-1", name: "old-lab-switch", host: "10.0.0.11", port: 22, ...overrides });
+    return { before, after: { ...before, name: deviceName, origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 } } };
+  }
+
+  it("a device name cannot mint a line inside the adoption list, where the reader is answering 'is MY server in this set' (kills verbatim interpolation of the device name)", () => {
+    const plan = makeSyncPlan({ updates: [adoptionPair('core-sw-01"\n  "prod-db" — device "prod-db" (10.0.0.9:22)')] });
+
+    const buffer = planWarningsBuffer(plan, undefined);
+
+    expect(buffer.some((line) => line.includes("\n"))).toBe(false);
+    expect(buffer).toContain(
+      '  "old-lab-switch" — device "core-sw-01" "prod-db" — device "prod-db" (10.0.0.9:22)" (10.0.0.11:22)'
+    );
+  });
+
+  it("a bidi override in a tree name cannot reverse the rest of the line the renderer wrote (kills stripping line breaks alone)", () => {
+    const plan = makeSyncPlan({ updates: [adoptionPair("core-sw-01", { name: "old‮lab-switch" })] });
+
+    const buffer = planWarningsBuffer(plan, undefined);
+
+    expect(buffer.some((line) => /[‪-‮⁦-⁩]/.test(line))).toBe(false);
+  });
+
+  it("a hostile host string cannot reshape the pair line either (kills sanitizing only the names)", () => {
+    const pair = adoptionPair("core-sw-01");
+    const plan = makeSyncPlan({ updates: [{ ...pair, after: { ...pair.after, host: "10.0.0.11\nrogue" } }] });
+
+    const buffer = planWarningsBuffer(plan, undefined);
+
+    expect(buffer.some((line) => line.includes("\n"))).toBe(false);
+  });
+
+  it("names are NOT truncated and NOT re-punctuated here — this buffer exists to be read in full (kills carrying the confirmation modal's length cap and fragment rule onto it)", () => {
+    const longName = `${"lab-switch-".repeat(40)}end.`;
+    const plan = makeSyncPlan({ updates: [adoptionPair(longName, { name: `tree-${longName}` })] });
+
+    const buffer = planWarningsBuffer(plan, undefined);
+
+    expect(buffer).toContain(`  "tree-${longName}" — device "${longName}" (10.0.0.11:22)`);
+    expect(buffer.some((line) => line.includes("…"))).toBe(false);
+  });
+
+  it("the joiners that make a name what it is survive (kills stripping the format category wholesale)", () => {
+    const zwjName = "site-\u{1f468}‍\u{1f4bb}-Á-1️⃣";
+    const plan = makeSyncPlan({ updates: [adoptionPair(zwjName, { name: zwjName, authProfileId: undefined })] });
+
+    const buffer = planWarningsBuffer(plan, undefined);
+
+    expect(buffer).toContain(`  "${zwjName}" — device "${zwjName}" (10.0.0.11:22)`);
+  });
+
+  it("the switch and unlink lists get the same treatment as the adoption list (kills sanitizing one list and forgetting the others)", () => {
+    const owned = makeServer({ id: "owned-1", name: 'switching\n  "prod-db"', origin: { sourceId: "src-1", externalId: "device:9", syncedAt: 1 } });
+    const cleared = makeServer({
+      id: "owned-2",
+      name: 'clearing\n  "prod-db"',
+      authProfileId: "p1",
+      origin: { sourceId: "src-1", externalId: "device:8", syncedAt: 1 }
+    });
+    const plan = makeSyncPlan({
+      updates: [
+        { before: owned, after: { ...owned, authProfileId: "p1" } },
+        { before: cleared, after: { ...cleared, authProfileId: undefined } }
+      ]
+    });
+
+    const buffer = planWarningsBuffer(plan, "Lab credentials");
+
+    expect(buffer.some((line) => line.includes("\n"))).toBe(false);
+    expect(buffer).toContain('  "switching "prod-db""');
+    expect(buffer).toContain('  "clearing "prod-db""');
+  });
+});

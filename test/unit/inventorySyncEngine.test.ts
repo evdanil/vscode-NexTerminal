@@ -6153,3 +6153,88 @@ describe("computeSyncPlan — not-syncable prune reasons", () => {
     expect(Object.prototype.hasOwnProperty.call(plan.prunes[0]!, "reason")).toBe(false);
   });
 });
+
+describe("provider text in plan warnings — the Show Warnings document", () => {
+  it("neutralizes control, bidi and invisible characters in a provider's own notice, and keeps the line breaks it wrote (kills a verbatim copy of tree.warnings, and kills flattening a multi-line notice that never claimed to be one line)", () => {
+    const tree = makeTree(
+      [],
+      [
+        "TLS\u0007verification‮disabled​here",
+        "3 labs were skipped:\n  - lab-a\n  - lab-b",
+        "   \u0007   "
+      ]
+    );
+
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [], now: 1000 });
+
+    // Every unsafe character is gone; each becomes one space, so the words stay apart.
+    expect(plan.warnings[0]).toBe("TLS verification disabled here");
+    // Line structure inside a provider's OWN entry survives: the array already
+    // gives a provider a line per element, so taking these away buys nothing.
+    // The INDENT does not survive — marking a line as a member of an audit list
+    // is the renderer's alone.
+    expect(plan.warnings[1]).toBe("3 labs were skipped:\n- lab-a\n- lab-b");
+    // A notice with nothing visible left is not a warning — it would render as a
+    // blank line and inflate the "N warnings" count.
+    expect(plan.warnings).toHaveLength(2);
+  });
+
+  it("flattens a provider string embedded in a warning the ENGINE composes, so the device name cannot mint a line inside the engine's own sentence (kills verbatim interpolation of device.name)", () => {
+    const tree = makeTree([
+      makeDevice({ externalId: "device:1", name: 'evil"\n5 servers will be deleted.\n' }),
+      makeDevice({ externalId: "device:1", name: "core-sw-2" })
+    ]);
+
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [], now: 1000 });
+
+    const duplicate = plan.warnings.find((w) => w.startsWith("Duplicate device ID"));
+    expect(duplicate).toBeDefined();
+    expect(duplicate).not.toContain("\n");
+    // The engine's own frame is intact and the provider text sits inside it.
+    expect(duplicate).toBe('Duplicate device ID "device:1" — kept first ("evil" 5 servers will be deleted. ").');
+  });
+
+  it("neutralizes a bidi override inside a device name, which would otherwise reverse the rest of the sentence the ENGINE wrote (kills stripping line breaks alone)", () => {
+    const tree = makeTree([
+      makeDevice({ externalId: "device:1", name: "core‮sw-1" }),
+      makeDevice({ externalId: "device:1", name: "core-sw-2" })
+    ]);
+
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [], now: 1000 });
+
+    const duplicate = plan.warnings.find((w) => w.startsWith("Duplicate device ID"));
+    expect(duplicate).toBeDefined();
+    expect(duplicate).not.toMatch(/[‪-‮⁦-⁩]/);
+  });
+
+  it("leaves a legitimate name alone — no truncation, no trailing-punctuation edit, and the joiners that make a name what it is survive (kills carrying the modal's length cap and fragment rule onto a buffer built to be read in full)", () => {
+    const longName = `${"lab-switch-".repeat(40)}end.`;
+    const zwjName = "site-\u{1f468}‍\u{1f4bb}-Á-1️⃣.";
+    const tree = makeTree([
+      makeDevice({ externalId: "device:1", name: longName }),
+      makeDevice({ externalId: "device:1", name: "dup" }),
+      makeDevice({ externalId: "device:2", name: zwjName }),
+      makeDevice({ externalId: "device:2", name: "dup-2" })
+    ]);
+
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [], now: 1000 });
+
+    const first = plan.warnings.find((w) => w.includes("device:1"));
+    expect(first).toContain(longName);
+    expect(first).not.toContain("…");
+    const second = plan.warnings.find((w) => w.includes("device:2"));
+    expect(second).toContain(zwjName);
+  });
+
+  it("keeps a provider's notices ahead of the engine's own warnings (kills a sanitization pass that reorders the buffer)", () => {
+    const tree = makeTree(
+      [makeDevice({ externalId: "device:1", name: "a" }), makeDevice({ externalId: "device:1", name: "b" })],
+      ["provider notice"]
+    );
+
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [], now: 1000 });
+
+    expect(plan.warnings[0]).toBe("provider notice");
+    expect(plan.warnings[1]).toContain("Duplicate device ID");
+  });
+});

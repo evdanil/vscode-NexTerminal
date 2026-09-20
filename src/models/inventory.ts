@@ -816,6 +816,44 @@ export function flattenProviderText(raw: string): string {
 }
 
 /**
+ * A provider's OWN notice (`InventoryTree.warnings`) as the Show Warnings
+ * document renders it: every line inert, the provider's line breaks kept.
+ *
+ * WHY THE LINE BREAKS SURVIVE HERE, when `flattenProviderText` exists precisely
+ * to remove them. That function is for a fragment the RENDERER drops into a
+ * sentence it composed — there a line break splits a line the renderer owns, and
+ * whatever lands on the new line reads as something this codebase wrote. A
+ * notice is not a fragment: the member is `string[]`, one entry per notice, and
+ * the document prints one entry after another. A provider that wants three lines
+ * simply sends three entries, so flattening an entry removes no capability it
+ * has — it only turns a legible list or a short error body into one long line in
+ * a buffer whose whole purpose is being read in full.
+ *
+ * WHAT IT STILL TAKES AWAY, applied per line so the shared character class stays
+ * the single definition of "unsafe":
+ *  - every control, bidi and invisible formatting character, for the reason
+ *    `PROVIDER_TEXT_UNSAFE_CHAR_RE` documents — a bidi override runs to the end
+ *    of its line, so an unterminated one inside a notice reorders the rest of
+ *    that line, and nothing invisible belongs in text a human is auditing;
+ *  - LEADING WHITESPACE. The buffer marks a member of an audit list by indenting
+ *    it under a counted heading, and that convention is worth only as much as
+ *    the renderer's exclusive hold on it; a notice that could indent itself
+ *    could pose as a member of the list printed below it;
+ *  - blank lines, so padding cannot push the warnings that matter off the first
+ *    screen.
+ *
+ * Returns "" when nothing visible is left — the caller drops such a notice
+ * rather than printing a blank line and counting it as a warning.
+ */
+export function sanitizeProviderNotice(raw: string): string {
+  return raw
+    .split(/\r\n?|\n/)
+    .map(flattenProviderText)
+    .filter((line) => line.length > 0)
+    .join("\n");
+}
+
+/**
  * The shared length rule: cut at a word boundary and mark the cut, so a capped
  * value stays well-formed prose rather than a word sliced in half. The cap is
  * the CALLER's, because how much of a value a reader needs is a per-field

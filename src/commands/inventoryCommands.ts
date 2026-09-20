@@ -1906,6 +1906,37 @@ export function describePlanDetail(
  * call it on synthetic plans rather than to reconstruct every plan shape through
  * a provider fetch.
  */
+/**
+ * A name or address as the Show Warnings audit lists render it: inert, and
+ * otherwise untouched.
+ *
+ * THE SECOND OF THE TWO PATHS by which provider text reaches this document. The
+ * first is `plan.warnings`, sanitized once where computeSyncPlan returns it; the
+ * values below never pass through that array — they are read straight off the
+ * plan's before/after records — so they are made inert where they enter a line
+ * this function composes. Sanitizing at the other end, in
+ * `openInventoryIssuesText`, would have covered both paths in one place but
+ * cannot work: by then a line is a finished string, and nothing distinguishes
+ * the two-space indent this function uses to mark a list member from indentation
+ * a provider supplied.
+ *
+ * The forgery it prevents is specific to these lists. Each is a counted heading
+ * with one indented line per affected server, printed so the reader can answer
+ * "is MY server in this set" one click before Apply; a name carrying a newline
+ * plus two spaces would add a member to that set, naming a server the sync does
+ * not touch. A bidi override would reorder the rest of the pair line — the
+ * address a record will carry afterwards — around it.
+ *
+ * FLATTEN ONLY. No length cap, unlike the confirm modal's `renderableServerName`:
+ * these lists exist to be complete, the buffer is a scrollable document where
+ * length costs nothing, and a truncated name is illegible to the one reader who
+ * came looking for it. No quote substitution either — a name containing a quote
+ * renders with it, because this is an audit of records, not a parseable format.
+ */
+function auditText(value: string): string {
+  return flattenProviderText(value);
+}
+
 export function planWarningsBuffer(
   plan: InventorySyncPlan,
   authProfileName?: string,
@@ -1945,7 +1976,7 @@ export function planWarningsBuffer(
       // visible in the tree after Apply — otherwise the audit reads as naming a
       // server the user then cannot find.
       const hiddenSuffix = u.before.isHidden ? " (hidden)" : "";
-      buffer.push(`  "${u.before.name}" — device "${u.after.name}" (${u.after.host}:${u.after.port})${hiddenSuffix}`);
+      buffer.push(`  "${auditText(u.before.name)}" — device "${auditText(u.after.name)}" (${auditText(u.after.host)}:${u.after.port})${hiddenSuffix}`);
     }
   }
   // ROUND 8 (P1) — one heading per DISTINCT target profile the plan actually
@@ -1967,7 +1998,7 @@ export function planWarningsBuffer(
         const n = group.length;
         buffer.push(`${n} server${n === 1 ? "" : "s"} will switch to ${target}:`);
         for (const u of group) {
-          buffer.push(`  "${u.before.name}"`);
+          buffer.push(`  "${auditText(u.before.name)}"`);
         }
       }
     } else {
@@ -1975,7 +2006,7 @@ export function planWarningsBuffer(
       const target = authProfileName !== undefined ? `auth profile "${authProfileName}"` : "a different auth profile";
       buffer.push(`${n} server${n === 1 ? "" : "s"} will switch to ${target}:`);
       for (const u of switches) {
-        buffer.push(`  "${u.before.name}"`);
+        buffer.push(`  "${auditText(u.before.name)}"`);
       }
     }
   }
@@ -1995,7 +2026,7 @@ export function planWarningsBuffer(
         const n = group.length;
         buffer.push(`${n} server${n === 1 ? "" : "s"} will stop using ${target} and revert to their own stored credentials:`);
         for (const u of group) {
-          buffer.push(`  "${u.before.name}"`);
+          buffer.push(`  "${auditText(u.before.name)}"`);
         }
       }
     } else {
@@ -2003,7 +2034,7 @@ export function planWarningsBuffer(
       const target = authProfileName !== undefined ? `auth profile "${authProfileName}"` : "their auth profile";
       buffer.push(`${n} server${n === 1 ? "" : "s"} will stop using ${target} and revert to their own stored credentials:`);
       for (const u of clears) {
-        buffer.push(`  "${u.before.name}"`);
+        buffer.push(`  "${auditText(u.before.name)}"`);
       }
     }
   }
