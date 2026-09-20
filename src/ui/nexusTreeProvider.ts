@@ -932,9 +932,21 @@ export class NexusTreeProvider
       ? this.snapshot.inventorySources.find((source) => source.id === server.origin!.sourceId)
       : undefined;
     const syncedSourceName = originSource?.name;
-    const hasNodeControl =
-      originSource !== undefined &&
-      (this.originHasNodeControl?.(originSource.providerId, server.origin?.externalId ?? "") ?? false);
+    // FAIL CLOSED on a faulty predicate. This runs synchronously inside
+    // `toServerItem` during `getChildren`, so a throwing third-party
+    // implementation would abort the whole Command Center render —
+    // registration can verify only that the member IS a function, never that
+    // it keeps its no-throw contract. A throw suppresses Start/Stop for that
+    // one row — the same outcome as returning false, and strictly better than
+    // taking the tree down.
+    let hasNodeControl = false;
+    if (originSource !== undefined) {
+      try {
+        hasNodeControl = this.originHasNodeControl?.(originSource.providerId, server.origin?.externalId ?? "") ?? false;
+      } catch {
+        hasNodeControl = false;
+      }
+    }
     // REVIEW FINDING (P2) — the username shown is the one a connection will
     // actually use, resolved through the shared ownership rule
     // (`authProfileOwnedCredentials`, models/config.ts). Reading

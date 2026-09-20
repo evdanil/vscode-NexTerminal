@@ -1567,6 +1567,20 @@ describe("NexusTreeProvider node-control marker — end-to-end snapshot wiring",
     );
     expect(serverItemById(provider, "nb").contextValue).toBe("nexus.server");
   });
+
+  it("survives a THROWING predicate: the row renders with NO marker (fail-closed) and getChildren still returns the tree (⊘ the predicate runs synchronously inside getChildren/toServerItem — an exception would abort the whole Command Center render, not just one row)", () => {
+    const provider = providerWith(
+      [makeServer({ id: "px", name: "P1", origin: { sourceId: "px-src", externalId: "105", syncedAt: 1 } })],
+      [{ id: "px-src", providerId: "proxmox", name: "My PVE" }],
+      new Map<string, "running" | "stopped">([["px", "running"]]),
+      () => {
+        throw new TypeError("faulty third-party capability check");
+      }
+    );
+    const children = provider.getChildren(undefined) as ServerTreeItem[];
+    expect(children.length).toBeGreaterThan(0);
+    expect(serverItemById(provider, "px").contextValue).toBe("nexus.server");
+  });
 });
 
 /**
