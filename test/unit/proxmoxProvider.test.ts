@@ -712,48 +712,83 @@ describe("createProxmoxProvider", () => {
       expect(included.tree.devices.map((d) => d.externalId)).toEqual(["105"]);
     });
 
-    // THE SYNC'S CLEAR-ONLY REPORT — the same explicit clears the STATUS poll
-    // collects, attached to the tree when (and only when) the sync's listing
-    // pass OBSERVED rows that must lose a stale decoration: every template row
-    // (regardless of the opt-in, which governs only the device set — the server
-    // a converted guest was synced as still exists and holds its stale running
-    // decoration, Start/Stop menu included, until something clears it) and
-    // every observed-but-stateless "unknown" guest. `truncated` is REQUIRED on
-    // the report: it carries no states at all, so as a COMPLETE report its
-    // clear-then-apply would wipe the source's entire runtime status; as a
-    // TRUNCATED (merging) report it removes exactly the observed-but-stateless
-    // ids and retains every other guest's decoration. The engine side (a merge
-    // honoring clearedExternalIds) is pinned in nexusCoreInventory.test.ts.
-    it("attaches a CLEAR-ONLY status report when the listing holds a template row — the vmid rides clearedExternalIds, statuses stay empty, truncated is true, and the opt-in is irrelevant (kills a sync that observes a conversion but reports no clear, leaving the previously synced VM's stale running decoration — and its Start/Stop menu — standing until a separate status refresh, indefinitely with polling off)", async () => {
-      const included = await syncRows([guestRow({ template: 1, name: "gold-image" })], {
-        baseUrl: BASE,
-        includeTemplates: true
-      });
-      expect(included.tree.status).toEqual({
+    // THE SYNC'S STATUS REPORT — the listing IS the status fetch: every row
+    // the sync already read carries its running/stopped state, so the tree
+    // carries a FULL report unconditionally and a sync alone refreshes running
+    // state exactly as an EVE-NG sync does. The mapping rules are the poll's
+    // (fetchStatusImpl): shape-valid guests report running/stopped REGARDLESS
+    // of includeStopped (status reports reality; the apply ignores ids
+    // matching no device), template rows and "unknown" guests are never
+    // reported and ride clearedExternalIds instead, and `truncated` marks a
+    // PARTIAL collection only — a complete report is applied clear-then-apply,
+    // which is exactly what drops a vanished guest's decoration. The engine
+    // side (validate + apply through syncNow, degraded not thrown, applied
+    // post-commit and incarnation-guarded) is generic machinery with no
+    // provider-specific branch, pinned in nexusCoreInventory.test.ts.
+    it("attaches the FULL status report to every tree — every guest's state rides the sync, template and unknown vmids ride clearedExternalIds, and a complete listing sets NO truncated (kills a sync that discards the states it just read, leaving every guest's Start/Stop menu hidden after a first sync until an unprompted palette command)", async () => {
+      const { tree } = await syncRows([
+        guestRow(),
+        guestRow({ vmid: 106, name: "gold-image", template: 1 }),
+        guestRow({ vmid: 114, name: "dns", type: "lxc", status: "stopped" }),
+        guestRow({ vmid: 118, name: "hatchling", status: "unknown" })
+      ]);
+      expect(tree.status).toEqual({
         contractVersion: 1,
-        statuses: {},
-        truncated: true,
-        clearedExternalIds: ["105"]
+        statuses: {
+          "105": { state: "running" },
+          "114": { state: "stopped" }
+        },
+        clearedExternalIds: ["106", "118"]
       });
-      // The device-set opt-in governs nothing here: with it OFF the template is
-      // still OBSERVED (and the pre-conversion server more likely to still
-      // exist), so the clear rides all the same.
+      // Complete listing ⇒ clear-then-apply is correct (it drops decorations
+      // for guests that vanished), so the flag must be ABSENT, not false —
+      // the validator tolerates a present-undefined key but the poll's
+      // omission idiom is the shape to hold.
+      expect(Object.prototype.hasOwnProperty.call(tree.status, "truncated")).toBe(false);
+      // The device-set opt-in governs nothing here: with includeTemplates OFF
+      // the template is still OBSERVED (and the pre-conversion server more
+      // likely to still exist), so the clear rides all the same.
       const excluded = await syncRows([guestRow({ template: 1, name: "gold-image" })]);
       expect(excluded.tree.status).toEqual({
         contractVersion: 1,
         statuses: {},
-        truncated: true,
         clearedExternalIds: ["105"]
       });
       expect(excluded.tree.devices).toEqual([]);
     });
 
-    it("clears a guest whose row reads status 'unknown' on the sync path too — the same observed-but-stateless class the poll clears, even when includeStopped keeps the row out of the device set (kills a sync-side clear list that covers only templates)", async () => {
+    it("reports stopped guests even when includeStopped keeps them out of the DEVICE set — status reports reality, the sync's device-set preference does not gate it (kills a report that mirrors includeStopped, under which a guest synced while running and then stopped keeps its stale running decoration — Start/Stop menu included — until a separate refresh)", async () => {
+      const { tree } = await syncRows([guestRow({ status: "stopped" }), guestRow({ vmid: 106, name: "up" })], {
+        baseUrl: BASE,
+        includeStopped: false
+      });
+      expect(tree.devices.map((d) => d.name)).toEqual(["up"]);
+      expect(tree.status?.statuses).toEqual({ "105": { state: "stopped" }, "106": { state: "running" } });
+    });
+
+    it("flags the report truncated when the row cap tripped — beyond-cap guests are absent and the MERGE must protect them (kills a complete report over a capped listing, whose clear-then-apply would drop every beyond-cap guest's decoration the sync never collected)", async () => {
+      const rows = Array.from({ length: 10_001 }, (_, i) => guestRow({ vmid: i + 1, name: `guest-${i + 1}`, status: "stopped" }));
+      const { tree } = await syncRows(rows);
+      expect(tree.truncated).toBe(true);
+      expect(tree.status?.truncated).toBe(true);
+      expect(Object.keys(tree.status?.statuses ?? {})).toHaveLength(10_000);
+      expect(tree.status?.statuses["10001"]).toBeUndefined();
+    });
+
+    it("flags the report truncated when the REPORT's own cap trips even though the device set stayed empty — includeStopped off holds the tree at zero devices while 10,001 stopped guests overflow the statuses budget (kills a report flag driven by the tree's cap alone, under which the beyond-cap guests' decorations are wiped by a clear-then-apply over a report that never collected them)", async () => {
+      const rows = Array.from({ length: 10_001 }, (_, i) => guestRow({ vmid: i + 1, name: `guest-${i + 1}`, status: "stopped" }));
+      const { tree } = await syncRows(rows, { baseUrl: BASE, includeStopped: false });
+      expect(tree.devices).toEqual([]);
+      expect(tree.truncated).toBeUndefined();
+      expect(tree.status?.truncated).toBe(true);
+      expect(Object.keys(tree.status?.statuses ?? {})).toHaveLength(10_000);
+    });
+
+    it("clears a guest whose row reads status 'unknown' on the sync path too — omitted from statuses, vmid in clearedExternalIds, the same observed-but-stateless class the poll clears, even when includeStopped keeps the row out of the device set (kills a sync-side clear list that covers only templates)", async () => {
       const { tree } = await syncRows([guestRow({ vmid: 118, status: "unknown" })]);
       expect(tree.status).toEqual({
         contractVersion: 1,
         statuses: {},
-        truncated: true,
         clearedExternalIds: ["118"]
       });
       const gated = await syncRows([guestRow({ vmid: 118, status: "unknown" })], {
@@ -761,20 +796,18 @@ describe("createProxmoxProvider", () => {
         includeStopped: false
       });
       expect(gated.tree.devices).toEqual([]);
-      expect(gated.tree.status?.clearedExternalIds).toEqual(["118"]);
-    });
-
-    it("leaves tree.status ABSENT when the listing holds neither a template row nor an unknown guest — the ordinary sync still carries no status at all (kills an unconditional status attach, whose empty-but-COMPLETE report would clear-then-apply and wipe the source's entire runtime status on every sync)", async () => {
-      const optInOn = await syncRows([guestRow(), guestRow({ vmid: 114, status: "stopped" })], {
-        baseUrl: BASE,
-        includeTemplates: true
+      expect(gated.tree.status).toEqual({
+        contractVersion: 1,
+        statuses: {},
+        clearedExternalIds: ["118"]
       });
-      expect(optInOn.tree.status).toBeUndefined();
     });
 
-    it("keeps the default-config sync status-less — includeTemplates off and no unknown rows means nothing observed to clear (kills attaching a report on every sync, whose merge would at best be noise and at worst — complete, not truncated — a wholesale wipe)", async () => {
-      const { tree } = await syncRows([guestRow()]);
-      expect(tree.status).toBeUndefined();
+    it("attaches the report even when there is nothing to say — an empty cluster yields an empty statuses object, no cleared list, no truncated (kills a conditional attach, which would reopen the gap the report closed: the ordinary sync must never leave tree.status unfilled)", async () => {
+      const empty = await syncRows([]);
+      expect(empty.tree.status).toEqual({ contractVersion: 1, statuses: {} });
+      const ordinary = await syncRows([guestRow()]);
+      expect(ordinary.tree.status).toEqual({ contractVersion: 1, statuses: { "105": { state: "running" } } });
     });
 
     it("renders the folder template with PVE's variables — pool, node, type, and the SORTED-FIRST tag — dropping empty and unknown segments (kills an unsorted-first tag policy, which reshuffles folders when the user reorders tags in PVE, and a dangling '/' from an absent pool)", async () => {
@@ -1425,6 +1458,51 @@ describe("createProxmoxProvider", () => {
       );
       expect(unknownState.tree.devices[0].attributes).toEqual({ type: ["node"], node: ["pve"] });
       expect(unknownState.tree.devices[0].endpoints).toEqual([{ kind: "ssh", host: "192.0.2.240", port: 22 }]);
+    });
+
+    // THE SYNC'S NODE STATUSES — the same gate the poll uses (`=== true`), the
+    // same source (the /cluster/status join's numeric `online`), the same
+    // omit-only rule for an entry whose `online` is absent or unrecognizable:
+    // a node entry is not an observed guest row, so it is omitted, never
+    // cleared.
+    it("reports node statuses onto the sync's own status report when includeNodes is on — online 1/0 become running/stopped, an unrecognizable entry invents nothing, and with the gate off no node status exists (kills a sync report that covers guests only while the poll reports nodes, and one that reads the resources row's degraded 'online' string)", async () => {
+      const on = await syncNodes(
+        { [RESOURCES]: { body: { data: [nodeRow()] } }, [STATUS]: { body: { data: [statusEntry()] } } },
+        { baseUrl: BASE, includeNodes: true }
+      );
+      expect(on.tree.status?.statuses).toEqual({ "node/pve": { state: "running" } });
+
+      const stopped = await syncNodes(
+        { [RESOURCES]: { body: { data: [nodeRow()] } }, [STATUS]: { body: { data: [statusEntry({ online: 0 })] } } },
+        { baseUrl: BASE, includeNodes: true }
+      );
+      expect(stopped.tree.status?.statuses).toEqual({ "node/pve": { state: "stopped" } });
+
+      const noOnline = statusEntry();
+      delete noOnline.online;
+      const unrecognizable = await syncNodes(
+        { [RESOURCES]: { body: { data: [nodeRow()] } }, [STATUS]: { body: { data: [noOnline] } } },
+        { baseUrl: BASE, includeNodes: true }
+      );
+      expect(unrecognizable.tree.status?.statuses).toEqual({});
+
+      const off = await syncNodes({ [RESOURCES]: { body: { data: [nodeRow()] } } }, { baseUrl: BASE });
+      expect(off.tree.status?.statuses).toEqual({});
+      expect(off.calls.every(({ url }) => !url.includes("/cluster/status"))).toBe(true);
+    });
+
+    it("flags the sync's report truncated when the node join fails — the guests reported, the nodes unreached, so the apply must MERGE instead of wiping every node's decoration (the poll's controller ruling, reused verbatim: a complete report is clear-then-apply, and this listing did not reach the nodes)", async () => {
+      const { tree } = await syncNodes(
+        {
+          [RESOURCES]: {
+            body: { data: [nodeRow(), { vmid: 105, name: "clawdbot", node: "pve", type: "qemu", status: "running", template: 0 }] }
+          },
+          [STATUS]: { status: 403, body: "" }
+        },
+        { baseUrl: BASE, includeNodes: true }
+      );
+      expect(tree.status?.statuses).toEqual({ "105": { state: "running" } });
+      expect(tree.status?.truncated).toBe(true);
     });
 
     it("emits a node /cluster/status knows nothing about — absent entry, a 403 without Sys.Audit, or a non-array payload — as addressless with no status, and the sync CONTINUES (kills a node fetch failure that aborts the whole sync)", async () => {
