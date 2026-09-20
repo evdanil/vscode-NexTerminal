@@ -8464,8 +8464,35 @@ describe("inventoryCommands", () => {
       const { start, server } = await setup();
       await start({ server });
       const info = mockShowInformationMessage.mock.calls.map((c) => String(c[0])).join("\n");
-      expect(info).toMatch(/sent/i);
-      expect(info).toMatch(/refresh lab status/i);
+      expect(info).toBe('Start sent to "R1" — it takes a few seconds to take effect, and the status catches up on its own.');
+    });
+
+    /**
+     * THE SAME TOAST FIRES ON A PROXMOX GUEST. `controlNode` is provider-general,
+     * so this one string is what a PVE guest's Start/Stop shows — and "lab" is
+     * EVE-NG's word, untrue of a cluster. It also used to send the user to run
+     * **Refresh Lab Status**, the very command the handler fires itself four
+     * lines later. Both faults are pinned here, not just the new wording: a
+     * reworded string that still names the command, or that reintroduces "lab",
+     * is the regression this test exists to stop.
+     */
+    it("the success toast names NO command and carries no EVE-NG 'lab' vocabulary — it is the toast a PROXMOX guest sees too (⊘ 'lab status will catch up on the next Refresh Lab Status' is EVE-NG wording on a PVE guest, and points at the refresh this handler already fired)", async () => {
+      const { stop, server } = await setup();
+      await stop({ server });
+      const info = mockShowInformationMessage.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(info).toContain("Stop sent");
+      expect(info).not.toMatch(/refresh lab status/i);
+      expect(info).not.toMatch(/\blabs?\b/i);
+    });
+
+    it("the 'nothing to control' refusal is provider-neutral — the same Start/Stop entries sit on Proxmox guests (⊘ \"Select a synced EVE-NG node\" names the wrong product on a PVE row)", async () => {
+      const { start, controlSpy } = await setup();
+      await start({ server: { id: "gone-since-the-tree-painted" } });
+      const msg = String(mockShowErrorMessage.mock.calls[0]?.[0] ?? "");
+      expect(msg).toMatch(/select/i);
+      expect(msg).not.toMatch(/EVE-NG/i);
+      expect(msg).not.toMatch(/\blabs?\b/i);
+      expect(controlSpy).not.toHaveBeenCalled();
     });
 
     it("M2 — a classified InventoryProviderError surfaces through describeInventoryError, so the failure toast carries the classified prefix (⊘ a bare err.message drops the 'Authentication failed:' classification every other inventory failure shows)", async () => {

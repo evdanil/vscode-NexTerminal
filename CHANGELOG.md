@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.230] — 2026-09-20
+
+### Fixed
+
+- **The message after a Start Node / Stop Node no longer talks about labs, or sends you to run a refresh Nexus has already run.** Start and Stop are offered on every node-control provider's rows — EVE-NG lab nodes and Proxmox guests alike — but the message they showed on success was written for EVE-NG alone: it said the *lab status* would catch up on the next **Refresh Lab Status**, which is the wrong vocabulary for a PVE guest and points at a command the extension fires for you the moment the action is sent. It now reads *Start sent to "R1" — it takes a few seconds to take effect, and the status catches up on its own.*: it still says plainly that the request has already gone out rather than pretending it is in progress, it names no product and no command, and it is true on both providers — the status refresh is fired for you, the source's status poll re-asks while the Command Center is open, and a sync from either provider carries the state as well. The refusal you see if the row's server has gone away between the tree painting it and your click dropped its EVE-NG wording for the same reason.
+
 ## [2.8.229] — 2026-09-20
 
 ### Fixed

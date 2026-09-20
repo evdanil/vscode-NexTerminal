@@ -5214,7 +5214,7 @@ export function registerInventoryCommands(
         // fallback. A server removed between tree render and click carries a
         // full, valid-looking (but stale) record on the item; trusting it would
         // dispatch a control at a just-deleted node's old origin. A missing id
-        // falls through to the "Select a synced EVE-NG node" refusal instead.
+        // falls through to the "Select a synced node" refusal instead.
         return core.getServer(withServer.server.id);
       }
     }
@@ -5225,7 +5225,9 @@ export function registerInventoryCommands(
   }
 
   /**
-   * NODE CONTROL (Phase 4) — Start/Stop one EVE-NG lab node from its tree item.
+   * NODE CONTROL (Phase 4) — Start/Stop one synced node from its tree item. EVE-NG
+   * named the mechanism; every provider implementing `controlNode` (Proxmox does)
+   * uses this same handler, so nothing it says to the user names a provider.
    * Resolves the server → its inventory source → the source's provider, and only
    * dispatches when that provider exposes `controlNode` (so a manual server or a
    * NetBox-origin one is refused rather than offered an action that can only
@@ -5238,7 +5240,9 @@ export function registerInventoryCommands(
   async function controlNode(arg: unknown, action: "start" | "stop"): Promise<void> {
     const server = resolveServerArg(arg);
     if (!server) {
-      void vscode.window.showErrorMessage(`Select a synced EVE-NG node to ${action} it.`);
+      // Provider-NEUTRAL: the same Start/Stop entries sit on a Proxmox guest's
+      // row, where "EVE-NG node" named the wrong product entirely.
+      void vscode.window.showErrorMessage(`Select a synced node to ${action} it.`);
       return;
     }
     const origin = server.origin;
@@ -5404,12 +5408,21 @@ export function registerInventoryCommands(
     if (!dispatched) {
       return;
     }
-    // HONEST completion toast — the API has already returned by now, but the node
-    // boots over seconds so the lab status lags. Say that, rather than phrasing it
-    // as if the request were about to be sent.
+    // HONEST completion toast — the API has already returned by now, but the
+    // device boots over seconds, so the state on the row lags. Say that, rather
+    // than phrasing it as if the request were about to be sent.
+    //
+    // It names NO COMMAND, and no provider's vocabulary. This one string is what
+    // BOTH node-control providers show, so "lab"/"Refresh Lab Status" was EVE-NG's
+    // word on a Proxmox guest — the same reason the row's `Status:` tooltip line
+    // dropped it. And the command it used to prescribe is one the user has no
+    // reason to run: `refreshStatus` for this source fires four lines below, the
+    // source's status poll re-asks while the Command Center is open, and both
+    // providers' syncs now carry status. The state catches up with nothing to
+    // click, which is what the sentence says.
     const sent = action === "start" ? "Start" : "Stop";
     void vscode.window.showInformationMessage(
-      `${sent} sent to "${server.name}" — lab status will catch up on the next Refresh Lab Status.`
+      `${sent} sent to "${server.name}" — it takes a few seconds to take effect, and the status catches up on its own.`
     );
     // Best-effort, NOT awaited — the node takes seconds to boot, so the status
     // will lag this refresh by a poll or two, which is expected.
