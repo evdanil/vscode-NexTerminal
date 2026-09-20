@@ -2120,6 +2120,21 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * Is this externalId a cluster NODE rather than a guest?
+ *
+ * ONE DEFINITION, THREE CALLERS (`controlNodeImpl`, `webConsoleUrlImpl`,
+ * `canWebConsole`), because "is a node" has to mean the SAME thing in the gate
+ * that hides a menu entry and in the implementation that refuses the action —
+ * two notions drifting apart is exactly how a menu comes to offer what the wire
+ * rejects. The prefix IS the discriminator and not a guess: `fetchInventoryImpl`
+ * mints these ids in one place, `node/${name}` for a node and the bare vmid for
+ * a guest, so nothing else can wear this shape.
+ */
+function isProxmoxNodeExternalId(externalId: string): boolean {
+  return externalId.startsWith("node/");
+}
+
+/**
  * FRESH vmid → {node, kind, name} resolution over `/cluster/resources?type=vm`.
  *
  * ONE DEFINITION, TWO CALLERS (`controlNodeImpl`, `webConsoleUrlImpl`), because
@@ -2194,7 +2209,7 @@ async function controlNodeImpl(
   externalId: string,
   action: "start" | "stop"
 ): Promise<void> {
-  if (externalId.startsWith("node/")) {
+  if (isProxmoxNodeExternalId(externalId)) {
     throw new InventoryProviderError(
       "protocol",
       `Nodes cannot be started or stopped from Nexus ("${externalId}" is a Proxmox node).`
@@ -2312,6 +2327,18 @@ async function webConsoleUrlImpl(
   secrets: InventorySourceSecrets,
   externalId: string
 ): Promise<string> {
+  // DEFENCE IN DEPTH, not a duplicate of the menu gate. `canWebConsole` keeps
+  // node rows out of the UI, but this member is callable directly (palette,
+  // third-party consumer), and without the guard a `node/<name>` id falls
+  // through to `resolveGuestRow`, which only ever matches vmids — so the node
+  // would be reported as a missing GUEST, sending the user to a re-sync that
+  // could not help. A node has no noVNC console at all; say that instead.
+  if (isProxmoxNodeExternalId(externalId)) {
+    throw new InventoryProviderError(
+      "protocol",
+      `Nodes have no web console in Nexus ("${externalId}" is a Proxmox node).`
+    );
+  }
   const transport = selectProxmoxTransport(transports, config);
   const baseUrl = normalizeBaseUrl(String(config.baseUrl ?? ""));
   const token = secrets.apiToken ?? "";
@@ -2407,6 +2434,15 @@ export function createProxmoxProvider(
       externalId: string
     ): Promise<string> {
       return webConsoleUrlImpl(transports, config, secrets, externalId);
+    },
+    // The device half of the web-console gate — guests only, sharing the one
+    // node discriminator with the refusal `webConsoleUrlImpl` raises, so the
+    // marker can never appear on a row whose click the provider would reject.
+    // A cluster node keeps its status decoration and its other menu entries; it
+    // just never offers a console, because a node's shell is not a guest's
+    // noVNC console and PVE serves it from a different place entirely.
+    canWebConsole(externalId: string): boolean {
+      return !isProxmoxNodeExternalId(externalId);
     }
   };
 }

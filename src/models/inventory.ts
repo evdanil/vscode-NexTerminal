@@ -461,6 +461,28 @@ export interface InventoryProvider {
     secrets: InventorySourceSecrets,
     externalId: string
   ): Promise<string>;
+  /**
+   * DEVICE-AWARE WEB-CONSOLE GATE — OPTIONAL, and to `webConsoleUrl` exactly
+   * what `canControlNode` is to `controlNode`. Which of this provider's synced
+   * devices the console route actually applies to, keyed by the same
+   * `externalId` the other members use. A provider whose device set includes
+   * records with no console — e.g. Proxmox cluster nodes, whose shell is not a
+   * guest's noVNC console and which `webConsoleUrl` refuses outright — must be
+   * able to keep those out of the Open Web Console menu without losing
+   * anything else about the row: the tree's marker gate consults this before
+   * stamping the web-console marker, so a refused device keeps its status
+   * decoration and every other menu entry it qualifies for.
+   *
+   * OPTIONAL — absent means NO DEVICE GATE: every device of a provider that
+   * implements `webConsoleUrl` qualifies, so a provider whose whole device set
+   * has a console implements nothing and behaves byte-identically. Must be pure
+   * and synchronous — a predicate over an ALREADY-SYNCED device, no I/O, no
+   * throwing — and must AGREE with `webConsoleUrl`'s own refusals: the menu
+   * must never offer what the implementation rejects. The ONLY consumer is the
+   * tree's marker gate, called through the predicate injected at the
+   * `NexusTreeProvider` constructor; nothing on the command path reads it.
+   */
+  canWebConsole?(externalId: string): boolean;
 }
 
 /**

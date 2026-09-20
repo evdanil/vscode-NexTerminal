@@ -214,6 +214,27 @@ describe("validateProviderShape", () => {
     expect(() => validateProviderShape(makeProvider({ webConsoleUrl: 42 as never }))).toThrow(/webConsoleUrl/);
   });
 
+  // canWebConsole provider capability — to webConsoleUrl what canControlNode is
+  // to controlNode, and it fails the same loud way: the device half of the gate
+  // is INVOKED during tree render, so a non-function value that survived
+  // registration would throw TypeError on every repaint of a row instead of
+  // being named here, once, at registration.
+  it("accepts a provider with NO canWebConsole — it is optional (kills making it required, which would break every provider whose whole device set has a web console)", () => {
+    const provider = makeProvider();
+    expect(provider.canWebConsole).toBeUndefined();
+    expect(() => validateProviderShape(provider)).not.toThrow();
+  });
+
+  it("accepts a provider WITH a function canWebConsole", () => {
+    const provider = makeProvider({ canWebConsole: () => true });
+    expect(() => validateProviderShape(provider)).not.toThrow();
+  });
+
+  it("rejects a non-function canWebConsole loudly (kills a silent survive-at-registration for a typo'd `canWebConsole` that is not callable — the marker gate invokes it during tree render, where a string value would throw TypeError on every repaint of a row)", () => {
+    expect(() => validateProviderShape(makeProvider({ canWebConsole: "nope" as never }))).toThrow(/canWebConsole/);
+    expect(() => validateProviderShape(makeProvider({ canWebConsole: 42 as never }))).toThrow(/canWebConsole/);
+  });
+
   // MINOR-14 (EVE-NG review) — `InventoryConfigField.defaultValue` is part of
   // the field contract now, so a malformed one must be caught at the
   // registration boundary rather than silently coerced when the Add form reads

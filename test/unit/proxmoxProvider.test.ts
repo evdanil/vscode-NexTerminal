@@ -373,6 +373,12 @@ describe("createProxmoxProvider", () => {
     expect(provider.canControlNode?.("node/pve")).toBe(false);
   });
 
+  it("declares canWebConsole — guests only, so a cluster node's node/<name> externalId carries no web-console marker (⊘ a device-blind gate offers Open Web Console on a hypervisor node, whose shell is not a guest's noVNC console and which webConsoleUrl always refuses)", () => {
+    const provider = createProxmoxProvider();
+    expect(provider.canWebConsole?.("105")).toBe(true);
+    expect(provider.canWebConsole?.("node/pve")).toBe(false);
+  });
+
   it("carries the Proxmox identity and the attribute vocabulary its devices report (kills an id that drifts from the registered one, and a filter key the devices can never match)", () => {
     const provider = createProxmoxProvider();
     expect(provider.id).toBe(PROXMOX_PROVIDER_ID);
@@ -2469,6 +2475,24 @@ describe("createProxmoxProvider", () => {
       expect((err as InventoryProviderError).kind).toBe("protocol");
       expect((err as Error).message).toContain("107");
       expect((err as Error).message).toMatch(/re-sync/i);
+    });
+
+    it("refuses a node/<name> externalId BEFORE any request, naming it as a Proxmox NODE (kills falling through the guest lookup, which rejects with \"Guest node/pve is no longer present — re-sync\": guest-shaped wording for a node, blaming the sync for a route that never applied to a hypervisor node at all)", async () => {
+      const { calls, fetchImpl } = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build-vm" }]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      const err = await provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "node/pve").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind).toBe("protocol");
+      expect((err as Error).message).toContain("node/pve");
+      expect((err as Error).message).toMatch(/is a Proxmox node/);
+      // The two halves of the guest-shaped rejection this exists to kill: it
+      // must not report the node as a missing guest, nor send the user to a
+      // re-sync that would change nothing.
+      expect((err as Error).message).not.toMatch(/no longer present/i);
+      expect((err as Error).message).not.toMatch(/re-sync/i);
+      // The predicate is the UI gate; the impl must stand on its own — a direct
+      // call must not spend a cluster read before refusing.
+      expect(calls).toEqual([]);
     });
   });
 });

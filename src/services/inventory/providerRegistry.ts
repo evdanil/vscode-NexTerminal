@@ -166,6 +166,16 @@ export function validateProviderShape(provider: unknown): asserts provider is In
   if (obj.webConsoleUrl !== undefined && typeof obj.webConsoleUrl !== "function") {
     throw new Error("Inventory provider webConsoleUrl must be a function when present.");
   }
+  // WEB CONSOLE MENU GATE — the twin of the canControlNode clause, and it fails
+  // the same loud way for the same reason. `canWebConsole` is OPTIONAL (absence
+  // means no device gate: every device of a web-console-capable provider
+  // qualifies), but a non-function value under that name IS an error: the gate
+  // INVOKES the member during tree render, so a typo'd `canWebConsole` that
+  // survived registration would throw TypeError on every repaint of a row
+  // instead of being named here, once, at registration.
+  if (obj.canWebConsole !== undefined && typeof obj.canWebConsole !== "function") {
+    throw new Error("Inventory provider canWebConsole must be a function when present.");
+  }
 }
 
 /**
