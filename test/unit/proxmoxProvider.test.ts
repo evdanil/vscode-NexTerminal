@@ -20,6 +20,7 @@ import {
 import { validateProviderShape } from "../../src/services/inventory/providerRegistry";
 import {
   InventoryProviderError,
+  resolveStatusTruncationRemedy,
   validateInventoryStatusReport,
   type InventorySourceValues
 } from "../../src/models/inventory";
@@ -363,6 +364,21 @@ describe("readProxmoxHardCap", () => {
 });
 
 describe("createProxmoxProvider", () => {
+  /**
+   * THE PARTIAL-STATUS REMEDY, in Proxmox's own words. A PVE cluster has neither
+   * a Root Folder nor a Lab Filter, and its budget is RAISED rather than
+   * narrowed — the opposite verb — which is why the warning site names no field
+   * and asks the provider instead.
+   */
+  it("declares its own remedy for a truncated status scan, naming the Hard Cap and no lab (⊘ falling back to EVE-NG's sentence sends a PVE user looking for a Root Folder and a Lab Filter their source does not have)", () => {
+    const remedy = resolveStatusTruncationRemedy(createProxmoxProvider());
+    expect(remedy).toBeDefined();
+    expect(remedy).toContain("Hard Cap (entries)");
+    expect(remedy).not.toMatch(/lab/i);
+    // The field it names has to be a field this provider actually has.
+    expect(createProxmoxProvider().configFields.map((f) => f.label)).toContain("Hard Cap (entries)");
+  });
+
   it("passes validateProviderShape — the same gate the registry applies at registration (⊘ a provider that only compiles still cannot be registered)", () => {
     expect(() => validateProviderShape(createProxmoxProvider())).not.toThrow();
   });
@@ -1698,7 +1714,7 @@ describe("createProxmoxProvider", () => {
       const warning = tree.warnings?.find((w) => w.includes("Cluster node status")) ?? "";
       expect(warning).toContain("Sys.Audit");
       expect(warning).toContain("last known running state");
-      expect(warning).not.toContain("Refresh Lab Status");
+      expect(warning).not.toContain("Refresh Inventory Status");
       // A healthy join pushes no such line — the warning names a real failure,
       // never a routine sync.
       const ok = await syncNodes(
@@ -1748,7 +1764,7 @@ describe("createProxmoxProvider", () => {
       expect(warning).not.toMatch(/guests beyond/);
       // The persistent-limit property stays intact: no remedy is offered,
       // because every path that could retry shares this same budget.
-      expect(warning).not.toContain("Refresh Lab Status");
+      expect(warning).not.toContain("Refresh Inventory Status");
       expect(warning).not.toContain("Sync Now");
     });
 

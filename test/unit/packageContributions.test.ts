@@ -1092,7 +1092,14 @@ describe("package contributions", () => {
       const command = packageJson.contributes.commands.find((item) => item.command === "nexus.inventory.refreshStatus");
       expect(command).toBeDefined();
       expect(command?.category).toBe("Nexus");
-      expect(command?.title).toBeTruthy();
+      // PROVIDER-NEUTRAL TITLE, and pinned as an ABSENCE as well as a value.
+      // The command refreshes live status for EVERY status-capable provider,
+      // so "Lab" — EVE-NG's word — was showing a Proxmox user a lab their
+      // cluster does not have. "Inventory" is the noun the whole neighbouring
+      // command family uses (Add/Edit/Remove Inventory Source, Sync Inventory
+      // Now), which is what keeps it legible in the palette.
+      expect(command?.title).toBe("Refresh Inventory Status");
+      expect(command?.title).not.toMatch(/lab/i);
 
       const paletteMenu = packageJson.contributes.menus.commandPalette ?? [];
       const paletteEntry = paletteMenu.find((item) => item.command === "nexus.inventory.refreshStatus");
@@ -1101,14 +1108,14 @@ describe("package contributions", () => {
     });
 
     /**
-     * FOLLOW-UP #42 — Refresh Lab Status is GONE from the Command Center's `...`
-     * menu. A sync now brings lab status current by itself, so a second,
+     * FOLLOW-UP #42 — the status refresh is GONE from the Command Center's `...`
+     * menu. A sync now brings live status current by itself, so a second,
      * non-standard entry sitting permanently in the hub's menu — visible even to
      * a user with no EVE-NG source at all — was buying nothing. The command
      * itself stays, on the Command Palette, for a status-only refresh between
      * syncs.
      */
-    it("does NOT put Refresh Lab Status in the Command Center title menu — a sync refreshes lab status, so the standalone entry does not earn a permanent seat there (⊘ leaving it shows a non-standard action to every user, EVE-NG source or not)", () => {
+    it("does NOT put Refresh Inventory Status in the Command Center title menu — a sync refreshes live status, so the standalone entry does not earn a permanent seat there (⊘ leaving it shows a non-standard action to every user, EVE-NG source or not)", () => {
       const titleMenuItems = packageJson.contributes.menus["view/title"] ?? [];
       expect(titleMenuItems.filter((item) => item.command === "nexus.inventory.refreshStatus")).toHaveLength(0);
       // The COMMAND and its palette entry are deliberately untouched — this
@@ -1186,12 +1193,25 @@ describe("package contributions", () => {
       }
       expect(functionalDocs).toMatch(/Lab Status Poll Interval/);
       expect(readme).toMatch(/Lab Status Poll Interval/);
-      expect(functionalDocs).toMatch(/Refresh Lab Status/);
-      expect(functionalDocs).toMatch(/Live lab status/i);
+      expect(functionalDocs).toMatch(/Refresh Inventory Status/);
+      expect(functionalDocs).toMatch(/Live device status/i);
       // BMC-menu gating note.
       expect(functionalDocs).toMatch(/ipmiHost/);
       expect(functionalDocs).toMatch(/connectBmcSol|BMC menu gating/);
-      expect(readme).toMatch(/Refresh Lab Status/);
+      expect(readme).toMatch(/Refresh Inventory Status/);
+    });
+
+    /**
+     * THE RETITLED COMMAND, in the docs that tell a user what to run. A palette
+     * title is the one string a reader retypes verbatim, so a doc still naming
+     * the old one sends them searching for a command that no longer exists —
+     * and puts EVE-NG's vocabulary in front of a Proxmox user on the way.
+     */
+    it("names the command by its CURRENT title in both documents, with the retired lab-flavoured one gone (\u2298 a rename the docs do not follow leaves the reader hunting the palette for a title that is no longer there)", () => {
+      expect(functionalDocs).not.toMatch(/Refresh Lab Status/);
+      expect(readme).not.toMatch(/Refresh Lab Status/);
+      expect(readme).toMatch(/Refresh Inventory Status/);
+      expect(functionalDocs).toMatch(/Refresh Inventory Status/);
     });
 
     it("documents that a completed sync now updates lab status, and stops telling the user to click a title-bar button that is gone (\u2298 docs that still describe the removed menu seat send the user hunting for it)", () => {

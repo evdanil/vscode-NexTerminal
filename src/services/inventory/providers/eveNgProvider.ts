@@ -123,7 +123,7 @@ export function readEveNgStatusPollSeconds(config: InventorySourceValues): numbe
  * account is in the functional documentation, §4.12.4.
  */
 const EVE_NG_STATUS_POLL_DESCRIPTION =
-  "How often, in seconds, to refresh this source's lab running status while the Command Center is visible. 0 turns polling off for this source — use Refresh Lab Status when you want it. Note that EVE-NG Community allows only one active session per user, so each poll logs you out of the EVE-NG web UI: give Nexus its own EVE-NG account, or leave this at 0.";
+  "How often, in seconds, to refresh this source's lab running status while the Command Center is visible. 0 turns polling off for this source — use Refresh Inventory Status when you want it. Note that EVE-NG Community allows only one active session per user, so each poll logs you out of the EVE-NG web UI: give Nexus its own EVE-NG account, or leave this at 0.";
 
 /**
  * THE CONFIG FIELD LIST IS PART OF THE PROVIDER FINGERPRINT
@@ -1949,6 +1949,12 @@ export function createEveNgProvider(
     label: "EVE-NG",
     configFields: EVE_NG_CONFIG_FIELDS,
     attributeKeys: ["lab", "template", "type", "console", "status", "image", "name"],
+    // A PARTIAL status scan, in EVE-NG's own words — see the contract on
+    // `InventoryProvider`. Cause-neutral on purpose: every stopping point here
+    // (the folder/lab/node caps, the request budget, the wall-clock deadline)
+    // is fixed by the same narrower crawl, and a cap truncates identically on a
+    // retry, so "try again" would be bad advice for all of them.
+    statusTruncationRemedy: "Narrow the Root Folder or Lab Filter to bring the lab tree inside the crawl's limits.",
     instanceKey(config: InventorySourceValues): string | undefined {
       return eveNgInstanceKey(config);
     },

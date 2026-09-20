@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.8.233] — 2026-09-20
+
+### Changed
+
+- **"Refresh Lab Status" is now "Refresh Inventory Status", and the two messages it shows have stopped talking about labs.** The command refreshes the live running/stopped state of every inventory source that reports one — EVE-NG labs and Proxmox clusters both — so its palette title named a thing a PVE cluster does not have, and it sat oddly beside **Add / Edit / Remove Inventory Source** and **Sync Inventory Now**. The command itself is unchanged, and so is anything you have bound to it; only what you read has moved. Its total-failure warning now says it could not refresh *live status* from any source, and its partial-refresh warning reads *Live status for "…" is partial — the scan stopped before it covered everything, so some devices may be stale or still unknown.* Both are reachable straight after a Proxmox **Start Node** / **Stop Node**, which refreshes that source for you.
+- **The advice at the end of that partial-refresh warning now comes from the source's own provider.** It used to tell everyone to narrow their **Root Folder** or **Lab Filter** — two fields only an EVE-NG source has. A Proxmox source's equivalent knob is **Hard Cap (entries)**, and raising it is the opposite of narrowing, so one sentence could never be right for both. Each provider now supplies its own remedy, in its own words: EVE-NG's still narrows the Root Folder or Lab Filter, Proxmox's raises the Hard Cap and, with cluster nodes imported, points at the API token's permission to read cluster status. When one refresh finds several sources partial and they do not agree on a remedy — or a provider offers none — the warning names no field at all and points at **Edit Inventory Source** instead, rather than handing one provider's user another provider's advice.
+
 ## [2.8.231] — 2026-09-20
 
 ### Fixed

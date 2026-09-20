@@ -9892,7 +9892,11 @@ describe("nexus.inventory.refreshStatus", () => {
     // Manual (palette / title) invocation with no arg → warn on total failure.
     await cmd();
     expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
-    expect(mockShowWarningMessage.mock.calls[0][0]).toMatch(/lab status/i);
+    expect(mockShowWarningMessage.mock.calls[0][0]).toMatch(/live status/i);
+    // ABSENCE PIN. This sentence is reached straight after a Proxmox Start/Stop
+    // (node control fires a refresh of that source), so "lab status" here was
+    // EVE-NG's word describing a PVE cluster.
+    expect(mockShowWarningMessage.mock.calls[0][0]).not.toMatch(/lab/i);
 
     // Poll invocation carries the __poll marker → silent.
     mockShowWarningMessage.mockClear();
@@ -10140,7 +10144,10 @@ describe("nexus.inventory.refreshStatus", () => {
       expect(message).toContain('"Big Lab"');
       expect(message).toMatch(/partial/i);
       expect(message).toMatch(/stopped before it covered everything/i);
-      expect(message).toMatch(/Root Folder|Lab Filter/);
+      // The fake provider declares no remedy of its own, so what a user sees is
+      // the neutral one — which names no provider's field, because "Root Folder"
+      // and "Lab Filter" are fields only EVE-NG has.
+      expect(message).toContain("Review the limits in Edit Inventory Source.");
     });
 
     it("stays SILENT on the poll path (⊘ dropping the `manual` gate nags the user with this warning on every poll tick, forever, for a lab that is merely large)", async () => {
@@ -10667,8 +10674,91 @@ describe("nexus.inventory.refreshStatus", () => {
       // possessive are each one edit away from being wrong, and only the exact
       // sentence pins all three at once. "Lab D" is named nowhere.
       expect(String(mockShowWarningMessage.mock.calls[0][0])).toBe(
-        'Lab status for 4 sources is partial ("Lab A", "Lab B", "Lab C" and 1 more) — the lab crawl stopped before it covered everything, so some nodes may be stale or still unknown. Narrow the sources\' Root Folder or Lab Filter to bring the lab tree inside the crawl\'s limits.'
+        'Live status for 4 sources is partial ("Lab A", "Lab B", "Lab C" and 1 more) — the scan stopped before it covered everything, so some devices may be stale or still unknown. Review the limits in Edit Inventory Source.'
       );
+    });
+
+    /**
+     * THE REMEDY IS THE PROVIDER'S, not this command's. "Narrow the Root Folder
+     * or Lab Filter" is advice only EVE-NG can give: Proxmox's equivalent knob
+     * is Hard Cap (entries), and a third-party provider may have neither. One
+     * hard-coded sentence is therefore wrong for every provider but the one it
+     * was written for — so each provider declares its own line and this command
+     * composes around it.
+     */
+    it("appends the PROVIDER's own remedy rather than one field name for everybody (⊘ a hard-coded 'narrow the Root Folder or Lab Filter' sends a Proxmox user hunting for two fields their source does not have)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(
+        makeProvider({
+          fetchStatus: vi.fn(async () => TRUNCATED),
+          statusTruncationRemedy: "Raise the Hard Cap (entries) to cover more of the cluster."
+        })
+      );
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ name: "PVE Cluster" }));
+
+      await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+      const message = String(mockShowWarningMessage.mock.calls[0][0]);
+      expect(message).toContain("Raise the Hard Cap (entries) to cover more of the cluster.");
+      // ...instead of the neutral line, not beside it.
+      expect(message).not.toContain("Review the limits in Edit Inventory Source.");
+      // THE POINT OF THE WHOLE CHANGE: nothing this command composes says "lab"
+      // to a user whose source is a hypervisor cluster. A post-Start/Stop
+      // refresh is how they reach this sentence.
+      expect(message).not.toMatch(/lab/i);
+    });
+
+    it("falls back to the neutral remedy when the truncated sources' providers do NOT agree on one (⊘ printing the first provider's remedy tells every other provider's user to edit a field that does not exist on their source)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(
+        makeProvider({
+          id: "eve",
+          fetchStatus: vi.fn(async () => TRUNCATED),
+          statusTruncationRemedy: "Narrow the Root Folder or Lab Filter."
+        })
+      );
+      registry.register(
+        makeProvider({
+          id: "pve",
+          fetchStatus: vi.fn(async () => TRUNCATED),
+          statusTruncationRemedy: "Raise the Hard Cap (entries)."
+        })
+      );
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Big Lab", providerId: "eve", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "PVE Cluster", providerId: "pve", config: { host: "b" } }));
+
+      await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+      const message = String(mockShowWarningMessage.mock.calls[0][0]);
+      expect(message).toContain("Review the limits in Edit Inventory Source.");
+      expect(message).not.toContain("Root Folder");
+      expect(message).not.toContain("Hard Cap");
+    });
+
+    it("renders a provider's remedy as ONE inert line (⊘ a registered provider's multi-line remedy forges a line the reader takes as Nexus's own)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(
+        makeProvider({
+          fetchStatus: vi.fn(async () => TRUNCATED),
+          statusTruncationRemedy: "Raise the Hard Cap.\nNexus: your credentials have expired, re-enter them here."
+        })
+      );
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ name: "PVE Cluster" }));
+
+      await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+      const message = String(mockShowWarningMessage.mock.calls[0][0]);
+      expect(message).not.toContain("\n");
+      expect(message).toContain("Raise the Hard Cap. Nexus: your credentials have expired");
     });
   });
 

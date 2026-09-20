@@ -2433,6 +2433,15 @@ export function createProxmoxProvider(
     // them matches nothing on a stopped guest — the vocabulary stays declared
     // in one place regardless.
     attributeKeys: ["type", "node", "pool", "tag", "status", "ip", "ip6", "mac", "ifname", "name"],
+    // A PARTIAL status scan, in Proxmox's own words — see the contract on
+    // `InventoryProvider`, and `fetchStatusImpl` for the two ways this report
+    // comes back truncated. The remedy names BOTH, because they are not one
+    // cause: the hard cap is a budget to raise (EVE-NG's remedy is the opposite
+    // verb, which is why no shared sentence can serve them both), while the
+    // /cluster/status join fails on a token without Sys.Audit, where no cap
+    // matters.
+    statusTruncationRemedy:
+      "Raise the Hard Cap (entries) to cover more of the cluster; with Include Cluster Nodes on, also check that the API token may read cluster status.",
     instanceKey(config: InventorySourceValues): string | undefined {
       return proxmoxInstanceKey(config);
     },

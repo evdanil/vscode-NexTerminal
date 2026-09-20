@@ -14,6 +14,7 @@ import {
   inventorySecretKey,
   inventorySourceValuesEqual,
   resolveProviderInstanceKey,
+  resolveStatusTruncationRemedy,
   sourceConfigUnchanged,
   validateInventoryStatusReport,
   type InventoryConfigField,
@@ -2553,7 +2554,7 @@ export function registerInventoryCommands(
    * the single counter meant and what the poll's own latch assumes. Claiming
    * lazily would let an all-sources sweep re-claim (and so re-crawl) a source a
    * targeted refresh had already started on, which is precisely the duplicated
-   * lab crawl the supersede rule exists to avoid.
+   * crawl the supersede rule exists to avoid.
    */
   const claimStatusRefresh = (sourceIds: readonly string[]): ReadonlyMap<string, number> => {
     const claims = new Map<string, number>();
@@ -3697,13 +3698,13 @@ export function registerInventoryCommands(
           core.applyInventoryStatus(source.id, fetchedStatus);
           // R3 (follow-up #43 review) — THE SECOND APPLIER. `refreshStatus`
           // records the generation that last applied status for a source and
-          // only warns "this source's lab status is partial" while its own apply
+          // only warns "this source's live status is partial" while its own apply
           // is still the newest one. That record exists precisely so a later
           // COMPLETE apply invalidates an earlier partial claim — but a sync
           // holds no generation claim and does not bump `source.revision`, so
           // without this line a truncated claim collected before the sync would
-          // still match at warning time and the user would be told to narrow a
-          // Root Folder for a tree this sync has just brought fully current.
+          // still match at warning time and the user would be told to go and
+          // narrow a source this sync has just brought fully current.
           // DELETING the entry (rather than writing some generation of our own)
           // is the minimal shape: the filter compares the record against the
           // warning sweep's OWN claim for this source, and a missing entry fails
@@ -4960,9 +4961,9 @@ export function registerInventoryCommands(
     let superseded = false;
     // TRUNCATED STATUS (follow-up 2) — the sources whose report came back
     // `truncated` AND was applied, by name, for one manual-only warning after the
-    // loop. `fetchStatus` sets the flag when the lab crawl hits its own time
-    // budget; the report then covers only the nodes it reached, so every other
-    // node keeps whatever state it already had — stale, or still `unknown`.
+    // loop. A provider sets the flag when its scan stops short of the whole
+    // source; the report then covers only the devices it reached, so every
+    // other one keeps whatever state it had — stale, or still `unknown`.
     // Nothing read the flag before, so a partial refresh was indistinguishable
     // from a complete one.
     // Entries carry the source ID as well as the name: the name is what the
@@ -4978,18 +4979,20 @@ export function registerInventoryCommands(
     //
     // MANUAL ONLY, exactly like the total-failure warning and for the same
     // reason: the poll fires on a timer, and a warning per tick would nag about a
-    // lab that is merely large. ONE message for the sweep, never one per source —
-    // a multi-lab refresh would otherwise stack a pile of notifications. Names up
-    // to three sources, in the spirit of the sync's own `namedExamples`.
+    // source that is merely large. ONE message for the sweep, never one per
+    // source — a multi-source refresh would otherwise stack a pile of
+    // notifications. Names up to three sources, in the spirit of the sync's own
+    // `namedExamples`.
     //
-    // CAUSE-NEUTRAL (Codex P2) — `truncated` is set by the wall-clock deadline
-    // AND by every size cap (nodes, labs, folder listings, depth), so naming the
-    // time budget is wrong for a lab tree that simply exceeds a cap — and
-    // "run it again" is actively bad advice there, because a cap is deterministic
-    // and truncates identically next time. The remedy that works for BOTH causes
-    // is a narrower crawl, so that is the only one offered. Propagating the real
-    // reason out of the provider would let this be specific again; the report
-    // contract carries no reason field today.
+    // CAUSE-NEUTRAL, and that is why the REMEDY is the provider's rather than
+    // ours (`InventoryProvider.statusTruncationRemedy`). `truncated` says only
+    // that a scan stopped short; the report contract carries no reason, so a
+    // remedy has to answer every way that provider's scan can end — and those
+    // differ so far between providers that the verbs disagree (EVE-NG narrows a
+    // crawl, Proxmox raises a budget). Naming a field here would therefore be
+    // naming ONE provider's field at everybody. What this layer still owns is
+    // the sentence around it, and the rule for when a specific remedy may be
+    // used at all: see the composition below.
     const warnIfTruncated = (): void => {
       if (options?.manual !== true || truncatedSources.length === 0) {
         return;
@@ -4998,10 +5001,10 @@ export function registerInventoryCommands(
       // carry ids. Applying a truncated report earns the right to say so only
       // while that apply is still what the tree shows. A NEWER sweep that applied
       // a COMPLETE report for the same source (very much the expected shape: this
-      // sweep is slow because the lab is big, and the user refreshed again) has
-      // replaced the partial status with a full one, so naming that source here
-      // describes a screen the user is no longer looking at and sends them to
-      // narrow a Root Folder that no longer needs narrowing. Drop those and warn
+      // sweep is slow because the source is big, and the user refreshed again)
+      // has replaced the partial status with a full one, so naming that source
+      // here describes a screen the user is no longer looking at and sends them
+      // off to narrow something that no longer needs it. Drop those and warn
       // about what is left, staying silent if that is nothing.
       //
       // Correct too when the newer sweep is ALSO truncated: it collected the
@@ -5014,7 +5017,7 @@ export function registerInventoryCommands(
       //     not ours. The generation record settles that.
       //  2. The source is no longer the RECORD we applied to. Removed mid-sweep,
       //     so there is nothing left to be partial about — naming it would tell
-      //     the user to narrow the Root Folder of something they just deleted —
+      //     the user off to narrow something they have just deleted —
       //     or removed and RECREATED under the same id, which a replace-mode
       //     import does: the replacement is a different incarnation with a fresh
       //     revision, its status was cleared with the record we applied to, and
@@ -5030,9 +5033,14 @@ export function registerInventoryCommands(
       // reach this closure-local map. A future fourth path could not either. The
       // live read is immune to all of them by construction, which a growing list
       // of notification call sites would not be.
-      const live = truncatedSources.filter((s) => {
+      //
+      // Each surviving entry carries the PROVIDER its remedy comes from, read
+      // off the LIVE record for the same reason the revision is checked against
+      // it: a collected entry is a snapshot, and the sentence has to describe
+      // the sources as they stand when it is shown.
+      const live = truncatedSources.flatMap((s) => {
         if (statusAppliedGeneration.get(s.id) !== myClaims.get(s.id)) {
-          return false;
+          return [];
         }
         // BOTH halves, deliberately. `revision` is optional (older records are
         // backfilled at load), so `getInventorySource(id)?.revision === captured`
@@ -5040,7 +5048,10 @@ export function registerInventoryCommands(
         // `undefined`, and so was its captured revision — as a match, and warn
         // about a source that is gone.
         const liveSource = core.getInventorySource(s.id);
-        return liveSource !== undefined && liveSource.revision === s.revision;
+        if (liveSource === undefined || liveSource.revision !== s.revision) {
+          return [];
+        }
+        return [{ name: s.name, providerId: liveSource.providerId }];
       });
       if (live.length === 0) {
         return;
@@ -5048,11 +5059,22 @@ export function registerInventoryCommands(
       const count = live.length;
       const names = live.slice(0, 3).map((s) => `"${s.name}"`).join(", ");
       const andMore = count > 3 ? ` and ${count - 3} more` : "";
-      const subject = count === 1 ? `Lab status for ${names} is partial` : `Lab status for ${count} sources is partial (${names}${andMore})`;
+      const subject = count === 1 ? `Live status for ${names} is partial` : `Live status for ${count} sources is partial (${names}${andMore})`;
+      // THE REMEDY IS THE PROVIDER'S (`InventoryProvider.statusTruncationRemedy`),
+      // and it is offered only when every source this ONE message covers agrees
+      // on it. "Narrow the Root Folder or Lab Filter" is advice only an EVE-NG
+      // user can act on; Proxmox's knob is the Hard Cap, and raising it is the
+      // opposite verb — so with both kinds of source truncated in one sweep,
+      // either sentence is wrong for somebody. AGREEMENT is the test rather
+      // than "one provider", because agreement is what the sentence needs.
+      //
+      // The fallback names no field, which is the honest thing to say when we
+      // cannot say which field: it is also what a provider declaring no remedy
+      // gets, and it still points at the form where every limit lives.
+      const remedies = new Set(live.map((source) => resolveStatusTruncationRemedy(registry.get(source.providerId))));
+      const remedy = (remedies.size === 1 ? [...remedies][0] : undefined) ?? "Review the limits in Edit Inventory Source.";
       void vscode.window.showWarningMessage(
-        `${subject} — the lab crawl stopped before it covered everything, so some nodes may be stale or still unknown. Narrow the ${
-          count === 1 ? "source's" : "sources'"
-        } Root Folder or Lab Filter to bring the lab tree inside the crawl's limits.`
+        `${subject} — the scan stopped before it covered everything, so some devices may be stale or still unknown. ${remedy}`
       );
     };
     for (const source of targets) {
@@ -5063,7 +5085,7 @@ export function registerInventoryCommands(
       // A `continue`, NOT the `return` this used to be (review H1). Supersede is
       // per source now, so a tick that took over ONE source says nothing about
       // the rest of this sweep's list: abandoning them would let any background
-      // tick silently truncate a manual all-sources Refresh Lab Status, which is
+      // tick silently truncate a manual all-sources Refresh Inventory Status, which is
       // the same class of bug (one source suppressing work on the others) the
       // per-source counters exist to remove. The sweep therefore runs to its
       // single exit below, where `warnIfTruncated` renders whatever it applied —
@@ -5256,7 +5278,7 @@ export function registerInventoryCommands(
     // never reaching this line.
     if (options?.manual && attempted > 0 && succeeded === 0 && !superseded) {
       void vscode.window.showWarningMessage(
-        "Could not refresh lab status from any inventory source — check the source's credentials and connectivity."
+        "Could not refresh live status from any inventory source — check the source's credentials and connectivity."
       );
     }
     // TRUNCATED STATUS (follow-up 2) — a partial refresh leaves some nodes' state
@@ -5493,9 +5515,9 @@ export function registerInventoryCommands(
     // rather than phrasing it as if the request were about to be sent.
     //
     // It names NO COMMAND, and no provider's vocabulary. This one string is what
-    // BOTH node-control providers show, so "lab"/"Refresh Lab Status" was EVE-NG's
-    // word on a Proxmox guest — the same reason the row's `Status:` tooltip line
-    // dropped it.
+    // BOTH node-control providers show, so a "lab" here was EVE-NG's word on a
+    // Proxmox guest — the same reason the row's `Status:` tooltip line dropped
+    // it, and the reason the command itself is no longer titled after a lab.
     //
     // And it promises only what this handler actually does. It deliberately does
     // NOT claim the row will be right — a re-check can be declined (the source may

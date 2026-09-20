@@ -391,7 +391,7 @@ export interface InventoryProvider {
   /**
    * LIVE STATUS (Phase 2) — OPTIONAL. Report the current running/stopped state
    * of this source's devices, keyed by the same `externalId` `fetchInventory`
-   * uses. Called on an explicit "Refresh Lab Status" and on the visible-gated
+   * uses. Called on an explicit "Refresh Inventory Status" and on the visible-gated
    * poll, NOT on a sync. A provider that does not implement it simply shows no
    * status (NetBox). The ONLY sanctioned caller is `fetchProviderStatus` below,
    * which clones the config, validates the return, and degrades every failure to
@@ -399,6 +399,31 @@ export interface InventoryProvider {
    * breaking the refresh path, exactly like `instanceKey`.
    */
   fetchStatus?(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<InventoryStatusReport>;
+  /**
+   * LIVE STATUS — OPTIONAL, and meaningless without `fetchStatus`. One sentence
+   * telling the user how to bring a TRUNCATED status scan of this source inside
+   * its limits, in this provider's own vocabulary.
+   *
+   * WHY THE PROVIDER OWNS THE SENTENCE. The warning the refresh renders is one
+   * message for a whole sweep, and the knob that fixes a partial scan is not the
+   * same knob twice: EVE-NG's is a narrower crawl (Root Folder, Lab Filter),
+   * Proxmox's is a bigger budget (Hard Cap), and the verbs are opposites. A
+   * single hard-coded remedy at the message site is therefore wrong for every
+   * provider but the one it was written for — which is exactly how "narrow your
+   * Lab Filter" came to be shown to a user whose source is a hypervisor cluster.
+   * The report contract carries no reason field, so this stays CAUSE-NEUTRAL:
+   * one sentence covering every way this provider's scan can stop short.
+   *
+   * A provider that declares none gets a neutral line naming no field, which is
+   * also what a sweep whose truncated sources DISAGREE falls back to.
+   *
+   * Read only through `resolveStatusTruncationRemedy` below, which makes the
+   * text inert and bounds it — a third-party provider registers through the
+   * public API, and this string is interpolated into a sentence Nexus composed.
+   * NOT part of `computeProviderFingerprint`, so adding or rewording one costs
+   * no source its credential re-confirmation.
+   */
+  statusTruncationRemedy?: string;
   /**
    * NODE CONTROL (Phase 4) — OPTIONAL. Start or stop ONE device, keyed by the
    * same `externalId` `fetchInventory`/`fetchStatus` use. Unlike `fetchStatus`
@@ -1035,6 +1060,31 @@ export async function fetchProviderStatus(
     return undefined;
   }
   return validateInventoryStatusReport(raw);
+}
+
+/** See `resolveStatusTruncationRemedy` — long enough for two clauses naming a field, short enough to stay a notification. */
+const STATUS_REMEDY_MAX_LENGTH = 240;
+
+/**
+ * LIVE STATUS — the ONE sanctioned way to read
+ * `InventoryProvider.statusTruncationRemedy`, in the same spirit as
+ * `resolveProviderInstanceKey`: a missing, non-string or blank declaration
+ * resolves to `undefined` (the caller then uses its own neutral line) rather
+ * than putting an empty fragment on the end of a sentence.
+ *
+ * FLATTENED, not merely trimmed. The value lands mid-sentence in a warning Nexus
+ * composed, so a line break in it would mint a line the reader takes as ours —
+ * the exact hazard `flattenProviderText` documents — and capped, because a
+ * notification is not a scrollable buffer.
+ */
+export function resolveStatusTruncationRemedy(
+  provider: Pick<InventoryProvider, "statusTruncationRemedy"> | undefined
+): string | undefined {
+  if (typeof provider?.statusTruncationRemedy !== "string") {
+    return undefined;
+  }
+  const text = capProviderText(flattenProviderText(provider.statusTruncationRemedy), STATUS_REMEDY_MAX_LENGTH);
+  return text.length > 0 ? text : undefined;
 }
 
 /**
