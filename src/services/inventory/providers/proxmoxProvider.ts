@@ -91,8 +91,9 @@ const PROXMOX_CONFIG_FIELDS: InventoryConfigField[] = [
     label: "API Token",
     type: "password",
     required: true,
+    placeholder: "root@pam!nexus=8c1a4bb2-3d7f-4c22-9a51-e0f2b6c1d990",
     description:
-      "A Proxmox API token (`<user@realm>!<tokenid>` plus its secret) with at least VM.Audit; add VM.PowerMgmt for Start/Stop, VM.GuestAgent.Audit (PVE 9) or VM.Monitor (PVE 8) for VM addresses, and Sys.Audit to import cluster nodes."
+      "The FULL token credential in Proxmox's own one-line form: `<user@realm>!<tokenid>=<secret>` — Datacenter → API Tokens shows the id, and the secret is the value shown exactly once at creation; join them with `=`. The token needs at least VM.Audit; add VM.PowerMgmt for Start/Stop, VM.GuestAgent.Audit (PVE 9) or VM.Monitor (PVE 8) for VM addresses, and Sys.Audit to import cluster nodes."
   },
   {
     // PVE's own grouping vocabulary. Status is deliberately NOT a placeholder:

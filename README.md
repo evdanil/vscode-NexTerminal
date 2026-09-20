@@ -205,7 +205,13 @@ A sync is bounded rather than open-ended, so a huge or unresponsive installation
 
 A Proxmox VE cluster is an inventory source too, and the shape is the same: **guests become servers** — each QEMU virtual machine and LXC container the cluster lists arrives as an SSH server, addressed from what the guest itself reports.
 
-1. Run `Nexus: Add Inventory Source (NetBox, EVE-NG…)`, choose **Proxmox**, and enter the cluster's base URL — what you open the web UI at, `https://pve.example.com:8006` shaped — plus an API token entered as one string: `<user@realm>!<tokenid>=<secret>`, the token id plus the secret PVE shows you once at creation. The token is stored in VS Code SecretStorage, never in a settings file. **Test Connection** confirms the URL is reachable and the token is accepted — it does not check what the token may read, so a token PVE accepts but has granted nothing passes here and fails on the first sync
+1. Run `Nexus: Add Inventory Source (NetBox, EVE-NG…)`, choose **Proxmox**, and enter the cluster's base URL — what you open the web UI at, `https://pve.example.com:8006` shaped. For **API Token**, enter the FULL credential as ONE string in Proxmox's own form — id, `=`, then the secret PVE shows you exactly once at creation:
+
+    ```
+    <user@realm>!<tokenid>=<secret>        e.g.  root@pam!nexus=8c1a4bb2-3d7f-4c22-9a51-e0f2b6c1d990
+    ```
+
+   The token is stored in VS Code SecretStorage, never in a settings file. **Test Connection** confirms the URL is reachable and the token is accepted — it does not check what the token may read, so a token PVE accepts but has granted nothing passes here and fails on the first sync
 2. Create the token least-privilege, on the PVE host:
 
    ```bash
