@@ -2480,6 +2480,27 @@ describe("createProxmoxProvider", () => {
       expect(resolved.toLowerCase()).not.toContain("token");
     });
 
+    it("REFUSES a template with template-shaped wording, before building any URL (\u2298 a template cannot run and has no console, so a URL for one is an action that can only fail \u2014 and reporting it as a missing guest blames the sync and sends the user to a re-sync that changes nothing)", async () => {
+      const { fetchImpl } = lookupFetch([{ vmid: 9000, node: "pve", type: "qemu", name: "debian-tpl", template: 1 }]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      const err = await provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "9000").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind).toBe("protocol");
+      expect((err as Error).message).toContain("9000");
+      expect((err as Error).message).toMatch(/template/i);
+      // The guest-shaped rejection this refusal exists to displace.
+      expect((err as Error).message).not.toMatch(/no longer present/i);
+      expect((err as Error).message).not.toMatch(/re-sync/i);
+    });
+
+    it("still builds the URL for an ordinary guest whose row carries template: 0 (\u2298 a truthiness slip on the template member refuses every guest PVE reports it for, killing the feature outright)", async () => {
+      const { fetchImpl } = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build-vm", template: 0 }]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      await expect(provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107")).resolves.toBe(
+        `${BASE}/?console=kvm&novnc=1&vmid=107&vmname=build-vm&node=pve&resize=off&cmd=`
+      );
+    });
+
     it("rejects with a re-sync hint when the vmid is no longer in the cluster listing (kills an error that names neither the guest nor the way out — same contract as controlNode's)", async () => {
       const { fetchImpl } = lookupFetch([]);
       const provider = createProxmoxProvider(fetchImpl, fetchImpl);

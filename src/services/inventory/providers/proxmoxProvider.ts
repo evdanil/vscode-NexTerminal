@@ -2138,7 +2138,7 @@ function isProxmoxNodeExternalId(externalId: string): boolean {
  * FRESH vmid → {node, kind, name} resolution over `/cluster/resources?type=vm`.
  *
  * ONE DEFINITION, TWO CALLERS (`controlNodeImpl`, `webConsoleUrlImpl`), because
- * both need the same three facts for the same reason: a bare vmid externalId
+ * both need the same facts for the same reason: a bare vmid externalId
  * does not name the node it runs on, and a guest can migrate between syncs — so
  * the last synced tree is never the source of this answer. Sharing it also
  * keeps the not-found contract (name the guest, name the way out) in one place;
@@ -2153,7 +2153,7 @@ async function resolveGuestRow(
   baseUrl: string,
   token: string,
   externalId: string
-): Promise<{ node: string; kind: "qemu" | "lxc"; name: string }> {
+): Promise<{ node: string; kind: "qemu" | "lxc"; name: string; template: boolean }> {
   const lookupUrl = new URL(`${baseUrl}${PROXMOX_API_BASE}/cluster/resources?type=vm`);
   const lookupRaw = await rawGet(transport, lookupUrl, token, FETCH_TIMEOUT_MS);
   if (lookupRaw.status < 200 || lookupRaw.status >= 300) {
@@ -2177,7 +2177,11 @@ async function resolveGuestRow(
     // A row matching the vmid but carrying an unusable node/type folds into
     // "not found" — nothing actionable could be built from it either way.
     if ((row.type === "qemu" || row.type === "lxc") && str(row.node)) {
-      return { node: row.node as string, kind: row.type, name: str(row.name) };
+      // `template` rides along because it is a property of the DEVICE that only
+      // this live row can report — nothing about template-ness survives the sync
+      // onto a server record — and one caller must refuse a template outright.
+      // PVE reports it as the number 1; anything else (absent, 0) is a guest.
+      return { node: row.node as string, kind: row.type, name: str(row.name), template: row.template === 1 };
     }
   }
   throw new InventoryProviderError(
@@ -2344,6 +2348,23 @@ async function webConsoleUrlImpl(
   const baseUrl = normalizeBaseUrl(String(config.baseUrl ?? ""));
   const token = secrets.apiToken ?? "";
   const target = await resolveGuestRow(transport, baseUrl, token, externalId);
+  // A TEMPLATE HAS NO CONSOLE, and this is the only layer that can know. PVE
+  // templates import under an opt-in with the same bare-vmid externalId every
+  // guest carries, and nothing about template-ness survives the sync onto the
+  // server record (device attributes are consumed by template-rule matching and
+  // never persisted; the origin stamps carry addresses, credentials and
+  // identity, not device class). So the marker gate — which answers from an
+  // externalId alone, without I/O — cannot tell a template row from a guest,
+  // and the fresh lookup this function already performs is where the answer
+  // actually exists. Refused in the TEMPLATE'S OWN terms: routing it through
+  // the not-found path below would report a device PVE is happily listing as
+  // gone, and send the user to a re-sync that would import it again unchanged.
+  if (target.template) {
+    throw new InventoryProviderError(
+      "protocol",
+      `Guest ${externalId} is a Proxmox template — a template cannot run, so it has no console.`
+    );
+  }
 
   const url = new URL(baseUrl);
   if (url.pathname !== "/") {

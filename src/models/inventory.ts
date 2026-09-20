@@ -477,8 +477,20 @@ export interface InventoryProvider {
    * implements `webConsoleUrl` qualifies, so a provider whose whole device set
    * has a console implements nothing and behaves byte-identically. Must be pure
    * and synchronous — a predicate over an ALREADY-SYNCED device, no I/O, no
-   * throwing — and must AGREE with `webConsoleUrl`'s own refusals: the menu
-   * must never offer what the implementation rejects. The ONLY consumer is the
+   * throwing — and must never CONTRADICT `webConsoleUrl`: a device it admits
+   * must not be one the implementation is known to reject from the id alone.
+   *
+   * IT CANNOT BE COMPLETE, and saying so is the point. The gate sees only an
+   * externalId and whatever that id encodes, so it catches exactly the refusals
+   * that are decidable from identity (a Proxmox `node/<name>` is never a
+   * guest). A refusal that depends on LIVE state the id does not carry — a PVE
+   * template, whose template-ness is reported by the cluster and survives
+   * nowhere on the synced record — is not decidable here, and the
+   * implementation's own refusal is the authoritative one. Such a device keeps
+   * its menu entry and is told why when it is used, which is honest; inventing
+   * a gate answer from data the tree does not have would not be.
+   *
+   * The ONLY consumer is the
    * tree's marker gate, called through the predicate injected at the
    * `NexusTreeProvider` constructor; nothing on the command path reads it.
    */
