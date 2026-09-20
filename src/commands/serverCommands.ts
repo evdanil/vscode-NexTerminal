@@ -1153,6 +1153,44 @@ async function connectTelnetServer(
   );
 }
 
+/**
+ * Show the addressless refusal as an ACTION rather than a mention: the whole gap
+ * this closes is that the console exists and the user never finds it, so the
+ * refusal carries the button that opens it. The server ID is passed rather than
+ * the click's `arg`, so the command re-resolves against live core (and the
+ * palette path, which has no `arg` at all, works identically).
+ *
+ * DETACHED ON PURPOSE — DO NOT `await` THIS, and do not make it return a promise
+ * that `connectServer` awaits. `showWarningMessage` does not settle until the
+ * notification is clicked or dismissed, and `connectServer` is awaited by callers
+ * that have work of their own to do afterwards: `connectAndAwaitSessionTerminal`
+ * (Run Macro on Server) and `connectAndRunScript` both await it before waiting on
+ * their own settle signal, and the URI handler awaits the `nexus.server.connect`
+ * command before opening SFTP. Signalling `onConnectFailed` does NOT release any
+ * of them — they are waiting on `connectServer`'s own promise — so awaiting the
+ * toast here hangs those commands for as long as the user leaves it on screen,
+ * which for an ignored notification is forever.
+ *
+ * Detaching costs the button nothing: VS Code keeps the notification and this
+ * handler alive after `connectServer` has returned, so a click minutes later
+ * still opens the console.
+ */
+function offerWebConsoleForAddressless(message: string, serverId: string): void {
+  const offer = (async () => {
+    const choice = await vscode.window.showWarningMessage(message, OPEN_WEB_CONSOLE_ACTION);
+    if (choice === OPEN_WEB_CONSOLE_ACTION) {
+      await vscode.commands.executeCommand("nexus.inventory.openWebConsole", serverId);
+    }
+  })();
+  // Nothing awaits `offer`, so a rejection out of the console command has no
+  // caller to surface it — without this it would be an unhandled rejection and
+  // the user would be left staring at a button that silently did nothing.
+  void offer.catch((error: unknown) => {
+    const detail = error instanceof Error ? error.message : String(error);
+    void vscode.window.showErrorMessage(`Could not open the web console: ${detail}`);
+  });
+}
+
 export async function connectServer(ctx: CommandContext, arg?: unknown, options: ConnectServerOptions = {}): Promise<void> {
   const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
   if (!server) {
@@ -1188,15 +1226,7 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
     // fixed it.
     options.onConnectFailed?.(addresslessMessage);
     if (offersWebConsole) {
-      // An ACTION, not a mention: the whole gap is that the console exists and
-      // the user never finds it, so the refusal carries the button that opens
-      // it. The server ID is passed rather than the click's `arg`, so the
-      // command re-resolves against live core (and the palette path, which has
-      // no `arg` at all, works identically).
-      const choice = await vscode.window.showWarningMessage(addresslessMessage, OPEN_WEB_CONSOLE_ACTION);
-      if (choice === OPEN_WEB_CONSOLE_ACTION) {
-        await vscode.commands.executeCommand("nexus.inventory.openWebConsole", server.id);
-      }
+      offerWebConsoleForAddressless(addresslessMessage, server.id);
       return;
     }
     void vscode.window.showInformationMessage(addresslessMessage);

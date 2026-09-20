@@ -5415,22 +5415,67 @@ describe("connectServer — addressless placeholder that has a web console", () 
   });
 
   /**
-   * The watchdog wrappers (Run Macro on Server / Connect and Run Script) arm a
-   * 90s timer and settle on `onConnectFailed`. The console offer is a
-   * notification the user may sit on for minutes, so the refusal must be
-   * SIGNALLED before it is shown — awaiting the click first would sit out the
-   * whole watchdog and end in a misleading timeout.
+   * THE OFFER MUST NOT HOLD THE CALLER. `connectServer` is awaited by commands
+   * that carry on afterwards: Run Macro on Server and Connect and Run Script
+   * both await it before waiting on their own settle signal, and the URI handler
+   * awaits the connect command before opening SFTP. `showWarningMessage` does
+   * not settle until the toast is clicked or dismissed, and `onConnectFailed`
+   * does not release those callers — they wait on `connectServer`'s own promise.
+   * So the notification is fired and forgotten, and this test holds the toast
+   * unanswered while it watches the promise settle. Note the assertions run
+   * against the LIVE promise: a test that discards it cannot see the hang.
    */
-  it("signals onConnectFailed BEFORE waiting on the notification (⊘ firing it after the await makes the macro watchdog time out while the toast is still on screen)", async () => {
+  it("settles its promise while the console notification is still on screen, and the button works after it has returned (⊘ awaiting the toast leaves Run Macro on Server and Connect and Run Script hung until the user answers it)", async () => {
     const { ctx } = addresslessHarness(true);
-    // Never resolves: the user has neither clicked nor dismissed.
-    mockShowWarningMessage.mockReturnValue(new Promise<string | undefined>(() => {}));
+    // The user has neither clicked nor dismissed; we answer it by hand, later.
+    let answerNotification!: (choice: string | undefined) => void;
+    mockShowWarningMessage.mockReturnValue(
+      new Promise<string | undefined>((resolve) => {
+        answerNotification = resolve;
+      })
+    );
     const onConnectFailed = vi.fn();
 
-    void connectServer(ctx, "vm-1", { onConnectFailed });
+    let settled = false;
+    const connecting = connectServer(ctx, "vm-1", { onConnectFailed }).then(() => {
+      settled = true;
+    });
     await flushPromises();
 
+    // The toast is up and unanswered...
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    expect(String(mockShowWarningMessage.mock.calls[0][0])).toMatch(/web console/i);
+    // ...and the connect call is already over.
+    expect(settled).toBe(true);
+
+    // The watchdog signal still comes FIRST, before the notification is raised:
+    // the wrappers arm a 90s timer, and a refusal announced only after the user
+    // answers would sit out the whole of it and end in a misleading timeout.
     expect(onConnectFailed).toHaveBeenCalledTimes(1);
     expect(String(onConnectFailed.mock.calls[0][0])).toMatch(/web console/i);
+    expect(onConnectFailed.mock.invocationCallOrder[0]).toBeLessThan(
+      mockShowWarningMessage.mock.invocationCallOrder[0]
+    );
+
+    // Detaching must not cost the button: a click after the return still opens
+    // the console.
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexus.inventory.openWebConsole", "vm-1");
+    answerNotification("Open Web Console");
+    await flushPromises();
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("nexus.inventory.openWebConsole", "vm-1");
+
+    await connecting;
+  });
+
+  it("surfaces a failure to open the console instead of leaving an unhandled rejection on the detached offer (⊘ a detached chain with no failure path loses the error and the button appears to do nothing)", async () => {
+    const { ctx } = addresslessHarness(true);
+    mockShowWarningMessage.mockResolvedValue("Open Web Console");
+    vi.mocked(vscode.commands.executeCommand).mockRejectedValueOnce(new Error("no console for vm-1"));
+
+    await connectServer(ctx, "vm-1");
+    await flushPromises();
+
+    const errors = messagesFrom(mockShowErrorMessage as never);
+    expect(errors.some((m) => /web console/i.test(m) && /no console for vm-1/.test(m))).toBe(true);
   });
 });
