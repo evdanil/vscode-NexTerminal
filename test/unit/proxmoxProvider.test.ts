@@ -260,9 +260,19 @@ describe("guest interface parsing", () => {
       "fe80::be24:11ff:fe50:85fa/64", // fe80::/10 spans fe80..febf
       "ff02::1",
       "ff05::1:3", // ff00::/8 multicast
-      "2001:db8::1%eth0" // scoped — not a usable host address
+      "2001:db8::1%eth0", // scoped — not a usable host address
+      "1:2:3:4:5:6:7:8:9", // nine groups — colon-shaped garbage the whitelist admitted (kills the character-whitelist IPv6 check)
+      "abcd:", // trailing empty group
+      "::ffff:999.999.999.999", // malformed embedded dotted quad
+      "2001:db8:::1" // triple colon
     ]) {
       expect(isGlobalAddress(addr)).toBe(false);
+    }
+    // Compressed and IPv4-mapped literals are real guests' shapes and must
+    // survive the syntax check (kills an over-strict parser that only knows
+    // one spelling).
+    for (const addr of ["2001:db8::", "0:0:0:0:0:ffff:192.0.2.7", "::ffff:192.0.2.7", "::ffff:192.0.2.7/128"]) {
+      expect(isGlobalAddress(addr)).toBe(true);
     }
   });
 

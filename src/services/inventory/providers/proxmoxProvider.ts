@@ -1,3 +1,4 @@
+import { isIPv4, isIPv6 } from "node:net";
 import { ADVANCED_SECTION_LABEL } from "../../../ui/formTypes";
 import { certificateFailureMessage, redirectNotFollowedMessage, type CertificateHintContext } from "../certificateHints";
 import { createInsecureHttpsFetch } from "../insecureFetch";
@@ -678,16 +679,31 @@ export function stripCidr(address: string): string {
  * and anything unparseable — a garbage string must not become an endpoint
  * host. CIDR suffixes are stripped before testing, so both endpoint shapes
  * read the same.
+ *
+ * SYNTAX is delegated, not hand-rolled (review P2): the stdlib `net.isIPv6` /
+ * `net.isIPv4` are the codebase's one definition of "a well-formed literal" —
+ * they reject the colon-shaped garbage a character whitelist admits
+ * (`1:2:3:4:5:6:7:8:9`, `abcd:`, `::ffff:999.999.999.999`), accept the
+ * compressed and IPv4-mapped forms real guests report (`2001:db8::1`,
+ * `::ffff:192.0.2.7`), and save this file from owning a second, weaker IPv6
+ * parser beside the one `profileTokens.isIpv6Literal` already guards its own
+ * boundary with. The range exclusions below are policy and stay here, applied
+ * to the parsed literal.
  */
 export function isGlobalAddress(raw: string): boolean {
   const addr = stripCidr(raw).toLowerCase();
   if (addr.includes(":")) {
-    if (addr === "::1" || addr === "::") {
+    // A zone suffix (`fe80::1%eth0`) is decoration we cannot connect through —
+    // reject it outright rather than strip it (stripping would turn a scoped
+    // link-local the guest reported into the global-looking address without
+    // its scope). `isIPv6` accepts zone ids, so this check runs first.
+    if (addr.includes("%")) {
       return false;
     }
-    // Hex digits, colons and v4-mapped dots only — a zone suffix or any other
-    // decoration is not something we can connect to.
-    if (!/^[0-9a-f:.]+$/.test(addr)) {
+    if (!isIPv6(addr)) {
+      return false;
+    }
+    if (addr === "::1" || addr === "::") {
       return false;
     }
     // fe80::/10 spans fe80..febf — first TWO hex digits "fe", third in 8-b.
@@ -699,11 +715,10 @@ export function isGlobalAddress(raw: string): boolean {
     }
     return true;
   }
-  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(addr);
-  if (!match) {
+  if (!isIPv4(addr)) {
     return false;
   }
-  const octets = [Number(match[1]), Number(match[2]), Number(match[3]), Number(match[4])];
+  const octets = addr.split(".").map(Number);
   if (octets.some((o) => o > 255)) {
     return false;
   }
