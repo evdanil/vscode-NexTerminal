@@ -5339,9 +5339,12 @@ export function registerInventoryCommands(
    * running/stopped state (a stopped guest's console page is the hypervisor's
    * own honest "not running", rendered in the hypervisor's voice).
    *
-   * The browser's existing session with the hypervisor is the credential; no
-   * token or password of ours rides the URL, which is why this is a handoff and
-   * not an embedded webview.
+   * The browser's existing session with the hypervisor is the CONSOLE's
+   * credential, and no token or password of ours rides the URL — which is why
+   * this is a handoff and not an embedded webview. The source's secrets are
+   * still loaded and spent: the capability authenticates its own lookup with
+   * them, which is why the capture below is guarded as carefully as a
+   * dispatching command's.
    *
    * BOTH HALVES of the capability are re-asked here, not trusted from the menu:
    * the tree's `.webConsole` marker gates WHICH rows offer the entry, but a

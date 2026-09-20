@@ -438,10 +438,14 @@ export interface InventoryProvider {
    * WEB CONSOLE — OPTIONAL. A URL for the USER'S BROWSER: the provider's own
    * web console for ONE device, keyed by the same `externalId` the other
    * members use. Nexus never fetches the returned URL; it hands it to
-   * `vscode.env.openExternal`, so the credential is whatever web session the
-   * browser already holds for that deployment — NOT the API token this method
-   * receives. An implementation MUST NOT embed a credential in the URL it
-   * returns: it is opened in an external browser and lands in history.
+   * `vscode.env.openExternal`, so the CONSOLE's credential is whatever web
+   * session the browser already holds for that deployment — not the secrets
+   * this method receives. Those are still real credentials in use: an
+   * implementation is expected to spend them on whatever provider-side lookup
+   * building the URL requires (a fresh location read, say), on the same
+   * transport and TLS terms as every other read. What it MUST NOT do is embed
+   * one in the URL it returns: that URL is opened in an external browser and
+   * lands in history.
    *
    * WHY IT EXISTS. A guest with no reachable address — no agent, no DHCP lease,
    * not yet booted — is a dead end in the tree: nothing to SSH to. Its
