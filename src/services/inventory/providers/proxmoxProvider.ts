@@ -256,15 +256,31 @@ export function parsePrimaryIpFamily(raw: unknown): PrimaryIpFamily {
 }
 
 function normalizeBaseUrl(raw: string): string {
-  // Trailing-slash trimming ONLY. The netbox copy this was taken from also
-  // strips a trailing "/api"; that strip is deliberately ABSENT here: NetBox's
-  // API lives under /api, so a pasted UI root gets trimmed there, but PVE's
-  // API root is /api2/json and a "/api" mount prefix is a legitimate
-  // reverse-proxy path (https://gateway.example/api) that must survive into
-  // every request. Consequence: https://pve.example/api and
-  // https://pve.example are DIFFERENT deployments (different instanceKeys) —
-  // correct, they are different mounts.
-  return raw.trim().replace(/\/+$/, "");
+  // PARSED, not string-trimmed: a base URL pasted from the PVE web UI commonly
+  // carries a fragment (`https://pve:8006/#v1:0:=qemu/100`) or a query string,
+  // and a preserved fragment absorbs the appended API path — the request would
+  // silently go to `/`. Search and hash are cleared, and userinfo is dropped
+  // (PVE authenticates with the API-token HEADER; pasted basic-auth must not
+  // silently become the transport credential). The PATHNAME survives: a
+  // reverse-proxy mount prefix (https://gateway.example/pve) is part of the
+  // deployment's address.
+  const trimmed = raw.trim().replace(/\/+$/, "");
+  try {
+    const url = new URL(trimmed);
+    url.search = "";
+    url.hash = "";
+    url.username = "";
+    url.password = "";
+    return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, "")}`;
+  } catch {
+    // Unparseable input passes through trimmed — request building fails later
+    // with the mapped error rather than guessing a repair here.
+    return trimmed;
+  }
+  // Deliberately NO "/api"-suffix strip (the netbox copy this came from has
+  // one): PVE's API root is /api2/json, and a "/api" mount prefix is a
+  // legitimate reverse-proxy path — https://gateway.example/api and
+  // https://gateway.example are DIFFERENT deployments (different instanceKeys).
 }
 
 /**

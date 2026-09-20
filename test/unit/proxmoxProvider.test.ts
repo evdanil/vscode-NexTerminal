@@ -434,6 +434,36 @@ describe("createProxmoxProvider", () => {
       expect(calls).toEqual(["https://gateway.example/api/api2/json/version"]);
     });
 
+    it("strips pasted URL STATE — a web-UI fragment or query must not absorb the appended API path (kills a string-trimming normalizer under which https://pve:8006/#v1:0:=qemu/100 sent every request to `/`, since the appended /api2/json/version landed INSIDE the fragment)", async () => {
+      const calls: string[] = [];
+      const fetchImpl = vi.fn(async (url: string) => {
+        calls.push(String(url));
+        return makeResponse(200, { data: { version: "9.2.11", release: "9.2" } });
+      });
+      const provider = createProxmoxProvider(fetchImpl as unknown as typeof fetch);
+
+      await expect(provider.testConnection({ baseUrl: "https://pve:8006/#v1:0:=qemu/100" }, SECRETS)).resolves.toBeUndefined();
+      await expect(provider.testConnection({ baseUrl: "https://pve:8006/?x=1#/y" }, SECRETS)).resolves.toBeUndefined();
+      await expect(provider.testConnection({ baseUrl: "https://gw.example/pve/?x=1" }, SECRETS)).resolves.toBeUndefined();
+      await expect(provider.testConnection({ baseUrl: "https://user:s3cr3t@pve:8006" }, SECRETS)).resolves.toBeUndefined();
+      expect(calls).toEqual([
+        "https://pve:8006/api2/json/version",
+        "https://pve:8006/api2/json/version",
+        "https://gw.example/pve/api2/json/version",
+        // PVE authenticates with the API-token header; pasted basic-auth must
+        // not silently become the transport credential.
+        "https://pve:8006/api2/json/version"
+      ]);
+      // ...and the persisted identity collapses the fragment spellings onto
+      // the same deployment, so a re-add after re-pasting without the fragment
+      // is still offered its adopted servers.
+      const provider2 = createProxmoxProvider(vi.fn() as unknown as typeof fetch);
+      expect(provider2.instanceKey?.({ baseUrl: "https://pve:8006/#v1:0:=qemu/100" })).toBe(
+        provider2.instanceKey?.({ baseUrl: "https://pve:8006" })
+      );
+      expect(calls.join("\n")).not.toContain("s3cr3t");
+    });
+
     it("maps an unauthenticated 401 to an auth error THAT NAMES THE TOKEN — PVE answers an empty body with the reason in the status line (kills a body-required parse that reports 'failed with HTTP 401: ' and nothing else)", async () => {
       const fetchImpl = vi.fn(async () => makeResponse(401, ""));
       const provider = createProxmoxProvider(fetchImpl as unknown as typeof fetch);
