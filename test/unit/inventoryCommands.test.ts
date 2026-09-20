@@ -77,17 +77,6 @@ vi.mock("vscode", () => ({
   Uri: {
     parse: (value: string) => ({ toString: () => value, value })
   },
-  // Module-load surface only. Reaching the shared http/https URL check pulls the
-  // macro/server command modules into the graph, and their tree items subclass
-  // these at module scope — this module calls none of them.
-  TreeItem: class {},
-  ThemeIcon: class {},
-  TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
-  EventEmitter: class {
-    public event = (): void => {};
-    public fire(): void {}
-    public dispose(): void {}
-  },
   ProgressLocation: { Notification: 15 },
   // Real enum values (Separator = -1, Default = 0) so the hub's separator row
   // is asserted against the same constant VS Code renders on.

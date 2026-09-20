@@ -53,7 +53,7 @@ import { mostCommonUsername } from "./configCommands";
 // The one http/https structural check every browser handoff in the extension
 // passes (server macros, the BMC web console) — shared rather than re-stated so
 // "a URL we may hand to the OS" means one thing everywhere.
-import { resolveMacroBrowserUrl } from "./serverMacroCommands";
+import { resolveMacroBrowserUrl } from "../utils/browserUrl";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 import { createInlineDeviceTemplateCreation } from "./inlineDeviceTemplateCreation";
 import { createInlineSavedFilterCreation } from "./inlineSavedFilterCreation";
