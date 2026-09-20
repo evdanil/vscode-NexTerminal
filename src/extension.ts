@@ -95,6 +95,7 @@ import { VscodeColorSchemeStorage } from "./storage/vscodeColorSchemeStorage";
 import { ColorSchemeService } from "./services/colorSchemeService";
 import { TerminalAppearancePanel } from "./ui/terminalAppearancePanel";
 import { tryRegisterResourceLabelFormatter } from "./services/sftp/resourceLabelFormatter";
+import type { ServerConfig } from "./models/config";
 import type { SftpServiceConfig } from "./services/sftp/sftpService";
 import type { SshConnectionOptions } from "./services/ssh/ssh2Connector";
 import { resolveScriptMaxRuntimeMs } from "./services/scripts/maxRuntime";
@@ -387,6 +388,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   inventoryProviderRegistry.register(createNetboxProvider());
   inventoryProviderRegistry.register(createEveNgProvider());
   inventoryProviderRegistry.register(createProxmoxProvider());
+
+  // WEB CONSOLE capability — the two-half question, asked of the capability
+  // rather than of a provider id: the PROVIDER half is whether `webConsoleUrl`
+  // exists at all (Proxmox yes, NetBox and EVE-NG no), the DEVICE half whether
+  // it applies to THIS record — Proxmox answers false for a cluster node, whose
+  // shell is not a guest's noVNC console and which its own `webConsoleUrl`
+  // refuses. An absent `canWebConsole` is taken at its word that every device of
+  // a capable provider qualifies. Deliberately NO status term: the console is
+  // what makes an addressless or unpolled guest manageable.
+  //
+  // ONE DEFINITION, TWO CONSUMERS — the tree's `.webConsole` marker (which gates
+  // the right-click entry and the Profile Actions entry) and the connect
+  // refusal's "Open Web Console" button. A second, hand-rolled copy of this
+  // question is how the menu and the message start disagreeing about a row.
+  const deviceOffersWebConsole = (providerId: string, externalId: string): boolean => {
+    const provider = inventoryProviderRegistry.get(providerId);
+    return provider !== undefined && provider.webConsoleUrl !== undefined && (provider.canWebConsole?.(externalId) ?? true);
+  };
+  // The same question asked of a SERVER, for the commands layer: a server is
+  // console-capable only through a live origin whose source still exists (a
+  // removed source leaves the origin behind, and it offers nothing).
+  const serverOffersWebConsole = (server: ServerConfig): boolean => {
+    const origin = server.origin;
+    if (!origin) {
+      return false;
+    }
+    const source = core.getInventorySource(origin.sourceId);
+    return source !== undefined && deviceOffersWebConsole(source.providerId, origin.externalId);
+  };
 
   const macroStore = new VscodeMacroStore(context);
   await macroStore.initialize();
@@ -756,7 +786,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     globalStoragePath,
     extensionPath: context.extensionPath,
     globalState: context.globalState,
-    sshDiagnostics
+    sshDiagnostics,
+    serverOffersWebConsole
   };
   const terminalRegistry = new TerminalRegistry(core);
   context.subscriptions.push(terminalRegistry);
@@ -913,18 +944,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     const provider = inventoryProviderRegistry.get(providerId);
     return provider !== undefined && provider.controlNode !== undefined && (provider.canControlNode?.(externalId) ?? true);
   },
-  // WEB CONSOLE — the same two-half question for the `.webConsole` marker, asked
-  // of the capability rather than of a provider id: the PROVIDER half is whether
-  // `webConsoleUrl` exists at all (Proxmox yes, NetBox and EVE-NG no), the DEVICE
-  // half whether it applies to THIS record — Proxmox answers false for a cluster
-  // node, whose shell is not a guest's noVNC console and which its own
-  // `webConsoleUrl` refuses. An absent `canWebConsole` is taken at its word that
-  // every device of a capable provider qualifies. Deliberately NO status term:
-  // the console is what makes an addressless or unpolled guest manageable.
-  (providerId, externalId) => {
-    const provider = inventoryProviderRegistry.get(providerId);
-    return provider !== undefined && provider.webConsoleUrl !== undefined && (provider.canWebConsole?.(externalId) ?? true);
-  });
+  // WEB CONSOLE — the `.webConsole` marker, from the shared capability predicate
+  // defined next to the provider registrations above.
+  deviceOffersWebConsole);
   const tunnelTreeProvider = new TunnelTreeProvider();
   const networkServerTreeProvider = new NetworkServerTreeProvider();
   // Core + registry so the Settings tree can render one row per inventory

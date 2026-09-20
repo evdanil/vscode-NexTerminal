@@ -62,3 +62,37 @@ describe("addresslessUnavailableMessage", () => {
     expect(message?.toLowerCase()).toContain("source");
   });
 });
+
+/**
+ * WEB CONSOLE VARIANT — for a device whose inventory source offers a browser
+ * console (a Proxmox guest with no qemu-guest-agent), the neutral message is
+ * actively wrong in every clause: the address is not missing "yet", the guest is
+ * not offline, and no amount of re-syncing will ever assign it one. The remedy
+ * that does exist — Open Web Console, which needs only vmid + node — goes
+ * unmentioned. The variant is OPT-IN on a capability the caller establishes,
+ * which is what keeps the default answer provider-neutral.
+ */
+describe("addresslessUnavailableMessage — web-console variant", () => {
+  it("points an addressless console-capable device at its web console instead of a re-sync (⊘ the neutral text tells the owner of an agentless guest to wait for an address that never arrives)", () => {
+    const message = addresslessUnavailableMessage(server({ addressless: true, host: "" }), { webConsoleAvailable: true });
+    expect(message).toContain("eve-r1");
+    expect(message?.toLowerCase()).toContain("web console");
+    // The three misleading clauses of the neutral text must all be gone.
+    expect(message).not.toMatch(/yet/i);
+    expect(message).not.toMatch(/offline/i);
+    expect(message).not.toMatch(/re-sync/i);
+  });
+
+  it("leaves the message UNCHANGED for an addressless device with no console — an IP-less NetBox row (⊘ mentioning a console the row does not have sends the user hunting for a button that is not there)", () => {
+    const neutral = addresslessUnavailableMessage(server({ addressless: true, host: "" }));
+    expect(addresslessUnavailableMessage(server({ addressless: true, host: "" }), {})).toBe(neutral);
+    expect(addresslessUnavailableMessage(server({ addressless: true, host: "" }), { webConsoleAvailable: false })).toBe(neutral);
+    // The neutral text is the one the other five call sites keep getting.
+    expect(neutral).toMatch(/re-sync the source/i);
+    expect(neutral).not.toMatch(/web console/i);
+  });
+
+  it("still says nothing for an ADDRESSED server even when a console is available (⊘ a capability-first read turns the guard into a blanket refusal for every console-capable guest that has an address)", () => {
+    expect(addresslessUnavailableMessage(server(), { webConsoleAvailable: true })).toBeUndefined();
+  });
+});

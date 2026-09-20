@@ -1,5 +1,6 @@
 import type * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
+import type { ServerConfig } from "../models/config";
 import type { TerminalLoggerFactory } from "../logging/terminalLogger";
 import type { SerialSidecarManager } from "../services/serial/serialSidecarManager";
 import type { SftpService } from "../services/sftp/sftpService";
@@ -92,4 +93,18 @@ export interface CommandContext {
   cwdSyncOutputChannel?: vscode.OutputChannel;
   /** Timestamped line sink for the "Nexus SSH" channel (transfers, UNC blocks). */
   sshDiagnostics?: (line: string) => void;
+  /**
+   * WEB CONSOLE capability — "does the inventory provider behind this server
+   * offer a browser console for THIS device". The commands layer cannot import
+   * the provider registry (the same layering reason the tree is handed a
+   * predicate for its `.webConsole` marker), so the answer crosses as a
+   * predicate wired in `extension.ts` from the SAME function that stamps the
+   * marker: the refusal a user reads and the menu entry they look for must
+   * never disagree about a row.
+   *
+   * OPTIONAL, and an absent predicate means "no console" — a host that does not
+   * supply one (every test harness) must not have console offers invented for
+   * it.
+   */
+  serverOffersWebConsole?: (server: ServerConfig) => boolean;
 }

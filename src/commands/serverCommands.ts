@@ -225,6 +225,9 @@ const DEPLOY_USE_STANDALONE_KEY_ACTION = "Use standalone key";
 const DEPLOY_USE_KEY_PROFILE_ACTION = "Use key auth profile";
 const DEPLOY_CREATE_KEY_PROFILE_ACTION = "Create new key auth profile...";
 const DEPLOY_REMOVE_STORED_PASSWORD_ACTION = "Remove stored password";
+// Spelled exactly as the command's own title in package.json, so the button on
+// the refusal and the entry in the menus read as one thing.
+const OPEN_WEB_CONSOLE_ACTION = "Open Web Console";
 
 function validateDeployKeyNameInput(value: string): string | null {
   const trimmed = value.trim();
@@ -1150,6 +1153,44 @@ async function connectTelnetServer(
   );
 }
 
+/**
+ * Show the addressless refusal as an ACTION rather than a mention: the whole gap
+ * this closes is that the console exists and the user never finds it, so the
+ * refusal carries the button that opens it. The server ID is passed rather than
+ * the click's `arg`, so the command re-resolves against live core (and the
+ * palette path, which has no `arg` at all, works identically).
+ *
+ * DETACHED ON PURPOSE — DO NOT `await` THIS, and do not make it return a promise
+ * that `connectServer` awaits. `showWarningMessage` does not settle until the
+ * notification is clicked or dismissed, and `connectServer` is awaited by callers
+ * that have work of their own to do afterwards: `connectAndAwaitSessionTerminal`
+ * (Run Macro on Server) and `connectAndRunScript` both await it before waiting on
+ * their own settle signal, and the URI handler awaits the `nexus.server.connect`
+ * command before opening SFTP. Signalling `onConnectFailed` does NOT release any
+ * of them — they are waiting on `connectServer`'s own promise — so awaiting the
+ * toast here hangs those commands for as long as the user leaves it on screen,
+ * which for an ignored notification is forever.
+ *
+ * Detaching costs the button nothing: VS Code keeps the notification and this
+ * handler alive after `connectServer` has returned, so a click minutes later
+ * still opens the console.
+ */
+function offerWebConsoleForAddressless(message: string, serverId: string): void {
+  const offer = (async () => {
+    const choice = await vscode.window.showWarningMessage(message, OPEN_WEB_CONSOLE_ACTION);
+    if (choice === OPEN_WEB_CONSOLE_ACTION) {
+      await vscode.commands.executeCommand("nexus.inventory.openWebConsole", serverId);
+    }
+  })();
+  // Nothing awaits `offer`, so a rejection out of the console command has no
+  // caller to surface it — without this it would be an unhandled rejection and
+  // the user would be left staring at a button that silently did nothing.
+  void offer.catch((error: unknown) => {
+    const detail = error instanceof Error ? error.message : String(error);
+    void vscode.window.showErrorMessage(`Could not open the web console: ${detail}`);
+  });
+}
+
 export async function connectServer(ctx: CommandContext, arg?: unknown, options: ConnectServerOptions = {}): Promise<void> {
   const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
   if (!server) {
@@ -1159,9 +1200,18 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
   // with no console address has nothing to connect to, so it must not reach the
   // SSH factory (prompt + vault + handshake to an empty host) or the telnet
   // path. This is the first thing checked, ahead of the protocol branch.
-  const addresslessMessage = addresslessUnavailableMessage(server);
+  //
+  // WEB CONSOLE — of the call sites sharing this guard, CONNECT is the one a
+  // console answers: the user clicked "open me a session on this device", and a
+  // browser console is another session on that device. A tunnel, a key deploy,
+  // an SFTP browse and a connection test all need an SSH transport that a
+  // console cannot supply, so they keep the neutral refusal rather than dangling
+  // an offer that would not help. The capability is asked of the host (see
+  // `CommandContext.serverOffersWebConsole`) because the commands layer cannot
+  // reach the provider registry; absent, the answer is "no console".
+  const offersWebConsole = ctx.serverOffersWebConsole?.(server) === true;
+  const addresslessMessage = addresslessUnavailableMessage(server, { webConsoleAvailable: offersWebConsole });
   if (addresslessMessage) {
-    void vscode.window.showInformationMessage(addresslessMessage);
     // REVIEW FINDING (P2) — signal the refusal, do not just return. A watchdog
     // wrapper (Run Macro on Server / Connect and Run Script) arms a 90s timer
     // and then awaits `onConnectFailed` (or a new session) to know the connect
@@ -1169,7 +1219,17 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
     // settle on, so it sits out the whole watchdog and then shows a MISLEADING
     // timeout. Firing `onConnectFailed` is the same signal a real initial-connect
     // failure raises (services/ssh/sshPty.ts), so the wrappers settle at once.
+    //
+    // FIRST, ahead of the notification below — the console offer is a button the
+    // user may leave on screen for minutes, and awaiting that click before
+    // signalling would put the watchdog's 90s timeout back exactly where this
+    // fixed it.
     options.onConnectFailed?.(addresslessMessage);
+    if (offersWebConsole) {
+      offerWebConsoleForAddressless(addresslessMessage, server.id);
+      return;
+    }
+    void vscode.window.showInformationMessage(addresslessMessage);
     return;
   }
   // TELNET (Phase 0) — branch BEFORE anything auth-shaped runs. A telnet server
