@@ -148,6 +148,59 @@ describe("validateInventoryStatusReport", () => {
     expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {}, clearedExternalIds: ["105", 42] })).toBeUndefined();
   });
 
+  // NOT-SYNCABLE REASONS — `notSyncableReasons`: why a device the source STILL
+  // LISTS is nonetheless absent from the tree's device set (Proxmox sends "it is
+  // now a template"). Purely advisory — the sync engine renders it on a pruned
+  // server's line and ignores it everywhere else — so a malformed entry DROPS
+  // (the console-field rule two blocks down) instead of rejecting a report whose
+  // statuses are perfectly good.
+  it("accepts an optional `notSyncableReasons` map and preserves it; a report without it is unchanged (⊘ stripping the field leaves the orphan popup unable to say a guest still exists and merely became a template)", () => {
+    const report: InventoryStatusReport = {
+      contractVersion: 1,
+      statuses: { "105": { state: "running" } },
+      clearedExternalIds: ["108"],
+      notSyncableReasons: { "108": "it is now a template" }
+    };
+    expect(validateInventoryStatusReport(report)).toEqual(report);
+    // Absent is fine and does not invent the field.
+    const none = validateInventoryStatusReport({ contractVersion: 1, statuses: {} });
+    expect(Object.prototype.hasOwnProperty.call(none!, "notSyncableReasons")).toBe(false);
+  });
+
+  it("DROPS a malformed `notSyncableReasons` — a non-object (array included) field, and entries whose key or value is not a non-empty string — while still returning the report (⊘ fail-closed here would blank a whole source's decorations over an advisory string, and trusting the shape would let a non-string reason reach the modal)", () => {
+    for (const bad of ["x", 7, true, null, ["108"]]) {
+      const result = validateInventoryStatusReport({
+        contractVersion: 1,
+        statuses: { "105": { state: "running" } },
+        notSyncableReasons: bad
+      });
+      expect(result).toBeDefined();
+      expect(result?.statuses).toEqual({ "105": { state: "running" } });
+      expect(Object.prototype.hasOwnProperty.call(result!, "notSyncableReasons")).toBe(false);
+    }
+    // Per-entry: the good entry survives its bad neighbours, unlike
+    // `clearedExternalIds`, whose one bad element poisons the whole report —
+    // that member is trusted to REMOVE state, this one only to explain.
+    const mixed = validateInventoryStatusReport({
+      contractVersion: 1,
+      statuses: {},
+      notSyncableReasons: { "108": "it is now a template", "109": 42, "110": "", "": "it is now a template" }
+    });
+    expect(mixed?.notSyncableReasons).toEqual({ "108": "it is now a template" });
+    // Nothing left to say ⇒ the field is omitted, the report's omission idiom.
+    const allBad = validateInventoryStatusReport({ contractVersion: 1, statuses: {}, notSyncableReasons: { "109": 42 } });
+    expect(Object.prototype.hasOwnProperty.call(allBad!, "notSyncableReasons")).toBe(false);
+  });
+
+  it("keeps a `__proto__` reason key as own data (⊘ writing it into a plain `{}` hits the inherited setter — the entry vanishes and a provider string lands on Object.prototype)", () => {
+    const raw = JSON.parse('{"contractVersion":1,"statuses":{},"notSyncableReasons":{"__proto__":"it is now a template","108":"it is now a template"}}');
+    const result = validateInventoryStatusReport(raw);
+    expect(result?.notSyncableReasons?.["108"]).toBe("it is now a template");
+    const descriptor = Object.getOwnPropertyDescriptor(result!.notSyncableReasons!, "__proto__");
+    expect(descriptor?.value).toBe("it is now a template");
+    expect(({} as Record<string, unknown>).__proto__).not.toBe("it is now a template");
+  });
+
   it("is prototype-pollution-safe AND preserves a __proto__ own key as real data (⊘ writing into a plain `{}` triggers the inherited setter — the entry is silently dropped and `state` leaks onto Object.prototype)", () => {
     const raw = JSON.parse('{"contractVersion":1,"statuses":{"__proto__":{"state":"running"},"real":{"state":"stopped"}}}');
     const result = validateInventoryStatusReport(raw);

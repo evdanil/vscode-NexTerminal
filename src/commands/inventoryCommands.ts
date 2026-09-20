@@ -1489,6 +1489,66 @@ function groupByAuthTarget(
 }
 
 /**
+ * How many servers a prune-reason line NAMES before it falls back to a count.
+ *
+ * Three, the cap this codebase already settled on for "names a reader can take
+ * in at a glance" (syncEngine's `namedExamples`, and the three-example
+ * `pushSkipSummary` those lines come from). Past it the render drops the names
+ * ENTIRELY rather than teasing with "e.g." as those warnings do: this is a modal
+ * the user is about to answer, not a scrollable buffer, and a partial list is
+ * the one thing a reader cannot act on — they still have to check whether their
+ * server is in the set, and now they have a wall of text too. The count plus the
+ * reason is the whole actionable fact; the names matter only while they are few
+ * enough to BE the set.
+ */
+const PRUNE_REASON_NAME_LIMIT = 3;
+
+/**
+ * PRUNE REASONS — the disclosure that a pruned server's device is STILL at the
+ * source, and why it stopped syncing (a Proxmox guest converted to a template).
+ * Without it the modal's prune line reads the same for a guest that was deleted
+ * and a guest that merely changed, which is the whole bug this renders away.
+ *
+ * Grouped BY REASON, not one line per server: a template sweep converts guests
+ * in batches, and five identical sentences say nothing the first one did not.
+ *
+ * Only servers that actually CARRY a reason are counted or named — never the
+ * policy's whole prune count. A sync that orphans two deleted guests and one
+ * converted one must not report three conversions, and naming the subset (or
+ * saying "N of them") is what keeps the mixed case honest.
+ */
+function pruneReasonLines(prunes: InventorySyncPlan["prunes"], policy: "orphan" | "delete" | "keep"): string[] {
+  // Insertion-ordered, so the reasons read in the order the plan pruned them.
+  const namesByReason = new Map<string, string[]>();
+  for (const prune of prunes) {
+    if (prune.policy !== policy || prune.reason === undefined) {
+      continue;
+    }
+    const existing = namesByReason.get(prune.reason);
+    if (existing !== undefined) {
+      existing.push(prune.server.name);
+    } else {
+      namesByReason.set(prune.reason, [prune.server.name]);
+    }
+  }
+  const lines: string[] = [];
+  for (const [reason, names] of namesByReason) {
+    const n = names.length;
+    // The reason is a fragment completing "… because <reason>" and is always
+    // phrased about ONE device ("it is now a template"), so the subject it
+    // attaches to stays singular in both branches — "it was" for one server,
+    // "each was" for several. Pluralizing the provider's fragment is not
+    // possible from here and is not the contract.
+    lines.push(
+      n <= PRUNE_REASON_NAME_LIMIT
+        ? `${names.map((name) => `"${name}"`).join(", ")} ${n === 1 ? "is" : "are"} still at the source — ${n === 1 ? "it was" : "each was"} not synced because ${reason}.`
+        : `${n} of them are still at the source — each was not synced because ${reason}.`
+    );
+  }
+  return lines;
+}
+
+/**
  * m1/m2 — full-sentence, singular/plural-correct rendering of a computed sync
  * plan for the confirm modal's `detail`.
  *
@@ -1710,14 +1770,19 @@ export function describePlanDetail(
     const orphanDestination = firstOrphan?.after.group;
     const orphanDestinationText = orphanDestination === undefined ? "the top level" : `"${orphanDestination}"`;
     lines.push(`${orphaned} server${orphaned === 1 ? "" : "s"} will be moved to ${orphanDestinationText}${hiddenSuffix}.`);
+    // Directly under the line it qualifies — "them" has to point at the servers
+    // just named, and only one prune policy is ever non-zero per sync.
+    lines.push(...pruneReasonLines(plan.prunes, "orphan"));
   }
   if (deleted > 0) {
     const pronoun = deleted === 1 ? "its" : "their";
     const passwordWord = deleted === 1 ? "password" : "passwords";
     lines.push(`${deleted} server${deleted === 1 ? "" : "s"} will be deleted, including ${pronoun} saved ${passwordWord}${hiddenSuffix}.`);
+    lines.push(...pruneReasonLines(plan.prunes, "delete"));
   }
   if (kept > 0) {
     lines.push(`${kept} server${kept === 1 ? "" : "s"} will be kept in place${hiddenSuffix}.`);
+    lines.push(...pruneReasonLines(plan.prunes, "keep"));
   }
   lines.push(`${plan.unchangedCount} server${plan.unchangedCount === 1 ? " is" : "s are"} unchanged.`);
   if (plan.warnings.length > 0) {

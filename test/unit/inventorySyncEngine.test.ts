@@ -6061,3 +6061,95 @@ describe("validateInventoryTree — telnet endpoint kind", () => {
     expect(plan.adds[0]).toEqual(expect.objectContaining({ host: "10.0.0.5", port: 2001, protocol: "telnet" }));
   });
 });
+
+/**
+ * PRUNE REASONS — the tree's status report may name, per externalId, WHY a
+ * device the source still lists is nonetheless absent from its device set (a
+ * Proxmox guest converted to a template). The engine's whole job with it is to
+ * carry the fragment onto the prune entry the pruned server produces; the field
+ * is advisory and must not touch WHICH servers are pruned.
+ */
+describe("computeSyncPlan — not-syncable prune reasons", () => {
+  const REASON = "it is now a template";
+
+  function treeWithReasons(reasons: unknown, devices: InventoryDevice[] = []): InventoryTree {
+    return {
+      contractVersion: 1,
+      devices,
+      status: { contractVersion: 1, statuses: {}, notSyncableReasons: reasons as Record<string, string> }
+    };
+  }
+
+  it("carries the reason onto the pruned entry under EVERY policy — orphan, delete and keep alike (kills an orphan-only carry, which leaves the user about to DELETE a server with no way to learn the guest behind it still exists)", () => {
+    for (const prunePolicy of ["orphan", "delete", "keep"] as const) {
+      const plan = computeSyncPlan({
+        source: makeSource({ prunePolicy }),
+        tree: treeWithReasons({ "device:1": REASON }),
+        currentServers: [makeOwnedServer()],
+        now: 1000
+      });
+      expect(plan.prunes).toHaveLength(1);
+      expect(plan.prunes[0]!.policy).toBe(prunePolicy);
+      expect(plan.prunes[0]!.reason).toBe(REASON);
+    }
+  });
+
+  it("leaves the prune SET, and every other field of the entries, untouched — a reason decorates, it never decides (kills any wiring that prunes, spares or re-policies a server because the source explained one)", () => {
+    const second = makeOwnedServer({
+      id: deterministicServerId("source-1", "device:2"),
+      name: "edge-sw-2",
+      host: "10.0.0.2",
+      origin: { sourceId: "source-1", externalId: "device:2", syncedAt: 1000 }
+    });
+    const present = makeDevice({ externalId: "device:3", name: "still-here", endpoints: [{ kind: "ssh", host: "10.0.0.3" }] });
+    const currentServers = [makeOwnedServer(), second];
+    const args = { source: makeSource({ prunePolicy: "orphan" as const }), currentServers, now: 1000 };
+    // A reason for a pruned device, a reason for a device that is STILL
+    // PRESENT (must prune nothing), and a reason for a device nobody owns.
+    const withReasons = computeSyncPlan({
+      ...args,
+      tree: treeWithReasons({ "device:1": REASON, "device:3": REASON, "device:99": REASON }, [present])
+    });
+    const without = computeSyncPlan({ ...args, tree: makeTree([present]) });
+    expect(withReasons.prunes.map((p) => `${p.policy}:${p.server.id}`)).toEqual(without.prunes.map((p) => `${p.policy}:${p.server.id}`));
+    expect(withReasons.prunes.map(({ reason, ...rest }) => rest)).toEqual(without.prunes);
+    expect(withReasons.unchangedCount).toBe(without.unchangedCount);
+    expect(withReasons.adds.map((s) => s.id)).toEqual(without.adds.map((s) => s.id));
+    expect(withReasons.warnings).toEqual(without.warnings);
+    // The reason that names a still-present device decorated nothing.
+    expect(withReasons.prunes.map((p) => p.server.origin?.externalId).sort()).toEqual(["device:1", "device:2"]);
+  });
+
+  it("ignores a malformed reasons payload instead of carrying (or throwing on) it — a non-object, an array, a non-string value, an empty value, an empty key (kills an unguarded `reasons[externalId]` read, which hands the modal a number to render inside its sentence)", () => {
+    const bad: unknown[] = ["nope", 7, true, null, ["device:1"], { "device:1": 42 }, { "device:1": "" }, { "device:1": { why: REASON } }];
+    for (const payload of bad) {
+      const plan = computeSyncPlan({
+        source: makeSource({ prunePolicy: "orphan" }),
+        tree: treeWithReasons(payload),
+        currentServers: [makeOwnedServer()],
+        now: 1000
+      });
+      expect(plan.prunes).toHaveLength(1);
+      expect(plan.prunes[0]!.reason).toBeUndefined();
+    }
+    // A good entry beside a bad one still lands: the map is filtered, not dropped.
+    const mixed = computeSyncPlan({
+      source: makeSource({ prunePolicy: "orphan" }),
+      tree: treeWithReasons({ "device:1": REASON, "device:2": 42 }),
+      currentServers: [makeOwnedServer()],
+      now: 1000
+    });
+    expect(mixed.prunes[0]!.reason).toBe(REASON);
+  });
+
+  it("carries nothing when the tree has no status report at all — the pre-feature shape (kills an engine that invents a reason, or dereferences a missing report, on every provider that supplies none)", () => {
+    const plan = computeSyncPlan({
+      source: makeSource({ prunePolicy: "orphan" }),
+      tree: makeTree([]),
+      currentServers: [makeOwnedServer()],
+      now: 1000
+    });
+    expect(plan.prunes).toHaveLength(1);
+    expect(Object.prototype.hasOwnProperty.call(plan.prunes[0]!, "reason")).toBe(false);
+  });
+});

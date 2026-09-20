@@ -44,6 +44,15 @@ const CONTROL_DEADLINE_MS = 120_000;
 const PROXMOX_API_BASE = "/api2/json";
 
 /**
+ * Why a converted guest stops syncing, as the sync's confirmation popup renders
+ * it: a sentence FRAGMENT completing "… because <reason>" (see
+ * `InventoryStatusReport.notSyncableReasons`), hence the lowercase start and the
+ * missing period. "now" is the load-bearing word — the guest is still on the
+ * cluster, it changed, which is precisely what a bare prune line cannot say.
+ */
+const TEMPLATE_NOT_SYNCABLE_REASON = "it is now a template";
+
+/**
  * INSECURE TLS — ONE definition of the option's name, used both as the config
  * field's label and inside the certificate-error hint that tells the user to go
  * turn it on. A message naming an option the form does not show is worse than
@@ -1450,6 +1459,10 @@ async function fetchInventoryImpl(
   // this loop OBSERVES so the sync can report the two stateless classes it
   // cannot decorate: converted templates and guests PVE cannot describe yet.
   const clearedExternalIds: string[] = [];
+  // THE SYNC'S REASON COLLECTION — the advisory half of the clears above: which
+  // of those ids belongs to a device the cluster STILL LISTS and will not sync.
+  // Only the template class qualifies (see the branch below).
+  const notSyncableReasons: Record<string, string> = {};
   // Running, non-template guests awaiting their address crawl. Templates never
   // crawl (no agent ever answers for one) and stopped guests cannot answer —
   // the crawl is the only per-guest fan-out this provider makes, so it is
@@ -1486,6 +1499,18 @@ async function fetchInventoryImpl(
     if (hasUsableVmid) {
       if (isTemplate) {
         clearedExternalIds.push(String(row.vmid));
+        // THE PRUNE REASON — the clear above retires the stale decoration; this
+        // says WHY, and it is the only thing that distinguishes "the guest was
+        // deleted" from "the guest is still here and became a template" in the
+        // sync's confirmation popup. Recorded on the SYNC path alone (see
+        // fetchStatusImpl for why the poll records none), and only for a
+        // template: the "unknown" branch below is PVE emitting a row before RRD
+        // data exists — transient, and calling it not-syncable would be a lie.
+        // With includeTemplates ON the row IS in the device set, so its server
+        // is never pruned and the advisory entry decorates nothing; the member's
+        // contract (models/inventory.ts) is exactly that an unpruned entry is
+        // ignored, so the branch needs no second opt-in test to stay truthful.
+        notSyncableReasons[String(row.vmid)] = TEMPLATE_NOT_SYNCABLE_REASON;
       } else if (row.status === "unknown" && isImportableGuestRow(row, true, false)) {
         // includeStopped is pinned TRUE here exactly as on the poll path —
         // observed is observed; the sync's device-set preference must not
@@ -1711,6 +1736,10 @@ async function fetchInventoryImpl(
   if (clearedExternalIds.length > 0) {
     statusReport.clearedExternalIds = clearedExternalIds;
   }
+  // Same omission idiom: with nothing to explain the member stays absent.
+  if (Object.keys(notSyncableReasons).length > 0) {
+    statusReport.notSyncableReasons = notSyncableReasons;
+  }
   if (capTripped || statusCapped || joinFailed) {
     statusReport.truncated = true;
   }
@@ -1882,6 +1911,16 @@ async function fetchStatusImpl(
     // isImportableGuestRow still honors includeTemplates there — and the sync
     // collects the same clears for its own tree report (see
     // fetchInventoryImpl's loop).
+    //
+    // NO `notSyncableReasons` HERE, deliberately, where the sync's twin of this
+    // branch records one. That member exists to be rendered on a PRUNE entry,
+    // and only `computeSyncPlan` renders it — from the TREE's report
+    // (`InventoryTree.status`), which is the sync's. This report goes to
+    // `applyInventoryStatus`, which reads `statuses` and `clearedExternalIds`
+    // and nothing else, and the poll never prunes anything. An entry written
+    // here could therefore never be read by anyone: it would be a field shipped
+    // on every poll for no reader. The clears are the asymmetry that IS real —
+    // they retire a stale decoration, which is the poll's whole job.
     const isTemplate = row.template === 1;
     if (!isTemplate && !isImportableGuestRow(row, true, false)) {
       // includeStopped is pinned TRUE — on the STATUS call only; the sync

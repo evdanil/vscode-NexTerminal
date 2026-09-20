@@ -186,6 +186,29 @@ export interface InventoryStatusReport {
   // like a guest whose state PVE no longer reports, must lose its stale
   // decoration even on a report that merges.
   clearedExternalIds?: string[];
+  // NOT-SYNCABLE REASONS — externalId → a short reason why a device the source
+  // STILL LISTS is nonetheless absent from this fetch's device set. Named for
+  // what it explains rather than for what it clears, because it is the sibling
+  // of `clearedExternalIds` and not a second spelling of it: that member says an
+  // id has no status, this one says the device behind the id will not sync.
+  // - The value is a sentence FRAGMENT completing "… because <reason>" — e.g.
+  //   "it is now a template". Lowercase start, no trailing period.
+  // - It describes a device the source CAN still see and will not sync. A device
+  //   that VANISHED has no entry: absence is exactly what distinguishes the two,
+  //   which is the whole point of the member.
+  // - ADVISORY. `computeSyncPlan` renders it on the prune entry of a server
+  //   whose device is pruned, and ignores it otherwise; nothing about pruning,
+  //   clearing or status application changes because an entry exists. An entry
+  //   for a device that is NOT pruned (an id still in the device set, an id
+  //   nobody owns) decorates nothing.
+  // - Optional and additive: a provider that never sets it behaves exactly as
+  //   before, and no consumer may require it.
+  // Because it only ever EXPLAINS, a malformed entry is DROPPED by
+  // `validateInventoryStatusReport` rather than failing the report the way a
+  // malformed `clearedExternalIds` does — the console-field rule in that
+  // function, for the same reason: blanking a source's decorations over an
+  // advisory string costs more than losing the string.
+  notSyncableReasons?: Record<string, string>;
 }
 
 export type InventoryConfigFieldType = "string" | "password" | "number" | "boolean" | "select";
@@ -532,6 +555,11 @@ export function validateInventoryStatusReport(raw: unknown): InventoryStatusRepo
       }
     }
   }
+  // NOT-SYNCABLE REASONS — normalized HERE (beside the cleared guard it
+  // qualifies) and assigned below, so the one shape decision lives in one place.
+  // Unlike the clears above it never rejects the report: see
+  // `normalizeNotSyncableReasons`.
+  const notSyncableReasons = normalizeNotSyncableReasons(obj.notSyncableReasons);
   const statuses = obj.statuses;
   // A plain object, not an array (Array is typeof "object") and not null.
   if (typeof statuses !== "object" || statuses === null || Array.isArray(statuses)) {
@@ -582,7 +610,49 @@ export function validateInventoryStatusReport(raw: unknown): InventoryStatusRepo
   if (Array.isArray(obj.clearedExternalIds)) {
     result.clearedExternalIds = obj.clearedExternalIds as string[];
   }
+  // Preserve the reason map only when something survived normalization. An
+  // empty map explains nothing, so it is omitted rather than preserved (where
+  // the cleared list preserves its empty array): absent and empty are the same
+  // downstream, and omitting keeps the validated report the minimal shape the
+  // provider tests assert against.
+  if (notSyncableReasons !== undefined) {
+    result.notSyncableReasons = notSyncableReasons;
+  }
   return result;
+}
+
+/**
+ * NOT-SYNCABLE REASONS — the ONE definition of "a usable reason map", shared by
+ * `validateInventoryStatusReport` and by `computeSyncPlan` (which reads the
+ * TREE's report, a provider value no validator has been past).
+ *
+ * DROPS rather than rejects: the member is advisory — it only ever explains a
+ * prune the engine was making anyway — so one quirky entry must not cost a
+ * source its decorations (the `clearedExternalIds` rule, which IS trusted to
+ * remove state) nor abort a sync whose devices are fine. A non-object (an array
+ * included: entries would read as "0" → the element) yields undefined; entries
+ * whose key or value is not a non-empty string are skipped; an all-bad or empty
+ * map yields undefined so callers need no empty-case branch.
+ *
+ * Built on a null-prototype object for the reason the statuses map is: a reason
+ * keyed `__proto__` (as JSON.parse can produce) must land as ordinary own data
+ * instead of hitting the inherited setter, which would drop the entry and leak a
+ * provider string onto `Object.prototype`.
+ */
+export function normalizeNotSyncableReasons(raw: unknown): Record<string, string> | undefined {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    return undefined;
+  }
+  const normalized: Record<string, string> = Object.create(null);
+  let any = false;
+  for (const [externalId, reason] of Object.entries(raw as Record<string, unknown>)) {
+    if (externalId.length === 0 || typeof reason !== "string" || reason.length === 0) {
+      continue;
+    }
+    normalized[externalId] = reason;
+    any = true;
+  }
+  return any ? normalized : undefined;
 }
 
 /**

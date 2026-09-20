@@ -10652,3 +10652,72 @@ describe("nexus.inventory.syncNow — the sync applies the fetched lab status", 
     expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("stopped"); // ...and the status still landed
   });
 });
+
+/**
+ * PRUNE REASONS in the confirm modal — a guest converted to a Proxmox template
+ * is pruned exactly like a guest that was deleted, and until the engine started
+ * carrying `notSyncableReasons` onto the prune entry the modal could not tell
+ * the two apart. These pin the rendered sentences, because the whole feature IS
+ * the sentence.
+ */
+describe("describePlanDetail — pruned servers whose device is still at the source", () => {
+  const REASON = "it is now a template";
+
+  function orphanPrune(name: string, reason?: string) {
+    const server = makeServer({ id: `owned-${name}`, name, group: "Proxmox" });
+    const entry = { policy: "orphan" as const, server, after: { ...server, group: "Proxmox/_orphaned" } };
+    return reason === undefined ? entry : { ...entry, reason };
+  }
+
+  it("names the ONE converted guest and its reason under the orphan line (kills the shipped line, which says only that a server moved and leaves 'deleted upstream' as the only reading)", () => {
+    const detail = describePlanDetail(makeSyncPlan({ prunes: [orphanPrune("idm.defcon.local", REASON)] }), []);
+    expect(detail).toContain('1 server will be moved to "Proxmox/_orphaned".');
+    expect(detail).toContain('"idm.defcon.local" is still at the source — it was not synced because it is now a template.');
+  });
+
+  it("groups servers that share a reason onto ONE named line (kills a line per server, which turns a five-guest template sweep into a wall of identical sentences)", () => {
+    const detail = describePlanDetail(
+      makeSyncPlan({ prunes: [orphanPrune("idm", REASON), orphanPrune("vault", REASON), orphanPrune("ns1", REASON)] }),
+      []
+    );
+    expect(detail).toContain('3 servers will be moved to "Proxmox/_orphaned".');
+    expect(detail).toContain('"idm", "vault", "ns1" are still at the source — each was not synced because it is now a template.');
+    expect(detail.split("\n").filter((l) => l.includes("still at the source"))).toHaveLength(1);
+  });
+
+  it("does NOT overclaim when only SOME pruned servers have a reason — the named subset is the whole claim (kills a line counting every prune, which would tell the user two deleted guests became templates)", () => {
+    const detail = describePlanDetail(
+      makeSyncPlan({ prunes: [orphanPrune("idm.defcon.local", REASON), orphanPrune("gone-1"), orphanPrune("gone-2")] }),
+      []
+    );
+    expect(detail).toContain('3 servers will be moved to "Proxmox/_orphaned".');
+    expect(detail).toContain('"idm.defcon.local" is still at the source — it was not synced because it is now a template.');
+    expect(detail).not.toContain("gone-1");
+    expect(detail).not.toContain("3 of them");
+  });
+
+  it("falls back to a counted aggregate past three names, and keeps one line per distinct reason (kills a modal that lists twenty names, and a render that folds two different explanations into one)", () => {
+    const many = Array.from({ length: 5 }, (_, i) => orphanPrune(`tpl-${i}`, REASON));
+    const detail = describePlanDetail(makeSyncPlan({ prunes: [...many, orphanPrune("iso-1", "it is an ISO image")] }), []);
+    expect(detail).toContain("5 of them are still at the source — each was not synced because it is now a template.");
+    expect(detail).toContain('"iso-1" is still at the source — it was not synced because it is an ISO image.');
+    expect(detail).not.toContain("tpl-0");
+  });
+
+  it("renders the same disclosure on the DELETE and KEEP lines (kills an orphan-only render — the user about to lose a server permanently is the one who most needs to know the guest still exists)", () => {
+    const deleteServer = makeServer({ id: "owned-d", name: "idm.defcon.local" });
+    const deleteDetail = describePlanDetail(makeSyncPlan({ prunes: [{ policy: "delete", server: deleteServer, reason: REASON }] }), []);
+    expect(deleteDetail).toContain("1 server will be deleted, including its saved password.");
+    expect(deleteDetail).toContain('"idm.defcon.local" is still at the source — it was not synced because it is now a template.');
+
+    const keepDetail = describePlanDetail(makeSyncPlan({ prunes: [{ policy: "keep", server: deleteServer, reason: REASON }] }), []);
+    expect(keepDetail).toContain("1 server will be kept in place.");
+    expect(keepDetail).toContain('"idm.defcon.local" is still at the source — it was not synced because it is now a template.');
+  });
+
+  it("says nothing extra for a plain deletion — no reasons, no line (kills a render that invents an explanation for a guest that really did vanish)", () => {
+    const detail = describePlanDetail(makeSyncPlan({ prunes: [orphanPrune("gone-1"), orphanPrune("gone-2")] }), []);
+    expect(detail).toContain('2 servers will be moved to "Proxmox/_orphaned".');
+    expect(detail).not.toContain("still at the source");
+  });
+});

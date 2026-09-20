@@ -791,7 +791,10 @@ describe("createProxmoxProvider", () => {
           "105": { state: "running" },
           "114": { state: "stopped" }
         },
-        clearedExternalIds: ["106", "118"]
+        clearedExternalIds: ["106", "118"],
+        // The template's clear carries its explanation; the "unknown" row's
+        // does not (pinned on its own below).
+        notSyncableReasons: { "106": "it is now a template" }
       });
       // Complete listing ⇒ clear-then-apply is correct (it drops decorations
       // for guests that vanished), so the flag must be ABSENT, not false —
@@ -805,7 +808,8 @@ describe("createProxmoxProvider", () => {
       expect(excluded.tree.status).toEqual({
         contractVersion: 1,
         statuses: {},
-        clearedExternalIds: ["105"]
+        clearedExternalIds: ["105"],
+        notSyncableReasons: { "105": "it is now a template" }
       });
       expect(excluded.tree.devices).toEqual([]);
     });
@@ -878,6 +882,27 @@ describe("createProxmoxProvider", () => {
         statuses: {},
         clearedExternalIds: ["118"]
       });
+    });
+
+    // THE PRUNE REASON — a guest converted to a template is still THERE, and
+    // the sync's clear alone cannot say so: the orphan/delete popup reads
+    // identically for a guest that was deleted. `notSyncableReasons` is the
+    // sentence fragment that tells the two apart.
+    it("names the REASON a template row no longer syncs and records NONE for an observed 'unknown' row — the vmid rides `notSyncableReasons` beside its clear, while a pre-RRD guest gets no entry (kills a popup that cannot tell a converted guest from a deleted one, and kills calling a guest PVE simply cannot describe yet 'not syncable')", async () => {
+      const { tree } = await syncRows([
+        guestRow(),
+        guestRow({ vmid: 106, name: "gold-image", template: 1 }),
+        guestRow({ vmid: 118, name: "hatchling", status: "unknown" })
+      ]);
+      // BOTH still clear — the reason explains one of them, it does not gate
+      // the clear (the two members answer different questions).
+      expect(tree.status?.clearedExternalIds).toEqual(["106", "118"]);
+      expect(tree.status?.notSyncableReasons).toEqual({ "106": "it is now a template" });
+      // The REAL downstream gate accepts the new member.
+      expect(validateInventoryStatusReport(tree.status)).toBeDefined();
+      // Nothing to explain ⇒ the field is absent, the report's omission idiom.
+      const plain = await syncRows([guestRow()]);
+      expect(Object.prototype.hasOwnProperty.call(plain.tree.status!, "notSyncableReasons")).toBe(false);
     });
 
     it("attaches the report even when there is nothing to say — an empty cluster yields an empty statuses object, no cleared list, no truncated (kills a conditional attach, which would reopen the gap the report closed: the ordinary sync must never leave tree.status unfilled)", async () => {
@@ -1964,6 +1989,15 @@ describe("createProxmoxProvider", () => {
       expect(off.report.statuses).toEqual({ "105": { state: "running" } });
       expect(off.report.clearedExternalIds).toEqual(["106", "107"]);
       expect(validateInventoryStatusReport(off.report)).toBeDefined();
+    });
+
+    it("carries NO `notSyncableReasons` on the POLL path — only the SYNC's tree report reaches computeSyncPlan, and applyInventoryStatus never reads the member, so an entry here could never be rendered anywhere (kills a copy of the sync branch that ships a field nothing can read)", async () => {
+      const { report } = await pollStatus(
+        { [RESOURCES]: { body: { data: [guestRow({ vmid: 106, name: "gold-image", template: 1 }), guestRow()] } } },
+        { baseUrl: BASE }
+      );
+      expect(report.clearedExternalIds).toEqual(["106"]);
+      expect(Object.prototype.hasOwnProperty.call(report, "notSyncableReasons")).toBe(false);
     });
 
     it("clears the converted template in a TRUNCATED (join-failure) report — the vmid rides `clearedExternalIds` so the MERGING apply removes the pre-conversion 'running' instead of retaining it, while the node statuses stay absent-and-retained (the Task-5 ruling: merge protects only what the report OMITS — an explicitly cleared entry is not omitted, it is asserted gone; the engine-side proof that the apply removes the stale status lives in nexusCoreInventory.test.ts) (kills the round-2 stopped-reporting shape, whose template entry is gone from statuses here)", async () => {
