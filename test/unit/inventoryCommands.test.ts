@@ -8548,6 +8548,35 @@ describe("inventoryCommands", () => {
       }
     });
 
+    /**
+     * AN ID IS NOT AN IDENTITY. A replace-mode restore (backup import, reset)
+     * removes and recreates a source under the SAME id, and those paths are
+     * global — they serialize on `configMutationLock` and bypass the command's
+     * per-source claim entirely, so nothing stops one landing inside the
+     * re-check's window. An existence-only guard accepts the replacement and
+     * refreshes status under a different deployment's configuration and
+     * credentials. `revision` is the codebase's own incarnation marker (minted
+     * fresh on EVERY write through `addOrUpdateInventorySource`, which is what
+     * the restore paths call) and is what the node-control capture already
+     * compares under the lock; the pending re-check compares it too.
+     */
+    it("a pending re-check is DROPPED when its source was REPLACED under the same id in the meantime (⊘ an existence-only guard sees the recreated record, accepts it, and refreshes status against a different deployment's config and credentials)", async () => {
+      vi.useFakeTimers();
+      try {
+        const { start, server, core } = await setup();
+        await start({ server });
+        const controlledRevision = core.getInventorySource("src-1")!.revision;
+        await core.removeInventorySource("src-1");
+        await core.addOrUpdateInventorySource(makeSource({ id: "src-1", secretFieldIds: [] }));
+        // The premise of the guard: a recreated record is a NEW incarnation.
+        expect(core.getInventorySource("src-1")!.revision).not.toBe(controlledRevision);
+        await vi.advanceTimersByTimeAsync(NODE_CONTROL_STATUS_RECHECK_MS * 4);
+        expect(statusRefreshArgs().filter((arg) => typeof arg === "object")).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it("DISPOSING the commands cancels a pending re-check, so no timer outlives the extension host (⊘ a stray timer wakes up after deactivate and fires a command into a disposed extension)", async () => {
       vi.useFakeTimers();
       try {

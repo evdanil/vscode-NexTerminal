@@ -2472,14 +2472,29 @@ export function registerInventoryCommands(
    *  - it does not OUTLIVE the extension — the disposable returned alongside the
    *    commands clears every pending timer, so nothing wakes up after
    *    deactivate to fire a command into a disposed extension host;
-   *  - it does not fire for a source that is GONE — the source is re-read when
-   *    the timer fires, five seconds being ample for a Remove Source in between.
+   *  - it does not fire for a source that is GONE, nor for a DIFFERENT record
+   *    wearing the same id — the source is re-read when the timer fires and its
+   *    incarnation is compared, five seconds being ample for a Remove Source or
+   *    a replace-mode restore in between.
    *
    * Uses the global `setTimeout` so the unit tests drive it with fake timers.
    */
   const pendingStatusRechecks = new Map<string, ReturnType<typeof setTimeout>>();
 
-  const scheduleStatusRecheck = (sourceId: string): void => {
+  /**
+   * `revision` is the discriminator, not the id. A backup import in replace mode
+   * (and Delete All Data followed by a restore) removes a source and recreates it
+   * under the SAME id, pointing at a different deployment with different
+   * credentials — and both paths are GLOBAL config mutations that serialize only
+   * on `configMutationLock`, so the per-source claim this command takes does not
+   * hold them off and one can land inside the five-second window. An
+   * existence-only re-read would accept the replacement and refresh status for a
+   * record the user never acted on. `addOrUpdateInventorySource` mints a fresh
+   * revision on every write — it is the codebase's own notion of a new
+   * incarnation of a record, and what the dispatch capture above compares under
+   * the lock — so the same comparison settles it here.
+   */
+  const scheduleStatusRecheck = (sourceId: string, revision: string | undefined): void => {
     const pending = pendingStatusRechecks.get(sourceId);
     if (pending !== undefined) {
       clearTimeout(pending);
@@ -2488,7 +2503,11 @@ export function registerInventoryCommands(
       sourceId,
       setTimeout(() => {
         pendingStatusRechecks.delete(sourceId);
-        if (core.getInventorySource(sourceId) === undefined) {
+        const live = core.getInventorySource(sourceId);
+        if (live === undefined) {
+          return;
+        }
+        if (live.revision !== revision) {
           return;
         }
         // The POLL form (`__poll`), not the manual one: nobody is waiting on
@@ -5494,7 +5513,9 @@ export function registerInventoryCommands(
     // the case that resolves immediately; the delayed re-check is what covers the
     // rest.
     void vscode.commands.executeCommand("nexus.inventory.refreshStatus", source.id);
-    scheduleStatusRecheck(source.id);
+    // `startRevision` — the incarnation this action was dispatched against, which
+    // the under-lock capture proved was still live at dispatch time.
+    scheduleStatusRecheck(source.id, startRevision);
   }
 
   /**
