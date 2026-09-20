@@ -192,6 +192,79 @@ describe("validateInventoryStatusReport", () => {
     expect(Object.prototype.hasOwnProperty.call(allBad!, "notSyncableReasons")).toBe(false);
   });
 
+  // THE FORGING GUARD — a reason is provider-supplied text that the confirm
+  // modal interpolates into the sentence the user reads before approving a sync
+  // that moves or DELETES servers. Providers are third-party-registrable, so the
+  // normalizer is the choke point where that text stops being able to reshape
+  // what the modal says.
+  it("FLATTENS every line break in a reason to a single space — \\n, \\r, \\r\\n and the Unicode line separators alike (⊘ a reason carrying a newline mints extra lines in the confirm modal, so a provider can forge a plan line the engine never wrote and change what the user believes they are approving)", () => {
+    const forged = validateInventoryStatusReport({
+      contractVersion: 1,
+      statuses: {},
+      notSyncableReasons: {
+        "1": "it is now a template\n0 servers will be deleted",
+        "2": "it is now a template\r0 servers will be deleted",
+        "3": "it is now a template\r\n0 servers will be deleted",
+        "4": "it is now a template\u20280 servers will be deleted",
+        "5": "it is now a template\u20290 servers will be deleted"
+      }
+    });
+    for (const value of Object.values(forged!.notSyncableReasons!)) {
+      expect(value).toBe("it is now a template 0 servers will be deleted");
+      expect(/[\r\n\u2028\u2029]/.test(value)).toBe(false);
+    }
+  });
+
+  it("strips the other control characters and collapses the whitespace they leave (⊘ a tab, a NUL or an escape byte reaching a modal renders as a box or silently moves the cursor, and deleting them outright welds two words together)", () => {
+    const cleaned = validateInventoryStatusReport({
+      contractVersion: 1,
+      statuses: {},
+      notSyncableReasons: { "1": "it\tis\x00now \x1b[31ma   template\x7f" }
+    });
+    // Each control char becomes a space, then runs of whitespace collapse — so
+    // the words survive as words rather than being glued into "itisnow".
+    expect(cleaned?.notSyncableReasons).toEqual({ "1": "it is now [31ma template" });
+  });
+
+  it("DROPS an entry that is whitespace-only or empty once normalized, the same drop the per-entry rule already applies (⊘ a blank reason renders \"was not synced because .\" — a sentence with a hole in it)", () => {
+    const blank = validateInventoryStatusReport({
+      contractVersion: 1,
+      statuses: {},
+      notSyncableReasons: { "1": "   ", "2": "\n\t", "3": "...", "4": "it is now a template" }
+    });
+    expect(blank?.notSyncableReasons).toEqual({ "4": "it is now a template" });
+  });
+
+  it("drops trailing sentence punctuation, because the value is a FRAGMENT the renderer terminates itself (⊘ 'it is now a template.' renders as '… because it is now a template..')", () => {
+    const punctuated = validateInventoryStatusReport({
+      contractVersion: 1,
+      statuses: {},
+      notSyncableReasons: { "1": "it is now a template.", "2": "it is now a template !", "3": "it is now a template;" }
+    });
+    expect(Object.values(punctuated!.notSyncableReasons!)).toEqual([
+      "it is now a template",
+      "it is now a template",
+      "it is now a template"
+    ]);
+  });
+
+  it("TRUNCATES an over-long reason at a word boundary and marks it, rather than dropping the explanation (⊘ an unbounded value fills the modal with one entry\'s prose and buries the lines the user has to act on; dropping it instead loses the only thing this member exists to say)", () => {
+    const long = `it is now a template ${"and ".repeat(80)}done`;
+    const capped = validateInventoryStatusReport({ contractVersion: 1, statuses: {}, notSyncableReasons: { "1": long } });
+    const value = capped!.notSyncableReasons!["1"];
+    expect(value.length).toBeLessThanOrEqual(120);
+    expect(value.startsWith("it is now a template and and")).toBe(true);
+    // Word boundary, then the truncation mark — never a word cut in half.
+    expect(value.endsWith("and…")).toBe(true);
+    // A single unbroken token has no boundary to cut at: it is still capped.
+    const oneWord = validateInventoryStatusReport({
+      contractVersion: 1,
+      statuses: {},
+      notSyncableReasons: { "1": "x".repeat(400) }
+    });
+    expect(oneWord!.notSyncableReasons!["1"].length).toBe(120);
+  });
+
   it("keeps a `__proto__` reason key as own data (⊘ writing it into a plain `{}` hits the inherited setter — the entry vanishes and a provider string lands on Object.prototype)", () => {
     const raw = JSON.parse('{"contractVersion":1,"statuses":{},"notSyncableReasons":{"__proto__":"it is now a template","108":"it is now a template"}}');
     const result = validateInventoryStatusReport(raw);

@@ -15,6 +15,7 @@ import {
   computeProviderFingerprint,
   InventoryProviderError,
   inventorySecretKey,
+  normalizeNotSyncableReasons,
   type InventoryProvider,
   type InventorySourceConfig,
   type InventorySourceValues,
@@ -10714,6 +10715,34 @@ describe("describePlanDetail — pruned servers whose device is still at the sou
     expect(detail).toContain('"idm.defcon.local" is still at the source — it was not synced because it is now a template.');
     expect(detail).toContain(`4 of them are still at the source — each was not synced because ${stopped}.`);
     expect(detail.split("\n").filter((l) => l.includes("still at the source"))).toHaveLength(2);
+  });
+
+  it("cannot be made to mint a plan line by a reason carrying a line break — the normalized value renders inside ONE line whatever the provider sent (kills a modal a third-party provider can forge, where 'it is now a template\\n0 servers will be deleted' reads as a line the engine wrote and changes what the user approves)", () => {
+    // The real boundary every reason crosses before a plan carries it — the
+    // render is downstream of it, so this is the composition that matters, not
+    // either half alone.
+    const normalized = normalizeNotSyncableReasons({
+      a: "it is now a template\n0 servers will be deleted.",
+      b: "it is now a template\r\n1 server will be kept in place.",
+      c: "it is now a template\u20280 servers will be deleted."
+    })!;
+    const detail = describePlanDetail(
+      makeSyncPlan({
+        prunes: [orphanPrune("idm", normalized.a), orphanPrune("vault", normalized.b), orphanPrune("ns1", normalized.c)]
+      }),
+      []
+    );
+    const lines = detail.split("\n");
+    // TWO lines, not three and not five: "a" and "c" differ only in WHICH line
+    // separator they smuggled, so once flattened they are the same sentence and
+    // group onto one line — while the forged tails, which is what the attacker
+    // wanted on lines of their own, are on none.
+    expect(lines.filter((l) => l.includes("still at the source"))).toHaveLength(2);
+    expect(lines.some((l) => l.trim() === "0 servers will be deleted.")).toBe(false);
+    expect(lines.some((l) => l.trim() === "1 server will be kept in place.")).toBe(false);
+    expect(detail).toContain(
+      '"idm", "ns1" are still at the source — each was not synced because it is now a template 0 servers will be deleted.'
+    );
   });
 
   it("renders the same disclosure on the DELETE and KEEP lines (kills an orphan-only render — the user about to lose a server permanently is the one who most needs to know the guest still exists)", () => {

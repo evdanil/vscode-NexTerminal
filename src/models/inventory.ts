@@ -192,7 +192,17 @@ export interface InventoryStatusReport {
   // of `clearedExternalIds` and not a second spelling of it: that member says an
   // id has no status, this one says the device behind the id will not sync.
   // - The value is a sentence FRAGMENT completing "… because <reason>" — e.g.
-  //   "it is now a template". Lowercase start, no trailing period.
+  //   "it is now a template". It must read mid-sentence: no trailing period (the
+  //   renderer writes one), and no leading capital unless the first word is a
+  //   proper noun, as in "Proxmox does not report it as running…".
+  // - IT IS UNTRUSTED TEXT, and the contract it is held to is ENFORCED, not
+  //   merely documented: `normalizeNotSyncableReasons` flattens every line break
+  //   and control character to a space, collapses whitespace, drops trailing
+  //   sentence punctuation, caps the value at 120 characters (cut at a word
+  //   boundary, marked with an ellipsis) and drops an entry left empty. A
+  //   provider gets to say WHY a device will not sync; it does not get to shape
+  //   the confirmation dialog, and a newline in this string would otherwise mint
+  //   a line the user reads as one the engine wrote.
   // - It describes a device the source CAN still see and will not sync. A device
   //   that VANISHED has no entry: absence is exactly what distinguishes the two,
   //   which is the whole point of the member.
@@ -622,6 +632,75 @@ export function validateInventoryStatusReport(raw: unknown): InventoryStatusRepo
 }
 
 /**
+ * Characters a reason may never carry into the modal, each replaced by a SPACE
+ * (never deleted: deletion welds the neighbouring words together, which is its
+ * own small lie about what the provider said).
+ *
+ * The C0 range and DEL, expressed as the terminal capture buffer expresses them
+ * — with one deliberate difference. That buffer keeps `\t`, `\n` and `\r`
+ * because it is line-based and those characters ARE its structure; a reason is a
+ * single sentence fragment, so for it they are exactly the threat: a line break
+ * is what lets a provider forge a plan line. U+2028/U+2029 join them because
+ * they are line terminators too, and the bidi controls because they reorder how
+ * a sentence RENDERS without changing what it contains — an invisible way to
+ * make the modal read differently from the text that was approved. None of them
+ * has any business in a fragment that completes "… because <reason>".
+ */
+const REASON_UNSAFE_CHAR_RE = /[\x00-\x1f\x7f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+
+/**
+ * Trailing sentence punctuation, dropped because the value is a FRAGMENT: the
+ * renderer writes the closing period itself, so "it is now a template." would
+ * render as "… because it is now a template..". NORMALIZED rather than rejected
+ * — a provider that ends its sentence properly has written a perfectly good
+ * explanation, and this function's job is to make values usable, not to fail
+ * them over typography.
+ */
+const REASON_TRAILING_PUNCTUATION_RE = /[.!?;,\s]+$/;
+
+/**
+ * Longest reason the modal renders in full.
+ *
+ * The line it lands in is already "<up to three quoted names> are still at the
+ * source — each was not synced because <reason>." — roughly 60 characters of
+ * frame plus the names, so 120 keeps the whole sentence inside a few wrapped
+ * lines of a dialog the user has to read past to reach the buttons. It is also
+ * comfortably above anything a real fragment needs: the longest this codebase
+ * ships is 71 characters, so the cap bites only on prose that was never an
+ * explanation — a stack trace or an error body pasted into the field.
+ *
+ * TRUNCATE rather than drop: the explanation is the entire point of the member,
+ * and its first clause is usually the useful part, so keeping a marked prefix
+ * beats replacing it with silence. The cut lands on a word boundary and the
+ * ellipsis says the value continues, so the copy stays well-formed — the modal's
+ * own period follows it, which reads as a truncated sentence rather than a typo.
+ */
+const REASON_MAX_LENGTH = 120;
+
+/**
+ * One reason value, sanitized — or `undefined` when nothing usable is left, which
+ * the caller drops exactly as it drops a non-string.
+ */
+function normalizeReasonText(raw: string): string | undefined {
+  const flattened = raw.replace(REASON_UNSAFE_CHAR_RE, " ").replace(/\s+/g, " ").trim();
+  const fragment = flattened.replace(REASON_TRAILING_PUNCTUATION_RE, "");
+  if (fragment.length === 0) {
+    return undefined;
+  }
+  if (fragment.length <= REASON_MAX_LENGTH) {
+    return fragment;
+  }
+  // One character of the budget belongs to the ellipsis, so the result is never
+  // longer than the cap it is named for.
+  const clipped = fragment.slice(0, REASON_MAX_LENGTH - 1);
+  const lastSpace = clipped.lastIndexOf(" ");
+  // A value with no space in its first 119 characters is one unbroken token —
+  // there is no boundary to prefer, so the hard cut is the only honest cut.
+  const body = (lastSpace > 0 ? clipped.slice(0, lastSpace) : clipped).replace(REASON_TRAILING_PUNCTUATION_RE, "");
+  return body.length === 0 ? undefined : `${body}\u2026`;
+}
+
+/**
  * NOT-SYNCABLE REASONS — the ONE definition of "a usable reason map", shared by
  * `validateInventoryStatusReport` and by `computeSyncPlan` (which reads the
  * TREE's report, a provider value no validator has been past).
@@ -638,6 +717,24 @@ export function validateInventoryStatusReport(raw: unknown): InventoryStatusRepo
  * keyed `__proto__` (as JSON.parse can produce) must land as ordinary own data
  * instead of hitting the inherited setter, which would drop the entry and leak a
  * provider string onto `Object.prototype`.
+ *
+ * SANITIZES, not merely type-checks, because the value is untrusted text that
+ * ends up INTERPOLATED into the confirm modal the user reads before approving a
+ * sync that moves or deletes servers — and providers are registrable by third
+ * parties through the public API. A reason carrying a newline could mint a line
+ * that reads exactly like one of the engine's own ("0 servers will be deleted"),
+ * changing what the user believes they are approving. That is the property this
+ * function owes its callers and the reason the checks live HERE rather than at
+ * the render sites: this is the one path both the validator and `computeSyncPlan`
+ * already go through, so a new render site cannot forget them. What it
+ * guarantees, in order: every line break and control character becomes a space
+ * (so nothing a provider sends can add, remove or reshape a LINE, and no
+ * invisible byte survives into the dialog), runs of whitespace collapse and the
+ * value is trimmed (so a deleted character cannot weld two words together),
+ * trailing sentence punctuation is dropped (the value is a FRAGMENT and the
+ * renderer terminates the sentence itself), an over-long value is cut at a word
+ * boundary and marked with an ellipsis, and anything empty after all that is
+ * dropped entry-wise exactly as a non-string is.
  */
 export function normalizeNotSyncableReasons(raw: unknown): Record<string, string> | undefined {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
@@ -646,10 +743,14 @@ export function normalizeNotSyncableReasons(raw: unknown): Record<string, string
   const normalized: Record<string, string> = Object.create(null);
   let any = false;
   for (const [externalId, reason] of Object.entries(raw as Record<string, unknown>)) {
-    if (externalId.length === 0 || typeof reason !== "string" || reason.length === 0) {
+    if (externalId.length === 0 || typeof reason !== "string") {
       continue;
     }
-    normalized[externalId] = reason;
+    const text = normalizeReasonText(reason);
+    if (text === undefined) {
+      continue;
+    }
+    normalized[externalId] = text;
     any = true;
   }
   return any ? normalized : undefined;
