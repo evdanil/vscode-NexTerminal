@@ -53,6 +53,31 @@ const PROXMOX_API_BASE = "/api2/json";
 const TEMPLATE_NOT_SYNCABLE_REASON = "it is now a template";
 
 /**
+ * ONE definition of the stopped opt-in's name, used both as its config field's
+ * label and inside the two fragments below — the same anti-drift rule the
+ * insecure-TLS option follows. A modal that names a setting the form does not
+ * show is worse than saying nothing, and the fragments exist precisely so the
+ * user can go flip it.
+ */
+const INCLUDE_STOPPED_LABEL = "Include Stopped Guests";
+
+/**
+ * Why a guest the stopped gate rejected stopped syncing. TWO fragments, not
+ * one, because PVE's two non-running statuses are not the same fact and the
+ * fragment must claim only what the row actually says:
+ *  - `"stopped"` is PVE stating the guest is off — the ordinary case (someone
+ *    powered a guest down), and the sentence can say so plainly.
+ *  - anything else reaching here is `"unknown"`, which PVE emits before RRD
+ *    data exists; the guest may well be RUNNING, so calling it stopped would be
+ *    an invention. The fragment reports the observation instead.
+ * Both name the opt-in, because unlike a conversion this exclusion is a setting
+ * the reader can change, and the popup groups by reason — so a sync that prunes
+ * both kinds renders one honest line each rather than one vague line for both.
+ */
+const STOPPED_NOT_SYNCABLE_REASON = `it is stopped and ${INCLUDE_STOPPED_LABEL} is off`;
+const NOT_RUNNING_NOT_SYNCABLE_REASON = `Proxmox does not report it as running and ${INCLUDE_STOPPED_LABEL} is off`;
+
+/**
  * INSECURE TLS — ONE definition of the option's name, used both as the config
  * field's label and inside the certificate-error hint that tells the user to go
  * turn it on. A message naming an option the form does not show is worse than
@@ -145,7 +170,7 @@ const PROXMOX_CONFIG_FIELDS: InventoryConfigField[] = [
     // with it. Turning the box off is an explicit act with that consequence,
     // not something a new source should do silently.
     id: "includeStopped",
-    label: "Include Stopped Guests",
+    label: INCLUDE_STOPPED_LABEL,
     type: "boolean",
     required: false,
     defaultValue: true,
@@ -1353,6 +1378,47 @@ function isImportableGuestRow(row: Record<string, unknown>, includeStopped: bool
 }
 
 /**
+ * WHICH GATE REJECTED THIS ROW, as the fragment the confirmation popup renders
+ * after "… was not synced because" — or `undefined` for a row this sync keeps.
+ *
+ * Deliberately the SAME clauses in the SAME order as `isImportableGuestRow`
+ * above, because the whole contract of a reason is that it names the gate that
+ * ACTUALLY excluded the row. Two independent condition sets would drift the
+ * first time either gate changed, and a drifted reason is worse than none: it
+ * sends the reader to the wrong setting. The single-return shape is also what
+ * makes the entries mutually exclusive — one vmid can never collect both
+ * fragments, and the one it collects is the first gate that rejected it, which
+ * is the one that decided.
+ *
+ * The type clause returns `undefined` rather than a fragment: a node or storage
+ * row was never a guest, so no server of this source's guest half ever matched
+ * it and there is no prune to explain.
+ *
+ * ONLY the sync path calls this (see `fetchStatusImpl` for why the poll records
+ * no reasons at all).
+ */
+function notSyncableReasonFor(
+  row: Record<string, unknown>,
+  includeStopped: boolean,
+  includeTemplates: boolean
+): string | undefined {
+  if (row.type !== "qemu" && row.type !== "lxc") {
+    return undefined;
+  }
+  if (row.template === 1 && !includeTemplates) {
+    return TEMPLATE_NOT_SYNCABLE_REASON;
+  }
+  if (includeStopped || row.status === "running") {
+    return undefined;
+  }
+  // Past the gate's own clause, so this row IS excluded for not being running.
+  // A template lands here too when `includeTemplates` is on — its PVE status is
+  // "stopped", so the stopped gate is what dropped it, and blaming the opt-in
+  // the user just switched ON would be exactly backwards.
+  return row.status === "stopped" ? STOPPED_NOT_SYNCABLE_REASON : NOT_RUNNING_NOT_SYNCABLE_REASON;
+}
+
+/**
  * The two per-guest address fetches (§IP selection): the guest config (NIC
  * MACs, for the §3 interface ordering) and the type's IP endpoint (qemu agent
  * / lxc interfaces). Both best-effort, in this order — the config informs how
@@ -1459,9 +1525,24 @@ async function fetchInventoryImpl(
   // this loop OBSERVES so the sync can report the two stateless classes it
   // cannot decorate: converted templates and guests PVE cannot describe yet.
   const clearedExternalIds: string[] = [];
-  // THE SYNC'S REASON COLLECTION — the advisory half of the clears above: which
-  // of those ids belongs to a device the cluster STILL LISTS and will not sync.
-  // Only the template class qualifies (see the branch below).
+  // THE SYNC'S REASON COLLECTION — the advisory companion to the clears above:
+  // every guest row the cluster STILL LISTS that this sync's own gates refuse,
+  // mapped to the gate that refused it (`notSyncableReasonFor`). Converted
+  // templates and non-running guests both qualify; the clears and this map
+  // overlap without being the same set (a stopped guest is reasoned about but
+  // never cleared — it has a real status to report).
+  //
+  // DELIBERATELY UNBOUNDED, exactly like `clearedExternalIds` above and unlike
+  // the status budget, and this list is the one that can actually get big: with
+  // the stopped opt-in off, EVERY non-running guest on the cluster earns an
+  // entry. It is still the right call. The cost is one key per row pointing at
+  // one of three INTERNED constants — the same order of cost as the bare id
+  // beside it, not a per-row string. And the failure modes are not symmetric: a
+  // missing STATUS entry makes the report partial, which changes how the apply
+  // merges, while a dropped reason changes nothing except that one arbitrary
+  // user is left without the explanation — and a cap picks that user by listing
+  // order, which is the one way to make this feature actively worse than its
+  // absence. Bounded silence is not better than an honest long list here.
   const notSyncableReasons: Record<string, string> = {};
   // Running, non-template guests awaiting their address crawl. Templates never
   // crawl (no agent ever answers for one) and stopped guests cannot answer —
@@ -1497,29 +1578,22 @@ async function fetchInventoryImpl(
       (typeof row.vmid === "number" && Number.isFinite(row.vmid)) ||
       (typeof row.vmid === "string" && row.vmid.length > 0);
     if (hasUsableVmid) {
+      // THE PRUNE REASON — the clears below retire a stale decoration; this says
+      // WHY the device stopped syncing, and it is the only thing that
+      // distinguishes "the guest was deleted" from "the guest is still here and
+      // this sync's own gates refuse it" in the confirmation popup. Recorded on
+      // the SYNC path alone (see fetchStatusImpl for why the poll records none)
+      // and driven entirely by `notSyncableReasonFor`, which mirrors the device
+      // filter's clauses so the fragment always names the gate that decided —
+      // see its doc comment. Written BEFORE the filter runs below, for the same
+      // reason the clears are: the row's own properties are what decide, and a
+      // row the filter drops never reaches the mapping code.
+      const reason = notSyncableReasonFor(row, includeStopped, includeTemplates);
+      if (reason !== undefined) {
+        notSyncableReasons[String(row.vmid)] = reason;
+      }
       if (isTemplate) {
         clearedExternalIds.push(String(row.vmid));
-        // THE PRUNE REASON — the clear above retires the stale decoration; this
-        // says WHY, and it is the only thing that distinguishes "the guest was
-        // deleted" from "the guest is still here and became a template" in the
-        // sync's confirmation popup. Recorded on the SYNC path alone (see
-        // fetchStatusImpl for why the poll records none), and only for a
-        // template: the "unknown" branch below is PVE emitting a row before RRD
-        // data exists — transient, and calling it not-syncable would be a lie.
-        // GATED ON THE OPT-IN because the reason must name the gate that
-        // ACTUALLY dropped the row. `isImportableGuestRow` skips its template
-        // test when includeTemplates is on and then lets
-        // `includeStopped || status === "running"` decide — and a template's
-        // PVE status is always "stopped" (a converted guest reports
-        // `status: "stopped", template: 1`). So with templates ON and stopped
-        // guests OFF the row is still excluded, still prunable, and its
-        // exclusion has nothing to do with template-ness: attaching this would
-        // tell the user a device was dropped "because it is now a template"
-        // while templates are switched on. With the opt-in OFF the template
-        // test is the only gate that can reject it, so the reason is exact.
-        if (!includeTemplates) {
-          notSyncableReasons[String(row.vmid)] = TEMPLATE_NOT_SYNCABLE_REASON;
-        }
       } else if (row.status === "unknown" && isImportableGuestRow(row, true, false)) {
         // includeStopped is pinned TRUE here exactly as on the poll path —
         // observed is observed; the sync's device-set preference must not

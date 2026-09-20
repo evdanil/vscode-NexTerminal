@@ -10704,6 +10704,18 @@ describe("describePlanDetail — pruned servers whose device is still at the sou
     expect(detail).not.toContain("tpl-0");
   });
 
+  it("renders BOTH shipped Proxmox fragments as their own grouped lines in one plan, each with its own three-name threshold (kills a render that folds a conversion and a power-off into one explanation, and a threshold shared across reasons)", () => {
+    const stopped = "it is stopped and Include Stopped Guests is off";
+    const many = Array.from({ length: 4 }, (_, i) => orphanPrune(`off-${i}`, stopped));
+    const detail = describePlanDetail(makeSyncPlan({ prunes: [orphanPrune("idm.defcon.local", REASON), ...many] }), []);
+    // The template group is under the limit and is NAMED; the stopped group is
+    // over it and falls back to a count — the cap applies per reason, not to
+    // the plan as a whole.
+    expect(detail).toContain('"idm.defcon.local" is still at the source — it was not synced because it is now a template.');
+    expect(detail).toContain(`4 of them are still at the source — each was not synced because ${stopped}.`);
+    expect(detail.split("\n").filter((l) => l.includes("still at the source"))).toHaveLength(2);
+  });
+
   it("renders the same disclosure on the DELETE and KEEP lines (kills an orphan-only render — the user about to lose a server permanently is the one who most needs to know the guest still exists)", () => {
     const deleteServer = makeServer({ id: "owned-d", name: "idm.defcon.local" });
     const deleteDetail = describePlanDetail(makeSyncPlan({ prunes: [{ policy: "delete", server: deleteServer, reason: REASON }] }), []);
