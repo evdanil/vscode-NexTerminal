@@ -5497,17 +5497,31 @@ export function registerInventoryCommands(
     // word on a Proxmox guest — the same reason the row's `Status:` tooltip line
     // dropped it.
     //
-    // And it promises only what the two lines below actually do: a refresh now
-    // and a second one a few seconds from now. It deliberately does NOT claim the
-    // row will be right — a re-check can be declined (the source may be busy) and
-    // a slow start can outrun it, in which case a sync or a manual refresh is
-    // what fixes the row. Promising the CHECK is a promise this handler keeps; an
-    // earlier "the status catches up on its own" was not, because with the
-    // per-source poll off — its default — nothing else re-asked at all.
+    // And it promises only what this handler actually does. It deliberately does
+    // NOT claim the row will be right — a re-check can be declined (the source may
+    // be busy) and a slow start can outrun it, in which case a sync or a manual
+    // refresh is what fixes the row. An earlier "the status catches up on its
+    // own" promised the OUTCOME and did not deliver it, because with the
+    // per-source poll off — its default — nothing re-asked at all.
+    //
+    // WHICH SENTENCE depends on whether a re-check is possible here at all.
+    // `controlNode` and `fetchStatus` are INDEPENDENTLY optional on a provider:
+    // a third-party provider may control nodes while reporting state only in the
+    // tree its sync returns (its rows can still carry state, which is what gets
+    // Start/Stop offered), and `refreshStatus` skips any provider with no
+    // `fetchStatus`. Promising a re-check there would be the same empty promise
+    // wearing new words — so that case says what WILL update the row, and nothing
+    // is fired or armed, since neither refresh could do anything for it.
+    const reportsStatus = typeof provider.fetchStatus === "function";
     const sent = action === "start" ? "Start" : "Stop";
     void vscode.window.showInformationMessage(
-      `${sent} sent to "${server.name}" — it takes a few seconds to take effect, and Nexus re-checks the status after that.`
+      reportsStatus
+        ? `${sent} sent to "${server.name}" — it takes a few seconds to take effect, and Nexus re-checks the status after that.`
+        : `${sent} sent to "${server.name}" — it takes a few seconds to take effect. This source reports node state only when it syncs, so the row updates on its next sync.`
     );
+    if (!reportsStatus) {
+      return;
+    }
     // Best-effort, NOT awaited. This one goes out while the device is still
     // transitioning and will often read the state it is leaving — it is here for
     // the case that resolves immediately; the delayed re-check is what covers the

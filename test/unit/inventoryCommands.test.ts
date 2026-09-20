@@ -8363,9 +8363,15 @@ describe("inventoryCommands", () => {
         secretFieldIds?: string[];
         secrets?: Record<string, string>;
         providerFingerprint?: string;
+        withStatus?: boolean;
       } = {}
     ) {
       const withControl = opts.withControl ?? true;
+      // BOTH built-in node-control providers implement `fetchStatus`, so that is
+      // the default shape here. `withStatus: false` builds the OTHER legal
+      // combination the interface allows — a provider that controls nodes but
+      // reports state only through the tree its sync returns.
+      const withStatus = opts.withStatus ?? true;
       const server = makeServer({
         id: "eve-1",
         name: "R1",
@@ -8377,7 +8383,12 @@ describe("inventoryCommands", () => {
       await core.initialize();
       const registry = new InventoryProviderRegistry();
       const controlSpy = vi.fn(async () => {});
-      const provider = makeProvider(withControl ? { controlNode: opts.controlNode ?? controlSpy } : {});
+      const provider = makeProvider({
+        ...(withControl ? { controlNode: opts.controlNode ?? controlSpy } : {}),
+        ...(withStatus
+          ? { fetchStatus: vi.fn(async () => ({ contractVersion: 1 as const, statuses: {} })) }
+          : {})
+      });
       registry.register(provider);
       const vault = makeVault(opts.secrets ?? {});
       const disposables = registerInventoryCommands(core, registry, vault, makeTeardown());
@@ -8510,6 +8521,31 @@ describe("inventoryCommands", () => {
         expect(statusRefreshArgs()).toEqual(["src-1"]);
         await vi.advanceTimersByTimeAsync(1);
         expect(statusRefreshArgs()).toEqual(["src-1", { sourceId: "src-1", __poll: true }]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    /**
+     * `controlNode` and `fetchStatus` are INDEPENDENTLY optional on
+     * `InventoryProvider`, and `refreshStatus` skips any provider that does not
+     * implement `fetchStatus`. A third-party provider can therefore control nodes
+     * while reporting state only through the tree its sync returns — its rows
+     * carry known state, so Start/Stop are offered — and for it NEITHER refresh
+     * can run. Telling that user the status is re-checked is the empty promise
+     * this message already had to shed once, so the sentence is conditioned on
+     * the capability and no timer is armed that could do nothing.
+     */
+    it("a provider that controls nodes but CANNOT report status is told what will actually update the row, and gets no refresh and no armed timer (⊘ promising a re-check that `refreshStatus` skips for want of `fetchStatus` is the same empty promise, and arming a timer for it wastes a wakeup)", async () => {
+      vi.useFakeTimers();
+      try {
+        const { start, server } = await setup({ withStatus: false });
+        await start({ server });
+        const info = mockShowInformationMessage.mock.calls.map((c) => String(c[0])).join("\n");
+        expect(info).toBe('Start sent to "R1" — it takes a few seconds to take effect. This source reports node state only when it syncs, so the row updates on its next sync.');
+        expect(info).not.toMatch(/re-check/i);
+        await vi.advanceTimersByTimeAsync(NODE_CONTROL_STATUS_RECHECK_MS * 4);
+        expect(statusRefreshArgs()).toEqual([]);
       } finally {
         vi.useRealTimers();
       }
