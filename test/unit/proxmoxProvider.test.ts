@@ -20,6 +20,7 @@ import {
 import { validateProviderShape } from "../../src/services/inventory/providerRegistry";
 import {
   InventoryProviderError,
+  resolveStatusTruncationRemedy,
   validateInventoryStatusReport,
   type InventorySourceValues
 } from "../../src/models/inventory";
@@ -363,6 +364,64 @@ describe("readProxmoxHardCap", () => {
 });
 
 describe("createProxmoxProvider", () => {
+  /**
+   * THE PARTIAL-STATUS REMEDY, in Proxmox's own words. A PVE cluster has neither
+   * a Root Folder nor a Lab Filter, and its budget is RAISED rather than
+   * narrowed — the opposite verb — which is why the warning site names no field
+   * and asks the provider instead.
+   */
+  it("declares its own remedy for a truncated status scan, naming the Hard Cap and no lab (⊘ falling back to EVE-NG's sentence sends a PVE user looking for a Root Folder and a Lab Filter their source does not have)", () => {
+    const remedy = resolveStatusTruncationRemedy(createProxmoxProvider());
+    expect(remedy).toBeDefined();
+    expect(remedy).toContain("Hard Cap (entries)");
+    expect(remedy).not.toMatch(/lab/i);
+    // The field it names has to be a field this provider actually has.
+    expect(createProxmoxProvider().configFields.map((f) => f.label)).toContain("Hard Cap (entries)");
+  });
+
+  /**
+   * NEITHER CAUSE LEADS. `fetchStatusImpl` sets `truncated` for two unrelated
+   * reasons — the entry cap, and a failed /cluster/status join (403 without
+   * Sys.Audit, a transient failure, a malformed payload) — and the join can
+   * fail with the entry count nowhere near the cap. A sentence that opens with
+   * "Raise the Hard Cap" therefore hands the second user a change that cannot
+   * fix their problem and makes every later scan larger for nothing. The report
+   * carries no reason, so the honest shape is both causes at equal standing
+   * plus an admission that this cannot tell which — never an order the sentence
+   * has no basis for.
+   */
+  it("gives its two truncation causes equal standing and says it cannot tell which applies (⊘ leading with the cap tells a user whose cluster-status join failed to raise a budget that was never the problem)", () => {
+    const remedy = resolveStatusTruncationRemedy(createProxmoxProvider()) ?? "";
+    expect(remedy).toContain("Hard Cap (entries)");
+    expect(remedy).toContain("Sys.Audit");
+    expect(remedy).toMatch(/does not say which|whichever applies/i);
+    // The specific regression: an imperative about ONE cause as the opening
+    // clause, read as "do this first" by a reader it cannot help.
+    expect(remedy).not.toMatch(/^(Raise|Increase|Lift|Bump) /);
+    // Sys.Audit is NECESSARY, not SUFFICIENT: `fetchClusterStatus` also returns
+    // undefined for a network error, a non-JSON response and a malformed
+    // payload, and `fetchStatusImpl` truncates on every one of them. Granting
+    // the privilege fixes none of those, so the clause that names it has to
+    // carry its own qualification rather than read as THE fix.
+    expect(remedy).toMatch(/Sys\.Audit[^.]*\b(anyway|regardless|even (then|with it)|still)\b/i);
+  });
+
+  /**
+   * THE DECLARED SENTENCE MUST SURVIVE ITS OWN READER. `resolveStatusTruncationRemedy`
+   * caps what a provider declares, and this one is twice-rewritten and close to
+   * that cap — a third edit that tipped it over would ship a remedy cut off
+   * mid-clause, with an ellipsis where the second cause used to be, and nothing
+   * else in the suite would notice. Pinned as identity rather than against the
+   * cap's number, because the property that matters is "nothing was elided",
+   * not "the constant is still 240".
+   */
+  it("declares a remedy short enough to survive the reader's cap intact (⊘ a longer rewrite ships a sentence truncated mid-clause, losing whichever cause fell off the end)", () => {
+    const declared = createProxmoxProvider().statusTruncationRemedy ?? "";
+    expect(declared).not.toBe("");
+    expect(resolveStatusTruncationRemedy(createProxmoxProvider())).toBe(declared);
+    expect(declared).not.toContain("…");
+  });
+
   it("passes validateProviderShape — the same gate the registry applies at registration (⊘ a provider that only compiles still cannot be registered)", () => {
     expect(() => validateProviderShape(createProxmoxProvider())).not.toThrow();
   });
@@ -1698,6 +1757,12 @@ describe("createProxmoxProvider", () => {
       const warning = tree.warnings?.find((w) => w.includes("Cluster node status")) ?? "";
       expect(warning).toContain("Sys.Audit");
       expect(warning).toContain("last known running state");
+      // BOTH TITLES, and the retired one is not redundant. This hint has come
+      // back twice; a pin that only knows the CURRENT title passes again the
+      // day someone restores the old sentence verbatim, which is the shape the
+      // regression actually took. Renaming the command is exactly when that
+      // guard must be kept, not replaced.
+      expect(warning).not.toContain("Refresh Inventory Status");
       expect(warning).not.toContain("Refresh Lab Status");
       // A healthy join pushes no such line — the warning names a real failure,
       // never a routine sync.
@@ -1748,7 +1813,8 @@ describe("createProxmoxProvider", () => {
       expect(warning).not.toMatch(/guests beyond/);
       // The persistent-limit property stays intact: no remedy is offered,
       // because every path that could retry shares this same budget.
-      expect(warning).not.toContain("Refresh Lab Status");
+      expect(warning).not.toContain("Refresh Inventory Status");
+      expect(warning).not.toContain("Refresh Lab Status"); // the retired title, still pinned — see the join-failure test above
       expect(warning).not.toContain("Sync Now");
     });
 

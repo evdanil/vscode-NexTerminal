@@ -17,7 +17,12 @@ import { deterministicServerId } from "../../src/services/inventory/deterministi
 import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import type { ServerConfig } from "../../src/models/config";
-import { computeProviderFingerprint, type InventoryConfigField, type InventoryStatusReport } from "../../src/models/inventory";
+import {
+  computeProviderFingerprint,
+  resolveStatusTruncationRemedy,
+  type InventoryConfigField,
+  type InventoryStatusReport
+} from "../../src/models/inventory";
 
 /**
  * EVE-NG's identity as a deployment — the same contract `netboxInstanceKey`
@@ -101,6 +106,25 @@ describe("eveNgInstanceKey", () => {
 });
 
 describe("createEveNgProvider — shape", () => {
+  /**
+   * THE PARTIAL-STATUS REMEDY is the provider's to give: the command that warns
+   * about a truncated status scan names no field of its own, because the field
+   * that fixes one is not the same field on every provider. EVE-NG's answer is a
+   * narrower crawl — and it has to name the two fields that narrow it, since a
+   * warning with no remedy at all is the outcome this indirection exists to
+   * avoid.
+   */
+  it("declares the EVE-NG remedy for a truncated status scan, naming the two fields that narrow the crawl (⊘ without it a partial refresh of a lab falls back to the neutral line and the user is never told which fields bound the crawl)", () => {
+    const remedy = resolveStatusTruncationRemedy(createEveNgProvider(vi.fn() as unknown as typeof fetch));
+    expect(remedy).toBeDefined();
+    expect(remedy).toContain("Root Folder");
+    expect(remedy).toContain("Lab Filter");
+    // The fields it names have to be fields this provider actually has.
+    const fieldLabels = createEveNgProvider(vi.fn() as unknown as typeof fetch).configFields.map((f) => f.label);
+    expect(fieldLabels).toContain("Root Folder");
+    expect(fieldLabels).toContain("Lab Filter");
+  });
+
   it("has the eve-ng id, the EVE-NG label, and a stable config field order (the form renders fields in this order, and the order is part of the provider fingerprint)", () => {
     const provider = createEveNgProvider(vi.fn() as unknown as typeof fetch);
     expect(provider.id).toBe(EVE_NG_PROVIDER_ID);

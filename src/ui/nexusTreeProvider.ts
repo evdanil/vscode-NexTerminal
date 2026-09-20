@@ -84,8 +84,8 @@ export class ServerTreeItem extends vscode.TreeItem {
     // contextValue marker below: emitted ONLY for a control-capable origin with
     // a KNOWN status, so a server whose provider has no controlNode but somehow
     // carries a status, and a freshly-synced node with none yet, get no
-    // node-control menu (the user runs Refresh Lab Status first — we never act
-    // blind).
+    // node-control menu (the status arrives with the next sync, poll or manual
+    // refresh — we never act blind).
     hasNodeControl = false,
     // WEB CONSOLE — whether this server's origin's provider offers a web console
     // for THIS device (it implements `webConsoleUrl`, and its optional
@@ -129,7 +129,7 @@ export class ServerTreeItem extends vscode.TreeItem {
     //
     // The line is SHARED by both node-control providers, and it names neither
     // a lab nor a command. "Lab" was EVE-NG's word and is untrue of a Proxmox
-    // cluster; the "run Refresh Lab Status" hint is now stale for BOTH, since
+    // cluster; the "run a refresh first" hint is now stale for BOTH, since
     // an EVE-NG and a Proxmox sync each carry status, so an unknown state is
     // resolved by the very next sync (or the poll) with nothing for the user
     // to run. An unknown state is therefore reported plainly.

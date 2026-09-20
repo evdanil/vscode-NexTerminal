@@ -1383,7 +1383,8 @@ describe("ServerTreeItem BMC ipmi contextValue marker", () => {
  * be gated by state. The marker is emitted ONLY for a control-capable origin
  * with a known status: a server whose provider has no controlNode (even one
  * that somehow carries a status) and a freshly-synced node with no status yet
- * get NOTHING — the user runs Refresh Lab Status first, so we never offer an
+ * get NOTHING — the status arrives with the next sync or refresh, so we never
+ * offer an
  * action blind. The final constructor arg carries the caller-resolved "this
  * origin's provider has node control" signal. The marker is named for the
  * MECHANISM, not for a provider: it is stamped for any provider implementing
@@ -1854,8 +1855,12 @@ describe("ServerTreeItem status tooltip line", () => {
     expect(tip({ hasNodeControl: true, status: "stopped" })).toContain("Status: stopped");
   });
 
-  it("shows a bare 'Status: unknown' for a freshly-synced node with no status yet, with NO command hint (⊘ pointing at Refresh Lab Status is stale advice for BOTH providers now that either sync carries status, and it names a lab a Proxmox cluster does not have)", () => {
+  it("shows a bare 'Status: unknown' for a freshly-synced node with no status yet, with NO command hint (⊘ pointing at Refresh Inventory Status is stale advice for BOTH providers now that either sync carries status, and it names a lab a Proxmox cluster does not have)", () => {
     expect(tip({ hasNodeControl: true, status: undefined })).toContain("Status: unknown");
+    expect(tip({ hasNodeControl: true, status: undefined })).not.toContain("Refresh Inventory Status");
+    // The RETIRED title too: the hint this pins came back twice, and a guard
+    // that only knows the current name stops catching a verbatim restore of
+    // the old sentence.
     expect(tip({ hasNodeControl: true, status: undefined })).not.toContain("Refresh Lab Status");
     expect(tip({ hasNodeControl: true, status: undefined })).not.toContain("Lab status");
   });
