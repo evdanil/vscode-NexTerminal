@@ -912,6 +912,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   (providerId, externalId) => {
     const provider = inventoryProviderRegistry.get(providerId);
     return provider !== undefined && provider.controlNode !== undefined && (provider.canControlNode?.(externalId) ?? true);
+  },
+  // WEB CONSOLE — the same two-half question for the `.webConsole` marker, asked
+  // of the capability rather than of a provider id: the PROVIDER half is whether
+  // `webConsoleUrl` exists at all (Proxmox yes, NetBox and EVE-NG no), the DEVICE
+  // half whether it applies to THIS record — Proxmox answers false for a cluster
+  // node, whose shell is not a guest's noVNC console and which its own
+  // `webConsoleUrl` refuses. An absent `canWebConsole` is taken at its word that
+  // every device of a capable provider qualifies. Deliberately NO status term:
+  // the console is what makes an addressless or unpolled guest manageable.
+  (providerId, externalId) => {
+    const provider = inventoryProviderRegistry.get(providerId);
+    return provider !== undefined && provider.webConsoleUrl !== undefined && (provider.canWebConsole?.(externalId) ?? true);
   });
   const tunnelTreeProvider = new TunnelTreeProvider();
   const networkServerTreeProvider = new NetworkServerTreeProvider();

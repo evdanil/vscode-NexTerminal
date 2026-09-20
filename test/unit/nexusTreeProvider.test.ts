@@ -1433,7 +1433,93 @@ describe("ServerTreeItem node-control contextValue marker", () => {
       "nexus.serverConnected.ipmi.nodeStopped"
     );
   });
+
+  /**
+   * WEB CONSOLE — the `.webConsole` marker is CAPABILITY-gated and deliberately
+   * STATUS-INDEPENDENT, which is the whole point of the feature: an addressless,
+   * unpolled guest is exactly the row that needs its hypervisor's console, and a
+   * stopped guest's console page is the hypervisor's own honest answer. It sits
+   * LAST in the fixed order `nexus.server[Connected][.ipmi][.node*][.webConsole]`.
+   */
+  describe("the web-console marker", () => {
+    function webItem(
+      opts: {
+        connected?: boolean;
+        ipmiHost?: string;
+        status?: "running" | "stopped";
+        hasNodeControl?: boolean;
+        hasWebConsole?: boolean;
+      } = {}
+    ): ServerTreeItem {
+      return new ServerTreeItem(
+        makeServer({ id: "s", ...(opts.ipmiHost ? { ipmiHost: opts.ipmiHost } : {}) }),
+        opts.connected ?? false,
+        undefined,
+        true,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        opts.status,
+        opts.hasNodeControl,
+        opts.hasWebConsole
+      );
+    }
+
+    it("appends .webConsole for a web-console-capable server with NO status at all (⊘ a status-gated marker hides the console from the addressless, unpolled guest the feature exists for)", () => {
+      expect(webItem({ hasWebConsole: true }).contextValue).toBe("nexus.server.webConsole");
+      expect(webItem({ hasWebConsole: true, status: "stopped" }).contextValue).toBe("nexus.server.webConsole");
+    });
+
+    it("emits NO marker without the capability (⊘ a default-true gate offers Open Web Console on every NetBox row and every hand-made server)", () => {
+      expect(webItem({}).contextValue).toBe("nexus.server");
+      expect(webItem({ hasWebConsole: false, status: "running" }).contextValue).toBe("nexus.server");
+    });
+
+    it("sits LAST in the fixed order, after .ipmi and the node-state marker (⊘ any other position makes every anchored server-menu regex miss the row)", () => {
+      expect(webItem({ hasWebConsole: true, ipmiHost: "10.0.0.9" }).contextValue).toBe("nexus.server.ipmi.webConsole");
+      expect(webItem({ hasWebConsole: true, hasNodeControl: true, status: "running" }).contextValue).toBe(
+        "nexus.server.nodeRunning.webConsole"
+      );
+      expect(
+        webItem({ connected: true, hasWebConsole: true, hasNodeControl: true, status: "stopped", ipmiHost: "10.0.0.9" })
+          .contextValue
+      ).toBe("nexus.serverConnected.ipmi.nodeStopped.webConsole");
+    });
+  });
 });
+
+// SHARED by both marker-wiring describes below (node control and web console):
+// one snapshot-driven NexusTreeProvider plus a by-id row lookup, so the two
+// capability gates are exercised through the same real `getChildren` path.
+function providerWith(
+  servers: ServerConfig[],
+  inventorySources: Array<{ id: string; providerId: string; name: string }>,
+  serverStatus: Map<string, "running" | "stopped">,
+  originHasNodeControl?: (providerId: string, externalId: string) => boolean,
+  originHasWebConsole?: (providerId: string, externalId: string) => boolean
+): NexusTreeProvider {
+  const provider = new NexusTreeProvider(noopCallbacks, originHasNodeControl, originHasWebConsole);
+  provider.setSnapshot({
+    ...emptySnapshot(),
+    servers,
+    inventorySources: inventorySources.map((s) => ({
+      ...s,
+      targetFolder: "",
+      prunePolicy: "orphan",
+      defaultUsername: "admin",
+      config: {},
+      secretFieldIds: []
+    })),
+    serverStatus
+  } as any);
+  return provider;
+}
+
+function serverItemById(provider: NexusTreeProvider, id: string): ServerTreeItem {
+  const children = provider.getChildren(undefined) as ServerTreeItem[];
+  return children.find((c) => c instanceof ServerTreeItem && c.server.id === id) as ServerTreeItem;
+}
 
 /**
  * NODE CONTROL (Phase 4, task #28; provider-general since Task 9) — P2 review
@@ -1457,34 +1543,6 @@ describe("ServerTreeItem node-control contextValue marker", () => {
  *     (defaults to false) → marker never reaches the item.
  */
 describe("NexusTreeProvider node-control marker — end-to-end snapshot wiring", () => {
-  function providerWith(
-    servers: ServerConfig[],
-    inventorySources: Array<{ id: string; providerId: string; name: string }>,
-    serverStatus: Map<string, "running" | "stopped">,
-    originHasNodeControl?: (providerId: string, externalId: string) => boolean
-  ): NexusTreeProvider {
-    const provider = new NexusTreeProvider(noopCallbacks, originHasNodeControl);
-    provider.setSnapshot({
-      ...emptySnapshot(),
-      servers,
-      inventorySources: inventorySources.map((s) => ({
-        ...s,
-        targetFolder: "",
-        prunePolicy: "orphan",
-        defaultUsername: "admin",
-        config: {},
-        secretFieldIds: []
-      })),
-      serverStatus
-    } as any);
-    return provider;
-  }
-
-  function serverItemById(provider: NexusTreeProvider, id: string): ServerTreeItem {
-    const children = provider.getChildren(undefined) as ServerTreeItem[];
-    return children.find((c) => c instanceof ServerTreeItem && c.server.id === id) as ServerTreeItem;
-  }
-
   it("resolves an eve-ng inventory source through origin.sourceId → predicate → .nodeRunning / .nodeStopped from serverStatus (⊘ a broken resolution, a typo'd 'eve-ng' literal in the fixture or predicate, or a dropped constructor arg leaves the EVE node with no node-control marker)", () => {
     const provider = providerWith(
       [
@@ -1573,6 +1631,98 @@ describe("NexusTreeProvider node-control marker — end-to-end snapshot wiring",
       [makeServer({ id: "px", name: "P1", origin: { sourceId: "px-src", externalId: "105", syncedAt: 1 } })],
       [{ id: "px-src", providerId: "proxmox", name: "My PVE" }],
       new Map<string, "running" | "stopped">([["px", "running"]]),
+      () => {
+        throw new TypeError("faulty third-party capability check");
+      }
+    );
+    const children = provider.getChildren(undefined) as ServerTreeItem[];
+    expect(children.length).toBeGreaterThan(0);
+    expect(serverItemById(provider, "px").contextValue).toBe("nexus.server");
+  });
+});
+
+/**
+ * WEB CONSOLE — the `.webConsole` marker's SNAPSHOT WIRING, the twin of the
+ * node-control block above: `snapshot.inventorySources` → origin.sourceId → the
+ * injected `originHasWebConsole` predicate → constructor arg. The predicate
+ * carries BOTH halves of the capability (does this provider implement
+ * `webConsoleUrl` at all, and does it apply to THIS device), so these drive it
+ * from a real snapshot and kill:
+ *   - a status gate creeping in (the addressless, unpolled guest is precisely
+ *     the row the console exists for),
+ *   - the gate ignoring the predicate (a NetBox row offering a console its
+ *     provider cannot produce),
+ *   - the DEVICE half ignored (a Proxmox cluster node offered a guest's noVNC
+ *     console, which its provider's own webConsoleUrl refuses outright),
+ *   - the fail-closed default flipped (a tree built without the predicate
+ *     offering the console everywhere),
+ *   - the predicate/constructor arg dropped at the ServerTreeItem call.
+ */
+describe("NexusTreeProvider web-console marker — end-to-end snapshot wiring", () => {
+  it("stamps .webConsole on a capable origin's row with NO status and no node control (⊘ a status-gated or control-coupled marker strands exactly the addressless guest the console is for)", () => {
+    const provider = providerWith(
+      [makeServer({ id: "pve-guest", name: "VM 105", origin: { sourceId: "pve-src", externalId: "105", syncedAt: 1 } })],
+      [{ id: "pve-src", providerId: "proxmox", name: "My PVE" }],
+      new Map<string, "running" | "stopped">(),
+      undefined,
+      (providerId) => providerId === "proxmox"
+    );
+    expect(serverItemById(provider, "pve-guest").contextValue).toBe("nexus.server.webConsole");
+  });
+
+  it("composes with the node-state marker on one row (⊘ the two gates sharing a slot, or the wrong order, makes every anchored menu regex miss a row that has both)", () => {
+    const provider = providerWith(
+      [makeServer({ id: "pve-run", name: "VM 105", origin: { sourceId: "pve-src", externalId: "105", syncedAt: 1 } })],
+      [{ id: "pve-src", providerId: "proxmox", name: "My PVE" }],
+      new Map<string, "running" | "stopped">([["pve-run", "running"]]),
+      (providerId) => providerId === "proxmox",
+      (providerId) => providerId === "proxmox"
+    );
+    expect(serverItemById(provider, "pve-run").contextValue).toBe("nexus.server.nodeRunning.webConsole");
+  });
+
+  it("emits NO marker for a netbox-origin row even with a node-control predicate present (⊘ a gate that ignores the web-console predicate offers a console no provider can produce)", () => {
+    const provider = providerWith(
+      [makeServer({ id: "nb", name: "N1", origin: { sourceId: "nb-src", externalId: "device:1", syncedAt: 1 } })],
+      [{ id: "nb-src", providerId: "netbox", name: "My NetBox" }],
+      new Map<string, "running" | "stopped">(),
+      () => true,
+      (providerId) => providerId === "proxmox"
+    );
+    expect(serverItemById(provider, "nb").contextValue).toBe("nexus.server");
+  });
+
+  it("emits NO marker when NO web-console predicate was injected (⊘ the fail-closed default must hold: a tree built without it never offers a console it cannot back)", () => {
+    const provider = providerWith(
+      [makeServer({ id: "pve-guest", name: "VM 105", origin: { sourceId: "pve-src", externalId: "105", syncedAt: 1 } })],
+      [{ id: "pve-src", providerId: "proxmox", name: "My PVE" }],
+      new Map<string, "running" | "stopped">([["pve-guest", "running"]]),
+      (providerId) => providerId === "proxmox"
+    );
+    expect(serverItemById(provider, "pve-guest").contextValue).toBe("nexus.server.nodeRunning");
+  });
+
+  it("gates DEVICE-AWARE within one provider: a Proxmox cluster node (externalId node/pve) gets NO marker while a bare-vmid guest on the same source does (⊘ a provider-only gate offers a guest's noVNC console on a hypervisor node, which webConsoleUrl refuses outright)", () => {
+    const provider = providerWith(
+      [
+        makeServer({ id: "pve-node", name: "pve", origin: { sourceId: "pve-src", externalId: "node/pve", syncedAt: 1 } }),
+        makeServer({ id: "pve-guest", name: "VM 105", origin: { sourceId: "pve-src", externalId: "105", syncedAt: 1 } })
+      ],
+      [{ id: "pve-src", providerId: "proxmox", name: "My PVE" }],
+      new Map<string, "running" | "stopped">(),
+      undefined,
+      (providerId, externalId) => providerId === "proxmox" && /^\d+$/.test(externalId)
+    );
+    expect(serverItemById(provider, "pve-node").contextValue).toBe("nexus.server");
+    expect(serverItemById(provider, "pve-guest").contextValue).toBe("nexus.server.webConsole");
+  });
+
+  it("survives a THROWING predicate: the row renders with NO marker and getChildren still returns the tree (⊘ the predicate runs synchronously inside getChildren — an exception would abort the whole Command Center render, not just one row)", () => {
+    const provider = providerWith(
+      [makeServer({ id: "px", name: "P1", origin: { sourceId: "px-src", externalId: "105", syncedAt: 1 } })],
+      [{ id: "px-src", providerId: "proxmox", name: "My PVE" }],
+      new Map<string, "running" | "stopped">(),
+      undefined,
       () => {
         throw new TypeError("faulty third-party capability check");
       }
