@@ -373,6 +373,15 @@ export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[
       const picks: ProfileActionPick[] = [
         { label: "Connect", command: "nexus.server.connect" },
         { label: "Test Connection", command: "nexus.server.testConnection" },
+        // WEB CONSOLE — read as a SEGMENT for the same reason the node state is,
+        // and placed here, with the other ways IN to the device, rather than
+        // after the power actions: on a guest whose inventory source manages it
+        // without an address (a Proxmox guest with no guest agent) Connect can
+        // only refuse, and this is the one entry that works. Burying it below
+        // Start/Stop would reproduce the invisibility this exists to fix.
+        ...(markers.includes("webConsole")
+          ? [{ label: "Open Web Console", command: "nexus.inventory.openWebConsole" }]
+          : []),
         ...(nodeState === "stopped" ? [{ label: "Start Node", command: "nexus.inventory.startNode" }] : []),
         ...(nodeState === "running" ? [{ label: "Stop Node", command: "nexus.inventory.stopNode" }] : []),
         ...(ctx.core.isServerConnected(arg.server.id)

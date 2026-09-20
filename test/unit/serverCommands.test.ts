@@ -5329,3 +5329,108 @@ describe("folder-op serialization (#84 P1)", () => {
     expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("connection target changed"));
   });
 });
+
+/**
+ * WEB CONSOLE ON THE CONNECT REFUSAL — a Proxmox guest with no qemu-guest-agent
+ * has no IP, ever. The neutral refusal tells its owner to wait for an address
+ * and re-sync, which is three wrong statements and no way forward, while the
+ * feature that does work (Open Web Console — vmid + node, no address needed)
+ * goes unmentioned. The offer is made ONLY where the capability is established,
+ * so an IP-less NetBox row keeps the neutral text.
+ */
+describe("connectServer — addressless placeholder that has a web console", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+  });
+
+  function addresslessHarness(offersConsole?: boolean) {
+    const harness = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [
+        makeServer({
+          id: "vm-1",
+          name: "build-vm",
+          addressless: true,
+          host: "",
+          port: 0,
+          origin: { sourceId: "src", externalId: "101", syncedAt: 1 }
+        })
+      ]
+    });
+    if (offersConsole !== undefined) {
+      harness.ctx.serverOffersWebConsole = () => offersConsole;
+    }
+    return harness;
+  }
+
+  function messagesFrom(mock: { mock: { calls: unknown[][] } }): string[] {
+    return mock.mock.calls.map((call) => String(call[0]));
+  }
+
+  it("offers Open Web Console as an ACTION on the refusal, and clicking it opens the console for that server (⊘ an information-only message leaves the user reading about a feature instead of using it)", async () => {
+    const { ctx } = addresslessHarness(true);
+    mockShowWarningMessage.mockResolvedValue("Open Web Console");
+
+    await connectServer(ctx, "vm-1");
+    await flushPromises();
+
+    const call = mockShowWarningMessage.mock.calls.at(-1)!;
+    expect(String(call[0])).toMatch(/web console/i);
+    expect(String(call[0])).toContain("build-vm");
+    expect(call.slice(1)).toEqual(["Open Web Console"]);
+    // The id, not the tree item: `resolveServerArg` re-resolves it against live
+    // core, which is what keeps a just-deleted row from being opened.
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("nexus.inventory.openWebConsole", "vm-1");
+    expect(SshPty).not.toHaveBeenCalled();
+  });
+
+  it("keeps the NEUTRAL message, with no console button, for an addressless device whose source offers none — an IP-less NetBox row (⊘ offering the console unconditionally points the user at a button that is not on the row)", async () => {
+    const { ctx } = addresslessHarness(false);
+
+    await connectServer(ctx, "vm-1");
+    await flushPromises();
+
+    const infos = messagesFrom(vi.mocked(vscode.window.showInformationMessage) as never);
+    expect(infos.some((m) => /no console address yet/i.test(m) && /re-sync/i.test(m))).toBe(true);
+    expect(infos.every((m) => !/web console/i.test(m))).toBe(true);
+    // No action button either — the refusal must not carry one for a row whose
+    // right-click menu has no console entry.
+    expect(mockShowWarningMessage.mock.calls.some((call) => call.includes("Open Web Console"))).toBe(false);
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexus.inventory.openWebConsole", expect.anything());
+  });
+
+  it("does the same when no capability answer is wired at all (⊘ treating an absent predicate as 'console available' offers it on every addressless server in every host that does not supply one)", async () => {
+    const { ctx } = addresslessHarness(undefined);
+
+    await connectServer(ctx, "vm-1");
+    await flushPromises();
+
+    const infos = messagesFrom(vi.mocked(vscode.window.showInformationMessage) as never);
+    expect(infos.some((m) => /no console address yet/i.test(m))).toBe(true);
+    expect(infos.every((m) => !/web console/i.test(m))).toBe(true);
+    expect(mockShowWarningMessage.mock.calls.some((call) => call.includes("Open Web Console"))).toBe(false);
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexus.inventory.openWebConsole", expect.anything());
+  });
+
+  /**
+   * The watchdog wrappers (Run Macro on Server / Connect and Run Script) arm a
+   * 90s timer and settle on `onConnectFailed`. The console offer is a
+   * notification the user may sit on for minutes, so the refusal must be
+   * SIGNALLED before it is shown — awaiting the click first would sit out the
+   * whole watchdog and end in a misleading timeout.
+   */
+  it("signals onConnectFailed BEFORE waiting on the notification (⊘ firing it after the await makes the macro watchdog time out while the toast is still on screen)", async () => {
+    const { ctx } = addresslessHarness(true);
+    // Never resolves: the user has neither clicked nor dismissed.
+    mockShowWarningMessage.mockReturnValue(new Promise<string | undefined>(() => {}));
+    const onConnectFailed = vi.fn();
+
+    void connectServer(ctx, "vm-1", { onConnectFailed });
+    await flushPromises();
+
+    expect(onConnectFailed).toHaveBeenCalledTimes(1);
+    expect(String(onConnectFailed.mock.calls[0][0])).toMatch(/web console/i);
+  });
+});

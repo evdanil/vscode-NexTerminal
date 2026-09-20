@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.8.231] — 2026-09-20
+
+### Fixed
+
+- **A synced guest that has a browser console is told about it, at the two moments it matters.** A hypervisor guest without a guest agent has no IP — not "not yet", and no amount of re-syncing will give it one — so the refusal Connect showed for it ("it may be offline, or its inventory source hasn't assigned one — re-sync the source once it has an address") was wrong in every clause, and never mentioned the one thing that works: **Open Web Console**, which reaches the guest through its hypervisor and needs no address at all. Connect now recognizes a device whose inventory source offers that console and says so instead — that the guest has no console address, that its source provides a web console needing none — and carries an **Open Web Console** button that opens it on the spot. The capability is the gate, not the provider: a NetBox row with no IP has no console, so it keeps the original wording, where re-syncing really is the remedy. The other refusals that share this guard — Test Connection, Deploy SSH Key, Browse Files, starting a tunnel — keep it too, because a browser console gives none of them the SSH transport they need.
+- **The row-click Profile Actions list offers Open Web Console.** The entry existed only on the right-click menu, so clicking a console-capable guest showed Connect, Test Connection and the power actions, and nothing about a console — on exactly the row whose Connect cannot work. It now appears for any row whose source offers a console for that device, alongside Connect and Test Connection and above Start/Stop, since on such a guest it is the entry that actually gets you in.
+
 ## [2.8.230] — 2026-09-20
 
 ### Fixed

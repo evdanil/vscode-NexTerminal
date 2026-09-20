@@ -32,6 +32,15 @@ export function telnetUnsupportedMessage(
   return `${feature} is not available for telnet servers. "${server.name}" is configured as Telnet, which carries no file transfer, port forwarding or authentication of its own — switch it to SSH to use this.`;
 }
 
+export interface AddresslessMessageOptions {
+  /**
+   * True only when the CALLER has confirmed this exact device has a browser
+   * console. Never inferred here — an addressless server is just as likely to be
+   * an IP-less NetBox row, which has no console at all.
+   */
+  webConsoleAvailable?: boolean;
+}
+
 /**
  * ADDRESSLESS (Codex P1 on #82) — the shared refusal for ANY connect/SSH-only
  * feature invoked against a synced placeholder that has no console address yet
@@ -42,12 +51,32 @@ export function telnetUnsupportedMessage(
  *
  * Returns `undefined` when the server IS addressed (the common case), so a call
  * site reads `const m = addresslessUnavailableMessage(server); if (m) { … }`.
+ *
+ * WEB CONSOLE — `options.webConsoleAvailable` is how a caller that has
+ * ESTABLISHED the capability (the provider behind this server implements
+ * `webConsoleUrl` and accepts this device) gets a message that names it. It is
+ * opt-in, and the default is the neutral text, so a caller that cannot answer
+ * the capability question cannot accidentally promise a console: the guard
+ * itself still knows nothing about providers.
  */
-export function addresslessUnavailableMessage(server: Pick<ServerConfig, "name" | "addressless">): string | undefined {
+export function addresslessUnavailableMessage(
+  server: Pick<ServerConfig, "name" | "addressless">,
+  options: AddresslessMessageOptions = {}
+): string | undefined {
   if (server.addressless !== true) {
     return undefined;
   }
-  // P2 (Codex review) — PROVIDER-NEUTRAL. This guard is shared and gets no
+  if (options.webConsoleAvailable === true) {
+    // Every clause of the neutral text below is false for this device: the
+    // address is not missing "yet", the guest is not offline, and re-syncing
+    // will never assign one — a hypervisor guest without a guest agent reports
+    // no IP by design. So this names the route that does work instead, in terms
+    // of the capability rather than of a provider: any source offering a web
+    // console gets this wording.
+    return `"${server.name}" has no console address, so Nexus cannot open a terminal session to it. Its inventory source provides a web console that needs no address — open that instead.`;
+  }
+  // P2 (Codex review) — PROVIDER-NEUTRAL, and this is still the answer for every
+  // caller that has NOT established a console. This guard is shared and gets no
   // provider identity, and an addressless server can come from an IP-less NetBox
   // row (remedy: assign an address in NetBox) as well as a stopped EVE-NG node —
   // so it must not prescribe an EVE-NG-specific remedy.

@@ -378,6 +378,51 @@ describe("Profile Actions quick-pick — EVE node power (M5)", () => {
     expect(unknown).not.toContain("Stop Node");
   });
 
+  /**
+   * WEB CONSOLE — the row-click path had no console entry at all, so the one
+   * action that works on a guest with no address (and never any address — a
+   * Proxmox guest without qemu-guest-agent) existed only in the right-click
+   * menu. Gated on the SAME `.webConsole` marker the menu's `when` regex reads,
+   * so the two surfaces cannot disagree about a row.
+   */
+  it("offers Open Web Console for a console-capable row (⊘ omitting it leaves the click path with no way to reach a guest that has no address and never will)", async () => {
+    const labels = await labelsFor(serverItem({ hasWebConsole: true }));
+    expect(labels).toContain("Open Web Console");
+  });
+
+  it("offers NOTHING of the sort for a row with no console capability (⊘ an ungated entry dispatches a command that can only refuse, on every NetBox row in the tree)", async () => {
+    const labels = await labelsFor(serverItem({}));
+    expect(labels).not.toContain("Open Web Console");
+    const nodeOnly = await labelsFor(serverItem({ hasNodeControl: true, status: "stopped" }));
+    expect(nodeOnly).not.toContain("Open Web Console");
+  });
+
+  // ORDER — the console is a way IN to the device, so it sits with Connect and
+  // Test Connection, above the power actions: on an addressless guest it is the
+  // only working route, and burying it under Start/Stop is what hid it.
+  it("places Open Web Console with the reach-the-device actions, above node power (⊘ appending it after the power actions reproduces the invisibility this fixes)", async () => {
+    const labels = await labelsFor(serverItem({ hasNodeControl: true, status: "stopped", hasWebConsole: true }));
+    expect(labels.indexOf("Open Web Console")).toBeGreaterThan(labels.indexOf("Connect"));
+    expect(labels.indexOf("Open Web Console")).toBeLessThan(labels.indexOf("Start Node"));
+  });
+
+  it("dispatches the console command with the tree item when picked (⊘ a mislabelled or unwired entry does nothing on click)", async () => {
+    const item = serverItem({ hasWebConsole: true });
+    const ctx = { core: { isServerConnected: () => false } } as any;
+    // The pick is taken FROM THE REAL LIST rather than injected, so the command
+    // id this entry actually carries is what gets dispatched — an entry wired to
+    // the wrong command would otherwise pass a hand-made pick unnoticed.
+    mockShowQuickPick.mockImplementationOnce(async (items: Array<{ label: string }>) =>
+      items.find((pick) => pick.label === "Open Web Console")
+    );
+    registerProfileCommands(ctx);
+    const handler = vi.mocked((await import("vscode")).commands.registerCommand).mock.calls.find(
+      ([command]) => command === "nexus.profile.actions"
+    )?.[1] as (arg: unknown) => Promise<void>;
+    await handler(item);
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.inventory.openWebConsole", item);
+  });
+
   it("passes the tree item through as the command arg so resolveServerArg gets arg.server (⊘ passing nothing makes the handler fall through to the palette refusal)", async () => {
     const item = serverItem({ hasNodeControl: true, status: "stopped" });
     const ctx = { core: { isServerConnected: () => false } } as any;
