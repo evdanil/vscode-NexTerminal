@@ -11906,6 +11906,113 @@ describe("nexus.inventory.refreshStatus — provider trust fingerprint", () => {
       await expect(refresh({ sourceId: "src-1", __poll: true })).resolves.toEqual({ unrefreshedSourceIds: ["src-1"] });
       expect(vault.get).not.toHaveBeenCalled();
     });
+
+    it("is keyed by the INCARNATION — a source replaced under the same id after the Continue is refused again (⊘ a latch keyed by id alone hands a replacement record's freshly restored credentials to the registrant the user approved for a different record)", async () => {
+      const { start, server, core, refresh, vault } = await setupWithNodeControl();
+      mockShowWarningMessage.mockResolvedValueOnce("Continue");
+      await start({ server });
+      vault.get.mockClear();
+
+      // A replace-mode import (or a reset-then-restore) removes the record and
+      // recreates one under the same id pointing somewhere else entirely.
+      // `addOrUpdateInventorySource` mints a fresh revision on every write, so
+      // the id survives and the incarnation does not.
+      await core.addOrUpdateInventorySource(
+        makeSource({ id: "src-1", name: "Alpha", secretFieldIds: ["apiToken"], providerFingerprint: STALE, config: { host: "somewhere-else" } })
+      );
+
+      await expect(refresh({ sourceId: "src-1", __poll: true })).resolves.toEqual({ unrefreshedSourceIds: ["src-1"] });
+      expect(vault.get).not.toHaveBeenCalled();
+    });
+
+    it("does not survive a replacement that lands WHILE the modal is open — the answer was about a record that no longer holds the id (⊘ the caller's own revision check aborts that operation, but the latch it already wrote lets the very next background refresh spend the replacement's credentials unasked)", async () => {
+      const { start, server, core, refresh, vault, controlSpy } = await setupWithNodeControl();
+      // Controllable modal: the mismatch question (the one `{ modal: true }`
+      // call) stays pending until we resolve it; any other warning resolves at
+      // once, as the busy refusals are fire-and-forget.
+      let resolveModal!: (choice: string | undefined) => void;
+      const modalChoice = new Promise<string | undefined>((resolve) => (resolveModal = resolve));
+      mockShowWarningMessage.mockImplementation((...args: unknown[]) => {
+        const isModal = typeof args[1] === "object" && args[1] !== null && (args[1] as { modal?: boolean }).modal === true;
+        return isModal ? modalChoice : Promise.resolve(undefined);
+      });
+
+      const inFlight = start({ server });
+      await vi.waitFor(() => {
+        expect(mockShowWarningMessage).toHaveBeenCalled();
+      });
+      // The record is swapped under the id while the user is still reading.
+      await core.addOrUpdateInventorySource(
+        makeSource({ id: "src-1", name: "Alpha", secretFieldIds: ["apiToken"], providerFingerprint: STALE, config: { host: "somewhere-else" } })
+      );
+      resolveModal("Continue");
+      await inFlight;
+      // The control itself was refused by the under-lock re-read, as it always was.
+      expect(controlSpy).not.toHaveBeenCalled();
+      vault.get.mockClear();
+
+      await expect(refresh({ sourceId: "src-1", __poll: true })).resolves.toEqual({ unrefreshedSourceIds: ["src-1"] });
+      expect(vault.get).not.toHaveBeenCalled();
+    });
+
+    it("compares the LIVE record, not the one the sweep captured — a replacement landing mid-sweep is refused when the loop reaches it (⊘ reading the revision off the sweep's own captured list compares the latch against a record that has just been superseded, and the secrets it then reads belong to the replacement)", async () => {
+      // Bespoke fixture: the sweep visits sources in insertion order, so the
+      // source it PARKS on has to be registered before the latched one.
+      const server = makeServer({
+        id: "eve-1",
+        name: "R1",
+        origin: { sourceId: "src-latched", externalId: "/Lab.unl#3", syncedAt: 1 }
+      });
+      const core = new NexusCore(new InMemoryConfigRepository([server]));
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      let seen = 0;
+      let releaseFirst!: () => void;
+      const firstGate = new Promise<void>((resolve) => (releaseFirst = resolve));
+      const fetchStatus = vi.fn(async () => {
+        if (seen++ === 0) await firstGate;
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus, controlNode: vi.fn(async () => {}) }));
+      const vault = makeVault({
+        [inventorySecretKey("src-park", "apiToken")]: "tok",
+        [inventorySecretKey("src-latched", "apiToken")]: "tok"
+      });
+      trackedDisposables.push(...registerInventoryCommands(core, registry, vault, makeTeardown()));
+      await core.addOrUpdateInventorySource(makeSource({ id: "src-park", name: "Park", secretFieldIds: ["apiToken"] }));
+      await core.addOrUpdateInventorySource(
+        makeSource({ id: "src-latched", name: "Alpha", secretFieldIds: ["apiToken"], providerFingerprint: STALE })
+      );
+      const refresh = registeredCommands.get("nexus.inventory.refreshStatus")! as (arg?: unknown) => Promise<{
+        unrefreshedSourceIds: string[];
+      }>;
+
+      mockShowWarningMessage.mockResolvedValueOnce("Continue");
+      await registeredCommands.get("nexus.inventory.startNode")!({ server });
+      vault.get.mockClear();
+
+      // The sweep captures its target list, then parks inside "Park"'s fetch.
+      const sweep = refresh({ __poll: true });
+      await vi.waitFor(() => {
+        expect(fetchStatus).toHaveBeenCalledTimes(1);
+      });
+      // "Alpha" is replaced under its id while the sweep still holds the old
+      // record in its captured list.
+      await core.addOrUpdateInventorySource(
+        makeSource({
+          id: "src-latched",
+          name: "Alpha",
+          secretFieldIds: ["apiToken"],
+          providerFingerprint: STALE,
+          config: { host: "somewhere-else" }
+        })
+      );
+      releaseFirst();
+
+      await expect(sweep).resolves.toEqual({ unrefreshedSourceIds: ["src-latched"] });
+      expect(vault.get).not.toHaveBeenCalledWith(inventorySecretKey("src-latched", "apiToken"));
+      expect(fetchStatus).toHaveBeenCalledTimes(1);
+    });
   });
 });
 

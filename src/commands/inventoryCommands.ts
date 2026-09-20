@@ -309,11 +309,12 @@ async function restampProviderFingerprintBestEffort(core: NexusCore, syncSnapsho
  * ABOUT THE STAMP, and it still holds: nothing here is persisted from those two
  * paths. A Continue does, however, set the SESSION LATCH
  * (`confirmedProviderShapes`) — runtime-only, this window only, keyed by the
- * exact fingerprint the user was shown — which is read by
- * `providerStillTrustedSilently` and by nothing else. So a click made to boot a
- * node authorises the background status reads for that one source, in this one
- * window, against that one shape; it blesses no later interactive flow, and a
- * further re-registration of a different shape asks again.
+ * exact fingerprint the user was shown AND the incarnation of the record the
+ * question was about — which is read by `providerStillTrustedSilently` and by
+ * nothing else. So a click made to boot a node authorises the background status
+ * reads for that one source, in this one window, against that one shape and
+ * that one record; it blesses no later interactive flow, and a further
+ * re-registration of a different shape asks again.
  *
  * ITS SILENT SIBLING is `providerStillTrustedSilently`, used by the status
  * refresh — the one automatic, repeating path — which must refuse rather than
@@ -328,7 +329,7 @@ async function restampProviderFingerprintBestEffort(core: NexusCore, syncSnapsho
 async function checkProviderFingerprint(
   source: InventorySourceConfig,
   provider: InventoryProvider,
-  confirmedProviderShapes: Map<string, string>
+  confirmedProviderShapes: Map<string, ProviderShapeConfirmation>
 ): Promise<{ outcome: "ok"; fingerprintToStamp: string | undefined } | { outcome: "cancelled" }> {
   const currentProviderFingerprint = computeProviderFingerprint(provider);
   if (sourceTrustsProviderShape(source, currentProviderFingerprint)) {
@@ -357,7 +358,14 @@ async function checkProviderFingerprint(
   // an unstamped source would be harmless — the silent path already trusts one
   // — but writing it only where the user was actually asked keeps the map
   // meaning what its name says.
-  confirmedProviderShapes.set(source.id, currentProviderFingerprint);
+  //
+  // `source.revision` is the ENTRY-TIME record — the one the modal just named,
+  // whose config and whose vault entries the user was answering about. NOT a
+  // revision re-read after the answer: the whole hazard this records is that
+  // the record can be replaced under its id while the question is on screen, so
+  // a revision captured afterwards would be the replacement's and would latch
+  // exactly the case that must not be latched.
+  confirmedProviderShapes.set(source.id, { fingerprint: currentProviderFingerprint, revision: source.revision });
   return { outcome: "ok", fingerprintToStamp: currentProviderFingerprint };
 }
 
@@ -374,6 +382,26 @@ function sourceTrustsProviderShape(source: InventorySourceConfig, currentProvide
 type SilentProviderTrust = { trusted: true; secrets: InventorySourceSecrets } | { trusted: false };
 
 /**
+ * ONE ANSWERED CONFIRMATION, as the session latch remembers it. Both halves are
+ * the question's, not the answer's: the provider shape the modal described, and
+ * the INCARNATION of the record it described it for.
+ *
+ * THE REVISION IS WHAT MAKES THE ID SAFE TO KEY BY. A source id is not an
+ * identity — a replace-mode import, and a reset followed by a restore, remove
+ * the record and recreate one under the same id pointing at a different
+ * deployment, and both can commit while the modal is still on screen. The
+ * caller's own under-lock re-read then aborts its operation, but the answer had
+ * already been given and the latch already written, so an id-only key would
+ * hand the REPLACEMENT's freshly restored credentials to the registrant the
+ * user approved for a record that no longer exists.
+ * `NexusCore.addOrUpdateInventorySource` mints a fresh revision on every write
+ * and is the only place a live record's revision is ever assigned, so revision
+ * equality is exactly the codebase's own notion of "still the same incarnation"
+ * — the same discriminator the delayed status re-check compares.
+ */
+type ProviderShapeConfirmation = { fingerprint: string; revision: string | undefined };
+
+/**
  * `checkProviderFingerprint`'s SILENT SIBLING — the same question, answered
  * without ever prompting, for the status refresh. That path is automatic and
  * repeating (the visible-gated poll ticks per source for as long as the Command
@@ -383,9 +411,16 @@ type SilentProviderTrust = { trusted: true; secrets: InventorySourceSecrets } | 
  *
  * It also trusts a shape the user CONFIRMED on an interactive path in this
  * window (`confirmedProviderShapes`), keyed by the exact fingerprint they were
- * shown — so a Start/Stop Continue is not immediately contradicted by the
- * re-check that action fires, while a SECOND re-registration of a different
- * shape is refused again rather than riding the first answer.
+ * shown AND the incarnation of the record they were shown it for — so a
+ * Start/Stop Continue is not immediately contradicted by the re-check that
+ * action fires, while a SECOND re-registration of a different shape, or a
+ * record replaced under the same id, is refused again rather than riding the
+ * first answer. `liveRevision` is the CURRENT holder of the id, read by the
+ * caller at the moment of the call: the credentials about to be read are
+ * whatever the vault holds for that id now, so it is the live record — not the
+ * possibly older one in `source` — that has to be the one the user confirmed.
+ * An absent revision on either side is a mismatch, never a match: `undefined`
+ * is also what a REMOVED record reports.
  *
  * THE VAULT READ IS FOLDED IN so the status path reads its secrets through one
  * function that cannot answer without having decided first. Be honest about how
@@ -399,13 +434,17 @@ async function providerStillTrustedSilently(
   source: InventorySourceConfig,
   provider: InventoryProvider,
   vault: SecretVault,
-  confirmedProviderShapes: ReadonlyMap<string, string>
+  confirmedProviderShapes: ReadonlyMap<string, ProviderShapeConfirmation>,
+  liveRevision: string | undefined
 ): Promise<SilentProviderTrust> {
   const currentProviderFingerprint = computeProviderFingerprint(provider);
-  if (
-    !sourceTrustsProviderShape(source, currentProviderFingerprint) &&
-    confirmedProviderShapes.get(source.id) !== currentProviderFingerprint
-  ) {
+  const confirmed = confirmedProviderShapes.get(source.id);
+  const confirmedForThisRecord =
+    confirmed !== undefined &&
+    confirmed.fingerprint === currentProviderFingerprint &&
+    confirmed.revision !== undefined &&
+    confirmed.revision === liveRevision;
+  if (!sourceTrustsProviderShape(source, currentProviderFingerprint) && !confirmedForThisRecord) {
     return { trusted: false };
   }
   const secrets: InventorySourceSecrets = {};
@@ -2556,10 +2595,12 @@ export function registerInventoryCommands(
   //
   // RUNTIME ONLY. Never persisted, never written to config or the vault; it
   // dies with the window, so the stamp remains the only durable trust record
-  // and a new window asks again. Keyed by the EXACT fingerprint rather than by
-  // a bare "confirmed" flag, so a SECOND re-registration under the same id —
-  // a different shape again — is refused rather than riding the first answer.
-  const confirmedProviderShapes = new Map<string, string>();
+  // and a new window asks again. The VALUE, not a bare "confirmed" flag, is
+  // what makes the id safe to key by: it carries the exact fingerprint shown
+  // and the incarnation of the record it was shown for, so neither a second
+  // re-registration of a different shape nor a record replaced under the same
+  // id rides the first answer. See `ProviderShapeConfirmation`.
+  const confirmedProviderShapes = new Map<string, ProviderShapeConfirmation>();
 
   /**
    * The ONE way a busy claim is dropped (review D6/E1/E2's funnel, kept as a
@@ -5337,7 +5378,18 @@ export function registerInventoryCommands(
       // `providerStillTrustedSilently`.
       let trust: SilentProviderTrust;
       try {
-        trust = await providerStillTrustedSilently(source, provider, vault, confirmedProviderShapes);
+        trust = await providerStillTrustedSilently(
+          source,
+          provider,
+          vault,
+          confirmedProviderShapes,
+          // THE LIVE revision, not `source.revision`. `targets` was captured at
+          // invocation and a replace-mode import can swap the record under this
+          // id mid-sweep; the secrets about to be read are keyed by the id, so
+          // they are the CURRENT holder's. Only the live record can answer
+          // whether it is the one the user confirmed.
+          core.getInventorySource(source.id)?.revision
+        );
       } catch {
         // A REJECTING VAULT READ — the only failure this call can produce, and
         // non-fatal per source exactly like the catch around the rest of the
