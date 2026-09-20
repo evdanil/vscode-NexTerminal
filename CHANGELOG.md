@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.229] — 2026-09-20
+
+### Fixed
+
+- **Text an inventory source supplies can no longer reshape the Show Warnings document.** The warnings a sync plan carries, and the audit lists naming every adopted pair and every server whose auth profile changes, quote names, addresses, device ids and folder paths exactly as the source reports them, plus any notice the source writes for itself — all of it text a third-party provider can register. The confirmation modal has been holding that text to a rule for a while now; this buffer was not, so a name carrying a line break could split a sentence Nexus wrote and put whatever followed on a line of its own, reading as something Nexus had said, and an invisible direction-changing character could reorder the rest of a line around it. Both are now neutralized where they enter: a line Nexus composes is flattened to the one line it was written to be, and every control, bidi and invisible formatting character becomes a space, on the plan's warnings and on the lists alike. A notice the source writes end to end keeps its own line breaks — the channel already gives it a line per entry, so it loses nothing by keeping them and stays legible when it is a list or an error the source is quoting — but it cannot indent its lines (that is how this document marks a server as a member of the list above it), cannot pad the page with blank lines, and a notice with nothing visible left is dropped instead of showing as an empty line and counting toward the warning total. What the modal does that this document deliberately does not: names are **not** truncated and their punctuation is left alone. These lists exist to be read in full — they are where you check whether one particular server is in the set before choosing Apply — and the document scrolls, so length costs nothing. Names keep the joiners that make them what they are, so an emoji or an accented character still renders as itself.
+
 ## [2.8.227] — 2026-09-20
 
 ### Fixed
