@@ -2447,8 +2447,16 @@ export function createProxmoxProvider(
     // standing rather than implying a likelihood it has no basis for. (The cap
     // is still a budget to RAISE, which is why EVE-NG's narrow-the-crawl
     // sentence could never have served both providers.)
+    //
+    // "AND CAN FAIL ANYWAY" is doing the same job one level down. Sys.Audit is
+    // NECESSARY for the read, not SUFFICIENT: `fetchClusterStatus` also answers
+    // undefined on a network error, a non-JSON response and a malformed
+    // payload, all of which truncate. Naming the privilege alone would present
+    // it as THE fix to a reader a grant cannot help. Four words say so; the
+    // failure modes themselves stay out of the string, because a remedy nobody
+    // finishes reading is worse than a slightly over-confident one.
     statusTruncationRemedy:
-      "Two things can cut this short and the report does not say which: the Hard Cap (entries), which can be raised, and — with Include Cluster Nodes on — the cluster-status read, which needs Sys.Audit on the API token.",
+      "Two things can cut this short and the report does not say which: the Hard Cap (entries), which can be raised, and — with Include Cluster Nodes on — the cluster-status read, which needs Sys.Audit on the API token and can fail anyway.",
     instanceKey(config: InventorySourceValues): string | undefined {
       return proxmoxInstanceKey(config);
     },

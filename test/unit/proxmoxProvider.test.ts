@@ -398,6 +398,28 @@ describe("createProxmoxProvider", () => {
     // The specific regression: an imperative about ONE cause as the opening
     // clause, read as "do this first" by a reader it cannot help.
     expect(remedy).not.toMatch(/^(Raise|Increase|Lift|Bump) /);
+    // Sys.Audit is NECESSARY, not SUFFICIENT: `fetchClusterStatus` also returns
+    // undefined for a network error, a non-JSON response and a malformed
+    // payload, and `fetchStatusImpl` truncates on every one of them. Granting
+    // the privilege fixes none of those, so the clause that names it has to
+    // carry its own qualification rather than read as THE fix.
+    expect(remedy).toMatch(/Sys\.Audit[^.]*\b(anyway|regardless|even (then|with it)|still)\b/i);
+  });
+
+  /**
+   * THE DECLARED SENTENCE MUST SURVIVE ITS OWN READER. `resolveStatusTruncationRemedy`
+   * caps what a provider declares, and this one is twice-rewritten and close to
+   * that cap — a third edit that tipped it over would ship a remedy cut off
+   * mid-clause, with an ellipsis where the second cause used to be, and nothing
+   * else in the suite would notice. Pinned as identity rather than against the
+   * cap's number, because the property that matters is "nothing was elided",
+   * not "the constant is still 240".
+   */
+  it("declares a remedy short enough to survive the reader's cap intact (⊘ a longer rewrite ships a sentence truncated mid-clause, losing whichever cause fell off the end)", () => {
+    const declared = createProxmoxProvider().statusTruncationRemedy ?? "";
+    expect(declared).not.toBe("");
+    expect(resolveStatusTruncationRemedy(createProxmoxProvider())).toBe(declared);
+    expect(declared).not.toContain("…");
   });
 
   it("passes validateProviderShape — the same gate the registry applies at registration (⊘ a provider that only compiles still cannot be registered)", () => {
