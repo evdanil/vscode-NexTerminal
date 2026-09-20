@@ -636,16 +636,45 @@ export function validateInventoryStatusReport(raw: unknown): InventoryStatusRepo
  * replaced by a SPACE (never deleted: deletion welds the neighbouring words
  * together, which is its own small lie about what the provider said).
  *
- * The C0 range and DEL, expressed as the terminal capture buffer expresses them
- * — with one deliberate difference. That buffer keeps `\t`, `\n` and `\r`
- * because it is line-based and those characters ARE its structure; the modal's
- * detail is line-based too, which is exactly why these values may not contain
- * them: a line break is what lets a provider forge a plan line. U+2028/U+2029
- * join them because they are line terminators too, and the bidi controls because
- * they reorder how text RENDERS without changing what it contains — an
- * invisible way to make the dialog read differently from what was approved.
+ * THE RULE, so the next reader can extend this correctly: a character is listed
+ * when its whole function is to CONTROL text rather than be text — to break a
+ * line, to reorder what follows, or to occupy no space while looking like
+ * nothing. A character is NOT listed when it is a constituent of real text, even
+ * an invisible one. What that admits and excludes:
+ *
+ * - CONTROLS: C0, DEL and C1 (`\x00-\x1f\x7f-\x9f`). The C0 half is the
+ *   terminal capture buffer's class, minus its exemptions — that buffer keeps
+ *   `\t`, `\n` and `\r` because it is line-based and they are its structure,
+ *   which is exactly why these values may not carry them: a line break is what
+ *   lets a provider forge a plan line. C1 belongs for the same reason and is easy
+ *   to miss: it holds NEL (U+0085) and CSI (U+009B), and `\s` matches NEITHER,
+ *   so the whitespace-collapse step below never absorbed them.
+ * - LINE AND PARAGRAPH SEPARATORS: U+2028/U+2029, line breaks by another name.
+ * - EVERY BIDI FORMATTING CONTROL: the marks (U+200E/U+200F and U+061C, the
+ *   Arabic one that is easy to forget because it sits far from the others), the
+ *   embeddings and overrides (U+202A-U+202E), and the isolates plus the
+ *   deprecated controls beside them (U+2066-U+206F). These reorder how text
+ *   RENDERS without changing what it contains — an invisible way to make the
+ *   dialog read differently from what was approved.
+ * - INVISIBLE SPACING AND ANNOTATION: soft hyphen, zero-width space, word joiner
+ *   and the invisible math operators, the Mongolian vowel separator, the
+ *   interlinear annotation marks, and the deprecated language tag (U+00AD,
+ *   U+200B, U+2060-U+2064, U+180E, U+FFF9-U+FFFB, U+E0001). Each takes no space
+ *   and carries no meaning a reader can see, so each can make two DIFFERENT
+ *   names render identically — and a name is what the user matches against
+ *   their own knowledge.
+ *
+ * DELIBERATELY NOT LISTED, though they are in the same Unicode category as much
+ * of the above: ZWJ and ZWNJ (U+200D/U+200C), which join emoji sequences and
+ * carry orthographic meaning in Persian and the Indic scripts; the tag block
+ * (U+E0020-U+E007F), which is what a subdivision flag is BUILT from; variation
+ * selectors and combining marks. Stripping the format category wholesale would
+ * shred the very grapheme clusters the truncation logic goes out of its way to
+ * keep whole, turning one glyph into three. Also absent on purpose: NBSP and the
+ * BOM, which `\s` does match, so the collapse below already flattens them.
  */
-const PROVIDER_TEXT_UNSAFE_CHAR_RE = /[\x00-\x1f\x7f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+const PROVIDER_TEXT_UNSAFE_CHAR_RE =
+  /[\x00-\x1f\x7f-\x9f\u00ad\u061c\u180e\u200b\u200e\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufff9-\ufffb\u{e0001}]/gu;
 
 /**
  * Trailing sentence punctuation, dropped because the value is a FRAGMENT: the

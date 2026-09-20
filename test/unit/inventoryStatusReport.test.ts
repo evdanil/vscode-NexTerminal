@@ -306,6 +306,36 @@ describe("validateInventoryStatusReport", () => {
     }
   });
 
+  // The invisible formatting controls `\s` does NOT match (verified: JavaScript's
+  // \s covers NBSP, BOM and U+2028/U+2029, but not NEL, not the C1 block, and
+  // none of the zero-width family) — so the whitespace-collapse step never
+  // absorbed them and they reached the dialog intact.
+  const INVISIBLE_CONTROLS = "\u0085\u009b؜­​⁠᠎￹‮";
+
+  it("replaces the invisible formatting controls that `\\s` never matches — the C1 block, the Arabic letter mark, soft hyphen, zero-width space, word joiner, interlinear annotation (⊘ each one reaches the dialog intact, defeating the stated guarantee that provider text arrives inert, and the C1 range carries NEL and CSI)", () => {
+    const value = validateInventoryStatusReport({
+      contractVersion: 1,
+      statuses: {},
+      notSyncableReasons: { "1": "it\u0085is\u009bnow؜a­template​⁠" }
+    })!.notSyncableReasons!["1"];
+    // Replaced by SPACES, then collapsed — the words stay words rather than
+    // being welded into "itisnowatemplate".
+    expect(value).toBe("it is now a template");
+    for (const ch of INVISIBLE_CONTROLS) {
+      expect([...value]).not.toContain(ch);
+    }
+  });
+
+  it("leaves the format characters that BUILD text alone — ZWJ, ZWNJ, a variation selector and the tag characters of a subdivision flag (⊘ a blanket strip of the format category shreds the very emoji sequences the truncation logic keeps whole, turning one glyph into three)", () => {
+    const intact = "gold‌image \u{1F468}‍\u{1F469}‍\u{1F467} \u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F} ❤️";
+    const value = validateInventoryStatusReport({
+      contractVersion: 1,
+      statuses: {},
+      notSyncableReasons: { "1": intact }
+    })!.notSyncableReasons!["1"];
+    expect(value).toBe(intact);
+  });
+
   it("keeps a `__proto__` reason key as own data (⊘ writing it into a plain `{}` hits the inherited setter — the entry vanishes and a provider string lands on Object.prototype)", () => {
     const raw = JSON.parse('{"contractVersion":1,"statuses":{},"notSyncableReasons":{"__proto__":"it is now a template","108":"it is now a template"}}');
     const result = validateInventoryStatusReport(raw);

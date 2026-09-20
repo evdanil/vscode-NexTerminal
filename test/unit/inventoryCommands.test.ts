@@ -10808,6 +10808,24 @@ describe("describePlanDetail — pruned servers whose device is still at the sou
     expect(clusterLine).not.toContain("\u{1F468}");
   });
 
+  it("strips the invisible formatting controls from a rendered NAME too, while keeping the ones that build an emoji (⊘ a name carrying a bidi override or a C1 control reorders or corrupts how the dialog reads, and a blanket format strip breaks a device whose name carries a flag)", () => {
+    const detail = describePlanDetail(
+      makeSyncPlan({ prunes: [orphanPrune("web\u0085\u009b01؜­​", REASON)] }),
+      []
+    );
+    const line = detail.split("\n").find((l) => l.includes("still at the source"))!;
+    expect(line).toContain('"web 01" is still at the source');
+    for (const ch of "\u0085\u009b؜­​‮") {
+      expect([...line]).not.toContain(ch);
+    }
+
+    const flagged = describePlanDetail(
+      makeSyncPlan({ prunes: [orphanPrune("\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}-edge", REASON)] }),
+      []
+    );
+    expect(flagged).toContain('"\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}-edge" is still at the source');
+  });
+
   it("renders the same disclosure on the DELETE and KEEP lines (kills an orphan-only render — the user about to lose a server permanently is the one who most needs to know the guest still exists)", () => {
     const deleteServer = makeServer({ id: "owned-d", name: "idm.defcon.local" });
     const deleteDetail = describePlanDetail(makeSyncPlan({ prunes: [{ policy: "delete", server: deleteServer, reason: REASON }] }), []);
