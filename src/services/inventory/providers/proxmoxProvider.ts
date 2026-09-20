@@ -1506,11 +1506,20 @@ async function fetchInventoryImpl(
         // fetchStatusImpl for why the poll records none), and only for a
         // template: the "unknown" branch below is PVE emitting a row before RRD
         // data exists — transient, and calling it not-syncable would be a lie.
-        // With includeTemplates ON the row IS in the device set, so its server
-        // is never pruned and the advisory entry decorates nothing; the member's
-        // contract (models/inventory.ts) is exactly that an unpruned entry is
-        // ignored, so the branch needs no second opt-in test to stay truthful.
-        notSyncableReasons[String(row.vmid)] = TEMPLATE_NOT_SYNCABLE_REASON;
+        // GATED ON THE OPT-IN because the reason must name the gate that
+        // ACTUALLY dropped the row. `isImportableGuestRow` skips its template
+        // test when includeTemplates is on and then lets
+        // `includeStopped || status === "running"` decide — and a template's
+        // PVE status is always "stopped" (a converted guest reports
+        // `status: "stopped", template: 1`). So with templates ON and stopped
+        // guests OFF the row is still excluded, still prunable, and its
+        // exclusion has nothing to do with template-ness: attaching this would
+        // tell the user a device was dropped "because it is now a template"
+        // while templates are switched on. With the opt-in OFF the template
+        // test is the only gate that can reject it, so the reason is exact.
+        if (!includeTemplates) {
+          notSyncableReasons[String(row.vmid)] = TEMPLATE_NOT_SYNCABLE_REASON;
+        }
       } else if (row.status === "unknown" && isImportableGuestRow(row, true, false)) {
         // includeStopped is pinned TRUE here exactly as on the poll path —
         // observed is observed; the sync's device-set preference must not

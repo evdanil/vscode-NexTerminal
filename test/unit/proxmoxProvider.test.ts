@@ -905,6 +905,23 @@ describe("createProxmoxProvider", () => {
       expect(Object.prototype.hasOwnProperty.call(plain.tree.status!, "notSyncableReasons")).toBe(false);
     });
 
+    it("records NO template reason when templates ARE included and the STOPPED gate is what drops the row — a template's PVE status is 'stopped', so with includeStopped off it is excluded for being stopped, not for being a template (kills an unconditional reason, which tells the user a device was dropped 'because it is now a template' while templates are switched ON)", async () => {
+      const { tree } = await syncRows([guestRow({ vmid: 106, name: "gold-image", template: 1, status: "stopped" })], {
+        baseUrl: BASE,
+        includeTemplates: true,
+        includeStopped: false
+      });
+      // The row IS excluded — by `isImportableGuestRow`'s stopped gate, which
+      // the template opt-in does not reach — so its server is prunable and any
+      // reason attached here WOULD be rendered in the confirmation popup.
+      expect(tree.devices).toEqual([]);
+      // The clear still rides: a template has no running/stopped state to show,
+      // whichever opt-in excluded it.
+      expect(tree.status?.clearedExternalIds).toEqual(["106"]);
+      // Template-ness is not why it was dropped, so the sync says nothing.
+      expect(Object.prototype.hasOwnProperty.call(tree.status!, "notSyncableReasons")).toBe(false);
+    });
+
     it("attaches the report even when there is nothing to say — an empty cluster yields an empty statuses object, no cleared list, no truncated (kills a conditional attach, which would reopen the gap the report closed: the ordinary sync must never leave tree.status unfilled)", async () => {
       const empty = await syncRows([]);
       expect(empty.tree.status).toEqual({ contractVersion: 1, statuses: {} });
