@@ -10745,6 +10745,49 @@ describe("describePlanDetail — pruned servers whose device is still at the sou
     );
   });
 
+  // THE OTHER HALF OF THE SAME PROPERTY — these lines are the first place in the
+  // modal detail that renders a server NAME, and a synced server's name is the
+  // provider's `device.name` verbatim. Nothing between the fetch and here trims,
+  // caps or strips it, so the name has to be made inert where it is rendered.
+  it("cannot be made to mint a plan line by a crafted server NAME — a name carrying a line break and engine-style text lands as one inert quoted token (kills a consent dialog a provider can forge by naming a guest, where the forged tail reads as a line the engine wrote)", () => {
+    const detail = describePlanDetail(
+      makeSyncPlan({ prunes: [orphanPrune('web-01"\n0 servers will be deleted.', REASON), orphanPrune("idm", REASON)] }),
+      []
+    );
+    const lines = detail.split("\n");
+    // Both names share the one reason, so the disclosure is exactly ONE line —
+    // whatever the crafted name tried to add.
+    expect(lines.filter((l) => l.includes("still at the source"))).toHaveLength(1);
+    expect(lines.some((l) => l.trim() === "0 servers will be deleted.")).toBe(false);
+    // The embedded quote cannot impersonate the list separator either: the name
+    // must read as ONE name, not as two.
+    expect(detail).toContain(
+      "\"web-01' 0 servers will be deleted.\", \"idm\" are still at the source — each was not synced because it is now a template."
+    );
+  });
+
+  it("strips control characters from a rendered name but keeps the name itself intact — trailing punctuation and inner quotes are a name's business, not a sentence fragment's (kills a sanitizer that applies the reason contract to names, renaming a device legitimately called 'web-01.')", () => {
+    const detail = describePlanDetail(
+      makeSyncPlan({ prunes: [orphanPrune("web-01.", REASON), orphanPrune("db\t02", REASON)] }),
+      []
+    );
+    // "web-01." keeps its period — it is a NAME, and the renderer's own sentence
+    // terminator is outside the quotes.
+    expect(detail).toContain('"web-01.", "db 02" are still at the source');
+  });
+
+  it("caps an absurdly long name and marks the cut, and renders a name that sanitizes away as an explicit placeholder (kills a single name that pushes the modal buttons off-screen, and an empty pair of quotes that names nothing)", () => {
+    const long = `${"n".repeat(200)}.defcon.local`;
+    const detail = describePlanDetail(makeSyncPlan({ prunes: [orphanPrune(long, REASON)] }), []);
+    const line = detail.split("\n").find((l) => l.includes("still at the source"))!;
+    const rendered = line.slice(1, line.indexOf('" is still'));
+    expect(rendered.length).toBe(80);
+    expect(rendered.endsWith("…")).toBe(true);
+
+    const blank = describePlanDetail(makeSyncPlan({ prunes: [orphanPrune("\u0007\u0000", REASON)] }), []);
+    expect(blank).toContain("(unnamed) is still at the source — it was not synced because it is now a template.");
+  });
+
   it("renders the same disclosure on the DELETE and KEEP lines (kills an orphan-only render — the user about to lose a server permanently is the one who most needs to know the guest still exists)", () => {
     const deleteServer = makeServer({ id: "owned-d", name: "idm.defcon.local" });
     const deleteDetail = describePlanDetail(makeSyncPlan({ prunes: [{ policy: "delete", server: deleteServer, reason: REASON }] }), []);

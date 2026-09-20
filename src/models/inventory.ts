@@ -632,21 +632,20 @@ export function validateInventoryStatusReport(raw: unknown): InventoryStatusRepo
 }
 
 /**
- * Characters a reason may never carry into the modal, each replaced by a SPACE
- * (never deleted: deletion welds the neighbouring words together, which is its
- * own small lie about what the provider said).
+ * Characters no provider-supplied string may carry into the confirm modal, each
+ * replaced by a SPACE (never deleted: deletion welds the neighbouring words
+ * together, which is its own small lie about what the provider said).
  *
  * The C0 range and DEL, expressed as the terminal capture buffer expresses them
  * — with one deliberate difference. That buffer keeps `\t`, `\n` and `\r`
- * because it is line-based and those characters ARE its structure; a reason is a
- * single sentence fragment, so for it they are exactly the threat: a line break
- * is what lets a provider forge a plan line. U+2028/U+2029 join them because
- * they are line terminators too, and the bidi controls because they reorder how
- * a sentence RENDERS without changing what it contains — an invisible way to
- * make the modal read differently from the text that was approved. None of them
- * has any business in a fragment that completes "… because <reason>".
+ * because it is line-based and those characters ARE its structure; the modal's
+ * detail is line-based too, which is exactly why these values may not contain
+ * them: a line break is what lets a provider forge a plan line. U+2028/U+2029
+ * join them because they are line terminators too, and the bidi controls because
+ * they reorder how text RENDERS without changing what it contains — an
+ * invisible way to make the dialog read differently from what was approved.
  */
-const REASON_UNSAFE_CHAR_RE = /[\x00-\x1f\x7f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+const PROVIDER_TEXT_UNSAFE_CHAR_RE = /[\x00-\x1f\x7f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 
 /**
  * Trailing sentence punctuation, dropped because the value is a FRAGMENT: the
@@ -678,26 +677,59 @@ const REASON_TRAILING_PUNCTUATION_RE = /[.!?;,\s]+$/;
 const REASON_MAX_LENGTH = 120;
 
 /**
+ * THE SECURITY PRIMITIVE, shared by every provider-supplied string the confirm
+ * modal renders: one line's worth of inert text. Every unsafe character becomes
+ * a space, runs of whitespace collapse, the result is trimmed — so nothing a
+ * provider supplies can add, remove or reshape a LINE of the plan detail, and no
+ * invisible character survives into the dialog.
+ *
+ * It deliberately stops there. What a value means — whether a trailing period
+ * belongs to it, how long it may be — differs per field, and folding those
+ * rules in here would leak one field's contract onto the next: a REASON is a
+ * sentence fragment the renderer terminates, while a NAME is a name, and a
+ * device legitimately called "web-01." must still render as itself.
+ */
+export function flattenProviderText(raw: string): string {
+  return raw.replace(PROVIDER_TEXT_UNSAFE_CHAR_RE, " ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * The shared length rule: cut at a word boundary and mark the cut, so a capped
+ * value stays well-formed prose rather than a word sliced in half. The cap is
+ * the CALLER's, because how much of a value a reader needs is a per-field
+ * question — see `REASON_MAX_LENGTH` and the modal's own name cap.
+ *
+ * `trimTrailing` defaults to whitespace alone (never leave " …"); a caller whose
+ * field has its own trailing-punctuation rule passes it in, rather than having
+ * that rule applied to fields it does not govern.
+ */
+export function capProviderText(text: string, maxLength: number, trimTrailing: RegExp = /\s+$/): string {
+  if (text.length <= maxLength) {
+    return text;
+  }
+  // One character of the budget belongs to the ellipsis, so the result is never
+  // longer than the cap it is named for.
+  const clipped = text.slice(0, maxLength - 1);
+  const lastSpace = clipped.lastIndexOf(" ");
+  // A value with no space inside the budget is one unbroken token — there is no
+  // boundary to prefer, so the hard cut is the only honest cut.
+  const body = (lastSpace > 0 ? clipped.slice(0, lastSpace) : clipped).replace(trimTrailing, "");
+  return `${body}\u2026`;
+}
+
+/**
  * One reason value, sanitized — or `undefined` when nothing usable is left, which
  * the caller drops exactly as it drops a non-string.
  */
 function normalizeReasonText(raw: string): string | undefined {
-  const flattened = raw.replace(REASON_UNSAFE_CHAR_RE, " ").replace(/\s+/g, " ").trim();
-  const fragment = flattened.replace(REASON_TRAILING_PUNCTUATION_RE, "");
+  const fragment = flattenProviderText(raw).replace(REASON_TRAILING_PUNCTUATION_RE, "");
   if (fragment.length === 0) {
     return undefined;
   }
-  if (fragment.length <= REASON_MAX_LENGTH) {
-    return fragment;
-  }
-  // One character of the budget belongs to the ellipsis, so the result is never
-  // longer than the cap it is named for.
-  const clipped = fragment.slice(0, REASON_MAX_LENGTH - 1);
-  const lastSpace = clipped.lastIndexOf(" ");
-  // A value with no space in its first 119 characters is one unbroken token —
-  // there is no boundary to prefer, so the hard cut is the only honest cut.
-  const body = (lastSpace > 0 ? clipped.slice(0, lastSpace) : clipped).replace(REASON_TRAILING_PUNCTUATION_RE, "");
-  return body.length === 0 ? undefined : `${body}\u2026`;
+  const capped = capProviderText(fragment, REASON_MAX_LENGTH, REASON_TRAILING_PUNCTUATION_RE);
+  // The cut can land past the last real word (a value that is one long token of
+  // punctuation), leaving only the marker — nothing to say, so nothing is said.
+  return capped === "\u2026" ? undefined : capped;
 }
 
 /**
