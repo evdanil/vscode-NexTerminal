@@ -15,6 +15,7 @@ import {
   computeProviderFingerprint,
   InventoryProviderError,
   inventorySecretKey,
+  normalizeNotSyncableReasons,
   type InventoryProvider,
   type InventorySourceConfig,
   type InventorySourceValues,
@@ -10650,5 +10651,207 @@ describe("nexus.inventory.syncNow — the sync applies the fetched lab status", 
     expect(order).toEqual(["status", "restamp"]);
     expect(core.getInventorySource("src-1")?.providerFingerprint).toBeDefined(); // the restamp still ran
     expect(core.getSnapshot().serverStatus.get(RUNNING_ID)).toBe("stopped"); // ...and the status still landed
+  });
+});
+
+/**
+ * PRUNE REASONS in the confirm modal — a guest converted to a Proxmox template
+ * is pruned exactly like a guest that was deleted, and until the engine started
+ * carrying `notSyncableReasons` onto the prune entry the modal could not tell
+ * the two apart. These pin the rendered sentences, because the whole feature IS
+ * the sentence.
+ */
+describe("describePlanDetail — pruned servers whose device is still at the source", () => {
+  const REASON = "it is now a template";
+
+  function orphanPrune(name: string, reason?: string) {
+    const server = makeServer({ id: `owned-${name}`, name, group: "Proxmox" });
+    const entry = { policy: "orphan" as const, server, after: { ...server, group: "Proxmox/_orphaned" } };
+    return reason === undefined ? entry : { ...entry, reason };
+  }
+
+  it("names the ONE converted guest and its reason under the orphan line (kills the shipped line, which says only that a server moved and leaves 'deleted upstream' as the only reading)", () => {
+    const detail = describePlanDetail(makeSyncPlan({ prunes: [orphanPrune("idm.defcon.local", REASON)] }), []);
+    expect(detail).toContain('1 server will be moved to "Proxmox/_orphaned".');
+    expect(detail).toContain('"idm.defcon.local" is still at the source — it was not synced because it is now a template.');
+  });
+
+  it("groups servers that share a reason onto ONE named line (kills a line per server, which turns a five-guest template sweep into a wall of identical sentences)", () => {
+    const detail = describePlanDetail(
+      makeSyncPlan({ prunes: [orphanPrune("idm", REASON), orphanPrune("vault", REASON), orphanPrune("ns1", REASON)] }),
+      []
+    );
+    expect(detail).toContain('3 servers will be moved to "Proxmox/_orphaned".');
+    expect(detail).toContain('"idm", "vault", "ns1" are still at the source — each was not synced because it is now a template.');
+    expect(detail.split("\n").filter((l) => l.includes("still at the source"))).toHaveLength(1);
+  });
+
+  it("does NOT overclaim when only SOME pruned servers have a reason — the named subset is the whole claim (kills a line counting every prune, which would tell the user two deleted guests became templates)", () => {
+    const detail = describePlanDetail(
+      makeSyncPlan({ prunes: [orphanPrune("idm.defcon.local", REASON), orphanPrune("gone-1"), orphanPrune("gone-2")] }),
+      []
+    );
+    expect(detail).toContain('3 servers will be moved to "Proxmox/_orphaned".');
+    expect(detail).toContain('"idm.defcon.local" is still at the source — it was not synced because it is now a template.');
+    expect(detail).not.toContain("gone-1");
+    expect(detail).not.toContain("3 of them");
+  });
+
+  it("falls back to a counted aggregate past three names, and keeps one line per distinct reason (kills a modal that lists twenty names, and a render that folds two different explanations into one)", () => {
+    const many = Array.from({ length: 5 }, (_, i) => orphanPrune(`tpl-${i}`, REASON));
+    const detail = describePlanDetail(makeSyncPlan({ prunes: [...many, orphanPrune("iso-1", "it is an ISO image")] }), []);
+    expect(detail).toContain("5 of them are still at the source — each was not synced because it is now a template.");
+    expect(detail).toContain('"iso-1" is still at the source — it was not synced because it is an ISO image.');
+    expect(detail).not.toContain("tpl-0");
+  });
+
+  it("renders BOTH shipped Proxmox fragments as their own grouped lines in one plan, each with its own three-name threshold (kills a render that folds a conversion and a power-off into one explanation, and a threshold shared across reasons)", () => {
+    const stopped = "it is stopped and Include Stopped Guests is off";
+    const many = Array.from({ length: 4 }, (_, i) => orphanPrune(`off-${i}`, stopped));
+    const detail = describePlanDetail(makeSyncPlan({ prunes: [orphanPrune("idm.defcon.local", REASON), ...many] }), []);
+    // The template group is under the limit and is NAMED; the stopped group is
+    // over it and falls back to a count — the cap applies per reason, not to
+    // the plan as a whole.
+    expect(detail).toContain('"idm.defcon.local" is still at the source — it was not synced because it is now a template.');
+    expect(detail).toContain(`4 of them are still at the source — each was not synced because ${stopped}.`);
+    expect(detail.split("\n").filter((l) => l.includes("still at the source"))).toHaveLength(2);
+  });
+
+  it("cannot be made to mint a plan line by a reason carrying a line break — the normalized value renders inside ONE line whatever the provider sent (kills a modal a third-party provider can forge, where 'it is now a template\\n0 servers will be deleted' reads as a line the engine wrote and changes what the user approves)", () => {
+    // The real boundary every reason crosses before a plan carries it — the
+    // render is downstream of it, so this is the composition that matters, not
+    // either half alone.
+    const normalized = normalizeNotSyncableReasons({
+      a: "it is now a template\n0 servers will be deleted.",
+      b: "it is now a template\r\n1 server will be kept in place.",
+      c: "it is now a template\u20280 servers will be deleted."
+    })!;
+    const detail = describePlanDetail(
+      makeSyncPlan({
+        prunes: [orphanPrune("idm", normalized.a), orphanPrune("vault", normalized.b), orphanPrune("ns1", normalized.c)]
+      }),
+      []
+    );
+    const lines = detail.split("\n");
+    // TWO lines, not three and not five: "a" and "c" differ only in WHICH line
+    // separator they smuggled, so once flattened they are the same sentence and
+    // group onto one line — while the forged tails, which is what the attacker
+    // wanted on lines of their own, are on none.
+    expect(lines.filter((l) => l.includes("still at the source"))).toHaveLength(2);
+    expect(lines.some((l) => l.trim() === "0 servers will be deleted.")).toBe(false);
+    expect(lines.some((l) => l.trim() === "1 server will be kept in place.")).toBe(false);
+    expect(detail).toContain(
+      '"idm", "ns1" are still at the source — each was not synced because it is now a template 0 servers will be deleted.'
+    );
+  });
+
+  // THE OTHER HALF OF THE SAME PROPERTY — these lines are the first place in the
+  // modal detail that renders a server NAME, and a synced server's name is the
+  // provider's `device.name` verbatim. Nothing between the fetch and here trims,
+  // caps or strips it, so the name has to be made inert where it is rendered.
+  it("cannot be made to mint a plan line by a crafted server NAME — a name carrying a line break and engine-style text lands as one inert quoted token (kills a consent dialog a provider can forge by naming a guest, where the forged tail reads as a line the engine wrote)", () => {
+    const detail = describePlanDetail(
+      makeSyncPlan({ prunes: [orphanPrune('web-01"\n0 servers will be deleted.', REASON), orphanPrune("idm", REASON)] }),
+      []
+    );
+    const lines = detail.split("\n");
+    // Both names share the one reason, so the disclosure is exactly ONE line —
+    // whatever the crafted name tried to add.
+    expect(lines.filter((l) => l.includes("still at the source"))).toHaveLength(1);
+    expect(lines.some((l) => l.trim() === "0 servers will be deleted.")).toBe(false);
+    // The embedded quote cannot impersonate the list separator either: the name
+    // must read as ONE name, not as two.
+    expect(detail).toContain(
+      "\"web-01' 0 servers will be deleted.\", \"idm\" are still at the source — each was not synced because it is now a template."
+    );
+  });
+
+  it("strips control characters from a rendered name but keeps the name itself intact — trailing punctuation and inner quotes are a name's business, not a sentence fragment's (kills a sanitizer that applies the reason contract to names, renaming a device legitimately called 'web-01.')", () => {
+    const detail = describePlanDetail(
+      makeSyncPlan({ prunes: [orphanPrune("web-01.", REASON), orphanPrune("db\t02", REASON)] }),
+      []
+    );
+    // "web-01." keeps its period — it is a NAME, and the renderer's own sentence
+    // terminator is outside the quotes.
+    expect(detail).toContain('"web-01.", "db 02" are still at the source');
+  });
+
+  it("caps an absurdly long name and marks the cut, and renders a name that sanitizes away as an explicit placeholder (kills a single name that pushes the modal buttons off-screen, and an empty pair of quotes that names nothing)", () => {
+    const long = `${"n".repeat(200)}.defcon.local`;
+    const detail = describePlanDetail(makeSyncPlan({ prunes: [orphanPrune(long, REASON)] }), []);
+    const line = detail.split("\n").find((l) => l.includes("still at the source"))!;
+    const rendered = line.slice(1, line.indexOf('" is still'));
+    expect(rendered.length).toBe(80);
+    expect(rendered.endsWith("…")).toBe(true);
+
+    const blank = describePlanDetail(makeSyncPlan({ prunes: [orphanPrune("\u0007\u0000", REASON)] }), []);
+    expect(blank).toContain("(unnamed) is still at the source — it was not synced because it is now a template.");
+  });
+
+  it("never cuts a rendered NAME mid-CHARACTER, and keeps a grapheme cluster whole — an emoji astride the cap is dropped rather than halved into a lone surrogate, and a ZWJ sequence is not left as a fragment of itself (⊘ the one dialog where the user is trying to RECOGNIZE their server shows it with a replacement glyph or a different emoji than the device carries)", () => {
+    // An astral pair astride index 79, in an unbroken token: the hard-cut path.
+    const astride = `${"n".repeat(78)}\u{1F600}${"n".repeat(10)}`;
+    const detail = describePlanDetail(makeSyncPlan({ prunes: [orphanPrune(astride, REASON)] }), []);
+    const rendered = detail.split("\n").find((l) => l.includes("still at the source"))!.slice(1);
+    const name = rendered.slice(0, rendered.indexOf('" is still'));
+    expect([...name].filter((c) => c.codePointAt(0)! >= 0xd800 && c.codePointAt(0)! <= 0xdfff)).toEqual([]);
+    expect(name.length).toBeLessThanOrEqual(80);
+    expect(name).toBe(`${"n".repeat(78)}…`);
+
+    // A ZWJ family emoji straddling the cap splits on a PAIR boundary without
+    // splitting a surrogate — so surrogate-safety alone would leave "\u{1F468}‍\u{1F469}",
+    // a different family than the device carries. The whole cluster goes.
+    const cluster = `${"n".repeat(74)}\u{1F468}‍\u{1F469}‍\u{1F467}${"x".repeat(20)}`;
+    const clusterDetail = describePlanDetail(makeSyncPlan({ prunes: [orphanPrune(cluster, REASON)] }), []);
+    const clusterLine = clusterDetail.split("\n").find((l) => l.includes("still at the source"))!;
+    expect(clusterLine).toContain(`"${"n".repeat(74)}…"`);
+    expect(clusterLine).not.toContain("\u{1F468}");
+  });
+
+  it("strips the invisible formatting controls from a rendered NAME too, while keeping the ones that build an emoji (⊘ a name carrying a bidi override or a C1 control reorders or corrupts how the dialog reads, and a blanket format strip breaks a device whose name carries a flag)", () => {
+    const detail = describePlanDetail(
+      makeSyncPlan({ prunes: [orphanPrune("web\u0085\u009b01؜­​", REASON)] }),
+      []
+    );
+    const line = detail.split("\n").find((l) => l.includes("still at the source"))!;
+    expect(line).toContain('"web 01" is still at the source');
+    for (const ch of "\u0085\u009b؜­​‮") {
+      expect([...line]).not.toContain(ch);
+    }
+
+    const flagged = describePlanDetail(
+      makeSyncPlan({ prunes: [orphanPrune("\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}-edge", REASON)] }),
+      []
+    );
+    expect(flagged).toContain('"\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}-edge" is still at the source');
+  });
+
+  it("renders a localized reason with exactly ONE sentence terminator, while a NAME ending in one keeps it (⊘ the fragment rule leaking onto names renames a device legitimately called 'ウェブ。', and not extending it at all doubles the terminator in the localized line)", () => {
+    // The reason arrives through the real boundary, terminator and all.
+    const reason = normalizeNotSyncableReasons({ a: "これはテンプレートです。" })!.a;
+    const detail = describePlanDetail(makeSyncPlan({ prunes: [orphanPrune("ウェブ。", reason)] }), []);
+    const line = detail.split("\n").find((l) => l.includes("still at the source"))!;
+    // One terminator, the renderer's own — and the NAME keeps the one it owns,
+    // because a name is not a sentence fragment.
+    expect(line).toBe(
+      '"ウェブ。" is still at the source — it was not synced because これはテンプレートです.'
+    );
+  });
+
+  it("renders the same disclosure on the DELETE and KEEP lines (kills an orphan-only render — the user about to lose a server permanently is the one who most needs to know the guest still exists)", () => {
+    const deleteServer = makeServer({ id: "owned-d", name: "idm.defcon.local" });
+    const deleteDetail = describePlanDetail(makeSyncPlan({ prunes: [{ policy: "delete", server: deleteServer, reason: REASON }] }), []);
+    expect(deleteDetail).toContain("1 server will be deleted, including its saved password.");
+    expect(deleteDetail).toContain('"idm.defcon.local" is still at the source — it was not synced because it is now a template.');
+
+    const keepDetail = describePlanDetail(makeSyncPlan({ prunes: [{ policy: "keep", server: deleteServer, reason: REASON }] }), []);
+    expect(keepDetail).toContain("1 server will be kept in place.");
+    expect(keepDetail).toContain('"idm.defcon.local" is still at the source — it was not synced because it is now a template.');
+  });
+
+  it("says nothing extra for a plain deletion — no reasons, no line (kills a render that invents an explanation for a guest that really did vanish)", () => {
+    const detail = describePlanDetail(makeSyncPlan({ prunes: [orphanPrune("gone-1"), orphanPrune("gone-2")] }), []);
+    expect(detail).toContain('2 servers will be moved to "Proxmox/_orphaned".');
+    expect(detail).not.toContain("still at the source");
   });
 });

@@ -1,6 +1,7 @@
 import type { AuthProfile, DetachedServerOrigin, ServerConfig, ServerOrigin, ServerProtocol } from "../../models/config";
 import { authProfileNeedsServerKeyPath, proxyConfigsEqual, serverOriginStampsEqual, templatedHasAnyStamp } from "../../models/config";
 import type { InventoryDevice, InventoryEndpoint, InventorySourceConfig, InventoryTree } from "../../models/inventory";
+import { normalizeNotSyncableReasons } from "../../models/inventory";
 import type { DeviceTemplateProfile } from "../../models/deviceTemplate";
 import type { InventorySyncApplication } from "../../core/nexusCore";
 import { normalizeFolderPath } from "../../utils/folderPaths";
@@ -162,10 +163,21 @@ export interface InventorySyncPlan {
   syncedAt: number;
   adds: ServerConfig[]; // deterministic ids, authType "agent", origin set, source's auth profile linked when it resolves
   updates: Array<{ before: ServerConfig; after: ServerConfig }>; // full replacement objects
+  /**
+   * PRUNE REASONS — `reason` is present when the source STILL LISTS this
+   * server's device and named why it nonetheless will not sync (a Proxmox guest
+   * converted to a template): the sentence fragment from
+   * `InventoryStatusReport.notSyncableReasons`, completing "… because <reason>".
+   * Absent means the engine knows nothing beyond "the device did not reappear",
+   * which is every other prune — deletion upstream included. It is carried on
+   * ALL THREE policies, not just `orphan`: the entry is pure presentation, and
+   * the user about to DELETE a server permanently is the one who most needs to
+   * learn that the guest behind it still exists.
+   */
   prunes: Array<
-    | { policy: "delete"; server: ServerConfig }
-    | { policy: "orphan"; server: ServerConfig; after: ServerConfig } // moved to <targetFolder>/_orphaned
-    | { policy: "keep"; server: ServerConfig }
+    | { policy: "delete"; server: ServerConfig; reason?: string }
+    | { policy: "orphan"; server: ServerConfig; after: ServerConfig; reason?: string } // moved to <targetFolder>/_orphaned
+    | { policy: "keep"; server: ServerConfig; reason?: string }
   >;
   unchangedCount: number;
   folders: string[]; // every folder any add/update/orphan lands in, plus targetFolder itself
@@ -3692,18 +3704,33 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       }
     }
 
+    // PRUNE REASONS — what the provider said about devices it can still SEE and
+    // will not sync (a guest converted to a template). Read off the tree's own
+    // status report, which no validator has been past on this path
+    // (`validateInventoryStatusReport` runs in the command layer, on a copy,
+    // after this), so it goes through the shared normalizer: a third-party
+    // provider's malformed map must degrade to "no reasons", never throw inside
+    // a sync it has nothing to do with. Purely advisory — read below ONLY to
+    // decorate an entry the loop was pushing anyway, so no prune decision can
+    // depend on it.
+    const notSyncableReasons = normalizeNotSyncableReasons(tree.status?.notSyncableReasons);
+
     // Prunes: owned servers whose device did not reappear in this fetch.
     for (const [externalId, server] of ownedByExternalId.entries()) {
       if (presentExternalIds.has(externalId)) {
         continue;
       }
+      // Spread, never a bare `reason: undefined`: a key present with an
+      // undefined value would make an explained prune and an unexplained one
+      // differ by shape, and `planDetailDrift` compares plans.
+      const reasonPart = notSyncableReasons?.[externalId] !== undefined ? { reason: notSyncableReasons[externalId] } : {};
       if (source.prunePolicy === "delete") {
-        prunes.push({ policy: "delete", server });
+        prunes.push({ policy: "delete", server, ...reasonPart });
       } else if (source.prunePolicy === "orphan") {
         // Origin is KEPT on the orphaned copy: a reappearing device matches by
         // externalId regardless of where the server currently sits, and its
         // group is source-owned so the next sync moves it back automatically.
-        prunes.push({ policy: "orphan", server, after: { ...server, group: orphanGroupForPrune } });
+        prunes.push({ policy: "orphan", server, after: { ...server, group: orphanGroupForPrune }, ...reasonPart });
         if (orphanGroupForPrune !== undefined) {
           folderSet.add(orphanGroupForPrune);
         }
@@ -3711,7 +3738,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           orphanFallbackCount++;
         }
       } else {
-        prunes.push({ policy: "keep", server });
+        prunes.push({ policy: "keep", server, ...reasonPart });
       }
     }
 

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   controlProviderNode,
   fetchProviderStatus,
@@ -146,6 +146,238 @@ describe("validateInventoryStatusReport", () => {
     expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {}, clearedExternalIds: ["105", ""] })).toBeUndefined();
     // One bad element poisons the whole report — the same first-bad-entry rule as statuses.
     expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {}, clearedExternalIds: ["105", 42] })).toBeUndefined();
+  });
+
+  // NOT-SYNCABLE REASONS — `notSyncableReasons`: why a device the source STILL
+  // LISTS is nonetheless absent from the tree's device set (Proxmox sends "it is
+  // now a template"). Purely advisory — the sync engine renders it on a pruned
+  // server's line and ignores it everywhere else — so a malformed entry DROPS
+  // (the console-field rule two blocks down) instead of rejecting a report whose
+  // statuses are perfectly good.
+  it("accepts an optional `notSyncableReasons` map and preserves it; a report without it is unchanged (⊘ stripping the field leaves the orphan popup unable to say a guest still exists and merely became a template)", () => {
+    const report: InventoryStatusReport = {
+      contractVersion: 1,
+      statuses: { "105": { state: "running" } },
+      clearedExternalIds: ["108"],
+      notSyncableReasons: { "108": "it is now a template" }
+    };
+    expect(validateInventoryStatusReport(report)).toEqual(report);
+    // Absent is fine and does not invent the field.
+    const none = validateInventoryStatusReport({ contractVersion: 1, statuses: {} });
+    expect(Object.prototype.hasOwnProperty.call(none!, "notSyncableReasons")).toBe(false);
+  });
+
+  it("DROPS a malformed `notSyncableReasons` — a non-object (array included) field, and entries whose key or value is not a non-empty string — while still returning the report (⊘ fail-closed here would blank a whole source's decorations over an advisory string, and trusting the shape would let a non-string reason reach the modal)", () => {
+    for (const bad of ["x", 7, true, null, ["108"]]) {
+      const result = validateInventoryStatusReport({
+        contractVersion: 1,
+        statuses: { "105": { state: "running" } },
+        notSyncableReasons: bad
+      });
+      expect(result).toBeDefined();
+      expect(result?.statuses).toEqual({ "105": { state: "running" } });
+      expect(Object.prototype.hasOwnProperty.call(result!, "notSyncableReasons")).toBe(false);
+    }
+    // Per-entry: the good entry survives its bad neighbours, unlike
+    // `clearedExternalIds`, whose one bad element poisons the whole report —
+    // that member is trusted to REMOVE state, this one only to explain.
+    const mixed = validateInventoryStatusReport({
+      contractVersion: 1,
+      statuses: {},
+      notSyncableReasons: { "108": "it is now a template", "109": 42, "110": "", "": "it is now a template" }
+    });
+    expect(mixed?.notSyncableReasons).toEqual({ "108": "it is now a template" });
+    // Nothing left to say ⇒ the field is omitted, the report's omission idiom.
+    const allBad = validateInventoryStatusReport({ contractVersion: 1, statuses: {}, notSyncableReasons: { "109": 42 } });
+    expect(Object.prototype.hasOwnProperty.call(allBad!, "notSyncableReasons")).toBe(false);
+  });
+
+  // THE FORGING GUARD — a reason is provider-supplied text that the confirm
+  // modal interpolates into the sentence the user reads before approving a sync
+  // that moves or DELETES servers. Providers are third-party-registrable, so the
+  // normalizer is the choke point where that text stops being able to reshape
+  // what the modal says.
+  it("FLATTENS every line break in a reason to a single space — \\n, \\r, \\r\\n and the Unicode line separators alike (⊘ a reason carrying a newline mints extra lines in the confirm modal, so a provider can forge a plan line the engine never wrote and change what the user believes they are approving)", () => {
+    const forged = validateInventoryStatusReport({
+      contractVersion: 1,
+      statuses: {},
+      notSyncableReasons: {
+        "1": "it is now a template\n0 servers will be deleted",
+        "2": "it is now a template\r0 servers will be deleted",
+        "3": "it is now a template\r\n0 servers will be deleted",
+        "4": "it is now a template\u20280 servers will be deleted",
+        "5": "it is now a template\u20290 servers will be deleted"
+      }
+    });
+    for (const value of Object.values(forged!.notSyncableReasons!)) {
+      expect(value).toBe("it is now a template 0 servers will be deleted");
+      expect(/[\r\n\u2028\u2029]/.test(value)).toBe(false);
+    }
+  });
+
+  it("strips the other control characters and collapses the whitespace they leave (⊘ a tab, a NUL or an escape byte reaching a modal renders as a box or silently moves the cursor, and deleting them outright welds two words together)", () => {
+    const cleaned = validateInventoryStatusReport({
+      contractVersion: 1,
+      statuses: {},
+      notSyncableReasons: { "1": "it\tis\x00now \x1b[31ma   template\x7f" }
+    });
+    // Each control char becomes a space, then runs of whitespace collapse — so
+    // the words survive as words rather than being glued into "itisnow".
+    expect(cleaned?.notSyncableReasons).toEqual({ "1": "it is now [31ma template" });
+  });
+
+  it("DROPS an entry that is whitespace-only or empty once normalized, the same drop the per-entry rule already applies (⊘ a blank reason renders \"was not synced because .\" — a sentence with a hole in it)", () => {
+    const blank = validateInventoryStatusReport({
+      contractVersion: 1,
+      statuses: {},
+      notSyncableReasons: { "1": "   ", "2": "\n\t", "3": "...", "4": "it is now a template" }
+    });
+    expect(blank?.notSyncableReasons).toEqual({ "4": "it is now a template" });
+  });
+
+  it("drops trailing sentence punctuation, because the value is a FRAGMENT the renderer terminates itself (⊘ 'it is now a template.' renders as '… because it is now a template..')", () => {
+    const punctuated = validateInventoryStatusReport({
+      contractVersion: 1,
+      statuses: {},
+      notSyncableReasons: { "1": "it is now a template.", "2": "it is now a template !", "3": "it is now a template;" }
+    });
+    expect(Object.values(punctuated!.notSyncableReasons!)).toEqual([
+      "it is now a template",
+      "it is now a template",
+      "it is now a template"
+    ]);
+  });
+
+  it("TRUNCATES an over-long reason at a word boundary and marks it, rather than dropping the explanation (⊘ an unbounded value fills the modal with one entry\'s prose and buries the lines the user has to act on; dropping it instead loses the only thing this member exists to say)", () => {
+    const long = `it is now a template ${"and ".repeat(80)}done`;
+    const capped = validateInventoryStatusReport({ contractVersion: 1, statuses: {}, notSyncableReasons: { "1": long } });
+    const value = capped!.notSyncableReasons!["1"];
+    expect(value.length).toBeLessThanOrEqual(120);
+    expect(value.startsWith("it is now a template and and")).toBe(true);
+    // Word boundary, then the truncation mark — never a word cut in half.
+    expect(value.endsWith("and…")).toBe(true);
+    // A single unbroken token has no boundary to cut at: it is still capped.
+    const oneWord = validateInventoryStatusReport({
+      contractVersion: 1,
+      statuses: {},
+      notSyncableReasons: { "1": "x".repeat(400) }
+    });
+    expect(oneWord!.notSyncableReasons!["1"].length).toBe(120);
+  });
+
+  it("never cuts a reason mid-CHARACTER — an astral code point sitting exactly on the truncation boundary is dropped whole, not halved into a lone surrogate (⊘ the modal renders the broken half as a replacement glyph, corrupting the explanation the user is reading to decide whether to approve a destructive sync)", () => {
+    // 118 ASCII + an emoji (2 UTF-16 units) puts the pair astride index 119 —
+    // the exact hard-cut boundary — and the token is unbroken, which is the
+    // path that takes the hard cut rather than backing up to a space.
+    const astride = `${"a".repeat(118)}\u{1F600}${"b".repeat(10)}`;
+    const capped = validateInventoryStatusReport({
+      contractVersion: 1,
+      statuses: {},
+      notSyncableReasons: { "1": astride }
+    });
+    const value = capped!.notSyncableReasons!["1"];
+    // Code-point-wise: spreading a string iterates code points, so a surviving
+    // half-pair shows up as a single char in the surrogate range. Comparing
+    // strings alone would pass while holding one.
+    expect([...value].filter((c) => c.codePointAt(0)! >= 0xd800 && c.codePointAt(0)! <= 0xdfff)).toEqual([]);
+    expect(value.length).toBeLessThanOrEqual(120);
+    // The emoji is either whole or gone; here there is no room, so it is gone.
+    expect(value).toBe(`${"a".repeat(118)}…`);
+  });
+
+  it("holds the surrogate floor even in a runtime with no `Intl.Segmenter` — the grapheme path degrades to whole code points rather than to a bare slice (⊘ a browser without the API gets the replacement glyph back, and a module that assumed the API would throw on load and take the whole extension with it)", async () => {
+    const segmenter = Intl.Segmenter;
+    Reflect.deleteProperty(Intl as unknown as Record<string, unknown>, "Segmenter");
+    try {
+      vi.resetModules();
+      // Re-evaluated WITHOUT the API, so the module picks its fallback path.
+      const fresh = await import("../../src/models/inventory");
+      const astride = `${"a".repeat(118)}\u{1F600}${"b".repeat(10)}`;
+      const value = fresh.validateInventoryStatusReport({
+        contractVersion: 1,
+        statuses: {},
+        notSyncableReasons: { "1": astride }
+      })!.notSyncableReasons!["1"];
+      expect([...value].filter((c) => c.codePointAt(0)! >= 0xd800 && c.codePointAt(0)! <= 0xdfff)).toEqual([]);
+      expect(value.length).toBeLessThanOrEqual(120);
+    } finally {
+      (Intl as unknown as Record<string, unknown>).Segmenter = segmenter;
+      vi.resetModules();
+    }
+  });
+
+  // The invisible formatting controls `\s` does NOT match (verified: JavaScript's
+  // \s covers NBSP, BOM and U+2028/U+2029, but not NEL, not the C1 block, and
+  // none of the zero-width family) — so the whitespace-collapse step never
+  // absorbed them and they reached the dialog intact.
+  const INVISIBLE_CONTROLS = "\u0085\u009b؜­​⁠᠎￹‮";
+
+  it("replaces the invisible formatting controls that `\\s` never matches — the C1 block, the Arabic letter mark, soft hyphen, zero-width space, word joiner, interlinear annotation (⊘ each one reaches the dialog intact, defeating the stated guarantee that provider text arrives inert, and the C1 range carries NEL and CSI)", () => {
+    const value = validateInventoryStatusReport({
+      contractVersion: 1,
+      statuses: {},
+      notSyncableReasons: { "1": "it\u0085is\u009bnow؜a­template​⁠" }
+    })!.notSyncableReasons!["1"];
+    // Replaced by SPACES, then collapsed — the words stay words rather than
+    // being welded into "itisnowatemplate".
+    expect(value).toBe("it is now a template");
+    for (const ch of INVISIBLE_CONTROLS) {
+      expect([...value]).not.toContain(ch);
+    }
+  });
+
+  it("leaves the format characters that BUILD text alone — ZWJ, ZWNJ, a variation selector and the tag characters of a subdivision flag (⊘ a blanket strip of the format category shreds the very emoji sequences the truncation logic keeps whole, turning one glyph into three)", () => {
+    const intact = "gold‌image \u{1F468}‍\u{1F469}‍\u{1F467} \u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F} ❤️";
+    const value = validateInventoryStatusReport({
+      contractVersion: 1,
+      statuses: {},
+      notSyncableReasons: { "1": intact }
+    })!.notSyncableReasons!["1"];
+    expect(value).toBe(intact);
+  });
+
+  it("drops a TRAILING sentence terminator in any script, not just the ASCII ones — the CJK full stop, the fullwidth marks, the Arabic question mark, the danda, the Armenian and Ethiopic stops (⊘ a localized reason keeps its terminator and the renderer appends its own, so the modal reads '… because 这是一个模板。.' — a contract the docs state unconditionally that localized text cannot satisfy)", () => {
+    const terminated = {
+      cjk: "it is now a template。",
+      fullwidthBang: "it is now a template！",
+      fullwidthQuestion: "it is now a template？",
+      fullwidthStop: "it is now a template．",
+      halfwidthStop: "it is now a template｡",
+      arabicQuestion: "it is now a template؟",
+      arabicStop: "it is now a template۔",
+      danda: "it is now a template।",
+      doubleDanda: "it is now a template॥",
+      armenian: "it is now a template։",
+      ethiopic: "it is now a template።",
+      greekQuestion: "it is now a template;",
+      fullwidthColon: "it is now a template：",
+      colon: "it is now a template:",
+      mixed: "it is now a template。！ "
+    };
+    const value = validateInventoryStatusReport({ contractVersion: 1, statuses: {}, notSyncableReasons: terminated })!
+      .notSyncableReasons!;
+    for (const key of Object.keys(terminated)) {
+      expect(value[key]).toBe("it is now a template");
+    }
+  });
+
+  it("strips only the TRAILING terminator — punctuation inside the fragment is content and survives (⊘ a sweep anchored anywhere but the end rewrites the provider's sentence instead of un-terminating it)", () => {
+    const value = validateInventoryStatusReport({
+      contractVersion: 1,
+      statuses: {},
+      notSyncableReasons: { "1": "これはテンプレート。詳細は PVE を確認。" }
+    })!.notSyncableReasons!["1"];
+    // The inner full stop stays; only the closing one goes.
+    expect(value).toBe("これはテンプレート。詳細は PVE を確認");
+  });
+
+  it("keeps a `__proto__` reason key as own data (⊘ writing it into a plain `{}` hits the inherited setter — the entry vanishes and a provider string lands on Object.prototype)", () => {
+    const raw = JSON.parse('{"contractVersion":1,"statuses":{},"notSyncableReasons":{"__proto__":"it is now a template","108":"it is now a template"}}');
+    const result = validateInventoryStatusReport(raw);
+    expect(result?.notSyncableReasons?.["108"]).toBe("it is now a template");
+    const descriptor = Object.getOwnPropertyDescriptor(result!.notSyncableReasons!, "__proto__");
+    expect(descriptor?.value).toBe("it is now a template");
+    expect(({} as Record<string, unknown>).__proto__).not.toBe("it is now a template");
   });
 
   it("is prototype-pollution-safe AND preserves a __proto__ own key as real data (⊘ writing into a plain `{}` triggers the inherited setter — the entry is silently dropped and `state` leaks onto Object.prototype)", () => {

@@ -791,7 +791,10 @@ describe("createProxmoxProvider", () => {
           "105": { state: "running" },
           "114": { state: "stopped" }
         },
-        clearedExternalIds: ["106", "118"]
+        clearedExternalIds: ["106", "118"],
+        // The template's clear carries its explanation; the "unknown" row's
+        // does not (pinned on its own below).
+        notSyncableReasons: { "106": "it is now a template" }
       });
       // Complete listing ⇒ clear-then-apply is correct (it drops decorations
       // for guests that vanished), so the flag must be ABSENT, not false —
@@ -805,7 +808,8 @@ describe("createProxmoxProvider", () => {
       expect(excluded.tree.status).toEqual({
         contractVersion: 1,
         statuses: {},
-        clearedExternalIds: ["105"]
+        clearedExternalIds: ["105"],
+        notSyncableReasons: { "105": "it is now a template" }
       });
       expect(excluded.tree.devices).toEqual([]);
     });
@@ -876,8 +880,90 @@ describe("createProxmoxProvider", () => {
       expect(gated.tree.status).toEqual({
         contractVersion: 1,
         statuses: {},
-        clearedExternalIds: ["118"]
+        clearedExternalIds: ["118"],
+        // The clear is unchanged by the opt-in; the REASON rides only here,
+        // because only here is the row excluded and its server prunable (pinned
+        // in its own right below).
+        notSyncableReasons: { "118": "Proxmox does not report it as running and Include Stopped Guests is off" }
       });
+    });
+
+    // THE PRUNE REASON — a guest converted to a template is still THERE, and
+    // the sync's clear alone cannot say so: the orphan/delete popup reads
+    // identically for a guest that was deleted. `notSyncableReasons` is the
+    // sentence fragment that tells the two apart.
+    it("names the REASON a template row no longer syncs and records NONE for an observed 'unknown' row — the vmid rides `notSyncableReasons` beside its clear, while a pre-RRD guest gets no entry (kills a popup that cannot tell a converted guest from a deleted one, and kills calling a guest PVE simply cannot describe yet 'not syncable')", async () => {
+      const { tree } = await syncRows([
+        guestRow(),
+        guestRow({ vmid: 106, name: "gold-image", template: 1 }),
+        guestRow({ vmid: 118, name: "hatchling", status: "unknown" })
+      ]);
+      // BOTH still clear — the reason explains one of them, it does not gate
+      // the clear (the two members answer different questions).
+      expect(tree.status?.clearedExternalIds).toEqual(["106", "118"]);
+      expect(tree.status?.notSyncableReasons).toEqual({ "106": "it is now a template" });
+      // The REAL downstream gate accepts the new member.
+      expect(validateInventoryStatusReport(tree.status)).toBeDefined();
+      // Nothing to explain ⇒ the field is absent, the report's omission idiom.
+      const plain = await syncRows([guestRow()]);
+      expect(Object.prototype.hasOwnProperty.call(plain.tree.status!, "notSyncableReasons")).toBe(false);
+    });
+
+    it("names the STOPPED gate, not templates, when templates ARE included — a template's PVE status is 'stopped', so with includeStopped off it is excluded for being stopped (kills a reason that blames the one opt-in the user switched ON)", async () => {
+      const { tree } = await syncRows([guestRow({ vmid: 106, name: "gold-image", template: 1, status: "stopped" })], {
+        baseUrl: BASE,
+        includeTemplates: true,
+        includeStopped: false
+      });
+      // The row IS excluded — by `isImportableGuestRow`'s stopped gate, which
+      // the template opt-in does not reach — so its server is prunable and the
+      // reason attached here IS rendered in the confirmation popup.
+      expect(tree.devices).toEqual([]);
+      // The clear still rides: a template has no running/stopped state to show,
+      // whichever opt-in excluded it.
+      expect(tree.status?.clearedExternalIds).toEqual(["106"]);
+      expect(tree.status?.notSyncableReasons).toEqual({ "106": "it is stopped and Include Stopped Guests is off" });
+    });
+
+    // THE STOPPED GATE'S OWN REASON — the twin of the template reason above,
+    // for the far more ordinary event: a guest is powered off (or the user
+    // turns Include Stopped Guests off) and its server drops out of the device
+    // set. It is still on the cluster, so the prune line owes the same
+    // disclosure the conversion case gets.
+    it("names the reason a NON-RUNNING guest stopped syncing, per PVE status — 'stopped' says stopped, an 'unknown' row says only that PVE does not report it running, and the template gate still wins where IT is what excluded the row (kills one fragment for both states, which would call a pre-RRD guest stopped, and a stopped reason that outranks the template one)", async () => {
+      const { tree } = await syncRows(
+        [
+          guestRow(),
+          guestRow({ vmid: 106, name: "gold-image", template: 1 }),
+          guestRow({ vmid: 114, name: "dns", type: "lxc", status: "stopped" }),
+          guestRow({ vmid: 118, name: "hatchling", status: "unknown" })
+        ],
+        { baseUrl: BASE, includeStopped: false }
+      );
+      // Only the running guest survives the gate.
+      expect(tree.devices.map((d) => d.externalId)).toEqual(["105"]);
+      expect(tree.status?.notSyncableReasons).toEqual({
+        // Excluded by the TEMPLATE gate — it is tested first and rejects the
+        // row before the stopped clause is reached, so template-ness is what
+        // actually excluded it and the reason must say so.
+        "106": "it is now a template",
+        "114": "it is stopped and Include Stopped Guests is off",
+        // PVE emits "unknown" before RRD data exists — the guest may well be
+        // running, so the fragment must claim only what was observed.
+        "118": "Proxmox does not report it as running and Include Stopped Guests is off"
+      });
+      // Every entry is exactly one fragment — the two branches cannot both
+      // write for one vmid.
+      expect(validateInventoryStatusReport(tree.status)).toBeDefined();
+    });
+
+    it("attaches NO gate reason while Include Stopped Guests is ON — a stopped or pre-RRD guest is synced then, so there is nothing to explain (kills a reason recorded for rows the gate never rejected, which would decorate a prune caused by something else entirely)", async () => {
+      const { tree } = await syncRows([
+        guestRow({ vmid: 114, name: "dns", status: "stopped" }),
+        guestRow({ vmid: 118, name: "hatchling", status: "unknown" })
+      ]);
+      expect(tree.devices.map((d) => d.externalId)).toEqual(["114", "118"]);
+      expect(Object.prototype.hasOwnProperty.call(tree.status!, "notSyncableReasons")).toBe(false);
     });
 
     it("attaches the report even when there is nothing to say — an empty cluster yields an empty statuses object, no cleared list, no truncated (kills a conditional attach, which would reopen the gap the report closed: the ordinary sync must never leave tree.status unfilled)", async () => {
@@ -1964,6 +2050,15 @@ describe("createProxmoxProvider", () => {
       expect(off.report.statuses).toEqual({ "105": { state: "running" } });
       expect(off.report.clearedExternalIds).toEqual(["106", "107"]);
       expect(validateInventoryStatusReport(off.report)).toBeDefined();
+    });
+
+    it("carries NO `notSyncableReasons` on the POLL path — only the SYNC's tree report reaches computeSyncPlan, and applyInventoryStatus never reads the member, so an entry here could never be rendered anywhere (kills a copy of the sync branch that ships a field nothing can read)", async () => {
+      const { report } = await pollStatus(
+        { [RESOURCES]: { body: { data: [guestRow({ vmid: 106, name: "gold-image", template: 1 }), guestRow()] } } },
+        { baseUrl: BASE }
+      );
+      expect(report.clearedExternalIds).toEqual(["106"]);
+      expect(Object.prototype.hasOwnProperty.call(report, "notSyncableReasons")).toBe(false);
     });
 
     it("clears the converted template in a TRUNCATED (join-failure) report — the vmid rides `clearedExternalIds` so the MERGING apply removes the pre-conversion 'running' instead of retaining it, while the node statuses stay absent-and-retained (the Task-5 ruling: merge protects only what the report OMITS — an explicitly cleared entry is not omitted, it is asserted gone; the engine-side proof that the apply removes the stale status lives in nexusCoreInventory.test.ts) (kills the round-2 stopped-reporting shape, whose template entry is gone from statuses here)", async () => {

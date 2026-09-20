@@ -9,6 +9,8 @@ import {
   controlProviderNode,
   fetchProviderStatus,
   InventoryProviderError,
+  capProviderText,
+  flattenProviderText,
   inventorySecretKey,
   inventorySourceValuesEqual,
   resolveProviderInstanceKey,
@@ -1489,6 +1491,126 @@ function groupByAuthTarget(
 }
 
 /**
+ * How many servers a prune-reason line NAMES before it falls back to a count.
+ *
+ * Three, the cap this codebase already settled on for "names a reader can take
+ * in at a glance" (syncEngine's `namedExamples`, and the three-example
+ * `pushSkipSummary` those lines come from). Past it the render drops the names
+ * ENTIRELY rather than teasing with "e.g." as those warnings do: this is a modal
+ * the user is about to answer, not a scrollable buffer, and a partial list is
+ * the one thing a reader cannot act on — they still have to check whether their
+ * server is in the set, and now they have a wall of text too. The count plus the
+ * reason is the whole actionable fact; the names matter only while they are few
+ * enough to BE the set.
+ */
+const PRUNE_REASON_NAME_LIMIT = 3;
+
+/**
+ * Longest server name these lines render in full.
+ *
+ * Eighty, not the reason's 120 and not something tighter, because a name is the
+ * token the reader SCANS for: they are looking for their own server, so cutting
+ * one short costs recognition in a way a clipped explanation does not. Eighty
+ * clears a DNS label's 63-character maximum, so every single-label host name
+ * survives whole and only an unusually long FQDN loses its tail; three of them
+ * still bound the line at 240 characters plus the frame.
+ */
+const PRUNE_REASON_NAME_MAX_LENGTH = 80;
+
+/**
+ * Shown in place of a name that sanitizes away to nothing. Unquoted and
+ * parenthesized, the shape `renderServerAddress` already uses for "this record
+ * has no address": a reader must be able to tell a description from a name, and
+ * an empty pair of quotes names nothing while looking like it does.
+ */
+const UNNAMED_SERVER_PLACEHOLDER = "(unnamed)";
+
+/**
+ * A stored server's name, made safe to render into the modal's detail text.
+ *
+ * A synced server's name is the PROVIDER's `device.name`, carried through
+ * verbatim — the fetch validates its type and nothing between there and here
+ * trims, caps or strips it. These prune-reason lines are the first place the
+ * detail interpolates a name at all, so this is where the property the detail
+ * owes its reader has to be enforced: nothing a provider supplies can add,
+ * remove or reshape a line of the plan being approved.
+ *
+ * Three steps, and deliberately only three:
+ *  - `flattenProviderText` — the shared primitive, which is what actually stops
+ *    a newline from minting a line.
+ *  - The double quote becomes a single one. It can no longer break a line, but
+ *    it is this line's LIST SEPARATOR: a device named `a" and "b` would render
+ *    as two quoted names and inflate the set the user thinks is affected. That
+ *    is the same "make the dialog read differently from what it means" move one
+ *    scale down, and one substitution closes it without escaping machinery the
+ *    modal's plain text cannot show anyway.
+ *  - The length cap, marked.
+ * Trailing punctuation is NOT touched: that rule belongs to the reason
+ * fragment, and a device named "web-01." is simply a device named "web-01.".
+ */
+/**
+ * The rendered form: quoted, unless it is the placeholder — which is a
+ * description of a missing name and must not dress up as one.
+ */
+function renderName(name: string): string {
+  const rendered = renderableServerName(name);
+  return rendered === UNNAMED_SERVER_PLACEHOLDER ? rendered : `"${rendered}"`;
+}
+
+function renderableServerName(name: string): string {
+  const flattened = flattenProviderText(name).replace(/"/g, "'");
+  if (flattened.length === 0) {
+    return UNNAMED_SERVER_PLACEHOLDER;
+  }
+  return capProviderText(flattened, PRUNE_REASON_NAME_MAX_LENGTH);
+}
+
+/**
+ * PRUNE REASONS — the disclosure that a pruned server's device is STILL at the
+ * source, and why it stopped syncing (a Proxmox guest converted to a template).
+ * Without it the modal's prune line reads the same for a guest that was deleted
+ * and a guest that merely changed, which is the whole bug this renders away.
+ *
+ * Grouped BY REASON, not one line per server: a template sweep converts guests
+ * in batches, and five identical sentences say nothing the first one did not.
+ *
+ * Only servers that actually CARRY a reason are counted or named — never the
+ * policy's whole prune count. A sync that orphans two deleted guests and one
+ * converted one must not report three conversions, and naming the subset (or
+ * saying "N of them") is what keeps the mixed case honest.
+ */
+function pruneReasonLines(prunes: InventorySyncPlan["prunes"], policy: "orphan" | "delete" | "keep"): string[] {
+  // Insertion-ordered, so the reasons read in the order the plan pruned them.
+  const namesByReason = new Map<string, string[]>();
+  for (const prune of prunes) {
+    if (prune.policy !== policy || prune.reason === undefined) {
+      continue;
+    }
+    const existing = namesByReason.get(prune.reason);
+    if (existing !== undefined) {
+      existing.push(prune.server.name);
+    } else {
+      namesByReason.set(prune.reason, [prune.server.name]);
+    }
+  }
+  const lines: string[] = [];
+  for (const [reason, names] of namesByReason) {
+    const n = names.length;
+    // The reason is a fragment completing "… because <reason>" and is always
+    // phrased about ONE device ("it is now a template"), so the subject it
+    // attaches to stays singular in both branches — "it was" for one server,
+    // "each was" for several. Pluralizing the provider's fragment is not
+    // possible from here and is not the contract.
+    lines.push(
+      n <= PRUNE_REASON_NAME_LIMIT
+        ? `${names.map(renderName).join(", ")} ${n === 1 ? "is" : "are"} still at the source — ${n === 1 ? "it was" : "each was"} not synced because ${reason}.`
+        : `${n} of them are still at the source — each was not synced because ${reason}.`
+    );
+  }
+  return lines;
+}
+
+/**
  * m1/m2 — full-sentence, singular/plural-correct rendering of a computed sync
  * plan for the confirm modal's `detail`.
  *
@@ -1710,14 +1832,19 @@ export function describePlanDetail(
     const orphanDestination = firstOrphan?.after.group;
     const orphanDestinationText = orphanDestination === undefined ? "the top level" : `"${orphanDestination}"`;
     lines.push(`${orphaned} server${orphaned === 1 ? "" : "s"} will be moved to ${orphanDestinationText}${hiddenSuffix}.`);
+    // Directly under the line it qualifies — "them" has to point at the servers
+    // just named, and only one prune policy is ever non-zero per sync.
+    lines.push(...pruneReasonLines(plan.prunes, "orphan"));
   }
   if (deleted > 0) {
     const pronoun = deleted === 1 ? "its" : "their";
     const passwordWord = deleted === 1 ? "password" : "passwords";
     lines.push(`${deleted} server${deleted === 1 ? "" : "s"} will be deleted, including ${pronoun} saved ${passwordWord}${hiddenSuffix}.`);
+    lines.push(...pruneReasonLines(plan.prunes, "delete"));
   }
   if (kept > 0) {
     lines.push(`${kept} server${kept === 1 ? "" : "s"} will be kept in place${hiddenSuffix}.`);
+    lines.push(...pruneReasonLines(plan.prunes, "keep"));
   }
   lines.push(`${plan.unchangedCount} server${plan.unchangedCount === 1 ? " is" : "s are"} unchanged.`);
   if (plan.warnings.length > 0) {

@@ -186,6 +186,39 @@ export interface InventoryStatusReport {
   // like a guest whose state PVE no longer reports, must lose its stale
   // decoration even on a report that merges.
   clearedExternalIds?: string[];
+  // NOT-SYNCABLE REASONS — externalId → a short reason why a device the source
+  // STILL LISTS is nonetheless absent from this fetch's device set. Named for
+  // what it explains rather than for what it clears, because it is the sibling
+  // of `clearedExternalIds` and not a second spelling of it: that member says an
+  // id has no status, this one says the device behind the id will not sync.
+  // - The value is a sentence FRAGMENT completing "… because <reason>" — e.g.
+  //   "it is now a template". It must read mid-sentence: no trailing period (the
+  //   renderer writes one), and no leading capital unless the first word is a
+  //   proper noun, as in "Proxmox does not report it as running…".
+  // - IT IS UNTRUSTED TEXT, and the contract it is held to is ENFORCED, not
+  //   merely documented: `normalizeNotSyncableReasons` flattens every line break
+  //   and control character to a space, collapses whitespace, drops trailing
+  //   sentence punctuation, caps the value at 120 characters (cut at a word
+  //   boundary, marked with an ellipsis) and drops an entry left empty. A
+  //   provider gets to say WHY a device will not sync; it does not get to shape
+  //   the confirmation dialog, and a newline in this string would otherwise mint
+  //   a line the user reads as one the engine wrote.
+  // - It describes a device the source CAN still see and will not sync. A device
+  //   that VANISHED has no entry: absence is exactly what distinguishes the two,
+  //   which is the whole point of the member.
+  // - ADVISORY. `computeSyncPlan` renders it on the prune entry of a server
+  //   whose device is pruned, and ignores it otherwise; nothing about pruning,
+  //   clearing or status application changes because an entry exists. An entry
+  //   for a device that is NOT pruned (an id still in the device set, an id
+  //   nobody owns) decorates nothing.
+  // - Optional and additive: a provider that never sets it behaves exactly as
+  //   before, and no consumer may require it.
+  // Because it only ever EXPLAINS, a malformed entry is DROPPED by
+  // `validateInventoryStatusReport` rather than failing the report the way a
+  // malformed `clearedExternalIds` does — the console-field rule in that
+  // function, for the same reason: blanking a source's decorations over an
+  // advisory string costs more than losing the string.
+  notSyncableReasons?: Record<string, string>;
 }
 
 export type InventoryConfigFieldType = "string" | "password" | "number" | "boolean" | "select";
@@ -532,6 +565,11 @@ export function validateInventoryStatusReport(raw: unknown): InventoryStatusRepo
       }
     }
   }
+  // NOT-SYNCABLE REASONS — normalized HERE (beside the cleared guard it
+  // qualifies) and assigned below, so the one shape decision lives in one place.
+  // Unlike the clears above it never rejects the report: see
+  // `normalizeNotSyncableReasons`.
+  const notSyncableReasons = normalizeNotSyncableReasons(obj.notSyncableReasons);
   const statuses = obj.statuses;
   // A plain object, not an array (Array is typeof "object") and not null.
   if (typeof statuses !== "object" || statuses === null || Array.isArray(statuses)) {
@@ -582,7 +620,291 @@ export function validateInventoryStatusReport(raw: unknown): InventoryStatusRepo
   if (Array.isArray(obj.clearedExternalIds)) {
     result.clearedExternalIds = obj.clearedExternalIds as string[];
   }
+  // Preserve the reason map only when something survived normalization. An
+  // empty map explains nothing, so it is omitted rather than preserved (where
+  // the cleared list preserves its empty array): absent and empty are the same
+  // downstream, and omitting keeps the validated report the minimal shape the
+  // provider tests assert against.
+  if (notSyncableReasons !== undefined) {
+    result.notSyncableReasons = notSyncableReasons;
+  }
   return result;
+}
+
+/**
+ * Characters no provider-supplied string may carry into the confirm modal, each
+ * replaced by a SPACE (never deleted: deletion welds the neighbouring words
+ * together, which is its own small lie about what the provider said).
+ *
+ * THE RULE, so the next reader can extend this correctly: a character is listed
+ * when its whole function is to CONTROL text rather than be text — to break a
+ * line, to reorder what follows, or to occupy no space while looking like
+ * nothing. A character is NOT listed when it is a constituent of real text, even
+ * an invisible one. What that admits and excludes:
+ *
+ * - CONTROLS: C0, DEL and C1 (`\x00-\x1f\x7f-\x9f`). The C0 half is the
+ *   terminal capture buffer's class, minus its exemptions — that buffer keeps
+ *   `\t`, `\n` and `\r` because it is line-based and they are its structure,
+ *   which is exactly why these values may not carry them: a line break is what
+ *   lets a provider forge a plan line. C1 belongs for the same reason and is easy
+ *   to miss: it holds NEL (U+0085) and CSI (U+009B), and `\s` matches NEITHER,
+ *   so the whitespace-collapse step below never absorbed them.
+ * - LINE AND PARAGRAPH SEPARATORS: U+2028/U+2029, line breaks by another name.
+ * - EVERY BIDI FORMATTING CONTROL: the marks (U+200E/U+200F and U+061C, the
+ *   Arabic one that is easy to forget because it sits far from the others), the
+ *   embeddings and overrides (U+202A-U+202E), and the isolates plus the
+ *   deprecated controls beside them (U+2066-U+206F). These reorder how text
+ *   RENDERS without changing what it contains — an invisible way to make the
+ *   dialog read differently from what was approved.
+ * - INVISIBLE SPACING AND ANNOTATION: soft hyphen, zero-width space, word joiner
+ *   and the invisible math operators, the Mongolian vowel separator, the
+ *   interlinear annotation marks, and the deprecated language tag (U+00AD,
+ *   U+200B, U+2060-U+2064, U+180E, U+FFF9-U+FFFB, U+E0001). Each takes no space
+ *   and carries no meaning a reader can see, so each can make two DIFFERENT
+ *   names render identically — and a name is what the user matches against
+ *   their own knowledge.
+ *
+ * DELIBERATELY NOT LISTED, though they are in the same Unicode category as much
+ * of the above: ZWJ and ZWNJ (U+200D/U+200C), which join emoji sequences and
+ * carry orthographic meaning in Persian and the Indic scripts; the tag block
+ * (U+E0020-U+E007F), which is what a subdivision flag is BUILT from; variation
+ * selectors and combining marks. Stripping the format category wholesale would
+ * shred the very grapheme clusters the truncation logic goes out of its way to
+ * keep whole, turning one glyph into three. Also absent on purpose: NBSP and the
+ * BOM, which `\s` does match, so the collapse below already flattens them.
+ */
+const PROVIDER_TEXT_UNSAFE_CHAR_RE =
+  /[\x00-\x1f\x7f-\x9f\u00ad\u061c\u180e\u200b\u200e\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufff9-\ufffb\u{e0001}]/gu;
+
+/**
+ * Trailing sentence punctuation, dropped because the value is a FRAGMENT: the
+ * renderer writes the closing period itself, so "it is now a template." would
+ * render as "… because it is now a template..". NORMALIZED rather than rejected
+ * — a provider that ends its sentence properly has written a perfectly good
+ * explanation, and this function's job is to make values usable, not to fail
+ * them over typography.
+ *
+ * THE RULE: Unicode's own `Terminal_Punctuation` property, not a hand-written
+ * list of the marks one keyboard happens to have. An ASCII-only class silently
+ * made the fragment contract unsatisfiable for localized text — a reason ending
+ * in 。, ！, ؟ or । kept its terminator and the modal read "… because <reason>。." —
+ * and the property is exactly the category that question belongs to: it holds
+ * every script's sentence-ending mark (the CJK and halfwidth stops, the
+ * fullwidth forms, the Arabic question mark and full stop, the danda, the
+ * Armenian and Ethiopic stops, the Greek question mark) and it is a strict
+ * superset of the `.!?;,` this class used to carry, plus the colon, which
+ * belongs for the same reason the semicolon did. It stops where it should, too:
+ * closing brackets and quotation marks are NOT terminal punctuation, so a
+ * fragment ending in one keeps it, and neither is the ellipsis — a provider
+ * that ends on "…" meant continuation, and the truncation marker this module
+ * appends elsewhere is the same character.
+ *
+ * Where the property and a naive sweep disagree, the property wins: the Armenian
+ * exclamation and question marks (U+055C/U+055E) are deliberately outside it,
+ * because Armenian writes them over the stressed vowel INSIDE the word rather
+ * than at the end, so a trailing one is not a terminator to strip.
+ *
+ * ANCHORED at the end, and only there: punctuation inside the fragment is the
+ * provider's content, and rewriting it would be editing the sentence rather than
+ * un-terminating it.
+ *
+ * REASON-ONLY, deliberately. `capProviderText` defaults to trimming whitespace
+ * alone, so a NAME never meets this rule: a device called "web-01." or "ウェブ。"
+ * is a device with that name, and the modal must show it as the user knows it.
+ */
+const REASON_TRAILING_PUNCTUATION_RE = /[\p{Terminal_Punctuation}\s]+$/u;
+
+/**
+ * Longest reason the modal renders in full.
+ *
+ * The line it lands in is already "<up to three quoted names> are still at the
+ * source — each was not synced because <reason>." — roughly 60 characters of
+ * frame plus the names, so 120 keeps the whole sentence inside a few wrapped
+ * lines of a dialog the user has to read past to reach the buttons. It is also
+ * comfortably above anything a real fragment needs: the longest this codebase
+ * ships is 71 characters, so the cap bites only on prose that was never an
+ * explanation — a stack trace or an error body pasted into the field.
+ *
+ * TRUNCATE rather than drop: the explanation is the entire point of the member,
+ * and its first clause is usually the useful part, so keeping a marked prefix
+ * beats replacing it with silence. The cut lands on a word boundary and the
+ * ellipsis says the value continues, so the copy stays well-formed — the modal's
+ * own period follows it, which reads as a truncated sentence rather than a typo.
+ */
+const REASON_MAX_LENGTH = 120;
+
+/**
+ * THE SECURITY PRIMITIVE, shared by every provider-supplied string the confirm
+ * modal renders: one line's worth of inert text. Every unsafe character becomes
+ * a space, runs of whitespace collapse, the result is trimmed — so nothing a
+ * provider supplies can add, remove or reshape a LINE of the plan detail, and no
+ * invisible character survives into the dialog.
+ *
+ * It deliberately stops there. What a value means — whether a trailing period
+ * belongs to it, how long it may be — differs per field, and folding those
+ * rules in here would leak one field's contract onto the next: a REASON is a
+ * sentence fragment the renderer terminates, while a NAME is a name, and a
+ * device legitimately called "web-01." must still render as itself.
+ */
+export function flattenProviderText(raw: string): string {
+  return raw.replace(PROVIDER_TEXT_UNSAFE_CHAR_RE, " ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * The shared length rule: cut at a word boundary and mark the cut, so a capped
+ * value stays well-formed prose rather than a word sliced in half. The cap is
+ * the CALLER's, because how much of a value a reader needs is a per-field
+ * question — see `REASON_MAX_LENGTH` and the modal's own name cap.
+ *
+ * `trimTrailing` defaults to whitespace alone (never leave " …"); a caller whose
+ * field has its own trailing-punctuation rule passes it in, rather than having
+ * that rule applied to fields it does not govern.
+ */
+export function capProviderText(text: string, maxLength: number, trimTrailing: RegExp = /\s+$/): string {
+  if (text.length <= maxLength) {
+    return text;
+  }
+  // One unit of the budget belongs to the ellipsis, so the result is never
+  // longer than the cap it is named for. The clip lands on a TEXT boundary, so
+  // it may come back shorter than asked — see `clipToTextBoundary`.
+  const clipped = clipToTextBoundary(text, maxLength - 1);
+  const lastSpace = clipped.lastIndexOf(" ");
+  // A value with no space inside the budget is one unbroken token — there is no
+  // boundary to prefer, so the hard cut is the only honest cut. It is also the
+  // only path that can land mid-character, which is why the clip above is
+  // boundary-aware rather than a bare `slice`.
+  const body = (lastSpace > 0 ? clipped.slice(0, lastSpace) : clipped).replace(trimTrailing, "");
+  return `${body}\u2026`;
+}
+
+/**
+ * Grapheme segmenter, built once and only if the runtime has one.
+ *
+ * `Intl.Segmenter` is standard in the Node the extension host runs and in every
+ * browser the web build targets, but this module is in the browser graph too and
+ * the fallback below costs three lines — cheap insurance against one runtime
+ * where the modal would otherwise show a mangled name.
+ */
+const GRAPHEME_SEGMENTER =
+  typeof Intl !== "undefined" && typeof Intl.Segmenter === "function"
+    ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+    : undefined;
+
+/**
+ * The longest prefix of `text` that is at most `limit` UTF-16 units AND ends on
+ * a character boundary the reader would recognize.
+ *
+ * WHY NOT A BARE `slice`: JavaScript counts UTF-16 units, so a cut at an
+ * arbitrary index can fall between the halves of an astral code point (emoji,
+ * the CJK extension blocks) and leave a lone surrogate, which renders as a
+ * replacement glyph. That corrupts the very name or explanation the user is
+ * reading in order to decide whether to approve a destructive sync — the one
+ * string in the dialog they are checking against their own knowledge.
+ *
+ * WHY GRAPHEMES rather than merely whole code points: a ZWJ emoji sequence or a
+ * base character plus its combining marks can be cut without splitting any
+ * surrogate pair, and the result still MISREPRESENTS the value — a different
+ * emoji, or a letter that lost its accent. The same argument that rules out the
+ * lone surrogate rules this out too, and `Intl.Segmenter` gets it right for a
+ * few lines on a path that runs only when a value is over its cap.
+ *
+ * THE UNIT THE CAP COUNTS is unchanged: UTF-16 units, the same thing
+ * `String.length` reports, so a caller's cap means what it appears to mean. What
+ * changes is that the prefix may be SHORTER than the cap — a boundary rarely
+ * falls exactly on it — never longer.
+ */
+function clipToTextBoundary(text: string, limit: number): string {
+  if (limit <= 0) {
+    return "";
+  }
+  if (text.length <= limit) {
+    return text;
+  }
+  if (GRAPHEME_SEGMENTER !== undefined) {
+    let end = 0;
+    for (const { segment } of GRAPHEME_SEGMENTER.segment(text)) {
+      if (end + segment.length > limit) {
+        break;
+      }
+      end += segment.length;
+    }
+    return text.slice(0, end);
+  }
+  // No segmenter: hold the floor by refusing to end on a high surrogate, whose
+  // low half is what the cut would have taken.
+  const code = text.charCodeAt(limit - 1);
+  return text.slice(0, code >= 0xd800 && code <= 0xdbff ? limit - 1 : limit);
+}
+
+/**
+ * One reason value, sanitized — or `undefined` when nothing usable is left, which
+ * the caller drops exactly as it drops a non-string.
+ */
+function normalizeReasonText(raw: string): string | undefined {
+  const fragment = flattenProviderText(raw).replace(REASON_TRAILING_PUNCTUATION_RE, "");
+  if (fragment.length === 0) {
+    return undefined;
+  }
+  const capped = capProviderText(fragment, REASON_MAX_LENGTH, REASON_TRAILING_PUNCTUATION_RE);
+  // The cut can land past the last real word (a value that is one long token of
+  // punctuation), leaving only the marker — nothing to say, so nothing is said.
+  return capped === "\u2026" ? undefined : capped;
+}
+
+/**
+ * NOT-SYNCABLE REASONS — the ONE definition of "a usable reason map", shared by
+ * `validateInventoryStatusReport` and by `computeSyncPlan` (which reads the
+ * TREE's report, a provider value no validator has been past).
+ *
+ * DROPS rather than rejects: the member is advisory — it only ever explains a
+ * prune the engine was making anyway — so one quirky entry must not cost a
+ * source its decorations (the `clearedExternalIds` rule, which IS trusted to
+ * remove state) nor abort a sync whose devices are fine. A non-object (an array
+ * included: entries would read as "0" → the element) yields undefined; entries
+ * whose key or value is not a non-empty string are skipped; an all-bad or empty
+ * map yields undefined so callers need no empty-case branch.
+ *
+ * Built on a null-prototype object for the reason the statuses map is: a reason
+ * keyed `__proto__` (as JSON.parse can produce) must land as ordinary own data
+ * instead of hitting the inherited setter, which would drop the entry and leak a
+ * provider string onto `Object.prototype`.
+ *
+ * SANITIZES, not merely type-checks, because the value is untrusted text that
+ * ends up INTERPOLATED into the confirm modal the user reads before approving a
+ * sync that moves or deletes servers — and providers are registrable by third
+ * parties through the public API. A reason carrying a newline could mint a line
+ * that reads exactly like one of the engine's own ("0 servers will be deleted"),
+ * changing what the user believes they are approving. That is the property this
+ * function owes its callers and the reason the checks live HERE rather than at
+ * the render sites: this is the one path both the validator and `computeSyncPlan`
+ * already go through, so a new render site cannot forget them. What it
+ * guarantees, in order: every line break and control character becomes a space
+ * (so nothing a provider sends can add, remove or reshape a LINE, and no
+ * invisible byte survives into the dialog), runs of whitespace collapse and the
+ * value is trimmed (so a deleted character cannot weld two words together),
+ * trailing sentence punctuation is dropped (the value is a FRAGMENT and the
+ * renderer terminates the sentence itself), an over-long value is cut at a word
+ * boundary and marked with an ellipsis, and anything empty after all that is
+ * dropped entry-wise exactly as a non-string is.
+ */
+export function normalizeNotSyncableReasons(raw: unknown): Record<string, string> | undefined {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    return undefined;
+  }
+  const normalized: Record<string, string> = Object.create(null);
+  let any = false;
+  for (const [externalId, reason] of Object.entries(raw as Record<string, unknown>)) {
+    if (externalId.length === 0 || typeof reason !== "string") {
+      continue;
+    }
+    const text = normalizeReasonText(reason);
+    if (text === undefined) {
+      continue;
+    }
+    normalized[externalId] = text;
+    any = true;
+  }
+  return any ? normalized : undefined;
 }
 
 /**
