@@ -5089,9 +5089,13 @@ export function registerInventoryCommands(
    *    when the user answers Continue to the modal an interactive path raises
    *    (Sync Inventory Now, Edit Source, Start/Stop Node, Open Web Console).
    *    Silent on the poll, one warning naming the sources on a manual sweep;
-   *    the source meanwhile keeps the status it last had, and its poll schedule
-   *    stays `warming` — retrying at a delay that doubles from 5 s up to the
-   *    source's own configured period, never reaching the network;
+   *    the source meanwhile keeps the status it last had. Its poll schedule
+   *    retries, but NOT always at the warm delay: a decline only backs off a
+   *    schedule still `warming`, and never demotes one already `steady` (see
+   *    inventoryStatusPoll's `state`), so a provider that changed after the
+   *    first successful tick is re-refused at the configured interval. Cheap
+   *    either way — a fingerprint compare, never the network — and neither
+   *    cadence converges, because only a Continue ends this one;
    *  - `fetchProviderStatus` swallows a throwing/ malformed provider answer into
    *    `undefined`, and a vault read that rejects is caught here.
    */
