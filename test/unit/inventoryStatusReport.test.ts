@@ -336,6 +336,41 @@ describe("validateInventoryStatusReport", () => {
     expect(value).toBe(intact);
   });
 
+  it("drops a TRAILING sentence terminator in any script, not just the ASCII ones — the CJK full stop, the fullwidth marks, the Arabic question mark, the danda, the Armenian and Ethiopic stops (⊘ a localized reason keeps its terminator and the renderer appends its own, so the modal reads '… because 这是一个模板。.' — a contract the docs state unconditionally that localized text cannot satisfy)", () => {
+    const terminated = {
+      cjk: "it is now a template。",
+      fullwidthBang: "it is now a template！",
+      fullwidthQuestion: "it is now a template？",
+      fullwidthStop: "it is now a template．",
+      halfwidthStop: "it is now a template｡",
+      arabicQuestion: "it is now a template؟",
+      arabicStop: "it is now a template۔",
+      danda: "it is now a template।",
+      doubleDanda: "it is now a template॥",
+      armenian: "it is now a template։",
+      ethiopic: "it is now a template።",
+      greekQuestion: "it is now a template;",
+      fullwidthColon: "it is now a template：",
+      colon: "it is now a template:",
+      mixed: "it is now a template。！ "
+    };
+    const value = validateInventoryStatusReport({ contractVersion: 1, statuses: {}, notSyncableReasons: terminated })!
+      .notSyncableReasons!;
+    for (const key of Object.keys(terminated)) {
+      expect(value[key]).toBe("it is now a template");
+    }
+  });
+
+  it("strips only the TRAILING terminator — punctuation inside the fragment is content and survives (⊘ a sweep anchored anywhere but the end rewrites the provider's sentence instead of un-terminating it)", () => {
+    const value = validateInventoryStatusReport({
+      contractVersion: 1,
+      statuses: {},
+      notSyncableReasons: { "1": "これはテンプレート。詳細は PVE を確認。" }
+    })!.notSyncableReasons!["1"];
+    // The inner full stop stays; only the closing one goes.
+    expect(value).toBe("これはテンプレート。詳細は PVE を確認");
+  });
+
   it("keeps a `__proto__` reason key as own data (⊘ writing it into a plain `{}` hits the inherited setter — the entry vanishes and a provider string lands on Object.prototype)", () => {
     const raw = JSON.parse('{"contractVersion":1,"statuses":{},"notSyncableReasons":{"__proto__":"it is now a template","108":"it is now a template"}}');
     const result = validateInventoryStatusReport(raw);

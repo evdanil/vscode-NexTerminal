@@ -10826,6 +10826,18 @@ describe("describePlanDetail — pruned servers whose device is still at the sou
     expect(flagged).toContain('"\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}-edge" is still at the source');
   });
 
+  it("renders a localized reason with exactly ONE sentence terminator, while a NAME ending in one keeps it (⊘ the fragment rule leaking onto names renames a device legitimately called 'ウェブ。', and not extending it at all doubles the terminator in the localized line)", () => {
+    // The reason arrives through the real boundary, terminator and all.
+    const reason = normalizeNotSyncableReasons({ a: "これはテンプレートです。" })!.a;
+    const detail = describePlanDetail(makeSyncPlan({ prunes: [orphanPrune("ウェブ。", reason)] }), []);
+    const line = detail.split("\n").find((l) => l.includes("still at the source"))!;
+    // One terminator, the renderer's own — and the NAME keeps the one it owns,
+    // because a name is not a sentence fragment.
+    expect(line).toBe(
+      '"ウェブ。" is still at the source — it was not synced because これはテンプレートです.'
+    );
+  });
+
   it("renders the same disclosure on the DELETE and KEEP lines (kills an orphan-only render — the user about to lose a server permanently is the one who most needs to know the guest still exists)", () => {
     const deleteServer = makeServer({ id: "owned-d", name: "idm.defcon.local" });
     const deleteDetail = describePlanDetail(makeSyncPlan({ prunes: [{ policy: "delete", server: deleteServer, reason: REASON }] }), []);

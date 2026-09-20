@@ -683,8 +683,36 @@ const PROVIDER_TEXT_UNSAFE_CHAR_RE =
  * — a provider that ends its sentence properly has written a perfectly good
  * explanation, and this function's job is to make values usable, not to fail
  * them over typography.
+ *
+ * THE RULE: Unicode's own `Terminal_Punctuation` property, not a hand-written
+ * list of the marks one keyboard happens to have. An ASCII-only class silently
+ * made the fragment contract unsatisfiable for localized text — a reason ending
+ * in 。, ！, ؟ or । kept its terminator and the modal read "… because <reason>。." —
+ * and the property is exactly the category that question belongs to: it holds
+ * every script's sentence-ending mark (the CJK and halfwidth stops, the
+ * fullwidth forms, the Arabic question mark and full stop, the danda, the
+ * Armenian and Ethiopic stops, the Greek question mark) and it is a strict
+ * superset of the `.!?;,` this class used to carry, plus the colon, which
+ * belongs for the same reason the semicolon did. It stops where it should, too:
+ * closing brackets and quotation marks are NOT terminal punctuation, so a
+ * fragment ending in one keeps it, and neither is the ellipsis — a provider
+ * that ends on "…" meant continuation, and the truncation marker this module
+ * appends elsewhere is the same character.
+ *
+ * Where the property and a naive sweep disagree, the property wins: the Armenian
+ * exclamation and question marks (U+055C/U+055E) are deliberately outside it,
+ * because Armenian writes them over the stressed vowel INSIDE the word rather
+ * than at the end, so a trailing one is not a terminator to strip.
+ *
+ * ANCHORED at the end, and only there: punctuation inside the fragment is the
+ * provider's content, and rewriting it would be editing the sentence rather than
+ * un-terminating it.
+ *
+ * REASON-ONLY, deliberately. `capProviderText` defaults to trimming whitespace
+ * alone, so a NAME never meets this rule: a device called "web-01." or "ウェブ。"
+ * is a device with that name, and the modal must show it as the user knows it.
  */
-const REASON_TRAILING_PUNCTUATION_RE = /[.!?;,\s]+$/;
+const REASON_TRAILING_PUNCTUATION_RE = /[\p{Terminal_Punctuation}\s]+$/u;
 
 /**
  * Longest reason the modal renders in full.
