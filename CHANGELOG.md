@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.227] — 2026-09-20
+
+### Fixed
+
+- **An inventory provider that arrives after Nexus has started now lights up its rows straight away.** The **Start Node** / **Stop Node** and **Open Web Console** entries appear on a synced server's row only when the extension providing that server's inventory source says it can do those things, and Nexus asked that question while painting the row. The three providers that ship with Nexus are there before the first paint, so they were never affected — but a provider from another extension registers whenever that extension starts, which can be well after the Command Center has drawn its rows, and those rows kept the answer they were painted with. Since all three commands are offered only on the row itself and deliberately not in the Command Palette, there was no other way to reach them: the actions stayed invisible for the rest of the session unless something unrelated happened to redraw the tree. The provider list now announces a provider arriving or going away, and the tree redraws on it — so the entries show up as soon as the provider is there, and disappear again if that provider is unregistered, rather than lingering on rows that nothing backs any more. The **Settings** view follows the same signal: a source whose provider was not yet loaded showed the raw provider id where its name belongs, and now switches to the name as soon as the provider registers. Several providers registering at once cost one redraw, not one each.
+
 ## [2.8.223] — 2026-09-20
 
 ### Fixed

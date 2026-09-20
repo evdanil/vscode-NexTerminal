@@ -5,6 +5,15 @@ export interface ProviderRegistration {
   dispose(): void;
 }
 
+/**
+ * Notified after the set of registered providers changes. No payload: every
+ * consumer answers its question by READING the registry (a capability probe, a
+ * label lookup) at the moment it paints, so the id that moved tells them
+ * nothing they do not re-derive anyway — and handing one over would only invite
+ * a consumer to cache what it should be asking for.
+ */
+export type ProviderRegistryListener = () => void;
+
 const VALID_FIELD_TYPES: ReadonlySet<InventoryConfigFieldType> = new Set(["string", "password", "number", "boolean", "select"]);
 const PROVIDER_ID_RE = /^[a-z0-9][a-z0-9-]*$/i;
 
@@ -187,6 +196,34 @@ export function validateProviderShape(provider: unknown): asserts provider is In
  */
 export class InventoryProviderRegistry {
   private readonly providers = new Map<string, InventoryProvider>();
+  private readonly listeners = new Set<ProviderRegistryListener>();
+
+  /**
+   * Fires after a provider is registered, and after a registration that still
+   * owned its id is disposed.
+   *
+   * WHY THE REGISTRY HAS AN EVENT AT ALL. Its consumers are painting surfaces:
+   * the Command Center stamps its node-control and web-console markers from
+   * capability probes that read this registry as each row is built, and the
+   * Settings tree resolves a source's provider LABEL the same way. Registration
+   * is not confined to activation — a third-party provider registers whenever
+   * its own extension activates, which can be minutes after those surfaces last
+   * painted — and nothing in a registration touches NexusCore, which is the only
+   * thing that otherwise repaints them. Without a signal here the rows keep the
+   * answers they were painted with, and the menu entries those markers gate
+   * (Start Node / Stop Node / Open Web Console) are hidden from the palette
+   * because each one names a row — so there is no second way to reach them.
+   * Disposal is the same staleness pointing the other way: a marker left
+   * stamped on a row whose capability has gone.
+   *
+   * SHAPE — `NexusCore.onDidChange`'s: subscribe, get an unsubscribe function
+   * back. Not a `vscode.EventEmitter`, because this module must stay importable
+   * without the VS Code API.
+   */
+  public onDidChange(listener: ProviderRegistryListener): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
 
   public register(provider: InventoryProvider): ProviderRegistration {
     validateProviderShape(provider);
@@ -194,6 +231,11 @@ export class InventoryProviderRegistry {
       throw new Error(`An inventory provider with id "${provider.id}" is already registered.`);
     }
     this.providers.set(provider.id, provider);
+    // AFTER the map write, so a listener that repaints from the registry sees
+    // the provider it was just told about. A rejected registration (duplicate
+    // id, bad shape) throws above and never reaches here — nothing changed, so
+    // nothing repaints.
+    this.emitChanged();
     let disposed = false;
     return {
       dispose: () => {
@@ -205,9 +247,29 @@ export class InventoryProviderRegistry {
         // disposed-then-re-registered id must survive a stale dispose() call.
         if (this.providers.get(provider.id) === provider) {
           this.providers.delete(provider.id);
+          // Inside the guard: a stale dispose evicts nothing, and an event for
+          // it would announce a removal that did not happen.
+          this.emitChanged();
         }
       }
     };
+  }
+
+  /**
+   * Swallow-and-log, the repo-wide convention for observer dispatch (see
+   * `NexusCore.emitChanged` and `ptyObserverHub.notifyOutput`). It matters more
+   * here than usual: the listeners are UI repaints and the emitter runs inside
+   * a third party's `register()` call, so one throwing consumer must neither
+   * fail somebody else's registration nor starve the surfaces after it.
+   */
+  private emitChanged(): void {
+    for (const listener of this.listeners) {
+      try {
+        listener();
+      } catch (error) {
+        console.error("[Nexus] inventory provider registry onDidChange listener threw; the registry change stands and other listeners still run:", error);
+      }
+    }
   }
 
   public get(id: string): InventoryProvider | undefined {

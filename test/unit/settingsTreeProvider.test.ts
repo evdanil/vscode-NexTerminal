@@ -83,9 +83,29 @@ function makeCore(sources: FakeSource[]) {
   };
 }
 
-const fakeRegistry = {
-  get: (id: string) => (id === "eve-ng" ? { label: "EVE-NG" } : id === "netbox" ? { label: "NetBox" } : undefined)
-};
+/** Minimal InventoryProviderRegistry stand-in: label lookup plus the onDidChange fan-out. */
+function makeRegistry(labels: Record<string, string>) {
+  const listeners: Array<() => void> = [];
+  return {
+    registry: {
+      get: (id: string) => (labels[id] === undefined ? undefined : { label: labels[id] }),
+      onDidChange: (listener: () => void) => {
+        listeners.push(listener);
+        return () => {
+          const i = listeners.indexOf(listener);
+          if (i >= 0) listeners.splice(i, 1);
+        };
+      }
+    },
+    register: (id: string, label: string) => {
+      labels[id] = label;
+      for (const l of [...listeners]) l();
+    },
+    listenerCount: () => listeners.length
+  };
+}
+
+const fakeRegistry = makeRegistry({ "eve-ng": "EVE-NG", netbox: "NetBox" }).registry;
 
 function providerWithSources(sources: FakeSource[]): SettingsTreeProvider {
   const { core } = makeCore(sources);
@@ -513,6 +533,37 @@ describe("SettingsTreeProvider", () => {
       expect(listenerCount()).toBe(1);
       provider.dispose();
       expect(listenerCount()).toBe(0);
+    });
+
+    /**
+     * The source rows resolve the PROVIDER LABEL from the registry at paint
+     * time and fall back to the raw providerId when it cannot be resolved. A
+     * provider whose extension activates after this view has painted changes
+     * that answer without changing anything in core — so the core-signature
+     * gate above (deliberately narrow) can never notice it.
+     */
+    it("repaints when a provider registers after the first paint, so the row stops showing the raw provider id (⊘ with no registry event the row reads 'acme-cmdb' until an unrelated core change happens to repaint it)", () => {
+      const sources: FakeSource[] = [{ id: "s1", providerId: "acme-cmdb", name: "Legacy" }];
+      const { core } = makeCore(sources);
+      const reg = makeRegistry({});
+      const provider = new SettingsTreeProvider(core as never, reg.registry as never);
+      const listener = vi.fn();
+      provider.onDidChangeTreeData(listener);
+      expect((groupChildren(provider)[0] as InventorySourceItem).description).toBe("acme-cmdb \u2014 never synced");
+
+      reg.register("acme-cmdb", "Acme CMDB");
+
+      expect(listener).toHaveBeenCalledWith(undefined);
+      expect((groupChildren(provider)[0] as InventorySourceItem).description).toBe("Acme CMDB \u2014 never synced");
+    });
+
+    it("unsubscribes from the registry on dispose (⊘ an un-disposed listener fires into a dead emitter for the rest of the session)", () => {
+      const { core } = makeCore([]);
+      const reg = makeRegistry({});
+      const provider = new SettingsTreeProvider(core as never, reg.registry as never);
+      expect(reg.listenerCount()).toBe(1);
+      provider.dispose();
+      expect(reg.listenerCount()).toBe(0);
     });
 
     it("still renders the group with just the Add row when constructed without a core (the web-extension / test construction path)", () => {
