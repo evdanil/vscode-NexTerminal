@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **A Proxmox sync now refreshes running state by itself — the listing is the status fetch.** The guest listing every sync already reads carries each guest's running/stopped state, and the sync threw it away: after a first sync no guest had a known status, every Start/Stop menu stayed hidden, and the only way to light one was running **Refresh Lab Status** from the Command Palette by hand. A sync now attaches a full status report to its tree, exactly as an EVE-NG sync has done since its own sync-carries-status change, at zero extra requests. Every shape-valid guest's state rides the report regardless of **Include Stopped Guests** — status reports reality, the toggle shapes the device list, and the apply ignores statuses matching no device. A template's vmid and an `unknown` row's vmid (PVE's word for a guest it has observed but cannot yet describe) are explicitly cleared, exactly as on the poll, so a converted template or a not-yet-described guest loses its stale decoration on the sync too. With **Include Cluster Nodes** on, the nodes report from the cluster status join the sync already makes. The report says `truncated` — so the apply merges instead of clearing — only when the collection was partial: the device cap tripped, the report's own cap tripped, or the node join failed. A complete listing applies clear-then-apply, which is exactly right: guests that vanished from the listing lose their decorations with the sync.
+
+### Changed
+
+- **The Proxmox API Token field asks for the full one-line credential.** The field's placeholder and description now show PVE's own `<user@realm>!<tokenid>=<secret>` form — the id from `Datacenter → API Tokens`, joined with `=` to the secret PVE shows exactly once at creation — instead of asking for the id alone and leaving the assembly to the reader.
+- **The Proxmox Base URL field says to keep the port.** PVE serves its API on 8006, so a URL typed without the port sent every request to 443, where nothing answers. The field now says so, names the one case where the port may be omitted (a reverse proxy fronting the cluster on 443), and notes that a mount path in the URL is preserved.
+- **The Proxmox poll field is labeled "Status Poll Interval (seconds)".** EVE-NG's "Lab" is dropped, because the source polls a cluster, not a lab. Labels are part of the provider fingerprint, so sources saved before the rename ask to re-confirm their credentials once, on the next sync.
+
 ## [2.8.219] — 2026-09-20
 
 ### Added
