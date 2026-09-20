@@ -1517,9 +1517,9 @@ describe("NexusTreeProvider node-control marker — end-to-end snapshot wiring",
     );
     expect(serverItemById(provider, "pve-run").contextValue).toBe("nexus.server.eveRunning");
     expect(serverItemById(provider, "pve-stop").contextValue).toBe("nexus.server.eveStopped");
-    // The tooltip's Lab status line follows the same predicate (Task 9) — a
+    // The tooltip's status line follows the same predicate (Task 9) — a
     // Proxmox guest gets the identical line an EVE node has always had.
-    expect(serverItemById(provider, "pve-run").tooltip).toContain("Lab status: running");
+    expect(serverItemById(provider, "pve-run").tooltip).toContain("Status: running");
   });
 
   it("gates the marker DEVICE-AWARE within one provider: a Proxmox-origin cluster node (externalId node/pve) with a KNOWN status gets NO marker while a bare-vmid guest with the same status does (⊘ a capability-only gate stamps Start/Stop onto a hypervisor node — the provider's own controlNode refuses node/<name> with a protocol error — and the node keeps its running/offline decoration, which the status description and icon drive independently of the marker)", () => {
@@ -1585,12 +1585,12 @@ describe("NexusTreeProvider node-control marker — end-to-end snapshot wiring",
 
 /**
  * NODE CONTROL (Phase 4, task #28; provider-general since Task 9) — M3. A
- * node-control-capable origin's row carries a labeled "Lab status:" line so a
- * freshly-synced node (unknown status) hints that Refresh Lab Status is what
- * unlocks Start/Stop. Rows whose provider has no node control get no such line.
- * hasNodeControl is the final constructor arg.
+ * node-control-capable origin's row carries a labeled "Status:" line, so the
+ * state the Start/Stop gate reads is visible on the row itself. Rows whose
+ * provider has no node control get no such line. hasNodeControl is the final
+ * constructor arg.
  */
-describe("ServerTreeItem lab-status tooltip line", () => {
+describe("ServerTreeItem status tooltip line", () => {
   function tip(opts: { status?: "running" | "stopped"; hasNodeControl?: boolean }): string {
     return new ServerTreeItem(
       makeServer({ id: "s", origin: { sourceId: "eve", externalId: "/L.unl#1", syncedAt: 1 } }),
@@ -1598,20 +1598,22 @@ describe("ServerTreeItem lab-status tooltip line", () => {
     ).tooltip as string;
   }
 
-  it("shows 'Lab status: running' for a running node on a control-capable origin (⊘ no lab-status line leaves running/stopped undiscoverable in the tooltip)", () => {
-    expect(tip({ hasNodeControl: true, status: "running" })).toContain("Lab status: running");
+  it("shows 'Status: running' for a running node on a control-capable origin (⊘ no status line leaves running/stopped undiscoverable in the tooltip)", () => {
+    expect(tip({ hasNodeControl: true, status: "running" })).toContain("Status: running");
   });
 
-  it("shows 'Lab status: stopped' for a stopped node", () => {
-    expect(tip({ hasNodeControl: true, status: "stopped" })).toContain("Lab status: stopped");
+  it("shows 'Status: stopped' for a stopped node", () => {
+    expect(tip({ hasNodeControl: true, status: "stopped" })).toContain("Status: stopped");
   });
 
-  it("shows 'Lab status: unknown — run Refresh Lab Status' for a freshly-synced node with no status yet (⊘ a silent tooltip gives no hint that Refresh Lab Status unlocks Start/Stop)", () => {
-    expect(tip({ hasNodeControl: true, status: undefined })).toContain("Lab status: unknown — run Refresh Lab Status");
+  it("shows a bare 'Status: unknown' for a freshly-synced node with no status yet, with NO command hint (⊘ pointing at Refresh Lab Status is stale advice for BOTH providers now that either sync carries status, and it names a lab a Proxmox cluster does not have)", () => {
+    expect(tip({ hasNodeControl: true, status: undefined })).toContain("Status: unknown");
+    expect(tip({ hasNodeControl: true, status: undefined })).not.toContain("Refresh Lab Status");
+    expect(tip({ hasNodeControl: true, status: undefined })).not.toContain("Lab status");
   });
 
-  it("adds NO lab-status line for a server without node control even when a status is set (⊘ a Lab status line on a NetBox server invents a lab it does not have)", () => {
-    expect(tip({ hasNodeControl: false, status: "running" })).not.toContain("Lab status:");
+  it("adds NO status line for a server without node control even when a status is set (⊘ a Status line on a NetBox server claims a running/stopped notion its provider never reports)", () => {
+    expect(tip({ hasNodeControl: false, status: "running" })).not.toContain("Status:");
   });
 });
 

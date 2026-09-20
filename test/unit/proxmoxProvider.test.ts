@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_FOLDER_TEMPLATE,
+  PROXMOX_HARD_CAP_FIELD_ID,
   PROXMOX_INSECURE_TLS_WARNING,
   PROXMOX_PROVIDER_ID,
   PROXMOX_STATUS_POLL_FIELD_ID,
@@ -13,6 +14,7 @@ import {
   parseQemuAgentIfaces,
   pickAddress,
   proxmoxInstanceKey,
+  readProxmoxHardCap,
   readProxmoxStatusPollSeconds
 } from "../../src/services/inventory/providers/proxmoxProvider";
 import { validateProviderShape } from "../../src/services/inventory/providerRegistry";
@@ -339,6 +341,27 @@ describe("readProxmoxStatusPollSeconds", () => {
   });
 });
 
+describe("readProxmoxHardCap", () => {
+  it("resolves 10,000 when the field is absent and clamps/floors every other value into [100, 1_000_000] — the poll reader's discipline applied to the cap (kills a raw `config.hardCap` read, under which a hand-edited backup carrying 0, -1 or NaN empties every sync's device set and every status report)", () => {
+    const config = (v: unknown): Record<string, unknown> => ({ baseUrl: "https://pve.example.com:8006", [PROXMOX_HARD_CAP_FIELD_ID]: v });
+    expect(PROXMOX_HARD_CAP_FIELD_ID).toBe("hardCap");
+    expect(readProxmoxHardCap(config(500) as never)).toBe(500);
+    expect(readProxmoxHardCap(config(50) as never)).toBe(100);
+    expect(readProxmoxHardCap(config(0) as never)).toBe(100);
+    expect(readProxmoxHardCap(config(-5) as never)).toBe(100);
+    expect(readProxmoxHardCap(config(999_999_999) as never)).toBe(1_000_000);
+    expect(readProxmoxHardCap(config(500.9) as never)).toBe(500);
+    // The ABSENT case (every source that predates the field) and a numeric
+    // STRING (which the form never stores, but a restored backup can carry)
+    // both land on the default — never on the minimum, which would silently
+    // shrink an existing source's cap by two orders of magnitude.
+    expect(readProxmoxHardCap(config(undefined) as never)).toBe(10_000);
+    expect(readProxmoxHardCap(config("500") as never)).toBe(10_000);
+    expect(readProxmoxHardCap(config(Number.NaN) as never)).toBe(10_000);
+    expect(readProxmoxHardCap({} as never)).toBe(10_000);
+  });
+});
+
 describe("createProxmoxProvider", () => {
   it("passes validateProviderShape — the same gate the registry applies at registration (⊘ a provider that only compiles still cannot be registered)", () => {
     expect(() => validateProviderShape(createProxmoxProvider())).not.toThrow();
@@ -369,11 +392,27 @@ describe("createProxmoxProvider", () => {
       "allowInsecureTls",
       "includeTemplates",
       "includeNodes",
-      "statusPollSeconds"
+      "statusPollSeconds",
+      "hardCap"
     ]);
     expect(provider.configFields.find((f) => f.id === "apiToken")?.type).toBe("password");
     expect(provider.configFields.find((f) => f.id === "baseUrl")?.placeholder).toBe("https://pve.example.com:8006");
     expect(provider.configFields.find((f) => f.id === "folderTemplate")?.placeholder).toBe(DEFAULT_FOLDER_TEMPLATE);
+    // LABELS are hashed too, and this test's own title says so — leaving them
+    // unpinned let a label revert pass the suite while the CHANGELOG, the
+    // README and the docs all asserted the new one AND the one-time credential
+    // re-confirmation it costs. Same for the two field strings this release
+    // rewrote, which the walkthrough quotes.
+    const byId = (id: string) => provider.configFields.find((f) => f.id === id)!;
+    expect(byId("statusPollSeconds").label).toBe("Status Poll Interval (seconds)");
+    expect(byId("hardCap").label).toBe("Hard Cap (entries)");
+    // The token field asks for PVE's ONE-LINE credential: the placeholder is a
+    // whole `<user@realm>!<tokenid>=<secret>` specimen, and the description
+    // spells the form out.
+    expect(byId("apiToken").placeholder).toMatch(/^[^!=]+![^!=]+=.+$/);
+    expect(byId("apiToken").description).toContain("<user@realm>!<tokenid>=<secret>");
+    // The base-url field names the port a PVE cluster actually answers on.
+    expect(byId("baseUrl").description).toContain("8006");
   });
 
   it("gives the boolean fields their contract defaults: includeStopped ON, the three disclosure-listed flags OFF and behind Advanced (kills a default-on insecure-TLS, and an includeStopped that ships OFF and silently drops the stopped guests the user asked to sync)", () => {
@@ -390,6 +429,20 @@ describe("createProxmoxProvider", () => {
     expect(poll.max).toBe(3600);
     expect(poll.integer).toBe(true);
     expect(poll.advanced).toBe(true);
+  });
+
+  it("declares hardCap as an advanced integer number field bounded [100, 1_000_000] with NO defaultValue, and its description names BOTH budgets it bounds (kills a defaultValue, which stamps the number onto every saved source and pins it there forever; and a description that names only devices, under which nobody raising it for a large cluster learns it also bounds the status report)", () => {
+    const field = createProxmoxProvider().configFields.find((f) => f.id === "hardCap")!;
+    expect(field.label).toBe("Hard Cap (entries)");
+    expect(field.type).toBe("number");
+    expect(field.advanced).toBe(true);
+    expect(field.integer).toBe(true);
+    expect(field.min).toBe(100);
+    expect(field.max).toBe(1_000_000);
+    expect(field.required).toBe(false);
+    expect(field.defaultValue).toBeUndefined();
+    expect(field.description).toContain("10,000");
+    expect(field.description).toContain("status");
   });
 
   it("shares primaryIpFamily's option VALUES with NetBox's field, in NetBox's order, under PVE's own labels (kills a divergent value spelling the shared code cannot read, and a label copied from NetBox that claims a 'primary IP' PVE does not have)", () => {
@@ -712,48 +765,107 @@ describe("createProxmoxProvider", () => {
       expect(included.tree.devices.map((d) => d.externalId)).toEqual(["105"]);
     });
 
-    // THE SYNC'S CLEAR-ONLY REPORT — the same explicit clears the STATUS poll
-    // collects, attached to the tree when (and only when) the sync's listing
-    // pass OBSERVED rows that must lose a stale decoration: every template row
-    // (regardless of the opt-in, which governs only the device set — the server
-    // a converted guest was synced as still exists and holds its stale running
-    // decoration, Start/Stop menu included, until something clears it) and
-    // every observed-but-stateless "unknown" guest. `truncated` is REQUIRED on
-    // the report: it carries no states at all, so as a COMPLETE report its
-    // clear-then-apply would wipe the source's entire runtime status; as a
-    // TRUNCATED (merging) report it removes exactly the observed-but-stateless
-    // ids and retains every other guest's decoration. The engine side (a merge
-    // honoring clearedExternalIds) is pinned in nexusCoreInventory.test.ts.
-    it("attaches a CLEAR-ONLY status report when the listing holds a template row — the vmid rides clearedExternalIds, statuses stay empty, truncated is true, and the opt-in is irrelevant (kills a sync that observes a conversion but reports no clear, leaving the previously synced VM's stale running decoration — and its Start/Stop menu — standing until a separate status refresh, indefinitely with polling off)", async () => {
-      const included = await syncRows([guestRow({ template: 1, name: "gold-image" })], {
-        baseUrl: BASE,
-        includeTemplates: true
-      });
-      expect(included.tree.status).toEqual({
+    // THE SYNC'S STATUS REPORT — the listing IS the status fetch: every row
+    // the sync already read carries its running/stopped state, so the tree
+    // carries a FULL report unconditionally and a sync alone refreshes running
+    // state exactly as an EVE-NG sync does. The mapping rules are the poll's
+    // (fetchStatusImpl): shape-valid guests report running/stopped REGARDLESS
+    // of includeStopped (status reports reality; the apply ignores ids
+    // matching no device), template rows and "unknown" guests are never
+    // reported and ride clearedExternalIds instead, and `truncated` marks a
+    // PARTIAL collection only — a complete report is applied clear-then-apply,
+    // which is exactly what drops a vanished guest's decoration. The engine
+    // side (validate + apply through syncNow, degraded not thrown, applied
+    // post-commit and incarnation-guarded) is generic machinery with no
+    // provider-specific branch, pinned in nexusCoreInventory.test.ts.
+    it("attaches the FULL status report to every tree — every guest's state rides the sync, template and unknown vmids ride clearedExternalIds, and a complete listing sets NO truncated (kills a sync that discards the states it just read, leaving every guest's Start/Stop menu hidden after a first sync until an unprompted palette command)", async () => {
+      const { tree } = await syncRows([
+        guestRow(),
+        guestRow({ vmid: 106, name: "gold-image", template: 1 }),
+        guestRow({ vmid: 114, name: "dns", type: "lxc", status: "stopped" }),
+        guestRow({ vmid: 118, name: "hatchling", status: "unknown" })
+      ]);
+      expect(tree.status).toEqual({
         contractVersion: 1,
-        statuses: {},
-        truncated: true,
-        clearedExternalIds: ["105"]
+        statuses: {
+          "105": { state: "running" },
+          "114": { state: "stopped" }
+        },
+        clearedExternalIds: ["106", "118"]
       });
-      // The device-set opt-in governs nothing here: with it OFF the template is
-      // still OBSERVED (and the pre-conversion server more likely to still
-      // exist), so the clear rides all the same.
+      // Complete listing ⇒ clear-then-apply is correct (it drops decorations
+      // for guests that vanished), so the flag must be ABSENT, not false —
+      // the validator tolerates a present-undefined key but the poll's
+      // omission idiom is the shape to hold.
+      expect(Object.prototype.hasOwnProperty.call(tree.status, "truncated")).toBe(false);
+      // The device-set opt-in governs nothing here: with includeTemplates OFF
+      // the template is still OBSERVED (and the pre-conversion server more
+      // likely to still exist), so the clear rides all the same.
       const excluded = await syncRows([guestRow({ template: 1, name: "gold-image" })]);
       expect(excluded.tree.status).toEqual({
         contractVersion: 1,
         statuses: {},
-        truncated: true,
         clearedExternalIds: ["105"]
       });
       expect(excluded.tree.devices).toEqual([]);
     });
 
-    it("clears a guest whose row reads status 'unknown' on the sync path too — the same observed-but-stateless class the poll clears, even when includeStopped keeps the row out of the device set (kills a sync-side clear list that covers only templates)", async () => {
+    it("reports stopped guests even when includeStopped keeps them out of the DEVICE set — status reports reality, the sync's device-set preference does not gate it (kills a report that mirrors includeStopped, under which a guest synced while running and then stopped keeps its stale running decoration — Start/Stop menu included — until a separate refresh)", async () => {
+      const { tree } = await syncRows([guestRow({ status: "stopped" }), guestRow({ vmid: 106, name: "up" })], {
+        baseUrl: BASE,
+        includeStopped: false
+      });
+      expect(tree.devices.map((d) => d.name)).toEqual(["up"]);
+      expect(tree.status?.statuses).toEqual({ "105": { state: "stopped" }, "106": { state: "running" } });
+    });
+
+    it("flags the report truncated when the row cap tripped — beyond-cap guests are absent and the MERGE must protect them (kills a complete report over a capped listing, whose clear-then-apply would drop every beyond-cap guest's decoration the sync never collected)", async () => {
+      const rows = Array.from({ length: 10_001 }, (_, i) => guestRow({ vmid: i + 1, name: `guest-${i + 1}`, status: "stopped" }));
+      const { tree } = await syncRows(rows);
+      expect(tree.truncated).toBe(true);
+      expect(tree.status?.truncated).toBe(true);
+      expect(Object.keys(tree.status?.statuses ?? {})).toHaveLength(10_000);
+      expect(tree.status?.statuses["10001"]).toBeUndefined();
+    });
+
+    it("flags the report truncated when the REPORT's own cap trips even though the device set stayed empty — includeStopped off holds the tree at zero devices while 10,001 stopped guests overflow the statuses budget (kills a report flag driven by the tree's cap alone, under which the beyond-cap guests' decorations are wiped by a clear-then-apply over a report that never collected them)", async () => {
+      const rows = Array.from({ length: 10_001 }, (_, i) => guestRow({ vmid: i + 1, name: `guest-${i + 1}`, status: "stopped" }));
+      const { tree } = await syncRows(rows, { baseUrl: BASE, includeStopped: false });
+      expect(tree.devices).toEqual([]);
+      expect(tree.truncated).toBeUndefined();
+      expect(tree.status?.truncated).toBe(true);
+      expect(Object.keys(tree.status?.statuses ?? {})).toHaveLength(10_000);
+    });
+
+    it("WARNS on the tree when the report's own cap trips without the tree's — syncNow shows tree warnings but never warns about a status report's own truncation, so a status-only cap would retain stale states (and Start/Stop menus) with nothing on screen saying the collection was partial (kills a silent status-only cap)", async () => {
+      const rows = Array.from({ length: 10_001 }, (_, i) => guestRow({ vmid: i + 1, name: `guest-${i + 1}`, status: "stopped" }));
+      const { tree } = await syncRows(rows, { baseUrl: BASE, includeStopped: false });
+      expect(tree.truncated).toBeUndefined();
+      expect(tree.warnings?.some((w) => w.includes("status entries") && w.includes("than the budget covers"))).toBe(true);
+      // ...and the two caps are independent: when the ROW cap trips, the
+      // status-collection warning must NOT also fire (the device warning
+      // channel stays honest about WHICH collection was partial). Stopped
+      // rows keep the IP crawl out of this scenario.
+      const rowsTree = Array.from({ length: 10_001 }, (_, i) => guestRow({ vmid: i + 1, name: `guest-${i + 1}`, status: "stopped" }));
+      const { tree: tree2 } = await syncRows(rowsTree);
+      expect(tree2.truncated).toBe(true);
+      expect(tree2.warnings?.some((w) => w.includes("Status collection stopped"))).toBe(false);
+    }, 20_000);
+
+    it("budgets the sync's STATUS collection by the CONFIGURED hardCap and names it in the warning — 501 stopped guests with Include Stopped off collect 500 states (kills a status budget still pinned to the constant while the device cap honours the field, which would make one source obey two different caps)", async () => {
+      const rows = Array.from({ length: 501 }, (_, i) => guestRow({ vmid: i + 1, name: `guest-${i + 1}`, status: "stopped" }));
+      const { tree } = await syncRows(rows, { baseUrl: BASE, includeStopped: false, hardCap: 500 });
+      expect(tree.devices).toEqual([]);
+      expect(Object.keys(tree.status?.statuses ?? {})).toHaveLength(500);
+      expect(tree.status?.truncated).toBe(true);
+      expect(tree.warnings?.some((w) => w.includes("stopped at 500 entries"))).toBe(true);
+    });
+
+    it("clears a guest whose row reads status 'unknown' on the sync path too — omitted from statuses, vmid in clearedExternalIds, the same observed-but-stateless class the poll clears, even when includeStopped keeps the row out of the device set (kills a sync-side clear list that covers only templates)", async () => {
       const { tree } = await syncRows([guestRow({ vmid: 118, status: "unknown" })]);
       expect(tree.status).toEqual({
         contractVersion: 1,
         statuses: {},
-        truncated: true,
         clearedExternalIds: ["118"]
       });
       const gated = await syncRows([guestRow({ vmid: 118, status: "unknown" })], {
@@ -761,20 +873,18 @@ describe("createProxmoxProvider", () => {
         includeStopped: false
       });
       expect(gated.tree.devices).toEqual([]);
-      expect(gated.tree.status?.clearedExternalIds).toEqual(["118"]);
-    });
-
-    it("leaves tree.status ABSENT when the listing holds neither a template row nor an unknown guest — the ordinary sync still carries no status at all (kills an unconditional status attach, whose empty-but-COMPLETE report would clear-then-apply and wipe the source's entire runtime status on every sync)", async () => {
-      const optInOn = await syncRows([guestRow(), guestRow({ vmid: 114, status: "stopped" })], {
-        baseUrl: BASE,
-        includeTemplates: true
+      expect(gated.tree.status).toEqual({
+        contractVersion: 1,
+        statuses: {},
+        clearedExternalIds: ["118"]
       });
-      expect(optInOn.tree.status).toBeUndefined();
     });
 
-    it("keeps the default-config sync status-less — includeTemplates off and no unknown rows means nothing observed to clear (kills attaching a report on every sync, whose merge would at best be noise and at worst — complete, not truncated — a wholesale wipe)", async () => {
-      const { tree } = await syncRows([guestRow()]);
-      expect(tree.status).toBeUndefined();
+    it("attaches the report even when there is nothing to say — an empty cluster yields an empty statuses object, no cleared list, no truncated (kills a conditional attach, which would reopen the gap the report closed: the ordinary sync must never leave tree.status unfilled)", async () => {
+      const empty = await syncRows([]);
+      expect(empty.tree.status).toEqual({ contractVersion: 1, statuses: {} });
+      const ordinary = await syncRows([guestRow()]);
+      expect(ordinary.tree.status).toEqual({ contractVersion: 1, statuses: { "105": { state: "running" } } });
     });
 
     it("renders the folder template with PVE's variables — pool, node, type, and the SORTED-FIRST tag — dropping empty and unknown segments (kills an unsorted-first tag policy, which reshuffles folders when the user reorders tags in PVE, and a dangling '/' from an absent pool)", async () => {
@@ -829,6 +939,21 @@ describe("createProxmoxProvider", () => {
       expect(tree.devices).toHaveLength(10_000);
       expect(tree.truncated).toBe(true);
       expect(tree.warnings).toContain("Truncated at 10000 devices — narrow the source.");
+    });
+
+    it("caps the device set at a CONFIGURED hardCap and names it in the warning — 501 rows under hardCap 500 yield 500 devices (kills a runtime read of the module constant, under which the field is saved, shown in the form, and ignored)", async () => {
+      const rows = Array.from({ length: 501 }, (_, i) => guestRow({ vmid: i + 1, name: `guest-${i + 1}`, status: "stopped" }));
+      const { tree } = await syncRows(rows, { baseUrl: BASE, hardCap: 500 });
+      expect(tree.devices).toHaveLength(500);
+      expect(tree.truncated).toBe(true);
+      expect(tree.warnings).toContain("Truncated at 500 devices — narrow the source.");
+    });
+
+    it("clamps a below-minimum hardCap at the RUNTIME site, not only in the reader — hardCap 50 still admits 100 devices (kills a site that reads `config.hardCap` directly, under which a hand-edited 1 turns a whole cluster into one device and a prune-suppressing truncation)", async () => {
+      const rows = Array.from({ length: 101 }, (_, i) => guestRow({ vmid: i + 1, name: `guest-${i + 1}`, status: "stopped" }));
+      const { tree } = await syncRows(rows, { baseUrl: BASE, hardCap: 50 });
+      expect(tree.devices).toHaveLength(100);
+      expect(tree.warnings).toContain("Truncated at 100 devices — narrow the source.");
     });
 
     it("refuses the whole sync when a row is not a JSON object — fail closed, never read-as-empty (kills a lenient mapper that skips corruption, under which the skipped row's server falls out of the engine's present set and gets pruned)", async () => {
@@ -1427,6 +1552,114 @@ describe("createProxmoxProvider", () => {
       expect(unknownState.tree.devices[0].endpoints).toEqual([{ kind: "ssh", host: "192.0.2.240", port: 22 }]);
     });
 
+    // THE SYNC'S NODE STATUSES — the same gate the poll uses (`=== true`), the
+    // same source (the /cluster/status join's numeric `online`), the same
+    // omit-only rule for an entry whose `online` is absent or unrecognizable:
+    // a node entry is not an observed guest row, so it is omitted, never
+    // cleared.
+    it("reports node statuses onto the sync's own status report when includeNodes is on — online 1/0 become running/stopped, an unrecognizable entry invents nothing, and with the gate off no node status exists (kills a sync report that covers guests only while the poll reports nodes, and one that reads the resources row's degraded 'online' string)", async () => {
+      const on = await syncNodes(
+        { [RESOURCES]: { body: { data: [nodeRow()] } }, [STATUS]: { body: { data: [statusEntry()] } } },
+        { baseUrl: BASE, includeNodes: true }
+      );
+      expect(on.tree.status?.statuses).toEqual({ "node/pve": { state: "running" } });
+
+      const stopped = await syncNodes(
+        { [RESOURCES]: { body: { data: [nodeRow()] } }, [STATUS]: { body: { data: [statusEntry({ online: 0 })] } } },
+        { baseUrl: BASE, includeNodes: true }
+      );
+      expect(stopped.tree.status?.statuses).toEqual({ "node/pve": { state: "stopped" } });
+
+      const noOnline = statusEntry();
+      delete noOnline.online;
+      const unrecognizable = await syncNodes(
+        { [RESOURCES]: { body: { data: [nodeRow()] } }, [STATUS]: { body: { data: [noOnline] } } },
+        { baseUrl: BASE, includeNodes: true }
+      );
+      expect(unrecognizable.tree.status?.statuses).toEqual({});
+
+      const off = await syncNodes({ [RESOURCES]: { body: { data: [nodeRow()] } } }, { baseUrl: BASE });
+      expect(off.tree.status?.statuses).toEqual({});
+      expect(off.calls.every(({ url }) => !url.includes("/cluster/status"))).toBe(true);
+    });
+
+    it("flags the sync's report truncated when the node join fails — the guests reported, the nodes unreached, so the apply must MERGE instead of wiping every node's decoration (the poll's controller ruling, reused verbatim: a complete report is clear-then-apply, and this listing did not reach the nodes)", async () => {
+      const { tree } = await syncNodes(
+        {
+          [RESOURCES]: {
+            body: { data: [nodeRow(), { vmid: 105, name: "clawdbot", node: "pve", type: "qemu", status: "running", template: 0 }] }
+          },
+          [STATUS]: { status: 403, body: "" }
+        },
+        { baseUrl: BASE, includeNodes: true }
+      );
+      expect(tree.status?.statuses).toEqual({ "105": { state: "running" } });
+      expect(tree.status?.truncated).toBe(true);
+    });
+
+    it("WARNS on the tree when the node join fails — the sync plan is the ONLY surface that can say a report was partial, and a token without Sys.Audit is the EXPECTED answer, not an exotic one (kills a silent join failure, under which imported nodes arrive addressless and every node's stale running dot stands indefinitely with nothing on screen)", async () => {
+      const { tree } = await syncNodes(
+        { [RESOURCES]: { body: { data: [nodeRow()] } }, [STATUS]: { status: 403, body: "" } },
+        { baseUrl: BASE, includeNodes: true }
+      );
+      expect(tree.status?.truncated).toBe(true);
+      const warning = tree.warnings?.find((w) => w.includes("Cluster node status")) ?? "";
+      expect(warning).toContain("Sys.Audit");
+      expect(warning).toContain("last known running state");
+      expect(warning).not.toContain("Refresh Lab Status");
+      // A healthy join pushes no such line — the warning names a real failure,
+      // never a routine sync.
+      const ok = await syncNodes(
+        { [RESOURCES]: { body: { data: [nodeRow()] } }, [STATUS]: { body: { data: [statusEntry()] } } },
+        { baseUrl: BASE, includeNodes: true }
+      );
+      expect(ok.tree.warnings?.some((w) => w.includes("Cluster node status"))).toBe(false);
+      // …and neither does a sync with node import OFF, which never makes the
+      // call at all.
+      const off = await syncNodes({ [RESOURCES]: { body: { data: [nodeRow()] } } }, { baseUrl: BASE });
+      expect(off.tree.warnings?.some((w) => w.includes("Cluster node status"))).toBe(false);
+    });
+
+    // THE STATUS-CAP WARNING WITH NODES IN THE BUDGET — node states and guest
+    // states share ONE entry budget, so the entry a cap trip omits may be a
+    // NODE. The warning is the only surface the user sees for this, and it
+    // must not name a guest when it cannot know that it was one.
+    it("names STATUS ENTRIES, not guests, when the entry budget runs out with node states in it — the omitted entry here is a node (kills the guest-only wording, which tells a user with two nodes and Include Stopped off that the cluster lists more than the cap in GUESTS and that a GUEST kept a stale state, when neither is true)", async () => {
+      const guests = Array.from({ length: 100 }, (_, i) => ({
+        vmid: i + 1,
+        name: `guest-${i + 1}`,
+        node: "pve",
+        type: "qemu",
+        status: "stopped",
+        template: 0
+      }));
+      const { tree } = await syncNodes(
+        {
+          [RESOURCES]: { body: { data: [...guests, nodeRow(), nodeRow({ id: "node/pve2", node: "pve2" })] } },
+          [STATUS]: { body: { data: [statusEntry(), statusEntry({ name: "pve2", id: "node/pve2", nodeid: 1 })] } }
+        },
+        { baseUrl: BASE, includeNodes: true, includeStopped: false, hardCap: 100 }
+      );
+      // The DEVICE cap never trips: Include Stopped is off, so the only
+      // devices are the two nodes.
+      expect(tree.devices.map((d) => d.externalId)).toEqual(["node/pve", "node/pve2"]);
+      expect(tree.truncated).toBeUndefined();
+      // The 100 guest states spent the whole entry budget, so what the
+      // collection actually omitted is the NODES' states.
+      expect(Object.keys(tree.status?.statuses ?? {})).toHaveLength(100);
+      expect(tree.status?.statuses["node/pve"]).toBeUndefined();
+      expect(tree.status?.truncated).toBe(true);
+      const warning = tree.warnings?.find((w) => w.includes("Status collection stopped")) ?? "";
+      expect(warning).toContain("100 entries");
+      expect(warning).toContain("status entries");
+      expect(warning).not.toMatch(/more guests than/);
+      expect(warning).not.toMatch(/guests beyond/);
+      // The persistent-limit property stays intact: no remedy is offered,
+      // because every path that could retry shares this same budget.
+      expect(warning).not.toContain("Refresh Lab Status");
+      expect(warning).not.toContain("Sync Now");
+    });
+
     it("emits a node /cluster/status knows nothing about — absent entry, a 403 without Sys.Audit, or a non-array payload — as addressless with no status, and the sync CONTINUES (kills a node fetch failure that aborts the whole sync)", async () => {
       const expectDegraded = async (statusRoute: { status?: number; body: unknown }): Promise<void> => {
         const { tree } = await syncNodes(
@@ -1784,6 +2017,13 @@ describe("createProxmoxProvider", () => {
       expect(report.truncated).toBe(true);
       // The cap needs no fan-out — the poll stays ONE call even at 10k guests.
       expect(calls).toHaveLength(1);
+    });
+
+    it("budgets the POLL's collection by the configured hardCap too — 501 guests under hardCap 500 report 500 states and truncated (kills a poll left on the constant while the sync honours the field, under which the same source reports two different collection sizes depending on which path ran)", async () => {
+      const rows = Array.from({ length: 501 }, (_, i) => guestRow({ vmid: i + 1, name: `guest-${i + 1}` }));
+      const { report } = await pollStatus({ [RESOURCES]: { body: { data: rows } } }, { baseUrl: BASE, hardCap: 500 });
+      expect(Object.keys(report.statuses)).toHaveLength(500);
+      expect(report.truncated).toBe(true);
     });
 
     it("fails closed on a mangled payload — the poll THROWS instead of answering, because a complete report is applied clear-then-apply and an empty-but-valid one would DELETE every live-state decoration the source has until the next healthy poll (kills an empty-report degrade, which hands the apply a legitimate-looking 'nothing to report' answer built from one mangled 200 body)", async () => {

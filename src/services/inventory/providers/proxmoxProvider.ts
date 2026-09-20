@@ -31,7 +31,9 @@ export const DEFAULT_FOLDER_TEMPLATE = "{node}";
 // the crawl budget bounds the whole guest-address walk, and the control pair
 // bounds one start/stop task's poll. The bounds are generous because the peer
 // is a cluster that may be answering for every other request a user has.
-const HARD_CAP = 10_000;
+// The cap's DEFAULT only — the value in force is per-source and resolved by
+// `readProxmoxHardCap` (see the field and the reader below).
+const DEFAULT_HARD_CAP = 10_000;
 const MAX_IP_GUESTS = 1_000;
 const FETCH_TIMEOUT_MS = 20_000;
 const TEST_CONNECTION_TIMEOUT_MS = 10_000;
@@ -78,7 +80,9 @@ const PROXMOX_CONFIG_FIELDS: InventoryConfigField[] = [
     label: "Proxmox Base URL",
     type: "string",
     required: true,
-    placeholder: "https://pve.example.com:8006"
+    placeholder: "https://pve.example.com:8006",
+    description:
+      "What you open the PVE web UI at, WITH the port — PVE serves its API on 8006, so without it the request goes to 443 and finds nothing. Omit the port only when a reverse proxy fronts the cluster on 443 (a mount path in the URL is fine and is preserved)."
   },
   {
     // The least-privilege recipe travels HERE rather than only in the README:
@@ -91,8 +95,9 @@ const PROXMOX_CONFIG_FIELDS: InventoryConfigField[] = [
     label: "API Token",
     type: "password",
     required: true,
+    placeholder: "root@pam!nexus=8c1a4bb2-3d7f-4c22-9a51-e0f2b6c1d990",
     description:
-      "A Proxmox API token (`<user@realm>!<tokenid>` plus its secret) with at least VM.Audit; add VM.PowerMgmt for Start/Stop, VM.GuestAgent.Audit (PVE 9) or VM.Monitor (PVE 8) for VM addresses, and Sys.Audit to import cluster nodes."
+      "The FULL token credential in Proxmox's own one-line form: `<user@realm>!<tokenid>=<secret>` — Datacenter → API Tokens shows the id, and the secret is the value shown exactly once at creation; join them with `=`. The token needs at least VM.Audit; add VM.PowerMgmt for Start/Stop, VM.GuestAgent.Audit (PVE 9) or VM.Monitor (PVE 8) for VM addresses, and Sys.Audit to import cluster nodes."
   },
   {
     // PVE's own grouping vocabulary. Status is deliberately NOT a placeholder:
@@ -190,12 +195,15 @@ const PROXMOX_CONFIG_FIELDS: InventoryConfigField[] = [
       "Also import the cluster's nodes as devices. The API token needs Sys.Audit for the node list and their addresses."
   },
   {
-    // PER-SOURCE LAB STATUS POLL — EVE-NG's field, minus the session-eviction
-    // clause: a PVE API token is stateless (no login session for a poll to
-    // evict), so polling costs nothing but the request itself. Advanced,
-    // because turning it on starts unattended requests against the cluster.
+    // PER-SOURCE STATUS POLL — EVE-NG's field pattern, minus the
+    // session-eviction clause: a PVE API token is stateless (no login session
+    // for a poll to evict), so polling costs nothing but the request itself.
+    // Advanced, because turning it on starts unattended requests against the
+    // cluster. The LABEL drops EVE-NG's "Lab" — this source polls a cluster,
+    // not a lab — and the change is fingerprint-visible (labels are hashed),
+    // so sources saved before it re-confirm their credentials once.
     id: "statusPollSeconds",
-    label: "Lab Status Poll Interval (seconds)",
+    label: "Status Poll Interval (seconds)",
     type: "number",
     required: false,
     advanced: true,
@@ -207,7 +215,34 @@ const PROXMOX_CONFIG_FIELDS: InventoryConfigField[] = [
     integer: true,
     placeholder: "0",
     description:
-      "How often, in seconds, to refresh this source's running status while the Command Center is visible. 0 turns polling off for this source \u2014 use Refresh Lab Status when you want it."
+      "How often, in seconds, to refresh this source's running status while the Command Center is visible. 0 turns polling off for this source \u2014 a Sync Now refreshes it on demand."
+  },
+  {
+    // ONE BUDGET, TWO COUNTS — this number bounds the devices a sync emits AND
+    // the status entries a sync or a poll collects, so a cluster large enough
+    // to trip it needs one value raised, not two. The label says ENTRIES, not
+    // guests: with node import on, node states spend this same budget, so a
+    // guest-shaped label would mislead in exactly the case the status-cap
+    // warning below exists to describe honestly. NO defaultValue: the reader
+    // resolves an absent field to DEFAULT_HARD_CAP, so every source that
+    // predates the field keeps the exact cap it has always had and nothing is
+    // stamped into stored configs that a later default change could not move.
+    // Appended LAST because ids, labels and ORDER are hashed into the provider
+    // fingerprint — sources saved on the 2.8.220 pre-release re-confirm their
+    // credentials once, the same one-off the poll field's rename costs.
+    id: "hardCap",
+    label: "Hard Cap (entries)",
+    type: "number",
+    required: false,
+    advanced: true,
+    min: 100,
+    max: 1_000_000,
+    // WHOLE ENTRIES ONLY, for the same reason the poll field refuses a
+    // fraction: there is no runtime meaning to half a device.
+    integer: true,
+    placeholder: "10000",
+    description:
+      "The one budget a sync obeys: how many devices it imports, and how many running/stopped states it collects (guests, plus cluster nodes when Include Cluster Nodes is on). Default 10,000. Beyond it guests are left out, the sync plan says so, and the status the sync carries is merged with what is already on screen instead of replacing it. Raise it for a very large cluster."
   }
 ];
 
@@ -245,6 +280,36 @@ export function readProxmoxStatusPollSeconds(config: InventorySourceValues): num
   const clamped = Math.min(Math.max(raw, PROXMOX_STATUS_POLL_MIN_SECONDS), PROXMOX_STATUS_POLL_MAX_SECONDS);
   // Floor rather than round: a value between 0 and 1 must land on OFF, not on a
   // sub-second period, and no user typing "1.9" meant "poll twice as often".
+  return Math.floor(clamped);
+}
+
+/**
+ * THE HARD CAP — the per-source budget every count in this provider obeys: the
+ * devices a sync emits, and the status entries a sync and a poll collect.
+ *
+ * Exported and clamped exactly the way the poll reader is, for exactly the same
+ * reason: the form bounds the value on the way IN, but a source restored from a
+ * hand-edited backup never went through the form, and a raw read there would
+ * let a 0 or a negative number empty every sync's device set — and, through the
+ * `truncated` flag that a tripped cap sets, suppress pruning for good.
+ *
+ * The ABSENT case resolves to the DEFAULT, not to the minimum: every source
+ * that predates the field must keep the cap it has always run under.
+ */
+export const PROXMOX_HARD_CAP_FIELD_ID = "hardCap";
+export const PROXMOX_HARD_CAP_MIN = 100;
+export const PROXMOX_HARD_CAP_MAX = 1_000_000;
+
+export function readProxmoxHardCap(config: InventorySourceValues): number {
+  const raw = config[PROXMOX_HARD_CAP_FIELD_ID];
+  if (typeof raw !== "number" || Number.isNaN(raw)) {
+    // Includes the ABSENT case (every source that predates the field) and a
+    // numeric STRING, which the form never stores but a backup could carry.
+    return DEFAULT_HARD_CAP;
+  }
+  const clamped = Math.min(Math.max(raw, PROXMOX_HARD_CAP_MIN), PROXMOX_HARD_CAP_MAX);
+  // Floor rather than round: a fractional cap is not a countable budget, and
+  // rounding up would admit one row past a bound the form refuses.
   return Math.floor(clamped);
 }
 
@@ -1340,6 +1405,9 @@ async function fetchInventoryImpl(
   // protective default and a stored non-boolean cannot silently drop guests.
   const includeStopped = config.includeStopped !== false;
   const includeTemplates = config.includeTemplates === true;
+  // THE CAP IN FORCE for this source, resolved ONCE so the device cap, the
+  // status budget and the warnings that name them cannot drift apart.
+  const hardCap = readProxmoxHardCap(config);
   // Which family the primary ssh endpoint prefers — read ONCE, here, so every
   // guest of the sync answers to the same preference.
   const family = parsePrimaryIpFamily(config.primaryIpFamily);
@@ -1356,6 +1424,27 @@ async function fetchInventoryImpl(
   const rows = await fetchResources(transport, baseUrl, token, FETCH_TIMEOUT_MS);
 
   const devices: InventoryDevice[] = [];
+  // THE SYNC'S STATUS COLLECTION — the listing rows the loop below OBSERVES
+  // are also the status fetch: their running/stopped members are exactly what
+  // fetchStatusImpl reports, so the sync reports them (see the branch in the
+  // loop) instead of discarding them. The STATUS list is bounded by the
+  // source's hard cap, the same budget the poll collects under, so the two
+  // paths describe the same fraction of one cluster.
+  //
+  // The CLEAR list below is deliberately NOT budgeted, and the reason is not
+  // that it cannot grow: it is that a clear is always SAFE to apply and
+  // cheap to carry — a bare id, asserting only that a row the sync observed
+  // has no state — so dropping one past a cap would cost a stale decoration
+  // while keeping it costs a string. A missing STATUS entry is the opposite:
+  // it makes the report partial, which is exactly what the cap is for. (The
+  // poll counts its clears against the same budget as its statuses; the sync
+  // does not. See the doc note in §4.12.8.)
+  const statusStatuses: Record<string, InventoryDeviceStatus> = {};
+  let statusCount = 0;
+  let statusCapped = false;
+  // The node join's failure flag, when node import is on — the same
+  // partial-report trigger the poll flags (see the includeNodes branch below).
+  let joinFailed = false;
   // THE SYNC'S CLEAR COLLECTION — the same list the STATUS poll collects (see
   // fetchStatusImpl's template and unknown branches), gathered from the rows
   // this loop OBSERVES so the sync can report the two stateless classes it
@@ -1388,10 +1477,8 @@ async function fetchInventoryImpl(
     // the opt-ins say so), mirroring fetchStatusImpl's branches. WHY the
     // device cap does not bound this list: the cap counts EMITTED DEVICES,
     // while template-ness and observed-statelessness are properties of the
-    // listing row itself and stay true past it — the poll shares its ONE cap
-    // budget because its statuses and clears are one bounded set, and this
-    // report carries no statuses at all. The vmid guard is the poll's: a row
-    // with no usable vmid names no server, so it clears nothing.
+    // listing row itself and stay true past it. The vmid guard is the poll's:
+    // a row with no usable vmid names no server, so it clears nothing.
     const isTemplate = row.template === 1;
     const hasUsableVmid =
       (typeof row.vmid === "number" && Number.isFinite(row.vmid)) ||
@@ -1407,6 +1494,30 @@ async function fetchInventoryImpl(
         clearedExternalIds.push(String(row.vmid));
       }
     }
+    // GUEST STATUSES — the poll's branches, over the rows this loop already
+    // read: shape-valid, non-template guests with a real running/stopped state
+    // report it, REGARDLESS of includeStopped and includeTemplates (status
+    // reports reality; those gates shape the device set, and the apply ignores
+    // ids matching no device). Templates and "unknown" rows never report —
+    // their vmids ride the cleared list above instead, which is what retires
+    // a stale decoration the row can no longer justify. The poll's cap bounds
+    // the list, so a huge cluster's report
+    // stays bounded: entries beyond it are simply absent and the report is
+    // flagged truncated below, which makes the apply MERGE rather than
+    // clear-then-apply — the same partial-report honesty as the poll's.
+    if (
+      !isTemplate &&
+      hasUsableVmid &&
+      isImportableGuestRow(row, true, false) &&
+      (row.status === "running" || row.status === "stopped")
+    ) {
+      if (statusCount >= hardCap) {
+        statusCapped = true;
+      } else {
+        statusStatuses[String(row.vmid)] = { state: row.status };
+        statusCount++;
+      }
+    }
     // Node rows (and storage and the other non-guest types the endpoint mixes
     // in) are ignored here — node import sources them from /cluster/status
     // when opted in. The type/template/includeStopped gates are the SHARED
@@ -1414,8 +1525,7 @@ async function fetchInventoryImpl(
     // set this loop produces (template rows are the one REPORTING divergence —
     // neither path ever status-reports one: the poll collects its vmid into
     // `clearedExternalIds` (see fetchStatusImpl's template branch), and this
-    // loop now collects the same list above for the tree's own clear-only
-    // report).
+    // loop collects the same list above for the tree's own report).
     if (!isImportableGuestRow(row, includeStopped, includeTemplates)) {
       continue;
     }
@@ -1425,7 +1535,7 @@ async function fetchInventoryImpl(
     // the cap rows are simply not mapped, and `truncated` makes the engine skip
     // pruning: a capped fetch must never be read as "these devices no longer
     // exist at the source".
-    if (devices.length >= HARD_CAP) {
+    if (devices.length >= hardCap) {
       capTripped = true;
       continue;
     }
@@ -1443,9 +1553,20 @@ async function fetchInventoryImpl(
   // rows establish existence only; names and addresses come from ONE
   // /cluster/status call joined by node name, because those rows carry neither
   // member. Any /cluster/status failure degrades the nodes to addressless and
-  // status-less rather than aborting — the guests above must still sync.
+  // status-less rather than aborting — the guests above must still sync. It
+  // ALSO makes the status report PARTIAL (joinFailed below): the poll's
+  // controller ruling, reused — a complete report is applied clear-then-apply,
+  // which would wipe every node's decoration until the join answers again,
+  // while a truncated (merging) one retains it for the entries the report
+  // omits.
   if (config.includeNodes === true) {
     const statusEntries = await fetchClusterStatus(transport, baseUrl, token, FETCH_TIMEOUT_MS);
+    // fetchClusterStatus's `undefined` is its failure sentinel (non-2xx,
+    // network, non-JSON, non-array data); a healthy EMPTY array is a real
+    // answer, not a failure.
+    if (statusEntries === undefined) {
+      joinFailed = true;
+    }
     const byName = new Map<string, Record<string, unknown>>();
     for (const entry of statusEntries ?? []) {
       if (typeof entry !== "object" || entry === null) {
@@ -1468,13 +1589,34 @@ async function fetchInventoryImpl(
       // Same cap the guest loop enforces, over the SAME devices array: nodes
       // only fill the room the guests left, and once it is spent the remaining
       // nodes must read as TRUNCATED (never pruned), not as vanished.
-      if (devices.length >= HARD_CAP) {
+      if (devices.length >= hardCap) {
         capTripped = true;
         break;
       }
-      const device = mapNode(row, byName.get(str(row.node)));
+      const joinEntry = byName.get(str(row.node));
+      const device = mapNode(row, joinEntry);
       if (device) {
         devices.push(device);
+      }
+      // NODE STATUSES — the poll's rule verbatim, keyed by the SAME
+      // `node/<name>` externalId: `online` 1/0 from the join (the ONLY
+      // endpoint carrying the numeric flag; the resources row's
+      // "online"/"offline" strings are a degraded, version-dependent shape and
+      // are never read). An entry whose `online` is absent or unrecognizable
+      // invents no state and is omitted — omit-only, unlike an unknown guest
+      // row (observed, so cleared): a node entry is not a guest row and may
+      // match no guest at all. A row the join missed (403 without Sys.Audit
+      // degrades the map, per the degraded-device test above) reports nothing
+      // — the joinFailed flag below is what protects those nodes'
+      // decorations. The report's own entry budget bounds the list, the
+      // same partial-report honesty as the guest branch.
+      if (joinEntry && (joinEntry.online === 1 || joinEntry.online === 0)) {
+        if (statusCount >= hardCap) {
+          statusCapped = true;
+        } else {
+          statusStatuses[`node/${str(row.node)}`] = { state: joinEntry.online === 1 ? "running" : "stopped" };
+          statusCount++;
+        }
       }
     }
   }
@@ -1485,7 +1627,7 @@ async function fetchInventoryImpl(
   // and the node loop breaks on the check above rather than pushing its own
   // line, so a guest-side trip can never produce two warnings.
   if (capTripped) {
-    warnings.push(`Truncated at ${HARD_CAP} devices — narrow the source.`);
+    warnings.push(`Truncated at ${hardCap} devices — narrow the source.`);
   }
 
   // GUEST ADDRESS CRAWL (§IP selection) — running, non-template guests only,
@@ -1532,39 +1674,84 @@ async function fetchInventoryImpl(
     }
   }
 
-  // THE SYNC'S CLEAR-ONLY REPORT — attached when, and ONLY when, the listing
-  // pass observed rows that must lose a stale decoration; the empty case stays
-  // ABSENT (the poll's empty-cleared omission idiom) so a sync that observed
-  // no conversions keeps the exact "sync carries no status" behavior §4.12.8
-  // documents.
+  // THE SYNC'S STATUS REPORT — attached UNCONDITIONALLY: the listing the loops
+  // above just read IS the status fetch (every state it needs sat on the
+  // rows), so the tree always carries what was observed — guests' running/
+  // stopped states, the cleared template/unknown vmids, node states when the
+  // join ran. There is no "nothing to say" case anymore: an empty cluster
+  // yields an empty statuses object, and a COMPLETE report is exactly what
+  // drops decorations for guests that vanished from the listing (the engine's
+  // clear-then-apply, §4.12.6). The engine needs no change — syncNow already
+  // validates and applies `tree.status` through the generic machinery
+  // (degraded-not-thrown, applied post-commit and incarnation-guarded,
+  // inventoryCommands.ts), and a complete report correctly invalidates an
+  // earlier refresh's partial-claim entry; the apply itself never warns.
   //
-  // WHY `truncated` MUST be true here: the report carries NO states at all, so
-  // as a COMPLETE report its clear-then-apply would wipe this source's ENTIRE
-  // runtime status. As a TRUNCATED (merging) report it removes exactly the
-  // observed-but-stateless ids and retains every other guest's decoration —
-  // which is precisely the truth (the sync observed these rows; it reports no
-  // states). The merge also deliberately preserves any earlier refresh's
-  // partial warning: the sync apply's truncated check only gates the
-  // `statusAppliedGeneration` invalidation (inventoryCommands.ts), it never
-  // warns, so there is nothing here to silence. The engine needs no change —
-  // `applyInventoryStatus` already honors cleared lists under merge.
-  // `truncated` is DEVICE-LEVEL ONLY: it claims device ROWS were omitted from
-  // the tree, and only the hard cap can omit rows — the device listing is ONE
-  // complete /cluster/resources call, and the crawl budgets bound address
-  // RESOLUTION, not device OBSERVATION. computeSyncPlan reads `truncated` as
-  // "the device listing is incomplete" and skips the prune phase over it;
-  // pruning compares against the complete listing, so it is safe (and
-  // correct) to prune after a crawl-limited sync.
+  // `status.truncated` — the REPORT is partial, and the apply must MERGE
+  // rather than clear-then-apply, in exactly the poll's three cases: the
+  // DEVICE cap tripped (the tree's rows were omitted past it, and with them
+  // the report cannot claim to describe the whole cluster), the STATUS
+  // collection hit its own entry budget (entries beyond it are absent, and a
+  // complete report's clear-then-apply would drop decorations the sync never
+  // collected), or the node join failed (includeNodes on; the guests were
+  // reached, the nodes were not). Any earlier refresh's partial warning is
+  // deliberately left standing by the engine in those cases: the sync apply's
+  // truncated check only gates the `statusAppliedGeneration` invalidation, it
+  // never warns — and a partial sync report leaves the "status is partial"
+  // claim true.
   //
-  // NOT the same flag as `fetchStatusImpl`'s `truncated` (device cap /
-  // node-join failure ⇒ merge semantics) or the clear-only report's
-  // `status.truncated` built just below (merge semantics for
-  // observed-but-stateless rows): those are STATUS-report flags with
-  // different meanings — do not unify them with this one.
+  // NOT the same flag as the TREE's `truncated` above (device rows omitted ⇒
+  // computeSyncPlan skips pruning) or `fetchStatusImpl`'s `truncated` (the
+  // poll's partial-collection flag): all three are built from overlapping
+  // budgets but answer different questions — do not unify them.
   const tree: InventoryTree = { contractVersion: 1, devices, warnings, truncated: capTripped || undefined };
+  const statusReport: InventoryStatusReport = { contractVersion: 1, statuses: statusStatuses };
+  // The poll's omission idiom: absent ⇒ a no-op downstream, and an empty list
+  // asserts nothing an absent one doesn't.
   if (clearedExternalIds.length > 0) {
-    tree.status = { contractVersion: 1, statuses: {}, truncated: true, clearedExternalIds };
+    statusReport.clearedExternalIds = clearedExternalIds;
   }
+  if (capTripped || statusCapped || joinFailed) {
+    statusReport.truncated = true;
+  }
+  // A FAILED NODE JOIN is the other truncation the user cannot otherwise see,
+  // and by far the likelier one: a token granted only the guest vocabulary
+  // gets 403 from /cluster/status, which is the EXPECTED answer, not an
+  // exotic failure. It degrades rather than aborts (the guests must still
+  // sync), and it flags the report truncated — so the apply MERGES and every
+  // node holds whatever running state it last had, for as long as the join
+  // keeps failing. Without a line here that retention is invisible: syncNow
+  // shows tree warnings and never reports a status report's own `truncated`.
+  // The remedy named is the one the field's own description gives, and it is
+  // not a command to run: nothing re-reads the nodes but another sync.
+  if (joinFailed) {
+    warnings.push(
+      "Cluster node status could not be read — imported nodes arrived without addresses and keep their last known running state. The API token needs Sys.Audit for the node list; if it has it, the cluster did not answer this time and the next sync fills them in."
+    );
+  }
+  // A status-ONLY cap (the tree's device set is complete, but the report's
+  // entry budget ran out — reachable with Include Stopped Guests off over a
+  // cluster listing more stopped guests than the cap) is invisible to the
+  // user on this path: syncNow never warns about a status report's OWN
+  // `truncated` (only the refresh path does), so the merge semantics would
+  // retain stale running/stopped states — and their Start/Stop menus — with
+  // nothing on screen saying the collection was partial. The tree-warnings
+  // channel is the one surface the sync plan shows; use it.
+  //
+  // It speaks of STATUS ENTRIES, never of guests: node states spend the same
+  // budget as guest states, so with node import on the entry a trip omits may
+  // well be a node — and this is the only line the user gets, so it must not
+  // name a kind it cannot know. The wording also states a PERSISTENT limit
+  // rather than a remedy: every path that could retry (a poll tick, a manual
+  // status refresh, another sync) collects under this same budget, so no
+  // second pass can complete the collection — beyond-cap entries simply keep
+  // their last known state until the cap itself is raised.
+  if (statusCapped && !capTripped) {
+    warnings.push(
+      `Status collection stopped at ${hardCap} entries — this cluster reports more status entries (guests, plus cluster nodes when node import is on) than the budget covers, and entries beyond the first ${hardCap} keep their last known state.`
+    );
+  }
+  tree.status = statusReport;
   return tree;
 }
 
@@ -1600,8 +1787,9 @@ async function fetchInventoryImpl(
  * under a merging report. The full truthfulness/merge argument sits on the
  * loop's template branch. The SYNC device set is unchanged (templates still
  * import as addressless placeholders when includeTemplates is on), and the
- * sync now collects the SAME clears onto its own clear-only tree report —
- * see fetchInventoryImpl's loop. NO console fields:
+ * sync attaches its OWN full tree report built from the same rows — the same
+ * clears, plus every guest's state; see fetchInventoryImpl's loop. NO console
+ * fields:
  * the listing rows carry nothing to fill them with, and the console-heal path
  * those fields feed exists for providers whose consoles actually move
  * (EVE-NG's telnet).
@@ -1614,7 +1802,8 @@ async function fetchInventoryImpl(
   * "unknown" rule (a node entry is not an observed guest row, so it does not
   * join the cleared list).
  *
- * TRUNCATION: two sources. The same HARD_CAP as the sync, in the same order
+ * TRUNCATION: two sources. The same per-source hard cap as the sync (the
+ * `hardCap` field, resolved through `readProxmoxHardCap`), in the same order
  * (guests first, then nodes) — entries beyond it are simply not collected;
  * and, when node import is on, a FAILED /cluster/status join — the poll
  * reached the guests but not the nodes, so the report is partial. Either
@@ -1637,6 +1826,9 @@ async function fetchStatusImpl(
   const transport = selectProxmoxTransport(transports, config);
   const baseUrl = normalizeBaseUrl(String(config.baseUrl ?? ""));
   const token = secrets.apiToken ?? "";
+  // The SAME budget the sync resolves, read the same way, so the two paths
+  // cannot disagree about how much of one cluster they will describe.
+  const hardCap = readProxmoxHardCap(config);
   // The opt-in reads with the same strictness as the sync: only `=== true`
   // turns the node join on (a restored backup's "true" string must not switch
   // a request on). includeStopped is deliberately NOT read here — see the
@@ -1688,7 +1880,7 @@ async function fetchStatusImpl(
     // honesty. RESIDUAL, none: with no status the Start/Stop menu never
     // appears for a template. The SYNC device set is unchanged —
     // isImportableGuestRow still honors includeTemplates there — and the sync
-    // collects the same clears for its own clear-only tree report (see
+    // collects the same clears for its own tree report (see
     // fetchInventoryImpl's loop).
     const isTemplate = row.template === 1;
     if (!isTemplate && !isImportableGuestRow(row, true, false)) {
@@ -1702,7 +1894,7 @@ async function fetchStatusImpl(
       // reporting a guest the sync skipped cannot light anything.
       continue;
     }
-    if (entryCount >= HARD_CAP) {
+    if (entryCount >= hardCap) {
       capTripped = true;
       continue;
     }
@@ -1769,7 +1961,7 @@ async function fetchStatusImpl(
       if (e.type !== "node" || !name) {
         continue;
       }
-      if (entryCount >= HARD_CAP) {
+      if (entryCount >= hardCap) {
         capTripped = true;
         break;
       }

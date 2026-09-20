@@ -116,15 +116,20 @@ export class ServerTreeItem extends vscode.TreeItem {
     // host, in the tooltip or the description.
     const addressless = server.addressless === true;
     const hostSummary = addressless ? "no console address yet" : `${displayUsername}@${server.host}:${server.port}`;
-    // NODE CONTROL (Phase 4, task #28) — a lab-status line for any
-    // node-control-capable origin (EVE-NG named it; Proxmox reports guest
-    // status too), so a freshly-synced node (no status yet) hints that Refresh
-    // Lab Status is what unlocks Start/Stop. Matches the labeled-line tooltip
-    // idiom.
-    const labStatusSuffix = hasNodeControl
-      ? `\nLab status: ${status === "running" ? "running" : status === "stopped" ? "stopped" : "unknown — run Refresh Lab Status"}`
+    // NODE CONTROL (Phase 4, task #28) — a status line for any
+    // node-control-capable origin, so the state the Start/Stop gate reads is
+    // visible on the row itself. Matches the labeled-line tooltip idiom.
+    //
+    // The line is SHARED by both node-control providers, and it names neither
+    // a lab nor a command. "Lab" was EVE-NG's word and is untrue of a Proxmox
+    // cluster; the "run Refresh Lab Status" hint is now stale for BOTH, since
+    // an EVE-NG and a Proxmox sync each carry status, so an unknown state is
+    // resolved by the very next sync (or the poll) with nothing for the user
+    // to run. An unknown state is therefore reported plainly.
+    const statusSuffix = hasNodeControl
+      ? `\nStatus: ${status === "running" ? "running" : status === "stopped" ? "stopped" : "unknown"}`
       : "";
-    this.tooltip = `${hostSummary}${proxyTooltipSuffix(server.proxy, serverLookup)}${authSuffix}${ipmiSuffix}${templateSuffix}${syncedSuffix}${labStatusSuffix}`;
+    this.tooltip = `${hostSummary}${proxyTooltipSuffix(server.proxy, serverLookup)}${authSuffix}${ipmiSuffix}${templateSuffix}${syncedSuffix}${statusSuffix}`;
     const authDesc = authProfileName ? ` (${authProfileName})` : "";
     // m7 — "(synced)" suffix idiom (was "· synced").
     const syncedDesc = server.origin ? " (synced)" : "";
