@@ -1291,6 +1291,11 @@ async function fetchInventoryImpl(
   const rows = await fetchResources(transport, baseUrl, token, FETCH_TIMEOUT_MS);
 
   const devices: InventoryDevice[] = [];
+  // THE SYNC'S CLEAR COLLECTION — the same list the STATUS poll collects (see
+  // fetchStatusImpl's template and unknown branches), gathered from the rows
+  // this loop OBSERVES so the sync can report the two stateless classes it
+  // cannot decorate: converted templates and guests PVE cannot describe yet.
+  const clearedExternalIds: string[] = [];
   // Running, non-template guests awaiting their address crawl. Templates never
   // crawl (no agent ever answers for one) and stopped guests cannot answer —
   // the crawl is the only per-guest fan-out this provider makes, so it is
@@ -1313,13 +1318,39 @@ async function fetchInventoryImpl(
       );
     }
     const row = raw as Record<string, unknown>;
+    // TEMPLATE/UNKNOWN CLEARS — decided by the ROW ALONE, BEFORE the shared
+    // filter below (which drops exactly these rows from the device set when
+    // the opt-ins say so), mirroring fetchStatusImpl's branches. WHY the
+    // device cap does not bound this list: the cap counts EMITTED DEVICES,
+    // while template-ness and observed-statelessness are properties of the
+    // listing row itself and stay true past it — the poll shares its ONE cap
+    // budget because its statuses and clears are one bounded set, and this
+    // report carries no statuses at all. The vmid guard is the poll's: a row
+    // with no usable vmid names no server, so it clears nothing.
+    const isTemplate = row.template === 1;
+    const hasUsableVmid =
+      (typeof row.vmid === "number" && Number.isFinite(row.vmid)) ||
+      (typeof row.vmid === "string" && row.vmid.length > 0);
+    if (hasUsableVmid) {
+      if (isTemplate) {
+        clearedExternalIds.push(String(row.vmid));
+      } else if (row.status === "unknown" && isImportableGuestRow(row, true, false)) {
+        // includeStopped is pinned TRUE here exactly as on the poll path —
+        // observed is observed; the sync's device-set preference must not
+        // gate an explicit clear for a guest it may have synced while it
+        // still reported a state.
+        clearedExternalIds.push(String(row.vmid));
+      }
+    }
     // Node rows (and storage and the other non-guest types the endpoint mixes
     // in) are ignored here — node import sources them from /cluster/status
     // when opted in. The type/template/includeStopped gates are the SHARED
     // `isImportableGuestRow`, so the status poll's guest rows track the device
-    // set this loop produces (template rows are the one divergence — the poll
-    // never status-reports one and collects its vmid into `clearedExternalIds`
-    // instead; see fetchStatusImpl's template branch).
+    // set this loop produces (template rows are the one REPORTING divergence —
+    // neither path ever status-reports one: the poll collects its vmid into
+    // `clearedExternalIds` (see fetchStatusImpl's template branch), and this
+    // loop now collects the same list above for the tree's own clear-only
+    // report).
     if (!isImportableGuestRow(row, includeStopped, includeTemplates)) {
       continue;
     }
@@ -1437,7 +1468,27 @@ async function fetchInventoryImpl(
     }
   }
 
-  return { contractVersion: 1, devices, warnings, truncated: truncated || undefined };
+  // THE SYNC'S CLEAR-ONLY REPORT — attached when, and ONLY when, the listing
+  // pass observed rows that must lose a stale decoration; the empty case stays
+  // ABSENT (the poll's empty-cleared omission idiom) so a sync that observed
+  // no conversions keeps the exact "sync carries no status" behavior §4.12.8
+  // documents.
+  //
+  // WHY `truncated` MUST be true here: the report carries NO states at all, so
+  // as a COMPLETE report its clear-then-apply would wipe this source's ENTIRE
+  // runtime status. As a TRUNCATED (merging) report it removes exactly the
+  // observed-but-stateless ids and retains every other guest's decoration —
+  // which is precisely the truth (the sync observed these rows; it reports no
+  // states). The merge also deliberately preserves any earlier refresh's
+  // partial warning: the sync apply's truncated check only gates the
+  // `statusAppliedGeneration` invalidation (inventoryCommands.ts), it never
+  // warns, so there is nothing here to silence. The engine needs no change —
+  // `applyInventoryStatus` already honors cleared lists under merge.
+  const tree: InventoryTree = { contractVersion: 1, devices, warnings, truncated: truncated || undefined };
+  if (clearedExternalIds.length > 0) {
+    tree.status = { contractVersion: 1, statuses: {}, truncated: true, clearedExternalIds };
+  }
+  return tree;
 }
 
 /**
@@ -1470,8 +1521,10 @@ async function fetchInventoryImpl(
  * row regardless of the opt-in (which governs only the SYNC device set), so a
  * guest converted into a template loses its stale decoration explicitly even
  * under a merging report. The full truthfulness/merge argument sits on the
- * loop's template branch. The SYNC path is unchanged: templates still import
- * as addressless placeholders when includeTemplates is on. NO console fields:
+ * loop's template branch. The SYNC device set is unchanged (templates still
+ * import as addressless placeholders when includeTemplates is on), and the
+ * sync now collects the SAME clears onto its own clear-only tree report —
+ * see fetchInventoryImpl's loop. NO console fields:
  * the listing rows carry nothing to fill them with, and the console-heal path
  * those fields feed exists for providers whose consoles actually move
  * (EVE-NG's telnet).
@@ -1556,8 +1609,10 @@ async function fetchStatusImpl(
     // with statuses — a template beyond the cap keeps its stale highlight
     // exactly as long as a guest beyond it does, the same partial-report
     // honesty. RESIDUAL, none: with no status the Start/Stop menu never
-    // appears for a template. The SYNC path is unchanged:
-    // isImportableGuestRow still honors includeTemplates there.
+    // appears for a template. The SYNC device set is unchanged —
+    // isImportableGuestRow still honors includeTemplates there — and the sync
+    // collects the same clears for its own clear-only tree report (see
+    // fetchInventoryImpl's loop).
     const isTemplate = row.template === 1;
     if (!isTemplate && !isImportableGuestRow(row, true, false)) {
       // includeStopped is pinned TRUE — on the STATUS call only; the sync

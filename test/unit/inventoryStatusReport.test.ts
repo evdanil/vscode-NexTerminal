@@ -113,7 +113,7 @@ describe("validateInventoryStatusReport", () => {
     expect(validateInventoryStatusReport({ contractVersion: 1, statuses: {}, truncated: null })).toBeUndefined();
   });
 
-  // Codex round 4 (P2) — `clearedExternalIds`: externalIds the provider asserts
+  // EXPLICIT CLEARS — `clearedExternalIds`: externalIds the provider asserts
   // have NO status any more, honored by applyInventoryStatus even under a
   // TRUNCATED (merging) report, because a merge retains merely-absent entries
   // while a cleared one is explicitly asserted gone (Proxmox sends every

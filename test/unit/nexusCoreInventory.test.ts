@@ -4836,7 +4836,7 @@ describe("NexusCore inventory status", () => {
     expect(snap.serverStatus.size).toBe(1);
   });
 
-  // Codex round 5 (P2) — the unknown-guest clear. A Proxmox guest whose row
+  // THE UNKNOWN-GUEST CLEAR — a Proxmox guest whose row
   // carries `status: "unknown"` (PVE's word for a guest it OBSERVED whose RRD
   // data has not caught up) is the same class as a converted template: the
   // provider omits it from `statuses` and names its vmid in

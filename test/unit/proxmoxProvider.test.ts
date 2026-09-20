@@ -655,6 +655,71 @@ describe("createProxmoxProvider", () => {
       expect(included.tree.devices.map((d) => d.externalId)).toEqual(["105"]);
     });
 
+    // THE SYNC'S CLEAR-ONLY REPORT — the same explicit clears the STATUS poll
+    // collects, attached to the tree when (and only when) the sync's listing
+    // pass OBSERVED rows that must lose a stale decoration: every template row
+    // (regardless of the opt-in, which governs only the device set — the server
+    // a converted guest was synced as still exists and holds its stale running
+    // decoration, Start/Stop menu included, until something clears it) and
+    // every observed-but-stateless "unknown" guest. `truncated` is REQUIRED on
+    // the report: it carries no states at all, so as a COMPLETE report its
+    // clear-then-apply would wipe the source's entire runtime status; as a
+    // TRUNCATED (merging) report it removes exactly the observed-but-stateless
+    // ids and retains every other guest's decoration. The engine side (a merge
+    // honoring clearedExternalIds) is pinned in nexusCoreInventory.test.ts.
+    it("attaches a CLEAR-ONLY status report when the listing holds a template row — the vmid rides clearedExternalIds, statuses stay empty, truncated is true, and the opt-in is irrelevant (kills a sync that observes a conversion but reports no clear, leaving the previously synced VM's stale running decoration — and its Start/Stop menu — standing until a separate status refresh, indefinitely with polling off)", async () => {
+      const included = await syncRows([guestRow({ template: 1, name: "gold-image" })], {
+        baseUrl: BASE,
+        includeTemplates: true
+      });
+      expect(included.tree.status).toEqual({
+        contractVersion: 1,
+        statuses: {},
+        truncated: true,
+        clearedExternalIds: ["105"]
+      });
+      // The device-set opt-in governs nothing here: with it OFF the template is
+      // still OBSERVED (and the pre-conversion server more likely to still
+      // exist), so the clear rides all the same.
+      const excluded = await syncRows([guestRow({ template: 1, name: "gold-image" })]);
+      expect(excluded.tree.status).toEqual({
+        contractVersion: 1,
+        statuses: {},
+        truncated: true,
+        clearedExternalIds: ["105"]
+      });
+      expect(excluded.tree.devices).toEqual([]);
+    });
+
+    it("clears a guest whose row reads status 'unknown' on the sync path too — the same observed-but-stateless class the poll clears, even when includeStopped keeps the row out of the device set (kills a sync-side clear list that covers only templates)", async () => {
+      const { tree } = await syncRows([guestRow({ vmid: 118, status: "unknown" })]);
+      expect(tree.status).toEqual({
+        contractVersion: 1,
+        statuses: {},
+        truncated: true,
+        clearedExternalIds: ["118"]
+      });
+      const gated = await syncRows([guestRow({ vmid: 118, status: "unknown" })], {
+        baseUrl: BASE,
+        includeStopped: false
+      });
+      expect(gated.tree.devices).toEqual([]);
+      expect(gated.tree.status?.clearedExternalIds).toEqual(["118"]);
+    });
+
+    it("leaves tree.status ABSENT when the listing holds neither a template row nor an unknown guest — the ordinary sync still carries no status at all (kills an unconditional status attach, whose empty-but-COMPLETE report would clear-then-apply and wipe the source's entire runtime status on every sync)", async () => {
+      const optInOn = await syncRows([guestRow(), guestRow({ vmid: 114, status: "stopped" })], {
+        baseUrl: BASE,
+        includeTemplates: true
+      });
+      expect(optInOn.tree.status).toBeUndefined();
+    });
+
+    it("keeps the default-config sync status-less — includeTemplates off and no unknown rows means nothing observed to clear (kills attaching a report on every sync, whose merge would at best be noise and at worst — complete, not truncated — a wholesale wipe)", async () => {
+      const { tree } = await syncRows([guestRow()]);
+      expect(tree.status).toBeUndefined();
+    });
+
     it("renders the folder template with PVE's variables — pool, node, type, and the SORTED-FIRST tag — dropping empty and unknown segments (kills an unsorted-first tag policy, which reshuffles folders when the user reorders tags in PVE, and a dangling '/' from an absent pool)", async () => {
       const cases: { template: string; row: Record<string, unknown>; expected: string }[] = [
         { template: "{pool}/{node}", row: guestRow({ pool: "prod" }), expected: "prod/pve" },

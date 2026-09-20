@@ -145,6 +145,18 @@ export function validateProviderShape(provider: unknown): asserts provider is In
   if (obj.controlNode !== undefined && typeof obj.controlNode !== "function") {
     throw new Error("Inventory provider controlNode must be a function when present.");
   }
+  // CONTROL MENU GATE — the twin of the controlNode clause. `canControlNode` is
+  // OPTIONAL (a provider whose whole device set is controllable declares
+  // nothing; absence means the tree's menu gate answers yes for every row), but
+  // a non-function value under that name IS an error, loudly rather than
+  // silently: a typo'd `canControlNode` would otherwise be indistinguishable at
+  // runtime from a provider that never declared one — except this one does not
+  // fail quietly, because the gate invokes the member DURING TREE RENDER, so
+  // the symptom of letting it through would be a TypeError on every repaint of
+  // a row instead of a clear verdict here, at registration.
+  if (obj.canControlNode !== undefined && typeof obj.canControlNode !== "function") {
+    throw new Error("Inventory provider canControlNode must be a function when present.");
+  }
 }
 
 /**
