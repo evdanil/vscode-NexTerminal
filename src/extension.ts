@@ -901,9 +901,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // NODE CONTROL (Task 9) — the tree cannot import the provider registry (UI
   // layering), so "does this origin's provider implement `controlNode` — and
   // can it control THIS device?" crosses as a predicate. The
-  // `.eveRunning`/`.eveStopped` marker names stay as EVE-NG named them: every
-  // server-menu `when` regex already tolerates them, and Proxmox inherits the
-  // mechanism unchanged. The DEVICE half (P2 review fix) asks the provider's
+  // `.nodeRunning`/`.nodeStopped` marker is named for the mechanism, not for a
+  // provider: EVE-NG nodes and Proxmox guests are stamped by the same rule. The
+  // DEVICE half (P2 review fix) asks the provider's
   // optional `canControlNode(externalId)`: a provider that does not declare it
   // is taken at its word that every device is controllable (EVE-NG), while one
   // that does (Proxmox — bare vmids only) keeps the records its controlNode

@@ -423,7 +423,7 @@ export interface InventoryProvider {
    * its own implementation rejects with a protocol error — must be able to
    * keep those out of the Start/Stop menu WITHOUT losing their status
    * decoration: the tree's marker gate consults this before stamping
-   * `.eveRunning`/`.eveStopped`, so a refused device keeps its running/offline
+   * `.nodeRunning`/`.nodeStopped`, so a refused device keeps its running/offline
    * dot and description (both driven by the status, not the marker) but
    * carries no menu. OPTIONAL — absent means EVERY device is controllable, so
    * a provider whose whole device set is controllable (EVE-NG) implements

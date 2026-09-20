@@ -157,8 +157,8 @@ describe("package contributions", () => {
     expect(menuItems.some((item) => item.when?.includes("viewItem == nexus.sessionNode"))).toBe(true);
     // BMC gating (Phase 2) broadened the connected-server menus to also match the
     // .ipmi variant; node control (Phase 4) broadened them again to tolerate the
-    // optional .eveRunning/.eveStopped group, so the assertion follows the new form.
-    expect(menuItems.some((item) => item.when?.includes("/^nexus\\.serverConnected(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/"))).toBe(true);
+    // optional .nodeRunning/.nodeStopped group, so the assertion follows the new form.
+    expect(menuItems.some((item) => item.when?.includes("/^nexus\\.serverConnected(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?$/"))).toBe(true);
     expect(menuItems.some((item) => item.when?.includes("viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/"))).toBe(true);
   });
 
@@ -196,12 +196,12 @@ describe("package contributions", () => {
     expect(menuItems).toEqual(expect.arrayContaining([
       expect.objectContaining({
         command: "nexus.server.testConnection",
-        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?$/",
         group: "inline@2"
       }),
       expect.objectContaining({
         command: "nexus.server.testConnection",
-        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.eveRunning|\\.eveStopped)?$/",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?$/",
         group: "0_connect@4"
       }),
       expect.objectContaining({
@@ -771,23 +771,23 @@ describe("package contributions", () => {
     // through: shrinking nexus.server.edit to `.ipmi`-only (hiding Edit on every
     // normal server) fails here, as does reverting any broadened entry to a
     // base-only regex or dropping `.ipmi` off a BMC entry.
-    it("matches exactly the intended subset of {server, serverConnected, .ipmi, .eve* variants} for each server menu, and never a non-server contextValue (M10 + the #83/#28 hazard die)", () => {
-      // NODE CONTROL (task #28) — the four base contextValues plus every EVE
-      // node-control variant `nexus.server[Connected][.ipmi][.eveRunning|.eveStopped]`.
+    it("matches exactly the intended subset of {server, serverConnected, .ipmi, .node* variants} for each server menu, and never a non-server contextValue (M10 + the #83/#28 hazard die)", () => {
+      // NODE CONTROL (task #28) — the four base contextValues plus every
+      // node-control variant `nexus.server[Connected][.ipmi][.nodeRunning|.nodeStopped]`.
       // Broadening the ~20 anchored server-menu regexes to TOLERATE the optional
-      // eve group is load-bearing: without it an EVE node (whose contextValue now
-      // carries the marker) loses EVERY context action — the exact #83 failure
+      // node group is load-bearing: without it a control-capable node (whose
+      // contextValue now carries the marker) loses EVERY context action — the #83 failure
       // mode. This affirmative both-directions table is what pins it: a regex that
       // fails to match a value its command must offer, OR matches one it must not,
       // fails here.
       const BASE = ["nexus.server", "nexus.serverConnected", "nexus.server.ipmi", "nexus.serverConnected.ipmi"];
-      const EVE = [
-        "nexus.server.eveRunning", "nexus.server.eveStopped",
-        "nexus.serverConnected.eveRunning", "nexus.serverConnected.eveStopped",
-        "nexus.server.ipmi.eveRunning", "nexus.server.ipmi.eveStopped",
-        "nexus.serverConnected.ipmi.eveRunning", "nexus.serverConnected.ipmi.eveStopped"
+      const NODE = [
+        "nexus.server.nodeRunning", "nexus.server.nodeStopped",
+        "nexus.serverConnected.nodeRunning", "nexus.serverConnected.nodeStopped",
+        "nexus.server.ipmi.nodeRunning", "nexus.server.ipmi.nodeStopped",
+        "nexus.serverConnected.ipmi.nodeRunning", "nexus.serverConnected.ipmi.nodeStopped"
       ];
-      const SERVER_VALUES = [...BASE, ...EVE];
+      const SERVER_VALUES = [...BASE, ...NODE];
 
       // Intent-driven category predicates — deliberately NOT the regexes under
       // test, so a regex mutated to agree with itself still fails the table.
@@ -795,19 +795,19 @@ describe("package contributions", () => {
       const CONNECTED = SERVER_VALUES.filter((v) => v.includes("Connected"));
       const IPMI_ONLY = SERVER_VALUES.filter((v) => v.includes(".ipmi"));
       const ALL = SERVER_VALUES;
-      const EVE_STOPPED = SERVER_VALUES.filter((v) => v.endsWith(".eveStopped"));
-      const EVE_RUNNING = SERVER_VALUES.filter((v) => v.endsWith(".eveRunning"));
+      const NODE_STOPPED = SERVER_VALUES.filter((v) => v.endsWith(".nodeStopped"));
+      const NODE_RUNNING = SERVER_VALUES.filter((v) => v.endsWith(".nodeRunning"));
 
-      // Sanity on the fixtures themselves: the eve variants must actually widen
-      // each category (a table that silently lost them would be vacuous).
+      // Sanity on the fixtures themselves: the node-control variants must actually
+      // widen each category (a table that silently lost them would be vacuous).
       expect(DISCONNECTED).toHaveLength(6);
       expect(CONNECTED).toHaveLength(6);
       expect(IPMI_ONLY).toHaveLength(6);
-      expect(EVE_STOPPED).toEqual([
-        "nexus.server.eveStopped", "nexus.serverConnected.eveStopped",
-        "nexus.server.ipmi.eveStopped", "nexus.serverConnected.ipmi.eveStopped"
+      expect(NODE_STOPPED).toEqual([
+        "nexus.server.nodeStopped", "nexus.serverConnected.nodeStopped",
+        "nexus.server.ipmi.nodeStopped", "nexus.serverConnected.ipmi.nodeStopped"
       ]);
-      expect(EVE_RUNNING).toHaveLength(4);
+      expect(NODE_RUNNING).toHaveLength(4);
 
       const NON_SERVER = [
         "nexus.folder", "nexus.folderWithServers", "nexus.macro", "nexus.serialProfile",
@@ -815,11 +815,11 @@ describe("package contributions", () => {
         "nexus.localShellProfile", "nexus.localShellProfileConnected",
         // near-misses that the `$` anchor must reject
         "nexus.serverFoo", "nexus.server.ipmi.extra", "nexus.serverConnectedX",
-        // eve near-misses — the optional group must be EXACT and stay in order
-        "nexus.server.eve", "nexus.server.eveRunningX", "nexus.server.eveStopped.extra",
-        "nexus.serverConnected.ipmi.eveStopped.extra",
-        // eve BEFORE ipmi is the wrong order — the fixed composition must reject it
-        "nexus.server.eveStopped.ipmi"
+        // node-marker near-misses — the optional group must be EXACT and stay in order
+        "nexus.server.node", "nexus.server.nodeRunningX", "nexus.server.nodeStopped.extra",
+        "nexus.serverConnected.ipmi.nodeStopped.extra",
+        // the node marker BEFORE ipmi is the wrong order — the fixed composition must reject it
+        "nexus.server.nodeStopped.ipmi"
       ];
 
       // command|group → the contextValues that entry MUST match (and only those).
@@ -833,8 +833,8 @@ describe("package contributions", () => {
         "nexus.server.runMacro|0_connect@5": ALL,
         "nexus.server.connectBmcSol|0_connect@6": IPMI_ONLY,
         "nexus.server.openBmcWebConsole|0_connect@7": IPMI_ONLY,
-        "nexus.inventory.startNode|00_power@1": EVE_STOPPED,
-        "nexus.inventory.stopNode|00_power@2": EVE_RUNNING,
+        "nexus.inventory.startNode|00_power@1": NODE_STOPPED,
+        "nexus.inventory.stopNode|00_power@2": NODE_RUNNING,
         "nexus.server.testConnection|0_connect@4": DISCONNECTED,
         "nexus.server.connect|0_connect@1": CONNECTED,
         "nexus.server.disconnect|0_connect@2": CONNECTED,
@@ -882,7 +882,7 @@ describe("package contributions", () => {
   /**
    * PER-SOURCE SYNC ON THE FOLDER ROW (follow-up #43) — the `.syncSource` marker
    * is an OPTIONAL SUFFIX on a Command Center folder's contextValue, the same
-   * shape `.eveRunning`/`.eveStopped` take on a server's. That only works if
+   * shape `.nodeRunning`/`.nodeStopped` take on a server's. That only works if
    * every existing folder `when` clause tolerates it: an entry left on the old
    * `== nexus.folderWithServers` or the old `/^nexus\.folder(WithServers)?$/`
    * would silently vanish from exactly the folders this feature marks — a lab's
