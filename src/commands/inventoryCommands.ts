@@ -2118,7 +2118,7 @@ function planHasNothingToDo(plan: InventorySyncPlan): boolean {
  */
 export function authProfileSwitchIds(plan: InventorySyncPlan): Set<string> {
   return new Set(
-    authProfileSwitches(plan).map((u) => `${u.before.id} ${u.before.authProfileId ?? ""} ${u.after.authProfileId ?? ""}`)
+    authProfileSwitches(plan).map((u) => `${u.before.id}\u0000${u.before.authProfileId ?? ""}\u0000${u.after.authProfileId ?? ""}`)
   );
 }
 
