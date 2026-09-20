@@ -414,8 +414,9 @@ export interface InventoryProvider {
    * The report contract carries no reason field, so this stays CAUSE-NEUTRAL:
    * one sentence covering every way this provider's scan can stop short.
    *
-   * A provider that declares none gets a neutral line naming no field, which is
-   * also what a sweep whose truncated sources DISAGREE falls back to.
+   * A provider that declares none gets NO remedy line at all — the warning ends
+   * after saying the status is partial. Same for a sweep whose truncated sources
+   * DISAGREE. Saying nothing beats prescribing a limit a provider may not have.
    *
    * Read only through `resolveStatusTruncationRemedy` below, which makes the
    * text inert and bounds it — a third-party provider registers through the
@@ -1069,7 +1070,7 @@ const STATUS_REMEDY_MAX_LENGTH = 240;
  * LIVE STATUS — the ONE sanctioned way to read
  * `InventoryProvider.statusTruncationRemedy`, in the same spirit as
  * `resolveProviderInstanceKey`: a missing, non-string or blank declaration
- * resolves to `undefined` (the caller then uses its own neutral line) rather
+ * resolves to `undefined` (the caller then renders no remedy at all) rather
  * than putting an empty fragment on the end of a sentence.
  *
  * FLATTENED, not merely trimmed. The value lands mid-sentence in a warning Nexus

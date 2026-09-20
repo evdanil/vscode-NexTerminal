@@ -2456,7 +2456,7 @@ export function createProxmoxProvider(
     // failure modes themselves stay out of the string, because a remedy nobody
     // finishes reading is worse than a slightly over-confident one.
     statusTruncationRemedy:
-      "Two things can cut this short and the report does not say which: the Hard Cap (entries), which can be raised, and — with Include Cluster Nodes on — the cluster-status read, which needs Sys.Audit on the API token and can fail anyway.",
+      "Two things can cut this short and the report does not say which: the Hard Cap (entries) that bounds the scan, and — with Include Cluster Nodes on — the cluster-status read, which needs Sys.Audit on the API token and can fail anyway.",
     instanceKey(config: InventorySourceValues): string | undefined {
       return proxmoxInstanceKey(config);
     },
