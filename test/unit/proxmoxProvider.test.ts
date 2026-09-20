@@ -379,6 +379,27 @@ describe("createProxmoxProvider", () => {
     expect(createProxmoxProvider().configFields.map((f) => f.label)).toContain("Hard Cap (entries)");
   });
 
+  /**
+   * NEITHER CAUSE LEADS. `fetchStatusImpl` sets `truncated` for two unrelated
+   * reasons — the entry cap, and a failed /cluster/status join (403 without
+   * Sys.Audit, a transient failure, a malformed payload) — and the join can
+   * fail with the entry count nowhere near the cap. A sentence that opens with
+   * "Raise the Hard Cap" therefore hands the second user a change that cannot
+   * fix their problem and makes every later scan larger for nothing. The report
+   * carries no reason, so the honest shape is both causes at equal standing
+   * plus an admission that this cannot tell which — never an order the sentence
+   * has no basis for.
+   */
+  it("gives its two truncation causes equal standing and says it cannot tell which applies (⊘ leading with the cap tells a user whose cluster-status join failed to raise a budget that was never the problem)", () => {
+    const remedy = resolveStatusTruncationRemedy(createProxmoxProvider()) ?? "";
+    expect(remedy).toContain("Hard Cap (entries)");
+    expect(remedy).toContain("Sys.Audit");
+    expect(remedy).toMatch(/does not say which|whichever applies/i);
+    // The specific regression: an imperative about ONE cause as the opening
+    // clause, read as "do this first" by a reader it cannot help.
+    expect(remedy).not.toMatch(/^(Raise|Increase|Lift|Bump) /);
+  });
+
   it("passes validateProviderShape — the same gate the registry applies at registration (⊘ a provider that only compiles still cannot be registered)", () => {
     expect(() => validateProviderShape(createProxmoxProvider())).not.toThrow();
   });
@@ -1714,7 +1735,13 @@ describe("createProxmoxProvider", () => {
       const warning = tree.warnings?.find((w) => w.includes("Cluster node status")) ?? "";
       expect(warning).toContain("Sys.Audit");
       expect(warning).toContain("last known running state");
+      // BOTH TITLES, and the retired one is not redundant. This hint has come
+      // back twice; a pin that only knows the CURRENT title passes again the
+      // day someone restores the old sentence verbatim, which is the shape the
+      // regression actually took. Renaming the command is exactly when that
+      // guard must be kept, not replaced.
       expect(warning).not.toContain("Refresh Inventory Status");
+      expect(warning).not.toContain("Refresh Lab Status");
       // A healthy join pushes no such line — the warning names a real failure,
       // never a routine sync.
       const ok = await syncNodes(
@@ -1765,6 +1792,7 @@ describe("createProxmoxProvider", () => {
       // The persistent-limit property stays intact: no remedy is offered,
       // because every path that could retry shares this same budget.
       expect(warning).not.toContain("Refresh Inventory Status");
+      expect(warning).not.toContain("Refresh Lab Status"); // the retired title, still pinned — see the join-failure test above
       expect(warning).not.toContain("Sync Now");
     });
 

@@ -1858,6 +1858,10 @@ describe("ServerTreeItem status tooltip line", () => {
   it("shows a bare 'Status: unknown' for a freshly-synced node with no status yet, with NO command hint (⊘ pointing at Refresh Inventory Status is stale advice for BOTH providers now that either sync carries status, and it names a lab a Proxmox cluster does not have)", () => {
     expect(tip({ hasNodeControl: true, status: undefined })).toContain("Status: unknown");
     expect(tip({ hasNodeControl: true, status: undefined })).not.toContain("Refresh Inventory Status");
+    // The RETIRED title too: the hint this pins came back twice, and a guard
+    // that only knows the current name stops catching a verbatim restore of
+    // the old sentence.
+    expect(tip({ hasNodeControl: true, status: undefined })).not.toContain("Refresh Lab Status");
     expect(tip({ hasNodeControl: true, status: undefined })).not.toContain("Lab status");
   });
 

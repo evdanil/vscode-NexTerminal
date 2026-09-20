@@ -2435,13 +2435,20 @@ export function createProxmoxProvider(
     attributeKeys: ["type", "node", "pool", "tag", "status", "ip", "ip6", "mac", "ifname", "name"],
     // A PARTIAL status scan, in Proxmox's own words — see the contract on
     // `InventoryProvider`, and `fetchStatusImpl` for the two ways this report
-    // comes back truncated. The remedy names BOTH, because they are not one
-    // cause: the hard cap is a budget to raise (EVE-NG's remedy is the opposite
-    // verb, which is why no shared sentence can serve them both), while the
-    // /cluster/status join fails on a token without Sys.Audit, where no cap
-    // matters.
+    // comes back truncated.
+    //
+    // NEITHER CAUSE LEADS, deliberately. The two are unrelated — the entry cap,
+    // and a /cluster/status join that failed (403 without Sys.Audit, a
+    // transient error, a malformed payload) — and the join can fail with the
+    // entry count nowhere near the cap. Opening with "Raise the Hard Cap" would
+    // therefore hand that user a change that cannot fix their problem and makes
+    // every later scan larger for nothing. The report carries no reason, so the
+    // sentence says plainly that it cannot tell which and gives both equal
+    // standing rather than implying a likelihood it has no basis for. (The cap
+    // is still a budget to RAISE, which is why EVE-NG's narrow-the-crawl
+    // sentence could never have served both providers.)
     statusTruncationRemedy:
-      "Raise the Hard Cap (entries) to cover more of the cluster; with Include Cluster Nodes on, also check that the API token may read cluster status.",
+      "Two things can cut this short and the report does not say which: the Hard Cap (entries), which can be raised, and — with Include Cluster Nodes on — the cluster-status read, which needs Sys.Audit on the API token.",
     instanceKey(config: InventorySourceValues): string | undefined {
       return proxmoxInstanceKey(config);
     },
