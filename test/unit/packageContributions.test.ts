@@ -157,8 +157,10 @@ describe("package contributions", () => {
     expect(menuItems.some((item) => item.when?.includes("viewItem == nexus.sessionNode"))).toBe(true);
     // BMC gating (Phase 2) broadened the connected-server menus to also match the
     // .ipmi variant; node control (Phase 4) broadened them again to tolerate the
-    // optional .nodeRunning/.nodeStopped group, so the assertion follows the new form.
-    expect(menuItems.some((item) => item.when?.includes("/^nexus\\.serverConnected(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?$/"))).toBe(true);
+    // optional .nodeRunning/.nodeStopped group, and Open Web Console broadened
+    // them once more with the optional .webConsole marker — the assertion follows
+    // the current form, which is the whole point of pinning it as a literal.
+    expect(menuItems.some((item) => item.when?.includes("/^nexus\\.serverConnected(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?$/"))).toBe(true);
     expect(menuItems.some((item) => item.when?.includes("viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/"))).toBe(true);
   });
 
@@ -196,12 +198,12 @@ describe("package contributions", () => {
     expect(menuItems).toEqual(expect.arrayContaining([
       expect.objectContaining({
         command: "nexus.server.testConnection",
-        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?$/",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?$/",
         group: "inline@2"
       }),
       expect.objectContaining({
         command: "nexus.server.testConnection",
-        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?$/",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?$/",
         group: "0_connect@4"
       }),
       expect.objectContaining({
@@ -257,6 +259,16 @@ describe("package contributions", () => {
       expect(item, command).toBeDefined();
       expect(item?.when, command).toBe("false");
     }
+  });
+
+  it("contributes Open Web Console, TREE-ONLY like the other row-conditional inventory commands (⊘ palette-visible it names no row, so every palette invocation can only refuse; and an uncontributed command leaves the menu entry pointing at nothing)", () => {
+    const command = packageJson.contributes.commands.find((item) => item.command === "nexus.inventory.openWebConsole");
+    expect(command).toBeDefined();
+    expect(command?.title).toBe("Open Web Console");
+    const paletteMenu = packageJson.contributes.menus.commandPalette ?? [];
+    const palette = paletteMenu.find((entry) => entry.command === "nexus.inventory.openWebConsole");
+    expect(palette).toBeDefined();
+    expect(palette?.when).toBe("false");
   });
 
   it("contributes settings.openPanel command", () => {
@@ -787,7 +799,12 @@ describe("package contributions", () => {
         "nexus.server.ipmi.nodeRunning", "nexus.server.ipmi.nodeStopped",
         "nexus.serverConnected.ipmi.nodeRunning", "nexus.serverConnected.ipmi.nodeStopped"
       ];
-      const SERVER_VALUES = [...BASE, ...NODE];
+      // OPEN WEB CONSOLE — the `.webConsole` marker is a further OPTIONAL suffix
+      // on every one of the values above (capability-gated and status-INdependent,
+      // so it composes with the marked and the unmarked forms alike). Generated
+      // rather than listed so the table cannot drift from the composition rule.
+      const WEB = [...BASE, ...NODE].map((value) => `${value}.webConsole`);
+      const SERVER_VALUES = [...BASE, ...NODE, ...WEB];
 
       // Intent-driven category predicates — deliberately NOT the regexes under
       // test, so a regex mutated to agree with itself still fails the table.
@@ -795,19 +812,23 @@ describe("package contributions", () => {
       const CONNECTED = SERVER_VALUES.filter((v) => v.includes("Connected"));
       const IPMI_ONLY = SERVER_VALUES.filter((v) => v.includes(".ipmi"));
       const ALL = SERVER_VALUES;
-      const NODE_STOPPED = SERVER_VALUES.filter((v) => v.endsWith(".nodeStopped"));
-      const NODE_RUNNING = SERVER_VALUES.filter((v) => v.endsWith(".nodeRunning"));
+      const NODE_STOPPED = SERVER_VALUES.filter((v) => v.includes(".nodeStopped"));
+      const NODE_RUNNING = SERVER_VALUES.filter((v) => v.includes(".nodeRunning"));
+      const WEB_CONSOLE = SERVER_VALUES.filter((v) => v.endsWith(".webConsole"));
 
       // Sanity on the fixtures themselves: the node-control variants must actually
       // widen each category (a table that silently lost them would be vacuous).
-      expect(DISCONNECTED).toHaveLength(6);
-      expect(CONNECTED).toHaveLength(6);
-      expect(IPMI_ONLY).toHaveLength(6);
+      expect(DISCONNECTED).toHaveLength(12);
+      expect(CONNECTED).toHaveLength(12);
+      expect(IPMI_ONLY).toHaveLength(12);
       expect(NODE_STOPPED).toEqual([
         "nexus.server.nodeStopped", "nexus.serverConnected.nodeStopped",
-        "nexus.server.ipmi.nodeStopped", "nexus.serverConnected.ipmi.nodeStopped"
+        "nexus.server.ipmi.nodeStopped", "nexus.serverConnected.ipmi.nodeStopped",
+        "nexus.server.nodeStopped.webConsole", "nexus.serverConnected.nodeStopped.webConsole",
+        "nexus.server.ipmi.nodeStopped.webConsole", "nexus.serverConnected.ipmi.nodeStopped.webConsole"
       ]);
-      expect(NODE_RUNNING).toHaveLength(4);
+      expect(NODE_RUNNING).toHaveLength(8);
+      expect(WEB_CONSOLE).toHaveLength(12);
 
       const NON_SERVER = [
         "nexus.folder", "nexus.folderWithServers", "nexus.macro", "nexus.serialProfile",
@@ -819,7 +840,10 @@ describe("package contributions", () => {
         "nexus.server.node", "nexus.server.nodeRunningX", "nexus.server.nodeStopped.extra",
         "nexus.serverConnected.ipmi.nodeStopped.extra",
         // the node marker BEFORE ipmi is the wrong order — the fixed composition must reject it
-        "nexus.server.nodeStopped.ipmi"
+        "nexus.server.nodeStopped.ipmi",
+        // and the same for the web-console marker: last in the order, spelled exactly
+        "nexus.server.webConsoleX", "nexus.server.webConsole.ipmi",
+        "nexus.server.ipmi.webConsole.nodeRunning"
       ];
 
       // command|group → the contextValues that entry MUST match (and only those).
@@ -833,6 +857,9 @@ describe("package contributions", () => {
         "nexus.server.runMacro|0_connect@5": ALL,
         "nexus.server.connectBmcSol|0_connect@6": IPMI_ONLY,
         "nexus.server.openBmcWebConsole|0_connect@7": IPMI_ONLY,
+        // REQUIRED marker, exactly as the two BMC entries require `.ipmi`: an
+        // optional group here would offer Open Web Console on every server row.
+        "nexus.inventory.openWebConsole|0_connect@8": WEB_CONSOLE,
         "nexus.inventory.startNode|00_power@1": NODE_STOPPED,
         "nexus.inventory.stopNode|00_power@2": NODE_RUNNING,
         "nexus.server.testConnection|0_connect@4": DISCONNECTED,
@@ -874,6 +901,41 @@ describe("package contributions", () => {
         for (const value of NON_SERVER) {
           expect(re!.test(value), `${key} must not match ${value}`).toBe(false);
         }
+      }
+    });
+
+    /**
+     * THE #83 HAZARD IN ONE LINE. Every server-menu `when` is `$`-anchored, so
+     * each new optional contextValue marker has to be added to ALL of them at
+     * once: a regex left behind matches NOTHING on a row that carries the new
+     * marker, and that row silently loses that menu entirely. This pin is the
+     * cheap, unconditional statement of the rule — the affirmative table above
+     * says WHICH values each entry may match; this says every entry must still
+     * match a row wearing every marker at once.
+     */
+    it("every server-menu `when` still matches a FULLY marked row (⊘ a regex not broadened with a new marker — or left on a stale marker name — silently drops its menu from exactly the rows the marker is for)", () => {
+      // AT LEAST ONE of the two, never both: Start Node's `when` accepts only
+      // the stopped form and Stop Node's only the running one, so "both" is
+      // unsatisfiable and would force those two regexes to be wrong. Both
+      // synthetic values carry EVERY marker in the fixed order, so an entry
+      // that matches neither is an entry whose regex missed one.
+      const FULLY_MARKED = [
+        "nexus.serverConnected.ipmi.nodeRunning.webConsole",
+        "nexus.server.ipmi.nodeStopped.webConsole"
+      ];
+      const menuItems = packageJson.contributes.menus["view/item/context"] ?? [];
+      const serverMenus = menuItems.filter(
+        (m) => (m.when ?? "").includes("nexusCommandCenter") && (m.when ?? "").includes("viewItem =~ /^nexus\\.server")
+      );
+      // The census itself is load-bearing: a shrunk filter would make the loop vacuous.
+      expect(serverMenus).toHaveLength(23);
+      for (const m of serverMenus) {
+        const re = viewItemRegex(m.when);
+        expect(re, `${m.command}|${m.group}`).not.toBeNull();
+        expect(
+          FULLY_MARKED.some((value) => re!.test(value)),
+          `${m.command}|${m.group} matches neither fully marked contextValue`
+        ).toBe(true);
       }
     });
   });

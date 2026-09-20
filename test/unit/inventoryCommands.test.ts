@@ -44,6 +44,10 @@ const mockOpenTextDocument = vi.fn();
 const mockShowTextDocument = vi.fn();
 const mockWebviewOpen = vi.fn();
 const mockAuthProfileEditorOpenNew = vi.fn();
+// OPEN WEB CONSOLE — the browser handoff. `openExternal` resolving FALSE is a
+// real outcome (no handler, or the user dismissed the trust prompt), so the
+// default is an explicit `true` and the refusal case overrides it per test.
+const mockOpenExternal = vi.fn(async () => true);
 
 vi.mock("vscode", () => ({
   commands: {
@@ -64,6 +68,25 @@ vi.mock("vscode", () => ({
   },
   workspace: {
     openTextDocument: (...args: unknown[]) => mockOpenTextDocument(...args)
+  },
+  // The browser handoff Open Web Console performs. `Uri.parse` keeps the string
+  // readable off the call so a test can assert the EXACT address handed out.
+  env: {
+    openExternal: (...args: unknown[]) => mockOpenExternal(...args)
+  },
+  Uri: {
+    parse: (value: string) => ({ toString: () => value, value })
+  },
+  // Module-load surface only. Reaching the shared http/https URL check pulls the
+  // macro/server command modules into the graph, and their tree items subclass
+  // these at module scope — this module calls none of them.
+  TreeItem: class {},
+  ThemeIcon: class {},
+  TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
+  EventEmitter: class {
+    public event = (): void => {};
+    public fire(): void {}
+    public dispose(): void {}
   },
   ProgressLocation: { Notification: 15 },
   // Real enum values (Separator = -1, Default = 0) so the hub's separator row
@@ -8654,6 +8677,172 @@ describe("inventoryCommands", () => {
       expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.inventory.refreshStatus", "src-1");
       expect(mockShowInformationMessage.mock.calls.some((c) => /changed/i.test(String(c[0])))).toBe(false);
     });
+  });
+});
+
+/**
+ * OPEN WEB CONSOLE — the generic browser handoff (`nexus.inventory.openWebConsole`).
+ * Resolves the row's server → its inventory source → the source's provider, asks
+ * the provider for a URL and hands that URL to the OS, so a guest with no address
+ * at all — the addressless placeholder a stopped or agent-less VM imports as — is
+ * still reachable. The capability is OPTIONAL on the provider contract, so the
+ * command is a no-op-with-an-explanation for every source that has none, and the
+ * finished URL passes the same http/https structural check every browser handoff
+ * in the extension uses before it reaches `openExternal`.
+ */
+describe("nexus.inventory.openWebConsole", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewOpen.mockImplementation(() => makeFakePanel());
+  });
+
+  const CONSOLE_URL =
+    "https://pve.example.com:8006/?console=kvm&novnc=1&vmid=107&vmname=build-vm&node=pve&resize=off&cmd=";
+
+  async function setup(
+    opts: {
+      withCapability?: boolean;
+      webConsoleUrl?: InventoryProvider["webConsoleUrl"];
+      canWebConsole?: InventoryProvider["canWebConsole"];
+      noOrigin?: boolean;
+      externalId?: string;
+      secretFieldIds?: string[];
+      secrets?: Record<string, string>;
+    } = {}
+  ) {
+    const withCapability = opts.withCapability ?? true;
+    const urlSpy = vi.fn(async () => CONSOLE_URL);
+    const server = makeServer({
+      id: "pve-1",
+      name: "VM 107",
+      ...(opts.noOrigin
+        ? {}
+        : { origin: { sourceId: "src-1", externalId: opts.externalId ?? "107", syncedAt: 1 } })
+    });
+    const core = new NexusCore(new InMemoryConfigRepository([server]));
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    const provider = makeProvider({
+      ...(withCapability ? { webConsoleUrl: opts.webConsoleUrl ?? urlSpy } : {}),
+      ...(opts.canWebConsole ? { canWebConsole: opts.canWebConsole } : {})
+    });
+    registry.register(provider);
+    const vault = makeVault(opts.secrets ?? {});
+    registerInventoryCommands(core, registry, vault, makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource({ id: "src-1", secretFieldIds: opts.secretFieldIds ?? [] }));
+    const open = registeredCommands.get("nexus.inventory.openWebConsole")!;
+    return { core, registry, vault, provider, urlSpy, server, open };
+  }
+
+  function openedUrl(): string {
+    return (mockOpenExternal.mock.calls[0][0] as unknown as { value: string }).value;
+  }
+
+  it("registers the command handler under its contributed id", async () => {
+    await setup();
+    expect(registeredCommands.get("nexus.inventory.openWebConsole")).toBeTypeOf("function");
+  });
+
+  it("asks the provider for the URL with the origin's externalId and the source's config+secrets, and opens exactly that URL (⊘ a hand-built or truncated address opens the wrong console, or none)", async () => {
+    const { open, urlSpy, server } = await setup({
+      secretFieldIds: ["apiToken"],
+      secrets: { [inventorySecretKey("src-1", "apiToken")]: "tok" }
+    });
+    await open({ server });
+    expect(urlSpy).toHaveBeenCalledWith({}, { apiToken: "tok" }, "107");
+    expect(openedUrl()).toBe(CONSOLE_URL);
+  });
+
+  it("reports an open the OS refused and never claims success (⊘ treating openExternal's false as done leaves the user staring at nothing, told it worked)", async () => {
+    const { open, server } = await setup();
+    mockOpenExternal.mockResolvedValueOnce(false as unknown as never);
+    await open({ server });
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    expect(String(mockShowWarningMessage.mock.calls[0][0])).toContain("VM 107");
+    expect(mockShowInformationMessage).not.toHaveBeenCalled();
+  });
+
+  it("SURFACES a capability failure as an error naming the server, and opens nothing (⊘ swallowing it reports a console that never opened as opened)", async () => {
+    const { open, server } = await setup({
+      webConsoleUrl: vi.fn(async () => {
+        throw new InventoryProviderError("protocol", "Guest 107 is no longer present in the Proxmox cluster — re-sync the source and try again.");
+      })
+    });
+    await open({ server });
+    expect(mockOpenExternal).not.toHaveBeenCalled();
+    const msg = String(mockShowErrorMessage.mock.calls[0][0]);
+    expect(msg).toContain("VM 107");
+    expect(msg).toContain("no longer present");
+  });
+
+  it("says so — and opens nothing — for a provider that offers NO web console (⊘ an unguarded palette invocation on a NetBox row throws TypeError on an absent optional member)", async () => {
+    const { open, server } = await setup({ withCapability: false });
+    await open({ server });
+    expect(mockOpenExternal).not.toHaveBeenCalled();
+    expect(String(mockShowInformationMessage.mock.calls[0][0])).toContain("does not offer a web console");
+  });
+
+  it("says so for a hand-made server with NO origin at all (⊘ dereferencing a missing origin throws instead of explaining)", async () => {
+    const { open, urlSpy, server } = await setup({ noOrigin: true });
+    await open({ server });
+    expect(urlSpy).not.toHaveBeenCalled();
+    expect(mockOpenExternal).not.toHaveBeenCalled();
+    expect(String(mockShowInformationMessage.mock.calls[0][0])).toContain("does not offer a web console");
+  });
+
+  it("honours the provider's DEVICE gate: a row canWebConsole refuses is explained, and the capability is never invoked (⊘ a provider-only guard sends a cluster node's externalId down a path the provider itself rejects)", async () => {
+    const { open, urlSpy, server } = await setup({
+      externalId: "node/pve",
+      canWebConsole: (externalId: string) => !externalId.startsWith("node/")
+    });
+    await open({ server });
+    expect(urlSpy).not.toHaveBeenCalled();
+    expect(mockOpenExternal).not.toHaveBeenCalled();
+    expect(String(mockShowInformationMessage.mock.calls[0][0])).toContain("does not offer a web console");
+  });
+
+  it("refuses an invocation that names no server at all, and opens nothing (⊘ dereferencing whatever the caller passed throws instead of explaining)", async () => {
+    const { open, urlSpy } = await setup();
+    await open(undefined);
+    expect(urlSpy).not.toHaveBeenCalled();
+    expect(mockOpenExternal).not.toHaveBeenCalled();
+    expect(mockShowErrorMessage).toHaveBeenCalled();
+  });
+
+  it("takes the secrets+config CAPTURE inside configMutationLock — while an unrelated writer holds the lock no vault read and no capability call happen, and both proceed once it frees (⊘ capturing without the lock reads credentials mid-purge, racing Delete All Data's vault wipe)", async () => {
+    const { open, urlSpy, vault, server } = await setup({
+      secretFieldIds: ["apiToken"],
+      secrets: { [inventorySecretKey("src-1", "apiToken")]: "tok" }
+    });
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => (releaseGate = resolve));
+    const held = configMutationLock.runExclusive(async () => {
+      await gate;
+    });
+    await Promise.resolve(); // let the gated writer actually acquire the lock
+
+    const inFlight = open({ server });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(vault.get).not.toHaveBeenCalled();
+      expect(urlSpy).not.toHaveBeenCalled();
+    } finally {
+      // Always free the shared configMutationLock singleton, even if an
+      // assertion above threw — otherwise a red run would wedge every later test.
+      releaseGate();
+      await held;
+      await inFlight;
+    }
+    expect(vault.get).toHaveBeenCalledWith(inventorySecretKey("src-1", "apiToken"));
+    expect(urlSpy).toHaveBeenCalledWith({}, { apiToken: "tok" }, "107");
+  });
+
+  it("REFUSES a non-http(s) address the provider returned, and opens nothing (⊘ handing any string to openExternal makes a compromised or buggy provider's file:/ or javascript: URL an external open)", async () => {
+    const { open, server } = await setup({ webConsoleUrl: vi.fn(async () => "javascript:alert(1)") });
+    await open({ server });
+    expect(mockOpenExternal).not.toHaveBeenCalled();
+    expect(String(mockShowErrorMessage.mock.calls[0][0])).toContain("VM 107");
   });
 });
 

@@ -89,6 +89,7 @@ const unsupportedCommands = [
   "nexus.inventory.manage",
   "nexus.inventory.startNode",
   "nexus.inventory.stopNode",
+  "nexus.inventory.openWebConsole",
   "nexus.macro.editor",
   "nexus.macro.add",
   "nexus.macro.addFromTemplate",
