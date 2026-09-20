@@ -788,7 +788,7 @@ describe("createProxmoxProvider", () => {
       const rows = Array.from({ length: 10_001 }, (_, i) => guestRow({ vmid: i + 1, name: `guest-${i + 1}`, status: "stopped" }));
       const { tree } = await syncRows(rows, { baseUrl: BASE, includeStopped: false });
       expect(tree.truncated).toBeUndefined();
-      expect(tree.warnings?.some((w) => w.includes("Status collection stopped at 10000"))).toBe(true);
+      expect(tree.warnings?.some((w) => w.includes("guests than the status budget covers"))).toBe(true);
       // ...and the two caps are independent: when the ROW cap trips, the
       // status-collection warning must NOT also fire (the device warning
       // channel stays honest about WHICH collection was partial). Stopped

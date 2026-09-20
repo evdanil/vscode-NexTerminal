@@ -1651,10 +1651,13 @@ async function fetchInventoryImpl(
   // `truncated` (only the refresh path does), so the merge semantics would
   // retain stale running/stopped states — and their Start/Stop menus — with
   // nothing on screen saying the collection was partial. The tree-warnings
-  // channel is the one surface the sync plan shows; use it.
+  // channel is the one surface the sync plan shows; use it. The wording
+  // states a PERSISTENT limit, not a remedy: Refresh Lab Status shares this
+  // budget, so no second pass can complete the collection — beyond-cap
+  // guests simply keep their last known state.
   if (statusCapped && !capTripped) {
     warnings.push(
-      `Status collection stopped at ${HARD_CAP} entries — guests beyond it may show stale state. Run Refresh Lab Status to complete it.`
+      `Status collection stopped at ${HARD_CAP} entries — this cluster lists more guests than the status budget covers, and guests beyond the first ${HARD_CAP} keep their last known state.`
     );
   }
   tree.status = statusReport;
