@@ -5371,23 +5371,42 @@ export function registerInventoryCommands(
       return;
     }
     // CAPTURE under configMutationLock, dispatch outside it — the split every
-    // source-reading command uses. The lock is taken for the vault reads alone,
-    // so credentials are never read mid-purge by Delete All Data or mid-swap by
-    // a replace-import (both commit under this same lock). No revision re-check
-    // follows, unlike the Start/Stop capture: this dispatch MUTATES nothing and
-    // persists nothing, so the worst a snapshot overtaken mid-call can do is
-    // open a console the user opens again — while a refusal here would cost an
-    // action that is always safe to retry.
+    // source-reading command uses, and the SAME capture the Start/Stop path
+    // performs, re-read and revision check included.
+    //
+    // THE RE-READ IS WHAT KEEPS CONFIG AND CREDENTIAL FROM DIFFERENT EDITS.
+    // `source` was resolved at handler entry; while this command waits for the
+    // lock, an Edit Source or a replace-import can commit a new endpoint AND a
+    // new API token under the same source id. The vault read below happens
+    // AFTER that commit, so pairing it with the entry-time config would send
+    // the NEW credential to the OLD endpoint — a token disclosed to whatever
+    // host the superseded config named. Reading the live record inside the lock
+    // and bailing when its revision moved (an id-preserving import mints a new
+    // one; a reset removes the record) is what makes the pair coherent. This is
+    // not the "stale snapshot is harmless" case it looks like: nothing is
+    // mutated here, but a mismatched pair still leaks.
+    //
+    // Keep the callback SHORT — the re-read and the vault reads only; the
+    // provider call stays outside the lock.
+    const startRevision = source.revision;
     const captured = await configMutationLock.runExclusive(async () => {
+      const live = core.getInventorySource(source.id);
+      if (!live || live.revision !== startRevision) {
+        return undefined;
+      }
       const secrets: InventorySourceSecrets = {};
-      for (const fieldId of source.secretFieldIds) {
+      for (const fieldId of live.secretFieldIds) {
         const value = await vault.get(inventorySecretKey(source.id, fieldId));
         if (value !== undefined) {
           secrets[fieldId] = value;
         }
       }
-      return { config: structuredClone(source.config), secrets };
+      return { config: structuredClone(live.config), secrets };
     });
+    if (!captured) {
+      void vscode.window.showInformationMessage(`"${source.name}" changed — try again in a moment.`);
+      return;
+    }
     // The capability resolves the guest's CURRENT location over the network, so
     // it is worth a progress title — and a failure SURFACES (the propagating
     // discipline node control uses): a console that did not open must say so

@@ -8698,6 +8698,7 @@ describe("nexus.inventory.openWebConsole", () => {
       externalId?: string;
       secretFieldIds?: string[];
       secrets?: Record<string, string>;
+      sourceConfig?: InventorySourceValues;
     } = {}
   ) {
     const withCapability = opts.withCapability ?? true;
@@ -8719,7 +8720,9 @@ describe("nexus.inventory.openWebConsole", () => {
     registry.register(provider);
     const vault = makeVault(opts.secrets ?? {});
     registerInventoryCommands(core, registry, vault, makeTeardown());
-    await core.addOrUpdateInventorySource(makeSource({ id: "src-1", secretFieldIds: opts.secretFieldIds ?? [] }));
+    await core.addOrUpdateInventorySource(
+      makeSource({ id: "src-1", secretFieldIds: opts.secretFieldIds ?? [], config: opts.sourceConfig ?? {} })
+    );
     const open = registeredCommands.get("nexus.inventory.openWebConsole")!;
     return { core, registry, vault, provider, urlSpy, server, open };
   }
@@ -8825,6 +8828,44 @@ describe("nexus.inventory.openWebConsole", () => {
     }
     expect(vault.get).toHaveBeenCalledWith(inventorySecretKey("src-1", "apiToken"));
     expect(urlSpy).toHaveBeenCalledWith({}, { apiToken: "tok" }, "107");
+  });
+
+  it("REFUSES when the source was edited while the command waited on the lock \u2014 it never pairs the pre-edit config with the post-edit credential (\u2298 capturing the entry-time config beside a fresh vault read sends the NEW API token to the OLD endpoint, disclosing the credential to whatever host the old config named)", async () => {
+    const { open, urlSpy, core, vault, server } = await setup({
+      sourceConfig: { host: "old-endpoint.example" },
+      secretFieldIds: ["apiToken"],
+      secrets: { [inventorySecretKey("src-1", "apiToken")]: "old-token" }
+    });
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => (releaseGate = resolve));
+    const held = configMutationLock.runExclusive(async () => {
+      await gate;
+    });
+    await Promise.resolve(); // let the gated writer actually acquire the lock
+
+    const inFlight = open({ server });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      // The edit lands while the command is queued behind the lock: a new
+      // endpoint and a new token, stored under the SAME source id, so the id
+      // alone cannot tell the two apart. `addOrUpdateInventorySource` mints a
+      // fresh revision, which is the signal the capture must notice.
+      await core.addOrUpdateInventorySource(
+        makeSource({ id: "src-1", secretFieldIds: ["apiToken"], config: { host: "new-endpoint.example" } })
+      );
+      await vault.store(inventorySecretKey("src-1", "apiToken"), "new-token");
+    } finally {
+      // Always free the shared configMutationLock singleton, even if an
+      // assertion above threw \u2014 otherwise a red run would wedge every later test.
+      releaseGate();
+      await held;
+      await inFlight;
+    }
+    // The disclosure this exists to prevent, stated literally.
+    expect(urlSpy).not.toHaveBeenCalledWith({ host: "old-endpoint.example" }, { apiToken: "new-token" }, "107");
+    expect(urlSpy).not.toHaveBeenCalled();
+    expect(mockOpenExternal).not.toHaveBeenCalled();
+    expect(mockShowInformationMessage.mock.calls.some((c) => /changed/i.test(String(c[0])))).toBe(true);
   });
 
   it("REFUSES a non-http(s) address the provider returned, and opens nothing (⊘ handing any string to openExternal makes a compromised or buggy provider's file:/ or javascript: URL an external open)", async () => {
