@@ -353,9 +353,21 @@ export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[
       // is composed into contextValue, so read it back rather than re-resolving. Only
       // ONE ever shows (the whens are mutually exclusive). The command arg is the
       // tree item, so the handler's resolveServerArg receives arg.server.
-      const nodeState = arg.contextValue?.endsWith(".nodeStopped")
+      //
+      // MATCHED AS A SEGMENT, never as a suffix. `contextValue` is a dot-joined
+      // marker list whose TAIL GROWS: `.webConsole` already follows the
+      // node-state marker on a console-capable guest, so an `endsWith` read
+      // found nothing there and this quick pick offered neither Start nor Stop
+      // on a row whose right-click menu offered one — the two surfaces
+      // disagreeing about one row, which is what reading the state back off the
+      // contextValue is supposed to make impossible. Splitting on "." asks only
+      // "is this marker present", so the next marker appended costs nothing
+      // here; stripping a known trailing marker would just be the same
+      // positional assumption wearing a different hat.
+      const markers = (arg.contextValue ?? "").split(".");
+      const nodeState = markers.includes("nodeStopped")
         ? "stopped"
-        : arg.contextValue?.endsWith(".nodeRunning")
+        : markers.includes("nodeRunning")
           ? "running"
           : undefined;
       const picks: ProfileActionPick[] = [
