@@ -2293,15 +2293,16 @@ async function controlNodeImpl(
 }
 
 /**
- * WEB CONSOLE (§Spec) — PVE's own noVNC page for ONE guest, as a URL for the
- * USER'S BROWSER. Nexus never fetches it.
+ * WEB CONSOLE (§Spec) — PVE's own console page for ONE guest, as a URL for the
+ * USER'S BROWSER (noVNC for a VM, xterm.js for a container — see the two shapes
+ * below). Nexus never fetches it.
  *
  * WHY THIS IS THE FEATURE. A guest with no reachable address — no
  * qemu-guest-agent, no lease, never booted — has nothing to SSH to and is a
  * dead end in the tree. The console needs no address at all, so it is the one
  * way into exactly the guests Nexus otherwise cannot offer anything for. Which
  * is also why there is NO running/stopped gate here: a stopped guest's noVNC
- * page is PVE's own "VM not running", in PVE's voice, in the browser — a
+ * page is PVE's own "not running" answer, in PVE's voice, in the browser — a
  * truthful answer that Nexus second-guessing from a possibly-unpolled status
  * would only replace with a worse one.
  *
@@ -2332,7 +2333,7 @@ async function webConsoleUrlImpl(
   // third-party consumer), and without the guard a `node/<name>` id falls
   // through to `resolveGuestRow`, which only ever matches vmids — so the node
   // would be reported as a missing GUEST, sending the user to a re-sync that
-  // could not help. A node has no noVNC console at all; say that instead.
+  // could not help. A node has no guest console at all; say that instead.
   if (isProxmoxNodeExternalId(externalId)) {
     throw new InventoryProviderError(
       "protocol",
@@ -2351,14 +2352,39 @@ async function webConsoleUrlImpl(
   // `URLSearchParams`, not concatenation: `vmname` is guest-controlled text, so
   // a name carrying "&" or "=" would otherwise forge parameters or truncate the
   // query — and the result is a blank console with no error anywhere.
-  url.searchParams.set("console", target.kind === "qemu" ? "kvm" : "lxc");
-  url.searchParams.set("novnc", "1");
+  //
+  // TWO SHAPES, ONE PER GUEST TYPE, each built the way PVE's own web UI builds
+  // it rather than by swapping a flag in a shared parameter set:
+  //
+  //   VM (qemu)      ?console=kvm&novnc=1&vmid&vmname&node&resize=off&cmd=
+  //   container (lxc) ?console=lxc&xtermjs=1&vmid&vmname&node&cmd=
+  //
+  // `resize` is a noVNC scaling option and has no meaning to the xterm.js page,
+  // which is why the container shape drops it and does not merely rename a flag.
+  //
+  // WHY xterm.js FOR A CONTAINER: it is what PVE's own Console button opens for
+  // a container when the datacenter console option is unset — its per-type
+  // default. Not because noVNC is unavailable for containers: a container node
+  // exposes vncproxy and vncwebsocket just as a VM does, and `console=lxc&novnc=1`
+  // opens a working console. This is about opening the SAME console PVE would,
+  // so the two routes to a container's shell do not differ in frontend.
+  //
+  // WHY NOT PVE'S DEFAULT FOR A VM: there the per-type default is `vv` — a
+  // downloaded .vv handed to a native SPICE client, which is not a browser
+  // handoff at all. noVNC is the in-browser console for a VM, so that is what
+  // this returns.
+  const isVm = target.kind === "qemu";
+  url.searchParams.set("console", isVm ? "kvm" : "lxc");
+  url.searchParams.set(isVm ? "novnc" : "xtermjs", "1");
   url.searchParams.set("vmid", externalId);
   url.searchParams.set("vmname", target.name);
   url.searchParams.set("node", target.node);
-  url.searchParams.set("resize", "off");
+  if (isVm) {
+    url.searchParams.set("resize", "off");
+  }
   // Empty-valued on purpose — PVE's console page expects the parameter present
-  // and blank (it means "no command to run"), so it serializes as `cmd=`.
+  // and blank (it means "no command to run"), so it serializes as `cmd=`. Both
+  // shapes carry it.
   url.searchParams.set("cmd", "");
   return url.toString();
 }

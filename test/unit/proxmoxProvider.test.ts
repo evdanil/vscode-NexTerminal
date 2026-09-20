@@ -2418,12 +2418,25 @@ describe("createProxmoxProvider", () => {
       );
     });
 
-    it("uses console=lxc for a container (kills a qemu-only builder — PVE serves a different console for a CT and kvm on an LXC is a dead page)", async () => {
+    it("builds PVE's xterm.js URL for a container with ITS full query — console=lxc, xtermjs=1 and NO resize (kills a builder that swaps one flag and keeps the noVNC shape, and kills a qemu-only builder: each type's complete query is pinned, so flags cannot be traded between them unnoticed)", async () => {
       const { fetchImpl } = lookupFetch([{ vmid: 114, node: "pve", type: "lxc", name: "dns-ct" }]);
       const provider = createProxmoxProvider(fetchImpl, fetchImpl);
       await expect(provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "114")).resolves.toBe(
-        `${BASE}/?console=lxc&novnc=1&vmid=114&vmname=dns-ct&node=pve&resize=off&cmd=`
+        `${BASE}/?console=lxc&xtermjs=1&vmid=114&vmname=dns-ct&node=pve&cmd=`
       );
+    });
+
+    it("keeps the two shapes apart: a container URL carries no novnc and no resize, a VM URL carries no xtermjs (\u2298 one shared parameter set for both types hands PVE a viewer flag the other type's page does not read)", async () => {
+      const ct = lookupFetch([{ vmid: 114, node: "pve", type: "lxc", name: "dns-ct" }]);
+      const ctUrl = new URL(await createProxmoxProvider(ct.fetchImpl, ct.fetchImpl).webConsoleUrl!({ baseUrl: BASE }, SECRETS, "114"));
+      expect(ctUrl.searchParams.get("xtermjs")).toBe("1");
+      expect(ctUrl.searchParams.has("novnc")).toBe(false);
+      expect(ctUrl.searchParams.has("resize")).toBe(false);
+      const vm = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build-vm" }]);
+      const vmUrl = new URL(await createProxmoxProvider(vm.fetchImpl, vm.fetchImpl).webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107"));
+      expect(vmUrl.searchParams.get("novnc")).toBe("1");
+      expect(vmUrl.searchParams.get("resize")).toBe("off");
+      expect(vmUrl.searchParams.has("xtermjs")).toBe(false);
     });
 
     it("PRESERVES a reverse-proxy mount path from the base URL (kills a builder that keeps only the origin — https://gateway.example/?console=… is not where that deployment's UI lives)", async () => {
