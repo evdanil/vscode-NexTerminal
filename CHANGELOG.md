@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.223] — 2026-09-20
+
+### Fixed
+
+- **Start Node / Stop Node now ask before handing a changed provider your saved credentials.** A start or stop reads the inventory source's stored secrets and then acts on the remote node with them, but it was the one credential-spending path that never checked whether the extension currently answering that source's provider id is still the one you configured the source against. Sync, Edit Source and Open Web Console all ask when that registrant's declared shape (its name or its config fields) has changed; node control now asks the same question, with the same wording, before the credential is read — Cancel reads nothing from the vault and sends nothing to the node. The question is asked outside the configuration lock, so a modal left open cannot freeze other configuration changes, and answering **Continue** covers that one action only: nothing is stamped, so the next start or stop asks again, and the sync and the edit keep asking too.
+
 ## [2.8.222] — 2026-09-20
 
 ### Added
