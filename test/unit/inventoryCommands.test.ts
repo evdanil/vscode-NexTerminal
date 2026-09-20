@@ -8699,6 +8699,7 @@ describe("nexus.inventory.openWebConsole", () => {
       secretFieldIds?: string[];
       secrets?: Record<string, string>;
       sourceConfig?: InventorySourceValues;
+      providerFingerprint?: string;
     } = {}
   ) {
     const withCapability = opts.withCapability ?? true;
@@ -8721,7 +8722,12 @@ describe("nexus.inventory.openWebConsole", () => {
     const vault = makeVault(opts.secrets ?? {});
     registerInventoryCommands(core, registry, vault, makeTeardown());
     await core.addOrUpdateInventorySource(
-      makeSource({ id: "src-1", secretFieldIds: opts.secretFieldIds ?? [], config: opts.sourceConfig ?? {} })
+      makeSource({
+        id: "src-1",
+        secretFieldIds: opts.secretFieldIds ?? [],
+        config: opts.sourceConfig ?? {},
+        ...(opts.providerFingerprint !== undefined ? { providerFingerprint: opts.providerFingerprint } : {})
+      })
     );
     const open = registeredCommands.get("nexus.inventory.openWebConsole")!;
     return { core, registry, vault, provider, urlSpy, server, open };
@@ -8866,6 +8872,60 @@ describe("nexus.inventory.openWebConsole", () => {
     expect(urlSpy).not.toHaveBeenCalled();
     expect(mockOpenExternal).not.toHaveBeenCalled();
     expect(mockShowInformationMessage.mock.calls.some((c) => /changed/i.test(String(c[0])))).toBe(true);
+  });
+
+  /**
+   * PROVIDER TRUST FINGERPRINT — the same Continue/Cancel gate `syncNow` and
+   * `editSource` put in front of their vault reads. VS Code gives Nexus no way
+   * to verify WHICH extension currently answers a `providerId`; the stamped
+   * fingerprint is the only signal that the id was re-registered by something
+   * whose declared shape differs from what the user configured against. One
+   * console click hands that registrant the source's decrypted token, so it is
+   * a secret-handover moment and must be confirmed like the other two.
+   */
+  it("ASKS before handing a changed registrant the saved token, and a Cancel reaches NO vault read and opens nothing (\u2298 one click silently discloses the stored credential to a provider the user never approved)", async () => {
+    const { open, urlSpy, vault, server } = await setup({
+      providerFingerprint: "stamped-against-a-different-shape",
+      secretFieldIds: ["apiToken"],
+      secrets: { [inventorySecretKey("src-1", "apiToken")]: "tok" }
+    });
+    // The harness's default for a modal is dismissal, which is Cancel.
+    await open({ server });
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    expect(String(mockShowWarningMessage.mock.calls[0][0])).toContain("saved credentials");
+    // The whole point of the gate: the refusal lands BEFORE the secret is read.
+    expect(vault.get).not.toHaveBeenCalled();
+    expect(urlSpy).not.toHaveBeenCalled();
+    expect(mockOpenExternal).not.toHaveBeenCalled();
+  });
+
+  it("proceeds on Continue — the token is read and the console opens (\u2298 a gate that refuses either way makes the command unusable against a provider the user has approved)", async () => {
+    const { open, urlSpy, vault, server } = await setup({
+      providerFingerprint: "stamped-against-a-different-shape",
+      secretFieldIds: ["apiToken"],
+      secrets: { [inventorySecretKey("src-1", "apiToken")]: "tok" }
+    });
+    mockShowWarningMessage.mockResolvedValueOnce("Continue");
+    await open({ server });
+    expect(vault.get).toHaveBeenCalledWith(inventorySecretKey("src-1", "apiToken"));
+    expect(urlSpy).toHaveBeenCalledWith({}, { apiToken: "tok" }, "107");
+    expect(openedUrl()).toBe(CONSOLE_URL);
+  });
+
+  it("asks NOTHING when the stamped fingerprint still matches the registrant, and nothing when the source carries no stamp at all (\u2298 a modal on every click trains the user to dismiss the one that matters)", async () => {
+    const matching = await setup({
+      providerFingerprint: computeProviderFingerprint(makeProvider()),
+      secretFieldIds: ["apiToken"],
+      secrets: { [inventorySecretKey("src-1", "apiToken")]: "tok" }
+    });
+    await matching.open({ server: matching.server });
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    expect(matching.urlSpy).toHaveBeenCalled();
+
+    const unstamped = await setup({ secretFieldIds: ["apiToken"], secrets: { [inventorySecretKey("src-1", "apiToken")]: "tok" } });
+    await unstamped.open({ server: unstamped.server });
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    expect(unstamped.urlSpy).toHaveBeenCalled();
   });
 
   it("REFUSES a non-http(s) address the provider returned, and opens nothing (⊘ handing any string to openExternal makes a compromised or buggy provider's file:/ or javascript: URL an external open)", async () => {

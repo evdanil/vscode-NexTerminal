@@ -5373,6 +5373,42 @@ export function registerInventoryCommands(
       );
       return;
     }
+    // PROVIDER TRUST FINGERPRINT — the same Continue/Cancel gate `syncNow` and
+    // `editSource` put in front of THEIR vault reads, and for the same reason:
+    // VS Code offers no way to verify WHICH extension currently answers this
+    // `providerId`, only whether the registrant's declared shape still matches
+    // what the user configured against. One click here hands that registrant
+    // the source's decrypted token, so this is a secret-handover moment like
+    // the other two, and it is confirmed with the same wording rather than a
+    // variant of it.
+    //
+    // BEFORE the lock, and that order is load-bearing in both directions. It
+    // must come before because the gate's whole purpose is to land ahead of any
+    // `vault.get` for this source — a confirmation asked after the read has
+    // already happened protects nothing. It must be OUTSIDE the lock because it
+    // is a MODAL: holding `configMutationLock` across an unbounded wait for a
+    // human would freeze every config mutation app-wide, including the Delete
+    // All Data someone might need to escape a suspect provider.
+    //
+    // The two guards are complementary, not redundant, and the modal is exactly
+    // the window that makes the second one matter: the fingerprint answers "may
+    // this registrant receive this source's secrets at all", while the re-read
+    // below answers "did the config and the secrets come from one incarnation"
+    // — and an Edit Source landing while the modal is up is caught there.
+    //
+    // `fingerprintToStamp` is deliberately DROPPED. `syncNow` restamps on its
+    // own success path and `editSource`'s Save restamps unconditionally, but
+    // this command persists nothing: stamping from a read-only console open
+    // would silently bless the changed registrant for every later flow off the
+    // back of a click the user made to look at a screen.
+    const fingerprintCheck = await checkProviderFingerprint(source, provider);
+    if (fingerprintCheck.outcome === "cancelled") {
+      // Cancel (or dismiss) aborts before ANY vault read for this source — the
+      // capture below never runs. Silent, like its siblings: the modal the user
+      // just dismissed IS the message.
+      return;
+    }
+
     // CAPTURE under configMutationLock, dispatch outside it — the split every
     // source-reading command uses, and the SAME capture the Start/Stop path
     // performs, re-read and revision check included.
