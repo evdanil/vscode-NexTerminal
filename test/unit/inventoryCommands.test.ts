@@ -10144,10 +10144,13 @@ describe("nexus.inventory.refreshStatus", () => {
       expect(message).toContain('"Big Lab"');
       expect(message).toMatch(/partial/i);
       expect(message).toMatch(/stopped before it covered everything/i);
-      // The fake provider declares no remedy of its own, so what a user sees is
-      // the neutral one — which names no provider's field, because "Root Folder"
-      // and "Lab Filter" are fields only EVE-NG has.
-      expect(message).toContain("Review the limits in Edit Inventory Source.");
+      // The fake provider declares no remedy of its own, so the sentence STOPS
+      // at what is known. It does not reach for a generic gesture: a provider
+      // may expose no configurable limit at all, and may have truncated from a
+      // transient failure, so "review the limits" was itself a prescription
+      // that might not exist.
+      expect(message).toMatch(/still unknown\.$/);
+      expect(message).not.toMatch(/Review the limits|Edit Inventory Source|try again|check the source/i);
     });
 
     it("stays SILENT on the poll path (⊘ dropping the `manual` gate nags the user with this warning on every poll tick, forever, for a lab that is merely large)", async () => {
@@ -10674,7 +10677,7 @@ describe("nexus.inventory.refreshStatus", () => {
       // possessive are each one edit away from being wrong, and only the exact
       // sentence pins all three at once. "Lab D" is named nowhere.
       expect(String(mockShowWarningMessage.mock.calls[0][0])).toBe(
-        'Live status for 4 sources is partial ("Lab A", "Lab B", "Lab C" and 1 more) — the scan stopped before it covered everything, so some devices may be stale or still unknown. Review the limits in Edit Inventory Source.'
+        'Live status for 4 sources is partial ("Lab A", "Lab B", "Lab C" and 1 more) — the scan stopped before it covered everything, so some devices may be stale or still unknown.'
       );
     });
 
@@ -10703,8 +10706,8 @@ describe("nexus.inventory.refreshStatus", () => {
 
       const message = String(mockShowWarningMessage.mock.calls[0][0]);
       expect(message).toContain("Raise the Hard Cap (entries) to cover more of the cluster.");
-      // ...instead of the neutral line, not beside it.
-      expect(message).not.toContain("Review the limits in Edit Inventory Source.");
+      // ...as the END of the sentence, with no neutral gesture trailing it.
+      expect(message).toMatch(/Raise the Hard Cap \(entries\) to cover more of the cluster\.$/);
       // THE POINT OF THE WHOLE CHANGE: nothing this command composes says "lab"
       // to a user whose source is a hypervisor cluster. A post-Start/Stop
       // refresh is how they reach this sentence.
@@ -10736,8 +10739,64 @@ describe("nexus.inventory.refreshStatus", () => {
       await registeredCommands.get("nexus.inventory.refreshStatus")!();
 
       const message = String(mockShowWarningMessage.mock.calls[0][0]);
-      expect(message).toContain("Review the limits in Edit Inventory Source.");
+      // Neither provider's advice, and no invented stand-in either.
+      expect(message).toMatch(/still unknown\.$/);
+      expect(message).not.toMatch(/Review the limits|Edit Inventory Source/i);
       expect(message).not.toContain("Root Folder");
+      expect(message).not.toContain("Hard Cap");
+    });
+
+    /**
+     * PROVENANCE. The advice has to belong to the report it explains. A sweep
+     * awaits each source in turn, and a provider can be DISPOSED mid-sweep with
+     * its id then claimed by a fresh registration — the registry's own contract,
+     * which `dispose` is written around. Resolving the remedy from the live
+     * registry at message-composition time therefore let the replacement's
+     * sentence describe the old registration's report, prescribing fields or
+     * capabilities unrelated to anything on screen. Neither the revision nor the
+     * generation guard can see a registry change, so the fix is to capture the
+     * remedy in the same iteration that produced the report, beside the
+     * truncated flag — not to re-check identity at the end.
+     */
+    it("carries the remedy of the provider that PRODUCED the report, not whatever holds its id by the time the warning is composed (⊘ a late registry lookup prescribes a re-registered provider's fields for a report it never made)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const original = registry.register(
+        makeProvider({
+          id: "pa",
+          fetchStatus: vi.fn(async () => TRUNCATED),
+          statusTruncationRemedy: "Narrow the Root Folder or Lab Filter."
+        })
+      );
+      // The SECOND source's fetch is where the swap happens: by then source A's
+      // report is applied and collected, and the warning has not been composed.
+      registry.register(
+        makeProvider({
+          id: "pb",
+          fetchStatus: vi.fn(async () => {
+            original.dispose();
+            registry.register(
+              makeProvider({
+                id: "pa",
+                fetchStatus: vi.fn(async () => REPORT),
+                statusTruncationRemedy: "Raise the Hard Cap (entries)."
+              })
+            );
+            return REPORT; // complete, so B contributes no truncation of its own
+          })
+        })
+      );
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ id: "a", name: "Big Lab", providerId: "pa", config: { host: "a" } }));
+      await core.addOrUpdateInventorySource(makeSource({ id: "b", name: "Other", providerId: "pb", config: { host: "b" } }));
+
+      await registeredCommands.get("nexus.inventory.refreshStatus")!();
+
+      expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+      const message = String(mockShowWarningMessage.mock.calls[0][0]);
+      expect(message).toContain('"Big Lab"');
+      expect(message).toContain("Narrow the Root Folder or Lab Filter.");
       expect(message).not.toContain("Hard Cap");
     });
 

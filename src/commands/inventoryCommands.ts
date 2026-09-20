@@ -4968,7 +4968,20 @@ export function registerInventoryCommands(
     // from a complete one.
     // Entries carry the source ID as well as the name: the name is what the
     // message renders, the id is what `warnIfTruncated` filters by.
-    const truncatedSources: { id: string; name: string; revision: string | undefined }[] = [];
+    //
+    // ...and the REMEDY, captured here rather than looked up when the message is
+    // composed. The advice has to belong to the report it explains, and a
+    // provider can be disposed mid-sweep with its id then claimed by a fresh
+    // registration — `ProviderRegistry.dispose` is written around exactly that
+    // case. A late `registry.get(providerId)` would then hand the replacement's
+    // sentence to the old registration's report and prescribe fields that have
+    // nothing to do with what is on screen. Neither the revision nor the
+    // generation guard can see a registry change, so provenance is the fix and
+    // an identity re-check at the end is not: the loop already holds the
+    // provider it called `fetchStatus` on, so the remedy is free to take there.
+    // The resolved STRING, not the provider, so a later mutation of the
+    // provider object cannot reach it either.
+    const truncatedSources: { id: string; name: string; revision: string | undefined; remedy: string | undefined }[] = [];
     // TRUNCATED STATUS (follow-up 2; R3 review) — a named renderer with ONE call
     // site, at the end of the sweep. It had two while a supersede bailed out of
     // the loop mid-list; per-source supersede (review H1) skips the superseded
@@ -5034,10 +5047,8 @@ export function registerInventoryCommands(
       // live read is immune to all of them by construction, which a growing list
       // of notification call sites would not be.
       //
-      // Each surviving entry carries the PROVIDER its remedy comes from, read
-      // off the LIVE record for the same reason the revision is checked against
-      // it: a collected entry is a snapshot, and the sentence has to describe
-      // the sources as they stand when it is shown.
+      // The surviving entries keep the remedy captured when their report was
+      // applied (see the collection's note on why it is not looked up here).
       const live = truncatedSources.flatMap((s) => {
         if (statusAppliedGeneration.get(s.id) !== myClaims.get(s.id)) {
           return [];
@@ -5051,7 +5062,7 @@ export function registerInventoryCommands(
         if (liveSource === undefined || liveSource.revision !== s.revision) {
           return [];
         }
-        return [{ name: s.name, providerId: liveSource.providerId }];
+        return [{ name: s.name, remedy: s.remedy }];
       });
       if (live.length === 0) {
         return;
@@ -5068,13 +5079,18 @@ export function registerInventoryCommands(
       // either sentence is wrong for somebody. AGREEMENT is the test rather
       // than "one provider", because agreement is what the sentence needs.
       //
-      // The fallback names no field, which is the honest thing to say when we
-      // cannot say which field: it is also what a provider declaring no remedy
-      // gets, and it still points at the form where every limit lives.
-      const remedies = new Set(live.map((source) => resolveStatusTruncationRemedy(registry.get(source.providerId))));
-      const remedy = (remedies.size === 1 ? [...remedies][0] : undefined) ?? "Review the limits in Edit Inventory Source.";
+      // WITH NO AGREED REMEDY THE SENTENCE STOPS. There is deliberately no
+      // neutral stand-in: the contract lets a provider declare none, and such a
+      // provider may expose no configurable limit at all and may have truncated
+      // from a transient failure — so a line like "review the limits" would be
+      // this layer inventing a prescription that need not exist, which is the
+      // one thing the indirection above is here to prevent. The subject and the
+      // body already carry everything that IS known (the status is partial,
+      // some devices may be stale). Saying nothing further is the honest end.
+      const remedies = new Set(live.map((source) => source.remedy));
+      const remedy = remedies.size === 1 ? [...remedies][0] : undefined;
       void vscode.window.showWarningMessage(
-        `${subject} — the scan stopped before it covered everything, so some devices may be stale or still unknown. ${remedy}`
+        `${subject} — the scan stopped before it covered everything, so some devices may be stale or still unknown.${remedy ? ` ${remedy}` : ""}`
       );
     };
     for (const source of targets) {
@@ -5202,7 +5218,13 @@ export function registerInventoryCommands(
             // do — that one only catches a supersede landing before the NEXT
             // source, never one landing inside this source's own fetch.
             if (report.truncated === true) {
-              truncatedSources.push({ id: source.id, name: source.name, revision: startRevision });
+              truncatedSources.push({
+                id: source.id,
+                name: source.name,
+                revision: startRevision,
+                // THIS provider's advice, for THIS report — see the collection's note.
+                remedy: resolveStatusTruncationRemedy(provider)
+              });
             }
             // PRIMARY HOST/PORT (task #29, deferred D8) — persist a telnet
             // console-port reassignment onto sync-owned nodes, so the next
