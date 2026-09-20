@@ -8359,6 +8359,7 @@ describe("inventoryCommands", () => {
         externalId?: string;
         secretFieldIds?: string[];
         secrets?: Record<string, string>;
+        providerFingerprint?: string;
       } = {}
     ) {
       const withControl = opts.withControl ?? true;
@@ -8377,7 +8378,13 @@ describe("inventoryCommands", () => {
       registry.register(provider);
       const vault = makeVault(opts.secrets ?? {});
       registerInventoryCommands(core, registry, vault, makeTeardown());
-      await core.addOrUpdateInventorySource(makeSource({ id: "src-1", secretFieldIds: opts.secretFieldIds ?? [] }));
+      await core.addOrUpdateInventorySource(
+        makeSource({
+          id: "src-1",
+          secretFieldIds: opts.secretFieldIds ?? [],
+          ...(opts.providerFingerprint !== undefined ? { providerFingerprint: opts.providerFingerprint } : {})
+        })
+      );
       const start = registeredCommands.get("nexus.inventory.startNode")!;
       const stop = registeredCommands.get("nexus.inventory.stopNode")!;
       return { core, registry, vault, provider, controlSpy, server, start, stop };
@@ -8665,6 +8672,121 @@ describe("inventoryCommands", () => {
       expect(controlSpy).toHaveBeenCalledWith({}, { password: "pw" }, "/Lab.unl#3", "start");
       expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.inventory.refreshStatus", "src-1");
       expect(mockShowInformationMessage.mock.calls.some((c) => /changed/i.test(String(c[0])))).toBe(false);
+    });
+
+    // ── PROVIDER TRUST FINGERPRINT ──
+    // The same Continue/Cancel gate the sync, the edit and the web console put in
+    // front of THEIR vault reads. VS Code gives Nexus no way to verify WHICH
+    // extension currently answers a `providerId`; the stamped fingerprint is the
+    // only signal that the id was re-registered by something whose declared shape
+    // differs from what the user configured against. One Start click hands that
+    // registrant the source's decrypted token — and then acts on the remote node
+    // with it — so it is a secret-handover moment and is confirmed like the others.
+
+    it("ASKS before handing a changed registrant the saved token, and a Cancel reaches NO vault read and dispatches nothing (⊘ one click silently discloses the stored credential to a provider the user never approved, and starts a node with it)", async () => {
+      const { start, controlSpy, vault, server } = await setup({
+        providerFingerprint: "stamped-against-a-different-shape",
+        secretFieldIds: ["password"],
+        secrets: { [inventorySecretKey("src-1", "password")]: "pw" }
+      });
+      // The harness's default for a modal is dismissal, which is Cancel.
+      await start({ server });
+      expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+      expect(String(mockShowWarningMessage.mock.calls[0][0])).toContain("saved credentials");
+      // The whole point of the gate: the refusal lands BEFORE the secret is read.
+      expect(vault.get).not.toHaveBeenCalled();
+      expect(controlSpy).not.toHaveBeenCalled();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.inventory.refreshStatus", expect.anything());
+      // Silent, like its siblings: the modal the user just dismissed IS the message.
+      expect(mockShowInformationMessage).not.toHaveBeenCalled();
+    });
+
+    it("gates STOP as well as START (⊘ guarding only the start path leaves the identical disclosure one menu entry away)", async () => {
+      const { stop, controlSpy, vault, server } = await setup({
+        providerFingerprint: "stamped-against-a-different-shape",
+        secretFieldIds: ["password"],
+        secrets: { [inventorySecretKey("src-1", "password")]: "pw" }
+      });
+      await stop({ server });
+      expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+      expect(vault.get).not.toHaveBeenCalled();
+      expect(controlSpy).not.toHaveBeenCalled();
+    });
+
+    it("proceeds on Continue — the token is read and the action dispatches (⊘ a gate that refuses either way makes Start/Stop unusable against a provider the user has approved)", async () => {
+      const { start, controlSpy, vault, server } = await setup({
+        providerFingerprint: "stamped-against-a-different-shape",
+        secretFieldIds: ["password"],
+        secrets: { [inventorySecretKey("src-1", "password")]: "pw" }
+      });
+      mockShowWarningMessage.mockResolvedValueOnce("Continue");
+      await start({ server });
+      expect(vault.get).toHaveBeenCalledWith(inventorySecretKey("src-1", "password"));
+      expect(controlSpy).toHaveBeenCalledWith({}, { password: "pw" }, "/Lab.unl#3", "start");
+    });
+
+    it("asks NOTHING when the stamped fingerprint still matches the registrant, and nothing when the source carries no stamp at all (⊘ a modal on every click trains the user to dismiss the one that matters)", async () => {
+      const matching = await setup({ providerFingerprint: computeProviderFingerprint(makeProvider()) });
+      await matching.start({ server: matching.server });
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+      expect(matching.controlSpy).toHaveBeenCalled();
+
+      const unstamped = await setup();
+      await unstamped.start({ server: unstamped.server });
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+      expect(unstamped.controlSpy).toHaveBeenCalled();
+    });
+
+    it("does NOT restamp the source on Continue — a second control asks again (⊘ stamping from a node action blesses the changed registrant for every later flow, silencing the gate the sync and the edit rely on)", async () => {
+      const { start, core, controlSpy, server } = await setup({
+        providerFingerprint: "stamped-against-a-different-shape",
+        secretFieldIds: ["password"],
+        secrets: { [inventorySecretKey("src-1", "password")]: "pw" }
+      });
+      mockShowWarningMessage.mockResolvedValueOnce("Continue");
+      await start({ server });
+      expect(controlSpy).toHaveBeenCalledTimes(1);
+      expect(core.getInventorySource("src-1")?.providerFingerprint).toBe("stamped-against-a-different-shape");
+
+      mockShowWarningMessage.mockResolvedValueOnce("Continue");
+      await start({ server });
+      expect(mockShowWarningMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it("asks OUTSIDE configMutationLock — an unrelated config mutation still runs to completion while the modal is pending (⊘ holding the global lock across an unbounded wait for a human freezes every config mutation app-wide, including the Delete All Data someone needs in order to escape a suspect provider)", async () => {
+      const { start, controlSpy, server } = await setup({
+        providerFingerprint: "stamped-against-a-different-shape",
+        secretFieldIds: ["password"],
+        secrets: { [inventorySecretKey("src-1", "password")]: "pw" }
+      });
+      // Controllable: the fingerprint-mismatch modal (an `{modal: true}` call)
+      // stays pending until resolveModal is invoked; any OTHER showWarningMessage
+      // call (the busy refusals, all fire-and-forget) resolves immediately.
+      let resolveModal!: (choice: string | undefined) => void;
+      const modalChoice = new Promise<string | undefined>((resolve) => (resolveModal = resolve));
+      mockShowWarningMessage.mockImplementation((...args: unknown[]) => {
+        const isModal = typeof args[1] === "object" && args[1] !== null && (args[1] as { modal?: boolean }).modal === true;
+        return isModal ? modalChoice : Promise.resolve(undefined);
+      });
+
+      const inFlight = start({ server });
+      try {
+        await vi.waitFor(() => expect(mockShowWarningMessage).toHaveBeenCalledTimes(1));
+        // A gate asked from INSIDE the lock would queue this writer behind the
+        // still-open modal; it has to finish while the user is still deciding.
+        const outcome = await Promise.race([
+          configMutationLock.runExclusive(async () => "ran"),
+          new Promise<string>((resolve) => setTimeout(() => resolve("blocked-by-the-modal"), 50))
+        ]);
+        expect(outcome).toBe("ran");
+      } finally {
+        resolveModal(undefined); // Cancel — nothing dispatches
+        await inFlight;
+        // Drop the modal implementation: vi.clearAllMocks() keeps it, and a
+        // never-resolving modal leaking into a later test would hang it.
+        mockShowWarningMessage.mockReset();
+      }
+      expect(controlSpy).not.toHaveBeenCalled();
     });
   });
 });

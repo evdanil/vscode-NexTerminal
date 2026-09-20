@@ -283,14 +283,18 @@ async function restampProviderFingerprintBestEffort(core: NexusCore, syncSnapsho
  * source's saved secrets when its declared shape (label/configFields) has
  * drifted since the source was last saved/edited (see
  * InventorySourceConfig.providerFingerprint's doc for the trust-model
- * rationale). Used by BOTH syncNow (before its required-secret vault reads)
- * and editSource (before the form — and its Test button's vault-backed
- * secret hydration — ever opens) so the two flows can't drift on when this
- * confirmation is required. `outcome: "cancelled"` means the caller must
- * abort before any vault read for this source; `fingerprintToStamp` is only
- * meaningful to callers (syncNow) that restamp on their own success path —
- * editSource's Save already restamps unconditionally on every save
- * (deliberate — see persistUpdatedInventorySource's ITEM A) and ignores it.
+ * rationale). Used by EVERY path that spends a source's stored secrets:
+ * syncNow (before its required-secret vault reads), editSource (before the
+ * form — and its Test button's vault-backed secret hydration — ever opens),
+ * openWebConsole and the Start/Stop node control (each before its under-lock
+ * capture), so the flows can't drift on when this confirmation is required.
+ * `outcome: "cancelled"` means the caller must abort before any vault read for
+ * this source; `fingerprintToStamp` is only meaningful to callers (syncNow)
+ * that restamp on their own success path — editSource's Save already restamps
+ * unconditionally on every save (deliberate — see persistUpdatedInventorySource's
+ * ITEM A) and ignores it, and the two read-only-to-config paths (the console and
+ * node control) drop it so a click made to look at a screen, or to boot a node,
+ * cannot bless a changed registrant for every later flow.
  */
 async function checkProviderFingerprint(
   source: InventorySourceConfig,
@@ -5268,6 +5272,58 @@ export function registerInventoryCommands(
     inFlightSourceIds.set(source.id, "control");
     let dispatched = false;
     try {
+      // PROVIDER TRUST FINGERPRINT — the same Continue/Cancel gate `syncNow`,
+      // `editSource` and `openWebConsole` put in front of THEIR vault reads, and
+      // for the same reason: VS Code offers no way to verify WHICH extension
+      // currently answers this `providerId`, only whether the registrant's
+      // declared shape still matches what the user configured against. One click
+      // here hands that registrant the source's decrypted credentials — and then
+      // ACTS on the remote node with them — so it is a secret-handover moment
+      // like the other three, confirmed with the same wording rather than a
+      // variant of it.
+      //
+      // BEFORE the capture and OUTSIDE the lock, and both halves are
+      // load-bearing. Before, because the gate exists to land ahead of any
+      // `vault.get` for this source — a confirmation asked after the read has
+      // already happened protects nothing. Outside, because it is a MODAL:
+      // holding `configMutationLock` across an unbounded wait for a human would
+      // freeze every config mutation app-wide, including the Delete All Data
+      // someone might need in order to escape a suspect provider.
+      //
+      // AFTER the claim, which is why it sits inside the `try` rather than up by
+      // the busy check: the check-then-claim pair above is deliberately
+      // await-free, so an awaited modal between them would reopen the very TOCTOU
+      // the claim closes. Held across the modal, the claim also means a sibling
+      // Sync/Edit/Remove arriving while the user is still deciding is refused as
+      // busy instead of mutating the source out from under the answer; the
+      // `finally` releases it on Cancel just as it does on a failed dispatch.
+      //
+      // The gate and the under-lock re-read are complementary, not redundant, and
+      // the modal is exactly the window that makes the second one matter: the
+      // fingerprint answers "may this registrant receive this source's secrets at
+      // all", while the re-read answers "did the config and the secrets come from
+      // one incarnation" — and an Edit Source landing while the modal is up moves
+      // the revision and is caught there.
+      //
+      // `fingerprintToStamp` is deliberately DROPPED. `syncNow` restamps on its
+      // own success path and `editSource`'s Save restamps unconditionally, but
+      // this command persists nothing about the source: its only local write is
+      // the best-effort status refresh it fires at the end, which touches server
+      // status and not the source's trust stamp. Stamping from a node action
+      // would silently bless the changed registrant for every later flow — the
+      // next sync, the next edit, the next console open would all stop asking —
+      // off the back of one Start click. A restamp taken here would also collide
+      // mechanically with the capture below: writing the source bumps its
+      // `revision`, which the under-lock re-read then reads as a moved record and
+      // refuses, so every control of an unstamped source would end in "changed —
+      // try again in a moment".
+      const fingerprintCheck = await checkProviderFingerprint(source, provider);
+      if (fingerprintCheck.outcome === "cancelled") {
+        // Cancel (or dismiss) aborts before ANY vault read for this source and
+        // before anything is dispatched at the node. Silent, like its siblings:
+        // the modal the user just dismissed IS the message.
+        return;
+      }
       const captured = await configMutationLock.runExclusive(async () => {
         // Re-read the LIVE source inside the lock. A replace-import that swapped it
         // (or a reset that removed it) commits under this same lock, so either it
