@@ -2421,7 +2421,10 @@ export class NexusCore {
    * deterministic-id server and an ADOPTED one whose id was preserved (#82).
    * Entries this source previously wrote but no longer reports —
    * pruned nodes, removed servers — are dropped; entries owned by OTHER sources
-   * are untouched. One emitChanged() on the way out, like registerSession.
+   * are untouched. A TRUNCATED report additionally honors `clearedExternalIds`
+   * (InventoryStatusReport): ids the provider explicitly asserts status-less are
+   * removed even though the merge retains merely-absent entries. One
+   * emitChanged() on the way out, like registerSession.
    */
   public applyInventoryStatus(sourceId: string, report: InventoryStatusReport): void {
     // TRUNCATION — a COMPLETE report is authoritative: clear this source's prior
@@ -2459,6 +2462,27 @@ export class NexusCore {
       if (serverId !== undefined) {
         this.serverStatus.set(serverId, deviceStatus.state);
         this.serverStatusSource.set(serverId, sourceId);
+      }
+    }
+    // EXPLICIT CLEARS — under MERGE an ABSENT entry is
+    // retained (the provider may simply not have reached it), but an id the
+    // provider EXPLICITLY names here was seen and is asserted to have NO
+    // status, so it is removed even from a partial report: Proxmox sends every
+    // template vmid this way, and a guest converted into a template must lose
+    // the stale decoration a merge would otherwise retain forever. Resolved
+    // through the SAME ownership map as the statuses above — source-scoped,
+    // unknown ids ignored, and both maps deleted together so the entry cannot
+    // linger in the source ledger the complete-report clear walks. Under a
+    // COMPLETE report this whole pass is a redundant no-op — the clear above
+    // already removed every entry this source owns — so it is skipped; a
+    // complete report carrying the field never gets its statuses clobbered.
+    if (report.truncated && report.clearedExternalIds) {
+      for (const externalId of report.clearedExternalIds) {
+        const serverId = serverIdByExternalId.get(externalId);
+        if (serverId !== undefined) {
+          this.serverStatus.delete(serverId);
+          this.serverStatusSource.delete(serverId);
+        }
       }
     }
     this.emitChanged();

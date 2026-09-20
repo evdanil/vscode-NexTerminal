@@ -168,6 +168,30 @@ describe("validateProviderShape", () => {
     expect(() => validateProviderShape(makeProvider({ controlNode: 42 as never }))).toThrow(/controlNode/);
   });
 
+  // canControlNode provider capability — the twin of the controlNode clause.
+  // OPTIONAL (a provider whose whole device set is controllable declares
+  // nothing; absence means the tree's menu gate answers yes for every row), but
+  // a non-function value under that name IS an error, loudly, for the same
+  // reason controlNode's is — with one twist that makes the boundary check
+  // matter more: the gate invokes the member DURING TREE RENDER, so a
+  // non-function `canControlNode` that survived registration would surface as
+  // a TypeError on every repaint instead of a clear registration-time verdict.
+  it("accepts a provider with NO canControlNode — it is optional (kills making it required, which would break every provider whose whole device set is controllable)", () => {
+    const provider = makeProvider();
+    expect(provider.canControlNode).toBeUndefined();
+    expect(() => validateProviderShape(provider)).not.toThrow();
+  });
+
+  it("accepts a provider WITH a function canControlNode", () => {
+    const provider = makeProvider({ canControlNode: () => true });
+    expect(() => validateProviderShape(provider)).not.toThrow();
+  });
+
+  it("rejects a non-function canControlNode loudly (kills a silent survive-at-registration for a typo'd `canControlNode` that is not callable — the menu gate invokes it during tree render, where a string value would throw TypeError on every repaint of a row)", () => {
+    expect(() => validateProviderShape(makeProvider({ canControlNode: "nope" as never }))).toThrow(/canControlNode/);
+    expect(() => validateProviderShape(makeProvider({ canControlNode: 42 as never }))).toThrow(/canControlNode/);
+  });
+
   // MINOR-14 (EVE-NG review) — `InventoryConfigField.defaultValue` is part of
   // the field contract now, so a malformed one must be caught at the
   // registration boundary rather than silently coerced when the Add form reads

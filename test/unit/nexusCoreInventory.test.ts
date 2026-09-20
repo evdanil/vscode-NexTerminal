@@ -4799,6 +4799,123 @@ describe("NexusCore inventory status", () => {
     expect(snap.serverStatus.get(b.id)).toBe("stopped");
   });
 
+  // EXPLICIT CLEARS — `clearedExternalIds`. A merge retains an entry that is
+  // merely ABSENT from a truncated report, but an id the provider EXPLICITLY
+  // names as gone was seen and is asserted status-less — Proxmox puts every
+  // template vmid there, so a guest converted into a template must lose the
+  // stale "running" it carried before conversion. ExternalId "105" mirrors the
+  // provider's bare-vmid shape; the report shape that feeds this apply is
+  // pinned in proxmoxProvider.test.ts.
+  it("P2 (round 4): a TRUNCATED report's clearedExternalIds REMOVES the named server's status even under merge, while a merely-absent entry is RETAINED (⊘ merge ignoring the explicit clear keeps a converted template's stale 'running' highlighted — the exact hole the cleared list closes)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const converted = makeSyncedServer("t", "source-1", "105");
+    const beyondCap = makeSyncedServer("r", "source-1", "dev#2");
+    await core.addServersBatch([converted, beyondCap]);
+
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "105": { state: "running" }, "dev#2": { state: "running" } }
+    });
+    expect(core.getSnapshot().serverStatus.get(converted.id)).toBe("running");
+
+    // Truncated (a failed node join / the cap): the provider reached NEITHER
+    // as a status, but it DID see vmid 105 and asserts it has no status any
+    // more. dev#2 is merely absent — merge retains it.
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: {},
+      truncated: true,
+      clearedExternalIds: ["105"]
+    });
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.has(converted.id)).toBe(false); // cleared, not retained
+    expect(snap.serverStatus.get(beyondCap.id)).toBe("running"); // absent ⇒ retained
+    // Only the retained entry is left standing.
+    expect(snap.serverStatus.size).toBe(1);
+  });
+
+  // THE UNKNOWN-GUEST CLEAR — a Proxmox guest whose row
+  // carries `status: "unknown"` (PVE's word for a guest it OBSERVED whose RRD
+  // data has not caught up) is the same class as a converted template: the
+  // provider omits it from `statuses` and names its vmid in
+  // `clearedExternalIds` (that report shape is pinned in
+  // proxmoxProvider.test.ts), so a merging report must drop the guest's stale
+  // running/stopped — and the Start/Stop menu riding it — rather than retain
+  // it indefinitely while the Sys.Audit join keeps failing. ExternalId "105"
+  // mirrors the provider's bare-vmid shape.
+  it("P2 (round 5): a TRUNCATED report drops a previously-status-bearing guest whose row now reads status 'unknown' — the observed-but-stateless row is explicitly cleared while guests that still report update and merely-absent ones are retained (⊘ omitting an unknown row without clearing it leaves the guest's stale 'running' and its Start/Stop menu standing on every merging report, potentially indefinitely)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const unknownGuest = makeSyncedServer("u", "source-1", "105");
+    const stillReporting = makeSyncedServer("v", "source-1", "114");
+    const absentNeighbor = makeSyncedServer("r", "source-1", "dev#2");
+    await core.addServersBatch([unknownGuest, stillReporting, absentNeighbor]);
+
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "105": { state: "running" }, "114": { state: "running" }, "dev#2": { state: "running" } }
+    });
+    expect(core.getSnapshot().serverStatus.get(unknownGuest.id)).toBe("running");
+
+    // The report shape the provider now emits for a poll whose node join
+    // failed while guest 105's row reads "unknown": guest 114 still reports,
+    // 105 is absent from statuses and explicitly cleared, and the join
+    // failure makes the report a merge.
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "114": { state: "stopped" } },
+      truncated: true,
+      clearedExternalIds: ["105"]
+    });
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.get(stillReporting.id)).toBe("stopped"); // present entry applied
+    expect(snap.serverStatus.has(unknownGuest.id)).toBe(false); // cleared, not retained
+    expect(snap.serverStatus.get(absentNeighbor.id)).toBe("running"); // absent ⇒ retained
+  });
+
+  it("P2 (round 4): a COMPLETE report ignores clearedExternalIds — the clear-then-apply pass already removed everything this source owns, so the list must never delete a status the same report just applied (the statuses/cleared pair is impossible through the validator; the engine is the last line against a hostile or buggy caller) (⊘ running the cleared pass unconditionally would clobber a present status)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const a = makeSyncedServer("a", "source-1", "dev#1");
+    await core.addServersBatch([a]);
+
+    // Constructed DIRECTLY, not through validateInventoryStatusReport — the
+    // validator checks each member's shape independently and would ACCEPT this
+    // overlapping report (mutual exclusion is provider-side construction), so
+    // it can arrive from a caller that bypassed that construction, which is
+    // exactly what the engine must survive: the present status must win over
+    // the cleared id on a complete report.
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "dev#1": { state: "running" } },
+      clearedExternalIds: ["dev#1"]
+    });
+
+    expect(core.getSnapshot().serverStatus.get(a.id)).toBe("running");
+  });
+
+  it("P2 (round 4): a cleared id matching no owned server is a no-op (⊘ inventing an entry for an unmatched id would put a status-less key into the runtime maps, and a throw would blind the whole apply over one stale id)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const a = makeSyncedServer("a", "source-1", "dev#1");
+    await core.addServersBatch([a]);
+    core.applyInventoryStatus("source-1", { contractVersion: 1, statuses: { "dev#1": { state: "running" } } });
+
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: {},
+      truncated: true,
+      clearedExternalIds: ["ghost-vmid", "105"]
+    });
+
+    const snap = core.getSnapshot();
+    expect(snap.serverStatus.get(a.id)).toBe("running"); // untouched
+    expect(snap.serverStatus.size).toBe(1);
+  });
+
   it("does not set a status for a serverId that resolves to no owned server (⊘ populating the map for a device the sync has not materialized leaves a stale highlight with nothing to hang it on)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();

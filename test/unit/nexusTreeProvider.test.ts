@@ -1374,20 +1374,25 @@ describe("ServerTreeItem BMC ipmi contextValue marker", () => {
 });
 
 /**
- * NODE CONTROL (Phase 4, task #28) — an EVE-origin server whose running/stopped
- * state is KNOWN gets a `.eveRunning` / `.eveStopped` marker APPENDED (after any
- * `.ipmi`), so the Start/Stop Node menu entries can be gated by state. The
- * marker is emitted ONLY for an EVE-origin server with a known status: a non-EVE
- * server (even one that somehow carries a status) and a freshly-synced EVE
- * server with no status yet get NOTHING — the user runs Refresh Lab Status
- * first, so we never offer an action blind. The final constructor arg carries
- * the caller-resolved "this origin is an eve-ng source" signal.
+ * NODE CONTROL (Phase 4, task #28; provider-general since Task 9) — a synced
+ * server whose origin's provider can control nodes (implements `controlNode`)
+ * and whose running/stopped state is KNOWN gets an `.eveRunning` / `.eveStopped`
+ * marker APPENDED (after any `.ipmi`), so the Start/Stop Node menu entries can
+ * be gated by state. The marker is emitted ONLY for a control-capable origin
+ * with a known status: a server whose provider has no controlNode (even one
+ * that somehow carries a status) and a freshly-synced node with no status yet
+ * get NOTHING — the user runs Refresh Lab Status first, so we never offer an
+ * action blind. The final constructor arg carries the caller-resolved "this
+ * origin's provider has node control" signal. The marker's NAME is historical:
+ * EVE-NG's Phase 4 named it, and every controlNode provider since (Proxmox)
+ * inherited the mechanism — the package.json `when` regexes already tolerate
+ * the suffix, so renaming would churn them for zero behavioral gain.
  */
-describe("ServerTreeItem EVE node-control contextValue marker", () => {
+describe("ServerTreeItem node-control contextValue marker", () => {
   // Positional args: (server, connected, lookup, showDesc, authName, authUser,
-  // syncedName, ipmiAuthName, status, isEveOrigin).
+  // syncedName, ipmiAuthName, status, hasNodeControl).
   function item(
-    opts: { connected?: boolean; ipmiHost?: string; status?: "running" | "stopped"; isEveOrigin?: boolean } = {}
+    opts: { connected?: boolean; ipmiHost?: string; status?: "running" | "stopped"; hasNodeControl?: boolean } = {}
   ): ServerTreeItem {
     return new ServerTreeItem(
       makeServer({ id: "s", ...(opts.ipmiHost ? { ipmiHost: opts.ipmiHost } : {}) }),
@@ -1399,59 +1404,66 @@ describe("ServerTreeItem EVE node-control contextValue marker", () => {
       undefined,
       undefined,
       opts.status,
-      opts.isEveOrigin
+      opts.hasNodeControl
     );
   }
 
-  it("appends .eveRunning for an EVE-origin RUNNING server and .eveStopped for a stopped one (⊘ no marker means Start/Stop can never be gated by state)", () => {
-    expect(item({ isEveOrigin: true, status: "running" }).contextValue).toBe("nexus.server.eveRunning");
-    expect(item({ isEveOrigin: true, status: "stopped" }).contextValue).toBe("nexus.server.eveStopped");
+  it("appends .eveRunning for a control-capable RUNNING server and .eveStopped for a stopped one (⊘ no marker means Start/Stop can never be gated by state)", () => {
+    expect(item({ hasNodeControl: true, status: "running" }).contextValue).toBe("nexus.server.eveRunning");
+    expect(item({ hasNodeControl: true, status: "stopped" }).contextValue).toBe("nexus.server.eveStopped");
   });
 
-  it("emits NO eve marker for an EVE-origin server whose status is UNKNOWN (⊘ offering Start/Stop before a status refresh acts blind)", () => {
-    expect(item({ isEveOrigin: true, status: undefined }).contextValue).toBe("nexus.server");
+  it("emits NO marker for a control-capable server whose status is UNKNOWN (⊘ offering Start/Stop before a status refresh acts blind)", () => {
+    expect(item({ hasNodeControl: true, status: undefined }).contextValue).toBe("nexus.server");
   });
 
-  it("emits NO eve marker for a NON-EVE server even when a status is somehow set (⊘ a status dot on a NetBox server must never light up node control it does not support)", () => {
-    expect(item({ isEveOrigin: false, status: "running" }).contextValue).toBe("nexus.server");
-    expect(item({ isEveOrigin: undefined, status: "stopped" }).contextValue).toBe("nexus.server");
+  it("emits NO marker for a server WITHOUT node control even when a status is somehow set (⊘ a status dot on a NetBox server must never light up node control it does not support)", () => {
+    expect(item({ hasNodeControl: false, status: "running" }).contextValue).toBe("nexus.server");
+    expect(item({ hasNodeControl: undefined, status: "stopped" }).contextValue).toBe("nexus.server");
   });
 
   it("composes with .ipmi in the fixed order nexus.server[.ipmi][.eveRunning|.eveStopped] (⊘ a wrong order or a dropped .ipmi breaks the BMC and node-control gates simultaneously)", () => {
-    expect(item({ isEveOrigin: true, status: "running", ipmiHost: "10.0.0.9" }).contextValue).toBe("nexus.server.ipmi.eveRunning");
-    expect(item({ isEveOrigin: true, status: "stopped", ipmiHost: "10.0.0.9" }).contextValue).toBe("nexus.server.ipmi.eveStopped");
+    expect(item({ hasNodeControl: true, status: "running", ipmiHost: "10.0.0.9" }).contextValue).toBe("nexus.server.ipmi.eveRunning");
+    expect(item({ hasNodeControl: true, status: "stopped", ipmiHost: "10.0.0.9" }).contextValue).toBe("nexus.server.ipmi.eveStopped");
   });
 
-  it("composes with the connected base string (⊘ a connected running EVE node must still expose Stop)", () => {
-    expect(item({ connected: true, isEveOrigin: true, status: "running" }).contextValue).toBe("nexus.serverConnected.eveRunning");
-    expect(item({ connected: true, isEveOrigin: true, status: "stopped", ipmiHost: "10.0.0.9" }).contextValue).toBe(
+  it("composes with the connected base string (⊘ a connected running node must still expose Stop)", () => {
+    expect(item({ connected: true, hasNodeControl: true, status: "running" }).contextValue).toBe("nexus.serverConnected.eveRunning");
+    expect(item({ connected: true, hasNodeControl: true, status: "stopped", ipmiHost: "10.0.0.9" }).contextValue).toBe(
       "nexus.serverConnected.ipmi.eveStopped"
     );
   });
 });
 
 /**
- * NODE CONTROL (Phase 4, task #28) — P2 review finding. The direct-constructor
- * tests above pin the marker COMPOSITION but never exercise the SNAPSHOT WIRING
- * that decides `isEveOrigin`: the resolution `snapshot.inventorySources` →
- * `providerId === "eve-ng"` → constructor arg lives in `toServerItem`, and
- * without a `getChildren`/`toServerItem` end-to-end test it is entirely
- * unpinned. These tests drive the provider from a real snapshot so the following
- * feature-killing mutations each DIE here:
- *   - `isEveOrigin = false` (marker never emitted → Start/Stop dead in the UI),
- *   - `isEveOrigin = originSource !== undefined` (any synced origin, e.g. NetBox,
- *     lights up node control it does not support),
- *   - the `"eve-ng"` literal typo'd (e.g. `"eveng"`) → never matches a real source,
- *   - the `isEveOrigin` constructor arg at the ServerTreeItem call dropped
+ * NODE CONTROL (Phase 4, task #28; provider-general since Task 9) — P2 review
+ * finding. The direct-constructor tests above pin the marker COMPOSITION but
+ * never exercise the SNAPSHOT WIRING that decides `hasNodeControl`: the
+ * resolution `snapshot.inventorySources` → origin.sourceId → the injected
+ * `originHasNodeControl` predicate → constructor arg lives in `toServerItem`,
+ * and without a `getChildren`/`toServerItem` end-to-end test it is entirely
+ * unpinned. These tests drive the provider from a real snapshot so the
+ * following feature-killing mutations each DIE here:
+ *   - the gate hard-coded back to `providerId === "eve-ng"` (a Proxmox guest
+ *     loses its marker → Start/Stop dead in the UI for every non-EVE provider),
+ *   - the gate ignoring the predicate (any synced origin, e.g. NetBox, lights
+ *     up node control it does not support),
+ *   - the gate ignoring the DEVICE half of the predicate (a Proxmox-origin
+ *     `node/<name>` externalId lights up Start/Stop — an action the provider's
+ *     own controlNode always refuses),
+ *   - the fail-closed default flipped (a tree built without the predicate
+ *     offers node control everywhere, acting blind),
+ *   - the predicate/constructor arg dropped at the ServerTreeItem call
  *     (defaults to false) → marker never reaches the item.
  */
-describe("NexusTreeProvider EVE node-control marker — end-to-end snapshot wiring", () => {
+describe("NexusTreeProvider node-control marker — end-to-end snapshot wiring", () => {
   function providerWith(
     servers: ServerConfig[],
     inventorySources: Array<{ id: string; providerId: string; name: string }>,
-    serverStatus: Map<string, "running" | "stopped">
+    serverStatus: Map<string, "running" | "stopped">,
+    originHasNodeControl?: (providerId: string, externalId: string) => boolean
   ): NexusTreeProvider {
-    const provider = new NexusTreeProvider(noopCallbacks);
+    const provider = new NexusTreeProvider(noopCallbacks, originHasNodeControl);
     provider.setSnapshot({
       ...emptySnapshot(),
       servers,
@@ -1473,7 +1485,7 @@ describe("NexusTreeProvider EVE node-control marker — end-to-end snapshot wiri
     return children.find((c) => c instanceof ServerTreeItem && c.server.id === id) as ServerTreeItem;
   }
 
-  it("resolves an eve-ng inventory source through origin.sourceId → providerId and stamps .eveRunning / .eveStopped from serverStatus (⊘ a broken isEveOrigin resolution, a typo'd 'eve-ng' literal, or a dropped constructor arg leaves the EVE node with no node-control marker)", () => {
+  it("resolves an eve-ng inventory source through origin.sourceId → predicate → .eveRunning / .eveStopped from serverStatus (⊘ a broken resolution, a typo'd 'eve-ng' literal in the fixture or predicate, or a dropped constructor arg leaves the EVE node with no node-control marker)", () => {
     const provider = providerWith(
       [
         makeServer({ id: "run", name: "R1", origin: { sourceId: "eve-src", externalId: "/Lab.unl#1", syncedAt: 1 } }),
@@ -1483,50 +1495,123 @@ describe("NexusTreeProvider EVE node-control marker — end-to-end snapshot wiri
       new Map<string, "running" | "stopped">([
         ["run", "running"],
         ["stop", "stopped"]
-      ])
+      ]),
+      (providerId) => providerId === "eve-ng"
     );
     expect(serverItemById(provider, "run").contextValue).toBe("nexus.server.eveRunning");
     expect(serverItemById(provider, "stop").contextValue).toBe("nexus.server.eveStopped");
   });
 
-  it("emits NO eve marker for a NON-eve-ng (e.g. netbox) source even when serverStatus carries a state (⊘ isEveOrigin = (originSource !== undefined) would light up node control on a NetBox-origin server that has no controlNode)", () => {
+  it("stamps the SAME marker for a Proxmox-origin guest whose provider has controlNode (⊘ re-hard-coding the gate to 'eve-ng' strands the implemented Proxmox controlNode behind no menu ever)", () => {
+    const provider = providerWith(
+      [
+        makeServer({ id: "pve-run", name: "VM 105", origin: { sourceId: "pve-src", externalId: "105", syncedAt: 1 } }),
+        makeServer({ id: "pve-stop", name: "VM 114", origin: { sourceId: "pve-src", externalId: "114", syncedAt: 1 } })
+      ],
+      [{ id: "pve-src", providerId: "proxmox", name: "My PVE" }],
+      new Map<string, "running" | "stopped">([
+        ["pve-run", "running"],
+        ["pve-stop", "stopped"]
+      ]),
+      (providerId) => providerId === "eve-ng" || providerId === "proxmox"
+    );
+    expect(serverItemById(provider, "pve-run").contextValue).toBe("nexus.server.eveRunning");
+    expect(serverItemById(provider, "pve-stop").contextValue).toBe("nexus.server.eveStopped");
+    // The tooltip's Lab status line follows the same predicate (Task 9) — a
+    // Proxmox guest gets the identical line an EVE node has always had.
+    expect(serverItemById(provider, "pve-run").tooltip).toContain("Lab status: running");
+  });
+
+  it("gates the marker DEVICE-AWARE within one provider: a Proxmox-origin cluster node (externalId node/pve) with a KNOWN status gets NO marker while a bare-vmid guest with the same status does (⊘ a capability-only gate stamps Start/Stop onto a hypervisor node — the provider's own controlNode refuses node/<name> with a protocol error — and the node keeps its running/offline decoration, which the status description and icon drive independently of the marker)", () => {
+    const provider = providerWith(
+      [
+        makeServer({ id: "pve-node", name: "pve", origin: { sourceId: "pve-src", externalId: "node/pve", syncedAt: 1 } }),
+        makeServer({ id: "pve-guest", name: "VM 105", origin: { sourceId: "pve-src", externalId: "105", syncedAt: 1 } })
+      ],
+      [{ id: "pve-src", providerId: "proxmox", name: "My PVE" }],
+      new Map<string, "running" | "stopped">([
+        ["pve-node", "running"],
+        ["pve-guest", "running"]
+      ]),
+      (providerId, externalId) => providerId === "proxmox" && /^\d+$/.test(externalId)
+    );
+    expect(serverItemById(provider, "pve-node").contextValue).toBe("nexus.server");
+    expect(serverItemById(provider, "pve-guest").contextValue).toBe("nexus.server.eveRunning");
+  });
+
+  it("emits NO marker for a control-capable origin whose status is UNKNOWN (⊘ the never-act-blind rule must survive the generalization)", () => {
+    const provider = providerWith(
+      [makeServer({ id: "pve-new", name: "VM 120", origin: { sourceId: "pve-src", externalId: "120", syncedAt: 1 } })],
+      [{ id: "pve-src", providerId: "proxmox", name: "My PVE" }],
+      new Map<string, "running" | "stopped">(),
+      (providerId) => providerId === "proxmox"
+    );
+    expect(serverItemById(provider, "pve-new").contextValue).toBe("nexus.server");
+  });
+
+  it("emits NO marker when NO predicate was injected, even for an eve-ng source (⊘ the fail-closed default must hold: a tree built without the predicate never acts blind)", () => {
+    const provider = providerWith(
+      [makeServer({ id: "eve", name: "R1", origin: { sourceId: "eve-src", externalId: "/Lab.unl#1", syncedAt: 1 } })],
+      [{ id: "eve-src", providerId: "eve-ng", name: "My EVE" }],
+      new Map<string, "running" | "stopped">([["eve", "running"]])
+    );
+    expect(serverItemById(provider, "eve").contextValue).toBe("nexus.server");
+  });
+
+  it("emits NO marker for a NON-eve-ng (e.g. netbox) source even when serverStatus carries a state and a predicate is present but false for it (⊘ a gate that ignores the predicate lights up node control on a NetBox-origin server that has no controlNode)", () => {
     const provider = providerWith(
       [makeServer({ id: "nb", name: "N1", origin: { sourceId: "nb-src", externalId: "device:1", syncedAt: 1 } })],
       [{ id: "nb-src", providerId: "netbox", name: "My NetBox" }],
-      new Map<string, "running" | "stopped">([["nb", "running"]])
+      new Map<string, "running" | "stopped">([["nb", "running"]]),
+      (providerId) => providerId === "eve-ng"
     );
     expect(serverItemById(provider, "nb").contextValue).toBe("nexus.server");
+  });
+
+  it("survives a THROWING predicate: the row renders with NO marker (fail-closed) and getChildren still returns the tree (⊘ the predicate runs synchronously inside getChildren/toServerItem — an exception would abort the whole Command Center render, not just one row)", () => {
+    const provider = providerWith(
+      [makeServer({ id: "px", name: "P1", origin: { sourceId: "px-src", externalId: "105", syncedAt: 1 } })],
+      [{ id: "px-src", providerId: "proxmox", name: "My PVE" }],
+      new Map<string, "running" | "stopped">([["px", "running"]]),
+      () => {
+        throw new TypeError("faulty third-party capability check");
+      }
+    );
+    const children = provider.getChildren(undefined) as ServerTreeItem[];
+    expect(children.length).toBeGreaterThan(0);
+    expect(serverItemById(provider, "px").contextValue).toBe("nexus.server");
   });
 });
 
 /**
- * NODE CONTROL (Phase 4, task #28) — M3. An EVE-origin node's tooltip carries a
- * labeled "Lab status:" line so a freshly-synced node (unknown status) hints
- * that Refresh Lab Status is what unlocks Start/Stop. Non-EVE nodes get no such
- * line. isEveOrigin is the final constructor arg.
+ * NODE CONTROL (Phase 4, task #28; provider-general since Task 9) — M3. A
+ * node-control-capable origin's row carries a labeled "Lab status:" line so a
+ * freshly-synced node (unknown status) hints that Refresh Lab Status is what
+ * unlocks Start/Stop. Rows whose provider has no node control get no such line.
+ * hasNodeControl is the final constructor arg.
  */
-describe("ServerTreeItem EVE lab-status tooltip line", () => {
-  function tip(opts: { status?: "running" | "stopped"; isEveOrigin?: boolean }): string {
+describe("ServerTreeItem lab-status tooltip line", () => {
+  function tip(opts: { status?: "running" | "stopped"; hasNodeControl?: boolean }): string {
     return new ServerTreeItem(
       makeServer({ id: "s", origin: { sourceId: "eve", externalId: "/L.unl#1", syncedAt: 1 } }),
-      false, undefined, true, undefined, undefined, undefined, undefined, opts.status, opts.isEveOrigin
+      false, undefined, true, undefined, undefined, undefined, undefined, opts.status, opts.hasNodeControl
     ).tooltip as string;
   }
 
-  it("shows 'Lab status: running' for a running EVE node (⊘ no lab-status line leaves running/stopped undiscoverable in the tooltip)", () => {
-    expect(tip({ isEveOrigin: true, status: "running" })).toContain("Lab status: running");
+  it("shows 'Lab status: running' for a running node on a control-capable origin (⊘ no lab-status line leaves running/stopped undiscoverable in the tooltip)", () => {
+    expect(tip({ hasNodeControl: true, status: "running" })).toContain("Lab status: running");
   });
 
-  it("shows 'Lab status: stopped' for a stopped EVE node", () => {
-    expect(tip({ isEveOrigin: true, status: "stopped" })).toContain("Lab status: stopped");
+  it("shows 'Lab status: stopped' for a stopped node", () => {
+    expect(tip({ hasNodeControl: true, status: "stopped" })).toContain("Lab status: stopped");
   });
 
-  it("shows 'Lab status: unknown — run Refresh Lab Status' for a freshly-synced EVE node with no status yet (⊘ a silent tooltip gives no hint that Refresh Lab Status unlocks Start/Stop)", () => {
-    expect(tip({ isEveOrigin: true, status: undefined })).toContain("Lab status: unknown — run Refresh Lab Status");
+  it("shows 'Lab status: unknown — run Refresh Lab Status' for a freshly-synced node with no status yet (⊘ a silent tooltip gives no hint that Refresh Lab Status unlocks Start/Stop)", () => {
+    expect(tip({ hasNodeControl: true, status: undefined })).toContain("Lab status: unknown — run Refresh Lab Status");
   });
 
-  it("adds NO lab-status line for a non-EVE node even when a status is set (⊘ a Lab status line on a NetBox server invents a lab it does not have)", () => {
-    expect(tip({ isEveOrigin: false, status: "running" })).not.toContain("Lab status:");
+  it("adds NO lab-status line for a server without node control even when a status is set (⊘ a Lab status line on a NetBox server invents a lab it does not have)", () => {
+    expect(tip({ hasNodeControl: false, status: "running" })).not.toContain("Lab status:");
   });
 });
 

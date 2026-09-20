@@ -163,6 +163,29 @@ export interface InventoryStatusReport {
   // the merge above leaves the unreached nodes showing stale (or `unknown`) state
   // and nothing else on screen would say so. The poll path stays silent.
   truncated?: boolean;
+  // EXPLICIT CLEARS — externalIds the provider asserts have
+  // NO status any more, honored by `applyInventoryStatus` even when the report
+  // is TRUNCATED: a merge retains an entry that is merely ABSENT (the provider
+  // may simply not have reached it), but an entry listed here was SEEN and is
+  // asserted gone, so it is removed for this source's servers regardless.
+  // Absent ⇒ a no-op. Three facts state the member's real contract:
+  // 1. VALIDATION — `validateInventoryStatusReport` checks each member's shape
+  //    independently and does NOT enforce mutual exclusion: a report carrying
+  //    an id in BOTH members still validates.
+  // 2. CONSTRUCTION — every provider must emit an id in at most ONE member
+  //    (an id either has a known status or is asserted to have none): mutual
+  //    exclusion by construction, not by validation.
+  // 3. PRECEDENCE if a caller bypasses that construction — under a TRUNCATED
+  //    report the cleared pass runs AFTER the statuses loop, so
+  //    `clearedExternalIds` WINS (the status is set, then removed); under a
+  //    COMPLETE report the clear pass is skipped entirely, so a present status
+  //    WINS. nexusCoreInventory.test.ts pins the complete-report case ("a
+  //    COMPLETE report ignores clearedExternalIds").
+  // Proxmox uses the member to clear every template row's vmid (§4.12.8) and
+  // every observed-but-stateless "unknown" guest row: a converted template,
+  // like a guest whose state PVE no longer reports, must lose its stale
+  // decoration even on a report that merges.
+  clearedExternalIds?: string[];
 }
 
 export type InventoryConfigFieldType = "string" | "password" | "number" | "boolean" | "select";
@@ -359,6 +382,25 @@ export interface InventoryProvider {
     externalId: string,
     action: "start" | "stop"
   ): Promise<void>;
+  /**
+   * DEVICE-AWARE CONTROL GATE (P2 review fix) — OPTIONAL. Which of this
+   * provider's synced devices `controlNode` can actually act on, keyed by the
+   * same `externalId` the other members use. A provider whose device set
+   * includes records `controlNode` refuses — e.g. Proxmox cluster nodes, which
+   * its own implementation rejects with a protocol error — must be able to
+   * keep those out of the Start/Stop menu WITHOUT losing their status
+   * decoration: the tree's marker gate consults this before stamping
+   * `.eveRunning`/`.eveStopped`, so a refused device keeps its running/offline
+   * dot and description (both driven by the status, not the marker) but
+   * carries no menu. OPTIONAL — absent means EVERY device is controllable, so
+   * a provider whose whole device set is controllable (EVE-NG) implements
+   * nothing and behaves byte-identically. Must be pure and synchronous, must
+   * not throw, and must AGREE with `controlNode`'s own refusals — the menu
+   * must never offer what the implementation rejects. The ONLY consumer is the
+   * tree's marker gate, called through the predicate injected at the
+   * `NexusTreeProvider` constructor; nothing on the command path reads it.
+   */
+  canControlNode?(externalId: string): boolean;
 }
 
 /**
@@ -473,6 +515,23 @@ export function validateInventoryStatusReport(raw: unknown): InventoryStatusRepo
   if (Object.prototype.hasOwnProperty.call(obj, "truncated") && typeof obj.truncated !== "boolean") {
     return undefined;
   }
+  // EXPLICIT CLEARS — optional; when present it MUST be an array whose every
+  // element is a non-empty string. A present non-array (or a non-string /
+  // empty-string element) is a shape the apply never agreed to, so the whole
+  // report is rejected — the same fail-closed rule as `truncated` above: a
+  // cleared list is trusted to REMOVE state, and trusting a malformed one is
+  // worse than dropping the poll.
+  if (Object.prototype.hasOwnProperty.call(obj, "clearedExternalIds")) {
+    const cleared = obj.clearedExternalIds;
+    if (!Array.isArray(cleared)) {
+      return undefined;
+    }
+    for (const id of cleared) {
+      if (typeof id !== "string" || id.length === 0) {
+        return undefined;
+      }
+    }
+  }
   const statuses = obj.statuses;
   // A plain object, not an array (Array is typeof "object") and not null.
   if (typeof statuses !== "object" || statuses === null || Array.isArray(statuses)) {
@@ -516,6 +575,12 @@ export function validateInventoryStatusReport(raw: unknown): InventoryStatusRepo
   // Preserve an explicit boolean (true OR false); never invent the key when absent.
   if (typeof obj.truncated === "boolean") {
     result.truncated = obj.truncated;
+  }
+  // Preserve the cleared list only when present and valid (checked above); an
+  // empty array is preserved as-is — a present-but-empty clear asserts nothing
+  // and is a no-op downstream, same as an absent field.
+  if (Array.isArray(obj.clearedExternalIds)) {
+    result.clearedExternalIds = obj.clearedExternalIds as string[];
   }
   return result;
 }

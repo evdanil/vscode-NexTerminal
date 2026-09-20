@@ -73,18 +73,20 @@ export class ServerTreeItem extends vscode.TreeItem {
     // or prompt. Resolved by the caller against `server.ipmiAuthProfileId`.
     ipmiAuthProfileName?: string,
     // LIVE STATUS (Phase 2) — the server's inventory running/stopped state,
-    // resolved by the caller from snapshot.serverStatus. Only EVE-origin servers
-    // ever carry one (only EVE reports status), so `undefined` means "not a
-    // status-bearing server" and the row renders exactly as before.
+    // resolved by the caller from snapshot.serverStatus. Only providers that
+    // report status (EVE-NG, Proxmox) ever carry one, so `undefined` means "not
+    // a status-bearing server" and the row renders exactly as before.
     status?: "running" | "stopped",
-    // NODE CONTROL (Phase 4, task #28) — whether this server's origin resolves to
-    // an `eve-ng` inventory source, decided by the caller (a live ServerOrigin
-    // carries no providerId — see toServerItem). Gates the `.eveRunning` /
-    // `.eveStopped` contextValue marker below: emitted ONLY for an EVE-origin
-    // server with a KNOWN status, so a non-EVE server that somehow carries a
-    // status, and a freshly-synced EVE server with none yet, get no node-control
-    // menu (the user runs Refresh Lab Status first — we never act blind).
-    isEveOrigin = false
+    // NODE CONTROL (Phase 4, task #28; provider-general since Task 9) — whether
+    // this server's origin's provider can control nodes (implements
+    // `controlNode`), decided by the caller (a live ServerOrigin carries no
+    // providerId — see toServerItem). Gates the `.eveRunning` / `.eveStopped`
+    // contextValue marker below: emitted ONLY for a control-capable origin with
+    // a KNOWN status, so a server whose provider has no controlNode but somehow
+    // carries a status, and a freshly-synced node with none yet, get no
+    // node-control menu (the user runs Refresh Lab Status first — we never act
+    // blind).
+    hasNodeControl = false
   ) {
     super(server.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
     this.id = `server:${server.id}`;
@@ -114,10 +116,12 @@ export class ServerTreeItem extends vscode.TreeItem {
     // host, in the tooltip or the description.
     const addressless = server.addressless === true;
     const hostSummary = addressless ? "no console address yet" : `${displayUsername}@${server.host}:${server.port}`;
-    // NODE CONTROL (Phase 4, task #28) — a lab-status line for EVE-origin nodes
-    // only, so a freshly-synced node (no status yet) hints that Refresh Lab
-    // Status is what unlocks Start/Stop. Matches the labeled-line tooltip idiom.
-    const labStatusSuffix = isEveOrigin
+    // NODE CONTROL (Phase 4, task #28) — a lab-status line for any
+    // node-control-capable origin (EVE-NG named it; Proxmox reports guest
+    // status too), so a freshly-synced node (no status yet) hints that Refresh
+    // Lab Status is what unlocks Start/Stop. Matches the labeled-line tooltip
+    // idiom.
+    const labStatusSuffix = hasNodeControl
       ? `\nLab status: ${status === "running" ? "running" : status === "stopped" ? "stopped" : "unknown — run Refresh Lab Status"}`
       : "";
     this.tooltip = `${hostSummary}${proxyTooltipSuffix(server.proxy, serverLookup)}${authSuffix}${ipmiSuffix}${templateSuffix}${syncedSuffix}${labStatusSuffix}`;
@@ -141,19 +145,23 @@ export class ServerTreeItem extends vscode.TreeItem {
     // other server menus were broadened to /^nexus\.server(Connected)?(\.ipmi)?$/,
     // so no existing menu is dropped for a BMC server.
     const hasIpmi = typeof server.ipmiHost === "string" && server.ipmiHost.trim() !== "";
-    // NODE CONTROL (task #28) — the eve-state marker, APPENDED after `.ipmi` in
+    // NODE CONTROL (task #28) — the node-state marker, APPENDED after `.ipmi` in
     // the fixed order `nexus.server[Connected][.ipmi][.eveRunning|.eveStopped]`.
-    // Only an EVE-origin server with a KNOWN status carries it; every package.json
-    // server-menu `when` regex was broadened to tolerate the optional group first,
-    // so no existing action is dropped for an EVE node (the #83 hazard).
-    const eveMarker = isEveOrigin && status ? (status === "running" ? ".eveRunning" : ".eveStopped") : "";
+    // Only a control-capable origin's server with a KNOWN status carries it;
+    // every package.json server-menu `when` regex was broadened to tolerate the
+    // optional group first, so no existing action is dropped (the #83 hazard).
+    // The NAME is historical: EVE-NG's Phase 4 named the marker `.eveRunning`/
+    // `.eveStopped`, and every provider implementing `controlNode` since
+    // (Proxmox) inherited the mechanism — renaming would churn ~20 `when`
+    // clauses and every contextValue pin for zero behavioral gain.
+    const eveMarker = hasNodeControl && status ? (status === "running" ? ".eveRunning" : ".eveStopped") : "";
     this.contextValue = `${connected ? "nexus.serverConnected" : "nexus.server"}${hasIpmi ? ".ipmi" : ""}${eveMarker}`;
     // LIVE STATUS (Phase 2) — the icon. A CONNECTED server always keeps its
     // connected (plug) icon: the connected affordance must not be lost (P3-6),
     // and the running state is still conveyed by the " (running)" description
     // and the green ▶ FileDecoration. The running/stopped dot is only for a
-    // NON-connected status-bearing (EVE-origin) server; every other server keeps
-    // the plain disconnect icon.
+    // NON-connected status-bearing server (EVE-NG and Proxmox report status);
+    // every other server keeps the plain disconnect icon.
     if (connected) {
       this.iconPath = new vscode.ThemeIcon("plug", new vscode.ThemeColor("testing.iconPassed"));
     } else if (status === "running") {
@@ -411,7 +419,17 @@ export class NexusTreeProvider
   public readonly dropMimeTypes = [TUNNEL_DRAG_MIME, ITEM_DRAG_MIME, "text/plain"];
 
   public constructor(
-    private readonly callbacks: NexusTreeCallbacks
+    private readonly callbacks: NexusTreeCallbacks,
+    // NODE CONTROL (Task 9) — answers "does this providerId's provider
+    // implement `controlNode`, and can it control THIS device?", injected
+    // from extension.ts because this UI module cannot import the provider
+    // registry (layering). The second argument is the server's origin
+    // externalId (P2 review fix), so a provider whose device set includes
+    // records its own controlNode refuses — Proxmox cluster nodes — can keep
+    // them out of the Start/Stop menu without losing their status decoration.
+    // Optional and FAIL-CLOSED: a tree built without it offers node control
+    // nowhere — never somewhere it is not backed by the capability.
+    private readonly originHasNodeControl?: (providerId: string, externalId: string) => boolean
   ) {}
 
   public readonly onDidChangeTreeData: vscode.Event<NexusTreeItem | undefined> =
@@ -901,16 +919,34 @@ export class NexusTreeProvider
     // stored on the server itself, so a source rename is reflected immediately
     // and a removed source (origin left dangling — see B5's tree tooltip doc)
     // falls back to the generic "Synced from inventory" line in ServerTreeItem.
-    // NODE CONTROL (task #28) — resolve the origin's source ONCE for both the
-    // display name and the providerId (a live ServerOrigin carries no providerId
-    // — Phase 4 gotcha #1). `isEveOrigin` gates the `.eveRunning`/`.eveStopped`
-    // contextValue marker; "eve-ng" is EVE_NG_PROVIDER_ID (string-literal here to
-    // avoid dragging the provider module into the UI bundle).
+    // NODE CONTROL (task #28; provider-general since Task 9) — resolve the
+    // origin's source ONCE for both the display name and the capability check
+    // (a live ServerOrigin carries no providerId — Phase 4 gotcha #1).
+    // `hasNodeControl` gates the `.eveRunning`/`.eveStopped` contextValue
+    // marker: the injected predicate answers whether the source's provider
+    // implements `controlNode` AND can control THIS device (the origin's
+    // externalId) — capability plus device, not a hard-coded provider id, so
+    // EVE-NG nodes and Proxmox guests get the same Start/Stop menu while a
+    // Proxmox cluster node (`node/<name>`) keeps its decoration but no menu.
     const originSource = server.origin
       ? this.snapshot.inventorySources.find((source) => source.id === server.origin!.sourceId)
       : undefined;
     const syncedSourceName = originSource?.name;
-    const isEveOrigin = originSource?.providerId === "eve-ng";
+    // FAIL CLOSED on a faulty predicate. This runs synchronously inside
+    // `toServerItem` during `getChildren`, so a throwing third-party
+    // implementation would abort the whole Command Center render —
+    // registration can verify only that the member IS a function, never that
+    // it keeps its no-throw contract. A throw suppresses Start/Stop for that
+    // one row — the same outcome as returning false, and strictly better than
+    // taking the tree down.
+    let hasNodeControl = false;
+    if (originSource !== undefined) {
+      try {
+        hasNodeControl = this.originHasNodeControl?.(originSource.providerId, server.origin?.externalId ?? "") ?? false;
+      } catch {
+        hasNodeControl = false;
+      }
+    }
     // REVIEW FINDING (P2) — the username shown is the one a connection will
     // actually use, resolved through the shared ownership rule
     // (`authProfileOwnedCredentials`, models/config.ts). Reading
@@ -929,7 +965,7 @@ export class NexusTreeProvider
       syncedSourceName,
       ipmiAuthProfile?.name,
       status,
-      isEveOrigin
+      hasNodeControl
     );
     // LIVE STATUS (Phase 2) — the resourceUri the decoration provider matches on
     // to paint the ▶ badge for a running server.

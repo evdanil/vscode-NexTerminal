@@ -146,6 +146,7 @@ tmp/
 .specify/
 .claude/
 .rtk/
+.mcp.json
 specs/*
 !specs/001-scripting-support/
 specs/001-scripting-support/*
@@ -162,3 +163,6 @@ docs/superpowers/
 
 # Local-only demo recording lab (README GIF)
 .demo-lab/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
