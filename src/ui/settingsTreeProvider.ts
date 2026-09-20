@@ -169,6 +169,8 @@ export class SettingsTreeProvider
   private readonly configListener: vscode.Disposable;
   /** NexusCore's onDidChange returns an unsubscribe function, not a Disposable. */
   private readonly coreListener?: () => void;
+  /** The provider registry's onDidChange returns an unsubscribe function too. */
+  private readonly registryListener?: () => void;
   /** MINOR-8 — the inventory-relevant slice of the last snapshot, so an unrelated core event does not re-render. */
   private lastInventorySignature: string;
 
@@ -201,6 +203,16 @@ export class SettingsTreeProvider
       this.lastInventorySignature = signature;
       this.onDidChangeTreeDataEmitter.fire(undefined);
     });
+    // Each source row renders its provider's LABEL, resolved from the registry
+    // as the row is built and falling back to the raw providerId when it cannot
+    // be resolved. A provider registered (or disposed) after the last paint
+    // changes that answer without changing anything in core, so the signature
+    // gate above — deliberately narrow — can never notice it. Registration is a
+    // once-per-extension-activation event, so this fires unconditionally rather
+    // than earning its own gate.
+    this.registryListener = providerRegistry?.onDidChange(() => {
+      this.onDidChangeTreeDataEmitter.fire(undefined);
+    });
     this.configListener = vscode.workspace.onDidChangeConfiguration((event) => {
       const affected = SETTINGS_META.some(
         (m) => event.affectsConfiguration(`${m.section}.${m.key}`)
@@ -213,6 +225,7 @@ export class SettingsTreeProvider
 
   public dispose(): void {
     this.coreListener?.();
+    this.registryListener?.();
     this.configListener.dispose();
     this.onDidChangeTreeDataEmitter.dispose();
   }

@@ -1235,6 +1235,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     core.getSnapshot().authProfiles.map((profile) => [profile.id, profile])
   );
 
+  // The two capability probes above answer from the LIVE registry each time a
+  // row is built, and a third-party provider registers through the public API
+  // whenever its own extension activates — which can be long after the Command
+  // Center first painted. A registration touches nothing in core, so without
+  // this subscription the rows keep the markers they were painted with and the
+  // menu entries those markers gate stay unreachable (their commands are hidden
+  // from the palette, since each one names a row). Disposal is the same
+  // staleness the other way and comes through the same event.
+  //
+  // Through `syncViews`, not `syncViewsImmediate`: a host extension registering
+  // several providers in one activate() emits one event each, and the coalescer
+  // every core change already goes through collapses that burst into a single
+  // paint.
+  const unsubscribeProviderRegistry = inventoryProviderRegistry.onDidChange(() => {
+    syncViews();
+  });
   const unsubscribeCore = core.onDidChange((snapshot) => {
     syncViews();
     for (const server of snapshot.servers) {
@@ -1628,6 +1644,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
       dispose: () => {
         unsubscribeCore();
         unsubscribeTunnel();
+        unsubscribeProviderRegistry();
         const shutdownReason = "Nexus extension is shutting down. This session has been closed.";
         const snapshot = core.getSnapshot();
         for (const session of snapshot.activeSessions) {

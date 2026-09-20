@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { InventoryProviderRegistry, validateProviderShape } from "../../src/services/inventory/providerRegistry";
 import { MAX_INVENTORY_INSTANCE_KEY_LENGTH, resolveProviderInstanceKey } from "../../src/models/inventory";
 import type { InventoryProvider } from "../../src/models/inventory";
@@ -66,6 +66,102 @@ describe("InventoryProviderRegistry", () => {
     registry.register(b);
     registry.register(c);
     expect(registry.list().map((p) => p.id)).toEqual(["provider-a", "provider-b", "provider-c"]);
+  });
+});
+
+/**
+ * REGISTRATION EVENT — the registry is read at PAINT TIME by capability gates
+ * (the tree's node-control and web-console markers, the Settings tree's
+ * provider label), so a registration that lands after a surface has painted is
+ * invisible to it until something unrelated repaints. The markers gate menu
+ * entries whose commands are hidden from the palette, so "until something
+ * unrelated repaints" means "never, reachably". These pin the event that closes
+ * that window — and the disposal half, which is the same staleness pointing the
+ * other way.
+ */
+describe("InventoryProviderRegistry onDidChange", () => {
+  it("fires once per registration (⊘ a silent register leaves every already-painted surface answering from a registry that does not know the provider)", () => {
+    const registry = new InventoryProviderRegistry();
+    const fired: number[] = [];
+    registry.onDidChange(() => fired.push(registry.list().length));
+
+    registry.register(makeProvider({ id: "provider-a" }));
+    registry.register(makeProvider({ id: "provider-b" }));
+
+    // One event each, and each one observed AFTER the map write — a listener
+    // that repaints from the registry must see the provider it was told about,
+    // not the state before it.
+    expect(fired).toEqual([1, 2]);
+  });
+
+  it("does NOT fire when register() rejects a duplicate id or a bad shape (⊘ a repaint for a registration that never happened)", () => {
+    const registry = new InventoryProviderRegistry();
+    registry.register(makeProvider({ id: "provider-a" }));
+    const listener = vi.fn();
+    registry.onDidChange(listener);
+
+    expect(() => registry.register(makeProvider({ id: "provider-a" }))).toThrow(/already registered/i);
+    expect(() => registry.register({ id: "", label: "x" } as unknown as InventoryProvider)).toThrow();
+
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("fires on dispose, after the provider has stopped resolving (⊘ a disposed provider's marker stays stamped on rows whose capability is gone, and the menu entry it gates leads to a 'not supported' error)", () => {
+    const registry = new InventoryProviderRegistry();
+    const registration = registry.register(makeProvider({ id: "provider-a" }));
+    const seen: Array<InventoryProvider | undefined> = [];
+    registry.onDidChange(() => seen.push(registry.get("provider-a")));
+
+    registration.dispose();
+
+    expect(seen).toEqual([undefined]);
+  });
+
+  it("does NOT fire for a stale dispose that evicts nothing — the replacement registration keeps the id and no repaint is claimed (⊘ an event per no-op, or worse, an event announcing a removal that did not happen)", () => {
+    const registry = new InventoryProviderRegistry();
+    const first = registry.register(makeProvider({ id: "provider-a" }));
+    first.dispose();
+    const replacement = makeProvider({ id: "provider-a", label: "Replacement" });
+    registry.register(replacement);
+
+    const listener = vi.fn();
+    registry.onDidChange(listener);
+    first.dispose(); // stale: the id now belongs to `replacement`
+
+    expect(listener).not.toHaveBeenCalled();
+    expect(registry.get("provider-a")).toBe(replacement);
+  });
+
+  it("stops delivering after the returned unsubscribe is called (⊘ a listener that outlives its owner repaints a disposed view for the rest of the session)", () => {
+    const registry = new InventoryProviderRegistry();
+    const listener = vi.fn();
+    const unsubscribe = registry.onDidChange(listener);
+    registry.register(makeProvider({ id: "provider-a" }));
+    expect(listener).toHaveBeenCalledTimes(1);
+
+    unsubscribe();
+    registry.register(makeProvider({ id: "provider-b" }));
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it("a throwing listener neither fails register() nor starves the listeners after it (⊘ one third-party consumer's exception aborts the registration or silences every other surface's repaint)", () => {
+    const registry = new InventoryProviderRegistry();
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const second = vi.fn();
+      registry.onDidChange(() => {
+        throw new TypeError("faulty consumer");
+      });
+      registry.onDidChange(second);
+
+      const provider = makeProvider({ id: "provider-a" });
+      expect(() => registry.register(provider)).not.toThrow();
+      expect(registry.get("provider-a")).toBe(provider);
+      expect(second).toHaveBeenCalledTimes(1);
+      expect(errorSpy).toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 });
 

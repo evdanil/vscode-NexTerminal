@@ -3,6 +3,8 @@ import * as vscode from "vscode";
 import { FolderTreeItem, LocalShellProfileTreeItem, LocalShellSessionTreeItem, NexusTreeProvider, NoMatchesTreeItem, SerialProfileTreeItem, SerialSessionTreeItem, ServerTreeItem, SessionTreeItem } from "../../src/ui/nexusTreeProvider";
 import { TUNNEL_DRAG_MIME } from "../../src/ui/dndMimeTypes";
 import type { LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile } from "../../src/models/config";
+import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
+import type { InventoryProvider } from "../../src/models/inventory";
 
 vi.mock("vscode", () => ({
   TreeItem: class {
@@ -1638,6 +1640,102 @@ describe("NexusTreeProvider node-control marker — end-to-end snapshot wiring",
     const children = provider.getChildren(undefined) as ServerTreeItem[];
     expect(children.length).toBeGreaterThan(0);
     expect(serverItemById(provider, "px").contextValue).toBe("nexus.server");
+  });
+});
+
+/**
+ * LATE PROVIDER REGISTRATION — the two marker gates above answer from the LIVE
+ * provider registry at paint time, and a third-party provider registers through
+ * the public API whenever its own extension activates, which can be long after
+ * the Command Center has painted. VS Code re-asks a tree provider for its items
+ * only after `onDidChangeTreeData` fires, so these drive the tree the way VS
+ * Code does — the assertion is on what the LAST notified paint produced, not on
+ * what a fresh out-of-band `getChildren` would return.
+ *
+ * This mirrors extension.ts's wiring: the same two predicate closures, over one
+ * registry, repainted from `registry.onDidChange`. The markers gate menu
+ * entries whose commands are hidden from the palette (they name a row), so a
+ * row that never gets restamped has no other route to Start/Stop or Open Web
+ * Console at all.
+ */
+describe("NexusTreeProvider capability markers follow the registry after the first paint", () => {
+  function lateProvider(): InventoryProvider {
+    return {
+      id: "late-pve",
+      label: "Late PVE",
+      configFields: [],
+      testConnection: async () => {},
+      fetchInventory: async () => ({ contractVersion: 1, devices: [] }),
+      controlNode: async () => {},
+      webConsoleUrl: async () => "https://pve.invalid/"
+    };
+  }
+
+  /**
+   * The tree extension.ts builds, plus the paint-on-notify loop VS Code runs:
+   * `lastPainted()` is only ever updated from an `onDidChangeTreeData` event.
+   */
+  function wiredTree(registry: InventoryProviderRegistry) {
+    const snapshot = {
+      ...emptySnapshot(),
+      servers: [makeServer({ id: "vm", name: "VM 105", origin: { sourceId: "src", externalId: "105", syncedAt: 1 } })],
+      inventorySources: [
+        {
+          id: "src",
+          providerId: "late-pve",
+          name: "Late PVE",
+          targetFolder: "",
+          prunePolicy: "orphan",
+          defaultUsername: "admin",
+          config: {},
+          secretFieldIds: []
+        }
+      ],
+      serverStatus: new Map<string, "running" | "stopped">([["vm", "running"]])
+    } as any;
+
+    const tree = new NexusTreeProvider(
+      noopCallbacks,
+      (providerId, externalId) => {
+        const provider = registry.get(providerId);
+        return provider !== undefined && provider.controlNode !== undefined && (provider.canControlNode?.(externalId) ?? true);
+      },
+      (providerId, externalId) => {
+        const provider = registry.get(providerId);
+        return provider !== undefined && provider.webConsoleUrl !== undefined && (provider.canWebConsole?.(externalId) ?? true);
+      }
+    );
+
+    let painted: string | undefined;
+    tree.onDidChangeTreeData(() => {
+      painted = serverItemById(tree, "vm").contextValue;
+    });
+    const unsubscribe = registry.onDidChange(() => tree.setSnapshot(snapshot));
+    tree.setSnapshot(snapshot);
+    return { lastPainted: () => painted, unsubscribe };
+  }
+
+  it("stamps .nodeRunning and .webConsole on a row painted BEFORE the provider registered (⊘ a registry with no registration event never repaints the row, and both menu entries stay unreachable for the rest of the session)", () => {
+    const registry = new InventoryProviderRegistry();
+    const { lastPainted, unsubscribe } = wiredTree(registry);
+    expect(lastPainted()).toBe("nexus.server");
+
+    registry.register(lateProvider());
+
+    expect(lastPainted()).toBe("nexus.server.nodeRunning.webConsole");
+    unsubscribe();
+  });
+
+  it("clears both markers when the registration is disposed (⊘ the same staleness the other way: the row keeps offering Start/Stop and Open Web Console after the provider backing them is gone)", () => {
+    const registry = new InventoryProviderRegistry();
+    const registration = registry.register(lateProvider());
+    const { lastPainted, unsubscribe } = wiredTree(registry);
+    expect(lastPainted()).toBe("nexus.server.nodeRunning.webConsole");
+
+    registration.dispose();
+
+    expect(lastPainted()).toBe("nexus.server");
+    unsubscribe();
   });
 });
 
