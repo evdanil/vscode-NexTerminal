@@ -50,6 +50,10 @@ import { naturalCompare } from "../utils/naturalCompare";
 import type { TemplateRule } from "../models/inventory";
 import { INVALID_FOLDER_PATH_MESSAGE, normalizeOptionalFolderPath } from "../utils/folderPaths";
 import { mostCommonUsername } from "./configCommands";
+// The one http/https structural check every browser handoff in the extension
+// passes (server macros, the BMC web console) — shared rather than re-stated so
+// "a URL we may hand to the OS" means one thing everywhere.
+import { resolveMacroBrowserUrl } from "../utils/browserUrl";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 import { createInlineDeviceTemplateCreation } from "./inlineDeviceTemplateCreation";
 import { createInlineSavedFilterCreation } from "./inlineSavedFilterCreation";
@@ -5325,6 +5329,178 @@ export function registerInventoryCommands(
     void vscode.commands.executeCommand("nexus.inventory.refreshStatus", source.id);
   }
 
+  /**
+   * OPEN WEB CONSOLE — the provider-general browser handoff. Resolves the row's
+   * server → its inventory source → the source's provider, asks the provider for
+   * a console URL and hands it to the OS. It is what makes an ADDRESSLESS guest
+   * manageable: a stopped VM, or one whose guest agent never reported an IP,
+   * imports as a placeholder with nothing to SSH to, and its hypervisor's own
+   * console is the only way in — so the entry is deliberately NOT gated on
+   * running/stopped state (a stopped guest's console page is the hypervisor's
+   * own honest "not running", rendered in the hypervisor's voice).
+   *
+   * The browser's existing session with the hypervisor is the CONSOLE's
+   * credential, and no token or password of ours rides the URL — which is why
+   * this is a handoff and not an embedded webview. The source's secrets are
+   * still loaded and spent: the capability authenticates its own lookup with
+   * them, which is why the capture below is guarded as carefully as a
+   * dispatching command's.
+   *
+   * BOTH HALVES of the capability are re-asked here, not trusted from the menu:
+   * the tree's `.webConsole` marker gates WHICH rows offer the entry, but a
+   * provider registered without the member (or one whose device gate refuses
+   * this record) must get an explanation rather than a TypeError or a wire
+   * refusal.
+   */
+  async function openWebConsole(arg: unknown): Promise<void> {
+    const server = resolveServerArg(arg);
+    if (!server) {
+      void vscode.window.showErrorMessage("Select a synced server to open its web console.");
+      return;
+    }
+    const origin = server.origin;
+    const source = origin ? core.getInventorySource(origin.sourceId) : undefined;
+    const provider = source ? registry.get(source.providerId) : undefined;
+    if (
+      !origin ||
+      !source ||
+      !provider ||
+      typeof provider.webConsoleUrl !== "function" ||
+      !deviceOffersWebConsole(provider, origin.externalId)
+    ) {
+      void vscode.window.showInformationMessage(
+        `"${server.name}" does not offer a web console — it is not synced from an inventory source that provides one.`
+      );
+      return;
+    }
+    // PROVIDER TRUST FINGERPRINT — the same Continue/Cancel gate `syncNow` and
+    // `editSource` put in front of THEIR vault reads, and for the same reason:
+    // VS Code offers no way to verify WHICH extension currently answers this
+    // `providerId`, only whether the registrant's declared shape still matches
+    // what the user configured against. One click here hands that registrant
+    // the source's decrypted token, so this is a secret-handover moment like
+    // the other two, and it is confirmed with the same wording rather than a
+    // variant of it.
+    //
+    // BEFORE the lock, and that order is load-bearing in both directions. It
+    // must come before because the gate's whole purpose is to land ahead of any
+    // `vault.get` for this source — a confirmation asked after the read has
+    // already happened protects nothing. It must be OUTSIDE the lock because it
+    // is a MODAL: holding `configMutationLock` across an unbounded wait for a
+    // human would freeze every config mutation app-wide, including the Delete
+    // All Data someone might need to escape a suspect provider.
+    //
+    // The two guards are complementary, not redundant, and the modal is exactly
+    // the window that makes the second one matter: the fingerprint answers "may
+    // this registrant receive this source's secrets at all", while the re-read
+    // below answers "did the config and the secrets come from one incarnation"
+    // — and an Edit Source landing while the modal is up is caught there.
+    //
+    // `fingerprintToStamp` is deliberately DROPPED. `syncNow` restamps on its
+    // own success path and `editSource`'s Save restamps unconditionally, but
+    // this command persists nothing: stamping from a read-only console open
+    // would silently bless the changed registrant for every later flow off the
+    // back of a click the user made to look at a screen.
+    const fingerprintCheck = await checkProviderFingerprint(source, provider);
+    if (fingerprintCheck.outcome === "cancelled") {
+      // Cancel (or dismiss) aborts before ANY vault read for this source — the
+      // capture below never runs. Silent, like its siblings: the modal the user
+      // just dismissed IS the message.
+      return;
+    }
+
+    // CAPTURE under configMutationLock, dispatch outside it — the split every
+    // source-reading command uses, and the SAME capture the Start/Stop path
+    // performs, re-read and revision check included.
+    //
+    // THE RE-READ IS WHAT KEEPS CONFIG AND CREDENTIAL FROM DIFFERENT EDITS.
+    // `source` was resolved at handler entry; while this command waits for the
+    // lock, an Edit Source or a replace-import can commit a new endpoint AND a
+    // new API token under the same source id. The vault read below happens
+    // AFTER that commit, so pairing it with the entry-time config would send
+    // the NEW credential to the OLD endpoint — a token disclosed to whatever
+    // host the superseded config named. Reading the live record inside the lock
+    // and bailing when its revision moved (an id-preserving import mints a new
+    // one; a reset removes the record) is what makes the pair coherent. This is
+    // not the "stale snapshot is harmless" case it looks like: nothing is
+    // mutated here, but a mismatched pair still leaks.
+    //
+    // Keep the callback SHORT — the re-read and the vault reads only; the
+    // provider call stays outside the lock.
+    const startRevision = source.revision;
+    const captured = await configMutationLock.runExclusive(async () => {
+      const live = core.getInventorySource(source.id);
+      if (!live || live.revision !== startRevision) {
+        return undefined;
+      }
+      const secrets: InventorySourceSecrets = {};
+      for (const fieldId of live.secretFieldIds) {
+        const value = await vault.get(inventorySecretKey(source.id, fieldId));
+        if (value !== undefined) {
+          secrets[fieldId] = value;
+        }
+      }
+      return { config: structuredClone(live.config), secrets };
+    });
+    if (!captured) {
+      void vscode.window.showInformationMessage(`"${source.name}" changed — try again in a moment.`);
+      return;
+    }
+    // The capability resolves the guest's CURRENT location over the network, so
+    // it is worth a progress title — and a failure SURFACES (the propagating
+    // discipline node control uses): a console that did not open must say so
+    // rather than leave the user waiting on a browser tab that never comes.
+    let resolved: string | undefined;
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: `Opening the web console for "${server.name}"…` },
+      async () => {
+        try {
+          resolved = await provider.webConsoleUrl!(captured.config, captured.secrets, origin.externalId);
+        } catch (err) {
+          void vscode.window.showErrorMessage(
+            `Could not open the web console for "${server.name}": ${describeInventoryError(err)}`
+          );
+        }
+      }
+    );
+    if (resolved === undefined) {
+      return;
+    }
+    // The structural check is asked of the FINISHED string, not assumed from
+    // where it came: a provider is third-party code and whatever it returns is
+    // about to be handed to the OS, so anything that is not an http(s) URL is
+    // refused here rather than opened.
+    const url = resolveMacroBrowserUrl(resolved);
+    if (!url) {
+      void vscode.window.showErrorMessage(
+        `The web console address for "${server.name}" is not a usable http(s) address. Nothing was opened.`
+      );
+      return;
+    }
+    const opened = await vscode.env.openExternal(vscode.Uri.parse(url));
+    if (!opened) {
+      // `openExternal` resolving `false` is a real outcome (no handler, or the
+      // user dismissed the trust prompt) and must never be reported as success.
+      void vscode.window.showWarningMessage(`Could not open the web console for "${server.name}".`);
+    }
+  }
+
+  /**
+   * The DEVICE half of the web-console capability, FAIL-CLOSED. `canWebConsole`
+   * is a third-party function the registry can only verify is callable, never
+   * that it keeps its no-throw contract — and a throw here would reject the
+   * command with an unhandled rejection instead of the explanation the user
+   * needs. Absent means the provider offers a console for every device it
+   * syncs, which is exactly how the tree's marker reads it.
+   */
+  function deviceOffersWebConsole(provider: InventoryProvider, externalId: string): boolean {
+    try {
+      return provider.canWebConsole?.(externalId) ?? true;
+    } catch {
+      return false;
+    }
+  }
+
   return [
     vscode.commands.registerCommand("nexus.inventory.addSource", addSource),
     // Arg widening: these four run from the palette (no argument at all), from
@@ -5352,6 +5528,11 @@ export function registerInventoryCommands(
     // source's provider implements controlNode (the tree stamps the marker) by
     // running/stopped state; the handler re-guards on the provider capability.
     vscode.commands.registerCommand("nexus.inventory.startNode", (arg?: unknown) => controlNode(arg, "start")),
-    vscode.commands.registerCommand("nexus.inventory.stopNode", (arg?: unknown) => controlNode(arg, "stop"))
+    vscode.commands.registerCommand("nexus.inventory.stopNode", (arg?: unknown) => controlNode(arg, "stop")),
+    // OPEN WEB CONSOLE — tree-only like Start/Stop Node (it names a row, and
+    // there is no useful palette form), gated in package.json on the tree's
+    // `.webConsole` marker; the handler re-guards on both halves of the
+    // capability.
+    vscode.commands.registerCommand("nexus.inventory.openWebConsole", (arg?: unknown) => openWebConsole(arg))
   ];
 }

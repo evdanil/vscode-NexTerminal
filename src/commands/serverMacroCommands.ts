@@ -17,6 +17,7 @@ import { formatProfileTokenErrorForCommand, hasProfileTokens, profileTokenLabel,
 import type { ProfileTokenError, ProfileTokenErrorCommandSubject, ProfileTokenForm } from "../services/profileTokens";
 import { profileTokenServer, resolveIpmiTerminalEnv, type ProfileTokenServer } from "./ipmiCredentials";
 import { VARIABLE_MARKER } from "../ui/macroVariableMarker";
+import { resolveMacroBrowserUrl } from "../utils/browserUrl";
 import { macroWillPrompt } from "./macroCommands";
 import { connectServer, pickServer, toServerFromArg } from "./serverCommands";
 import { runMacroWithTarget, terminalSendTarget, type MacroSendTarget } from "./macroVariablePrompt";
@@ -118,29 +119,6 @@ export function buildServerMacroPicks(macros: readonly TerminalMacro[], server: 
     };
   });
   return items.sort((a, b) => Number(hasProfileTokens(b.macro.text)) - Number(hasProfileTokens(a.macro.text)));
-}
-
-/**
- * The http/https whitelist for `runIn: "browser"` macros, following
- * `resolveBrowserUrl` (utils/tunnelProfile.ts) exactly — scheme parsed off a
- * real URL parse, never a prefix match. Returns the URL to open, or `undefined`
- * for anything that is not an http(s) URL: `javascript:`, `file:`, `vscode:`
- * and a bare `10.0.0.1` all land there.
- */
-export function resolveMacroBrowserUrl(text: string): string | undefined {
-  const trimmed = text.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-  try {
-    const scheme = new URL(trimmed).protocol.replace(/:$/, "");
-    if (scheme === "http" || scheme === "https") {
-      return trimmed;
-    }
-  } catch {
-    // malformed URL — not openable
-  }
-  return undefined;
 }
 
 /**

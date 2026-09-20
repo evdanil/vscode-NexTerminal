@@ -8,9 +8,9 @@ import {
   openServerAdvancedEdit,
   reportProfileTokenError,
   resolveIpmiGatewayServer,
-  resolveMacroBrowserUrl,
   resolveServerSessionTarget
 } from "./serverMacroCommands";
+import { resolveMacroBrowserUrl } from "../utils/browserUrl";
 import { pickServer, toServerFromArg } from "./serverCommands";
 import type { CommandContext } from "./types";
 

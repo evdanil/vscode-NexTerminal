@@ -373,6 +373,12 @@ describe("createProxmoxProvider", () => {
     expect(provider.canControlNode?.("node/pve")).toBe(false);
   });
 
+  it("declares canWebConsole — guests only, so a cluster node's node/<name> externalId carries no web-console marker (⊘ a device-blind gate offers Open Web Console on a hypervisor node, whose shell is not a guest's noVNC console and which webConsoleUrl always refuses)", () => {
+    const provider = createProxmoxProvider();
+    expect(provider.canWebConsole?.("105")).toBe(true);
+    expect(provider.canWebConsole?.("node/pve")).toBe(false);
+  });
+
   it("carries the Proxmox identity and the attribute vocabulary its devices report (kills an id that drifts from the registered one, and a filter key the devices can never match)", () => {
     const provider = createProxmoxProvider();
     expect(provider.id).toBe(PROXMOX_PROVIDER_ID);
@@ -2381,6 +2387,146 @@ describe("createProxmoxProvider", () => {
       expect((err as InventoryProviderError).kind).toBe("auth");
       // The POST was attempted and refused — no task poll could follow.
       expect(calls).toHaveLength(2);
+    });
+  });
+
+  /**
+   * WEB CONSOLE (§Spec) — the one provider member that makes NO request on
+   * behalf of what it returns: the URL goes to the user's browser, where the
+   * PVE web session is the credential. Every assertion here defends a piece of
+   * the URL PVE actually serves, because a wrong one fails as a blank noVNC
+   * page with no diagnostic anywhere in Nexus.
+   */
+  describe("webConsoleUrl", () => {
+    const BASE = "https://pve.example.com:8006";
+    const SECRETS = { apiToken: "root@pam!test=secret" };
+
+    function lookupFetch(rows: unknown[], status = 200) {
+      const calls: Array<{ url: string; method: string; headers?: Record<string, string> }> = [];
+      const impl = async (input: string | URL, init?: { method?: string; headers?: Record<string, string> }): Promise<unknown> => {
+        calls.push({ url: String(input), method: init?.method ?? "GET", headers: init?.headers });
+        return makeResponse(status, { data: rows });
+      };
+      return { calls, fetchImpl: impl as unknown as typeof fetch };
+    }
+
+    it("builds PVE's noVNC URL for a qemu guest with the FULL query, including the empty-valued cmd= PVE expects (kills a hand-concatenated query that drops or mis-orders a member — the console opens blank with nothing to diagnose)", async () => {
+      const { fetchImpl } = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build-vm" }]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      await expect(provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107")).resolves.toBe(
+        `${BASE}/?console=kvm&novnc=1&vmid=107&vmname=build-vm&node=pve&resize=off&cmd=`
+      );
+    });
+
+    it("builds PVE's xterm.js URL for a container with ITS full query — console=lxc, xtermjs=1 and NO resize (kills a builder that swaps one flag and keeps the noVNC shape, and kills a qemu-only builder: each type's complete query is pinned, so flags cannot be traded between them unnoticed)", async () => {
+      const { fetchImpl } = lookupFetch([{ vmid: 114, node: "pve", type: "lxc", name: "dns-ct" }]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      await expect(provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "114")).resolves.toBe(
+        `${BASE}/?console=lxc&xtermjs=1&vmid=114&vmname=dns-ct&node=pve&cmd=`
+      );
+    });
+
+    it("keeps the two shapes apart: a container URL carries no novnc and no resize, a VM URL carries no xtermjs (\u2298 one shared parameter set for both types hands PVE a viewer flag the other type's page does not read)", async () => {
+      const ct = lookupFetch([{ vmid: 114, node: "pve", type: "lxc", name: "dns-ct" }]);
+      const ctUrl = new URL(await createProxmoxProvider(ct.fetchImpl, ct.fetchImpl).webConsoleUrl!({ baseUrl: BASE }, SECRETS, "114"));
+      expect(ctUrl.searchParams.get("xtermjs")).toBe("1");
+      expect(ctUrl.searchParams.has("novnc")).toBe(false);
+      expect(ctUrl.searchParams.has("resize")).toBe(false);
+      const vm = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build-vm" }]);
+      const vmUrl = new URL(await createProxmoxProvider(vm.fetchImpl, vm.fetchImpl).webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107"));
+      expect(vmUrl.searchParams.get("novnc")).toBe("1");
+      expect(vmUrl.searchParams.get("resize")).toBe("off");
+      expect(vmUrl.searchParams.has("xtermjs")).toBe(false);
+    });
+
+    it("PRESERVES a reverse-proxy mount path from the base URL (kills a builder that keeps only the origin — https://gateway.example/?console=… is not where that deployment's UI lives)", async () => {
+      const { fetchImpl } = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build-vm" }]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      await expect(provider.webConsoleUrl!({ baseUrl: "https://gateway.example/pve" }, SECRETS, "107")).resolves.toBe(
+        "https://gateway.example/pve/?console=kvm&novnc=1&vmid=107&vmname=build-vm&node=pve&resize=off&cmd="
+      );
+    });
+
+    it("QUERY-ENCODES the guest name — it is guest-controlled text (kills raw interpolation, where a space or an & truncates the query and the remaining parameters are silently lost)", async () => {
+      const { fetchImpl } = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build vm&novnc=0" }]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      const resolved = await provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107");
+      const parsed = new URL(resolved);
+      expect(parsed.searchParams.get("vmname")).toBe("build vm&novnc=0");
+      // The injected `novnc=0` must not survive as a parameter of its own.
+      expect(parsed.searchParams.getAll("novnc")).toEqual(["1"]);
+    });
+
+    it("resolves node/type/name FRESH from ?type=vm before building anything, and reflects a node the guest has since migrated to (kills a URL built from the last sync's node — the console would open on a host that no longer runs the guest)", async () => {
+      const { calls, fetchImpl } = lookupFetch([{ vmid: 107, node: "pve-2", type: "qemu", name: "build-vm" }]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      const resolved = await provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107");
+      expect(new URL(resolved).searchParams.get("node")).toBe("pve-2");
+      expect(calls.map((c) => `${c.method} ${c.url}`)).toEqual([`GET ${BASE}/api2/json/cluster/resources?type=vm`]);
+    });
+
+    it("authenticates the lookup with the same PVEAPIToken header every other read uses (kills a lookup issued anonymously, which answers 401 and reads as 'guest gone')", async () => {
+      const { calls, fetchImpl } = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build-vm" }]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      await provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107");
+      expect(calls[0].headers).toMatchObject({ Authorization: "PVEAPIToken=root@pam!test=secret" });
+    });
+
+    it("NEVER puts the API token in the returned URL — it is opened in an external browser and lands in history (kills a builder that 'helpfully' authenticates the link)", async () => {
+      const { fetchImpl } = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build-vm" }]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      const resolved = await provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107");
+      expect(resolved).not.toContain("secret");
+      expect(resolved.toLowerCase()).not.toContain("token");
+    });
+
+    it("REFUSES a template with template-shaped wording, before building any URL (\u2298 a template cannot run and has no console, so a URL for one is an action that can only fail \u2014 and reporting it as a missing guest blames the sync and sends the user to a re-sync that changes nothing)", async () => {
+      const { fetchImpl } = lookupFetch([{ vmid: 9000, node: "pve", type: "qemu", name: "debian-tpl", template: 1 }]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      const err = await provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "9000").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind).toBe("protocol");
+      expect((err as Error).message).toContain("9000");
+      expect((err as Error).message).toMatch(/template/i);
+      // The guest-shaped rejection this refusal exists to displace.
+      expect((err as Error).message).not.toMatch(/no longer present/i);
+      expect((err as Error).message).not.toMatch(/re-sync/i);
+    });
+
+    it("still builds the URL for an ordinary guest whose row carries template: 0 (\u2298 a truthiness slip on the template member refuses every guest PVE reports it for, killing the feature outright)", async () => {
+      const { fetchImpl } = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build-vm", template: 0 }]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      await expect(provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107")).resolves.toBe(
+        `${BASE}/?console=kvm&novnc=1&vmid=107&vmname=build-vm&node=pve&resize=off&cmd=`
+      );
+    });
+
+    it("rejects with a re-sync hint when the vmid is no longer in the cluster listing (kills an error that names neither the guest nor the way out — same contract as controlNode's)", async () => {
+      const { fetchImpl } = lookupFetch([]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      const err = await provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind).toBe("protocol");
+      expect((err as Error).message).toContain("107");
+      expect((err as Error).message).toMatch(/re-sync/i);
+    });
+
+    it("refuses a node/<name> externalId BEFORE any request, naming it as a Proxmox NODE (kills falling through the guest lookup, which rejects with \"Guest node/pve is no longer present — re-sync\": guest-shaped wording for a node, blaming the sync for a route that never applied to a hypervisor node at all)", async () => {
+      const { calls, fetchImpl } = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build-vm" }]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      const err = await provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "node/pve").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind).toBe("protocol");
+      expect((err as Error).message).toContain("node/pve");
+      expect((err as Error).message).toMatch(/is a Proxmox node/);
+      // The two halves of the guest-shaped rejection this exists to kill: it
+      // must not report the node as a missing guest, nor send the user to a
+      // re-sync that would change nothing.
+      expect((err as Error).message).not.toMatch(/no longer present/i);
+      expect((err as Error).message).not.toMatch(/re-sync/i);
+      // The predicate is the UI gate; the impl must stand on its own — a direct
+      // call must not spend a cluster read before refusing.
+      expect(calls).toEqual([]);
     });
   });
 });

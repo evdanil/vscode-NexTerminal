@@ -901,9 +901,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // NODE CONTROL (Task 9) — the tree cannot import the provider registry (UI
   // layering), so "does this origin's provider implement `controlNode` — and
   // can it control THIS device?" crosses as a predicate. The
-  // `.eveRunning`/`.eveStopped` marker names stay as EVE-NG named them: every
-  // server-menu `when` regex already tolerates them, and Proxmox inherits the
-  // mechanism unchanged. The DEVICE half (P2 review fix) asks the provider's
+  // `.nodeRunning`/`.nodeStopped` marker is named for the mechanism, not for a
+  // provider: EVE-NG nodes and Proxmox guests are stamped by the same rule. The
+  // DEVICE half (P2 review fix) asks the provider's
   // optional `canControlNode(externalId)`: a provider that does not declare it
   // is taken at its word that every device is controllable (EVE-NG), while one
   // that does (Proxmox — bare vmids only) keeps the records its controlNode
@@ -912,6 +912,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   (providerId, externalId) => {
     const provider = inventoryProviderRegistry.get(providerId);
     return provider !== undefined && provider.controlNode !== undefined && (provider.canControlNode?.(externalId) ?? true);
+  },
+  // WEB CONSOLE — the same two-half question for the `.webConsole` marker, asked
+  // of the capability rather than of a provider id: the PROVIDER half is whether
+  // `webConsoleUrl` exists at all (Proxmox yes, NetBox and EVE-NG no), the DEVICE
+  // half whether it applies to THIS record — Proxmox answers false for a cluster
+  // node, whose shell is not a guest's noVNC console and which its own
+  // `webConsoleUrl` refuses. An absent `canWebConsole` is taken at its word that
+  // every device of a capable provider qualifies. Deliberately NO status term:
+  // the console is what makes an addressless or unpolled guest manageable.
+  (providerId, externalId) => {
+    const provider = inventoryProviderRegistry.get(providerId);
+    return provider !== undefined && provider.webConsoleUrl !== undefined && (provider.canWebConsole?.(externalId) ?? true);
   });
   const tunnelTreeProvider = new TunnelTreeProvider();
   const networkServerTreeProvider = new NetworkServerTreeProvider();

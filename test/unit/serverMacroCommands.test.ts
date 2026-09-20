@@ -75,10 +75,10 @@ import { setActiveMacroStore } from "../../src/macroSettings";
 import {
   buildServerMacroPicks,
   commandReadsIpmiEnv,
-  resolveMacroBrowserUrl,
   runMacroOnServer,
   sessionIpmiHintNote
 } from "../../src/commands/serverMacroCommands";
+import { resolveMacroBrowserUrl } from "../../src/utils/browserUrl";
 
 const store = new InMemoryMacroStore();
 

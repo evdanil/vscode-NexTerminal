@@ -284,7 +284,7 @@ describe("Profile Actions quick-pick — EVE node power (M5)", () => {
     mockShowQuickPick.mockReset();
   });
 
-  function serverItem(opts: { status?: "running" | "stopped"; hasNodeControl?: boolean }): ServerTreeItem {
+  function serverItem(opts: { status?: "running" | "stopped"; hasNodeControl?: boolean; hasWebConsole?: boolean }): ServerTreeItem {
     const server = {
       id: "eve-1",
       name: "R1",
@@ -294,8 +294,20 @@ describe("Profile Actions quick-pick — EVE node power (M5)", () => {
       origin: { sourceId: "src", externalId: "/L.unl#1", syncedAt: 1 }
     } as any;
     // (server, connected, lookup, showDesc, authName, authUser, syncedName,
-    // ipmiAuthName, status, hasNodeControl)
-    return new ServerTreeItem(server, false, undefined, true, undefined, undefined, undefined, undefined, opts.status, opts.hasNodeControl);
+    // ipmiAuthName, status, hasNodeControl, hasWebConsole)
+    return new ServerTreeItem(
+      server,
+      false,
+      undefined,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      opts.status,
+      opts.hasNodeControl,
+      opts.hasWebConsole
+    );
   }
 
   async function labelsFor(item: ServerTreeItem): Promise<string[]> {
@@ -326,6 +338,42 @@ describe("Profile Actions quick-pick — EVE node power (M5)", () => {
     expect(nonEve).not.toContain("Start Node");
     expect(nonEve).not.toContain("Stop Node");
     const unknown = await labelsFor(serverItem({ hasNodeControl: true, status: undefined }));
+    expect(unknown).not.toContain("Start Node");
+    expect(unknown).not.toContain("Stop Node");
+  });
+
+  /**
+   * THE MARKER IS NOT THE LAST SEGMENT. `contextValue` is a dot-joined marker
+   * list whose TAIL GROWS — a web-console-capable guest carries `.webConsole`
+   * after the node-state marker — so reading the state with `endsWith` (or any
+   * other positional rule) stops finding it the moment another marker is
+   * appended. The row's right-click menu keeps offering Start/Stop, because its
+   * `when` regexes tolerate the extra group, so the two surfaces start
+   * disagreeing about the same row — exactly what reading the state back off
+   * the contextValue exists to prevent.
+   */
+  it("finds the node state with a FURTHER marker appended after it — a web-console-capable stopped guest reads nexus.server.nodeStopped.webConsole (\u2298 a suffix/positional read offers neither Start nor Stop on a row whose right-click menu offers Start)", async () => {
+    const item = serverItem({ hasNodeControl: true, status: "stopped", hasWebConsole: true });
+    // The fixture must actually be the composite value, or the test is vacuous.
+    expect(item.contextValue).toBe("nexus.server.nodeStopped.webConsole");
+    const labels = await labelsFor(item);
+    expect(labels).toContain("Start Node");
+    expect(labels).not.toContain("Stop Node");
+  });
+
+  it("does the same for a RUNNING web-console-capable guest (\u2298 the same positional read hides Stop Node from every console-capable running guest)", async () => {
+    const item = serverItem({ hasNodeControl: true, status: "running", hasWebConsole: true });
+    expect(item.contextValue).toBe("nexus.server.nodeRunning.webConsole");
+    const labels = await labelsFor(item);
+    expect(labels).toContain("Stop Node");
+    expect(labels).not.toContain("Start Node");
+  });
+
+  it("still offers NEITHER for a web-console-capable row with no node control or no status (\u2298 a segment read that matched too loosely would light node power on a row that has none)", async () => {
+    const noControl = await labelsFor(serverItem({ hasNodeControl: false, status: "running", hasWebConsole: true }));
+    expect(noControl).not.toContain("Start Node");
+    expect(noControl).not.toContain("Stop Node");
+    const unknown = await labelsFor(serverItem({ hasNodeControl: true, status: undefined, hasWebConsole: true }));
     expect(unknown).not.toContain("Start Node");
     expect(unknown).not.toContain("Stop Node");
   });

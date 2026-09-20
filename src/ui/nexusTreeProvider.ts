@@ -80,13 +80,20 @@ export class ServerTreeItem extends vscode.TreeItem {
     // NODE CONTROL (Phase 4, task #28; provider-general since Task 9) — whether
     // this server's origin's provider can control nodes (implements
     // `controlNode`), decided by the caller (a live ServerOrigin carries no
-    // providerId — see toServerItem). Gates the `.eveRunning` / `.eveStopped`
+    // providerId — see toServerItem). Gates the `.nodeRunning` / `.nodeStopped`
     // contextValue marker below: emitted ONLY for a control-capable origin with
     // a KNOWN status, so a server whose provider has no controlNode but somehow
     // carries a status, and a freshly-synced node with none yet, get no
     // node-control menu (the user runs Refresh Lab Status first — we never act
     // blind).
-    hasNodeControl = false
+    hasNodeControl = false,
+    // WEB CONSOLE — whether this server's origin's provider offers a web console
+    // for THIS device (it implements `webConsoleUrl`, and its optional
+    // `canWebConsole` does not refuse the record), decided by the caller for the
+    // same layering reason as `hasNodeControl`. Gates the `.webConsole` marker
+    // below, which — unlike the node-state marker — requires NO known status:
+    // an addressless, unpolled guest is the row the console exists for.
+    hasWebConsole = false
   ) {
     super(server.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
     this.id = `server:${server.id}`;
@@ -151,16 +158,24 @@ export class ServerTreeItem extends vscode.TreeItem {
     // so no existing menu is dropped for a BMC server.
     const hasIpmi = typeof server.ipmiHost === "string" && server.ipmiHost.trim() !== "";
     // NODE CONTROL (task #28) — the node-state marker, APPENDED after `.ipmi` in
-    // the fixed order `nexus.server[Connected][.ipmi][.eveRunning|.eveStopped]`.
+    // the fixed order `nexus.server[Connected][.ipmi][.nodeRunning|.nodeStopped]`.
     // Only a control-capable origin's server with a KNOWN status carries it;
     // every package.json server-menu `when` regex was broadened to tolerate the
     // optional group first, so no existing action is dropped (the #83 hazard).
-    // The NAME is historical: EVE-NG's Phase 4 named the marker `.eveRunning`/
-    // `.eveStopped`, and every provider implementing `controlNode` since
-    // (Proxmox) inherited the mechanism — renaming would churn ~20 `when`
-    // clauses and every contextValue pin for zero behavioral gain.
-    const eveMarker = hasNodeControl && status ? (status === "running" ? ".eveRunning" : ".eveStopped") : "";
-    this.contextValue = `${connected ? "nexus.serverConnected" : "nexus.server"}${hasIpmi ? ".ipmi" : ""}${eveMarker}`;
+    // The marker is named for the MECHANISM, not for a provider: it is stamped
+    // for any provider implementing `controlNode`, so it reads correctly on an
+    // EVE-NG lab node and on a Proxmox guest alike.
+    const nodeMarker = hasNodeControl && status ? (status === "running" ? ".nodeRunning" : ".nodeStopped") : "";
+    // WEB CONSOLE — LAST in the fixed order
+    // `nexus.server[Connected][.ipmi][.nodeRunning|.nodeStopped][.webConsole]`.
+    // Position is load-bearing, not cosmetic: every server-menu `when` regex is
+    // anchored and spells the groups in this order, so a marker in any other
+    // slot matches none of them and the row loses every context action (#83).
+    // CAPABILITY ONLY — no status term: the console is what makes an addressless
+    // or unpolled guest manageable at all, and a stopped guest's console page is
+    // the hypervisor's own honest answer.
+    const webConsoleMarker = hasWebConsole ? ".webConsole" : "";
+    this.contextValue = `${connected ? "nexus.serverConnected" : "nexus.server"}${hasIpmi ? ".ipmi" : ""}${nodeMarker}${webConsoleMarker}`;
     // LIVE STATUS (Phase 2) — the icon. A CONNECTED server always keeps its
     // connected (plug) icon: the connected affordance must not be lost (P3-6),
     // and the running state is still conveyed by the " (running)" description
@@ -434,7 +449,14 @@ export class NexusTreeProvider
     // them out of the Start/Stop menu without losing their status decoration.
     // Optional and FAIL-CLOSED: a tree built without it offers node control
     // nowhere — never somewhere it is not backed by the capability.
-    private readonly originHasNodeControl?: (providerId: string, externalId: string) => boolean
+    private readonly originHasNodeControl?: (providerId: string, externalId: string) => boolean,
+    // WEB CONSOLE — the same shape and the same reason: "does this providerId's
+    // provider offer a web console, and does it offer one for THIS device?",
+    // injected from extension.ts because the registry is out of this layer's
+    // reach. Optional and FAIL-CLOSED for the same reason as its sibling: a tree
+    // built without it offers a console nowhere rather than somewhere nothing
+    // backs it.
+    private readonly originHasWebConsole?: (providerId: string, externalId: string) => boolean
   ) {}
 
   public readonly onDidChangeTreeData: vscode.Event<NexusTreeItem | undefined> =
@@ -789,7 +811,7 @@ export class NexusTreeProvider
     // an explicit contextValue) cannot inherit either.
     //
     // THE MARKER IS AN OPTIONAL SUFFIX on whichever base value the row already
-    // has, exactly as `.eveRunning`/`.eveStopped` suffix a server's — so the
+    // has, exactly as `.nodeRunning`/`.nodeStopped` suffix a server's — so the
     // `nexus.folder` / `nexus.folderWithServers` distinction survives it and
     // every existing folder menu entry keeps matching (their `when` regexes were
     // widened with the same optional group). Appending, rather than replacing,
@@ -927,7 +949,7 @@ export class NexusTreeProvider
     // NODE CONTROL (task #28; provider-general since Task 9) — resolve the
     // origin's source ONCE for both the display name and the capability check
     // (a live ServerOrigin carries no providerId — Phase 4 gotcha #1).
-    // `hasNodeControl` gates the `.eveRunning`/`.eveStopped` contextValue
+    // `hasNodeControl` gates the `.nodeRunning`/`.nodeStopped` contextValue
     // marker: the injected predicate answers whether the source's provider
     // implements `controlNode` AND can control THIS device (the origin's
     // externalId) — capability plus device, not a hard-coded provider id, so
@@ -945,11 +967,19 @@ export class NexusTreeProvider
     // one row — the same outcome as returning false, and strictly better than
     // taking the tree down.
     let hasNodeControl = false;
+    let hasWebConsole = false;
     if (originSource !== undefined) {
       try {
         hasNodeControl = this.originHasNodeControl?.(originSource.providerId, server.origin?.externalId ?? "") ?? false;
       } catch {
         hasNodeControl = false;
+      }
+      // Separately guarded: the two predicates are independent capabilities, and
+      // one faulty implementation must not cost the row the other's marker.
+      try {
+        hasWebConsole = this.originHasWebConsole?.(originSource.providerId, server.origin?.externalId ?? "") ?? false;
+      } catch {
+        hasWebConsole = false;
       }
     }
     // REVIEW FINDING (P2) — the username shown is the one a connection will
@@ -970,7 +1000,8 @@ export class NexusTreeProvider
       syncedSourceName,
       ipmiAuthProfile?.name,
       status,
-      hasNodeControl
+      hasNodeControl,
+      hasWebConsole
     );
     // LIVE STATUS (Phase 2) — the resourceUri the decoration provider matches on
     // to paint the ▶ badge for a running server.

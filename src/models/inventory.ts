@@ -423,7 +423,7 @@ export interface InventoryProvider {
    * its own implementation rejects with a protocol error — must be able to
    * keep those out of the Start/Stop menu WITHOUT losing their status
    * decoration: the tree's marker gate consults this before stamping
-   * `.eveRunning`/`.eveStopped`, so a refused device keeps its running/offline
+   * `.nodeRunning`/`.nodeStopped`, so a refused device keeps its running/offline
    * dot and description (both driven by the status, not the marker) but
    * carries no menu. OPTIONAL — absent means EVERY device is controllable, so
    * a provider whose whole device set is controllable (EVE-NG) implements
@@ -434,6 +434,71 @@ export interface InventoryProvider {
    * `NexusTreeProvider` constructor; nothing on the command path reads it.
    */
   canControlNode?(externalId: string): boolean;
+  /**
+   * WEB CONSOLE — OPTIONAL. A URL for the USER'S BROWSER: the provider's own
+   * web console for ONE device, keyed by the same `externalId` the other
+   * members use. Nexus never fetches the returned URL; it hands it to
+   * `vscode.env.openExternal`, so the CONSOLE's credential is whatever web
+   * session the browser already holds for that deployment — not the secrets
+   * this method receives. Those are still real credentials in use: an
+   * implementation is expected to spend them on whatever provider-side lookup
+   * building the URL requires (a fresh location read, say), on the same
+   * transport and TLS terms as every other read. What it MUST NOT do is embed
+   * one in the URL it returns: that URL is opened in an external browser and
+   * lands in history.
+   *
+   * WHY IT EXISTS. A guest with no reachable address — no agent, no DHCP lease,
+   * not yet booted — is a dead end in the tree: nothing to SSH to. Its
+   * hypervisor's console is the one way in, and it needs no address at all.
+   *
+   * MAY THROW, and the throw PROPAGATES, deliberately unlike
+   * `fetchProviderStatus`'s degrade-to-no-op and exactly like `controlNode`: a
+   * console the user asked for that did not open must say why. Implementations
+   * are pure-with-network — they resolve, they do not mutate.
+   *
+   * The ONLY sanctioned caller is the generic open-web-console command. A
+   * provider that does not implement it offers no web console, and its rows
+   * carry no web-console marker, so the menu entry never appears on them.
+   */
+  webConsoleUrl?(
+    config: InventorySourceValues,
+    secrets: InventorySourceSecrets,
+    externalId: string
+  ): Promise<string>;
+  /**
+   * DEVICE-AWARE WEB-CONSOLE GATE — OPTIONAL, and to `webConsoleUrl` exactly
+   * what `canControlNode` is to `controlNode`. Which of this provider's synced
+   * devices the console route actually applies to, keyed by the same
+   * `externalId` the other members use. A provider whose device set includes
+   * records with no console — e.g. Proxmox cluster nodes, whose shell is not a
+   * guest's noVNC console and which `webConsoleUrl` refuses outright — must be
+   * able to keep those out of the Open Web Console menu without losing
+   * anything else about the row: the tree's marker gate consults this before
+   * stamping the web-console marker, so a refused device keeps its status
+   * decoration and every other menu entry it qualifies for.
+   *
+   * OPTIONAL — absent means NO DEVICE GATE: every device of a provider that
+   * implements `webConsoleUrl` qualifies, so a provider whose whole device set
+   * has a console implements nothing and behaves byte-identically. Must be pure
+   * and synchronous — a predicate over an ALREADY-SYNCED device, no I/O, no
+   * throwing — and must never CONTRADICT `webConsoleUrl`: a device it admits
+   * must not be one the implementation is known to reject from the id alone.
+   *
+   * IT CANNOT BE COMPLETE, and saying so is the point. The gate sees only an
+   * externalId and whatever that id encodes, so it catches exactly the refusals
+   * that are decidable from identity (a Proxmox `node/<name>` is never a
+   * guest). A refusal that depends on LIVE state the id does not carry — a PVE
+   * template, whose template-ness is reported by the cluster and survives
+   * nowhere on the synced record — is not decidable here, and the
+   * implementation's own refusal is the authoritative one. Such a device keeps
+   * its menu entry and is told why when it is used, which is honest; inventing
+   * a gate answer from data the tree does not have would not be.
+   *
+   * The ONLY consumer is the
+   * tree's marker gate, called through the predicate injected at the
+   * `NexusTreeProvider` constructor; nothing on the command path reads it.
+   */
+  canWebConsole?(externalId: string): boolean;
 }
 
 /**

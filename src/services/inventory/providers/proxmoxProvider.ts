@@ -2120,6 +2120,77 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * Is this externalId a cluster NODE rather than a guest?
+ *
+ * ONE DEFINITION, THREE CALLERS (`controlNodeImpl`, `webConsoleUrlImpl`,
+ * `canWebConsole`), because "is a node" has to mean the SAME thing in the gate
+ * that hides a menu entry and in the implementation that refuses the action —
+ * two notions drifting apart is exactly how a menu comes to offer what the wire
+ * rejects. The prefix IS the discriminator and not a guess: `fetchInventoryImpl`
+ * mints these ids in one place, `node/${name}` for a node and the bare vmid for
+ * a guest, so nothing else can wear this shape.
+ */
+function isProxmoxNodeExternalId(externalId: string): boolean {
+  return externalId.startsWith("node/");
+}
+
+/**
+ * FRESH vmid → {node, kind, name} resolution over `/cluster/resources?type=vm`.
+ *
+ * ONE DEFINITION, TWO CALLERS (`controlNodeImpl`, `webConsoleUrlImpl`), because
+ * both need the same facts for the same reason: a bare vmid externalId
+ * does not name the node it runs on, and a guest can migrate between syncs — so
+ * the last synced tree is never the source of this answer. Sharing it also
+ * keeps the not-found contract (name the guest, name the way out) in one place;
+ * two copies would drift and one of the two commands would stop saying "re-sync".
+ *
+ * `name` is best-effort: PVE omits it on a guest that has never been named, and
+ * an unnamed guest is still resolvable — only the callers that render a label
+ * care, and "" renders as an empty label rather than a failure.
+ */
+async function resolveGuestRow(
+  transport: ProxmoxTransport,
+  baseUrl: string,
+  token: string,
+  externalId: string
+): Promise<{ node: string; kind: "qemu" | "lxc"; name: string; template: boolean }> {
+  const lookupUrl = new URL(`${baseUrl}${PROXMOX_API_BASE}/cluster/resources?type=vm`);
+  const lookupRaw = await rawGet(transport, lookupUrl, token, FETCH_TIMEOUT_MS);
+  if (lookupRaw.status < 200 || lookupRaw.status >= 300) {
+    throwForStatus(lookupRaw, lookupUrl);
+  }
+  // Fail-closed like the sync's listing read (fetchResources): a mangled
+  // payload must not read as "the guest is gone".
+  const lookupParsed = parseJsonOrThrow(lookupRaw.text, lookupUrl);
+  const rows = (lookupParsed as { data?: unknown }).data;
+  if (!Array.isArray(rows)) {
+    throw new InventoryProviderError("protocol", `Response from ${lookupUrl} has no resource list ("data" is not an array).`);
+  }
+  for (const raw of rows) {
+    if (typeof raw !== "object" || raw === null) {
+      continue;
+    }
+    const row = raw as Record<string, unknown>;
+    if (String(row.vmid) !== externalId) {
+      continue;
+    }
+    // A row matching the vmid but carrying an unusable node/type folds into
+    // "not found" — nothing actionable could be built from it either way.
+    if ((row.type === "qemu" || row.type === "lxc") && str(row.node)) {
+      // `template` rides along because it is a property of the DEVICE that only
+      // this live row can report — nothing about template-ness survives the sync
+      // onto a server record — and one caller must refuse a template outright.
+      // PVE reports it as the number 1; anything else (absent, 0) is a guest.
+      return { node: row.node as string, kind: row.type, name: str(row.name), template: row.template === 1 };
+    }
+  }
+  throw new InventoryProviderError(
+    "protocol",
+    `Guest ${externalId} is no longer present in the Proxmox cluster — re-sync the source and try again.`
+  );
+}
+
+/**
  * NODE CONTROL (§Control) — start or stop ONE guest, keyed by the bare vmid
  * externalId `fetchInventory`/`fetchStatus` emit. Unlike `fetchStatusImpl`,
  * failures PROPAGATE (contract note, models/inventory.ts:346-355): the caller
@@ -2142,7 +2213,7 @@ async function controlNodeImpl(
   externalId: string,
   action: "start" | "stop"
 ): Promise<void> {
-  if (externalId.startsWith("node/")) {
+  if (isProxmoxNodeExternalId(externalId)) {
     throw new InventoryProviderError(
       "protocol",
       `Nodes cannot be started or stopped from Nexus ("${externalId}" is a Proxmox node).`
@@ -2152,40 +2223,7 @@ async function controlNodeImpl(
   const baseUrl = normalizeBaseUrl(String(config.baseUrl ?? ""));
   const token = secrets.apiToken ?? "";
 
-  const lookupUrl = new URL(`${baseUrl}${PROXMOX_API_BASE}/cluster/resources?type=vm`);
-  const lookupRaw = await rawGet(transport, lookupUrl, token, FETCH_TIMEOUT_MS);
-  if (lookupRaw.status < 200 || lookupRaw.status >= 300) {
-    throwForStatus(lookupRaw, lookupUrl);
-  }
-  // Fail-closed like the sync's listing read (fetchResources): a mangled
-  // payload must not read as "the guest is gone".
-  const lookupParsed = parseJsonOrThrow(lookupRaw.text, lookupUrl);
-  const rows = (lookupParsed as { data?: unknown }).data;
-  if (!Array.isArray(rows)) {
-    throw new InventoryProviderError("protocol", `Response from ${lookupUrl} has no resource list ("data" is not an array).`);
-  }
-  let target: { node: string; kind: "qemu" | "lxc" } | undefined;
-  for (const raw of rows) {
-    if (typeof raw !== "object" || raw === null) {
-      continue;
-    }
-    const row = raw as Record<string, unknown>;
-    if (String(row.vmid) !== externalId) {
-      continue;
-    }
-    // A row matching the vmid but carrying an unusable node/type folds into
-    // "not found" — nothing actionable could be built from it either way.
-    if ((row.type === "qemu" || row.type === "lxc") && str(row.node)) {
-      target = { node: row.node as string, kind: row.type };
-      break;
-    }
-  }
-  if (!target) {
-    throw new InventoryProviderError(
-      "protocol",
-      `Guest ${externalId} is no longer present in the Proxmox cluster — re-sync the source and try again.`
-    );
-  }
+  const target = await resolveGuestRow(transport, baseUrl, token, externalId);
 
   const actionUrl = new URL(
     `${baseUrl}${PROXMOX_API_BASE}/nodes/${encodeURIComponent(target.node)}/${target.kind}/${encodeURIComponent(externalId)}/status/${action}`
@@ -2259,6 +2297,120 @@ async function controlNodeImpl(
 }
 
 /**
+ * WEB CONSOLE (§Spec) — PVE's own console page for ONE guest, as a URL for the
+ * USER'S BROWSER (noVNC for a VM, xterm.js for a container — see the two shapes
+ * below). Nexus never fetches it.
+ *
+ * WHY THIS IS THE FEATURE. A guest with no reachable address — no
+ * qemu-guest-agent, no lease, never booted — has nothing to SSH to and is a
+ * dead end in the tree. The console needs no address at all, so it is the one
+ * way into exactly the guests Nexus otherwise cannot offer anything for. Which
+ * is also why there is NO running/stopped gate here: a stopped guest's noVNC
+ * page is PVE's own "not running" answer, in PVE's voice, in the browser — a
+ * truthful answer that Nexus second-guessing from a possibly-unpolled status
+ * would only replace with a worse one.
+ *
+ * THE BROWSER'S PVE SESSION IS THE CREDENTIAL (its PVEAuthCookie), not the API
+ * token. The token is used for the RESOLUTION lookup below and MUST NOT be
+ * appended to the returned URL: PVE's ticket endpoint is `allowtoken: 0`, so it
+ * would not authenticate the console anyway, and a URL handed to an external
+ * browser lands in history and in whatever the OS handler logs. First open may
+ * show PVE's login page; that is the intended handshake.
+ *
+ * FRESH RESOLUTION, for the same reason `controlNodeImpl` does it: the node in
+ * the URL must be the node running the guest NOW, not the one the last sync saw.
+ *
+ * THE MOUNT PATH SURVIVES. `normalizeBaseUrl` keeps a reverse-proxy prefix and
+ * strips its trailing slash, so the slash is put back before serializing —
+ * `https://gateway.example/pve` must open `…/pve/?console=…`, which is where
+ * that deployment's UI lives; an origin-only URL reaches the proxy's root.
+ * A bare origin already has pathname "/" and is left alone.
+ */
+async function webConsoleUrlImpl(
+  transports: ProxmoxTransports,
+  config: InventorySourceValues,
+  secrets: InventorySourceSecrets,
+  externalId: string
+): Promise<string> {
+  // DEFENCE IN DEPTH, not a duplicate of the menu gate. `canWebConsole` keeps
+  // node rows out of the UI, but this member is callable directly (palette,
+  // third-party consumer), and without the guard a `node/<name>` id falls
+  // through to `resolveGuestRow`, which only ever matches vmids — so the node
+  // would be reported as a missing GUEST, sending the user to a re-sync that
+  // could not help. A node has no guest console at all; say that instead.
+  if (isProxmoxNodeExternalId(externalId)) {
+    throw new InventoryProviderError(
+      "protocol",
+      `Nodes have no web console in Nexus ("${externalId}" is a Proxmox node).`
+    );
+  }
+  const transport = selectProxmoxTransport(transports, config);
+  const baseUrl = normalizeBaseUrl(String(config.baseUrl ?? ""));
+  const token = secrets.apiToken ?? "";
+  const target = await resolveGuestRow(transport, baseUrl, token, externalId);
+  // A TEMPLATE HAS NO CONSOLE, and this is the only layer that can know. PVE
+  // templates import under an opt-in with the same bare-vmid externalId every
+  // guest carries, and nothing about template-ness survives the sync onto the
+  // server record (device attributes are consumed by template-rule matching and
+  // never persisted; the origin stamps carry addresses, credentials and
+  // identity, not device class). So the marker gate — which answers from an
+  // externalId alone, without I/O — cannot tell a template row from a guest,
+  // and the fresh lookup this function already performs is where the answer
+  // actually exists. Refused in the TEMPLATE'S OWN terms: routing it through
+  // the not-found path below would report a device PVE is happily listing as
+  // gone, and send the user to a re-sync that would import it again unchanged.
+  if (target.template) {
+    throw new InventoryProviderError(
+      "protocol",
+      `Guest ${externalId} is a Proxmox template — a template cannot run, so it has no console.`
+    );
+  }
+
+  const url = new URL(baseUrl);
+  if (url.pathname !== "/") {
+    url.pathname = `${url.pathname}/`;
+  }
+  // `URLSearchParams`, not concatenation: `vmname` is guest-controlled text, so
+  // a name carrying "&" or "=" would otherwise forge parameters or truncate the
+  // query — and the result is a blank console with no error anywhere.
+  //
+  // TWO SHAPES, ONE PER GUEST TYPE, each built the way PVE's own web UI builds
+  // it rather than by swapping a flag in a shared parameter set:
+  //
+  //   VM (qemu)      ?console=kvm&novnc=1&vmid&vmname&node&resize=off&cmd=
+  //   container (lxc) ?console=lxc&xtermjs=1&vmid&vmname&node&cmd=
+  //
+  // `resize` is a noVNC scaling option and has no meaning to the xterm.js page,
+  // which is why the container shape drops it and does not merely rename a flag.
+  //
+  // WHY xterm.js FOR A CONTAINER: it is what PVE's own Console button opens for
+  // a container when the datacenter console option is unset — its per-type
+  // default. Not because noVNC is unavailable for containers: a container node
+  // exposes vncproxy and vncwebsocket just as a VM does, and `console=lxc&novnc=1`
+  // opens a working console. This is about opening the SAME console PVE would,
+  // so the two routes to a container's shell do not differ in frontend.
+  //
+  // WHY NOT PVE'S DEFAULT FOR A VM: there the per-type default is `vv` — a
+  // downloaded .vv handed to a native SPICE client, which is not a browser
+  // handoff at all. noVNC is the in-browser console for a VM, so that is what
+  // this returns.
+  const isVm = target.kind === "qemu";
+  url.searchParams.set("console", isVm ? "kvm" : "lxc");
+  url.searchParams.set(isVm ? "novnc" : "xtermjs", "1");
+  url.searchParams.set("vmid", externalId);
+  url.searchParams.set("vmname", target.name);
+  url.searchParams.set("node", target.node);
+  if (isVm) {
+    url.searchParams.set("resize", "off");
+  }
+  // Empty-valued on purpose — PVE's console page expects the parameter present
+  // and blank (it means "no command to run"), so it serializes as `cmd=`. Both
+  // shapes carry it.
+  url.searchParams.set("cmd", "");
+  return url.toString();
+}
+
+/**
  * INSECURE TLS — the insecure transport is a SECOND injectable so a test can
  * assert which one a given config selects, rather than inferring it. Default
  * construction does no I/O and opens no socket, so building it eagerly here
@@ -2319,6 +2471,25 @@ export function createProxmoxProvider(
     // running/offline decoration; it just never gets a Start/Stop entry.
     canControlNode(externalId: string): boolean {
       return /^\d+$/.test(externalId);
+    },
+    // The optional web-console member (§Spec) — the one member whose result
+    // Nexus does not consume itself: it is a URL for the user's browser, where
+    // the PVE web session authenticates, not the token used to resolve it.
+    webConsoleUrl(
+      config: InventorySourceValues,
+      secrets: InventorySourceSecrets,
+      externalId: string
+    ): Promise<string> {
+      return webConsoleUrlImpl(transports, config, secrets, externalId);
+    },
+    // The device half of the web-console gate — guests only, sharing the one
+    // node discriminator with the refusal `webConsoleUrlImpl` raises, so the
+    // marker can never appear on a row whose click the provider would reject.
+    // A cluster node keeps its status decoration and its other menu entries; it
+    // just never offers a console, because a node's shell is not a guest's
+    // noVNC console and PVE serves it from a different place entirely.
+    canWebConsole(externalId: string): boolean {
+      return !isProxmoxNodeExternalId(externalId);
     }
   };
 }

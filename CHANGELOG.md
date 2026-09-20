@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.222] — 2026-09-20
+
+### Added
+
+- **Open Web Console — a Proxmox guest's own console, in your browser, with no address needed.** Right-click any guest synced from a Proxmox source and choose **Open Web Console**: Nexus builds the address of PVE's own console page for that guest — noVNC for a virtual machine, xterm.js for a container, matching the frontend PVE's own Console button opens for each — and opens it in your browser. It needs no address of its own, which is the point — a VM whose guest agent never reported an IP, or one that is simply stopped, imports as an addressless placeholder with nothing to SSH to, and until now that row was a dead end. The credential for the console is the PVE session your browser already holds (the first open may show PVE's login page). Your API token is not that credential and never appears in the address, but it is used: each click spends it on one authenticated guest-location lookup, on the same connection and under the same **Allow a Self-Signed or Mismatched Certificate** setting as a sync, so an invalid or unprivileged token fails that lookup rather than the console. No new secret is stored, and if the provider answering that source's id has changed shape since you configured it, you are asked before the token is read at all — the same confirmation a sync asks. The guest's current node is resolved fresh at the moment you click, so a guest migrated since the last sync opens on the node running it now, and a reverse-proxy mount path in the source's Base URL is preserved. The entry is offered for **guests only** — an imported cluster node has a shell of its own, not a guest console — and carries no running/stopped gate, so a stopped guest opens PVE's own "not running" page. A template still shows the entry, because nothing on a synced row distinguishes one, and choosing it says plainly that a template cannot run and so has no console. Sources whose provider offers no web console (NetBox, EVE-NG) are unchanged: the entry does not appear on their rows at all.
+
 ## [2.8.221] — 2026-09-20
 
 ### Added
