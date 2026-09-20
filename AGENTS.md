@@ -34,7 +34,10 @@ esbuild emits `dist/extension.js`, `dist/webExtension.js`, `dist/services/serial
 
 ## Never do these
 
-- **Never put `[release]` on its own line in a commit message** — that exact line is the opt-in release trigger and publishes irreversibly to the Marketplace and Open VSX. Releases happen only on the maintainer's explicit say-so. Never write `[skip release]` (dead string, matches nothing). When a release IS asked for, the sanctioned path is pushing the `v{version}` tag, which `release.yml` and `publish-openvsx.yml` trigger on directly — not writing the marker line.
+- **Never put `[release]` on its own line in a commit message** — that exact line is the opt-in release trigger and publishes irreversibly to the Marketplace and Open VSX. Never write `[skip release]` (dead string, matches nothing). Two paths exist and they are not equal:
+  - The **merge commit** marker is the maintainer's own route (`auto-release.yml`, `docs/HANDOVER.md`) — legitimate, but never added on anyone else's initiative.
+  - A **branch commit** must never carry it: a squash body carries branch commit body lines verbatim, so a marker written on a branch becomes a marker on the merge and releases something nobody asked to release.
+  - When you are told to cut a release, push the `v{version}` tag — `release.yml` and `publish-openvsx.yml` trigger on it directly, so the job is done without writing the marker at all. Verify first: version matches the CHANGELOG's top heading, the tag does not already exist, CI on `main` is green.
 - Don't bump `package.json` version on outside-contributor PRs (maintainer bumps on merge). Maintainer-authored change PRs do bump the patch version — **CI enforces it**: the `Version bump` check fails any PR whose version has not moved past `main`'s, because a later release onto an existing tag fails with an opaque "tag already exists". A docs-only or chore PR still needs the bump; it does not need a CHANGELOG entry if nothing a user can observe changed.
 - Don't commit: `.claude/`, `.specify/`, `docs/plans/`, `docs/superpowers/` (a few legacy files are still tracked — don't add new ones), `specs/` except `specs/001-scripting-support/contracts/script-api.d.ts`, `dist/`, `coverage/`, `*.vsix`, secrets or real hostnames.
 - No model identifiers in commit messages, PR text, or comments.
