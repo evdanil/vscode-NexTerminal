@@ -7,6 +7,7 @@ import {
   planDetailDrift,
   planWarningsBuffer,
   registerInventoryCommands,
+  NODE_CONTROL_STATUS_RECHECK_MS,
   type InventoryRuntimeTeardown
 } from "../../src/commands/inventoryCommands";
 import { InventorySourceRemovalMismatchError, NexusCore } from "../../src/core/nexusCore";
@@ -8351,6 +8352,8 @@ describe("inventoryCommands", () => {
    * is refused with a message rather than offered an action that can only fail.
    */
   describe("nexus.inventory.startNode / stopNode", () => {
+    const trackedDisposables: Array<{ dispose: () => void }> = [];
+
     async function setup(
       opts: {
         withControl?: boolean;
@@ -8377,7 +8380,8 @@ describe("inventoryCommands", () => {
       const provider = makeProvider(withControl ? { controlNode: opts.controlNode ?? controlSpy } : {});
       registry.register(provider);
       const vault = makeVault(opts.secrets ?? {});
-      registerInventoryCommands(core, registry, vault, makeTeardown());
+      const disposables = registerInventoryCommands(core, registry, vault, makeTeardown());
+      trackedDisposables.push(...disposables);
       await core.addOrUpdateInventorySource(
         makeSource({
           id: "src-1",
@@ -8387,7 +8391,24 @@ describe("inventoryCommands", () => {
       );
       const start = registeredCommands.get("nexus.inventory.startNode")!;
       const stop = registeredCommands.get("nexus.inventory.stopNode")!;
-      return { core, registry, vault, provider, controlSpy, server, start, stop };
+      return { core, registry, vault, provider, controlSpy, server, start, stop, disposables };
+    }
+
+    /**
+     * Every `setup()` leaves live command disposables behind, and one of them
+     * owns the pending post-control status re-check. Disposing them here stops a
+     * timer armed by one test from firing a refresh into the next one's
+     * expectations.
+     */
+    afterEach(() => {
+      while (trackedDisposables.length > 0) {
+        trackedDisposables.pop()!.dispose();
+      }
+    });
+
+    /** The `nexus.inventory.refreshStatus` invocations so far, in order, by argument. */
+    function statusRefreshArgs(): unknown[] {
+      return mockExecuteCommand.mock.calls.filter((call) => call[0] === "nexus.inventory.refreshStatus").map((call) => call[1]);
     }
 
     it("registers both startNode and stopNode command handlers", async () => {
@@ -8464,7 +8485,82 @@ describe("inventoryCommands", () => {
       const { start, server } = await setup();
       await start({ server });
       const info = mockShowInformationMessage.mock.calls.map((c) => String(c[0])).join("\n");
-      expect(info).toBe('Start sent to "R1" — it takes a few seconds to take effect, and the status catches up on its own.');
+      expect(info).toBe('Start sent to "R1" — it takes a few seconds to take effect, and Nexus re-checks the status after that.');
+    });
+
+    /**
+     * WHAT THE TOAST PROMISES MUST ACTUALLY HAPPEN. The per-source status poll is
+     * OFF unless someone turned it on — both providers' readers resolve an absent
+     * interval to 0 — so in the DEFAULT configuration the immediate refresh fired
+     * beside the toast is the only automatic re-ask, and it goes out the instant
+     * the API returned, while the device is still transitioning. A toast that says
+     * the status is re-checked afterwards is only true if a SECOND refresh
+     * actually fires. It goes out in the poll's silent form because nobody is
+     * waiting on it: the manual form warns when a refresh fails, and a warning
+     * arriving seconds after a successful Start is a nag about something the user
+     * did not ask for.
+     */
+    it("RE-CHECKS the status a few seconds after the dispatch — a second, silent refresh in the poll's own form (⊘ with the poll off, which is the DEFAULT, the immediate refresh observes the pre-transition state and the row stays stale until the user acts — so the toast's promise is false)", async () => {
+      vi.useFakeTimers();
+      try {
+        const { start, server } = await setup();
+        await start({ server });
+        expect(statusRefreshArgs()).toEqual(["src-1"]);
+        await vi.advanceTimersByTimeAsync(NODE_CONTROL_STATUS_RECHECK_MS - 1);
+        expect(statusRefreshArgs()).toEqual(["src-1"]);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(statusRefreshArgs()).toEqual(["src-1", { sourceId: "src-1", __poll: true }]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("the re-check delay is a FEW seconds — what the toast says (⊘ a minute-scale delay makes the sentence a lie in the other direction)", () => {
+      expect(NODE_CONTROL_STATUS_RECHECK_MS).toBeGreaterThan(1000);
+      expect(NODE_CONTROL_STATUS_RECHECK_MS).toBeLessThanOrEqual(15_000);
+    });
+
+    it("the re-check does NOT stack — repeated Start/Stop on one source leaves exactly ONE pending re-check (⊘ a timer per click hammers the lab box once for every impatient double-click)", async () => {
+      vi.useFakeTimers();
+      try {
+        const { start, stop, server } = await setup();
+        await start({ server });
+        await stop({ server });
+        await start({ server });
+        await vi.advanceTimersByTimeAsync(NODE_CONTROL_STATUS_RECHECK_MS * 4);
+        const rechecks = statusRefreshArgs().filter((arg) => typeof arg === "object");
+        expect(rechecks).toEqual([{ sourceId: "src-1", __poll: true }]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("a pending re-check is DROPPED when its source is gone by the time it fires (⊘ refreshing a removed source asks the registry to work for a record that no longer exists)", async () => {
+      vi.useFakeTimers();
+      try {
+        const { start, server, core } = await setup();
+        await start({ server });
+        await core.removeInventorySource("src-1");
+        await vi.advanceTimersByTimeAsync(NODE_CONTROL_STATUS_RECHECK_MS * 4);
+        expect(statusRefreshArgs().filter((arg) => typeof arg === "object")).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("DISPOSING the commands cancels a pending re-check, so no timer outlives the extension host (⊘ a stray timer wakes up after deactivate and fires a command into a disposed extension)", async () => {
+      vi.useFakeTimers();
+      try {
+        const { start, server, disposables } = await setup();
+        await start({ server });
+        for (const disposable of disposables) {
+          disposable.dispose();
+        }
+        await vi.advanceTimersByTimeAsync(NODE_CONTROL_STATUS_RECHECK_MS * 4);
+        expect(statusRefreshArgs().filter((arg) => typeof arg === "object")).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     /**

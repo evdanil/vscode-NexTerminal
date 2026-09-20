@@ -2404,6 +2404,28 @@ function referencedTemplatesChanged(shown: Map<string, string | undefined>, curr
   return false;
 }
 
+/**
+ * NODE CONTROL — how long after a dispatched Start/Stop the follow-up status
+ * re-check waits before it fires.
+ *
+ * A device does not change state at the instant its API accepts the request, so
+ * the refresh fired beside the toast routinely reads the state the node is
+ * LEAVING. The per-source status poll would cover that — but it is OFF unless a
+ * user turned it on (both providers' readers resolve an absent interval to 0),
+ * and nothing else re-asks on its own, so in the default configuration a single
+ * immediate refresh leaves the row stale until the user syncs or refreshes by
+ * hand. One delayed re-check is what makes the row converge with nothing to
+ * click, and it is what the success toast says happens.
+ *
+ * FIVE SECONDS is chosen to match the sentence ("a few seconds") rather than to
+ * outlast a boot: the state being read is the hypervisor's own running/stopped
+ * flag, which flips when the node is started, not when its guest OS is up. A
+ * longer wait would cover more slow starts at the cost of a row that sits wrong
+ * for longer in the common case — and the re-check is best-effort either way,
+ * which is why the toast promises the CHECK and not the result.
+ */
+export const NODE_CONTROL_STATUS_RECHECK_MS = 5_000;
+
 export function registerInventoryCommands(
   core: NexusCore,
   registry: InventoryProviderRegistry,
@@ -2437,6 +2459,45 @@ export function registerInventoryCommands(
    */
   const releaseSourceClaim = (sourceId: string): void => {
     inFlightSourceIds.delete(sourceId);
+  };
+
+  /**
+   * PENDING POST-CONTROL STATUS RE-CHECKS, one entry per source at most.
+   *
+   * A scheduled timer is a promise the extension has to keep, so the three ways
+   * it could become worse than the stale row it fixes are each closed here:
+   *  - it does not STACK — a second Start/Stop on the same source replaces that
+   *    source's pending timer instead of adding one, so an impatient
+   *    double-click still costs exactly one re-check;
+   *  - it does not OUTLIVE the extension — the disposable returned alongside the
+   *    commands clears every pending timer, so nothing wakes up after
+   *    deactivate to fire a command into a disposed extension host;
+   *  - it does not fire for a source that is GONE — the source is re-read when
+   *    the timer fires, five seconds being ample for a Remove Source in between.
+   *
+   * Uses the global `setTimeout` so the unit tests drive it with fake timers.
+   */
+  const pendingStatusRechecks = new Map<string, ReturnType<typeof setTimeout>>();
+
+  const scheduleStatusRecheck = (sourceId: string): void => {
+    const pending = pendingStatusRechecks.get(sourceId);
+    if (pending !== undefined) {
+      clearTimeout(pending);
+    }
+    pendingStatusRechecks.set(
+      sourceId,
+      setTimeout(() => {
+        pendingStatusRechecks.delete(sourceId);
+        if (core.getInventorySource(sourceId) === undefined) {
+          return;
+        }
+        // The POLL form (`__poll`), not the manual one: nobody is waiting on
+        // this refresh, and the manual path warns when a refresh fails — a
+        // warning arriving seconds after a Start the user already saw succeed is
+        // a nag about something they never asked for.
+        void vscode.commands.executeCommand("nexus.inventory.refreshStatus", { sourceId, __poll: true });
+      }, NODE_CONTROL_STATUS_RECHECK_MS)
+    );
   };
 
   // LIVE STATUS (Phase 2) — monotonic status-refresh generation, PER SOURCE.
@@ -5409,24 +5470,31 @@ export function registerInventoryCommands(
       return;
     }
     // HONEST completion toast — the API has already returned by now, but the
-    // device boots over seconds, so the state on the row lags. Say that, rather
-    // than phrasing it as if the request were about to be sent.
+    // device changes state over seconds, so the state on the row lags. Say that,
+    // rather than phrasing it as if the request were about to be sent.
     //
     // It names NO COMMAND, and no provider's vocabulary. This one string is what
     // BOTH node-control providers show, so "lab"/"Refresh Lab Status" was EVE-NG's
     // word on a Proxmox guest — the same reason the row's `Status:` tooltip line
-    // dropped it. And the command it used to prescribe is one the user has no
-    // reason to run: `refreshStatus` for this source fires four lines below, the
-    // source's status poll re-asks while the Command Center is open, and both
-    // providers' syncs now carry status. The state catches up with nothing to
-    // click, which is what the sentence says.
+    // dropped it.
+    //
+    // And it promises only what the two lines below actually do: a refresh now
+    // and a second one a few seconds from now. It deliberately does NOT claim the
+    // row will be right — a re-check can be declined (the source may be busy) and
+    // a slow start can outrun it, in which case a sync or a manual refresh is
+    // what fixes the row. Promising the CHECK is a promise this handler keeps; an
+    // earlier "the status catches up on its own" was not, because with the
+    // per-source poll off — its default — nothing else re-asked at all.
     const sent = action === "start" ? "Start" : "Stop";
     void vscode.window.showInformationMessage(
-      `${sent} sent to "${server.name}" — it takes a few seconds to take effect, and the status catches up on its own.`
+      `${sent} sent to "${server.name}" — it takes a few seconds to take effect, and Nexus re-checks the status after that.`
     );
-    // Best-effort, NOT awaited — the node takes seconds to boot, so the status
-    // will lag this refresh by a poll or two, which is expected.
+    // Best-effort, NOT awaited. This one goes out while the device is still
+    // transitioning and will often read the state it is leaving — it is here for
+    // the case that resolves immediately; the delayed re-check is what covers the
+    // rest.
     void vscode.commands.executeCommand("nexus.inventory.refreshStatus", source.id);
+    scheduleStatusRecheck(source.id);
   }
 
   /**
@@ -5633,6 +5701,21 @@ export function registerInventoryCommands(
     // there is no useful palette form), gated in package.json on the tree's
     // `.webConsole` marker; the handler re-guards on both halves of the
     // capability.
-    vscode.commands.registerCommand("nexus.inventory.openWebConsole", (arg?: unknown) => openWebConsole(arg))
+    vscode.commands.registerCommand("nexus.inventory.openWebConsole", (arg?: unknown) => openWebConsole(arg)),
+    // Not a command — the owner of the pending post-control status re-checks.
+    // It rides in this array because that is what the extension disposes on
+    // deactivate, and a timer that survives it would fire a command at a host
+    // that has torn the extension down. A plain object rather than
+    // `new vscode.Disposable(...)`: `dispose()` is the whole of the type, and the
+    // literal (extension.ts uses the same idiom) keeps the unit tests that
+    // register these commands from needing the constructor on their `vscode` mock.
+    {
+      dispose: () => {
+        for (const timer of pendingStatusRechecks.values()) {
+          clearTimeout(timer);
+        }
+        pendingStatusRechecks.clear();
+      }
+    }
   ];
 }
