@@ -42,8 +42,11 @@ import { wireViewVisibility, type VisibilityAwareView } from "../terminal/viewVi
  * pollable. The arm fire (the immediate tick on a source's not-running →
  * running transition) can legitimately be DECLINED by `refreshStatus`: the
  * source may be claimed by a sibling command (mid-sync/edit/remove/control),
- * or its declared credential may not be in the vault yet (mid-restore of a
- * backup). Both blockers clear moments later — and used to announce that
+ * its declared credential may not be in the vault yet (mid-restore of a
+ * backup), or the extension now answering its provider id may declare a
+ * different shape from the one the source was configured against, which
+ * `refreshStatus` refuses silently rather than asking about on a background
+ * tick. The first two clear moments later — and used to announce that
  * through two cross-module notification channels (a per-source "claim
  * released" observer on the inventory commands, and the config-mutation
  * lock's queue-drained event), which the scheduler redeemed against a
@@ -60,9 +63,11 @@ import { wireViewVisibility, type VisibilityAwareView } from "../terminal/viewVi
  * window for a notification to fall into, because there is no notification.
  *
  * What a warm retry COSTS, stated plainly: a declined fire never reaches the
- * network. `refreshStatus` refuses a claimed source, and a source with a
- * missing declared credential, BEFORE any provider call — the pre-checks are
- * map lookups and local `SecretStorage` reads. The only warm retry that
+ * network. `refreshStatus` refuses a claimed source, a source with a missing
+ * declared credential, and a source whose provider id has been re-registered
+ * with a different shape, BEFORE any provider call — the pre-checks are map
+ * lookups and local `SecretStorage` reads (the trust check is cheaper still:
+ * a fingerprint compare with no read at all). The only warm retry that
  * reaches the lab box is the one that succeeds. The warm delay still BACKS
  * OFF (5 s doubling per declined retry, capped at the source's own configured
  * period), so a source whose credentials never arrive converges to polling
@@ -71,6 +76,13 @@ import { wireViewVisibility, type VisibilityAwareView } from "../terminal/viewVi
  * is latency: a blocker that clears is noticed by the NEXT warm tick rather
  * than at the instant it clears, i.e. within the current warm delay (5 s in
  * every fresh arming; more only after repeated declines).
+ *
+ * THE TRUST REFUSAL IS THE ONE BLOCKER THAT NEED NEVER CLEAR, and the warm-up
+ * is stated here so that is not read as an oversight. Nobody but the user can
+ * end it — by answering the Continue/Cancel modal an interactive path raises —
+ * so an affected source stays `warming` indefinitely, at the backed-off delay,
+ * costing one map lookup per tick. A manual Refresh Inventory Status is where
+ * it is SAID: this scheduler never speaks.
  *
  * Kept in its own `vscode`-free module (only the type-only `VisibilityAwareView`
  * import, erased at compile time) so it unit-tests with a plain fake view and
@@ -116,10 +128,13 @@ export interface InventoryStatusPollSource {
 export interface InventoryStatusPollFireResult {
   /**
    * FALSE when no refresh actually happened for this source AND something later
-   * can change that: it was mid-sync/edit/remove/control, or its credentials
-   * were not in the vault yet. A provider that simply has no status to give, or
-   * a lab box that answered with an error, both count as RAN — the tick did its
-   * job and there is nothing to retry for.
+   * can change that: it was mid-sync/edit/remove/control, its credentials were
+   * not in the vault yet, or its provider id is answered by a registrant of a
+   * different shape than the source was configured against (there "later" means
+   * the user confirming the change, not a blocker draining on its own). A
+   * provider that simply has no status to give, or a lab box that answered with
+   * an error, both count as RAN — the tick did its job and there is nothing to
+   * retry for.
    */
   ran: boolean;
 }

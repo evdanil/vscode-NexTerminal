@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import {
   adoptionCandidateKeys,
   adoptionPairKeys,
@@ -11668,5 +11670,293 @@ describe("planWarningsBuffer — provider text in the audit lists", () => {
     expect(buffer.some((line) => line.includes("\n"))).toBe(false);
     expect(buffer).toContain('  "switching "prod-db""');
     expect(buffer).toContain('  "clearing "prod-db""');
+  });
+});
+
+/**
+ * PROVIDER TRUST ON THE STATUS REFRESH. `refreshStatus` is the only automatic,
+ * repeating path that spends a source's stored credentials: the visible-gated
+ * poll re-resolves `registry.get(source.providerId)` on every tick. It
+ * therefore gets the SILENT half of the trust gate — a registrant whose
+ * declared shape no longer matches what the source was configured against is
+ * refused before any vault read, and nothing is prompted, because a modal on an
+ * unattended repeating path is a nag rather than a question.
+ */
+describe("nexus.inventory.refreshStatus — provider trust fingerprint", () => {
+  const trackedDisposables: Array<{ dispose: () => void }> = [];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewOpen.mockImplementation(() => makeFakePanel());
+  });
+
+  /**
+   * Every setup below leaves live command disposables behind, one of which owns
+   * the pending post-control status re-check timer. Disposing them here stops a
+   * timer armed by one test firing a refresh into the next one's expectations.
+   */
+  afterEach(() => {
+    while (trackedDisposables.length > 0) {
+      trackedDisposables.pop()!.dispose();
+    }
+  });
+
+  const REPORT = { contractVersion: 1 as const, statuses: { "dev#1": { state: "running" as const } } };
+  /** A stamp taken against a provider shape the current registrant does not have. */
+  const STALE = "stamped-against-a-different-shape";
+  const TOTAL_FAILURE = "Could not refresh live status from any inventory source";
+
+  /** Sources sharing one `fetchStatus` provider, each with its own vaulted apiToken. */
+  async function setup(sources: { id: string; name: string; providerFingerprint?: string }[]) {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => REPORT);
+    registry.register(makeProvider({ fetchStatus }));
+    const vault = makeVault(Object.fromEntries(sources.map((s) => [inventorySecretKey(s.id, "apiToken"), "tok"])));
+    trackedDisposables.push(...registerInventoryCommands(core, registry, vault, makeTeardown()));
+    for (const s of sources) {
+      await core.addOrUpdateInventorySource(
+        makeSource({
+          id: s.id,
+          name: s.name,
+          secretFieldIds: ["apiToken"],
+          ...(s.providerFingerprint !== undefined ? { providerFingerprint: s.providerFingerprint } : {})
+        })
+      );
+    }
+    return {
+      core,
+      registry,
+      vault,
+      fetchStatus,
+      refresh: registeredCommands.get("nexus.inventory.refreshStatus")! as (arg?: unknown) => Promise<{ unrefreshedSourceIds: string[] }>
+    };
+  }
+
+  /** Every message passed to showWarningMessage as its SOLE argument (i.e. not a modal). */
+  function notifications(): string[] {
+    return mockShowWarningMessage.mock.calls.filter((call) => call.length === 1).map((call) => String(call[0]));
+  }
+
+  it("REFUSES a source whose registrant declares a different shape — neither the vault nor the provider is reached (⊘ an ungated status sweep hands the stored credentials to a re-registered id on every poll tick)", async () => {
+    const { refresh, vault, fetchStatus } = await setup([{ id: "src-1", name: "Alpha", providerFingerprint: STALE }]);
+
+    // Reported as unrefreshed: the poll can make good on it once the user has
+    // confirmed the change on an interactive path.
+    await expect(refresh({ sourceId: "src-1", __poll: true })).resolves.toEqual({ unrefreshedSourceIds: ["src-1"] });
+
+    // The vault mock, not only the provider: the secrets must never leave
+    // SecretStorage, whatever the provider call would have done with them.
+    expect(vault.get).not.toHaveBeenCalled();
+    expect(fetchStatus).not.toHaveBeenCalled();
+  });
+
+  it("stays SILENT on the poll form — no notification and no modal (⊘ a question asked on a background tick fires unattended and repeatedly, which is what trains a user to dismiss it)", async () => {
+    const { refresh } = await setup([{ id: "src-1", name: "Alpha", providerFingerprint: STALE }]);
+
+    await refresh({ sourceId: "src-1", __poll: true });
+
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("MANUAL form warns ONCE, names the refused source and names the command that clears it (⊘ a silent manual refresh leaves the row frozen with nothing on screen to explain it)", async () => {
+    const { refresh } = await setup([{ id: "src-1", name: "Alpha", providerFingerprint: STALE }]);
+
+    await refresh("src-1");
+
+    expect(notifications()).toHaveLength(1);
+    expect(notifications()[0]).toContain('"Alpha"');
+    expect(notifications()[0]).toContain("Sync Inventory Now");
+    // A report, never a question: the sweep raises no modal of its own.
+    expect(mockShowWarningMessage.mock.calls.every((call) => call.length === 1)).toBe(true);
+  });
+
+  it("names every refused source in ONE message on a multi-source manual sweep (⊘ one notification per source stacks a pile of them on a sweep of a whole inventory)", async () => {
+    const { refresh } = await setup([
+      { id: "src-1", name: "Alpha", providerFingerprint: STALE },
+      { id: "src-2", name: "Beta", providerFingerprint: STALE }
+    ]);
+
+    await refresh();
+
+    expect(notifications()).toHaveLength(1);
+    expect(notifications()[0]).toContain('"Alpha"');
+    expect(notifications()[0]).toContain('"Beta"');
+  });
+
+  it("a refused source does NOT trigger the total-failure verdict on a single-source manual refresh (⊘ counting a refusal in `attempted` fires a second warning telling the user to check credentials and connectivity, neither of which is what is wrong)", async () => {
+    const { refresh } = await setup([{ id: "src-1", name: "Alpha", providerFingerprint: STALE }]);
+
+    await refresh("src-1");
+
+    // EXACTLY ONE message — the refusal — and the count is the load-bearing
+    // half. A tally that counted the refusal in `attempted` still renders the
+    // refusal correctly, so only the absence of the SECOND notification
+    // separates the two implementations.
+    expect(notifications()).toHaveLength(1);
+    expect(notifications().some((message) => message.includes(TOTAL_FAILURE))).toBe(false);
+  });
+
+  it("a MATCHING stamp and an UNSTAMPED source both proceed exactly as before (⊘ a gate that refuses either way silently stops live status for every source in the product)", async () => {
+    const { refresh, vault, fetchStatus } = await setup([
+      { id: "src-1", name: "Alpha", providerFingerprint: computeProviderFingerprint(makeProvider()) },
+      { id: "src-2", name: "Beta" }
+    ]);
+
+    await expect(refresh()).resolves.toEqual({ unrefreshedSourceIds: [] });
+
+    expect(vault.get).toHaveBeenCalledWith(inventorySecretKey("src-1", "apiToken"));
+    expect(vault.get).toHaveBeenCalledWith(inventorySecretKey("src-2", "apiToken"));
+    expect(fetchStatus).toHaveBeenCalledTimes(2);
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  /**
+   * THE SESSION LATCH. An interactive Continue is remembered for this window
+   * only — never stamped, never persisted — so the background reads the user
+   * has just authorised (including the re-check a Start/Stop toast promises)
+   * are not refused seconds after they answered. Keyed by the EXACT fingerprint
+   * they were shown, so a second re-registration asks again.
+   */
+  describe("session confirmation latch", () => {
+    /** Two sources on one node-control + status provider, plus a server to Start. */
+    async function setupWithNodeControl() {
+      const server = makeServer({
+        id: "eve-1",
+        name: "R1",
+        origin: { sourceId: "src-1", externalId: "/Lab.unl#3", syncedAt: 1 }
+      });
+      const core = new NexusCore(new InMemoryConfigRepository([server]));
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const fetchStatus = vi.fn(async () => REPORT);
+      const controlSpy = vi.fn(async () => {});
+      const registration = registry.register(makeProvider({ fetchStatus, controlNode: controlSpy }));
+      const vault = makeVault({
+        [inventorySecretKey("src-1", "apiToken")]: "tok",
+        [inventorySecretKey("src-2", "apiToken")]: "tok"
+      });
+      trackedDisposables.push(...registerInventoryCommands(core, registry, vault, makeTeardown()));
+      for (const id of ["src-1", "src-2"]) {
+        await core.addOrUpdateInventorySource(
+          makeSource({ id, name: id === "src-1" ? "Alpha" : "Beta", secretFieldIds: ["apiToken"], providerFingerprint: STALE })
+        );
+      }
+      return {
+        core,
+        registry,
+        registration,
+        vault,
+        fetchStatus,
+        controlSpy,
+        server,
+        start: registeredCommands.get("nexus.inventory.startNode")!,
+        refresh: registeredCommands.get("nexus.inventory.refreshStatus")! as (arg?: unknown) => Promise<{ unrefreshedSourceIds: string[] }>
+      };
+    }
+
+    it("a Continue on an interactive path lets the next POLL refresh of that source proceed (⊘ without it, the re-check the Start/Stop toast promises is refused seconds after the user confirmed the very same change)", async () => {
+      const { start, server, vault, fetchStatus, refresh, core } = await setupWithNodeControl();
+      mockShowWarningMessage.mockResolvedValueOnce("Continue");
+      await start({ server });
+      vault.get.mockClear();
+      fetchStatus.mockClear();
+
+      await expect(refresh({ sourceId: "src-1", __poll: true })).resolves.toEqual({ unrefreshedSourceIds: [] });
+
+      expect(vault.get).toHaveBeenCalledWith(inventorySecretKey("src-1", "apiToken"));
+      expect(fetchStatus).toHaveBeenCalledTimes(1);
+      // RUNTIME ONLY — the latch is not a stamp. The record still carries the
+      // old fingerprint, so the next interactive path asks again.
+      expect(core.getInventorySource("src-1")?.providerFingerprint).toBe(STALE);
+    });
+
+    it("CANCEL does not latch — a following refresh still refuses (⊘ latching on the dismissal blesses precisely the registrant the user declined)", async () => {
+      const { start, server, vault, fetchStatus, refresh } = await setupWithNodeControl();
+      mockShowWarningMessage.mockResolvedValueOnce(undefined);
+      await start({ server });
+      expect(vault.get).not.toHaveBeenCalled();
+
+      await expect(refresh({ sourceId: "src-1", __poll: true })).resolves.toEqual({ unrefreshedSourceIds: ["src-1"] });
+
+      expect(fetchStatus).not.toHaveBeenCalled();
+    });
+
+    it("is PER SOURCE — confirming src-1 does not unblock src-2 (⊘ a latch keyed by provider id blesses every source of that provider off one Continue)", async () => {
+      const { start, server, refresh } = await setupWithNodeControl();
+      mockShowWarningMessage.mockResolvedValueOnce("Continue");
+      await start({ server });
+
+      await expect(refresh({ sourceId: "src-2", __poll: true })).resolves.toEqual({ unrefreshedSourceIds: ["src-2"] });
+    });
+
+    it("is keyed by the EXACT fingerprint — a SECOND re-registration of a different shape is refused despite the earlier Continue (⊘ keying by source id alone rides one answer into every later registrant of that id)", async () => {
+      const { start, server, registry, registration, refresh, vault } = await setupWithNodeControl();
+      mockShowWarningMessage.mockResolvedValueOnce("Continue");
+      await start({ server });
+      vault.get.mockClear();
+
+      // The id is freed and reclaimed by a registrant of a THIRD shape — the
+      // exact case the latch must not cover.
+      registration.dispose();
+      registry.register(makeProvider({ label: "Something Else Entirely", fetchStatus: vi.fn(async () => REPORT) }));
+
+      await expect(refresh({ sourceId: "src-1", __poll: true })).resolves.toEqual({ unrefreshedSourceIds: ["src-1"] });
+      expect(vault.get).not.toHaveBeenCalled();
+    });
+  });
+});
+
+/**
+ * A SOURCE-TEXT INVARIANT, and the only mechanism that makes the trust claim
+ * real. `vault` is in scope for the whole of `registerInventoryCommands`, there
+ * is no linter in this repo, and nothing else notices a tenth
+ * `vault.get(inventorySecretKey(...))` appearing on an ungated path. Pinning
+ * the COUNT turns adding one into a deliberate act that has to be argued for in
+ * the diff.
+ */
+describe("inventoryCommands — the secret reads are counted", () => {
+  const source = readFileSync(path.resolve(__dirname, "..", "..", "src", "commands", "inventoryCommands.ts"), "utf8");
+
+  it("has exactly the NINE sanctioned reads of an inventory secret (⊘ a name check passes any number of call sites, which is how an ungated tenth one ships unnoticed)", () => {
+    // CALL SITES ONLY — a comment that merely names the call (the doc on
+    // `providerStillTrustedSilently` does, so the grep that finds this test
+    // finds the rule too) is prose, not a read.
+    const callSites =
+      source
+        .split("\n")
+        .filter((line) => !/^\s*(\*|\/\/|\/\*)/.test(line))
+        .join("\n")
+        .split("vault.get(inventorySecretKey(").length - 1;
+    expect(
+      callSites,
+      [
+        "The number of `vault.get(inventorySecretKey(...))` call sites in",
+        "src/commands/inventoryCommands.ts has changed.",
+        "",
+        "The nine sanctioned sites, and what gates each:",
+        "  1. persistUpdatedInventorySource — reads the PREVIOUS value so a failed",
+        "     save can be rolled back. Hands nothing to a provider, so no gate.",
+        "  2. handleFormTest (`hydrateFrom`) — gated by editSource's",
+        "     checkProviderFingerprint, taken before the form ever opens.",
+        "  3. removeSource — restores the secrets it deleted when the removal",
+        "     failed. Hands nothing to a provider, so no gate.",
+        "  4-6. syncNow: the required-field loop, the payload loop, and the re-read",
+        "     inside the locked attempt — all gated by syncNow's",
+        "     checkProviderFingerprint.",
+        "  7. providerStillTrustedSilently — the status refresh, gated by the",
+        "     silent verdict computed in that same function.",
+        "  8. controlNode — gated by its checkProviderFingerprint.",
+        "  9. openWebConsole — gated by its checkProviderFingerprint.",
+        "",
+        "IF YOU ADDED A SITE it spends a source's stored credentials. Say in the",
+        "diff which gate it sits behind — checkProviderFingerprint on a path a",
+        "user drove, providerStillTrustedSilently on anything automatic — then",
+        "add it to the list above and raise this count.",
+        "IF YOU REMOVED OR MOVED ONE, drop it from the list and lower the count."
+      ].join("\n")
+    ).toBe(9);
   });
 });
