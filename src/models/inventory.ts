@@ -707,14 +707,76 @@ export function capProviderText(text: string, maxLength: number, trimTrailing: R
   if (text.length <= maxLength) {
     return text;
   }
-  // One character of the budget belongs to the ellipsis, so the result is never
-  // longer than the cap it is named for.
-  const clipped = text.slice(0, maxLength - 1);
+  // One unit of the budget belongs to the ellipsis, so the result is never
+  // longer than the cap it is named for. The clip lands on a TEXT boundary, so
+  // it may come back shorter than asked — see `clipToTextBoundary`.
+  const clipped = clipToTextBoundary(text, maxLength - 1);
   const lastSpace = clipped.lastIndexOf(" ");
   // A value with no space inside the budget is one unbroken token — there is no
-  // boundary to prefer, so the hard cut is the only honest cut.
+  // boundary to prefer, so the hard cut is the only honest cut. It is also the
+  // only path that can land mid-character, which is why the clip above is
+  // boundary-aware rather than a bare `slice`.
   const body = (lastSpace > 0 ? clipped.slice(0, lastSpace) : clipped).replace(trimTrailing, "");
   return `${body}\u2026`;
+}
+
+/**
+ * Grapheme segmenter, built once and only if the runtime has one.
+ *
+ * `Intl.Segmenter` is standard in the Node the extension host runs and in every
+ * browser the web build targets, but this module is in the browser graph too and
+ * the fallback below costs three lines — cheap insurance against one runtime
+ * where the modal would otherwise show a mangled name.
+ */
+const GRAPHEME_SEGMENTER =
+  typeof Intl !== "undefined" && typeof Intl.Segmenter === "function"
+    ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+    : undefined;
+
+/**
+ * The longest prefix of `text` that is at most `limit` UTF-16 units AND ends on
+ * a character boundary the reader would recognize.
+ *
+ * WHY NOT A BARE `slice`: JavaScript counts UTF-16 units, so a cut at an
+ * arbitrary index can fall between the halves of an astral code point (emoji,
+ * the CJK extension blocks) and leave a lone surrogate, which renders as a
+ * replacement glyph. That corrupts the very name or explanation the user is
+ * reading in order to decide whether to approve a destructive sync — the one
+ * string in the dialog they are checking against their own knowledge.
+ *
+ * WHY GRAPHEMES rather than merely whole code points: a ZWJ emoji sequence or a
+ * base character plus its combining marks can be cut without splitting any
+ * surrogate pair, and the result still MISREPRESENTS the value — a different
+ * emoji, or a letter that lost its accent. The same argument that rules out the
+ * lone surrogate rules this out too, and `Intl.Segmenter` gets it right for a
+ * few lines on a path that runs only when a value is over its cap.
+ *
+ * THE UNIT THE CAP COUNTS is unchanged: UTF-16 units, the same thing
+ * `String.length` reports, so a caller's cap means what it appears to mean. What
+ * changes is that the prefix may be SHORTER than the cap — a boundary rarely
+ * falls exactly on it — never longer.
+ */
+function clipToTextBoundary(text: string, limit: number): string {
+  if (limit <= 0) {
+    return "";
+  }
+  if (text.length <= limit) {
+    return text;
+  }
+  if (GRAPHEME_SEGMENTER !== undefined) {
+    let end = 0;
+    for (const { segment } of GRAPHEME_SEGMENTER.segment(text)) {
+      if (end + segment.length > limit) {
+        break;
+      }
+      end += segment.length;
+    }
+    return text.slice(0, end);
+  }
+  // No segmenter: hold the floor by refusing to end on a high surrogate, whose
+  // low half is what the cut would have taken.
+  const code = text.charCodeAt(limit - 1);
+  return text.slice(0, code >= 0xd800 && code <= 0xdbff ? limit - 1 : limit);
 }
 
 /**

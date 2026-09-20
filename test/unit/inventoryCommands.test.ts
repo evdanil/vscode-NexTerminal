@@ -10788,6 +10788,26 @@ describe("describePlanDetail — pruned servers whose device is still at the sou
     expect(blank).toContain("(unnamed) is still at the source — it was not synced because it is now a template.");
   });
 
+  it("never cuts a rendered NAME mid-CHARACTER, and keeps a grapheme cluster whole — an emoji astride the cap is dropped rather than halved into a lone surrogate, and a ZWJ sequence is not left as a fragment of itself (⊘ the one dialog where the user is trying to RECOGNIZE their server shows it with a replacement glyph or a different emoji than the device carries)", () => {
+    // An astral pair astride index 79, in an unbroken token: the hard-cut path.
+    const astride = `${"n".repeat(78)}\u{1F600}${"n".repeat(10)}`;
+    const detail = describePlanDetail(makeSyncPlan({ prunes: [orphanPrune(astride, REASON)] }), []);
+    const rendered = detail.split("\n").find((l) => l.includes("still at the source"))!.slice(1);
+    const name = rendered.slice(0, rendered.indexOf('" is still'));
+    expect([...name].filter((c) => c.codePointAt(0)! >= 0xd800 && c.codePointAt(0)! <= 0xdfff)).toEqual([]);
+    expect(name.length).toBeLessThanOrEqual(80);
+    expect(name).toBe(`${"n".repeat(78)}…`);
+
+    // A ZWJ family emoji straddling the cap splits on a PAIR boundary without
+    // splitting a surrogate — so surrogate-safety alone would leave "\u{1F468}‍\u{1F469}",
+    // a different family than the device carries. The whole cluster goes.
+    const cluster = `${"n".repeat(74)}\u{1F468}‍\u{1F469}‍\u{1F467}${"x".repeat(20)}`;
+    const clusterDetail = describePlanDetail(makeSyncPlan({ prunes: [orphanPrune(cluster, REASON)] }), []);
+    const clusterLine = clusterDetail.split("\n").find((l) => l.includes("still at the source"))!;
+    expect(clusterLine).toContain(`"${"n".repeat(74)}…"`);
+    expect(clusterLine).not.toContain("\u{1F468}");
+  });
+
   it("renders the same disclosure on the DELETE and KEEP lines (kills an orphan-only render — the user about to lose a server permanently is the one who most needs to know the guest still exists)", () => {
     const deleteServer = makeServer({ id: "owned-d", name: "idm.defcon.local" });
     const deleteDetail = describePlanDetail(makeSyncPlan({ prunes: [{ policy: "delete", server: deleteServer, reason: REASON }] }), []);

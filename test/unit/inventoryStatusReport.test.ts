@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   controlProviderNode,
   fetchProviderStatus,
@@ -263,6 +263,47 @@ describe("validateInventoryStatusReport", () => {
       notSyncableReasons: { "1": "x".repeat(400) }
     });
     expect(oneWord!.notSyncableReasons!["1"].length).toBe(120);
+  });
+
+  it("never cuts a reason mid-CHARACTER — an astral code point sitting exactly on the truncation boundary is dropped whole, not halved into a lone surrogate (⊘ the modal renders the broken half as a replacement glyph, corrupting the explanation the user is reading to decide whether to approve a destructive sync)", () => {
+    // 118 ASCII + an emoji (2 UTF-16 units) puts the pair astride index 119 —
+    // the exact hard-cut boundary — and the token is unbroken, which is the
+    // path that takes the hard cut rather than backing up to a space.
+    const astride = `${"a".repeat(118)}\u{1F600}${"b".repeat(10)}`;
+    const capped = validateInventoryStatusReport({
+      contractVersion: 1,
+      statuses: {},
+      notSyncableReasons: { "1": astride }
+    });
+    const value = capped!.notSyncableReasons!["1"];
+    // Code-point-wise: spreading a string iterates code points, so a surviving
+    // half-pair shows up as a single char in the surrogate range. Comparing
+    // strings alone would pass while holding one.
+    expect([...value].filter((c) => c.codePointAt(0)! >= 0xd800 && c.codePointAt(0)! <= 0xdfff)).toEqual([]);
+    expect(value.length).toBeLessThanOrEqual(120);
+    // The emoji is either whole or gone; here there is no room, so it is gone.
+    expect(value).toBe(`${"a".repeat(118)}…`);
+  });
+
+  it("holds the surrogate floor even in a runtime with no `Intl.Segmenter` — the grapheme path degrades to whole code points rather than to a bare slice (⊘ a browser without the API gets the replacement glyph back, and a module that assumed the API would throw on load and take the whole extension with it)", async () => {
+    const segmenter = Intl.Segmenter;
+    Reflect.deleteProperty(Intl as unknown as Record<string, unknown>, "Segmenter");
+    try {
+      vi.resetModules();
+      // Re-evaluated WITHOUT the API, so the module picks its fallback path.
+      const fresh = await import("../../src/models/inventory");
+      const astride = `${"a".repeat(118)}\u{1F600}${"b".repeat(10)}`;
+      const value = fresh.validateInventoryStatusReport({
+        contractVersion: 1,
+        statuses: {},
+        notSyncableReasons: { "1": astride }
+      })!.notSyncableReasons!["1"];
+      expect([...value].filter((c) => c.codePointAt(0)! >= 0xd800 && c.codePointAt(0)! <= 0xdfff)).toEqual([]);
+      expect(value.length).toBeLessThanOrEqual(120);
+    } finally {
+      (Intl as unknown as Record<string, unknown>).Segmenter = segmenter;
+      vi.resetModules();
+    }
   });
 
   it("keeps a `__proto__` reason key as own data (⊘ writing it into a plain `{}` hits the inherited setter — the entry vanishes and a provider string lands on Object.prototype)", () => {
