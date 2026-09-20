@@ -157,6 +157,15 @@ export function validateProviderShape(provider: unknown): asserts provider is In
   if (obj.canControlNode !== undefined && typeof obj.canControlNode !== "function") {
     throw new Error("Inventory provider canControlNode must be a function when present.");
   }
+  // WEB CONSOLE — the twin of the canControlNode clause, and it matters for the
+  // same reason: the member's PRESENCE is what stamps the tree marker that
+  // surfaces the Open Web Console entry, so a typo'd `webConsoleUrl` carrying a
+  // non-function value would show the entry on every row of that provider and
+  // then throw TypeError when one is clicked. Named here, at registration,
+  // rather than in a click the user cannot connect back to the registration.
+  if (obj.webConsoleUrl !== undefined && typeof obj.webConsoleUrl !== "function") {
+    throw new Error("Inventory provider webConsoleUrl must be a function when present.");
+  }
 }
 
 /**

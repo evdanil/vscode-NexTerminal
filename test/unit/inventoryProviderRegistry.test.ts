@@ -192,6 +192,28 @@ describe("validateProviderShape", () => {
     expect(() => validateProviderShape(makeProvider({ canControlNode: 42 as never }))).toThrow(/canControlNode/);
   });
 
+  // webConsoleUrl provider capability — the twin of the canControlNode clause,
+  // and it fails the same loud way for the same reason: the tree's marker gate
+  // reads the member's PRESENCE during render, so a typo'd `webConsoleUrl` that
+  // survived registration stamps a row with a menu entry the click cannot
+  // honour — the command invokes the member, and a non-function value throws
+  // TypeError mid-click instead of being named here, at registration.
+  it("accepts a provider with NO webConsoleUrl — it is optional (kills making it required, which would break every provider that offers no web console)", () => {
+    const provider = makeProvider();
+    expect(provider.webConsoleUrl).toBeUndefined();
+    expect(() => validateProviderShape(provider)).not.toThrow();
+  });
+
+  it("accepts a provider WITH a function webConsoleUrl", () => {
+    const provider = makeProvider({ webConsoleUrl: async () => "https://pve.example.com:8006/?console=kvm" });
+    expect(() => validateProviderShape(provider)).not.toThrow();
+  });
+
+  it("rejects a non-function webConsoleUrl loudly (kills a silent survive-at-registration for a typo'd `webConsoleUrl` that is not callable — the marker gate reads its presence at render and the command invokes it on click, so a string value shows the menu entry and throws TypeError when used)", () => {
+    expect(() => validateProviderShape(makeProvider({ webConsoleUrl: "nope" as never }))).toThrow(/webConsoleUrl/);
+    expect(() => validateProviderShape(makeProvider({ webConsoleUrl: 42 as never }))).toThrow(/webConsoleUrl/);
+  });
+
   // MINOR-14 (EVE-NG review) — `InventoryConfigField.defaultValue` is part of
   // the field contract now, so a malformed one must be caught at the
   // registration boundary rather than silently coerced when the Add form reads

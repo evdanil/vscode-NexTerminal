@@ -2383,4 +2383,92 @@ describe("createProxmoxProvider", () => {
       expect(calls).toHaveLength(2);
     });
   });
+
+  /**
+   * WEB CONSOLE (§Spec) — the one provider member that makes NO request on
+   * behalf of what it returns: the URL goes to the user's browser, where the
+   * PVE web session is the credential. Every assertion here defends a piece of
+   * the URL PVE actually serves, because a wrong one fails as a blank noVNC
+   * page with no diagnostic anywhere in Nexus.
+   */
+  describe("webConsoleUrl", () => {
+    const BASE = "https://pve.example.com:8006";
+    const SECRETS = { apiToken: "root@pam!test=secret" };
+
+    function lookupFetch(rows: unknown[], status = 200) {
+      const calls: Array<{ url: string; method: string; headers?: Record<string, string> }> = [];
+      const impl = async (input: string | URL, init?: { method?: string; headers?: Record<string, string> }): Promise<unknown> => {
+        calls.push({ url: String(input), method: init?.method ?? "GET", headers: init?.headers });
+        return makeResponse(status, { data: rows });
+      };
+      return { calls, fetchImpl: impl as unknown as typeof fetch };
+    }
+
+    it("builds PVE's noVNC URL for a qemu guest with the FULL query, including the empty-valued cmd= PVE expects (kills a hand-concatenated query that drops or mis-orders a member — the console opens blank with nothing to diagnose)", async () => {
+      const { fetchImpl } = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build-vm" }]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      await expect(provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107")).resolves.toBe(
+        `${BASE}/?console=kvm&novnc=1&vmid=107&vmname=build-vm&node=pve&resize=off&cmd=`
+      );
+    });
+
+    it("uses console=lxc for a container (kills a qemu-only builder — PVE serves a different console for a CT and kvm on an LXC is a dead page)", async () => {
+      const { fetchImpl } = lookupFetch([{ vmid: 114, node: "pve", type: "lxc", name: "dns-ct" }]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      await expect(provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "114")).resolves.toBe(
+        `${BASE}/?console=lxc&novnc=1&vmid=114&vmname=dns-ct&node=pve&resize=off&cmd=`
+      );
+    });
+
+    it("PRESERVES a reverse-proxy mount path from the base URL (kills a builder that keeps only the origin — https://gateway.example/?console=… is not where that deployment's UI lives)", async () => {
+      const { fetchImpl } = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build-vm" }]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      await expect(provider.webConsoleUrl!({ baseUrl: "https://gateway.example/pve" }, SECRETS, "107")).resolves.toBe(
+        "https://gateway.example/pve/?console=kvm&novnc=1&vmid=107&vmname=build-vm&node=pve&resize=off&cmd="
+      );
+    });
+
+    it("QUERY-ENCODES the guest name — it is guest-controlled text (kills raw interpolation, where a space or an & truncates the query and the remaining parameters are silently lost)", async () => {
+      const { fetchImpl } = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build vm&novnc=0" }]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      const resolved = await provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107");
+      const parsed = new URL(resolved);
+      expect(parsed.searchParams.get("vmname")).toBe("build vm&novnc=0");
+      // The injected `novnc=0` must not survive as a parameter of its own.
+      expect(parsed.searchParams.getAll("novnc")).toEqual(["1"]);
+    });
+
+    it("resolves node/type/name FRESH from ?type=vm before building anything, and reflects a node the guest has since migrated to (kills a URL built from the last sync's node — the console would open on a host that no longer runs the guest)", async () => {
+      const { calls, fetchImpl } = lookupFetch([{ vmid: 107, node: "pve-2", type: "qemu", name: "build-vm" }]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      const resolved = await provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107");
+      expect(new URL(resolved).searchParams.get("node")).toBe("pve-2");
+      expect(calls.map((c) => `${c.method} ${c.url}`)).toEqual([`GET ${BASE}/api2/json/cluster/resources?type=vm`]);
+    });
+
+    it("authenticates the lookup with the same PVEAPIToken header every other read uses (kills a lookup issued anonymously, which answers 401 and reads as 'guest gone')", async () => {
+      const { calls, fetchImpl } = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build-vm" }]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      await provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107");
+      expect(calls[0].headers).toMatchObject({ Authorization: "PVEAPIToken=root@pam!test=secret" });
+    });
+
+    it("NEVER puts the API token in the returned URL — it is opened in an external browser and lands in history (kills a builder that 'helpfully' authenticates the link)", async () => {
+      const { fetchImpl } = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build-vm" }]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      const resolved = await provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107");
+      expect(resolved).not.toContain("secret");
+      expect(resolved.toLowerCase()).not.toContain("token");
+    });
+
+    it("rejects with a re-sync hint when the vmid is no longer in the cluster listing (kills an error that names neither the guest nor the way out — same contract as controlNode's)", async () => {
+      const { fetchImpl } = lookupFetch([]);
+      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+      const err = await provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(InventoryProviderError);
+      expect((err as InventoryProviderError).kind).toBe("protocol");
+      expect((err as Error).message).toContain("107");
+      expect((err as Error).message).toMatch(/re-sync/i);
+    });
+  });
 });

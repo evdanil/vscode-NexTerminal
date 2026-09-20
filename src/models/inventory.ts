@@ -434,6 +434,33 @@ export interface InventoryProvider {
    * `NexusTreeProvider` constructor; nothing on the command path reads it.
    */
   canControlNode?(externalId: string): boolean;
+  /**
+   * WEB CONSOLE — OPTIONAL. A URL for the USER'S BROWSER: the provider's own
+   * web console for ONE device, keyed by the same `externalId` the other
+   * members use. Nexus never fetches the returned URL; it hands it to
+   * `vscode.env.openExternal`, so the credential is whatever web session the
+   * browser already holds for that deployment — NOT the API token this method
+   * receives. An implementation MUST NOT embed a credential in the URL it
+   * returns: it is opened in an external browser and lands in history.
+   *
+   * WHY IT EXISTS. A guest with no reachable address — no agent, no DHCP lease,
+   * not yet booted — is a dead end in the tree: nothing to SSH to. Its
+   * hypervisor's console is the one way in, and it needs no address at all.
+   *
+   * MAY THROW, and the throw PROPAGATES, deliberately unlike
+   * `fetchProviderStatus`'s degrade-to-no-op and exactly like `controlNode`: a
+   * console the user asked for that did not open must say why. Implementations
+   * are pure-with-network — they resolve, they do not mutate.
+   *
+   * The ONLY sanctioned caller is the generic open-web-console command. A
+   * provider that does not implement it offers no web console, and its rows
+   * carry no web-console marker, so the menu entry never appears on them.
+   */
+  webConsoleUrl?(
+    config: InventorySourceValues,
+    secrets: InventorySourceSecrets,
+    externalId: string
+  ): Promise<string>;
 }
 
 /**
