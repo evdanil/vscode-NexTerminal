@@ -402,6 +402,38 @@ type SilentProviderTrust = { trusted: true; secrets: InventorySourceSecrets } | 
 type ProviderShapeConfirmation = { fingerprint: string; revision: string | undefined };
 
 /**
+ * THE WHOLE SILENT VERDICT, WITHOUT THE VAULT — is this registrant one this
+ * record may be handed its credentials to, either because the stamp still
+ * agrees with its shape or because the user confirmed this exact shape for this
+ * exact incarnation in this window? Pure and free of I/O, which is what lets
+ * the manual warning's composer re-ask it at compose time: a message about
+ * withheld credentials must not itself touch the keychain.
+ *
+ * Extracted rather than duplicated for the same reason
+ * `sourceTrustsProviderShape` is shared with `checkProviderFingerprint` — two
+ * copies of a trust decision drift, and the copy that drifts silently is the one
+ * that decides what the user is told.
+ */
+function providerShapeIsTrusted(
+  source: InventorySourceConfig,
+  provider: InventoryProvider,
+  confirmedProviderShapes: ReadonlyMap<string, ProviderShapeConfirmation>,
+  liveRevision: string | undefined
+): boolean {
+  const currentProviderFingerprint = computeProviderFingerprint(provider);
+  if (sourceTrustsProviderShape(source, currentProviderFingerprint)) {
+    return true;
+  }
+  const confirmed = confirmedProviderShapes.get(source.id);
+  return (
+    confirmed !== undefined &&
+    confirmed.fingerprint === currentProviderFingerprint &&
+    confirmed.revision !== undefined &&
+    confirmed.revision === liveRevision
+  );
+}
+
+/**
  * `checkProviderFingerprint`'s SILENT SIBLING — the same question, answered
  * without ever prompting, for the status refresh. That path is automatic and
  * repeating (the visible-gated poll ticks per source for as long as the Command
@@ -437,14 +469,7 @@ async function providerStillTrustedSilently(
   confirmedProviderShapes: ReadonlyMap<string, ProviderShapeConfirmation>,
   liveRevision: string | undefined
 ): Promise<SilentProviderTrust> {
-  const currentProviderFingerprint = computeProviderFingerprint(provider);
-  const confirmed = confirmedProviderShapes.get(source.id);
-  const confirmedForThisRecord =
-    confirmed !== undefined &&
-    confirmed.fingerprint === currentProviderFingerprint &&
-    confirmed.revision !== undefined &&
-    confirmed.revision === liveRevision;
-  if (!sourceTrustsProviderShape(source, currentProviderFingerprint) && !confirmedForThisRecord) {
+  if (!providerShapeIsTrusted(source, provider, confirmedProviderShapes, liveRevision)) {
     return { trusted: false };
   }
   const secrets: InventorySourceSecrets = {};
@@ -5300,15 +5325,58 @@ export function registerInventoryCommands(
       if (options?.manual !== true || refusedSources.length === 0) {
         return;
       }
-      // STILL THERE, AND STILL THE RECORD WE REFUSED. Read live rather than
-      // trusting removals to notify us: `completeReset` and a replace-mode
-      // config import drop sources by calling core directly and cannot reach
-      // this closure. Both halves are checked because `revision` is optional on
-      // an older record — `getInventorySource(id)?.revision === captured` alone
-      // would read a REMOVED legacy source as a match and name something gone.
-      const live = refusedSources.filter((refused) => {
+      // STILL THERE, STILL THE RECORD WE REFUSED, AND STILL REFUSED.
+      //
+      // (1) STILL THERE / STILL THAT RECORD. Read live rather than trusting
+      //     removals to notify us: `completeReset` and a replace-mode config
+      //     import drop sources by calling core directly and cannot reach this
+      //     closure. Both halves are checked because `revision` is optional on
+      //     an older record — `getInventorySource(id)?.revision === captured`
+      //     alone would read a REMOVED legacy source as a match and name
+      //     something gone.
+      //
+      // (2) STILL REFUSED — re-asked here, not inherited from the loop. A sweep
+      //     over several sources refuses the first and then AWAITS the rest, and
+      //     the user can clear that first refusal in the meantime: a Continue on
+      //     Start/Stop or Open Web Console latches the source and writes
+      //     nothing, so its revision never moves and check (1) passes it
+      //     happily. The message would then send them to confirm a change they
+      //     confirmed while it was running, about a source whose live status has
+      //     already resumed — advice that is not merely redundant but wrong
+      //     about the current state. (A Sync or an Edit clears it by restamping,
+      //     which mints a revision and is already caught by (1).)
+      //
+      //     `providerShapeIsTrusted`, never the full silent gate: that one reads
+      //     secrets, and composing a message about credentials that were WITHHELD
+      //     must not touch the keychain to do it.
+      //
+      //     NO SEPARATE GENERATION CHECK, unlike `warnIfTruncated`. That one asks
+      //     "is the status on screen still the one I applied" — a question about a
+      //     paint, which only a generation record can answer. This asks "does the
+      //     refusal I am about to describe still hold", and the trust re-check
+      //     answers it directly and strictly more completely: a newer sweep can
+      //     only have succeeded for this source if trust was restored, while a
+      //     Continue that no refresh has yet followed restores trust with no
+      //     generation written at all. Adding the generation condition for
+      //     symmetry would also suppress a still-true message whenever a SILENT
+      //     poll tick happened to repaint the source, which is a real loss.
+      const live = refusedSources.flatMap((refused) => {
         const liveSource = core.getInventorySource(refused.id);
-        return liveSource !== undefined && liveSource.revision === refused.revision;
+        if (liveSource === undefined || liveSource.revision !== refused.revision) {
+          return [];
+        }
+        // NO REGISTRANT AT ALL is not a standing refusal — there is nothing left
+        // to distrust, and the remedy would be a lie twice over: a sync against
+        // an absent provider refuses with its own message instead. It matches
+        // how the sweep itself treats a vanished provider: skip, say nothing.
+        const provider = registry.get(liveSource.providerId);
+        if (provider === undefined) {
+          return [];
+        }
+        if (providerShapeIsTrusted(liveSource, provider, confirmedProviderShapes, liveSource.revision)) {
+          return [];
+        }
+        return [refused];
       });
       if (live.length === 0) {
         return;

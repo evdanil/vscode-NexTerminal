@@ -11955,6 +11955,106 @@ describe("nexus.inventory.refreshStatus — provider trust fingerprint", () => {
       expect(vault.get).not.toHaveBeenCalled();
     });
 
+    it("drops a refusal the user CLEARED mid-sweep, and still names one that stands (⊘ a sweep that composes its warning from what it recorded tells the user to go and confirm a change they confirmed while it was running, and to fix a source whose live status has already resumed)", async () => {
+      // Order matters: the sweep visits sources in insertion order. "Alpha" is
+      // refused first, "Park" holds the sweep open while the user clears
+      // Alpha's refusal, and "Gamma" is refused after the release so there is
+      // still a true claim left for the message to make.
+      const server = makeServer({
+        id: "eve-1",
+        name: "R1",
+        origin: { sourceId: "src-alpha", externalId: "/Lab.unl#3", syncedAt: 1 }
+      });
+      const core = new NexusCore(new InMemoryConfigRepository([server]));
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      let releasePark!: () => void;
+      const parkGate = new Promise<void>((resolve) => (releasePark = resolve));
+      const fetchStatus = vi.fn(async () => {
+        await parkGate;
+        return REPORT;
+      });
+      registry.register(makeProvider({ fetchStatus, controlNode: vi.fn(async () => {}) }));
+      const vault = makeVault({
+        [inventorySecretKey("src-alpha", "apiToken")]: "tok",
+        [inventorySecretKey("src-park", "apiToken")]: "tok",
+        [inventorySecretKey("src-gamma", "apiToken")]: "tok"
+      });
+      trackedDisposables.push(...registerInventoryCommands(core, registry, vault, makeTeardown()));
+      await core.addOrUpdateInventorySource(
+        makeSource({ id: "src-alpha", name: "Alpha", secretFieldIds: ["apiToken"], providerFingerprint: STALE })
+      );
+      await core.addOrUpdateInventorySource(makeSource({ id: "src-park", name: "Park", secretFieldIds: ["apiToken"] }));
+      await core.addOrUpdateInventorySource(
+        makeSource({ id: "src-gamma", name: "Gamma", secretFieldIds: ["apiToken"], providerFingerprint: STALE })
+      );
+      const refresh = registeredCommands.get("nexus.inventory.refreshStatus")! as (arg?: unknown) => Promise<{
+        unrefreshedSourceIds: string[];
+      }>;
+
+      // A MANUAL sweep: Alpha is refused and recorded, then the loop parks.
+      const sweep = refresh();
+      await vi.waitFor(() => {
+        expect(fetchStatus).toHaveBeenCalledTimes(1);
+      });
+
+      // The user clears Alpha's refusal from another surface while the sweep
+      // is still open. Start/Stop writes nothing, so Alpha's revision does not
+      // move — only the session latch changes.
+      mockShowWarningMessage.mockResolvedValueOnce("Continue");
+      await registeredCommands.get("nexus.inventory.startNode")!({ server });
+      releasePark();
+      await sweep;
+
+      // Alpha's live status has already resumed, so the advice about it is not
+      // merely redundant, it is wrong about the current state.
+      expect(notifications()).toHaveLength(1);
+      expect(notifications()[0]).not.toContain('"Alpha"');
+      // ...and the message is still delivered for the source that genuinely
+      // still stands refused.
+      expect(notifications()[0]).toContain('"Gamma"');
+      expect(notifications()[0]).toContain("Live status for \"Gamma\" was skipped");
+    });
+
+    it("drops a refusal whose registrant has since gone away — there is nothing left to distrust (⊘ naming it prescribes a sync that the missing provider refuses with a different message entirely, and the composer throws computing a fingerprint of nothing)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      let releasePark!: () => void;
+      const parkGate = new Promise<void>((resolve) => (releasePark = resolve));
+      const registration = registry.register(
+        makeProvider({
+          fetchStatus: vi.fn(async () => {
+            await parkGate;
+            return REPORT;
+          })
+        })
+      );
+      const vault = makeVault({
+        [inventorySecretKey("src-alpha", "apiToken")]: "tok",
+        [inventorySecretKey("src-park", "apiToken")]: "tok"
+      });
+      trackedDisposables.push(...registerInventoryCommands(core, registry, vault, makeTeardown()));
+      await core.addOrUpdateInventorySource(
+        makeSource({ id: "src-alpha", name: "Alpha", secretFieldIds: ["apiToken"], providerFingerprint: STALE })
+      );
+      await core.addOrUpdateInventorySource(makeSource({ id: "src-park", name: "Park", secretFieldIds: ["apiToken"] }));
+      const refresh = registeredCommands.get("nexus.inventory.refreshStatus")! as (arg?: unknown) => Promise<{
+        unrefreshedSourceIds: string[];
+      }>;
+
+      const sweep = refresh();
+      await vi.waitFor(() => {
+        expect(mockShowWarningMessage).toHaveBeenCalledTimes(0);
+      });
+      // The owning extension is disabled while the sweep is still open.
+      registration.dispose();
+      releasePark();
+      await expect(sweep).resolves.toEqual({ unrefreshedSourceIds: ["src-alpha"] });
+
+      expect(notifications()).toEqual([]);
+    });
+
     it("compares the LIVE record, not the one the sweep captured — a replacement landing mid-sweep is refused when the loop reaches it (⊘ reading the revision off the sweep's own captured list compares the latch against a record that has just been superseded, and the secrets it then reads belong to the replacement)", async () => {
       // Bespoke fixture: the sweep visits sources in insertion order, so the
       // source it PARKS on has to be registered before the latched one.
