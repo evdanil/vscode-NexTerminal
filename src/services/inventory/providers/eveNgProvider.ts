@@ -130,9 +130,12 @@ const EVE_NG_STATUS_POLL_DESCRIPTION =
  * (`computeProviderFingerprint`, models/inventory.ts): its ids, labels, types,
  * required flags and ORDER are hashed and stamped onto every source at save
  * time, and a later change makes every existing source re-prompt the user to
- * re-confirm handing the registrant its saved credentials. Adding a field later
- * is therefore a user-visible event, not a refactor — which is why the whole
- * set this provider will need is declared up front.
+ * re-confirm handing the registrant its saved credentials — and, because this
+ * provider implements `fetchStatus`, ALSO stops its live status silently until
+ * that prompt is answered (the status refresh refuses a mismatch rather than
+ * asking about it on a background tick). Adding a field later is therefore a
+ * user-visible event, not a refactor — which is why the whole set this provider
+ * will need is declared up front.
  */
 const EVE_NG_CONFIG_FIELDS: InventoryConfigField[] = [
   {
@@ -221,7 +224,9 @@ const EVE_NG_CONFIG_FIELDS: InventoryConfigField[] = [
     // add-source prompts. Adding it does move the fingerprint, so every
     // existing EVE-NG source re-confirms its saved credentials once \u2014 the
     // gate working as designed, not a bug, and not something to dodge by
-    // exempting the field from the hash.
+    // exempting the field from the hash. Pointedly so for THIS field: until
+    // that one confirmation, the status refresh refuses each existing source
+    // silently, so the very poll this option turns on does not run for them.
     //
     // NO `defaultValue`: that member is boolean-only by contract
     // (`validateProviderShape` rejects a non-boolean), and it is not needed \u2014

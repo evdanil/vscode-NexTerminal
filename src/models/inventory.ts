@@ -1188,15 +1188,21 @@ export interface InventorySourceConfig {
   // for `registerInventoryProvider` (see publicApi.ts's trust-model doc), so
   // this cannot prove WHICH extension is answering to `providerId` — only
   // that the currently-registered provider's declared shape still looks like
-  // the one the user last knowingly configured. syncNow compares this
-  // against computeProviderFingerprint(currentRegistrant) before reading any
-  // vault secret for the source; a mismatch means the id was re-registered
-  // (by an update, or by a different extension entirely) with a materially
-  // different provider since, and the user is asked to confirm handing that
-  // registrant the saved credentials. Optional for backward compatibility —
-  // a source saved before this field existed has none; syncNow stamps it
-  // silently on that source's first successful sync afterward (nothing to
-  // compare it against yet, so no warning is shown).
+  // the one the user last knowingly configured. EVERY path that reads a vault
+  // secret for the source compares this against
+  // computeProviderFingerprint(currentRegistrant) first; a mismatch means the
+  // id was re-registered (by an update, or by a different extension entirely)
+  // with a materially different provider since, and the secrets are never
+  // handed over unasked. WHAT A MISMATCH DOES splits by whether a human is
+  // there to ask: the four user-driven paths (syncNow, editSource and its
+  // form's Test button, Start/Stop Node, Open Web Console) show a
+  // Continue/Cancel modal, while the STATUS REFRESH — automatic and repeating,
+  // so a modal would nag — refuses silently and stays refused until the user
+  // confirms on one of those four. See publicApi.ts's trust-model doc for the
+  // contract as a provider author reads it. Optional for backward
+  // compatibility — a source saved before this field existed has none; syncNow
+  // stamps it silently on that source's first successful sync afterward
+  // (nothing to compare it against yet, so no warning is shown).
   providerFingerprint?: string;
   // REVIEW FINDING 1 (P2, folder-GC ownership) — the folder paths (strictly
   // under `targetFolder`, ancestors included) that THIS source's own syncs
@@ -1312,8 +1318,11 @@ function templateRulesEqual(a: TemplateRule[] | undefined, b: TemplateRule[] | u
  * configured with — `advanced`, `defaultValue`, `min`/`max`, `integer`,
  * `placeholder` — each documented at its declaration above and each
  * constraint among them PINNED by a test, because an unpinned exclusion here is
- * a latent re-prompt-every-user bug: this hash gates a modal asking the user to
- * re-confirm handing a re-registered provider their saved credentials. No `vscode` import — callable from models/ and safe for both the
+ * a latent bug in BOTH directions this hash gates: a modal asking every user to
+ * re-confirm handing a re-registered provider their saved credentials, and —
+ * since the status refresh refuses a mismatch instead of asking — live status
+ * quietly ceasing for every affected source until they do. The second is the
+ * worse half, because nothing announces it on the path that trips it. No `vscode` import — callable from models/ and safe for both the
  * command layer and tests.
  *
  * sha256, hex-encoded, truncated to the first 16 characters — this is a

@@ -24,15 +24,45 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  * stores a `providerFingerprint` — a hash of the registered provider's
  * OBSERVABLE shape (its `label` and `configFields`) taken at the moment the
  * source was created or last edited (see `computeProviderFingerprint()` in
- * `models/inventory.ts`). Before reading any of the source's saved
- * credentials, `syncNow` recomputes that fingerprint against the CURRENT
- * registrant for the source's `providerId` and, on a mismatch, shows a modal
- * asking the user to confirm handing that registrant the saved credentials
- * (Cancel aborts before any secret is read). This only detects that the
- * registrant's declared shape changed — a replacement provider that happens
- * to declare an identical label/configFields (or a user who clicks through
- * the warning) is indistinguishable from the original. It closes the SILENT
- * handover, not the trust boundary itself.
+ * `models/inventory.ts`). EVERY path that reads a source's saved credentials
+ * recomputes that fingerprint against the CURRENT registrant for the source's
+ * `providerId` first, and a mismatch is never handed the secrets unasked. This
+ * only detects that the registrant's declared shape CHANGED — a replacement
+ * that happens to declare an identical label/configFields, or a user who
+ * clicks through the question, is indistinguishable from the original. It
+ * closes the SILENT handover, not the trust boundary itself.
+ *
+ * WHAT A MISMATCH DOES depends on whether a human is there to ask, and a
+ * provider author should know which of their entry points is which:
+ *
+ *  - USER-DRIVEN paths — `fetchInventory` (Sync Inventory Now),
+ *    `testConnection` (the Add/Edit form's Test button), `controlNode`
+ *    (Start/Stop Node) and `webConsoleUrl` (Open Web Console) — show a modal
+ *    asking the user to confirm handing that registrant the saved credentials.
+ *    Cancel aborts before any secret is read, so the method is never called.
+ *  - `fetchStatus` is different, and this is the part worth reading twice. It
+ *    is the only entry point Nexus calls BY ITSELF and REPEATEDLY: the
+ *    per-source status poll re-resolves the registrant on every tick for as
+ *    long as the Command Center is open. A modal there would fire unattended
+ *    and over and over, so a mismatch is REFUSED SILENTLY instead — no vault
+ *    read, no call into the provider, nothing shown on a poll tick. A manual
+ *    Refresh Inventory Status reports the skipped sources once.
+ *  - A refusal on that path DOES NOT EXPIRE. Nothing Nexus does clears it; it
+ *    ends only when the user confirms the change on one of the user-driven
+ *    paths above. Until then `fetchStatus` is simply never called for that
+ *    source, however long the window stays open.
+ *  - A CONFIRMATION LATCHES for that window, so the status path is not left
+ *    contradicting an answer the user has just given. The latch is runtime
+ *    only — never persisted, never stamped onto the record — and is keyed by
+ *    the exact provider shape confirmed AND the exact incarnation of the
+ *    source record it was confirmed for. Re-registering the id with yet
+ *    another shape, replacing the source record, or opening a new window all
+ *    ask again.
+ *
+ * The practical consequence for a provider author: DO NOT CHANGE `label` or
+ * `configFields` casually on an id that already has sources configured against
+ * it. Every such change is a new shape, and every existing source stops
+ * reporting live status until its user has confirmed the change once.
  *
  * ADOPT-ON-ADD AND `instanceKey` (REVIEW FINDING, P1): a provider that does not
  * implement the optional `instanceKey(config)` method gets no adoption — a
