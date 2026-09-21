@@ -1530,14 +1530,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     // object), and the `__poll` marker tells it this is the background path, so
     // it stays silent on total failure (the manual command warns instead).
     // The command answers with the sources it did NOT refresh — busy with a
-    // sibling command, or missing a declared credential (review D6/E1). This
-    // fire names exactly one source, so that answer is the whole verdict on it,
-    // and the poll uses it to tell a fire that ran from one that was declined —
-    // a declined source keeps WARMING (short self-clocked retries; see the
-    // poll's own doc), which is how an Edit Source save that held the source's
-    // claim across the change event, or a backup restore whose credentials
-    // land after the record, still gets fresh status within seconds. Nothing
-    // here (or anywhere else) notifies the poll when those blockers clear.
+    // sibling command, missing a declared credential, or refused because the
+    // extension now answering its provider id declares a different shape than
+    // the source was configured against. This fire names exactly one source, so
+    // that answer is the whole verdict on it, and the poll uses it to tell a
+    // fire that ran from one that was declined. A declined source retries
+    // (see the poll's own doc for the cadence — a decline backs off a WARMING
+    // schedule and leaves a STEADY one alone), which is how an Edit Source save
+    // that held the source's claim across the change event, or a backup restore
+    // whose credentials land after the record, still gets fresh status within
+    // seconds. Nothing here (or anywhere else) notifies the poll when a blocker
+    // clears — and the trust refusal does not clear on its own at all: it ends
+    // only when the user answers Continue on a path that asks.
     fire: (sourceId) =>
       Promise.resolve(
         vscode.commands.executeCommand("nexus.inventory.refreshStatus", { sourceId, __poll: true })
