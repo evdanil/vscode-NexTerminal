@@ -12211,8 +12211,12 @@ describe("nexus.inventory.refreshStatus — provider trust fingerprint", () => {
       }>;
 
       const sweep = refresh();
+      // GATE ON THE PARK, like its sibling above. Waiting on "no warning yet"
+      // is true before the sweep has done anything at all, so it waits for
+      // nothing and the dispose below can land before the sweep has even
+      // reached Alpha — testing a different race than the one named.
       await vi.waitFor(() => {
-        expect(mockShowWarningMessage).toHaveBeenCalledTimes(0);
+        expect(registry.get("fake")!.fetchStatus).toHaveBeenCalledTimes(1);
       });
       // The owning extension is disabled while the sweep is still open.
       registration.dispose();
@@ -12279,6 +12283,80 @@ describe("nexus.inventory.refreshStatus — provider trust fingerprint", () => {
       await expect(sweep).resolves.toEqual({ unrefreshedSourceIds: ["src-latched"] });
       expect(vault.get).not.toHaveBeenCalledWith(inventorySecretKey("src-latched", "apiToken"));
       expect(fetchStatus).toHaveBeenCalledTimes(1);
+    });
+
+    it("skips a source REPLACED mid-sweep even when its stamp still matches — the vault is never read for the new holder of the id (⊘ a trust gate that returns early on the stamp reads the REPLACEMENT's credentials and sends them to the address the sweep captured, which the post-fetch revision guard cannot undo)", async () => {
+      // THE STAMP IS NOT AN INCARNATION. A replace-mode restore keeps the
+      // provider shape — it is the same extension answering — so the stamp
+      // matches on both sides of the swap and says nothing about WHICH record
+      // now owns the id. The parked source exists only to hold the sweep open
+      // past its own capture, and must be registered first because the sweep
+      // visits sources in insertion order.
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      let seen = 0;
+      let releaseFirst!: () => void;
+      const firstGate = new Promise<void>((resolve) => (releaseFirst = resolve));
+      const fetchStatus = vi.fn(async () => {
+        if (seen++ === 0) await firstGate;
+        return REPORT;
+      });
+      const provider = makeProvider({ fetchStatus });
+      registry.register(provider);
+      const MATCHING = computeProviderFingerprint(provider);
+      const vault = makeVault({
+        [inventorySecretKey("src-park", "apiToken")]: "tok",
+        [inventorySecretKey("src-swapped", "apiToken")]: "tok"
+      });
+      trackedDisposables.push(...registerInventoryCommands(core, registry, vault, makeTeardown()));
+      await core.addOrUpdateInventorySource(
+        makeSource({ id: "src-park", name: "Park", secretFieldIds: ["apiToken"], providerFingerprint: MATCHING })
+      );
+      await core.addOrUpdateInventorySource(
+        makeSource({
+          id: "src-swapped",
+          name: "Alpha",
+          secretFieldIds: ["apiToken"],
+          providerFingerprint: MATCHING,
+          config: { host: "host-a" }
+        })
+      );
+      const refresh = registeredCommands.get("nexus.inventory.refreshStatus")! as (arg?: unknown) => Promise<{
+        unrefreshedSourceIds: string[];
+      }>;
+
+      // The sweep captures its target list — Alpha pointing at host-a — then
+      // parks inside "Park"'s fetch.
+      const sweep = refresh({ __poll: true });
+      await vi.waitFor(() => {
+        expect(fetchStatus).toHaveBeenCalledTimes(1);
+      });
+      // A replace-mode restore commits under Alpha's id: a different deployment,
+      // and (in the real flow, a moment later in the same locked run) a
+      // different token under the same vault key.
+      await core.addOrUpdateInventorySource(
+        makeSource({
+          id: "src-swapped",
+          name: "Alpha",
+          secretFieldIds: ["apiToken"],
+          providerFingerprint: MATCHING,
+          config: { host: "host-b" }
+        })
+      );
+      releaseFirst();
+
+      const outcome = await sweep;
+
+      // THE VAULT MOCK IS THE ASSERTION, and it is asserted FIRST. The post-fetch
+      // revision guard drops the report either way, so a sweep that read the
+      // secret still ends with the right state on screen — and the credential
+      // already spent against host-a. Only the vault separates the two.
+      expect(vault.get).not.toHaveBeenCalledWith(inventorySecretKey("src-swapped", "apiToken"));
+      expect(fetchStatus).toHaveBeenCalledTimes(1);
+      // Reported, not refused: the replacement is transient and the next tick
+      // refreshes it under its own record.
+      expect(outcome).toEqual({ unrefreshedSourceIds: ["src-swapped"] });
     });
   });
 });
