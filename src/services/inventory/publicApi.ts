@@ -24,9 +24,13 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  * stores a `providerFingerprint` — a hash of the registered provider's
  * OBSERVABLE shape (its `label` and `configFields`) taken at the moment the
  * source was created or last edited (see `computeProviderFingerprint()` in
- * `models/inventory.ts`). EVERY path that reads a source's saved credentials
- * recomputes that fingerprint against the CURRENT registrant for the source's
- * `providerId` first, and a mismatch is never handed the secrets unasked. This
+ * `models/inventory.ts`). Every path that PASSES a source's saved credentials
+ * TO A PROVIDER recomputes that fingerprint against the current registrant for
+ * the source's `providerId` first, and a mismatch is never handed the secrets
+ * unasked. Reads that never reach a registrant are deliberately outside this —
+ * a backup export, the post-import verification, and the rollback captures in
+ * `removeSource`/`persistUpdatedInventorySource` handle the user's own data and
+ * have no provider to distrust. This
  * only detects that the registrant's declared shape CHANGED — a replacement
  * that happens to declare an identical label/configFields, or a user who
  * clicks through the question, is indistinguishable from the original. It

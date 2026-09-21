@@ -1188,9 +1188,11 @@ export interface InventorySourceConfig {
   // for `registerInventoryProvider` (see publicApi.ts's trust-model doc), so
   // this cannot prove WHICH extension is answering to `providerId` — only
   // that the currently-registered provider's declared shape still looks like
-  // the one the user last knowingly configured. EVERY path that reads a vault
-  // secret for the source compares this against
-  // computeProviderFingerprint(currentRegistrant) first; a mismatch means the
+  // the one the user last knowingly configured. Every path that SPENDS a vault
+  // secret ON A PROVIDER compares this against
+  // computeProviderFingerprint(currentRegistrant) first (a read that never
+  // reaches a registrant — a backup export, a rollback capture — does not, and
+  // has nothing to distrust); a mismatch means the
   // id was re-registered (by an update, or by a different extension entirely)
   // with a materially different provider since, and the secrets are never
   // handed over unasked. WHAT A MISMATCH DOES splits by whether a human is
