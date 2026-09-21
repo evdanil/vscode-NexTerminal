@@ -309,9 +309,9 @@ async function restampProviderFingerprintBestEffort(core: NexusCore, syncSnapsho
  * — see persistUpdatedInventorySource's ITEM A) and ignores it, and the two
  * read-only-to-config paths (the console and node control) drop it, which is
  * what keeps them out of the durable answer. The WINDOW-SCOPED half is not the
- * caller's at all: a Continue sets the session latch
- * (`confirmedProviderShapes`) below rather than in any caller — see that write
- * for why — and `providerStillTrustedSilently` is the only reader.
+ * caller's at all: a Continue sets the session latch below rather than in any
+ * caller — see that write for why here, and `ProviderShapeConfirmation` for
+ * what the latch is and who may read it.
  *
  * ITS SILENT SIBLING is `providerStillTrustedSilently`, used by the status
  * refresh — the one automatic, repeating path — which must refuse rather than
@@ -379,9 +379,32 @@ function sourceTrustsProviderShape(source: InventorySourceConfig, currentProvide
 type SilentProviderTrust = { trusted: true; secrets: InventorySourceSecrets } | { trusted: false };
 
 /**
- * ONE ANSWERED CONFIRMATION, as the session latch remembers it. Both halves are
- * the question's, not the answer's: the provider shape the modal described, and
- * the INCARNATION of the record it described it for.
+ * ONE ANSWERED CONFIRMATION, as the session latch remembers it — and THE one
+ * description of that latch. Every other site that touches it says what is true
+ * only there and points here; the user-facing contract (what a Continue buys on
+ * each path, and which two paths settle the question durably instead) is
+ * publicApi.ts's trust-model doc.
+ *
+ * Both halves are the question's, not the answer's: the provider shape the
+ * modal described, and the INCARNATION of the record it described it for.
+ *
+ * WHAT THE LATCH IS, in full, so that no use site has to restate it:
+ *  - SCOPE. Runtime only. Never persisted, never written to config or the
+ *    vault. It lives in a `Map` local to `registerInventoryCommands`, so it
+ *    dies with the window and a new window asks again. The stamp on the record
+ *    is the only durable trust record there is.
+ *  - WRITER. `checkProviderFingerprint`, and nowhere else — only on the branch
+ *    where a user was actually shown the modal and answered Continue.
+ *  - READER. `providerShapeIsTrusted`, and through it the silent status gate
+ *    and the manual warning's composer. No interactive path reads it, so an
+ *    answer given here never spares the user a later sync, edit, node control
+ *    or console open: those all ask again.
+ *  - WHAT IT THEREFORE BUYS. Background status reads, for that one source, in
+ *    that one window, against that one shape and that one record. It exists so
+ *    the silent refusal cannot contradict an answer the user has just given.
+ *  - WHAT INVALIDATES IT. A second re-registration declaring a third shape
+ *    (the fingerprint half), and a record replaced under the same id (the
+ *    revision half, below).
  *
  * THE REVISION IS WHAT MAKES THE ID SAFE TO KEY BY. A source id is not an
  * identity — a replace-mode import, and a reset followed by a restore, remove
@@ -438,14 +461,11 @@ function providerShapeIsTrusted(
  * is precisely how a user is trained to dismiss the one that matters. It
  * therefore REFUSES: no vault read, no provider call.
  *
- * It also trusts a shape the user CONFIRMED on an interactive path in this
- * window (`confirmedProviderShapes`), keyed by the exact fingerprint they were
- * shown AND the incarnation of the record they were shown it for — so a
- * Start/Stop Continue is not immediately contradicted by the re-check that
- * action fires, while a SECOND re-registration of a different shape, or a
- * record replaced under the same id, is refused again rather than riding the
- * first answer. `liveRevision` is the CURRENT holder of the id, read by the
- * caller at the moment of the call: the credentials about to be read are
+ * It is also the only reader of the session latch (`confirmedProviderShapes`,
+ * described on `ProviderShapeConfirmation`), which is what stops it
+ * contradicting an answer a user has just given. What this function contributes
+ * to that comparison is `liveRevision`: the CURRENT holder of the id, read by
+ * the caller at the moment of the call. The credentials about to be read are
  * whatever the vault holds for that id now, so it is the live record — not the
  * possibly older one in `source` — that has to be the one the user confirmed.
  * An absent revision on either side is a mismatch, never a match: `undefined`
@@ -2606,25 +2626,12 @@ export function registerInventoryCommands(
   // one-size-fits-all "is currently syncing" this used to be.
   const inFlightSourceIds = new Map<string, SourceBusyReason>();
 
-  // THE SESSION CONFIRMATION LATCH — source id -> the provider fingerprint the
-  // user was shown and answered "Continue" to on an interactive path in THIS
-  // window. Written only by `checkProviderFingerprint`, read only by
-  // `providerStillTrustedSilently`.
-  //
-  // It exists because the silent refusal and the interactive Continue otherwise
-  // contradict each other within seconds: Start/Stop Node confirms a changed
-  // registrant, dispatches, and fires its own status re-check — which, with no
-  // memory of the answer, would refuse the source the user has just authorised
-  // and (on the manual form) warn them to confirm a change they have only just
-  // confirmed.
-  //
-  // RUNTIME ONLY. Never persisted, never written to config or the vault; it
-  // dies with the window, so the stamp remains the only durable trust record
-  // and a new window asks again. The VALUE, not a bare "confirmed" flag, is
-  // what makes the id safe to key by: it carries the exact fingerprint shown
-  // and the incarnation of the record it was shown for, so neither a second
-  // re-registration of a different shape nor a record replaced under the same
-  // id rides the first answer. See `ProviderShapeConfirmation`.
+  // THE SESSION CONFIRMATION LATCH — source id -> the answer the user gave on an
+  // interactive path in this window. `ProviderShapeConfirmation` is where it is
+  // described; what is local here is that BEING THIS LOCAL IS THE MECHANISM.
+  // "For this window only" is not a policy anything has to enforce or remember
+  // to expire — it is this variable's lifetime, and the only way to widen it
+  // would be to move the declaration out of this function.
   const confirmedProviderShapes = new Map<string, ProviderShapeConfirmation>();
 
   /**
@@ -5881,14 +5888,12 @@ export function registerInventoryCommands(
       // try again in a moment".
       //
       // WHAT A CONTINUE DOES REACH is the session latch
-      // `confirmedProviderShapes`, set inside `checkProviderFingerprint`. That
-      // is deliberately NOT the blessing the paragraph above refuses. It is not
-      // persisted, it dies with the window, it is keyed by the exact fingerprint
-      // the user was shown, and it is read by the silent status gate and by
-      // nothing else — so every later INTERACTIVE flow still asks. Its whole job
-      // is to stop this command contradicting itself: the refresh it fires below
-      // would otherwise refuse the source seconds after the user authorised it,
-      // and break the promise the success toast makes.
+      // (`ProviderShapeConfirmation`), which is deliberately NOT the blessing
+      // the paragraph above refuses. THIS COMMAND IS WHY THE LATCH EXISTS AT
+      // ALL: the status refresh it fires below would otherwise refuse the source
+      // seconds after the user authorised it, and — on the manual form — warn
+      // them to confirm a change they had only just confirmed, breaking the
+      // promise the success toast makes.
       const fingerprintCheck = await checkProviderFingerprint(source, provider, confirmedProviderShapes);
       if (fingerprintCheck.outcome === "cancelled") {
         // Cancel (or dismiss) aborts before ANY vault read for this source and
@@ -6062,11 +6067,12 @@ export function registerInventoryCommands(
     // would silently bless the changed registrant for every later flow off the
     // back of a click the user made to look at a screen.
     //
-    // A Continue does set the session latch `confirmedProviderShapes` (inside
-    // `checkProviderFingerprint`), which is a different and much smaller thing:
-    // runtime-only, this window only, keyed by the exact fingerprint shown, and
-    // read by the silent status gate alone. Nothing persists and no later
-    // interactive flow stops asking.
+    // A Continue does set the session latch (`ProviderShapeConfirmation`), which
+    // is a different and much smaller thing. Unlike Start/Stop Node, this
+    // command gains nothing from it — it fires no status re-check of its own —
+    // so the latch here is simply what the shared gate does, not something this
+    // path needs. Worth knowing before anyone reads it as a second blessing:
+    // nothing persists, and no later interactive flow stops asking.
     const fingerprintCheck = await checkProviderFingerprint(source, provider, confirmedProviderShapes);
     if (fingerprintCheck.outcome === "cancelled") {
       // Cancel (or dismiss) aborts before ANY vault read for this source — the
