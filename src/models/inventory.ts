@@ -1183,7 +1183,8 @@ export interface InventorySourceConfig {
   revision?: string;
   // ITEM A (provider trust fingerprint) — a stable hash of the PROVIDER's
   // observable shape (label + ordered configFields) at the moment this
-  // source was last saved (addSource) or edited (editSource), computed by
+  // source was last saved (addSource), edited (editSource) or synced
+  // successfully (syncNow's ITEM A restamp), computed by
   // computeProviderFingerprint() below. VS Code exposes no caller identity
   // for `registerInventoryProvider` (see publicApi.ts's trust-model doc), so
   // this cannot prove WHICH extension is answering to `providerId` — only
@@ -1200,7 +1201,11 @@ export interface InventorySourceConfig {
   // form's Test button, Start/Stop Node, Open Web Console) show a
   // Continue/Cancel modal, while the STATUS REFRESH — automatic and repeating,
   // so a modal would nag — refuses silently and stays refused until the user
-  // confirms on one of those four. See publicApi.ts's trust-model doc for the
+  // confirms on one of those four. WHERE THAT CONFIRMATION GOES also splits:
+  // syncNow (on success) and editSource (on Save) restamp THIS FIELD, so the
+  // question is settled durably; the node control and the console write
+  // nothing and stamp nothing, leaving only the window-scoped latch in
+  // inventoryCommands' `confirmedProviderShapes`. See publicApi.ts's trust-model doc for the
   // contract as a provider author reads it. Optional for backward
   // compatibility — a source saved before this field existed has none; syncNow
   // stamps it silently on that source's first successful sync afterward

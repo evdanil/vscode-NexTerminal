@@ -23,8 +23,8 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  * Mitigation (honest, not a real identity check): each inventory source
  * stores a `providerFingerprint` — a hash of the registered provider's
  * OBSERVABLE shape (its `label` and `configFields`) taken at the moment the
- * source was created or last edited (see `computeProviderFingerprint()` in
- * `models/inventory.ts`). Every path that PASSES a source's saved credentials
+ * source was created, last edited, or last synced successfully (see
+ * `computeProviderFingerprint()` in `models/inventory.ts`). Every path that PASSES a source's saved credentials
  * TO A PROVIDER recomputes that fingerprint against the current registrant for
  * the source's `providerId` first, and a mismatch is never handed the secrets
  * unasked. Reads that never reach a registrant are deliberately outside this —
@@ -62,6 +62,15 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  *    source record it was confirmed for. Re-registering the id with yet
  *    another shape, replacing the source record, or opening a new window all
  *    ask again.
+ *  - TWO OF THE FOUR ALSO SETTLE IT DURABLY, and an author should not read
+ *    the latch as the whole story. A successful sync and a saved Edit Source
+ *    RESTAMP `providerFingerprint` with the confirmed shape, so nothing asks
+ *    again until the shape changes once more — those two write the record
+ *    anyway, so they have somewhere to record the answer and a user whose
+ *    intent is durable. `controlNode` and `webConsoleUrl` write nothing and
+ *    deliberately stamp nothing: a click made to boot a node or look at a
+ *    screen is not a statement about future credential hand-offs, so the
+ *    window-scoped latch is all they leave behind.
  *
  * The practical consequence for a provider author: DO NOT CHANGE `label` or
  * `configFields` casually on an id that already has sources configured against
