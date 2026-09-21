@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.237] — 2026-09-21
+
+### Fixed
+
+- **A source replaced while a status refresh is running no longer has its new credentials sent to the old source's address.** Refresh Inventory Status takes its list of sources when it starts and then works through them one at a time, each source's crawl waiting on the network before the next begins. A restore from backup in replace mode commits during that wait: it puts a different record behind a source's id — a different server, a different deployment — and stores that record's credentials under the same id a moment later. The refresh reached the swapped source still holding the old record, so it read the *new* record's saved credentials and offered them to the *old* record's host. The status it fetched was then discarded, correctly, because the record had moved — but the credentials had already left, and nothing gets those back. The refresh now checks, before it touches the keychain for a source, that the record behind the id is still the one it set out to refresh; if it is not, the source is passed over and picked up by the next refresh under whatever record now holds it. Nothing is reported for it and nothing is asked of you: this is a moment, not a fault. Two narrower windows remain and cannot be closed from here, both of the same shape — a keychain read issued a hair before the restore lands may still come back with what the restore wrote.
+
 ## [2.8.236] — 2026-09-21
 
 ### Fixed

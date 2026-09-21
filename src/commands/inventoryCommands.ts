@@ -433,12 +433,19 @@ type ProviderShapeConfirmation = { fingerprint: string; revision: string | undef
  * `sourceTrustsProviderShape` is shared with `checkProviderFingerprint` — two
  * copies of a trust decision drift, and the copy that drifts silently is the one
  * that decides what the user is told.
+ *
+ * `source` MUST BE THE LIVE RECORD, and both callers owe that: the latch is
+ * keyed by id, and an id is not an identity while a replace-mode restore can
+ * put a different deployment behind one. The warning composer re-reads it to
+ * ask; the status sweep compares the record it captured against the live one
+ * and skips ahead of this call when they differ. Passing a stale `source`
+ * compares the latch against a record that is no longer the one whose
+ * credentials would be spent.
  */
 function providerShapeIsTrusted(
   source: InventorySourceConfig,
   provider: InventoryProvider,
-  confirmedProviderShapes: ReadonlyMap<string, ProviderShapeConfirmation>,
-  liveRevision: string | undefined
+  confirmedProviderShapes: ReadonlyMap<string, ProviderShapeConfirmation>
 ): boolean {
   const currentProviderFingerprint = computeProviderFingerprint(provider);
   if (sourceTrustsProviderShape(source, currentProviderFingerprint)) {
@@ -449,7 +456,7 @@ function providerShapeIsTrusted(
     confirmed !== undefined &&
     confirmed.fingerprint === currentProviderFingerprint &&
     confirmed.revision !== undefined &&
-    confirmed.revision === liveRevision
+    confirmed.revision === source.revision
   );
 }
 
@@ -463,13 +470,14 @@ function providerShapeIsTrusted(
  *
  * It is also the only reader of the session latch (`confirmedProviderShapes`,
  * described on `ProviderShapeConfirmation`), which is what stops it
- * contradicting an answer a user has just given. What this function contributes
- * to that comparison is `liveRevision`: the CURRENT holder of the id, read by
- * the caller at the moment of the call. The credentials about to be read are
- * whatever the vault holds for that id now, so it is the live record — not the
- * possibly older one in `source` — that has to be the one the user confirmed.
- * An absent revision on either side is a mismatch, never a match: `undefined`
- * is also what a REMOVED record reports.
+ * contradicting an answer a user has just given. `source` MUST BE THE LIVE
+ * RECORD: the credentials about to be read are whatever the vault holds for
+ * that id NOW, so a possibly older captured record cannot be what the answer is
+ * checked against. That obligation is stated at `providerShapeIsTrusted` and
+ * discharged by both callers — the sweep re-reads the record immediately
+ * before the gate, and the warning composer passes the live record it already
+ * holds. An absent revision on either side is a mismatch, never a match:
+ * `undefined` is also what a REMOVED record reports.
  *
  * THE VAULT READ IS FOLDED IN so the status path reads its secrets through one
  * function that cannot answer without having decided first. Be honest about how
@@ -486,10 +494,9 @@ async function providerStillTrustedSilently(
   source: InventorySourceConfig,
   provider: InventoryProvider,
   vault: SecretVault,
-  confirmedProviderShapes: ReadonlyMap<string, ProviderShapeConfirmation>,
-  liveRevision: string | undefined
+  confirmedProviderShapes: ReadonlyMap<string, ProviderShapeConfirmation>
 ): Promise<SilentProviderTrust> {
-  if (!providerShapeIsTrusted(source, provider, confirmedProviderShapes, liveRevision)) {
+  if (!providerShapeIsTrusted(source, provider, confirmedProviderShapes)) {
     return { trusted: false };
   }
   const secrets: InventorySourceSecrets = {};
@@ -5392,7 +5399,7 @@ export function registerInventoryCommands(
         if (!provider || typeof provider.fetchStatus !== "function") {
           return [];
         }
-        if (providerShapeIsTrusted(liveSource, provider, confirmedProviderShapes, liveSource.revision)) {
+        if (providerShapeIsTrusted(liveSource, provider, confirmedProviderShapes)) {
           return [];
         }
         // WHICH REMEDY THIS SOURCE CAN ACTUALLY FINISH. Sync Inventory Now is
@@ -5495,6 +5502,60 @@ export function registerInventoryCommands(
         unrefreshedSourceIds.push(source.id);
         continue; // busy with a sync/edit/remove — skip, don't race it
       }
+      // STILL THE RECORD THIS SWEEP CAPTURED? `targets` was read at invocation
+      // and every source after the first is reached across an await, so a
+      // replace-mode restore (or a reset followed by one) can have swapped the
+      // record under this id in the meantime. That matters here and nowhere
+      // else in the loop because of WHICH halves come from WHERE: the secrets
+      // below are read LIVE, keyed by the id, so they are the new holder's —
+      // while the address they are sent to is `source.config`, captured. A
+      // replacement is a different deployment, so proceeding hands the new
+      // record's token to the old record's host. The post-fetch revision guard
+      // drops the report, which repairs the SCREEN and nothing else: the
+      // credential is spent by then.
+      //
+      // The trust gate cannot answer this, and asking it to would be a category
+      // error. It decides whether the registrant answering the provider id is
+      // one this record may be handed credentials to — a question about the
+      // PROVIDER's shape, which a replacement shares (it is the same extension
+      // answering). Incarnation is the loop's own business, because the loop is
+      // what holds the stale capture.
+      //
+      // Both halves are checked, for the reason `warnIfProviderRefused` checks
+      // both: `revision` is optional on an older record, so a bare
+      // `getInventorySource(id)?.revision === source.revision` reads a REMOVED
+      // legacy source as a match.
+      //
+      // RESIDUAL, AND IT IS NOT CLOSED HERE. This check and the first
+      // `vault.get` it guards run in one synchronous turn, so nothing can
+      // interleave between them — but a keychain read issued before a
+      // replacement commits may still resolve after it, and the reads for a
+      // second and later secret field happen across awaits. Closing that needs
+      // the under-lock capture `controlNode` and `openWebConsole` make (re-read,
+      // compare, read secrets, clone the config, all inside
+      // `configMutationLock`). Deliberately NOT taken on this path: it is
+      // timer-driven and repeats for every visible source for as long as the
+      // Command Center is open, so it would put a keychain round trip per source
+      // per tick on the lock that every config write in the extension serializes
+      // on — an ongoing cost against a window narrower than the one above.
+      const liveSource = core.getInventorySource(source.id);
+      if (liveSource === undefined || liveSource.revision !== source.revision) {
+        // REPORTED, NOT REFUSED. `refusedSources` is for the trust warning,
+        // whose remedy is "run Sync Inventory Now and confirm" — advice that is
+        // nonsense here, because nothing was distrusted and there is nothing for
+        // the user to answer. This blocker is transient and clears itself: the
+        // replacement's own write re-arms the poll, and the next tick refreshes
+        // it under its own record. So it goes where the other two self-clearing
+        // skips go.
+        //
+        // NOT COUNTED IN `attempted`, on the trust refusal's precedent rather
+        // than the missing-credential one. That counter gates a verdict telling
+        // the user to check the source's credentials and connectivity, and
+        // neither was in question: the lab box was never contacted. (The
+        // missing-credential decline counts because there that wording is TRUE.)
+        unrefreshedSourceIds.push(source.id);
+        continue;
+      }
       const provider = registry.get(source.providerId);
       if (!provider || typeof provider.fetchStatus !== "function") {
         continue; // provider gone or offers no status (e.g. NetBox)
@@ -5524,18 +5585,7 @@ export function registerInventoryCommands(
       // `providerStillTrustedSilently`.
       let trust: SilentProviderTrust;
       try {
-        trust = await providerStillTrustedSilently(
-          source,
-          provider,
-          vault,
-          confirmedProviderShapes,
-          // THE LIVE revision, not `source.revision`. `targets` was captured at
-          // invocation and a replace-mode import can swap the record under this
-          // id mid-sweep; the secrets about to be read are keyed by the id, so
-          // they are the CURRENT holder's. Only the live record can answer
-          // whether it is the one the user confirmed.
-          core.getInventorySource(source.id)?.revision
-        );
+        trust = await providerStillTrustedSilently(source, provider, vault, confirmedProviderShapes);
       } catch {
         // A REJECTING VAULT READ — the only failure this call can produce, and
         // non-fatal per source exactly like the catch around the rest of the
