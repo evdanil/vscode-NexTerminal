@@ -11709,7 +11709,7 @@ describe("nexus.inventory.refreshStatus — provider trust fingerprint", () => {
 
   /** Sources sharing one `fetchStatus` provider, each with its own vaulted apiToken. */
   async function setup(
-    sources: { id: string; name: string; providerFingerprint?: string }[],
+    sources: { id: string; name: string; providerFingerprint?: string; vaulted?: boolean }[],
     providerOverrides: Partial<InventoryProvider> = {}
   ) {
     const core = new NexusCore(new InMemoryConfigRepository());
@@ -11717,7 +11717,12 @@ describe("nexus.inventory.refreshStatus — provider trust fingerprint", () => {
     const registry = new InventoryProviderRegistry();
     const fetchStatus = vi.fn(async () => REPORT);
     registry.register(makeProvider({ fetchStatus, ...providerOverrides }));
-    const vault = makeVault(Object.fromEntries(sources.map((s) => [inventorySecretKey(s.id, "apiToken"), "tok"])));
+    // `vaulted: false` models the record keeping its `secretFieldIds` while the
+    // SecretStorage entry behind one of them is gone — a restore whose secret
+    // payload did not carry it, most obviously.
+    const vault = makeVault(
+      Object.fromEntries(sources.filter((s) => s.vaulted !== false).map((s) => [inventorySecretKey(s.id, "apiToken"), "tok"]))
+    );
     trackedDisposables.push(...registerInventoryCommands(core, registry, vault, makeTeardown()));
     for (const s of sources) {
       await core.addOrUpdateInventorySource(
@@ -11848,6 +11853,29 @@ describe("nexus.inventory.refreshStatus — provider trust fingerprint", () => {
     expect(syncSubject).toBe('"Beta"');
     const editSubject = message.slice(0, message.indexOf(" need Edit Source instead")).split(". ").pop();
     expect(editSubject).toBe('"Alpha"');
+    // The Sync advice carries its conditional tail HERE too. The two shapes
+    // share one string for that reason; asserting it only on the single-source
+    // shape would let this one drift back to promising an outcome.
+    expect(message).toContain("one that stops short names the credential it is missing");
+  });
+
+  it("does not promise the sync will finish for a source whose listed credential is gone from the vault \u2014 the one case the predicate cannot see (\u2298 `secretFieldIds` proves an entry was once written, never that it is still there, so an unconditional \"confirm the change to resume live status\" is a promise syncNow breaks in exactly the way this warning exists to stop)", async () => {
+    // The record still declares `apiToken`, and the provider still requires it,
+    // so the predicate classifies this source as syncable \u2014 correctly, on the
+    // evidence it is allowed to have. The vault is empty, so syncNow will abort
+    // in its required-secret loop before restamping and the refusal will stand.
+    const { refresh } = await setup([{ id: "src-1", name: "Alpha", providerFingerprint: STALE, vaulted: false }]);
+
+    await refresh("src-1");
+
+    expect(notifications()).toHaveLength(1);
+    const message = notifications()[0];
+    // Still Sync: it IS the right first move, and nothing here can prove
+    // otherwise without reading the keychain, which this composer may not do.
+    expect(message).toContain("Sync Inventory Now");
+    // But the outcome is no longer asserted. The old sentence promised it.
+    expect(message).not.toContain("confirm the change to resume live status");
+    expect(message).toContain("stops short");
   });
 
   it("leaves an added OPTIONAL password field pointing at Sync Inventory Now — that one does not stop a sync (⊘ testing `type === \"password\"` without the required flag sends the user to Edit Source for a credential the sync never asks for)", async () => {

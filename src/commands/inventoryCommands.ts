@@ -5414,6 +5414,19 @@ export function registerInventoryCommands(
         // about credentials that were WITHHELD must not touch the keychain to
         // compose itself — and keeps the sanctioned vault reads at their pinned
         // count.
+        //
+        // WHICH MAKES THIS TEST SOUND IN ONE DIRECTION ONLY, and the message
+        // below is worded around that. An id ABSENT from the list proves there
+        // is no entry behind it. An id PRESENT proves only that one was written
+        // once: a backup restored without its secret payload, or an entry lost
+        // any other way, leaves the id listed with nothing behind it, and a
+        // sync for that source aborts in the very same loop. Nothing here can
+        // see it — reading the vault to find out is the one thing this composer
+        // may not do, and the sweep has no observation to offer either, because
+        // a refused source never read its secrets; that is what the refusal IS.
+        // So the Sync clause below stops asserting the outcome, and the case
+        // this cannot detect is handed to the one message that can name the
+        // field: syncNow's own missing-credential error, which has it.
         const syncWouldStopShort = provider.configFields.some(
           (field) => field.type === "password" && field.required === true && !liveSource.secretFieldIds.includes(field.id)
         );
@@ -5437,7 +5450,11 @@ export function registerInventoryCommands(
           : `Live status for ${count} sources was skipped (${renderNames(live)})`;
       const needsEdit = live.filter((source) => source.syncWouldStopShort);
       const syncable = live.filter((source) => !source.syncWouldStopShort);
-      const syncClause = `Run Sync Inventory Now on ${count === 1 ? "it" : "each of them"} and confirm the change to resume live status.`;
+      // ONE TAIL, SHARED BY BOTH SHAPES THE SYNC ADVICE TAKES, so the honest
+      // half cannot be dropped from one of them by a later edit to the other.
+      const syncTail =
+        "and confirm the change; live status resumes on the first sync that completes, and one that stops short names the credential it is missing.";
+      const syncClause = `Run Sync Inventory Now on ${count === 1 ? "it" : "each of them"} ${syncTail}`;
       const editClause = `Open Edit Source on ${
         count === 1 ? "it" : "each of them"
       }: the provider's new shape asks for a credential this source has never stored, so a sync would stop short of confirming anything. Entering it and saving resumes live status.`;
@@ -5446,7 +5463,7 @@ export function registerInventoryCommands(
           ? syncClause
           : syncable.length === 0
             ? editClause
-            : `Run Sync Inventory Now on ${renderNames(syncable)} and confirm the change to resume live status. ${renderNames(
+            : `Run Sync Inventory Now on ${renderNames(syncable)} ${syncTail} ${renderNames(
                 needsEdit
               )} need Edit Source instead — the provider's new shape asks them for a credential they have never stored, so a sync would stop short of confirming anything.`;
       void vscode.window.showWarningMessage(
