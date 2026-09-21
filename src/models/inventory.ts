@@ -1186,30 +1186,19 @@ export interface InventorySourceConfig {
   // source was last saved (addSource), edited (editSource) or synced
   // successfully (syncNow's ITEM A restamp), computed by
   // computeProviderFingerprint() below. VS Code exposes no caller identity
-  // for `registerInventoryProvider` (see publicApi.ts's trust-model doc), so
-  // this cannot prove WHICH extension is answering to `providerId` — only
-  // that the currently-registered provider's declared shape still looks like
-  // the one the user last knowingly configured. Every path that SPENDS a vault
-  // secret ON A PROVIDER compares this against
-  // computeProviderFingerprint(currentRegistrant) first (a read that never
-  // reaches a registrant — a backup export, a rollback capture — does not, and
-  // has nothing to distrust); a mismatch means the
-  // id was re-registered (by an update, or by a different extension entirely)
-  // with a materially different provider since, and the secrets are never
-  // handed over unasked. WHAT A MISMATCH DOES splits by whether a human is
-  // there to ask: the four user-driven paths (syncNow, editSource and its
-  // form's Test button, Start/Stop Node, Open Web Console) show a
-  // Continue/Cancel modal, while the STATUS REFRESH — automatic and repeating,
-  // so a modal would nag — refuses silently and stays refused until the user
-  // confirms on one of those four. WHERE THAT CONFIRMATION GOES also splits:
-  // syncNow (on success) and editSource (on Save) restamp THIS FIELD, so the
-  // question is settled durably; the node control and the console write
-  // nothing and stamp nothing, leaving only the window-scoped latch in
-  // inventoryCommands' `confirmedProviderShapes`. See publicApi.ts's trust-model doc for the
-  // contract as a provider author reads it. Optional for backward
-  // compatibility — a source saved before this field existed has none; syncNow
-  // stamps it silently on that source's first successful sync afterward
-  // (nothing to compare it against yet, so no warning is shown).
+  // for `registerInventoryProvider`, so this cannot prove WHICH extension is
+  // answering to `providerId` — only that the currently-registered provider's
+  // declared shape still looks like the one the user last knowingly
+  // configured. WHO COMPARES IT, what a mismatch costs on each path, and which
+  // confirmations restamp this field rather than merely latching for the
+  // window are stated once, in publicApi.ts's trust-model doc — the contract a
+  // provider author reads, and the only place any of it is written.
+  //
+  // What is true HERE and nowhere else: the field is optional for backward
+  // compatibility, and absent means UNGATED. A source saved before it existed
+  // has no stamp, so nothing compares and nothing refuses; syncNow stamps it
+  // silently on that source's first successful sync afterward, because there
+  // is no earlier answer for the new shape to contradict.
   providerFingerprint?: string;
   // REVIEW FINDING 1 (P2, folder-GC ownership) — the folder paths (strictly
   // under `targetFolder`, ancestors included) that THIS source's own syncs
@@ -1324,13 +1313,14 @@ function templateRulesEqual(a: TemplateRule[] | undefined, b: TemplateRule[] | u
  * member that describes HOW a value is entered rather than WHAT the source is
  * configured with — `advanced`, `defaultValue`, `min`/`max`, `integer`,
  * `placeholder` — each documented at its declaration above and each
- * constraint among them PINNED by a test, because an unpinned exclusion here is
- * a latent bug in BOTH directions this hash gates: a modal asking every user to
- * re-confirm handing a re-registered provider their saved credentials, and —
- * since the status refresh refuses a mismatch instead of asking — live status
- * quietly ceasing for every affected source until they do. The second is the
- * worse half, because nothing announces it on the path that trips it. No `vscode` import — callable from models/ and safe for both the
- * command layer and tests.
+ * constraint among them PINNED by a test. The pins are the point: this hash
+ * gates the two outcomes publicApi.ts's trust-model doc describes, so getting
+ * an exclusion wrong is a latent bug in BOTH directions at once — a modal
+ * every user has to answer, and the silent half where live status simply stops
+ * for every affected source until they answer it. The silent half is the worse
+ * one, because nothing announces it on the path that trips it, which is why an
+ * exclusion is not allowed to rest on this comment alone. No `vscode` import —
+ * callable from models/ and safe for both the command layer and tests.
  *
  * sha256, hex-encoded, truncated to the first 16 characters — this is a
  * drift-detection fingerprint, not a security credential, so collision

@@ -116,9 +116,9 @@ export interface InventoryStatusRefreshOutcome {
    * else's and clear on their own (the sibling command finishes; the restore
    * lands the credential). The trust refusal does not: it takes a deliberate
    * Continue on an interactive path, so a source can sit here indefinitely.
-   * Reporting it is still right — the poll's warm retry is a map lookup that
-   * never reaches the network, and it is what makes good on the confirmation
-   * the moment it arrives — but a consumer must not read this list as
+   * Reporting it is still right — the poll's retry is a fingerprint compare
+   * that never reaches the vault or the network, and it is what makes good on
+   * the confirmation the moment it arrives — but a consumer must not read this list as
    * "resolving by itself".
    */
   unrefreshedSourceIds: string[];
@@ -292,29 +292,26 @@ async function restampProviderFingerprintBestEffort(core: NexusCore, syncSnapsho
 /**
  * F3 — shared Continue/Cancel gate for handing a provider registrant a
  * source's saved secrets when its declared shape (label/configFields) has
- * drifted since the source was last saved/edited (see
- * InventorySourceConfig.providerFingerprint's doc for the trust-model
- * rationale). Used by EVERY path that spends a source's stored secrets:
- * syncNow (before its required-secret vault reads), editSource (before the
- * form — and its Test button's vault-backed secret hydration — ever opens),
+ * drifted since the source was last saved/edited. The rule this enforces — what
+ * is hashed, which sources are gated at all, and what a Continue buys on each
+ * path — is publicApi.ts's trust-model doc; what follows is only how this
+ * function implements it. Used by EVERY path that spends a source's stored
+ * secrets: syncNow (before its required-secret vault reads), editSource (before
+ * the form — and its Test button's vault-backed secret hydration — ever opens),
  * openWebConsole and the Start/Stop node control (each before its under-lock
  * capture), so the flows can't drift on when this confirmation is required.
+ *
+ * Two outputs, and a caller has to know which it owns.
  * `outcome: "cancelled"` means the caller must abort before any vault read for
- * this source; `fingerprintToStamp` is only meaningful to callers (syncNow)
- * that restamp on their own success path — editSource's Save already restamps
- * unconditionally on every save (deliberate — see persistUpdatedInventorySource's
- * ITEM A) and ignores it, and the two read-only-to-config paths (the console and
- * node control) drop it so a click made to look at a screen, or to boot a node,
- * cannot bless a changed registrant for every later flow. THAT SENTENCE IS
- * ABOUT THE STAMP, and it still holds: nothing here is persisted from those two
- * paths. A Continue does, however, set the SESSION LATCH
- * (`confirmedProviderShapes`) — runtime-only, this window only, keyed by the
- * exact fingerprint the user was shown AND the incarnation of the record the
- * question was about — which is read by `providerStillTrustedSilently` and by
- * nothing else. So a click made to boot a node authorises the background status
- * reads for that one source, in this one window, against that one shape and
- * that one record; it blesses no later interactive flow, and a further
- * re-registration of a different shape asks again.
+ * this source. `fingerprintToStamp` is the DURABLE half, and it is only
+ * meaningful to callers (syncNow) that restamp on their own success path —
+ * editSource's Save already restamps unconditionally on every save (deliberate
+ * — see persistUpdatedInventorySource's ITEM A) and ignores it, and the two
+ * read-only-to-config paths (the console and node control) drop it, which is
+ * what keeps them out of the durable answer. The WINDOW-SCOPED half is not the
+ * caller's at all: a Continue sets the session latch below rather than in any
+ * caller — see that write for why here, and `ProviderShapeConfirmation` for
+ * what the latch is and who may read it.
  *
  * ITS SILENT SIBLING is `providerStillTrustedSilently`, used by the status
  * refresh — the one automatic, repeating path — which must refuse rather than
@@ -382,9 +379,32 @@ function sourceTrustsProviderShape(source: InventorySourceConfig, currentProvide
 type SilentProviderTrust = { trusted: true; secrets: InventorySourceSecrets } | { trusted: false };
 
 /**
- * ONE ANSWERED CONFIRMATION, as the session latch remembers it. Both halves are
- * the question's, not the answer's: the provider shape the modal described, and
- * the INCARNATION of the record it described it for.
+ * ONE ANSWERED CONFIRMATION, as the session latch remembers it — and THE one
+ * description of that latch. Every other site that touches it says what is true
+ * only there and points here; the user-facing contract (what a Continue buys on
+ * each path, and which two paths settle the question durably instead) is
+ * publicApi.ts's trust-model doc.
+ *
+ * Both halves are the question's, not the answer's: the provider shape the
+ * modal described, and the INCARNATION of the record it described it for.
+ *
+ * WHAT THE LATCH IS, in full, so that no use site has to restate it:
+ *  - SCOPE. Runtime only. Never persisted, never written to config or the
+ *    vault. It lives in a `Map` local to `registerInventoryCommands`, so it
+ *    dies with the window and a new window asks again. The stamp on the record
+ *    is the only durable trust record there is.
+ *  - WRITER. `checkProviderFingerprint`, and nowhere else — only on the branch
+ *    where a user was actually shown the modal and answered Continue.
+ *  - READER. `providerShapeIsTrusted`, and through it the silent status gate
+ *    and the manual warning's composer. No interactive path reads it, so an
+ *    answer given here never spares the user a later sync, edit, node control
+ *    or console open: those all ask again.
+ *  - WHAT IT THEREFORE BUYS. Background status reads, for that one source, in
+ *    that one window, against that one shape and that one record. It exists so
+ *    the silent refusal cannot contradict an answer the user has just given.
+ *  - WHAT INVALIDATES IT. A second re-registration declaring a third shape
+ *    (the fingerprint half), and a record replaced under the same id (the
+ *    revision half, below).
  *
  * THE REVISION IS WHAT MAKES THE ID SAFE TO KEY BY. A source id is not an
  * identity — a replace-mode import, and a reset followed by a restore, remove
@@ -441,14 +461,11 @@ function providerShapeIsTrusted(
  * is precisely how a user is trained to dismiss the one that matters. It
  * therefore REFUSES: no vault read, no provider call.
  *
- * It also trusts a shape the user CONFIRMED on an interactive path in this
- * window (`confirmedProviderShapes`), keyed by the exact fingerprint they were
- * shown AND the incarnation of the record they were shown it for — so a
- * Start/Stop Continue is not immediately contradicted by the re-check that
- * action fires, while a SECOND re-registration of a different shape, or a
- * record replaced under the same id, is refused again rather than riding the
- * first answer. `liveRevision` is the CURRENT holder of the id, read by the
- * caller at the moment of the call: the credentials about to be read are
+ * It is also the only reader of the session latch (`confirmedProviderShapes`,
+ * described on `ProviderShapeConfirmation`), which is what stops it
+ * contradicting an answer a user has just given. What this function contributes
+ * to that comparison is `liveRevision`: the CURRENT holder of the id, read by
+ * the caller at the moment of the call. The credentials about to be read are
  * whatever the vault holds for that id now, so it is the live record — not the
  * possibly older one in `source` — that has to be the one the user confirmed.
  * An absent revision on either side is a mismatch, never a match: `undefined`
@@ -459,8 +476,11 @@ function providerShapeIsTrusted(
  * far that goes: `vault` is in scope for the whole of
  * `registerInventoryCommands` and there is no linter here, so this does NOT
  * prevent a future path from calling `vault.get(inventorySecretKey(...))`
- * directly. The count pinned by the source-text test in
- * `test/unit/inventoryCommands.test.ts` is what actually enforces it.
+ * directly. Nothing prevents that. A source-text test in
+ * `test/unit/inventoryCommands.test.ts` pins the number of such call sites in
+ * this file, which makes the naive addition fail loudly — and the naive
+ * addition is the one that has actually happened. It is a tripwire, not a
+ * guarantee, and its own doc says what walks over it.
  */
 async function providerStillTrustedSilently(
   source: InventorySourceConfig,
@@ -2606,25 +2626,12 @@ export function registerInventoryCommands(
   // one-size-fits-all "is currently syncing" this used to be.
   const inFlightSourceIds = new Map<string, SourceBusyReason>();
 
-  // THE SESSION CONFIRMATION LATCH — source id -> the provider fingerprint the
-  // user was shown and answered "Continue" to on an interactive path in THIS
-  // window. Written only by `checkProviderFingerprint`, read only by
-  // `providerStillTrustedSilently`.
-  //
-  // It exists because the silent refusal and the interactive Continue otherwise
-  // contradict each other within seconds: Start/Stop Node confirms a changed
-  // registrant, dispatches, and fires its own status re-check — which, with no
-  // memory of the answer, would refuse the source the user has just authorised
-  // and (on the manual form) warn them to confirm a change they have only just
-  // confirmed.
-  //
-  // RUNTIME ONLY. Never persisted, never written to config or the vault; it
-  // dies with the window, so the stamp remains the only durable trust record
-  // and a new window asks again. The VALUE, not a bare "confirmed" flag, is
-  // what makes the id safe to key by: it carries the exact fingerprint shown
-  // and the incarnation of the record it was shown for, so neither a second
-  // re-registration of a different shape nor a record replaced under the same
-  // id rides the first answer. See `ProviderShapeConfirmation`.
+  // THE SESSION CONFIRMATION LATCH — source id -> the answer the user gave on an
+  // interactive path in this window. `ProviderShapeConfirmation` is where it is
+  // described; what is local here is that BEING THIS LOCAL IS THE MECHANISM.
+  // "For this window only" is not a policy anything has to enforce or remember
+  // to expire — it is this variable's lifetime, and the only way to widen it
+  // would be to move the declaration out of this function.
   const confirmedProviderShapes = new Map<string, ProviderShapeConfirmation>();
 
   /**
@@ -5139,8 +5146,8 @@ export function registerInventoryCommands(
     // The first two blockers are somebody else's and clear on their own. The
     // TRUST REFUSAL does not — only a deliberate Continue on an interactive path
     // ends it — so a refused source sits in this list until the user answers.
-    // Still worth reporting for the same reason: the retry costs a map lookup
-    // and delivers the refresh the instant the answer arrives.
+    // Still worth reporting for the same reason: the retry costs a fingerprint
+    // compare and delivers the refresh the instant the answer arrives.
     const unrefreshedSourceIds: string[] = [];
     const targets = sourceIdArg
       ? (() => {
@@ -5388,24 +5395,79 @@ export function registerInventoryCommands(
         if (providerShapeIsTrusted(liveSource, provider, confirmedProviderShapes, liveSource.revision)) {
           return [];
         }
-        return [refused];
+        // WHICH REMEDY THIS SOURCE CAN ACTUALLY FINISH. Sync Inventory Now is
+        // the one-step answer for almost every refusal — it raises the
+        // Continue/Cancel modal and restamps on Continue — but it checks its
+        // required secrets against the registrant's CURRENT schema immediately
+        // after that modal and before anything is restamped. So when the very
+        // shape change that caused the refusal also added a REQUIRED password
+        // field, the sync aborts in that loop with its own "missing saved
+        // credential" error and the refusal outlives the confirmation the user
+        // just gave. Edit Source is the only surface that asks the same
+        // question AND lets the missing credential be typed, and its Save
+        // restamps unconditionally — one step where the sync would be two.
+        //
+        // ASKED OF THE RECORD, NOT OF THE VAULT: `secretFieldIds` is the ids
+        // actually written to SecretStorage for this source, so a required
+        // password field absent from it has no entry to read. Deriving it this
+        // way keeps the promise the surrounding composer makes — a message
+        // about credentials that were WITHHELD must not touch the keychain to
+        // compose itself — and keeps the sanctioned vault reads at their pinned
+        // count.
+        //
+        // WHICH MAKES THIS TEST SOUND IN ONE DIRECTION ONLY, and the message
+        // below is worded around that. An id ABSENT from the list proves there
+        // is no entry behind it. An id PRESENT proves only that one was written
+        // once: a backup restored without its secret payload, or an entry lost
+        // any other way, leaves the id listed with nothing behind it, and a
+        // sync for that source aborts in the very same loop. Nothing here can
+        // see it — reading the vault to find out is the one thing this composer
+        // may not do, and the sweep has no observation to offer either, because
+        // a refused source never read its secrets; that is what the refusal IS.
+        // So the Sync clause below stops asserting the outcome, and the case
+        // this cannot detect is handed to the one message that can name the
+        // field: syncNow's own missing-credential error, which has it.
+        const syncWouldStopShort = provider.configFields.some(
+          (field) => field.type === "password" && field.required === true && !liveSource.secretFieldIds.includes(field.id)
+        );
+        return [{ ...refused, syncWouldStopShort }];
       });
       if (live.length === 0) {
         return;
       }
       const count = live.length;
-      const names = live.slice(0, 3).map((source) => `"${source.name}"`).join(", ");
-      const andMore = count > 3 ? ` and ${count - 3} more` : "";
+      /** Up to three names, then a count — the same legibility cap the truncation warning uses. */
+      const renderNames = (entries: { name: string }[]): string => {
+        const shown = entries
+          .slice(0, 3)
+          .map((entry) => `"${entry.name}"`)
+          .join(", ");
+        return entries.length > 3 ? `${shown} and ${entries.length - 3} more` : shown;
+      };
       const subject =
-        count === 1 ? `Live status for ${names} was skipped` : `Live status for ${count} sources was skipped (${names}${andMore})`;
-      // THE REMEDY IS A COMMAND THAT EXISTS AND ACTUALLY CLEARS THIS. Sync
-      // Inventory Now raises the Continue/Cancel modal and, on Continue,
-      // restamps the source — so answering it once ends the refusal for good,
-      // rather than for this window only as the latch does.
+        count === 1
+          ? `Live status for ${renderNames(live)} was skipped`
+          : `Live status for ${count} sources was skipped (${renderNames(live)})`;
+      const needsEdit = live.filter((source) => source.syncWouldStopShort);
+      const syncable = live.filter((source) => !source.syncWouldStopShort);
+      // ONE TAIL, SHARED BY BOTH SHAPES THE SYNC ADVICE TAKES, so the honest
+      // half cannot be dropped from one of them by a later edit to the other.
+      const syncTail =
+        "and confirm the change; live status resumes on the first sync that completes, and one that stops short names the credential it is missing.";
+      const syncClause = `Run Sync Inventory Now on ${count === 1 ? "it" : "each of them"} ${syncTail}`;
+      const editClause = `Open Edit Source on ${
+        count === 1 ? "it" : "each of them"
+      }: the provider's new shape asks for a credential this source has never stored, so a sync would stop short of confirming anything. Entering it and saving resumes live status.`;
+      const remedy =
+        needsEdit.length === 0
+          ? syncClause
+          : syncable.length === 0
+            ? editClause
+            : `Run Sync Inventory Now on ${renderNames(syncable)} ${syncTail} ${renderNames(
+                needsEdit
+              )} need Edit Source instead — the provider's new shape asks them for a credential they have never stored, so a sync would stop short of confirming anything.`;
       void vscode.window.showWarningMessage(
-        `${subject} — the extension now answering the provider id declares a different shape from the one the source was configured against, so its saved credentials were not used. Run Sync Inventory Now on ${
-          count === 1 ? "it" : "each of them"
-        } and confirm the change to resume live status.`
+        `${subject} — the extension now answering the provider id declares a different shape from the one the source was configured against, so its saved credentials were not used. ${remedy}`
       );
     };
     for (const source of targets) {
@@ -5843,14 +5905,12 @@ export function registerInventoryCommands(
       // try again in a moment".
       //
       // WHAT A CONTINUE DOES REACH is the session latch
-      // `confirmedProviderShapes`, set inside `checkProviderFingerprint`. That
-      // is deliberately NOT the blessing the paragraph above refuses. It is not
-      // persisted, it dies with the window, it is keyed by the exact fingerprint
-      // the user was shown, and it is read by the silent status gate and by
-      // nothing else — so every later INTERACTIVE flow still asks. Its whole job
-      // is to stop this command contradicting itself: the refresh it fires below
-      // would otherwise refuse the source seconds after the user authorised it,
-      // and break the promise the success toast makes.
+      // (`ProviderShapeConfirmation`), which is deliberately NOT the blessing
+      // the paragraph above refuses. THIS COMMAND IS WHY THE LATCH EXISTS AT
+      // ALL: the status refresh it fires below would otherwise refuse the source
+      // seconds after the user authorised it, and — on the manual form — warn
+      // them to confirm a change they had only just confirmed, breaking the
+      // promise the success toast makes.
       const fingerprintCheck = await checkProviderFingerprint(source, provider, confirmedProviderShapes);
       if (fingerprintCheck.outcome === "cancelled") {
         // Cancel (or dismiss) aborts before ANY vault read for this source and
@@ -6024,11 +6084,12 @@ export function registerInventoryCommands(
     // would silently bless the changed registrant for every later flow off the
     // back of a click the user made to look at a screen.
     //
-    // A Continue does set the session latch `confirmedProviderShapes` (inside
-    // `checkProviderFingerprint`), which is a different and much smaller thing:
-    // runtime-only, this window only, keyed by the exact fingerprint shown, and
-    // read by the silent status gate alone. Nothing persists and no later
-    // interactive flow stops asking.
+    // A Continue does set the session latch (`ProviderShapeConfirmation`), which
+    // is a different and much smaller thing. Unlike Start/Stop Node, this
+    // command gains nothing from it — it fires no status re-check of its own —
+    // so the latch here is simply what the shared gate does, not something this
+    // path needs. Worth knowing before anyone reads it as a second blessing:
+    // nothing persists, and no later interactive flow stops asking.
     const fingerprintCheck = await checkProviderFingerprint(source, provider, confirmedProviderShapes);
     if (fingerprintCheck.outcome === "cancelled") {
       // Cancel (or dismiss) aborts before ANY vault read for this source — the

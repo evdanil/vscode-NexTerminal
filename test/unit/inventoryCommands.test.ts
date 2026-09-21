@@ -11708,13 +11708,21 @@ describe("nexus.inventory.refreshStatus — provider trust fingerprint", () => {
   const TOTAL_FAILURE = "Could not refresh live status from any inventory source";
 
   /** Sources sharing one `fetchStatus` provider, each with its own vaulted apiToken. */
-  async function setup(sources: { id: string; name: string; providerFingerprint?: string }[]) {
+  async function setup(
+    sources: { id: string; name: string; providerFingerprint?: string; vaulted?: boolean }[],
+    providerOverrides: Partial<InventoryProvider> = {}
+  ) {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();
     const registry = new InventoryProviderRegistry();
     const fetchStatus = vi.fn(async () => REPORT);
-    registry.register(makeProvider({ fetchStatus }));
-    const vault = makeVault(Object.fromEntries(sources.map((s) => [inventorySecretKey(s.id, "apiToken"), "tok"])));
+    registry.register(makeProvider({ fetchStatus, ...providerOverrides }));
+    // `vaulted: false` models the record keeping its `secretFieldIds` while the
+    // SecretStorage entry behind one of them is gone — a restore whose secret
+    // payload did not carry it, most obviously.
+    const vault = makeVault(
+      Object.fromEntries(sources.filter((s) => s.vaulted !== false).map((s) => [inventorySecretKey(s.id, "apiToken"), "tok"]))
+    );
     trackedDisposables.push(...registerInventoryCommands(core, registry, vault, makeTeardown()));
     for (const s of sources) {
       await core.addOrUpdateInventorySource(
@@ -11771,6 +11779,122 @@ describe("nexus.inventory.refreshStatus — provider trust fingerprint", () => {
     expect(notifications()[0]).toContain("Sync Inventory Now");
     // A report, never a question: the sweep raises no modal of its own.
     expect(mockShowWarningMessage.mock.calls.every((call) => call.length === 1)).toBe(true);
+  });
+
+  /**
+   * THE REMEDY HAS TO BE ONE THE USER CAN ACTUALLY FINISH. Sync Inventory Now
+   * raises the Continue/Cancel modal and restamps on Continue, so it ends the
+   * refusal for good — except when the shape change that caused the refusal
+   * ALSO added a required password field. `syncNow` checks its required secrets
+   * against the CURRENT provider schema, straight after the modal and before
+   * anything is restamped, and aborts there when the vault holds nothing for the
+   * new field. The user then answers the question, watches the sync stop, and
+   * still has the refusal. Edit Source is the one surface that both asks the
+   * same question and lets the missing credential be typed, and its Save
+   * restamps unconditionally.
+   */
+  const ADDED_REQUIRED_SECRET = [
+    { id: "host", label: "Host", type: "string", required: true },
+    { id: "apiToken", label: "API Token", type: "password", required: true },
+    // The field the new shape added. Sources built by `setup` predate it, so
+    // their `secretFieldIds` never names it and the vault holds nothing for it.
+    { id: "vaultToken", label: "Vault Token", type: "password", required: true }
+  ] satisfies InventoryProvider["configFields"];
+
+  it("names EDIT SOURCE when the new shape added a required secret the record has never stored (\u2298 naming Sync Inventory Now sends the user to a command that aborts in its required-secret loop before it can restamp, so the refusal survives the sync they were told would end it)", async () => {
+    const { refresh } = await setup([{ id: "src-1", name: "Alpha", providerFingerprint: STALE }], {
+      configFields: ADDED_REQUIRED_SECRET
+    });
+
+    await refresh("src-1");
+
+    expect(notifications()).toHaveLength(1);
+    expect(notifications()[0]).toContain('"Alpha"');
+    expect(notifications()[0]).toContain("Edit Source");
+    // The absence is the load-bearing half: the old message named this command
+    // for every refusal, and naming it here is the two-step path.
+    expect(notifications()[0]).not.toContain("Sync Inventory Now");
+  });
+
+  it("still names SYNC INVENTORY NOW when every required secret the new shape declares is already stored (\u2298 pointing every refusal at Edit Source costs the one-step remedy on the ordinary path, where a sync both confirms and restamps)", async () => {
+    const { refresh } = await setup([{ id: "src-1", name: "Alpha", providerFingerprint: STALE }]);
+
+    await refresh("src-1");
+
+    expect(notifications()).toHaveLength(1);
+    expect(notifications()[0]).toContain("Sync Inventory Now");
+    expect(notifications()[0]).not.toContain("Edit Source");
+  });
+
+  it("names BOTH remedies, against the right sources, on a sweep that refused one of each (\u2298 one remedy for the whole sweep is wrong for whichever half it does not describe)", async () => {
+    const { core, refresh } = await setup(
+      [
+        { id: "src-1", name: "Alpha", providerFingerprint: STALE },
+        { id: "src-2", name: "Beta", providerFingerprint: STALE }
+      ],
+      { configFields: ADDED_REQUIRED_SECRET }
+    );
+    // Beta HAS the added field's credential stored, so a sync would reach its
+    // restamp; Alpha does not.
+    const beta = core.getInventorySource("src-2")!;
+    await core.addOrUpdateInventorySource({ ...beta, secretFieldIds: ["apiToken", "vaultToken"] });
+
+    await refresh();
+
+    expect(notifications()).toHaveLength(1);
+    const message = notifications()[0];
+    // WHICH NAMES SIT UNDER WHICH REMEDY is the whole assertion — a message
+    // carrying both clauses with the sets swapped is still a message carrying
+    // both clauses, and it sends each user to the command that cannot help them.
+    const syncSubject = message.slice(
+      message.indexOf("Run Sync Inventory Now on ") + "Run Sync Inventory Now on ".length,
+      message.indexOf(" and confirm the change")
+    );
+    expect(syncSubject).toBe('"Beta"');
+    const editSubject = message.slice(0, message.indexOf(" need Edit Source instead")).split(". ").pop();
+    expect(editSubject).toBe('"Alpha"');
+    // The Sync advice carries its conditional tail HERE too. The two shapes
+    // share one string for that reason; asserting it only on the single-source
+    // shape would let this one drift back to promising an outcome.
+    expect(message).toContain("one that stops short names the credential it is missing");
+  });
+
+  it("does not promise the sync will finish for a source whose listed credential is gone from the vault \u2014 the one case the predicate cannot see (\u2298 `secretFieldIds` proves an entry was once written, never that it is still there, so an unconditional \"confirm the change to resume live status\" is a promise syncNow breaks in exactly the way this warning exists to stop)", async () => {
+    // The record still declares `apiToken`, and the provider still requires it,
+    // so the predicate classifies this source as syncable \u2014 correctly, on the
+    // evidence it is allowed to have. The vault is empty, so syncNow will abort
+    // in its required-secret loop before restamping and the refusal will stand.
+    const { refresh } = await setup([{ id: "src-1", name: "Alpha", providerFingerprint: STALE, vaulted: false }]);
+
+    await refresh("src-1");
+
+    expect(notifications()).toHaveLength(1);
+    const message = notifications()[0];
+    // Still Sync: it IS the right first move, and nothing here can prove
+    // otherwise without reading the keychain, which this composer may not do.
+    expect(message).toContain("Sync Inventory Now");
+    // But the outcome is no longer asserted. The old sentence promised it.
+    expect(message).not.toContain("confirm the change to resume live status");
+    expect(message).toContain("stops short");
+  });
+
+  it("leaves an added OPTIONAL password field pointing at Sync Inventory Now — that one does not stop a sync (⊘ testing `type === \"password\"` without the required flag sends the user to Edit Source for a credential the sync never asks for)", async () => {
+    const { refresh } = await setup([{ id: "src-1", name: "Alpha", providerFingerprint: STALE }], {
+      configFields: [
+        { id: "host", label: "Host", type: "string", required: true },
+        { id: "apiToken", label: "API Token", type: "password", required: true },
+        // Added by the same shape change, and equally unstored — but syncNow's
+        // required-secret loop skips a field that is not required, so the sync
+        // reaches its restamp and ends the refusal in one step.
+        { id: "proxyPassword", label: "Proxy Password", type: "password", required: false }
+      ]
+    });
+
+    await refresh("src-1");
+
+    expect(notifications()).toHaveLength(1);
+    expect(notifications()[0]).toContain("Sync Inventory Now");
+    expect(notifications()[0]).not.toContain("Edit Source");
   });
 
   it("names every refused source in ONE message on a multi-source manual sweep (⊘ one notification per source stacks a pile of them on a sweep of a whole inventory)", async () => {
@@ -12160,17 +12284,35 @@ describe("nexus.inventory.refreshStatus — provider trust fingerprint", () => {
 });
 
 /**
- * A SOURCE-TEXT INVARIANT, and the only mechanism that makes the trust claim
- * real. `vault` is in scope for the whole of `registerInventoryCommands`, there
- * is no linter in this repo, and nothing else notices a tenth
- * `vault.get(inventorySecretKey(...))` appearing on an ungated path. Pinning
- * the COUNT turns adding one into a deliberate act that has to be argued for in
- * the diff.
+ * A SOURCE-TEXT TRIPWIRE. Say what it is, because the claim it used to make for
+ * itself — that it is what makes the trust rule real — is false, and a test
+ * believed to be a guarantee is worse than one known to be a nudge.
+ *
+ * WHAT IT DOES: `vault` is in scope for the whole of
+ * `registerInventoryCommands`, there is no linter in this repo, and nothing
+ * else notices a tenth `vault.get(inventorySecretKey(...))` appearing on an
+ * ungated path. Pinning the COUNT turns the naive addition — one more literal
+ * call, written the way the nine below are written — into a failure that has to
+ * be argued for in the diff. That is the addition that has actually happened.
+ *
+ * WHAT WALKS STRAIGHT OVER IT, so nobody builds on it as a guarantee:
+ *  - a hoisted key — `const key = inventorySecretKey(...); await vault.get(key)`;
+ *  - a line break after `vault.get(`;
+ *  - any local alias of `vault`, or a helper that closes over it;
+ *  - a read from ANOTHER file. `configCommands.ts` reads these same keys today
+ *    (the backup export and the post-import credential check). Both are
+ *    correctly outside the trust gate — neither hands a provider anything —
+ *    but nothing here would notice a third one that did.
+ * It also fails on a harmless rewrap of an existing site, which is noise rather
+ * than a finding: re-read the nine below, confirm the set is unchanged, move on.
+ *
+ * Kept anyway: it is one string compare, and it catches the one shape of this
+ * mistake that has been made in this file.
  */
 describe("inventoryCommands — the secret reads are counted", () => {
   const source = readFileSync(path.resolve(__dirname, "..", "..", "src", "commands", "inventoryCommands.ts"), "utf8");
 
-  it("has exactly the NINE sanctioned reads of an inventory secret (⊘ a name check passes any number of call sites, which is how an ungated tenth one ships unnoticed)", () => {
+  it("has exactly the NINE sanctioned reads of an inventory secret (⊘ a name check passes any number of call sites, which is how a literal ungated tenth one ships unnoticed)", () => {
     // CALL SITES ONLY — a comment that merely names the call (the doc on
     // `providerStillTrustedSilently` does, so the grep that finds this test
     // finds the rule too) is prose, not a read.
@@ -12205,7 +12347,9 @@ describe("inventoryCommands — the secret reads are counted", () => {
         "diff which gate it sits behind — checkProviderFingerprint on a path a",
         "user drove, providerStillTrustedSilently on anything automatic — then",
         "add it to the list above and raise this count.",
-        "IF YOU REMOVED OR MOVED ONE, drop it from the list and lower the count."
+        "IF YOU REMOVED OR MOVED ONE, drop it from the list and lower the count.",
+        "IF YOU ONLY REWRAPPED ONE, this test is a text match and cannot tell:",
+        "check the nine against the list and restore the count."
       ].join("\n")
     ).toBe(9);
   });

@@ -8,7 +8,14 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  * guarantees may change in a future major version; `contractVersion` is the
  * only field a consumer should branch on.
  *
- * Trust model: provider binding is by string `id`, not by which extension
+ * Trust model — and this doc is where it is WRITTEN. The rule below is
+ * restated nowhere else: the fingerprint field and its hash in
+ * `models/inventory.ts`, the two gates in `commands/inventoryCommands.ts` and
+ * every provider's config-field list carry only what is true at that site plus
+ * a pointer here, so changing the rule is an edit to one comment rather than a
+ * sweep that has no way of proving itself complete.
+ *
+ * Provider binding is by string `id`, not by which extension
  * registered it. An inventory source only remembers the `id` it was
  * configured against; at sync time it is handed to whichever provider
  * currently holds that `id` in the registry. If two extensions (or a
@@ -22,19 +29,37 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  *
  * Mitigation (honest, not a real identity check): each inventory source
  * stores a `providerFingerprint` — a hash of the registered provider's
- * OBSERVABLE shape (its `label` and `configFields`) taken at the moment the
- * source was created, last edited, or last synced successfully (see
- * `computeProviderFingerprint()` in `models/inventory.ts`). Every path that PASSES a source's saved credentials
- * TO A PROVIDER recomputes that fingerprint against the current registrant for
- * the source's `providerId` first, and a mismatch is never handed the secrets
- * unasked. Reads that never reach a registrant are deliberately outside this —
+ * OBSERVABLE shape, taken at the moment the source was created, last edited,
+ * or last synced successfully (see `computeProviderFingerprint()` in
+ * `models/inventory.ts`, which also explains each exclusion). WHAT IT HASHES:
+ * the provider's `label`, and its `configFields` — each field's `id`, `label`,
+ * `type` and `required` flag, plus a select field's `options` — in the
+ * provider's own declared ORDER, so reordering the list is a new shape just as
+ * renaming a field is. What it does NOT hash is everything that describes how a
+ * value is entered rather than what the source is configured with (`advanced`,
+ * `defaultValue`, `min`/`max`, `integer`, `placeholder`) and the `id` itself:
+ * hashing the id would make every mismatch invisible, since a different
+ * provider answering to the SAME id is the whole thing being detected.
+ *
+ * Every path that PASSES a source's saved credentials TO A PROVIDER recomputes
+ * that fingerprint against the current registrant for the source's
+ * `providerId` first, and a mismatch is never handed the secrets unasked. Reads that never reach a registrant are deliberately outside this —
  * a backup export, the post-import verification, and the rollback captures in
  * `removeSource`/`persistUpdatedInventorySource` handle the user's own data and
- * have no provider to distrust. This
- * only detects that the registrant's declared shape CHANGED — a replacement
- * that happens to declare an identical label/configFields, or a user who
- * clicks through the question, is indistinguishable from the original. It
- * closes the SILENT handover, not the trust boundary itself.
+ * have no provider to distrust.
+ *
+ * ONLY A STAMPED SOURCE IS GATED, which is the limit worth knowing before
+ * reading the rest as a guarantee. A source saved before the field existed
+ * carries no stamp, so there is nothing to compare against and every path
+ * trusts it — until its next save (an add, an edit, or its first successful
+ * sync) stamps the current registrant's shape silently, with no modal, because
+ * there was no prior answer to contradict. From then on it is gated like any
+ * other.
+ *
+ * The comparison only detects that the registrant's declared shape CHANGED — a
+ * replacement that happens to declare an identical label/configFields, or a
+ * user who clicks through the question, is indistinguishable from the
+ * original. It closes the SILENT handover, not the trust boundary itself.
  *
  * WHAT A MISMATCH DOES depends on whether a human is there to ask, and a
  * provider author should know which of their entry points is which:
@@ -75,10 +100,13 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  * The practical consequence for a provider author: DO NOT CHANGE `label` or
  * `configFields` casually on an id that already has sources configured against
  * it. Every such change is a new shape, and every existing STAMPED source
- * stops reporting live status until its user has confirmed the change once.
- * (A source saved before the fingerprint existed carries no stamp and is
- * trusted until its next save stamps one — so the blast radius is every source
- * saved by a current build, not literally every source.)
+ * stops reporting live status until its user has confirmed the change once —
+ * so the blast radius is every source saved by a current build, which in
+ * practice is all of them. ADDING A REQUIRED SECRET FIELD is worse than the
+ * rest: the sync that would otherwise settle the question aborts at its
+ * missing-credential check before it can restamp, so those users have to go
+ * through Edit Source to enter the credential and confirm in one step. The
+ * manual status warning names whichever of the two can actually finish.
  *
  * ADOPT-ON-ADD AND `instanceKey` (REVIEW FINDING, P1): a provider that does not
  * implement the optional `instanceKey(config)` method gets no adoption — a
