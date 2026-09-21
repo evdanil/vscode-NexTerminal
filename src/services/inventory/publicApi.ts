@@ -74,8 +74,11 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  *
  * The practical consequence for a provider author: DO NOT CHANGE `label` or
  * `configFields` casually on an id that already has sources configured against
- * it. Every such change is a new shape, and every existing source stops
- * reporting live status until its user has confirmed the change once.
+ * it. Every such change is a new shape, and every existing STAMPED source
+ * stops reporting live status until its user has confirmed the change once.
+ * (A source saved before the fingerprint existed carries no stamp and is
+ * trusted until its next save stamps one — so the blast radius is every source
+ * saved by a current build, not literally every source.)
  *
  * ADOPT-ON-ADD AND `instanceKey` (REVIEW FINDING, P1): a provider that does not
  * implement the optional `instanceKey(config)` method gets no adoption — a

@@ -129,7 +129,7 @@ const EVE_NG_STATUS_POLL_DESCRIPTION =
  * THE CONFIG FIELD LIST IS PART OF THE PROVIDER FINGERPRINT
  * (`computeProviderFingerprint`, models/inventory.ts): its ids, labels, types,
  * required flags and ORDER are hashed and stamped onto every source at save
- * time, and a later change makes every existing source re-prompt the user to
+ * time, and a later change makes every existing STAMPED source (one saved by a build that had the fingerprint) re-prompt the user to
  * re-confirm handing the registrant its saved credentials — and, because this
  * provider implements `fetchStatus`, ALSO stops its live status silently until
  * that prompt is answered (the status refresh refuses a mismatch rather than
