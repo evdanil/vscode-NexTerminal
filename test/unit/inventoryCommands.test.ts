@@ -12016,6 +12016,49 @@ describe("nexus.inventory.refreshStatus — provider trust fingerprint", () => {
       expect(notifications()[0]).toContain("Live status for \"Gamma\" was skipped");
     });
 
+    it("drops a refusal whose replacement registrant cannot report status at all — the sweep would skip it silently anyway (⊘ promising that a sync will resume live status for a source whose provider has no fetchStatus: the sync may even restamp it, and the status never comes back)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      let releasePark!: () => void;
+      const parkGate = new Promise<void>((resolve) => (releasePark = resolve));
+      const registration = registry.register(
+        makeProvider({
+          fetchStatus: vi.fn(async () => {
+            await parkGate;
+            return REPORT;
+          })
+        })
+      );
+      const vault = makeVault({
+        [inventorySecretKey("src-alpha", "apiToken")]: "tok",
+        [inventorySecretKey("src-park", "apiToken")]: "tok"
+      });
+      trackedDisposables.push(...registerInventoryCommands(core, registry, vault, makeTeardown()));
+      await core.addOrUpdateInventorySource(
+        makeSource({ id: "src-alpha", name: "Alpha", secretFieldIds: ["apiToken"], providerFingerprint: STALE })
+      );
+      await core.addOrUpdateInventorySource(makeSource({ id: "src-park", name: "Park", secretFieldIds: ["apiToken"] }));
+      const refresh = registeredCommands.get("nexus.inventory.refreshStatus")! as (arg?: unknown) => Promise<{
+        unrefreshedSourceIds: string[];
+      }>;
+
+      // Alpha is refused, then the sweep parks inside Park's fetch.
+      const sweep = refresh();
+      await vi.waitFor(() => {
+        expect(registry.get("fake")!.fetchStatus).toHaveBeenCalledTimes(1);
+      });
+      // The id is reclaimed by a registrant that reports no status at all —
+      // still a different shape, so still distrusted, but nothing a refresh
+      // could ever have called.
+      registration.dispose();
+      registry.register(makeProvider({ label: "Status-Free Provider" })); // no fetchStatus
+      releasePark();
+      await expect(sweep).resolves.toEqual({ unrefreshedSourceIds: ["src-alpha"] });
+
+      expect(notifications()).toEqual([]);
+    });
+
     it("drops a refusal whose registrant has since gone away — there is nothing left to distrust (⊘ naming it prescribes a sync that the missing provider refuses with a different message entirely, and the composer throws computing a fingerprint of nothing)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();

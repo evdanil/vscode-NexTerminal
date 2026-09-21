@@ -5365,12 +5365,24 @@ export function registerInventoryCommands(
         if (liveSource === undefined || liveSource.revision !== refused.revision) {
           return [];
         }
-        // NO REGISTRANT AT ALL is not a standing refusal — there is nothing left
-        // to distrust, and the remedy would be a lie twice over: a sync against
-        // an absent provider refuses with its own message instead. It matches
-        // how the sweep itself treats a vanished provider: skip, say nothing.
+        // MIRROR THE SWEEP'S OWN SKIPS, in the sweep's own order. Both of
+        // these are conditions under which a refresh would pass this source
+        // over in silence, so a warning about it is noise — and worse than
+        // noise, because the message promises that a sync resumes live status:
+        //
+        //  - NO REGISTRANT AT ALL. Nothing left to distrust, and the remedy is
+        //    a lie twice over — a sync against an absent provider refuses with
+        //    its own message instead.
+        //  - A REGISTRANT THAT REPORTS NO STATUS. `fetchStatus` is optional
+        //    (NetBox implements none), and the loop above skips such a provider
+        //    before it ever reaches the trust gate, so this source could not
+        //    have been refused under the current registrant at all. Its shape
+        //    may well still be distrusted, and a sync may well restamp it —
+        //    and live status would still never come back, because there is
+        //    nothing to call. Promising otherwise is the "remedy that cannot
+        //    happen" this codebase keeps having to relearn.
         const provider = registry.get(liveSource.providerId);
-        if (provider === undefined) {
+        if (!provider || typeof provider.fetchStatus !== "function") {
           return [];
         }
         if (providerShapeIsTrusted(liveSource, provider, confirmedProviderShapes, liveSource.revision)) {
