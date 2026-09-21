@@ -12256,17 +12256,35 @@ describe("nexus.inventory.refreshStatus — provider trust fingerprint", () => {
 });
 
 /**
- * A SOURCE-TEXT INVARIANT, and the only mechanism that makes the trust claim
- * real. `vault` is in scope for the whole of `registerInventoryCommands`, there
- * is no linter in this repo, and nothing else notices a tenth
- * `vault.get(inventorySecretKey(...))` appearing on an ungated path. Pinning
- * the COUNT turns adding one into a deliberate act that has to be argued for in
- * the diff.
+ * A SOURCE-TEXT TRIPWIRE. Say what it is, because the claim it used to make for
+ * itself — that it is what makes the trust rule real — is false, and a test
+ * believed to be a guarantee is worse than one known to be a nudge.
+ *
+ * WHAT IT DOES: `vault` is in scope for the whole of
+ * `registerInventoryCommands`, there is no linter in this repo, and nothing
+ * else notices a tenth `vault.get(inventorySecretKey(...))` appearing on an
+ * ungated path. Pinning the COUNT turns the naive addition — one more literal
+ * call, written the way the nine below are written — into a failure that has to
+ * be argued for in the diff. That is the addition that has actually happened.
+ *
+ * WHAT WALKS STRAIGHT OVER IT, so nobody builds on it as a guarantee:
+ *  - a hoisted key — `const key = inventorySecretKey(...); await vault.get(key)`;
+ *  - a line break after `vault.get(`;
+ *  - any local alias of `vault`, or a helper that closes over it;
+ *  - a read from ANOTHER file. `configCommands.ts` reads these same keys today
+ *    (the backup export and the post-import credential check). Both are
+ *    correctly outside the trust gate — neither hands a provider anything —
+ *    but nothing here would notice a third one that did.
+ * It also fails on a harmless rewrap of an existing site, which is noise rather
+ * than a finding: re-read the nine below, confirm the set is unchanged, move on.
+ *
+ * Kept anyway: it is one string compare, and it catches the one shape of this
+ * mistake that has been made in this file.
  */
 describe("inventoryCommands — the secret reads are counted", () => {
   const source = readFileSync(path.resolve(__dirname, "..", "..", "src", "commands", "inventoryCommands.ts"), "utf8");
 
-  it("has exactly the NINE sanctioned reads of an inventory secret (⊘ a name check passes any number of call sites, which is how an ungated tenth one ships unnoticed)", () => {
+  it("has exactly the NINE sanctioned reads of an inventory secret (⊘ a name check passes any number of call sites, which is how a literal ungated tenth one ships unnoticed)", () => {
     // CALL SITES ONLY — a comment that merely names the call (the doc on
     // `providerStillTrustedSilently` does, so the grep that finds this test
     // finds the rule too) is prose, not a read.
@@ -12301,7 +12319,9 @@ describe("inventoryCommands — the secret reads are counted", () => {
         "diff which gate it sits behind — checkProviderFingerprint on a path a",
         "user drove, providerStillTrustedSilently on anything automatic — then",
         "add it to the list above and raise this count.",
-        "IF YOU REMOVED OR MOVED ONE, drop it from the list and lower the count."
+        "IF YOU REMOVED OR MOVED ONE, drop it from the list and lower the count.",
+        "IF YOU ONLY REWRAPPED ONE, this test is a text match and cannot tell:",
+        "check the nine against the list and restore the count."
       ].join("\n")
     ).toBe(9);
   });

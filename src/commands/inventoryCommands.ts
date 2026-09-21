@@ -456,8 +456,11 @@ function providerShapeIsTrusted(
  * far that goes: `vault` is in scope for the whole of
  * `registerInventoryCommands` and there is no linter here, so this does NOT
  * prevent a future path from calling `vault.get(inventorySecretKey(...))`
- * directly. The count pinned by the source-text test in
- * `test/unit/inventoryCommands.test.ts` is what actually enforces it.
+ * directly. Nothing prevents that. A source-text test in
+ * `test/unit/inventoryCommands.test.ts` pins the number of such call sites in
+ * this file, which makes the naive addition fail loudly — and the naive
+ * addition is the one that has actually happened. It is a tripwire, not a
+ * guarantee, and its own doc says what walks over it.
  */
 async function providerStillTrustedSilently(
   source: InventorySourceConfig,
