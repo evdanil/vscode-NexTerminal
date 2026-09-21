@@ -102,7 +102,11 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  * it. Every such change is a new shape, and every existing STAMPED source
  * stops reporting live status until its user has confirmed the change once —
  * so the blast radius is every source saved by a current build, which in
- * practice is all of them.
+ * practice is all of them. ADDING A REQUIRED SECRET FIELD is worse than the
+ * rest: the sync that would otherwise settle the question aborts at its
+ * missing-credential check before it can restamp, so those users have to go
+ * through Edit Source to enter the credential and confirm in one step. The
+ * manual status warning names whichever of the two can actually finish.
  *
  * ADOPT-ON-ADD AND `instanceKey` (REVIEW FINDING, P1): a provider that does not
  * implement the optional `instanceKey(config)` method gets no adoption — a

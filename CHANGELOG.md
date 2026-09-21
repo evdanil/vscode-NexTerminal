@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.8.236] — 2026-09-21
+
+### Fixed
+
+- **The live-status warning now names the command that can actually end the refusal.** When the extension answering an inventory source's provider id changes shape, the live status refresh stops for that source until you confirm the change, and a manual **Refresh Inventory Status** says so and tells you what to run. It always said **Sync Inventory Now** — which is right almost always, since the sync raises the confirmation and settles it for good on Continue. It is wrong in one reachable case: if the provider's new shape added a **required** password or token field, the sync checks its required credentials straight after the confirmation and stops there, because nothing is stored for the new field yet. You would answer the question, watch the sync refuse, and still have no live status. The warning now detects that case and names **Edit Source** instead, which asks the same question, takes the missing credential and settles it on Save — one step where the other was two. A refresh that skipped one source of each kind names both, against the right sources.
+
+  That sentence is the whole of what this release changes for you. The rest of it moves the provider-trust rule out of the eight places it was written into one, which changes nothing Nexus does.
+
 ## [2.8.235] — 2026-09-20
 
 ### Fixed

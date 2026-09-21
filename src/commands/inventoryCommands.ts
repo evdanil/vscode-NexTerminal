@@ -5385,24 +5385,62 @@ export function registerInventoryCommands(
         if (providerShapeIsTrusted(liveSource, provider, confirmedProviderShapes, liveSource.revision)) {
           return [];
         }
-        return [refused];
+        // WHICH REMEDY THIS SOURCE CAN ACTUALLY FINISH. Sync Inventory Now is
+        // the one-step answer for almost every refusal — it raises the
+        // Continue/Cancel modal and restamps on Continue — but it checks its
+        // required secrets against the registrant's CURRENT schema immediately
+        // after that modal and before anything is restamped. So when the very
+        // shape change that caused the refusal also added a REQUIRED password
+        // field, the sync aborts in that loop with its own "missing saved
+        // credential" error and the refusal outlives the confirmation the user
+        // just gave. Edit Source is the only surface that asks the same
+        // question AND lets the missing credential be typed, and its Save
+        // restamps unconditionally — one step where the sync would be two.
+        //
+        // ASKED OF THE RECORD, NOT OF THE VAULT: `secretFieldIds` is the ids
+        // actually written to SecretStorage for this source, so a required
+        // password field absent from it has no entry to read. Deriving it this
+        // way keeps the promise the surrounding composer makes — a message
+        // about credentials that were WITHHELD must not touch the keychain to
+        // compose itself — and keeps the sanctioned vault reads at their pinned
+        // count.
+        const syncWouldStopShort = provider.configFields.some(
+          (field) => field.type === "password" && field.required === true && !liveSource.secretFieldIds.includes(field.id)
+        );
+        return [{ ...refused, syncWouldStopShort }];
       });
       if (live.length === 0) {
         return;
       }
       const count = live.length;
-      const names = live.slice(0, 3).map((source) => `"${source.name}"`).join(", ");
-      const andMore = count > 3 ? ` and ${count - 3} more` : "";
+      /** Up to three names, then a count — the same legibility cap the truncation warning uses. */
+      const renderNames = (entries: { name: string }[]): string => {
+        const shown = entries
+          .slice(0, 3)
+          .map((entry) => `"${entry.name}"`)
+          .join(", ");
+        return entries.length > 3 ? `${shown} and ${entries.length - 3} more` : shown;
+      };
       const subject =
-        count === 1 ? `Live status for ${names} was skipped` : `Live status for ${count} sources was skipped (${names}${andMore})`;
-      // THE REMEDY IS A COMMAND THAT EXISTS AND ACTUALLY CLEARS THIS. Sync
-      // Inventory Now raises the Continue/Cancel modal and, on Continue,
-      // restamps the source — so answering it once ends the refusal for good,
-      // rather than for this window only as the latch does.
+        count === 1
+          ? `Live status for ${renderNames(live)} was skipped`
+          : `Live status for ${count} sources was skipped (${renderNames(live)})`;
+      const needsEdit = live.filter((source) => source.syncWouldStopShort);
+      const syncable = live.filter((source) => !source.syncWouldStopShort);
+      const syncClause = `Run Sync Inventory Now on ${count === 1 ? "it" : "each of them"} and confirm the change to resume live status.`;
+      const editClause = `Open Edit Source on ${
+        count === 1 ? "it" : "each of them"
+      }: the provider's new shape asks for a credential this source has never stored, so a sync would stop short of confirming anything. Entering it and saving resumes live status.`;
+      const remedy =
+        needsEdit.length === 0
+          ? syncClause
+          : syncable.length === 0
+            ? editClause
+            : `Run Sync Inventory Now on ${renderNames(syncable)} and confirm the change to resume live status. ${renderNames(
+                needsEdit
+              )} need Edit Source instead — the provider's new shape asks them for a credential they have never stored, so a sync would stop short of confirming anything.`;
       void vscode.window.showWarningMessage(
-        `${subject} — the extension now answering the provider id declares a different shape from the one the source was configured against, so its saved credentials were not used. Run Sync Inventory Now on ${
-          count === 1 ? "it" : "each of them"
-        } and confirm the change to resume live status.`
+        `${subject} — the extension now answering the provider id declares a different shape from the one the source was configured against, so its saved credentials were not used. ${remedy}`
       );
     };
     for (const source of targets) {

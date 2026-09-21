@@ -11708,12 +11708,15 @@ describe("nexus.inventory.refreshStatus — provider trust fingerprint", () => {
   const TOTAL_FAILURE = "Could not refresh live status from any inventory source";
 
   /** Sources sharing one `fetchStatus` provider, each with its own vaulted apiToken. */
-  async function setup(sources: { id: string; name: string; providerFingerprint?: string }[]) {
+  async function setup(
+    sources: { id: string; name: string; providerFingerprint?: string }[],
+    providerOverrides: Partial<InventoryProvider> = {}
+  ) {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();
     const registry = new InventoryProviderRegistry();
     const fetchStatus = vi.fn(async () => REPORT);
-    registry.register(makeProvider({ fetchStatus }));
+    registry.register(makeProvider({ fetchStatus, ...providerOverrides }));
     const vault = makeVault(Object.fromEntries(sources.map((s) => [inventorySecretKey(s.id, "apiToken"), "tok"])));
     trackedDisposables.push(...registerInventoryCommands(core, registry, vault, makeTeardown()));
     for (const s of sources) {
@@ -11771,6 +11774,99 @@ describe("nexus.inventory.refreshStatus — provider trust fingerprint", () => {
     expect(notifications()[0]).toContain("Sync Inventory Now");
     // A report, never a question: the sweep raises no modal of its own.
     expect(mockShowWarningMessage.mock.calls.every((call) => call.length === 1)).toBe(true);
+  });
+
+  /**
+   * THE REMEDY HAS TO BE ONE THE USER CAN ACTUALLY FINISH. Sync Inventory Now
+   * raises the Continue/Cancel modal and restamps on Continue, so it ends the
+   * refusal for good — except when the shape change that caused the refusal
+   * ALSO added a required password field. `syncNow` checks its required secrets
+   * against the CURRENT provider schema, straight after the modal and before
+   * anything is restamped, and aborts there when the vault holds nothing for the
+   * new field. The user then answers the question, watches the sync stop, and
+   * still has the refusal. Edit Source is the one surface that both asks the
+   * same question and lets the missing credential be typed, and its Save
+   * restamps unconditionally.
+   */
+  const ADDED_REQUIRED_SECRET = [
+    { id: "host", label: "Host", type: "string", required: true },
+    { id: "apiToken", label: "API Token", type: "password", required: true },
+    // The field the new shape added. Sources built by `setup` predate it, so
+    // their `secretFieldIds` never names it and the vault holds nothing for it.
+    { id: "vaultToken", label: "Vault Token", type: "password", required: true }
+  ] satisfies InventoryProvider["configFields"];
+
+  it("names EDIT SOURCE when the new shape added a required secret the record has never stored (\u2298 naming Sync Inventory Now sends the user to a command that aborts in its required-secret loop before it can restamp, so the refusal survives the sync they were told would end it)", async () => {
+    const { refresh } = await setup([{ id: "src-1", name: "Alpha", providerFingerprint: STALE }], {
+      configFields: ADDED_REQUIRED_SECRET
+    });
+
+    await refresh("src-1");
+
+    expect(notifications()).toHaveLength(1);
+    expect(notifications()[0]).toContain('"Alpha"');
+    expect(notifications()[0]).toContain("Edit Source");
+    // The absence is the load-bearing half: the old message named this command
+    // for every refusal, and naming it here is the two-step path.
+    expect(notifications()[0]).not.toContain("Sync Inventory Now");
+  });
+
+  it("still names SYNC INVENTORY NOW when every required secret the new shape declares is already stored (\u2298 pointing every refusal at Edit Source costs the one-step remedy on the ordinary path, where a sync both confirms and restamps)", async () => {
+    const { refresh } = await setup([{ id: "src-1", name: "Alpha", providerFingerprint: STALE }]);
+
+    await refresh("src-1");
+
+    expect(notifications()).toHaveLength(1);
+    expect(notifications()[0]).toContain("Sync Inventory Now");
+    expect(notifications()[0]).not.toContain("Edit Source");
+  });
+
+  it("names BOTH remedies, against the right sources, on a sweep that refused one of each (\u2298 one remedy for the whole sweep is wrong for whichever half it does not describe)", async () => {
+    const { core, refresh } = await setup(
+      [
+        { id: "src-1", name: "Alpha", providerFingerprint: STALE },
+        { id: "src-2", name: "Beta", providerFingerprint: STALE }
+      ],
+      { configFields: ADDED_REQUIRED_SECRET }
+    );
+    // Beta HAS the added field's credential stored, so a sync would reach its
+    // restamp; Alpha does not.
+    const beta = core.getInventorySource("src-2")!;
+    await core.addOrUpdateInventorySource({ ...beta, secretFieldIds: ["apiToken", "vaultToken"] });
+
+    await refresh();
+
+    expect(notifications()).toHaveLength(1);
+    const message = notifications()[0];
+    // WHICH NAMES SIT UNDER WHICH REMEDY is the whole assertion — a message
+    // carrying both clauses with the sets swapped is still a message carrying
+    // both clauses, and it sends each user to the command that cannot help them.
+    const syncSubject = message.slice(
+      message.indexOf("Run Sync Inventory Now on ") + "Run Sync Inventory Now on ".length,
+      message.indexOf(" and confirm the change")
+    );
+    expect(syncSubject).toBe('"Beta"');
+    const editSubject = message.slice(0, message.indexOf(" need Edit Source instead")).split(". ").pop();
+    expect(editSubject).toBe('"Alpha"');
+  });
+
+  it("leaves an added OPTIONAL password field pointing at Sync Inventory Now — that one does not stop a sync (⊘ testing `type === \"password\"` without the required flag sends the user to Edit Source for a credential the sync never asks for)", async () => {
+    const { refresh } = await setup([{ id: "src-1", name: "Alpha", providerFingerprint: STALE }], {
+      configFields: [
+        { id: "host", label: "Host", type: "string", required: true },
+        { id: "apiToken", label: "API Token", type: "password", required: true },
+        // Added by the same shape change, and equally unstored — but syncNow's
+        // required-secret loop skips a field that is not required, so the sync
+        // reaches its restamp and ends the refusal in one step.
+        { id: "proxyPassword", label: "Proxy Password", type: "password", required: false }
+      ]
+    });
+
+    await refresh("src-1");
+
+    expect(notifications()).toHaveLength(1);
+    expect(notifications()[0]).toContain("Sync Inventory Now");
+    expect(notifications()[0]).not.toContain("Edit Source");
   });
 
   it("names every refused source in ONE message on a multi-source manual sweep (⊘ one notification per source stacks a pile of them on a sweep of a whole inventory)", async () => {
