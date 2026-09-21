@@ -116,9 +116,9 @@ export interface InventoryStatusRefreshOutcome {
    * else's and clear on their own (the sibling command finishes; the restore
    * lands the credential). The trust refusal does not: it takes a deliberate
    * Continue on an interactive path, so a source can sit here indefinitely.
-   * Reporting it is still right — the poll's warm retry is a map lookup that
-   * never reaches the network, and it is what makes good on the confirmation
-   * the moment it arrives — but a consumer must not read this list as
+   * Reporting it is still right — the poll's retry is a fingerprint compare
+   * that never reaches the vault or the network, and it is what makes good on
+   * the confirmation the moment it arrives — but a consumer must not read this list as
    * "resolving by itself".
    */
   unrefreshedSourceIds: string[];
@@ -5136,8 +5136,8 @@ export function registerInventoryCommands(
     // The first two blockers are somebody else's and clear on their own. The
     // TRUST REFUSAL does not — only a deliberate Continue on an interactive path
     // ends it — so a refused source sits in this list until the user answers.
-    // Still worth reporting for the same reason: the retry costs a map lookup
-    // and delivers the refresh the instant the answer arrives.
+    // Still worth reporting for the same reason: the retry costs a fingerprint
+    // compare and delivers the refresh the instant the answer arrives.
     const unrefreshedSourceIds: string[] = [];
     const targets = sourceIdArg
       ? (() => {

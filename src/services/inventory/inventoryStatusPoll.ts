@@ -65,10 +65,10 @@ import { wireViewVisibility, type VisibilityAwareView } from "../terminal/viewVi
  * What a warm retry COSTS, stated plainly: a declined fire never reaches the
  * network. `refreshStatus` refuses a claimed source, a source with a missing
  * declared credential, and a source whose provider id has been re-registered
- * with a different shape, BEFORE any provider call — the pre-checks are map
- * lookups and local `SecretStorage` reads (the trust check is cheaper still:
- * a fingerprint compare with no read at all). The only warm retry that
- * reaches the lab box is the one that succeeds. The warm delay still BACKS
+ * with a different shape, BEFORE any provider call — a map lookup for the
+ * claim, local `SecretStorage` reads for the declared credential, and for the
+ * trust gate a fingerprint compare, which does no I/O at all. The only warm
+ * retry that reaches the lab box is the one that succeeds. The warm delay still BACKS
  * OFF (5 s doubling per declined retry, capped at the source's own configured
  * period), so a source whose credentials never arrive converges to polling
  * its vault at exactly the cadence the user configured — no more than a
@@ -80,9 +80,17 @@ import { wireViewVisibility, type VisibilityAwareView } from "../terminal/viewVi
  * THE TRUST REFUSAL IS THE ONE BLOCKER THAT NEED NEVER CLEAR, and the warm-up
  * is stated here so that is not read as an oversight. Nobody but the user can
  * end it — by answering the Continue/Cancel modal an interactive path raises —
- * so an affected source stays `warming` indefinitely, at the backed-off delay,
- * costing one map lookup per tick. A manual Refresh Inventory Status is where
- * it is SAID: this scheduler never speaks.
+ * so an affected source is re-refused for as long as that takes. WHICH CADENCE
+ * it is re-refused at turns on whether a fire ever RAN for this arming, and
+ * the two answers converge: a source refused from the start never leaves
+ * `warming`, so its delay doubles per declined retry until the cap in
+ * `syncTimer` holds it at the source's configured period, while a source
+ * refused only after a successful tick is already `steady` and a decline never
+ * demotes `steady` (see `state`), so it is re-refused at that same configured
+ * interval directly. Either way the tick costs a fingerprint compare — a
+ * sha256 over the registrant's declared label and config fields — and touches
+ * neither the vault nor the network. A manual Refresh Inventory Status is
+ * where it is SAID: this scheduler never speaks.
  *
  * Kept in its own `vscode`-free module (only the type-only `VisibilityAwareView`
  * import, erased at compile time) so it unit-tests with a plain fake view and
