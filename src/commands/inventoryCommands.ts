@@ -292,29 +292,26 @@ async function restampProviderFingerprintBestEffort(core: NexusCore, syncSnapsho
 /**
  * F3 — shared Continue/Cancel gate for handing a provider registrant a
  * source's saved secrets when its declared shape (label/configFields) has
- * drifted since the source was last saved/edited (see
- * InventorySourceConfig.providerFingerprint's doc for the trust-model
- * rationale). Used by EVERY path that spends a source's stored secrets:
- * syncNow (before its required-secret vault reads), editSource (before the
- * form — and its Test button's vault-backed secret hydration — ever opens),
+ * drifted since the source was last saved/edited. The rule this enforces — what
+ * is hashed, which sources are gated at all, and what a Continue buys on each
+ * path — is publicApi.ts's trust-model doc; what follows is only how this
+ * function implements it. Used by EVERY path that spends a source's stored
+ * secrets: syncNow (before its required-secret vault reads), editSource (before
+ * the form — and its Test button's vault-backed secret hydration — ever opens),
  * openWebConsole and the Start/Stop node control (each before its under-lock
  * capture), so the flows can't drift on when this confirmation is required.
+ *
+ * Two outputs, and a caller has to know which it owns.
  * `outcome: "cancelled"` means the caller must abort before any vault read for
- * this source; `fingerprintToStamp` is only meaningful to callers (syncNow)
- * that restamp on their own success path — editSource's Save already restamps
- * unconditionally on every save (deliberate — see persistUpdatedInventorySource's
- * ITEM A) and ignores it, and the two read-only-to-config paths (the console and
- * node control) drop it so a click made to look at a screen, or to boot a node,
- * cannot bless a changed registrant for every later flow. THAT SENTENCE IS
- * ABOUT THE STAMP, and it still holds: nothing here is persisted from those two
- * paths. A Continue does, however, set the SESSION LATCH
- * (`confirmedProviderShapes`) — runtime-only, this window only, keyed by the
- * exact fingerprint the user was shown AND the incarnation of the record the
- * question was about — which is read by `providerStillTrustedSilently` and by
- * nothing else. So a click made to boot a node authorises the background status
- * reads for that one source, in this one window, against that one shape and
- * that one record; it blesses no later interactive flow, and a further
- * re-registration of a different shape asks again.
+ * this source. `fingerprintToStamp` is the DURABLE half, and it is only
+ * meaningful to callers (syncNow) that restamp on their own success path —
+ * editSource's Save already restamps unconditionally on every save (deliberate
+ * — see persistUpdatedInventorySource's ITEM A) and ignores it, and the two
+ * read-only-to-config paths (the console and node control) drop it, which is
+ * what keeps them out of the durable answer. The WINDOW-SCOPED half is not the
+ * caller's at all: a Continue sets the session latch
+ * (`confirmedProviderShapes`) below rather than in any caller — see that write
+ * for why — and `providerStillTrustedSilently` is the only reader.
  *
  * ITS SILENT SIBLING is `providerStillTrustedSilently`, used by the status
  * refresh — the one automatic, repeating path — which must refuse rather than
