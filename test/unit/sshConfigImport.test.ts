@@ -42,6 +42,42 @@ describe("convertSshConfig", () => {
     expect(result.sessions[0].keyPath).toBeUndefined();
   });
 
+  it("treats `IdentityFile none` as ssh_config(5)'s \"no identity file\" sentinel, not a path (⊘ storing keyPath \"none\" makes the profile key-auth on a file the connector cannot read, so it never connects)", () => {
+    const result = convert("Host web\n  HostName web.example.com\n  IdentityFile none\n");
+
+    expect(result.sessions).toHaveLength(1);
+    expect(result.sessions[0].keyPath).toBeUndefined();
+    expect(result.sessions[0].authType).toBe("password");
+    // Not a key we failed to use — a key the user said not to use. The counter
+    // the confirm modal reports must not claim a loss that did not happen.
+    expect(result.droppedIdentityFileCount).toBe(0);
+    expect(result.skippedCount).toBe(0);
+  });
+
+  it("⊘ only the exact lowercase word `none` is the sentinel — a real path keeps key auth, including one that merely contains or is named after it (kills a substring or case-insensitive match)", () => {
+    const paths = ["/keys/none.pem", "/keys/none", "none.pem", "None", "NONE", "./none"];
+
+    for (const p of paths) {
+      const result = convert(`Host web\n  IdentityFile ${p}\n`);
+      expect(result.sessions[0].authType, p).toBe("key");
+      expect(result.sessions[0].keyPath, p).toBe(p);
+    }
+  });
+
+  it("carries a backslash-escaped space in IdentityFile through to keyPath (⊘ the tokenizer flushing at the escaped space stores `/tmp/my\\` and the profile is key-auth on a path that does not exist)", () => {
+    const result = convert("Host web\n  IdentityFile /tmp/my\\ key\n");
+
+    expect(result.sessions[0].keyPath).toBe("/tmp/my key");
+    expect(result.sessions[0].authType).toBe("key");
+  });
+
+  it("⊘ keeps a quoted `none` a sentinel — ssh strips the quotes before comparing, so `\"none\"` disables the identity file just as the bare word does", () => {
+    const result = convert('Host web\n  IdentityFile "none"\n');
+
+    expect(result.sessions[0].keyPath).toBeUndefined();
+    expect(result.sessions[0].authType).toBe("password");
+  });
+
   it("expands %h in HostName to the alias (⊘ passing it through creates a server at the literal host \"%h.example.com\" that can never resolve)", () => {
     const result = convert("Host web1\n  HostName %h.example.com\n");
 

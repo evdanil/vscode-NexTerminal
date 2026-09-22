@@ -392,6 +392,56 @@ Host box
     expect(result.entries[0].identityFile).toBe("~/my keys/id_ed25519");
   });
 
+  it("joins a backslash-escaped space into the token and drops the backslash — `ssh -G` reports `identityfile /tmp/my key` for it (⊘ flushing at the escaped space records `/tmp/my\\`, a path that does not exist, and makes the profile key-auth on it)", () => {
+    const result = parseSshConfig("Host box\n  IdentityFile /tmp/my\\ key\n");
+    expect(result.entries[0].identityFile).toBe("/tmp/my key");
+    expect(result.entries[0].identityFile).not.toContain("\\");
+  });
+
+  it("escapes a tab the same way a space is escaped (⊘ handling only \" \" leaves a tab flushing the token early)", () => {
+    const result = parseSshConfig("Host box\n  IdentityFile /tmp/my\\\tkey\n");
+    expect(result.entries[0].identityFile).toBe("/tmp/my\tkey");
+  });
+
+  it("reads `\\\\` as one literal backslash", () => {
+    const result = parseSshConfig("Host box\n  IdentityFile /tmp/a\\\\b\n");
+    expect(result.entries[0].identityFile).toBe("/tmp/a\\b");
+  });
+
+  it("⊘ keeps the backslashes in a Windows key path, which holds no recognised escape (a blanket \"drop every backslash\" rule hands the connector C:Usersme.sshid_rsa)", () => {
+    const result = parseSshConfig("Host box\n  IdentityFile C:\\Users\\me\\.ssh\\id_rsa\n");
+    expect(result.entries[0].identityFile).toBe("C:\\Users\\me\\.ssh\\id_rsa");
+  });
+
+  it("⊘ keeps a trailing backslash at end of line as a literal backslash — ssh_config has no line continuation, so it cannot mean one", () => {
+    const result = parseSshConfig("Host box\n  IdentityFile /tmp/key\\\n  User ops\n");
+    expect(result.entries[0].identityFile).toBe("/tmp/key\\");
+    // The next line is still its own directive, not a continuation of this one.
+    expect(result.entries[0].user).toBe("ops");
+    expect(result.issues).toHaveLength(0);
+  });
+
+  it("⊘ recognises `\\\\` and `\\\"` inside quotes but leaves an escaped space there alone — inside quotes a space needs no escape, so OpenSSH treats `\\ ` as an unrecognised escape and keeps the backslash", () => {
+    expect(parseSshConfig('Host box\n  IdentityFile "/tmp/a\\\\b"\n').entries[0].identityFile).toBe("/tmp/a\\b");
+    expect(parseSshConfig('Host box\n  IdentityFile "/tmp/my\\ key"\n').entries[0].identityFile).toBe("/tmp/my\\ key");
+  });
+
+  it("reads `\\\"` as a literal quote that neither opens nor closes a quoted run (⊘ toggling on it swallows the following space and merges two Host patterns into one alias)", () => {
+    const result = parseSshConfig('Host a\\"b c\n  HostName 10.0.0.1\n');
+    expect(result.entries.map((e) => e.alias)).toEqual(['a"b', "c"]);
+  });
+
+  it("⊘ leaves `\\#` as a literal backslash-hash, matching argv_split's unrecognised-escape rule — the backslash opens the token, which is what stops the `#` starting a comment", () => {
+    const result = parseSshConfig("Host box\n  IdentityFile \\#odd/key\n");
+    expect(result.entries[0].identityFile).toBe("\\#odd/key");
+    expect(result.entries[0].identityFile).not.toBe("#odd/key");
+  });
+
+  it("⊘ still ends the line at a `#` that opens a token even now that escapes are honoured (a backslash earlier in the line must not turn the rest of it into data)", () => {
+    const result = parseSshConfig("Host box\n  IdentityFile /tmp/my\\ key # the prod key\n");
+    expect(result.entries[0].identityFile).toBe("/tmp/my key");
+  });
+
   it("returns an empty result for an empty or comment-only file, without an issue (⊘ reporting a parse failure on a legitimately empty config sends the user hunting a bug that is not there)", () => {
     const result = parseSshConfig("\n# nothing here\n\n");
     expect(result.entries).toHaveLength(0);
