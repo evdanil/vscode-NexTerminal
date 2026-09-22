@@ -4980,6 +4980,53 @@ describe("import from SSH config command (nexus.config.import.sshConfig)", () =>
   });
 
   /**
+   * Codex P1 (#146). The branch used to require a POSITIVE `ssh-config` sniff,
+   * which inverted the sniffer's own contract — it exists to contradict a
+   * format the user already declared, never to choose one — and refused two
+   * configs ssh(1) accepts. `host-list` is the catch-all: "no opinion", not
+   * "not an ssh config".
+   */
+  it("imports a root that is ONLY `Include config.d/*`, which has no Host line to sniff (⊘ requiring a positive ssh-config signature refuses the common include-only layout outright)", async () => {
+    // Absolute include path, so the test does not depend on the home directory
+    // the resolver expands a relative one against; the include-only shape is
+    // what is under test here, not the resolution rule (pinned separately).
+    serveFiles(
+      {
+        [SSH_CONFIG_PATH]: "Include /fake/config.d/*\n",
+        "/fake/config.d/web.conf": "Host web1\n  HostName web1.example.com\n  User deploy\n"
+      },
+      { "/fake/config.d": ["web.conf"] }
+    );
+    pickConfigFile();
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    expect(core.getSnapshot().servers.map((server) => server.host)).toEqual(["web1.example.com"]);
+  });
+
+  it("imports a config written with lowercase `host`, which ssh accepts (⊘ the sniffer's capital-H signature is deliberate for host-list disambiguation and must not gate this branch)", async () => {
+    serveFiles({
+      [SSH_CONFIG_PATH]: "host web1\n  hostname web1.example.com\n  user deploy\n"
+    });
+    pickConfigFile();
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    expect(core.getSnapshot().servers.map((server) => server.host)).toEqual(["web1.example.com"]);
+  });
+
+  it("⊘ still refuses a file carrying another format's POSITIVE signature, which is the whole point of the gate", async () => {
+    serveFiles({ [SSH_CONFIG_PATH]: "[Bookmarks]\nSubRep=\nImgNum=42\n" });
+    pickConfigFile();
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  /**
    * Codex P1 (#146). The skip-what-you-already-have filter used to be computed
    * at the top of the import, BEFORE the confirmation modal and before
    * `configMutationLock`. The modal then waits on a human, which is an

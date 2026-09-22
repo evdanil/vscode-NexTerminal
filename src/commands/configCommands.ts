@@ -4030,8 +4030,26 @@ export function registerConfigCommands(
     const raw = await vscode.workspace.fs.readFile(uri);
     const text = Buffer.from(raw).toString("utf8");
 
+    // REFUSE ONLY ON A POSITIVE SIGNATURE OF A DIFFERENT FORMAT (Codex P1,
+    // #146). `host-list` is the catch-all — it means "no opinion", not "not an
+    // ssh config" — and the sniffer's own contract is to CONTRADICT a format
+    // the user already declared, never to choose one. Requiring a positive
+    // `ssh-config` match inverted that and refused two configs that are
+    // perfectly valid:
+    //
+    //   - a root that is only `Include config.d/*`, a common modern layout,
+    //     which has no `Host` line anywhere in the file the user picked;
+    //   - one written with lowercase `host`, which ssh(1) accepts and this
+    //     parser accepts, but which is deliberately NOT a positive ssh-config
+    //     signature (see `SSH_CONFIG_HOST_RE` — a whitespace-delimited host
+    //     list's `host name user port` header would otherwise be misread as an
+    //     ssh config, and that trade is the right way round).
+    //
+    // The first of those could also dead-end the one-time offer: it follows
+    // includes, so it can find hosts, say so, and then have this gate refuse
+    // the file when the user clicks Import.
     const sniff = sniffImportFormat(text);
-    if (sniff !== "ssh-config") {
+    if (sniff !== "ssh-config" && sniff !== "host-list") {
       await reportSshConfigFormatMismatch(text, sniff);
       return;
     }
@@ -4042,6 +4060,24 @@ export function registerConfigCommands(
     // goes through the same stat-first ceiling as the check above, so the
     // second read cannot exceed what the first one just cleared.
     const parsed = await resolveSshConfig(uri.fsPath, createSshConfigIo(INVENTORY_MAX_BYTES));
+
+    // The "is this even an ssh config?" question, asked AFTER the parse rather
+    // than before it. The sniffer cannot answer it for the two shapes above —
+    // an include-only root has no `Host` line to see, and a lowercase one is
+    // deliberately not a positive signature — but the RESOLVER can, because it
+    // has followed the includes the sniffer could not. Zero blocks from a file
+    // the sniffer had no opinion about is the CSV-picked-by-mistake case, and
+    // it keeps the message that names the problem instead of the vaguer "no
+    // hosts found", which reads as an empty config rather than a wrong file.
+    //
+    // Entry count, not session count: a config of nothing but `Host *` parses
+    // to one entry and zero sessions, and that is an ssh config with nothing
+    // importable in it — a different thing, already reported as such.
+    if (sniff === "host-list" && parsed.entries.length === 0) {
+      await reportSshConfigFormatMismatch(text, sniff);
+      return;
+    }
+
     await applySshConfigResult(parsed);
   }
 
