@@ -83,9 +83,7 @@ import { registerDeviceTemplateCommands } from "./commands/deviceTemplateCommand
 import { registerSavedFilterCommands } from "./commands/savedFilterCommands";
 import { registerInventoryCommands, type InventoryRuntimeTeardown } from "./commands/inventoryCommands";
 import { InventoryProviderRegistry } from "./services/inventory/providerRegistry";
-import { createNetboxProvider } from "./services/inventory/providers/netboxProvider";
-import { createEveNgProvider } from "./services/inventory/providers/eveNgProvider";
-import { createProxmoxProvider } from "./services/inventory/providers/proxmoxProvider";
+import { createBuiltInProviders } from "./services/inventory/builtInProviders";
 import { statusPollSources } from "./services/inventory/statusPollSources";
 import { createNexusExtensionApi, type NexusExtensionApi } from "./services/inventory/publicApi";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
@@ -384,10 +382,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // to registerInventoryCommands (below) and to any third party registering
   // through the public API returned from this function. Registration ORDER is
   // the order the add-source provider picker lists them in.
+  //
+  // The list itself lives in `builtInProviders.ts`, not here: the same array
+  // also drives the package.json naming check, so a provider added there
+  // cannot ship unregistered OR unnamed. Both are failures this codebase has
+  // already had. Add a provider there, never by appending a call here.
   const inventoryProviderRegistry = new InventoryProviderRegistry();
-  inventoryProviderRegistry.register(createNetboxProvider());
-  inventoryProviderRegistry.register(createEveNgProvider());
-  inventoryProviderRegistry.register(createProxmoxProvider());
+  for (const provider of createBuiltInProviders()) {
+    inventoryProviderRegistry.register(provider);
+  }
 
   // WEB CONSOLE capability — the two-half question, asked of the capability
   // rather than of a provider id: the PROVIDER half is whether `webConsoleUrl`

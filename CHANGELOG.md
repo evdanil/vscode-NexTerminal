@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **Proxmox is now findable by name from the Command Palette and the marketplace listing, as NetBox and EVE-NG already were.** Proxmox shipped as a built-in inventory source but was never added to the wording of the entry points that name them: the *Add Inventory Source* command title, the Command Center's welcome view, the extension description and the marketplace keywords all still read "NetBox, EVE-NG". Because the Command Palette matches on command title, typing "proxmox" there matched nothing at all, which reads as the feature not existing — the precise outcome the "name every shipped provider" rule was written to prevent. The rule had a test, and the test passed, because the list it checked against was written by hand and nobody extended it. That list is now derived from the providers themselves, so a provider that ships is named wherever providers are named, whether or not anyone remembers. The four places in the README that quote the command title as a step to run were updated to match, including the first step of the Proxmox walkthrough itself.
+
 ## [2.8.237] — 2026-09-21
 
 ### Fixed

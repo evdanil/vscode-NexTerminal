@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { createEveNgProvider, readEveNgStatusPollSeconds } from "../../src/services/inventory/providers/eveNgProvider";
+import { createBuiltInProviders } from "../../src/services/inventory/builtInProviders";
 
 const packageJsonPath = path.resolve(__dirname, "..", "..", "package.json");
 const readmePath = path.resolve(__dirname, "..", "..", "README.md");
@@ -40,12 +41,21 @@ describe("package contributions", () => {
    * for the same reason.
    */
   describe("provider-inclusive inventory entry points", () => {
-    const shippedProviders = [/NetBox/i, /EVE-NG/i];
+    /**
+   * DERIVED, never hand-listed — this is the whole fix. The previous version of
+   * this constant was `[/NetBox/i, /EVE-NG/i]`, and it PASSED while the rule
+   * above was being violated: Proxmox shipped without joining either entry
+   * point, and a check whose expected list is hand-maintained can only verify
+   * the entries someone remembered to add. Reading the labels off the real
+   * provider array means a provider added to `builtInProviders.ts` is named
+   * here whether or not anyone thought about it.
+   */
+  const shippedProviders = createBuiltInProviders().map((provider) => provider.label);
 
     it("names EVERY shipped provider in nexus.inventory.addSource's title (\u2298 \"(NetBox)\" reads as NetBox-only; \u2298 naming none is unsearchable for both)", () => {
       const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title ?? "";
       for (const provider of shippedProviders) {
-        expect(title).toMatch(provider);
+        expect(title).toContain(provider);
       }
     });
 
@@ -54,13 +64,43 @@ describe("package contributions", () => {
       const line = welcome.split("\n").find((l) => l.includes("nexus.inventory.addSource")) ?? "";
       expect(line).not.toBe("");
       for (const provider of shippedProviders) {
-        expect(line).toMatch(provider);
+        expect(line).toContain(provider);
       }
     });
 
     it("signals that the list is open-ended rather than the complete set of providers Nexus will ever have", () => {
       const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title ?? "";
       expect(title).toContain("\u2026");
+    });
+
+    it("⊘ names NOBODY who is not a shipped provider (kills a stale name surviving a provider's removal, which the include-everyone check cannot see)", () => {
+      const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title ?? "";
+      const named = (/\(([^)]*)\)/.exec(title)?.[1] ?? "")
+        .split(",")
+        .map((part) => part.trim().replace(/\u2026$/, "").trim())
+        .filter((part) => part.length > 0);
+      expect(named.length).toBeGreaterThan(0);
+      for (const name of named) {
+        expect(shippedProviders).toContain(name);
+      }
+    });
+
+    /**
+     * README repeats the command title verbatim as a run-this instruction, so a
+     * rename here silently turns every one of those steps into a command that
+     * does not exist — including, when Proxmox was added, the first step of
+     * Proxmox's OWN walkthrough. Pin the absence of any stale spelling rather
+     * than only the presence of the new one: a test that checks the new wording
+     * passes again the day someone restores the old.
+     */
+    it("⊘ leaves no README copy of the add-source title spelled differently from package.json", () => {
+      const readme = readFileSync(readmePath, "utf8");
+      const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title ?? "";
+      const occurrences = readme.match(/Add Inventory Source \([^)]*\)/g) ?? [];
+      expect(occurrences.length).toBeGreaterThan(0);
+      for (const occurrence of occurrences) {
+        expect(occurrence).toBe(title);
+      }
     });
   });
 
