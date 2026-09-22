@@ -9,9 +9,13 @@ import * as path from "node:path";
  *  1. {@link parseSshConfig} is PURE — string in, result out. No `fs`, no
  *     `vscode`, no I/O of any kind. `Include` directives come back as DATA
  *     ({@link SshConfigParseResult.includes}); this layer resolves nothing.
- *  2. {@link resolveSshConfig} walks those includes, and every byte it reads
- *     goes through an injected {@link SshConfigIo}. Tests therefore need no
- *     module mocking — they hand in a Map-backed io object.
+ *  2. {@link resolveSshConfig} follows those includes by TEXTUAL SPLICE: every
+ *     `Include` line is replaced by the lines of the file(s) it names,
+ *     recursively, and the assembled document is parsed ONCE. Every byte it
+ *     reads goes through an injected {@link SshConfigIo}, so tests need no
+ *     module mocking — they hand in a Map-backed io object. Each assembled line
+ *     keeps a back-pointer to its real (file, line) so entries and issues still
+ *     report coordinates a user can open.
  *
  * This is an IMPORTER, not `ssh(1)`. Where real OpenSSH would `fatal()` (a
  * missing include, a bad port, a too-deep include chain) we record an issue,
@@ -30,6 +34,14 @@ import * as path from "node:path";
  *    counted. Negated patterns (`!foo`) are skipped.
  *  - `Match` blocks are skipped wholesale: their conditions (`exec`, `host`,
  *    `originalhost`, ...) cannot be evaluated statically at import time.
+ *  - `Include` is TEXTUAL. readconf.c reads the included file's lines in place,
+ *    inside whatever block is open at the `Include` line — which is why
+ *    ssh_config(5) says it "may appear inside a Match or Host block to perform
+ *    conditional inclusion". So directives before an included file's first
+ *    `Host` line belong to the INCLUDING block, and an included file that opens
+ *    its own `Host` block ends the enclosing one for the lines that follow it
+ *    back in the parent. The one deliberate departure: an `Include` inside a
+ *    `Match` block is not followed (see {@link assembleDocument}).
  *  - A block with no `HostName` uses the ALIAS as the host — that is what ssh
  *    itself does, so such blocks are real, connectable hosts and must not be
  *    dropped.
@@ -182,10 +194,10 @@ function normalizePort(raw: string): number | undefined {
  * Drop every alias already claimed by an earlier entry (OpenSSH first-match-wins
  * applied to whole blocks) and report how many were dropped.
  *
- * Runs once per file inside {@link parseSshConfig} and again over the spliced
- * stream in {@link resolveSshConfig}. That is safe: "keep the first occurrence"
- * per file followed by "keep the first occurrence" across files removes exactly
- * the set one global pass would, and the two counts sum to the same total.
+ * Runs once, inside {@link parseSshConfig}. Because {@link resolveSshConfig}
+ * splices every include into ONE document and parses that document a single
+ * time, this pass is already the global one — there is no second, cross-file
+ * dedupe whose count would have to be reconciled with this one.
  */
 function dedupeByAlias(entries: SshConfigEntry[]): { entries: SshConfigEntry[]; duplicateAliasCount: number } {
   const kept: SshConfigEntry[] = [];
@@ -220,6 +232,20 @@ function emptyResult(): SshConfigParseResult {
 }
 
 /**
+ * Split config text into lines the way both layers must agree on.
+ *
+ * BOM first, then CRLF — a BOM'd CRLF file is the normal shape of a config
+ * copied off Windows, and both must survive to reach the keyword regex.
+ *
+ * Shared with the include assembler on purpose: a line's index here IS its
+ * reported line number, so if the two layers split differently every issue and
+ * entry coming out of an included file points at the wrong line.
+ */
+function splitConfigLines(text: string): string[] {
+  return text.replace(/^﻿/, "").replace(/\r\n/g, "\n").split("\n");
+}
+
+/**
  * Parse one OpenSSH client config. PURE — no I/O, no `vscode`, no `fs`.
  *
  * `Include` directives are returned untouched in {@link SshConfigParseResult.includes};
@@ -227,9 +253,7 @@ function emptyResult(): SshConfigParseResult {
  */
 export function parseSshConfig(text: string): SshConfigParseResult {
   const result = emptyResult();
-  // BOM first, then CRLF — a BOM'd CRLF file is the normal shape of a config
-  // copied off Windows, and both must survive to reach the keyword regex.
-  const lines = text.replace(/^﻿/, "").replace(/\r\n/g, "\n").split("\n");
+  const lines = splitConfigLines(text);
 
   const rawEntries: SshConfigEntry[] = [];
   let block: BlockState | undefined;
@@ -435,14 +459,15 @@ function globToRegExp(pattern: string): RegExp {
   return new RegExp(`${source}$`);
 }
 
-interface WalkContext {
+/** Everything the include assembler threads through the recursion. */
+interface AssemblyContext {
   io: SshConfigIo;
   result: SshConfigParseResult;
   /** Absolute paths already parsed — the cycle guard. */
   visited: Set<string>;
 }
 
-function addIssue(ctx: WalkContext, file: string, line: number, text: string, reason: string): void {
+function addIssue(ctx: AssemblyContext, file: string, line: number, text: string, reason: string): void {
   ctx.result.issues.push({ file, line, text, reason });
 }
 
@@ -453,7 +478,7 @@ function addIssue(ctx: WalkContext, file: string, line: number, text: string, re
  * survive, and that must not depend on the filesystem's readdir order.
  */
 async function expandIncludePattern(
-  ctx: WalkContext,
+  ctx: AssemblyContext,
   includingFile: string,
   line: number,
   pattern: string
@@ -499,12 +524,44 @@ async function expandIncludePattern(
   return matches;
 }
 
+/** One line of the assembled document, tagged with where it really came from. */
+interface AssembledLine {
+  text: string;
+  /** Absolute path of the file this line was read from. */
+  file: string;
+  /** 1-based line number WITHIN that file. */
+  line: number;
+}
+
 /**
- * Parse `filePath` and splice each of its includes in at the line it appeared
- * on. Returns entries in final source order, still undeduped — the caller
- * applies first-match-wins over the whole stream.
+ * Read `filePath` and return its lines with every `Include` line REPLACED by
+ * the lines of the file(s) it names, recursively.
+ *
+ * This is the whole point of the module's second layer, and the reason it is a
+ * splice rather than a per-file parse. `Include` in OpenSSH is textual: the
+ * included file's lines are read in place, inside the block that was open at
+ * the `Include` line. So
+ *
+ *     Host foo
+ *       Include foo.conf          # foo.conf holds only: HostName example.test
+ *
+ * gives `foo` that `HostName` — `ssh -G foo` prints `hostname example.test`.
+ * Parsing each included file as a standalone document (what this replaced)
+ * discards every directive ahead of its first `Host` line, which for the config
+ * above is all of them, and `foo` imports with its alias as its host.
+ *
+ * Only the `Include` lines the PURE parser reported are spliced, and that is
+ * exactly how an `Include` inside a `Match` block stays unfollowed:
+ * {@link parseSshConfig} never reports it, so the line is copied through
+ * verbatim and the final parse skips it along with the rest of the conditional
+ * block. Following it would import hosts gated behind a condition nobody
+ * evaluated.
+ *
+ * The per-file parse done here to find those lines is thrown away — entries,
+ * issues and counters all come from the single parse of the assembled
+ * document, so nothing is counted twice.
  */
-async function walkFile(ctx: WalkContext, filePath: string, depth: number): Promise<SshConfigEntry[]> {
+async function assembleDocument(ctx: AssemblyContext, filePath: string, depth: number): Promise<AssembledLine[]> {
   const text = await ctx.io.readFile(filePath);
   if (text === undefined) {
     ctx.result.issues.push({ file: filePath, line: 0, text: "", reason: `could not read "${filePath}"` });
@@ -512,26 +569,25 @@ async function walkFile(ctx: WalkContext, filePath: string, depth: number): Prom
     return [];
   }
 
-  const parsed = parseSshConfig(text);
-  for (const issue of parsed.issues) {
-    ctx.result.issues.push({ ...issue, file: filePath });
+  const includesByLine = new Map<number, SshConfigInclude>();
+  for (const include of parseSshConfig(text).includes) {
+    includesByLine.set(include.line, include);
   }
-  ctx.result.wildcardPatternCount += parsed.wildcardPatternCount;
-  ctx.result.negatedPatternCount += parsed.negatedPatternCount;
-  ctx.result.matchBlockCount += parsed.matchBlockCount;
-  // Duplicates this file resolved against itself; cross-file ones are counted
-  // by the final pass in resolveSshConfig.
-  ctx.result.duplicateAliasCount += parsed.duplicateAliasCount;
 
-  const ordered: SshConfigEntry[] = [];
-  let cursor = 0;
+  const lines = splitConfigLines(text);
+  const assembled: AssembledLine[] = [];
 
-  for (const include of parsed.includes) {
-    while (cursor < parsed.entries.length && parsed.entries[cursor].line < include.line) {
-      ordered.push({ ...parsed.entries[cursor], source: filePath });
-      cursor++;
+  for (let i = 0; i < lines.length; i++) {
+    const lineNumber = i + 1;
+    const include = includesByLine.get(lineNumber);
+    if (include === undefined) {
+      assembled.push({ text: lines[i], file: filePath, line: lineNumber });
+      continue;
     }
 
+    // The `Include` line itself is consumed: what takes its place is the
+    // included text, at exactly this position. Position decides which value
+    // wins, so nothing may be appended or hoisted.
     for (const pattern of include.patterns) {
       if (depth + 1 > MAX_INCLUDE_DEPTH) {
         // OpenSSH fatals here ("Too many recursive configuration includes").
@@ -560,17 +616,12 @@ async function walkFile(ctx: WalkContext, filePath: string, depth: number): Prom
           continue;
         }
         ctx.visited.add(target);
-        ordered.push(...(await walkFile(ctx, target, depth + 1)));
+        assembled.push(...(await assembleDocument(ctx, target, depth + 1)));
       }
     }
   }
 
-  while (cursor < parsed.entries.length) {
-    ordered.push({ ...parsed.entries[cursor], source: filePath });
-    cursor++;
-  }
-
-  return ordered;
+  return assembled;
 }
 
 /**
@@ -583,13 +634,38 @@ async function walkFile(ctx: WalkContext, filePath: string, depth: number): Prom
 export async function resolveSshConfig(rootPath: string, io: SshConfigIo): Promise<SshConfigParseResult> {
   const result = emptyResult();
   const absoluteRoot = path.resolve(expandHome(rootPath));
-  const ctx: WalkContext = { io, result, visited: new Set([absoluteRoot]) };
+  const ctx: AssemblyContext = { io, result, visited: new Set([absoluteRoot]) };
 
-  const ordered = await walkFile(ctx, absoluteRoot, 0);
+  const assembled = await assembleDocument(ctx, absoluteRoot, 0);
+  const parsed = parseSshConfig(assembled.map((line) => line.text).join("\n"));
 
-  const deduped = dedupeByAlias(ordered);
-  result.entries = deduped.entries;
-  result.duplicateAliasCount += deduped.duplicateAliasCount;
+  // Every line number that parse produced indexes the ASSEMBLED document, which
+  // exists nowhere on disk. Translate each one back before it reaches a caller:
+  // an issue at line 41 of a file the user can open is actionable, an issue at
+  // line 41 of a document only this function ever saw is not.
+  const originOf = (line: number): AssembledLine | undefined => assembled[line - 1];
+
+  for (const entry of parsed.entries) {
+    const origin = originOf(entry.line);
+    result.entries.push(
+      origin === undefined ? { ...entry, source: absoluteRoot } : { ...entry, line: origin.line, source: origin.file }
+    );
+  }
+  for (const issue of parsed.issues) {
+    const origin = originOf(issue.line);
+    result.issues.push(
+      origin === undefined ? { ...issue, file: absoluteRoot } : { ...issue, line: origin.line, file: origin.file }
+    );
+  }
+
+  result.wildcardPatternCount += parsed.wildcardPatternCount;
+  result.negatedPatternCount += parsed.negatedPatternCount;
+  result.matchBlockCount += parsed.matchBlockCount;
+  result.duplicateAliasCount += parsed.duplicateAliasCount;
+  // `includes` stays empty by contract: this layer's job is that no unfollowed
+  // include is left to report. The only `Include` lines that survive the splice
+  // sit inside a `Match` block, and the pure parser does not report those
+  // either.
 
   return result;
 }

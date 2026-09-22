@@ -580,3 +580,101 @@ describe("resolveSshConfig — include guards", () => {
     expect(result.entries.map((e) => e.alias)).toEqual(["work", "home"]);
   });
 });
+
+/**
+ * OpenSSH's `Include` is TEXTUAL: readconf.c reads the included file's lines in
+ * place, inside whatever block is open at the `Include` line — which is why
+ * ssh_config(5) documents it as usable "inside a Match or Host block to perform
+ * conditional inclusion".
+ *
+ * Every test here fails against the shape this replaced, which re-parsed each
+ * included file as a STANDALONE document and so threw away every directive
+ * ahead of its first `Host` line.
+ */
+describe("resolveSshConfig — Include is textual, not a standalone re-parse", () => {
+  it("gives the ENCLOSING Host block the pre-`Host` directives of the file it Includes, exactly as `ssh -G foo` reports them (⊘ re-parsing the include as its own document discards HostName/User entirely, so `foo` imports with its alias as its host and no user at all)", async () => {
+    const io = makeIo({
+      [sshPath("config")]: "Host foo\n  Include foo.conf\n",
+      [sshPath("foo.conf")]: "HostName example.test\nUser bob\n"
+    });
+
+    const result = await resolveSshConfig(sshPath("config"), io);
+
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0]).toMatchObject({ alias: "foo", host: "example.test", user: "bob" });
+    // ⊘ The standalone-re-parse bug's exact output: alias as host, no user.
+    expect(result.entries[0].host).not.toBe("foo");
+    expect(result.entries[0].user).not.toBeUndefined();
+    // ⊘ And the included directives must not invent a second, nameless entry.
+    expect(result.entries.map((e) => e.alias)).toEqual(["foo"]);
+  });
+
+  it("lets an included file's own `Host` block END the enclosing one, so directives after the Include in the PARENT belong to the new block (⊘ scoping the include's effect to the included file re-opens the parent's block afterwards and files `User after` under `foo`)", async () => {
+    const io = makeIo({
+      [sshPath("config")]: "Host foo\n  Include sub.conf\n  User after\n",
+      [sshPath("sub.conf")]: "HostName from-include.test\nHost bar\n  HostName bar.test\n"
+    });
+
+    const result = await resolveSshConfig(sshPath("config"), io);
+
+    expect(result.entries.map((e) => e.alias)).toEqual(["foo", "bar"]);
+    // The pre-`Host` line of sub.conf still lands on the enclosing block...
+    expect(result.entries[0]).toMatchObject({ alias: "foo", host: "from-include.test" });
+    // ...and `Host bar` closed it, so the parent's trailing User belongs to bar.
+    expect(result.entries[1]).toMatchObject({ alias: "bar", host: "bar.test", user: "after" });
+    // ⊘ `foo` must not pick up the directive that followed the Include.
+    expect(result.entries[0].user).toBeUndefined();
+  });
+
+  it("treats an Include with no enclosing block as global defaults, importing nothing from it (⊘ synthesising a block to hold the spliced directives invents a phantom entry with an empty alias; leaking them forward hands `box` a user the config scoped to everything)", async () => {
+    const io = makeIo({
+      [sshPath("config")]: "Include defaults.conf\n\nHost box\n  HostName 10.0.0.70\n",
+      [sshPath("defaults.conf")]: "User globaluser\nPort 9999\n"
+    });
+
+    const result = await resolveSshConfig(sshPath("config"), io);
+
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0]).toMatchObject({ alias: "box", host: "10.0.0.70" });
+    expect(result.entries[0].user).toBeUndefined();
+    expect(result.entries[0].port).toBeUndefined();
+    // ⊘ No phantom entry, under any spelling of "no alias".
+    expect(result.entries.map((e) => e.alias)).not.toContain("");
+    expect(result.entries.map((e) => e.alias)).not.toContain("defaults.conf");
+    expect(result.issues).toHaveLength(0);
+  });
+
+  it("applies first-value-wins ACROSS the splice boundary: a value set before the Include beats the same keyword inside it (⊘ merging the included file's values over the block's own inverts ssh_config(5) first-obtained-value and connects as the wrong user)", async () => {
+    const io = makeIo({
+      [sshPath("config")]: "Host foo\n  User first\n  Include late.conf\n",
+      [sshPath("late.conf")]: "User second\nHostName late.test\n"
+    });
+
+    const result = await resolveSshConfig(sshPath("config"), io);
+
+    expect(result.entries[0].user).toBe("first");
+    expect(result.entries[0].user).not.toBe("second");
+    // The include IS applied — the keyword the block had not set still lands,
+    // so the assertion above is not passing because nothing was spliced.
+    expect(result.entries[0].host).toBe("late.test");
+  });
+
+  it("reports entry and issue lines as lines of the FILE they came from, not of the spliced document (⊘ handing back the assembled document's own line numbers points the user at line 4 of a two-line include that exists nowhere on disk)", async () => {
+    const io = makeIo({
+      [sshPath("config")]: "Host a\n  HostName 10.0.0.71\nInclude sub.conf\n",
+      [sshPath("sub.conf")]: "Host b\n  Port bad\n"
+    });
+
+    const result = await resolveSshConfig(sshPath("config"), io);
+
+    expect(result.entries.map((e) => ({ alias: e.alias, source: e.source, line: e.line }))).toEqual([
+      { alias: "a", source: sshPath("config"), line: 1 },
+      { alias: "b", source: sshPath("sub.conf"), line: 1 }
+    ]);
+    expect(result.issues).toHaveLength(1);
+    expect(result.issues[0].file).toBe(sshPath("sub.conf"));
+    // `Port bad` is line 2 of sub.conf, and line 4 of the spliced document.
+    expect(result.issues[0].line).toBe(2);
+    expect(result.issues[0].line).not.toBe(4);
+  });
+});
