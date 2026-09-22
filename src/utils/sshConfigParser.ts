@@ -40,8 +40,10 @@ import * as path from "node:path";
  *    conditional inclusion". So directives before an included file's first
  *    `Host` line belong to the INCLUDING block, and an included file that opens
  *    its own `Host` block ends the enclosing one for the lines that follow it
- *    back in the parent. The one deliberate departure: an `Include` inside a
- *    `Match` block is not followed (see {@link assembleDocument}).
+ *    back in the parent — and, symmetrically, a `Match` an included file leaves
+ *    open still covers the parent's following lines. The one deliberate
+ *    departure: an `Include` that lands inside a `Match` block is not followed,
+ *    wherever that `Match` was opened (see {@link assembleDocument}).
  *  - A block with no `HostName` uses the ALIAS as the host — that is what ssh
  *    itself does, so such blocks are real, connectable hosts and must not be
  *    dropped.
@@ -105,7 +107,11 @@ export interface SshConfigParseResult {
   includeMissingCount: number;
   /** Includes refused for exceeding {@link MAX_INCLUDE_DEPTH}. */
   includeDepthExceededCount: number;
-  /** Includes skipped because that absolute path had already been parsed. */
+  /**
+   * Includes refused for naming a file already open further up the include
+   * chain — a real cycle (`a` → `a`, or `a` → `b` → `a`). A file included twice
+   * along different branches is NOT a cycle and is expanded both times.
+   */
   includeCycleCount: number;
 }
 
@@ -176,6 +182,37 @@ function tokenizeArgs(rest: string): string[] {
   flush();
 
   return tokens;
+}
+
+/** `Keyword value`, `Keyword=value` and `Keyword = value` are all legal. */
+const KEYWORD_LINE_RE = /^([A-Za-z][A-Za-z0-9_-]*)[ \t]*=?[ \t]*(.*)$/;
+
+/** One classified source line. */
+type ConfigLine =
+  | { kind: "blank" }
+  | { kind: "malformed"; text: string }
+  | { kind: "directive"; keyword: string; spelling: string; args: string[]; text: string };
+
+/**
+ * Classify one raw line: blank/comment, unparseable, or a directive.
+ *
+ * Shared by both layers on purpose, and that sharing is now a CORRECTNESS
+ * requirement rather than tidiness. The include assembler tracks `Host`/`Match`
+ * transitions as it emits lines, and the single parse of the assembled document
+ * tracks them again over the very same lines; the two must classify every line
+ * identically or the assembler will splice an `Include` the parser then treats
+ * as `Match`-nested (or the reverse). One function, one answer.
+ */
+function readConfigLine(raw: string): ConfigLine {
+  const text = raw.trim();
+  if (text === "" || text.startsWith("#")) {
+    return { kind: "blank" };
+  }
+  const match = text.match(KEYWORD_LINE_RE);
+  if (!match) {
+    return { kind: "malformed", text };
+  }
+  return { kind: "directive", keyword: match[1].toLowerCase(), spelling: match[1], args: tokenizeArgs(match[2]), text };
 }
 
 function isWildcardPattern(pattern: string): boolean {
@@ -294,20 +331,16 @@ export function parseSshConfig(text: string): SshConfigParseResult {
 
   for (let i = 0; i < lines.length; i++) {
     const lineNumber = i + 1;
-    const trimmed = lines[i].trim();
-    if (trimmed === "" || trimmed.startsWith("#")) {
+    const parsed = readConfigLine(lines[i]);
+    if (parsed.kind === "blank") {
+      continue;
+    }
+    if (parsed.kind === "malformed") {
+      result.issues.push({ line: lineNumber, text: parsed.text, reason: "line does not start with a keyword" });
       continue;
     }
 
-    // `Keyword value`, `Keyword=value` and `Keyword = value` are all legal.
-    const match = trimmed.match(/^([A-Za-z][A-Za-z0-9_-]*)[ \t]*=?[ \t]*(.*)$/);
-    if (!match) {
-      result.issues.push({ line: lineNumber, text: trimmed, reason: "line does not start with a keyword" });
-      continue;
-    }
-
-    const keyword = match[1].toLowerCase();
-    const args = tokenizeArgs(match[2]);
+    const { keyword, args, text: trimmed } = parsed;
 
     if (keyword === "host") {
       closeBlock();
@@ -367,7 +400,7 @@ export function parseSshConfig(text: string): SshConfigParseResult {
       continue;
     }
     if (args.length === 0) {
-      result.issues.push({ line: lineNumber, text: trimmed, reason: `${match[1]} has no value` });
+      result.issues.push({ line: lineNumber, text: trimmed, reason: `${parsed.spelling} has no value` });
       continue;
     }
     if (block.seen.has(keyword)) {
@@ -463,8 +496,39 @@ function globToRegExp(pattern: string): RegExp {
 interface AssemblyContext {
   io: SshConfigIo;
   result: SshConfigParseResult;
-  /** Absolute paths already parsed — the cycle guard. */
-  visited: Set<string>;
+  /**
+   * Absolute paths on the ACTIVE recursion stack — the cycle guard. A path is
+   * added when the assembler enters that file and removed when it leaves, so a
+   * file can only collide with itself while it is still open further up the
+   * chain. That is what a cycle is.
+   *
+   * It is deliberately NOT a whole-walk "already seen" set. Under the splice an
+   * include contributes its directives to whatever block is open at the
+   * `Include` line, so
+   *
+   *     Host a
+   *       Include common
+   *     Host b
+   *       Include common
+   *
+   * must expand `common` TWICE — OpenSSH applies it to both hosts. A global set
+   * would skip the second expansion as a "cycle" and import `b` with different
+   * credentials than ssh(1) uses, silently.
+   */
+  stack: Set<string>;
+  /**
+   * True while the assembler sits between a `Match` line and the next `Host` or
+   * `Match` — including when that `Match` arrived from a file spliced earlier.
+   *
+   * Block state has to live on the CONTEXT, not per file, because the splice is
+   * textual: an included file that opens a `Match` and never closes it leaves
+   * the parent's following lines inside that `Match`, exactly as if the lines
+   * had been typed there. An `Include` reached in that state is one OpenSSH
+   * applies conditionally, so it must not be followed. Discovering includes by
+   * re-parsing each file standalone (what this replaced) cannot see state that
+   * leaked across a splice boundary and would follow it.
+   */
+  inMatchBlock: boolean;
 }
 
 function addIssue(ctx: AssemblyContext, file: string, line: number, text: string, reason: string): void {
@@ -550,16 +614,23 @@ interface AssembledLine {
  * discards every directive ahead of its first `Host` line, which for the config
  * above is all of them, and `foo` imports with its alias as its host.
  *
- * Only the `Include` lines the PURE parser reported are spliced, and that is
- * exactly how an `Include` inside a `Match` block stays unfollowed:
- * {@link parseSshConfig} never reports it, so the line is copied through
- * verbatim and the final parse skips it along with the rest of the conditional
- * block. Following it would import hosts gated behind a condition nobody
- * evaluated.
+ * Include DISCOVERY therefore happens here, line by line, rather than by
+ * re-parsing each file on its own: this loop tracks `Host`/`Match` transitions
+ * in {@link AssemblyContext.inMatchBlock} as it emits, so it knows the block
+ * state OpenSSH would be in at every `Include` line — including a `Match` that
+ * an earlier splice left open. An `Include` reached inside a `Match` is copied
+ * through verbatim instead of being expanded; the single parse of the assembled
+ * document then skips it along with the rest of the conditional block, because
+ * it re-derives the same state from the same lines. Following it would import
+ * hosts gated behind a condition nobody evaluated.
  *
- * The per-file parse done here to find those lines is thrown away — entries,
- * issues and counters all come from the single parse of the assembled
- * document, so nothing is counted twice.
+ * A `Match` opened by an included file is allowed to LEAK back into the parent
+ * rather than being force-closed at end-of-include. That is textual-splice
+ * fidelity: readconf.c has one `Match` state machine over one stream of lines
+ * and no notion of a file boundary closing a block.
+ *
+ * Entries, issues and counters all come from the single parse of the assembled
+ * document, so nothing here is counted twice.
  */
 async function assembleDocument(ctx: AssemblyContext, filePath: string, depth: number): Promise<AssembledLine[]> {
   const text = await ctx.io.readFile(filePath);
@@ -569,56 +640,75 @@ async function assembleDocument(ctx: AssemblyContext, filePath: string, depth: n
     return [];
   }
 
-  const includesByLine = new Map<number, SshConfigInclude>();
-  for (const include of parseSshConfig(text).includes) {
-    includesByLine.set(include.line, include);
-  }
-
   const lines = splitConfigLines(text);
   const assembled: AssembledLine[] = [];
 
-  for (let i = 0; i < lines.length; i++) {
-    const lineNumber = i + 1;
-    const include = includesByLine.get(lineNumber);
-    if (include === undefined) {
-      assembled.push({ text: lines[i], file: filePath, line: lineNumber });
-      continue;
-    }
+  ctx.stack.add(filePath);
+  try {
+    for (let i = 0; i < lines.length; i++) {
+      const lineNumber = i + 1;
+      const parsed = readConfigLine(lines[i]);
 
-    // The `Include` line itself is consumed: what takes its place is the
-    // included text, at exactly this position. Position decides which value
-    // wins, so nothing may be appended or hoisted.
-    for (const pattern of include.patterns) {
-      if (depth + 1 > MAX_INCLUDE_DEPTH) {
-        // OpenSSH fatals here ("Too many recursive configuration includes").
-        // An importer stops descending and keeps what it already has.
-        addIssue(
-          ctx,
-          filePath,
-          include.line,
-          pattern,
-          `Include "${pattern}" skipped: nesting deeper than ${MAX_INCLUDE_DEPTH} levels`
-        );
-        ctx.result.includeDepthExceededCount++;
+      if (parsed.kind === "directive") {
+        if (parsed.keyword === "host") {
+          // A `Host` line ends a `Match` block even when it names no pattern —
+          // parseSshConfig clears the flag before validating the arguments, and
+          // the two must stay in step.
+          ctx.inMatchBlock = false;
+        } else if (parsed.keyword === "match") {
+          ctx.inMatchBlock = true;
+        }
+      }
+
+      // Everything that is not a followable `Include` is copied through, and
+      // the single parse of the assembled document has the last word on it:
+      // a malformed line, an `Include` with no path and an `Include` inside a
+      // `Match` all get their issue (or their silence) from there, once.
+      const followable =
+        parsed.kind === "directive" && parsed.keyword === "include" && !ctx.inMatchBlock && parsed.args.length > 0;
+      if (!followable) {
+        assembled.push({ text: lines[i], file: filePath, line: lineNumber });
         continue;
       }
 
-      const targets = await expandIncludePattern(ctx, filePath, include.line, pattern);
-      for (const target of targets) {
-        if (ctx.visited.has(target)) {
-          // OpenSSH has no cycle guard — it relies on the depth cap and blows
-          // up on a self-include. Tracking absolute paths stops the loop far
-          // earlier. It also catches a benign second include of the same file,
-          // which costs nothing: first-match-wins means a re-parse could only
-          // ever contribute aliases the first parse already claimed.
-          addIssue(ctx, filePath, include.line, pattern, `Include "${target}" skipped: already included (cycle)`);
-          ctx.result.includeCycleCount++;
+      // The `Include` line itself is consumed: what takes its place is the
+      // included text, at exactly this position. Position decides which value
+      // wins, so nothing may be appended or hoisted.
+      for (const pattern of parsed.args) {
+        if (depth + 1 > MAX_INCLUDE_DEPTH) {
+          // OpenSSH fatals here ("Too many recursive configuration includes").
+          // An importer stops descending and keeps what it already has.
+          addIssue(
+            ctx,
+            filePath,
+            lineNumber,
+            pattern,
+            `Include "${pattern}" skipped: nesting deeper than ${MAX_INCLUDE_DEPTH} levels`
+          );
+          ctx.result.includeDepthExceededCount++;
           continue;
         }
-        ctx.visited.add(target);
-        assembled.push(...(await assembleDocument(ctx, target, depth + 1)));
+
+        const targets = await expandIncludePattern(ctx, filePath, lineNumber, pattern);
+        for (const target of targets) {
+          if (ctx.stack.has(target)) {
+            // OpenSSH has no cycle guard — it relies on the depth cap and blows
+            // up on a self-include. Refusing a file that is already open
+            // further up the chain stops the loop far earlier. Only that case
+            // is refused: a file included twice along DIFFERENT branches is not
+            // a cycle, and under the splice its second expansion carries real
+            // directives into a different open block (see
+            // {@link AssemblyContext.stack}).
+            addIssue(ctx, filePath, lineNumber, pattern, `Include "${target}" skipped: already open (cycle)`);
+            ctx.result.includeCycleCount++;
+            continue;
+          }
+          assembled.push(...(await assembleDocument(ctx, target, depth + 1)));
+        }
       }
     }
+  } finally {
+    ctx.stack.delete(filePath);
   }
 
   return assembled;
@@ -634,7 +724,9 @@ async function assembleDocument(ctx: AssemblyContext, filePath: string, depth: n
 export async function resolveSshConfig(rootPath: string, io: SshConfigIo): Promise<SshConfigParseResult> {
   const result = emptyResult();
   const absoluteRoot = path.resolve(expandHome(rootPath));
-  const ctx: AssemblyContext = { io, result, visited: new Set([absoluteRoot]) };
+  // The stack starts empty: assembleDocument pushes each file as it enters it,
+  // root included, so `Include config` inside ~/.ssh/config is still a cycle.
+  const ctx: AssemblyContext = { io, result, stack: new Set(), inMatchBlock: false };
 
   const assembled = await assembleDocument(ctx, absoluteRoot, 0);
   const parsed = parseSshConfig(assembled.map((line) => line.text).join("\n"));

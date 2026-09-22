@@ -517,6 +517,48 @@ describe("resolveSshConfig — include guards", () => {
     expect(io.reads.filter((p) => p === sshPath("a.conf"))).toHaveLength(1);
   });
 
+  it("expands the SAME file again under a second Host, because that is not a cycle (⊘ a whole-walk visited set skips the second `Include common` as a cycle, so `b` imports without the User/IdentityFile ssh(1) gives it — silently, and with a bogus cycle in the summary)", async () => {
+    // `Host x` / `Include common` repeated per host is an ordinary layout. Under
+    // the textual splice the second expansion is NOT redundant: it feeds a
+    // different open block.
+    const io = makeIo({
+      [sshPath("config")]: "Host a\n  Include common.conf\n\nHost b\n  Include common.conf\n",
+      [sshPath("common.conf")]: "User deploy\n  IdentityFile ~/.ssh/id_deploy\n"
+    });
+
+    const result = await resolveSshConfig(sshPath("config"), io);
+
+    expect(result.entries.map((e) => ({ alias: e.alias, user: e.user, identityFile: e.identityFile }))).toEqual([
+      { alias: "a", user: "deploy", identityFile: "~/.ssh/id_deploy" },
+      { alias: "b", user: "deploy", identityFile: "~/.ssh/id_deploy" }
+    ]);
+    // ⊘ Nothing cyclic happened, so nothing may be reported as one.
+    expect(result.includeCycleCount).toBe(0);
+    expect(result.issues.some((i) => i.reason.includes("cycle"))).toBe(false);
+    // The file really was read twice — the assertion above is not passing
+    // because a single read happened to satisfy both blocks.
+    expect(io.reads.filter((p) => p === sshPath("common.conf"))).toHaveLength(2);
+  });
+
+  it("still refuses a cycle when the looping file is ALSO included innocently elsewhere (⊘ swapping the visited set for no guard at all makes the repeated-include fix recurse forever on a self-include)", async () => {
+    const io = makeIo({
+      [sshPath("config")]: "Host a\n  Include leaf.conf\n\nHost b\n  Include loop.conf\n",
+      [sshPath("leaf.conf")]: "User leafuser\n",
+      // loop.conf pulls in leaf.conf (fine — leaf is closed by now) and itself.
+      [sshPath("loop.conf")]: "Include leaf.conf\nInclude loop.conf\n"
+    });
+
+    const result = await resolveSshConfig(sshPath("config"), io);
+
+    expect(result.entries.map((e) => ({ alias: e.alias, user: e.user }))).toEqual([
+      { alias: "a", user: "leafuser" },
+      { alias: "b", user: "leafuser" }
+    ]);
+    expect(result.includeCycleCount).toBe(1);
+    expect(io.reads.filter((p) => p === sshPath("loop.conf"))).toHaveLength(1);
+    expect(io.reads.filter((p) => p === sshPath("leaf.conf"))).toHaveLength(2);
+  });
+
   it("is lenient about a missing include: an issue, a count, and every other host still imported (⊘ throwing on a stale `Include work.conf` costs the user all 200 hosts because of one deleted file)", async () => {
     const io = makeIo({
       [sshPath("config")]: "Include gone.conf\n\nHost survivor\n  HostName 10.0.0.50\n"
@@ -676,5 +718,56 @@ describe("resolveSshConfig — Include is textual, not a standalone re-parse", (
     // `Port bad` is line 2 of sub.conf, and line 4 of the spliced document.
     expect(result.issues[0].line).toBe(2);
     expect(result.issues[0].line).not.toBe(4);
+  });
+
+  it("does not follow a later Include that a PREVIOUSLY SPLICED file left inside an open Match (⊘ discovering includes by re-parsing each file standalone cannot see the leaked Match, follows the include, and the `Host` inside it exits the Match — importing a host gated behind a condition nobody evaluated)", async () => {
+    const io = makeIo({
+      // The parent's own text has no Match in it, which is the whole trap: only
+      // the assembled stream shows that `Include gated.conf` is conditional.
+      [sshPath("config")]:
+        "Include opener.conf\nInclude gated.conf\n\nHost plain\n  HostName 10.0.0.80\n",
+      [sshPath("opener.conf")]: 'Match exec "test -f /tmp/vpn"\n  User vpnuser\n',
+      [sshPath("gated.conf")]: "Host gated\n  HostName 10.0.0.81\n"
+    });
+
+    const result = await resolveSshConfig(sshPath("config"), io);
+
+    // `Host plain` is the line that ends the leaked Match, so it still imports.
+    expect(result.entries.map((e) => e.alias)).toEqual(["plain"]);
+    // ⊘ The conditional host must not appear, and its file must never be read.
+    expect(result.entries.map((e) => e.alias)).not.toContain("gated");
+    expect(io.reads).not.toContain(sshPath("gated.conf"));
+    expect(result.matchBlockCount).toBe(1);
+  });
+
+  it("lets a Match opened inside an included file keep covering the PARENT's following lines (⊘ force-closing the block at end-of-include hands `box` the conditional `User`, which is a value ssh(1) only applies when the Match condition holds)", async () => {
+    // The deliberate choice: the splice is textual, so readconf.c's single
+    // Match state machine spans the file boundary. See assembleDocument.
+    const io = makeIo({
+      [sshPath("config")]: "Host box\n  HostName 10.0.0.82\nInclude opener.conf\n  User conditional\n",
+      [sshPath("opener.conf")]: 'Match exec "true"\n'
+    });
+
+    const result = await resolveSshConfig(sshPath("config"), io);
+
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0]).toMatchObject({ alias: "box", host: "10.0.0.82" });
+    // ⊘ The conditional value must not reach the block the Include interrupted.
+    expect(result.entries[0].user).toBeUndefined();
+    expect(result.entries[0].user).not.toBe("conditional");
+    expect(result.matchBlockCount).toBe(1);
+  });
+
+  it("resumes following Includes after a `Host` line closes the leaked Match (⊘ latching the Match flag once it is set swallows every remaining Include in the file and loses hosts ssh reads fine)", async () => {
+    const io = makeIo({
+      [sshPath("config")]: "Include opener.conf\nHost anchor\n  HostName 10.0.0.83\nInclude later.conf\n",
+      [sshPath("opener.conf")]: 'Match exec "true"\n',
+      [sshPath("later.conf")]: "Host later\n  HostName 10.0.0.84\n"
+    });
+
+    const result = await resolveSshConfig(sshPath("config"), io);
+
+    expect(result.entries.map((e) => e.alias)).toEqual(["anchor", "later"]);
+    expect(io.reads).toContain(sshPath("later.conf"));
   });
 });
