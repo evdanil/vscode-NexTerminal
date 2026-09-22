@@ -5053,6 +5053,24 @@ describe("import from SSH config command (nexus.config.import.sshConfig)", () =>
     expect(errors).not.toContain("doesn't look like an SSH config file");
   });
 
+  /**
+   * Codex P3 (#146), and the case my own two tests for the previous fix did
+   * not cover: they used an include directory with a fragment in it, so the
+   * fragment's `Host *` supplied a wildcard count and the predicate passed for
+   * the wrong reason. With the directory EMPTY there are no entries, no
+   * counters, and `includes` is returned empty by the resolver — every term
+   * the old predicate asked about is zero for a perfectly valid config.
+   */
+  it("accepts an include-only root whose glob directory is EMPTY (⊘ a predicate assembled from entries/counters/includes reads all-zero here and calls a valid config the wrong file)", async () => {
+    serveFiles({ [SSH_CONFIG_PATH]: "Include /fake/empty.d/*\n" }, { "/fake/empty.d": [] });
+    pickConfigFile();
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    const errors = mockShowErrorMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(errors).not.toContain("doesn't look like an SSH config file");
+  });
+
   it("⊘ still refuses a file carrying another format's POSITIVE signature, which is the whole point of the gate", async () => {
     serveFiles({ [SSH_CONFIG_PATH]: "[Bookmarks]\nSubRep=\nImgNum=42\n" });
     pickConfigFile();

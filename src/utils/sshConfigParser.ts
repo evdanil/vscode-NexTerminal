@@ -98,6 +98,30 @@ export interface SshConfigParseResult {
   /** `Include` directives encountered, in source order. Data only. */
   includes: SshConfigInclude[];
   issues: SshConfigParseIssue[];
+  /**
+   * True once ANY line anywhere in the walk was recognised as ssh_config
+   * grammar: a `Host` or `Match` header, an `Include`, or one of the keywords
+   * this parser models ({@link SINGLE_VALUE_KEYWORDS}). It answers exactly one
+   * question — "is this file even an ssh config?" — and nothing about whether
+   * there was anything worth importing.
+   *
+   * IT EXISTS BECAUSE EVERY OTHER FIELD A CALLER MIGHT ASK THAT WITH IS EMPTIED
+   * OR CONSUMED BY THE TIME THE CALLER SEES IT. {@link resolveSshConfig} swallows
+   * `Include` lines into the splice and returns `includes` EMPTY by contract, and
+   * a config whose grammar is all defaults and includes yields no `entries` and
+   * no wildcard/negated/Match counts either. An include-only root whose glob
+   * directory is empty therefore comes back all-zero, and a caller sniffing on
+   * those fields calls a perfectly valid config the wrong kind of file.
+   *
+   * So it is ORed across the whole walk, never reset per file, and is set by the
+   * include assembler for the `Include` lines the splice consumes as well as by
+   * the parse of the assembled document. Consequently:
+   *  - an include-only root whose includes resolve to nothing → true;
+   *  - a defaults-only `Host *` config → true;
+   *  - a CSV host list or a MobaXterm INI body → false (their lines are either
+   *    unparseable as directives or carry keywords this parser does not model).
+   */
+  sawSshGrammar: boolean;
   /** `Host` patterns skipped for containing `*` or `?` (a defaults block). */
   wildcardPatternCount: number;
   /** `Host` patterns skipped for being negated (`!foo`). */
@@ -114,7 +138,11 @@ export interface SshConfigParseResult {
    * it skipped would tell the user a host was lost when its settings were kept.
    */
   duplicateAliasCount: number;
-  /** Includes skipped because the file (or every glob match) could not be read. */
+  /**
+   * Includes that contributed no text: the named file could not be read, or the
+   * pattern named no readable file at all — an empty glob expansion, a glob in a
+   * directory component, or a bracket expression that does not compile.
+   */
   includeMissingCount: number;
   /** Includes refused for exceeding {@link MAX_INCLUDE_DEPTH}. */
   includeDepthExceededCount: number;
@@ -151,15 +179,40 @@ interface BlockState {
 }
 
 /**
- * Split an argument list on whitespace, honouring double quotes so a quoted
- * path with spaces survives (`IdentityFile "~/my keys/id_ed25519"`), honouring
- * backslash escapes, and dropping an unquoted `#` comment and everything after
- * it.
+ * Split an argument list on whitespace, honouring quotes so a quoted path with
+ * spaces survives (`IdentityFile "~/my keys/id_ed25519"`), honouring backslash
+ * escapes, and dropping an unquoted `#` comment and everything after it.
  *
  * A `#` that OPENS a token is a comment; one inside a token is not. That is
  * OpenSSH's rule (the comment check happens only while it is skipping the
  * whitespace before a token), so `Host web#1` keeps its `#` and `Host web # prod`
  * does not.
+ *
+ * BOTH QUOTE CHARACTERS QUOTE. `argv_split()` keeps ONE `quote` variable
+ * holding the character that opened the current quoted run — `"` or `'` — so
+ * the two are symmetric, and everything below follows from that single variable
+ * rather than from a rule invented here:
+ *  - A quote only OPENS a run while no run is open, and only the SAME character
+ *    closes it. So a `"` inside single quotes and a `'` inside double quotes are
+ *    ordinary literal characters: `IdentityFile "/tmp/it's here"` is one token,
+ *    `/tmp/it's here`.
+ *  - A quote may open a run MID-token, and the run ending does not end the
+ *    token: `IdentityFile /tmp/'my key'.pub` is `/tmp/my key.pub`, exactly one
+ *    argument. The quotes are delimiters, never content.
+ *  - Single quotes are NOT shell-style literal runs. `\\`, `\"` and `\'` are
+ *    still recognised escapes inside them (see below); only `\ `/`\<tab>` stop
+ *    being recognised inside quotes, either kind, because a quoted space needs
+ *    no escape.
+ * The first of those was checked against OpenSSH 9.6: `IdentityFile '/tmp/my key'`
+ * makes `ssh -G -F <file> host` report `identityfile /tmp/my key`. The other two
+ * are read off `argv_split()`'s own control flow rather than from a run, so if
+ * one is ever found to differ, that function is the authority — not this list.
+ *
+ * ONE DELIBERATE LENIENCY: `argv_split()` FAILS the whole line on an unterminated
+ * quote, and readconf.c then `fatal()`s the config. Here an unterminated quote
+ * simply ends with the line, emitting the token it had accumulated — an importer
+ * that threw away 200 hosts over one stray `"` would be obeying ssh(1) at the
+ * user's expense. This is the only place the split deviates.
  *
  * ESCAPES ARE SELECTIVE, and deliberately so. OpenSSH splits a config line with
  * `argv_split()` (misc.c), which drops the backslash for exactly five escapes —
@@ -178,7 +231,7 @@ interface BlockState {
  *  - Escapes are processed inside quotes too, but only `\\`, `\"` and `\'` are
  *    recognised there — an escaped space inside quotes is an unrecognised escape
  *    (the space needs no escaping there), so `"my\ key"` keeps its backslash.
- *  - `\"` never opens or closes a quoted run; it is a literal `"`.
+ *  - `\"` and `\'` never open or close a quoted run; each is a literal quote.
  *  - A trailing backslash at end of line is an unrecognised escape with nothing
  *    after it: it stays in the token as a literal `\`. ssh_config has no
  *    line-continuation syntax, so there is nothing else it could mean.
@@ -191,7 +244,12 @@ interface BlockState {
 function tokenizeArgs(rest: string): string[] {
   const tokens: string[] = [];
   let current = "";
-  let quoted = false;
+  /**
+   * The quote character that opened the run currently open, or "" outside
+   * quotes — `argv_split()`'s `quote`, which is a CHAR and not a flag for
+   * exactly this reason: only the character that opened a run can close it.
+   */
+  let quote = "";
   let started = false;
 
   const flush = (): void => {
@@ -207,7 +265,7 @@ function tokenizeArgs(rest: string): string[] {
     if (ch === "\\") {
       const next = rest[i + 1];
       const recognised =
-        next === "\\" || next === '"' || next === "'" || (!quoted && (next === " " || next === "\t"));
+        next === "\\" || next === '"' || next === "'" || (quote === "" && (next === " " || next === "\t"));
       if (recognised) {
         // Consumed here, so the escaped character can no longer end the token.
         current += next;
@@ -220,16 +278,27 @@ function tokenizeArgs(rest: string): string[] {
       started = true;
       continue;
     }
-    if (ch === '"') {
-      quoted = !quoted;
-      started = true;
-      continue;
+    if (ch === '"' || ch === "'") {
+      if (quote === "") {
+        // Opens a run — mid-token is fine, the quotes are delimiters not content.
+        quote = ch;
+        started = true;
+        continue;
+      }
+      if (quote === ch) {
+        // Only the character that opened the run closes it.
+        quote = "";
+        started = true;
+        continue;
+      }
+      // The OTHER quote character inside a run: an ordinary literal, falling
+      // through to be appended below.
     }
-    if (!quoted && (ch === " " || ch === "\t")) {
+    if (quote === "" && (ch === " " || ch === "\t")) {
       flush();
       continue;
     }
-    if (!quoted && ch === "#" && !started) {
+    if (quote === "" && ch === "#" && !started) {
       break;
     }
     current += ch;
@@ -389,6 +458,7 @@ function emptyResult(): SshConfigParseResult {
     entries: [],
     includes: [],
     issues: [],
+    sawSshGrammar: false,
     wildcardPatternCount: 0,
     negatedPatternCount: 0,
     matchBlockCount: 0,
@@ -475,6 +545,13 @@ export function parseSshConfig(text: string): SshConfigParseResult {
     }
 
     const { keyword, args, text: trimmed } = parsed;
+
+    // Set before any of the branches below, and before the `Match` skip: a
+    // keyword this parser knows is ssh-config grammar whether or not the line
+    // it sits on yields anything importable. See SshConfigParseResult.sawSshGrammar.
+    if (keyword === "host" || keyword === "match" || keyword === "include" || SINGLE_VALUE_KEYWORDS.has(keyword)) {
+      result.sawSshGrammar = true;
+    }
 
     if (keyword === "host") {
       closeBlock();
@@ -596,8 +673,19 @@ function hasGlobChars(value: string): boolean {
  * No `**` — glob(3) has no such operator and neither does OpenSSH's include
  * matching; `**` here is just two adjacent `*`, which cannot cross `/` because
  * this only ever runs against a single basename.
+ *
+ * TOTAL BY CONTRACT: returns `undefined` for a pattern that cannot be compiled
+ * rather than letting `new RegExp` throw. A bracket expression is copied into
+ * the regex source largely as written, and JavaScript rejects some classes
+ * glob(3) merely finds unsatisfiable — `[z-a]` is `SyntaxError: Range out of
+ * order in character class`. That throw used to escape {@link expandIncludePattern},
+ * {@link assembleDocument} and {@link resolveSshConfig} in turn, rejecting the
+ * whole import over one `Include config.d/[z-a]` line that ssh(1) itself accepts
+ * and simply matches nothing with. Callers treat `undefined` as "matches
+ * nothing" and record an issue, which is both what OpenSSH does and what this
+ * module does with every other bad input.
  */
-function globToRegExp(pattern: string): RegExp {
+function globToRegExp(pattern: string): RegExp | undefined {
   let source = "^";
   for (let i = 0; i < pattern.length; i++) {
     const ch = pattern[i];
@@ -623,7 +711,13 @@ function globToRegExp(pattern: string): RegExp {
       source += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
     }
   }
-  return new RegExp(`${source}$`);
+  try {
+    return new RegExp(`${source}$`);
+  } catch {
+    // Only a bracket expression can get us here: every other branch above
+    // either emits a fixed fragment or escapes the character it copies.
+    return undefined;
+  }
 }
 
 /** Everything the include assembler threads through the recursion. */
@@ -703,8 +797,17 @@ async function expandIncludePattern(
     return [];
   }
 
-  const names = await ctx.io.readDir(dir);
   const re = globToRegExp(base);
+  if (re === undefined) {
+    // ssh(1) accepts a config holding an uncompilable class and the include
+    // simply matches nothing, so this is the same outcome as a glob with no
+    // matches — issue, count, carry on — and never a rejected import.
+    addIssue(ctx, includingFile, line, pattern, `Include pattern "${pattern}" is not a valid glob and matched no files`);
+    ctx.result.includeMissingCount++;
+    return [];
+  }
+
+  const names = await ctx.io.readDir(dir);
   // glob(3): a leading `.` is never matched by a wildcard — only by a pattern
   // that spells the dot out. Without this, `Include config.d/*` would suck in
   // editor backups and `.git` droppings.
@@ -808,6 +911,12 @@ async function assembleDocument(ctx: AssemblyContext, filePath: string, depth: n
       // The `Include` line itself is consumed: what takes its place is the
       // included text, at exactly this position. Position decides which value
       // wins, so nothing may be appended or hoisted.
+      //
+      // Which is also why the grammar signal has to be raised HERE and not left
+      // to the single parse of the assembled document: this line is about to
+      // stop existing, and if its includes resolve to nothing the document can
+      // end up empty. An include-only root is still unmistakably an ssh config.
+      ctx.result.sawSshGrammar = true;
       for (const pattern of parsed.args) {
         if (depth + 1 > MAX_INCLUDE_DEPTH) {
           // OpenSSH fatals here ("Too many recursive configuration includes").
@@ -884,6 +993,9 @@ export async function resolveSshConfig(rootPath: string, io: SshConfigIo): Promi
     );
   }
 
+  // ORed, not assigned: the assembler already raised this for every `Include`
+  // line the splice consumed, and those lines are not in the parsed document.
+  result.sawSshGrammar = result.sawSshGrammar || parsed.sawSshGrammar;
   result.wildcardPatternCount += parsed.wildcardPatternCount;
   result.negatedPatternCount += parsed.negatedPatternCount;
   result.matchBlockCount += parsed.matchBlockCount;

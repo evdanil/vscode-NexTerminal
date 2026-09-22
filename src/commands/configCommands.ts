@@ -4081,16 +4081,19 @@ export function registerConfigCommands(
     //
     // What separates "wrong file" from "valid config with nothing to import"
     // is whether the parser RECOGNISED any ssh-config grammar at all, not
-    // whether that grammar yielded importable hosts. A CSV yields no entries
-    // AND no wildcards, no Match blocks and no includes; a defaults-only
-    // config yields no entries but does report the wildcard it skipped.
-    const sawSshGrammar =
-      parsed.entries.length > 0 ||
-      parsed.wildcardPatternCount > 0 ||
-      parsed.negatedPatternCount > 0 ||
-      parsed.matchBlockCount > 0 ||
-      parsed.includes.length > 0;
-    if (sniff === "host-list" && !sawSshGrammar) {
+    // whether that grammar yielded importable hosts.
+    //
+    // Asked of the parser, which is the only layer that can answer it. The
+    // first attempt at this check assembled the predicate HERE, out of
+    // `entries`, the skip counters and `includes.length` — and `includes` is
+    // returned EMPTY by contract, because the resolver swallows those lines
+    // into the splice. So an include-only root whose glob directory happens to
+    // be empty came back all-zero on every term and a valid config was called
+    // the wrong kind of file. That was the same mistake as the entry-count
+    // version it replaced: reaching for a signal that does not survive the
+    // layer it is read from. `sawSshGrammar` is ORed across the whole walk and
+    // exists precisely so this caller has something that does.
+    if (sniff === "host-list" && !parsed.sawSshGrammar) {
       await reportSshConfigFormatMismatch(text, sniff);
       return;
     }

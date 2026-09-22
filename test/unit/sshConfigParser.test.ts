@@ -392,6 +392,38 @@ Host box
     expect(result.entries[0].identityFile).toBe("~/my keys/id_ed25519");
   });
 
+  it("keeps a SINGLE-quoted value with spaces intact — argv_split() quotes on `'` exactly as it does on `\"`, and `ssh -G` reports `identityfile /tmp/my key` for it (⊘ tracking only the double quote splits at the space and hands the profile the unusable key path `'/tmp/my`)", () => {
+    const result = parseSshConfig("Host box\n  IdentityFile '/tmp/my key'\n");
+    expect(result.entries[0].identityFile).toBe("/tmp/my key");
+    expect(result.entries[0].identityFile).not.toContain("'");
+  });
+
+  it("⊘ treats a `\"` inside single quotes and a `'` inside double quotes as literal characters — only the character that OPENED a run can close it (one shared boolean lets either quote close the other's run, so the rest of the line spills back out of quoting and splits at the next space)", () => {
+    expect(parseSshConfig("Host box\n  IdentityFile '/tmp/it\"s here'\n").entries[0].identityFile).toBe('/tmp/it"s here');
+    expect(parseSshConfig("Host box\n  IdentityFile \"/tmp/it's here\"\n").entries[0].identityFile).toBe("/tmp/it's here");
+  });
+
+  it("lets a quote open a quoted run MID-token and keeps the token going after it closes, as argv_split does (⊘ quoting only a token that STARTS with a quote splits `/tmp/'my key'.pub` into two arguments and loses the extension)", () => {
+    expect(parseSshConfig("Host box\n  IdentityFile /tmp/'my key'.pub\n").entries[0].identityFile).toBe("/tmp/my key.pub");
+    const fanned = parseSshConfig("Host 'a b' c\n  HostName 10.0.0.1\n");
+    expect(fanned.entries.map((e) => e.alias)).toEqual(["a b", "c"]);
+  });
+
+  it("⊘ recognises `\\\\` inside single quotes but leaves an escaped space there alone — these are argv_split runs, NOT shell-style literal runs (a literal-run rule keeps the backslash in `'/tmp/a\\\\b'` and points IdentityFile at a path ssh never opens)", () => {
+    expect(parseSshConfig("Host box\n  IdentityFile '/tmp/a\\\\b'\n").entries[0].identityFile).toBe("/tmp/a\\b");
+    expect(parseSshConfig("Host box\n  IdentityFile '/tmp/my\\ key'\n").entries[0].identityFile).toBe("/tmp/my\\ key");
+  });
+
+  it("reads `\\'` as a literal single quote that neither opens nor closes a quoted run (⊘ opening a run on it swallows the following space and merges two Host patterns into one alias)", () => {
+    const result = parseSshConfig("Host a\\'b c\n  HostName 10.0.0.1\n");
+    expect(result.entries.map((e) => e.alias)).toEqual(["a'b", "c"]);
+  });
+
+  it("⊘ still ends the line at a `#` once a single-quoted value has closed (leaving the quote state stuck open turns ` # prod` into part of the key path)", () => {
+    const result = parseSshConfig("Host box\n  IdentityFile '/tmp/my key' # prod\n");
+    expect(result.entries[0].identityFile).toBe("/tmp/my key");
+  });
+
   it("joins a backslash-escaped space into the token and drops the backslash — `ssh -G` reports `identityfile /tmp/my key` for it (⊘ flushing at the escaped space records `/tmp/my\\`, a path that does not exist, and makes the profile key-auth on it)", () => {
     const result = parseSshConfig("Host box\n  IdentityFile /tmp/my\\ key\n");
     expect(result.entries[0].identityFile).toBe("/tmp/my key");
@@ -722,6 +754,27 @@ describe("resolveSshConfig — include guards", () => {
     expect(result.issues[0].reason).toContain("matched no files");
   });
 
+  it("is lenient about an Include glob whose bracket range cannot compile: an issue, a count, and the rest of the import survives — ssh(1) 9.6 accepts the config and simply matches nothing (⊘ interpolating the pattern straight into `new RegExp` throws `SyntaxError: Range out of order in character class`, which escapes resolveSshConfig as a REJECTION and costs the user every host in the file)", async () => {
+    const io = makeIo({
+      [sshPath("config")]: "Include config.d/[z-a]\n\nHost survivor\n  HostName 10.0.0.52\n",
+      [sshPath("config.d", "a.conf")]: "Host never\n  HostName 10.0.0.53\n"
+    });
+
+    // Asserted as RESOLVES, not merely "has these entries": the defect this pins
+    // is a rejected promise, and a test that only awaits the value reports it as
+    // a thrown error rather than as the contract violation it actually is.
+    const run = resolveSshConfig(sshPath("config"), io);
+    await expect(run).resolves.toBeTruthy();
+    const result = await run;
+
+    expect(result.entries.map((e) => e.alias)).toEqual(["survivor"]);
+    expect(result.includeMissingCount).toBe(1);
+    expect(result.issues).toHaveLength(1);
+    expect(result.issues[0].reason).toContain("not a valid glob");
+    expect(result.issues[0].file).toBe(sshPath("config"));
+    expect(result.issues[0].line).toBe(1);
+  });
+
   it("returns an empty result, not a rejection, when the root config itself cannot be read (⊘ letting the read error escape turns 'you have no ~/.ssh/config' into an unhandled promise rejection)", async () => {
     const io = makeIo({});
 
@@ -928,5 +981,74 @@ describe("resolveSshConfig — Include is textual, not a standalone re-parse", (
 
     expect(result.entries.map((e) => e.alias)).toEqual(["anchor", "later"]);
     expect(io.reads).toContain(sshPath("later.conf"));
+  });
+});
+
+/**
+ * The signal answers exactly one caller question — "is this file even an ssh
+ * config?" — and it is asked AFTER resolveSshConfig has consumed every Include,
+ * which can leave entries 0 / includes 0 / every counter 0 for a config that is
+ * perfectly valid. These pin both halves: true for the shapes that import
+ * nothing, false for the two formats the importer must not mistake for a config.
+ */
+describe("sawSshGrammar — the recognised-grammar signal", () => {
+  it("is true for a defaults-only `Host *` config, which yields no entries at all (⊘ answering the question with entries.length reports a valid config as the wrong kind of file)", () => {
+    const result = parseSshConfig("Host *\n  User ops\n  Port 2222\n");
+    expect(result.entries).toHaveLength(0);
+    expect(result.sawSshGrammar).toBe(true);
+  });
+
+  it("is true for a keyword-only config with no block header at all — globals are grammar too (⊘ keying the signal off Host/Match headers alone misses a config that is nothing but defaults)", () => {
+    const result = parseSshConfig("User ops\nPort 2222\n");
+    expect(result.entries).toHaveLength(0);
+    expect(result.sawSshGrammar).toBe(true);
+  });
+
+  it("is true for a Match-only config (⊘ a signal that ignores Match calls a conditional-only config not an ssh config)", () => {
+    expect(parseSshConfig('Match exec "true"\n  User vpn\n').sawSshGrammar).toBe(true);
+  });
+
+  it("survives the include splice: an include-only root whose glob resolves to nothing still reports grammar, though entries, includes and every counter come back zero (⊘ leaving the signal to the parse of the ASSEMBLED document reports false for the one shape it exists for — the Include line is consumed by the splice, so the document parsed is empty)", async () => {
+    const io = makeIo({ [sshPath("config")]: "Include config.d/*\n" });
+
+    const result = await resolveSshConfig(sshPath("config"), io);
+
+    expect(result.entries).toHaveLength(0);
+    expect(result.includes).toHaveLength(0);
+    expect(result.wildcardPatternCount).toBe(0);
+    expect(result.negatedPatternCount).toBe(0);
+    expect(result.matchBlockCount).toBe(0);
+    expect(result.includeMissingCount).toBe(1);
+    expect(result.sawSshGrammar).toBe(true);
+  });
+
+  it("is ORed across the whole walk rather than reset per file, so grammar arriving only from an INCLUDED file survives (⊘ assigning the parsed document's value over the assembler's drops whichever half the other supplied)", async () => {
+    const io = makeIo({
+      [sshPath("config")]: "Include sub.conf\n",
+      [sshPath("sub.conf")]: "Host inner\n  HostName 10.0.0.90\n"
+    });
+
+    const result = await resolveSshConfig(sshPath("config"), io);
+
+    expect(result.entries.map((e) => e.alias)).toEqual(["inner"]);
+    expect(result.sawSshGrammar).toBe(true);
+  });
+
+  it("⊘ is false for a CSV host list, whose lines open with a value and never with a keyword (a signal that counts any line the parser touched as grammar makes the importer treat a CSV as an ssh config and answer 'no hosts found' instead of naming the real format)", () => {
+    const result = parseSshConfig("10.0.0.1,sw1,admin\n10.0.0.2,sw2,admin\n");
+    expect(result.entries).toHaveLength(0);
+    expect(result.sawSshGrammar).toBe(false);
+  });
+
+  it("⊘ is false for a MobaXterm INI body, whose `Key=value` lines DO parse as directives but carry no keyword this parser models (a signal keyed on 'the line matched KEYWORD_LINE_RE' is true here and misroutes every MobaXterm export)", () => {
+    const result = parseSshConfig("[Bookmarks]\nSubRep=\nImgNum=42\nsw1=#109#0%10.0.0.1%22%admin%%-1%\n");
+    expect(result.entries).toHaveLength(0);
+    expect(result.sawSshGrammar).toBe(false);
+  });
+
+  it("⊘ is false when the root config cannot be read at all — nothing was parsed, so nothing was recognised", async () => {
+    const result = await resolveSshConfig(sshPath("config"), makeIo({}));
+
+    expect(result.sawSshGrammar).toBe(false);
   });
 });
