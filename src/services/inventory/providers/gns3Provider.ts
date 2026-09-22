@@ -385,6 +385,27 @@ function parseBodyOnce(text: string): ParsedBody {
  * `{message}` on 3.x. Returned bounded, and ONLY ever used to explain a
  * FAILURE — a success body is read by the callers, never by this.
  */
+/**
+ * Server-supplied text on its way INTO a sentence this codebase composed.
+ *
+ * Every one of these values reaches a notification whose other words are ours,
+ * so a newline in one mints a line the reader takes as Nexus's own and a bidi
+ * control reorders the sentence around it. `flattenProviderText` is the shared
+ * answer; this wrapper exists so the call is one short, greppable name at every
+ * composition rather than five chances to forget — which is exactly how the
+ * first pass at this shipped covering the response body and the project NAME
+ * and missing the project ID in four other messages.
+ *
+ * NOT for data fields. `InventoryDevice.name` and `folderPath` carry provider
+ * text too, deliberately unflattened, because NetBox, EVE-NG and Proxmox all
+ * carry theirs through untouched and one provider diverging would be the
+ * surprise. If that is wrong it is wrong in four places and wants its own
+ * change.
+ */
+function inMessage(raw: string): string {
+  return flattenProviderText(raw);
+}
+
 function errorDetail(parsed: ParsedBody, text: string): string {
   const json = parsed?.json;
   const message = isObject(json) ? str(json.message) : "";
@@ -395,7 +416,7 @@ function errorDetail(parsed: ParsedBody, text: string): string {
   // returns this body; a newline in it would mint a line in a notification
   // that reads like one of ours, and a bidi control would reorder the sentence
   // around it. The slice bounds length; this bounds shape.
-  return flattenProviderText((message || text).slice(0, BODY_SLICE));
+  return inMessage((message || text).slice(0, BODY_SLICE));
 }
 
 /**
@@ -913,7 +934,7 @@ class Gns3ApiClient {
     if (!Array.isArray(data)) {
       throw new InventoryProviderError(
         "protocol",
-        `GNS3 returned a malformed node list for project ${projectId} — expected an array. Failing the sync rather than risk pruning that project's servers.`
+        `GNS3 returned a malformed node list for project ${inMessage(projectId)} — expected an array. Failing the sync rather than risk pruning that project's servers.`
       );
     }
     const nodes: Record<string, unknown>[] = [];
@@ -927,13 +948,13 @@ class Gns3ApiClient {
       if (!isObject(node)) {
         throw new InventoryProviderError(
           "protocol",
-          `GNS3 returned a malformed node in project ${projectId} (not an object). Failing the sync rather than downgrade the node's server over corrupt data.`
+          `GNS3 returned a malformed node in project ${inMessage(projectId)} (not an object). Failing the sync rather than downgrade the node's server over corrupt data.`
         );
       }
       if (!str(node.node_id)) {
         throw new InventoryProviderError(
           "protocol",
-          `GNS3 returned a node with no node_id in project ${projectId}. Failing the sync rather than risk pruning that node's server.`
+          `GNS3 returned a node with no node_id in project ${inMessage(projectId)}. Failing the sync rather than risk pruning that node's server.`
         );
       }
       nodes.push(node);
@@ -1327,7 +1348,7 @@ async function controlNodeImpl(
 ): Promise<void> {
   const parsed = parseExternalId(externalId);
   if (!parsed) {
-    throw new InventoryProviderError("protocol", `Malformed node id "${externalId}" — expected "<projectId>#<nodeId>".`);
+    throw new InventoryProviderError("protocol", `Malformed node id "${inMessage(externalId)}" — expected "<projectId>#<nodeId>".`);
   }
   const { projectId, nodeId } = parsed;
 
@@ -1338,13 +1359,13 @@ async function controlNodeImpl(
   if (!project) {
     throw new InventoryProviderError(
       "protocol",
-      `GNS3 no longer lists the project this node belongs to (${projectId}). Sync this source to bring the inventory up to date.`
+      `GNS3 no longer lists the project this node belongs to (${inMessage(projectId)}). Sync this source to bring the inventory up to date.`
     );
   }
   if (!project.opened) {
     throw new InventoryProviderError(
       "protocol",
-      `"${flattenProviderText(project.name)}" is closed, and GNS3 refuses to start or stop a node in a closed project. Open the project in GNS3, then try again — Nexus will not open it for you, because opening a project boots every node set to auto-start and reassigns the console ports.`
+      `"${inMessage(project.name)}" is closed, and GNS3 refuses to start or stop a node in a closed project. Open the project in GNS3, then try again — Nexus will not open it for you, because opening a project boots every node set to auto-start and reassigns the console ports.`
     );
   }
 

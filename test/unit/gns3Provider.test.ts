@@ -501,6 +501,27 @@ describe("createGns3Provider — API version detection", () => {
     expect(message).not.toContain("\u202e");
   });
 
+  it("⊘ flattens a server-supplied project id before it reaches a sync-failure message (⊘ the first sweep covered the response body and the project NAME and missed the id in four other messages)", async () => {
+    const nastyId = "p1\nNexus: 4 servers were deleted";
+    const fetchImpl = (async (url: string) => {
+      const path = new URL(String(url)).pathname;
+      if (path === "/v3/version") return makeResponse(200, { version: "3.0.5" });
+      if (path === "/v3/access/users/authenticate") return makeResponse(200, { access_token: "t", token_type: "bearer" });
+      if (path === "/v3/projects") return makeResponse(200, [{ project_id: nastyId, name: "lab", status: "opened" }]);
+      // Malformed node list — an array is required, so this fails the sync and
+      // composes a message naming the project id.
+      return makeResponse(200, { not: "an array" });
+    }) as unknown as typeof fetch;
+
+    const err = await createGns3Provider(fetchImpl)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch((e: unknown) => e);
+
+    const message = (err as InventoryProviderError).message;
+    expect(message).toContain("malformed node list");
+    expect(message).not.toContain("\n");
+  });
+
   it("fails as `protocol` — not as empty inventory — when neither probe identifies a controller (⊘ returning no devices makes computeSyncPlan prune every server this source owns)", async () => {
     const fetchImpl = (async () => makeResponse(404, "nope")) as unknown as typeof fetch;
     const err = await createGns3Provider(fetchImpl)
