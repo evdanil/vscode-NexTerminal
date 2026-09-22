@@ -3856,9 +3856,20 @@ export function registerConfigCommands(
    * importing one file in the same few seconds is not a case worth a
    * distributed lock; it IS a case worth not claiming to have solved.
    *
-   * NOT dedupe-on-alias: two ssh aliases pointing at the same host:port:user
-   * (`web` and `web.prod`) are one server here, and importing both would leave
-   * a duplicate that only differs by name.
+   * THE KEY IS host+port+username, AND IT IS A RE-IMPORT CHECK ONLY (Codex P2,
+   * #146 — an earlier version of this comment said the opposite of the code AND
+   * of the docs, so it is spelled out).
+   *
+   * It compares candidates against what is ALREADY STORED. It does not collapse
+   * candidates against each other: two aliases in one file pointing at the same
+   * host:port:user (`web` and `web-alias`) import as TWO servers, because one
+   * `Host` block becomes one server — the promise README and §4.12's import
+   * section both make. The alias is the name the user types, so dropping one of
+   * them loses a handle they use daily, and the "duplicate differing only by
+   * name" it avoids is not a cost worth that.
+   *
+   * The two rules compose without a special case: a second import of the same
+   * file finds both aliases' keys already stored and skips both.
    */
   async function applySshConfigResult(parsed: SshConfigParseResult): Promise<void> {
     const converted = convertSshConfig(parsed, { defaultUsername: localLoginName() });
@@ -3877,6 +3888,8 @@ export function registerConfigCommands(
       return candidates.filter((session) => !existing.has(keyOf(session)));
     };
 
+    // For the MODAL only. The write-time filter below re-runs against the full
+    // candidate set, not this one — see the call to `applyImportedSessions`.
     const sessions = skipExisting(converted.sessions);
     const dedupedCount = converted.sessions.length - sessions.length;
 
@@ -3913,7 +3926,15 @@ export function registerConfigCommands(
       "wildcard or unsupported",
       "SSH host",
       detailLines.length > 0 ? detailLines.join("\n") : undefined,
-      skipExisting
+      // Codex P2 (#146) — deliberately ignores what it is handed and re-derives
+      // from `converted.sessions`, the COMPLETE candidate set. Filtering the
+      // already-filtered list would leave the pre-modal snapshot still deciding
+      // what CAN be written: a host removed from `sessions` because a matching
+      // server existed is gone for good, so if that server is DELETED while the
+      // modal is open, the import silently skips a host the user does have in
+      // their config and does not have in Nexus. Re-deriving means the only
+      // snapshot that decides anything is the one taken inside the lock.
+      () => skipExisting(converted.sessions)
     );
   }
 

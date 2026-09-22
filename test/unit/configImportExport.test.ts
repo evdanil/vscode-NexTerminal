@@ -5019,6 +5019,50 @@ describe("import from SSH config command (nexus.config.import.sshConfig)", () =>
     expect(matching[0].id).toBe("concurrent-1");
   });
 
+  /**
+   * Codex P2 (#146), the other half of the same mistake. Moving the filter
+   * inside the lock is not enough if the list it filters was ALREADY narrowed
+   * outside it: a host dropped pre-modal because a matching server existed
+   * cannot come back, so deleting that server while the modal is open loses a
+   * host the user has in their config and does not have in Nexus. The in-lock
+   * filter therefore re-derives from the complete candidate set, and the
+   * pre-modal pass survives only to populate the modal's disclosure.
+   */
+  it("imports a host whose matching server is DELETED while the modal is open (⊘ re-filtering the already-filtered list lets the pre-modal snapshot decide what CAN be written)", async () => {
+    // TWO hosts: `db1` is new, so the modal is shown at all; `web1` already
+    // exists and is filtered out before it. The modal is the window.
+    serveFiles({
+      [SSH_CONFIG_PATH]:
+        "Host web1\n  HostName web1.example.com\n  User deploy\n  Port 2222\n\n" +
+        "Host db1\n  HostName db1.example.com\n  User deploy\n  Port 2222\n"
+    });
+    pickConfigFile();
+
+    await core.addOrUpdateServer({
+      id: "doomed-1",
+      name: "web1-old",
+      host: "web1.example.com",
+      port: 2222,
+      username: "deploy",
+      authType: "password",
+      isHidden: false
+    });
+
+    mockShowInformationMessage.mockImplementationOnce(async () => {
+      // The user deletes it from the tree while the confirmation is up.
+      await core.removeServer("doomed-1");
+      return "Import";
+    });
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    const hosts = core.getSnapshot().servers.map((server) => server.host).sort();
+    expect(hosts).toEqual(["db1.example.com", "web1.example.com"]);
+    const web1 = core.getSnapshot().servers.find((server) => server.host === "web1.example.com")!;
+    expect(web1.id).not.toBe("doomed-1");
+    expect(web1.name).toBe("web1");
+  });
+
   it("says so plainly when the write-time re-check leaves nothing (⊘ \"Imported 0 SSH hosts\" reads as a failure of a parse that in fact succeeded)", async () => {
     serveFiles({
       [SSH_CONFIG_PATH]: "Host web1\n  HostName web1.example.com\n  User deploy\n  Port 2222\n"
@@ -5210,7 +5254,7 @@ describe("import from SSH config command (nexus.config.import.sshConfig)", () =>
     );
   });
 
-  it("dedupes on host+port+username, not on the alias — two aliases for one host are one server", async () => {
+  it("keeps BOTH aliases for one host on a first import — one Host block is one server, and the dedupe is against what is already STORED (⊘ collapsing candidates against each other drops an alias the user types daily)", async () => {
     serveFiles({
       [SSH_CONFIG_PATH]: "Host web\n  HostName web.example.com\n  User deploy\n\nHost web-alias\n  HostName web.example.com\n  User deploy\n"
     });
