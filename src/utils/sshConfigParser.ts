@@ -25,9 +25,12 @@ import * as path from "node:path";
  * Semantics deliberately mirrored from OpenSSH's `readconf.c`:
  *
  *  - Keywords are case-insensitive.
- *  - FIRST value wins per keyword within a block ("first obtained value ...
- *    will be used" — ssh_config(5)). This is the opposite of most config
- *    formats and the single easiest thing to get backwards.
+ *  - FIRST value wins per keyword ("first obtained value ... will be used" —
+ *    ssh_config(5)). This is the opposite of most config formats and the single
+ *    easiest thing to get backwards. It is per KEYWORD, not per block: when the
+ *    same alias appears in two `Host` blocks, ssh keeps the first value obtained
+ *    for each option across BOTH, so the blocks merge rather than the later one
+ *    being discarded (see {@link mergeByAlias}).
  *  - `Host a b c` fans out: each non-wildcard, non-negated pattern becomes its
  *    own entry sharing the block's settings.
  *  - Wildcard patterns (`*`, `?`) are defaults blocks, not hosts — skipped and
@@ -101,7 +104,15 @@ export interface SshConfigParseResult {
   negatedPatternCount: number;
   /** `Match` blocks skipped whole. */
   matchBlockCount: number;
-  /** Later blocks dropped because an earlier block already claimed the alias. */
+  /**
+   * Repeated-alias blocks that contributed NOTHING — every keyword they set had
+   * already been obtained from an earlier block, so under first-value-wins they
+   * are dead text.
+   *
+   * A repeated block that filled in a field the earlier one left unset is NOT
+   * counted: it was MERGED, not skipped (see {@link mergeByAlias}), and calling
+   * it skipped would tell the user a host was lost when its settings were kept.
+   */
   duplicateAliasCount: number;
   /** Includes skipped because the file (or every glob match) could not be read. */
   includeMissingCount: number;
@@ -228,26 +239,101 @@ function normalizePort(raw: string): number | undefined {
 }
 
 /**
- * Drop every alias already claimed by an earlier entry (OpenSSH first-match-wins
- * applied to whole blocks) and report how many were dropped.
+ * One entry plus the bit {@link mergeByAlias} needs and callers must not see:
+ * whether the block actually spelled out a `HostName`.
+ *
+ * {@link SshConfigEntry.host} cannot answer that on its own, because a block
+ * without a `HostName` carries the alias there as a FALLBACK. A fallback must
+ * lose to a later block's real `HostName`; a value must not.
+ */
+interface RawEntry {
+  entry: SshConfigEntry;
+  hostExplicit: boolean;
+}
+
+/**
+ * Fill every field `first` still has unset from `later`, and report whether
+ * anything moved.
+ *
+ * Fields already set are never touched: first-value-wins is the rule being
+ * implemented here, not an obstacle to it.
+ */
+function mergeInto(first: RawEntry, later: RawEntry): boolean {
+  let merged = false;
+
+  // The alias-as-host fallback is not a value OpenSSH "obtained", so a later
+  // block's real HostName still wins it — `ssh -G` reports that HostName.
+  if (!first.hostExplicit && later.hostExplicit) {
+    first.entry.host = later.entry.host;
+    first.hostExplicit = true;
+    merged = true;
+  }
+  if (first.entry.port === undefined && later.entry.port !== undefined) {
+    first.entry.port = later.entry.port;
+    merged = true;
+  }
+  if (first.entry.user === undefined && later.entry.user !== undefined) {
+    first.entry.user = later.entry.user;
+    merged = true;
+  }
+  if (first.entry.proxyJump === undefined && later.entry.proxyJump !== undefined) {
+    first.entry.proxyJump = later.entry.proxyJump;
+    merged = true;
+  }
+  if (first.entry.identityFile === undefined && later.entry.identityFile !== undefined) {
+    first.entry.identityFile = later.entry.identityFile;
+    merged = true;
+  }
+
+  return merged;
+}
+
+/**
+ * Fold repeated `Host` aliases into one entry the way OpenSSH reads them, and
+ * count only the repeats that turned out to be dead text.
+ *
+ * ssh(1) does NOT pick one block and discard the rest. First-match-wins is per
+ * OPTION, not per block: "the first obtained value for each parameter" is kept,
+ * across every block whose pattern matches. For
+ *
+ *     Host foo
+ *       HostName example.test
+ *     Host foo
+ *       User bob
+ *
+ * `ssh -G -F <file> foo` reports BOTH `hostname example.test` AND `user bob`.
+ * Dropping the later block wholesale (what this used to do) imported `foo` with
+ * no user, and lost a later `Port` or `IdentityFile` exactly as quietly.
+ *
+ * So a repeated alias MERGES into the first entry: fields still unset are
+ * filled, fields already set are left alone. The entry keeps the FIRST block's
+ * `line`/`source` — that is the block that named the host, and the coordinate a
+ * user opening the file wants.
  *
  * Runs once, inside {@link parseSshConfig}. Because {@link resolveSshConfig}
  * splices every include into ONE document and parses that document a single
- * time, this pass is already the global one — there is no second, cross-file
- * dedupe whose count would have to be reconciled with this one.
+ * time, this pass is already the global one: a repeated alias arriving from an
+ * included file merges through this very code, with no cross-file second pass
+ * whose count would have to be reconciled with this one.
  */
-function dedupeByAlias(entries: SshConfigEntry[]): { entries: SshConfigEntry[]; duplicateAliasCount: number } {
+function mergeByAlias(raw: RawEntry[]): { entries: SshConfigEntry[]; duplicateAliasCount: number } {
   const kept: SshConfigEntry[] = [];
-  const seen = new Set<string>();
+  const byAlias = new Map<string, RawEntry>();
   let duplicateAliasCount = 0;
 
-  for (const entry of entries) {
-    if (seen.has(entry.alias)) {
-      duplicateAliasCount++;
+  for (const candidate of raw) {
+    const first = byAlias.get(candidate.entry.alias);
+    if (first === undefined) {
+      byAlias.set(candidate.entry.alias, candidate);
+      // Pushed by reference on purpose: a later block merges INTO this object.
+      kept.push(candidate.entry);
       continue;
     }
-    seen.add(entry.alias);
-    kept.push(entry);
+    if (!mergeInto(first, candidate)) {
+      // Nothing of this block survived first-value-wins, so it really was
+      // skipped — the only case the counter now claims.
+      duplicateAliasCount++;
+    }
   }
 
   return { entries: kept, duplicateAliasCount };
@@ -292,7 +378,7 @@ export function parseSshConfig(text: string): SshConfigParseResult {
   const result = emptyResult();
   const lines = splitConfigLines(text);
 
-  const rawEntries: SshConfigEntry[] = [];
+  const rawEntries: RawEntry[] = [];
   let block: BlockState | undefined;
   // True while inside a `Match` block: every directive up to the next `Host`
   // or `Match` is conditional, so none of it (Includes included) is imported.
@@ -316,14 +402,17 @@ export function parseSshConfig(text: string): SshConfigParseResult {
     }
     for (const alias of block.aliases) {
       rawEntries.push({
-        alias,
-        // No HostName means ssh connects to the alias itself — a real host, not a stub.
-        host: hostName ?? alias,
-        port,
-        user: block.values.get("user"),
-        proxyJump: block.values.get("proxyjump"),
-        identityFile: block.values.get("identityfile"),
-        line: block.line
+        entry: {
+          alias,
+          // No HostName means ssh connects to the alias itself — a real host, not a stub.
+          host: hostName ?? alias,
+          port,
+          user: block.values.get("user"),
+          proxyJump: block.values.get("proxyjump"),
+          identityFile: block.values.get("identityfile"),
+          line: block.line
+        },
+        hostExplicit: hostName !== undefined
       });
     }
     block = undefined;
@@ -414,9 +503,9 @@ export function parseSshConfig(text: string): SshConfigParseResult {
 
   closeBlock();
 
-  const deduped = dedupeByAlias(rawEntries);
-  result.entries = deduped.entries;
-  result.duplicateAliasCount = deduped.duplicateAliasCount;
+  const merged = mergeByAlias(rawEntries);
+  result.entries = merged.entries;
+  result.duplicateAliasCount = merged.duplicateAliasCount;
 
   return result;
 }

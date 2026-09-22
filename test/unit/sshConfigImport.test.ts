@@ -50,6 +50,31 @@ describe("convertSshConfig", () => {
     expect(result.unsupportedTokenCount).toBe(0);
   });
 
+  it("expands %h in IdentityFile to the RESOLVED hostname, not the alias (⊘ expanding it to the alias stores a key path that does not exist — and since an IdentityFile makes the profile key-auth, the connection fails on it)", () => {
+    const result = convert("Host foo\n  HostName 127.0.0.1\n  IdentityFile /tmp/id_%h\n");
+
+    expect(result.sessions).toHaveLength(1);
+    expect(result.sessions[0].keyPath).toBe("/tmp/id_127.0.0.1");
+    expect(result.sessions[0].keyPath).not.toBe("/tmp/id_foo");
+    expect(result.sessions[0].authType).toBe("key");
+    expect(result.droppedIdentityFileCount).toBe(0);
+  });
+
+  it("⊘ still expands %h in HostName itself to the ALIAS — the two sites take different values, and moving IdentityFile's fix to the HostName site breaks the host instead", () => {
+    const result = convert("Host web1\n  HostName %h.example.com\n  IdentityFile /keys/id_%h\n");
+
+    expect(result.sessions[0].host).toBe("web1.example.com");
+    expect(result.sessions[0].host).not.toBe("%h.example.com");
+    // Downstream of HostName, %h is the resolved host — i.e. the EXPANDED HostName.
+    expect(result.sessions[0].keyPath).toBe("/keys/id_web1.example.com");
+  });
+
+  it("uses the alias for %h in IdentityFile when the block sets no HostName — there the alias IS the resolved host", () => {
+    const result = convert("Host foo\n  IdentityFile /tmp/id_%h\n");
+
+    expect(result.sessions[0].keyPath).toBe("/tmp/id_foo");
+  });
+
   it("expands %% to a literal percent, and reads %%h as a literal \"%h\" rather than an expansion (⊘ a naive replace() of %h first turns the escape into an expansion)", () => {
     expect(expandSshTokens("a%%b", "web")).toBe("a%b");
     expect(expandSshTokens("%%h", "web")).toBe("%h");

@@ -15,9 +15,14 @@ import type { SshConfigParseResult } from "./sshConfigParser";
  *    reading `HostName %h.example.com` would otherwise become a server whose
  *    host is the literal string `%h.example.com` — a row that looks imported,
  *    sits in the tree, and can never resolve. Only the two tokens an importer
- *    can answer statically are expanded: `%h` (the host ssh was asked for,
- *    which for a `Host` block IS the alias) and `%%` (a literal `%`). Anything
- *    else — `%p`, `%r`, `%n`, `%C`, `%d`, `%u`, `%L`, `%l`, `%i` — depends on
+ *    can answer statically are expanded: `%h` and `%%` (a literal `%`). What
+ *    `%h` stands for depends on WHERE it appears, and OpenSSH is not sloppy
+ *    about it: in `HostName` it is the host ssh was asked for, i.e. the alias;
+ *    everywhere downstream — `IdentityFile` included — it is the RESOLVED
+ *    remote host, i.e. the expanded `HostName`. Both sites are fed the right
+ *    value in {@link convertSshConfig}.
+ *
+ *    Anything else — `%p`, `%r`, `%n`, `%C`, `%d`, `%u`, `%L`, `%l`, `%i` — depends on
  *    the connection, the local user or the local machine, none of which an
  *    import has. Such an entry is SKIPPED and counted, never imported broken:
  *    a row that is absent is a question the user can answer, a row that is
@@ -58,11 +63,16 @@ export interface SshConfigImportOptions {
  * Expand the `%` tokens an importer can answer, or return `undefined` when one
  * it cannot answer is present.
  *
+ * `hostToken` is what `%h` expands to, and the caller decides that per site: the
+ * ALIAS when expanding `HostName`, the already-expanded HOST when expanding
+ * anything derived from it (`IdentityFile`). This function has no way to tell
+ * the two apart, which is why it takes the value rather than the entry.
+ *
  * Scanned left to right precisely so `%%h` is a literal `%h` — the escape has
  * to be consumed before the token check, or an escaped token reads as a real
  * one.
  */
-export function expandSshTokens(value: string, alias: string): string | undefined {
+export function expandSshTokens(value: string, hostToken: string): string | undefined {
   let out = "";
   for (let i = 0; i < value.length; i++) {
     if (value[i] !== "%") {
@@ -76,7 +86,7 @@ export function expandSshTokens(value: string, alias: string): string | undefine
       continue;
     }
     if (next === "h") {
-      out += alias;
+      out += hostToken;
       i++;
       continue;
     }
@@ -113,7 +123,14 @@ export function convertSshConfig(
 
     let keyPath: string | undefined;
     if (entry.identityFile !== undefined) {
-      const expanded = expandSshTokens(entry.identityFile, entry.alias);
+      // `%h` in IdentityFile is the RESOLVED remote host — the HostName, not the
+      // alias (verified with `ssh -vvv`: alias `foo` + `HostName 127.0.0.1` +
+      // `IdentityFile /tmp/id_%h` makes ssh read `/tmp/id_127.0.0.1`). Passing
+      // the alias here stored a key path that does not exist, and because an
+      // IdentityFile makes the profile key-auth, the connection failed on it.
+      // `host` above is already expanded, so `%h` in the HostName itself — where
+      // it DOES mean the alias — is resolved before it reaches the key path.
+      const expanded = expandSshTokens(entry.identityFile, host);
       if (expanded === undefined || expanded.trim() === "") {
         droppedIdentityFileCount++;
       } else {

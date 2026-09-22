@@ -191,7 +191,7 @@ Host box
     expect(result.entries[0].port).toBeUndefined();
   });
 
-  it("keeps the FIRST block for a duplicated alias and counts the rest (⊘ last-block-wins overwrites a working host with a later stub, and an uncounted drop hides it from the import summary)", () => {
+  it("keeps the FIRST block's HostName when a later block repeats the alias with nothing new, and counts that dead block (⊘ last-block-wins overwrites a working host with a later stub, and an uncounted dead block hides it from the import summary)", () => {
     const result = parseSshConfig(`Host box
   HostName original.example.com
 
@@ -204,6 +204,94 @@ Host box
     expect(result.entries.map((e) => e.host)).toEqual(["original.example.com", "other.example.com"]);
     expect(result.duplicateAliasCount).toBe(1);
     expect(result.entries.map((e) => e.host)).not.toContain("shadow.example.com");
+  });
+
+  it("carries BOTH blocks' settings when the same alias appears twice (⊘ dropping the later block wholesale imports `foo` with no user, though `ssh -G -F <file> foo` reports one — first-match-wins is per OPTION, not per block)", () => {
+    const result = parseSshConfig(`Host foo
+  HostName example.test
+
+Host foo
+  User bob
+`);
+
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0]).toMatchObject({ alias: "foo", host: "example.test", user: "bob" });
+    // ⊘ Nothing was skipped here — the later block's User is in the entry, so
+    // reporting it as a skipped duplicate would be a lie to the import summary.
+    expect(result.duplicateAliasCount).toBe(0);
+  });
+
+  it("lets the EARLIER block win a field they both set, while still merging the fields it left unset (⊘ a merge that overwrites turns first-value-wins into last-value-wins for every repeated alias)", () => {
+    const result = parseSshConfig(`Host foo
+  HostName first.example.test
+  User alice
+
+Host foo
+  HostName second.example.test
+  User bob
+  Port 2222
+`);
+
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0].host).toBe("first.example.test");
+    expect(result.entries[0].user).toBe("alice");
+    expect(result.entries[0].host).not.toBe("second.example.test");
+    expect(result.entries[0].user).not.toBe("bob");
+    // Port was never obtained from the first block, so the later one supplies it.
+    expect(result.entries[0].port).toBe(2222);
+  });
+
+  it("merges Port, IdentityFile and ProxyJump too, not only User (⊘ a merge that special-cases one keyword still loses the key path, and a host ssh reaches with a key imports without one)", () => {
+    const result = parseSshConfig(`Host foo
+  HostName example.test
+
+Host foo
+  Port 2222
+  IdentityFile ~/.ssh/id_foo
+  ProxyJump bastion
+`);
+
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0]).toMatchObject({
+      host: "example.test",
+      port: 2222,
+      identityFile: "~/.ssh/id_foo",
+      proxyJump: "bastion"
+    });
+  });
+
+  it("takes a later block's HostName when the first block declared none — the alias sitting in `host` there is a fallback, not a value ssh obtained (⊘ treating the fallback as a set value imports `foo` as host `foo` while ssh connects to example.test)", () => {
+    const result = parseSshConfig(`Host foo
+  User bob
+
+Host foo
+  HostName example.test
+`);
+
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0].host).toBe("example.test");
+    expect(result.entries[0].user).toBe("bob");
+    expect(result.entries[0].host).not.toBe("foo");
+  });
+
+  it("counts a repeated block ONLY when it contributed nothing, and keeps the first block's line (⊘ counting every repeat reports merged hosts as skipped, and moving the coordinate points the user at a block that named nothing)", () => {
+    const result = parseSshConfig(`Host foo
+  HostName example.test
+  User alice
+
+Host foo
+  HostName shadow.test
+  User bob
+
+Host foo
+  Port 2222
+`);
+
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0].port).toBe(2222);
+    // Only the middle block is dead text; the third one merged a Port.
+    expect(result.duplicateAliasCount).toBe(1);
+    expect(result.entries[0].line).toBe(1);
   });
 
   it("records an issue for a `Host` line with no patterns instead of emitting a nameless entry (⊘ an empty alias becomes an unnamed, unusable server row)", () => {
@@ -756,6 +844,27 @@ describe("resolveSshConfig — Include is textual, not a standalone re-parse", (
     expect(result.entries[0].user).toBeUndefined();
     expect(result.entries[0].user).not.toBe("conditional");
     expect(result.matchBlockCount).toBe(1);
+  });
+
+  it("merges a repeated alias that arrives from an INCLUDED file, exactly as one repeated in the same file (⊘ dropping the later block wholesale loses the User and key an included fragment adds to a host the root already declared — the splice is where most repeats actually come from)", async () => {
+    const io = makeIo({
+      [sshPath("config")]: "Host foo\n  HostName example.test\n\nInclude extra.conf\n",
+      [sshPath("extra.conf")]: "Host foo\n  User bob\n  IdentityFile ~/.ssh/id_foo\n"
+    });
+
+    const result = await resolveSshConfig(sshPath("config"), io);
+
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0]).toMatchObject({
+      alias: "foo",
+      host: "example.test",
+      user: "bob",
+      identityFile: "~/.ssh/id_foo"
+    });
+    expect(result.duplicateAliasCount).toBe(0);
+    // Coordinates stay on the block that named the host.
+    expect(result.entries[0].source).toBe(sshPath("config"));
+    expect(result.entries[0].line).toBe(1);
   });
 
   it("resumes following Includes after a `Host` line closes the leaked Match (⊘ latching the Match flag once it is set swallows every remaining Include in the file and loses hosts ssh reads fine)", async () => {
