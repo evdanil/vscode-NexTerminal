@@ -213,8 +213,13 @@ Host named
     expect(result.entries.map((e) => e.alias)).not.toContain("db.internal");
   });
 
-  it("cancels case-insensitively, as match_pattern() compares (⊘ a case-sensitive cancel imports `Foo` from `Host Foo !foo`, a host ssh would never apply the block to)", () => {
+  it("cancels case-SENSITIVELY, as `match_pattern()` compares (⊘ an `i` flag makes `!foo` cancel `Foo` and drops a profile OpenSSH keeps — confirmed against OpenSSH_9.6p1: `ssh -G -F <file> Foo` on `Host Foo bar !foo` applies the block to `Foo`)", () => {
     const result = parseSshConfig("Host Foo bar !foo\n  User ops\n");
+    expect(result.entries.map((e) => e.alias)).toEqual(["Foo", "bar"]);
+  });
+
+  it("⊘ still cancels an EXACT-case match, so dropping the `i` flag did not disable negation itself", () => {
+    const result = parseSshConfig("Host foo bar !foo\n  User ops\n");
     expect(result.entries.map((e) => e.alias)).toEqual(["bar"]);
   });
 

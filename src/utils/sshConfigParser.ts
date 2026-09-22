@@ -379,7 +379,7 @@ function matchesHostPattern(pattern: string, host: string): boolean {
     .replace(/[.+^${}()|[\]\\]/g, "\\$&")
     .replace(/\*/g, ".*")
     .replace(/\?/g, ".");
-  return new RegExp(`^${source}$`, "i").test(host);
+  return new RegExp(`^${source}$`).test(host);
 }
 
 function normalizePort(raw: string): number | undefined {

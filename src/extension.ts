@@ -1518,8 +1518,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // source is added, edited or removed, and is disposed with the extension.
   //
   // The polled providers are those that declare a poll-interval reader in
-  // statusPollSources.ts (currently EVE-NG and Proxmox — the built-ins with a
-  // `fetchStatus`); the mapping itself lives there so it stays unit-testable.
+  // statusPollSources.ts (currently EVE-NG, Proxmox and GNS3 — the built-ins
+  // with a `fetchStatus`); the mapping itself lives there so it stays
+  // unit-testable. Adding a provider with `fetchStatus` means adding it there
+  // too: that map is keyed by provider id and nothing derives it, so a new
+  // provider is silently never polled until someone edits it.
   const inventoryStatusPoll = startInventoryStatusPoll({
     view: commandCenterView,
     getSources: () => statusPollSources(core.getSnapshot().inventorySources),
