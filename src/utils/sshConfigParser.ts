@@ -368,9 +368,23 @@ function isWildcardPattern(pattern: string): boolean {
  * meaning ssh does not give it and would stop `!*` cancelling an alias that
  * happens to contain a slash.
  *
- * Case-insensitive, as `match_pattern()` is. Note that {@link mergeByAlias}
- * still keys on the exact alias string, so `Host Foo` and `Host foo` remain two
- * entries — a separate, known departure, not one this function creates.
+ * Case-SENSITIVE, as `match_pattern()` is. Confirmed against OpenSSH_9.6p1:
+ * `ssh -G -F <file> Foo` on `Host Foo bar !foo` applies the block to `Foo`, so
+ * `!foo` does NOT cancel `Foo`. This shipped the other way round once, with an
+ * `i` flag and a test asserting the opposite, on the strength of a recollection
+ * of match.c that nobody had run — so the observed command is recorded here
+ * rather than the reasoning, and the test title carries it too.
+ *
+ * It follows that {@link mergeByAlias} keying on the exact alias string is
+ * CORRECT rather than a departure: `Host Foo` and `Host foo` are two different
+ * hosts to ssh, so they are two entries here. An earlier revision of this
+ * comment called that a known departure and a review thread reported it as a
+ * gap left unfixed; both descended from the same wrong recollection and are
+ * withdrawn. Do not "fix" the merge to be case-insensitive.
+ *
+ * Note the deliberate asymmetry with the DEDUPE key in `configCommands.ts`,
+ * which compares hosts case-insensitively: that key is a HOSTNAME (DNS is
+ * case-insensitive), not an ssh alias. Different thing, different rule.
  */
 function matchesHostPattern(pattern: string, host: string): boolean {
   // Every character is escaped before the two wildcards are re-introduced, so
