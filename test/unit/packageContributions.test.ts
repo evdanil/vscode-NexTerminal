@@ -2,12 +2,16 @@ import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { createEveNgProvider, readEveNgStatusPollSeconds } from "../../src/services/inventory/providers/eveNgProvider";
+import { createBuiltInProviders } from "../../src/services/inventory/builtInProviders";
+import { SHIPPED_IMPORTER_NAMES } from "../../src/utils/shippedImporters";
 
 const packageJsonPath = path.resolve(__dirname, "..", "..", "package.json");
 const readmePath = path.resolve(__dirname, "..", "..", "README.md");
 const functionalDocsPath = path.resolve(__dirname, "..", "..", "docs", "functional-documentation.md");
 const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
   dependencies: Record<string, string>;
+  description: string;
+  keywords: string[];
   activationEvents?: string[];
   configurationDefaults?: Record<string, unknown>;
   contributes: {
@@ -40,12 +44,21 @@ describe("package contributions", () => {
    * for the same reason.
    */
   describe("provider-inclusive inventory entry points", () => {
-    const shippedProviders = [/NetBox/i, /EVE-NG/i];
+    /**
+   * DERIVED, never hand-listed — this is the whole fix. The previous version of
+   * this constant was `[/NetBox/i, /EVE-NG/i]`, and it PASSED while the rule
+   * above was being violated: Proxmox shipped without joining either entry
+   * point, and a check whose expected list is hand-maintained can only verify
+   * the entries someone remembered to add. Reading the labels off the real
+   * provider array means a provider added to `builtInProviders.ts` is named
+   * here whether or not anyone thought about it.
+   */
+  const shippedProviders = createBuiltInProviders().map((provider) => provider.label);
 
     it("names EVERY shipped provider in nexus.inventory.addSource's title (\u2298 \"(NetBox)\" reads as NetBox-only; \u2298 naming none is unsearchable for both)", () => {
       const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title ?? "";
       for (const provider of shippedProviders) {
-        expect(title).toMatch(provider);
+        expect(title).toContain(provider);
       }
     });
 
@@ -54,13 +67,71 @@ describe("package contributions", () => {
       const line = welcome.split("\n").find((l) => l.includes("nexus.inventory.addSource")) ?? "";
       expect(line).not.toBe("");
       for (const provider of shippedProviders) {
-        expect(line).toMatch(provider);
+        expect(line).toContain(provider);
       }
     });
 
     it("signals that the list is open-ended rather than the complete set of providers Nexus will ever have", () => {
       const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title ?? "";
       expect(title).toContain("\u2026");
+    });
+
+    /**
+     * THE OTHER HALF OF THE SAME FIX, and the half that was missing. The
+     * derived check above covered the command title and the welcome line — but
+     * the CHANGELOG entry for it named four surfaces, and the other two (the
+     * marketplace `description` and `keywords`) stayed hand-edited with
+     * nothing reading the provider list at all. A fifth provider would have
+     * shipped unnamed in exactly half the surfaces the fix was written for,
+     * which is the original defect with a smaller blast radius, not a fixed
+     * one. Both are now derived, so the sentence "a provider that ships is
+     * named wherever providers are named" is true of every surface it claims.
+     *
+     * The marketplace listing is not a cosmetic surface here: it is the one
+     * users search BEFORE installing, so a provider missing from it reads as a
+     * provider the extension does not have.
+     */
+    it("names EVERY shipped provider in the marketplace description (\u2298 a hand-edited description leaves a shipped provider unnamed where users search before installing)", () => {
+      for (const provider of shippedProviders) {
+        expect(packageJson.description).toContain(provider);
+      }
+    });
+
+    it("carries EVERY shipped provider's id in the marketplace keywords (\u2298 a hand-edited keyword list makes a shipped provider unsearchable in the gallery)", () => {
+      const keywords = packageJson.keywords.map((keyword) => keyword.toLowerCase());
+      for (const provider of createBuiltInProviders()) {
+        expect(keywords).toContain(provider.id.toLowerCase());
+      }
+    });
+
+    it("⊘ names NOBODY who is not a shipped provider (kills a stale name surviving a provider's removal, which the include-everyone check cannot see)", () => {
+      const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title ?? "";
+      const named = (/\(([^)]*)\)/.exec(title)?.[1] ?? "")
+        .split(",")
+        .map((part) => part.trim().replace(/\u2026$/, "").trim())
+        .filter((part) => part.length > 0);
+      expect(named.length).toBeGreaterThan(0);
+      for (const name of named) {
+        expect(shippedProviders).toContain(name);
+      }
+    });
+
+    /**
+     * README repeats the command title verbatim as a run-this instruction, so a
+     * rename here silently turns every one of those steps into a command that
+     * does not exist — including, when Proxmox was added, the first step of
+     * Proxmox's OWN walkthrough. Pin the absence of any stale spelling rather
+     * than only the presence of the new one: a test that checks the new wording
+     * passes again the day someone restores the old.
+     */
+    it("⊘ leaves no README copy of the add-source title spelled differently from package.json", () => {
+      const readme = readFileSync(readmePath, "utf8");
+      const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title ?? "";
+      const occurrences = readme.match(/Add Inventory Source \([^)]*\)/g) ?? [];
+      expect(occurrences.length).toBeGreaterThan(0);
+      for (const occurrence of occurrences) {
+        expect(occurrence).toBe(title);
+      }
     });
   });
 
@@ -1268,6 +1339,85 @@ describe("package contributions", () => {
       expect(functionalDocs).toMatch(/the cap \*\*pushes its own sync warning\*\*/);
       expect(functionalDocs).toMatch(/suppressed when the crawl was already truncated/);
     });
+  });
+
+  /**
+   * The import half of the welcome view's two derived lines. Same history as
+   * the provider half above, and the same remedy: the list used to be written
+   * by hand in package.json with nothing checking it, so an importer could ship
+   * and go unnamed on the one line a user with an empty tree actually reads.
+   * Both assertions below read `SHIPPED_IMPORTER_NAMES` — add an importer there
+   * and the line has to name it, whether or not anyone remembered.
+   */
+  describe("importer-inclusive welcome line", () => {
+    const shippedImporters = [...SHIPPED_IMPORTER_NAMES];
+
+    function importWelcomeLine(): string {
+      const welcome = packageJson.contributes.viewsWelcome?.find((w) => w.view === "nexusCommandCenter")?.contents ?? "";
+      return welcome.split("\n").find((line) => line.includes("command:nexus.config.import)")) ?? "";
+    }
+
+    it("names EVERY shipped importer on the Command Center welcome view's import line (\u2298 a hand-written list only verifies the importers someone remembered to add)", () => {
+      const line = importWelcomeLine();
+      expect(line).not.toBe("");
+      for (const importer of shippedImporters) {
+        expect(line).toContain(importer);
+      }
+    });
+
+    it("signals that the list is open-ended rather than the complete set of formats Nexus will ever read", () => {
+      expect(importWelcomeLine()).toContain("\u2026");
+    });
+
+    /**
+     * Same reasoning as the provider half's marketplace checks: the
+     * description advertised "import from MobaXterm/SecureCRT" for a release
+     * that also shipped the ssh-config importer, and the keywords named the
+     * two old clients and not the new source. Both derive from
+     * SHIPPED_IMPORTER_NAMES now, so an importer added there has to reach the
+     * listing as well as the welcome line.
+     */
+    it("names EVERY shipped importer in the marketplace description (\u2298 advertising only the importers someone remembered to type)", () => {
+      for (const importer of shippedImporters) {
+        expect(packageJson.description).toContain(importer);
+      }
+    });
+
+    it("carries EVERY shipped importer in the marketplace keywords (\u2298 a user searching the gallery for their old client's format finds nothing)", () => {
+      const keywords = packageJson.keywords.map((keyword) => keyword.toLowerCase());
+      for (const importer of shippedImporters) {
+        // Substring, not equality: a keyword may carry the format plus a word
+        // ("csv import"), which is still the name being searchable.
+        expect(keywords.some((keyword) => keyword.includes(importer.toLowerCase())), importer).toBe(true);
+      }
+    });
+
+    it("\u2298 names NOTHING that is not a shipped importer (kills a stale name surviving an importer's removal, which the include-everyone check cannot see)", () => {
+      const named = (/\(([^)]*)\)/.exec(importWelcomeLine())?.[1] ?? "")
+        .split(",")
+        .map((part) => part.trim().replace(/\u2026$/, "").trim())
+        .filter((part) => part.length > 0);
+      expect(named.length).toBeGreaterThan(0);
+      for (const name of named) {
+        expect(shippedImporters).toContain(name);
+      }
+    });
+  });
+
+  // The ssh-config importer's palette surface. All four of its siblings carry a
+  // commandPalette entry with `"when": "true"`; a command declared without one
+  // is still invocable from code but invisible to a user typing "ssh config",
+  // which for a migration shortcut is the whole point of it existing.
+  it("contributes nexus.config.import.sshConfig as a palette-invocable Nexus command (\u2298 a missing commandPalette entry makes the shortcut unsearchable)", () => {
+    const command = packageJson.contributes.commands.find((item) => item.command === "nexus.config.import.sshConfig");
+    expect(command).toBeDefined();
+    expect(command?.title).toBe("Import from SSH Config");
+    expect(command?.category).toBe("Nexus");
+
+    const paletteMenu = packageJson.contributes.menus.commandPalette ?? [];
+    const paletteEntry = paletteMenu.find((item) => item.command === "nexus.config.import.sshConfig");
+    expect(paletteEntry).toBeDefined();
+    expect(paletteEntry?.when).toBe("true");
   });
 
   it("contributes nexus.config.import.inventory as a palette-invocable Nexus command", () => {

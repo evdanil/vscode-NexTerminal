@@ -22,6 +22,7 @@ import { CwdTracker } from "./services/terminal/cwdTracker";
 import { CwdSyncCoordinator } from "./services/sftp/cwdSyncCoordinator";
 import type { CwdSyncState } from "./services/sftp/cwdSyncCoordinator";
 import { detectOrphanNexusTerminals } from "./services/terminal/orphanDetect";
+import { maybeOfferSshConfigImport } from "./services/import/sshConfigImportOffer";
 import { migrateHighlightRulesGlobalSetting } from "./services/terminal/highlightRuleMigration";
 import { wireViewVisibility } from "./services/terminal/viewVisibilityWiring";
 import { startInventoryStatusPoll } from "./services/inventory/inventoryStatusPoll";
@@ -83,9 +84,7 @@ import { registerDeviceTemplateCommands } from "./commands/deviceTemplateCommand
 import { registerSavedFilterCommands } from "./commands/savedFilterCommands";
 import { registerInventoryCommands, type InventoryRuntimeTeardown } from "./commands/inventoryCommands";
 import { InventoryProviderRegistry } from "./services/inventory/providerRegistry";
-import { createNetboxProvider } from "./services/inventory/providers/netboxProvider";
-import { createEveNgProvider } from "./services/inventory/providers/eveNgProvider";
-import { createProxmoxProvider } from "./services/inventory/providers/proxmoxProvider";
+import { createBuiltInProviders } from "./services/inventory/builtInProviders";
 import { statusPollSources } from "./services/inventory/statusPollSources";
 import { createNexusExtensionApi, type NexusExtensionApi } from "./services/inventory/publicApi";
 import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
@@ -384,10 +383,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // to registerInventoryCommands (below) and to any third party registering
   // through the public API returned from this function. Registration ORDER is
   // the order the add-source provider picker lists them in.
+  //
+  // The list itself lives in `builtInProviders.ts`, not here: the same array
+  // also drives the package.json naming check, so a provider added there
+  // cannot ship unregistered OR unnamed. Both are failures this codebase has
+  // already had. Add a provider there, never by appending a call here.
   const inventoryProviderRegistry = new InventoryProviderRegistry();
-  inventoryProviderRegistry.register(createNetboxProvider());
-  inventoryProviderRegistry.register(createEveNgProvider());
-  inventoryProviderRegistry.register(createProxmoxProvider());
+  for (const provider of createBuiltInProviders()) {
+    inventoryProviderRegistry.register(provider);
+  }
 
   // WEB CONSOLE capability — the two-half question, asked of the capability
   // rather than of a provider id: the PROVIDER half is whether `webConsoleUrl`
@@ -1514,8 +1518,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // source is added, edited or removed, and is disposed with the extension.
   //
   // The polled providers are those that declare a poll-interval reader in
-  // statusPollSources.ts (currently EVE-NG and Proxmox — the built-ins with a
-  // `fetchStatus`); the mapping itself lives there so it stays unit-testable.
+  // statusPollSources.ts (currently EVE-NG, Proxmox and GNS3 — the built-ins
+  // with a `fetchStatus`); the mapping itself lives there so it stays
+  // unit-testable. Adding a provider with `fetchStatus` means adding it there
+  // too: that map is keyed by provider id and nothing derives it, so a new
+  // provider is silently never polled until someone edits it.
   const inventoryStatusPoll = startInventoryStatusPoll({
     view: commandCenterView,
     getSources: () => statusPollSources(core.getSnapshot().inventorySources),
@@ -1554,6 +1561,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   });
   context.subscriptions.push(inventoryStatusPoll);
   const configDisposables = registerConfigCommands(core, secretVault, context);
+
+  // One-time offer to import ~/.ssh/config, shown at most once ever. Strictly
+  // fire-and-forget: the helper owns every guard and never rejects, so nothing
+  // here can delay or fail activation. See sshConfigImportOffer.ts.
+  //
+  // DELIBERATELY DOWN HERE, not beside detectOrphanNexusTerminals where it
+  // started. It needs two things that only exist at this point:
+  //
+  //  - `core`, initialized. The offer counts hosts it can actually import, and
+  //    that means subtracting the servers already in Nexus. Offering "Nexus
+  //    found 12 SSH hosts… Import?" and then answering "All 12 are already in
+  //    Nexus — nothing to import" spends the one offer this user will ever get
+  //    on a notification with no action behind it.
+  //  - `nexus.config.import.sshConfig`, registered by the line above. VS Code
+  //    would resolve the dispatch against the in-flight activation anyway (the
+  //    command is contributed, so `executeCommand` awaits activation rather
+  //    than rejecting), and the offer is `void`-ed so activate() never awaits
+  //    it — but dispatching a command that is already there needs no argument
+  //    about who awaits whom.
+  void maybeOfferSshConfigImport(context, core);
   const macroDisposables = registerMacroCommands(() => {
     return buildMacroProfileInputsFromSnapshot(core.getSnapshot());
   });

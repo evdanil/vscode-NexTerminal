@@ -18,8 +18,11 @@
  *
  * PURE STRINGS, NO TRANSPORT. Nothing here imports `node:https` — it is shared
  * by the desktop providers but must never be what drags a node-only module into
- * a bundle.
+ * a bundle. (`models/inventory` is not such a module: every provider that calls
+ * into this one already imports it for `InventoryProviderError`.)
  */
+
+import { flattenProviderText } from "../../models/inventory";
 
 /** What one provider needs to say about itself inside an otherwise shared sentence. */
 export interface CertificateHintContext {
@@ -129,7 +132,23 @@ const LOCATION_SLICE = 200;
  * sentence, which is why it opens lower-case.
  */
 export function redirectNotFollowedMessage(location: string | undefined): string {
-  const target = typeof location === "string" ? location.trim().slice(0, LOCATION_SLICE) : "";
+  // FLATTENED HERE, where the header ENTERS the sentence below, rather than at
+  // the four provider call sites that interpolate the result — a site that has
+  // to remember is a site that will forget (AGENTS.md).
+  //
+  // WHAT THE EXPOSURE ACTUALLY IS, so the next reader does not relax this on a
+  // wrong premise: undici rejects CR/LF and C0 characters in a header VALUE, so
+  // a real HTTP client will not hand us a `Location` that mints a new line in
+  // the notification. What undici does NOT reject is the bidi and invisible
+  // formatting block — an RLO/LRO/isolate reorders the rendered sentence around
+  // the address, and a zero-width character makes two different addresses
+  // render identically. Those reach the user intact. `fetchImpl` is also a
+  // seam: a non-undici transport need not enforce even the CR/LF rule, and the
+  // flatten covers that at no extra cost.
+  //
+  // Flatten BEFORE the slice so the ceiling applies to what is actually
+  // rendered (collapsing runs of whitespace can only shorten it).
+  const target = typeof location === "string" ? flattenProviderText(location).slice(0, LOCATION_SLICE) : "";
   const where = target
     ? ` — the server named ${target}.`
     : ", though the response carried no Location header to name it.";

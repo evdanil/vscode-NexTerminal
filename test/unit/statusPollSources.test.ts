@@ -3,6 +3,7 @@ import { statusPollSources } from "../../src/services/inventory/statusPollSource
 import { EVE_NG_PROVIDER_ID } from "../../src/services/inventory/providers/eveNgProvider";
 import { PROXMOX_PROVIDER_ID } from "../../src/services/inventory/providers/proxmoxProvider";
 import { NETBOX_PROVIDER_ID } from "../../src/services/inventory/providers/netboxProvider";
+import { GNS3_PROVIDER_ID } from "../../src/services/inventory/providers/gns3Provider";
 import type { InventorySourceConfig, InventorySourceValues } from "../../src/models/inventory";
 
 /**
@@ -38,6 +39,13 @@ describe("statusPollSources", () => {
     const sources = [makeSource("pve-1", PROXMOX_PROVIDER_ID, { statusPollSeconds: 60 })];
     expect(statusPollSources(sources)).toEqual([
       { id: "pve-1", intervalSeconds: 60, incarnation: "rev-pve-1" }
+    ]);
+  });
+
+  it("maps a GNS3 source identically — a wiring that forgets the third polled provider fails here", () => {
+    const sources = [makeSource("gns3-1", GNS3_PROVIDER_ID, { statusPollSeconds: 60 })];
+    expect(statusPollSources(sources)).toEqual([
+      { id: "gns3-1", intervalSeconds: 60, incarnation: "rev-gns3-1" }
     ]);
   });
 

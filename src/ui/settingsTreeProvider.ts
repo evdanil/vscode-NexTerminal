@@ -94,11 +94,12 @@ interface DataAction {
 }
 
 // nexus.config.import is the unified chooser (Nexus export, MobaXterm INI,
-// SecureCRT, or a CSV/text host list) \u2014 one row covers what used to be two.
+// SecureCRT, an SSH config, or a CSV/text host list) \u2014 one row covers what
+// used to be two.
 const DATA_ACTIONS: DataAction[] = [
   { label: "Backup\u2026", command: "nexus.config.export.backup", icon: "lock", tooltip: "Create an encrypted backup of all data" },
   { label: "Export for Sharing\u2026", command: "nexus.config.export", icon: "export", tooltip: "Export sanitized configuration for sharing" },
-  { label: "Import\u2026", command: "nexus.config.import", icon: "cloud-download", tooltip: "Import servers or configuration \u2014 Nexus export, MobaXterm INI, SecureCRT, or a CSV/text host list" },
+  { label: "Import\u2026", command: "nexus.config.import", icon: "cloud-download", tooltip: "Import servers or configuration \u2014 Nexus export, MobaXterm INI, SecureCRT, an SSH config, or a CSV/text host list" },
   { label: "Reset All to Defaults", command: "nexus.settings.resetAll", icon: "discard", tooltip: "Reset all settings to their default values" },
   { label: "Delete All Data\u2026", command: "nexus.config.completeReset", icon: "warning", tooltip: "Permanently delete all data. This cannot be undone." }
 ];

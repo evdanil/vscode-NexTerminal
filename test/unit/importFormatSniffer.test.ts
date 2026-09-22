@@ -85,4 +85,52 @@ describe("sniffImportFormat", () => {
   it("falls back to host-list for whitespace-only input", () => {
     expect(sniffImportFormat("   \n\t\n")).toBe("host-list");
   });
+
+  // An ~/.ssh/config used to land in the everything-else class, so picking it in
+  // "Host List File…" ran it through the inventory parser, which reads `Host lab`
+  // positionally and creates a server NAMED lab whose HOST is the literal word
+  // "Host". Every test below fails against a sniffer with no ssh-config rule.
+  describe("ssh-config", () => {
+    it("classes a config whose first directive is a Host block (⊘ returning host-list here is what made `Host lab` a server at host \"Host\")", () => {
+      expect(sniffImportFormat("Host lab\n  HostName 10.0.0.1\n  User admin\n")).toBe("ssh-config");
+    });
+
+    it("classes a config that opens with comments and a global block, where the first Host line is far down the file", () => {
+      const text = "# work config\n\nServerAliveInterval 60\n\nHost bastion\n  HostName bastion.example.com\n";
+      expect(sniffImportFormat(text)).toBe("ssh-config");
+    });
+
+    it("classes a config made only of defaults and HostName (no bare Host line to match)", () => {
+      expect(sniffImportFormat("Host *\n  HostName fallback.example.com\n")).toBe("ssh-config");
+    });
+
+    it("classes an indented Host line — ssh accepts leading whitespace, so the sniffer must too", () => {
+      expect(sniffImportFormat("\tHost lab\n\t  HostName 10.0.0.1\n")).toBe("ssh-config");
+    });
+
+    it("classes a BOM'd / CRLF config, the normal shape of one copied off Windows", () => {
+      expect(sniffImportFormat("\uFEFFHost lab\r\n  HostName 10.0.0.1\r\n")).toBe("ssh-config");
+    });
+
+    it("⊘ leaves a lowercase `host name user` header a host-list — a whitespace-delimited CSV header is not an ssh config (⊘ a case-insensitive rule steals it)", () => {
+      expect(sniffImportFormat("host name user port\n10.0.0.1 sw1 admin 22\n")).toBe("host-list");
+    });
+
+    it("⊘ leaves `Host=` alone: an INI key with no whitespace after the keyword is not a Host directive", () => {
+      expect(sniffImportFormat("[Session]\nHost=10.0.0.1\n")).toBe("host-list");
+    });
+
+    it("⊘ does not steal a MobaXterm export that happens to contain a Host line — the [Bookmarks] signature is checked first", () => {
+      expect(sniffImportFormat("[Bookmarks]\nSubRep=\nHost example\n")).toBe("mobaxterm");
+    });
+
+    it("⊘ does not steal a Nexus JSON export or an XML export containing the word Host", () => {
+      expect(sniffImportFormat('{"version":2,"servers":[{"host":"Host lab"}]}')).toBe("nexus-json");
+      expect(sniffImportFormat("<VanDyke>\nHost lab\n</VanDyke>")).toBe("xml");
+    });
+
+    it("⊘ a bare `Host` with nothing after it stays host-list — the pattern requires a pattern argument", () => {
+      expect(sniffImportFormat("Host\nHost   \n")).toBe("host-list");
+    });
+  });
 });

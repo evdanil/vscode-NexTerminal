@@ -74,8 +74,9 @@ export class ServerTreeItem extends vscode.TreeItem {
     ipmiAuthProfileName?: string,
     // LIVE STATUS (Phase 2) — the server's inventory running/stopped state,
     // resolved by the caller from snapshot.serverStatus. Only providers that
-    // report status (EVE-NG, Proxmox) ever carry one, so `undefined` means "not
-    // a status-bearing server" and the row renders exactly as before.
+    // report status (EVE-NG, Proxmox, GNS3) ever carry one, so `undefined`
+    // means "not a status-bearing server" and the row renders exactly as
+    // before.
     status?: "running" | "stopped",
     // NODE CONTROL (Phase 4, task #28; provider-general since Task 9) — whether
     // this server's origin's provider can control nodes (implements
@@ -127,12 +128,12 @@ export class ServerTreeItem extends vscode.TreeItem {
     // node-control-capable origin, so the state the Start/Stop gate reads is
     // visible on the row itself. Matches the labeled-line tooltip idiom.
     //
-    // The line is SHARED by both node-control providers, and it names neither
+    // The line is SHARED by every node-control provider, and it names neither
     // a lab nor a command. "Lab" was EVE-NG's word and is untrue of a Proxmox
-    // cluster; the "run a refresh first" hint is now stale for BOTH, since
-    // an EVE-NG and a Proxmox sync each carry status, so an unknown state is
-    // resolved by the very next sync (or the poll) with nothing for the user
-    // to run. An unknown state is therefore reported plainly.
+    // cluster or a GNS3 project; the "run a refresh first" hint is stale for
+    // all of them, since an EVE-NG, Proxmox or GNS3 sync each carry status, so
+    // an unknown state is resolved by the very next sync (or the poll) with
+    // nothing for the user to run. An unknown state is therefore reported plainly.
     const statusSuffix = hasNodeControl
       ? `\nStatus: ${status === "running" ? "running" : status === "stopped" ? "stopped" : "unknown"}`
       : "";
@@ -180,7 +181,8 @@ export class ServerTreeItem extends vscode.TreeItem {
     // connected (plug) icon: the connected affordance must not be lost (P3-6),
     // and the running state is still conveyed by the " (running)" description
     // and the green ▶ FileDecoration. The running/stopped dot is only for a
-    // NON-connected status-bearing server (EVE-NG and Proxmox report status);
+    // NON-connected status-bearing server (EVE-NG, Proxmox and GNS3 report
+    // status);
     // every other server keeps the plain disconnect icon.
     if (connected) {
       this.iconPath = new vscode.ThemeIcon("plug", new vscode.ThemeColor("testing.iconPassed"));
