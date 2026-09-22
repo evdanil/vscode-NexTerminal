@@ -4070,10 +4070,27 @@ export function registerConfigCommands(
     // it keeps the message that names the problem instead of the vaguer "no
     // hosts found", which reads as an empty config rather than a wrong file.
     //
-    // Entry count, not session count: a config of nothing but `Host *` parses
-    // to one entry and zero sessions, and that is an ssh config with nothing
-    // importable in it — a different thing, already reported as such.
-    if (sniff === "host-list" && parsed.entries.length === 0) {
+    // NOT entry count. An earlier version of this check keyed on
+    // `parsed.entries.length === 0` and explained itself by asserting that a
+    // config of nothing but `Host *` parses to one entry. It does not — the
+    // parser SKIPS wildcard blocks, so it parses to zero — and that assertion
+    // was written without being checked, which made the check report "this is
+    // not an SSH config" for two files that plainly are: a lowercase `host *`
+    // defaults-only config, and an include-only root whose fragments hold
+    // nothing but defaults.
+    //
+    // What separates "wrong file" from "valid config with nothing to import"
+    // is whether the parser RECOGNISED any ssh-config grammar at all, not
+    // whether that grammar yielded importable hosts. A CSV yields no entries
+    // AND no wildcards, no Match blocks and no includes; a defaults-only
+    // config yields no entries but does report the wildcard it skipped.
+    const sawSshGrammar =
+      parsed.entries.length > 0 ||
+      parsed.wildcardPatternCount > 0 ||
+      parsed.negatedPatternCount > 0 ||
+      parsed.matchBlockCount > 0 ||
+      parsed.includes.length > 0;
+    if (sniff === "host-list" && !sawSshGrammar) {
       await reportSshConfigFormatMismatch(text, sniff);
       return;
     }

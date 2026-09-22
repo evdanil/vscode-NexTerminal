@@ -8,7 +8,7 @@ import type { SshConfigParseResult } from "./sshConfigParser";
  * importer already speaks ({@link ImportParseResult}). PURE — no `vscode`, no
  * `fs`; the caller does the reading.
  *
- * Two decisions live here, both of which the parser deliberately left open:
+ * Three decisions live here, all of which the parser deliberately left open:
  *
  * 1. **`%` TOKENS ARE EXPANDED, OR THE ENTRY IS DROPPED.** `sshConfigParser`
  *    hands back `HostName` verbatim (see its "Not modelled" note), so a block
@@ -36,6 +36,12 @@ import type { SshConfigParseResult } from "./sshConfigParser";
  *    with `authType: "password"` and no `keyPath`, and the count is reported
  *    separately so the confirm modal can say so.
  *
+ * 3. **`IdentityFile none` IS A SENTINEL, NOT A PATH.** ssh_config(5) gives the
+ *    argument `none` the meaning "load no identity file", so such a block has
+ *    deliberately no key and imports exactly like a block with no `IdentityFile`
+ *    line at all: password auth, no `keyPath`. It is NOT counted as a dropped
+ *    identity file — see {@link SshConfigImportResult.droppedIdentityFileCount}.
+ *
  * `~/` in `IdentityFile` is expanded here because nothing downstream does it:
  * `ssh2Connector.ts` passes `server.keyPath` straight to `readFile`, so a
  * stored `~/.ssh/id_ed25519` is an ENOENT at connect time. `~user/...` is left
@@ -46,9 +52,21 @@ import type { SshConfigParseResult } from "./sshConfigParser";
 export interface SshConfigImportResult extends ImportParseResult {
   /** Entries dropped because a `%` token survived expansion in the host. */
   unsupportedTokenCount: number;
-  /** Entries kept, but stripped of an `IdentityFile` a `%` token made unresolvable. */
+  /**
+   * Entries kept, but stripped of an `IdentityFile` a `%` token made
+   * unresolvable — i.e. "this host named a key we could not use".
+   *
+   * `IdentityFile none` is NOT counted: it names no key on purpose, so there was
+   * nothing to lose and nothing for the user to go and fix.
+   */
   droppedIdentityFileCount: number;
 }
+
+/**
+ * ssh_config(5)'s "no identity file at all" sentinel. A bare word, not a path:
+ * ssh compares the argument as written, so the match is case-sensitive.
+ */
+const IDENTITY_FILE_NONE = "none";
 
 export interface SshConfigImportOptions {
   /**
@@ -122,7 +140,24 @@ export function convertSshConfig(
     }
 
     let keyPath: string | undefined;
-    if (entry.identityFile !== undefined) {
+    // `IdentityFile none` is ssh_config(5)'s sentinel for "load no identity
+    // file at all" — it is not the name of a file. Treated here as if the block
+    // had named no IdentityFile, so the entry falls through to the no-key
+    // policy below; left as a path it became `keyPath: "none"`, which the
+    // connector then tried to `readFile`, so the profile could not connect.
+    //
+    // Matched case-sensitively, and only as the whole argument. ssh compares
+    // the argument verbatim, and this parser already treats every keyword
+    // ARGUMENT as case-sensitive — `readConfigLine` lowercases the KEYWORD and
+    // nothing else, so hostnames, users and patterns all keep their case. So
+    // `None` stays a path, as do `none.pem` and `/keys/none`.
+    //
+    // Deliberately NOT counted in `droppedIdentityFileCount`: that number is
+    // reported to the user as "we could not use the key this host named", and
+    // `none` is the user saying there is no key to use. Counting it would claim
+    // a loss that did not happen and send the user looking for a key path to
+    // repair.
+    if (entry.identityFile !== undefined && entry.identityFile !== IDENTITY_FILE_NONE) {
       // `%h` in IdentityFile is the RESOLVED remote host — the HostName, not the
       // alias (verified with `ssh -vvv`: alias `foo` + `HostName 127.0.0.1` +
       // `IdentityFile /tmp/id_%h` makes ssh read `/tmp/id_127.0.0.1`). Passing
@@ -139,9 +174,12 @@ export function convertSshConfig(
     }
 
     // THE POINT OF THE FEATURE: an `~/.ssh/config` is the canonical KEY-based
-    // config, so a row with an IdentityFile must arrive as key auth. Importing
-    // it as "password" would prompt every one of these hosts for a password the
-    // user does not have and never set.
+    // config, so a row that named a USABLE key must arrive as key auth.
+    // Importing it as "password" would prompt every one of these hosts for a
+    // password the user does not have and never set. The converse is not true:
+    // an `IdentityFile` line does not by itself mean key auth — `none` names no
+    // key, and a `%`-token path we could not expand leaves none either. Both
+    // land on the password prompt, which is exactly what ssh falls back to.
     const authType: AuthType = keyPath ? "key" : "password";
 
     sessions.push({

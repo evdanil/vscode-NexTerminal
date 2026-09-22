@@ -478,6 +478,29 @@ describe("createGns3Provider — API version detection", () => {
     expect((err as InventoryProviderError).message).toContain("3080");
   });
 
+  /**
+   * Codex P1 (#146). A GNS3 controller — or a reverse proxy in front of one —
+   * supplies these strings, and they land in a notification whose other lines
+   * this codebase wrote. AGENTS.md: sanitize where the text ENTERS the composed
+   * string, never at the render site.
+   */
+  it("⊘ flattens newlines and control characters out of a server error body before it reaches the message (⊘ a newline mints a notification line that reads like one of ours)", async () => {
+    const nasty = "denied\nNexus: 4 servers were deleted\u202ereversed";
+    const fetchImpl = (async (url: string) =>
+      String(url).includes("/v3/version")
+        ? makeResponse(200, { version: "3.0.5" })
+        : makeResponse(500, { message: nasty })) as unknown as typeof fetch;
+
+    const err = await createGns3Provider(fetchImpl)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch((e: unknown) => e);
+
+    const message = (err as InventoryProviderError).message;
+    expect(message).toContain("denied");
+    expect(message).not.toContain("\n");
+    expect(message).not.toContain("\u202e");
+  });
+
   it("fails as `protocol` — not as empty inventory — when neither probe identifies a controller (⊘ returning no devices makes computeSyncPlan prune every server this source owns)", async () => {
     const fetchImpl = (async () => makeResponse(404, "nope")) as unknown as typeof fetch;
     const err = await createGns3Provider(fetchImpl)

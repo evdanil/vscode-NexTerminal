@@ -152,12 +152,41 @@ interface BlockState {
 
 /**
  * Split an argument list on whitespace, honouring double quotes so a quoted
- * path with spaces survives (`IdentityFile "~/my keys/id_ed25519"`), and
- * dropping an unquoted `#` comment and everything after it.
+ * path with spaces survives (`IdentityFile "~/my keys/id_ed25519"`), honouring
+ * backslash escapes, and dropping an unquoted `#` comment and everything after
+ * it.
  *
- * OpenSSH's `strdelim()` only treats a `#` that OPENS a token as a comment, so
- * that is the rule here too: `Host web#1` keeps its `#`, `Host web # prod`
+ * A `#` that OPENS a token is a comment; one inside a token is not. That is
+ * OpenSSH's rule (the comment check happens only while it is skipping the
+ * whitespace before a token), so `Host web#1` keeps its `#` and `Host web # prod`
  * does not.
+ *
+ * ESCAPES ARE SELECTIVE, and deliberately so. OpenSSH splits a config line with
+ * `argv_split()` (misc.c), which drops the backslash for exactly five escapes —
+ * `\\`, `\"`, `\'`, and, OUTSIDE quotes, `\ ` and `\<tab>` — and treats every
+ * other `\X` as an "unrecognised escape": the backslash is KEPT and `X` is then
+ * handled as an ordinary character. Copying that set rather than stripping every
+ * backslash is what keeps a Windows path readable: `C:\Users\me\.ssh\id_rsa` has
+ * no recognised escape in it, so it survives whole, which is also what
+ * `ssh -G` reports for it. A blanket "drop the backslash" rule would hand the
+ * connector `C:Usersme.sshid_rsa`.
+ *
+ * Consequences worth stating, because each one is a decision:
+ *  - An escape is consumed BEFORE the whitespace and comment boundaries are
+ *    applied, which is the actual bug this rule exists to fix:
+ *    `IdentityFile /tmp/my\ key` is one token, `/tmp/my key`.
+ *  - Escapes are processed inside quotes too, but only `\\`, `\"` and `\'` are
+ *    recognised there — an escaped space inside quotes is an unrecognised escape
+ *    (the space needs no escaping there), so `"my\ key"` keeps its backslash.
+ *  - `\"` never opens or closes a quoted run; it is a literal `"`.
+ *  - A trailing backslash at end of line is an unrecognised escape with nothing
+ *    after it: it stays in the token as a literal `\`. ssh_config has no
+ *    line-continuation syntax, so there is nothing else it could mean.
+ *  - `\#` is an unrecognised escape, so it yields `\#` and not `#`. It does stop
+ *    the `#` starting a comment, but only because the backslash has already
+ *    opened the token — not because the escape was honoured. Matching OpenSSH
+ *    here beats inventing a nicer rule: a user who writes `\#` in a path gets
+ *    from us exactly the path ssh would use.
  */
 function tokenizeArgs(rest: string): string[] {
   const tokens: string[] = [];
@@ -175,6 +204,22 @@ function tokenizeArgs(rest: string): string[] {
 
   for (let i = 0; i < rest.length; i++) {
     const ch = rest[i];
+    if (ch === "\\") {
+      const next = rest[i + 1];
+      const recognised =
+        next === "\\" || next === '"' || next === "'" || (!quoted && (next === " " || next === "\t"));
+      if (recognised) {
+        // Consumed here, so the escaped character can no longer end the token.
+        current += next;
+        i++;
+      } else {
+        // Unrecognised escape (including a trailing backslash): OpenSSH keeps
+        // the backslash and re-reads the next character as an ordinary one.
+        current += ch;
+      }
+      started = true;
+      continue;
+    }
     if (ch === '"') {
       quoted = !quoted;
       started = true;

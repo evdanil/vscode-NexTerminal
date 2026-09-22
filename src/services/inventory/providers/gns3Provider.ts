@@ -3,6 +3,7 @@ import { certificateFailureMessage, redirectNotFollowedMessage, type Certificate
 import { createInsecureHttpsFetch } from "../insecureFetch";
 import {
   InventoryProviderError,
+  flattenProviderText,
   type InventoryConfigField,
   type InventoryDevice,
   type InventoryDeviceStatus,
@@ -387,7 +388,14 @@ function parseBodyOnce(text: string): ParsedBody {
 function errorDetail(parsed: ParsedBody, text: string): string {
   const json = parsed?.json;
   const message = isObject(json) ? str(json.message) : "";
-  return (message || text).slice(0, BODY_SLICE);
+  // FLATTENED HERE, at the boundary where server text ENTERS a sentence this
+  // codebase composed (Codex P1, #146) — not at the three call sites that
+  // interpolate the result, because a site that has to remember is a site that
+  // will forget. A GNS3 controller, or a reverse proxy in front of one,
+  // returns this body; a newline in it would mint a line in a notification
+  // that reads like one of ours, and a bidi control would reorder the sentence
+  // around it. The slice bounds length; this bounds shape.
+  return flattenProviderText((message || text).slice(0, BODY_SLICE));
 }
 
 /**
@@ -1336,7 +1344,7 @@ async function controlNodeImpl(
   if (!project.opened) {
     throw new InventoryProviderError(
       "protocol",
-      `"${project.name}" is closed, and GNS3 refuses to start or stop a node in a closed project. Open the project in GNS3, then try again — Nexus will not open it for you, because opening a project boots every node set to auto-start and reassigns the console ports.`
+      `"${flattenProviderText(project.name)}" is closed, and GNS3 refuses to start or stop a node in a closed project. Open the project in GNS3, then try again — Nexus will not open it for you, because opening a project boots every node set to auto-start and reassigns the console ports.`
     );
   }
 

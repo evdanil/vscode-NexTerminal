@@ -5017,6 +5017,42 @@ describe("import from SSH config command (nexus.config.import.sshConfig)", () =>
     expect(core.getSnapshot().servers.map((server) => server.host)).toEqual(["web1.example.com"]);
   });
 
+  /**
+   * Codex P3 (#146). The wrong-file check keyed on entry count and justified
+   * itself by asserting `Host *` parses to one entry. It parses to ZERO — the
+   * parser skips wildcard blocks — so a defaults-only config was reported as
+   * not being an SSH config at all. The discriminator is now whether the
+   * parser recognised any ssh grammar, which a CSV does not and a
+   * defaults-only config does.
+   */
+  it("accepts a lowercase defaults-only `host *` config as an ssh config with nothing to import (⊘ an entry-count discriminator calls a valid config the wrong file, because wildcard blocks parse to zero entries)", async () => {
+    serveFiles({ [SSH_CONFIG_PATH]: "host *\n  User deploy\n  ServerAliveInterval 60\n" });
+    pickConfigFile();
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    const errors = mockShowErrorMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(errors).not.toContain("doesn't look like an SSH config file");
+    const said = mockShowWarningMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(said).toContain("No SSH hosts found");
+  });
+
+  it("accepts an include-only root whose fragments hold only defaults (⊘ same entry-count mistake, reached through the include path)", async () => {
+    serveFiles(
+      {
+        [SSH_CONFIG_PATH]: "Include /fake/config.d/*\n",
+        "/fake/config.d/defaults": "Host *\n  User deploy\n"
+      },
+      { "/fake/config.d": ["defaults"] }
+    );
+    pickConfigFile();
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    const errors = mockShowErrorMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(errors).not.toContain("doesn't look like an SSH config file");
+  });
+
   it("⊘ still refuses a file carrying another format's POSITIVE signature, which is the whole point of the gate", async () => {
     serveFiles({ [SSH_CONFIG_PATH]: "[Bookmarks]\nSubRep=\nImgNum=42\n" });
     pickConfigFile();
