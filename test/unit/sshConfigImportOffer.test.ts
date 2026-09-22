@@ -29,6 +29,17 @@ vi.mock("vscode", () => ({
 }));
 
 import { maybeOfferSshConfigImport, SSH_CONFIG_OFFER_KEY } from "../../src/services/import/sshConfigImportOffer";
+import type { NexusCore } from "../../src/core/nexusCore";
+import type { ServerConfig } from "../../src/models/config";
+
+/**
+ * Stand-in for `NexusCore`: the offer reads exactly one thing off it — the
+ * servers already stored — because a host the user already has is not a host
+ * there is anything to offer about.
+ */
+function makeCore(servers: Partial<ServerConfig>[] = []): NexusCore {
+  return { getSnapshot: () => ({ servers }) } as unknown as NexusCore;
+}
 
 const sshDir = path.join(os.homedir(), ".ssh");
 const configPath = path.join(sshDir, "config");
@@ -74,8 +85,8 @@ describe("one-time ~/.ssh/config import offer", () => {
     const { context } = makeContext();
     serveConfig(REAL_CONFIG);
 
-    await maybeOfferSshConfigImport(context);
-    await maybeOfferSshConfigImport(context);
+    await maybeOfferSshConfigImport(context, makeCore());
+    await maybeOfferSshConfigImport(context, makeCore());
 
     expect(mockShowInformationMessage).toHaveBeenCalledTimes(1);
   });
@@ -97,7 +108,7 @@ describe("one-time ~/.ssh/config import offer", () => {
       return undefined;
     });
 
-    await maybeOfferSshConfigImport(context);
+    await maybeOfferSshConfigImport(context, makeCore());
 
     expect(markerAtDispatch).toBeUndefined();
     expect(store.get(SSH_CONFIG_OFFER_KEY)).toBe(true);
@@ -119,7 +130,7 @@ describe("one-time ~/.ssh/config import offer", () => {
       return new Promise<string | undefined>((resolve) => { release = resolve; });
     });
 
-    const pending = maybeOfferSshConfigImport(context);
+    const pending = maybeOfferSshConfigImport(context, makeCore());
     await dispatched;
     await new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -134,7 +145,7 @@ describe("one-time ~/.ssh/config import offer", () => {
     const { context } = makeContext({ [SSH_CONFIG_OFFER_KEY]: true });
     serveConfig(REAL_CONFIG);
 
-    await maybeOfferSshConfigImport(context);
+    await maybeOfferSshConfigImport(context, makeCore());
 
     expect(mockStat).not.toHaveBeenCalled();
     expect(mockShowInformationMessage).not.toHaveBeenCalled();
@@ -144,7 +155,7 @@ describe("one-time ~/.ssh/config import offer", () => {
     const { context, store } = makeContext();
     mockStat.mockRejectedValue(new Error("ENOENT"));
 
-    await maybeOfferSshConfigImport(context);
+    await maybeOfferSshConfigImport(context, makeCore());
 
     expect(mockShowInformationMessage).not.toHaveBeenCalled();
     expect(store.has(SSH_CONFIG_OFFER_KEY)).toBe(false);
@@ -154,7 +165,7 @@ describe("one-time ~/.ssh/config import offer", () => {
     const { context } = makeContext();
     serveConfig("Host *\n  User root\n  ServerAliveInterval 60\n\nHost *.internal\n  User admin\n");
 
-    await maybeOfferSshConfigImport(context);
+    await maybeOfferSshConfigImport(context, makeCore());
 
     expect(mockShowInformationMessage).not.toHaveBeenCalled();
   });
@@ -163,7 +174,7 @@ describe("one-time ~/.ssh/config import offer", () => {
     const { context } = makeContext();
     serveConfig("Include config.d/*\nInclude missing_file\n");
 
-    await maybeOfferSshConfigImport(context);
+    await maybeOfferSshConfigImport(context, makeCore());
 
     expect(mockShowInformationMessage).not.toHaveBeenCalled();
   });
@@ -172,7 +183,7 @@ describe("one-time ~/.ssh/config import offer", () => {
     const { context } = makeContext();
     serveConfig(REAL_CONFIG, 3 * 1024 * 1024);
 
-    await maybeOfferSshConfigImport(context);
+    await maybeOfferSshConfigImport(context, makeCore());
 
     expect(mockReadFile).not.toHaveBeenCalled();
     expect(mockShowInformationMessage).not.toHaveBeenCalled();
@@ -184,7 +195,7 @@ describe("one-time ~/.ssh/config import offer", () => {
     mockReadFile.mockRejectedValue(new Error("EACCES"));
     mockReadDirectory.mockRejectedValue(new Error("EACCES"));
 
-    await expect(maybeOfferSshConfigImport(context)).resolves.toBeUndefined();
+    await expect(maybeOfferSshConfigImport(context, makeCore())).resolves.toBeUndefined();
     expect(mockShowInformationMessage).not.toHaveBeenCalled();
   });
 
@@ -199,7 +210,7 @@ describe("one-time ~/.ssh/config import offer", () => {
       }
     } as unknown as import("vscode").ExtensionContext;
 
-    await expect(maybeOfferSshConfigImport(context)).resolves.toBeUndefined();
+    await expect(maybeOfferSshConfigImport(context, makeCore())).resolves.toBeUndefined();
     // The toast still went out. A failed marker write costs a REPEATED offer
     // next activation, which is the right way to fail: abandoning a
     // notification the user can already see would strand them with no offer
@@ -219,7 +230,7 @@ describe("one-time ~/.ssh/config import offer", () => {
     } as unknown as import("vscode").ExtensionContext;
     mockShowInformationMessage.mockResolvedValue("Import");
 
-    await maybeOfferSshConfigImport(context);
+    await maybeOfferSshConfigImport(context, makeCore());
 
     expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.config.import.sshConfig", expect.anything());
   });
@@ -228,7 +239,7 @@ describe("one-time ~/.ssh/config import offer", () => {
     const { context } = makeContext();
     serveConfig(`${REAL_CONFIG}\nHost db\n  HostName db.example.com\n`);
 
-    await maybeOfferSshConfigImport(context);
+    await maybeOfferSshConfigImport(context, makeCore());
 
     const [message, ...buttons] = mockShowInformationMessage.mock.calls[0];
     expect(message).toContain("2 SSH hosts");
@@ -241,7 +252,7 @@ describe("one-time ~/.ssh/config import offer", () => {
     serveConfig(REAL_CONFIG);
     mockShowInformationMessage.mockResolvedValue("Import");
 
-    await maybeOfferSshConfigImport(context);
+    await maybeOfferSshConfigImport(context, makeCore());
 
     expect(mockExecuteCommand).toHaveBeenCalledWith(
       "nexus.config.import.sshConfig",
@@ -249,12 +260,71 @@ describe("one-time ~/.ssh/config import offer", () => {
     );
   });
 
+  /**
+   * THE OFFER IS ONE-SHOT, so an offer with nothing behind it is not a wasted
+   * notification — it is the feature, spent. Before the dedupe, a user
+   * upgrading with their fleet already in Nexus was told "Nexus found 2 SSH
+   * hosts… Import?", clicked Import, and was answered "All 2 hosts in your SSH
+   * config are already in Nexus — nothing to import". The marker was gone, and
+   * the offer never comes back. The offer's own contract already ruled this
+   * out for a config that parses to nothing; a config that parses to nothing
+   * NEW is the same interruption with no action behind it.
+   */
+  it("stays silent, and leaves the marker UNSET, when every host in the config is already in Nexus (⊘ counting the raw parse spends the one-shot offer on 'nothing to import')", async () => {
+    const { context, store } = makeContext();
+    serveConfig(`${REAL_CONFIG}\nHost db\n  HostName db.example.com\n  User admin\n`);
+    const core = makeCore([
+      { host: "web1.example.com", port: 22, username: "deploy" },
+      { host: "db.example.com", port: 22, username: "admin" }
+    ]);
+
+    await maybeOfferSshConfigImport(context, core);
+
+    expect(mockShowInformationMessage).not.toHaveBeenCalled();
+    // Not spent: the day the user adds a host to their config, the offer is
+    // still there to make.
+    expect(store.has(SSH_CONFIG_OFFER_KEY)).toBe(false);
+  });
+
+  it("counts only the hosts that are NOT already in Nexus (⊘ offering the raw host count promises an import of rows the command will then skip)", async () => {
+    const { context } = makeContext();
+    serveConfig(`${REAL_CONFIG}\nHost db\n  HostName db.example.com\n  User admin\n`);
+    const core = makeCore([{ host: "web1.example.com", port: 22, username: "deploy" }]);
+
+    await maybeOfferSshConfigImport(context, core);
+
+    const [message] = mockShowInformationMessage.mock.calls[0];
+    expect(message).toContain("1 SSH host");
+    expect(message).not.toContain("2 SSH hosts");
+  });
+
+  it("matches the import path's key exactly — host case-insensitively, plus port and username (⊘ a host-only key hides a host stored under a different login or port)", async () => {
+    const { context } = makeContext();
+    serveConfig(
+      "Host a\n  HostName A.example.com\n  User deploy\n\n" +
+        "Host b\n  HostName b.example.com\n  User deploy\n  Port 2222\n\n" +
+        "Host c\n  HostName c.example.com\n  User other\n"
+    );
+    // `a` matches despite the case difference; `b` and `c` differ on port and
+    // username respectively, so both are still importable.
+    const core = makeCore([
+      { host: "a.example.com", port: 22, username: "deploy" },
+      { host: "b.example.com", port: 22, username: "deploy" },
+      { host: "c.example.com", port: 22, username: "deploy" }
+    ]);
+
+    await maybeOfferSshConfigImport(context, core);
+
+    const [message] = mockShowInformationMessage.mock.calls[0];
+    expect(message).toContain("2 SSH hosts");
+  });
+
   it("[Dismiss] imports nothing", async () => {
     const { context } = makeContext();
     serveConfig(REAL_CONFIG);
     mockShowInformationMessage.mockResolvedValue("Dismiss");
 
-    await maybeOfferSshConfigImport(context);
+    await maybeOfferSshConfigImport(context, makeCore());
 
     expect(mockExecuteCommand).not.toHaveBeenCalled();
   });

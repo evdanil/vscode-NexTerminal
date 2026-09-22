@@ -9,6 +9,12 @@ const mockChmod = vi.hoisted(() => vi.fn(async () => {}));
 // session" — can assert the call is skipped, not just that behavior is unchanged.
 const mockHasSecureCrtSessionsRoot = vi.hoisted(() => vi.fn());
 
+// Lets a test stand in for a machine whose uid has no passwd entry and whose
+// environment sets neither USER nor USERNAME — `localLoginName()` answers ""
+// there by design, and "" is not a username this extension can store. Only the
+// answer is replaced; `convertSshConfig` stays real.
+const localLogin = vi.hoisted(() => ({ name: undefined as string | undefined }));
+
 // Capture registered command handlers
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowInformationMessage = vi.fn();
@@ -124,6 +130,14 @@ vi.mock("node:fs/promises", async () => {
   };
 });
 
+vi.mock("../../src/utils/sshConfigImport", async () => {
+  const actual = await vi.importActual<typeof import("../../src/utils/sshConfigImport")>("../../src/utils/sshConfigImport");
+  return {
+    ...actual,
+    localLoginName: () => localLogin.name ?? actual.localLoginName()
+  };
+});
+
 vi.mock("../../src/utils/securecrtParser", async () => {
   const actual = await vi.importActual<typeof import("../../src/utils/securecrtParser")>("../../src/utils/securecrtParser");
   mockHasSecureCrtSessionsRoot.mockImplementation(actual.hasSecureCrtSessionsRoot);
@@ -147,7 +161,7 @@ import { VscodeMacroStore, macroSecretKey } from "../../src/storage/vscodeMacroS
 import { setActiveMacroStore, getMacros } from "../../src/macroSettings";
 import { INVALID_FOLDER_PATH_MESSAGE } from "../../src/utils/folderPaths";
 import { getAssignedBinding } from "../../src/macroBindingHelpers";
-import { isValidDetachedServerOrigin } from "../../src/utils/validation";
+import { isValidDetachedServerOrigin, validateServerConfig } from "../../src/utils/validation";
 import type { SecretVault } from "../../src/services/ssh/contracts";
 import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
@@ -4946,6 +4960,7 @@ describe("import from SSH config command (nexus.config.import.sshConfig)", () =>
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    localLogin.name = undefined;
     registeredCommands.clear();
     configStore.clear();
     vault = new MockVault();
@@ -5090,17 +5105,38 @@ describe("import from SSH config command (nexus.config.import.sshConfig)", () =>
    * Serializing the WRITES does nothing when the decision about what to write
    * was made outside the lock.
    *
-   * The modal's resolution is where a concurrent import is simulated, because
-   * that is exactly where the real one gets in.
+   * THE CONCURRENT WRITER HAS TO BE A LOCK HOLDER, and that is the whole
+   * design of this test. An earlier version simulated the concurrent import
+   * inside the modal mock, so the server landed while the modal was resolving
+   * — i.e. BEFORE the import reached `runExclusive` at all. That test passed
+   * against the exact implementation it exists to forbid: move
+   * `filterBeforeWrite` to just before `configMutationLock.runExclusive`
+   * (after the modal, outside the lock) and it stayed green, because by then
+   * the concurrent server was already stored and the outside-the-lock filter
+   * saw it too.
+   *
+   * What separates the two placements is a writer the import must WAIT for.
+   * Here the concurrent import holds the lock across the modal and commits its
+   * server only after the modal has been answered — so an outside-the-lock
+   * filter runs on a tree that does not have it yet and writes a duplicate,
+   * while the in-lock filter cannot run until the holder has released and is
+   * therefore looking at the committed state.
    */
-  it("re-checks what already exists INSIDE the write lock, so a server that lands while the modal is open is not imported twice (⊘ filtering before the modal writes a duplicate of anything a concurrent import added)", async () => {
+  it("re-checks what already exists INSIDE the write lock, so a server committed by the lock HOLDER the import is queued behind is not imported twice (⊘ filtering after the modal but before runExclusive duplicates it)", async () => {
     serveFiles({
       [SSH_CONFIG_PATH]: "Host web1\n  HostName web1.example.com\n  User deploy\n  Port 2222\n"
     });
     pickConfigFile();
 
-    mockShowInformationMessage.mockImplementationOnce(async () => {
-      // A concurrent import commits while this modal is on screen.
+    // A concurrent import that already OWNS the lock. It commits its server as
+    // its last act, so anything deciding what to write without taking the lock
+    // decides against a tree that is one server out of date.
+    let releaseHolder: () => void = () => {};
+    let signalHolding: () => void = () => {};
+    const holding = new Promise<void>((resolve) => { signalHolding = resolve; });
+    const holderDone = configMutationLock.runExclusive(async () => {
+      signalHolding();
+      await new Promise<void>((resolve) => { releaseHolder = resolve; });
       await core.addOrUpdateServer({
         id: "concurrent-1",
         name: "web1",
@@ -5110,10 +5146,21 @@ describe("import from SSH config command (nexus.config.import.sshConfig)", () =>
         authType: "password",
         isHidden: false
       });
+    });
+
+    mockShowInformationMessage.mockImplementationOnce(async () => {
+      await holding;
+      // Released on a MACROtask, so the import's own continuation after the
+      // modal — which is microtasks — has run and queued on the lock before
+      // the holder commits anything. That ordering is what makes an
+      // outside-the-lock filter observably wrong rather than accidentally
+      // right.
+      setTimeout(() => releaseHolder(), 0);
       return "Import";
     });
 
     await registeredCommands.get("nexus.config.import.sshConfig")!();
+    await holderDone;
 
     const matching = core.getSnapshot().servers.filter((server) => server.host === "web1.example.com");
     expect(matching).toHaveLength(1);
@@ -5515,6 +5562,254 @@ describe("import from SSH config command (nexus.config.import.sshConfig)", () =>
 
     expect(mockStat).not.toHaveBeenCalled();
     expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  /**
+   * THE HIGHEST-VALUE INVARIANT ON THIS PATH, because breaking it is invisible
+   * until a reload. `NexusCore.addOrUpdateServer` validates nothing, but
+   * `VscodeConfigRepository.getServers` DROPS every stored row that fails
+   * `validateServerConfig` with only a `console.warn` — and for ssh that
+   * requires a NON-EMPTY username (telnet is the exemption, ssh is not). So a
+   * row written with `username: ""` appears in the tree, connects for that
+   * session, and is simply gone the next time the window loads.
+   *
+   * The ssh-config importer is the only one that could produce such a row:
+   * MobaXterm defaults an empty username to "user", and the inventory importer
+   * prompts. Here the default came from `localLoginName()`, which deliberately
+   * answers "" when the uid has no passwd entry and neither USER nor USERNAME
+   * is set — a plain container — and a config whose blocks omit `User` is the
+   * common shape.
+   *
+   * Asserted over the GUARD rather than over the field, so it keeps holding if
+   * the guard gains a rule: whatever `validateServerConfig` requires, every row
+   * this import writes has to satisfy.
+   */
+  it("⊘ writes NO row that fails validateServerConfig, even when localLoginName() is empty and no block sets User (the storage layer drops such rows on reload, so the imported servers silently vanish)", async () => {
+    localLogin.name = "";
+    serveFiles({
+      [SSH_CONFIG_PATH]: "Host web1\n  HostName web1.example.com\n\nHost db\n  HostName db.example.com\n"
+    });
+    pickConfigFile();
+    mockShowInputBox.mockResolvedValueOnce("deploy");
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    const servers = core.getSnapshot().servers;
+    expect(servers).toHaveLength(2);
+    for (const server of servers) {
+      expect(validateServerConfig(server), JSON.stringify(server)).toBe(true);
+    }
+    expect(servers.map((server) => server.username)).toEqual(["deploy", "deploy"]);
+  });
+
+  it("asks once for a default username when there is no local login name, naming how many hosts it covers", async () => {
+    localLogin.name = "";
+    serveFiles({
+      [SSH_CONFIG_PATH]: "Host web1\n  HostName web1.example.com\n\nHost db\n  HostName db.example.com\n\nHost known\n  HostName known.example.com\n  User admin\n"
+    });
+    pickConfigFile();
+    mockShowInputBox.mockResolvedValueOnce("deploy");
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    expect(mockShowInputBox).toHaveBeenCalledTimes(1);
+    expect(mockShowInputBox).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Default SSH Username", prompt: "Applied to the 2 hosts in this SSH config that set no User" })
+    );
+    // The block that names its own User keeps it.
+    const known = core.getSnapshot().servers.find((server) => server.name === "known")!;
+    expect(known.username).toBe("admin");
+  });
+
+  it("⊘ writes NOTHING when the default-username prompt is canceled with Esc (a cancelled prompt must not fall through to the rows it exists to make valid)", async () => {
+    localLogin.name = "";
+    serveFiles({ [SSH_CONFIG_PATH]: "Host web1\n  HostName web1.example.com\n" });
+    pickConfigFile();
+    mockShowInputBox.mockResolvedValueOnce(undefined);
+    mockShowInformationMessage.mockResolvedValue("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    expect(core.getSnapshot().servers).toHaveLength(0);
+    expect(mockShowWarningMessage).toHaveBeenCalledWith("Import canceled.");
+  });
+
+  it("⊘ writes NOTHING when the default-username prompt is answered blank — a blank answer is the empty username all over again", async () => {
+    localLogin.name = "";
+    serveFiles({ [SSH_CONFIG_PATH]: "Host web1\n  HostName web1.example.com\n" });
+    pickConfigFile();
+    mockShowInputBox.mockResolvedValueOnce("   ");
+    mockShowInformationMessage.mockResolvedValue("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    expect(core.getSnapshot().servers).toHaveLength(0);
+    expect(mockShowWarningMessage).toHaveBeenCalledWith("Import canceled — a username is required.");
+  });
+
+  it("⊘ does NOT prompt when the machine has a local login name — ssh's own default is the answer that matches what `ssh <alias>` does", async () => {
+    localLogin.name = "localuser";
+    serveFiles({ [SSH_CONFIG_PATH]: "Host web1\n  HostName web1.example.com\n" });
+    pickConfigFile();
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    expect(mockShowInputBox).not.toHaveBeenCalled();
+    expect(core.getSnapshot().servers[0].username).toBe("localuser");
+  });
+
+  it("⊘ does NOT prompt when every block names its own User, however empty the local login name is (kills a prompt keyed on the login name alone)", async () => {
+    localLogin.name = "";
+    serveFiles({ [SSH_CONFIG_PATH]: "Host web1\n  HostName web1.example.com\n  User deploy\n" });
+    pickConfigFile();
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    expect(mockShowInputBox).not.toHaveBeenCalled();
+    expect(core.getSnapshot().servers[0].username).toBe("deploy");
+  });
+
+  /**
+   * ProxyJump is parsed and then dropped. A host behind a bastion therefore
+   * imports as a DIRECT connection to a private address: the profile looks
+   * fine, every connect times out, and nothing anywhere said why. Nexus models
+   * jump hosts natively (`proxyJumpHostId`), so there is a real remedy to name
+   * — which is what makes naming the loss worth doing at all.
+   */
+  it("names the hosts whose ProxyJump was dropped, and the remedy that exists for them (⊘ importing a bastioned host as a direct connection with nothing said about it)", async () => {
+    serveFiles({
+      [SSH_CONFIG_PATH]: "Host db\n  HostName 10.0.5.7\n  User deploy\n  ProxyJump bastion\n"
+    });
+    pickConfigFile();
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    const detail = (mockShowInformationMessage.mock.calls[0][1] as { detail?: string }).detail ?? "";
+    expect(detail).toContain("1 host will import as a direct connection");
+    expect(detail).toContain("ProxyJump is not imported");
+    // The remedy has to be one the reader can actually carry out, naming the
+    // fields rather than describing a feature to go and find.
+    expect(detail).toContain("SSH Jump Host");
+    expect(detail).toContain("Jump Host Server");
+    // The host still imports — a direct profile is worth more than no profile.
+    expect(core.getSnapshot().servers.map((server) => server.host)).toEqual(["10.0.5.7"]);
+  });
+
+  it("⊘ says nothing about ProxyJump when no host had one (kills a line that always renders)", async () => {
+    serveFiles({ [SSH_CONFIG_PATH]: "Host web1\n  HostName web1.example.com\n  User deploy\n" });
+    pickConfigFile();
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    const detail = (mockShowInformationMessage.mock.calls[0][1] as { detail?: string }).detail;
+    expect(detail ?? "").not.toContain("ProxyJump");
+  });
+
+  /**
+   * The modal's headline counts the DEDUPED list, so its detail has to count
+   * the same rows. Totals taken over every candidate disagree with it on
+   * exactly the case this importer is built for — re-importing a config as it
+   * grows — and tell the user about a host the run is not touching.
+   */
+  it("counts the dropped IdentityFile over the hosts it will WRITE, not over every candidate (⊘ a total over all candidates reports a host a re-import is skipping)", async () => {
+    const config =
+      "Host nokey\n  HostName nokey.example.com\n  User deploy\n  IdentityFile ~/.ssh/%C_key\n\n" +
+      "Host jumped\n  HostName 10.0.5.7\n  User deploy\n  ProxyJump bastion\n\n" +
+      "Host fresh\n  HostName fresh.example.com\n  User deploy\n";
+    serveFiles({ [SSH_CONFIG_PATH]: config });
+    pickConfigFile();
+    // `nokey` and `jumped` are already in Nexus; only `fresh` is new.
+    await core.addOrUpdateServer({
+      id: "have-1", name: "nokey", host: "nokey.example.com", port: 22, username: "deploy",
+      authType: "password", isHidden: false
+    });
+    await core.addOrUpdateServer({
+      id: "have-2", name: "jumped", host: "10.0.5.7", port: 22, username: "deploy",
+      authType: "password", isHidden: false
+    });
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    const [headline, options] = mockShowInformationMessage.mock.calls[0];
+    expect(headline).toBe("Found 1 SSH host. Import?");
+    const detail = (options as { detail?: string }).detail ?? "";
+    expect(detail).toContain("2 hosts you already have will be skipped.");
+    expect(detail).not.toContain("will use password auth");
+    expect(detail).not.toContain("direct connection");
+  });
+
+  /**
+   * The same escape hatch the inventory importer offers, for the same class of
+   * thing: lines the parser could not read. Offered only when there are any —
+   * and the detail states the count it corresponds to, so the button is not a
+   * door onto an empty document.
+   */
+  it("offers Show Skipped Lines when the parser recorded unreadable lines, and choosing it imports NOTHING (⊘ discarding parsed.issues leaves a count with no way to see what it means)", async () => {
+    serveFiles({
+      [SSH_CONFIG_PATH]: "Host lab\n  HostName 10.0.0.1\n  User admin\n  Port notanumber\n"
+    });
+    pickConfigFile();
+    mockOpenTextDocument.mockResolvedValue({ uri: { fsPath: "/scratch" } });
+    mockShowInformationMessage.mockResolvedValueOnce("Show Skipped Lines");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    const call = mockShowInformationMessage.mock.calls[0];
+    expect(call.slice(2)).toEqual(["Import", "Show Skipped Lines"]);
+    expect((call[1] as { detail?: string }).detail).toContain("1 line could not be parsed.");
+    expect(mockOpenTextDocument).toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.stringContaining("is not a number in 1-65535") })
+    );
+    // Inspecting is not importing — the user re-runs the command afterwards.
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  it("⊘ offers no second button when the parser read every line (kills a button that opens an empty document)", async () => {
+    serveFiles({ [SSH_CONFIG_PATH]: "Host lab\n  HostName 10.0.0.1\n  User admin\n" });
+    pickConfigFile();
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    const call = mockShowInformationMessage.mock.calls[0];
+    expect(call.slice(2)).toEqual(["Import"]);
+    expect((call[1] as { detail?: string }).detail ?? "").not.toContain("could not be parsed");
+  });
+
+  /**
+   * ⊘ THE DESIGN THIS FEATURE IS NOT. An ssh config was very nearly modelled as
+   * an InventoryProvider, which would have made every imported row a SYNCED
+   * row: badged "(synced)" in the tree, owned by a source, re-written or
+   * deleted by the next sync of it, and refusing the edits a hand-made profile
+   * accepts. It is an IMPORT — a one-way copy producing ordinary profiles the
+   * user owns — and nothing in the ssh-config path may quietly acquire an
+   * inventory identity. Pinned as an absence because nothing else would notice
+   * it being added.
+   */
+  it("⊘ creates NO inventory linkage: imported servers carry no origin and no inventory source is created", async () => {
+    serveFiles({
+      [SSH_CONFIG_PATH]: "Host web1\n  HostName web1.example.com\n  User deploy\n\nHost db\n  HostName db.example.com\n  User admin\n"
+    });
+    pickConfigFile();
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+    const sourcesBefore = core.getSnapshot().inventorySources.length;
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    const servers = core.getSnapshot().servers;
+    expect(servers).toHaveLength(2);
+    for (const server of servers) {
+      expect(server.origin, server.name).toBeUndefined();
+      expect(server.formerlySynced, server.name).toBeUndefined();
+    }
+    expect(core.getSnapshot().inventorySources).toHaveLength(sourcesBefore);
   });
 
   it("does nothing when the confirm modal is canceled", async () => {

@@ -8,7 +8,7 @@ import type { SshConfigParseResult } from "./sshConfigParser";
  * importer already speaks ({@link ImportParseResult}). PURE — no `vscode`, no
  * `fs`; the caller does the reading.
  *
- * Three decisions live here, all of which the parser deliberately left open:
+ * Five decisions live here, all of which the parser deliberately left open:
  *
  * 1. **`%` TOKENS ARE EXPANDED, OR THE ENTRY IS DROPPED.** `sshConfigParser`
  *    hands back `HostName` verbatim (see its "Not modelled" note), so a block
@@ -42,6 +42,33 @@ import type { SshConfigParseResult } from "./sshConfigParser";
  *    line at all: password auth, no `keyPath`. It is NOT counted as a dropped
  *    identity file — see {@link SshConfigImportResult.droppedIdentityFileCount}.
  *
+ * 4. **A BLOCK WITH NO USABLE `User` TAKES `defaultUsername`, AND THE CALLER
+ *    MUST SUPPLY A NON-EMPTY ONE.** ssh falls back to the local login name
+ *    there, which is what {@link localLoginName} answers — but it can answer
+ *    `""` (a uid with no passwd entry and no `$USER`, i.e. a plain container),
+ *    and `""` is not a username this extension can store: `validateServerConfig`
+ *    requires a non-empty one for ssh, and `VscodeConfigRepository.getServers`
+ *    DROPS every row that fails it with only a `console.warn`. A row written
+ *    with an empty username therefore appears in the tree, connects for that
+ *    session, and VANISHES on the next window reload — invisible until then.
+ *
+ *    This module cannot prompt (it is pure), so it does the next best thing:
+ *    it reports {@link SshConfigImportResult.missingUsernameCount}, the number
+ *    of importable entries that fell back to the default, so the caller can
+ *    ask the user for one BEFORE any row is written. A blank or whitespace-only
+ *    `User` (`User ""` parses to the empty string, and `??` would keep it)
+ *    counts as "no user" for exactly the same reason.
+ *
+ * 5. **`ProxyJump` IS NOT IMPORTED, AND THE ENTRY SAYS SO.** Nexus models jump
+ *    hosts natively (`proxyJumpHostId`), but mapping an ssh-config `ProxyJump`
+ *    onto one needs a rule for a jump target that is itself an alias in the
+ *    same file — a design decision, not a conversion. Until there is one, such
+ *    a host imports as a DIRECT connection, which for a private-address host
+ *    behind a bastion means every connect times out. Silently is the one way
+ *    that must not happen, so the entry carries
+ *    {@link SshConfigImportedSession.droppedProxyJump} and the confirm modal
+ *    names both the loss and the remedy.
+ *
  * `~/` in `IdentityFile` is expanded here because nothing downstream does it:
  * `ssh2Connector.ts` passes `server.keyPath` straight to `readFile`, so a
  * stored `~/.ssh/id_ed25519` is an ENOENT at connect time. `~user/...` is left
@@ -49,7 +76,29 @@ import type { SshConfigParseResult } from "./sshConfigParser";
  * would hand the wrong key to the wrong host.
  */
 
+/**
+ * An importable row plus the two per-entry losses the confirm modal reports.
+ *
+ * PER-ENTRY, not just totalled, because the modal's headline counts the rows
+ * that will actually be WRITTEN — the candidate list minus the hosts already in
+ * Nexus — and a total counted over every candidate disagrees with it. Re-import
+ * a config whose one unexpandable-IdentityFile host is already present and the
+ * total says "1 host will use password auth" about a host this import is not
+ * touching.
+ */
+export interface SshConfigImportedSession extends ImportedSession {
+  /**
+   * This entry named an `IdentityFile` a `%` token made unresolvable, so it
+   * arrives on password auth with no key. Never set for `IdentityFile none` —
+   * see {@link SshConfigImportResult.droppedIdentityFileCount}.
+   */
+  droppedIdentityFile?: boolean;
+  /** This entry named a `ProxyJump`, which is not imported (decision 5 above). */
+  droppedProxyJump?: boolean;
+}
+
 export interface SshConfigImportResult extends ImportParseResult {
+  sessions: SshConfigImportedSession[];
   /** Entries dropped because a `%` token survived expansion in the host. */
   unsupportedTokenCount: number;
   /**
@@ -58,8 +107,25 @@ export interface SshConfigImportResult extends ImportParseResult {
    *
    * `IdentityFile none` is NOT counted: it names no key on purpose, so there was
    * nothing to lose and nothing for the user to go and fix.
+   *
+   * TOTALLED OVER EVERY CANDIDATE. A caller reporting it to the user after
+   * filtering the candidates (the ssh-config branch skips hosts already in
+   * Nexus) must count {@link SshConfigImportedSession.droppedIdentityFile} over
+   * what it will write instead.
    */
   droppedIdentityFileCount: number;
+  /**
+   * Entries kept, but imported as DIRECT connections although they named a
+   * `ProxyJump`. Same totalling caveat as `droppedIdentityFileCount`.
+   */
+  droppedProxyJumpCount: number;
+  /**
+   * Importable entries that named no usable `User` and therefore took
+   * `options.defaultUsername`. Non-zero means the caller's default is what
+   * those rows will be stored with — so a caller holding an EMPTY default must
+   * obtain one before writing anything (decision 4 above).
+   */
+  missingUsernameCount: number;
 }
 
 /**
@@ -73,6 +139,12 @@ export interface SshConfigImportOptions {
    * Username for a block with no `User`. ssh itself uses the local login name
    * there, so that is what the caller passes; injected rather than read here to
    * keep this module pure and its tests independent of the machine.
+   *
+   * MAY BE EMPTY, and then every entry that needs it lands with `username: ""`,
+   * which is a row the storage layer discards on reload. The count is reported
+   * as {@link SshConfigImportResult.missingUsernameCount} precisely so a caller
+   * can detect that case and ask the user, rather than the conversion guessing
+   * or dropping hosts the user asked for (decision 4 in the module comment).
    */
   defaultUsername?: string;
 }
@@ -128,9 +200,11 @@ export function convertSshConfig(
   parsed: SshConfigParseResult,
   options: SshConfigImportOptions = {}
 ): SshConfigImportResult {
-  const sessions: ImportedSession[] = [];
+  const sessions: SshConfigImportedSession[] = [];
   let unsupportedTokenCount = 0;
   let droppedIdentityFileCount = 0;
+  let droppedProxyJumpCount = 0;
+  let missingUsernameCount = 0;
 
   for (const entry of parsed.entries) {
     const host = expandSshTokens(entry.host, entry.alias);
@@ -140,6 +214,7 @@ export function convertSshConfig(
     }
 
     let keyPath: string | undefined;
+    let droppedIdentityFile = false;
     // `IdentityFile none` is ssh_config(5)'s sentinel for "load no identity
     // file at all" — it is not the name of a file. Treated here as if the block
     // had named no IdentityFile, so the entry falls through to the no-key
@@ -168,6 +243,7 @@ export function convertSshConfig(
       const expanded = expandSshTokens(entry.identityFile, host);
       if (expanded === undefined || expanded.trim() === "") {
         droppedIdentityFileCount++;
+        droppedIdentityFile = true;
       } else {
         keyPath = expandHome(expanded);
       }
@@ -182,17 +258,36 @@ export function convertSshConfig(
     // land on the password prompt, which is exactly what ssh falls back to.
     const authType: AuthType = keyPath ? "key" : "password";
 
+    // A blank `User` is NO user, not a username of zero characters. `User ""`
+    // parses to the empty string, and `??` keeps it — which would defeat the
+    // caller's default and store a row `validateServerConfig` rejects, i.e. a
+    // server that vanishes on the next reload (decision 4).
+    const declaredUser = entry.user !== undefined && entry.user.trim() !== "" ? entry.user : undefined;
+    if (declaredUser === undefined) {
+      missingUsernameCount++;
+    }
+
+    // Counted only for entries that actually IMPORT: a host skipped for an
+    // unexpandable address lost more than its ProxyJump, and reporting it here
+    // would send the user to fix a profile that does not exist.
+    const droppedProxyJump = entry.proxyJump !== undefined && entry.proxyJump.trim() !== "";
+    if (droppedProxyJump) {
+      droppedProxyJumpCount++;
+    }
+
     sessions.push({
       // The alias is the name the user already knows the host by — `ssh web1`
       // is muscle memory, so `web1` is what the profile is called.
       name: entry.alias,
       host,
       port: entry.port ?? 22,
-      username: entry.user ?? options.defaultUsername ?? "",
+      username: declaredUser ?? options.defaultUsername ?? "",
       // ssh config has no folder concept. Not a gap to fill with a guess.
       folder: "",
       authType,
-      keyPath
+      keyPath,
+      ...(droppedIdentityFile ? { droppedIdentityFile: true } : {}),
+      ...(droppedProxyJump ? { droppedProxyJump: true } : {})
     });
   }
 
@@ -209,7 +304,9 @@ export function convertSshConfig(
       parsed.matchBlockCount,
     folders: [],
     unsupportedTokenCount,
-    droppedIdentityFileCount
+    droppedIdentityFileCount,
+    droppedProxyJumpCount,
+    missingUsernameCount
   };
 }
 
@@ -222,6 +319,13 @@ export function convertSshConfig(
  * conversion stays a pure function of its input and its tests stay independent
  * of the machine they run on. `os.userInfo()` throws when the uid has no passwd
  * entry — a plain container — hence the environment fallback and the final "".
+ *
+ * THAT `""` IS NOT A USABLE DEFAULT, and a caller must not pass it through to
+ * {@link convertSshConfig} and write the result: an ssh server with an empty
+ * username fails `validateServerConfig`, and `VscodeConfigRepository.getServers`
+ * drops such a row on the next read, so the imported servers disappear on the
+ * next window reload with nothing but a `console.warn`. Callers ask the user
+ * for a default instead — see `missingUsernameCount`.
  */
 export function localLoginName(): string {
   try {

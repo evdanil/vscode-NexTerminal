@@ -1,7 +1,7 @@
 import * as os from "node:os";
 import { describe, expect, it } from "vitest";
 import { convertSshConfig, expandSshTokens, localLoginName } from "../../src/utils/sshConfigImport";
-import { parseSshConfig } from "../../src/utils/sshConfigParser";
+import { parseSshConfig, type SshConfigEntry, type SshConfigParseResult } from "../../src/utils/sshConfigParser";
 
 /**
  * The pure half of the ssh-config importer: parse result in, importable
@@ -11,6 +11,16 @@ import { parseSshConfig } from "../../src/utils/sshConfigParser";
  */
 function convert(text: string, defaultUsername = "localuser") {
   return convertSshConfig(parseSshConfig(text), { defaultUsername });
+}
+
+/**
+ * A parse result carrying exactly these entries and nothing else. Built from a
+ * real empty parse rather than an object literal, so it keeps every counter
+ * the parser adds without this file having to track them — the converter is
+ * what is under test here, not the parser's shape.
+ */
+function parsedWith(entries: SshConfigEntry[]): SshConfigParseResult {
+  return { ...parseSshConfig(""), entries };
 }
 
 describe("convertSshConfig", () => {
@@ -174,11 +184,95 @@ describe("convertSshConfig", () => {
     expect(result.skippedCount).toBe(3);
   });
 
-  it("⊘ drops a HostName of \"\" rather than creating a server with an empty host", () => {
-    const result = convert('Host web\n  HostName ""\n');
+  it("⊘ drops an entry whose host is empty rather than creating a server with an empty host", () => {
+    // Fed as a parse RESULT rather than as config text: the parser's own
+    // handling of a quoted-empty `HostName` is its business (and has changed),
+    // while the rule under test here is the converter's — an entry that
+    // reaches it with nothing in `host` must not become a row.
+    const result = convertSshConfig(parsedWith([{ alias: "web", host: "", line: 1 }]));
 
     expect(result.sessions).toHaveLength(0);
     expect(result.unsupportedTokenCount).toBe(1);
+  });
+
+  /**
+   * THE INVARIANT THE STORAGE LAYER ENFORCES SILENTLY. An ssh server with an
+   * empty username fails `validateServerConfig`, and
+   * `VscodeConfigRepository.getServers` DROPS such a row on the next read with
+   * only a `console.warn` — so a server written that way is in the tree,
+   * connects for the session, and is gone after a reload. `??` cannot see the
+   * difference between "no User" and `User ""`, which is why the check is a
+   * trim and not a nullish coalesce.
+   */
+  it("treats a blank User as NO user, so the caller's default is what lands (⊘ `??` keeps the empty string and writes a row storage discards on the next reload)", () => {
+    const result = convertSshConfig(parsedWith([{ alias: "web", host: "web.example.com", user: "", line: 1 }]), {
+      defaultUsername: "localuser"
+    });
+
+    expect(result.sessions[0].username).toBe("localuser");
+    expect(result.missingUsernameCount).toBe(1);
+  });
+
+  it("counts the entries that took the default username, so a caller with an EMPTY default knows it has to ask (⊘ reporting nothing leaves the caller writing username-less rows that vanish on reload)", () => {
+    const result = convert(
+      "Host one\n  HostName one.example.com\n\nHost two\n  HostName two.example.com\n  User deploy\n\nHost three\n  HostName three.example.com\n"
+    );
+
+    expect(result.sessions).toHaveLength(3);
+    // `two` declares a User; the other two fall back.
+    expect(result.missingUsernameCount).toBe(2);
+  });
+
+  it("⊘ counts NO missing username for a config where every block declares User (kills a counter that reports the entry count)", () => {
+    const result = convert("Host one\n  HostName one.example.com\n  User deploy\n");
+
+    expect(result.missingUsernameCount).toBe(0);
+  });
+
+  /**
+   * ProxyJump is parsed and then dropped: Nexus models jump hosts natively
+   * (`proxyJumpHostId`) but mapping an alias-valued `ProxyJump` onto one needs
+   * a rule this importer does not have yet. A host behind a bastion therefore
+   * imports as a DIRECT connection to a private address, where every connect
+   * times out with nothing to explain it — so the loss is flagged per entry and
+   * the confirm modal names it with the remedy.
+   */
+  it("flags and counts a host whose ProxyJump is dropped, keeping the host (⊘ importing it silently leaves a profile that can only ever time out)", () => {
+    const result = convert(
+      "Host db\n  HostName 10.0.5.7\n  User deploy\n  ProxyJump bastion\n\nHost direct\n  HostName direct.example.com\n  User deploy\n"
+    );
+
+    expect(result.sessions).toHaveLength(2);
+    expect(result.sessions[0].droppedProxyJump).toBe(true);
+    expect(result.sessions[0].host).toBe("10.0.5.7");
+    expect(result.sessions[1].droppedProxyJump).toBeUndefined();
+    expect(result.droppedProxyJumpCount).toBe(1);
+    // Not a skip: the host imported, it just lost its jump.
+    expect(result.skippedCount).toBe(0);
+  });
+
+  it("⊘ does not count a ProxyJump for an entry that was SKIPPED anyway — the user cannot set a jump host on a profile that does not exist", () => {
+    const result = convert("Host db\n  HostName %C.example.com\n  ProxyJump bastion\n");
+
+    expect(result.sessions).toHaveLength(0);
+    expect(result.droppedProxyJumpCount).toBe(0);
+  });
+
+  it("flags the per-entry IdentityFile loss as well as totalling it — the modal counts over the rows it will actually write (⊘ a total-only report names hosts a re-import is not touching)", () => {
+    const result = convert(
+      "Host kept\n  HostName kept.example.com\n  IdentityFile ~/.ssh/%C_key\n\nHost plain\n  HostName plain.example.com\n"
+    );
+
+    expect(result.sessions[0].droppedIdentityFile).toBe(true);
+    expect(result.sessions[1].droppedIdentityFile).toBeUndefined();
+    expect(result.droppedIdentityFileCount).toBe(1);
+  });
+
+  it("⊘ flags no IdentityFile loss for `IdentityFile none` — the user said there was no key, so there is nothing for them to go and fix", () => {
+    const result = convert("Host web\n  HostName web.example.com\n  IdentityFile none\n");
+
+    expect(result.sessions[0].droppedIdentityFile).toBeUndefined();
+    expect(result.droppedIdentityFileCount).toBe(0);
   });
 });
 

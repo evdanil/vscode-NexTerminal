@@ -10,6 +10,8 @@ const readmePath = path.resolve(__dirname, "..", "..", "README.md");
 const functionalDocsPath = path.resolve(__dirname, "..", "..", "docs", "functional-documentation.md");
 const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
   dependencies: Record<string, string>;
+  description: string;
+  keywords: string[];
   activationEvents?: string[];
   configurationDefaults?: Record<string, unknown>;
   contributes: {
@@ -72,6 +74,34 @@ describe("package contributions", () => {
     it("signals that the list is open-ended rather than the complete set of providers Nexus will ever have", () => {
       const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title ?? "";
       expect(title).toContain("\u2026");
+    });
+
+    /**
+     * THE OTHER HALF OF THE SAME FIX, and the half that was missing. The
+     * derived check above covered the command title and the welcome line — but
+     * the CHANGELOG entry for it named four surfaces, and the other two (the
+     * marketplace `description` and `keywords`) stayed hand-edited with
+     * nothing reading the provider list at all. A fifth provider would have
+     * shipped unnamed in exactly half the surfaces the fix was written for,
+     * which is the original defect with a smaller blast radius, not a fixed
+     * one. Both are now derived, so the sentence "a provider that ships is
+     * named wherever providers are named" is true of every surface it claims.
+     *
+     * The marketplace listing is not a cosmetic surface here: it is the one
+     * users search BEFORE installing, so a provider missing from it reads as a
+     * provider the extension does not have.
+     */
+    it("names EVERY shipped provider in the marketplace description (\u2298 a hand-edited description leaves a shipped provider unnamed where users search before installing)", () => {
+      for (const provider of shippedProviders) {
+        expect(packageJson.description).toContain(provider);
+      }
+    });
+
+    it("carries EVERY shipped provider's id in the marketplace keywords (\u2298 a hand-edited keyword list makes a shipped provider unsearchable in the gallery)", () => {
+      const keywords = packageJson.keywords.map((keyword) => keyword.toLowerCase());
+      for (const provider of createBuiltInProviders()) {
+        expect(keywords).toContain(provider.id.toLowerCase());
+      }
     });
 
     it("⊘ names NOBODY who is not a shipped provider (kills a stale name surviving a provider's removal, which the include-everyone check cannot see)", () => {
@@ -1337,6 +1367,29 @@ describe("package contributions", () => {
 
     it("signals that the list is open-ended rather than the complete set of formats Nexus will ever read", () => {
       expect(importWelcomeLine()).toContain("\u2026");
+    });
+
+    /**
+     * Same reasoning as the provider half's marketplace checks: the
+     * description advertised "import from MobaXterm/SecureCRT" for a release
+     * that also shipped the ssh-config importer, and the keywords named the
+     * two old clients and not the new source. Both derive from
+     * SHIPPED_IMPORTER_NAMES now, so an importer added there has to reach the
+     * listing as well as the welcome line.
+     */
+    it("names EVERY shipped importer in the marketplace description (\u2298 advertising only the importers someone remembered to type)", () => {
+      for (const importer of shippedImporters) {
+        expect(packageJson.description).toContain(importer);
+      }
+    });
+
+    it("carries EVERY shipped importer in the marketplace keywords (\u2298 a user searching the gallery for their old client's format finds nothing)", () => {
+      const keywords = packageJson.keywords.map((keyword) => keyword.toLowerCase());
+      for (const importer of shippedImporters) {
+        // Substring, not equality: a keyword may carry the format plus a word
+        // ("csv import"), which is still the name being searchable.
+        expect(keywords.some((keyword) => keyword.includes(importer.toLowerCase())), importer).toBe(true);
+      }
     });
 
     it("\u2298 names NOTHING that is not a shipped importer (kills a stale name surviving an importer's removal, which the include-everyone check cannot see)", () => {

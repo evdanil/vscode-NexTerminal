@@ -226,6 +226,25 @@ function normalizeBaseUrl(raw: string): string {
 }
 
 /**
+ * A base URL on its way BACK INTO A MESSAGE, minus any `user:pass@` prefix.
+ *
+ * `normalizeBaseUrl` already drops userinfo on every URL that PARSES — it
+ * rebuilds from `protocol` + `host`, which carry none. The gap is the one string
+ * it hands back untouched: a URL that does not parse. `admin:s3cret@gns3.local:3080`
+ * is exactly that shape (it parses as the scheme `admin:`, which `parseHttpUrl`
+ * rejects), it is a plausible paste, and `buildUrl` then echoes it verbatim into
+ * "…is not a valid URL" — showing the user a password back, and writing it into
+ * whatever records the sync failure.
+ *
+ * The host survives, because the host is the diagnostic half of the echo; only
+ * the credential is replaced. The `@` must come before any `/` for this to be
+ * userinfo at all, so a path containing `@` is left alone.
+ */
+function redactUserinfo(raw: string): string {
+  return raw.replace(/^([a-z][a-z0-9+.-]*:\/\/)?[^/@\s]+@/i, (_match, scheme?: string) => `${scheme ?? ""}…@`);
+}
+
+/**
  * `new URL` accepts far more than a fetchable address, and the shape it accepts
  * WRONGLY here is exactly the typo this field invites: `gns3.local:3080` parses
  * perfectly well, as the scheme `gns3.local:` with the opaque path `3080`. Left
@@ -458,6 +477,44 @@ function readHeader(res: Response, name: string): string | undefined {
   return value ?? undefined;
 }
 
+/**
+ * THE EVIDENCE A VERSION PROBE HAS TO PRODUCE: a body that parsed as JSON and
+ * carries a `version` STRING. Both `/v2/version` and `/v3/version` answer
+ * `{"version": "2.2.49", …}` — the one field both API versions have always had,
+ * which is why it is the field checked rather than the whole shape.
+ *
+ * The value is not pattern-matched against a version NUMBER. A fork, a nightly
+ * or a future release may spell it however it likes, and the point of this check
+ * is only to separate a GNS3 controller from a web server that answers 200 HTML
+ * to everything — a non-empty `version` string does that completely. Tightening
+ * it further would start refusing real controllers.
+ */
+function isVersionPayload(parsed: ParsedBody): boolean {
+  return isObject(parsed?.json) && str(parsed.json.version).length > 0;
+}
+
+/**
+ * A `WWW-Authenticate` naming the Basic scheme. Substring-matched rather than
+ * parsed: the header may carry several challenges and a realm with anything in
+ * it, and the question here is only whether Basic is among them.
+ */
+function isBasicChallenge(header: string | undefined): boolean {
+  return /basic/i.test(header ?? "");
+}
+
+/**
+ * What one probe DID, for the refusal message. A 200 that failed
+ * `isVersionPayload` gets said out loud: "returned HTTP 200" beside "did not
+ * answer as a GNS3 controller" reads as a contradiction, and this shape is
+ * precisely the port-80 typo the message is trying to send the user back to.
+ */
+function describeProbe(probe: { res: Response; parsed: ParsedBody }): string {
+  if (probe.res.status === 200) {
+    return "returned HTTP 200 but no GNS3 version payload";
+  }
+  return `returned HTTP ${probe.res.status}`;
+}
+
 interface RawResponse {
   status: number;
   text: string;
@@ -633,7 +690,7 @@ class Gns3ApiClient {
     }
     throw new InventoryProviderError(
       "network",
-      `The GNS3 server URL "${this.baseUrl}" is not a valid URL — include http:// or https://.`
+      `The GNS3 server URL "${redactUserinfo(this.baseUrl)}" is not a valid URL — include http:// or https://.`
     );
   }
 
@@ -705,40 +762,64 @@ class Gns3ApiClient {
    * `GET /v3/version` first, because a 3.x controller does NOT serve `/v2` at
    * all and probing the other way round would misidentify it.
    *
-   *  - 200 on `/v3/version` ⇒ v3.
-   *  - 401 on `/v3/version` ⇒ v3 as well: the route EXISTS and is asking for a
-   *    token, which a 2.2 controller (no such path) would never do. GNS3 3.0.5
-   *    serves `/v3/version` unauthenticated, so this is a defensive reading
-   *    rather than an observed one — but the alternative, falling through to the
-   *    v2 probe, ends in "could not identify" on a server we had just
-   *    identified.
-   *  - anything else ⇒ probe `GET /v2/version`, where BOTH 200 and
-   *    401-with-`WWW-Authenticate: Basic` identify v2. The 401 case is not a
-   *    nicety: GNS3 2.2 with `auth=True` answers 401 to EVERY request including
-   *    this one, so a 200-only rule would refuse to talk to an authenticated 2.2
-   *    server at all.
+   *  - 200 on `/v3/version` CARRYING A VERSION BODY ⇒ v3.
+   *  - 401 on `/v3/version` whose challenge is NOT Basic ⇒ v3 as well: the route
+   *    EXISTS and is asking for a token, which a 2.2 controller (no such path)
+   *    would never do. GNS3 3.0.5 serves `/v3/version` unauthenticated, so this
+   *    is a defensive reading rather than an observed one — but the alternative,
+   *    falling through to the v2 probe, ends in "could not identify" on a server
+   *    we had just identified.
+   *  - anything else ⇒ probe `GET /v2/version`, where BOTH a 200 carrying a
+   *    version body and 401-with-`WWW-Authenticate: Basic` identify v2. The 401
+   *    case is not a nicety: GNS3 2.2 with `auth=True` answers 401 to EVERY
+   *    request including this one, so a 200-only rule would refuse to talk to an
+   *    authenticated 2.2 server at all.
+   *
+   * WHY A STATUS CODE ALONE IS NOT EVIDENCE, on either probe. The base-URL field
+   * says in so many words that omitting `:3080` is the typo it invites — and
+   * that typo lands on port 80, i.e. on whatever generic web server or SPA
+   * reverse proxy (`try_files … /index.html`) sits there, which answers 200 with
+   * HTML for EVERY path. Accepting that as "a 3.x controller" sent the user down
+   * the authentication path instead: "this is a GNS3 3.x server, which requires
+   * a username and password" (adding them fixes nothing), or, with credentials
+   * already set, "GNS3 accepted the login … but returned no access_token".
+   * Neither remedy can happen, while the honest one — check the URL and its port
+   * — is the very message four lines below. So both probes require a body that
+   * parses as JSON and carries a `version` string; anything else falls through.
+   *
+   * WHY THE BASIC CHALLENGE IS EXCLUDED ON THE v3 PROBE. A reverse proxy with a
+   * Basic wall in front of a 2.2 controller answers `401 + WWW-Authenticate:
+   * Basic` on every path, `/v3/version` included. Read as v3, the JSON login
+   * POST is what 401s next and the user is told "GNS3 rejected the credentials"
+   * — blaming a password that works, while the Basic header a v2 source would
+   * have sent is never tried. A Basic challenge is evidence of Basic auth, which
+   * is exactly what the v2 rule below already says; this makes the two agree.
    *
    * A server that identifies as neither fails with BOTH probe results in the
    * message — "could not identify" with no evidence is the least useful sentence
-   * this provider could produce.
+   * this provider could produce. A 200 that failed the body check says so, since
+   * "returned HTTP 200" on its own reads as a contradiction of the refusal.
    */
   private async detectApiVersion(timeoutMs: number): Promise<Gns3ApiVersion> {
     const v3Url = this.buildUrl("/v3/version");
     const v3 = await this.raw(v3Url, { headers: { Accept: "application/json" } }, timeoutMs);
-    if (v3.res.status === 200 || v3.res.status === 401) {
+    if (v3.res.status === 200 && isVersionPayload(v3.parsed)) {
+      return "v3";
+    }
+    if (v3.res.status === 401 && !isBasicChallenge(readHeader(v3.res, "www-authenticate"))) {
       return "v3";
     }
     const v2Url = this.buildUrl("/v2/version");
     const v2 = await this.raw(v2Url, { headers: { Accept: "application/json" } }, timeoutMs);
-    if (v2.res.status === 200) {
+    if (v2.res.status === 200 && isVersionPayload(v2.parsed)) {
       return "v2";
     }
-    if (v2.res.status === 401 && /basic/i.test(readHeader(v2.res, "www-authenticate") ?? "")) {
+    if (v2.res.status === 401 && isBasicChallenge(readHeader(v2.res, "www-authenticate"))) {
       return "v2";
     }
     throw new InventoryProviderError(
       "protocol",
-      `${this.baseUrl} did not answer as a GNS3 controller — ${v3Url.pathname} returned HTTP ${v3.res.status} and ${v2Url.pathname} returned HTTP ${v2.res.status}. Check the server URL and its port (3080 by default).`
+      `${this.baseUrl} did not answer as a GNS3 controller — ${v3Url.pathname} ${describeProbe(v3)} and ${v2Url.pathname} ${describeProbe(v2)}. Check the server URL and its port (3080 by default).`
     );
   }
 

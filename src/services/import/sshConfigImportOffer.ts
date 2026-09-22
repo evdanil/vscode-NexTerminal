@@ -4,6 +4,7 @@ import { defaultSshDir } from "../ssh/deploySshKey";
 import { createSshConfigIo } from "../ssh/sshConfigIo";
 import { convertSshConfig, localLoginName } from "../../utils/sshConfigImport";
 import { resolveSshConfig } from "../../utils/sshConfigParser";
+import type { NexusCore } from "../../core/nexusCore";
 
 /**
  * Marker for the strictly-once `~/.ssh/config` import offer. Versioned in the
@@ -31,6 +32,25 @@ const SSH_CONFIG_MAX_BYTES = 2 * 1024 * 1024;
  * Includes that resolve to nothing, parses FINE and yields nothing to import —
  * offering there would be an interruption with no action behind it.
  *
+ * AND "NOTHING TO IMPORT" INCLUDES HOSTS THE USER ALREADY HAS. The count is
+ * taken AFTER subtracting the servers already in `NexusCore`, using the same
+ * host+port+username key the import path dedupes on. Without that, a user
+ * upgrading with their fleet already in Nexus was told "Nexus found 12 SSH
+ * hosts… Import?", clicked Import, and was answered "All 12 hosts are already
+ * in Nexus — nothing to import" — with the one offer they will ever get spent
+ * on it. That is the same "interruption with no action behind it" the
+ * paragraph above rules out, so it is ruled out the same way: no importable
+ * host after dedupe, no offer, no marker spent.
+ *
+ * WHICH IS WHY IT NEEDS `core`, AND THEREFORE RUNS AFTER `core.initialize()`
+ * and after the import command is registered. The registration order is not
+ * incidental: `Import` dispatches `nexus.config.import.sshConfig`, and
+ * although VS Code would resolve that against the in-flight activation (the
+ * command is `contributes`d, so `executeCommand` awaits activation rather than
+ * rejecting), dispatching a command that is already registered removes the
+ * question. The offer is still `void`-ed by the caller, so nothing here can
+ * delay activation.
+ *
  * THE MARKER IS SET WHEN THE NOTIFICATION IS SHOWN, NOT WHEN IT IS ANSWERED.
  * VS Code notifications are dismissible, auto-collapse into the bell, and
  * commonly go unanswered; keying the marker on the answer would re-ask on every
@@ -56,7 +76,7 @@ const SSH_CONFIG_MAX_BYTES = 2 * 1024 * 1024;
  * snapshot write is the pre-existing `globalState` limitation, reported (not
  * prevented) by `onConcurrentOverwrite`.
  */
-export async function maybeOfferSshConfigImport(context: vscode.ExtensionContext): Promise<void> {
+export async function maybeOfferSshConfigImport(context: vscode.ExtensionContext, core: NexusCore): Promise<void> {
   try {
     if (context.globalState.get(SSH_CONFIG_OFFER_KEY) !== undefined) {
       return;
@@ -73,7 +93,22 @@ export async function maybeOfferSshConfigImport(context: vscode.ExtensionContext
     }
 
     const parsed = await resolveSshConfig(configPath, createSshConfigIo(SSH_CONFIG_MAX_BYTES));
-    const importable = convertSshConfig(parsed, { defaultUsername: localLoginName() }).sessions.length;
+    const candidates = convertSshConfig(parsed, { defaultUsername: localLoginName() }).sessions;
+
+    // The import path's key, spelled the same way here on purpose: a count this
+    // offer reports and a count the import then acts on must be the same count.
+    // (`localLoginName()` can be empty on a host with no passwd entry, where
+    // the IMPORT asks the user for a default instead — so a no-`User` host is
+    // keyed here on "" and may be offered although it is already stored under
+    // the answer the user will give. That can only OVER-count, never under —
+    // the offer appears where it would have appeared before this dedupe
+    // existed, and the import's own dedupe still decides what is written.)
+    const existing = new Set(
+      core.getSnapshot().servers.map((server) => `${server.host.toLowerCase()}|${server.port}|${server.username}`)
+    );
+    const importable = candidates.filter(
+      (session) => !existing.has(`${session.host.toLowerCase()}|${session.port}|${session.username}`)
+    ).length;
     if (importable === 0) {
       return;
     }

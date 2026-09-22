@@ -49,6 +49,13 @@ interface World {
   v2RequiresAuth?: boolean;
   /** Suppress the `WWW-Authenticate: Basic` header on that 401. */
   v2OmitAuthenticateHeader?: boolean;
+  /**
+   * A reverse proxy with an HTTP Basic wall in front of the controller: EVERY
+   * unauthenticated request is refused `401 + WWW-Authenticate: Basic`,
+   * `/v3/version` included. A real deployment shape, and the one a status-code
+   * -only detection rule reads as "a 3.x controller".
+   */
+  proxyBasicWall?: boolean;
   projects?: Record<string, unknown>[];
   /** Raw node arrays keyed by project id. A project absent here answers 404. */
   nodes?: Record<string, unknown[]>;
@@ -84,6 +91,12 @@ function makeWorld(world: World): { fetchImpl: typeof fetch; calls: Call[] } {
       body: typeof init?.body === "string" ? init.body : undefined,
       init
     });
+
+    // The wall sits in FRONT of every path, so it answers before any route
+    // below — which is the whole point: the proxy has no idea what `/v3` is.
+    if (world.proxyBasicWall && !headers.Authorization) {
+      return makeResponse(401, { message: "Unauthorized" }, { "WWW-Authenticate": 'Basic realm="lab"' });
+    }
 
     // --- version probes -----------------------------------------------------
     if (path === "/v3/version") {
@@ -476,6 +489,114 @@ describe("createGns3Provider — API version detection", () => {
     expect((err as InventoryProviderError).message).toContain("/v3/version");
     expect((err as InventoryProviderError).message).toContain("/v2/version");
     expect((err as InventoryProviderError).message).toContain("3080");
+  });
+
+  /**
+   * THE TYPO THE BASE-URL FIELD PREDICTS. Omitting `:3080` sends the probe to
+   * port 80, where a generic web server or an SPA reverse proxy (`try_files …
+   * /index.html`) answers 200 with HTML for every path. Read as "a 3.x
+   * controller" on the status code alone, that lands the user in the
+   * authentication path — told to add a username and password (which fixes
+   * nothing) or that the login "returned no access_token". Neither remedy can
+   * happen; the one that can is the message this function already has.
+   */
+  it("does NOT read a 200 of HTML on /v3/version as a 3.x controller, and refuses with the URL/port remedy (⊘ a status-code-only rule sends the `:3080`-less typo down the authentication path, where every remedy offered is a lie)", async () => {
+    const html = "<!doctype html><html><body>Welcome to nginx</body></html>";
+    const spa = (async () => makeResponse(200, html)) as unknown as typeof fetch;
+    const err = await createGns3Provider(spa)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(InventoryProviderError);
+    expect((err as InventoryProviderError).kind).toBe("protocol");
+    const message = (err as InventoryProviderError).message;
+    expect(message).toContain("3080");
+    expect(message).toContain("/v3/version");
+    expect(message).toContain("/v2/version");
+    // ⊘ The two misdetection dead ends, neither of which names a remedy the
+    // user can act on.
+    expect(message).not.toContain("access_token");
+    expect(message).not.toContain("requires a username and password");
+  });
+
+  it("probes /v2/version after a 200 of HTML on /v3/version, rather than stopping at the status code (⊘ accepting the 200 never asks the other probe and loses the evidence the refusal is built from)", async () => {
+    const seen: string[] = [];
+    const spa = (async (input: string) => {
+      seen.push(new URL(String(input)).pathname);
+      return makeResponse(200, "<html>index</html>");
+    }) as unknown as typeof fetch;
+    await createGns3Provider(spa)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch(() => undefined);
+    // The first two calls only: what happens AFTER the second probe is the next
+    // test's business, so this one stays red for its own reason alone.
+    expect(seen.slice(0, 2)).toEqual(["/v3/version", "/v2/version"]);
+  });
+
+  it("does NOT accept a 200 whose JSON carries no `version` field (⊘ any-JSON-will-do passes a proxy's `{\"status\":\"ok\"}` health page off as a controller)", async () => {
+    const fetchImpl = (async () => makeResponse(200, { status: "ok" })) as unknown as typeof fetch;
+    const err = await createGns3Provider(fetchImpl)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch((e: unknown) => e);
+    expect((err as InventoryProviderError).kind).toBe("protocol");
+    const message = (err as InventoryProviderError).message;
+    expect(message).toContain("did not answer as a GNS3 controller");
+    // ⊘ NOT the login dead end: this body would satisfy a JSON-shaped check and
+    // then fail on the missing token, blaming the credentials instead.
+    expect(message).not.toContain("access_token");
+  });
+
+  /**
+   * A Basic wall in front of a 2.2 controller answers `401 + WWW-Authenticate:
+   * Basic` on EVERY path, `/v3/version` included. Read as v3, the JSON login
+   * POST is what 401s next and the user is told their credentials were
+   * rejected — while the Basic header a v2 source would have sent is never
+   * tried. The provider's own v2 rule four lines below already treats a Basic
+   * challenge as evidence of Basic auth; this makes the two agree.
+   */
+  it("falls through to the v2 probe on a 401 whose challenge is Basic, and syncs over HTTP Basic (⊘ reading any 401 as v3 sends a JSON login into a Basic wall and blames a password that works)", async () => {
+    const world = oneProjectWorld([node()]);
+    world.proxyBasicWall = true;
+    const { fetchImpl, calls } = makeWorld(world);
+    const tree = await createGns3Provider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    expect(tree.devices).toHaveLength(1);
+    expect(calls.map((c) => c.path).slice(0, 2)).toEqual(["/v3/version", "/v2/version"]);
+    const projects = calls.find((c) => c.path === "/v2/projects");
+    expect(projects?.headers.Authorization).toBe(`Basic ${Buffer.from("admin:pw").toString("base64")}`);
+    // ⊘ The login POST that the misdetection would have issued never happens.
+    expect(calls.some((c) => c.path === "/v3/access/users/authenticate")).toBe(false);
+  });
+
+  it("⊘ produces no rejected-credentials message for a Basic wall in front of a 2.2 controller (⊘ the v3 misreading fails the sync by blaming the user's password)", async () => {
+    const world = oneProjectWorld([node()]);
+    world.proxyBasicWall = true;
+    const { fetchImpl } = makeWorld(world);
+    const result = await createGns3Provider(fetchImpl)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch((e: unknown) => e);
+    expect(result).not.toBeInstanceOf(InventoryProviderError);
+  });
+
+  /**
+   * The defensive half of the v3 rule still stands: a token challenge on a route
+   * a 2.2 controller does not serve at all is the server saying which API it
+   * speaks, and falling through would end in "could not identify" on a server we
+   * had just identified.
+   */
+  it("still reads a 401 challenging for Bearer on /v3/version as v3 (⊘ excluding every 401 refuses a 3.x controller that protects its version route)", async () => {
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(String(input)).pathname;
+      calls.push(path);
+      if (path === "/v3/version") return makeResponse(401, { message: "Not authenticated" }, { "WWW-Authenticate": "Bearer" });
+      if (path === "/v3/access/users/authenticate") return makeResponse(200, { access_token: TOKEN, token_type: "bearer" });
+      if (path === "/v3/projects") return makeResponse(200, [project()]);
+      if (path === `/v3/projects/${PROJECT_ID}/nodes`) return makeResponse(200, [node()]);
+      return makeResponse(500, "unrouted");
+    }) as unknown as typeof fetch;
+
+    const tree = await createGns3Provider(fetchImpl).fetchInventory(CONFIG, SECRETS);
+    expect(tree.devices).toHaveLength(1);
+    expect(calls).not.toContain("/v2/version");
   });
 
   /**
@@ -971,6 +1092,42 @@ describe("createGns3Provider — error mapping", () => {
     expect((err as InventoryProviderError).message).toContain("https://gns3.example.com/login");
   });
 
+  /**
+   * THE `Location` IS SERVER-CONTROLLED TEXT, and `redirectNotFollowedMessage`
+   * drops it into a sentence this codebase composed — so it is flattened where
+   * it ENTERS that sentence, in the shared helper
+   * (`services/inventory/certificateHints.ts`), not at the four providers that
+   * interpolate the result.
+   *
+   * The exposure is NOT newline injection through a real HTTP client: undici
+   * rejects CR/LF and C0 in a header value. It is the bidi and invisible
+   * formatting block, which undici passes through untouched and which reorders
+   * the rendered notification around the address it names. The newline is
+   * asserted too because `fetchImpl` is a seam and a non-undici transport
+   * enforces nothing.
+   *
+   * Lives in this file because there is no `certificateHints` test file; the
+   * helper's other three callers pass it the same header.
+   */
+  it("⊘ flattens a bidi control out of the Location header before it reaches the redirect message (⊘ an RLO in a header undici does NOT reject reverses the sentence the user reads)", async () => {
+    const nasty = "https://gns3.example.com/‮login\nX-Nexus: 4 servers were deleted";
+    const fetchImpl = (async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path === "/v3/version") return makeResponse(404, "no");
+      if (path === "/v2/version") return makeResponse(200, { version: "2.2.49" });
+      return makeResponse(301, "", { Location: nasty });
+    }) as unknown as typeof fetch;
+    const err = await createGns3Provider(fetchImpl)
+      .fetchInventory(CONFIG, SECRETS)
+      .catch((e: unknown) => e);
+    const message = (err as InventoryProviderError).message;
+    // The address is still named — flattening must not cost the answer.
+    expect(message).toContain("https://gns3.example.com/");
+    expect(message).not.toContain("‮");
+    expect(message).not.toContain("\n");
+    expect(message.split("\n")).toHaveLength(1);
+  });
+
   it("maps a transport failure to `network`, naming the OS code rather than a stack trace", async () => {
     const fetchImpl = (async () => {
       throw Object.assign(new Error("fetch failed"), { cause: { code: "ECONNREFUSED" } });
@@ -1014,6 +1171,128 @@ describe("createGns3Provider — error mapping", () => {
       expect(calls).toHaveLength(0);
     }
   );
+
+  /**
+   * THE ONE UNPARSEABLE URL THAT CARRIES A SECRET. `normalizeBaseUrl` drops
+   * userinfo on every URL that parses — it rebuilds from protocol + host — but
+   * hands back the raw string when the parse fails, and
+   * `admin:s3cret@gns3.local:3080` is exactly that shape (scheme `admin:`,
+   * rejected by `parseHttpUrl`). Echoed verbatim, the refusal shows the user
+   * their own password back and writes it into whatever records the sync
+   * failure.
+   */
+  it("⊘ does not echo a `user:pass@` prefix back in the invalid-URL refusal, while still naming the host (⊘ echoing the raw string puts a typed password in a notification and in the sync error record)", async () => {
+    const { fetchImpl, calls } = makeWorld(oneProjectWorld([node()]));
+    const err = await createGns3Provider(fetchImpl)
+      .fetchInventory({ baseUrl: "admin:s3cret@gns3.example.com:3080" }, SECRETS)
+      .catch((e: unknown) => e);
+    const message = (err as InventoryProviderError).message;
+    expect((err as InventoryProviderError).kind).toBe("network");
+    expect(message).not.toContain("s3cret");
+    expect(message).not.toContain("admin");
+    // The host is the diagnostic half of the echo and must survive the redaction.
+    expect(message).toContain("gns3.example.com:3080");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("leaves an `@` that is part of a PATH alone, since only a prefix before the first slash is userinfo", async () => {
+    const { fetchImpl } = makeWorld(oneProjectWorld([node()]));
+    const err = await createGns3Provider(fetchImpl)
+      .fetchInventory({ baseUrl: "gns3.local:3080/api@v2" }, SECRETS)
+      .catch((e: unknown) => e);
+    expect((err as InventoryProviderError).message).toContain("gns3.local:3080/api@v2");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Every server-supplied value that enters a composed message
+// ---------------------------------------------------------------------------
+
+/**
+ * ONE PIN PER `inMessage` CALL SITE, and the reason it is a table rather than a
+ * test per message: the bug this guards against was itself a MISSED SITE — the
+ * first sweep flattened the response body and the project NAME and left the
+ * project id raw in four other messages. Two of those sites had a pin; four did
+ * not, so stripping `inMessage` from any of them left the suite green. A table
+ * enumerated from the call sites fails the day a seventh message is composed
+ * without one.
+ *
+ * The payload carries BOTH shapes the helper exists to remove: a newline, which
+ * mints a line the reader takes as one of Nexus's own, and an RLO (U+202E),
+ * which reorders the rendered sentence around it. Each case asserts the composed
+ * message is one line and control-free while still naming the value — a site
+ * that simply dropped the value would pass the first two assertions.
+ */
+describe("createGns3Provider — server text entering a composed message", () => {
+  /** `p1` is the part that must survive; the rest is what must not. */
+  const NASTY = "p1\nNexus: 4 servers were deleted‮reversed";
+
+  async function messageOf(run: () => Promise<unknown>): Promise<string> {
+    const err = await run().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(InventoryProviderError);
+    return (err as InventoryProviderError).message;
+  }
+
+  /** `/v3/version` 404s, `/v2/version` identifies v2; the rest is per-case. */
+  function v2Then(route: (path: string) => unknown): typeof fetch {
+    return (async (input: string) => {
+      const path = decodeURIComponent(new URL(String(input)).pathname);
+      if (path === "/v3/version") return makeResponse(404, { message: "Not Found" });
+      if (path === "/v2/version") return makeResponse(200, { version: "2.2.49" });
+      return route(path);
+    }) as unknown as typeof fetch;
+  }
+
+  const cases: [string, () => Promise<unknown>][] = [
+    [
+      "the error body echoed by throwForStatus",
+      () => fetchTree({ api: "v2", projectsHttp: 500, projectsBody: { message: NASTY } })
+    ],
+    [
+      "the project id in the malformed-node-list refusal",
+      () =>
+        createGns3Provider(
+          v2Then((path) => (path === "/v2/projects" ? makeResponse(200, [project({ project_id: NASTY })]) : makeResponse(200, { not: "an array" })))
+        ).fetchInventory(CONFIG, SECRETS)
+    ],
+    [
+      "the project id in the malformed-node refusal",
+      () => fetchTree({ api: "v2", projects: [project({ project_id: NASTY })], nodes: { [NASTY]: [null] } })
+    ],
+    [
+      "the project id in the missing-node_id refusal",
+      () => fetchTree({ api: "v2", projects: [project({ project_id: NASTY })], nodes: { [NASTY]: [{ name: "R1" }] } })
+    ],
+    [
+      "the node id in controlNode's malformed-id refusal",
+      () => {
+        const { fetchImpl } = makeWorld(oneProjectWorld([node()]));
+        return createGns3Provider(fetchImpl).controlNode!(CONFIG, SECRETS, NASTY, "start");
+      }
+    ],
+    [
+      "the project id in controlNode's stale-inventory refusal",
+      () => {
+        const { fetchImpl } = makeWorld({ api: "v2", projects: [] });
+        return createGns3Provider(fetchImpl).controlNode!(CONFIG, SECRETS, `${NASTY}#${NODE_ID}`, "start");
+      }
+    ],
+    [
+      "the project name in controlNode's closed-project refusal",
+      () => {
+        const { fetchImpl } = makeWorld(oneProjectWorld([node()], { name: NASTY, status: "closed" }));
+        return createGns3Provider(fetchImpl).controlNode!(CONFIG, SECRETS, `${PROJECT_ID}#${NODE_ID}`, "start");
+      }
+    ]
+  ];
+
+  it.each(cases)("⊘ flattens %s (⊘ a raw newline mints a notification line that reads like one of ours)", async (_label, run) => {
+    const message = await messageOf(run);
+    expect(message).toContain("p1");
+    expect(message.split("\n")).toHaveLength(1);
+    expect(message).not.toContain("\r");
+    expect(message).not.toContain("‮");
+  });
 });
 
 // ---------------------------------------------------------------------------

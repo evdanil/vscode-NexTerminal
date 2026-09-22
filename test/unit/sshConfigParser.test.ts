@@ -98,6 +98,28 @@ describe("parseSshConfig — keywords", () => {
     expect(result.issues[0].reason).toContain("1-65535");
   });
 
+  it("holds a bad Port bad across a REPEATED alias too, not only inside one block — both paths state the same policy (⊘ testing `port === undefined` at the merge lets a second block's Port fill the slot the first block's garbage already claimed, so the identical two lines mean one thing written in one block and the opposite in two)", () => {
+    const oneBlock = parseSshConfig("Host foo\n  Port notanumber\n  Port 2222\n");
+    const twoBlocks = parseSshConfig("Host foo\n  Port notanumber\n\nHost foo\n  Port 2222\n");
+
+    expect(oneBlock.entries[0].port).toBeUndefined();
+    expect(twoBlocks.entries).toHaveLength(1);
+    expect(twoBlocks.entries[0].port).toBeUndefined();
+    // The second block really did contribute nothing, so it is the dead text the counter claims.
+    expect(twoBlocks.duplicateAliasCount).toBe(1);
+  });
+
+  it("keeps a good first Port when a later block repeats the alias with a bad one, the other order round (⊘ validating at the merge instead of at the block lets the later garbage overwrite a working port)", () => {
+    const result = parseSshConfig("Host foo\n  Port 2222\n\nHost foo\n  Port notanumber\n");
+    expect(result.entries[0].port).toBe(2222);
+  });
+
+  it("still lets a later block supply a Port the earlier block never mentioned (⊘ setting the obtained bit for every block rather than only for the ones that wrote a Port blocks every merge, and a host whose Port lives in its second block imports on 22)", () => {
+    const result = parseSshConfig("Host foo\n  HostName 10.0.0.83\n\nHost foo\n  Port 2222\n");
+    expect(result.entries[0].port).toBe(2222);
+    expect(result.duplicateAliasCount).toBe(0);
+  });
+
   it("accepts the `Keyword=value` spelling ssh_config also allows (⊘ splitting on whitespace only parses `Port=2222` as an unknown keyword and loses the port)", () => {
     const result = parseSshConfig("Host box\n  HostName=10.0.0.9\n  Port = 2222\n");
     expect(result.entries[0].host).toBe("10.0.0.9");
@@ -111,6 +133,19 @@ describe("parseSshConfig — keywords", () => {
     expect(result.entries[0].host).toBe("box");
     expect(result.entries[0].port).toBeUndefined();
     expect(result.issues.map((i) => i.reason)).toEqual(["HostName has no value", "Port has no value"]);
+  });
+
+  it('treats a quoted empty value as no value at all, leaving a later line in the block free to supply the real one (⊘ storing "" hands the connector an IdentityFile that names no file, and the block\'s real key path is then discarded as a repeat)', () => {
+    const result = parseSshConfig('Host box\n  IdentityFile ""\n  IdentityFile ~/.ssh/id_real\n');
+    expect(result.entries[0].identityFile).toBe("~/.ssh/id_real");
+    expect(result.issues).toHaveLength(1);
+    expect(result.issues[0].reason).toContain("has no value");
+  });
+
+  it("⊘ keeps only the FIRST IdentityFile and silently drops the rest, though OpenSSH ACCUMULATES them — a deliberate departure, since an imported server row holds exactly one key path (a last-wins rule would import the wrong key with nothing to show it happened)", () => {
+    const result = parseSshConfig("Host box\n  IdentityFile ~/.ssh/id_first\n  IdentityFile ~/.ssh/id_second\n");
+    expect(result.entries[0].identityFile).toBe("~/.ssh/id_first");
+    expect(result.issues).toHaveLength(0);
   });
 
   it("ignores keywords it does not model rather than failing the file (⊘ treating an unknown keyword as an error aborts the import of a config that ssh itself reads fine)", () => {
@@ -158,6 +193,49 @@ Host named
     // ⊘ Neither spelling of the negated pattern may survive.
     expect(result.entries.map((e) => e.alias)).not.toContain("!staging");
     expect(result.entries.map((e) => e.alias)).not.toContain("staging");
+  });
+
+  it("cancels a positive alias that a `!` on the same line negates, so `Host foo bar !foo` applies to `bar` alone (⊘ counting the negation and then emitting `foo` anyway imports the ONE host the user carved out, handing it the exception's destination, account and key)", () => {
+    const result = parseSshConfig(`Host foo bar !foo
+  HostName shared.example.com
+  User ops
+`);
+    expect(result.entries.map((e) => e.alias)).toEqual(["bar"]);
+    expect(result.entries[0]).toMatchObject({ host: "shared.example.com", user: "ops" });
+    expect(result.negatedPatternCount).toBe(1);
+  });
+
+  it("cancels with a GLOB negation too — `!*.internal` subtracts every alias on the line that matches it (⊘ comparing the negation as a literal string leaves db.internal and app.internal imported, which is the exact shape `!` exists to write)", () => {
+    const result = parseSshConfig(`Host db.internal app.internal edge.dmz !*.internal
+  User ops
+`);
+    expect(result.entries.map((e) => e.alias)).toEqual(["edge.dmz"]);
+    expect(result.entries.map((e) => e.alias)).not.toContain("db.internal");
+  });
+
+  it("cancels case-insensitively, as match_pattern() compares (⊘ a case-sensitive cancel imports `Foo` from `Host Foo !foo`, a host ssh would never apply the block to)", () => {
+    const result = parseSshConfig("Host Foo bar !foo\n  User ops\n");
+    expect(result.entries.map((e) => e.alias)).toEqual(["bar"]);
+  });
+
+  it("opens NO block when the negations cancel every alias on the line, so what follows describes nothing (⊘ opening a block with an empty alias list emits a nameless entry the tree renders as a blank server row)", () => {
+    const result = parseSshConfig(`Host box
+  HostName 10.0.0.80
+
+Host foo !foo
+  HostName cancelled.example.com
+  User ops
+`);
+    expect(result.entries.map((e) => e.alias)).toEqual(["box"]);
+    expect(result.entries[0].host).toBe("10.0.0.80");
+    expect(result.entries.map((e) => e.alias)).not.toContain("");
+    expect(result.entries.map((e) => e.alias)).not.toContain("foo");
+  });
+
+  it("⊘ still counts the negations it now applies — negatedPatternCount reports the `!` patterns, which is what it says, not the aliases they cancelled (dropping the counter once the subtraction works leaves the import summary claiming nothing on the line was skipped)", () => {
+    const result = parseSshConfig("Host foo bar !foo !*.internal\n  User ops\n");
+    expect(result.negatedPatternCount).toBe(2);
+    expect(result.entries.map((e) => e.alias)).toEqual(["bar"]);
   });
 
   it("skips AND counts a wildcard pattern — `Host *` is a defaults block (⊘ importing it creates a bogus server named `*`, and dropping it without counting leaves the import summary claiming nothing was skipped)", () => {
@@ -292,6 +370,20 @@ Host foo
     // Only the middle block is dead text; the third one merged a Port.
     expect(result.duplicateAliasCount).toBe(1);
     expect(result.entries[0].line).toBe(1);
+  });
+
+  it('ignores a quoted empty `Host ""` token, which names nothing, and keeps the rest of the line (⊘ pushing it emits a phantom entry whose alias is the empty string — a blank, unconnectable row in the server tree, same defect as the include-shaped phantom pinned below)', () => {
+    const result = parseSshConfig('Host "" foo\n  HostName 10.0.0.81\n');
+    expect(result.entries.map((e) => e.alias)).toEqual(["foo"]);
+    expect(result.entries.map((e) => e.alias)).not.toContain("");
+    expect(result.issues).toHaveLength(0);
+  });
+
+  it('reports `Host ""` on its own exactly as a bare `Host`: no patterns, no block, one issue (⊘ treating the empty token as a pattern opens a block for it and every following directive lands on a nameless entry)', () => {
+    const result = parseSshConfig('Host ""\n  HostName 10.0.0.82\n');
+    expect(result.entries).toHaveLength(0);
+    expect(result.issues).toHaveLength(1);
+    expect(result.issues[0].reason).toContain("no patterns");
   });
 
   it("records an issue for a `Host` line with no patterns instead of emitting a nameless entry (⊘ an empty alias becomes an unnamed, unusable server row)", () => {
@@ -506,20 +598,55 @@ Host box
 });
 
 describe("resolveSshConfig — include resolution", () => {
-  it("resolves a relative Include against ~/.ssh, NOT against the including file's directory (⊘ the intuitive `dirname(includingFile)` rule reads a completely different file — here /etc/ssh/extra.conf — which is what OpenSSH does not do)", async () => {
+  it("resolves a relative Include against ~/.ssh for a USER config — never against the directory of the file doing the including, and never against a base the INCLUDED file's location suggests (⊘ the intuitive `dirname(includingFile)` rule reads a completely different file, here /etc/ssh/extra.conf; deciding the base per file rather than per walk reads that same decoy)", async () => {
     const io = makeIo({
-      "/etc/ssh/ssh_config": "Include extra.conf\n",
+      [sshPath("config")]: "Include /etc/ssh/main.conf\n",
+      "/etc/ssh/main.conf": "Include extra.conf\n",
       "/etc/ssh/extra.conf": "Host decoy\n  HostName wrong.example.com\n",
       [sshPath("extra.conf")]: "Host fromhome\n  HostName right.example.com\n"
     });
 
-    const result = await resolveSshConfig("/etc/ssh/ssh_config", io);
+    const result = await resolveSshConfig(sshPath("config"), io);
 
     expect(result.entries.map((e) => e.alias)).toEqual(["fromhome"]);
     expect(result.entries[0].host).toBe("right.example.com");
-    // ⊘ The sibling-directory file must never be read.
+    // ⊘ The sibling-directory file must never be read: this walk is rooted in a
+    // user config, so every relative Include in it resolves under ~/.ssh.
     expect(io.reads).not.toContain("/etc/ssh/extra.conf");
     expect(result.entries.map((e) => e.alias)).not.toContain("decoy");
+  });
+
+  it("resolves a relative Include against /etc/ssh when the ROOT is the system config, which is the other half of the ssh_config(5) rule (⊘ hard-coding ~/.ssh sends a user who imported /etc/ssh/ssh_config to their own config.d instead of the system's — reading a file ssh would not read there, and reporting the one it would as missing)", async () => {
+    const io = makeIo({
+      "/etc/ssh/ssh_config": "Include extra.conf\n",
+      "/etc/ssh/extra.conf": "Host system\n  HostName right.example.com\n",
+      [sshPath("extra.conf")]: "Host fromhome\n  HostName wrong.example.com\n"
+    });
+
+    const result = await resolveSshConfig("/etc/ssh/ssh_config", io);
+
+    expect(result.entries.map((e) => e.alias)).toEqual(["system"]);
+    expect(result.entries[0].host).toBe("right.example.com");
+    expect(io.reads).not.toContain(sshPath("extra.conf"));
+    expect(result.includeMissingCount).toBe(0);
+  });
+
+  it("⊘ does NOT expand `~user/...` in an Include path: it stays literal, resolves under the include base and is reported missing (deliberate — `~other` names ANOTHER account's home, and quietly reading OUR home instead would import a different file under a name the user would never question)", async () => {
+    const otherHome = path.join(path.sep, "home", "other", "hosts.conf");
+    const io = makeIo({
+      [sshPath("config")]: "Include ~other/hosts.conf\n",
+      [otherHome]: "Host theirs\n  HostName 10.0.0.85\n",
+      [sshPath("hosts.conf")]: "Host ours\n  HostName 10.0.0.86\n"
+    });
+
+    const result = await resolveSshConfig(sshPath("config"), io);
+
+    expect(result.entries).toHaveLength(0);
+    expect(io.reads).toContain(sshPath("~other", "hosts.conf"));
+    expect(io.reads).not.toContain(otherHome);
+    expect(io.reads).not.toContain(sshPath("hosts.conf"));
+    expect(result.includeMissingCount).toBe(1);
+    expect(result.issues[0].reason).toContain("could not read");
   });
 
   it("expands a leading `~` in an Include path (⊘ leaving the tilde literal makes the resolver look for a directory actually named `~`, and every include silently goes missing)", async () => {
@@ -563,14 +690,13 @@ describe("resolveSshConfig — include resolution", () => {
     expect(result.entries.map((e) => e.alias)).not.toContain("ignored");
   });
 
-  it("matches `?` and `[...]` but never crosses a directory with `*`, per glob(3) (⊘ implementing `**`-style matching pulls in a whole subtree the user never listed)", async () => {
+  it("matches `?` and `[...]` against the basename, per glob(3) (⊘ compiling `?` as a regex `.*`, or `[12]` as literal text, either drags in host22.conf or finds nothing at all)", async () => {
     const io = makeIo({
       [sshPath("config")]: "Include config.d/host?.conf\nInclude config.d/set[12].conf\n",
       [sshPath("config.d", "host1.conf")]: "Host h1\n  HostName 10.0.0.21\n",
       [sshPath("config.d", "host22.conf")]: "Host h22\n  HostName 10.0.0.22\n",
       [sshPath("config.d", "set1.conf")]: "Host s1\n  HostName 10.0.0.23\n",
-      [sshPath("config.d", "set9.conf")]: "Host s9\n  HostName 10.0.0.24\n",
-      [sshPath("config.d", "nested", "deep.conf")]: "Host deep\n  HostName 10.0.0.25\n"
+      [sshPath("config.d", "set9.conf")]: "Host s9\n  HostName 10.0.0.24\n"
     });
 
     const result = await resolveSshConfig(sshPath("config"), io);
@@ -578,7 +704,54 @@ describe("resolveSshConfig — include resolution", () => {
     expect(result.entries.map((e) => e.alias)).toEqual(["h1", "s1"]);
     expect(result.entries.map((e) => e.alias)).not.toContain("h22");
     expect(result.entries.map((e) => e.alias)).not.toContain("s9");
+  });
+
+  /**
+   * The listing io hands back is the whole of what a glob may match: what keeps
+   * an include inside one directory is that the expander never descends, NOT the
+   * `[^/]` in the compiled pattern — matching only ever runs on a basename, so
+   * no test can tell `[^/]` from `.`. This one pins the property that IS
+   * observable, with a listing that really does name a subdirectory, because the
+   * fixture this replaced listed none and asserted the absence of a host that
+   * nothing could have produced.
+   */
+  it("never descends into a subdirectory the listing names — no `**`, and no stat-then-recurse (⊘ implementing `**`-style matching, or recursing into any name that is not a file, pulls in a whole subtree the user never listed)", async () => {
+    const deepPath = sshPath("config.d", "nested", "deep.conf");
+    const files: Record<string, string> = {
+      [sshPath("config")]: "Include config.d/*.conf\n",
+      [sshPath("config.d", "real.conf")]: "Host real\n  HostName 10.0.0.25\n",
+      [deepPath]: "Host deep\n  HostName 10.0.0.26\n"
+    };
+    const reads: string[] = [];
+    const listed: string[] = [];
+    const io: SshConfigIo & { reads: string[]; listed: string[] } = {
+      reads,
+      listed,
+      async readFile(filePath: string): Promise<string | undefined> {
+        reads.push(filePath);
+        return Object.prototype.hasOwnProperty.call(files, filePath) ? files[filePath] : undefined;
+      },
+      async readDir(dir: string): Promise<string[]> {
+        listed.push(dir);
+        // Unlike makeIo, this listing names the SUBDIRECTORY as well as the file
+        // — which is what a real readdir does, and what the expander must not
+        // follow.
+        if (dir === sshPath("config.d")) {
+          return ["real.conf", "nested"];
+        }
+        if (dir === sshPath("config.d", "nested")) {
+          return ["deep.conf"];
+        }
+        return [];
+      }
+    };
+
+    const result = await resolveSshConfig(sshPath("config"), io);
+
+    expect(result.entries.map((e) => e.alias)).toEqual(["real"]);
     expect(result.entries.map((e) => e.alias)).not.toContain("deep");
+    expect(io.reads).not.toContain(deepPath);
+    expect(io.listed).not.toContain(sshPath("config.d", "nested"));
   });
 
   it("does not let a wildcard match a dotfile, per glob(3) (⊘ a regex-only `*` sweeps up editor backups and `.bak` droppings sitting next to the real configs)", async () => {
@@ -775,6 +948,47 @@ describe("resolveSshConfig — include guards", () => {
     expect(result.issues[0].line).toBe(1);
   });
 
+  it("treats `[!]` as the literal characters glob(3) makes of it, an empty set being no set at all (⊘ mapping the leading `!` to `^` compiles `[^]`, which in JavaScript matches ANY single character, so `Include config.d/[!]` quietly swallows every one-character file in the directory)", async () => {
+    const io = makeIo({
+      [sshPath("config")]: "Include config.d/[!]\n\nHost survivor\n  HostName 10.0.0.54\n",
+      [sshPath("config.d", "a")]: "Host onechar\n  HostName 10.0.0.55\n",
+      [sshPath("config.d", "b")]: "Host otherchar\n  HostName 10.0.0.56\n"
+    });
+
+    const result = await resolveSshConfig(sshPath("config"), io);
+
+    expect(result.entries.map((e) => e.alias)).toEqual(["survivor"]);
+    expect(result.entries.map((e) => e.alias)).not.toContain("onechar");
+    expect(result.entries.map((e) => e.alias)).not.toContain("otherchar");
+    expect(result.includeMissingCount).toBe(1);
+    expect(result.issues[0].reason).toContain("matched no files");
+  });
+
+  it("reads a `]` in FIRST position as an ordinary member of the set, per glob(3) (⊘ scanning for the terminator straight from the `[` ends the set immediately, and `[]a]` compiles to an empty class that matches nothing followed by a literal `a]`)", async () => {
+    const io = makeIo({
+      [sshPath("config")]: "Include config.d/[]a].conf\n",
+      [sshPath("config.d", "a.conf")]: "Host member\n  HostName 10.0.0.57\n"
+    });
+
+    const result = await resolveSshConfig(sshPath("config"), io);
+
+    expect(result.entries.map((e) => e.alias)).toEqual(["member"]);
+    expect(result.includeMissingCount).toBe(0);
+  });
+
+  it("⊘ escapes a backslash inside a bracket class before copying it into the regex source, so the class still compiles (dropping the escape makes `[a\\]` an unterminated class, `new RegExp` throws, and a pattern that names a real file is reported as an invalid glob that matched nothing — glob(3)'s own backslash-as-escape rule is separately not modelled)", async () => {
+    const io = makeIo({
+      [sshPath("config")]: "Include config.d/[a\\].conf\n",
+      [sshPath("config.d", "a.conf")]: "Host classy\n  HostName 10.0.0.58\n"
+    });
+
+    const result = await resolveSshConfig(sshPath("config"), io);
+
+    expect(result.entries.map((e) => e.alias)).toEqual(["classy"]);
+    expect(result.includeMissingCount).toBe(0);
+    expect(result.issues).toHaveLength(0);
+  });
+
   it("returns an empty result, not a rejection, when the root config itself cannot be read (⊘ letting the read error escape turns 'you have no ~/.ssh/config' into an unhandled promise rejection)", async () => {
     const io = makeIo({});
 
@@ -799,6 +1013,29 @@ describe("resolveSshConfig — include guards", () => {
     expect(result.issues).toHaveLength(1);
     expect(result.issues[0].file).toBe(sshPath("sub.conf"));
     expect(result.issues[0].reason).toContain("not a number");
+  });
+
+  it("resolves — never rejects — for an INCLUDED file of a few hundred thousand lines (⊘ splicing a child's lines with `assembled.push(...child)` spreads 200,000 elements as call arguments and V8 throws `RangeError: Maximum call stack size exceeded`; it escapes as a promise REJECTION, the import command has no catch, and the user gets a raw command-failure toast and zero hosts — from a ~1.6 MB file, well inside the 2 MiB the import path allows)", async () => {
+    // Generated rather than fixtured: a file this size has no business in the
+    // repo, and the defect is about the COUNT of lines, which a generator states
+    // exactly. Only an INCLUDED file can hit it — the root's own lines are
+    // pushed one at a time.
+    const io = makeIo({
+      [sshPath("config")]: "Include big.conf\n",
+      [sshPath("big.conf")]: `${"# filler\n".repeat(200_000)}Host huge\n  HostName 10.0.0.99\n`
+    });
+
+    // Asserted as RESOLVES, not merely "has these entries": the contract this
+    // pins is that the promise settles, and a test that only awaits the value
+    // reports the violation as a thrown error rather than as what it is.
+    const run = resolveSshConfig(sshPath("config"), io);
+    await expect(run).resolves.toBeTruthy();
+    const result = await run;
+
+    expect(result.entries.map((e) => e.alias)).toEqual(["huge"]);
+    // Line origins still survive the splice at that size.
+    expect(result.entries[0].source).toBe(sshPath("big.conf"));
+    expect(result.entries[0].line).toBe(200_001);
   });
 
   it("follows every pattern on a multi-pattern Include line, left to right (⊘ resolving only patterns[0] silently drops the second half of `Include work.conf home.conf`)", async () => {
@@ -1022,15 +1259,34 @@ describe("sawSshGrammar — the recognised-grammar signal", () => {
     expect(result.sawSshGrammar).toBe(true);
   });
 
-  it("is ORed across the whole walk rather than reset per file, so grammar arriving only from an INCLUDED file survives (⊘ assigning the parsed document's value over the assembler's drops whichever half the other supplied)", async () => {
-    const io = makeIo({
-      [sshPath("config")]: "Include sub.conf\n",
-      [sshPath("sub.conf")]: "Host inner\n  HostName 10.0.0.90\n"
-    });
+  /**
+   * The resolver ORs two independent sources: the assembler raises the flag for
+   * every `Include` line the splice CONSUMES, and the parse of the assembled
+   * document raises it for everything else. A fixture that supplies BOTH halves
+   * cannot tell an OR from either assignment — which is what the single test
+   * these two replace did, with an `Include` root AND a `Host` in the included
+   * file. Each of these supplies exactly one half.
+   */
+  it("takes the PARSED document's grammar, for a root with no Include at all (⊘ `result.sawSshGrammar = result.sawSshGrammar` keeps only the assembler's half, and a lowercase `host`/`hostname` config — which the format sniffer's case-sensitive regex already fails to recognise — is then called the wrong kind of file and imported as a host list)", async () => {
+    const io = makeIo({ [sshPath("config")]: "host inner\n  hostname 10.0.0.90\n" });
 
     const result = await resolveSshConfig(sshPath("config"), io);
 
     expect(result.entries.map((e) => e.alias)).toEqual(["inner"]);
+    expect(result.sawSshGrammar).toBe(true);
+  });
+
+  it("takes the ASSEMBLER's grammar, for a root whose only grammar is the Include line the splice consumed (⊘ `result.sawSshGrammar = parsed.sawSshGrammar` keeps only the parsed document's half, and here that document is EMPTY: the Include line no longer exists and the directory it named holds nothing)", async () => {
+    const io = makeIo({
+      [sshPath("config")]: "Include config.d/*.conf\n",
+      // The directory exists and is listable, and holds nothing the glob matches.
+      [sshPath("config.d", ".keep")]: ""
+    });
+
+    const result = await resolveSshConfig(sshPath("config"), io);
+
+    expect(result.entries).toHaveLength(0);
+    expect(result.includeMissingCount).toBe(1);
     expect(result.sawSshGrammar).toBe(true);
   });
 

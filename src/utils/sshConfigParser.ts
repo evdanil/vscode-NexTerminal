@@ -31,10 +31,11 @@ import * as path from "node:path";
  *    same alias appears in two `Host` blocks, ssh keeps the first value obtained
  *    for each option across BOTH, so the blocks merge rather than the later one
  *    being discarded (see {@link mergeByAlias}).
- *  - `Host a b c` fans out: each non-wildcard, non-negated pattern becomes its
- *    own entry sharing the block's settings.
+ *  - `Host a b c` fans out: each non-wildcard pattern the line does not also
+ *    negate becomes its own entry sharing the block's settings.
  *  - Wildcard patterns (`*`, `?`) are defaults blocks, not hosts — skipped and
- *    counted. Negated patterns (`!foo`) are skipped.
+ *    counted. A negated pattern (`!foo`) names no host itself AND SUBTRACTS:
+ *    `Host foo bar !foo` applies to `bar` alone, so `foo` is not imported.
  *  - `Match` blocks are skipped wholesale: their conditions (`exec`, `host`,
  *    `originalhost`, ...) cannot be evaluated statically at import time.
  *  - `Include` is TEXTUAL. readconf.c reads the included file's lines in place,
@@ -53,9 +54,16 @@ import * as path from "node:path";
  *
  * Not modelled (all of it lives outside what an import needs): `%`-token
  * expansion in `HostName`/`ProxyJump`/`IdentityFile` (`%h`, `%p`, `%r` come
- * through verbatim), `CanonicalizeHostname`, multiple accumulating
- * `IdentityFile` lines (first wins, like every other keyword here), and
- * per-host options beyond the five read below.
+ * through verbatim), `CanonicalizeHostname`, and per-host options beyond the
+ * five read below.
+ *
+ * ONE DELIBERATE DEPARTURE FROM ssh(1), stated plainly because it is a choice
+ * and not an oversight: OpenSSH ACCUMULATES `IdentityFile` — every line adds
+ * another key to the list it will try — while this parser keeps only the FIRST,
+ * like every other keyword. An imported server row holds ONE key path, so the
+ * alternative on offer is not "all of them" but "the last one silently
+ * replacing the first". Later paths are dropped without an issue: they are
+ * valid config, not a mistake the user should be sent to fix.
  */
 
 /** A single importable host derived from one `Host` pattern. */
@@ -124,7 +132,11 @@ export interface SshConfigParseResult {
   sawSshGrammar: boolean;
   /** `Host` patterns skipped for containing `*` or `?` (a defaults block). */
   wildcardPatternCount: number;
-  /** `Host` patterns skipped for being negated (`!foo`). */
+  /**
+   * `Host` patterns that were negations (`!foo`) — the `!` patterns themselves,
+   * which name no host. The aliases a negation CANCELLED are counted nowhere:
+   * they were never patterns of their own.
+   */
   negatedPatternCount: number;
   /** `Match` blocks skipped whole. */
   matchBlockCount: number;
@@ -344,6 +356,32 @@ function isWildcardPattern(pattern: string): boolean {
   return pattern.includes("*") || pattern.includes("?");
 }
 
+/**
+ * Does an ssh HOST pattern match a host name?
+ *
+ * Deliberately NOT {@link globToRegExp}, which compiles FILE globs for
+ * `Include` expansion: there `/` is a path separator (`*` is `[^/]*`) and
+ * `[...]` is a character class. ssh's host matching is `match_pattern()`
+ * (match.c), which knows `*` and `?` and nothing else — a bracket is an
+ * ordinary character there — and has no notion of a separator, a host name
+ * being one flat string. Borrowing the file-glob compiler would give `[` a
+ * meaning ssh does not give it and would stop `!*` cancelling an alias that
+ * happens to contain a slash.
+ *
+ * Case-insensitive, as `match_pattern()` is. Note that {@link mergeByAlias}
+ * still keys on the exact alias string, so `Host Foo` and `Host foo` remain two
+ * entries — a separate, known departure, not one this function creates.
+ */
+function matchesHostPattern(pattern: string, host: string): boolean {
+  // Every character is escaped before the two wildcards are re-introduced, so
+  // the source is always a valid regex and this cannot throw.
+  const source = pattern
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*")
+    .replace(/\?/g, ".");
+  return new RegExp(`^${source}$`, "i").test(host);
+}
+
 function normalizePort(raw: string): number | undefined {
   if (!/^\d+$/.test(raw)) {
     return undefined;
@@ -353,16 +391,30 @@ function normalizePort(raw: string): number | undefined {
 }
 
 /**
- * One entry plus the bit {@link mergeByAlias} needs and callers must not see:
- * whether the block actually spelled out a `HostName`.
+ * One entry plus the two bits {@link mergeByAlias} needs and callers must not
+ * see: whether the block actually spelled out a `HostName`, and whether it
+ * spelled out a `Port`.
  *
- * {@link SshConfigEntry.host} cannot answer that on its own, because a block
- * without a `HostName` carries the alias there as a FALLBACK. A fallback must
- * lose to a later block's real `HostName`; a value must not.
+ * {@link SshConfigEntry.host} cannot answer the first on its own, because a
+ * block without a `HostName` carries the alias there as a FALLBACK. A fallback
+ * must lose to a later block's real `HostName`; a value must not.
  */
 interface RawEntry {
   entry: SshConfigEntry;
   hostExplicit: boolean;
+  /**
+   * Whether the block spelled out a `Port` AT ALL — true even when the value
+   * was rejected by {@link normalizePort}.
+   *
+   * {@link SshConfigEntry.port} cannot answer that either: a Port that was never
+   * written and one written as `notanumber` are both `undefined` there. Inside
+   * ONE block `block.seen` already stops a second `Port` from taking a bad
+   * first one's place; without this bit the very same two lines split across
+   * two blocks sharing an alias behave the opposite way, and the policy stated
+   * in {@link parseSshConfig}'s `closeBlock` holds on one path and not the
+   * other.
+   */
+  portObtained: boolean;
 }
 
 /**
@@ -382,8 +434,17 @@ function mergeInto(first: RawEntry, later: RawEntry): boolean {
     first.hostExplicit = true;
     merged = true;
   }
-  if (first.entry.port === undefined && later.entry.port !== undefined) {
+  // An invalid Port was still OBTAINED: first-obtained-value is about the
+  // keyword appearing, not about the value proving usable, and the block that
+  // wrote it already got its issue. So the latch moves even when the value it
+  // carries is `undefined` — that is what stops a later block filling a slot
+  // the earlier one already claimed and badly spelled.
+  if (!first.portObtained && later.portObtained) {
     first.entry.port = later.entry.port;
+    first.portObtained = true;
+    // Counted as a contribution even when no usable value moved: the keyword
+    // this block set had NOT been obtained before, so the block is not the dead
+    // text {@link SshConfigParseResult.duplicateAliasCount} claims to count.
     merged = true;
   }
   if (first.entry.user === undefined && later.entry.user !== undefined) {
@@ -527,7 +588,8 @@ export function parseSshConfig(text: string): SshConfigParseResult {
           identityFile: block.values.get("identityfile"),
           line: block.line
         },
-        hostExplicit: hostName !== undefined
+        hostExplicit: hostName !== undefined,
+        portObtained: rawPort !== undefined
       });
     }
     block = undefined;
@@ -560,11 +622,27 @@ export function parseSshConfig(text: string): SshConfigParseResult {
         result.issues.push({ line: lineNumber, text: trimmed, reason: "Host directive has no patterns" });
         continue;
       }
-      const aliases: string[] = [];
+      if (args.every((pattern) => pattern === "")) {
+        // `Host ""` is a token that names nothing, so the line is as empty-handed
+        // as a bare `Host` and takes the same issue rather than inventing a
+        // second wording for one condition.
+        result.issues.push({ line: lineNumber, text: trimmed, reason: "Host directive has no patterns" });
+        continue;
+      }
+      // Two passes, because a negation applies to the WHOLE line wherever it sits
+      // on it: `Host foo bar !foo` and `Host !foo foo bar` both leave ssh
+      // applying the block to `bar` alone.
+      const negated: string[] = [];
+      const positives: string[] = [];
       for (const pattern of args) {
+        if (pattern === "") {
+          // A quoted empty token names no host; it is neither a wildcard nor a
+          // negation, so it is counted as neither.
+          continue;
+        }
         if (pattern.startsWith("!")) {
-          // A negation subtracts from a pattern set; on its own it names no host.
           result.negatedPatternCount++;
+          negated.push(pattern.slice(1));
           continue;
         }
         if (isWildcardPattern(pattern)) {
@@ -572,11 +650,26 @@ export function parseSshConfig(text: string): SshConfigParseResult {
           result.wildcardPatternCount++;
           continue;
         }
-        aliases.push(pattern);
+        positives.push(pattern);
       }
+      // A negation SUBTRACTS from the set the positive patterns build — that is
+      // the whole of what `!` does — so an alias any negation matches is not
+      // imported at all: the block never applies to it, and importing it would
+      // hand the user the excluded host with the exception's destination, user
+      // and key. Negations may be globs themselves, so `!*.internal` cancels
+      // `db.internal`.
+      //
+      // A cancelled alias is counted nowhere. `negatedPatternCount` counts the
+      // `!` patterns, which is what its name and doc say, and a second counter
+      // would change a result shape the import commands already read.
+      const aliases = positives.filter((alias) => !negated.some((pattern) => matchesHostPattern(pattern, alias)));
       if (aliases.length > 0) {
         block = { aliases, line: lineNumber, values: new Map(), valueLines: new Map(), seen: new Set() };
       }
+      // No block is opened when nothing survives — every pattern a wildcard, or
+      // every alias cancelled. The directives that follow then fall through the
+      // `!block` branch below as globals and import nothing, which is correct:
+      // there is no host left for them to describe.
       continue;
     }
 
@@ -610,7 +703,11 @@ export function parseSshConfig(text: string): SshConfigParseResult {
       // plays; it belongs to no alias, so there is nothing to import.
       continue;
     }
-    if (args.length === 0) {
+    if (args.length === 0 || args[0] === "") {
+      // `IdentityFile ""` obtains nothing: a quoted empty token names no file, no
+      // user and no port, so it takes the same issue as the bare keyword. Not
+      // marking the keyword seen is the point — a later line in the block is
+      // still free to supply the real value, exactly as if this line were absent.
       result.issues.push({ line: lineNumber, text: trimmed, reason: `${parsed.spelling} has no value` });
       continue;
     }
@@ -647,20 +744,39 @@ function expandHome(value: string): string {
   return value.replace(/^~(?=\/|\\|$)/, os.homedir());
 }
 
+/** The system-wide config directory, and the include base for a read rooted in it. */
+const SYSTEM_CONFIG_DIR = "/etc/ssh";
+
 /**
- * Resolve one `Include` pattern to an absolute path (or a directory + glob).
+ * The directory a relative `Include` path resolves against for this walk.
  *
- * OpenSSH's rule, and it is NOT the intuitive one: a pattern without a leading
- * `/` resolves against `~/.ssh/`, never against the directory of the file doing
- * the including. So `Include config.d/*` inside `/etc/ssh/ssh_config` still
- * looks in `~/.ssh/config.d/` for a user config read.
+ * ssh_config(5): a file named without a leading `/` is assumed to be in
+ * `~/.ssh` when included from a USER configuration file, and in `/etc/ssh` when
+ * included from the SYSTEM one. Neither is the directory of the file doing the
+ * including — that is the intuitive rule, and it is the wrong one.
+ *
+ * Which of the two applies is a property of the WALK, not of the file holding
+ * the `Include`: a file the system config pulls in is still part of a system
+ * read wherever it lives. So it is decided once, from the root this import was
+ * pointed at, and carried on {@link AssemblyContext}. The file dialog will
+ * happily hand us `/etc/ssh/ssh_config`, so this is a path users reach.
  */
-function resolveIncludePath(pattern: string): string {
+function includeBaseFor(absoluteRoot: string): string {
+  return absoluteRoot === SYSTEM_CONFIG_DIR || absoluteRoot.startsWith(`${SYSTEM_CONFIG_DIR}/`)
+    ? SYSTEM_CONFIG_DIR
+    : path.join(os.homedir(), ".ssh");
+}
+
+/**
+ * Resolve one `Include` pattern to an absolute path (or a directory + glob),
+ * against the walk's base (see {@link includeBaseFor}).
+ */
+function resolveIncludePath(pattern: string, base: string): string {
   const expanded = expandHome(pattern);
   if (expanded.startsWith("/") || path.isAbsolute(expanded)) {
     return path.normalize(expanded);
   }
-  return path.normalize(path.join(os.homedir(), ".ssh", expanded));
+  return path.normalize(path.join(base, expanded));
 }
 
 function hasGlobChars(value: string): boolean {
@@ -671,8 +787,12 @@ function hasGlobChars(value: string): boolean {
  * glob(3) basename matcher: `*`, `?` and `[...]` (with `!`/`^` negation).
  *
  * No `**` — glob(3) has no such operator and neither does OpenSSH's include
- * matching; `**` here is just two adjacent `*`, which cannot cross `/` because
- * this only ever runs against a single basename.
+ * matching; `**` here is just two adjacent `*`. What actually keeps an include
+ * inside one directory is the CALLER: {@link expandIncludePattern} globs the
+ * basename alone, against the direct children {@link SshConfigIo.readDir}
+ * reports, and never descends. The `[^/]` in the two wildcard branches is belt
+ * and braces for an `io` that broke that contract and returned a path — under
+ * the contract it cannot be told apart from `.`, so no test can pin it.
  *
  * TOTAL BY CONTRACT: returns `undefined` for a pattern that cannot be compiled
  * rather than letting `new RegExp` throw. A bracket expression is copied into
@@ -694,18 +814,35 @@ function globToRegExp(pattern: string): RegExp | undefined {
     } else if (ch === "?") {
       source += "[^/]";
     } else if (ch === "[") {
-      const close = pattern.indexOf("]", i + 1);
+      // glob(3) scans the set in this order, and the order is the whole of the
+      // rule: an optional leading `!`/`^` negates, and a `]` in FIRST position
+      // after it is an ordinary member, not the terminator. So the search for
+      // the terminator starts past both.
+      let cursor = i + 1;
+      let negated = false;
+      if (pattern[cursor] === "!" || pattern[cursor] === "^") {
+        negated = true;
+        cursor++;
+      }
+      const clsStart = cursor;
+      if (pattern[cursor] === "]") {
+        cursor++;
+      }
+      const close = pattern.indexOf("]", cursor);
       if (close === -1) {
+        // Unterminated — which is what `[!]` and `[]` are once the first `]` is
+        // read as a member. glob(3) then treats the `[` as an ordinary
+        // character, so the pattern matches itself literally. Taking the `!` as
+        // a negation of an empty set instead compiles `[^]`, which in JavaScript
+        // matches ANY character: `Include config.d/[!]` would quietly pull in
+        // every one-character file in the directory.
         source += "\\[";
         continue;
       }
-      let cls = pattern.slice(i + 1, close);
-      let negated = false;
-      if (cls.startsWith("!") || cls.startsWith("^")) {
-        negated = true;
-        cls = cls.slice(1);
-      }
-      source += `[${negated ? "^" : ""}${cls.replace(/\\/g, "\\\\")}]`;
+      const cls = pattern.slice(clsStart, close);
+      // The class is copied into the regex source as written, so the two
+      // characters that would end or escape it there have to be escaped here.
+      source += `[${negated ? "^" : ""}${cls.replace(/[\\\]]/g, "\\$&")}]`;
       i = close;
     } else {
       source += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
@@ -724,6 +861,18 @@ function globToRegExp(pattern: string): RegExp | undefined {
 interface AssemblyContext {
   io: SshConfigIo;
   result: SshConfigParseResult;
+  /**
+   * THE assembled document, appended to in place by every level of the
+   * recursion. One array, never merged from children — see
+   * {@link assembleDocument} for why returning per-file arrays was a rejection
+   * waiting to happen.
+   */
+  out: AssembledLine[];
+  /**
+   * Directory a relative `Include` resolves against for this walk, fixed once
+   * from the root path ({@link includeBaseFor}).
+   */
+  includeBase: string;
   /**
    * Absolute paths on the ACTIVE recursion stack — the cycle guard. A path is
    * added when the assembler enters that file and removed when it leaves, so a
@@ -775,7 +924,7 @@ async function expandIncludePattern(
   line: number,
   pattern: string
 ): Promise<string[]> {
-  const resolved = resolveIncludePath(pattern);
+  const resolved = resolveIncludePath(pattern, ctx.includeBase);
   const slash = Math.max(resolved.lastIndexOf("/"), resolved.lastIndexOf(path.sep));
   const dir = slash >= 0 ? resolved.slice(0, slash) || path.sep : ".";
   const base = slash >= 0 ? resolved.slice(slash + 1) : resolved;
@@ -835,8 +984,21 @@ interface AssembledLine {
 }
 
 /**
- * Read `filePath` and return its lines with every `Include` line REPLACED by
- * the lines of the file(s) it names, recursively.
+ * Read `filePath` and APPEND its lines to {@link AssemblyContext.out}, with
+ * every `Include` line REPLACED by the lines of the file(s) it names,
+ * recursively.
+ *
+ * Children append to that one shared array rather than returning their own,
+ * and that is a CONTRACT requirement, not a micro-optimisation. Splicing a
+ * child's lines in with `assembled.push(...child)` spreads them as call
+ * arguments, and V8 rejects a spread of that size — measured on Node 22:
+ * 100,000 elements fine, 150,000 `RangeError: Maximum call stack size
+ * exceeded`. An included file of 150,000 lines is about 150 KB, far inside the
+ * 2 MiB the import commands cap a config at, so an ordinary (if large)
+ * generated `config.d` file made {@link resolveSshConfig} REJECT — and its
+ * caller, having been promised it never does, has no catch and imports zero
+ * hosts. Only included files could hit it: the root's own lines are pushed one
+ * at a time, which is why the contract test never caught this.
  *
  * This is the whole point of the module's second layer, and the reason it is a
  * splice rather than a per-file parse. `Include` in OpenSSH is textual: the
@@ -869,16 +1031,15 @@ interface AssembledLine {
  * Entries, issues and counters all come from the single parse of the assembled
  * document, so nothing here is counted twice.
  */
-async function assembleDocument(ctx: AssemblyContext, filePath: string, depth: number): Promise<AssembledLine[]> {
+async function assembleDocument(ctx: AssemblyContext, filePath: string, depth: number): Promise<void> {
   const text = await ctx.io.readFile(filePath);
   if (text === undefined) {
     ctx.result.issues.push({ file: filePath, line: 0, text: "", reason: `could not read "${filePath}"` });
     ctx.result.includeMissingCount++;
-    return [];
+    return;
   }
 
   const lines = splitConfigLines(text);
-  const assembled: AssembledLine[] = [];
 
   ctx.stack.add(filePath);
   try {
@@ -904,7 +1065,7 @@ async function assembleDocument(ctx: AssemblyContext, filePath: string, depth: n
       const followable =
         parsed.kind === "directive" && parsed.keyword === "include" && !ctx.inMatchBlock && parsed.args.length > 0;
       if (!followable) {
-        assembled.push({ text: lines[i], file: filePath, line: lineNumber });
+        ctx.out.push({ text: lines[i], file: filePath, line: lineNumber });
         continue;
       }
 
@@ -946,15 +1107,13 @@ async function assembleDocument(ctx: AssemblyContext, filePath: string, depth: n
             ctx.result.includeCycleCount++;
             continue;
           }
-          assembled.push(...(await assembleDocument(ctx, target, depth + 1)));
+          await assembleDocument(ctx, target, depth + 1);
         }
       }
     }
   } finally {
     ctx.stack.delete(filePath);
   }
-
-  return assembled;
 }
 
 /**
@@ -969,9 +1128,17 @@ export async function resolveSshConfig(rootPath: string, io: SshConfigIo): Promi
   const absoluteRoot = path.resolve(expandHome(rootPath));
   // The stack starts empty: assembleDocument pushes each file as it enters it,
   // root included, so `Include config` inside ~/.ssh/config is still a cycle.
-  const ctx: AssemblyContext = { io, result, stack: new Set(), inMatchBlock: false };
+  const ctx: AssemblyContext = {
+    io,
+    result,
+    out: [],
+    includeBase: includeBaseFor(absoluteRoot),
+    stack: new Set(),
+    inMatchBlock: false
+  };
 
-  const assembled = await assembleDocument(ctx, absoluteRoot, 0);
+  await assembleDocument(ctx, absoluteRoot, 0);
+  const assembled = ctx.out;
   const parsed = parseSshConfig(assembled.map((line) => line.text).join("\n"));
 
   // Every line number that parse produced indexes the ASSEMBLED document, which

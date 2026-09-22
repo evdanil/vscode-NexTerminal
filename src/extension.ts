@@ -335,11 +335,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     void vscode.window.showInformationMessage(message);
   }
 
-  // One-time offer to import ~/.ssh/config, shown at most once ever. Strictly
-  // fire-and-forget: the helper owns every guard and never rejects, so nothing
-  // here can delay or fail activation. See sshConfigImportOffer.ts.
-  void maybeOfferSshConfigImport(context);
-
   // Heal a stale user snapshot of nexus.terminal.highlighting.rules in global
   // settings (label-less rules from before v2.8.182, the truncating IPv6
   // pattern from before v2.8.187). Fire-and-forget and non-fatal: the read-time
@@ -1563,6 +1558,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   });
   context.subscriptions.push(inventoryStatusPoll);
   const configDisposables = registerConfigCommands(core, secretVault, context);
+
+  // One-time offer to import ~/.ssh/config, shown at most once ever. Strictly
+  // fire-and-forget: the helper owns every guard and never rejects, so nothing
+  // here can delay or fail activation. See sshConfigImportOffer.ts.
+  //
+  // DELIBERATELY DOWN HERE, not beside detectOrphanNexusTerminals where it
+  // started. It needs two things that only exist at this point:
+  //
+  //  - `core`, initialized. The offer counts hosts it can actually import, and
+  //    that means subtracting the servers already in Nexus. Offering "Nexus
+  //    found 12 SSH hosts… Import?" and then answering "All 12 are already in
+  //    Nexus — nothing to import" spends the one offer this user will ever get
+  //    on a notification with no action behind it.
+  //  - `nexus.config.import.sshConfig`, registered by the line above. VS Code
+  //    would resolve the dispatch against the in-flight activation anyway (the
+  //    command is contributed, so `executeCommand` awaits activation rather
+  //    than rejecting), and the offer is `void`-ed so activate() never awaits
+  //    it — but dispatching a command that is already there needs no argument
+  //    about who awaits whom.
+  void maybeOfferSshConfigImport(context, core);
   const macroDisposables = registerMacroCommands(() => {
     return buildMacroProfileInputsFromSnapshot(core.getSnapshot());
   });

@@ -25,7 +25,7 @@ import { validateAuthProfile } from "../utils/validation";
 import { encrypt, decrypt, type EncryptedPayload } from "../utils/configCrypto";
 import { parseMobaxtermSessions, type ImportedSession } from "../utils/mobaxtermParser";
 import { parseSshConfig, resolveSshConfig, type SshConfigParseResult } from "../utils/sshConfigParser";
-import { convertSshConfig, localLoginName } from "../utils/sshConfigImport";
+import { convertSshConfig, localLoginName, type SshConfigImportedSession } from "../utils/sshConfigImport";
 import { createSshConfigIo } from "../services/ssh/sshConfigIo";
 import { parseInventoryList, type InventoryParseIssue, MAX_DATA_ROWS as INVENTORY_MAX_ROWS } from "../utils/inventoryParser";
 import { normalizeOptionalFolderPath, INVALID_FOLDER_PATH_MESSAGE } from "../utils/folderPaths";
@@ -3367,7 +3367,16 @@ export function registerConfigCommands(
      * Omitted by MobaXterm and SecureCRT, whose rows are written exactly as
      * before.
      */
-    filterBeforeWrite?: (sessions: ImportedSession[]) => ImportedSession[]
+    filterBeforeWrite?: (sessions: ImportedSession[]) => ImportedSession[],
+    /**
+     * A second modal button that inspects rather than imports — the
+     * ssh-config branch's "Show Skipped Lines", mirroring the inventory
+     * importer's. Choosing it runs the action and RETURNS: nothing is written,
+     * and the user re-runs the command once they have looked. Omitted by
+     * MobaXterm and SecureCRT, whose modal keeps exactly the one button it
+     * always had.
+     */
+    extraAction?: { label: string; run: () => Promise<void> }
   ): Promise<void> {
     if (result.sessions.length === 0) {
       const note = result.skippedCount > 0
@@ -3382,8 +3391,12 @@ export function registerConfigCommands(
     const confirm = await vscode.window.showInformationMessage(
       `Found ${result.sessions.length} ${pluralizeNoun(noun, result.sessions.length)}${folderNote}${skipNote}. Import?`,
       detail ? { modal: true, detail } : { modal: true },
-      "Import"
+      ...(extraAction ? ["Import", extraAction.label] : ["Import"])
     );
+    if (extraAction && confirm === extraAction.label) {
+      await extraAction.run();
+      return;
+    }
     if (confirm !== "Import") return;
 
     // #84 P1 (Codex, serialization audit) — the write phase adds folders and
@@ -3872,7 +3885,50 @@ export function registerConfigCommands(
    * file finds both aliases' keys already stored and skips both.
    */
   async function applySshConfigResult(parsed: SshConfigParseResult): Promise<void> {
-    const converted = convertSshConfig(parsed, { defaultUsername: localLoginName() });
+    // THE DEFAULT USERNAME IS ASKED FOR WHEN THERE IS NO LOCAL ONE TO USE.
+    // `localLoginName()` deliberately answers "" when the uid has no passwd
+    // entry and neither `$USER` nor `$USERNAME` is set — a plain container —
+    // and "" is not a username that can be STORED: `validateServerConfig`
+    // requires a non-empty one for ssh, so `VscodeConfigRepository.getServers`
+    // drops every such row on the next read. Imported like that, the servers
+    // appear in the tree, connect for the session, and are simply gone after
+    // the next window reload, with only a `console.warn` anywhere.
+    //
+    // Prompting rather than dropping those hosts: they are hosts the user
+    // asked to import, and one answer covers all of them. Same shape as the
+    // inventory importer's default-username prompt, including Esc and a blank
+    // answer both cancelling the whole import — a cancelled prompt must never
+    // fall through to writing the rows it exists to make valid.
+    //
+    // Outside `configMutationLock` (which `applyImportedSessions` takes later,
+    // after its own modal): an input box is interactive UI and the lock is
+    // never held across one.
+    let defaultUsername = localLoginName();
+    if (!defaultUsername) {
+      // Counted on the real parse result rather than guessed from `entries`:
+      // only the conversion knows which blocks survive token expansion, and
+      // only those become rows that need a username.
+      const missing = convertSshConfig(parsed).missingUsernameCount;
+      if (missing > 0) {
+        const username = await vscode.window.showInputBox({
+          title: "Default SSH Username",
+          prompt: `Applied to the ${missing} ${pluralizeNoun("host", missing)} in this SSH config that set no User`,
+          value: mostCommonUsername(core.getSnapshot().servers),
+          ignoreFocusOut: true
+        });
+        if (username === undefined) {
+          void vscode.window.showWarningMessage("Import canceled.");
+          return;
+        }
+        if (!username.trim()) {
+          void vscode.window.showWarningMessage("Import canceled — a username is required.");
+          return;
+        }
+        defaultUsername = username.trim();
+      }
+    }
+
+    const converted = convertSshConfig(parsed, { defaultUsername });
 
     // One key shape, used twice: once now to tell the user what the import
     // will skip, and again under the write lock to decide what it actually
@@ -3883,7 +3939,7 @@ export function registerConfigCommands(
       );
     const keyOf = (session: ImportedSession): string =>
       `${session.host.toLowerCase()}|${session.port}|${session.username}`;
-    const skipExisting = (candidates: ImportedSession[]): ImportedSession[] => {
+    const skipExisting = (candidates: SshConfigImportedSession[]): SshConfigImportedSession[] => {
       const existing = existingServerKeys();
       return candidates.filter((session) => !existing.has(keyOf(session)));
     };
@@ -3903,16 +3959,41 @@ export function registerConfigCommands(
       return;
     }
 
+    // COUNTED OVER `sessions`, NOT OVER EVERY CANDIDATE. The headline above the
+    // detail counts the deduped list, so a total taken over all candidates
+    // disagrees with it: re-import a config whose one unexpandable-IdentityFile
+    // host is already in Nexus and `converted.droppedIdentityFileCount` says
+    // "1 host will use password auth" about a host this import is not writing.
+    // That is why the losses are flags on each session and not just totals.
+    const droppedIdentityFiles = sessions.filter((session) => session.droppedIdentityFile).length;
+    const droppedProxyJumps = sessions.filter((session) => session.droppedProxyJump).length;
+
     const detailLines: string[] = [];
     if (dedupedCount > 0) {
       detailLines.push(`${dedupedCount} ${pluralizeNoun("host", dedupedCount)} you already have will be skipped.`);
     }
-    if (converted.droppedIdentityFileCount > 0) {
+    if (droppedIdentityFiles > 0) {
       // Named, because the user asked for key auth and is getting a password
       // prompt instead; the remedy is one field in the profile editor.
       detailLines.push(
-        `${converted.droppedIdentityFileCount} ${pluralizeNoun("host", converted.droppedIdentityFileCount)} will use password auth: ` +
+        `${droppedIdentityFiles} ${pluralizeNoun("host", droppedIdentityFiles)} will use password auth: ` +
           "their IdentityFile uses an ssh token Nexus cannot expand. Set the key path on the profile afterwards."
+      );
+    }
+    if (droppedProxyJumps > 0) {
+      // A ProxyJump host imported as a direct connection is the one loss here
+      // that shows up as nothing at all: the profile looks right and every
+      // connect to its private address times out with no hint why. Nexus has
+      // native jump hosts, so the remedy is real and one form away — this says
+      // where, rather than describing a feature the reader has to go find.
+      detailLines.push(
+        `${droppedProxyJumps} ${pluralizeNoun("host", droppedProxyJumps)} will import as a direct connection: ` +
+          "their ProxyJump is not imported. Set Proxy to \"SSH Jump Host\" and pick the Jump Host Server on the profile afterwards."
+      );
+    }
+    if (parsed.issues.length > 0) {
+      detailLines.push(
+        `${parsed.issues.length} ${pluralizeNoun("line", parsed.issues.length)} could not be parsed.`
       );
     }
 
@@ -3934,7 +4015,19 @@ export function registerConfigCommands(
       // modal is open, the import silently skips a host the user does have in
       // their config and does not have in Nexus. Re-deriving means the only
       // snapshot that decides anything is the one taken inside the lock.
-      () => skipExisting(converted.sessions)
+      () => skipExisting(converted.sessions),
+      // The same escape hatch the inventory importer offers, on the same
+      // button, for the same class of thing: lines the parser could not read
+      // (a bad `Port`, an `Include` it could not follow). It is offered only
+      // when there ARE such lines, and the detail above states the count it
+      // corresponds to — a button opening an empty document would be worse
+      // than none. It deliberately does NOT claim to explain the "wildcard or
+      // unsupported" figure: a `Host *` defaults block is not a line that
+      // failed, it is a block with nothing to import, and there is no remedy
+      // to name for it.
+      parsed.issues.length > 0
+        ? { label: "Show Skipped Lines", run: () => openInventoryIssuesDocument(parsed.issues) }
+        : undefined
     );
   }
 
