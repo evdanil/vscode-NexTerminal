@@ -80,21 +80,54 @@ describe("one-time ~/.ssh/config import offer", () => {
     expect(mockShowInformationMessage).toHaveBeenCalledTimes(1);
   });
 
-  it("sets the marker BEFORE the notification is answered — a dismissed (unanswered) offer never returns (⊘ updating globalState after the await re-offers until someone clicks)", async () => {
+  /**
+   * ORDERING, in the one arrangement that is correct (Codex P2, #146). Both
+   * neighbours of this point are bugs: spending the marker before the toast is
+   * dispatched can burn the user's only offer on a notification that never
+   * appears, and writing it after the ANSWER re-offers forever to anyone who
+   * dismisses without clicking. The marker belongs between the two.
+   */
+  it("dispatches the notification BEFORE spending the marker (⊘ writing it first spends the only offer on a toast that may never appear)", async () => {
     const { context, store } = makeContext();
     serveConfig(REAL_CONFIG);
 
-    let markerAtShowTime: unknown;
+    let markerAtDispatch: unknown = "not-called";
     mockShowInformationMessage.mockImplementation(async () => {
-      markerAtShowTime = store.get(SSH_CONFIG_OFFER_KEY);
-      // The user closes the toast without choosing — the common case.
+      markerAtDispatch = store.get(SSH_CONFIG_OFFER_KEY);
       return undefined;
     });
 
     await maybeOfferSshConfigImport(context);
 
-    expect(markerAtShowTime).toBe(true);
+    expect(markerAtDispatch).toBeUndefined();
     expect(store.get(SSH_CONFIG_OFFER_KEY)).toBe(true);
+  });
+
+  it("spends the marker BEFORE awaiting the answer — a toast dismissed without a click never returns (⊘ updating globalState after the await re-offers until someone clicks)", async () => {
+    const { context, store } = makeContext();
+    serveConfig(REAL_CONFIG);
+
+    // Hold the answer open, so "the user has not answered yet" is a state the
+    // assertion can actually observe. Driven off the dispatch itself rather
+    // than a fixed number of ticks: there are awaits before it (stat, include
+    // resolution), so counting microtasks would be timing-coupled.
+    let release: (choice: string | undefined) => void = () => {};
+    let signalDispatched: () => void = () => {};
+    const dispatched = new Promise<void>((resolve) => { signalDispatched = resolve; });
+    mockShowInformationMessage.mockImplementation(() => {
+      signalDispatched();
+      return new Promise<string | undefined>((resolve) => { release = resolve; });
+    });
+
+    const pending = maybeOfferSshConfigImport(context);
+    await dispatched;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // Marker already spent while the answer is still outstanding.
+    expect(store.get(SSH_CONFIG_OFFER_KEY)).toBe(true);
+
+    release(undefined);
+    await pending;
   });
 
   it("does not touch the filesystem at all once the marker is set (⊘ re-reading the config every activation is work nobody asked for)", async () => {
@@ -167,8 +200,28 @@ describe("one-time ~/.ssh/config import offer", () => {
     } as unknown as import("vscode").ExtensionContext;
 
     await expect(maybeOfferSshConfigImport(context)).resolves.toBeUndefined();
-    // No marker means no offer: better a missed offer than one that repeats forever.
-    expect(mockShowInformationMessage).not.toHaveBeenCalled();
+    // The toast still went out. A failed marker write costs a REPEATED offer
+    // next activation, which is the right way to fail: abandoning a
+    // notification the user can already see would strand them with no offer
+    // and no explanation (Codex P2, #146).
+    expect(mockShowInformationMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("still honours Import when the marker write fails (⊘ a failed globalState write must not swallow a click the user already made)", async () => {
+    serveConfig(REAL_CONFIG);
+    const context = {
+      globalState: {
+        get: () => undefined,
+        update: async () => {
+          throw new Error("state write failed");
+        }
+      }
+    } as unknown as import("vscode").ExtensionContext;
+    mockShowInformationMessage.mockResolvedValue("Import");
+
+    await maybeOfferSshConfigImport(context);
+
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.config.import.sshConfig", expect.anything());
   });
 
   it("names the host count and the permanent route, with Import and Dismiss buttons (⊘ an offer that never returns and names no other way in strands the user who dismisses it)", async () => {

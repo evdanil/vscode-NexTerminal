@@ -78,17 +78,36 @@ export async function maybeOfferSshConfigImport(context: vscode.ExtensionContext
       return;
     }
 
-    // Before the message, deliberately (see the contract above). If this write
-    // fails, no offer is made at all — better a missed offer than one that
-    // repeats forever because its marker never landed.
-    await context.globalState.update(SSH_CONFIG_OFFER_KEY, true);
-
-    const choice = await vscode.window.showInformationMessage(
+    // ORDER MATTERS, and it is the opposite of the obvious one (Codex P2,
+    // #146). Writing the marker BEFORE dispatching the toast spends the single
+    // offer this user will ever get on a notification that may never appear:
+    // if `showInformationMessage` rejects, or the host shuts down between the
+    // two statements, the catch below swallows it and the marker stays. The
+    // user is then never offered the import and never told why.
+    //
+    // So dispatch first, WITHOUT awaiting the answer — the toast is on screen
+    // once this resolves into a pending promise, which is what "the offer was
+    // made" actually means — then spend the marker, then wait for the answer.
+    // A window closed mid-toast still does not re-ask, which is the property
+    // the marker exists for.
+    const choicePromise = vscode.window.showInformationMessage(
       `Nexus found ${importable} SSH ${importable === 1 ? "host" : "hosts"} in ~/.ssh/config. ` +
         "Import them as connection profiles? This offer is shown only once — you can always run Nexus: Import… later.",
       "Import",
       "Dismiss"
     );
+
+    try {
+      await context.globalState.update(SSH_CONFIG_OFFER_KEY, true);
+    } catch {
+      // Its own catch, so a failed marker write does not abandon a toast the
+      // user can already see. The cost is that the offer may come back next
+      // activation — the right way round: a repeated offer is a mild
+      // annoyance, a silently spent one is a feature the user never learns
+      // exists.
+    }
+
+    const choice = await choicePromise;
     if (choice === "Import") {
       // The path is already known, so the command is handed the URI and skips
       // its own file dialog.

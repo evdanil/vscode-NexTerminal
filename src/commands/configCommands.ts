@@ -23,7 +23,7 @@ import {
 } from "../services/ssh/silentAuth";
 import { validateAuthProfile } from "../utils/validation";
 import { encrypt, decrypt, type EncryptedPayload } from "../utils/configCrypto";
-import { parseMobaxtermSessions } from "../utils/mobaxtermParser";
+import { parseMobaxtermSessions, type ImportedSession } from "../utils/mobaxtermParser";
 import { parseSshConfig, resolveSshConfig, type SshConfigParseResult } from "../utils/sshConfigParser";
 import { convertSshConfig, localLoginName } from "../utils/sshConfigImport";
 import { createSshConfigIo } from "../services/ssh/sshConfigIo";
@@ -3351,7 +3351,23 @@ export function registerConfigCommands(
      * SecureCRT, and the options object is built without the key at all when it
      * is — their modal call is unchanged, argument for argument.
      */
-    detail?: string
+    detail?: string,
+    /**
+     * P1 (Codex, #146) — the LAST word on which sessions get written, applied
+     * INSIDE `configMutationLock` rather than by the caller beforehand.
+     *
+     * The ssh-config route skips hosts you already have. Deciding that before
+     * the confirm modal, as it first did, left a real window: two imports in
+     * one window — the first-run offer and a palette invocation, say — both
+     * snapshot the same "what exists", the modal awaits a human in between,
+     * and both then write, duplicating every row the lock was supposed to
+     * protect. Serializing the WRITES does nothing if the decision about what
+     * to write was already made outside the lock.
+     *
+     * Omitted by MobaXterm and SecureCRT, whose rows are written exactly as
+     * before.
+     */
+    filterBeforeWrite?: (sessions: ImportedSession[]) => ImportedSession[]
   ): Promise<void> {
     if (result.sessions.length === 0) {
       const note = result.skippedCount > 0
@@ -3374,11 +3390,16 @@ export function registerConfigCommands(
     // servers through per-entity full-snapshot writes; serialize it under
     // configMutationLock (AFTER the confirm modal, no UI held) so a concurrent
     // background port-heal cannot clobber it or be reverted by it.
+    let written = result.sessions.length;
     await configMutationLock.runExclusive(async () => {
+      // Re-decided here, under the lock, against state read here — see
+      // `filterBeforeWrite`.
+      const sessions = filterBeforeWrite ? filterBeforeWrite(result.sessions) : result.sessions;
+      written = sessions.length;
       for (const folder of result.folders) {
         await core.addGroup(folder);
       }
-      for (const session of result.sessions) {
+      for (const session of sessions) {
         await core.addOrUpdateServer({
           id: randomUUID(),
           name: session.name,
@@ -3398,8 +3419,17 @@ export function registerConfigCommands(
       }
     });
 
+    if (written === 0) {
+      // Everything the modal offered turned out to be present by the time the
+      // lock was taken — a concurrent import won the race. Saying "Imported 0"
+      // would read as a failure; nothing was wrong and nothing was lost.
+      void vscode.window.showInformationMessage(
+        `Nothing to import from ${sourceName} — every host was already in Nexus.`
+      );
+      return;
+    }
     void vscode.window.showInformationMessage(
-      `Imported ${result.sessions.length} ${pluralizeNoun(noun, result.sessions.length)} from ${sourceName}.`
+      `Imported ${written} ${pluralizeNoun(noun, written)} from ${sourceName}.`
     );
   }
 
@@ -3805,11 +3835,26 @@ export function registerConfigCommands(
    * is worse: it makes the user the deduplicator, on a file whose whole appeal
    * is that they never have to maintain it.
    *
-   * That decision is also the mitigation for the offer's globalState race (see
-   * `sshConfigImportOffer.ts`): if two windows both show the offer and both
-   * import, the second import finds the first one's servers already present and
-   * adds nothing, so the losing side of a last-writer-wins snapshot write is a
-   * write that had nothing new in it.
+   * WHAT THE SKIP DOES AND DOES NOT COVER (Codex P1, #146 — an earlier version
+   * of this comment claimed more than it delivered, so the limit is stated
+   * here rather than left to be rediscovered).
+   *
+   * WITHIN one window it is now exact: the filter is re-evaluated inside
+   * `configMutationLock`, against state read inside the lock, so two imports
+   * racing each other — the first-run offer and a palette invocation, with a
+   * human-paced modal in between — cannot both decide to write the same host.
+   *
+   * ACROSS windows it is best-effort, and cannot be more than that here.
+   * `core.getSnapshot()` reads this window's in-memory state; it does not
+   * re-read `globalState`, and `globalState` offers no compare-and-set (see
+   * the doc comment atop `vscodeConfigRepository.ts`). So a second window
+   * importing the same file at the same moment may not see the first window's
+   * servers, may re-add them, and its full-snapshot save may land on top of
+   * the first's. That is the same last-writer-wins exposure every other
+   * multi-window write in this extension carries, not one this importer
+   * introduces — and `onConcurrentOverwrite` is what surfaces it. Two windows
+   * importing one file in the same few seconds is not a case worth a
+   * distributed lock; it IS a case worth not claiming to have solved.
    *
    * NOT dedupe-on-alias: two ssh aliases pointing at the same host:port:user
    * (`web` and `web.prod`) are one server here, and importing both would leave
@@ -3818,12 +3863,21 @@ export function registerConfigCommands(
   async function applySshConfigResult(parsed: SshConfigParseResult): Promise<void> {
     const converted = convertSshConfig(parsed, { defaultUsername: localLoginName() });
 
-    const existingKeys = new Set(
-      core.getSnapshot().servers.map((server) => `${server.host.toLowerCase()}|${server.port}|${server.username}`)
-    );
-    const sessions = converted.sessions.filter(
-      (session) => !existingKeys.has(`${session.host.toLowerCase()}|${session.port}|${session.username}`)
-    );
+    // One key shape, used twice: once now to tell the user what the import
+    // will skip, and again under the write lock to decide what it actually
+    // writes. The second is authoritative — see `filterBeforeWrite`.
+    const existingServerKeys = (): Set<string> =>
+      new Set(
+        core.getSnapshot().servers.map((server) => `${server.host.toLowerCase()}|${server.port}|${server.username}`)
+      );
+    const keyOf = (session: ImportedSession): string =>
+      `${session.host.toLowerCase()}|${session.port}|${session.username}`;
+    const skipExisting = (candidates: ImportedSession[]): ImportedSession[] => {
+      const existing = existingServerKeys();
+      return candidates.filter((session) => !existing.has(keyOf(session)));
+    };
+
+    const sessions = skipExisting(converted.sessions);
     const dedupedCount = converted.sessions.length - sessions.length;
 
     // Said plainly rather than as "no hosts found (N skipped)", which reads as
@@ -3858,7 +3912,8 @@ export function registerConfigCommands(
       // lie about a file in which every entry is an SSH host.
       "wildcard or unsupported",
       "SSH host",
-      detailLines.length > 0 ? detailLines.join("\n") : undefined
+      detailLines.length > 0 ? detailLines.join("\n") : undefined,
+      skipExisting
     );
   }
 

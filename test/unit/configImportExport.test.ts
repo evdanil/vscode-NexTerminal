@@ -4979,6 +4979,72 @@ describe("import from SSH config command (nexus.config.import.sshConfig)", () =>
     expect(registeredCommands.has("nexus.config.import.sshConfig")).toBe(true);
   });
 
+  /**
+   * Codex P1 (#146). The skip-what-you-already-have filter used to be computed
+   * at the top of the import, BEFORE the confirmation modal and before
+   * `configMutationLock`. The modal then waits on a human, which is an
+   * unbounded window: a second import — the first-run offer and a palette
+   * invocation, say — could land its servers in that gap, and the first import
+   * would still write the rows it had decided on, duplicating every one.
+   * Serializing the WRITES does nothing when the decision about what to write
+   * was made outside the lock.
+   *
+   * The modal's resolution is where a concurrent import is simulated, because
+   * that is exactly where the real one gets in.
+   */
+  it("re-checks what already exists INSIDE the write lock, so a server that lands while the modal is open is not imported twice (⊘ filtering before the modal writes a duplicate of anything a concurrent import added)", async () => {
+    serveFiles({
+      [SSH_CONFIG_PATH]: "Host web1\n  HostName web1.example.com\n  User deploy\n  Port 2222\n"
+    });
+    pickConfigFile();
+
+    mockShowInformationMessage.mockImplementationOnce(async () => {
+      // A concurrent import commits while this modal is on screen.
+      await core.addOrUpdateServer({
+        id: "concurrent-1",
+        name: "web1",
+        host: "web1.example.com",
+        port: 2222,
+        username: "deploy",
+        authType: "password",
+        isHidden: false
+      });
+      return "Import";
+    });
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    const matching = core.getSnapshot().servers.filter((server) => server.host === "web1.example.com");
+    expect(matching).toHaveLength(1);
+    expect(matching[0].id).toBe("concurrent-1");
+  });
+
+  it("says so plainly when the write-time re-check leaves nothing (⊘ \"Imported 0 SSH hosts\" reads as a failure of a parse that in fact succeeded)", async () => {
+    serveFiles({
+      [SSH_CONFIG_PATH]: "Host web1\n  HostName web1.example.com\n  User deploy\n  Port 2222\n"
+    });
+    pickConfigFile();
+
+    mockShowInformationMessage.mockImplementationOnce(async () => {
+      await core.addOrUpdateServer({
+        id: "concurrent-1",
+        name: "web1",
+        host: "web1.example.com",
+        port: 2222,
+        username: "deploy",
+        authType: "password",
+        isHidden: false
+      });
+      return "Import";
+    });
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    const said = mockShowInformationMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(said).toContain("every host was already in Nexus");
+    expect(said).not.toContain("Imported 0");
+  });
+
   it("imports an IdentityFile host as KEY auth carrying the key path — the point of the feature (⊘ the tail's hardcoded authType: \"password\" makes every key-based host prompt for a password the user does not have)", async () => {
     serveFiles({
       [SSH_CONFIG_PATH]: "Host web1\n  HostName web1.example.com\n  User deploy\n  Port 2222\n  IdentityFile /keys/id_ed25519\n"
