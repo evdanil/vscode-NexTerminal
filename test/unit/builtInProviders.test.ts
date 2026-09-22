@@ -16,7 +16,7 @@ import { validateProviderShape } from "../../src/services/inventory/providerRegi
  */
 describe("built-in inventory providers", () => {
   it("declares exactly the shipped providers, in add-source picker order (⊘ a set comparison would pass on a reorder, and order is what the user sees first)", () => {
-    expect(createBuiltInProviders().map((p) => p.id)).toEqual(["netbox", "eve-ng", "proxmox"]);
+    expect(createBuiltInProviders().map((p) => p.id)).toEqual(["netbox", "eve-ng", "proxmox", "gns3"]);
   });
 
   it("gives every provider a non-empty label, which is the ONLY string every list, row and description renders it by", () => {

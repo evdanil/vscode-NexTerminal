@@ -1,5 +1,6 @@
 import type { InventoryProvider } from "../../models/inventory";
 import { createEveNgProvider } from "./providers/eveNgProvider";
+import { createGns3Provider } from "./providers/gns3Provider";
 import { createNetboxProvider } from "./providers/netboxProvider";
 import { createProxmoxProvider } from "./providers/proxmoxProvider";
 
@@ -36,5 +37,5 @@ import { createProxmoxProvider } from "./providers/proxmoxProvider";
  * host into a test that only wants to know which providers exist.
  */
 export function createBuiltInProviders(): InventoryProvider[] {
-  return [createNetboxProvider(), createEveNgProvider(), createProxmoxProvider()];
+  return [createNetboxProvider(), createEveNgProvider(), createProxmoxProvider(), createGns3Provider()];
 }

@@ -1,7 +1,7 @@
 {
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
-  "description": "Full SSH + serial + telnet + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial and telnet consoles, jump-host chains, SFTP, tunnels, expect/send macros with prompted variables, and a JS scripting engine, all in one sidebar. Bulk-import devices from CSV or a plain host list, save root-owned files over SFTP with sudo, import from MobaXterm/SecureCRT, NetBox, EVE-NG and Proxmox inventory sync with auth profiles and device templates, IPv6/IPv4 dual-address connect-fallback, 2FA, legacy KEX for old Cisco gear.",
+  "description": "Full SSH + serial + telnet + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial and telnet consoles, jump-host chains, SFTP, tunnels, expect/send macros with prompted variables, and a JS scripting engine, all in one sidebar. Bulk-import devices from CSV or a plain host list, save root-owned files over SFTP with sudo, import from MobaXterm/SecureCRT, NetBox, EVE-NG, Proxmox and GNS3 inventory sync with auth profiles and device templates, IPv6/IPv4 dual-address connect-fallback, 2FA, legacy KEX for old Cisco gear.",
   "version": "2.8.238",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
@@ -48,6 +48,7 @@
     "eve-ng",
     "netbox",
     "proxmox",
+    "gns3",
     "serial console",
     "com port",
     "vscodium",
@@ -137,7 +138,7 @@
     "viewsWelcome": [
       {
         "view": "nexusCommandCenter",
-        "contents": "Start by adding a connection profile — or import the servers you already have.\n[Add Profile](command:nexus.profile.add)\n[Import Servers (CSV, MobaXterm, SecureCRT, SSH Config…)](command:nexus.config.import)\n[Add Inventory Source (NetBox, EVE-NG, Proxmox…)](command:nexus.inventory.addSource)\n[Add Network Device Profile (SSH / Telnet)](command:nexus.server.add)\n[Add Serial Profile](command:nexus.serial.add)\n[Add Local Shell Profile](command:nexus.localShell.add)\n[Add Local Server Profile](command:nexus.localServer.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)"
+        "contents": "Start by adding a connection profile — or import the servers you already have.\n[Add Profile](command:nexus.profile.add)\n[Import Servers (CSV, MobaXterm, SecureCRT, SSH Config…)](command:nexus.config.import)\n[Add Inventory Source (NetBox, EVE-NG, Proxmox, GNS3…)](command:nexus.inventory.addSource)\n[Add Network Device Profile (SSH / Telnet)](command:nexus.server.add)\n[Add Serial Profile](command:nexus.serial.add)\n[Add Local Shell Profile](command:nexus.localShell.add)\n[Add Local Server Profile](command:nexus.localServer.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)"
       },
       {
         "view": "nexusTunnels",
@@ -659,7 +660,7 @@
       },
       {
         "command": "nexus.inventory.addSource",
-        "title": "Add Inventory Source (NetBox, EVE-NG, Proxmox…)",
+        "title": "Add Inventory Source (NetBox, EVE-NG, Proxmox, GNS3…)",
         "category": "Nexus",
         "icon": "$(add)"
       },
