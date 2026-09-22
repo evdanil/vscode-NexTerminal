@@ -22,6 +22,7 @@ import { CwdTracker } from "./services/terminal/cwdTracker";
 import { CwdSyncCoordinator } from "./services/sftp/cwdSyncCoordinator";
 import type { CwdSyncState } from "./services/sftp/cwdSyncCoordinator";
 import { detectOrphanNexusTerminals } from "./services/terminal/orphanDetect";
+import { maybeOfferSshConfigImport } from "./services/import/sshConfigImportOffer";
 import { migrateHighlightRulesGlobalSetting } from "./services/terminal/highlightRuleMigration";
 import { wireViewVisibility } from "./services/terminal/viewVisibilityWiring";
 import { startInventoryStatusPoll } from "./services/inventory/inventoryStatusPoll";
@@ -333,6 +334,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
         : `Nexus: ${orphans.count} sessions disconnected after an extension reload or restart. The tabs are frozen on their last output — close them manually when you are done reviewing. Reconnect from the Connectivity Hub when ready.`;
     void vscode.window.showInformationMessage(message);
   }
+
+  // One-time offer to import ~/.ssh/config, shown at most once ever. Strictly
+  // fire-and-forget: the helper owns every guard and never rejects, so nothing
+  // here can delay or fail activation. See sshConfigImportOffer.ts.
+  void maybeOfferSshConfigImport(context);
 
   // Heal a stale user snapshot of nexus.terminal.highlighting.rules in global
   // settings (label-less rules from before v2.8.182, the truncating IPv6

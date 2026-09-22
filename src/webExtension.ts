@@ -79,6 +79,7 @@ const unsupportedCommands = [
   "nexus.config.import",
   "nexus.config.import.mobaxterm",
   "nexus.config.import.securecrt",
+  "nexus.config.import.sshConfig",
   "nexus.config.import.inventory",
   "nexus.config.completeReset",
   "nexus.inventory.addSource",

@@ -24,6 +24,9 @@ import {
 import { validateAuthProfile } from "../utils/validation";
 import { encrypt, decrypt, type EncryptedPayload } from "../utils/configCrypto";
 import { parseMobaxtermSessions } from "../utils/mobaxtermParser";
+import { parseSshConfig, resolveSshConfig, type SshConfigParseResult } from "../utils/sshConfigParser";
+import { convertSshConfig, localLoginName } from "../utils/sshConfigImport";
+import { createSshConfigIo } from "../services/ssh/sshConfigIo";
 import { parseInventoryList, type InventoryParseIssue, MAX_DATA_ROWS as INVENTORY_MAX_ROWS } from "../utils/inventoryParser";
 import { normalizeOptionalFolderPath, INVALID_FOLDER_PATH_MESSAGE } from "../utils/folderPaths";
 import { defaultSshDir } from "../services/ssh/deploySshKey";
@@ -1929,6 +1932,14 @@ export function registerConfigCommands(
       if (choice === "Import as SecureCRT XML") await applySecureCrtXmlText(text);
       return;
     }
+    if (sniff === "ssh-config") {
+      const choice = await vscode.window.showErrorMessage(
+        "That file isn't a Nexus export — it looks like an SSH config.",
+        "Import as SSH Config"
+      );
+      if (choice === "Import as SSH Config") await applySshConfigText(text);
+      return;
+    }
 
     // sniff === "nexus-json": starts with "{" but either didn't parse at all, or
     // parsed to JSON that isn't shaped like an export. These get different
@@ -3334,7 +3345,13 @@ export function registerConfigCommands(
     sourceName: string,
     noSessionsLocation: string,
     skipLabel: string = "non-SSH",
-    noun: string = "SSH session"
+    noun: string = "SSH session",
+    /**
+     * Extra lines under the confirm modal's question. Omitted by MobaXterm and
+     * SecureCRT, and the options object is built without the key at all when it
+     * is — their modal call is unchanged, argument for argument.
+     */
+    detail?: string
   ): Promise<void> {
     if (result.sessions.length === 0) {
       const note = result.skippedCount > 0
@@ -3348,7 +3365,7 @@ export function registerConfigCommands(
     const skipNote = result.skippedCount > 0 ? ` (${result.skippedCount} ${skipLabel} skipped)` : "";
     const confirm = await vscode.window.showInformationMessage(
       `Found ${result.sessions.length} ${pluralizeNoun(noun, result.sessions.length)}${folderNote}${skipNote}. Import?`,
-      { modal: true },
+      detail ? { modal: true, detail } : { modal: true },
       "Import"
     );
     if (confirm !== "Import") return;
@@ -3368,7 +3385,13 @@ export function registerConfigCommands(
           host: session.host,
           port: session.port,
           username: session.username,
-          authType: "password",
+          // Default, not a constant: MobaXterm and SecureCRT set neither field
+          // and must keep producing exactly the password-auth rows they always
+          // have. The ssh-config importer sets both, because an IdentityFile
+          // host imported as password auth prompts for a password that does
+          // not exist (see ImportedSession.authType).
+          authType: session.authType ?? "password",
+          keyPath: session.keyPath,
           isHidden: false,
           group: session.folder || undefined
         });
@@ -3402,6 +3425,11 @@ export function registerConfigCommands(
     if (sniff === "xml") {
       const choice = await vscode.window.showErrorMessage(message, "Import as SecureCRT XML");
       if (choice === "Import as SecureCRT XML") await applySecureCrtXmlText(text);
+      return;
+    }
+    if (sniff === "ssh-config") {
+      const choice = await vscode.window.showErrorMessage(message, "Import as SSH Config");
+      if (choice === "Import as SSH Config") await applySshConfigText(text);
       return;
     }
     // host-list (the everything-else class): no other signature to reroute to.
@@ -3716,6 +3744,19 @@ export function registerConfigCommands(
       else if (choice === "Import as Host List Anyway") await applyInventoryText(text);
       return;
     }
+    if (sniff === "ssh-config") {
+      // Without this branch the inventory parser reads `Host lab` positionally
+      // and creates a server named `lab` whose HOST is the literal word `Host`
+      // — a row that looks imported and can never connect.
+      const choice = await vscode.window.showErrorMessage(
+        "This looks like an SSH config file (~/.ssh/config), not a host list.",
+        "Import as SSH Config",
+        "Import as Host List Anyway"
+      );
+      if (choice === "Import as SSH Config") await applySshConfigText(text);
+      else if (choice === "Import as Host List Anyway") await applyInventoryText(text);
+      return;
+    }
 
     await applyInventoryText(text);
   }
@@ -3742,6 +3783,190 @@ export function registerConfigCommands(
     if (text === undefined) return;
 
     await applyInventoryText(text);
+  }
+
+  /**
+   * SSH config (`~/.ssh/config`) import: shared tail for the dialog, the
+   * one-time detection offer, and every cross-branch reroute. Takes an
+   * already-parsed result because the reroute paths hold BYTES, not a path.
+   *
+   * DECISION — RE-IMPORT SKIPS WHAT ALREADY EXISTS, it does not add it twice.
+   * `applyImportedSessions` mints a fresh `randomUUID()` per row with no
+   * dedupe, which never bit MobaXterm or SecureCRT: those are once-per-user
+   * migrations off a file you export by hand. An ssh config is the opposite —
+   * it lives at a stable path, Nexus offers to import it on first run, and
+   * `Nexus: Import from SSH Config` sits in the palette forever. "Import
+   * twice" is the normal case here, and doing it twice must not double every
+   * server. So this route filters against existing servers on
+   * host+port+username (host case-insensitively) before the tail ever sees
+   * them — the same key the inventory importer dedupes on, chosen to match so
+   * two bulk importers do not disagree about what "already have it" means.
+   * Disclosure alone ("this ADDS, it does not merge") was the alternative and
+   * is worse: it makes the user the deduplicator, on a file whose whole appeal
+   * is that they never have to maintain it.
+   *
+   * That decision is also the mitigation for the offer's globalState race (see
+   * `sshConfigImportOffer.ts`): if two windows both show the offer and both
+   * import, the second import finds the first one's servers already present and
+   * adds nothing, so the losing side of a last-writer-wins snapshot write is a
+   * write that had nothing new in it.
+   *
+   * NOT dedupe-on-alias: two ssh aliases pointing at the same host:port:user
+   * (`web` and `web.prod`) are one server here, and importing both would leave
+   * a duplicate that only differs by name.
+   */
+  async function applySshConfigResult(parsed: SshConfigParseResult): Promise<void> {
+    const converted = convertSshConfig(parsed, { defaultUsername: localLoginName() });
+
+    const existingKeys = new Set(
+      core.getSnapshot().servers.map((server) => `${server.host.toLowerCase()}|${server.port}|${server.username}`)
+    );
+    const sessions = converted.sessions.filter(
+      (session) => !existingKeys.has(`${session.host.toLowerCase()}|${session.port}|${session.username}`)
+    );
+    const dedupedCount = converted.sessions.length - sessions.length;
+
+    // Said plainly rather than as "no hosts found (N skipped)", which reads as
+    // a failed parse of a file that in fact parsed perfectly.
+    if (sessions.length === 0 && dedupedCount > 0) {
+      const verb = dedupedCount === 1 ? "is" : "are";
+      void vscode.window.showInformationMessage(
+        `All ${dedupedCount} ${pluralizeNoun("host", dedupedCount)} in your SSH config ${verb} already in Nexus — nothing to import.`
+      );
+      return;
+    }
+
+    const detailLines: string[] = [];
+    if (dedupedCount > 0) {
+      detailLines.push(`${dedupedCount} ${pluralizeNoun("host", dedupedCount)} you already have will be skipped.`);
+    }
+    if (converted.droppedIdentityFileCount > 0) {
+      // Named, because the user asked for key auth and is getting a password
+      // prompt instead; the remedy is one field in the profile editor.
+      detailLines.push(
+        `${converted.droppedIdentityFileCount} ${pluralizeNoun("host", converted.droppedIdentityFileCount)} will use password auth: ` +
+          "their IdentityFile uses an ssh token Nexus cannot expand. Set the key path on the profile afterwards."
+      );
+    }
+
+    await applyImportedSessions(
+      { sessions, skippedCount: converted.skippedCount, folders: [] },
+      "your SSH config",
+      "file",
+      // Names what was ACTUALLY skipped: defaults blocks (`Host *`), negations,
+      // `Match` blocks and `%`-token drops. The default "non-SSH" would be a
+      // lie about a file in which every entry is an SSH host.
+      "wildcard or unsupported",
+      "SSH host",
+      detailLines.length > 0 ? detailLines.join("\n") : undefined
+    );
+  }
+
+  /**
+   * Reroute tail: parse already-acquired ssh-config TEXT.
+   *
+   * `Include` cannot be followed from bytes — the resolver needs the root's own
+   * path to resolve relative include patterns against, and a reroute arrives
+   * with the file already read past a different branch's dialog. Rather than
+   * silently importing a subset, say so and name the route that does follow
+   * them; that route exists, is one command away, and needs nothing the user
+   * does not already have.
+   */
+  async function applySshConfigText(text: string): Promise<void> {
+    const parsed = parseSshConfig(text);
+    if (parsed.includes.length > 0) {
+      const count = parsed.includes.length;
+      void vscode.window.showWarningMessage(
+        `${count} Include ${pluralizeNoun("directive", count)} in this file ${count === 1 ? "was" : "were"} not followed. ` +
+          "Run Nexus: Import from SSH Config and pick the file again to import the hosts they hold."
+      );
+    }
+    await applySshConfigResult(parsed);
+  }
+
+  /**
+   * "Declared SSH config but the content disagrees" fallback — same contract as
+   * every other branch: a confidently different signature gets a one-click
+   * reroute with the same bytes, and the everything-else class gets the plain
+   * error because there is no other signature to reroute to.
+   */
+  async function reportSshConfigFormatMismatch(text: string, sniff: SniffedFormat): Promise<void> {
+    const message = "This doesn't look like an SSH config file — no Host or HostName line found.";
+    if (sniff === "nexus-json") {
+      const choice = await vscode.window.showErrorMessage(message, "Import as Nexus Export");
+      if (choice === "Import as Nexus Export") await applyNexusExportText(text);
+      return;
+    }
+    if (sniff === "xml") {
+      const choice = await vscode.window.showErrorMessage(message, "Import as SecureCRT XML");
+      if (choice === "Import as SecureCRT XML") await applySecureCrtXmlText(text);
+      return;
+    }
+    if (sniff === "mobaxterm") {
+      const choice = await vscode.window.showErrorMessage(message, "Import as MobaXterm");
+      if (choice === "Import as MobaXterm") await applyMobaxtermText(text);
+      return;
+    }
+    void vscode.window.showErrorMessage(message);
+  }
+
+  /**
+   * Only a genuinely URI-shaped argument pre-resolves the path. VS Code hands a
+   * command whatever the invoking surface passes — a tree item from a menu, a
+   * string from a keybinding `args` — and treating one of those as a file would
+   * stat nonsense instead of opening the dialog the user expects.
+   */
+  function asFileUri(arg: unknown): vscode.Uri | undefined {
+    return typeof (arg as vscode.Uri | undefined)?.fsPath === "string" ? (arg as vscode.Uri) : undefined;
+  }
+
+  /**
+   * `nexus.config.import.sshConfig`. With `preResolvedUri` (the one-time offer,
+   * which already found and parsed `~/.ssh/config`) the file dialog is skipped
+   * entirely — re-asking for a path the caller just handed over is the kind of
+   * step that makes an offer not worth accepting.
+   */
+  async function importSshConfig(preResolvedUri?: vscode.Uri): Promise<void> {
+    let uri = preResolvedUri;
+    if (!uri) {
+      const uris = await vscode.window.showOpenDialog({
+        canSelectFiles: true,
+        canSelectMany: false,
+        // Opens in ~/.ssh, where the file this command exists for lives.
+        defaultUri: vscode.Uri.file(defaultSshDir()),
+        // NO extension filter: `~/.ssh/config` has no extension at all, so an
+        // extension-based filter would hide it behind a dropdown change.
+        filters: { "All Files": ["*"] },
+        title: "Import from SSH Config"
+      });
+      if (!uris || uris.length === 0) return;
+      uri = uris[0];
+    }
+
+    // Stat first and reject WITHOUT reading — the guard importHostListFile uses.
+    // (importMobaxterm has no size check at all; that is the gap, not the pattern.)
+    const stat = await vscode.workspace.fs.stat(uri);
+    if (stat.size > INVENTORY_MAX_BYTES) {
+      void vscode.window.showErrorMessage("The SSH config exceeds the 2 MB size limit.");
+      return;
+    }
+
+    const raw = await vscode.workspace.fs.readFile(uri);
+    const text = Buffer.from(raw).toString("utf8");
+
+    const sniff = sniffImportFormat(text);
+    if (sniff !== "ssh-config") {
+      await reportSshConfigFormatMismatch(text, sniff);
+      return;
+    }
+
+    // Re-read through the resolver rather than parsing `text`: only the
+    // resolver follows `Include`, and it needs the root PATH to resolve
+    // relative include patterns against. Every read it makes — root included —
+    // goes through the same stat-first ceiling as the check above, so the
+    // second read cannot exceed what the first one just cleared.
+    const parsed = await resolveSshConfig(uri.fsPath, createSshConfigIo(INVENTORY_MAX_BYTES));
+    await applySshConfigResult(parsed);
   }
 
   const SECURECRT_XML_MAX_BYTES = 10 * 1024 * 1024;
@@ -3869,7 +4094,15 @@ export function registerConfigCommands(
   }
 
   interface ImportChooserItem extends vscode.QuickPickItem {
-    value?: "clipboard" | "hostListFile" | "inventorySource" | "mobaxterm" | "securecrtXml" | "securecrtFolder" | "nexusExport";
+    value?:
+      | "clipboard"
+      | "hostListFile"
+      | "inventorySource"
+      | "mobaxterm"
+      | "securecrtXml"
+      | "securecrtFolder"
+      | "sshConfig"
+      | "nexusExport";
   }
 
   // Row order is deliberate, not alphabetical: bulk host-list add is the lead
@@ -3911,6 +4144,14 @@ export function registerConfigCommands(
       description: "SecureCRT's Config/Sessions directory",
       value: "securecrtFolder"
     },
+    // Appended rather than inserted: the three rows above are where migrating
+    // users already look, and re-ranking them to promote a new one moves a
+    // target people have learned.
+    {
+      label: "$(key) SSH Config File…",
+      description: "Hosts from ~/.ssh/config, with their IdentityFile keys",
+      value: "sshConfig"
+    },
     { label: "nexus", kind: vscode.QuickPickItemKind.Separator },
     {
       label: "$(json) Nexus Export File…",
@@ -3946,6 +4187,9 @@ export function registerConfigCommands(
       case "securecrtFolder":
         await runSecureCrtImport("folder");
         break;
+      case "sshConfig":
+        await importSshConfig();
+        break;
       case "nexusExport":
         await importNexusExport();
         break;
@@ -3958,6 +4202,9 @@ export function registerConfigCommands(
     vscode.commands.registerCommand("nexus.config.import", importConfig),
     vscode.commands.registerCommand("nexus.config.import.mobaxterm", importMobaxterm),
     vscode.commands.registerCommand("nexus.config.import.securecrt", importSecureCrt),
+    // The argument is how the one-time offer skips the file dialog for a path
+    // it has already resolved; anything that isn't a URI opens the dialog.
+    vscode.commands.registerCommand("nexus.config.import.sshConfig", (arg?: unknown) => importSshConfig(asFileUri(arg))),
     vscode.commands.registerCommand("nexus.config.import.inventory", importInventory),
     vscode.commands.registerCommand("nexus.config.completeReset", completeReset)
   ];

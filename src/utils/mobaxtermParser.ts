@@ -1,3 +1,4 @@
+import type { AuthType } from "../models/config";
 import { normalizeFolderPath } from "./folderPaths";
 
 export interface ImportedSession {
@@ -6,6 +7,20 @@ export interface ImportedSession {
   port: number;
   username: string;
   folder: string;
+  /**
+   * How the created server authenticates. OPTIONAL and additive: absent means
+   * `"password"`, which is what `applyImportedSessions` hardcoded before this
+   * field existed, so MobaXterm and SecureCRT imports are byte-identical
+   * whether or not they ever set it.
+   *
+   * It exists for the `~/.ssh/config` importer, where it is not a nicety: an
+   * ssh config is the canonical KEY-based config and `IdentityFile` is in most
+   * real ones, so importing those rows as password auth would prompt every
+   * single one of them for a password the user does not have.
+   */
+  authType?: AuthType;
+  /** Private-key path for `authType: "key"`. Absolute — see `sshConfigImport.ts`. */
+  keyPath?: string;
 }
 
 export interface ImportParseResult {

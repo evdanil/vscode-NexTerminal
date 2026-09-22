@@ -1419,6 +1419,7 @@ describe("import chooser (nexus.config.import)", () => {
       "$(file-code) MobaXterm INI File…",
       "$(file-code) SecureCRT XML Export…",
       "$(folder-opened) SecureCRT Sessions Folder…",
+      "$(key) SSH Config File…",
       "nexus",
       "$(json) Nexus Export File…"
     ]);
@@ -1430,6 +1431,7 @@ describe("import chooser (nexus.config.import)", () => {
     expect(byLabel("MobaXterm INI")?.description).toBe("Sessions from a MobaXterm .ini bookmarks export");
     expect(byLabel("SecureCRT XML")?.description).toBe("Created in SecureCRT via Tools → Export Settings");
     expect(byLabel("SecureCRT Sessions Folder")?.description).toBe("SecureCRT's Config/Sessions directory");
+    expect(byLabel("SSH Config File")?.description).toBe("Hosts from ~/.ssh/config, with their IdentityFile keys");
     expect(byLabel("Nexus Export File")?.description).toBe("An encrypted backup or a shared config (.json)");
   });
 
@@ -4925,6 +4927,391 @@ Server=#109#0%host.test%22%user%%-1%
 
     const cmd = registeredCommands.get("nexus.config.import.mobaxterm")!;
     await cmd();
+
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+});
+
+/**
+ * `~/.ssh/config` import. The pure conversion (token expansion, key auth,
+ * counters) is pinned in `sshConfigImport.test.ts`; what follows is the
+ * command: its dialog, its size guard, its dedupe, and its place in the
+ * sniffer's reroute web.
+ */
+describe("import from SSH config command (nexus.config.import.sshConfig)", () => {
+  let core: NexusCore;
+  let vault: MockVault;
+
+  const SSH_CONFIG_PATH = "/fake/ssh_config";
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    configStore.clear();
+    vault = new MockVault();
+    const repo = new InMemoryConfigRepository();
+    core = new NexusCore(repo);
+    await core.initialize();
+    registerConfigCommands(core, vault);
+  });
+
+  /** Serve one file (plus optional extra paths) through the mocked workspace.fs. */
+  function serveFiles(files: Record<string, string>, dirs: Record<string, string[]> = {}): void {
+    mockStat.mockImplementation(async (uri: { fsPath: string }) => {
+      if (uri.fsPath in files) return { type: 1, size: Buffer.byteLength(files[uri.fsPath], "utf8") };
+      if (uri.fsPath in dirs) return { type: 2, size: 0 };
+      throw new Error(`ENOENT: ${uri.fsPath}`);
+    });
+    mockReadFile.mockImplementation(async (uri: { fsPath: string }) => {
+      if (uri.fsPath in files) return Buffer.from(files[uri.fsPath], "utf8");
+      throw new Error(`ENOENT: ${uri.fsPath}`);
+    });
+    mockReadDirectory.mockImplementation(async (uri: { fsPath: string }) =>
+      (dirs[uri.fsPath] ?? []).map((name) => [name, 1] as [string, number])
+    );
+  }
+
+  function pickConfigFile(): void {
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: SSH_CONFIG_PATH, scheme: "file" }]);
+  }
+
+  it("is registered as a command", () => {
+    expect(registeredCommands.has("nexus.config.import.sshConfig")).toBe(true);
+  });
+
+  it("imports an IdentityFile host as KEY auth carrying the key path — the point of the feature (⊘ the tail's hardcoded authType: \"password\" makes every key-based host prompt for a password the user does not have)", async () => {
+    serveFiles({
+      [SSH_CONFIG_PATH]: "Host web1\n  HostName web1.example.com\n  User deploy\n  Port 2222\n  IdentityFile /keys/id_ed25519\n"
+    });
+    pickConfigFile();
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    const [server] = core.getSnapshot().servers;
+    expect(server).toMatchObject({
+      name: "web1",
+      host: "web1.example.com",
+      port: 2222,
+      username: "deploy",
+      authType: "key",
+      keyPath: "/keys/id_ed25519"
+    });
+  });
+
+  it("⊘ leaves the MobaXterm importer producing password auth with NO keyPath — the widened tail must be a default, not a new behaviour for existing importers", async () => {
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/moba.ini", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from("[Bookmarks]\nSubRep=\nServer=#109#0%host.test%22%user%%-1%\n", "utf8"));
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.mobaxterm")!();
+
+    const [server] = core.getSnapshot().servers;
+    expect(server.authType).toBe("password");
+    expect(server.keyPath).toBeUndefined();
+  });
+
+  it("⊘ leaves the SecureCRT XML importer producing password auth with NO keyPath", async () => {
+    const xml =
+      '<VanDyke><key name="Sessions"><key name="lab">' +
+      '<dword name="Is Session">1</dword><string name="Protocol Name">SSH2</string>' +
+      '<string name="Hostname">lab.example.com</string><string name="Username">admin</string>' +
+      "</key></key></VanDyke>";
+    mockShowQuickPick.mockResolvedValueOnce({ label: "SecureCRT XML Export File (.xml)", value: "xml" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/export.xml", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 1, size: xml.length });
+    mockReadFile.mockResolvedValue(Buffer.from(xml, "utf8"));
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.securecrt")!();
+
+    const [server] = core.getSnapshot().servers;
+    expect(server.authType).toBe("password");
+    expect(server.keyPath).toBeUndefined();
+  });
+
+  it("expands %h against the alias end to end (⊘ passing the token through creates a server at the literal host \"%h.example.com\")", async () => {
+    serveFiles({ [SSH_CONFIG_PATH]: "Host web1\n  HostName %h.example.com\n  User deploy\n" });
+    pickConfigFile();
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    expect(core.getSnapshot().servers[0].host).toBe("web1.example.com");
+  });
+
+  it("SKIPS a host whose HostName keeps an unexpandable token and counts it as \"wildcard or unsupported\" (⊘ importing it, and ⊘ the tail's default \"non-SSH\" label, which is a lie about a file of nothing but SSH hosts)", async () => {
+    serveFiles({
+      [SSH_CONFIG_PATH]: "Host good\n  HostName good.example.com\n  User deploy\n\nHost bad\n  HostName %C.example.com\n  User deploy\n"
+    });
+    pickConfigFile();
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    expect(mockShowInformationMessage).toHaveBeenCalledWith(
+      "Found 1 SSH host (1 wildcard or unsupported skipped). Import?",
+      expect.objectContaining({ modal: true }),
+      "Import"
+    );
+    expect(core.getSnapshot().servers.map((server) => server.name)).toEqual(["good"]);
+  });
+
+  it("rejects an oversized config WITHOUT reading it — stat-first, like importHostListFile (⊘ copying importMobaxterm, which has no size check at all, decodes a 2 GB file into the extension host)", async () => {
+    pickConfigFile();
+    mockStat.mockResolvedValue({ type: 1, size: 3 * 1024 * 1024 });
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    expect(mockReadFile).not.toHaveBeenCalled();
+    expect(mockShowErrorMessage).toHaveBeenCalledWith("The SSH config exceeds the 2 MB size limit.");
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  it("opens the dialog in ~/.ssh with no extension filter — the file this command exists for has no extension", async () => {
+    pickConfigFile();
+    serveFiles({ [SSH_CONFIG_PATH]: "Host lab\n  User admin\n" });
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    expect(mockShowOpenDialog).toHaveBeenCalledWith({
+      canSelectFiles: true,
+      canSelectMany: false,
+      defaultUri: expect.objectContaining({ fsPath: path.join(os.homedir(), ".ssh") }),
+      filters: { "All Files": ["*"] },
+      title: "Import from SSH Config"
+    });
+  });
+
+  it("[Import] from the one-time offer does NOT re-prompt: a URI argument skips the file dialog (⊘ ignoring the argument re-asks for a path the offer already resolved)", async () => {
+    serveFiles({ [SSH_CONFIG_PATH]: "Host lab\n  HostName 10.0.0.1\n  User admin\n" });
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!({ fsPath: SSH_CONFIG_PATH, scheme: "file" });
+
+    expect(mockShowOpenDialog).not.toHaveBeenCalled();
+    expect(core.getSnapshot().servers).toHaveLength(1);
+  });
+
+  it("⊘ a non-URI command argument (a tree item from a menu) still opens the dialog rather than being statted as a path", async () => {
+    pickConfigFile();
+    serveFiles({ [SSH_CONFIG_PATH]: "Host lab\n  User admin\n" });
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!({ label: "some tree item" });
+
+    expect(mockShowOpenDialog).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-importing the same config ADDS NOTHING and says so — an ssh config at a stable path is imported more than once by design (⊘ minting a fresh UUID per row doubles every server on the second run)", async () => {
+    serveFiles({
+      [SSH_CONFIG_PATH]: "Host web1\n  HostName web1.example.com\n  User deploy\n\nHost db\n  HostName db.example.com\n  User admin\n"
+    });
+    pickConfigFile();
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+    expect(core.getSnapshot().servers).toHaveLength(2);
+
+    mockShowInformationMessage.mockClear();
+    mockShowInformationMessage.mockResolvedValue("Import");
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    expect(core.getSnapshot().servers).toHaveLength(2);
+    expect(mockShowInformationMessage).toHaveBeenCalledWith(
+      "All 2 hosts in your SSH config are already in Nexus — nothing to import."
+    );
+  });
+
+  it("imports only the NEW hosts on a re-import and names the skipped count in the confirm modal", async () => {
+    serveFiles({ [SSH_CONFIG_PATH]: "Host web1\n  HostName web1.example.com\n  User deploy\n" });
+    pickConfigFile();
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    serveFiles({
+      [SSH_CONFIG_PATH]: "Host web1\n  HostName web1.example.com\n  User deploy\n\nHost db\n  HostName db.example.com\n  User admin\n"
+    });
+    mockShowInformationMessage.mockClear();
+    mockShowInformationMessage.mockResolvedValue("Import");
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    expect(core.getSnapshot().servers.map((server) => server.name)).toEqual(["web1", "db"]);
+    expect(mockShowInformationMessage).toHaveBeenCalledWith(
+      "Found 1 SSH host. Import?",
+      { modal: true, detail: "1 host you already have will be skipped." },
+      "Import"
+    );
+  });
+
+  it("dedupes on host+port+username, not on the alias — two aliases for one host are one server", async () => {
+    serveFiles({
+      [SSH_CONFIG_PATH]: "Host web\n  HostName web.example.com\n  User deploy\n\nHost web-alias\n  HostName web.example.com\n  User deploy\n"
+    });
+    pickConfigFile();
+    mockShowInformationMessage.mockResolvedValue("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    expect(core.getSnapshot().servers).toHaveLength(2);
+    // Both rows are new to an empty tree, so both import; the dedupe is against
+    // what is ALREADY stored, which the re-import test above covers.
+    expect(core.getSnapshot().servers.map((server) => server.name)).toEqual(["web", "web-alias"]);
+  });
+
+  it("names the hosts whose IdentityFile could not be expanded, because they arrive on password auth instead", async () => {
+    serveFiles({ [SSH_CONFIG_PATH]: "Host web\n  HostName web.example.com\n  User deploy\n  IdentityFile ~/.ssh/%C_key\n" });
+    pickConfigFile();
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    const detail = mockShowInformationMessage.mock.calls[0][1] as { detail?: string };
+    expect(detail.detail).toContain("1 host will use password auth");
+    expect(core.getSnapshot().servers[0].authType).toBe("password");
+  });
+
+  it("follows Include directives through workspace.fs, globbing a config.d directory (⊘ parsing only the root file drops every host a modern config keeps in an include)", async () => {
+    serveFiles(
+      {
+        [SSH_CONFIG_PATH]: "Include /fake/config.d/*\n\nHost root-host\n  HostName root.example.com\n  User admin\n",
+        "/fake/config.d/10-work": "Host work\n  HostName work.example.com\n  User deploy\n"
+      },
+      { "/fake/config.d": ["10-work"] }
+    );
+    pickConfigFile();
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    expect(core.getSnapshot().servers.map((server) => server.name).sort()).toEqual(["root-host", "work"]);
+  });
+
+  it("warns, and names the route that would work, when a REROUTED config's Includes cannot be followed — a reroute holds bytes, not a path", async () => {
+    // Declared "Host List File…", content is an ssh config: the reroute hands
+    // over the bytes it already read, so there is no root path to resolve
+    // `Include` against.
+    const text = "Include config.d/*\n\nHost lab\n  HostName 10.0.0.1\n  User admin\n";
+    mockShowQuickPick.mockResolvedValueOnce({ value: "hostListFile" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/hosts.csv", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 1, size: text.length });
+    mockReadFile.mockResolvedValue(Buffer.from(text, "utf8"));
+    mockShowErrorMessage.mockResolvedValueOnce("Import as SSH Config");
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      "1 Include directive in this file was not followed. Run Nexus: Import from SSH Config and pick the file again to import the hosts they hold."
+    );
+    expect(core.getSnapshot().servers.map((server) => server.name)).toEqual(["lab"]);
+  });
+
+  it("Host List File… contradicted by an ssh config stops with a named error and a reroute, rather than parsing `Host lab` into a server named lab at the host \"Host\" (⊘ no ssh-config sniff class)", async () => {
+    const text = "Host lab\n  HostName 10.0.0.1\n  User admin\n";
+    mockShowQuickPick.mockResolvedValueOnce({ value: "hostListFile" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/hosts.csv", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 1, size: text.length });
+    mockReadFile.mockResolvedValue(Buffer.from(text, "utf8"));
+    mockShowErrorMessage.mockResolvedValueOnce("Import as SSH Config");
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(
+      "This looks like an SSH config file (~/.ssh/config), not a host list.",
+      "Import as SSH Config",
+      "Import as Host List Anyway"
+    );
+    // The reroute reuses the same bytes — no second dialog.
+    expect(mockShowOpenDialog).toHaveBeenCalledTimes(1);
+    const [server] = core.getSnapshot().servers;
+    expect(server.name).toBe("lab");
+    expect(server.host).toBe("10.0.0.1");
+  });
+
+  it("keeps the 'Import as Host List Anyway' escape hatch working for a capital-H host list the sniffer mis-flags", async () => {
+    const text = "Host lab\n10.0.0.1,sw1,admin\n";
+    mockShowQuickPick.mockResolvedValueOnce({ value: "hostListFile" });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/hosts.csv", scheme: "file" }]);
+    mockStat.mockResolvedValue({ type: 1, size: text.length });
+    mockReadFile.mockResolvedValue(Buffer.from(text, "utf8"));
+    mockShowErrorMessage.mockResolvedValueOnce("Import as Host List Anyway");
+    mockShowInputBox.mockResolvedValue("");
+    mockShowInformationMessage.mockResolvedValue("Import");
+    mockShowWarningMessage.mockResolvedValue(undefined);
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(core.getSnapshot().servers.map((server) => server.host)).toContain("10.0.0.1");
+  });
+
+  it("declared SSH Config but the content is a MobaXterm INI: named error plus a one-click reroute using the same bytes", async () => {
+    const ini = "[Bookmarks]\nSubRep=\nServer=#109#0%host.test%22%user%%-1%\n";
+    serveFiles({ [SSH_CONFIG_PATH]: ini });
+    pickConfigFile();
+    mockShowErrorMessage.mockResolvedValueOnce("Import as MobaXterm");
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(
+      "This doesn't look like an SSH config file — no Host or HostName line found.",
+      "Import as MobaXterm"
+    );
+    expect(mockShowOpenDialog).toHaveBeenCalledTimes(1);
+    expect(core.getSnapshot().servers[0].host).toBe("host.test");
+  });
+
+  it("⊘ offers NO reroute button when the content is the everything-else class — there is no other signature to reroute to", async () => {
+    serveFiles({ [SSH_CONFIG_PATH]: "10.0.0.1,sw1,admin\n" });
+    pickConfigFile();
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(
+      "This doesn't look like an SSH config file — no Host or HostName line found."
+    );
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  it("the chooser's SSH Config File… row routes into this branch", async () => {
+    mockShowQuickPick.mockResolvedValueOnce({ value: "sshConfig" });
+    pickConfigFile();
+    serveFiles({ [SSH_CONFIG_PATH]: "Host lab\n  HostName 10.0.0.1\n  User admin\n" });
+    mockShowInformationMessage.mockResolvedValueOnce("Import");
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    expect(mockShowOpenDialog).toHaveBeenCalledWith(expect.objectContaining({ title: "Import from SSH Config" }));
+    expect(core.getSnapshot().servers).toHaveLength(1);
+  });
+
+  it("warns without importing when the config holds only defaults blocks", async () => {
+    serveFiles({ [SSH_CONFIG_PATH]: "Host *\n  User root\n" });
+    pickConfigFile();
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith("No SSH hosts found (1 wildcard or unsupported skipped).");
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  it("does nothing when the file picker is canceled", async () => {
+    mockShowOpenDialog.mockResolvedValue(undefined);
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
+
+    expect(mockStat).not.toHaveBeenCalled();
+    expect(core.getSnapshot().servers).toHaveLength(0);
+  });
+
+  it("does nothing when the confirm modal is canceled", async () => {
+    serveFiles({ [SSH_CONFIG_PATH]: "Host lab\n  HostName 10.0.0.1\n  User admin\n" });
+    pickConfigFile();
+    mockShowInformationMessage.mockResolvedValueOnce(undefined);
+
+    await registeredCommands.get("nexus.config.import.sshConfig")!();
 
     expect(core.getSnapshot().servers).toHaveLength(0);
   });

@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { createEveNgProvider, readEveNgStatusPollSeconds } from "../../src/services/inventory/providers/eveNgProvider";
 import { createBuiltInProviders } from "../../src/services/inventory/builtInProviders";
+import { SHIPPED_IMPORTER_NAMES } from "../../src/utils/shippedImporters";
 
 const packageJsonPath = path.resolve(__dirname, "..", "..", "package.json");
 const readmePath = path.resolve(__dirname, "..", "..", "README.md");
@@ -1308,6 +1309,62 @@ describe("package contributions", () => {
       expect(functionalDocs).toMatch(/the cap \*\*pushes its own sync warning\*\*/);
       expect(functionalDocs).toMatch(/suppressed when the crawl was already truncated/);
     });
+  });
+
+  /**
+   * The import half of the welcome view's two derived lines. Same history as
+   * the provider half above, and the same remedy: the list used to be written
+   * by hand in package.json with nothing checking it, so an importer could ship
+   * and go unnamed on the one line a user with an empty tree actually reads.
+   * Both assertions below read `SHIPPED_IMPORTER_NAMES` — add an importer there
+   * and the line has to name it, whether or not anyone remembered.
+   */
+  describe("importer-inclusive welcome line", () => {
+    const shippedImporters = [...SHIPPED_IMPORTER_NAMES];
+
+    function importWelcomeLine(): string {
+      const welcome = packageJson.contributes.viewsWelcome?.find((w) => w.view === "nexusCommandCenter")?.contents ?? "";
+      return welcome.split("\n").find((line) => line.includes("command:nexus.config.import)")) ?? "";
+    }
+
+    it("names EVERY shipped importer on the Command Center welcome view's import line (\u2298 a hand-written list only verifies the importers someone remembered to add)", () => {
+      const line = importWelcomeLine();
+      expect(line).not.toBe("");
+      for (const importer of shippedImporters) {
+        expect(line).toContain(importer);
+      }
+    });
+
+    it("signals that the list is open-ended rather than the complete set of formats Nexus will ever read", () => {
+      expect(importWelcomeLine()).toContain("\u2026");
+    });
+
+    it("\u2298 names NOTHING that is not a shipped importer (kills a stale name surviving an importer's removal, which the include-everyone check cannot see)", () => {
+      const named = (/\(([^)]*)\)/.exec(importWelcomeLine())?.[1] ?? "")
+        .split(",")
+        .map((part) => part.trim().replace(/\u2026$/, "").trim())
+        .filter((part) => part.length > 0);
+      expect(named.length).toBeGreaterThan(0);
+      for (const name of named) {
+        expect(shippedImporters).toContain(name);
+      }
+    });
+  });
+
+  // The ssh-config importer's palette surface. All four of its siblings carry a
+  // commandPalette entry with `"when": "true"`; a command declared without one
+  // is still invocable from code but invisible to a user typing "ssh config",
+  // which for a migration shortcut is the whole point of it existing.
+  it("contributes nexus.config.import.sshConfig as a palette-invocable Nexus command (\u2298 a missing commandPalette entry makes the shortcut unsearchable)", () => {
+    const command = packageJson.contributes.commands.find((item) => item.command === "nexus.config.import.sshConfig");
+    expect(command).toBeDefined();
+    expect(command?.title).toBe("Import from SSH Config");
+    expect(command?.category).toBe("Nexus");
+
+    const paletteMenu = packageJson.contributes.menus.commandPalette ?? [];
+    const paletteEntry = paletteMenu.find((item) => item.command === "nexus.config.import.sshConfig");
+    expect(paletteEntry).toBeDefined();
+    expect(paletteEntry?.when).toBe("true");
   });
 
   it("contributes nexus.config.import.inventory as a palette-invocable Nexus command", () => {
