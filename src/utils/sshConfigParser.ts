@@ -637,9 +637,15 @@ export function parseSshConfig(text: string): SshConfigParseResult {
         continue;
       }
       if (args.every((pattern) => pattern === "")) {
-        // `Host ""` is a token that names nothing, so the line is as empty-handed
-        // as a bare `Host` and takes the same issue rather than inventing a
-        // second wording for one condition.
+        // ERROR RECOVERY, NOT FIDELITY. Real ssh does not treat `Host ""` as a
+        // line that named nothing: OpenSSH 9.6 rejects the empty argument,
+        // `ssh -G` exits 255 with `Missing argument`, and the whole config is
+        // abandoned. An importer that abandoned the file would throw away every
+        // host the user asked for over one malformed line, so this recovers with
+        // an issue and carries on -- the same trade this module makes for an
+        // unterminated quote and an unreadable include.
+        // It takes the bare-`Host` issue rather than a second wording, because
+        // to a reader the two lines are the same complaint.
         result.issues.push({ line: lineNumber, text: trimmed, reason: "Host directive has no patterns" });
         continue;
       }
@@ -718,10 +724,16 @@ export function parseSshConfig(text: string): SshConfigParseResult {
       continue;
     }
     if (args.length === 0 || args[0] === "") {
-      // `IdentityFile ""` obtains nothing: a quoted empty token names no file, no
-      // user and no port, so it takes the same issue as the bare keyword. Not
-      // marking the keyword seen is the point — a later line in the block is
-      // still free to supply the real value, exactly as if this line were absent.
+      // ERROR RECOVERY, NOT FIDELITY — same trade as the `Host ""` branch above.
+      // OpenSSH 9.6 does not read `IdentityFile ""` as an absent line: it
+      // rejects the empty argument, `ssh -G` exits 255 with `Missing argument`,
+      // and the rest of the config is never read. Aborting an import over one
+      // malformed line is worse for a user than importing the rest, so the line
+      // takes the bare-keyword issue and the walk continues.
+      // Not marking the keyword seen is the deliberate part: a later line in the
+      // block may still supply the real value. That is this importer's recovery
+      // choice, NOT a claim about what ssh would have obtained -- ssh would have
+      // obtained nothing at all, because it would have stopped here.
       result.issues.push({ line: lineNumber, text: trimmed, reason: `${parsed.spelling} has no value` });
       continue;
     }

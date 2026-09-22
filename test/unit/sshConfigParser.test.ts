@@ -135,7 +135,7 @@ describe("parseSshConfig — keywords", () => {
     expect(result.issues.map((i) => i.reason)).toEqual(["HostName has no value", "Port has no value"]);
   });
 
-  it('treats a quoted empty value as no value at all, leaving a later line in the block free to supply the real one (⊘ storing "" hands the connector an IdentityFile that names no file, and the block\'s real key path is then discarded as a repeat)', () => {
+  it('RECOVERS from a quoted empty value, leaving a later line in the block free to supply the real one — importer policy, NOT ssh fidelity: OpenSSH 9.6 rejects the empty argument and `ssh -G` exits 255 with `Missing argument`, reading no further (⊘ storing "" hands the connector an IdentityFile that names no file, and the block\'s real key path is then discarded as a repeat)', () => {
     const result = parseSshConfig('Host box\n  IdentityFile ""\n  IdentityFile ~/.ssh/id_real\n');
     expect(result.entries[0].identityFile).toBe("~/.ssh/id_real");
     expect(result.issues).toHaveLength(1);
@@ -377,14 +377,14 @@ Host foo
     expect(result.entries[0].line).toBe(1);
   });
 
-  it('ignores a quoted empty `Host ""` token, which names nothing, and keeps the rest of the line (⊘ pushing it emits a phantom entry whose alias is the empty string — a blank, unconnectable row in the server tree, same defect as the include-shaped phantom pinned below)', () => {
+  it('ignores a quoted empty `Host ""` token and keeps the rest of the line — recovery, not fidelity: real ssh rejects the empty argument and abandons the config, which would cost the user every host in the file (⊘ pushing it emits a phantom entry whose alias is the empty string — a blank, unconnectable row in the server tree, same defect as the include-shaped phantom pinned below)', () => {
     const result = parseSshConfig('Host "" foo\n  HostName 10.0.0.81\n');
     expect(result.entries.map((e) => e.alias)).toEqual(["foo"]);
     expect(result.entries.map((e) => e.alias)).not.toContain("");
     expect(result.issues).toHaveLength(0);
   });
 
-  it('reports `Host ""` on its own exactly as a bare `Host`: no patterns, no block, one issue (⊘ treating the empty token as a pattern opens a block for it and every following directive lands on a nameless entry)', () => {
+  it('reports `Host ""` on its own exactly as a bare `Host`: no patterns, no block, one issue — the recovery ssh does not do, since it would exit 255 on the empty argument (⊘ treating the empty token as a pattern opens a block for it and every following directive lands on a nameless entry)', () => {
     const result = parseSshConfig('Host ""\n  HostName 10.0.0.82\n');
     expect(result.entries).toHaveLength(0);
     expect(result.issues).toHaveLength(1);
