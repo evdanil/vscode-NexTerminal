@@ -3,12 +3,15 @@ import { randomUUID } from "node:crypto";
 import type { CommandContext } from "./types";
 import type { SavedFilterDefinition } from "../models/savedFilter";
 import { configMutationLock } from "../services/configMutationLock";
+import type { InventoryProviderRegistry } from "../services/inventory/providerRegistry";
+import { flattenProviderText } from "../models/inventory";
+import { savedFilterTarget } from "../ui/formDefinitions";
 import { naturalCompare } from "../utils/naturalCompare";
 
 /**
  * SAVED FILTER DEFINITIONS (issue #48 PR-E, backlog #1) — the `nexus.savedFilter
- * .manage` palette command: a named library of reusable inventory Device Filter
- * queries. Mirrors the device-template / auth-profile manage idioms — a QuickPick
+ * .manage` palette command: a named library of reusable inventory-source filter
+ * text. Mirrors the device-template / auth-profile manage idioms — a QuickPick
  * hub over list → add / edit / delete — but simpler: a saved filter is just a
  * name + query string with no secrets and no live references.
  *
@@ -18,8 +21,28 @@ import { naturalCompare } from "../utils/naturalCompare";
  * `NexusCore.removeSavedFilter`.
  */
 
-const EMPTY_STATE =
-  'No saved filters yet. Create one here, or use "Save current filter as…" next to a source\'s Device Filter.';
+/**
+ * The Manage Saved Filters empty state. Issue #152 — it names the Saved Filter
+ * picker rather than a field, because each provider titles its filter field its
+ * own way (e.g. NetBox's Device Filter, EVE-NG's Lab Filter). Codex on #164 — and
+ * it names which providers' forms HAVE that picker, read from the registry (the
+ * same `savedFilterTarget` the form renders it by), so a user with only Proxmox
+ * sources, whose form has no filter field, is not sent looking for one. Each label
+ * enters the sentence through `flattenProviderText` — a provider registered through
+ * the public API supplies it — and one with nothing visible left is left out.
+ */
+function emptyStateMessage(registry: InventoryProviderRegistry): string {
+  const withPicker = registry
+    .list()
+    .filter((provider) => savedFilterTarget(provider) !== undefined)
+    .map((provider) => flattenProviderText(provider.label))
+    .filter((label) => label !== "");
+  if (withPicker.length === 0) {
+    return "No saved filters yet. Create one here.";
+  }
+  const forms = withPicker.length === 1 ? withPicker[0] : `${withPicker.slice(0, -1).join(", ")} and ${withPicker[withPicker.length - 1]}`;
+  return `No saved filters yet. Create one here, or choose "Save current filter as…" in the Saved Filter picker on ${forms} source forms.`;
+}
 
 async function promptFilterFields(seed?: SavedFilterDefinition): Promise<{ name: string; filter: string } | undefined> {
   // U1/U4 — both steps are titled as one coherent 2-step progress flow that keeps
@@ -40,10 +63,12 @@ async function promptFilterFields(seed?: SavedFilterDefinition): Promise<{ name:
   }
   const filter = await vscode.window.showInputBox({
     title: `${verb} Saved Filter (2/2) — Filter Query`,
-    prompt: "The filter query this saved filter applies to an inventory source's filter field. Leave empty to match all devices.",
-    placeHolder: "e.g. role=core-switch&site=syd",
+    // Issue #152 — no example query: NetBox's field takes a query string, EVE-NG's
+    // and GNS3's a name substring, so any sample is wrong for some of the sources
+    // the same saved filter can be copied into.
+    prompt: "The text this saved filter copies into an inventory source's filter field, written the way that field expects. Leave empty to match all devices.",
     value: seed?.filter ?? "",
-    // An empty query is a legal catch-all (the Device Filter field admits ""),
+    // An empty query is a legal catch-all (every provider's filter field admits ""),
     // so it is allowed here too — no validateInput rejecting a blank.
     ignoreFocusOut: true
   });
@@ -169,10 +194,10 @@ async function deleteSavedFilterFlow(ctx: CommandContext): Promise<void> {
   }
 }
 
-async function manageSavedFilters(ctx: CommandContext): Promise<void> {
+async function manageSavedFilters(ctx: CommandContext, registry: InventoryProviderRegistry): Promise<void> {
   const filters = ctx.core.getSnapshot().savedFilters;
   if (filters.length === 0) {
-    const choice = await vscode.window.showInformationMessage(EMPTY_STATE, "New Saved Filter");
+    const choice = await vscode.window.showInformationMessage(emptyStateMessage(registry), "New Saved Filter");
     if (choice === "New Saved Filter") {
       await addSavedFilter(ctx);
     }
@@ -218,6 +243,6 @@ async function manageSavedFilters(ctx: CommandContext): Promise<void> {
   }
 }
 
-export function registerSavedFilterCommands(ctx: CommandContext): vscode.Disposable[] {
-  return [vscode.commands.registerCommand("nexus.savedFilter.manage", () => manageSavedFilters(ctx))];
+export function registerSavedFilterCommands(ctx: CommandContext, registry: InventoryProviderRegistry): vscode.Disposable[] {
+  return [vscode.commands.registerCommand("nexus.savedFilter.manage", () => manageSavedFilters(ctx, registry))];
 }

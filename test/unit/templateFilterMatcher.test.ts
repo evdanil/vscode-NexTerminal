@@ -3,10 +3,12 @@ import {
   deviceMatchesFilter,
   describeFilterConditions,
   filterSpecificity,
+  knownKeysList,
   parseTemplateFilter,
   unknownFilterKeys
 } from "../../src/services/inventory/templateApply";
 import type { InventoryDevice } from "../../src/models/inventory";
+import { createBuiltInProviders } from "../../src/services/inventory/builtInProviders";
 
 /**
  * DEVICE TEMPLATES (issue #48 PR-T2) — the pure matcher: parse (§2.3), specificity
@@ -147,5 +149,133 @@ describe("describeFilterConditions / unknownFilterKeys — §7.2 live feedback",
     expect(unknownFilterKeys(parseTemplateFilter("tag=core&name=x"), keys)).toEqual([]);
     expect(unknownFilterKeys(parseTemplateFilter("role=switch"), keys)).toEqual([]);
     expect(unknownFilterKeys(parseTemplateFilter("whatever=1"), undefined)).toEqual([]);
+  });
+
+  // Issue #163 (item 1) — the list a user is shown must be the list the validator
+  // accepts. `unknownFilterKeys` always accepts `name`, so a provider that does not
+  // declare it (or declares `[]`) must still see it listed — once.
+  it.each([
+    ["an empty list", [], "name"],
+    ["a list lacking `name`", ["zone", "rack-unit"], "zone, rack-unit, name"],
+    ["a list containing `name`", ["zone", "name"], "zone, name"],
+    ["a list containing `Name` (compared the way the validator compares)", ["Name", "zone"], "Name, zone"]
+  ])("knownKeysList for %s lists every key the validator accepts, `name` exactly once", (_label, keys, expected) => {
+    const listed = knownKeysList(keys as string[]);
+    expect(listed).toBe(expected);
+    // Every listed key passes the validator it describes.
+    const everyListedKey = listed.split(", ").map((k) => `${k}=x`).join("&");
+    expect(unknownFilterKeys(parseTemplateFilter(everyListedKey), keys as string[])).toEqual([]);
+  });
+
+  // Codex on #164 — a provider registered through the public API supplies these
+  // keys, and the list is spliced into text this extension writes (the Rule Filter
+  // prompt and both Known-keys warnings).
+  /** Typing each listed key exactly as shown must pass the validator the list describes. */
+  function expectEveryListedKeyAccepted(listed: string, keys: string[]): void {
+    const typed = listed.split(", ").map((k) => `${k}=x`).join("&");
+    expect(unknownFilterKeys(parseTemplateFilter(typed), keys)).toEqual([]);
+  }
+
+  it("knownKeysList never shows a line break, bidi override or zero-width character: a key holding one is shown percent-encoded (\u2298 advertising `zo ne` for a declared `zo\\nne`; \u2298 provider text reshaping the prompt or the warnings)", () => {
+    const keys = ["zo\nne", "rack\u202Eunit", "ro\u200Ble", "\u200B", "zone"];
+    const listed = knownKeysList(keys);
+
+    expect(listed).toBe("zo%0Ane, rack%E2%80%AEunit, ro%E2%80%8Ble, %E2%80%8B, zone, name");
+    expect(listed).not.toMatch(/[\n\u202E\u200B]/);
+    expectEveryListedKeyAccepted(listed, keys);
+  });
+
+  // Codex on #164 — the filter syntax is a URL query string (URLSearchParams), so
+  // `&` and `=` split a typed key and `+` / `%xx` decode. Such a key still works
+  // typed percent-encoded (`a%2Bb=x` reads back as `a+b`), so it is listed that
+  // way rather than hidden; surrounding space, case and `tag` need no encoding.
+  it("knownKeysList lists a key the filter syntax would misread by its percent-encoded spelling, and keeps plain keys plain (\u2298 advertising `a&b`, which types as two keys; \u2298 hiding `a+b`, which works as `a%2Bb`)", () => {
+    const keys = ["a&b", "a=b", "a+b", "a%20b", " zone ", "tag", "Name"];
+    const listed = knownKeysList(keys);
+
+    expect(listed).toBe("a%26b, a%3Db, a%2Bb, a%2520b, zone, tag, Name");
+    expectEveryListedKeyAccepted(listed, keys);
+  });
+
+  it("knownKeysList leaves out only a key no spelling can express, without throwing (\u2298 a whitespace-only key shown as an empty slot; \u2298 a lone surrogate crashing the prompt through `encodeURIComponent`)", () => {
+    const keys = ["   ", "\uD800", "zone"];
+
+    expect(knownKeysList(keys)).toBe("zone, name");
+  });
+
+  // Codex on #164 — the list is joined with ", ", so a key holding a comma would
+  // read as two keys; and a key made only of ZWJ, variation selectors, tag
+  // characters or combining marks would be an entry nobody can see. Neither is
+  // plain ASCII, so both are shown encoded.
+  it("knownKeysList shows a key holding a comma percent-encoded, so each listed entry is one key (\u2298 `rack, zone` reading as two keys)", () => {
+    const keys = ["rack, zone", "a,b", "zone"];
+    const listed = knownKeysList(keys);
+
+    expect(listed).toBe("rack%2C%20zone, a%2Cb, zone, name");
+    expect(listed.split(", ")).toHaveLength(keys.length + 1);
+    expectEveryListedKeyAccepted(listed, keys);
+  });
+
+  it("knownKeysList shows a key with no visible character percent-encoded (\u2298 a ZWJ, variation selector, tag characters or a lone combining mark listed as an invisible entry)", () => {
+    const keys = ["\u200D", "\uFE0F", "\u{E0067}\u{E0062}", "\u0301", "zone"];
+    const listed = knownKeysList(keys);
+
+    expect(listed).toBe("%E2%80%8D, %EF%B8%8F, %F3%A0%81%A7%F3%A0%81%A2, %CC%81, zone, name");
+    expectEveryListedKeyAccepted(listed, keys);
+  });
+
+  // Codex on #164 — a Hangul Filler (U+3164) or Braille blank (U+2800) is a
+  // "letter" or "symbol" that renders blank, and a key such as `\u2014 key` collides
+  // with the prompt's own " \u2014 " separator. Rather than chase such cases one
+  // predicate at a time, anything beyond plain ASCII is shown encoded.
+  it("knownKeysList shows every key beyond plain ASCII percent-encoded, visible or not (\u2298 a blank-rendering Hangul Filler or Braille blank; \u2298 `\u2014 key` blending into the prompt's \u2014 separator)", () => {
+    const keys = [
+      "caf\u00e9",
+      "\u{1F469}\u200D\u{1F4BB}",
+      "\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}",
+      "\u3164",
+      "\u2800",
+      "\u2014 key",
+      // `encodeURIComponent` leaves these ASCII marks unescaped (Codex on #164);
+      // the encoded spelling escapes them too, so "percent-encoded" means exactly that.
+      "!",
+      "a*b",
+      "(x)",
+      "~t",
+      "it's"
+    ];
+    const listed = knownKeysList(keys);
+
+    expect(listed).toBe(
+      [
+        "caf%C3%A9",
+        "%F0%9F%91%A9%E2%80%8D%F0%9F%92%BB",
+        "%F0%9F%8F%B4%F3%A0%81%A7%F3%A0%81%A2%F3%A0%81%B3%F3%A0%81%A3%F3%A0%81%B4%F3%A0%81%BF",
+        "%E3%85%A4",
+        "%E2%A0%80",
+        "%E2%80%94%20key",
+        "%21",
+        "a%2Ab",
+        "%28x%29",
+        "%7Et",
+        "it%27s",
+        "name"
+      ].join(", ")
+    );
+    expect(listed).not.toMatch(/[^\x21-\x7E ]/); // nothing but printable ASCII and the list's own spaces
+    expectEveryListedKeyAccepted(listed, keys);
+  });
+
+  it("knownKeysList shows plain-ASCII keys (letters, digits, `_`, `.`, `-`) exactly as declared (\u2298 encoding a key that needs none)", () => {
+    expect(knownKeysList(["site", "ip6", "if_name", "dns.name", "sub-net"])).toBe("site, ip6, if_name, dns.name, sub-net, name");
+  });
+
+  it("every built-in provider's key list renders exactly as declared (\u2298 a display rule that alters NetBox, EVE-NG, Proxmox or GNS3 keys)", () => {
+    const providers = createBuiltInProviders();
+    expect(providers.map((p) => p.id)).toEqual(["netbox", "eve-ng", "proxmox", "gns3"]);
+    for (const provider of providers) {
+      expect(provider.attributeKeys, provider.id).toBeDefined();
+      expect(knownKeysList(provider.attributeKeys!), provider.id).toBe(provider.attributeKeys!.join(", "));
+    }
   });
 });

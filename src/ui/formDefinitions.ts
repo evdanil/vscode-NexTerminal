@@ -9,7 +9,14 @@ import { computePoolSize } from "../services/networkServers/dhcp/engine/dhcpNetw
 // the settings, and both surfaces seed themselves from it rather than each
 // re-deriving a CIDR out of a mask.
 import { DHCP_CIDR_FIELD_KEY, dhcpCurrentCidr } from "../commands/networkServerSettings";
-import type { InventoryConfigField, InventoryProvider, InventorySourceConfig, InventorySourceValues, TemplateRule } from "../models/inventory";
+import {
+  flattenProviderText,
+  type InventoryConfigField,
+  type InventoryProvider,
+  type InventorySourceConfig,
+  type InventorySourceValues,
+  type TemplateRule
+} from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
 import type { LocalServerConfig } from "../models/localServer";
@@ -1572,14 +1579,44 @@ export const DEVICE_TEMPLATE_CREATE_SENTINEL = "__create__deviceTemplate";
 
 /**
  * SAVED FILTER DEFINITIONS (issue #48 PR-E) — the provider config-field id the
- * saved-filter picker fills. NetBox's Device Filter is `filter`; the picker only
- * renders for a provider that declares a config field with this id, and fills
- * that field's prefixed form key (`inventoryConfigFieldPrefixedKey("filter")`).
+ * saved-filter picker fills. The picker only renders for a provider that declares
+ * a config field with this id, and fills that field's prefixed form key
+ * (`inventoryConfigFieldPrefixedKey("filter")`).
  */
 export const SAVED_FILTER_TARGET_FIELD_ID = "filter";
+
+/** The field the saved-filter picker fills, and the name composed text calls it by. */
+export interface SavedFilterTarget {
+  field: InventoryConfigField;
+  /** `field.label`, inert — see `savedFilterTarget`. Compose with this, never `field.label`. */
+  label: string;
+}
+
+/**
+ * The provider config field the saved-filter picker fills, or `undefined` when the
+ * provider has none — and then the form renders no picker. Every string about the
+ * picker names this field by the provider's own label, because each provider titles
+ * it its own way (issue #152: "Device Filter" was shown on forms whose field is a
+ * Lab or Project Filter).
+ *
+ * `label` comes back already through `flattenProviderText`: a provider registered
+ * through the public API supplies it, and it is spliced into sentences this
+ * extension writes (the picker hint, the "Save current filter as…" warning), so a
+ * line break or bidi control in it must not reshape them. Sanitizing here, where
+ * the label enters, is what keeps a future composing site from forgetting to.
+ * A label with nothing visible left falls back to a neutral "filter field".
+ *
+ * P8 — gated on field TYPE, not just id: the picker writes a filter STRING into
+ * its target, so it may only attach to a string field. A third-party provider that
+ * named a boolean / password / number / select field `filter` gets no picker.
+ */
+export function savedFilterTarget(provider: InventoryProvider): SavedFilterTarget | undefined {
+  const field = provider.configFields.find((f) => f.id === SAVED_FILTER_TARGET_FIELD_ID && f.type === "string");
+  return field === undefined ? undefined : { field, label: flattenProviderText(field.label) || "filter field" };
+}
 /** The picker's own form key. NOT a persisted source field — `parseSourceFormValues`
  *  and `formValuesToProviderConfig` never read it, so it is a pure picker whose
- *  only effect is filling the Device Filter field via autofill. */
+ *  only effect is filling the provider's filter field. */
 export const SAVED_FILTER_SELECT_KEY = "savedFilter";
 /** "Save current filter as…" — the `__create__` sentinel (formHtml routes any
  *  option whose value starts with `__create__` to the inline-create handler). */
@@ -1587,14 +1624,14 @@ export const SAVED_FILTER_SAVE_CURRENT_SENTINEL = "__create__savedFilter";
 
 /**
  * SAVED FILTER DEFINITIONS (issue #48 PR-E) — the "Saved Filter" picker rendered
- * directly above the Device Filter field. Reuses PR-F1's filterable select and
- * fills the Device Filter field SYNCHRONOUSLY in the webview (`fillTarget` +
- * per-option `fillValue`): picking a saved filter copies its raw query string
- * straight into `cfg_filter` before Save can be clicked, and the trailing
- * "Save current filter as…" sentinel routes to `onCreateInline`, which saves the
- * current Device Filter text as a named definition. Rendered even with zero saved
- * filters — the empty state is constructive (the "Save current filter as…" row is
- * always offered), never a dead-end.
+ * directly above the provider's filter field (`savedFilterTarget`), whose
+ * sanitized label the hint names. Reuses PR-F1's filterable select and fills that field
+ * SYNCHRONOUSLY in the webview (`fillTarget` + per-option `fillValue`): picking a
+ * saved filter copies its raw text straight into `cfg_filter` before Save can be
+ * clicked, and the trailing "Save current filter as…" sentinel routes to
+ * `onCreateInline`, which saves the field's current text as a named definition.
+ * Rendered even with zero saved filters — the empty state is constructive (the
+ * "Save current filter as…" row is always offered), never a dead-end.
  *
  * FIX B (PR #64 Codex review round 2) — the fill is synchronous, NOT the async
  * `autofill` round trip it used to be. The old round trip (`onAutofill` →
@@ -1606,7 +1643,7 @@ export const SAVED_FILTER_SAVE_CURRENT_SENTINEL = "__create__savedFilter";
  * re-resolves the picker id at submit). (None) has no `fillValue` (no-op, never
  * clears); the save-current sentinel has none (inline-create, never a fill).
  */
-function savedFilterSelectField(savedFilters: SavedFilterDefinition[] | undefined): FormFieldDescriptor {
+function savedFilterSelectField(savedFilters: SavedFilterDefinition[] | undefined, targetLabel: string): FormFieldDescriptor {
   const list = savedFilters ?? [];
   return {
     type: "select",
@@ -1615,7 +1652,7 @@ function savedFilterSelectField(savedFilters: SavedFilterDefinition[] | undefine
     // Grows with the library — filterable, with (None) pinned top and the save
     // affordance pinned bottom, same as the auth-profile / device-template selects.
     filterable: true,
-    // Synchronous fill into the Device Filter field — no `autofill` round trip
+    // Synchronous fill into the provider's filter field — no `autofill` round trip
     // (FIX B). `fillTarget` is the prefixed form key the picker writes; each real
     // option below carries its raw `fillValue` (the query string, `""` included).
     fillTarget: inventoryConfigFieldPrefixedKey(SAVED_FILTER_TARGET_FIELD_ID),
@@ -1628,7 +1665,7 @@ function savedFilterSelectField(savedFilters: SavedFilterDefinition[] | undefine
     // a link to a definition, so there is no id to pre-select. This is a
     // pick-to-fill control, not a stored value.
     value: "",
-    hint: "Pick a saved filter to fill the Device Filter below, or save the current one for reuse on other sources."
+    hint: `Pick a saved filter to fill the ${targetLabel} below, or save the current one for reuse on other sources.`
   };
 }
 
@@ -1771,6 +1808,7 @@ export function inventorySourceFormDefinition(
   const isEdit = Boolean(seed);
   const existingSecretFieldIds = new Set(seed?.secretFieldIds ?? []);
   const existingConfig = seed?.config ?? {};
+  const filterTarget = savedFilterTarget(provider);
 
   // A seeded id whose profile is gone must seed as `(None)`, not merely LOOK
   // like it. `renderField`'s select case resolves the displayed LABEL by
@@ -1904,20 +1942,13 @@ export function inventorySourceFormDefinition(
         hint: "What should happen when a device disappears from the source."
       },
       // Provider config fields, with the SAVED FILTER DEFINITIONS (PR-E) picker
-      // interleaved directly above the Device Filter field so the two read as one
-      // control. The picker renders only for a provider that declares a `filter`
-      // config field (NetBox does); other providers get their config fields
-      // unchanged, byte-for-byte.
-      //
-      // P8 — gated on field TYPE, not just id: the picker fills the target field
-      // with a filter STRING via autofill, so it may only attach to a text/string
-      // field. A third-party provider that happened to name a boolean / password /
-      // number / select field `filter` must not get a string autofill written at
-      // it. NetBox's `filter` is a `type: "string"` field, so this is a defensive
-      // no-op for the only provider that ships the picker today.
+      // interleaved directly above the provider's filter field so the two read as
+      // one control. The picker renders only for a provider whose
+      // `savedFilterTarget` exists (a string `filter` field — see P8 there); a
+      // provider without one gets its config fields unchanged, byte-for-byte.
       ...provider.configFields.flatMap((field) =>
-        field.id === SAVED_FILTER_TARGET_FIELD_ID && field.type === "string"
-          ? [savedFilterSelectField(savedFilters), inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds)]
+        field === filterTarget?.field
+          ? [savedFilterSelectField(savedFilters, filterTarget.label), inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds)]
           : [inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds)]
       )
     ]

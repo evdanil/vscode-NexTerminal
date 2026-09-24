@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CommandContext } from "../../src/commands/types";
 import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import type { InventoryProvider } from "../../src/models/inventory";
 
 /**
  * SAVED FILTER DEFINITIONS (issue #48 PR-E, backlog #1) — the manage command and
@@ -54,6 +55,24 @@ async function makeCore(): Promise<NexusCore> {
   return core;
 }
 
+/** A source form's provider, reduced to what the inline affordance reads: the
+ *  `filter` config field it saves from, under the label that provider gives it. */
+function providerWithFilterField(label: string, providerLabel = "Fixture"): InventoryProvider {
+  return {
+    id: `fixture-${label.toLowerCase().replace(/\W+/g, "-")}`,
+    label: providerLabel,
+    configFields: [{ id: "filter", label, type: "string" }],
+    testConnection: async () => undefined,
+    fetchInventory: async () => ({ nodes: [] }) as never
+  };
+}
+const DEVICE_FILTER_PROVIDER = providerWithFilterField("Device Filter", "NetBox-like");
+/** A provider whose source form has no filter field, so no Saved Filter picker (Proxmox's shape). */
+const NO_FILTER_PROVIDER: InventoryProvider = { ...DEVICE_FILTER_PROVIDER, id: "no-filter", label: "Proxmox-like", configFields: [] };
+/** The command only lists the registry's providers. */
+const registryOf = (...providers: InventoryProvider[]) =>
+  ({ list: () => providers }) as unknown as Parameters<typeof registerSavedFilterCommands>[1];
+
 describe("nexus.savedFilter.manage", () => {
   let core: NexusCore;
   let ctx: CommandContext;
@@ -63,7 +82,7 @@ describe("nexus.savedFilter.manage", () => {
     registeredCommands.clear();
     core = await makeCore();
     ctx = { core } as unknown as CommandContext;
-    registerSavedFilterCommands(ctx);
+    registerSavedFilterCommands(ctx, registryOf(DEVICE_FILTER_PROVIDER, NO_FILTER_PROVIDER));
   });
 
   it("empty state offers 'New Saved Filter' and, on accept, prompts name + query and saves it", async () => {
@@ -93,6 +112,80 @@ describe("nexus.savedFilter.manage", () => {
     const queryPrompt = String((mockShowInputBox.mock.calls[1][0] as { prompt: string }).prompt);
     expect(queryPrompt).not.toMatch(/NetBox/i);
     expect(queryPrompt.toLowerCase()).toContain("filter");
+  });
+
+  // Issue #152 — the same library feeds every provider's filter field, and only
+  // NetBox's takes a query string: on an EVE-NG or GNS3 source the text is a
+  // substring of a lab path or project name, which `role=…&site=…` never is.
+  it("offers no NetBox query as the filter-query example (⊘ placeHolder 'e.g. role=core-switch&site=syd')", async () => {
+    mockShowInformationMessage.mockResolvedValueOnce("New Saved Filter");
+    mockShowInputBox.mockResolvedValueOnce("Syd core");
+    mockShowInputBox.mockResolvedValueOnce("role=core");
+
+    await registeredCommands.get("nexus.savedFilter.manage")!();
+
+    const queryBox = mockShowInputBox.mock.calls[1][0] as { prompt?: string; placeHolder?: string };
+    expect(`${queryBox.prompt ?? ""} ${queryBox.placeHolder ?? ""}`).not.toMatch(/role=|site=/);
+  });
+
+  it("the empty state names no provider's field (⊘ 'next to a source's Device Filter' — EVE-NG and GNS3 forms have a Lab / Project Filter)", async () => {
+    mockShowInformationMessage.mockResolvedValueOnce(undefined); // dismissed
+
+    await registeredCommands.get("nexus.savedFilter.manage")!();
+
+    const emptyState = String(mockShowInformationMessage.mock.calls[0][0]);
+    expect(emptyState).toContain("No saved filters yet");
+    expect(emptyState).toContain("Save current filter as…");
+    expect(emptyState).not.toContain("Device Filter");
+  });
+
+  // Codex on #164 — Proxmox source forms have no filter field, so no picker. The
+  // empty state names the forms that do, from the registered providers, and a
+  // registry with none of them is not pointed at a picker at all.
+  it("the empty state points only at forms that have a Saved Filter picker, named from the registered providers (⊘ sending a Proxmox-only user to a picker their form never shows)", async () => {
+    const labLike = providerWithFilterField("Lab Filter", "Lab-like");
+    registeredCommands.clear();
+    registerSavedFilterCommands(ctx, registryOf(DEVICE_FILTER_PROVIDER, NO_FILTER_PROVIDER, labLike));
+    mockShowInformationMessage.mockResolvedValueOnce(undefined);
+
+    await registeredCommands.get("nexus.savedFilter.manage")!();
+
+    const emptyState = String(mockShowInformationMessage.mock.calls[0][0]);
+    expect(emptyState).toContain("NetBox-like and Lab-like source forms");
+    expect(emptyState).not.toContain("Proxmox-like");
+  });
+
+  // Codex on #164 — provider labels come from the public API; the sentence is ours.
+  it("the empty state makes each provider label inert and leaves out one with nothing visible (⊘ a label adding or reordering lines in the notification)", async () => {
+    registeredCommands.clear();
+    registerSavedFilterCommands(
+      ctx,
+      registryOf(
+        providerWithFilterField("Device Filter", "Net\nBox\u202E\u200B"),
+        providerWithFilterField("Lab Filter", "\u200B"),
+        providerWithFilterField("Project Filter", "GNS3-like")
+      )
+    );
+    mockShowInformationMessage.mockResolvedValueOnce(undefined);
+
+    await registeredCommands.get("nexus.savedFilter.manage")!();
+
+    const emptyState = String(mockShowInformationMessage.mock.calls[0][0]);
+    expect(emptyState).toContain("on Net Box and GNS3-like source forms");
+    expect(emptyState).not.toMatch(/[\n\u202E\u200B]/);
+  });
+
+  it("with only providers that have no filter field, the empty state offers no picker at all (⊘ a remedy the user's forms cannot show)", async () => {
+    registeredCommands.clear();
+    registerSavedFilterCommands(ctx, registryOf(NO_FILTER_PROVIDER));
+    mockShowInformationMessage.mockResolvedValueOnce(undefined);
+
+    await registeredCommands.get("nexus.savedFilter.manage")!();
+
+    const emptyState = String(mockShowInformationMessage.mock.calls[0][0]);
+    expect(emptyState).toContain("No saved filters yet");
+    expect(emptyState).not.toContain("Save current filter as");
+    expect(emptyState).not.toContain("picker");
   });
 
   it("editing a row re-prompts name + query (pre-filled) and updates in place, keeping the id", async () => {
@@ -148,7 +241,7 @@ describe("inline 'Save current filter as…' affordance (PR-E)", () => {
   }
 
   it("saves the CURRENT Device Filter text under a prompted name and appends it to the picker", async () => {
-    const controller = createInlineSavedFilterCreation({ core });
+    const controller = createInlineSavedFilterCreation({ core, provider: DEVICE_FILTER_PROVIDER });
     const panel = fakePanel();
     controller.attachPanel(panel as never);
     mockShowInputBox.mockResolvedValueOnce("Reusable");
@@ -174,7 +267,7 @@ describe("inline 'Save current filter as…' affordance (PR-E)", () => {
   });
 
   it("with no Device Filter typed yet, warns and saves NOTHING (kills saving an empty definition)", async () => {
-    const controller = createInlineSavedFilterCreation({ core });
+    const controller = createInlineSavedFilterCreation({ core, provider: DEVICE_FILTER_PROVIDER });
     const panel = fakePanel();
     controller.attachPanel(panel as never);
 
@@ -186,8 +279,53 @@ describe("inline 'Save current filter as…' affordance (PR-E)", () => {
     expect(core.getSnapshot().savedFilters).toHaveLength(0);
   });
 
+  // Issue #152 — the warning tells the user which field to type in, so it must
+  // be the field this form actually shows.
+  it("the nothing-typed warning names the form's OWN filter field (⊘ 'Type a Device Filter first' on a Project Filter form)", async () => {
+    const controller = createInlineSavedFilterCreation({ core, provider: providerWithFilterField("Project Filter") });
+    controller.attachPanel(fakePanel() as never);
+
+    controller.handleCreateInline(SAVED_FILTER_SELECT_KEY, { [filterKey]: "" });
+    await flush();
+
+    const warning = String(mockShowWarningMessage.mock.calls[0]?.[0]);
+    expect(warning).toContain("Project Filter");
+    expect(warning).not.toContain("Device Filter");
+  });
+
+  // Codex on #164 — the label comes from the provider, the sentence from us.
+  it("the nothing-typed warning makes the field label inert (⊘ a line break, bidi override or zero-width character from a provider's label reshaping the warning)", async () => {
+    const controller = createInlineSavedFilterCreation({ core, provider: providerWithFilterField("Project\nFilter\u202E\u200B") });
+    controller.attachPanel(fakePanel() as never);
+
+    controller.handleCreateInline(SAVED_FILTER_SELECT_KEY, { [filterKey]: "" });
+    await flush();
+
+    const warning = String(mockShowWarningMessage.mock.calls[0]?.[0]);
+    expect(warning.startsWith("Project Filter is empty")).toBe(true);
+    expect(warning).not.toMatch(/[\n\u202E\u200B]/);
+  });
+
+  // A provider with no filter field renders no picker, so a create that names the
+  // picker's key has no field behind it — neither a text to save nor a field to
+  // name in the warning. Proxmox is the built-in case.
+  it("does nothing for a provider with no filter field (⊘ a fallback that still prompts, saves, or warns about a field the form does not have)", async () => {
+    const controller = createInlineSavedFilterCreation({ core, provider: NO_FILTER_PROVIDER });
+    const panel = fakePanel();
+    controller.attachPanel(panel as never);
+
+    controller.handleCreateInline(SAVED_FILTER_SELECT_KEY, { [filterKey]: "role=core" });
+    controller.handleCreateInline(SAVED_FILTER_SELECT_KEY, { [filterKey]: "" });
+    await flush();
+
+    expect(mockShowInputBox).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    expect(core.getSnapshot().savedFilters).toHaveLength(0);
+    expect(panel.addSelectOption).not.toHaveBeenCalled();
+  });
+
   it("ignores a create fired by a DIFFERENT select's key (kills a handler that fires on any create)", async () => {
-    const controller = createInlineSavedFilterCreation({ core });
+    const controller = createInlineSavedFilterCreation({ core, provider: DEVICE_FILTER_PROVIDER });
     const panel = fakePanel();
     controller.attachPanel(panel as never);
 
@@ -199,7 +337,7 @@ describe("inline 'Save current filter as…' affordance (PR-E)", () => {
   });
 
   it("cancelling the name prompt saves nothing", async () => {
-    const controller = createInlineSavedFilterCreation({ core });
+    const controller = createInlineSavedFilterCreation({ core, provider: DEVICE_FILTER_PROVIDER });
     const panel = fakePanel();
     controller.attachPanel(panel as never);
     mockShowInputBox.mockResolvedValueOnce(undefined); // cancelled
@@ -233,7 +371,7 @@ describe("FIX A — saved-filter mutations serialize under configMutationLock", 
     registeredCommands.clear();
     core = await makeCore();
     ctx = { core } as unknown as CommandContext;
-    registerSavedFilterCommands(ctx);
+    registerSavedFilterCommands(ctx, registryOf(DEVICE_FILTER_PROVIDER, NO_FILTER_PROVIDER));
   });
 
   /** Acquire the lock and hold it until the returned `release` is called — a
@@ -288,7 +426,7 @@ describe("FIX A — saved-filter mutations serialize under configMutationLock", 
   });
 
   it("inline 'Save current filter as…' does not land while the lock is held, then lands on release", async () => {
-    const controller = createInlineSavedFilterCreation({ core });
+    const controller = createInlineSavedFilterCreation({ core, provider: DEVICE_FILTER_PROVIDER });
     const panel = { addSelectOption: vi.fn(), onDidDispose: vi.fn(), dispose: vi.fn() };
     controller.attachPanel(panel as never);
     const { held, release } = holdLock();

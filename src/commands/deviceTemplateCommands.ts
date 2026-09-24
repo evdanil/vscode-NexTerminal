@@ -9,6 +9,7 @@ import {
   parseTemplateFilter,
   planManualTemplateApply,
   TEMPLATE_FIELD_SHORT_LABELS,
+  knownKeysList,
   unknownFilterKeys,
   type ManualApplyPlan,
   type TemplatableField
@@ -734,11 +735,24 @@ async function pickRuleTemplate(ctx: CommandContext, seedTemplateId: string | un
   return pick.template;
 }
 
+/**
+ * The filter InputBox's prompt: the keys the source's own provider reports, then
+ * the syntax. Issue #152 — it used to list NetBox's keys on every source,
+ * advertising keys that the live feedback below then flags as never matching. The
+ * list comes from `knownKeysList`, the same one the feedback prints, so it includes
+ * `name` — the key the example uses, which every provider matches on. A provider
+ * that declares no list has its filters checked against none, so none is shown.
+ */
+function ruleFilterPrompt(attributeKeys: readonly string[] | undefined): string {
+  const syntax = "key=value, conditions joined with &, e.g. name=core-*";
+  return attributeKeys !== undefined ? `Keys: ${knownKeysList(attributeKeys)} — ${syntax}` : `Filter by ${syntax}`;
+}
+
 /** UX-S2 — the filter InputBox with live, severity-graded feedback via the validation channel. Returns the raw entered filter, or undefined on cancel. */
 async function promptRuleFilter(seed: string | undefined, attributeKeys: readonly string[] | undefined): Promise<string | undefined> {
   return vscode.window.showInputBox({
     title: "Rule Filter",
-    prompt: "Keys: role, site, location, rack, tenant, status, platform, tag, name — e.g. role=switch&site=syd",
+    prompt: ruleFilterPrompt(attributeKeys),
     value: seed ?? "",
     ignoreFocusOut: true,
     validateInput: (input) => {
@@ -816,9 +830,8 @@ async function saveTemplateRules(
     if (unknown.length > 0) {
       // U2 — carry §2.2's actionable "Known keys: …" clause the live-feedback path
       // (templateRulesView.filterFeedback) already shows; the save-time toast must too.
-      const known = (attributeKeys ?? []).join(", ");
       void vscode.window.showWarningMessage(
-        `Rule "${filterLabel(changedRule.filter)}": key '${unknown[0]}' is not one this source's provider reports — this rule will never match. Known keys: ${known}`
+        `Rule "${filterLabel(changedRule.filter)}": key '${unknown[0]}' is not one this source's provider reports — this rule will never match. Known keys: ${knownKeysList(attributeKeys ?? [])}`
       );
     }
   }

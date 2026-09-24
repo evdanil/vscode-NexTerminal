@@ -98,6 +98,16 @@ describe("filterFeedback — live InputBox severities (§7.2 UX-S2)", () => {
     expect(fb.message).toContain("Known keys: role, site");
   });
 
+  // Issue #163 (item 1) — `name` is always accepted, so it is always a known key.
+  it.each([
+    [["zone"], "Known keys: zone, name"],
+    [[], "Known keys: name"]
+  ])("the Known keys list for %j includes `name` even when the provider leaves it out (⊘ the declared list joined as-is — an empty 'Known keys: ')", (keys, expected) => {
+    const fb = filterFeedback("rack=1", keys as string[]);
+    expect(fb.message).toContain(expected);
+    expect(fb.message).not.toMatch(/Known keys: $/);
+  });
+
   it("bare name=* → Info zero-specificity note (§2.3 m9b)", () => {
     const fb = filterFeedback("name=*", NETBOX_KEYS);
     expect(fb.severity).toBe("info");
