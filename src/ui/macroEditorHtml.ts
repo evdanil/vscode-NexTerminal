@@ -429,8 +429,10 @@ export function renderMacroEditorHtml(
     <!-- B1 (issue #48 PR-B) — a legacy ipmitool macro defaults to Session terminal
          (absent runIn), which types the command into the connected SSH session, so
          it runs on the REMOTE host. Non-blocking hint (does NOT disable Save); shown
-         only while Run in = Session terminal AND the text looks like ipmitool. -->
-    <div class="hint" id="session-ipmitool-hint" style="display:none;">This looks like an ipmitool command. "Session terminal" types it into the connected SSH session, so it runs on the remote host. Choose "Local terminal" to run it from this machine, then tick "Provide IPMI credentials" to supply the BMC password.</div>
+         only while Run in = Session terminal AND the text looks like ipmitool.
+         #151 — worded to be true for every password flag rather than detecting
+         one: the checkbox only helps -E, and -a prompts on its own. -->
+    <div class="hint" id="session-ipmitool-hint" style="display:none;">This looks like an ipmitool command. "Session terminal" types it into the connected SSH session, so it runs on the remote host. Choose "Local terminal" to run it from this machine. To have Nexus supply the BMC password, use <code>-E</code> and tick "Provide IPMI credentials"; with <code>-a</code>, ipmitool asks for it in the terminal.</div>
   </div>
 
   <!-- Issue #48 PR-C — "Run on": where a Local terminal macro's terminal actually

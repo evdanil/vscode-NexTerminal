@@ -479,9 +479,17 @@ command runs in a fresh local terminal.
 
 A macro that uses `${profile.ipmiHost}` or `${profile.ipmiUsername}` **without**
 the checkbox still runs. `ipmitool -E` then prompts or fails on its own, and the
-send confirmation tells you which switch is missing. Token usage is a hint, never
-an authorization: a macro's text is something anyone can write, so it can never
-be what decides that a stored password is handed over.
+send confirmation tells you which switch is missing. It says so only when
+something in the macro would read the password from the environment: ipmitool
+with `-E`, a command that uses `IPMI_PASSWORD` or `IPMITOOL_PASSWORD` itself, or
+another command that uses the IPMI tokens. An ipmitool command that gets its
+password another way is not told to tick it, because the checkbox would change
+nothing: `-P` and `-f` supply the password, `-a` makes ipmitool ask for it, and
+so does leaving out every password option on a command that reaches the BMC
+with `-H` — unless `-A NONE` turns authentication off, in which case no password
+is used at all. Token usage is a hint, never an authorization: a macro's text is
+something anyone can write, so it can never be what decides that a stored
+password is handed over.
 
 ### Upgrading an older IPMI macro
 
