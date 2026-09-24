@@ -54,4 +54,19 @@ describe("script-api.d.ts contract sync", () => {
     );
     expect(bundled.split(/\r?\n/, 1)[0]).toBe(BUNDLED_DTS_VERSION_HEADER);
   });
+
+  it("no @example in the shipped types ends a script with a top-level `return` (#155)", () => {
+    // ⊘ `if (!m) { log.warn(...); return; }` in waitFor's example: it runs,
+    // but under the seeded jsconfig.json (checkJs) a script copying it gets
+    // TS1108, "A 'return' statement can only be used within a function body".
+    const bundled = readFileSync(
+      path.join(REPO_ROOT, "src", "services", "scripts", "assets", "nexus-scripts.d.ts"),
+      "utf8"
+    );
+    const examples = [...bundled.matchAll(/@example\r?\n([\s\S]*?)\*\//g)].map((m) => m[1]);
+    expect(examples.length).toBeGreaterThan(0);
+    for (const example of examples) {
+      expect(example).not.toMatch(/\breturn\b/);
+    }
+  });
 });

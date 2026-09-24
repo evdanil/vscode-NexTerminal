@@ -13,12 +13,17 @@
 // `before` (the output between the previous cursor and this match).
 // On timeout it THROWS. Use `waitFor` if you'd rather get `null`.
 
-// The script only sees output that arrives after it starts, so the prompt
-// already on screen is invisible to it. `sendLine("")` presses Enter for a
-// fresh one. (Under Connect and Run Script… the run starts before the host has
-// printed its first prompt, so drop this line there — see the README.)
-await sendLine("");
-const ready = await expect(/[$#] $/);
+// The script only sees output that arrives after it starts. On a terminal that
+// is already open, the prompt is on screen and won't come again; under Connect
+// and Run Script… it usually arrives just after the start. So wait briefly for
+// it (`waitFor` returns null on timeout), and press Enter for a fresh one only
+// if none came — an Enter while the first prompt is on its way would leave a
+// spare prompt for a later wait to match too early.
+let ready = await waitFor(/[$#] $/, { timeout: 2_000 });
+if (!ready) {
+  await sendLine("");
+  ready = await expect(/[$#] $/);
+}
 log.info("shell ready — prompt ends with", JSON.stringify(ready.text));
 
 // `sendLine(text)` writes `text` + "\r" to the session — same effect as the

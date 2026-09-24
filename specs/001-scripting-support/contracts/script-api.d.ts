@@ -1,4 +1,4 @@
-// Nexus Scripts API types — v8
+// Nexus Scripts API types — v9
 /**
  * Nexus Terminal — Scripts API
  *
@@ -180,7 +180,11 @@ declare global {
    *
    * @example
    *   const m = await waitFor(/Login: $/, { timeout: 10_000 });
-   *   if (!m) { log.warn("no login prompt"); return; }
+   *   if (m) {
+   *     await sendLine("admin");
+   *   } else {
+   *     log.warn("no login prompt");
+   *   }
    */
   function waitFor(pattern: string | RegExp, opts?: WaitOptions): Promise<Match | null>;
 

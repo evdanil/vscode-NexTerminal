@@ -32,6 +32,24 @@ vi.mock("vscode", async () => {
         this.fn();
       }
     },
+    CancellationTokenSource: class MockCancellationTokenSource {
+      private readonly listeners = new Set<() => void>();
+      public readonly token = {
+        isCancellationRequested: false,
+        onCancellationRequested: (l: () => void) => {
+          this.listeners.add(l);
+          return { dispose: () => this.listeners.delete(l) };
+        }
+      };
+      public cancel(): void {
+        if (this.token.isCancellationRequested) return;
+        this.token.isCancellationRequested = true;
+        for (const l of Array.from(this.listeners)) l();
+      }
+      public dispose(): void {
+        this.listeners.clear();
+      }
+    },
     Uri: {
       file: (p: string) => ({ fsPath: p, scheme: "file", authority: "", path: p, toString: () => p }),
       joinPath: (base: { fsPath: string }, ...parts: string[]) => ({
@@ -638,6 +656,51 @@ describe("ScriptRuntimeManager — unit fakes", () => {
     expect(vscode.window.showErrorMessage).toHaveBeenCalledWith(
       expect.stringContaining("targets SSH sessions")
     );
+  });
+
+  it("a target refusal names the session it was handed, and never claims a focused terminal (#155)", async () => {
+    // ⊘ "…but the focused terminal is …": an explicit session reaches this
+    // check from Quick Run AND from Connect/Open and Run Script…, where the
+    // session is the one the command just opened and nothing was focused.
+    // The runtime cannot tell the two apart, so the refusal must be true for both.
+    const vscode = await import("vscode");
+    const showError = vscode.window.showErrorMessage as unknown as ReturnType<typeof vi.fn>;
+
+    const typeMismatch = await createLocalHarness(`/**\n * @nexus-script\n * @name Probe\n * @target-type ssh\n */\n`);
+    await typeMismatch.manager.runScript(typeMismatch.scriptUri as never, "test-local-session");
+    const typeMessage = String(showError.mock.calls.at(-1)?.[0]);
+    expect(typeMessage).toContain('"Probe" targets SSH sessions');
+    expect(typeMessage).toContain("Nexus Local Shell: Dev");
+    expect(typeMessage).toContain("Local Shell");
+    expect(typeMessage).not.toContain("focused terminal");
+
+    const profileMismatch = await createHarness(`/**\n * @nexus-script\n * @name Probe\n * @target-profile lab-router-a\n */\n`);
+    const runId = await profileMismatch.manager.runScript(profileMismatch.scriptUri as never, "test-session");
+    expect(runId).toBeUndefined();
+    const profileMessage = String(showError.mock.calls.at(-1)?.[0]);
+    expect(profileMessage).toContain('"Probe" targets profile "lab-router-a"');
+    expect(profileMessage).toContain("test-terminal");
+    expect(profileMessage).not.toContain("focused terminal");
+  });
+
+  it("an explicit session the runtime cannot find is reported, not a silent no-op (#155)", async () => {
+    // ⊘ `if (!target) return undefined` for an explicit session id: that is
+    // how Quick Run on a focused Local Server terminal did nothing and said
+    // nothing, and how Connect and Run Script… still would if the session
+    // closed between registering and the run starting. (Cancelling the
+    // session PICKER stays silent — that is the user's own choice.)
+    const vscode = await import("vscode");
+    const h = await createHarness(`/**\n * @nexus-script\n * @name Probe\n */\n`);
+
+    const runId = await h.manager.runScript(h.scriptUri as never, "session-that-is-gone");
+
+    expect(runId).toBeUndefined();
+    expect(h.manager.getRuns()).toHaveLength(0);
+    expect(h.worker.posted).toHaveLength(0);
+    expect(vscode.window.showErrorMessage).toHaveBeenCalledTimes(1);
+    const message = String((vscode.window.showErrorMessage as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+    expect(message).toContain('"Probe" did not run');
+    expect(message).toContain("session could not be found");
   });
 
   it("releases input-lock when a Local Shell session is deregistered during a run", async () => {
@@ -1360,5 +1423,288 @@ describe("ScriptRuntimeManager — nexus.include plumbing", () => {
     } finally {
       await cleanup();
     }
+  });
+});
+
+// -----------------------------------------------------------------------------
+// #155 — a prompt / confirm / alert must not outlive the run that asked. The
+// run can end under an open dialog (stopped, its session dropped, or the
+// script finished or threw without awaiting it). VS Code can close an input
+// box (it takes a CancellationToken) but not a modal message; whatever the
+// user answers after the run ended must reach nobody, and must be said to.
+// -----------------------------------------------------------------------------
+
+describe("ScriptRuntimeManager — dialogs do not outlive their run (#155)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  type Token = { isCancellationRequested: boolean; onCancellationRequested(l: () => void): unknown };
+
+  function resultFor(h: Harness, id: number): WorkerInbound | undefined {
+    return h.worker.posted.find((m) => m.kind === "rpc-result" && (m as { id: number }).id === id);
+  }
+
+  const endings: Array<[string, (h: Harness) => Promise<void>]> = [
+    ["stopped", async (h) => h.manager.stopScript("test-session")],
+    [
+      "connection-lost",
+      async (h) => {
+        h.core.removeSession();
+        h.core.emitChange();
+        await new Promise((r) => setTimeout(r, 250));
+      }
+    ],
+    // The script finished (or threw) without awaiting its prompt().
+    ["completed", async (h) => h.worker.emit({ kind: "complete" })],
+    ["failed", async (h) => h.worker.emit({ kind: "failed", error: { message: "boom" } })]
+  ];
+
+  it.each(endings)("an open prompt input box is closed when the run ends — %s", async (_label, endRun) => {
+    // ⊘ showInputBox called without a CancellationToken (the box stays on
+    // screen, its answer addressed to a worker that is gone), or a token
+    // cancelled only by stopScript — which misses a dropped session and a
+    // script that ended on its own.
+    const vscode = await import("vscode");
+    let token: Token | undefined;
+    let called = false;
+    vi.mocked(vscode.window.showInputBox).mockImplementationOnce(((_opts: unknown, t?: Token) => {
+      called = true;
+      token = t;
+      return new Promise<string | undefined>((resolve) => t?.onCancellationRequested(() => resolve(undefined)));
+    }) as never);
+    const h = await createHarness(`/**\n * @nexus-script\n * @name Asker\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+
+    h.worker.emit({ kind: "rpc", id: 1, method: "prompt", args: ["Image?"] });
+    await waitFor(() => called);
+    expect(token).toBeDefined();
+    expect(token!.isCancellationRequested).toBe(false);
+
+    await endRun(h);
+    await waitNextTick();
+
+    expect(token!.isCancellationRequested).toBe(true);
+    // Closing the box ourselves is not an answer: nothing is posted to the
+    // worker for it, and the user is not told an answer was ignored.
+    expect(resultFor(h, 1)).toBeUndefined();
+    expect(vscode.window.showWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["confirm", "showInformationMessage", "OK"],
+    ["alert", "showInformationMessage", "OK"],
+    // An input box answered in the same moment the run ended.
+    ["prompt", "showInputBox", "typed a moment too late"]
+  ] as const)("%s: an answer given after the run ended is never delivered, and the user is told it was ignored", async (method, api, answer) => {
+    // ⊘ posting the late answer as an rpc-result (what the runtime did): the
+    // answer belongs to a run that is over, and a worker that is still ending
+    // (stopScript waits up to 100 ms for it) would run the continuation the
+    // script left on the dialog — a sendLine included.
+    // ⊘ dropping it silently: a click on OK would read as "the script carried on".
+    const vscode = await import("vscode");
+    let answerNow: (v: string) => void = () => {};
+    let shown = false;
+    vi.mocked(vscode.window[api]).mockImplementationOnce((() => {
+      shown = true;
+      // A modal message has no token to honour; the late input box models the
+      // user pressing Enter as the run ends.
+      return new Promise<string>((resolve) => {
+        answerNow = resolve;
+      });
+    }) as never);
+    const h = await createHarness(`/**\n * @nexus-script\n * @name Asker\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+
+    h.worker.emit({ kind: "rpc", id: 7, method, args: ["Insert the USB stick"] });
+    await waitFor(() => shown);
+    await h.manager.stopScript("test-session");
+    answerNow(answer);
+    await waitFor(
+      () => resultFor(h, 7) !== undefined || vi.mocked(vscode.window.showWarningMessage).mock.calls.length > 0
+    );
+
+    expect(resultFor(h, 7)).toBeUndefined();
+    const warning = String(vi.mocked(vscode.window.showWarningMessage).mock.calls[0][0]);
+    expect(warning).toContain('"Asker"');
+    expect(warning).toContain("Insert the USB stick");
+    expect(warning).toContain("ignored");
+    // The answer itself is never echoed — it may be a password.
+    expect(warning).not.toContain(answer);
+    expect(h.output.some((l) => l.includes(`${method} answered after the run ended`))).toBe(true);
+  });
+
+  it("a dialog a finished run asks for afterwards is never shown, and the request is refused as Stopped", async () => {
+    // ⊘ serving an RPC that arrives after the run ended. The worker is ended
+    // with its run now, but a message it posted before that still arrives
+    // (Node delivers what was already queued), so a timer the script left
+    // behind can still reach the host asking for prompt(). Showing that
+    // dialog is a question on behalf of a run that is over.
+    const vscode = await import("vscode");
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    h.worker.emit({ kind: "complete" });
+
+    h.worker.emit({ kind: "rpc", id: 3, method: "prompt", args: ["Still there?"] });
+    h.worker.emit({ kind: "rpc", id: 4, method: "confirm", args: ["Still there?"] });
+    await waitFor(() => resultFor(h, 3) !== undefined && resultFor(h, 4) !== undefined);
+
+    expect(vscode.window.showInputBox).not.toHaveBeenCalled();
+    expect(vscode.window.showInformationMessage).not.toHaveBeenCalled();
+    expect(resultFor(h, 3)).toMatchObject({ ok: false, error: { code: "Stopped" } });
+    expect(resultFor(h, 4)).toMatchObject({ ok: false, error: { code: "Stopped" } });
+  });
+
+  it("an answer given while the run is live still reaches the script", async () => {
+    // The guard above must not swallow the normal case.
+    const vscode = await import("vscode");
+    vi.mocked(vscode.window.showInputBox).mockImplementationOnce((async () => "ir1800.bin") as never);
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+
+    h.worker.emit({ kind: "rpc", id: 5, method: "prompt", args: ["Image?"] });
+    await waitFor(() => resultFor(h, 5) !== undefined);
+
+    expect(resultFor(h, 5)).toMatchObject({ ok: true, value: "ir1800.bin" });
+    expect(vscode.window.showWarningMessage).not.toHaveBeenCalled();
+  });
+});
+
+// -----------------------------------------------------------------------------
+// #155 review — a finished run must not act on its terminal. The worker's
+// parentPort listener keeps its thread alive after the script settles, so it
+// used to outlive every run that ended on its own (complete / failed): a timer
+// the script left behind could still send, after the run had released its
+// input lock and macro filter — and every such run leaked a Worker.
+// -----------------------------------------------------------------------------
+
+describe("ScriptRuntimeManager — a finished run cannot act on its terminal (#155)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function resultFor(h: Harness, id: number): WorkerInbound | undefined {
+    return h.worker.posted.find((m) => m.kind === "rpc-result" && (m as { id: number }).id === id);
+  }
+
+  it.each([
+    ["complete", { kind: "complete" }],
+    ["failed", { kind: "failed", error: { message: "boom" } }]
+  ] as const)("the worker is terminated when the script reports %s", async (_label, message) => {
+    // ⊘ ending the run on `complete` / `failed` without terminating the
+    // worker (only stop, a dropped session and deactivation used to).
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    expect(h.worker.terminated).toBe(false);
+
+    h.worker.emit(message as WorkerOutbound);
+
+    expect(h.worker.terminated).toBe(true);
+    expect(h.manager.getRuns()).toHaveLength(0);
+  });
+
+  it("the worker is terminated when it crashes", async () => {
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    for (const l of h.worker.errorListeners) l(new Error("worker blew up"));
+    expect(h.worker.terminated).toBe(true);
+  });
+
+  it.each(["send", "sendLine", "sendKey", "poll"] as const)(
+    "%s posted before the worker ended is refused, not written, once the run has ended",
+    async (method) => {
+      // ⊘ terminating the worker and nothing else: a message the worker had
+      // already posted is still delivered after terminate(), and would write
+      // to a terminal whose input lock and macro filter were just released.
+      const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+      await h.manager.runScript(h.scriptUri as never, "test-session");
+      h.worker.emit({ kind: "complete" });
+
+      const args = method === "poll" ? [{ send: "\r", until: "never", every: 50, timeout: 100 }] : method === "sendKey" ? ["enter"] : ["reload"];
+      h.worker.emit({ kind: "rpc", id: 9, method, args });
+      await waitFor(() => resultFor(h, 9) !== undefined);
+
+      expect(h.pty.writes).toEqual([]);
+      expect(resultFor(h, 9)).toMatchObject({ ok: false, error: { code: "Stopped" } });
+    }
+  );
+
+  it("a send arriving while a stop is still waiting for the worker to end is refused too", async () => {
+    // ⊘ guarding on `cleanedUp` alone: stopScript waits up to 100 ms for the
+    // worker to end before it cleans up, and a script can still reach the
+    // terminal in that window, after the user asked it to stop.
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    h.worker.terminate = () => new Promise<number>(() => {}); // a worker slow to end
+    const stopping = h.manager.stopScript("test-session");
+
+    h.worker.emit({ kind: "rpc", id: 11, method: "sendLine", args: ["reload"] });
+    await waitFor(() => resultFor(h, 11) !== undefined);
+
+    expect(h.pty.writes).toEqual([]);
+    expect(resultFor(h, 11)).toMatchObject({ ok: false, error: { code: "Stopped" } });
+    await stopping;
+  });
+
+  describe("a poll already running when its run ends sends nothing more (#155 review)", () => {
+    // ⊘ checking the run only when `poll` is dispatched: a poll already in
+    // its loop keeps ticking — cleanupRun does not reject a pending scan, so
+    // each `every` the scan times out and the loop sends again, to a session
+    // whose input lock and macro filter were released, or that a new run now
+    // owns. A stop has the same window while it waits up to 100 ms for the
+    // worker, before rejectAllPending runs.
+    const POLL = { send: "\r", until: "NEVER", every: 50, timeout: 5_000 };
+
+    async function startPolling(h: Harness): Promise<void> {
+      await h.manager.runScript(h.scriptUri as never, "test-session");
+      h.worker.emit({ kind: "rpc", id: 20, method: "poll", args: [POLL] });
+      await waitFor(() => h.pty.writes.length >= 2); // two live ticks
+    }
+
+    it("after the script completes", async () => {
+      const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+      await startPolling(h);
+      h.worker.emit({ kind: "complete" });
+      const atEnd = h.pty.writes.length;
+
+      await waitFor(() => resultFor(h, 20) !== undefined, 2_000);
+
+      expect(h.pty.writes).toHaveLength(atEnd);
+      expect(resultFor(h, 20)).toMatchObject({ ok: false, error: { code: "Stopped" } });
+    });
+
+    it("after a stop is requested, while the worker is slow to end", async () => {
+      const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+      await startPolling(h);
+      h.worker.terminate = () => new Promise<number>(() => {});
+      const stopping = h.manager.stopScript("test-session");
+      const atStop = h.pty.writes.length;
+
+      await stopping; // the whole ≤100 ms wait: two `every` intervals
+
+      expect(h.pty.writes).toHaveLength(atStop);
+    });
+
+    it("after a new run has started on the same session", async () => {
+      const h = await createHarness(`/**\n * @nexus-script\n * @name Second\n */\n`);
+      await startPolling(h);
+      h.worker.emit({ kind: "complete" });
+      const atEnd = h.pty.writes.length;
+      await h.manager.runScript(h.scriptUri as never, "test-session");
+      expect(h.manager.getRuns()).toHaveLength(1);
+
+      await new Promise((r) => setTimeout(r, 200)); // four `every` intervals
+
+      expect(h.pty.writes).toHaveLength(atEnd);
+    });
+  });
+
+  it("sends from a live run still reach the terminal", async () => {
+    // The guard must not swallow the normal case.
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    h.worker.emit({ kind: "rpc", id: 12, method: "sendLine", args: ["show version"] });
+    await waitFor(() => resultFor(h, 12) !== undefined);
+    expect(h.pty.writes).toEqual(["show version\r"]);
   });
 });

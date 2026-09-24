@@ -69,7 +69,7 @@ Graceful degradation — registers stub commands that warn "Nexus runtime featur
 - `scriptHeader.ts` — JSDoc header parser (`@nexus-script`, `@name`, `@target-type`, `@default-timeout`, `@lock-input`, `@allow-macros`).
 - `scriptTarget.ts` — session picker. Filters by `@target-type`, auto-selects on `@target-profile` match.
 - `scriptMacroFilter.ts` — per-session policy that gates macro firing during a script run.
-- `scriptTypesGenerator.ts` — writes `nexus-scripts.d.ts` + `jsconfig.json` into the workspace's scripts directory when a script is run (the `.d.ts` is rewritten only when its version marker changes; `jsconfig.json` whenever it differs) so IntelliSense/hovers work.
+- `scriptTypesGenerator.ts` — writes `nexus-scripts.d.ts` + `jsconfig.json` into the workspace's scripts directory when a script is run (the `.d.ts` is rewritten only when its version marker changes; `jsconfig.json` only when it is missing or an unedited pre-2.8.3 copy, so user edits survive) so IntelliSense/hovers work.
 - `assets/` — bundled `nexus-scripts.d.ts` + `jsconfig.json` copied by the esbuild step into `dist/services/scripts/assets/`.
 - UI surfaces: `src/ui/scriptTreeProvider.ts` (Scripts sidebar entry), `src/ui/scriptCodeLensProvider.ts` (inline ▶ Run / ◼ Stop), status bar item in `extension.ts:activate()`. Output Channel: `"Nexus Scripts"`.
 - Macro coordination: `MacroAutoTrigger` has `pushFilter(sessionId, filter)` / `bindObserverToSession(obs, id)` / `createObserver(..., sessionId?)` so scripts can suspend macros on their session without touching unrelated sessions.

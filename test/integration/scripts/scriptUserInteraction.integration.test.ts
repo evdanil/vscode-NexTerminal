@@ -24,6 +24,15 @@ vi.mock("vscode", () => ({
       this.fn();
     }
   },
+  // `prompt` hands its input box a token so the runtime can close the box
+  // when the run ends; these tests never end a run under an open box.
+  CancellationTokenSource: class MockCancellationTokenSource {
+    public readonly token = { isCancellationRequested: false, onCancellationRequested: () => ({ dispose: () => {} }) };
+    public cancel(): void {
+      this.token.isCancellationRequested = true;
+    }
+    public dispose(): void {}
+  },
   Uri: {
     file: (p: string) => ({ fsPath: p, scheme: "file", path: p, toString: () => p }),
     joinPath: (base: { fsPath: string }, ...parts: string[]) => ({
@@ -48,6 +57,7 @@ vi.mock("vscode", () => ({
   },
   window: {
     showErrorMessage: vi.fn(),
+    showWarningMessage: vi.fn(),
     showInformationMessage: vi.fn(async () => mockConfirmResponse),
     showInputBox: vi.fn(async (opts?: { password?: boolean }) => {
       if (opts?.password && mockInputResponse !== undefined) {
@@ -247,6 +257,62 @@ describe("scriptUserInteraction — prompt / confirm / alert", () => {
     );
     await manager.runScript({ fsPath: fixture } as never, "test-session");
     await waitFor(() => events.some((e) => e.kind === "log" && e.text === "resumed"), 3_000);
+    await fs.unlink(fixture).catch(() => {});
+  }, 10_000);
+
+  it("a confirm answered after its script finished runs none of the script's leftover code (#155)", async () => {
+    // ⊘ delivering the late answer to a worker that is still alive: it
+    // resolves the promise the script left behind, and the continuation —
+    // here a sendLine — writes to the terminal after the run ended and
+    // released its input lock and macro filter. Two things stop it now: the
+    // worker is ended with its run, and the answer is never posted.
+    const vscode = await import("vscode");
+    let answer: (v: string) => void = () => {};
+    vscode.window.showInformationMessage = vi.fn(
+      () => new Promise<string>((resolve) => {
+        answer = resolve;
+      })
+    ) as never;
+    const { manager, events, pty } = runtimeFixture();
+    const os = await import("node:os");
+    const fs = await import("node:fs/promises");
+    const fixture = path.join(os.tmpdir(), `nexus-confirm-late-${Date.now()}.js`);
+    await fs.writeFile(
+      fixture,
+      `/**\n * @nexus-script\n * @name Late\n */\nvoid confirm("Reload?").then((ok) => sendLine(ok ? "reload" : "keep"));\n`
+    );
+
+    await manager.runScript({ fsPath: fixture } as never, "test-session");
+    await waitFor(() => events.some((e) => e.kind === "ended"), 3_000);
+    answer("OK");
+    // Long enough for a wrongly delivered answer to round-trip through the worker.
+    await new Promise((r) => setTimeout(r, 300));
+
+    expect(pty.writes).toEqual([]);
+    expect(vscode.window.showWarningMessage).toHaveBeenCalledWith(expect.stringContaining("your answer was ignored"));
+    await fs.unlink(fixture).catch(() => {});
+  }, 10_000);
+
+  it("a timer a finished script left behind never reaches the terminal (#155)", async () => {
+    // ⊘ ending the run without ending its worker: the worker's message
+    // listener keeps the thread alive after the script body settles, so the
+    // timer fires and its sendLine writes "reload" to the terminal after the
+    // run released its input lock and macro filter.
+    const { manager, events, pty } = runtimeFixture();
+    const os = await import("node:os");
+    const fs = await import("node:fs/promises");
+    const fixture = path.join(os.tmpdir(), `nexus-leftover-timer-${Date.now()}.js`);
+    await fs.writeFile(
+      fixture,
+      `/**\n * @nexus-script\n * @name Leftover\n */\nsetTimeout(() => { void sendLine("reload"); }, 300);\n`
+    );
+
+    await manager.runScript({ fsPath: fixture } as never, "test-session");
+    await waitFor(() => events.some((e) => e.kind === "ended"), 3_000);
+    // Three times the timer's delay.
+    await new Promise((r) => setTimeout(r, 900));
+
+    expect(pty.writes).toEqual([]);
     await fs.unlink(fixture).catch(() => {});
   }, 10_000);
 });

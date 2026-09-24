@@ -91,7 +91,8 @@ vi.mock("vscode", () => ({
 }));
 
 import * as vscode from "vscode";
-import { registerScriptCommands } from "../../../src/commands/scriptCommands";
+import { SCRIPT_TEMPLATES, registerScriptCommands } from "../../../src/commands/scriptCommands";
+import { parseScriptHeader } from "../../../src/services/scripts/scriptHeader";
 import type { ScriptRuntimeManager } from "../../../src/services/scripts/scriptRuntimeManager";
 
 function makeManager(overrides: Partial<Record<string, unknown>> = {}): ScriptRuntimeManager {
@@ -185,7 +186,8 @@ describe("scriptCommands", () => {
       expect(body).toBeDefined();
       expect(body!).toMatch(/@nexus-script/);
       expect(body!).toMatch(/@name wait-send/);
-      expect(body!).toMatch(/await expect\(\s*\/login:/);
+      expect(body!).toMatch(/const LOGIN = \/login:/);
+      expect(body!).toMatch(/await waitFor\(LOGIN\b/);
       expect(body!).toMatch(/await sendLine\("admin"\)/);
     });
 
@@ -774,6 +776,118 @@ describe("scriptCommands", () => {
       const uri = { fsPath: "/ws/.nexus/scripts/foo.js", scheme: "file", toString: () => "/ws/.nexus/scripts/foo.js" };
       await handler(uri);
       expect(state.mockFsDelete).not.toHaveBeenCalled();
+    });
+
+    it("says the script goes to the Trash, not that deleting it cannot be undone (#155)", async () => {
+      // ⊘ "This cannot be undone." over a delete that moves the file to the
+      // Trash. The second half pins why the new wording is true: the delete
+      // asks for the Trash, and where there is none VS Code refuses the
+      // delete rather than falling back to a permanent one.
+      state.warningReturn = "Delete";
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.delete")!;
+      const uri = { fsPath: "/ws/.nexus/scripts/foo.js", scheme: "file", toString: () => "/ws/.nexus/scripts/foo.js" };
+      await handler(uri);
+
+      const [message, options] = state.mockShowWarningMessage.mock.calls[0] as [string, unknown];
+      expect(message).toContain("foo.js");
+      expect(message).toContain("Trash");
+      expect(message).not.toContain("cannot be undone");
+      expect(options).toEqual({ modal: true });
+      expect(state.mockFsDelete).toHaveBeenCalledWith(uri, { useTrash: true });
+    });
+  });
+
+  // #155 — the New Script templates are the first script most users run, so
+  // they must follow the scripting guide rather than contradict it.
+  describe("starter templates follow the scripting guide (#155)", () => {
+    const API_GLOBALS = [
+      "prompt", "confirm", "alert", "expect", "waitFor", "waitAny", "send", "sendLine",
+      "sendKey", "poll", "sleep", "tail", "log", "macros", "session", "nexus"
+    ];
+
+    function codeAfterHeader(body: string): string {
+      return body.slice(body.indexOf("*/") + 2);
+    }
+
+    function promptPatternOf(body: string): RegExp {
+      const m = body.match(/^const PROMPT = \/([^/\n]+)\/([a-z]*);$/m);
+      expect(m, "each template declares its prompt pattern once, as PROMPT").not.toBeNull();
+      return new RegExp(m![1], m![2]);
+    }
+
+    it.each(SCRIPT_TEMPLATES.map((t) => [t.label, t] as const))("%s: declares no local that shadows a script API global", (_label, template) => {
+      // ⊘ `const prompt = await expect(...)`: for the rest of the script
+      // `prompt(...)` is a Match object, not the dialog.
+      const declared = new RegExp(String.raw`\b(?:const|let|var)\s+(?:${API_GLOBALS.join("|")})\b`);
+      expect(template.body).not.toMatch(declared);
+    });
+
+    it.each(SCRIPT_TEMPLATES.map((t) => [t.label, t] as const))("%s: waits briefly for its first prompt and presses Enter only if none came", (_label, template) => {
+      // ⊘ opening with a plain wait: on an idle, already-open terminal the
+      // prompt was printed before the run started and never comes again, so
+      // the wait times out. ⊘ opening with an unconditional sendLine(""): when
+      // the first prompt is still on its way (Connect and Run Script… on SSH)
+      // the Enter leaves a spare prompt for a later wait to match too early.
+      // ⊘ telling the user to delete the Enter for one launch path: whether the
+      // prompt beats the run there is a race, not a property of the path.
+      // Plain string checks and single-quantifier patterns only: no nested or
+      // overlapping repetition (CodeQL js/redos).
+      const code = codeAfterHeader(template.body);
+      const head = code.match(/if \(!\(await waitFor\((\w+), \{ timeout: [\d_]+ \}\)\)\) \{\n/);
+      expect(head, "opening: if (!(await waitFor(P, { timeout: N }))) {").not.toBeNull();
+      const waitedFor = head![1];
+      const openingAt = code.indexOf(head![0]);
+      // The Enter, then the same wait made strict — and nothing else — inside the if.
+      const body = code.slice(openingAt + head![0].length).split("\n", 3).map((line) => line.trim());
+      expect(body[0]).toBe('await sendLine("");');
+      expect(body[1].startsWith(`await expect(${waitedFor}, `)).toBe(true);
+      expect(body[2]).toBe("}");
+      const firstWaitOrSend = code.search(/\bawait (?:expect|waitFor|waitAny|poll|sendLine|send|sendKey)\(/);
+      expect(firstWaitOrSend).toBe(openingAt + "if (!(".length);
+      expect(code).not.toMatch(/delete this line|remove (?:the|this) line/i);
+    });
+
+    it.each(
+      SCRIPT_TEMPLATES.filter((t) => t.body.includes("terminal length 0")).map((t) => [t.label, t] as const)
+    )("%s: waits for an IOS prompt, which has no trailing space", (_label, template) => {
+      // ⊘ /[$#] $/ in a template that sends Cisco commands: "Router#" never
+      // matches, so every wait times out.
+      const PROMPT = promptPatternOf(template.body);
+      expect(PROMPT.test("\r\nRouter#")).toBe(true);
+      expect(PROMPT.test("\r\nRouter>")).toBe(true);
+      expect(PROMPT.test("\r\nswitch# ")).toBe(true);
+      // Every shell-prompt wait goes through PROMPT; the only other wait is a login prompt.
+      const waitArgs = [...template.body.matchAll(/\b(?:expect|waitFor)\(([^,)]+)/g)].map((m) => m[1].trim());
+      expect(waitArgs.length).toBeGreaterThan(0);
+      for (const arg of waitArgs) expect(arg === "PROMPT" || /login/i.test(arg)).toBe(true);
+    });
+
+    it("the Cisco sweep covers the templates it should", () => {
+      // Guards the filter above from silently matching nothing.
+      expect(SCRIPT_TEMPLATES.filter((t) => t.body.includes("terminal length 0")).map((t) => t.id)).toEqual([
+        "wait-send",
+        "capture-output",
+        "backup-running-config"
+      ]);
+    });
+
+    it.each(SCRIPT_TEMPLATES.map((t) => [t.label, t] as const))("%s: its header parses cleanly, and @allow-macros is never offered outside it", (_label, template) => {
+      // ⊘ "Uncomment to let a specific macro fire" above `// @allow-macros
+      // password` in the script BODY: headers are read only from the leading
+      // JSDoc block, so uncommenting that line does nothing.
+      const header = parseScriptHeader(template.body.replaceAll("{{NAME}}", "probe"));
+      expect(header.marker).toBe(true);
+      expect(header.parseErrors).toEqual([]);
+      expect(header.warnings).toEqual([]);
+      expect(header.allowMacros).toEqual([]);
+      expect(codeAfterHeader(template.body)).not.toContain("@allow-macros");
+    });
+
+    it("Basic command explains @allow-macros inside its header block", () => {
+      const basic = SCRIPT_TEMPLATES.find((t) => t.id === "basic-command")!;
+      const headerBlock = basic.body.slice(0, basic.body.indexOf("*/"));
+      expect(headerBlock).toContain("@allow-macros");
     });
   });
 });
