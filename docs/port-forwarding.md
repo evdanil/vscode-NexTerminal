@@ -26,6 +26,10 @@ You can also drag a tunnel profile onto a server in the [Connectivity Hub](conne
 
 ## Which Servers Can Carry a Tunnel
 
+A tunnel reaches its server the way a terminal does — through the server's [jump host or proxy](ssh-and-telnet.md#jump-hosts-and-proxies) when it has one — in shared and isolated mode alike. In isolated mode each client gets its own connection to the server, but a jump-host hop underneath it is shared through [connection multiplexing](ssh-and-telnet.md#connection-multiplexing), as a terminal's is.
+
+Each isolated client logs in to the server on its own, so a server password you chose not to save is asked for on every client connection. A SOCKS5 or HTTP proxy password is not asked for per client: clients that arrive while you answer it, or before the first connection using it has succeeded and saved it, share that answer.
+
 A tunnel that opens its own connection always dials the server's primary Host — the [Alternate host](ssh-and-telnet.md#alternate-host) fallback is the terminal's own. A shared-mode tunnel that rides a terminal's existing multiplexed connection uses whichever address that connection reached. Port forwarding isn't available on a [telnet](ssh-and-telnet.md#telnet) server.
 
 ## Related settings

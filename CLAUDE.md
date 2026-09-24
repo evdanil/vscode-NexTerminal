@@ -26,14 +26,14 @@ Storage Layer — ConfigRepository interface (VS Code globalState or in-memory f
 ```
 
 ### Key wiring: `extension.ts:activate()`
-All services are instantiated and wired in the `activate()` function. NexusCore observers propagate state changes to UI providers. Service event emitters (TunnelManager, SerialSidecarManager) feed back into NexusCore to register/unregister active sessions.
+All services are instantiated and wired in the `activate()` function; the SSH transport layers (credentials → proxy → pool) and the `TunnelManager` on top of them are composed by `createSshTransportStack` (`src/services/ssh/sshTransportStack.ts`). NexusCore observers propagate state changes to UI providers. Service event emitters (TunnelManager, SerialSidecarManager) feed back into NexusCore to register/unregister active sessions.
 
 ### Core state: `NexusCore`
 Observer pattern hub. Holds servers, tunnel profiles, serial profiles, and all active sessions/tunnels in memory. Persists config changes through `ConfigRepository`. UI consumers call `getSnapshot()` for immutable state views.
 
 ### Service isolation model
-- **SSH terminals** (`SshPty`): Each terminal gets its own SSH connection via `SilentAuthSshFactory` → `Ssh2Connector`
-- **Tunnels** (`TunnelManager`): Local TCP listener forwards to remote via SSH. Two modes: `isolated` (new SSH connection per client) or `shared` (single SSH connection)
+- **SSH terminals** (`SshPty`): connect through the stack composed by `createSshTransportStack` (`src/services/ssh/sshTransportStack.ts`), called in this order: `SshConnectionPool` (multiplexing) → `ProxySshFactory` (the server's jump host / SOCKS5 / HTTP CONNECT proxy) → `SilentAuthSshFactory` (credentials) → `Ssh2Connector`. With multiplexing on for a server, its terminals, SFTP and shared-mode tunnels lease one pooled connection; with it off (the server's own toggle, which overrides the global `nexus.ssh.multiplexing.enabled`), each gets its own. A jump-host hop always goes through the pool, so it is shared unless multiplexing is off for the jump host.
+- **Tunnels** (`TunnelManager`): Local TCP listener forwards to remote via SSH. Two modes: `shared` (one pool lease per tunnel, carrying all its clients) or `isolated` (a new connection per client from `ProxySshFactory`, never the pool — so it still honours the server's proxy, and its jump-host hop goes through the pool)
 - **Serial** (`SerialSidecarManager`): Spawns `serialSidecarWorker.js` child process. Communicates via JSON-RPC over stdio. Native `serialport` module runs outside extension host for crash isolation
 - **Scripts** (`ScriptRuntimeManager`): Each running script lives in its own `node:worker_threads` Worker (separate V8 isolate, same process). IPC is structured-clone `postMessage` with a pending-Promise map keyed by monotonic request id. Workers are killed via `worker.terminate()` — preempts tight JS loops at V8 safe points in single-digit ms. Three isolation tiers: in-process (SSH), worker-thread (Scripts — cheap, fast-kill), child-process (Serial — crash-isolates native addons)
 
