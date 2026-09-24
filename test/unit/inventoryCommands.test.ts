@@ -11769,6 +11769,124 @@ describe("nexus.inventory.refreshStatus — provider trust fingerprint", () => {
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
   });
 
+  /**
+   * STATELESS, NOT STALE (#144). The refusal does not clear on its own, so a
+   * running/stopped highlight left in place would sit there indefinitely looking
+   * exactly like fresh state. Each case seeds a status the source earned while
+   * it was still trusted, then refreshes under the distrusted registrant.
+   */
+  async function seedKnownStatus(core: NexusCore): Promise<void> {
+    await core.addOrUpdateServer(
+      makeServer({ id: "owned-1", origin: { sourceId: "src-1", externalId: "dev#1", syncedAt: 1 } })
+    );
+    core.applyInventoryStatus("src-1", REPORT);
+    expect(core.getSnapshot().serverStatus.get("owned-1")).toBe("running");
+  }
+
+  it("DROPS the refused source's last-known status on the POLL, still silently (⊘ keeping it leaves a green dot on a node nobody is refreshing, indistinguishable from fresh state)", async () => {
+    const { core, refresh } = await setup([{ id: "src-1", name: "Alpha", providerFingerprint: STALE }]);
+    await seedKnownStatus(core);
+
+    await refresh({ sourceId: "src-1", __poll: true });
+
+    expect(core.getSnapshot().serverStatus.has("owned-1")).toBe(false);
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("DROPS the refused source's last-known status on the MANUAL refresh too, and the warning still names only source-level remedies (⊘ the manual path keeps the stale state; ⊘ the message pointing at Start/Stop, which a stateless row no longer offers)", async () => {
+    const { core, refresh } = await setup([{ id: "src-1", name: "Alpha", providerFingerprint: STALE }]);
+    await seedKnownStatus(core);
+
+    await refresh("src-1");
+
+    expect(core.getSnapshot().serverStatus.has("owned-1")).toBe(false);
+    expect(notifications()).toHaveLength(1);
+    expect(notifications()[0]).toContain("Sync Inventory Now");
+    expect(notifications()[0]).not.toMatch(/Start|Stop Node/);
+  });
+
+  it("does not emit a change when a re-refused source has nothing left to drop (⊘ an unconditional drop+emit churns every tree on every poll tick for as long as the refusal stands)", async () => {
+    const { core, refresh } = await setup([{ id: "src-1", name: "Alpha", providerFingerprint: STALE }]);
+    await seedKnownStatus(core);
+    await refresh({ sourceId: "src-1", __poll: true });
+
+    const listener = vi.fn();
+    const unsubscribe = core.onDidChange(listener);
+    try {
+      await refresh({ sourceId: "src-1", __poll: true });
+    } finally {
+      unsubscribe();
+    }
+
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("an older manual sweep does not call a source's status PARTIAL after a later refusal dropped it (⊘ dropping the status without invalidating the applied-generation record leaves a truncation warning describing state that is no longer on screen)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    let releaseSecond!: () => void;
+    const secondGate = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+    const providerA = makeProvider({
+      fetchStatus: vi.fn(async (config: InventorySourceValues) => {
+        if (config.host === "b") {
+          await secondGate;
+          return { contractVersion: 1 as const, statuses: {} };
+        }
+        return { ...REPORT, truncated: true };
+      })
+    });
+    const registrationA = registry.register(providerA);
+    const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok", [inventorySecretKey("src-2", "apiToken")]: "tok" });
+    trackedDisposables.push(...registerInventoryCommands(core, registry, vault, makeTeardown()));
+    await core.addOrUpdateInventorySource(
+      makeSource({ id: "src-1", name: "Alpha", config: { host: "a" }, secretFieldIds: ["apiToken"], providerFingerprint: computeProviderFingerprint(providerA) })
+    );
+    await core.addOrUpdateInventorySource(makeSource({ id: "src-2", name: "Beta", config: { host: "b" }, secretFieldIds: ["apiToken"] }));
+    await core.addOrUpdateServer(makeServer({ id: "owned-1", origin: { sourceId: "src-1", externalId: "dev#1", syncedAt: 1 } }));
+    const refresh = registeredCommands.get("nexus.inventory.refreshStatus")! as (arg?: unknown) => Promise<unknown>;
+
+    // Manual sweep: Alpha's truncated report lands, then the sweep waits on Beta.
+    const manual = refresh();
+    await vi.waitFor(() => expect(core.getSnapshot().serverStatus.get("owned-1")).toBe("running"));
+    // The id is re-registered with a different shape; the next poll refuses Alpha and drops it.
+    registrationA.dispose();
+    const providerB = makeProvider({ label: "Reshaped Provider", fetchStatus: vi.fn(async () => REPORT) });
+    expect(computeProviderFingerprint(providerB)).not.toBe(computeProviderFingerprint(providerA));
+    registry.register(providerB);
+    await refresh({ sourceId: "src-1", __poll: true });
+    expect(core.getSnapshot().serverStatus.has("owned-1")).toBe(false);
+
+    releaseSecond();
+    await manual;
+
+    expect(notifications().some((message) => message.includes("partial"))).toBe(false);
+  });
+
+  it("leaves a TRUSTED source's status alone when a sibling is refused (⊘ dropping by sweep rather than by source wipes every source's state)", async () => {
+    const { core, refresh, fetchStatus } = await setup([
+      { id: "src-1", name: "Alpha", providerFingerprint: STALE },
+      { id: "src-2", name: "Beta" }
+    ]);
+    await seedKnownStatus(core);
+    await core.addOrUpdateServer(
+      makeServer({ id: "owned-2", origin: { sourceId: "src-2", externalId: "dev#1", syncedAt: 1 } })
+    );
+    core.applyInventoryStatus("src-2", REPORT);
+    // Beta's own refresh must not simply re-apply "running", or a drop that hit
+    // every source would be papered over. A truncated EMPTY report merges —
+    // absent entries are retained — so Beta keeps its status only if nothing
+    // dropped it.
+    fetchStatus.mockImplementation(async () => ({ contractVersion: 1 as const, statuses: {}, truncated: true }));
+
+    await refresh({ __poll: true });
+
+    expect(core.getSnapshot().serverStatus.has("owned-1")).toBe(false);
+    expect(core.getSnapshot().serverStatus.get("owned-2")).toBe("running");
+  });
+
   it("MANUAL form warns ONCE, names the refused source and names the command that clears it (⊘ a silent manual refresh leaves the row frozen with nothing on screen to explain it)", async () => {
     const { refresh } = await setup([{ id: "src-1", name: "Alpha", providerFingerprint: STALE }]);
 
