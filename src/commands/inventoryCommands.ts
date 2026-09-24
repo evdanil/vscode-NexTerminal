@@ -5128,7 +5128,9 @@ export function registerInventoryCommands(
    *    when the user answers Continue to the modal an interactive path raises
    *    (Sync Inventory Now, Edit Source, Start/Stop Node, Open Web Console).
    *    Silent on the poll, one warning naming the sources on a manual sweep;
-   *    the source meanwhile keeps the status it last had. Its poll schedule
+   *    the source meanwhile DROPS its status (#144) — its rows go stateless
+   *    rather than showing a running/stopped picture nobody is refreshing, and
+   *    so lose Start/Stop Node, which needs a known state. Its poll schedule
    *    retries, but NOT always at the warm delay: a decline only backs off a
    *    schedule still `warming`, and never demotes one already `steady` (see
    *    inventoryStatusPoll's `state`), so a provider that changed after the
@@ -5352,7 +5354,8 @@ export function registerInventoryCommands(
       // (2) STILL REFUSED — re-asked here, not inherited from the loop. A sweep
       //     over several sources refuses the first and then AWAITS the rest, and
       //     the user can clear that first refusal in the meantime: a Continue on
-      //     Start/Stop or Open Web Console latches the source and writes
+      //     Open Web Console (or on a Start/Stop invoked from a row painted
+      //     before the refusal dropped its status) latches the source and writes
       //     nothing, so its revision never moves and check (1) passes it
       //     happily. The message would then send them to confirm a change they
       //     confirmed while it was running, about a source whose live status has
@@ -5613,6 +5616,32 @@ export function registerInventoryCommands(
         // same staleness reason `warnIfTruncated` captures one: a source removed
         // or recreated later in the sweep must not be named.
         refusedSources.push({ id: source.id, name: source.name, revision: source.revision });
+        // STATELESS, NOT STALE (#144). This refusal does not clear on its own,
+        // so whatever running/stopped highlight the source's rows carried would
+        // otherwise sit there indefinitely looking exactly like fresh state — a
+        // node that has since stopped keeps its green dot, and a `steady`
+        // schedule re-refuses it silently every interval. Dropping the status
+        // makes the rows say "unknown", which is the truth.
+        //
+        // `clearInventoryStatus` emits only when it actually dropped something,
+        // so a source already stateless from an earlier tick costs nothing and
+        // does not churn every tree on each re-refusal.
+        //
+        // Only while this sweep still holds the source's claim: a newer
+        // invocation owns what the source shows now, and decides for itself.
+        // `statusAppliedGeneration` is invalidated with it, as the sync's apply
+        // does, so an older sweep's "status is partial" warning cannot describe
+        // a truncated apply this drop has just removed from the screen.
+        //
+        // TRADE-OFF: Start/Stop Node is gated on a KNOWN running/stopped state
+        // (the `.nodeRunning`/`.nodeStopped` marker), so those rows lose it until
+        // the refusal ends. The remedies the manual warning names — Sync
+        // Inventory Now and Edit Source — are source-level and unaffected, and
+        // Open Web Console is capability-gated, not status-gated.
+        if (holdsClaim(source.id)) {
+          core.clearInventoryStatus(source.id);
+          statusAppliedGeneration.delete(source.id);
+        }
         continue;
       }
       attempted++;

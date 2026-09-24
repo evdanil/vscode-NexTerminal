@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.239] — 2026-09-24
+
+### Fixed
+
+- **A source whose live status is refused no longer shows its last state as if it were current.** When the extension answering a source's provider id declares a different shape from the one the source was configured against, the status refresh skips it without reading its credentials. Until now the source's rows kept whatever running/stopped state they last had — and since that refusal does not clear by itself, a node that had since stopped could keep its green dot indefinitely, with nothing to tell it apart from a fresh reading. The rows now drop their state and show none, on the background poll (still silently) and on a manual **Refresh Inventory Status** (whose warning is unchanged). One consequence to know about: **Start Node** and **Stop Node** are only offered on a row whose state is known, so they disappear from those rows until the refusal ends. Confirming the change through **Sync Inventory Now** (the command the warning names) or **Edit Source** ends it — a completed sync brings the state straight back, an Edit Source save on the next status refresh — and **Open Web Console** stays available throughout.
+
 ## [2.8.238] — 2026-09-22
 
 ### Added
