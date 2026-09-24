@@ -341,17 +341,17 @@ export function canonicalMacroBinding(macro: TerminalMacro): string {
 /**
  * `reload()`'s explicit-cooldown fallback, bounds, and scope gate.
  *
- * `DEFAULT_TRIGGER_COOLDOWN` is DEFINED here and re-exported by services/macroAutoTrigger.ts for
- * its existing consumers, and `VALID_MACRO_TRIGGER_SCOPES` replaces the copy that file and
- * commands/configCommands.ts each kept. Three places have to agree about what a stored trigger
- * field MEANS — the compiler that runs it, the content keys that decide whether two records are
- * the same macro, and the import sanitizer that rewrites it — and every duplicate-macro bug on
- * this branch has been two of those three disagreeing. One definition each is the only form of
- * that agreement that cannot drift.
+ * `DEFAULT_TRIGGER_COOLDOWN` is DEFINED here, and `VALID_MACRO_TRIGGER_SCOPES` replaces the copy
+ * services/macroAutoTrigger.ts and commands/configCommands.ts each kept. Every place that reads a
+ * stored trigger field has to agree about what it MEANS — the compiler that runs it, the content
+ * keys that decide whether two records are the same macro, the import sanitizer that rewrites it,
+ * and the Macro Editor that shows it — and every duplicate-macro bug on this branch has been two
+ * of those disagreeing (#150 was the editor). One definition each is the only form of that
+ * agreement that cannot drift.
  */
 export const DEFAULT_TRIGGER_COOLDOWN = 3;
-const TRIGGER_COOLDOWN_MIN_SECONDS = 0;
-const TRIGGER_COOLDOWN_MAX_SECONDS = 300;
+export const TRIGGER_COOLDOWN_MIN_SECONDS = 0;
+export const TRIGGER_COOLDOWN_MAX_SECONDS = 300;
 export const VALID_MACRO_TRIGGER_SCOPES = new Set<MacroTriggerScope>([
   "all-terminals",
   "active-session",
@@ -371,9 +371,12 @@ export const VALID_MACRO_TRIGGER_SCOPES = new Set<MacroTriggerScope>([
  *   - anything else present (a quoted number from a hand-edited settings.json, `NaN`, an
  *     object) → `DEFAULT_TRIGGER_COOLDOWN`, which is what `clampSeconds()` falls back to.
  *
- * BOTH READERS OF A STORED COOLDOWN GO THROUGH THIS, and that is the point of it existing:
- * `canonicalMacroCooldown()` below, and `sanitizeImportedMacro()` (commands/configCommands.ts),
- * which now writes the result back onto the imported record. Deleting the field instead — what
+ * EVERY READER OF A STORED COOLDOWN GOES THROUGH THIS, and that is the point of it existing:
+ * `canonicalMacroCooldown()` below; `sanitizeImportedMacro()` (commands/configCommands.ts),
+ * which now writes the result back onto the imported record; and the Macro Editor's Trigger
+ * Cooldown field (`renderMacroEditorHtml()`), which shows the cooldown that will run rather than
+ * the raw stored value, and shows the field EMPTY for `undefined` — so saving it untouched keeps
+ * the macro following the setting (#150). Deleting the field instead — what
  * the sanitizer used to do for anything outside 0..300 or not a number — did not just "reject an
  * invalid value", it CHANGED THE MACRO: a pinned 300s became "follow the setting". So a record
  * absorbed verbatim from a legacy settings.json could never key-match its own exported copy, and
@@ -385,6 +388,22 @@ export function compiledTriggerCooldownSeconds(value: unknown): number | undefin
     return clamp(value, TRIGGER_COOLDOWN_MIN_SECONDS, TRIGGER_COOLDOWN_MAX_SECONDS);
   }
   return DEFAULT_TRIGGER_COOLDOWN;
+}
+
+/**
+ * The `nexus.terminal.macros.defaultCooldown` SETTING as `MacroAutoTrigger.reload()` compiles it,
+ * in seconds: a finite number clamped to the per-macro bounds, anything else the shipped
+ * `DEFAULT_TRIGGER_COOLDOWN`. Unlike a macro's own cooldown there is no "absent" outcome — a
+ * macro without one always runs at some default.
+ *
+ * Shared because the Macro Editor shows this value as the default of every macro that pins no
+ * cooldown, and a default the editor shows but the runtime does not use is issue #150: the field
+ * displayed a hard-coded 3 whatever the setting said.
+ */
+export function compiledDefaultCooldownSeconds(setting: unknown): number {
+  return typeof setting === "number" && Number.isFinite(setting)
+    ? clamp(setting, TRIGGER_COOLDOWN_MIN_SECONDS, TRIGGER_COOLDOWN_MAX_SECONDS)
+    : DEFAULT_TRIGGER_COOLDOWN;
 }
 
 /**

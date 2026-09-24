@@ -14,6 +14,15 @@ let lastHtml = "";
  * is being told was not saved.
  */
 let htmlWrites = 0;
+/**
+ * `nexus.terminal.macros.*` as the panel reads it, and the configuration-change
+ * listener it registers. The editor shows the `defaultCooldown` setting beside a
+ * macro that pins no cooldown of its own (#150), so these are the two ends of
+ * that: what the setting says, and the event that says it changed.
+ */
+let macroConfig: Record<string, unknown> = {};
+let onDidChangeConfigurationHandler: ((event: { affectsConfiguration(section: string): boolean }) => void) | undefined;
+const mockConfigListenerDispose = vi.fn();
 
 vi.mock("vscode", () => ({
   window: {
@@ -43,6 +52,15 @@ vi.mock("vscode", () => ({
     showErrorMessage: (...args: unknown[]) => mockShowErrorMessage(...args),
     showInformationMessage: (...args: unknown[]) => mockShowInformationMessage(...args)
   },
+  workspace: {
+    getConfiguration: vi.fn(() => ({
+      get: (key: string, fallback?: unknown) => (key in macroConfig ? macroConfig[key] : fallback)
+    })),
+    onDidChangeConfiguration: vi.fn((handler: (event: { affectsConfiguration(section: string): boolean }) => void) => {
+      onDidChangeConfigurationHandler = handler;
+      return { dispose: mockConfigListenerDispose };
+    })
+  },
   ViewColumn: { Active: 1 },
   ConfigurationTarget: { Global: 1 },
   commands: { executeCommand: vi.fn() }
@@ -56,6 +74,7 @@ vi.mock("node:crypto", async (importOriginal) => {
   };
 });
 
+import { TRIGGER_COOLDOWN_RANGE_MESSAGE } from "../../src/ui/macroEditorHtml";
 import type { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import type { DuplicateIdMacroStore } from "../helpers/duplicateIdMacroStore";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
@@ -96,6 +115,8 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
     mockShowWarningMessage.mockReset();
     onDidReceiveMessageHandler = undefined;
     onDidDisposeHandler = undefined;
+    onDidChangeConfigurationHandler = undefined;
+    macroConfig = {};
     lastHtml = "";
     htmlWrites = 0;
   });
@@ -154,7 +175,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
       secret: false,
       keybinding: null,
       triggerPattern: null,
-      triggerCooldown: 3,
+      triggerCooldown: null,
       triggerInterval: null,
       triggerInitiallyDisabled: false,
       triggerScope: "all-terminals",
@@ -195,7 +216,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
       secret: false,
       keybinding: null,
       triggerPattern: null,
-      triggerCooldown: 3,
+      triggerCooldown: null,
       triggerInterval: null,
       triggerInitiallyDisabled: false,
       triggerScope: "all-terminals",
@@ -259,7 +280,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
         secret: false,
         keybinding: null,
         triggerPattern: null,
-        triggerCooldown: 3,
+        triggerCooldown: null,
         triggerInterval: null,
         triggerInitiallyDisabled: false,
         triggerScope: "all-terminals",
@@ -590,7 +611,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
           secret: false,
           keybinding: null,
           triggerPattern: null,
-          triggerCooldown: 3,
+          triggerCooldown: null,
           triggerInterval: null,
           triggerInitiallyDisabled: false,
           triggerScope: "all-terminals",
@@ -660,7 +681,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
       secret: false,
       keybinding: null,
       triggerPattern: null,
-      triggerCooldown: 3,
+      triggerCooldown: null,
       triggerInterval: null,
       triggerInitiallyDisabled: false,
       triggerScope: "all-terminals",
@@ -693,7 +714,7 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
       secret: false,
       keybinding: null,
       triggerPattern: null,
-      triggerCooldown: 3,
+      triggerCooldown: null,
       triggerInterval: null,
       triggerInitiallyDisabled: false,
       triggerScope: "all-terminals",
@@ -1383,6 +1404,131 @@ describe("MacroEditorPanel id-keyed save/delete", () => {
       await sendMessage({ type: "delete", index: 1, id: betaId, renderGeneration: renderedGeneration() });
 
       expect(getMacros().map((m) => m.name)).toEqual(["Alpha", "Gamma"]);
+    });
+  });
+
+  /**
+   * Issue #150. The field used to show a hard-coded 3 and post 3 for an empty box, and the
+   * host then deleted any cooldown equal to 3 — so "no override" and "exactly 3 seconds" were
+   * one value, and with `defaultCooldown` at 10 a macro the user set to 3 ran at 10. The
+   * contract now: `null` (the empty field) is "follow the setting", any number is the macro's own.
+   */
+  describe("trigger cooldown (#150)", () => {
+    const DEFAULT_COOLDOWN_KEY = "nexus.terminal.macros.defaultCooldown";
+
+    /** One attribute of the rendered cooldown `<input>`, read back out of the panel's HTML. */
+    function renderedCooldownAttr(name: "value" | "placeholder"): string | undefined {
+      const tag = /<input type="number" id="macro-cooldown"[^>]*>/.exec(lastHtml)?.[0] ?? "";
+      return new RegExp(`\\b${name}="([^"]*)"`).exec(tag)?.[1];
+    }
+
+    it("stores a typed 3 even though it equals the built-in default, so the setting cannot move it", async () => {
+      macroConfig.defaultCooldown = 10;
+      await harness([]);
+      const { sendMessage } = await openPanel();
+
+      await sendMessage(baseSaveMsg({ text: "secret\n", triggerPattern: "Password:", triggerCooldown: 3 }));
+
+      expect(getMacros()[0].triggerCooldown).toBe(3);
+    });
+
+    it("stores a typed value equal to the CURRENT setting as the macro's own", async () => {
+      // A "fix" that compared against the effective default instead of the constant would drop
+      // this one, and the macro would then follow the setting the next time it changed.
+      macroConfig.defaultCooldown = 10;
+      await harness([]);
+      const { sendMessage } = await openPanel();
+
+      await sendMessage(baseSaveMsg({ text: "secret\n", triggerPattern: "Password:", triggerCooldown: 10 }));
+
+      expect(getMacros()[0].triggerCooldown).toBe(10);
+    });
+
+    it("an empty field stores no override, and clears one the macro had", async () => {
+      await harness([{ name: "pw", text: "secret\n", triggerPattern: "Password:", triggerCooldown: 5 }]);
+      const id = getMacros()[0].id!;
+      const { sendMessage } = await openPanel(0);
+      expect(renderedCooldownAttr("value")).toBe("5");
+
+      await sendMessage(baseSaveMsg({ index: 0, id, text: "secret\n", triggerPattern: "Password:", triggerCooldown: null }));
+
+      // Absent, not `null`: the whole store reads absence as "follow the setting", and a stored
+      // `null` is a field no earlier build wrote.
+      expect(getMacros()[0]).not.toHaveProperty("triggerCooldown");
+    });
+
+    it("a macro with no override opens empty, shows the setting as the default, and saving it invents no override", async () => {
+      // The shape of every macro saved at 3 before this fix: nothing stored. It must keep
+      // following the setting — opening and saving it is not a migration.
+      macroConfig.defaultCooldown = 10;
+      await harness([{ name: "pw", text: "secret\n", triggerPattern: "Password:" }]);
+      const id = getMacros()[0].id!;
+      const { sendMessage } = await openPanel(0);
+
+      expect(renderedCooldownAttr("value")).toBe("");
+      expect(renderedCooldownAttr("placeholder")).toBe("Default: 10");
+
+      await sendMessage(baseSaveMsg({ index: 0, id, name: "pw renamed", text: "secret\n", triggerPattern: "Password:", triggerCooldown: null }));
+
+      expect(getMacros()[0].name).toBe("pw renamed");
+      expect(getMacros()[0]).not.toHaveProperty("triggerCooldown");
+    });
+
+    it("shows the default the runtime compiles from the setting, not the raw setting", async () => {
+      // MacroAutoTrigger.reload() clamps the setting into 0..300 and falls back to 3 for a
+      // non-number; the placeholder has to name the cooldown that will actually apply.
+      macroConfig.defaultCooldown = 500;
+      await harness([{ name: "pw", text: "secret\n", triggerPattern: "Password:" }]);
+      await openPanel(0);
+      expect(renderedCooldownAttr("placeholder")).toBe("Default: 300");
+
+      macroConfig.defaultCooldown = "10";
+      await harness([{ name: "pw", text: "secret\n", triggerPattern: "Password:" }]);
+      await openPanel(0);
+      expect(renderedCooldownAttr("placeholder")).toBe("Default: 3");
+    });
+
+    it("refuses a cooldown outside 0..300 or not a number, on the cooldown field, and writes nothing", async () => {
+      await harness([]);
+      const { sendMessage } = await openPanel();
+
+      for (const bad of [301, -1, "5", Number.NaN, Number.POSITIVE_INFINITY]) {
+        mockPostMessage.mockClear();
+        await sendMessage(baseSaveMsg({ text: "secret\n", triggerPattern: "Password:", triggerCooldown: bad }));
+        expect(mockPostMessage).toHaveBeenCalledWith({
+          type: "saveError",
+          field: "cooldown",
+          message: TRIGGER_COOLDOWN_RANGE_MESSAGE
+        });
+      }
+      expect(getMacros()).toHaveLength(0);
+
+      // Both bounds are legal values.
+      await sendMessage(baseSaveMsg({ name: "zero", text: "secret\n", triggerPattern: "Password:", triggerCooldown: 0 }));
+      await sendMessage(baseSaveMsg({ name: "max", text: "secret\n", triggerPattern: "Password:", triggerCooldown: 300 }));
+      expect(getMacros().map((m) => m.triggerCooldown)).toEqual([0, 300]);
+    });
+
+    it("posts a changed default to the open editor without re-rendering over unsaved edits", async () => {
+      macroConfig.defaultCooldown = 10;
+      await harness([{ name: "pw", text: "secret\n", triggerPattern: "Password:" }]);
+      await openPanel(0);
+      const rendersBefore = htmlWrites;
+
+      macroConfig.defaultCooldown = 999;
+      onDidChangeConfigurationHandler!({ affectsConfiguration: (section) => section === DEFAULT_COOLDOWN_KEY });
+
+      // Clamped, like the render. Posted, not rendered: a render rebuilds the form from the
+      // store and would throw away whatever the user has typed but not saved.
+      expect(mockPostMessage).toHaveBeenCalledWith({ type: "defaultCooldown", seconds: 300 });
+      expect(htmlWrites).toBe(rendersBefore);
+
+      mockPostMessage.mockClear();
+      onDidChangeConfigurationHandler!({ affectsConfiguration: (section) => section === "nexus.terminal.macros.bufferLength" });
+      expect(mockPostMessage).not.toHaveBeenCalled();
+
+      onDidDisposeHandler!();
+      expect(mockConfigListenerDispose).toHaveBeenCalled();
     });
   });
 

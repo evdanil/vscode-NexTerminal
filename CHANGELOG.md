@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.245] — 2026-09-25
+
+### Fixed
+
+- **A macro's auto-trigger cooldown can now be set to 3 seconds, and the Macro Editor shows the default a macro will actually use.** The **Trigger Cooldown** field always showed 3, whatever `nexus.terminal.macros.defaultCooldown` was set to, and saving a 3 stored nothing, so the macro followed that setting instead. With the setting at 10, a macro you had set to 3 ran at 10. The field is now empty for a macro without its own cooldown, with the setting's current value shown in it as `Default: N`. That value updates if you change the setting while the editor is open. A number you type, from 0 to 300, is kept as that macro's own even when it equals the default, and clearing the field puts the macro back on the setting. A number outside 0–300 is now refused with a message instead of being quietly clamped when the macro runs. Macros saved earlier with the field at 3 have no cooldown of their own stored, so they keep following the setting as before. To pin one of them to 3, type 3 and save.
+
 ## [2.8.243] — 2026-09-24
 
 ### Fixed

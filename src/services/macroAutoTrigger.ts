@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { createAnsiRegex } from "../utils/ansi";
-import { clamp, normalizeBoundedNumber as clampLength } from "../utils/helpers";
+import { normalizeBoundedNumber as clampLength } from "../utils/helpers";
 import { validateRegexSafety } from "../utils/regexSafety";
 import type { MacroTriggerScope, TerminalMacro } from "../models/terminalMacro";
 import { resolveMacroRunTarget } from "../models/terminalMacro";
@@ -11,6 +11,7 @@ import { getMacros } from "../macroSettings";
 import {
   DEFAULT_TRIGGER_COOLDOWN,
   VALID_MACRO_TRIGGER_SCOPES,
+  compiledDefaultCooldownSeconds,
   compiledTriggerCooldownSeconds,
   compiledTriggerIntervalSeconds
 } from "../storage/macroStore";
@@ -18,10 +19,6 @@ import {
 const MAX_INPUT_LENGTH = 8192;
 const MAX_BUFFER_LENGTH = 2048;
 const CONTROL_CHARS_RE = /[\x00-\x08\x0b-\x1f\x7f]/g;
-// Both defined in storage/macroStore.ts, alongside the content keys and the import sanitizer that
-// have to agree with what this file compiles. `DEFAULT_TRIGGER_COOLDOWN` is re-exported because
-// that is where its existing consumer imports it from.
-export { DEFAULT_TRIGGER_COOLDOWN };
 
 /**
  * Stable per-macro identity for every state map in this file (pause/resume,
@@ -173,10 +170,6 @@ export interface PtyOutputObserver {
   dispose(): void;
 }
 
-function clampSeconds(value: number | undefined, fallback: number, min: number, max: number): number {
-  return typeof value === "number" && Number.isFinite(value) ? clamp(value, min, max) : fallback;
-}
-
 interface CompiledTriggerRule {
   regex: RegExp;
   macroText: string;
@@ -224,12 +217,9 @@ export class MacroAutoTrigger implements vscode.Disposable {
     const macros = getMacros();
     const macrosConfig = vscode.workspace.getConfiguration("nexus.terminal.macros");
     this.enabled = macrosConfig.get<boolean>("autoTrigger", true);
-    this.defaultCooldownMs = clampSeconds(
-      macrosConfig.get<number>("defaultCooldown", DEFAULT_TRIGGER_COOLDOWN),
-      DEFAULT_TRIGGER_COOLDOWN,
-      0,
-      300
-    ) * 1000;
+    // Through the same function the Macro Editor shows this setting with, as the default of
+    // every macro that pins no cooldown of its own (#150).
+    this.defaultCooldownMs = compiledDefaultCooldownSeconds(macrosConfig.get<unknown>("defaultCooldown")) * 1000;
     this.maxBufferLength = clampLength(
       macrosConfig.get<number>("bufferLength", MAX_BUFFER_LENGTH),
       MAX_BUFFER_LENGTH,
@@ -289,10 +279,11 @@ export class MacroAutoTrigger implements vscode.Disposable {
         const regex = new RegExp(macro.triggerPattern);
         if (regex.test("")) continue;
         // The single definition of what a stored cooldown/interval MEANS, shared with the two
-        // content keys and with `sanitizeImportedMacro()` (storage/macroStore.ts). Identical
-        // arithmetic to the inline `clampSeconds(macro.triggerCooldown, DEFAULT, 0, 300) * 1000`
-        // it replaces — sharing it is what stops the three readers drifting apart again, which is
-        // how a record ended up unable to key-match its own exported copy.
+        // content keys, with `sanitizeImportedMacro()` and with the Macro Editor's cooldown field
+        // (storage/macroStore.ts). Identical arithmetic to the inline
+        // `clampSeconds(macro.triggerCooldown, DEFAULT, 0, 300) * 1000` it replaces — sharing it is
+        // what stops the readers drifting apart again, which is how a record ended up unable to
+        // key-match its own exported copy.
         const cooldownSeconds = compiledTriggerCooldownSeconds(macro.triggerCooldown);
         const intervalSeconds = compiledTriggerIntervalSeconds(macro.triggerInterval);
         const rule: CompiledTriggerRule = {

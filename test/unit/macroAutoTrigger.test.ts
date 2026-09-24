@@ -340,6 +340,41 @@ describe("MacroAutoTrigger", () => {
     obs.dispose();
   });
 
+  it("reads an out-of-range or non-number default cooldown the way the Macro Editor shows it", () => {
+    // #150 — the editor names this setting as the default of every macro without its own
+    // cooldown, through the same `compiledDefaultCooldownSeconds()` this compiler reads it
+    // with, so a 500 is shown as 300 and has to RUN as 300 (and a quoted "10" as the shipped 3).
+    setConfig([{ name: "pw", text: "secret\n", triggerPattern: "Password:" }], true, { defaultCooldown: 500 });
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    obs.onOutput("Password:");
+    flush();
+    vi.advanceTimersByTime(299_999);
+    obs.onOutput("Password:");
+    flush();
+    expect(sent).toHaveLength(1);
+    // Exactly 300 s after the first send, not "eventually": an unclamped 500 would still block.
+    vi.advanceTimersByTime(1);
+    obs.onOutput("Password:");
+    flush();
+    expect(sent).toHaveLength(2);
+    obs.dispose();
+
+    setConfig([{ name: "pw", text: "secret\n", triggerPattern: "Password:" }], true, { defaultCooldown: "10" });
+    const quoted = new MacroAutoTrigger();
+    const quotedSent: string[] = [];
+    const quotedObs = quoted.createObserver((text) => quotedSent.push(text));
+    quotedObs.onOutput("Password:");
+    flush();
+    vi.advanceTimersByTime(3_000);
+    quotedObs.onOutput("Password:");
+    flush();
+    expect(quotedSent).toHaveLength(2);
+    quotedObs.dispose();
+  });
+
   it("uses the configured buffer length when trimming prompt history", () => {
     setConfig(
       [{ name: "end", text: "found\n", triggerPattern: "MARKER$" }],
@@ -1934,18 +1969,15 @@ describe("MacroAutoTrigger", () => {
 
   describe("shared trigger-field definitions", () => {
     it("compiles cooldowns and intervals through the same functions the content keys and the import sanitizer use", async () => {
-      // `DEFAULT_TRIGGER_COOLDOWN` and the two `compiledTrigger*Seconds()` helpers moved into
-      // storage/macroStore.ts so that the three readers of a stored trigger field — this compiler,
-      // `canonicalMacroTriggerTerms()`, and `sanitizeImportedMacro()` — cannot hold three opinions
-      // about what it means. Every duplicate-macro bug on this branch was two of those three
-      // disagreeing, so the wiring itself is worth pinning: if the re-export ever resolved to
-      // `undefined` (an import cycle, a bundling accident), the macro editor would start persisting
-      // an explicit `3` where it now leaves the field absent, and every macro it saved would key as
-      // a different macro from the one it replaced.
+      // `DEFAULT_TRIGGER_COOLDOWN` and the `compiledTrigger*Seconds()` / `compiledDefaultCooldownSeconds()`
+      // helpers live in storage/macroStore.ts so that every reader of a trigger field — this
+      // compiler, `canonicalMacroTriggerTerms()`, `sanitizeImportedMacro()`, and the Macro Editor's
+      // cooldown field — cannot hold opinions of its own about what it means. Every duplicate-macro
+      // bug on this branch was two of those readers disagreeing, and #150 was the editor showing a
+      // default the compiler did not use.
       const store = await import("../../src/storage/macroStore");
-      const { DEFAULT_TRIGGER_COOLDOWN } = await import("../../src/services/macroAutoTrigger");
+      const { DEFAULT_TRIGGER_COOLDOWN } = store;
       expect(DEFAULT_TRIGGER_COOLDOWN).toBe(3);
-      expect(DEFAULT_TRIGGER_COOLDOWN).toBe(store.DEFAULT_TRIGGER_COOLDOWN);
 
       // The three branches this compiler takes, asserted against the shared helper rather than
       // restated: clamped inside the bounds, the shipped fallback for anything unusable, and
@@ -1955,6 +1987,13 @@ describe("MacroAutoTrigger", () => {
       expect(store.compiledTriggerCooldownSeconds("5")).toBe(DEFAULT_TRIGGER_COOLDOWN);
       expect(store.compiledTriggerCooldownSeconds(undefined)).toBeUndefined();
       expect(store.compiledTriggerCooldownSeconds(null)).toBeUndefined();
+      // The `defaultCooldown` SETTING has the same bounds and fallback, but no "absent": a macro
+      // without its own cooldown always runs at some default.
+      expect(store.compiledDefaultCooldownSeconds(10)).toBe(10);
+      expect(store.compiledDefaultCooldownSeconds(500)).toBe(300);
+      expect(store.compiledDefaultCooldownSeconds(-5)).toBe(0);
+      expect(store.compiledDefaultCooldownSeconds("10")).toBe(DEFAULT_TRIGGER_COOLDOWN);
+      expect(store.compiledDefaultCooldownSeconds(undefined)).toBe(DEFAULT_TRIGGER_COOLDOWN);
       // The interval is NOT clamped — `reload()` asks only for `> 0`.
       expect(store.compiledTriggerIntervalSeconds(0.5)).toBe(0.5);
       expect(store.compiledTriggerIntervalSeconds(0)).toBeUndefined();

@@ -7158,8 +7158,9 @@ echo hi</textarea>
 
   <div class="form-group">
     <label for="macro-cooldown">Trigger Cooldown (seconds)</label>
-    <input type="number" id="macro-cooldown" value="3" min="0" max="300" step="1" />
-    <div class="hint">Seconds between auto-triggers on the same terminal. Prevents echo-loops where server re-prompts after each response.</div>
+    <input type="number" id="macro-cooldown" value="" min="0" max="300" step="1" placeholder="Default: 3" />
+    <div class="field-error" id="error-cooldown"></div>
+    <div class="hint">Seconds between auto-triggers on the same terminal. Prevents echo-loops where server re-prompts after each response. Leave empty to use the Default Trigger Cooldown setting (nexus.terminal.macros.defaultCooldown), shown in the empty field; a number entered here applies to this macro only, even when it equals that default.</div>
   </div>
 
   <div class="form-group">
@@ -7602,6 +7603,23 @@ echo hi</textarea>
         return { used: used, unknown: unknown };
       }
 
+      var COOLDOWN_PLACEHOLDER_PREFIX = "Default: ";
+      var COOLDOWN_RANGE_MESSAGE = "Enter a number of seconds from 0 to 300, or leave the field empty to use the default.";
+      function readCooldownField(input) {
+        var raw = String(input.value).trim();
+        if (raw === "") {
+          var badInput = !!(input.validity && input.validity.badInput);
+          return { value: null, error: badInput ? COOLDOWN_RANGE_MESSAGE : "" };
+        }
+        var seconds = Number(raw);
+        if (!isFinite(seconds) || seconds < 0 || seconds > 300) {
+          return { value: null, error: COOLDOWN_RANGE_MESSAGE };
+        }
+        return { value: seconds, error: "" };
+      }
+      function cooldownPlaceholder(seconds) {
+        return COOLDOWN_PLACEHOLDER_PREFIX + seconds;
+      }
 
       function isValidBinding(value) {
         return VALID_PATTERN.test(value.trim().toLowerCase());
@@ -8126,7 +8144,10 @@ echo hi</textarea>
           document.getElementById("error-trigger-profile").textContent = "";
         }
       });
-      document.getElementById("macro-cooldown").addEventListener("input", markDirty);
+      document.getElementById("macro-cooldown").addEventListener("input", function() {
+        markDirty();
+        document.getElementById("error-cooldown").textContent = "";
+      });
       document.getElementById("macro-interval").addEventListener("input", markDirty);
       document.getElementById("macro-trigger-disabled").addEventListener("change", markDirty);
       document.getElementById("macro-binding").addEventListener("input", function() {
@@ -8172,7 +8193,7 @@ echo hi</textarea>
         var secret = document.getElementById("macro-secret").checked;
         var bindingVal = document.getElementById("macro-binding").value.trim().toLowerCase();
         var triggerVal = document.getElementById("macro-trigger").value.trim();
-        var cooldownVal = parseInt(document.getElementById("macro-cooldown").value, 10);
+        var cooldownField = readCooldownField(document.getElementById("macro-cooldown"));
         var intervalVal = parseInt(document.getElementById("macro-interval").value, 10);
         var triggerInitiallyDisabled = document.getElementById("macro-trigger-disabled").checked;
         var triggerScope = document.getElementById("macro-trigger-scope").value;
@@ -8221,6 +8242,13 @@ echo hi</textarea>
           valid = false;
         } else {
           document.getElementById("error-trigger-profile").textContent = "";
+        }
+
+        // #150 — every macro stores its cooldown whether or not it has a pattern, so this is
+        // checked unconditionally; an empty field is legal (it means "use the default").
+        document.getElementById("error-cooldown").textContent = cooldownField.error;
+        if (cooldownField.error) {
+          valid = false;
         }
 
         if (triggerVal && runInVal !== "session") {
@@ -8275,7 +8303,7 @@ echo hi</textarea>
           secret: secret,
           keybinding: bindingVal || null,
           triggerPattern: triggerVal || null,
-          triggerCooldown: isNaN(cooldownVal) ? 3 : cooldownVal,
+          triggerCooldown: cooldownField.value,
           triggerInterval: isNaN(intervalVal) || intervalVal < 1 ? null : intervalVal,
           triggerInitiallyDisabled: triggerInitiallyDisabled,
           triggerScope: triggerScope,
@@ -8320,6 +8348,10 @@ echo hi</textarea>
               errEl.scrollIntoView({ block: "center" });
             }
           }
+        } else if (msg.type === "defaultCooldown" && typeof msg.seconds === "number") {
+          // The setting changed while this form is open. Posted rather than re-rendered by the
+          // panel, because a render rebuilds the form from the store and discards unsaved edits.
+          document.getElementById("macro-cooldown").placeholder = cooldownPlaceholder(msg.seconds);
         }
       });
       updateTriggerProfileState();
