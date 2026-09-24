@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmod } from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
@@ -8,6 +8,8 @@ import { cloneTemplatedStamps, templatedHasAnyStamp } from "../models/config";
 import type { InventorySourceConfig } from "../models/inventory";
 import { inventorySecretKey } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
+import type { LocalServerConfig } from "../models/localServer";
+import type { DhcpConfigProfile, TftpConfigProfile } from "../models/networkServerProfile";
 import type { SavedFilterDefinition } from "../models/savedFilter";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { hasImportedCapabilityField, IMPORTED_CAPABILITY_RESET_NOTICE, stripImportedCapabilityFields } from "../models/terminalMacro";
@@ -27,6 +29,11 @@ import { parseMobaxtermSessions, type ImportedSession } from "../utils/mobaxterm
 import { parseSshConfig, resolveSshConfig, type SshConfigParseResult } from "../utils/sshConfigParser";
 import { convertSshConfig, localLoginName, type SshConfigImportedSession } from "../utils/sshConfigImport";
 import { createSshConfigIo } from "../services/ssh/sshConfigIo";
+import {
+  readKnownHostFingerprints,
+  restoreKnownHostFingerprints,
+  sanitizeKnownHostFingerprints
+} from "../services/ssh/vscodeHostKeyVerifier";
 import { parseInventoryList, type InventoryParseIssue, MAX_DATA_ROWS as INVENTORY_MAX_ROWS } from "../utils/inventoryParser";
 import { normalizeOptionalFolderPath, INVALID_FOLDER_PATH_MESSAGE } from "../utils/folderPaths";
 import { defaultSshDir } from "../services/ssh/deploySshKey";
@@ -43,6 +50,9 @@ import {
   validateTunnelProfile,
   validateSerialProfile,
   validateLocalShellProfile,
+  validateLocalServerConfig,
+  validateTftpConfigProfile,
+  validateDhcpConfigProfile,
   validateInventorySource,
   validateDeviceTemplate,
   validateSavedFilter,
@@ -98,6 +108,12 @@ interface NexusConfigExport {
   servers?: ServerConfig[];
   tunnels?: TunnelProfile[];
   serialProfiles?: SerialProfile[];
+  /**
+   * In a backup, each record travels WITHOUT its `env` — the map goes in
+   * `encryptedSecrets.localShellEnv`, keyed by profile id, for the reason
+   * `localServers` gives. Backups taken before 2.8.243 carry `env` here in the
+   * clear, and still import. A share export drops it (`sanitizeForSharing`).
+   */
   localShellProfiles?: LocalShellProfile[];
   authProfiles?: AuthProfile[];
   /** Backup-only (§B6) — never present on a share export; secrets live under `encryptedSecrets.inventorySourceSecrets`. */
@@ -117,6 +133,27 @@ interface NexusConfigExport {
    * non-secret data as a source's own Device Filter field.
    */
   savedFilters?: SavedFilterDefinition[];
+  /**
+   * LOCAL SERVER PROFILES — backup-only, EXCLUDED from a share export: an
+   * executable path, a working directory and environment variables describe
+   * THIS machine and mean nothing (or something unsafe) on a stranger's. Each
+   * record travels WITHOUT its `env`: variables routinely carry tokens and
+   * passwords, so the whole map goes in `encryptedSecrets.localServerEnv`
+   * (keyed by profile id) and is put back on import. Absent from every backup
+   * written before 2.8.243 — see the replace-mode note in importMergeReplaceLocked.
+   */
+  localServers?: LocalServerConfig[];
+  /**
+   * SAVED TFTP / DHCP PROFILES — backup-only, EXCLUDED from a share export.
+   * They are bench presets for this machine's own interfaces and address plan
+   * (a TFTP root path, a bind address, a pool, MAC reservations), so a share has
+   * nothing portable to offer; keeping them out also keeps the share path's
+   * scope where it was. No secrets, so no vault section — `leaseStorePath` is a
+   * machine-local path that never travels with a profile (see
+   * `captureDhcpProfileBody`), and import strips it.
+   */
+  tftpProfiles?: TftpConfigProfile[];
+  dhcpProfiles?: DhcpConfigProfile[];
   groups?: string[];
   macros?: TerminalMacro[]; // Non-secret fields; secret macros carry `text: ""`
   /** Explicit macro folders (`nexus.macros.folders`, §4.1) — carried exactly as `groups` is. */
@@ -142,6 +179,23 @@ interface NexusConfigExport {
    */
   inventoryStatusPollPerSource?: boolean;
   encryptedSecrets?: EncryptedPayload;
+}
+
+/**
+ * Runtime teardown the config-wide commands need but must not own: this module
+ * writes configuration and never holds a process or a daemon. Wired in
+ * extension.ts; optional so the commands still register without it (tests,
+ * and any host that runs neither manager). Both must resolve, never reject.
+ */
+export interface ConfigRuntimeHooks {
+  /**
+   * Stop one Local Server — its process, any pending auto-restart, its
+   * terminals — BEFORE its profile is removed (`stopLocalServerForRemoval`).
+   * Called with `configMutationLock` held; must not take it.
+   */
+  stopLocalServer(configId: string): Promise<void>;
+  /** Stop every running embedded TFTP/DHCP service (`stopRunningNetworkServices`). */
+  stopNetworkServices(): Promise<void>;
 }
 
 interface BackupFileEntry {
@@ -768,6 +822,11 @@ export function isValidExport(data: unknown): data is NexusConfigExport {
   if (obj.savedFilters !== undefined && !Array.isArray(obj.savedFilters)) {
     return false;
   }
+  for (const key of ["localServers", "tftpProfiles", "dhcpProfiles"] as const) {
+    if (obj[key] !== undefined && !Array.isArray(obj[key])) {
+      return false;
+    }
+  }
   if (
     obj.settings !== undefined &&
     (typeof obj.settings !== "object" || obj.settings === null || Array.isArray(obj.settings))
@@ -806,6 +865,13 @@ async function importPreservingIds<T extends { id: string }>(
 ): Promise<ImportTally> {
   const tally: ImportTally = { imported: 0, skipped: 0, importedIds: [] };
   for (const item of items ?? []) {
+    // A file is untrusted: a `null` (or any non-object) entry is a record that
+    // cannot be imported, not a reason to throw halfway through an import —
+    // in replace mode, after the wipe has already run.
+    if (typeof item !== "object" || item === null) {
+      tally.skipped++;
+      continue;
+    }
     ensureId(item as unknown as Record<string, unknown>);
     if (existingIds.has(item.id) || !validate(item)) {
       tally.skipped++;
@@ -949,6 +1015,213 @@ function sanitizeImportedInventorySources(sources: InventorySourceConfig[] | und
     delete (source as unknown as Record<string, unknown>).managedFolders;
   }
   return sources;
+}
+
+/**
+ * THE READABLE-HALF SEAL (Codex P1 on PR #168). A backup keeps its secrets in
+ * `encryptedSecrets` and every record they belong to — a Local Server's
+ * command, a server's host, a Local Shell's path — in the readable half beside
+ * it, joined only by profile id. Encrypting the secrets kept them private but
+ * did not stop anyone holding the file from rewriting the record they are
+ * restored onto: point a server at another host, or a Local Server at another
+ * program, keep the id, and a restore handed the saved password or the
+ * protected environment to the rewritten record. That is a property of the
+ * whole format rather than of one collection, so the fix is format-wide too:
+ * the encrypted section carries a SHA-256 of the readable half, and import
+ * refuses a file whose readable half no longer matches — before anything on
+ * this machine changes.
+ *
+ * Why a digest inside the ciphertext rather than GCM associated data: older
+ * builds decrypt without associated data, so binding it into the tag would make
+ * every new backup undecryptable there. A digest they do not know about is an
+ * ignored key. And because the digest lives INSIDE the authenticated section,
+ * it cannot be stripped or recomputed without the password: making the readable
+ * half look like an older, unsealed backup does not skip the check.
+ *
+ * What it does not cover, by construction: a backup made before 2.8.243 has no
+ * seal and imports as it always did; and a file whose encrypted section has
+ * been removed altogether carries no secrets to hand to anything — it imports
+ * as the plain, unauthenticated export it has become.
+ */
+const CLEAR_PART_SEAL_VERSION = 1;
+
+/**
+ * Deterministic JSON: object keys sorted, no whitespace. Only ever applied to a
+ * value that has already been through `JSON.parse(JSON.stringify(…))`, so no
+ * `undefined`, function or non-finite number reaches it, and the export side
+ * and the import side see exactly the same tree — the file's own spacing and
+ * key order (which anything re-saving the JSON may change) do not matter.
+ */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  if (value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/** SHA-256 (hex) of everything in a backup except `encryptedSecrets`. */
+function clearPartDigest(backup: object): string {
+  const { encryptedSecrets: _sealed, ...readable } = JSON.parse(JSON.stringify(backup)) as Record<string, unknown>;
+  return createHash("sha256").update(canonicalJson(readable), "utf8").digest("hex");
+}
+
+/**
+ * Checks the seal a decrypted backup carries against the file's readable half.
+ * `unsealed` — no seal: a backup from before 2.8.243, imported as it always was.
+ * `unsupported` — a seal from a newer format this build cannot check.
+ */
+function checkClearPartSeal(backup: object, secrets: Record<string, unknown>): "unsealed" | "intact" | "changed" | "unsupported" {
+  const seal = secrets.clearPartSeal;
+  if (seal === undefined) {
+    return "unsealed";
+  }
+  if (typeof seal !== "object" || seal === null) {
+    return "changed";
+  }
+  const { version, sha256 } = seal as { version?: unknown; sha256?: unknown };
+  if (typeof version !== "number" || typeof sha256 !== "string") {
+    return "changed";
+  }
+  if (version !== CLEAR_PART_SEAL_VERSION) {
+    return "unsupported";
+  }
+  return sha256 === clearPartDigest(backup) ? "intact" : "changed";
+}
+
+/**
+ * The Replace-mode guard for the collections Replace clears only when the file
+ * carries them (Codex P1 on PR #168). A carried list with entries of which NONE
+ * can be imported would have its local counterpart deleted and nothing put in
+ * its place, so it is named here and the import refused before anything is
+ * removed. An EMPTY list is a deliberate answer — the backup of a machine with
+ * none — and still clears. Runs after the same preparation the import applies
+ * (env restored, folder normalised, lease path stripped) and assigns a missing
+ * id exactly as `importPreservingIds` would, so "importable" means what the
+ * import itself will decide.
+ */
+function unusableCarriedCollections(data: NexusConfigExport): string[] {
+  const carried: Array<[string, readonly unknown[] | undefined, (item: unknown) => boolean]> = [
+    ["Local Server", data.localServers, validateLocalServerConfig],
+    ["saved TFTP profile", data.tftpProfiles, validateTftpConfigProfile],
+    ["saved DHCP profile", data.dhcpProfiles, validateDhcpConfigProfile]
+  ];
+  const importable = (item: unknown, validate: (item: unknown) => boolean): boolean => {
+    if (typeof item !== "object" || item === null) return false;
+    ensureId(item as Record<string, unknown>);
+    return validate(item);
+  };
+  return carried
+    .filter(([, items, validate]) => Array.isArray(items) && items.length > 0 && !items.some((item) => importable(item, validate)))
+    .map(([label]) => label);
+}
+
+/**
+ * Splits each profile's environment off for the encrypted section of a backup.
+ * Local Shell and Local Server profiles both carry an `env` map, and variables
+ * routinely hold tokens and passwords, so the readable half of the file gets
+ * each record WITHOUT it and `encryptedSecrets` gets the maps, keyed by profile
+ * id. A profile with no variables contributes no entry.
+ */
+function splitEnvIntoSecrets<T extends { id: string; env?: Record<string, unknown> }>(
+  profiles: readonly T[]
+): { clear: Array<Omit<T, "env">>; envById: Record<string, T["env"]> } {
+  // Prototype-free: a profile id is data from a file, and `__proto__` is a
+  // legal one — on a plain object that assignment hits the prototype setter
+  // and the environment silently vanishes from the backup.
+  const envById: Record<string, T["env"]> = Object.create(null) as Record<string, T["env"]>;
+  const clear = profiles.map((profile) => {
+    const { env, ...clearRecord } = profile;
+    if (env && Object.keys(env).length > 0) {
+      envById[profile.id] = env;
+    }
+    return clearRecord;
+  });
+  return { clear, envById };
+}
+
+/**
+ * The import half of {@link splitEnvIntoSecrets}: puts each profile's
+ * environment back from the encrypted section, in place and BEFORE validation.
+ *
+ * Looked up by the id the FILE carries — before `ensureId` could mint a new
+ * one. A profile skipped later (merge mode, an id already here) never lands, so
+ * its environment is discarded with it rather than written anywhere. The map is
+ * shape-checked with the rest of the record by the collection's validator. A
+ * profile the encrypted section has nothing for keeps whatever `env` it carries
+ * in the clear: every Local Shell profile in a backup taken before 2.8.243 has
+ * its variables there, and they import exactly as they always did.
+ */
+function restoreEnvFromSecrets(profiles: readonly unknown[] | undefined, envById: unknown): void {
+  if (!profiles || typeof envById !== "object" || envById === null || Array.isArray(envById)) {
+    return;
+  }
+  const envs = envById as Record<string, unknown>;
+  for (const profile of profiles) {
+    if (typeof profile !== "object" || profile === null) continue;
+    const record = profile as Record<string, unknown>;
+    if (typeof record.id === "string" && Object.prototype.hasOwnProperty.call(envs, record.id)) {
+      record.env = envs[record.id];
+    }
+  }
+}
+
+/**
+ * Readies a backup's Local Server profiles for `importPreservingIds`, in place
+ * (the same discipline as `sanitizeImportedInventorySources`, and for the same
+ * reason it runs BEFORE validation).
+ *
+ * 1. Puts each profile's environment back (`restoreEnvFromSecrets`).
+ * 2. Normalises `group` the way every other writer of this field does
+ *    (`formValuesToLocalServer`, the move commands): trimmed and canonical, and
+ *    a path that could never have been saved — `..`, a backslash, over-depth —
+ *    drops the profile to the root rather than rejecting it, as
+ *    `sanitizeMacroGroup` does for macros. A blank `group` becomes "no folder";
+ *    left as `""` it would fail validation and cost the user the profile.
+ */
+function prepareImportedLocalServers(
+  servers: LocalServerConfig[] | undefined,
+  envByServerId: unknown
+): LocalServerConfig[] | undefined {
+  if (!servers) {
+    return servers;
+  }
+  restoreEnvFromSecrets(servers, envByServerId);
+  for (const server of servers) {
+    if (typeof server !== "object" || server === null) continue;
+    const record = server as unknown as Record<string, unknown>;
+    const group = normalizeOptionalFolderPath(record.group);
+    if (typeof group === "string") {
+      record.group = group;
+    } else {
+      delete record.group;
+    }
+  }
+  return servers;
+}
+
+/**
+ * Strips `config.leaseStorePath` from a backup's DHCP profiles, in place and
+ * BEFORE validation. It is the lease file of the machine that took the backup
+ * — a path this extension resolves per machine and never stores in a profile
+ * (`captureDhcpProfileBody`) — so it has nothing to say here, and a malformed
+ * one must not be able to reject the profile around it.
+ */
+function sanitizeImportedDhcpProfiles(profiles: DhcpConfigProfile[] | undefined): DhcpConfigProfile[] | undefined {
+  for (const profile of profiles ?? []) {
+    if (typeof profile !== "object" || profile === null) continue;
+    const config = (profile as unknown as Record<string, unknown>).config;
+    if (typeof config === "object" && config !== null) {
+      delete (config as Record<string, unknown>).leaseStorePath;
+    }
+  }
+  return profiles;
 }
 
 /** Mechanical validate-then-add tail shared by the share-import remap loops; remap stays inline. */
@@ -1125,6 +1398,9 @@ export function sanitizeForSharing(
     return { ...p, id: newId, deviceHint: undefined };
   });
 
+  // Issue #159 — `env` goes with `cwd` and `startupCommand`: variables
+  // routinely carry tokens (the backup keeps them in its encrypted section for
+  // exactly that reason), and a share file promises "credentials stripped".
   const newLocalShellProfiles = localShellProfiles.map((p) => {
     const newId = randomUUID();
     idMap.set(p.id, newId);
@@ -1132,7 +1408,8 @@ export function sanitizeForSharing(
       ...p,
       id: newId,
       cwd: undefined,
-      startupCommand: undefined
+      startupCommand: undefined,
+      env: undefined
     };
   });
 
@@ -1553,9 +1830,13 @@ export function mostCommonUsername(servers: ServerConfig[]): string {
  * through the test harness.
  *
  * Deliberately still narrow in one direction: tunnels, serial profiles,
- * local shell profiles, and explicit groups are NOT captured here — none of
- * them are vault-backed (exportBackup reads those straight off
- * `core.getSnapshot()`), so there is nothing for this lock to protect there.
+ * local shell profiles, Local Server profiles, saved TFTP/DHCP profiles, and
+ * explicit groups are NOT captured here — none of them are vault-backed
+ * (exportBackup reads those straight off `core.getSnapshot()`; a Local
+ * Server's environment rides in the encrypted section but lives on the
+ * profile record, not in the vault), so there is nothing for this lock to
+ * protect there. Nor are the trusted SSH host keys, which live in globalState
+ * and are written by the host-key verifier, which never takes this lock.
  * Macro secrets (`getMacros()`) are also outside — they live in the macro
  * store, not this SecretVault. The save dialog and the master-password
  * prompt stay outside too — none of that is UI-free, and the lock's own
@@ -1670,7 +1951,8 @@ export async function captureBackupStateForExport(
 export function registerConfigCommands(
   core: NexusCore,
   vault: SecretVault,
-  context?: import("vscode").ExtensionContext
+  context?: import("vscode").ExtensionContext,
+  runtime?: ConfigRuntimeHooks
 ): vscode.Disposable[] {
   async function exportBackup(): Promise<void> {
     const masterPassword = await promptMasterPassword();
@@ -1688,7 +1970,8 @@ export function registerConfigCommands(
         // `snapshot.inventorySources`, which would be a second,
         // independently stale read. `snapshot` below is used only for the
         // buckets the lock does not cover (tunnels, serial profiles, local
-        // shell profiles, explicit groups) — none of which are vault-backed.
+        // shell profiles, Local Server profiles, saved TFTP/DHCP profiles,
+        // explicit groups) — none of which are vault-backed.
         const captured = await captureBackupStateForExport(core, vault);
         const snapshot = core.getSnapshot();
         const settings = readSettings();
@@ -1721,9 +2004,26 @@ export function registerConfigCommands(
         secrets.secretMacros = secretMacroBlobs;
         secrets.fileBackups = fileBackups;
 
-        const encryptedSecrets = encrypt(JSON.stringify(secrets), masterPassword);
+        // LOCAL SHELL and LOCAL SERVER profiles — the profile lists go in the
+        // clear like every other collection; each profile's environment does
+        // not (see `NexusConfigExport.localServers` / `.localShellProfiles`).
+        // Both halves come from the SAME snapshot, so a profile and its
+        // variables are one generation.
+        const localShells = splitEnvIntoSecrets(snapshot.localShellProfiles);
+        const localServers = splitEnvIntoSecrets(snapshot.localServers);
+        secrets.localShellEnv = localShells.envById;
+        secrets.localServerEnv = localServers.envById;
+        // TRUSTED SSH HOST KEYS — in the encrypted section for INTEGRITY more than
+        // secrecy: the section is authenticated (AES-GCM), so nobody holding the
+        // file but not the password can swap in a key that a Replace restore
+        // would then trust without the changed-key warning. It also keeps the
+        // list of every host this machine has connected to — including ones no
+        // profile names any more — out of the readable half of the file.
+        if (context?.globalState) {
+          secrets.knownHostFingerprints = readKnownHostFingerprints(context.globalState);
+        }
 
-        const exportData: NexusConfigExport = {
+        const clearPart: NexusConfigExport = {
           version: 2,
           exportType: "backup",
           exportedAt: new Date().toISOString(),
@@ -1734,17 +2034,23 @@ export function registerConfigCommands(
           servers: captured.servers,
           tunnels: snapshot.tunnels,
           serialProfiles: snapshot.serialProfiles,
-          localShellProfiles: snapshot.localShellProfiles,
+          localShellProfiles: localShells.clear,
           authProfiles: captured.authProfiles,
           inventorySources: captured.inventorySources,
           deviceTemplates: captured.deviceTemplates,
           savedFilters: captured.savedFilters,
+          localServers: localServers.clear,
+          tftpProfiles: snapshot.tftpProfiles,
+          dhcpProfiles: snapshot.dhcpProfiles,
           groups: snapshot.explicitGroups,
           macros: nonSecretForTopLevel,
           macroFolders: getMacroFolders(),
-          settings, // no longer contains nexus.terminal.macros
-          encryptedSecrets
+          settings // no longer contains nexus.terminal.macros
         };
+        // The seal goes INSIDE the encrypted section; see CLEAR_PART_SEAL_VERSION.
+        secrets.clearPartSeal = { version: CLEAR_PART_SEAL_VERSION, sha256: clearPartDigest(clearPart) };
+        const encryptedSecrets = encrypt(JSON.stringify(secrets), masterPassword);
+        const exportData: NexusConfigExport = { ...clearPart, encryptedSecrets };
 
         const uri = await vscode.window.showSaveDialog({
           defaultUri: vscode.Uri.file("nexus-backup.json"),
@@ -1756,7 +2062,15 @@ export function registerConfigCommands(
         const json = JSON.stringify(exportData, null, 2);
         await vscode.workspace.fs.writeFile(uri, Buffer.from(json, "utf8"));
 
-        const count = captured.servers.length + snapshot.tunnels.length + snapshot.serialProfiles.length + snapshot.localShellProfiles.length + captured.authProfiles.length;
+        const count =
+          captured.servers.length +
+          snapshot.tunnels.length +
+          snapshot.serialProfiles.length +
+          snapshot.localShellProfiles.length +
+          captured.authProfiles.length +
+          snapshot.localServers.length +
+          snapshot.tftpProfiles.length +
+          snapshot.dhcpProfiles.length;
         const fileCount = fileBackups.reduce((sum, folder) => sum + folder.files.length, 0);
         const fileNote = fileCount > 0
           ? ` and ${plural(fileCount, "encrypted .ssh/script file")}`
@@ -1788,6 +2102,11 @@ export function registerConfigCommands(
       allMacros
     );
 
+    // Backup-only, deliberately absent here: inventory sources, device templates
+    // and saved filters (workspace wiring), Local Server profiles (this
+    // machine's executables, paths and environment), saved TFTP/DHCP profiles
+    // (this bench's interfaces and address plan) and trusted SSH host keys
+    // (this machine's trust decisions). See each field on NexusConfigExport.
     const exportData: NexusConfigExport = {
       version: 2,
       exportType: "share",
@@ -1890,6 +2209,24 @@ export function registerConfigCommands(
         decryptedSecrets = JSON.parse(decrypt(data.encryptedSecrets, password));
       } catch {
         void vscode.window.showErrorMessage("Incorrect password or corrupted backup.");
+        return;
+      }
+      if (typeof decryptedSecrets !== "object" || decryptedSecrets === null || Array.isArray(decryptedSecrets)) {
+        void vscode.window.showErrorMessage("Incorrect password or corrupted backup.");
+        return;
+      }
+      // Checked against `data` exactly as parsed — the import below mutates it.
+      const seal = checkClearPartSeal(data, decryptedSecrets);
+      if (seal === "changed") {
+        void vscode.window.showErrorMessage(
+          "This backup was changed after it was created: its readable part no longer matches the part its master password protects, so nothing was imported. Import the file exactly as it was saved, or take a new backup."
+        );
+        return;
+      }
+      if (seal === "unsupported") {
+        void vscode.window.showErrorMessage(
+          "This backup was sealed by a newer version of Nexus, which this version cannot check, so nothing was imported. Update Nexus and import it again."
+        );
         return;
       }
     }
@@ -2379,6 +2716,23 @@ export function registerConfigCommands(
   ): Promise<void> {
     const snapshot = core.getSnapshot();
 
+    // Prepared BEFORE the replace-mode wipe so the guard below judges each
+    // entry exactly as the import will; see `unusableCarriedCollections`.
+    data.localServers = prepareImportedLocalServers(data.localServers, decryptedSecrets?.localServerEnv);
+    data.dhcpProfiles = sanitizeImportedDhcpProfiles(data.dhcpProfiles);
+    if (mode === "replace") {
+      const unusable = unusableCarriedCollections(data);
+      if (unusable.length > 0) {
+        const lists = unusable.length === 1
+          ? `${unusable[0]} list has`
+          : `${unusable.slice(0, -1).join(", ")} and ${unusable[unusable.length - 1]} lists have`;
+        void vscode.window.showErrorMessage(
+          `Nothing was imported: the backup's ${lists} entries, but none that can be imported, so Replace would delete yours and restore none. Import it with Merge to keep yours, or use another backup.`
+        );
+        return;
+      }
+    }
+
     if (mode === "replace") {
       for (const server of snapshot.servers) {
         await core.removeServer(server.id);
@@ -2424,6 +2778,38 @@ export function registerConfigCommands(
       for (const filter of snapshot.savedFilters) {
         await core.removeSavedFilter(filter.id);
       }
+      // LOCAL SERVERS and SAVED TFTP/DHCP PROFILES — replaced only when the
+      // payload CARRIES the collection, unlike the buckets above, which Replace
+      // wipes whatever the file holds. These three first entered the backup in
+      // 2.8.243, so every older backup lacks the key, and wiping on its account
+      // would destroy local data the file never claimed to replace — the same
+      // rule, for the same reason, as the macro-folder clear below ("Nothing
+      // was replaced; nothing should have been cleared"). A backup from this
+      // build always carries all three arrays, empty or not, so restoring one
+      // still replaces them wholesale.
+      //
+      // A Local Server is stopped before its profile goes, exactly as Remove
+      // Local Server does (`stopLocalServerForRemoval`) — a deleted profile must
+      // not leave its process running with no row to stop it from. Nothing is
+      // STARTED on the way back in: a restored profile is configuration only.
+      if (Array.isArray(data.localServers)) {
+        for (const server of snapshot.localServers) {
+          await runtime?.stopLocalServer(server.id);
+          await core.removeLocalServerConfig(server.id);
+        }
+      }
+      // A saved profile owns no runtime state (see NexusCore.removeTftpProfile),
+      // so replacing them never touches a running service.
+      if (Array.isArray(data.tftpProfiles)) {
+        for (const profile of snapshot.tftpProfiles) {
+          await core.removeTftpProfile(profile.id);
+        }
+      }
+      if (Array.isArray(data.dhcpProfiles)) {
+        for (const profile of snapshot.dhcpProfiles) {
+          await core.removeDhcpProfile(profile.id);
+        }
+      }
     }
 
     // F14 — merge mode: existing inventory source ids join the existing-id set so
@@ -2442,14 +2828,19 @@ export function registerConfigCommands(
           ...snapshot.deviceTemplates.map((t) => t.id),
           // SAVED FILTER DEFINITIONS (PR-E) — same, so a same-id saved filter is
           // not silently overwritten in merge mode.
-          ...snapshot.savedFilters.map((f) => f.id)
+          ...snapshot.savedFilters.map((f) => f.id),
+          // LOCAL SERVERS / SAVED TFTP-DHCP PROFILES — same rule: a local record
+          // wins over a same-id one from the file (and so does its environment).
+          ...snapshot.localServers.map((c) => c.id),
+          ...snapshot.tftpProfiles.map((p) => p.id),
+          ...snapshot.dhcpProfiles.map((p) => p.id)
         ])
       : new Set<string>();
 
     let imported = 0;
     let skipped = 0;
     // id-PRESERVING import (distinct from the share path's fresh-id remap): each entity keeps
-    // its id and is skipped when that id already exists. Same shape across all six buckets.
+    // its id and is skipped when that id already exists. Same shape across every bucket.
     const serverTally = await importPreservingIds(data.servers, existingIds, validateServerConfig, (e) => addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s)));
     const tunnelTally = await importPreservingIds(data.tunnels, existingIds, validateTunnelProfile, (e) => core.addOrUpdateTunnel(e));
     const serialTally = await importPreservingIds(data.serialProfiles, existingIds, validateSerialProfile, (e) => core.addOrUpdateSerialProfile(e));
@@ -2465,6 +2856,8 @@ export function registerConfigCommands(
     const inventorySourceTally = await importPreservingIds(data.inventorySources, existingIds, validateInventorySource, (e) =>
       core.addOrUpdateInventorySource(e)
     );
+    // Environment restored from the encrypted section first; see `restoreEnvFromSecrets`.
+    restoreEnvFromSecrets(data.localShellProfiles, decryptedSecrets?.localShellEnv);
     const localShellTally = await importPreservingIds(data.localShellProfiles, existingIds, validateLocalShellProfile, (e) => core.addOrUpdateLocalShellProfile(e));
     const authProfileTally = await importPreservingIds(data.authProfiles, existingIds, validateAuthProfile, (e) => core.addOrUpdateAuthProfile(e));
     // DEVICE TEMPLATES (PR-T1) — imported id-preserving like every other bucket.
@@ -2475,7 +2868,34 @@ export function registerConfigCommands(
     const savedFilterTally = await importPreservingIds(data.savedFilters, existingIds, validateSavedFilter, (e) =>
       core.addOrUpdateSavedFilter(e)
     );
-    for (const tally of [serverTally, tunnelTally, serialTally, inventorySourceTally, localShellTally, authProfileTally, deviceTemplateTally, savedFilterTally]) {
+    // LOCAL SERVERS — environment restored from the encrypted section and the
+    // folder normalised at the top of this function; see
+    // `prepareImportedLocalServers`. Importing a profile never starts it.
+    const localServerTally = await importPreservingIds(data.localServers, existingIds, validateLocalServerConfig, (e) =>
+      core.addOrUpdateLocalServerConfig(e)
+    );
+    // SAVED TFTP / DHCP PROFILES — configuration only; a restore never writes
+    // them into `nexus.networkServers.*` (that is Apply Profile's job) and never
+    // starts a service.
+    const tftpProfileTally = await importPreservingIds(data.tftpProfiles, existingIds, validateTftpConfigProfile, (e) =>
+      core.addOrUpdateTftpProfile(e)
+    );
+    const dhcpProfileTally = await importPreservingIds(data.dhcpProfiles, existingIds, validateDhcpConfigProfile, (e) =>
+      core.addOrUpdateDhcpProfile(e)
+    );
+    for (const tally of [
+      serverTally,
+      tunnelTally,
+      serialTally,
+      inventorySourceTally,
+      localShellTally,
+      authProfileTally,
+      deviceTemplateTally,
+      savedFilterTally,
+      localServerTally,
+      tftpProfileTally,
+      dhcpProfileTally
+    ]) {
       imported += tally.imported;
       skipped += tally.skipped;
     }
@@ -2863,6 +3283,7 @@ export function registerConfigCommands(
 
     // Restore passwords/passphrases from decrypted secrets
     let fileRestoreResult: RestoreBackupFoldersResult = { restoredFiles: 0, skippedExistingFiles: 0 };
+    let hostKeyConflicts = 0;
     // Sources whose record + secrets were both successfully rolled back this run.
     const failedInventorySourceNames: string[] = [];
     // FINDING 1 — sources whose secret store ALSO failed to roll back (removeInventorySource
@@ -2944,8 +3365,8 @@ export function registerConfigCommands(
         // whole loop, so one failure never aborts the rest.
         //
         // A vault-first reordering (store secrets, THEN persist the record) would close this
-        // more cleanly, but importPreservingIds is the generic shared path all six imported
-        // buckets go through — special-casing the ordering there for inventory sources alone
+        // more cleanly, but importPreservingIds is the generic shared path every imported
+        // bucket goes through — special-casing the ordering there for inventory sources alone
         // would complicate every other bucket's call site. This per-source rollback is the
         // minimal change scoped to the one bucket that reads secrets back out of the vault.
         for (const [sourceId, fields] of Object.entries(inventorySourceSecrets)) {
@@ -3132,6 +3553,15 @@ export function registerConfigCommands(
         }
       }
       fileRestoreResult = await restoreBackupFolders(decryptedSecrets, mode, context);
+      // TRUSTED SSH HOST KEYS — only when the backup carries a usable set: an
+      // older backup has none, a set whose every entry is malformed counts as
+      // none, and "no set" must not read as "trust nothing" in replace mode.
+      // Merge keeps this machine's key wherever the two disagree and counts it
+      // for the summary; see `restoreKnownHostFingerprints`.
+      const incomingHostKeys = sanitizeKnownHostFingerprints(decryptedSecrets.knownHostFingerprints);
+      if (context?.globalState && incomingHostKeys) {
+        hostKeyConflicts = (await restoreKnownHostFingerprints(context.globalState, incomingHostKeys, mode)).conflicts;
+      }
     }
 
     // FINDING 1 (P2, secrets review) — after the secret-restore phase above, catch the case a
@@ -3224,14 +3654,22 @@ export function registerConfigCommands(
     if (mode === "replace") {
       await vscode.commands.executeCommand("nexus.filter.clear");
     }
+    // Merge never overwrites a trusted host key (see restoreKnownHostFingerprints);
+    // saying so is what keeps that from reading as a restore that silently failed.
+    const hostKeyNote = hostKeyConflicts > 0
+      ? ` Kept the locally trusted SSH host key for ${plural(hostKeyConflicts, "host")} where the backup holds a different key.`
+      : "";
     void vscode.window.showInformationMessage(
-      `Imported ${plural(imported, "profile")}${mode === "replace" ? " (replaced existing)" : ""}${skipNote}${restoredFileNote}.`
+      `Imported ${plural(imported, "profile")}${mode === "replace" ? " (replaced existing)" : ""}${skipNote}${restoredFileNote}.${hostKeyNote}`
     );
   }
 
   async function completeReset(): Promise<void> {
     const confirm = await vscode.window.showWarningMessage(
-      "This will permanently delete ALL servers, tunnels, serial profiles, local shell profiles, inventory sources, macros, groups, and saved passwords. This cannot be undone.",
+      "This will permanently delete ALL servers, tunnels, serial profiles, local shell profiles, Local Server profiles, " +
+        "saved TFTP/DHCP profiles, inventory sources, device templates, saved filters, macros, groups, and saved passwords, " +
+        "and reset every Nexus setting. Running Local Servers and TFTP/DHCP services are stopped before their configuration is removed. " +
+        "This cannot be undone.",
       { modal: true },
       "Delete Everything"
     );
@@ -3244,6 +3682,11 @@ export function registerConfigCommands(
       validateInput: (value) => value === "DELETE" ? undefined : "Type DELETE to confirm"
     });
     if (typed !== "DELETE") return;
+
+    // The TFTP/DHCP services go first, and OUTSIDE the lock: stopping one is a
+    // round trip to the daemon process, and it depends on no config the lock
+    // protects. See `stopRunningNetworkServices` for why a reset stops them.
+    await runtime?.stopNetworkServices();
 
     // CONFIG MUTATION LOCK — both confirmations have already resolved above;
     // everything from here down is the mutation phase, with no further
@@ -3308,6 +3751,21 @@ export function registerConfigCommands(
       }
       for (const filter of snapshot.savedFilters) {
         await core.removeSavedFilter(filter.id);
+      }
+
+      // Local Server profiles (issue #149) — each stopped first, as Remove Local
+      // Server does, so no process outlives the profile it was started from.
+      for (const server of snapshot.localServers) {
+        await runtime?.stopLocalServer(server.id);
+        await core.removeLocalServerConfig(server.id);
+      }
+      // Saved TFTP/DHCP profiles (issue #149) — configuration only; the running
+      // services were stopped above, before the lock.
+      for (const profile of snapshot.tftpProfiles) {
+        await core.removeTftpProfile(profile.id);
+      }
+      for (const profile of snapshot.dhcpProfiles) {
+        await core.removeDhcpProfile(profile.id);
       }
 
       // Clear macros (globalState + vault entries)

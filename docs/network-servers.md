@@ -32,7 +32,7 @@ Save refuses a bind only when the interface's network genuinely does not match t
 
 ## Quick Settings and Profiles
 
-**Quick Settings** also offers to fill in the gateway and broadcast that follow from a new pool, with DNS pointed at the gateway, and named profiles capture a whole bench setup for next week, relay-agent support included.
+**Quick Settings** also offers to fill in the gateway and broadcast that follow from a new pool, with DNS pointed at the gateway, and named profiles capture a whole bench setup for next week, relay-agent support included. Saved profiles travel in an [Encrypted Backup](import-export.md#encrypted-backup-and-share-export) but never in Export for Sharing, and Delete All Data removes them.
 
 ## Isolation and Trust
 

@@ -97,14 +97,18 @@ Choosing **Nexus Export File…** also accepts a minimal hand-written JSON file 
 
 An encrypted backup protected by a master password, or a sanitized share export (credentials stripped, IDs remapped). Proxy configurations are preserved across backup and restore.
 
-- **Encrypted Backup**: Run `Nexus: Encrypted Backup` to create a master-password-protected backup of your servers, tunnels, serial and Local Shell profiles, auth profiles, folders, inventory sources, device templates, saved filters, macros and macro folders, settings, saved credentials, the user `.ssh` folder, and the configured Nexus scripts folder
-- **Share Export**: Run `Nexus: Export for Sharing` to create a sanitized export safe for sharing (credentials stripped, learned hardware identifiers removed, IDs remapped)
+- **Encrypted Backup**: Run `Nexus: Encrypted Backup` to create a master-password-protected backup of your servers, tunnels, serial, Local Shell and Local Server profiles, saved TFTP/DHCP profiles, auth profiles, folders, inventory sources, device templates, saved filters, macros and macro folders, settings, saved credentials, trusted SSH host keys, the user `.ssh` folder, and the configured Nexus scripts folder
+- **Share Export**: Run `Nexus: Export for Sharing` to create a sanitized export safe for sharing (credentials stripped, Local Shell environment variables removed, learned hardware identifiers removed, IDs remapped)
 
 You can also open **Settings** and use **Backup…** to save a password-protected backup, or **Export for Sharing…** to create a sanitized export without secrets.
 
-The master password encrypts the secrets — saved passwords, passphrases, tokens and secret macro text — and the backed-up `.ssh` and script files. Everything else in the file, including profile names, hosts, usernames, ids and settings, is stored in the clear, so keep the file private.
+The master password encrypts the secrets — saved passwords, passphrases, tokens, secret macro text, and the environment variables of your Local Shell and Local Server profiles — along with your trusted SSH host keys and the backed-up `.ssh` and script files. Everything else in the file is readable by anyone who has it: profile names, hosts, usernames, ids, settings, and a Local Server's program, arguments and working directory. Keep the file private, and give a Local Server the secrets it needs through its environment variables rather than its arguments.
 
-**Not in an Encrypted Backup yet:** Local Server profiles and saved TFTP/DHCP profiles (your TFTP/DHCP settings are included). Restoring with Replace leaves the ones already on this machine alone; on a new machine, recreate them by hand. Trusted host keys and session logs are not backed up either.
+The password also seals the readable part. A backup made by this version records a fingerprint of it inside the encrypted part, and if anything in the readable part is changed afterwards — a server's host, a Local Server's command — the import is refused before anything on this machine changes, so the passwords and variables a backup restores are never attached to a record someone else rewrote. Restoring an unchanged backup works whatever the file's spacing or key order; a backup made before 2.8.243 has no seal and imports as it always did.
+
+**Replace refuses a list it could not restore.** If the backup's Local Server, saved TFTP or saved DHCP profile list has entries but none of them can be imported, Replace stops before deleting anything and says which list; Merge imports what it can. An empty list is a real answer and still clears yours.
+
+**Local Servers, TFTP/DHCP profiles and host keys on restore:** Merge adds the ones you don't have and keeps the ones you do; where the backup trusts a different SSH host key than this machine does, your current key is kept and the import summary says how many hosts that affected. Replace swaps in the backup's, stopping any running Local Server it removes first. A restore starts nothing — Local Servers come back stopped, and a TFTP/DHCP profile isn't applied until you load it. A backup made before 2.8.243 has none of these, and restoring it leaves yours untouched, Replace included. Export for Sharing never includes them. Session logs are not backed up.
 
 To bring either file back in, run `Nexus: Import…` and choose **Nexus Export File…** — see [Import](#import) for how Merge and Replace treat local `.ssh` and script files.
 

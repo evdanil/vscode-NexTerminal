@@ -38,6 +38,7 @@ import {
   dhcpInterfaceChoices,
   dhcpRangeEndForCount,
   effectiveDhcpRangeEnd,
+  NETWORK_SERVER_LABELS,
   readSettingBoolean,
   readSettingNumber,
   readSettingString,
@@ -187,6 +188,39 @@ function errorMessageFor(error: unknown, prefix: string): string {
   }
   const message = error instanceof Error ? error.message : String(error);
   return `${prefix}: ${message}`;
+}
+
+/**
+ * Stops every embedded service that is serving (or coming up) right now.
+ *
+ * Delete All Data calls this before it resets the `nexus.networkServers.*`
+ * settings. A running service keeps the configuration it was launched with
+ * until it is restarted, so without this the reset would leave a DHCP server
+ * answering on the LAN with a pool — or a TFTP root, writable if it was — that
+ * no longer exists anywhere in Nexus. Saved TFTP/DHCP profiles own no runtime
+ * state, so deleting THEM would not require it; the settings wipe does.
+ *
+ * Best effort per service: one that refuses to stop does not stop the reset or
+ * the other service. It is named instead, with a Stop button that retries it
+ * — not awaited, so an ignored notification never holds up the reset.
+ */
+export async function stopRunningNetworkServices(
+  core: Pick<CommandContext["core"], "getSnapshot">,
+  manager: Pick<NetworkServerManager, "stop">
+): Promise<void> {
+  for (const session of core.getSnapshot().activeNetworkServerSessions) {
+    if (session.status !== "running" && session.status !== "starting") continue;
+    const kind = session.kind;
+    try {
+      await manager.stop(kind);
+    } catch (error) {
+      void vscode.window
+        .showWarningMessage(errorMessageFor(error, `The ${NETWORK_SERVER_LABELS[kind]} service could not be stopped and is still running`), "Stop")
+        .then((choice) => {
+          if (choice === "Stop") void vscode.commands.executeCommand("nexus.networkServer.stop", kind);
+        });
+    }
+  }
 }
 
 export function registerNetworkServerCommands(
