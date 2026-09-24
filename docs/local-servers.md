@@ -16,6 +16,8 @@ Distinct from [**Embedded Network Servers**](network-servers.md), which serves T
 
 To file a profile in a folder, drag it onto the folder in the Connectivity Hub, or use **Move to Folder…** on its right-click menu, which offers your existing folders, a new one, or the top level.
 
+Environment variables often hold tokens, so an [Encrypted Backup](import-export.md#encrypted-backup-and-share-export) keeps them in its password-protected part, and **Export for Sharing** leaves Local Server profiles out altogether.
+
 ## Output
 
 A local server's output lands in an ordinary Nexus terminal — [highlighting](terminal.md#highlighting), scrollback capture and [Reset / Clear Scrollback / Copy All](terminal.md#tab-commands) all apply. [Session transcript logging](terminal.md#session-transcript-logging) is not available for Local Server output; use Copy All to capture a run.

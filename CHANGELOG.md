@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.8.243] — 2026-09-24
+
+### Fixed
+
+- **An Encrypted Backup now carries your Local Server profiles, saved TFTP/DHCP profiles and trusted SSH host keys.** All three were left out, so a machine rebuilt from a backup came back without them. A Local Server's environment variables — where tokens and passwords tend to live — are stored in the password-protected part of the file rather than beside the profile, and so are the trusted host keys, which also means nobody holding the file without the password can plant a host key for Nexus to trust. The environment variables of your Local Shell profiles, which used to sit in the readable part of the file, now go in the protected part too; a backup made by an earlier version still restores them, though an earlier version restoring a backup made by this one brings those profiles back without their variables, because it does not know where to look. Restoring with **Merge** adds what is new and keeps what you already have. Where the backup trusts a different key for a host than this machine does, the key you already trust is kept and the import summary says how many hosts that affected — quietly swapping it would hide exactly the change the host-key warning exists to catch. **Replace** swaps in the backup's Local Servers, TFTP/DHCP profiles and host keys, stopping any Local Server it removes first. A restore never starts anything: Local Servers come back stopped, and a TFTP/DHCP profile is not applied to your live settings until you load it. A backup made by an earlier version has none of these in it, and restoring it leaves yours untouched, with Replace too. **Export for Sharing** still leaves all three out: they describe this machine, not something a colleague can use.
+
+- **A backup can no longer be edited to steer your saved secrets somewhere else.** The readable part of an Encrypted Backup — every profile's name, host, command and settings — sat beside the encrypted part joined only by an id, so anyone holding the file could, for instance, point a server at another host or a Local Server at another program and have a restore hand the saved password or the protected environment variables to the rewritten record. A backup made by this version records a fingerprint of its readable part inside the encrypted part, and an import that finds the two no longer match is refused before anything changes. Backups made before this version carry no fingerprint and import as before.
+
+- **Replace no longer empties a collection it cannot restore.** If a backup's Local Server, saved TFTP or saved DHCP profile list had entries but none that could be imported, Replace deleted yours and restored none. It now refuses and names the list, before deleting anything.
+
+- **Export for Sharing no longer includes a Local Shell profile's environment variables.** It already left out the profile's working directory and startup command, but kept its variables — and any token in them — in a file meant to have its credentials stripped. The profile itself is still shared.
+
+- **Delete All Data now deletes Local Server profiles and saved TFTP/DHCP profiles too, and its warning says so.** It used to leave both behind while its warning listed everything it would delete. It now also stops the TFTP and DHCP services before deleting anything — a service left running would have kept serving its old configuration after the settings describing it were reset — and stops each running Local Server just before removing its profile. Trusted SSH host keys, script files and session logs are still left in place.
+
 ## [2.8.242] — 2026-09-24
 
 ### Changed

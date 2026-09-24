@@ -5,12 +5,12 @@ import { registerCwdSyncCommands, FOLLOW_TERMINAL_STATE_KEY } from "./commands/c
 import { registerScriptCommands } from "./commands/scriptCommands";
 import { registerSerialCommands } from "./commands/serialCommands";
 import { registerLocalShellCommands } from "./commands/localShellCommands";
-import { registerNetworkServerCommands } from "./commands/networkServerCommands";
+import { registerNetworkServerCommands, stopRunningNetworkServices } from "./commands/networkServerCommands";
 import { registerNetworkServerProfileCommands } from "./commands/networkServerProfileCommands";
 import { registerNetworkServerTransferCommands } from "./commands/networkServerTransferCommands";
 import { NetworkServerManager } from "./services/networkServers/networkServerManager";
 import { NetworkServerTreeProvider } from "./ui/networkServerTreeProvider";
-import { registerLocalServerCommands } from "./commands/localServerCommands";
+import { registerLocalServerCommands, stopLocalServerForRemoval } from "./commands/localServerCommands";
 import { registerServerCommands, teardownServerRuntime } from "./commands/serverCommands";
 import { registerServerMacroCommands } from "./commands/serverMacroCommands";
 import { registerBmcCommands } from "./commands/bmcCommands";
@@ -1560,7 +1560,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
       })
   });
   context.subscriptions.push(inventoryStatusPoll);
-  const configDisposables = registerConfigCommands(core, secretVault, context);
+  // Delete All Data and a Replace-mode backup restore remove Local Server
+  // profiles, and Delete All Data resets the settings the TFTP/DHCP services
+  // were launched from — so both need the same runtime teardown the dedicated
+  // commands perform, which configCommands itself has no business owning.
+  const configDisposables = registerConfigCommands(core, secretVault, context, {
+    stopLocalServer: (configId) => stopLocalServerForRemoval(localServerCtx, configId),
+    stopNetworkServices: () => stopRunningNetworkServices(core, networkServerManager)
+  });
 
   // One-time offer to import ~/.ssh/config, shown at most once ever. Strictly
   // fire-and-forget: the helper owns every guard and never rejects, so nothing

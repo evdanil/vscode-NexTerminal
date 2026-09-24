@@ -356,6 +356,48 @@ function errorMessageFor(error: unknown, prefix: string): string {
   return `${prefix}: ${message}`;
 }
 
+/**
+ * The runtime teardown that has to happen BEFORE a Local Server profile is
+ * deleted: stop its process, call off an auto-restart a crash has already
+ * scheduled, and close the terminal tabs the config still owns.
+ *
+ * Shared by every path that deletes profiles — Remove Local Server here, and
+ * Delete All Data and a Replace-mode backup restore in configCommands.ts (wired
+ * through `ConfigRuntimeHooks` in extension.ts). Without it a deleted profile's
+ * process keeps running with no row to stop it from.
+ *
+ * The pending-restart cancel matters beyond tidiness. `retryStart` refuses a
+ * config that no longer exists, which is enough while a deletion STAYS a
+ * deletion — but a Replace restore re-creates the same ids a moment later, and
+ * a backoff timer armed before it would then respawn the old process against
+ * the restored profile, a start nobody asked for.
+ *
+ * Takes no lock of its own: every caller already holds `configMutationLock`
+ * across the stop and the removal that follows it. Never throws — a stop that
+ * fails still leaves the terminals cleaned up, as Remove always has.
+ */
+export async function stopLocalServerForRemoval(
+  ctx: Pick<CommandContext, "core" | "localServerTerminals"> & {
+    localServerManager: Pick<LocalServerManager, "cancelPendingRestart" | "stopConfig">;
+  },
+  configId: string
+): Promise<void> {
+  const manager = ctx.localServerManager;
+  manager.cancelPendingRestart(configId);
+  try {
+    await manager.stopConfig(configId, true);
+  } catch {
+    /* best effort; the terminal cleanup below still runs */
+  }
+  for (const [sessionId, entry] of ctx.localServerTerminals.entries()) {
+    if (entry.configId === configId) {
+      entry.terminal.dispose();
+      ctx.localServerTerminals.delete(sessionId);
+      ctx.core.unregisterLocalServerSession(sessionId);
+    }
+  }
+}
+
 export function registerLocalServerCommands(
   ctx: CommandContext & { localServerManager: LocalServerManager }
 ): vscode.Disposable[] {
@@ -603,18 +645,7 @@ export function registerLocalServerCommands(
             "nothing was removed. Remove it again to review the current details.";
           return;
         }
-        try {
-          await manager.stopConfig(configId, true);
-        } catch {
-          /* best effort; session cleanup is also gated by the cascade helper */
-        }
-        for (const [sessionId, entry] of ctx.localServerTerminals.entries()) {
-          if (entry.configId === configId) {
-            entry.terminal.dispose();
-            ctx.localServerTerminals.delete(sessionId);
-            ctx.core.unregisterLocalServerSession(sessionId);
-          }
-        }
+        await stopLocalServerForRemoval(ctx, configId);
         await ctx.core.removeLocalServerConfig(configId);
       });
       if (alreadyRemoved !== undefined) {

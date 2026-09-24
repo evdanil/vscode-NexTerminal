@@ -61,12 +61,14 @@ vi.mock("vscode", () => ({
     registerCommand: (id: string, handler: (...args: unknown[]) => unknown) => {
       registeredCommands.set(id, handler);
       return { dispose: vi.fn() };
-    }
+    },
+    executeCommand: vi.fn()
   },
   window: {
     showQuickPick: vi.fn(),
     showErrorMessage: vi.fn(),
-    showInformationMessage: vi.fn()
+    showInformationMessage: vi.fn(),
+    showWarningMessage: vi.fn()
   },
   workspace: {
     getConfiguration: (section: string) => ({
@@ -96,7 +98,7 @@ vi.mock("../../../src/ui/formDefinitions", () => ({
 }));
 
 import * as vscode from "vscode";
-import { registerNetworkServerCommands } from "../../../src/commands/networkServerCommands";
+import { registerNetworkServerCommands, stopRunningNetworkServices } from "../../../src/commands/networkServerCommands";
 import { networkServerFormDefinition } from "../../../src/ui/formDefinitions";
 
 function fakeManager(overrides: Record<string, unknown> = {}) {
@@ -501,5 +503,70 @@ describe("registerNetworkServerCommands — inspectLogs", () => {
     expect(vscode.window.showInformationMessage).toHaveBeenCalledWith(
       "Network server diagnostics are not available."
     );
+  });
+});
+
+/**
+ * Delete All Data resets the `nexus.networkServers.*` settings a running service
+ * was launched from, so it stops the services first rather than leave one
+ * serving a pool — or a writable TFTP root — that no longer exists anywhere.
+ */
+describe("stopRunningNetworkServices", () => {
+  function coreWith(sessions: Array<{ kind: string; status: string }>) {
+    return { getSnapshot: () => ({ activeNetworkServerSessions: sessions }) } as any;
+  }
+
+  beforeEach(() => {
+    vi.mocked(vscode.window.showWarningMessage).mockReset();
+    vi.mocked(vscode.commands.executeCommand).mockReset();
+  });
+
+  it("stops each service that is serving or coming up, and leaves stopped and failed ones alone", async () => {
+    const manager = fakeManager();
+
+    await stopRunningNetworkServices(
+      coreWith([
+        { kind: "tftp", status: "running" },
+        { kind: "dhcp", status: "starting" }
+      ]),
+      manager
+    );
+    await stopRunningNetworkServices(
+      coreWith([
+        { kind: "tftp", status: "stopped" },
+        { kind: "dhcp", status: "error" }
+      ]),
+      manager
+    );
+
+    expect(manager.stop.mock.calls).toEqual([["tftp"], ["dhcp"]]);
+    expect(vscode.window.showWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not let one failed stop skip the other service, and names the one still running with a Stop button that retries it", async () => {
+    const manager = fakeManager({
+      stop: vi.fn(async (kind: string) => {
+        if (kind === "tftp") throw new NetworkServerError("DaemonNotReady", "daemon is not responding");
+      })
+    });
+    vi.mocked(vscode.window.showWarningMessage).mockResolvedValueOnce("Stop" as any);
+
+    await stopRunningNetworkServices(
+      coreWith([
+        { kind: "tftp", status: "running" },
+        { kind: "dhcp", status: "running" }
+      ]),
+      manager
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(manager.stop.mock.calls).toEqual([["tftp"], ["dhcp"]]);
+    expect(vscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
+    const [message, button] = vi.mocked(vscode.window.showWarningMessage).mock.calls[0] as unknown as [string, string];
+    expect(message).toContain("TFTP");
+    expect(message).toContain("still running");
+    expect(message).toContain("daemon is not responding");
+    expect(button).toBe("Stop");
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("nexus.networkServer.stop", "tftp");
   });
 });

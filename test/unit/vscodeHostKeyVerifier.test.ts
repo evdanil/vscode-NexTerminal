@@ -110,6 +110,56 @@ describe("VscodeHostKeyVerifier TOFU", () => {
     expect(result).toBe(false);
   });
 
+  /**
+   * The store has a second writer now — a backup restore rewrites
+   * `nexus.ssh.knownHostFingerprints.v1` — so a trust decision must not write
+   * back the copy it read BEFORE a modal the user may leave open for minutes.
+   * Doing that silently discarded whatever landed in between.
+   */
+  it("a trust decision made across a modal does not write back a stale copy of the store", async () => {
+    mockTrustNewHosts(false);
+    let answer: (choice: string) => void = () => undefined;
+    vi.mocked(vscode.window.showWarningMessage).mockImplementation(
+      () => new Promise((resolve) => { answer = resolve as (choice: string) => void; }) as any
+    );
+    const verifier = new VscodeHostKeyVerifier(memento);
+    const pending = verifier.verify(makeServer(), DUMMY_KEY);
+    await Promise.resolve();
+
+    // Another writer (a backup restore) lands while the modal is open.
+    await memento.update("nexus.ssh.knownHostFingerprints.v1", { "restored.lab:22": "SHA256:restored" });
+    answer("Trust and Continue");
+    expect(await pending).toBe(true);
+
+    const stored = memento.get<Record<string, string>>("nexus.ssh.knownHostFingerprints.v1");
+    expect(stored?.["restored.lab:22"]).toBe("SHA256:restored");
+    expect(stored?.["example.com:22"]).toMatch(/^SHA256:/u);
+  });
+
+  it("an accepted CHANGED key does not write back a stale copy of the store either", async () => {
+    mockTrustNewHosts(true);
+    const verifier = new VscodeHostKeyVerifier(memento);
+    await verifier.verify(makeServer(), DUMMY_KEY);
+    let answer: (choice: string) => void = () => undefined;
+    vi.mocked(vscode.window.showWarningMessage).mockImplementation(
+      () => new Promise((resolve) => { answer = resolve as (choice: string) => void; }) as any
+    );
+    const pending = verifier.verify(makeServer(), DIFFERENT_KEY);
+    await Promise.resolve();
+
+    const current = memento.get<Record<string, string>>("nexus.ssh.knownHostFingerprints.v1") ?? {};
+    await memento.update("nexus.ssh.knownHostFingerprints.v1", { ...current, "restored.lab:22": "SHA256:restored" });
+    answer("Accept New Key");
+    expect(await pending).toBe(true);
+
+    const stored = memento.get<Record<string, string>>("nexus.ssh.knownHostFingerprints.v1");
+    expect(stored?.["restored.lab:22"]).toBe("SHA256:restored");
+    const second = new VscodeHostKeyVerifier(memento);
+    vi.mocked(vscode.window.showWarningMessage).mockClear();
+    expect(await second.verify(makeServer(), DIFFERENT_KEY)).toBe(true);
+    expect(vscode.window.showWarningMessage).not.toHaveBeenCalled();
+  });
+
   it("accepts known host with matching fingerprint silently", async () => {
     mockTrustNewHosts(true);
     const verifier = new VscodeHostKeyVerifier(memento);

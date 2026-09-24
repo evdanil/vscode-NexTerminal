@@ -90,7 +90,7 @@ vi.mock("../../src/utils/naturalCompare", () => ({ naturalCompare: (a: string, b
 vi.mock("../../src/commands/serverCommands", () => ({ collectGroups: () => [] }));
 
 import * as vscode from "vscode";
-import { formValuesToLocalServer, registerLocalServerCommands } from "../../src/commands/localServerCommands";
+import { formValuesToLocalServer, registerLocalServerCommands, stopLocalServerForRemoval } from "../../src/commands/localServerCommands";
 import type { LocalServerConfig } from "../../src/models/localServer";
 import type { FormValues } from "../../src/ui/formTypes";
 import { NexusCore } from "../../src/core/nexusCore";
@@ -1365,5 +1365,77 @@ describe("nexus.localServer.duplicate re-resolves under the lock (issue #108 fol
 
     expect(await repo.getLocalServers()).toEqual([]);
     expect(core.getSnapshot().localServers).toEqual([]);
+  });
+});
+
+/**
+ * The teardown every path that deletes a Local Server profile runs first —
+ * Remove Local Server, Delete All Data, and a Replace-mode backup restore.
+ */
+describe("stopLocalServerForRemoval", () => {
+  function fixture(options: { stopFails?: boolean } = {}) {
+    const manager = {
+      cancelPendingRestart: vi.fn(() => true),
+      stopConfig: vi.fn(async () => {
+        if (options.stopFails) throw new Error("pty already gone");
+      })
+    };
+    const mine = { dispose: vi.fn() };
+    const other = { dispose: vi.fn() };
+    const localServerTerminals = new Map<string, { terminal: { dispose: () => void }; configId: string }>([
+      ["session-mine", { terminal: mine, configId: "cfg-1" }],
+      ["session-other", { terminal: other, configId: "cfg-2" }]
+    ]);
+    const core = { unregisterLocalServerSession: vi.fn() };
+    const ctx = { core, localServerTerminals, localServerManager: manager };
+    return { ctx, manager, mine, other, localServerTerminals, core };
+  }
+
+  it("calls off a pending auto-restart as well as stopping the running session, then closes that config's terminals only", async () => {
+    const f = fixture();
+
+    await stopLocalServerForRemoval(f.ctx as never, "cfg-1");
+
+    // A restore that re-creates the SAME id would otherwise let a crash-backoff
+    // timer armed before it respawn the old process against the new profile.
+    expect(f.manager.cancelPendingRestart).toHaveBeenCalledWith("cfg-1");
+    expect(f.manager.stopConfig).toHaveBeenCalledWith("cfg-1", true);
+    expect(f.mine.dispose).toHaveBeenCalledTimes(1);
+    expect(f.other.dispose).not.toHaveBeenCalled();
+    expect([...f.localServerTerminals.keys()]).toEqual(["session-other"]);
+    expect(f.core.unregisterLocalServerSession.mock.calls).toEqual([["session-mine"]]);
+  });
+
+  it("still closes the config's terminals when the stop itself fails", async () => {
+    const f = fixture({ stopFails: true });
+
+    await expect(stopLocalServerForRemoval(f.ctx as never, "cfg-1")).resolves.toBeUndefined();
+
+    expect(f.mine.dispose).toHaveBeenCalledTimes(1);
+    expect([...f.localServerTerminals.keys()]).toEqual(["session-other"]);
+  });
+
+  it("Remove Local Server runs it before the profile is deleted", async () => {
+    const f = fixture();
+    const config = { id: "cfg-1", name: "API", executable: "node" };
+    let present = true;
+    const order: string[] = [];
+    f.manager.cancelPendingRestart.mockImplementation(() => { order.push(`cancel:${String(present)}`); return false; });
+    const ctx = {
+      ...f.ctx,
+      core: {
+        ...f.core,
+        getSnapshot: () => ({ localServers: present ? [config] : [] }),
+        getLocalServer: (id: string) => (present && id === config.id ? config : undefined),
+        removeLocalServerConfig: vi.fn(async () => { order.push("remove"); present = false; })
+      }
+    };
+    registerLocalServerCommands(ctx as never);
+    vi.mocked(vscode.window.showWarningMessage).mockResolvedValueOnce("Remove" as never);
+
+    await registeredCommands.get("nexus.localServer.remove")!({ config });
+
+    expect(order).toEqual(["cancel:true", "remove"]);
+    expect(f.manager.stopConfig).toHaveBeenCalledWith("cfg-1", true);
   });
 });
