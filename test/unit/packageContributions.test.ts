@@ -1,14 +1,13 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { createEveNgProvider, readEveNgStatusPollSeconds } from "../../src/services/inventory/providers/eveNgProvider";
 import { createBuiltInProviders } from "../../src/services/inventory/builtInProviders";
 import { SHIPPED_IMPORTER_NAMES } from "../../src/utils/shippedImporters";
 
-const packageJsonPath = path.resolve(__dirname, "..", "..", "package.json");
-const readmePath = path.resolve(__dirname, "..", "..", "README.md");
-const functionalDocsPath = path.resolve(__dirname, "..", "..", "docs", "functional-documentation.md");
-const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
+const repoRoot = path.resolve(__dirname, "..", "..");
+const readDoc = (relativePath: string) => readFileSync(path.join(repoRoot, relativePath), "utf8");
+const packageJson = JSON.parse(readDoc("package.json")) as {
   dependencies: Record<string, string>;
   description: string;
   keywords: string[];
@@ -22,10 +21,64 @@ const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
     keybindings?: Array<{ command: string; key: string; mac?: string; when?: string }>;
   };
 };
-const readme = readFileSync(readmePath, "utf8");
-const functionalDocs = readFileSync(functionalDocsPath, "utf8");
+const functionalDocs = readDoc("docs/functional-documentation.md");
+
+/**
+ * The user-facing documentation: the README (the Marketplace listing) plus
+ * every guide anywhere under docs/. The README keeps one line per feature and
+ * the detail lives in the guides, so a presence check reads the guide that now
+ * holds the text, and an ABSENCE check must scan all of them — a stale string
+ * reintroduced into any one guide still reaches a reader.
+ *
+ * Walked recursively rather than listed, so a guide added later — in a new
+ * subfolder too, the way docs/inventory/ was — is covered without anyone
+ * remembering to add it here. Two kinds of file are left out on purpose:
+ * - the contributor references, which may name retired keys and internals in
+ *   order to explain them;
+ * - docs/plans/ and docs/superpowers/, which are gitignored and local-only
+ *   (AGENTS.md "Don't commit"): they never reach CI or a reader, and old plans
+ *   quote retired strings, so sweeping them would fail on a maintainer's
+ *   checkout and nowhere else.
+ */
+const CONTRIBUTOR_REFERENCES = ["docs/functional-documentation.md", "docs/network-server-daemon-protocol.md"];
+const LOCAL_ONLY_DIRS = ["docs/plans/", "docs/superpowers/"];
+const userGuidePaths = readdirSync(path.join(repoRoot, "docs"), { recursive: true, encoding: "utf8" })
+  .map((file) => `docs/${file.split(path.sep).join("/")}`)
+  .filter((file) => file.endsWith(".md"))
+  .filter((file) => !CONTRIBUTOR_REFERENCES.includes(file) && !LOCAL_ONLY_DIRS.some((dir) => file.startsWith(dir)))
+  .sort();
+const userDocs: ReadonlyArray<readonly [string, string]> = [
+  ["README.md", readDoc("README.md")],
+  ...userGuidePaths.map((p) => [p, readDoc(p)] as const)
+];
+/**
+ * A presence check reads its guide FROM the corpus, never from disk, so every
+ * file a presence check relies on is guaranteed to be under the absence sweeps
+ * as well — and naming a file the corpus does not hold fails loudly.
+ */
+const userDoc = (name: string): string => {
+  const hit = userDocs.find(([docName]) => docName === name);
+  if (!hit) {
+    throw new Error(`${name} is not in the user-doc corpus`);
+  }
+  return hit[1];
+};
+const readme = userDoc("README.md");
 
 describe("package contributions", () => {
+  it("reads the README and every user guide into the doc corpus, and leaves the contributor references out (⊘ a glob that finds nothing turns every absence check in this file into a vacuous pass)", () => {
+    const names = userDocs.map(([name]) => name);
+    for (const expected of ["README.md", "docs/local-servers.md", "docs/settings.md", "docs/inventory/eve-ng.md", "docs/inventory/proxmox.md"]) {
+      expect(names).toContain(expected);
+    }
+    // An exclusion that no longer names a real file excludes nothing, and the
+    // not.toContain below would then pass vacuously while the entry rots.
+    for (const reference of CONTRIBUTOR_REFERENCES) {
+      expect(existsSync(path.join(repoRoot, reference)), reference).toBe(true);
+      expect(names).not.toContain(reference);
+    }
+  });
+
   it("includes onUri in activationEvents for URI handler support", () => {
     expect(packageJson.activationEvents).toContain("onUri");
   });
@@ -117,20 +170,22 @@ describe("package contributions", () => {
     });
 
     /**
-     * README repeats the command title verbatim as a run-this instruction, so a
-     * rename here silently turns every one of those steps into a command that
-     * does not exist — including, when Proxmox was added, the first step of
-     * Proxmox's OWN walkthrough. Pin the absence of any stale spelling rather
-     * than only the presence of the new one: a test that checks the new wording
-     * passes again the day someone restores the old.
+     * The README's quick start and every provider guide repeat the command title
+     * verbatim as a run-this instruction, so a rename here silently turns every
+     * one of those steps into a command that does not exist — including, when
+     * Proxmox was added, the first step of Proxmox's OWN walkthrough. Pin the
+     * absence of any stale spelling rather than only the presence of the new
+     * one: a test that checks the new wording passes again the day someone
+     * restores the old. Scanned across ALL user docs, since the walkthroughs
+     * live in the guides now.
      */
-    it("⊘ leaves no README copy of the add-source title spelled differently from package.json", () => {
-      const readme = readFileSync(readmePath, "utf8");
+    it("⊘ leaves no copy in the user docs of the add-source title spelled differently from package.json", () => {
       const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title ?? "";
-      const occurrences = readme.match(/Add Inventory Source \([^)]*\)/g) ?? [];
-      expect(occurrences.length).toBeGreaterThan(0);
-      for (const occurrence of occurrences) {
-        expect(occurrence).toBe(title);
+      expect(readme.match(/Add Inventory Source \([^)]*\)/g) ?? []).not.toHaveLength(0);
+      for (const [name, doc] of userDocs) {
+        for (const occurrence of doc.match(/Add Inventory Source \([^)]*\)/g) ?? []) {
+          expect(occurrence, name).toBe(title);
+        }
       }
     });
   });
@@ -189,16 +244,17 @@ describe("package contributions", () => {
      * Rejecting ONE known-stale string cannot catch the next rename — it only
      * knows the title we already stopped using. This reads the CONTRIBUTED
      * title and holds the docs to it, so any future retitle that leaves the
-     * README behind fails here rather than sending a reader to the palette
-     * for a command label that does not exist.
+     * README or a guide behind fails here rather than sending a reader to the
+     * palette for a command label that does not exist.
      */
-    it("quotes the CURRENT contributed title wherever docs present it as a literal command (\u2298 a rename that updates package.json and leaves the README pointing at the old label)", () => {
+    it("quotes the CURRENT contributed title wherever docs present it as a literal command (\u2298 a rename that updates package.json and leaves the README or a guide pointing at the old label)", () => {
       const title = packageJson.contributes.commands.find((c) => c.command === "nexus.inventory.addSource")?.title ?? "";
       expect(title).not.toBe("");
-      const quoted = [...readme.matchAll(/`Nexus: Add Inventory Source[^`]*`/g)].map((m) => m[0]);
-      expect(quoted.length).toBeGreaterThan(0);
-      for (const occurrence of quoted) {
-        expect(occurrence).toBe(`\`Nexus: ${title}\``);
+      expect(readme).toMatch(/`Nexus: Add Inventory Source[^`]*`/);
+      for (const [name, doc] of userDocs) {
+        for (const [occurrence] of doc.matchAll(/`Nexus: Add Inventory Source[^`]*`/g)) {
+          expect(occurrence, name).toBe(`\`Nexus: ${title}\``);
+        }
       }
     });
 
@@ -1220,8 +1276,9 @@ describe("package contributions", () => {
      * the whole of the remedy, and it has to name the fix: a separate EVE-NG
      * account for Nexus.
      */
-    it("documents the one-session-per-EVE-NG-account behaviour and names the dedicated-account remedy in both documents (\u2298 leaving it undocumented makes a user who turns polling on read their own web UI logging out as a Nexus bug, with nothing anywhere telling them what to do about it)", () => {
-      for (const [name, doc] of [["functional docs", functionalDocs], ["README", readme]] as const) {
+    it("documents the one-session-per-EVE-NG-account behaviour and names the dedicated-account remedy in the functional docs and the EVE-NG guide (\u2298 leaving it undocumented makes a user who turns polling on read their own web UI logging out as a Nexus bug, with nothing anywhere telling them what to do about it)", () => {
+      const eveNgGuide = userDoc("docs/inventory/eve-ng.md");
+      for (const [name, doc] of [["functional docs", functionalDocs], ["EVE-NG guide", eveNgGuide]] as const) {
         expect(doc, name).toMatch(/one active session per user|one session per (EVE-NG )?account/i);
         expect(doc, name).toMatch(/logs? (you|them) out of the EVE-NG web UI/i);
         expect(doc, name).toMatch(/(separate|its own|second) EVE-NG account|account for Nexus/i);
@@ -1251,25 +1308,30 @@ describe("package contributions", () => {
       expect(provider.configFields[provider.configFields.length - 1]?.id).toBe("statusPollSeconds");
     });
 
-    it("documents the live-status feature, the poll setting, and the BMC-menu gating in the functional docs and README", () => {
+    it("documents the live-status feature, the poll setting, and the BMC-menu gating in the functional docs and the user docs", () => {
       // The poll is a PER-SOURCE field now. The functional docs may still NAME
       // the retired key — that is how a user who has it in settings.json finds
       // out where it went — but never as a live setting: no settings-table row
       // for it, and every mention has to sit beside the words that retire it.
-      // The README, which is the user-facing document, must not name it at all.
+      // The user docs — the README and every guide — must not name it at all.
       expect(functionalDocs).not.toContain("| `nexus.inventory.statusPollSeconds` |");
-      expect(readme).not.toContain("nexus.inventory.statusPollSeconds");
+      for (const [name, doc] of userDocs) {
+        expect(doc, name).not.toContain("nexus.inventory.statusPollSeconds");
+      }
       for (const line of functionalDocs.split("\n").filter((l) => l.includes("nexus.inventory.statusPollSeconds"))) {
         expect(line, line.slice(0, 80)).toMatch(/used to|no longer|stopped being|retired/i);
       }
+      const eveNgGuide = userDoc("docs/inventory/eve-ng.md");
+      const proxmoxGuide = userDoc("docs/inventory/proxmox.md");
       expect(functionalDocs).toMatch(/Lab Status Poll Interval/);
-      expect(readme).toMatch(/Lab Status Poll Interval/);
+      expect(eveNgGuide).toMatch(/Lab Status Poll Interval/);
       expect(functionalDocs).toMatch(/Refresh Inventory Status/);
       expect(functionalDocs).toMatch(/Live device status/i);
       // BMC-menu gating note.
       expect(functionalDocs).toMatch(/ipmiHost/);
       expect(functionalDocs).toMatch(/connectBmcSol|BMC menu gating/);
-      expect(readme).toMatch(/Refresh Inventory Status/);
+      expect(eveNgGuide).toMatch(/Refresh Inventory Status/);
+      expect(proxmoxGuide).toMatch(/Refresh Inventory Status/);
     });
 
     /**
@@ -1278,10 +1340,13 @@ describe("package contributions", () => {
      * the old one sends them searching for a command that no longer exists —
      * and puts EVE-NG's vocabulary in front of a Proxmox user on the way.
      */
-    it("names the command by its CURRENT title in both documents, with the retired lab-flavoured one gone (\u2298 a rename the docs do not follow leaves the reader hunting the palette for a title that is no longer there)", () => {
+    it("names the command by its CURRENT title in the functional docs and the user docs, with the retired lab-flavoured one gone (\u2298 a rename the docs do not follow leaves the reader hunting the palette for a title that is no longer there)", () => {
       expect(functionalDocs).not.toMatch(/Refresh Lab Status/);
-      expect(readme).not.toMatch(/Refresh Lab Status/);
-      expect(readme).toMatch(/Refresh Inventory Status/);
+      for (const [name, doc] of userDocs) {
+        expect(doc, name).not.toMatch(/Refresh Lab Status/);
+      }
+      expect(userDoc("docs/inventory/eve-ng.md")).toMatch(/Refresh Inventory Status/);
+      expect(userDoc("docs/inventory/proxmox.md")).toMatch(/Refresh Inventory Status/);
       expect(functionalDocs).toMatch(/Refresh Inventory Status/);
     });
 
@@ -1301,7 +1366,9 @@ describe("package contributions", () => {
       // ...and "exactly one reason" is no longer true either.
       expect(functionalDocs).not.toMatch(/marks it `truncated` for exactly \*\*one\*\* reason/);
       expect(functionalDocs).not.toMatch(/Available from the palette and as a Command Center title action/);
-      expect(readme).not.toMatch(/Refresh Lab Status\*\* in the Command Center title bar/);
+      for (const [name, doc] of userDocs) {
+        expect(doc, name).not.toMatch(/Refresh Lab Status\*\* in the Command Center title bar/);
+      }
     });
 
     /**
@@ -1646,7 +1713,7 @@ describe("terminal output performance defaults", () => {
       );
       expect(meta).toBeDefined();
       expect(meta?.default).toBe(false);
-      expect(readme).toContain("nexus.logging.terminalOutputTrace");
+      expect(userDoc("docs/settings.md")).toContain("nexus.logging.terminalOutputTrace");
       expect(functionalDocs).toContain("nexus.logging.terminalOutputTrace");
     });
   });
@@ -1896,30 +1963,36 @@ describe("Local Servers command titles are unambiguous in the Command Palette", 
   });
 
   /**
-   * The README walks a first-time user to a menu item by name. Rejecting ONE
-   * known-stale string ("Start Server") would only know the label already
-   * retired; this reads the CONTRIBUTED title and holds the README to it, so
-   * the next retitle fails here rather than sending a reader looking for a
-   * menu entry that does not exist.
+   * The Local Servers guide walks a first-time user to a menu item by name.
+   * Rejecting ONE known-stale string ("Start Server") would only know the label
+   * already retired; this reads the CONTRIBUTED title and holds the guide to
+   * it, so the next retitle fails here rather than sending a reader looking for
+   * a menu entry that does not exist.
    */
-  it("names the CURRENT contributed title where the README tells the user what to right-click", () => {
+  it("names the CURRENT contributed title where the Local Servers guide tells the user what to right-click", () => {
     const title = commandOf("nexus.localServer.start")?.title ?? "";
     expect(title).not.toBe("");
-    const instructions = [...readme.matchAll(/Right-click the profile and choose \*\*([^*]+)\*\*/g)].map((m) => m[1]);
+    const guide = userDoc("docs/local-servers.md");
+    const instructions = [...guide.matchAll(/Right-click the profile and choose \*\*([^*]+)\*\*/g)].map((m) => m[1]);
     expect(instructions).toContain(title);
   });
 });
 
 /**
  * The environment-variable field distinguishes `KEY=value`, `KEY=` (empty
- * string) and `KEY=null` (unset). Only the form's own hint said so; the README
- * documented the plain form alone, so the only place the contract was written
- * down was a hint a user sees after they have already guessed.
+ * string) and `KEY=null` (unset). Only the form's own hint said so; the user
+ * docs documented the plain form alone, so the only place the contract was
+ * written down was a hint a user sees after they have already guessed. The
+ * walkthrough now lives in the Local Servers guide's "Add a Local Server".
  */
 describe("Local Servers environment-variable contract is documented", () => {
-  it("documents the unset and empty-string forms in the README, not just KEY=value", () => {
-    const section = readme.slice(readme.indexOf("### Add a Local Server"));
-    const step = section.slice(0, section.indexOf("### ", 1));
+  it("documents the unset and empty-string forms in the Local Servers guide's walkthrough, not just KEY=value", () => {
+    const guide = userDoc("docs/local-servers.md");
+    const start = guide.indexOf("## Add a Local Server");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const section = guide.slice(start);
+    const end = section.indexOf("\n## ", 1);
+    const step = end === -1 ? section : section.slice(0, end);
     expect(step).toContain("`KEY=value`");
     expect(step).toContain("`KEY=`");
     expect(step).toContain("`KEY=null`");

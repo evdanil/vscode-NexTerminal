@@ -18,8 +18,7 @@ The template includes a trailing newline, so running it sends the command and
 presses Enter.
 
 If you want a macro that asks you for input every time it runs — a host, a
-username, a password — skip ahead to **Variables**, below, and start from the
-**IPMI SOL console** template instead of **Send command**.
+username, a password — skip ahead to **Variables**, below.
 
 ## Blank Macros vs Template Macros
 
@@ -34,9 +33,9 @@ you run it manually or assign a shortcut.
 Built-in templates include:
 
 - **Send command**: sends a normal command to the active terminal.
-- **Send password when prompted**: creates a paused secret active-session
-  trigger with no sample password stored. Enter the secret, save, then resume
-  auto-trigger when you are ready.
+- **Send password when prompted**: creates a paused secret trigger, scoped to
+  the active terminal, with no sample password stored. Enter the secret, save,
+  then resume auto-trigger when you are ready.
 - **Wait and send confirmation**: sends `yes` when a confirmation prompt
   appears.
 - **Scoped auto-trigger example**: shows a prompt-triggered command that starts
@@ -44,7 +43,15 @@ Built-in templates include:
 - **IPMI SOL console**: opens a serial-over-LAN console with `ipmitool`,
   reading the BMC address, the BMC username and the BMC password from the server
   profile — a complete worked example of **Profile tokens** and of
-  **Providing IPMI credentials** (both below). Nothing is prompted for.
+  **Providing IPMI credentials** (both below). Nothing is prompted for unless
+  no BMC password is saved.
+- **IPMI SOL console (via jump host)**: the same console, but typed into an
+  SSH session of the server's **IPMI Gateway** — another server, chosen under
+  Advanced beside **IPMI / BMC Host** — instead of run on this machine. It uses
+  ipmitool's `-a`, so ipmitool asks for the BMC password on the gateway, and it
+  ships with **Provide IPMI credentials** off — a password can't be handed to a
+  remote shell's environment. On a server with no IPMI Gateway set it runs on
+  this machine instead, and says so.
 - **IPMI Power Status / IPMI Power On / IPMI Power Off (hard, no OS shutdown)**:
   chassis power control, in the same shape as the SOL template. Power Off is an
   abrupt power cut, not a graceful shutdown — that is why it says so in its name.
@@ -72,11 +79,18 @@ Secret macros store their text in VS Code SecretStorage instead of the normal
 macro metadata store. They are intended for values such as passwords, tokens, or
 enable secrets.
 
+Right-click a secret macro in the Macros view for **Copy Value** and **Paste
+Value**, which copy its secret value to, or paste it from, the system clipboard.
+Clipboard copies place the value in the OS clipboard as plain text. **Paste
+Value** replaces the stored value with the clipboard text, and asks whether to
+append a newline when that text does not already end with one.
+
 Protected:
 
 - The macro text is stored through VS Code SecretStorage.
 - The Macros view does not show the secret value.
-- Copying all macros as JSON redacts secret text.
+- `Nexus: Copy All Macros as JSON` (Command Palette), which puts every macro on
+  the clipboard as JSON, leaves secret text out.
 
 Not protected:
 
@@ -94,12 +108,10 @@ Not protected:
   remembered, but once it is sent it is subject to the same terminal/host
   echo, scrollback, and clipboard caveats listed above for secret macro text.
 
-For secret auto-triggers, prefer **Active session** or **Matching profile** scope
-instead of **All terminals**.
-
 A host or background session can trigger a secret macro by printing text that
-matches the pattern. For passwords and tokens, use **Active session** or
-**Matching profile**, keep the regex narrow, and avoid **All terminals**.
+matches the pattern. For secret auto-triggers — passwords and tokens — choose
+the **Active terminal only** or **Matching profile only** scope rather than
+**All terminals**, and keep the regex narrow.
 
 ## Variables
 
@@ -113,8 +125,7 @@ the Text field in the Macro Editor to catch that.
 
 ### Declaring a variable
 
-Open a macro in the Macro Editor and use the new **Variables** section, or
-start from the **IPMI SOL console** template (see Quick Start, above). Each
+Open a macro in the Macro Editor and use the **Variables** section. Each
 variable has:
 
 - **Name** — must match `/^[A-Za-z_][A-Za-z0-9_]{0,31}$/` (letters, digits, and
@@ -148,6 +159,11 @@ Only declared variables whose placeholder actually appears (unescaped) in the
 text are prompted for, once each, in declaration order — a variable you
 declare but never reference in the text produces no prompt.
 
+Running the macro opens one input box per declared-and-used variable, with a
+**Back** button to return to the previous prompt (not shown on the first one).
+Pressing Esc or closing the box at any step cancels the whole run — nothing is
+sent.
+
 Empty input is accepted as a legitimate value. Pressing Enter through a prompt
 with nothing typed substitutes an empty string, which can produce a malformed
 command (for example `-H  -U root`); that is your call to make, and Nexus does
@@ -170,27 +186,36 @@ the shape when something really is per-run:
 ```
 Text:      ipmitool -I lanplus -H ${profile.ipmiHost} -U ${profile.ipmiUsername} -E chassis bootdev $device
 Run in:    Local terminal
+Provide IPMI credentials: on
 Variables: device (Boot device)
 ```
 
 The address and the username are read from the server profile you run the macro
-against; only `$device` is asked for. Running it prompts once, then sends the
-filled-in command line to a local terminal — even if you switch to a different
-terminal tab while the prompt is still open.
+against; only `$device` is asked for. Running it prompts once for the boot
+device (and for the BMC password only if none is saved), then sends the
+filled-in command line to a fresh local terminal that already holds the BMC
+password in its environment — even if you switch to a different terminal tab
+while the prompt is still open.
 
 ### Which terminal receives the macro
 
 This is a real behavioral difference between the two send paths, and it is
 easy to miss:
 
-- A macro with **no** declared variables is sent through the same
-  immediate, same-tick path Nexus has always used: whatever terminal is
-  active at the moment you invoke it.
+- A **Session terminal** macro with **no** declared variables is sent through
+  the same immediate, same-tick path Nexus has always used: whatever terminal
+  is active at the moment you invoke it.
 - A macro that declares variables is different: the target terminal is
   captured at the moment you invoke the macro, *before* any prompts are
   shown, and the resolved text is sent to that same terminal even if you
   switch to a different tab while the prompts are still open (see **Worked
   example**, above).
+
+Both apply to a macro you run from the Macros view, the `Alt+S` picker or a
+keyboard shortcut. A macro that uses a `${profile.…}` token, or whose **Run in**
+is not *Session terminal*, is never sent from there, whichever way you started
+it: Nexus offers to hand it to **Run Macro on Server…** instead, because only
+that command knows which server the macro is aimed at.
 
 One consequence: the variable-free path sends through VS Code's own
 text-sending command, which resolves VS Code's own `${workspaceFolder}` /
@@ -223,14 +248,15 @@ A macro can prompt for input, or auto-trigger from terminal output — not both.
 Prompting means opening an input box, which cannot happen safely from a
 background pattern match running on a possibly-inactive terminal. If you need
 a fully automated flow that also needs to compute values or branch on
-conditions, use a **Script** with `prompt()` instead — see the Scripts
-documentation. Scripts have loops, conditionals, and timeouts that macros
+conditions, use a **Script** with `prompt()` instead — see
+[Interacting with the user](scripting.md#interacting-with-the-user) in the
+scripting guide. Scripts have loops, conditionals, and timeouts that macros
 intentionally do not.
 
 If a macro somehow ends up with both a trigger pattern and variables (this
 cannot happen through config import — sanitization strips the trigger in
 exactly this case; the two real sources are legacy `nexus.terminal.macros`
-settings absorption, which persists entries verbatim, or a direct edit to
+settings absorption, which does not strip the trigger, or a direct edit to
 Nexus's stored state), Nexus treats it as a plain, non-auto-triggering macro:
 no zap icon, no enable/disable toggle, and the macro's tooltip in the sidebar
 reads `Auto-trigger suppressed: macro has variables`.
@@ -310,9 +336,9 @@ nothing in *any* of those four shells: it cannot make one execute something,
 expand something, or throw away the rest of your command line.
 
 That allowed set is: letters, digits and accents in any language, a space, and
-the eight punctuation marks `.`, `-`, `_`, `/`, `:`, `,`, `+`. Anything else —
+the seven punctuation marks `.`, `-`, `_`, `/`, `:`, `,`, `+`. Anything else —
 `(`, `)`, `{`, `}`, `%`, `!`, `*`, `?`, `[`, `]`, `~`, `#`, `^`, `=`, `@`,
-quotes, `;`, `\|`, `&`, `<`, `>`, `\`, `$`, a backtick, and symbols such as `°`
+quotes, `;`, `|`, `&`, `<`, `>`, `\`, `$`, a backtick, and symbols such as `°`
 or an emoji — is refused, and the message tells you what *is* accepted.
 
 **Why an allowed set and not a banned one.** Earlier versions of Nexus banned a
@@ -397,7 +423,8 @@ compiles a trigger rule.
 
 `ipmitool` can read the BMC password from the environment instead of the command
 line — that is what its `-E` flag does, and it is why the shipped IPMI templates
-use `-E` and never `-P`. A password on a command line is visible in `ps` on the
+use `-E` (the jump-host SOL template, which runs on a gateway, uses `-a` instead)
+and never `-P`. A password on a command line is visible in `ps` on the
 machine that runs it, in the terminal's scrollback, and in Nexus's own
 *Copy All to Clipboard* transcript; a password in the environment is readable
 only by the same OS user, and dies with the terminal.
@@ -428,6 +455,28 @@ If no password is stored for the linked profile — or no profile is linked at a
 saved. Cancelling the prompt cancels the run; a terminal without the variable is
 not what you asked for.
 
+Put together, this is the shipped **IPMI SOL console** template:
+
+```
+Text:      ipmitool -I lanplus -H ${profile.ipmiHost} -U ${profile.ipmiUsername} -E sol activate
+Run in:    Local terminal
+Provide IPMI credentials: on
+```
+
+The shipped text also starts with a single space, which keeps the command out
+of a shell history that ignores space-prefixed lines (see **Avoiding remote
+shell history**, above — the same convention applies to your local shell), and
+ends with a newline, so the command runs as soon as it is typed.
+
+Nothing is prompted for, unless no password is stored for the linked auth
+profile (above). `${profile.ipmiHost}` and `${profile.ipmiUsername}`
+come from the server profile you run the macro against (its **IPMI / BMC Host**
+and the **IPMI Auth Profile** linked beside it), and `-E` tells ipmitool to read
+the password from the environment, which the **Provide IPMI credentials**
+checkbox fills in from that same auth profile. Right-click a server in the
+Connectivity Hub → **Run Macro on Server…**, pick the macro, and the completed
+command runs in a fresh local terminal.
+
 A macro that uses `${profile.ipmiHost}` or `${profile.ipmiUsername}` **without**
 the checkbox still runs. `ipmitool -E` then prompts or fails on its own, and the
 send confirmation tells you which switch is missing. Token usage is a hint, never
@@ -449,14 +498,32 @@ already has all of this set.
 
 ### Capability settings are never imported
 
-**Provide IPMI credentials** is stripped from every macro that arrives from
-outside this installation — a shared bundle *and* a restored backup, without
-exception. A shared macro could otherwise arrive already armed, and its first
-run would hand the BMC password to whatever its text does with the environment,
-with you never having seen the checkbox. Provenance is not something the import
-can check (a backup file is an ordinary file; nothing in it says whose it is),
-so the rule is the same on both paths and worth remembering in one sentence:
-after a restore, re-tick the box on the IPMI macros you trust.
+Two settings are reset on every macro that arrives from outside this
+installation — a shared bundle, a restored backup, or a macro taken over from
+the old `nexus.terminal.macros` setting, without exception:
+
+- **Provide IPMI credentials** is turned off. A shared macro could otherwise
+  arrive already armed, and its first run would hand the BMC password to
+  whatever its text does with the environment, with you never having seen the
+  checkbox.
+- **Run on** goes back to *This machine*. *The server's IPMI gateway* runs the
+  command in an SSH session on that gateway — often the most privileged box you
+  have — so an imported macro could otherwise run its author's command there.
+
+Provenance is not something the import can check (a backup file is an ordinary
+file; nothing in it says whose it is), so the rule is the same on every path.
+When a backup or share import resets either setting, Nexus tells you once
+afterwards, in a notification that names both.
+
+The macro text does not change, which is what makes the reset easy to miss. A
+restored **IPMI SOL console** still says `-E`, but no password reaches its
+environment, so ipmitool prompts or fails on its own. A restored **IPMI SOL
+console (via jump host)** now runs its `-a` command on *this* machine, against a
+BMC that may only be reachable from the gateway — the send confirmation points
+you back at **Run on**, but only once the command has gone out. So after a
+restore, open the IPMI macros you trust and put back what they had: tick
+**Provide IPMI credentials** on the `-E` ones, and set **Run on** → *The
+server's IPMI gateway* on the jump-host ones.
 
 Inserting a template is not an import — it is you, on this machine, asking for a
 specific command — so the shipped IPMI templates keep the flag they ship with.
@@ -471,7 +538,13 @@ through the macro picker:
   with the credential environment supplied exactly as a ticked macro would get
   it. Choosing the command *is* the consent — there is no stored record here to
   arrive pre-armed from somewhere else, which is what the macro checkbox exists
-  to guard against.
+  to guard against. That is for a server with no **IPMI Gateway** set. With one
+  set, the same command with `-a` in place of `-E` is typed into an SSH session
+  of the gateway server instead — Nexus offers to connect it first if it isn't
+  connected — and ipmitool asks for the BMC password there; Nexus reads and
+  prompts for no password on that path. If the gateway server has since been
+  deleted, lost its address, or been switched to Telnet, the command stops with
+  an error naming the reason rather than running on your own machine.
 - **Open BMC Web Console** opens the BMC's web interface in your default
   browser. HTTPS unless the server's **BMC Web Protocol** (Advanced, beside the
   other IPMI fields) is set to HTTP — some older iDRAC/iLO cards serve nothing
@@ -484,10 +557,13 @@ command — the browser web-console *macro template* writes its own `https://`
 scheme into its text, so changing the protocol does not change what an
 already-inserted template opens; edit the macro's URL, or use the command.
 
-Both are listed on every server, configured or not — the menu never hides them —
-and a server missing a piece gets an error naming the field and where to set it,
-with an **Edit Server** button that opens the form with Advanced already
-expanded.
+Both reuse the same address and credential rules as the macros (see **Profile
+tokens** and **Providing IPMI credentials**, above).
+
+Both appear on the right-click menu of a server that has an **IPMI / BMC Host**
+set, and in the Command Palette, where you pick the server. A server missing a
+piece gets an error naming the field and where to set it, with an **Edit
+Server** button that opens the form with Advanced already expanded.
 
 ## Where a macro runs
 
@@ -498,7 +574,12 @@ expanded.
   that server*; if it is not connected, Nexus offers to connect first.
 - **Local terminal** — a new VS Code terminal on your own machine. This is
   where `ipmitool` runs. As in a session, the macro's own trailing newline
-  decides whether the line executes.
+  decides whether the line executes. Its **Run on** field can send it to the
+  server's **IPMI Gateway** instead — typed into an SSH session of that
+  server — and it falls back to this machine when the server has no gateway
+  set; a gateway that has been deleted, lost its address or been switched to
+  Telnet stops the run with the reason (see **IPMI SOL console (via jump
+  host)**, above).
 - **Browser** — the text is a URL, opened with your default browser. Only
   `http://` and `https://` are accepted; anything else is refused. A profile
   address that is a bare IPv6 literal is bracketed for you (see **IPv6 in a
@@ -516,15 +597,17 @@ pasted into a terminal rather than executed.
 
 ## Keybindings
 
-Use **Assign Shortcut** from a macro's context menu to choose a shortcut. Nexus
+Use **Assign Shortcut** from a macro's context menu to choose a shortcut, or
+assign it inline in the Macro Editor's **Keyboard Shortcut** field. Nexus
 supports these forms:
 
 - `alt+m`
 - `alt+shift+5`
 - `ctrl+shift+a`
 
-Keys can use A-Z or 0-9. If you assign a shortcut already used by another macro,
-Nexus moves the shortcut to the new macro.
+Keys can use A-Z or 0-9 — 108 combinations across the three modifier groups
+`Alt`, `Alt+Shift`, and `Ctrl+Shift`. If you assign a shortcut already used by
+another macro, Nexus moves the shortcut to the new macro.
 
 Macros without shortcuts are still available from the macro picker with
 `Alt+S`.
@@ -535,19 +618,23 @@ If VS Code or the integrated terminal intercepts macro shortcuts, run
 If your macro shortcuts (`Alt+S`, `Alt+<key>`) do nothing, the usual cause is
 `terminal.integrated.sendKeybindingsToShell` being set to `true` — that setting
 overrides `commandsToSkipShell` and lets the terminal swallow the shortcuts. It
-must be `false`. Nexus shows a one-time hint when it detects this (or a missing
+must be `false`. Nexus shows a hint when it detects this (or a missing
 `commandsToSkipShell` entry, or `window.enableMenuBarMnemonics` capturing Alt
-shortcuts); clicking **Fix Keybindings** on that hint, or running **Nexus: Fix
-Macro Keybindings** from the Command Palette, corrects all three.
+shortcuts) — at most once per session, and never again once you choose **Don't
+Show Again**. Clicking **Fix Keybindings** on that hint corrects all three at
+once; **Nexus: Fix Macro Keybindings** from the Command Palette does the same
+after asking you to confirm.
 
 ## Organising macros into folders
 
 The Macros view groups macros into folders, the same way the Connectivity Hub
-groups servers and serial profiles.
+groups servers and serial profiles. For macros, folders are a display grouping —
+unlike script folders, which are real directories under your scripts folder
+(see the [scripting guide](scripting.md#organising-scripts-into-folders)).
 
 Folders are yours to create — an empty folder stays until you remove it.
 
-- **New Folder** — the `$(new-folder)` button in the Macros view title bar.
+- **New Macro Folder** — the `$(new-folder)` button in the Macros view title bar.
   Enter a path (`Cisco/Routers` for a nested folder); it appears immediately,
   empty, and survives a reload. Naming a folder that already exists is a
   no-op with an info message rather than an error.
@@ -558,7 +645,9 @@ Folders are yours to create — an empty folder stays until you remove it.
   **(root)**) — this is the fastest way to sort a flat pile of macros into
   folders in one pass.
 - **Drag a macro onto a folder** — moves that one macro into the folder.
-  Dragging onto the root of the tree clears the macro's folder. The Macros
+  Dropping it onto another macro moves it into that macro's folder, and
+  dragging onto the root of the tree clears the macro's folder; dragging never
+  reorders (use **Move Up** / **Move Down** for that). The Macros
   view does not support multi-select drag; use **Move to Folder** from the
   palette for moving several macros at once.
 - **Reordering inside a folder** — **Move Up** / **Move Down** swap a macro
@@ -583,6 +672,11 @@ The Macro Editor's **Folder** field accepts the same `/`-separated paths and
 offers your existing folders in a dropdown as you type. Leaving it blank (or
 clearing it) puts the macro at the root.
 
+The Macros view validates folder paths the same way the Scripts view does: `.`
+and `..` segments are rejected, and a `\` is rejected with a message telling you
+to use `/` — a path like `../../home/you/something` can never write or move
+something outside where it belongs.
+
 Two same-named macros in different folders are only distinguished from each
 other by folder in **Run Macro**'s quick pick — check the `detail` line under
 each entry if you have duplicates across folders.
@@ -590,9 +684,10 @@ each entry if you have duplicates across folders.
 ## Auto-Trigger Basics
 
 Add a **Trigger Pattern** to make a macro run when terminal output matches a
-regular expression. Nexus watches SSH and Serial terminal output, removes ANSI
-escape codes and most control characters, keeps a bounded tail buffer, and tests
-the trigger pattern against that buffer.
+regular expression. Nexus watches the output of every Nexus terminal — SSH,
+Telnet, Serial and Local Shell — removes ANSI escape codes and most control
+characters, keeps a bounded tail buffer, and tests the trigger pattern against
+that buffer.
 
 Enter only the JavaScript regex pattern, without surrounding slashes or flags.
 Use `[Pp]assword:\s*$`, not `/password:\s*$/i`. Macro triggers do not have a
@@ -601,58 +696,68 @@ separate flags field.
 Rules to keep in mind:
 
 - A pattern must not match the empty string.
-- Nexus rejects patterns that can match an empty string, are longer than the
-  allowed limit, or use risky shapes such as nested quantifiers like `(.*)+` or
+- Nexus rejects patterns that can match an empty string, are longer than 500
+  characters, or use risky shapes such as nested quantifiers like `(.*)+` or
   repeated alternation like `(yes|no)*`.
 - Avoid those risky shapes by anchoring to the prompt, replacing broad repeats
   with line-bounded text such as `[^\n]*`, or using bounded repeats such as
   `(?:yes|no){1,3}` when repetition is required.
-- Matching text is removed from the buffer after a match, even if cooldown stops
-  the macro from firing. This prevents one prompt from repeatedly retriggering
-  the same macro.
-- Global auto-trigger behavior is controlled by
-  `nexus.terminal.macros.autoTrigger`.
+- After a match, the buffer is cut back to just after the matched text — the
+  match and everything before it are discarded — even if cooldown stops the
+  macro from firing. This prevents one prompt from repeatedly retriggering the
+  same macro.
+- Three settings control auto-trigger globally:
+  `nexus.terminal.macros.autoTrigger` turns the whole mechanism on or off;
+  `nexus.terminal.macros.defaultCooldown` is the cooldown, in seconds, for a
+  macro that sets none of its own (default 3, range 0–300); and
+  `nexus.terminal.macros.bufferLength` is how many characters of recent output
+  that tail buffer keeps per terminal (default 2048, range 256–16384).
 
 ## Trigger Scope
 
-Each auto-trigger can be scoped.
+Each auto-trigger can be scoped with the Macro Editor's **Auto-Trigger Scope**
+field.
 
 **All terminals**
 
 The current default when no explicit trigger scope is set, kept for compatibility
 with older macros. Any Nexus terminal output can match the pattern. Use this for
 harmless, broad helpers only. For passwords, tokens, and other sensitive
-responses, choose **Active session** or **Matching profile** instead.
+responses, choose **Active terminal only** or **Matching profile only** instead.
 
-**Active session**
+**Active terminal only**
 
 The macro only matches the terminal that is currently active. This is safer for
 passwords and prompts because it reduces the chance that a background session
 receives input.
 
-**Matching profile**
+**Matching profile only**
 
 The macro only matches sessions opened from the selected profile. This is useful
 when a prompt or command is specific to one device type, lab, or host.
 
 ## Profile Matching
 
-Choose **Matching profile** in the Macro Editor, then select the profile. Nexus
-stores the profile id with the macro. During auto-trigger evaluation, the macro
-only runs when the terminal session's profile id matches that stored id.
+Choose **Matching profile only** in the Macro Editor, then select the profile.
+Nexus stores the profile id with the macro. During auto-trigger evaluation, the
+macro only runs when the terminal session's profile id matches that stored id.
 
 If the profile is deleted or the macro has no stored profile id, the trigger
-does not run in **Matching profile** scope. Reopen the macro and select the
+does not run in **Matching profile only** scope. Reopen the macro and select the
 profile again.
 
 ## Cooldown vs Interval
 
 Cooldown and interval solve different problems.
 
-**Cooldown** is for normal prompt-response macros. After the macro fires, the
-same macro cannot fire again on that terminal until the cooldown has elapsed.
+**Cooldown** is for normal prompt-response macros, and prevents echo loops.
+After the macro fires, the same macro cannot fire again on that terminal until
+the cooldown has elapsed.
 If another match appears during cooldown, Nexus ignores that match and does not
-schedule a delayed retry.
+schedule a delayed retry. The Macro Editor's **Trigger Cooldown** field starts
+at 3 seconds. Left at 3 (or empty), the macro follows
+`nexus.terminal.macros.defaultCooldown`, which is also 3 unless you change it;
+any other value is the macro's own.
 
 Example: a password macro has `triggerCooldown: 5`. It fires at `12:00:00`.
 Another `Password:` prompt arrives at `12:00:02`; it is ignored. A later prompt
@@ -717,11 +822,14 @@ startup or at any other time, because for a secret macro that would mean decidin
 which macro owns the stored password. The rewrite happens only as part of a
 change you make.
 
-To fix it, use **Move Up** or **Move Down** on any macro. That re-saves the list,
-which assigns fresh ids, and both macros go back to normal. Reordering keeps
-working on a flagged macro because it acts on the row you clicked — Nexus checks
-that the macro still sitting at that row is the one the row was drawn for, which
-is a question the shared id cannot answer but the position can.
+To fix it, use **Move Up** or **Move Down** on any macro that can actually move —
+one already at the top of its folder cannot move up, and the status bar says so
+without changing anything, so pick **Move Down** or another macro. A move that
+happens re-saves the list, which assigns fresh ids, and both macros go back to
+normal. Reordering keeps working on a flagged macro because it acts on the row
+you clicked — Nexus checks that the macro still sitting at that row is the one
+the row was drawn for, which is a question the shared id cannot answer but the
+position can.
 
 Everything that has to identify a flagged macro from something other than a
 clicked row refuses instead of guessing: the macro editor will not save or delete
@@ -738,8 +846,8 @@ fresh id, so the shared id survives on exactly one macro — and which one that
 is depends on details you cannot see, so it may well be the macro a write must
 not land on.)
 
-Refreshing the view and retrying resolves that, and so does reordering any
-macro.
+Refreshing the view and retrying resolves that, and so does moving any macro
+that can move.
 
 Running a macro manually, and its keyboard shortcut, are unaffected.
 
@@ -785,9 +893,9 @@ Why: matches a complete interface status line at a buffer or line boundary and
 handles both `down` and `administratively down` without relying on multiline
 regex flags.
 
-Risk: if this macro sends a remediation command, scope it to a matching profile
-or active session. Interface status output is common and can appear during
-read-only checks.
+Risk: if this macro sends a remediation command, scope it with **Matching
+profile only** or **Active terminal only**. Interface status output is common
+and can appear during read-only checks.
 
 ### Paging Prompts
 
@@ -825,8 +933,9 @@ Why: matches a common `user@host:path$` or `user@host:path#` prompt at the end o
 the buffer. The `(?:^|\n)` part makes the prompt start at a line boundary.
 
 Risk: prompt formats vary. A very broad pattern such as `[$#]\s*$` is convenient
-but can match command output ending in `$` or `#`. Use active-session or profile
-scope, and avoid short intervals with broad shell prompt patterns.
+but can match command output ending in `$` or `#`. Use the **Active terminal
+only** or **Matching profile only** scope, and avoid short intervals with broad
+shell prompt patterns.
 
 ## Regex References
 

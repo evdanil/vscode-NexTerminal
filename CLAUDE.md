@@ -59,22 +59,22 @@ Cross-window writes: `globalState` is shared across VS Code windows, last-writer
 `ActiveSession`, `ActiveTunnel`, `ActiveSerialSession` — runtime state tracked by NexusCore
 
 ### Web extension (`webExtension.ts`)
-Graceful degradation — registers stub commands showing "not available in browser" warnings. Intentional MVP gap.
+Graceful degradation — registers stub commands that warn "Nexus runtime features are unavailable in the web extension host. Use desktop VS Code." — an intentional MVP gap.
 
 ## Scripts subsystem (`src/services/scripts/`)
 
 - `scriptRuntimeManager.ts` — main-thread orchestrator. Holds `Map<sessionId, RunningScript>`, dispatches RPC from worker, manages lifecycle (starting → running → completed/stopped/failed/connection-lost → cleanup).
-- `scriptWorker.ts` — bundled separately to `dist/services/scripts/scriptWorker.js`. Loads user `.js` source via the `AsyncFunction` constructor and exposes the script API (`waitFor` / `expect` / `sendLine` / `poll` / `prompt` / etc.) as globals that post RPCs back to the main thread. MUST NOT import `vscode` (see the build constraint in AGENTS.md — the build does not catch this for this bundle).
+- `scriptWorker.ts` — bundled separately to `dist/services/scripts/scriptWorker.js`. Loads user `.js` source via the `AsyncFunction` constructor and exposes the script API (`waitFor` / `expect` / `sendLine` / `poll` / `prompt` / etc.) as globals that post RPCs back to the main thread. MUST NOT import `vscode` (see the build constraint in AGENTS.md — the build rejects such an import).
 - `scriptOutputBuffer.ts` — rolling 64 KiB string buffer with forward-only cursor; ANSI stripped at write time via `createAnsiRegex()`.
 - `scriptHeader.ts` — JSDoc header parser (`@nexus-script`, `@name`, `@target-type`, `@default-timeout`, `@lock-input`, `@allow-macros`).
 - `scriptTarget.ts` — session picker. Filters by `@target-type`, auto-selects on `@target-profile` match.
 - `scriptMacroFilter.ts` — per-session policy that gates macro firing during a script run.
-- `scriptTypesGenerator.ts` — writes `nexus-scripts.d.ts` + `jsconfig.json` into the workspace's scripts directory on first script command so IntelliSense/hovers work.
+- `scriptTypesGenerator.ts` — writes `nexus-scripts.d.ts` + `jsconfig.json` into the workspace's scripts directory when a script is run (the `.d.ts` is rewritten only when its version marker changes; `jsconfig.json` whenever it differs) so IntelliSense/hovers work.
 - `assets/` — bundled `nexus-scripts.d.ts` + `jsconfig.json` copied by the esbuild step into `dist/services/scripts/assets/`.
 - UI surfaces: `src/ui/scriptTreeProvider.ts` (Scripts sidebar entry), `src/ui/scriptCodeLensProvider.ts` (inline ▶ Run / ◼ Stop), status bar item in `extension.ts:activate()`. Output Channel: `"Nexus Scripts"`.
 - Macro coordination: `MacroAutoTrigger` has `pushFilter(sessionId, filter)` / `bindObserverToSession(obs, id)` / `createObserver(..., sessionId?)` so scripts can suspend macros on their session without touching unrelated sessions.
 - PTY integration: `SshPty`, `SmartSerialPty`, `SerialPty` all implement `SessionPtyHandle` — `addOutputObserver(o): Disposable`, `setInputBlocked(bool)`, `writeProgrammatic(data)`, `resetTerminal()`, `markShuttingDown(reason)`. `markShuttingDown` fires from the deactivate subscription; it tears down the transport and fires a farewell banner, **but VS Code's IPC race on extension-host shutdown means the banner rarely reaches the renderer** (see microsoft/vscode#122825, #140697). The reliable mechanism is `services/terminal/orphanDetect.ts` (`detectOrphanNexusTerminals`), called as the first thing in `activate()` — it scans `vscode.window.terminals` for `/Nexus (SSH|Serial):/` and, if any match, shows an information notification. Orphans are intentionally NOT disposed: the last-rendered content is usually worth reviewing, and VS Code has no API to rewrite or append to a dead pseudoterminal from a new extension instance, so the only available action would be to destroy the content. Closing is the user's call. The handle is exposed on `ActiveSession.pty` / `ActiveSerialSession.pty` (runtime-only; not persisted).
-- Settings: `nexus.scripts.path`, `nexus.scripts.defaultTimeout`, `nexus.scripts.macroPolicy` — captured into each `RunningScript` at start; changes do not apply to in-flight runs.
+- Settings: `nexus.scripts.path`, `nexus.scripts.defaultTimeoutSeconds`, `nexus.scripts.macroPolicy`, `nexus.scripts.maxReadSizeMb`, `nexus.scripts.maxRuntimeSeconds` (legacy fallback `nexus.scripts.maxRuntimeMs`) — all read once when a run starts (the runtime cap into the watchdog timer in `extension.ts`, the rest into that run's `RunningScript`); changes do not apply to in-flight runs.
 
 ## Terminal tab commands subsystem (`src/services/terminal/` + `src/commands/terminalTabCommands.ts`)
 

@@ -1,0 +1,79 @@
+# Inventory Sync
+
+An inventory source syncs servers straight from NetBox, EVE-NG, a Proxmox cluster or a GNS3 server, so devices already recorded there become connection profiles without being re-typed. This page covers what every source shares; each provider has its own guide.
+
+## Providers
+
+- **[NetBox](netbox.md)** — point an inventory source at your NetBox instance and devices become connection profiles, foldered by site and rack, linked to an auth profile so they can actually connect the moment they land.
+- **[EVE-NG](eve-ng.md)** — point one at an EVE-NG server and the lab tree comes across the same way: labs become folders, nodes become servers on their own telnet consoles, and running labs light up in the tree.
+- **[Proxmox VE](proxmox.md)** — point one at a Proxmox cluster and its virtual machines and containers become SSH servers foldered by node, pool, type or tag — cluster nodes can come across too, live running status lights the tree the same way, and a guest's Start/Stop rides the same machinery as a lab node's.
+- **[GNS3](gns3.md)** — point one at a GNS3 server and its projects become folders and its nodes become servers on their own telnet consoles — closed projects included, since that is how most projects sit most of the time.
+- **[Device Templates](device-templates.md)** — apply a named, reusable bundle of connection settings to the servers a sync creates and maintains, instead of hand-editing each one.
+
+## Add a Source
+
+Run `Nexus: Add Inventory Source (NetBox, EVE-NG, Proxmox, GNS3…)` to sync your whole device inventory in one go — the first step is choosing a provider, and each provider guide above walks through its own form. Manage sources from **Settings → Inventory Sources**, which lists every configured source with four inline icons — **Sync Inventory Now**, **Edit Inventory Source**, **Edit Template Rules** and **Remove Inventory Source** — or from the Command Palette: `Nexus: Manage Inventory Sources` opens the same list in a panel of its own, with a **New Inventory Source…** button, and `Nexus: Sync Inventory Now`, `Nexus: Edit Inventory Source` and `Nexus: Remove Inventory Source` ask which source when you have more than one.
+
+**Saved filters.** A source form with a text filter — NetBox's **Device Filter**, EVE-NG's **Lab Filter**, GNS3's **Project Filter** — has a **Saved Filter** picker just above it. Choosing a saved filter copies its text into the field, and **Save current filter as…** names what you have typed so another source can reuse it. A saved filter is a copy to start from, not a link: editing or deleting it later leaves every source's own filter as it is. The list is shared by all three providers, so name each filter for what it is — a NetBox query such as `status=active&site=syd` means nothing as an EVE-NG lab filter. Create, edit or delete them with `Nexus: Manage Saved Filters` too. Proxmox sources have no filter field, so no picker.
+
+## Every Sync Shows Its Plan First
+
+Nothing is applied blind: every sync computes a plan — servers to add, update, move, or remove — and shows it for confirmation first, with warnings and affected-server lists one click away.
+
+## Keep a Source in Sync
+
+Run **Sync Now** again whenever devices change at the source. Re-syncing follows renames and rack moves at the source (with one documented exception — renaming or moving an EVE-NG *lab* re-creates its nodes, see [Rename Nodes Freely; Rename Labs Deliberately](eve-ng.md#rename-nodes-freely-rename-labs-deliberately)), and a device that disappears from the source is handled per the source's **Removed-Device Policy** — moved to an `_orphaned` subfolder (the default, which keeps its settings in case it returns), deleted, or kept in place.
+
+A device can also stop syncing without disappearing — a Proxmox guest converted to a template is no longer a guest to sync, and a guest that is merely powered off drops out too when **Include Stopped Guests** is off — so its server is handed to that same policy. Where the source can say why, the confirmation says it too, under the line that moves, deletes or keeps the servers: *"web-template" is still at the source — it was not synced because it is now a template.* or *"web-01" is still at the source — it was not synced because it is stopped and Include Stopped Guests is off.* Servers that share a reason are named on one line, up to three of them, and past three the line counts them instead of listing them; a sync that prunes for more than one reason gets a line per reason. A device that genuinely vanished gets no such line, and a sync that prunes some of each names only the ones it can explain — which is the whole point.
+
+You can also re-sync straight from the tree: the folder a source syncs into carries an inline **sync** icon in the Command Center. It appears only where the answer is unambiguous — the folder has to exist, and exactly one source can target it, so two sources sharing a folder get no icon and neither does a source that syncs into the root. The same icon appears for every kind of source — always on the folder the source syncs into, never on the lab or project folders a sync creates beneath it.
+
+## Synced Fields and Your Edits
+
+A synced server's own **Host** and **Port** behave like every other synced field — the sync keeps them current while the record still carries exactly what the sync last wrote, and hands off for good once you have edited them. A device that genuinely moves at the source is still followed. EVE-NG and GNS3 nodes get one extra piece of care, since both emulators hand out console ports dynamically: see [Console Ports After a Restart](eve-ng.md#console-ports-after-a-restart) — the same healing applies to a [GNS3](gns3.md#closed-projects-come-across-too) node.
+
+## Remove a Source and Re-Adopt Its Servers
+
+Removing a source (**Remove**, beside Sync Now) asks what to do with the servers it created: **Delete Servers**, or **Keep Servers** as ordinary servers in your list. Keeping them doesn't strand them — each kept server records which device and which source instance (which NetBox, EVE-NG server, Proxmox cluster or GNS3 server) it was synced from, so if you add that same instance back later, the sync notices and asks once: **Adopt Existing** re-links those servers instead of adding copies — each keeps its saved credentials and settings, the source takes over its name, address and folder from then on, and its **Removed-Device Policy** now applies to it like any other synced server — while **Add Separately** leaves them alone and adds the devices as new servers. Your answer on its own changes nothing: the sync plan still follows, counting the adoptions, and **Show Warnings** names every kept server alongside the device reclaiming it, so you can check each pairing before Apply.
+
+The eligibility rule is narrow on purpose. A server is offered for adoption only if a source actually synced it, you kept it when that source was removed, it's still at the address the device reports, and the source you're syncing points at the same instance it was synced from (compared by base URL, so a record kept from your lab instance can never be claimed by the same device id in production). A server you created by hand is never adopted, no matter how exactly its address matches. When two kept records claim one device, Nexus adopts neither rather than guessing.
+
+When adoption is refused — the device changed address while detached, or two kept records claim the same device — the device is added as a new server instead, and the plan's warnings say which device and why.
+
+There is one exception, and it is what a restored id-preserving backup leaves behind: when the kept server still holds the identifier a new server for its device would need, there is nothing to add the device beside, so it is skipped rather than duplicated. The warning says that too — naming that server as the device's own former record rather than as an unrelated one, and giving the repair, which is to put it back at the device's address and reclaim it on the next sync, or delete it and let the next sync add the device fresh. The adoption question says so before you answer: when this applies to every device it asks about, its second button reads **Don't Adopt** instead of **Add Separately**, since nothing would be added; when it applies to only some, it names them as the exceptions.
+
+## Credentials Stay Yours
+
+If a source gains an auth profile later, servers from earlier syncs adopt it on the next sync — but only servers still carrying exactly what the sync gave them. A server whose username or authentication you've edited keeps its own credentials (use **Apply Auth Profile** on it or its folder — see [Auth Profiles](../ssh-and-telnet.md#auth-profiles) — if you do want it on the profile), and setting one synced server's Auth Profile back to **(None)** is a per-server opt-out that later syncs respect. That opt-out survives remove-and-re-add, too: a link you cleared before the source was removed stays cleared after the source adopts the server back, while a kept server the old source never gave a profile picks one up on the reclaim, exactly as a newly synced server does. One combination is refused up front: a private-key profile that carries no key file works fine on a server that brings its own key, but a synced server has none to bring, so linking such a profile to a source is rejected with the reason instead of creating servers that could never log in.
+
+## Start and Stop Nodes
+
+**Start Node** / **Stop Node** on a node's right-click menu bring a node up or down without leaving the editor. The mechanism is provider-general: any inventory provider that can control nodes gets the same menu — see [EVE-NG](eve-ng.md#start-and-stop-nodes), [Proxmox](proxmox.md#start-and-stop-guests) and [GNS3](gns3.md#nexus-will-not-open-a-project-for-you) for how each behaves.
+
+A start or stop spends the source's saved credentials, so if the extension now answering that source's provider id looks different from the one you configured the source against — its label or its fields changed — Nexus asks first, and Cancel reads no credential and sends nothing to the node. Answering **Continue** here stores nothing: the next start, stop, sync, edit or console open asks again, because a click made to boot a node is not a statement about future credential hand-offs. What it does do is let that one source's automatic status refreshes through for the rest of the window — otherwise the re-check Nexus fires seconds later would refuse the source and tell you to confirm a change you had only just confirmed. That window-scoped answer is tied to the exact source record and provider shape you were shown, so a new window asks again, and so does a source replaced by a backup restore or a provider id re-registered with yet another shape. (Answering the same question from **Sync Inventory Now** or **Edit Inventory Source** is different: those save the source anyway, so a successful sync or a saved form records the new shape and nothing asks again until it changes.)
+
+## Servers with No Address Yet
+
+A sync creates a server for every device it finds, including one it has no address for — a stopped or VNC-only EVE-NG node, a Proxmox guest whose agent isn't answering, a GNS3 node whose console isn't telnet, a NetBox device with no usable IP. Rather than vanishing from the tree (which would read as *deleted at the source* and hand it to the Removed-Device Policy), it arrives as a placeholder: a real row, marked `(no address)`, with its folder, its auth profile and its BMC settings intact. Only the console endpoint is missing.
+
+Everything that needs that endpoint says so by name instead of failing later:
+
+- **Connect**, **Test Connection**, **Deploy SSH Key**, **Browse Files**, and starting a tunnel each refuse up front, naming the server and the reason — no password prompt, no handshake against an empty host. When the device is one whose source offers a browser console — a Proxmox guest — **Connect says so instead, and offers the console**: its refusal reads that the guest has no console address and that its source provides a web console needing none, with an **Open Web Console** button that opens it. That wording is reserved for devices that actually have one; a NetBox row with no IP still gets the plain "re-sync once it has an address", because for it that is the real remedy. The other four keep the plain wording too — a browser console gives them no SSH transport to work with. **Duplicate** refuses too, since a copy would be a placeholder no source could ever fill in.
+- **Connect Folder Servers** skips the placeholders in a folder and tells you how many it skipped, rather than raising one notice per stopped node — an EVE-NG lab folder is mostly stopped nodes.
+- It is left out of the **Jump Host** and **IPMI Gateway** pickers. A choice you saved earlier, on a server that went addressless since, is refused before any credential is read — and a BMC command routed through such a gateway aborts with the reason rather than quietly running on your own machine.
+- BMC actions still work on a placeholder that has a BMC address of its own, because the out-of-band address isn't part of the console endpoint.
+- **Open Web Console** still works on a Proxmox-synced placeholder, for the same reason: the hypervisor's console is reached through the hypervisor, not through the guest's own address. It is on the row's right-click menu, in the row-click **Profile Actions** list, and on Connect's own refusal.
+
+When the device gains an address, the next sync fills it in on that same server — same row, same folder, same settings — and it starts connecting. Not every placeholder is waiting on that, though: an HTML5/VNC-only EVE-NG node will not gain one, because its console already exists and simply isn't telnet. If the address goes away again the server reverts to a placeholder, unless it's an address you typed yourself, which is kept. You can give one an address by hand too: Host and Port aren't required when editing a placeholder, typing a host makes it an ordinary addressed server on save, and the Port field is pre-filled with the right default for its protocol (23 for telnet).
+
+## Upgrade notes
+
+**Why a pruned device is still at the source (2.8.221).** Until 2.8.221 a server whose device stopped syncing and one whose device genuinely vanished read identically in the sync confirmation.
+
+**Host and Port ownership (2.8.189).** Earlier builds took them from the source on every sync, so an address you corrected by hand was silently overwritten on the next one; from 2.8.189 they behave like every other synced field. Syncing on a build older than 2.8.189 leaves no record of which addresses the sync owns. A server whose address still matches its device picks the record up on the next sync from a current build; one whose address moved at the source in between reads as hand-edited and stops following until you set it back to the device's address.
+
+## See also
+
+- [NetBox](netbox.md) · [EVE-NG](eve-ng.md) · [Proxmox VE](proxmox.md) · [GNS3](gns3.md) · [Device Templates](device-templates.md)
+- [Auth Profiles](../ssh-and-telnet.md#auth-profiles) — the credential sets a source links its servers to
+- [Import a Device List](../import-export.md#import-a-device-list) — for devices that live in a spreadsheet rather than an inventory system

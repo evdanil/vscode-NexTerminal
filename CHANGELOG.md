@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.8.242] — 2026-09-24
+
+### Changed
+
+- **Every feature now has its own guide.** The README had grown into one long page trying to be both the Marketplace listing and the manual. It is now a short overview — a quick start and one line per feature — and each line links to that feature's guide; the full list is the [documentation index](https://github.com/evdanil/vscode-NexTerminal/blob/main/docs/README.md). Every guide was checked against what the extension actually does as it was split out, and the statements that turned out to be wrong are corrected in the guides and below. The extension itself is unchanged.
+
+### Fixed
+
+- **The Proxmox API-token recipe now gives you a token that works, holding only the rights Nexus uses.** If you set up a Proxmox source by the earlier walkthrough, check your token against the new one. That recipe created a token for a `nexus@pve` user it never created, so its first command failed with "no such user"; where the user did exist, the recipe granted it nothing, and PVE never lets a privilege-separated token do more than its user — so unless you had given the user rights yourself, the token passed **Test Connection** and then synced no guests at all. It also granted the built-in `PVEVMUser` role, which carries console, backup and CD-ROM/cloud-init rights Nexus never uses, lets the token read and write files inside every VM through the guest agent on PVE 9, and lacks VM.Monitor on PVE 8, so VMs imported with no address. The recipe now creates the user and gives the user and the token the same custom role holding exactly VM.Audit, VM.PowerMgmt and VM.GuestAgent.Audit (VM.Monitor on PVE 8), with Sys.Audit granted on `/` — where the cluster status endpoint checks it, not `/vms` — only for cluster-node import. See the [Proxmox VE guide](https://github.com/evdanil/vscode-NexTerminal/blob/main/docs/inventory/proxmox.md).
+
+### Corrected
+
+Four statements in earlier notes were wrong. Those entries are left as published, because a changelog is a record rather than a draft — the corrections belong here instead.
+
+- **Allow a Self-Signed or Mismatched Certificate does not bypass VS Code's proxy.** 2.8.190 said that with the option on an EVE-NG source's "connection is made directly and **does not use VS Code's `http.proxy` setting**", and 2.8.191 said the same of NetBox ("with it on the connection is made directly and **does not use VS Code's `http.proxy` setting**, so a proxied source can start failing for reasons that have nothing to do with the certificate"). Neither was true. With the option on, requests still go through VS Code's proxy resolution, `http.proxy` included, unless `http.proxySupport` is `off` — and certificate checking stays off for that one source behind a proxy too. If a proxied source stops connecting after you tick the option, the proxy is not the reason.
+- **Session transcripts do not record Local Server output.** 2.8.207 said a Local Server's "Output lands in an ordinary Nexus terminal, so highlighting, scrollback capture, Reset / Clear Scrollback / Copy All and session transcripts all work on it." All of that works except session transcripts, which are written for SSH, telnet and serial sessions only; use **Copy All** to capture a run.
+- **The Proxmox token recipe was not least-privilege.** 2.8.219 said "The walkthrough ships a least-privilege API token recipe". The walkthrough it shipped granted the built-in `PVEVMUser` role and never created the user the token belongs to — see **Fixed** above for what that did and what replaces it.
+
 ## [2.8.241] — 2026-09-24
 
 ### Fixed

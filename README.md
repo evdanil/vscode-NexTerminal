@@ -7,16 +7,16 @@ A full SSH + serial + port-forwarding client inside VS Code — without Remote-S
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/evgeny_danilchenko)
 
-- **Replaces PuTTY + MobaXterm + SecureCRT + TeraTerm** — SSH, serial consoles, local shells, port forwarding, and SFTP live in one VS Code sidebar instead of four separate windows.
-- **Unlike Remote-SSH, nothing is installed on the remote.** It's a pure client: no `vscode-server` unpacked into the target, no node process running on the far end. That matters when the far end is a Cisco switch, a bastion you only get a shell on, or a change-controlled box where you can't drop an agent.
-- **Bring your existing connections** — import session profiles straight from your `~/.ssh/config` (keys and all), MobaXterm `.ini`, and SecureCRT XML exports, folder hierarchy preserved, so switching costs you minutes, not a weekend.
-- **Onboard a whole rack in one paste** — feed it a CSV export or a plain list of hostnames and it creates the connections in bulk, with folders, ports, and usernames picked up from the columns. Duplicates are skipped and unparsable lines are reported with their line numbers instead of failing the batch.
-- **Sync servers straight from NetBox, EVE-NG, a Proxmox cluster or a GNS3 server** — point an inventory source at your NetBox instance and devices become connection profiles, foldered by site and rack, linked to an auth profile so they can actually connect the moment they land. Point one at an EVE-NG server instead and the lab tree comes across the same way: labs become folders, nodes become servers on their own telnet consoles, and running labs light up in the tree. Point one at a Proxmox cluster and its virtual machines and containers become SSH servers foldered by node, pool, type or tag — cluster nodes can come across too, live running status lights the tree the same way, and a guest's Start/Stop rides the same machinery as a lab node's. Point one at a GNS3 server and its projects become folders and its nodes become servers on their own telnet consoles — closed projects included, since that is how most projects sit most of the time. Re-syncing follows renames and rack moves at the source (with one documented exception — renaming or moving an EVE-NG *lab* re-creates its nodes, see the walkthrough), every sync shows you its plan before anything is applied, and removing a source then re-adding it later offers to re-adopt the servers you kept instead of duplicating them.
-- **Edit root-owned files without dropping to a shell** — save `/etc/*` over SFTP with `sudo`, writing through the file's existing inode so owner, mode, and ACLs are preserved. Your sudo password goes to the SSH channel's stdin only: never to disk, never to secret storage, never to a log.
+- **Replaces PuTTY + MobaXterm + SecureCRT + TeraTerm** — SSH, serial consoles, local shells, port forwarding, and SFTP live in one VS Code sidebar instead of four separate windows. → [Connectivity Hub](docs/connectivity-hub.md)
+- **Unlike Remote-SSH, nothing is installed on the remote.** A pure client: no `vscode-server` unpacked into the target, no node process on the far end — what you need on a Cisco switch, a shell-only bastion, or a change-controlled box. → [SSH and Telnet](docs/ssh-and-telnet.md)
+- **Bring your existing connections** — import profiles from your `~/.ssh/config` (keys and all), MobaXterm `.ini`, and SecureCRT XML exports, folder hierarchy preserved where the source has one. → [Import and Export](docs/import-export.md)
+- **Onboard a whole rack in one paste** — a CSV export or a plain list of hostnames becomes connections in bulk; duplicates are skipped and unparsable lines reported by line number. → [Import a device list](docs/import-export.md#import-a-device-list)
+- **Sync servers straight from NetBox, EVE-NG, a Proxmox cluster or a GNS3 server** — NetBox devices arrive foldered by site and rack, EVE-NG and GNS3 labs become folders of nodes on their own telnet consoles, and Proxmox VMs and containers become SSH servers; every sync shows its plan before anything is applied. → [Inventory Sync](docs/inventory/README.md)
+- **Edit root-owned files without dropping to a shell** — save `/etc/*` over SFTP with `sudo`, through the file's existing inode so owner, mode, and ACLs are preserved; your sudo password goes to the SSH channel's stdin only. → [Save as Root](docs/file-explorer.md#save-as-root)
 
 ## Reaching a device two hops away
 
-Jump hosts are set per server, and a jump host can have a jump host of its own — so the chain goes as deep as your network does. Below, an access switch is reached through an NMS host, which is itself reached through a bastion. One connect walks the chain, authenticating each hop in turn, and the shell lands on the switch. No `ProxyJump` stanza to hand-write, and nothing installed on any host along the way.
+Jump hosts are set per server, and a jump host can have one of its own. Below, an access switch is reached through an NMS host, itself reached through a bastion: one connect walks the chain, authenticating each hop in turn. No `ProxyJump` stanza to hand-write. → [Jump hosts and proxies](docs/ssh-and-telnet.md#jump-hosts-and-proxies)
 
 ![Nexus Terminal setting up a two-level jump-host chain — access switch reached through an NMS host, which is itself reached through a bastion — then authenticating each hop in turn and opening a shell on the switch](media/demo-jump-host.gif)
 
@@ -29,537 +29,116 @@ Jump hosts are set per server, and a jump host can have a jump host of its own �
 
 ## Install
 
-- **VS Code Marketplace** — open the Extensions view (`Ctrl+Shift+X`), search **Nexus Terminal**, and click Install. Listing: https://marketplace.visualstudio.com/items?itemName=sentriflow.vscode-nexterminal
-- **Open VSX** (VSCodium, Theia, Gitpod) — search **Nexus Terminal** in the Extensions view, or install the VSIX directly. Listing: https://open-vsx.org/extension/sentriflow/vscode-nexterminal
+- **VS Code Marketplace** — open the Extensions view (`Ctrl+Shift+X`), search **Nexus Terminal**, and click **Install**. [Listing](https://marketplace.visualstudio.com/items?itemName=sentriflow.vscode-nexterminal)
+- **Open VSX** (VSCodium, Eclipse Theia, Gitpod) — search **Nexus Terminal** in the Extensions view and click **Install**. [Listing](https://open-vsx.org/extension/sentriflow/vscode-nexterminal)
+- **VSIX** — download the `.vsix` from [GitHub Releases](https://github.com/evdanil/vscode-NexTerminal/releases), then `Extensions` > `...` > `Install from VSIX...`.
 
-## Features
-
-- **SSH Terminal Sessions** — Connect to remote servers with password, private key, or SSH agent authentication. Two-factor authentication (keyboard-interactive) is fully supported — passwords auto-fill while verification codes are prompted separately. Credentials are cached securely via VS Code SecretStorage with silent re-auth. Per-server legacy algorithm toggle for older devices (Cisco IOS, embedded systems) — including devices that only speak the 1024-bit `diffie-hellman-group1-sha1` key exchange, which VS Code's Electron crypto otherwise refuses to build ("Unknown DH group"). An optional **Alternate host** gives a server a second SSH address (e.g. the IPv6 to its IPv4); if the primary can't be reached at the connection level — no route, refused, timed out, or a name that won't resolve — Nexus retries the alternate once automatically and names the address that won, while auth/host-key/proxy failures are never retried on the other address. Faults that arrive *after* a session is up — a keepalive timeout, a protocol error, the connection closing — are recorded in the **Nexus SSH** output channel, so a terminal that drops on its own leaves a cause behind instead of only "Connection lost".
-- **SSH Key Deployment** — Right-click any server and select "Deploy SSH Key" to automate key-based authentication setup. Discovers existing local keys or generates new ed25519 key pairs, deploys the public key to the remote `authorized_keys`, and optionally converts the server profile to key auth. Cross-platform (Windows, macOS, Linux).
-- **SSH Host Key Verification** — Trust-on-first-use (TOFU) model stores host keys on first connection and alerts if a key changes (potential MITM). Configurable via `nexus.ssh.trustNewHosts`.
-- **Auth Profiles** — Define reusable credential sets (password, private key, or SSH agent) and apply them to individual servers or entire folders in bulk. A NetBox inventory source can carry a profile too, so every server it syncs connects with those credentials from the start. The link is a reference, not a copy — edit the profile once and every server using it picks up the change, no re-sync needed. A failed login on one linked server never erases the profile's saved credential — one broken device can't lock the rest of the fleet out of silent re-auth; the stored credential is only replaced when a device actually signs in with a new one. Manage profiles from a dedicated editor panel accessible via the Settings tree or context menu.
-- **Proxy Support** — Route SSH connections through intermediaries when direct access isn't available. Three proxy types are supported per server:
-  - **SSH Jump Host** — Select another configured server as a bastion/jump host (ProxyJump equivalent). Supports multi-hop chaining (A → B → C) with full auth reuse.
-  - **SOCKS5 Proxy** — Connect through a SOCKS5 proxy server with optional username/password authentication.
-  - **HTTP CONNECT Proxy** — Connect through an HTTP proxy using the CONNECT method, common in corporate environments.
-- **SFTP File Explorer** — Browse, download, and manage remote files on connected servers. Drag-and-drop support for moving files between directories, and for uploading local files and folders onto a remote directory. Every upload and download is size-checked against its source once it finishes, and an item that was attempted and failed is counted as a failure rather than folded into the skip count. Windows network shares (`\\server\share`) are handled explicitly — see below. One SSH profile can be set to open the File Explorer automatically after normal Connect when the view is not already showing that server.
-- **Directory Sync (Follow Terminal Directory)** — Keeps the File Explorer pointed at whatever directory your SSH terminal is actually in, instead of wherever you last browsed. It's continuous, not a one-off jump, on any shell that announces its own directory (`fish`, `starship`, or bash/zsh with one added line — see below); everything else gets a manual **Go to Terminal Directory** action. Nexus never types anything into a session to make this work.
-- **Telnet Sessions** — Set a server's **Protocol** to *Telnet* and it connects over raw telnet instead of SSH, for console servers, virtual-lab consoles, and gear that offers nothing else. It is a per-server switch on the profile you already have, not a separate kind of profile: pick Telnet and the credential fields disappear, because telnet has no login of its own — you authenticate at the device's own prompt, in the terminal. Nexus speaks the negotiation properly (echo and suppress-go-ahead, terminal type, and live window-size updates on resize), so full-screen tools and line editing behave. Everything the terminal layer gives an SSH tab it gives a telnet tab too: highlighting, Reset / Clear Scrollback / Copy All, auto-trigger macros, and scripts (`@target-type telnet`). **Telnet is cleartext** — there is no encryption and no authentication in the protocol — so SFTP, port forwarding, jump hosts and key deployment aren't available on a telnet server, and asking for one says so up front instead of failing inside a handshake.
-- **Serial Terminal Sessions** — Connect to serial ports (COM/ttyUSB) with configurable baud rate, data bits, parity, stop bits, and RTS/CTS flow control. Supports break signal and XON passthrough. Includes **Smart Follow** mode for Windows COM-port renumbering: it retries the preferred port, silently reconnects only to the previously approved device when metadata matches, prompts before switching to unfamiliar replacement ports, updates the saved preferred port after a successful move, and keeps the terminal open while waiting or stopped instead of tearing the tab down on serial errors. Runs in an isolated sidecar process for crash safety.
-- **Local Shell Profiles** — Save named local terminal profiles and open one or more local shell sessions from the Connectivity Hub. Use a launchable VS Code terminal profile from the profile dropdown, including common resolved PowerShell, Git Bash, Command Prompt, and WSL profiles when available, or choose **Custom Shell** to set an explicit shell path, one argument per line, a working directory, and an optional startup command. Manual macros, auto-trigger macros, and Nexus scripts work with Local Shell sessions.
-- **Port Forwarding (TCP Tunnels)** — Three tunnel modes:
-  - **Local (-L)** — Forward a local port to a remote host through SSH.
-  - **Reverse (-R)** — Forward a remote port back to a local target.
-  - **Dynamic SOCKS5 (-D)** — Run a local SOCKS5 proxy that routes traffic to any destination through SSH.
-
-  All modes support configurable local bind addresses (localhost, LAN, or all interfaces), auto-start/auto-stop with server connections, live traffic counters, and a browser URL shortcut for quick access.
-- **Embedded Network Servers (TFTP + DHCP)** — Serve firmware and configs to lab hardware, and hand it addresses, without installing a separate daemon or borrowing the office DHCP server. Both services bind every interface (`0.0.0.0`) unless you pick one, from a live list of this machine's IPv4 addresses, in Quick Settings or the full form. TFTP is read-only until you opt into uploads, and sandboxes every filename a client sends inside the configured root, so a `../` cannot escape it; live transfers show progress and speed and can be cancelled from the sidebar. DHCP runs full DORA with static reservations, leases that survive a restart, and the ZTP boot options a switch actually asks for (66, 67, 150, 60, 43). A **Network (CIDR)** row in both Quick Settings and the full form takes a whole network in one go — type `192.168.2.0/24` and the subnet mask, pool, gateway and DNS that follow from it are filled in; nothing is stored under that shorthand, and Quick Settings shows exactly what it would write and asks before writing it. If the NIC the service is bound to is not on the subnet the pool hands out — a lab that binds `192.168.1.x` and offers `10.0.0.x` leases looks correct in every individual field and serves nothing usable — the sidebar, Quick Settings and the form all say so, and offer the one NIC already on that subnet when exactly one matches — never a virtual adapter (Docker, WSL, Hyper-V, VPN), which stays selectable but is not something to pick for you. Save refuses a bind only when the interface's network genuinely does not match the pool *and* no pool could be derived on that interface either, so a pool that already fits the NIC you picked — a `/30` point-to-point link, a range narrowed inside a wider subnet, a NIC the platform reports without a netmask — saves as it always did. **Quick Settings** also offers to fill in the gateway, broadcast, and DNS that follow from a new pool, and named profiles capture a whole bench setup for next week, relay-agent support included. Both run inside one isolated daemon child process — the same crash-isolation model as the serial sidecar — so closing VS Code always releases UDP 69/67. Requires a trusted workspace. The daemon has two interchangeable implementations behind `nexus.networkServers.engine`. Since 2.8.205 the default is the native Rust one, packaged for all six supported platforms; the bundled JavaScript daemon remains available and is still the automatic fallback if no native binary is available here, so the services start either way.
-- **SSH Connection Multiplexing** — Share SSH connections across terminals, tunnels, and SFTP for the same server. Reduces connection overhead with automatic ref-counting and configurable idle timeout. Per-server toggle lets you disable multiplexing for devices that don't support multiple channels (e.g. Cisco). Automatic fallback to standalone connections handles channel failures transparently.
-- **Connectivity Hub** — Sidebar tree view showing all servers, serial devices, and local shell profiles, organized into nested folders. Built-in filter to quickly search by name; when a filter matches nothing, the Hub says "No matches found" instead of showing the first-run onboarding. Drag and drop to rearrange profiles, move between folders, or assign tunnels to servers. Active SSH and serial sessions highlight unread terminal activity in the tree and prepend `●` to the terminal tab title until you focus that terminal again.
-- **Terminal Appearance** — Customize terminal font family, size, and weight. Import color schemes from MobaXterm INI files or configure custom themes with live preview.
-- **Local Servers** — Run the local processes a bench needs alongside everything else: a dev server, a proxy, a mock API, a build watcher. Save a profile with an executable, arguments, working directory and environment, then start, stop and restart it from the Connectivity Hub, with its output in an ordinary Nexus terminal — highlighting, scrollback capture, Reset / Clear Scrollback / Copy All, and session transcripts all apply. A process that exits on its own can be restarted automatically, with the delay doubling on each attempt and the count clearing once it has run steadily; five consecutive failures is a hard ceiling, because a process that has died five times without once staying up is broken rather than unlucky. Working directories are confined to the folders you have open, and starting one requires a trusted workspace. Distinct from **Embedded Network Servers**, which serves TFTP and DHCP to hardware on the wire — Local Servers runs programs on this machine.
-- **Terminal Highlighting** — Configurable regex-based pattern highlighting for SSH, serial, and Local Shell terminal output. 22 built-in rules detect errors, warnings, status keywords, IPv4/MAC addresses, URLs, interface counters and more with inline ANSI colouring while respecting existing terminal colours. The IPv6 and UUID rules ship **disabled** — those two patterns cost more than all the others combined — but stay in the list, ready to switch on with a per-row checkbox in the Rule Editor. Every rule can also carry its own label and description so the list stays readable without decoding regexes. Includes a visual Rule Editor with live preview, staged Apply/Cancel, rule ordering, custom SGR foreground codes, regex safety checks, and one-click reset to defaults.
-- **Terminal Macros** — Define reusable text sequences and send them to the active terminal with one click or keyboard shortcut. Assign any macro a custom keybinding from 108 combinations across three modifier groups: `Alt`, `Alt+Shift`, and `Ctrl+Shift` with A-Z or 0-9 keys. Macros without a keybinding are accessible via `Alt+S` quick-pick. Includes a Macro Editor panel with multiline editing, secret macro support, inline keybinding assignment, and Macros-view actions to copy or paste secret values via the system clipboard. Clipboard copies place the value in the OS clipboard as plain text. **Auto-trigger (expect/send)**: add a `triggerPattern` regex to any macro — when terminal output matches, the macro text is sent automatically. Existing macros default to all-terminal matching for compatibility; new macros can be scoped to the active terminal or a matching profile, which is recommended for secret prompts. `triggerCooldown` prevents echo loops, `triggerInterval` enables prompt-gated polling macros, and macros can optionally start with auto-trigger paused until you resume them from the Macros view. Pause/resume, interval ownership, and cooldown state all follow the macro itself, so reordering or deleting other macros never moves that state onto the wrong one. See the [macro guide](docs/macros.md) for step-by-step setup, trigger scopes, cooldowns, intervals, and regex examples.
-- **Macro Variables** — Declare named variables on a macro (label, default, mask-input, remember) in the Macro Editor and reference them in its text as `$name` or `${name}`; running the macro walks a step-by-step prompt (with Back) for each variable actually used, then sends the filled-in command to the terminal you invoked it from — even if you switch tabs while the prompts are open. A placeholder for a name you never declared is sent through unchanged rather than blocking the macro. Variables and auto-trigger can't be combined on the same macro — prompting needs a foreground input box, which a background pattern match can't safely open. See the [macro guide](docs/macros.md) for the full variable reference.
-- **Server profile tokens & IPMI/BMC macros** — Reference the server a macro runs against with `${profile.host}`, `${profile.port}`, `${profile.username}`, `${profile.name}`, `${profile.ipmiHost}` (set **IPMI / BMC Host** under Advanced in the server form) and `${profile.ipmiUsername}` (taken from the **IPMI Auth Profile** linked beside it). Right-click a server in the Connectivity Hub → **Run Macro on Server…** to resolve them against that server; macros can target the session, a local terminal (ipmitool SOL), or the browser (BMC web console). Five starter templates ship in **Add Macro From Template** — SOL console, chassis power status/on/off, and the web console. See the [macro guide](docs/macros.md#profile-tokens).
-- **BMC access without typing a password** — Link an **IPMI Auth Profile** to a server (the same auth profiles you already use for SSH — one shared BMC credential can serve the whole fleet) and tick **Provide IPMI credentials** on an ipmitool macro. Nexus puts that profile's saved password into the macro's local terminal as `IPMITOOL_PASSWORD`/`IPMI_PASSWORD`, where `ipmitool -E` reads it — so the password never appears on the command line, in `ps`, in the scrollback, or in *Copy All to Clipboard*. The checkbox is off by default and never arrives switched on from a shared or restored macro: capability settings are always re-confirmed on this machine. Shipped ipmitool templates arrive with it already set, so the common path needs no configuration.
-- **One-click BMC actions** — Right-click a server → **Connect BMC Serial Console** opens a local terminal already running `ipmitool … -E sol activate` against that server's BMC, and **Open BMC Web Console** opens its web interface in your browser (HTTPS by default; switch a server to plain HTTP under Advanced when its card offers nothing else). Both reuse the same address and credential rules as the macros — a server missing a piece gets an error that names the field and where to set it, rather than a broken command.
-- **Keyboard Passthrough** — Optionally pass `Ctrl+` key combinations (e.g. `Ctrl+B`, `Ctrl+N`) directly to the terminal for applications like vim, nano, and htop. Configurable per-key with 10 supported combinations.
-- **Session Transcript Logging** — Automatically log clean terminal output (ANSI codes stripped) to files with configurable rotation. Per-profile toggle.
-- **Terminal Tab Commands** — Right-click any Nexus terminal tab for three PuTTY-style commands: *Reset Terminal* (clears the visible screen while preserving scrollback), *Clear Scrollback* (clears visible and captured transcript together), and *Copy All to Clipboard* (ANSI-stripped transcript of the session). After a session disconnects, Reset and Clear grey out; Copy All stays enabled so a run can always be captured for a ticket or chat.
-- **Settings Panel** — View and edit extension settings in a dedicated webview panel with grouped categories, terminal-adjacent actions, validation, and host-confirmed auto-save.
-- **Configuration Export/Import** — Full encrypted backup with master password protection, or sanitized share export (credentials stripped, IDs remapped). Proxy configurations are preserved across backup and restore.
-- **Import from SSH Config / MobaXterm / SecureCRT** — Migrate SSH session profiles directly from your `~/.ssh/config` (`Include` directives followed, `IdentityFile` hosts arriving as key auth — bar `none`, which ssh reads as "no key"), MobaXterm INI files, or SecureCRT XML exports and session directories. Folder hierarchy is preserved where the source has one. Nexus offers the `~/.ssh/config` import once, on first run, if you have one.
-- **NetBox Inventory Sync** — Add your NetBox instance as an inventory source and Nexus creates and maintains server profiles from its devices: placed under a target folder of your choosing, organized by a folder template (`{site}/{rack}` by default; `{location}`, `{role}`, and `{tenant}` also available), narrowed by any NetBox device filter, with virtual machines included on request. The API token lives in VS Code SecretStorage, never in a settings file. Nothing is applied blind: every sync computes a plan — servers to add, update, move, or remove — and shows it for confirmation first, with warnings and affected-server lists one click away. A device NetBox has no usable IP for is created as well, as a server with no address and counted in the plan's warnings, rather than being dropped with a "skipped" note — so it stays in your tree and starts connecting once NetBox gives it an address. Devices renamed or re-racked at the source follow on the next sync; a device that disappears is moved to the source's `_orphaned` subfolder by default, keeping its settings in case it returns (deleting or keeping it in place are per-source alternatives). Removing a source asks whether to delete the servers it created or keep them — and a kept server remembers the device and NetBox it was synced from, so re-adding that NetBox later asks once whether to **Adopt Existing** (re-link the kept servers: each keeps its saved credentials and settings, while the source takes over its name, address, folder, and — from then on — its Removed-Device Policy) or **Add Separately**. Adoption is deliberately narrow: only a server a source actually synced, kept when that source was removed, and still at its device's address qualifies, and only for a source pointed at the same NetBox — a server you made by hand is never taken over, however exactly its address matches; a record kept from a lab instance can't be claimed by the same device id in production; and when two kept records claim one device, Nexus adopts neither rather than guessing. The answer alone changes nothing: adoptions go through the same plan as everything else, counted in the preview and named, pair by pair, under Show Warnings. Link an **Auth Profile** to the source and every server it creates connects with those credentials. Servers from earlier syncs adopt the profile on the next sync — but only those still carrying exactly what the sync gave them: anything you've hand-edited keeps its own credentials, and clearing the profile on one synced server is a per-server opt-out that later syncs respect. A source's **Primary IP Family** (Automatic / Prefer IPv4 / Prefer IPv6) decides which address fills each server's Host; when a device carries both families, the other family's primary IP is written into **Alternate host** automatically, so synced servers arrive ready to fall back from one stack to the other. The folder a source syncs into carries an inline **sync** icon — when that folder exists and exactly one source targets it — so re-syncing one source is a single click on the tree. Manage sources from **Settings → Inventory Sources** (Sync Now / Edit / Template Rules / Remove per source) or the Command Palette.
-- **EVE-NG Lab Sync** — Add an EVE-NG server as an inventory source and its lab tree becomes connection profiles: **labs become folders, nodes become servers**, each pointed at the node's own telnet console. The username and password you log into EVE-NG with are kept in VS Code SecretStorage, never in a settings file. Narrow what comes across with a **Root Folder** (scan one subtree of the lab tree) and a **Lab Filter** (a case-insensitive substring of a lab's full path), and set a **Console Host Override** for an EVE-NG behind NAT — a console EVE-NG reports on `127.0.0.1` or `0.0.0.0` is describing its own machine, so Nexus substitutes the host from the base URL, and an override wins over both. A node with no telnet console is still created, as a visible server with no address rather than being dropped. A **stopped** node upgrades to a real telnet server as soon as it starts and its console exists (downgrading again if it goes away); an **HTML5/VNC-only** node has a console Nexus cannot drive, so it stays addressless until its console type is changed to telnet in EVE-NG. **Refresh Inventory Status** paints running nodes and the labs holding them green in the tree, and each source's own **Lab Status Poll Interval** keeps that current while the Command Center is open — set per source, so a busy lab can poll often and a quiet one not at all. **Start Node** / **Stop Node** on a node's right-click menu bring a lab node up or down without leaving the editor. The folder a source syncs into carries an inline **sync** icon — when that folder exists and **exactly one** source targets it (two sources sharing a folder, or a source targeting the root, get no icon) — so re-syncing one source is a single click on the tree rather than a trip through Settings. **Community edition is the certified target**: Nexus is edition-aware and works against Professional, but Pro support is preliminary and a sync against one says so in its warnings.
-- **Device Templates** — Apply a named, reusable bundle of connection settings to the servers a sync creates and maintains, instead of hand-editing each one. A device template can set **Proxy**, **Auth Profile** (SSH), **Multiplexing**, **Legacy Algorithms**, **Session Logging**, **IPMI Auth Profile**, and **IPMI Gateway**; each field is tri-state — *Not set*, *Fill* (only where nothing is set), or *Override* (replace source and earlier-synced values) — and templates never store secrets, so proxies still prompt on first connect. Bind a template to a source's devices with filter rules (`role=switch&site=syd`; keys `role, site, location, rack, tenant, status, platform, tag, name`), or pick one **Device Template** in the source form to cover everything it syncs. When several rules match a device the settings **cascade per field** — the most specific rule wins each setting it sets, never by rule order. Your own edits always win, clearing a template-applied value opts that server out, and changes land on each source's next sync. Create and manage templates with **New Device Template** / **Manage Device Templates** / **Edit Template Rules**, or apply one to a folder immediately with **Apply Device Template**.
-- **Scripts** — Author `.js` automation scripts under `.nexus/scripts/` (or the folder of your choice via *Nexus Settings → Scripts → Scripts Folder*, which exposes a native folder picker; works with or without an open workspace — when none is open, scripts live in the extension's global storage) and run them against any active SSH, Serial, or Local Shell session. Scripts use an async expect/send API (`waitFor`, `expect`, `waitAny`, `send`, `sendLine`, `sendKey`, `poll`, `prompt`, `confirm`, `alert`, `sleep`, `log`, `nexus.fs`, `nexus.include`) with IntelliSense auto-seeded on first run. Long scripts split across files: `await nexus.include("./lib/helpers.js")` loads a plain `.js` file as a module and resolves to its exports, with relative paths resolving against the file they are written in. Each script runs in an isolated `worker_threads` Worker so runaway loops can be stopped in &lt;100 ms. Macros on the script's session are suspended automatically (configurable via `nexus.scripts.macroPolicy` and the per-script `@allow-macros` header); macros on unrelated sessions keep firing normally. Scripts require a trusted workspace — Restricted Mode disables them. Minimal example:
-  ```js
-  /**
-   * @nexus-script
-   * @name Quick login check
-   * @target-type ssh
-   */
-  await expect(/[$#] $/, { timeout: 10_000 });
-  await sendLine("uname -a");
-  const out = await expect(/[$#] $/);
-  log.info("kernel:", out.before.trim());
-  ```
-  See the **[full scripting guide](docs/scripting.md)** for the complete API reference, header fields, match-window semantics, error-handling patterns, macro coordination, and [`examples/scripts/`](examples/scripts/) for seven runnable scripts demonstrating `if` / `while` / `for` loops, retries, polling, user interaction, and complete multi-step procedures.
-- **Folders for Macros and Scripts** — Group Terminal Macros and Nexus Scripts into folders, the same way servers and serial profiles are organized in the Connectivity Hub. Create a macro folder explicitly (New Folder) or by moving/dragging a macro into it; script folders are just directories under the scripts folder — create one with New Folder, or give New Script a `folder/name` path and Nexus creates the folder for you. A folder is yours to create and persists even while empty; removing a macro folder re-parents its macros instead of deleting them. See the [macro guide](docs/macros.md#organising-macros-into-folders) and the [scripting guide](docs/scripting.md#organising-scripts-into-folders).
-- **Web Extension Fallback** — Graceful degradation in browser-based VS Code (SSH/serial features require desktop runtime).
-
-## Getting Started
-
-Nexus Terminal is available from both the VS Code Marketplace and Open VSX registries.
+Then open the **Nexus** sidebar (activity bar icon).
 
 **Requires VS Code 1.105 or newer** (or an Open VSX-compatible editor built on that API level). Older hosts are not offered the extension by the Marketplace, and installing the VSIX by hand on one is refused.
 
-### First Use Flow
-
-1. Open the **Nexus** sidebar and create a profile with `Nexus: Add Profile`, `Nexus: Add Server`, `Nexus: Add Serial Profile`, or `Nexus: Add Local Shell Profile` — or sync your whole device inventory in one go with `Nexus: Add Inventory Source (NetBox, EVE-NG, Proxmox, GNS3…)`.
-2. Select **Connect** / **Open Local Shell** on the profile to open an SSH, Serial, or Local Shell terminal.
-3. For SSH profiles, open **File Explorer** and run **Browse Files** to choose the connected profile and browse SFTP files.
-4. Open **Port Forwarding**, add a tunnel with `Nexus: Add Tunnel`, assign an SSH server, then select **Start**.
-5. Create repeatable terminal input with `Nexus: Add Blank Macro` or **Add Macro From Template**; create longer automation with `Nexus: New Nexus Script`.
-6. Open **Settings** and use **Encrypted Backup** to save a password-protected backup, or **Export for Sharing** to create a sanitized export without secrets.
-
-### Install from VS Code Marketplace
-
-1. Open VS Code and go to the Extensions view (`Ctrl+Shift+X`)
-2. Search for **Nexus Terminal**
-3. Select the listing from the **Visual Studio Marketplace**
-4. Click **Install**
-5. Open the **Nexus** sidebar (activity bar icon)
-
-### Install from Open VSX
-
-- Listing URL: https://open-vsx.org/extension/sentriflow/vscode-nexterminal
-
-1. Open your Open VSX-compatible editor (for example VSCodium, Eclipse Theia, or Gitpod).
-2. Go to the Extensions view and search for **Nexus Terminal** in the Open VSX registry, then click **Install**.
-3. Or install directly from a downloaded VSIX: `Extensions` > `...` > `Install from VSIX...` and select the package file.
-4. Open the **Nexus** sidebar (activity bar icon).
-
-### Install from VSIX
-
-1. Download the `.vsix` from [GitHub Releases](https://github.com/evdanil/vscode-NexTerminal/releases)
-2. In VS Code or Open VSX-compatible editors: `Extensions` > `...` > `Install from VSIX...`
-3. Open the **Nexus** sidebar (activity bar icon)
-
-### Add a Server
-
-1. Click `+` in the Connectivity Hub title bar, or run `Nexus: Add Server` from the command palette
-2. Enter host, port, username, and authentication details (password, private key, or SSH agent)
-3. Optionally configure a proxy (SSH jump host, SOCKS5, or HTTP CONNECT) under the Proxy section
-4. Right-click the server and select **Connect** to open a terminal session
-5. To set up key-based auth: right-click the server → **Deploy SSH Key** → select or generate a key → the public key is deployed automatically
-
-### Connect Through a Proxy
-
-If your target server is behind a firewall or bastion host:
-
-1. **SSH Jump Host** — First add the bastion server as a regular server profile, then edit the target server and set its proxy to "SSH Jump Host", selecting the bastion from the dropdown. Multi-hop chains (A → B → C) work automatically.
-2. **SOCKS5 / HTTP CONNECT** — Edit the target server and set its proxy type, entering the proxy host, port, and optional credentials. Proxy passwords are stored securely in VS Code SecretStorage.
-
-### Sync Servers from NetBox
-
-If your device inventory already lives in NetBox, you don't have to re-type it:
-
-1. Run `Nexus: Add Inventory Source (NetBox, EVE-NG, Proxmox, GNS3…)` and choose **NetBox** — the first step is choosing a provider — or open **Settings → Inventory Sources**, which lists every configured source with inline **Sync Now**, **Edit**, **Template Rules**, and **Remove**
-2. Enter your NetBox base URL and an API token with read access to DCIM (and Virtualization, if you include VMs). The token is stored in VS Code SecretStorage. **Test Connection** confirms the URL is reachable and the token is accepted — it does not check that the token can read your devices, so a token NetBox accepts but hasn't granted DCIM access will pass here and fail on the first sync
-3. Optionally narrow the sync with a device filter (e.g. `status=active&site=syd`), shape the folder layout with a template (`{site}/{rack}` by default), and set a **Target Folder** to keep synced servers under
-4. Pick an **Auth Profile** so the servers the sync creates can actually connect — choose an existing profile or create one inline without leaving the form. Its username fills the **Default SSH Username** field; with **(None)**, servers use the default username with SSH agent authentication
-5. If the base URL is `https://` and your NetBox is behind a self-signed certificate — or you reach it by IP address and its certificate does not list that address (a certificate *can* cover an IP, so check before assuming) — tick **Allow a Self-Signed or Mismatched Certificate** under **Advanced options**. It is off by default; read the note below the list before turning it on
-6. Save, then choose **Sync Now**. The plan is shown before anything is applied — how many servers will be added, updated, moved, or removed, and, when credentials would change, exactly which servers by name under **Show Warnings**
-
-**Allow a Self-Signed or Mismatched Certificate** is the same option EVE-NG sources have, doing the same thing: Nexus connects over HTTPS without checking the server's certificate for that one source. The traffic is still encrypted, but it is no longer *authenticated* — anything on the network path can intercept it, and **your NetBox API token** is sent over that connection, on every request. That is the part worth pausing on: the token is a bearer credential with nothing else standing behind it, so anyone who captures it has your NetBox's read access until you revoke it. Reasonable for a self-hosted NetBox on a network you trust; not for one reachable from outside it. It applies to that source alone — nothing else in VS Code is affected — and it does nothing at all on an `http://` base URL, which is not encrypted in the first place. Two things to know before you turn it on: if you reach NetBox through a proxy, this connection **bypasses VS Code's `http.proxy` setting** and goes direct, so a proxied source can start failing for reasons that have nothing to do with the certificate; and every sync that actually runs unverified says so in its plan, by design, so the choice does not go quiet after you make it. Leave it off and use a trusted certificate where you can. If you hit a certificate error before finding this, the error itself names the option.
-
-> **One-time prompt on upgrade.** Adding this option changed the NetBox source form, and Nexus asks you to re-confirm handing a changed provider your saved credentials whenever that happens. Existing NetBox sources will therefore prompt **once** on their next sync — exactly as EVE-NG sources did in 2.8.190. Confirm once and it does not come back.
-
-A device NetBox has no usable IP for is not skipped. It arrives as a server with **no address** — visible in the tree, marked `(no address)`, and counted in the plan's warnings — keeping its folder and settings until NetBox gives it an address, which the next sync fills in on that same server. It can't connect in the meantime, and asking it to says exactly that rather than failing inside a handshake (see [Servers with no address yet](#servers-with-no-address-yet)).
-
-A device that carries an **out-of-band IP** in NetBox (`oob_ip`) also fills that server's **IPMI / BMC Host**, so `${profile.ipmiHost}` macros — the IPMI SOL console and BMC web console templates — work on synced servers without typing an address anywhere. A value you typed by hand is never overwritten, clearing the field on one server is a per-server opt-out later syncs respect, and a device that stops reporting an out-of-band IP keeps its last known address rather than having it erased. Where an address you typed already matches exactly what the device reports — the usual outcome of copying it out of NetBox — the sync starts keeping that field current: nothing visible changes, and from then on it follows the BMC when it is re-addressed at the source. An address NetBox reports that can't be used as a host — a URL, say — is reported in the plan's warnings instead of being stored. Removing a source with **Keep Servers** and reclaiming its servers later preserves all of this. (One caveat if you move between versions: syncing on a build older than 2.8.97 drops the record of which addresses the sync owns. The addresses themselves survive, and any server whose address still matches its device picks the record back up on the next sync from a current build; for the rest — those whose BMC also moved meanwhile — clearing the IPMI / BMC Host hands the field back to the sync.)
-
-A synced server's own **Host** and **Port** now follow that same discipline. Earlier builds took them from the source on every sync, so an address you corrected by hand was silently overwritten on the next one; from 2.8.189 they behave like every other synced field — the sync keeps them current while the record still carries exactly what the sync last wrote, and hands off for good once you have edited them. A device that genuinely moves at the source is still followed. Lab nodes get one extra piece of care: EVE-NG hands out console ports dynamically, so a restarted node often lands on a new one, and a **Refresh Inventory Status** stores the new port so the next connect goes to the right place instead of a dead one. Only a port the sync owns is healed that way — a port you set by hand never is — and it is the *next* connect that uses it; a terminal already open keeps the port it connected with. (The same version caveat as above applies: syncing on a build older than 2.8.189 leaves no record of which addresses the sync owns. A server whose address still matches its device picks the record up on the next sync from a current build; one whose address moved at the source in between reads as hand-edited and stops following until you set it back to the device's address.)
-
-Run **Sync Now** again whenever devices change at the source: renames and rack moves follow, and a device that disappears from NetBox is handled per the source's **Removed-Device Policy** — moved to an `_orphaned` subfolder (the default, which keeps its settings in case it returns), deleted, or kept in place.
-
-A device can also stop syncing without disappearing — a Proxmox guest converted to a template is no longer a guest to sync, and a guest that is merely powered off drops out too when **Include Stopped Guests** is off — so its server is handed to that same policy. Where the source can say why, the confirmation says it too, under the line that moves, deletes or keeps the servers: *"idm.defcon.local" is still at the source — it was not synced because it is now a template.* or *"web-01" is still at the source — it was not synced because it is stopped and Include Stopped Guests is off.* Servers that share a reason are named on one line, up to three of them, and past three the line counts them instead of listing them; a sync that prunes both kinds gets a line for each. A device that genuinely vanished gets no such line, and a sync that prunes some of each names only the ones it can explain — which is the whole point, since until now the two read identically.
-
-You can also re-sync straight from the tree: the folder a source syncs into carries an inline **sync** icon in the Command Center. It appears only where the answer is unambiguous — the folder has to exist, and exactly one source can target it, so two sources sharing a folder get no icon and neither does a source that syncs into the root. The same icon appears for every kind of source, EVE-NG labs included.
-
-Removing a source (**Remove**, beside Sync Now) asks what to do with the servers it created: **Delete Servers**, or **Keep Servers** as ordinary servers in your list. Keeping them doesn't strand them — each kept server records which device and which NetBox it was synced from, so if you add the same NetBox back later, the sync notices and asks once: **Adopt Existing** re-links those servers instead of adding copies — each keeps its saved credentials and settings, the source takes over its name, address and folder from then on, and its **Removed-Device Policy** now applies to it like any other synced server — while **Add Separately** leaves them alone and adds the devices as new servers. Your answer on its own changes nothing: the sync plan still follows, counting the adoptions, and **Show Warnings** names every kept server alongside the device reclaiming it, so you can check each pairing before Apply.
-
-The eligibility rule is narrow on purpose. A server is offered for adoption only if a source actually synced it, you kept it when that source was removed, it's still at the address the device reports, and the source you're syncing points at the same NetBox it was synced from (compared by base URL, so a record kept from your lab instance can never be claimed by the same device id in production). A server you created by hand is never adopted, no matter how exactly its address matches. When adoption is refused — the device changed address while detached, or two kept records claim the same device — the device is added as a new server instead, and the plan's warnings say which device and why. There is one exception, and it is what a restored id-preserving backup leaves behind: when the kept server still holds the identifier a new server for its device would need, there is nothing to add the device beside, so it is skipped rather than duplicated. The warning says that too — naming that server as the device's own former record rather than as an unrelated one, and giving the repair, which is to put it back at the device's address and reclaim it on the next sync, or delete it and let the next sync add the device fresh.
-
-Credentials stay yours. If a source gains an auth profile later, servers from earlier syncs adopt it on the next sync — but only servers still carrying exactly what the sync gave them. A server whose username or authentication you've edited keeps its own credentials (use **Apply Auth Profile** on it or its folder if you do want it on the profile), and setting one synced server's Auth Profile back to **(None)** is a per-server opt-out that later syncs respect. That opt-out survives remove-and-re-add, too: a link you cleared before the source was removed stays cleared after the source adopts the server back, while a kept server the old source never gave a profile picks one up on the reclaim, exactly as a newly synced server does. One combination is refused up front: a private-key profile that carries no key file works fine on a server that brings its own key, but a synced server has none to bring, so linking such a profile to a source is rejected with the reason instead of creating servers that could never log in.
-
-### Sync Servers from an EVE-NG Lab
-
-EVE-NG labs are an inventory source too, and the shape is the same: **labs become folders, nodes become servers**, each pointed at the node's native telnet console.
-
-1. Run `Nexus: Add Inventory Source (NetBox, EVE-NG, Proxmox, GNS3…)`, choose **EVE-NG**, and enter the base URL of the EVE-NG web UI plus the username and password you log into it with. The password is stored in VS Code SecretStorage
-2. Optionally set a **Root Folder** to scan only part of the lab tree, a **Lab Filter** (a case-insensitive substring of a lab's full path), and a **Console Host Override** for when EVE-NG sits behind NAT and reports console addresses you cannot reach
-3. **Include Stopped Nodes** is on by default. Turning it off makes a stopped node look deleted to the sync, so the source's Removed-Device Policy applies to it — leave it on unless you only ever want running gear
-4. If the base URL is `https://` and the server holds EVE-NG's own self-signed certificate — or you reach it by IP address and its certificate does not list that address (a certificate *can* cover an IP, so check before assuming) — tick **Allow a Self-Signed or Mismatched Certificate** under **Advanced options**. It is off by default; read the note below the list before turning it on
-5. Save, then **Sync Now**. As with any source, the plan is shown before anything is applied
-
-**Allow a Self-Signed or Mismatched Certificate** is the honest name for what it does: Nexus connects over HTTPS without checking the server's certificate for that one source. The traffic is still encrypted, but it is no longer *authenticated* — anything on the network path between you and the lab can intercept it, and the EVE-NG username and password are sent over that connection. It is a reasonable trade for a lab box on a network you trust, which is what EVE-NG usually is; it is not reasonable for a server reachable from outside that network. It applies to that source alone — nothing else in VS Code is affected — and it does nothing at all on an `http://` base URL, which is not encrypted in the first place. Leave it off and use a trusted certificate where you can. If you hit a certificate error before finding this, the error itself now names the option.
-
-Each lab becomes a folder under the source's Target Folder, named after the lab file, nested under whatever folders it sits in relative to the Root Folder. A node with a native telnet console arrives as a **telnet** server on the console's own port. When EVE-NG reports that console on `127.0.0.1` or `0.0.0.0` — the usual answer, since it is describing its own machine — Nexus substitutes the host from the base URL, and a **Console Host Override** wins over both.
-
-**Rename nodes freely; rename labs deliberately.** A node renamed inside its lab keeps its server — the name just follows on the next sync, as with any other source. A **lab** is different: EVE-NG offers no identifier for a lab that survives a rename, so Nexus identifies a node by its lab's path plus its node id, and renaming or moving a lab makes every node in it look like a brand-new device. The servers you had are handed to the source's Removed-Device Policy — moved to `_orphaned` with the default setting — and the nodes come back as fresh servers, without the credentials, jump host or other per-server settings you had put on the old ones. Nothing is lost silently (the plan shows the removals and the adds before it applies them), but there is no way to carry those edits across: settle the lab tree first, then invest in per-server settings.
-
-Nodes with an HTML5/VNC console, and nodes that have no console address yet, are still imported — as servers with no address. The two are not the same wait, though the warning wording covers both: a **stopped** node is temporary and gets its address the moment it starts, while an **HTML5/VNC-only** node already has a working console — it simply isn't telnet, which is what Nexus speaks to a lab node — so it stays a placeholder for good, until you change that node's console type to telnet in EVE-NG. One warning line mentions them, and the sync owns it: it gives the total and, when both apply, splits it into the placeholders this sync just added and the ones that were already placeholders from an earlier sync. They are deliberately not dropped: a device missing from the tree reads as *deleted at the source*, and the source's Removed-Device Policy would act on it. What such a placeholder can and can't do is below, in [Servers with no address yet](#servers-with-no-address-yet).
-
-A sync is bounded rather than open-ended, so a huge or unresponsive installation can't hang it: the crawl stops at 1,000 labs, 10,000 nodes, 12 folder levels, 2,000 folder listings, or 120 seconds — whichever comes first — and the plan's warnings name what it didn't reach. A crawl that stopped short never prunes: servers whose labs it never got to are left alone instead of being read as deleted.
-
-**Community edition is the certified target.** The client is edition-aware and works against Professional, but a Pro server adds a warning to every sync saying so: lab discovery and console mapping are validated against Community, and Pro's differences are not yet covered.
-
-**See which labs are running, live.** Just **sync** — a completed EVE-NG sync brings every node's running/stopped state up to date, no extra step, including the stopped nodes **Include Stopped Nodes** leaves out of the sync itself. (A crawl that stopped at one of its limits updates only what it reached.) Between syncs, run **Refresh Inventory Status** from the Command Palette, or set the source's **Lab Status Poll Interval (seconds)** under **Advanced options** to poll while the Command Center is open — it is per source (`0`–`3600`, whole seconds, `0` = off), so a busy lab can poll every 30 seconds while a quiet one stays off. Read the note on EVE-NG sessions below before turning it on. Running EVE-NG nodes get a green dot with a `(running)` tag, while stopped ones get a hollow grey dot and a `(stopped)` tag. A green ▶ rides on every running node's row and on the lab folder holding it, so an at-a-glance look at the tree tells you which labs are up. A node you are already connected to keeps its plug icon, and there the ▶ and the `(running)` tag are what carry its lab state.
-
-**Give Nexus its own EVE-NG account.** EVE-NG Community allows only one active session per user account — confirmed in direct testing, where every poll deauthenticated the browser session; Professional is untested in this respect. Whichever login happened most recently is the one that stays: sync or poll while you are signed in as the same user and Nexus logs you out of the EVE-NG web UI — and when you log back in, Nexus's session is the one that goes. It also shows up as an occasional mid-sync `session timed out` / HTTP 412 failure. Nexus recovers from that by logging in again once, silently, which works but evicts the browser again in turn; with polling on and a browser open the two will keep taking the session off each other. Create a second EVE-NG account for Nexus and the problem disappears. Failing that, leave **Lab Status Poll Interval** at `0` and sync when you are not using the web UI.
-
-**Start and stop nodes from the tree.** Right-click an EVE-NG node whose state is known and choose **Start Node** (on a stopped one) or **Stop Node** (on a running one); Nexus issues the start/stop and then re-checks the status twice — once straight away and once a few seconds later, since a node does not change state the instant its API accepts the request. A slow start can outrun both re-checks, and the row then keeps its old state until a sync, a manual **Refresh Inventory Status**, or the source's poll interval picks it up. Tested against EVE-NG Community; EVE-NG Professional support is preliminary. The mechanism is provider-general: any inventory provider that can control nodes gets the same menu — for Proxmox guests, see [Sync Servers from a Proxmox Cluster](#sync-servers-from-a-proxmox-cluster). A start or stop spends the source's saved credentials, so if the extension now answering that source's provider id looks different from the one you configured the source against — its name or its fields changed — Nexus asks first, and Cancel reads no credential and sends nothing to the node. Answering **Continue** here stores nothing: the next start, stop, sync, edit or console open asks again, because a click made to boot a node is not a statement about future credential hand-offs. What it does do is let that one source's automatic status refreshes through for the rest of the window — otherwise the re-check Nexus fires seconds later would refuse the source and tell you to confirm a change you had only just confirmed. That window-scoped answer is tied to the exact source record and provider shape you were shown, so a new window asks again, and so does a source replaced by a backup restore or a provider id re-registered with yet another shape. (Answering the same question from **Sync Inventory Now** or **Edit Source** is different: those save the source anyway, so a successful sync or a saved form records the new shape and nothing asks again until it changes.)
-
-### Sync Servers from a Proxmox Cluster
-
-A Proxmox VE cluster is an inventory source too, and the shape is the same: **guests become servers** — each QEMU virtual machine and LXC container the cluster lists arrives as an SSH server, addressed from what the guest itself reports.
-
-1. Run `Nexus: Add Inventory Source (NetBox, EVE-NG, Proxmox, GNS3…)`, choose **Proxmox**, and enter the cluster's base URL — what you open the web UI at, `https://pve.example.com:8006` shaped. Keep the port: PVE serves its API on 8006, and a URL without one sends every request to 443, where nothing answers. Omit the port only when a reverse proxy fronts the cluster on 443 — a mount path in the URL is fine and is kept. For **API Token**, enter the FULL credential as ONE string in Proxmox's own form — id, `=`, then the secret PVE shows you exactly once at creation:
-
-    ```
-    <user@realm>!<tokenid>=<secret>        e.g.  root@pam!nexus=8c1a4bb2-3d7f-4c22-9a51-e0f2b6c1d990
-    ```
-
-   The token is stored in VS Code SecretStorage, never in a settings file. **Test Connection** confirms the URL is reachable and the token is accepted — it does not check what the token may read, so a token PVE accepts but has granted nothing passes here and fails on the first sync
-2. Create the token least-privilege, on the PVE host:
-
-   ```bash
-   pveum user token add nexus@pve nexus -privsep 1
-   pveum acl modify /vms -token 'nexus@pve!nexus' -role PVEVMUser
-   ```
-
-   Grant explicit privileges instead of the role and each buys one thing: **VM.Audit** lists the guests, reads each guest's config for its NIC addresses, and answers container addresses; **VM.PowerMgmt** is Start/Stop; **VM.GuestAgent.Audit** on PVE 9 — **VM.Monitor** on PVE 8 — is what makes VM addresses readable, because it talks to the guest agent, which must be installed and running inside the VM; **Sys.Audit** is only needed for cluster-node import
-3. Shape the tree with a **Folder Template** — `{node}` by default, so guests land under the PVE node that runs them. `{pool}`, `{type}` and `{tag}` are also available, and a guest carrying several tags syncs under the alphabetically first one. A guest with no pool or tags simply lands higher up
-4. Pick a **Primary IP Family** — Automatic takes the first address the guest reports; Prefer IPv4 / Prefer IPv6 choose the family, falling back to the other when the guest has none in the preferred one. When the chosen network card carries both families, the other one fills **Alternate host** automatically, exactly as from NetBox (see [Reach a device on either its IPv4 or its IPv6](#reach-a-device-on-either-its-ipv4-or-its-ipv6))
-5. **Include Stopped Guests** is on by default. A stopped guest imports as a placeholder with no address — it cannot answer — and gains one on the sync after it starts; turning the toggle off makes a stopped guest look deleted, so the source's Removed-Device Policy applies to it
-6. If the cluster answers with a certificate your machine does not trust — a stock PVE host issues one from the cluster's own CA — tick **Allow a Self-Signed or Mismatched Certificate** under **Advanced options**. It is the same option NetBox and EVE-NG sources have, doing the same thing: Nexus connects over HTTPS without checking the certificate for that one source. The traffic is still encrypted, but it is no longer *authenticated* — anything on the network path can intercept it, and **your Proxmox API token** is sent over that connection on every request. It is off by default, every sync that actually ran with it says so in its plan, and it does nothing at all on an `http://` base URL
-
-A VM whose guest agent is not running — the common case, since nothing installs the agent for you — arrives as a server with no address and gains one on a later sync once the agent answers; the same is true of any guest the address crawl did not reach, because lookups are bounded at 1,000 guests or 120 seconds per sync. The crawl bounds address resolution, not the device listing itself — a sync whose crawl stopped short still knows every guest in the cluster, so pruning runs normally, and a warning names the budget that stopped. Both cases are the addressless placeholder described in [Servers with no address yet](#servers-with-no-address-yet).
-
-**Very large clusters have one number to raise.** **Hard Cap (entries)** under **Advanced options** bounds both halves of a sync at once: how many devices it imports, and how many running/stopped states it collects (guests, plus the cluster nodes when node import is on). It is 10,000 by default and accepts 100 to 1,000,000; leave it alone and nothing changes. Past the cap, guests are left out of the sync — the plan says so, and nothing is pruned, because a capped listing must never be read as *these guests are gone* — and the status the sync carries is merged with what is already on the tree instead of replacing it, so no guest beyond the cap loses its decoration to a collection that never reached it.
-
-Tick **Include Cluster Nodes** under **Advanced options** to import the cluster's nodes as servers too, at the source's Target Folder root. This is where **Sys.Audit** earns its keep: the guest listing identifies nodes by name but carries no node addresses or running state — those come from a second call to the cluster's status endpoint — so without that privilege the nodes arrive without addresses or running state, and without the toggle the nodes do not arrive at all. A guest's identity is its vmid — unique across the whole cluster, stable across renames and node migration — so renaming or migrating a guest keeps its server.
-
-**See which guests are running, live.** Just **sync** — a completed Proxmox sync brings every guest's running/stopped state up to date by itself, no extra step, exactly as an EVE-NG sync does: the listing the sync reads already carries each guest's state, so the sync hands it back as it builds the tree. (Three things can leave one sync's picture partial, and the sync plan names each: a listing cut short by the hard cap, a status collection that ran out of that same budget, and a cluster-node status join that failed — a token without **Sys.Audit** is the usual reason. In each case the sync updates only what it reached, and whatever it did not reach keeps the state it already had.) Between syncs, **Refresh Inventory Status** from the Command Palette — or another **Sync Now** — brings the state up to date on demand, or set the source's **Status Poll Interval (seconds)** under **Advanced options** to poll while the Command Center is open (`0`–`3600`, whole seconds, `0` = off) — the field is the shared EVE-NG machinery with EVE-NG's "Lab" dropped, since a PVE cluster is not a lab, and there is no EVE-NG-style caveat to go with it: a PVE API token is stateless, so a poll costs nothing but its requests and cannot log you out of anything. Running guests get the green dot, stopped ones the hollow grey.
-
-**Start/Stop is async, like PVE itself.** Right-click a guest whose state is known — after a sync or with the poll on — and choose **Start Node** (on a stopped one) or **Stop Node** (on a running one), the same tree entries an EVE-NG lab node gets. A start or stop is issued to PVE, which answers immediately with a task id; Nexus polls that task — up to two minutes — and surfaces the task's own verdict, success or PVE's own message ("VM 105 already running"). A stop that is still running when the two minutes are up is reported honestly: the task keeps going on the PVE node, and the message names its task log. Start/Stop is offered for **guests only**: imported cluster nodes keep their running/offline decoration — the green or hollow dot and its suffix — but carry no Start/Stop menu, because Nexus cannot power-cycle a hypervisor node. A template is never status-reported at all — a template cannot run, and a known status on its row would light a Start/Stop menu PVE refuses to serve. Its vmid is instead explicitly cleared on every poll — and on every sync too, by the status report the sync attaches to its tree — so a guest you converted into a template loses the stale running dot it carried before conversion, even on a partial (merging) report, without needing a separate status refresh first. A guest PVE lists but cannot describe yet — its row reads `unknown` before RRD data exists — is cleared the same way on both paths, so a stale running/stopped highlight (and its Start/Stop menu) cannot survive on a partial report either.
-
-**Converting a guest to a template retires its server, and the plan says which.** A template is not a syncable guest, so the server stops matching a device and the source's **Removed-Device Policy** applies to it — orphaned by default, deleted or kept per the source. The sync's confirmation names the conversion (*"idm.defcon.local" is still at the source — it was not synced because it is now a template.*), so a server leaving because you converted its guest is no longer indistinguishable from one leaving because the guest was deleted. Turning **Include Templates** on keeps templates in the device set instead — as long as **Include Stopped Guests** is also on, since a template reports as stopped and the stopped gate would otherwise drop it anyway. A template dropped that way is still pruned, and the confirmation names the gate that actually dropped it: *it is stopped and Include Stopped Guests is off*, not the template opt-in you just switched on.
-
-**Open the guest's console in your browser.** Right-click any Proxmox-synced guest and choose **Open Web Console** — or click the row and pick it from **Profile Actions**, where it sits with Connect and Test Connection: Nexus builds the address of PVE's own console page for that guest — noVNC for a virtual machine, xterm.js for a container, which is the frontend PVE's own Console button opens for each — and opens it in your browser. It needs **no address of its own**, which is the point — a VM with no guest agent, or one that is simply stopped, has nothing to SSH to, and its console is the way in. The credential for the console itself is the **PVE session your browser already holds**: the first open may land on PVE's login page, and after signing in the console is right there. Your API token is not that credential and is never put in the address — but it is used: each click makes one authenticated `GET /cluster/resources` call with it, to find which node is running the guest right now. So the token travels exactly as far as it does on a sync or a status refresh, on the same connection and under the same **Allow a Self-Signed or Mismatched Certificate** setting, and an invalid or unprivileged token fails that lookup rather than the console. No new secret is stored.
-
-The guest's current node is resolved fresh at the moment you click, so a guest migrated since the last sync opens on the node running it now. A stopped guest opens PVE's own "not running" console page — honest, and in PVE's voice. The entry is offered for **guests only**: an imported cluster node has a shell of its own, not a guest console, so its row carries no such entry. A **template** (imported only if you tick Include Templates) does carry the entry — nothing on a synced row says "template", so the menu cannot know — but choosing it says so plainly: a template cannot run, so it has no console.
-
-### Sync Servers from a GNS3 Server
-
-1. Run `Nexus: Add Inventory Source (NetBox, EVE-NG, Proxmox, GNS3…)`, choose **GNS3**, and enter the server URL. A stock GNS3 server answers on plain HTTP at port 3080, so `http://gns3.example.com:3080` is the usual shape — keep the port, and include the scheme
-2. Fill in **Username** and **Password** if your server needs them. GNS3 2.2 ships with HTTP authentication **off**, so both are optional there; GNS3 3.x always requires them. Nexus works out which generation it is talking to when it connects, so there is nothing to select. The password is stored in VS Code SecretStorage; on 3.x the login token it exchanges for is kept in memory for the session only and never written to disk
-3. Narrow what comes across with **Project Filter** — a case-insensitive substring of the project name, saved to the same shared filter list NetBox and EVE-NG sources use. Leave it empty to import every project
-4. If the consoles are reached through NAT or a port forward, set **Console Host Override** to the address you actually connect to. Without it, Nexus uses the host from the server URL, which is right for a direct connection
-5. If your server is behind HTTPS with a certificate your machine does not trust, tick **Allow a Self-Signed or Mismatched Certificate** under **Advanced options** — the same option the other providers have, doing the same thing, and doing nothing at all on an `http://` URL
-
-**Closed projects come across too.** A GNS3 server will list the nodes of a project that is not open, and since most projects sit closed most of the time, skipping them would leave you with almost nothing. Their nodes arrive stopped, addressed from the project's saved topology. GNS3 reassigns console ports when a project is opened, so that saved port can be out of date — sync again once the project is open and the live port replaces it. Turning on **Node Status Poll Interval (seconds)** under **Advanced options** keeps a running node's port current without a full sync.
-
-**Nexus will not open a project for you, and that is deliberate.** Opening one can start every node in the lab, rewrites the project file on disk, reassigns console ports, and tells every other connected GNS3 client that it opened. So the sync only ever reads, and **Start Node** on a node in a closed project refuses and tells you to open the project in GNS3 first, rather than doing it on your behalf. Start/Stop stays visible on those nodes rather than quietly disappearing — whether a project is open changes outside Nexus, and a missing menu would not explain itself.
-
-Nodes whose console is not telnet — VNC or SPICE consoles, cloud and switch nodes with no console at all — arrive as placeholders with no address, described in [Servers with no address yet](#servers-with-no-address-yet), rather than as servers pointed at a port that will not answer. Each project becomes one folder; a node's identity is its project and node id, so renaming a project or a node follows on the next sync instead of re-creating the server.
-
-
-### Servers with no address yet
-
-A sync creates a server for every device it finds, including one it has no address for — a stopped or VNC-only EVE-NG node, a NetBox device with no usable IP. Rather than vanishing from the tree (which would read as *deleted at the source* and hand it to the Removed-Device Policy), it arrives as a placeholder: a real row, marked `(no address)`, with its folder, its auth profile and its BMC settings intact. Only the console endpoint is missing.
-
-Everything that needs that endpoint says so by name instead of failing later:
-
-- **Connect**, **Test Connection**, **Deploy SSH Key**, **Browse Files**, and assigning a tunnel each refuse up front, naming the server and the reason — no password prompt, no handshake against an empty host. When the device is one whose source offers a browser console — a Proxmox guest — **Connect says so instead, and offers the console**: its refusal reads that the guest has no console address and that its source provides a web console needing none, with an **Open Web Console** button that opens it. That wording is reserved for devices that actually have one; a NetBox row with no IP still gets the plain "re-sync once it has an address", because for it that is the real remedy. The other four keep the plain wording too — a browser console gives them no SSH transport to work with. **Duplicate** refuses too, since a copy would be a placeholder no source could ever fill in.
-- **Connect Folder Servers** skips the placeholders in a folder and tells you how many it skipped, rather than raising one notice per stopped node — an EVE-NG lab folder is mostly stopped nodes.
-- It is left out of the **Jump Host** and **IPMI Gateway** pickers. A choice you saved earlier, on a server that went addressless since, is refused before any credential is read — and a BMC command routed through such a gateway aborts with the reason rather than quietly running on your own machine.
-- BMC actions still work on a placeholder that has a BMC address of its own, because the out-of-band address isn't part of the console endpoint.
-- **Open Web Console** still works on a Proxmox-synced placeholder, for the same reason: the hypervisor's console is reached through the hypervisor, not through the guest's own address. It is on the row's right-click menu, in the row-click **Profile Actions** list, and on Connect's own refusal.
-
-When the device gains an address, the next sync fills it in on that same server — same row, same folder, same settings — and it starts connecting. Not every placeholder is waiting on that, though: an HTML5/VNC-only EVE-NG node will not gain one, because its console already exists and simply isn't telnet. If the address goes away again the server reverts to a placeholder, unless it's an address you typed yourself, which is kept. You can give one an address by hand too: Host and Port aren't required when editing a placeholder, typing a host makes it an ordinary addressed server on save, and the Port field is pre-filled with the right default for its protocol (23 for telnet).
-
-### Apply a Device Template to Synced Servers
-
-A source's auth profile is one setting shared across every server it creates. A **device template** carries the rest: a proxy, a multiplexing choice, a legacy-algorithm toggle, session logging, and a BMC login (its own **IPMI Auth Profile** and **IPMI Gateway**) — a reusable bundle applied to matched devices so you don't set them on each synced server by hand.
-
-1. Create one with `Nexus: New Device Template` (or **Manage Device Templates**). For each field, choose **Not set**, **Fill** (write only where the server has nothing set), or **Override** (replace source data and values earlier syncs wrote — but never a value you set by hand). Templates hold no secrets, so a templated proxy still prompts for its password on first connect.
-2. Bind it to devices. The simplest path is the **Device Template** select in the inventory source form, which applies one template to every device that source syncs. For finer control, run `Nexus: Edit Template Rules` and add filter rules like `role=switch&site=syd` (keys `role, site, location, rack, tenant, status, platform, tag, name`; a repeated key is OR, distinct keys are AND, an empty filter matches every device), each pointing at a template.
-3. When more than one rule matches a device, the settings **cascade per field**: the most specific rule wins each setting it defines, while broader rules supply the rest — the order you added the rules never decides it.
-4. The ownership rules match the rest of inventory sync: your own edits always win, clearing a template-applied value is a per-server opt-out, and changes apply on each source's **next** sync rather than the moment you save the template.
-
-To apply a template to servers already in a folder without waiting for a sync, right-click the folder and choose **Apply Device Template**. Values written that way count as your own edits, so later syncs leave them alone — which is also how you overwrite a pre-template hand value that Override deliberately preserves.
-
-### Reach a device on either its IPv4 or its IPv6
-
-A server can hold a second SSH address in its **Alternate host** field (Advanced section of the server form) — typically the IPv6 to its IPv4, or the reverse. When a terminal can't reach the primary Host at the connection level (no route, refused, timed out, or a name that won't resolve), Nexus retries once against the alternate and the terminal banner names the address that won. It falls back only on those transport-level failures — an authentication, host-key, key, or proxy failure is never retried on the other address, since it would fail there too and could cost a second credential prompt. This covers the SSH terminal only; tunnels and jump hosts stay on the primary Host.
-
-From NetBox, this fills itself in. Set the source's **Primary IP Family** — **Automatic** (NetBox's own primary IP, IPv6 when a device has both), **Prefer IPv4**, or **Prefer IPv6** — to choose which family becomes the Host; when the device carries both, the other family's primary IP is written into Alternate host automatically. That alternate is sync-owned like every other synced field: an address you type in yourself is never overwritten, clearing it is a per-server opt-out, and a device that stops reporting a second family keeps its last known alternate. The out-of-band (BMC) address is not affected by the family choice.
-
-### Add a Serial Device
-
-1. Click the serial icon in the Connectivity Hub title bar, or run `Nexus: Add Serial Profile`
-2. Use **Scan Serial Ports** to discover available ports
-3. Choose **Standard** or **Smart Follow** connection mode, then configure baud rate, data bits, parity, and stop bits
-4. Right-click the profile and select **Connect**
-5. Smart Follow profiles coexist with other serial sessions on different ports, print status updates in the terminal when they switch ports or wait for reattach, silently reconnect only to the previously approved device, and prompt before switching to unfamiliar free ports. Connecting any serial profile is blocked only when the target port is already held by another Nexus serial session.
-
-### Add a Local Shell Profile
-
-1. Run `Nexus: Add Local Shell Profile`, or use `Nexus: Add Profile` and select **Local Shell Profile**
-2. Name the profile for the workflow you want to save, for example `PowerShell Admin`, `WSL Ubuntu`, or `Project Shell`
-3. Choose **VS Code Terminal Profile** to pick a launchable VS Code terminal profile. Nexus lists explicit-path profiles plus common resolved profiles such as PowerShell, Git Bash, Command Prompt, and detected WSL distros when their executable can be found.
-4. Choose **Custom Shell** when you need a path, command, or arguments Nexus cannot infer. For WSL on Windows, use `C:\Windows\System32\wsl.exe`; add arguments one per line when you need a distro or startup option, for example `-d` and `Ubuntu`
-5. Optionally set a working directory and startup command, then save the profile
-6. Right-click the profile and select **Open Local Shell**. You can open multiple sessions from the same saved Local Shell profile.
-7. Auto-trigger macros can match Local Shell output. Existing macros scoped to **All terminals** will also apply to Local Shell sessions; use profile-scoped macros for shell-specific prompts.
-
-### Add a Local Server
-
-1. Run `Nexus: Add Local Server Profile`, or use `Nexus: Add Profile` and select **Local Server**
-2. Name it for the thing it runs — `API (dev)`, `Mock Billing`, `Vite watch`
-3. Set the executable. A bare name is looked up on `PATH`; `~`, `${workspaceFolder}` and `${env:NAME}` are expanded
-4. Add arguments one per line, and a working directory if the default is wrong. The directory must resolve inside a folder you have open — a profile pointing outside it is refused rather than started
-5. Add environment variables as `KEY=value`, one per line. Three forms are distinct: `KEY=value` sets it, `KEY=` sets it to an empty string, and `KEY=null` unsets it for the child process even when the extension host inherited one. `${workspaceFolder}` and `${env:NAME}` are expanded in values
-6. Optionally enable **Auto-Restart** so the process comes back when it exits on its own. Leave the per-profile limit empty to follow *Nexus Settings → Local Servers*, or set your own; `0` means never restart it
-7. Right-click the profile and choose **Start**. Its output opens in a Nexus terminal, and the row shows whether it is running, restarting or failed. From the Command Palette the same commands are grouped under `Nexus Local Servers:` — `Nexus Local Servers: Start`, `Stop`, `Restart`, `Inspect Logs`
-
-Auto-restart counts *consecutive* failures. A server that runs for the stable-runtime threshold without exiting has its count cleared, so this bounds a crash loop rather than restarts over the profile's life — and once the limit is reached the server is marked failed and waits for you to start it again.
-
-### Macro Variables
-
-A macro can prompt you for input every time it runs, instead of sending fixed text. Open a macro in the Macro Editor and add one or more entries under **Variables**: a name, an optional label (the prompt text shown in the input box), an optional default, **Mask input (never stored)** for secrets like passwords, and whether to remember the last value entered in the current VS Code window.
-
-Reference a declared variable in the macro's text as `$name` or `${name}` — both forms work once `name` is declared. A placeholder whose name was never declared as a variable is sent to the terminal exactly as written, so a typo in a variable name doesn't block the macro; watch the live hints under the Text field in the Macro Editor to catch it.
-
-Running the macro opens one input box per declared-and-used variable, in declaration order, with a **Back** button to return to the previous prompt (not shown on the first one). Pressing Esc or closing the box at any step cancels the whole run — nothing is sent. Once every prompt is answered, Nexus sends the filled-in text to the terminal you invoked the macro from, even if you've since switched to a different terminal tab.
-
-Prompted variables are for values that genuinely change per run. The **IPMI SOL console** template no longer needs any: it reads everything from the server profile instead.
-
-```
-Text:      ipmitool -I lanplus -H ${profile.ipmiHost} -U ${profile.ipmiUsername} -E sol activate
-Run in:    Local terminal
-Provide IPMI credentials: on
-```
-
-Nothing is prompted for. `${profile.ipmiHost}` and `${profile.ipmiUsername}` come from the server profile you run the macro against (its **IPMI / BMC Host** and the **IPMI Auth Profile** linked beside it), and `-E` tells ipmitool to read the password from the environment, which the **Provide IPMI credentials** checkbox fills in from that same auth profile. Right-click a server in the Connectivity Hub → **Run Macro on Server…**, pick the macro, and the completed command runs in a fresh local terminal. If no password is saved for the profile, Nexus asks for one — masked, used for that run only, never stored.
-
-The checkbox is what authorizes the hand-over, and it is off unless you tick it. A macro that uses IPMI tokens without it still runs; ipmitool simply prompts or fails, and Nexus tells you which switch is missing. A macro that arrives from a colleague's share file or from a restored backup always arrives with the box clear, whatever the file says — consent belongs to the person who ticked it here. Re-tick it on the macros you trust after a restore.
-
-A macro can prompt for input, or auto-trigger from terminal output — not both. If a macro somehow ends up with both, Nexus treats it as a plain, non-auto-triggering macro instead of running either behavior partially.
-
-See the [macro guide](docs/macros.md) for the full variable syntax table, the `'${password}'` quoting idiom, and the `HISTCONTROL=ignorespace` trick for keeping a value out of the remote shell's history.
-
-### Organizing Macros and Scripts into Folders
-
-Both the Macros view and the Scripts view group their contents into folders, matching the Connectivity Hub. Folders are yours to create — an empty folder stays until you remove it.
-
-For macros, folders are a display grouping: use **New Folder** in the Macros view title bar to create one, then drag a macro onto it (or right-click a macro → **Move to Folder**) to move it in. Running **Move to Folder** from the Command Palette with nothing selected opens a multi-select quick pick first, so sorting a flat pile of macros into folders is a bulk operation rather than one drag per macro. Removing a folder re-parents its macros to the parent folder instead of deleting them, and reordering with **Move Up** / **Move Down** only ever swaps a macro with its neighbor in the *same* folder.
-
-For scripts, a folder is a real directory under your configured scripts folder (`nexus.scripts.path`, default `.nexus/scripts`). Use **New Folder** in the Scripts view, or give **New Script** a path like `cisco/backup` and Nexus creates `cisco/` for you if it doesn't exist yet. A folder's right-click menu repeats New Script and New Folder scoped to that folder, plus **Reveal in Explorer**. The Scripts view scans up to 10 folder levels deep and up to 500 directories/files (scripts included) before stopping, to keep a misconfigured scripts path from hanging the sidebar; if that happens, a row pinned at the top of the view links straight to the setting.
-
-Both views validate folder paths the same way: `.` and `..` segments are rejected, and a `\` is rejected with a message telling you to use `/` — a path like `../../home/you/something` can never write or move something outside where it belongs.
-
-### Set Up Port Forwarding
-
-1. Switch to the **Port Forwarding** section in the sidebar
-2. Click `+` to add a tunnel profile and choose the type:
-   - **Local Forward (-L)**: specify local port, remote host, and remote port
-   - **Reverse Forward (-R)**: specify remote bind address/port and local target host/port
-   - **Dynamic SOCKS5 (-D)**: specify local port (default 1080) — routes traffic to any destination through SSH
-3. Assign an SSH server to the tunnel, or leave it unassigned to choose at start time
-4. Right-click the tunnel and select **Start**
-
-You can also drag a tunnel profile onto a server in the Connectivity Hub to start it immediately.
-
-### Browse Remote Files
-
-1. Connect to an SSH server
-2. Open the **File Explorer** section in the Nexus sidebar
-3. Click the server icon to set it as the active SFTP target
-4. Browse, download, or drag files between remote directories
-
-In an SSH profile's advanced options, enable **Open File Explorer on first connection** to start SFTP automatically after normal Connect when the File Explorer is not already showing that server. Saving it checked disables it on any other SSH profile, and it does not run when that profile is used as a jump host, tunnel connection, group connect item, or script-started connection.
-
-Saving a remote file in the editor, and creating one with **New File**, leave permissions alone: an existing file keeps its own mode, and a new file is created under the remote server's `umask`. Earlier releases wrote through a path that chmod'd every file it opened to `0666`, which quietly made a `0600` key or credentials file world-readable and world-writable on save.
-
-#### Save as Root
-
-SFTP writes as the logged-in SSH user, so editing a root-owned file normally fails. If your SSH user has sudo rights on the remote host, Nexus can save it anyway:
-
-- **Reactive**: edit and save a root-owned file as usual. If the write is denied, Nexus offers to retry with `sudo`. Declining suppresses the offer for that file until you close its editor tab or explicitly choose **Edit as Root (sudo)**.
-- **Proactive**: right-click a file in the File Explorer and choose **Edit as Root (sudo)** to mark it editable up front — needed for files with no write bits at all (e.g. `0444`), which VS Code otherwise blocks from editing before the save is ever attempted. This only helps with *writes*: elevated reads are not supported, so a file you can't even read as your SSH user (e.g. `0440 root:root` on `/etc/sudoers`) still fails to open, Edit as Root notwithstanding.
-
-Elevation covers saving file *contents* only — deleting, renaming, and creating directories are not elevated, because those need write access to the **parent directory** rather than to the file. So you can save a new file into a root-owned directory and then find you can't remove it from the File Explorer; do that from a terminal on the host. Extending elevation to those operations is tracked in [#32](https://github.com/evdanil/vscode-NexTerminal/issues/32).
-
-The file is staged to a temporary path over SFTP and then moved into place with `sudo` over an SSH exec channel. Your sudo password (only asked if the account needs one) is piped directly to that channel — it is never written to disk, VS Code's secret storage, or any log. By default the password isn't kept between saves; enable `nexus.sftp.sudo.rememberPasswordForSession` to keep it in memory until that server disconnects or the window closes. Either way, the remote host's own sudo credential timestamp (typically ~5 minutes) can let consecutive saves skip the password prompt regardless of this setting. A short grace window (30 seconds) after you type the password also covers an immediately-following elevated write to the same server — such as VS Code's own Save As, which issues two writes for one save — without prompting twice.
-
-For an existing file, the write goes through the file's own inode, so its owner, mode, ACLs, and hard links are preserved exactly. A brand-new file — or an existing one recreated because it vanished remotely between open and save (log rotation, a concurrent delete) — is created using the mode last observed for it, or `644` if none was ever observed. That restoration is read/write bits only — a recreated file never comes back with execute or setuid/setgid/sticky bits, which can be narrowed but never restored. A staged write the server refuses outright — no space left, an over-quota home directory, an appliance rejecting the path — fails the save instead of being installed over the target; ssh2 reports a rejected SFTP write and a completed one with the same stream event, so such a save used to be reported as done and then moved a truncated file into place. **The write is not atomic** — a disk-full condition or a dropped connection partway through can leave the target partially written with no backup, so if a save fails, keep the editor open and retry rather than closing it. Sudoers policies requiring a TTY (`requiretty`) are not supported over this path — a plain-language error explains that up front, along with how to work around it. The install writes through a shell redirect (`cat < temp > target`), which follows symlinks and does not check the target's type first: if another local, non-root account on the remote host can write to the target's parent directory, it can swap the target for a symlink between your open and your save, and the elevated write lands root-owned content wherever that link points — the same exposure as the common `sudo tee /path` idiom. Elevated saves can be turned off entirely with `nexus.sftp.sudo.enabled`.
-
-Elevation depends on the SSH account actually having sudo rights on the remote host (sudoers membership, or a group like `wheel`/`sudo`) — the password Nexus asks for is normally **your own** login password, the same one a `sudo` prompt at a real terminal would ask for. If you're not in sudoers but happen to know the root password, elevation can't use it: sudo authenticates the invoking user, not root, so the root password isn't accepted in its place. The practical workaround is to add a second Nexus server profile that logs in **as root** over SSH and edit the file directly through that connection — only possible if the remote host's SSH server permits root login. Elevating with the root password via `su` instead of `sudo` is not supported and isn't planned: unlike `sudo -S`, `su` on Linux reads its password from `/dev/tty` rather than stdin, and Nexus has no PTY channel available to drive that prompt. One host-configuration wrinkle worth knowing: if the remote sudoers file sets `Defaults rootpw` (or `targetpw`), sudo actually wants **root's** password instead of yours — a password rejected on such a host isn't necessarily wrong, just the wrong *kind*, and the retry prompt calls this out.
-
-#### Transfers to and from a Windows network share
-
-VS Code blocks access to Windows network paths (`\\server\share`) unless the host is listed in its own `security.allowedUNCHosts` setting. Nexus reads and writes the local side of a transfer through Node directly, so a blocked share fails with the real reason and names the host — a drag-and-drop upload from one used to be counted as a skipped file and finish as *Upload completed with skips*, having moved nothing.
-
-A blocked transfer offers **Allow Host…** and **Open Settings**. **Allow Host…** asks again in a modal that names both the host and the setting, and only a positive answer there appends the host to `security.allowedUNCHosts` in your user settings; declining at either step changes nothing. `security.restrictUNCAccess` itself is never touched — the restriction stays on, one host is added to the list it consults. The extension host is handed that list once when it starts, so Nexus re-checks the path afterwards: if it works now, it just asks you to repeat the transfer, and it offers **Reload Window** only when the change genuinely hasn't taken effect yet. One prompt per host rather than per file, so a directory upload from a blocked share asks once.
-
-Downloading into a network share no longer takes the server's other sessions with it. The local file was opened deep inside the SSH client's own callback stack, so VS Code's UNC check threw there and tore down the shared connection — every terminal on that server disconnected at once. The destination is now probed first, on Nexus's own stack, without creating or truncating anything.
-
-A transfer whose local side is a UNC path also runs a smaller pipeline — 8 concurrent 32 KB operations instead of the default 64 — because the default queues far more parallel file operations than Node's thread pool can serve and stalls the whole extension host whenever the share does. A mapped drive letter (`Z:\…`) can't be told from a local disk without Windows API calls, so it keeps the default profile.
-
-Blocked hosts, and the byte count of every completed transfer, are recorded in the **Nexus SSH** output channel.
-
-### Directory Sync (Follow Terminal Directory)
-
-The File Explorer can track whichever SSH terminal you're focused on, so it moves with that terminal's current directory instead of sitting wherever you last navigated.
-
-This is **continuous sync** — not a one-off jump — for any shell that announces its own directory. `fish` (≥ 3.x) does this unconditionally, and prompt frameworks like `starship` do too, using the same `OSC 7` escape sequence Nexus already reads out of the terminal's own output. Plain bash and zsh don't announce it by default, but one snippet each fixes that for good:
-
-```bash
-# ~/.bashrc — let Nexus follow this shell's directory
-PROMPT_COMMAND='printf "\033]7;file://%s%s\033\\" "$HOSTNAME" "$PWD"'"${PROMPT_COMMAND:+; $PROMPT_COMMAND}"
-```
-
-```zsh
-# ~/.zshrc — let Nexus follow this shell's directory
-__nexus_osc7() { printf '\033]7;file://%s%s\033\\' "${HOST}" "$PWD"; }
-precmd_functions+=(__nexus_osc7)
-```
-
-(zsh sets `$HOST` automatically — `$HOSTNAME` is frequently unset there, unlike in bash.) Add either once and that shell reports its directory continuously from then on — no waiting for a future Nexus release.
-
-For anything that isn't a POSIX shell — Cisco IOS, Juniper, FortiOS, or any other device that will never emit that escape sequence — run **Go to Terminal Directory** to jump the File Explorer to your terminal's current directory on demand, using a best-effort read of the visible prompt.
-
-Turn continuous following on or off from the toggle at the left of the File Explorer title bar, or from the right-click menu on the `.` row that shows your current directory — never from Settings. Turning it on jumps immediately to the focused terminal's already-known directory if one is on record and the explorer is idle and visible, rather than waiting for the next `cd` or focus change. Navigating manually (Go to Path, Go Home, or `..`) pauses following rather than fighting it; one click on **Resume Following Terminal Directory** jumps straight back to the terminal's directory.
-
-If you turn following on for a terminal that hasn't reported a directory yet, Nexus tells you right away instead of leaving the toggle looking broken: **Show Me How** drops the rc one-liner into the Nexus Directory Sync output channel, and **Go to Terminal Directory** jumps there manually in the meantime. That notice shows once per server per window.
-
-**Nexus never types anything into your session to make this work, in this release.** Every part of this feature only reads what the shell already sends — it either volunteers its own directory, or you ask for it explicitly with Go to Terminal Directory.
-
-### Open a profile from the command line
-
-Nexus registers a `vscode://` URI handler so you can open any saved profile — **SSH, Serial, or Local Shell** — from a terminal, a script, a browser link, or a CI job. The profile type is detected automatically from the name (or id) you give, and Nexus runs the matching connect action.
-
-**URI forms:**
-
-```
-vscode://sentriflow.vscode-nexterminal/<name>            # open the named profile (SSH / Serial / Local Shell)
-vscode://sentriflow.vscode-nexterminal/<name>?sftp       # SSH only: connect + open File Explorer (SFTP)
-vscode://sentriflow.vscode-nexterminal/<name>?id=<uuid>  # use profile id instead of name
-```
-
-- `<name>` is case-insensitive and matched across all profile types; the first match is used when multiple profiles share a name (a warning suggests `?id=` to disambiguate).
-- `?id=<uuid>` overrides the name for unambiguous lookup. Find a profile's id in **Nexus → Settings → Export Configuration**.
-- `?sftp` is **SSH-only** — it opens the SSH terminal **and** the File Explorer for SFTP browsing in one click. Requesting `?sftp` on a Serial or Local Shell profile shows an error.
-
-**Open from the command line:**
-
-```bash
-code --open-url "vscode://sentriflow.vscode-nexterminal/Production"
-```
-
-> **Note:** Use `--open-url`, not `--file-uri` or `--folder-uri` — those open local files/folders and do not route to the extension's URI handler.
-
-**Shell alias (bash / zsh):**
-
-```bash
-nexterm() { code --open-url "vscode://sentriflow.vscode-nexterminal/$1"; }
-# Usage (works for SSH, Serial, and Local Shell profiles by name):
-nexterm Production
-nexterm "My Server"
-nexterm "Lab Console"      # a saved Serial profile
-nexterm Production?sftp     # SSH only
-```
-
-Add this to your `~/.bashrc` or `~/.zshrc` to make it permanent.
-
-**PowerShell function:**
-
-```powershell
-function nexterm($p) { code --open-url "vscode://sentriflow.vscode-nexterminal/$p" }
-# Usage:
-nexterm Production
-nexterm "My Server"
-nexterm "Production?sftp"
-```
-
-Add this to your PowerShell profile (`$PROFILE`) to make it permanent.
-
-### Export / Import Configuration
-
-- **Encrypted Backup**: Run `Nexus: Export Backup` to create a master-password-protected backup including all profiles, settings, saved credentials, the user `.ssh` folder, and the configured Nexus scripts folder
-- **Share Export**: Run `Nexus: Export Configuration` to create a sanitized export safe for sharing (credentials stripped, learned hardware identifiers removed, IDs remapped)
-- **Import**: Run `Nexus: Import…` — also reachable from the Connectivity Hub's `...` overflow menu, the Connectivity Hub welcome view, and the Data Management section of Settings. It asks what you're importing, then opens the matching picker:
-  - **Paste Host List from Clipboard** / **Host List File…** — a CSV export, a device inventory, or a plain hostname list
-  - **MobaXterm INI File…** — sessions from a MobaXterm `.ini` bookmarks export
-  - **SecureCRT XML Export…** / **SecureCRT Sessions Folder…** — sessions from SecureCRT
-  - **SSH Config File…** — hosts from an OpenSSH client config (`~/.ssh/config`), with their `IdentityFile` keys
-  - **Nexus Export File…** — an encrypted backup or a shared config (`.json`). Merge skips existing local `.ssh` / script files; Replace overwrites files present in the backup but does not delete extra local files.
-
-  If the file you picked doesn't match what you told the picker — say, you chose "Host List File…" but selected a MobaXterm export — Nexus names the mismatch and offers a one-click button to re-import it as the format it actually looks like, instead of a dead end.
-
-  `Nexus: Import from MobaXterm`, `Nexus: Import from SecureCRT`, `Nexus: Import from SSH Config`, and `Nexus: Import Servers from List (CSV/Text)` remain available in the command palette as direct shortcuts into those same pickers, for anyone who already knows exactly what they're importing.
-
-#### Import from MobaXterm or SecureCRT
-
-Power users migrating from other SSH clients can import their connection profiles directly:
-
-- **MobaXterm**: choose **MobaXterm INI File…** and select your MobaXterm `.ini` configuration file. SSH sessions are imported with their folder organization preserved.
-- **SecureCRT**: choose **SecureCRT XML Export…** or **SecureCRT Sessions Folder…** and select the corresponding export file or `Sessions/` directory. SSH sessions are imported with their hierarchy as folder groups.
-
-Both importers extract hostname, port, and username from each SSH session. Non-SSH sessions (RDP, Telnet, etc.) are skipped. Servers imported from MobaXterm or SecureCRT default to password authentication.
-
-#### Import from an SSH config (`~/.ssh/config`)
-
-Choose **SSH Config File…** (or run `Nexus: Import from SSH Config`) and pick an OpenSSH client config — the picker opens in `~/.ssh`, where the file usually has no extension at all.
-
-- Each `Host` block becomes a profile named after the alias you already type: `ssh web1` becomes a profile called **web1**. `HostName`, `Port` and `User` come across; a block with no `HostName` connects to its alias, exactly as `ssh` does, and a block with no `User` gets your local login name — or, on a machine that has no local login name to read (a plain container), Nexus asks you once for a username to use for those hosts rather than importing profiles that would fail to save.
-- **`IdentityFile` hosts arrive as key authentication**, with the key path filled in (`~` expanded), so they connect without asking for a password you never set. Two exceptions, both deliberate: `IdentityFile none` is ssh's way of saying *this host has no key*, so it arrives on password auth like any other; and a key path Nexus cannot finish expanding — one still holding a `%` token it does not model — costs that host its key but not the host itself, which the confirm modal counts for you. Everything else arrives as password auth.
-- `Include` directives are followed, with the same rules `ssh` uses (relative patterns resolve against `~/.ssh/`, a glob matches basenames only). A cycle, a missing file, or nesting deeper than 16 levels is reported and skipped — one bad line never costs you the rest of the file.
-- Skipped, and counted in the confirmation: defaults blocks (`Host *`, `Host ?`), negated patterns (`!prod`), `Match` blocks (their conditions can only be evaluated while connecting), and any host whose `HostName` uses an ssh `%` token Nexus cannot expand at import time. `%h` and `%%` are expanded; `%p`, `%r`, `%C` and the rest depend on the connection, so those hosts are left out rather than imported as a name that can never resolve.
-- **Importing twice is safe**: a host already in Nexus at the same address, port and username is skipped, not added again. That makes the file re-importable as it grows, rather than a one-shot migration.
-- Not imported: `ProxyJump` — the confirmation names how many hosts are affected, and they import as direct connections; set **Proxy** to **SSH Jump Host** and pick the Jump Host Server on the profile afterwards. There is no folder concept in an ssh config, so every host lands at the root.
-
-The first time Nexus starts on a machine with an importable `~/.ssh/config`, it offers this import once — and only once, whatever you answer. "Importable" means hosts you do not already have: if every host in the file is already in Nexus, the offer stays silent and is not spent, so upgrading with your hosts already imported does not burn it on a notification with nothing behind it. `Nexus: Import…` stays available forever.
-
-#### Import a device list (CSV / text)
-
-For everyone else — a spreadsheet export, a device inventory, or just a list of hostnames — choose **Paste Host List from Clipboard** or **Host List File…** (`.csv`, `.txt`, `.tsv`, up to 2 MB and 5,000 rows; anything beyond the row cap is reported, not silently dropped).
-
-Accepted formats:
-
-- **A header row** naming columns in any order: `host`/`hostname`/`address`/`ip`, `name`/`label`/`device`, `user`/`username`, `port`, `folder`/`group`/`site`.
-- **No header**, positional: `host[,name[,username[,port[,folder]]]]` — note the third field is read as a **username**, not a folder. A bare `host,name,folder` list needs a header row (e.g. `host,name,folder`) so the columns are matched by name instead of position.
-- **Shorthand** in the host field: `user@host`, `host:port`, `user@host:port`.
-- Lines starting with `#` and blank lines are ignored.
-
-```csv
-# host, name, user, port, folder
-10.0.0.1, core-sw1, netadmin, 22, DC1/Core
-10.0.0.2, core-sw2, netadmin, 22, DC1/Core
-sw3.lab.example.com
-netadmin@sw4.lab.example.com:2022
-```
-
-If any row omits a username you're prompted once for a default (pre-filled with your most common existing username). If the list has no folder column of its own you're then prompted for an optional folder prefix, applied to every row. A single confirm dialog then summarizes what's about to happen — how many servers, how many folders will be created, how many rows already exist and will be skipped, how many lines couldn't be parsed — before anything is written; a **Show Skipped Lines** button opens the unparsable rows in a scratch document without importing. Rows that already match an existing server (same host, port, and username — host compared case-insensitively) are skipped and the count is reported. Imported servers always use password authentication — switch to key-based auth afterward via **Edit Server** if needed.
-
-#### Hand-writing an import file
-
-Choosing **Nexus Export File…** also accepts a minimal hand-written JSON file — useful for one connection or a quick script, without going through any other importer:
-
-```json
-{
-  "version": 2,
-  "servers": [
-    {
-      "id": "8400e8b0-8b3e-4b8a-9b1a-000000000001",
-      "name": "core-sw1",
-      "host": "10.0.0.1",
-      "port": 22,
-      "username": "netadmin",
-      "authType": "password",
-      "isHidden": false,
-      "group": "DC1/Core"
-    }
-  ]
-}
-```
-
-`name`, `host`, `port`, `username`, `authType`, and `isHidden` are required. `group` is optional (omit it for a top-level server), and so is `id` — Nexus fills one in for you if it's left blank or omitted; it just needs to be unique if you do supply it.
+## Quick start
+
+1. Open the **Nexus** sidebar and create a profile with `Nexus: Add Profile`, `Nexus: Add Network Device Profile (SSH / Telnet)`, `Nexus: Add Serial Profile`, or `Nexus: Add Local Shell Profile` — or sync your whole device inventory in one go with `Nexus: Add Inventory Source (NetBox, EVE-NG, Proxmox, GNS3…)`. See [SSH and Telnet](docs/ssh-and-telnet.md#add-a-server), [Serial Consoles](docs/serial.md#add-a-serial-device), [Local Shells](docs/local-shells.md#add-a-local-shell-profile), [Inventory Sync](docs/inventory/README.md).
+2. Select **Connect** / **Open Local Shell** on the profile to open an SSH, telnet, Serial, or Local Shell terminal. See [Terminal](docs/terminal.md).
+3. For SSH profiles, open **File Explorer** and run **Browse Files** to choose the connected profile and browse SFTP files. See [File Explorer](docs/file-explorer.md#browse-remote-files).
+4. Open **Port Forwarding**, add a tunnel with `Nexus: Add Tunnel`, assign an SSH server, then select **Start**. See [Port Forwarding](docs/port-forwarding.md#set-up-a-tunnel).
+5. Create repeatable terminal input with `Nexus: Add Blank Macro` or **Add Macro From Template**; create longer automation with `Nexus: New Nexus Script`. See [Macros](docs/macros.md#quick-start-your-first-macro), [Scripting](docs/scripting.md#quickstart).
+6. Open **Settings** and use **Backup…** to save a password-protected backup, or **Export for Sharing…** to create a sanitized export without secrets. See [Import and Export](docs/import-export.md#encrypted-backup-and-share-export).
+
+## Features
+
+### Connect
+
+- **SSH sessions** — password, private key, SSH agent, and 2FA keyboard-interactive auth, with silent re-auth from VS Code SecretStorage. → [Authentication](docs/ssh-and-telnet.md#authentication)
+- **Legacy devices** — a per-server legacy-algorithm toggle for older gear, including devices that only speak 1024-bit `diffie-hellman-group1-sha1`. → [Legacy Devices](docs/ssh-and-telnet.md#legacy-devices)
+- **Alternate host** — a second SSH address for a server (e.g. the IPv6 to its IPv4), retried once when the primary can't be reached at the connection level; NetBox and Proxmox syncs fill it from the device's other address family. → [Alternate Host](docs/ssh-and-telnet.md#alternate-host)
+- **SSH key deployment** — right-click a server → **Deploy SSH Key** to find or generate a key and install it in the remote `authorized_keys`. → [Deploy an SSH Key](docs/ssh-and-telnet.md#deploy-an-ssh-key)
+- **Host key verification** — trust-on-first-use, with an alert when a host key changes. → [Host Key Verification](docs/ssh-and-telnet.md#host-key-verification)
+- **Auth profiles** — reusable credential sets applied to single servers or whole folders; edit one and every linked server follows. → [Auth Profiles](docs/ssh-and-telnet.md#auth-profiles)
+- **Jump hosts and proxies** — SSH jump-host chains, SOCKS5, and HTTP CONNECT, set per server. → [Jump Hosts and Proxies](docs/ssh-and-telnet.md#jump-hosts-and-proxies)
+- **Connection multiplexing** — terminals, tunnels, and SFTP to one server share an SSH connection, with a per-server opt-out. → [Connection Multiplexing](docs/ssh-and-telnet.md#connection-multiplexing)
+- **Dropped-session diagnostics** — faults after a session is up are recorded in the **Nexus SSH** output channel, so a dropped terminal leaves a cause behind. → [When a Session Drops](docs/ssh-and-telnet.md#when-a-session-drops)
+- **Telnet** — a per-server protocol switch for console servers, lab consoles, and gear that offers nothing else. → [Telnet](docs/ssh-and-telnet.md#telnet)
+- **Serial consoles** — COM/ttyUSB ports with full line settings, a port scan, and break signal, in an isolated sidecar process. → [Serial Consoles](docs/serial.md)
+- **Smart Follow** — a serial session rides through Windows COM-port renumbering, reconnecting only to the device you approved. → [Smart Follow](docs/serial.md#smart-follow)
+- **Local shells** — saved local terminal profiles (a VS Code terminal profile or a custom shell), several sessions per profile. → [Local Shells](docs/local-shells.md)
+
+### Files & forwarding
+
+- **SFTP File Explorer** — browse, upload, download, and drag-and-drop files on connected servers, every transfer size-checked; one SSH profile can open it on connect. → [File Explorer](docs/file-explorer.md)
+- **Save as root** — save root-owned files with `sudo` when the SSH user can't write them. → [Save as Root](docs/file-explorer.md#save-as-root)
+- **Windows network shares** — transfers to and from `\\server\share` paths; a host VS Code blocks fails with the real reason and an **Allow Host…** offer. → [Windows Network Shares](docs/file-explorer.md#windows-network-shares)
+- **Directory Sync** — the File Explorer follows your SSH terminal's current directory on shells that announce it; Nexus never types anything into the session. → [Directory Sync](docs/file-explorer.md#directory-sync)
+- **Port forwarding** — Local (-L), Reverse (-R), and Dynamic SOCKS5 (-D) tunnels with auto-start/stop, live traffic counters, and a browser shortcut; drop a tunnel on a server to start it. → [Port Forwarding](docs/port-forwarding.md)
+
+### Fleet & inventory
+
+- **Connectivity Hub** — one sidebar tree of servers, serial devices, local shells, and local servers in nested folders, with a filter and drag and drop. → [Connectivity Hub](docs/connectivity-hub.md)
+- **Profile actions** — click a profile for Connect, **Test Connection**, Connect and Run Script, Duplicate, Copy Connection Info, and more; right-click a folder to connect or disconnect the servers in it. → [Profile Actions](docs/connectivity-hub.md#profile-actions)
+- **Unread activity** — SSH and serial sessions with output you haven't seen are marked in the tree and with `●` on the tab. → [Unread Activity](docs/connectivity-hub.md#unread-activity)
+- **Inventory sources** — add and manage sources from one command or **Settings → Inventory Sources**, with reusable saved filters and a per-source opt-in for self-signed certificates. → [Add a Source](docs/inventory/README.md#add-a-source)
+- **NetBox sync** — devices become server profiles under a folder template, narrowed by any device filter; out-of-band IPs fill the BMC host. → [NetBox](docs/inventory/netbox.md)
+- **EVE-NG sync** — labs become folders and nodes become telnet servers on their own consoles. → [EVE-NG](docs/inventory/eve-ng.md)
+- **Proxmox VE sync** — VMs and containers become SSH servers foldered by node, pool, type, or tag; cluster nodes can come across too. → [Proxmox VE](docs/inventory/proxmox.md)
+- **GNS3 sync** — projects become folders and nodes become telnet servers, closed projects included. → [GNS3](docs/inventory/gns3.md)
+- **Sync plan preview** — every sync shows what it will add, update, move, or remove before anything is applied. → [Every Sync Shows Its Plan First](docs/inventory/README.md#every-sync-shows-its-plan-first)
+- **Re-sync** — renames and moves at the source follow, a vanished device is orphaned, deleted, or kept per source, and a source's folder can carry a one-click sync icon. → [Keep a Source in Sync](docs/inventory/README.md#keep-a-source-in-sync)
+- **Remove and re-adopt** — removing a source can keep its servers, and adding that source back offers to re-adopt them instead of duplicating them. → [Remove a Source and Re-Adopt Its Servers](docs/inventory/README.md#remove-a-source-and-re-adopt-its-servers)
+- **Live status** — running nodes and guests light up in the tree after a sync, on **Refresh Inventory Status**, or on a per-source poll. → [EVE-NG](docs/inventory/eve-ng.md#see-which-labs-are-running-live), [Proxmox VE](docs/inventory/proxmox.md#see-which-guests-are-running-live), [GNS3](docs/inventory/gns3.md#closed-projects-come-across-too)
+- **Start and stop nodes** — **Start Node** / **Stop Node** on a lab node's or guest's right-click menu. → [Start and Stop Nodes](docs/inventory/README.md#start-and-stop-nodes)
+- **Proxmox web console** — **Open Web Console** opens a guest's console in your browser, with no guest address needed. → [Open the Guest Console](docs/inventory/proxmox.md#open-the-guest-console-in-your-browser)
+- **Servers with no address yet** — a device the source has no address for still arrives, as a placeholder row that says why it can't connect. → [Servers with No Address Yet](docs/inventory/README.md#servers-with-no-address-yet)
+- **Device templates** — reusable bundles of connection settings applied to the servers a sync creates, or to a folder on demand. → [Device Templates](docs/inventory/device-templates.md)
+- **Import from an SSH config** — `~/.ssh/config` hosts arrive with their `IdentityFile` keys, `Include`s followed; offered once on first run when you have one. → [Import from an SSH Config](docs/import-export.md#import-from-an-ssh-config)
+- **Import from MobaXterm or SecureCRT** — SSH sessions arrive with their folder hierarchy. → [Import from MobaXterm or SecureCRT](docs/import-export.md#import-from-mobaxterm-or-securecrt)
+- **Import a device list** — paste or load a CSV or host list, confirmed in one summary before anything is written. → [Import a Device List](docs/import-export.md#import-a-device-list)
+
+### Automation
+
+- **Terminal macros** — reusable text sent with one click, a keybinding (108 combinations), or the `Alt+S` picker, written in the Macro Editor or started from a template. See the [macro guide](docs/macros.md) for step-by-step setup, trigger scopes, cooldowns, intervals, and regex examples.
+- **Secret macros** — text kept in VS Code SecretStorage, with **Copy Value** / **Paste Value** in the Macros view. → [Secret Macros](docs/macros.md#secret-macros)
+- **Auto-trigger (expect/send)** — a macro fires when terminal output matches its regex, scopable to the active terminal or a matching profile, with cooldowns, polling intervals, and pause/resume. → [Auto-Trigger Basics](docs/macros.md#auto-trigger-basics)
+- **Macro variables** — prompt for values each run with `$name` / `${name}`. → [Variables](docs/macros.md#variables)
+- **Server profile tokens & IPMI/BMC macros** — `${profile.host}`, `${profile.ipmiHost}` and friends, resolved by **Run Macro on Server…**; a macro can run in the session, a local terminal, or the browser. → [Profile tokens](docs/macros.md#profile-tokens)
+- **BMC access without typing a password** — an IPMI Auth Profile can hand `ipmitool -E` its password through the environment, never the command line. → [Providing IPMI credentials](docs/macros.md#providing-ipmi-credentials)
+- **One-click BMC actions** — **Connect BMC Serial Console** and **Open BMC Web Console** on a server's right-click menu. → [One-click BMC actions](docs/macros.md#one-click-bmc-actions)
+- **Scripts** — JavaScript automation with an async expect/send API against any SSH, telnet, Serial, or Local Shell session, each run in an isolated worker with that session's macros suspended by default. → [Scripting guide](docs/scripting.md)
+- **Running scripts** — from the Scripts view, the **▶ Run in Nexus** CodeLens, or **Connect and Run Script…** on a profile; runnable examples included. → [Commands and views](docs/scripting.md#commands-and-views)
+- **Fix Macro Keybindings** — one command corrects the VS Code settings that let the terminal or the menu bar swallow macro shortcuts. → [Keybindings](docs/macros.md#keybindings)
+- **Folders for macros and scripts** — both views group their contents into folders, like the Connectivity Hub. → [Macros](docs/macros.md#organising-macros-into-folders), [Scripts](docs/scripting.md#organising-scripts-into-folders)
+
+### Lab services
+
+- **TFTP server** — read-only until you opt into uploads, sandboxed to its root, with live transfer progress. → [TFTP](docs/network-servers.md#tftp)
+- **DHCP server** — full DORA with reservations, leases that survive a restart, and ZTP boot options; a Network (CIDR) row fills in a whole subnet. → [DHCP](docs/network-servers.md#dhcp)
+- **Bench profiles** — Quick Settings and named profiles capture a whole TFTP/DHCP setup; both services run in one isolated daemon. → [Quick Settings and Profiles](docs/network-servers.md#quick-settings-and-profiles)
+- **NIC and pool check** — the Network Servers view, Quick Settings and the full form warn when DHCP's bound NIC is not on the pool's subnet, and offer the one NIC that is. → [When the NIC and the Pool Disagree](docs/network-servers.md#when-the-nic-and-the-pool-disagree)
+- **Engine choice** — a native Rust daemon by default, with the bundled JavaScript one selectable and taking over automatically where no native binary is available. → [Engine](docs/network-servers.md#engine)
+- **Local servers** — start, stop, and restart the local processes a bench needs from the Connectivity Hub, with optional auto-restart. → [Local Servers](docs/local-servers.md)
+
+### Terminal
+
+- **Highlighting** — regex rules colour errors, warnings, addresses, and more, edited in a visual Rule Editor. → [Highlighting](docs/terminal.md#highlighting)
+- **Tab commands** — right-click a Nexus terminal tab for Reset Terminal, Clear Scrollback, and Copy All to Clipboard. → [Tab Commands](docs/terminal.md#tab-commands)
+- **Session transcripts** — clean, ANSI-stripped output of SSH, telnet, and serial sessions logged to rotating files, per profile; **Open Log Directory** opens them. → [Session Transcript Logging](docs/terminal.md#session-transcript-logging)
+- **Keyboard passthrough** — `Ctrl+` combinations go straight to vim, nano, or htop, configurable per key. → [Keyboard Passthrough](docs/terminal.md#keyboard-passthrough)
+- **Appearance** — terminal font and colour schemes, including schemes imported from MobaXterm. → [Appearance](docs/terminal.md#appearance)
+
+### Everything else
+
+- **Settings panel** — edit settings in a grouped panel with validation and auto-save; key settings are listed in the [settings reference](docs/settings.md). → [Settings Panel](docs/connectivity-hub.md#settings-panel)
+- **Settings Guard** — restores the `terminal.integrated.commandsToSkipShell` entries macro shortcuts need when an external program (e.g. a corporate DLP/endpoint agent) strips them, with Undo and **Nexus: Show Settings Guard Report**. → [Settings Guard](docs/connectivity-hub.md#settings-guard)
+- **Encrypted backup and share export** — a master-password-protected backup, or a sanitized export (credentials stripped, IDs remapped) to share; a hand-written JSON file imports too. → [Encrypted Backup and Share Export](docs/import-export.md#encrypted-backup-and-share-export)
+- **Start over** — **Nexus: Reset All Settings to Defaults** resets settings, and **Nexus: Delete All Data** deletes your connection profiles, tunnels, inventory sources, macros, and saved credentials after a typed confirmation. → [Start Over](docs/connectivity-hub.md#start-over)
+- **Open from the command line** — a `vscode://` URI opens a saved network device (SSH or telnet), Serial, or Local Shell profile from a terminal, script, or link. → [Open a Profile from the Command Line](docs/open-from-command-line.md)
+- **In the browser** — browser-based VS Code gets graceful degradation only: SSH and serial features require the desktop runtime. → [In the Browser](docs/connectivity-hub.md#in-the-browser)
+
+## Documentation
+
+Every feature has its own guide — start at the [documentation index](docs/README.md).
+
+For contributors: [functional documentation](docs/functional-documentation.md) (architecture and design), the [network server daemon protocol](docs/network-server-daemon-protocol.md) (the wire contract between the extension host and the daemon), and [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Development
 
@@ -569,72 +148,7 @@ npm run build
 npm test
 ```
 
-To package a VSIX:
-```bash
-npm run package:vsix
-```
-
-## Key Settings
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `nexus.logging.sessionTranscripts` | `true` | Enable session transcript logging |
-| `nexus.logging.sessionLogDirectory` | *(extension storage)* | Custom directory for session logs |
-| `nexus.logging.terminalOutputTrace` | `false` | Troubleshooting only: write every chunk of terminal output to the diagnostic log. Slows terminal output and stores session data — including anything echoed on screen, such as passwords — as plaintext on disk |
-| `nexus.logging.maxFileSizeMb` | `10` | Max log file size before rotation |
-| `nexus.logging.maxRotatedFiles` | `1` | Number of rotated log files to keep |
-| `nexus.ssh.multiplexing.enabled` | `true` | Share SSH connections across terminals, tunnels, and SFTP |
-| `nexus.ssh.multiplexing.idleTimeout` | `300` | Seconds to keep idle multiplexed connection alive |
-| `nexus.ssh.trustNewHosts` | `true` | Auto-trust host keys on first connection (TOFU); prompt only on key change |
-| `nexus.ssh.connectionTimeout` | `60` | SSH connection timeout in seconds |
-| `nexus.ssh.keepaliveInterval` | `10` | Interval between SSH keepalive packets in seconds (`0` disables keepalives) |
-| `nexus.ssh.keepaliveCountMax` | `3` | Missed keepalive responses before the connection is treated as dead |
-| `nexus.ssh.terminalType` | `xterm-256color` | `$TERM` value reported to the remote shell |
-| `nexus.ssh.proxyTimeout` | `60` | Proxy handshake timeout for SOCKS5 and HTTP CONNECT proxies |
-| `nexus.tunnel.defaultConnectionMode` | `shared` | `shared` or `isolated` SSH mode for tunnels |
-| `nexus.tunnel.defaultBindAddress` | `127.0.0.1` | Default bind address for reverse tunnels |
-| `nexus.tunnel.socks5HandshakeTimeout` | `10` | Dynamic tunnel SOCKS5 handshake timeout in seconds |
-| `nexus.terminal.openLocation` | `editor` | Where to open terminals: `panel` or `editor` tab |
-| `nexus.terminal.keyboardPassthrough` | `true` | Pass Ctrl+ key combinations to the terminal |
-| `nexus.terminal.passthroughKeys` | `[b,e,g,j,k,n,o,p,r,w]` | Which Ctrl+ keys to pass through when enabled |
-| `nexus.terminal.macros.autoTrigger` | `true` | Enable auto-trigger for macros with a `triggerPattern`; per-macro scope can limit matching to the active terminal or a matching profile |
-| `nexus.terminal.macros.defaultCooldown` | `3` | Default cooldown in seconds for auto-trigger macros without a per-macro override |
-| `nexus.terminal.macros.bufferLength` | `2048` | Max characters retained per terminal for auto-trigger pattern matching |
-| `nexus.terminal.highlighting.enabled` | `true` | Enable regex-based terminal highlighting; rules are edited in the Highlighting Rules editor. The IPv6 and UUID rules ship disabled — switch either on with its per-rule checkbox in the editor |
-| `nexus.ui.showTreeDescriptions` | `true` | Show connection details beside items in the Connectivity Hub |
-| `nexus.sftp.cacheTtlSeconds` | `10` | SFTP directory listing cache TTL |
-| `nexus.sftp.maxCacheEntries` | `500` | Maximum cached SFTP directory listings |
-| `nexus.sftp.autoRefreshInterval` | `10` | Polling interval for file explorer (seconds); also used as the auto-mode safety net unless recursive inotify is available |
-| `nexus.sftp.remoteWatchMode` | `auto` | Remote change detection mode: `auto` prefers recursive inotify, `polling` uses interval-based refresh only |
-| `nexus.sftp.maxOpenFileSizeMB` | `5` | Largest single file Nexus will hold in memory — opening a remote file in the editor, and transferring a file whose reported size is `0` (pseudo-files and appliances that mis-report size have to be read to the end to find out how big they are). Ordinary uploads and downloads stream and are not limited by this |
-| `nexus.sftp.operationTimeout` | `30` | Timeout for SFTP directory and metadata operations (listing, stat, realpath, rename, mkdir, delete) |
-| `nexus.sftp.commandTimeout` | `300` | Timeout for remote SFTP commands, file transfers, and editor file open/save; upload/download use it as an inactivity timeout rather than a total duration cap |
-| `nexus.sftp.deleteDepthLimit` | `100` | Safety limit for recursive delete directory depth |
-| `nexus.sftp.deleteOperationLimit` | `10000` | Safety limit for items removed by one recursive delete |
-| `nexus.sftp.sudo.enabled` | `true` | Offer to save remote files with sudo when the SSH user lacks write permission |
-| `nexus.sftp.sudo.rememberPasswordForSession` | `false` | Keep the sudo password in memory until that server disconnects or the window closes, rather than clearing it after each save; never written to disk or secret storage. Turning this off doesn't guarantee a prompt every time — the remote host's own sudo credential timestamp can skip it regardless, and a short grace window (30 seconds) after each password entry applies either way |
-| `nexus.networkServers.engine` | `rust` | Which implementation backs the embedded TFTP and DHCP services. `rust` (default since 2.8.205) is a native binary packaged for all six supported platforms; `node` is the bundled JavaScript daemon, which is also the automatic fallback if no native binary is available here — the reason is logged and the services start either way. `nexus.networkServers.dhcp.allowRelayAgents` is honoured by the Rust engine only. Takes effect the next time the daemon starts |
-| `nexus.localServers.defaultMaxAutoRestarts` | `5` | How many times in a row a local server may restart automatically, for profiles that set no limit of their own. `0` means never. Five is also the hard ceiling — the setting can ask for fewer, not more |
-| `nexus.localServers.stableRuntimeMs` | `10000` | How long a local server must run without exiting before it counts as healthy and its consecutive-restart count is cleared |
-| `nexus.localServers.initialBackoffMs` | `500` | Delay before the first automatic restart. Each further attempt doubles it |
-| `nexus.localServers.maxBackoffMs` | `30000` | Ceiling on the delay between automatic restarts, however far the doubling has gone |
-| `nexus.serial.rpcTimeout` | `10` | Timeout for serial sidecar commands in seconds |
-| `nexus.scripts.path` | `.nexus/scripts` | Directory where Nexus scripts live. Absolute paths are used as-is. Relative paths resolve against the workspace root when a folder is open, otherwise the extension's global storage. Pick a folder via *Nexus Settings → Scripts → Scripts Folder* |
-| `nexus.scripts.defaultTimeoutSeconds` | `30` | Default per-wait timeout in seconds for `waitFor` / `expect` / `waitAny` when not specified |
-| `nexus.scripts.macroPolicy` | `suspend-all` | Macro policy while a script runs: `suspend-all` or `keep-enabled` |
-| `nexus.scripts.maxReadSizeMb` | `4` | Largest file (in MiB) a script may read via `nexus.fs.readText` / `readJson`; range 1–16. Snapshotted when a run starts |
-| `nexus.scripts.maxRuntimeSeconds` | `1800` | Overall runtime cap in seconds. Exceeded runs are auto-stopped with reason `max-runtime-exceeded`; `0` disables the cap; maximum `2147483` |
-| `nexus.scripts.maxRuntimeMs` | `1800000` | Legacy millisecond runtime cap retained for compatibility when the seconds setting is absent |
-
-## Maintainer Notes
-
-- Release process: [docs/release.md](docs/release.md)
-
-## Documentation
-
-See [docs/functional-documentation.md](docs/functional-documentation.md) for detailed architecture and design documentation.
-
-The wire contract between the extension host and the network server daemon is specified in [docs/network-server-daemon-protocol.md](docs/network-server-daemon-protocol.md), written so that either side can be built from it alone.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution bar, tests, and packaging.
 
 ## Support
 

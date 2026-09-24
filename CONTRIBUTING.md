@@ -75,9 +75,9 @@ npx vitest run -t "pattern"
 
 Run `npm run build`, then press <kbd>F5</kbd> in VS Code to launch an Extension Development Host with the extension loaded. The `Run Extension` configuration is committed to `.vscode/launch.json`, so F5 works on a fresh checkout. There is deliberately no pre-launch build task wired up — which means a stale `dist/` gives you a stale Development Host, so build first when you have changed anything.
 
-**All four bundles must build.** esbuild emits two *host* targets — `dist/extension.js` (Node, the real extension) and `dist/webExtension.js` (browser, a deliberately degraded fallback) — plus two isolated workers, `dist/services/serial/serialSidecarWorker.js` and `dist/services/scripts/scriptWorker.js`. A Node-only import that reaches the browser graph breaks the web build, and `npm run build` will tell you.
+**All five bundles must build.** esbuild (configured in `scripts/buildConfigs.mjs`) emits two *host* targets — `dist/extension.js` (Node, the real extension) and `dist/webExtension.js` (browser, a deliberately degraded fallback) — plus three out-of-host bundles: the isolated workers `dist/services/serial/serialSidecarWorker.js` and `dist/services/scripts/scriptWorker.js`, and the TFTP/DHCP daemon `dist/services/networkServers/networkServerDaemon.js`. A Node-only import that reaches the browser graph breaks the web build, and `npm run build` will tell you.
 
-The worker bundles must not import `vscode` — they run outside the extension host, where that module does not exist. **The build only half-enforces this, so do not rely on it.** `serialSidecarWorker` does not list `vscode` as external, so an accidental import fails to resolve and the build stops. `scriptWorker` *does* list it external (`esbuild.mjs`), so the identical mistake bundles cleanly and leaves a runtime `require("vscode")` in a worker that has no extension host around it — every script then fails at startup, with nothing said at build time. When you touch `src/services/scripts/scriptWorker.ts` or anything it imports, check that constraint by eye.
+The out-of-host bundles must not import `vscode` — they run outside the extension host, where that module does not exist. The build enforces this: none of the three lists `vscode` as external, and each carries a plugin that stops the build with an error naming the importing file (`test/unit/esbuildWorkerIsolation.test.ts` holds the real build configuration to that). If you hit it, move whatever needs the vscode API to the main-thread orchestrator and pass the result across the existing RPC boundary.
 
 ---
 
@@ -120,7 +120,7 @@ There is **no linter or formatter** configured. That is deliberate, and it puts 
 
 - `NexusCore` is the single source of truth. UI reads immutable snapshots; changes flow out through observers.
 - `configMutationLock` serialises config mutation, but it is a **convention at the command layer, not an enforced invariant** — so do not assume a write you are reasoning about is serialised. `NexusCore`'s mutators do not take the lock themselves, so any direct `core.addOrUpdate*` call bypasses it unless its call site takes the lock explicitly — check the call site, not the command's name or type. (Tunnel add/edit/duplicate, and serial, local-shell, local-server and network-server-profile rename, all do as of #108; that list is not exhaustive of what does, and plenty of writers elsewhere still don't.) What the lock reliably covers is multi-step read-validate-write spans, where an interleaved write between the read and the write would commit a decision made against stale state. If you add one of those, take the lock and re-resolve your state *inside* it. Long-running network I/O must **not** run under the lock — capture and validate under it, then dispatch outside.
-- Services are isolated according to risk: SSH in-process, scripts in worker threads, serial in a child process (native addon crash isolation). If you add something that can crash the host or hold an OS resource, follow the child-process pattern.
+- Services are isolated according to risk: SSH in-process, scripts in worker threads, serial and the TFTP/DHCP daemon in child processes (crash isolation for native code). If you add something that can crash the host or hold an OS resource, follow the child-process pattern.
 - Storage is `globalState` via the `ConfigRepository` interface, and it is shared across VS Code windows with last-writer-wins semantics. Read the doc comment at the top of `vscodeConfigRepository.ts` before adding a collection.
 
 ---
@@ -133,7 +133,7 @@ Error messages, warnings and settings descriptions are part of the product.
 - Don't promise what the code does not do. If a limit exists, state it plainly rather than omitting it.
 - Match the existing voice: direct, specific, no exclamation marks, no apologising.
 
-If your change adds or alters user-facing behaviour, update `README.md` and `docs/functional-documentation.md` in the same PR.
+If your change adds or alters user-facing behaviour, update the matching guide under `docs/` (the [documentation index](docs/README.md) lists them) and `docs/functional-documentation.md` in the same PR. Touch the feature's one-line summary in `README.md` only if that summary changes.
 
 ---
 

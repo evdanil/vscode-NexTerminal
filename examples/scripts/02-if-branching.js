@@ -41,6 +41,10 @@ switch (r.index) {
     break;
 }
 
-// Wait for the remote shell prompt regardless of which path we took.
-await expect(/[$#] $/, { timeout: 15_000 });
+// After a credential, wait for the remote shell prompt. In case 3 the prompt
+// was the match itself — and a match is consumed, so waiting for it again
+// would only time out.
+if (r.index !== 3) {
+  await expect(/[$#] $/, { timeout: 15_000 });
+}
 log.info("logged in");

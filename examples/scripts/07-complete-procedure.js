@@ -12,54 +12,65 @@
 // API primitives fit together. Adapt the prompts/commands to your device family.
 //
 // Note: `@allow-macros hostname-prompt` assumes a macro named "hostname-prompt"
-// exists in your workspace — replace or remove this line if you don't have one.
-// The header is just a declarative allow-list; an unknown name is a no-op.
+// exists in your workspace — replace or remove the name (here and in the
+// `macros.allow` call below) if you don't have one. An unknown name is a no-op.
+// Likewise `@target-profile lab-router-a`: rename it to your serial profile or
+// remove it. Quick Run and Connect and Run Script… refuse a session of another
+// profile; Run shows the session picker.
+//
+// IOS and IOS XE prompts end in `>` or `#` with no trailing space (`Router#`),
+// so the prompt patterns below make the space optional (` ?`) — NX-OS-style
+// `switch# ` still matches.
 //
 // Key patterns:
 //   - try/catch around every expect for graceful failure handling
 //   - waitAny to disambiguate devices with multiple prompt styles
-//   - poll for device reboots where a plain expect would time out
-//   - macros.disableAll() to suspend unrelated password/hostname macros
-//     that might fire on our input (the runtime auto-restores on exit,
-//     so no finally-block cleanup is needed)
-//   - `session` metadata so the same script can behave differently on
-//     production vs. lab devices
+//   - poll to wake the console (the prompt already on screen was printed
+//     before the run started, so the script can't see it) and to wait
+//     through device reboots where a plain expect would time out
+//   - macros.disableAll() to suspend unrelated password macros that might
+//     fire on our input (the runtime auto-restores on exit, so no
+//     finally-block cleanup is needed)
+//   - `session` metadata in the log, so a run is easy to find later
 //
 // `@allow-macros hostname-prompt` lets the "expect hostname → send hostname"
 // macro keep firing during the run while suspending everything else.
 
 log.info(`procedure starting on ${session.name} (${session.type})`);
 
-// Suspend any macros the default policy didn't catch.
+// Suspend every macro on this session even if `nexus.scripts.macroPolicy` is
+// "keep-enabled". disableAll() clears the header's allow-list too, so allow
+// the hostname macro again afterwards.
 macros.disableAll();
+macros.allow("hostname-prompt");
 
 try {
   // 1. Wake the console and capture the running configuration.
-  await poll({ send: "\r", until: /[>#] $/, every: 1_000, timeout: 15_000 });
+  await poll({ send: "\r", until: /[>#] ?$/, every: 1_000, timeout: 15_000 });
   await sendLine("enable");
-  const auth = await waitAny([/Password:\s*$/i, /# $/], { timeout: 5_000 });
+  const auth = await waitAny([/Password:\s*$/i, /# ?$/], { timeout: 5_000 });
   if (auth.index === 0) {
     await sendLine(await prompt("Enable password", { password: true }));
-    await expect(/# $/);
+    await expect(/# ?$/);
   }
   await sendLine("terminal length 0");
-  await expect(/# $/);
+  await expect(/# ?$/);
   await sendLine("show running-config");
-  const cfg = await expect(/# $/, { timeout: 60_000 });
+  const cfg = await expect(/# ?$/, { timeout: 60_000 });
   log.info(`captured ${cfg.before.split("\n").length} lines of running-config`);
 
   // 2. Check what IOS images are on flash.
   await sendLine("dir usbflash0:");
-  const dir = await expect(/# $/);
-  const imageMatch = dir.before.match(/(\S+\.bin)/);
+  const dir = await expect(/# ?$/);
+  let imageMatch = dir.before.match(/(\S+\.bin)/);
   if (!imageMatch) {
     await alert("No image found on usbflash0. Insert a USB stick with the image and click OK.");
     await sendLine("dir usbflash0:");
-    const dir2 = await expect(/# $/);
-    const imageMatch2 = dir2.before.match(/(\S+\.bin)/);
-    if (!imageMatch2) throw new Error("no image on usbflash0 after re-insert");
+    const dir2 = await expect(/# ?$/);
+    imageMatch = dir2.before.match(/(\S+\.bin)/);
+    if (!imageMatch) throw new Error("no image on usbflash0 after re-insert");
   }
-  const image = (imageMatch || dir.before.match(/(\S+\.bin)/))[1];
+  const image = imageMatch[1];
   log.info("using image:", image);
 
   // 3. Confirm before destructive action.
@@ -78,10 +89,11 @@ try {
 
     // 5. Verify.
     await sendLine("");
-    await expect(/[>#] $/, { timeout: 30_000 });
+    await expect(/[>#] ?$/, { timeout: 30_000 });
     await sendLine("show version | include IOS XE Software");
-    const ver = await expect(/[>#] $/);
-    log.info("running version:", ver.before.trim());
+    const ver = await expect(/[>#] ?$/);
+    // Drop the echoed command (first line) and the prompt's hostname (last line).
+    log.info("running version:", ver.before.trim().split(/\r?\n/).slice(1, -1).join("\n"));
     await alert("Downgrade complete. Verify the version string above.");
   }
 } catch (err) {
