@@ -961,6 +961,37 @@ describe("createProxmoxProvider", () => {
       expect(tree.warnings?.some((w) => w.includes("stopped at 500 entries"))).toBe(true);
     });
 
+    // THE CLEAR LIST IS BOUNDED BY THE LISTING, NOT BY THE CAP (#128) — a
+    // deliberate absence of a budget, pinned so it cannot be "fixed" quietly.
+    // Every way of capping the clears loses a correctness guarantee to save at
+    // most a few percent of a sync's transient peak: the list is ≤ one bare id
+    // per /cluster/resources row, a listing the sync already holds whole. Rows
+    // are stopped templates so no address crawl fans out. hardCap 100 is the
+    // field minimum, so 150 rows are enough to overflow it.
+    it("does NOT budget the sync's clear list — 150 template rows under hardCap 100 (the field minimum) ride 150 clears on a COMPLETE report with no statuses, no truncation and no status-cap warning (kills a clear list counted against the entry budget, which either turns a complete report into a merge that retains every absent decoration or silently drops the clears past the cap, by listing order, on every path until the cap is raised — #128)", async () => {
+      const rows = Array.from({ length: 150 }, (_, i) => guestRow({ vmid: 1000 + i, name: `gold-${i}`, template: 1, status: "stopped" }));
+      const { tree } = await syncRows(rows, { baseUrl: BASE, hardCap: 100 });
+      expect(tree.devices).toEqual([]); // includeTemplates off: nothing imported, so the device cap cannot trip
+      expect(tree.truncated).toBeUndefined();
+      expect(tree.status?.statuses).toEqual({});
+      expect(tree.status?.clearedExternalIds).toEqual(rows.map((r) => String(r.vmid)));
+      expect(Object.prototype.hasOwnProperty.call(tree.status!, "truncated")).toBe(false);
+      expect(tree.warnings?.some((w) => w.includes("Status collection stopped"))).toBe(false);
+      expect(tree.warnings?.some((w) => w.includes("Truncated at"))).toBe(false);
+      // The sibling map is the same decision (#124): one reason per template row, uncapped.
+      expect(Object.keys(tree.status?.notSyncableReasons ?? {})).toHaveLength(150);
+    });
+
+    it("keeps EVERY template clear on a device-capped sync — includeTemplates ON, 150 template rows under hardCap 100 import 100 devices, flag the tree and the report truncated, and still ride all 150 clears, rows 101-150 included (kills a clear push moved below the device-cap check: those are exactly the rows whose devices were dropped, and on the MERGING report this sync produces a previously synced one would keep its stale running dot — and the Start/Stop menu it lights — for as long as the cap holds — #128)", async () => {
+      const rows = Array.from({ length: 150 }, (_, i) => guestRow({ vmid: 1000 + i, name: `gold-${i}`, template: 1, status: "stopped" }));
+      const { tree } = await syncRows(rows, { baseUrl: BASE, hardCap: 100, includeTemplates: true });
+      expect(tree.devices).toHaveLength(100);
+      expect(tree.truncated).toBe(true);
+      expect(tree.status?.truncated).toBe(true);
+      expect(tree.status?.statuses).toEqual({}); // templates never report a status
+      expect(tree.status?.clearedExternalIds).toEqual(rows.map((r) => String(r.vmid)));
+    });
+
     it("clears a guest whose row reads status 'unknown' on the sync path too — omitted from statuses, vmid in clearedExternalIds, the same observed-but-stateless class the poll clears, even when includeStopped keeps the row out of the device set (kills a sync-side clear list that covers only templates)", async () => {
       const { tree } = await syncRows([guestRow({ vmid: 118, status: "unknown" })]);
       expect(tree.status).toEqual({
