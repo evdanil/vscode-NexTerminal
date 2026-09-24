@@ -1,6 +1,6 @@
 # Import and Export
 
-Bring your existing connections into Nexus, and take your configuration with you. Migrate SSH session profiles directly from your `~/.ssh/config`, MobaXterm INI files, or SecureCRT XML exports and session directories — folder hierarchy is preserved where the source has one, so switching costs you minutes, not a weekend. Onboard a whole rack from a CSV export or a plain list of hostnames. Export an encrypted backup of everything, or a sanitized copy you can share.
+Bring your existing connections into Nexus, and take your configuration with you. Migrate SSH session profiles directly from your `~/.ssh/config`, MobaXterm INI files, or SecureCRT XML exports and session directories — folder hierarchy is preserved where the source has one, so switching costs you minutes, not a weekend. Onboard a whole rack from a CSV export or a plain list of hostnames. Export an encrypted backup of your connections, credentials and settings, or a sanitized copy you can share.
 
 ## Import
 
@@ -95,12 +95,16 @@ Choosing **Nexus Export File…** also accepts a minimal hand-written JSON file 
 
 ## Encrypted Backup and Share Export
 
-Full encrypted backup with master password protection, or sanitized share export (credentials stripped, IDs remapped). Proxy configurations are preserved across backup and restore.
+An encrypted backup protected by a master password, or a sanitized share export (credentials stripped, IDs remapped). Proxy configurations are preserved across backup and restore.
 
-- **Encrypted Backup**: Run `Nexus: Encrypted Backup` to create a master-password-protected backup including all profiles, settings, saved credentials, the user `.ssh` folder, and the configured Nexus scripts folder
+- **Encrypted Backup**: Run `Nexus: Encrypted Backup` to create a master-password-protected backup of your servers, tunnels, serial and Local Shell profiles, auth profiles, folders, inventory sources, device templates, saved filters, macros and macro folders, settings, saved credentials, the user `.ssh` folder, and the configured Nexus scripts folder
 - **Share Export**: Run `Nexus: Export for Sharing` to create a sanitized export safe for sharing (credentials stripped, learned hardware identifiers removed, IDs remapped)
 
 You can also open **Settings** and use **Backup…** to save a password-protected backup, or **Export for Sharing…** to create a sanitized export without secrets.
+
+The master password encrypts the secrets — saved passwords, passphrases, tokens and secret macro text — and the backed-up `.ssh` and script files. Everything else in the file, including profile names, hosts, usernames, ids and settings, is stored in the clear, so keep the file private.
+
+**Not in an Encrypted Backup yet:** Local Server profiles and saved TFTP/DHCP profiles (your TFTP/DHCP settings are included). Restoring with Replace leaves the ones already on this machine alone; on a new machine, recreate them by hand. Trusted host keys and session logs are not backed up either.
 
 To bring either file back in, run `Nexus: Import…` and choose **Nexus Export File…** — see [Import](#import) for how Merge and Replace treat local `.ssh` and script files.
 
