@@ -3876,10 +3876,11 @@ export function registerConfigCommands(
    * It compares candidates against what is ALREADY STORED. It does not collapse
    * candidates against each other: two aliases in one file pointing at the same
    * host:port:user (`web` and `web-alias`) import as TWO servers, because one
-   * `Host` block becomes one server — the promise README and §4.12's import
-   * section both make. The alias is the name the user types, so dropping one of
-   * them loses a handle they use daily, and the "duplicate differing only by
-   * name" it avoids is not a cost worth that.
+   * `Host` block becomes one server — the promise docs/import-export.md and
+   * the SSH Config File… bullet of functional-documentation §4.10 both make.
+   * The alias is the name the user types, so dropping one of them loses a
+   * handle they use daily, and the "duplicate differing only by name" it
+   * avoids is not a cost worth that.
    *
    * The two rules compose without a special case: a second import of the same
    * file finds both aliases' keys already stored and skips both.

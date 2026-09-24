@@ -1,6 +1,6 @@
 # Nexus Scripts — User Guide
 
-Nexus Scripts let you automate multi-step terminal procedures in plain JavaScript, with full editor support, running against any live SSH, Serial, or Local Shell session.
+Nexus Scripts let you automate multi-step terminal procedures in plain JavaScript, with full editor support, running against any live SSH, Telnet, Serial, or Local Shell session.
 
 - [When to use a script (vs. a macro)](#when-to-use-a-script-vs-a-macro)
 - [Quickstart](#quickstart)
@@ -33,7 +33,7 @@ Nexus Scripts let you automate multi-step terminal procedures in plain JavaScrip
 
 ## When to use a script (vs. a macro)
 
-Nexus Terminal already ships with [Terminal Macros](../README.md#features), including auto-triggered "expect/send" pairs for single-shot reactions like "send the stored password when `Password:` appears". Macros are ideal when you want to react to a single prompt, once, and keep the terminal in the user's hands.
+Nexus Terminal already ships with [Terminal Macros](macros.md), including auto-triggered "expect/send" pairs for single-shot reactions like "send the stored password when `Password:` appears". Macros are ideal when you want to react to a single prompt, once, and keep the terminal in the user's hands.
 
 Scripts exist for the work that macros can't express:
 
@@ -49,8 +49,8 @@ A script is a regular `.js` file — kept either in your workspace (under versio
 
 ## Quickstart
 
-1. **(Optional) Open a folder in VS Code.** When a folder is open, scripts live under `<workspace>/.nexus/scripts/` so they can travel with your repo. With no folder open, Nexus transparently stores scripts in its extension global-storage folder instead — every script command (run, new, edit, "Connect and Run Script…") still works.
-2. **Open at least one SSH, Serial, or Local Shell session** through the Nexus sidebar.
+1. **(Optional) Open a folder in VS Code.** When a folder is open, scripts live under `<workspace>/.nexus/scripts/` (in the first folder of a multi-root workspace) so they can travel with your repo. With no folder open, Nexus transparently stores scripts in its extension global-storage folder instead — every script command (run, new, edit, "Connect and Run Script…") still works.
+2. **Open at least one SSH, Telnet, Serial, or Local Shell session** through the Nexus sidebar.
 3. **Create a script** at `.nexus/scripts/hello.js` (or simply run `Nexus: New Nexus Script` — it writes to the resolved scripts directory wherever it lives):
    ```js
    /**
@@ -59,42 +59,47 @@ A script is a regular `.js` file — kept either in your workspace (under versio
     * @target-type ssh
     */
 
-   const prompt = await expect(/[$#] $/, { timeout: 10_000 });
-   log.info("shell ready:", prompt.text);
+   // The prompt already on screen was printed before the run started, so the
+   // script can't see it — press Enter to get a fresh one.
+   await sendLine("");
+   await expect(/[$#] $/, { timeout: 10_000 });
+   log.info("shell ready");
 
    await sendLine("uname -a");
    const out = await expect(/[$#] $/);
-   log.info("kernel:", out.before.trim());
+   // `before` holds the echoed command, its output, and the start of the new
+   // prompt (the pattern matched only its trailing "$ "). Keep the middle.
+   const lines = out.before.trim().split(/\r?\n/);
+   log.info("kernel:", lines.slice(1, -1).join("\n"));
    ```
-4. **Run it** — any of several equivalent ways:
+4. **Run it** — any of these ways. The first three bind to a session that is already open, which is what the script above assumes:
    - `Cmd/Ctrl+Shift+P` → **Nexus: Run Nexus Script** (always shows the session picker).
-   - In the **Nexus** sidebar, expand **Scripts** and click the inline **▶** button. This "quick-run" binds to the terminal you currently have focused; if no Nexus terminal is focused it falls back to the picker.
+   - In the **Nexus** sidebar, expand **Scripts** and click the inline **▶** button. This "quick-run" binds to the active terminal (the one you last focused) when it is a Nexus SSH, Telnet, Serial, or Local Shell terminal; with no terminal, or a plain (non-Nexus) one, it falls back to the picker. If that session doesn't match the script's `@target-type` / `@target-profile`, quick-run refuses with an error instead — use **Run** to pick another session. A focused Local Server terminal is neither kind: quick-run does nothing there and shows no message — use **Run**.
    - Open `hello.js` in the editor and click the **▶ Run in Nexus** CodeLens above the header — always shows the picker.
-   - Right-click a server, serial, or Local Shell profile → **Connect/Open and Run Script…** — picks a script, opens the profile, and runs it against the new session.
+   - Right-click a server, serial, or Local Shell profile → **Connect/Open and Run Script…** — picks a script, opens the profile, and runs it against the new session. On an SSH or Telnet server the run starts as soon as the connection is up, before the host has printed anything, so its first prompt normally arrives *after* the run starts: for this path, remove the `sendLine("")` line and the comment above it, or the extra Enter leaves a spare prompt that the second `expect` matches before `uname` has answered. See [Match window semantics](#match-window-semantics).
 
    The session picker always renders — even when only one session is eligible — so you can see which terminal the script will drive before it starts. Auto-pick only happens when the script's `@target-profile` uniquely matches an active session.
 
-   For Local Shell profiles, the VS Code terminal-profile dropdown only includes profiles with an explicit executable path. Source/autodetect profiles are not script-capable through extensions; configure WSL as a custom Local Shell profile with `wsl.exe` as the shell path and any distribution arguments in the shell arguments field.
-5. **Watch it run.** The **Nexus Scripts** Output Channel prints each event:
+   To script a local shell, open it from a Nexus Local Shell profile (a plain VS Code terminal can't be scripted) — see [Local Shells](local-shells.md) for the launch options.
+5. **Watch it run.** The **Nexus Scripts** Output Channel prints each wait, log line, and the outcome, prefixed with the script name and the session's terminal name (what you send isn't logged):
    ```text
-   [12:01:33.221] Hello  start (session: web-1, ssh)
-   [12:01:33.245] Hello  → waitFor /[$#] $/
-   [12:01:33.512] Hello  ← matched
-   [12:01:33.514] Hello  log info: shell ready: ubuntu@web-1:~$
-   [12:01:33.515] Hello  → send "uname -a\r"
-   [12:01:33.517] Hello  → waitFor /[$#] $/
-   [12:01:33.612] Hello  ← matched
-   [12:01:33.613] Hello  log info: kernel: Linux web-1 6.2.0 ...
-   [12:01:33.614] Hello  end: completed (393ms)
+   [12:01:33.221] Hello@Nexus SSH: web-1  start (session: Nexus SSH: web-1, ssh)
+   [12:01:33.245] Hello@Nexus SSH: web-1  → waitFor /[$#] $/
+   [12:01:33.312] Hello@Nexus SSH: web-1  ← matched
+   [12:01:33.314] Hello@Nexus SSH: web-1  log info: shell ready
+   [12:01:33.317] Hello@Nexus SSH: web-1  → waitFor /[$#] $/
+   [12:01:33.412] Hello@Nexus SSH: web-1  ← matched
+   [12:01:33.413] Hello@Nexus SSH: web-1  log info: kernel: Linux web-1 6.2.0 ...
+   [12:01:33.414] Hello@Nexus SSH: web-1  end: completed (193ms)
    ```
 
-The first time you run any script command in this workspace, Nexus writes `types/nexus-scripts.d.ts` + `jsconfig.json` next to your scripts so the editor gives autocomplete, JSDoc hovers, and inline type-checking for every primitive.
+The first time you run a script in this workspace (from any entry point — even if you then cancel the session picker), Nexus writes `types/nexus-scripts.d.ts` + `jsconfig.json` next to your scripts so the editor gives autocomplete, JSDoc hovers, and inline type-checking for every primitive.
 
 ---
 
 ## Script examples
 
-Browse [`examples/scripts/`](../examples/scripts/) for runnable scripts that demonstrate branching, loops, retries, polling, user interaction, and complete multi-step procedures. In VS Code, use **Nexus: Open Script Examples** or the examples icon in the **Scripts** view title bar.
+Browse [`examples/scripts/`](../examples/scripts/) for seven runnable scripts that demonstrate branching and loops (`if` / `while` / `for`), retries, polling, user interaction, and complete multi-step procedures. In VS Code, use **Nexus: Open Script Examples** or the examples icon in the **Scripts** view title bar.
 
 ---
 
@@ -104,25 +109,29 @@ Every script has two parts: a **JSDoc header** and an **async body**.
 
 ```js
 /**
- * @nexus-script                       // required marker
- * @name Router IOS Downgrade          // display name
- * @target-type serial                 // only run against serial sessions
- * @default-timeout 30s                // default wait timeout
+ * Boot a router from ROMMON.
+ * @nexus-script
+ * @name Router IOS Downgrade
+ * @target-type serial
+ * @default-timeout 30s
  */
 
 // Async body — plain JavaScript. `await` any API primitive.
-await expect(/ROMMON>/i);
+await expect(/rommon \d+ >/i);
 await sendLine("boot");
 ```
 
-**The header must be the first JSDoc block in the file** and must contain `@nexus-script` on one of its lines. If the marker appears after the first executable statement (e.g. after `const x = 1`), the file is not recognized as a Nexus script.
+Here `@nexus-script` is the required marker, `@name` the display name, `@target-type serial` limits the script to serial sessions, and `@default-timeout 30s` sets the default wait timeout. The header is read line by line and **everything after a tag is its value** — a trailing `// comment` becomes part of it (and makes a `@target-type` or `@default-timeout` value invalid). Put notes on lines of their own: a line that doesn't start with a tag, like the first one above, is ignored.
+
+**The header must be the first thing in the file** — only a `#!` line and blank lines may come before its `/**` — and must contain `@nexus-script` on one of its lines. Anything else first (a statement, a `//` comment, a plain `/* */` block) means the file is not recognized as a Nexus script.
 
 The body runs inside an `async` function, so:
 
 - `await` every call to a Nexus primitive (`await expect(...)`, `await sendLine(...)`, etc.).
 - Top-level `await` works — you don't need to wrap your code in `(async () => {...})()`.
-- Regular JavaScript (`if`, `while`, `for...of`, `try/catch`, destructuring, closures, imports of the globals) all work as expected.
-- You can `throw` to fail the run with an error message; the Output Channel logs it and the final state is `failed`.
+- Regular JavaScript (`if`, `while`, `for...of`, `try/catch`, destructuring, closures) all work as expected. The API functions are globals — there is nothing to import.
+- You can `throw` to fail the run: the Output Channel logs the message and stack, the final state is `failed`, and — unless the error carries one of the [expected codes](#error-handling) — VS Code shows the failure toast. To stop early without the toast, throw an error whose `code` is `"Cancelled"`: `throw Object.assign(new Error("user declined"), { code: "Cancelled" })`. The run still ends `failed`, quietly.
+- To finish early without failing, let the code fall through (`if` / `else`). A top-level `return` works too at run time, but under the seeded `jsconfig.json` the editor marks it as an error (TS1108, *A 'return' statement can only be used within a function body*), so the samples in this guide don't use it.
 
 ---
 
@@ -133,20 +142,21 @@ Every field except `@nexus-script` is optional.
 | Tag | Value | Default | Notes |
 |---|---|---|---|
 | `@nexus-script` | flag — no value | — | Required marker. Files without this are not Nexus scripts. |
-| `@name` | single-line string | filename without `.js` | Display name in tree, CodeLens, picker, and status bar. |
+| `@name` | single-line string | filename without `.js` | Display name in the Scripts view, the pickers, the status bar, and the Output Channel. |
 | `@description` | single-line string | empty | Shown as tooltip in the sidebar. |
 | `@target-type` | `ssh`, `telnet`, `serial`, or `local` | unrestricted | Filters the session picker so only matching sessions are offered. `ssh` and `telnet` are distinct — a telnet session is never offered to an `ssh` script, or the other way round. Classification follows the transport the session was **opened** on, not the profile's current setting, so editing a server's Protocol while its terminal is open does not reclassify a terminal already running. |
-| `@target-profile` | server name, serial profile name, Local Shell profile name, or matching id | none | When a session of this profile is active, it's auto-selected without showing the picker. Duplicate names are disambiguated with a narrowed picker. |
-| `@default-timeout` | duration: `1500ms`, `30s`, `5m` | `nexus.scripts.defaultTimeoutSeconds` (30s) | Used by `waitFor`/`expect`/`waitAny` when no per-call `timeout` is provided. |
+| `@target-profile` | server name, serial profile name, Local Shell profile name, or matching id | none | When a session of this profile is active, it's auto-selected without showing the picker. Duplicate names are disambiguated with a narrowed picker. Quick-run and **Connect/Open and Run Script…** bind a session directly, and refuse one of another profile. |
+| `@default-timeout` | duration: `1500ms`, `30s`, `5m` | `nexus.scripts.defaultTimeoutSeconds` (30s) | Used by `waitFor`/`expect`/`waitAny`/`poll` when no per-call `timeout` is provided. |
 | `@lock-input` | flag — no value | absent (terminal stays interactive) | Makes the bound terminal read-only for the run. User keystrokes are discarded with a one-shot notice line. |
 | `@allow-macros` | comma-separated macro names | `[]` | Names of macros to keep enabled on the bound session while the script runs. Default policy (suspend-all) suspends everything else. |
 
 ### Header validation
 
-- Unknown `@<tag>` names produce a warning in the Output Channel — the script still loads.
-- Invalid values for `@target-type` (not `ssh` / `telnet` / `serial` / `local`) or `@default-timeout` (not `<n>ms|s|m`) block the run with a descriptive error.
-- Duplicate fields are tolerated: the first occurrence wins and a warning is logged — **except `@allow-macros`, which concatenates** so you can spread a long allow-list across multiple lines.
-- Only the first JSDoc block in the file is examined.
+- Unknown `@<tag>` names don't stop the script: they are ignored, and the Output Channel logs a `header warning: …` line for each one, right after the run's `start` line.
+- Invalid values for `@target-type` (not `ssh` / `telnet` / `serial` / `local`) or `@default-timeout` (not `<n>ms|s|m`) block the run with a descriptive error. The Scripts view also marks such a script with a warning icon whose tooltip lists the errors.
+- A tag's value is the rest of its line, so a trailing `// comment` becomes part of it — see [Anatomy of a script](#anatomy-of-a-script).
+- Duplicate fields are tolerated: the first occurrence wins, and the Output Channel logs a warning when the script runs — **except `@allow-macros`, which concatenates** so you can spread a long allow-list across multiple lines.
+- Only the leading `/** … */` block — the one that opens the file — is examined.
 
 ---
 
@@ -162,11 +172,11 @@ Wait for `pattern` to match new output from the bound session. Resolves with a `
 
 ```js
 const m = await waitFor(/Login: $/, { timeout: 10_000 });
-if (!m) {
-  log.warn("no login prompt — giving up");
-  return;
+if (m) {
+  log.info("got prompt:", m.text);
+} else {
+  log.warn("no login prompt — skipping the login step");
 }
-log.info("got prompt:", m.text);
 ```
 
 #### `expect(pattern, opts?)` → `Promise<Match>`
@@ -206,15 +216,15 @@ switch (r.index) {
 | Field | Type | Meaning |
 |---|---|---|
 | `text` | `string` | The full matched substring. |
-| `groups` | `string[]` | Regex capture groups. Empty array for string patterns; `[]` for regexes with no groups. |
-| `before` | `string` | Output between the previous cursor position and the match — useful for capturing command output between prompts. |
+| `groups` | `string[]` | Regex capture groups, in order — `[]` for a string pattern or a regex without groups. An optional group that didn't take part in the match is `""`. |
+| `before` | `string` | Output between the previous cursor position and the match — useful for capturing command output between prompts. It usually starts with the echoed command line, and when the pattern matches only the end of the prompt (like `/[$#] $/`) it ends with the start of the prompt line. See [Loop over a command list](#loop-over-a-command-list-and-capture-each-output). |
 
 **`opts` for `waitFor` / `expect` / `waitAny`:**
 
 | Option | Type | Default | Notes |
 |---|---|---|---|
 | `timeout` | `number` (ms) | `@default-timeout` header or `nexus.scripts.defaultTimeoutSeconds` setting | Upper bound on the wait. |
-| `lookback` | `number` | `1024` on the first wait of the script, `0` afterwards | Bytes of recent output to scan before waiting for new bytes. See [match window semantics](#match-window-semantics). |
+| `lookback` | `number` | `0` | Characters of already-scanned output before the cursor to scan again — e.g. `4096` to re-match a prompt an earlier wait already consumed. Until something has matched, a wait already scans everything received since the run started, and no `lookback` reaches output from before that. See [match window semantics](#match-window-semantics). |
 
 ### Sending input
 
@@ -249,7 +259,7 @@ Send a named control key. Legal values:
 
 ```js
 await sendKey("ctrl-c");      // cancel a running command
-await sendKey("esc");          // exit a pager like `less`
+await sendKey("esc");          // leave vi's insert mode, or a menu
 ```
 
 ### Polling
@@ -260,10 +270,10 @@ Repeatedly send `send` (a string) on a fixed cadence, watching for `until`. Reso
 
 | Option | Type | Notes |
 |---|---|---|
-| `send` | `string` | Text to send on each tick. Minimum tick is 50 ms. |
+| `send` | `string` | Text to send on each tick; the first is sent straight away. Must be a string: to do something more elaborate on each tick, write the loop yourself with `sendLine` and `waitFor`. |
 | `until` | `string \| RegExp` | Pattern that ends the poll loop. |
-| `every` | `number` (ms) | Tick interval. |
-| `timeout` | `number` (ms) | Total wall-clock budget. |
+| `every` | `number` (ms) | Tick interval. Minimum 50 ms; 1000 if omitted. |
+| `timeout` | `number` (ms) | Total wall-clock budget. The script's default wait timeout if omitted; never less than `every`. |
 
 Use `poll` when a device is busy for a long time and a plain `expect` would time out. Typical use: wait for a device to finish rebooting after a firmware install.
 
@@ -278,7 +288,7 @@ await poll({
 
 ### Interacting with the user
 
-All three show native VS Code modal dialogs.
+`prompt` shows VS Code's input box at the top of the window (Escape, or clicking elsewhere, cancels it); `confirm` and `alert` show modal dialogs.
 
 #### `prompt(message, opts?)` → `Promise<string>`
 
@@ -287,7 +297,7 @@ Ask for free-text input. Returns `""` on cancel.
 | Option | Type | Notes |
 |---|---|---|
 | `default` | `string` | Pre-fill the input box. |
-| `password` | `boolean` | When true, mask input and exclude the value from the Output Channel. |
+| `password` | `boolean` | When true, mask the input. (No answer to any `prompt` is written to the Output Channel by the runtime.) |
 
 ```js
 const name = await prompt("Hostname to configure", { default: "router-01" });
@@ -299,9 +309,10 @@ const pw = await prompt("Enable password", { password: true });
 Native modal with **OK** and **Cancel** buttons. Resolves `true` when the user picks **OK**, `false` on **Cancel** or dismiss.
 
 ```js
-if (!(await confirm("Reboot device now?"))) {
+if (await confirm("Reboot device now?")) {
+  await sendLine("reload");
+} else {
   log.info("user declined");
-  return;
 }
 ```
 
@@ -336,7 +347,7 @@ if (!m) log.warn("no OK — recent output:", await tail());
 
 #### `log.info(...)` / `log.warn(...)` / `log.error(...)` → `void`
 
-Write a level-tagged line to the **Nexus Scripts** Output Channel. Accepts multiple arguments — objects are JSON-stringified.
+Write a level-tagged line to the **Nexus Scripts** Output Channel. Accepts multiple arguments — objects are JSON-stringified, and an `Error` prints its stack.
 
 ```js
 log.info("step 1 complete");
@@ -344,7 +355,7 @@ log.warn("ping lost:", loss, "%");
 log.error("auth failed for", session.name);
 ```
 
-`log` is not async — it doesn't block the script. Password values entered through `prompt(msg, { password: true })` are excluded from log events; any other values you pass to `log.*` are written verbatim — don't log secrets.
+`log` is not async — it doesn't block the script. The runtime never logs what the user typed into a `prompt`; anything you pass to `log.*` is written verbatim — don't log secrets.
 
 ### Reading files — nexus.fs
 
@@ -398,10 +409,10 @@ Both `..` traversal and absolute paths are accepted, as long as the *result* lan
 | `err.code` | Thrown by | When |
 |---|---|---|
 | `"NoScriptDir"` | any `nexus.fs.*` call | The script is an unsaved `untitled:` buffer with no folder on disk. |
-| `"InvalidPath"` | any `nexus.fs.*` call | The path is empty, not a string, contains a NUL byte, or (Windows) is drive-relative (`"C:file.txt"`). |
+| `"InvalidPath"` | any `nexus.fs.*` call | The path is empty, not a string, contains a NUL byte, or (Windows) is drive-relative (`"C:file.txt"`) — or it contains a `\` while the script lives on a remote location (Remote-SSH, WSL, Codespaces); use `/` there. |
 | `"PathOutsideScope"` | any `nexus.fs.*` call | The resolved path lands outside both allowed roots. |
-| `"FileNotFound"` | `readText` | Nothing exists at the path, or it's a directory. |
-| `"FileTooLarge"` | `readText` | The file is bigger than the run's effective cap (`nexus.scripts.maxReadSizeMb`, default 4 MiB). `err.sizeBytes` / `err.maxBytes` carry the numbers — `sizeBytes` is a lower bound when the true size could not be determined (a file that grew mid-read, or a provider that under-reported it, reports the cap + 1). |
+| `"FileNotFound"` | `readText` | Nothing exists at the path, or it's a directory (or, for a local file, not a regular file — a device or a pipe). |
+| `"FileTooLarge"` | `readText` | The file is bigger than the run's effective cap (`nexus.scripts.maxReadSizeMb`, default 4 MiB). `err.sizeBytes` / `err.maxBytes` carry the numbers — `sizeBytes` is the size actually found, except when a local file's size couldn't be trusted (it grew past the cap mid-read, or its reported size was wrong): then it is a lower bound, the cap + 1. |
 | `"NotUtf8"` | `readText` | The bytes aren't valid UTF-8. |
 | `"ReadFailed"` | `readText`, `exists` | The path resolved and passed the size check, but the read (or `exists`'s probe) itself failed — permissions, a misbehaving remote filesystem provider — or the operation timed out (30 seconds; see **Deadline** above). A failed `exists` probe throws this rather than answering `false`. |
 | `"InvalidJson"` | `readJson` | The file read fine but isn't valid JSON. A `SyntaxError`, not a plain `Error`. |
@@ -441,7 +452,7 @@ await helpers.login("admin");
 | `return { retry, backoff }` | the returned value — used **only** when `exports` was never touched and `module.exports` was never reassigned |
 | none of the above | `{}` (never `undefined`) |
 
-The `return` form works because a module body genuinely *is* an async function body here, the same as a script body. A module that both touches `exports` and returns something keeps the CommonJS meaning: the returned value is ignored.
+The `return` form works because a module body genuinely *is* an async function body here, the same as a script body — though the editor marks it, as it does any top-level `return` (see [Anatomy of a script](#anatomy-of-a-script)). A module that both touches `exports` and returns something keeps the CommonJS meaning: the returned value is ignored.
 
 **Relative paths resolve against the file they are written in.** This is the rule for `nexus.include` *and* for `nexus.fs` inside an included file — so `lib/helpers.js` doing `nexus.fs.readText("./banner.txt")` reads `lib/banner.txt`, and a library folder that ships its own data files works no matter which script includes it. Nesting works the same way: an included file may include its own siblings, up to 16 levels deep.
 
@@ -453,9 +464,9 @@ The `return` form works because a module body genuinely *is* an async function b
 - Inside an included file, `module`, `exports` and `nexus` are function parameters — don't re-declare them with `const`/`let` (a `var` is fine). Doing so is a compile error (`Identifier 'nexus' has already been declared`) with no line number, like any syntax error. This matters when moving code out of an entry script, where `const nexus = …` is legal shadowing.
 - Containment is unchanged: the resolved path must land inside the scripts folder or the entry script's own folder, exactly like `nexus.fs`. An `untitled:` (unsaved) script has no folder, so every include throws `NoScriptDir`.
 
-**Loaded once per run.** Modules whose source was delivered are loaded at most once per run — later includes of the same file (however they spell the path) get back the *same* exports object, and compile or body failures are sticky: a module that threw keeps throwing the same error rather than half-running again. Refusals are different: a cycle, a missing file, a marked script or a path outside scope is re-evaluated (and re-read) on every call, so fixing the file and calling again works. Two includes of the same not-yet-loaded module — from `Promise.all`, or from two libraries reaching one helper — share a single read and a single execution.
+**Loaded once per run.** Modules whose source was delivered are loaded at most once per run — later includes of the same file get back the *same* exports object, however they spell a path to it (`./lib/a.js` and `./lib/../lib/a.js` are one module — letter case is the exception, see *Module identity* below), and compile or body failures are sticky: a module that threw keeps throwing the same error rather than half-running again. Refusals are different: a cycle, a missing file, a marked script or a path outside scope is re-evaluated (and re-read) on every call, so fixing the file and calling again works. Two includes of the same not-yet-loaded module — from `Promise.all`, or from two libraries reaching one helper — share a single read and a single execution.
 
-Caching is per **run**, never per session: the edit → run loop always picks up your latest saved library code. Note the word *saved* — unlike the entry script, whose unsaved editor buffer is used when you run from the CodeLens, an included file is always read from disk. Save your libraries before running.
+Caching is per **run**, never per session: the edit → run loop always picks up your latest saved library code. Note the word *saved* — unlike the entry script, where whatever is in its open editor (saved or not) is what runs, an included file is always read from disk. Save your libraries before running.
 
 **Cycles are refused, not partially resolved.** If `a.js` includes `b.js` which includes `a.js`, the include throws `CircularInclude` with the loop spelled out — `main.js → lib/a.js → lib/b.js → lib/a.js` — in both the message and `err.cycle`. (CommonJS would hand back a half-built exports object; in an async module system the ancestor has not finished awaiting, so what you would get is arbitrarily incomplete.) A **diamond** is not a cycle: two different modules may both include the same helper, and they share one instance of it.
 
@@ -508,7 +519,7 @@ const info = { hostname: "r1", uptimeSeconds: 5 };   // a @typedef exported by t
 
 ### Macro coordination
 
-By default, all macros on the script's bound session are **suspended** for the duration of the run. Macros on unrelated sessions keep firing. You can override this four ways:
+By default, all macros on the script's bound session are **suspended** for the duration of the run. Macros on unrelated sessions keep firing. You can override this three ways, and on exit the prior state comes back automatically:
 
 - **Per-script header** — `@allow-macros name1, name2` keeps those named macros enabled for the run.
 - **Workspace setting** — `nexus.scripts.macroPolicy = "keep-enabled"` inverts the default so all macros fire unless the script explicitly denies them.
@@ -530,21 +541,20 @@ A read-only `session` global describes the session the script is bound to:
 | Field | Type | Notes |
 |---|---|---|
 | `session.id` | `string` | Stable session id (matches `ActiveSession.id` in NexusCore). |
-| `session.type` | `"ssh" \| "serial" \| "local"` | Transport type. |
-| `session.name` | `string` | Terminal title (display name). |
-| `session.targetId` | `string` | Server id (for SSH), serial profile id (for serial), or Local Shell profile id (for local). |
+| `session.type` | `"ssh" \| "telnet" \| "serial" \| "local"` | Transport type. |
+| `session.name` | `string` | Terminal title, e.g. `Nexus SSH: web-1`. |
+| `session.targetId` | `string` | Server id (SSH and Telnet), serial profile id (serial), or Local Shell profile id (local). |
 
-Use it to branch on context, e.g. to change behaviour based on whether you're running against a lab device or production:
+`session` is set before the first statement of your script runs. Use it to branch on context, e.g. to change behaviour based on whether you're running against a lab device or production:
 
 ```js
-if (session.name.startsWith("prod-")) {
+if (session.name.includes("prod-")) {
   if (!(await confirm(`This is production (${session.name}). Really continue?`))) {
-    return;
+    // Ends the run without the failure toast — see "Error handling".
+    throw Object.assign(new Error("declined on production"), { code: "Cancelled" });
   }
 }
 ```
-
-> **Note**: `session` is populated after the script connects, so it won't be available synchronously at the very top of the body; safest to reference it inside an `async` context (which is everything in a script body).
 
 ---
 
@@ -554,8 +564,8 @@ Every script runs inside an async function, so normal `try / catch / finally` ap
 
 | `err.code` | Thrown by | When |
 |---|---|---|
-| `"Timeout"` | `expect`, `waitAny`, `poll` | The pattern didn't appear within the wait budget. |
-| `"ConnectionLost"` | any in-flight `expect` / `send` / `poll` / `prompt` | The bound session disconnected mid-wait. |
+| `"Timeout"` | `expect`, `waitAny`, `poll` | The pattern didn't appear within the wait budget. `err.pattern` is the pattern as the Output Channel shows it, `err.timeoutMs` the timeout that applied, and `err.elapsedMs` how long the call actually waited — measured, for all three. |
+| `"ConnectionLost"` | a `waitFor` / `expect` / `waitAny` / `poll` in flight when the session drops | The bound session disconnected mid-wait; `err.sessionId` names it. A script busy with anything else at that moment (a `prompt` / `confirm` / `alert`, a `sleep`, a `nexus.fs` or `nexus.include` call) never sees it. Either way the script is terminated if it is still running about 150 ms after the drop, so keep `catch` / `finally` work to a log line. |
 | `"InvalidKey"` | `sendKey` | An unknown control-key name was passed. |
 | `"NoScriptDir"` / `"InvalidPath"` / `"PathOutsideScope"` / `"FileNotFound"` / `"FileTooLarge"` / `"NotUtf8"` / `"ReadFailed"` / `"InvalidJson"` | `nexus.fs.*` | See [Reading files — nexus.fs](#reading-files--nexusfs) for the full table. These are **not** silent expected codes — uncaught, they toast just like any other bug. |
 
@@ -563,7 +573,7 @@ A typical error-handler:
 
 ```js
 try {
-  await expect(/# $/);
+  await expect(/# ?$/);
   await sendLine("install add file ...");
   await poll({ send: "", until: /Press RETURN/, every: 5_000, timeout: 15 * 60_000 });
 } catch (err) {
@@ -574,7 +584,7 @@ try {
   } else {
     log.error("unexpected:", err.message);
   }
-  throw err;                   // re-throw so the run ends with state=failed
+  throw err;                   // re-throw so the run doesn't end as `completed`
 }
 ```
 
@@ -582,8 +592,8 @@ Uncaught exceptions end the run with final state `failed`. The Output Channel lo
 
 Nexus distinguishes two flavours of failure and the UI treats them differently:
 
-- **Expected failures** — an uncaught `Timeout`, `ConnectionLost`, `Stopped`, or `Cancelled`. These are the documented error contract; the run ends quietly in `failed` and nothing pops up.
-- **Unexpected failures** — a syntax error, `TypeError`, module-load error, or a Worker crash. VS Code surfaces an error toast with a **Show Output** button so the stack is one click away.
+- **Expected failures** — an uncaught `Timeout` (the run ends `failed`), a dropped session (`connection-lost`), a stop from the Stop command, the status bar, or the `maxRuntimeSeconds` cap (`stopped`), or an error your script throws with `code: "Cancelled"` (`failed`; the runtime itself never throws `Cancelled`). These are the documented error contract; the run ends quietly and nothing pops up.
+- **Unexpected failures** — anything else: an error your script throws without one of those codes, a syntax error, `TypeError`, module-load error, or a Worker crash. VS Code surfaces an error toast with a **Show Output** button so the stack is one click away.
 
 If you want to shut a script down from the host side (e.g. a deploy pipeline's watchdog), call the `Nexus: Stop Nexus Script` command or rely on the workspace setting `nexus.scripts.maxRuntimeSeconds` — a default 30-minute overall cap that force-stops runaway scripts. Set it to `0` to disable the cap. The legacy `nexus.scripts.maxRuntimeMs` setting is still read when the seconds setting is absent.
 
@@ -593,17 +603,18 @@ If you want to shut a script down from the host side (e.g. a deploy pipeline's w
 
 Understanding how `expect` / `waitFor` scan output matters when you're debugging "why didn't my pattern match?"
 
-- Each running script owns a rolling buffer of the session's recent output (default 64 KiB; ANSI escapes stripped at write time so patterns match on the same characters the user sees).
-- The buffer has a **forward-only cursor**. The first wait scans the last 1 KB of output **plus** any new output that arrives; subsequent waits only scan output that arrives after the previous wait's match.
-- Once a wait matches, the cursor advances past the match. The same prompt can't accidentally satisfy two consecutive waits.
+- Each running script owns a rolling buffer of the session's recent output (the last 65,536 characters; ANSI escapes stripped at write time so patterns match on the same characters the user sees). **The buffer starts empty when the run starts**: anything the session printed before that — including a prompt already sitting on screen — is never in it.
+- The buffer has a **forward-only cursor**. A wait scans from the cursor to the end of the buffer, then keeps scanning as new output arrives. Until something has matched, that window is everything received since the run started; after that, only output following the previous match.
+- Once a wait matches, the cursor advances past the match. The same prompt can't accidentally satisfy two consecutive waits. A wait that times out leaves the cursor where it was.
 - If a wait's pattern doesn't match immediately, the runtime re-scans on every new output chunk until it matches or the timeout fires.
-- Per-call `lookback` overrides the default (use `lookback: 4096` if you know you've got a large banner or quick prompt you want to re-match).
+- Per-call `lookback: n` widens the window to include `n` characters before the cursor — use it (e.g. `lookback: 4096`) to re-match a banner or prompt an earlier wait already consumed. It never reaches output from before the run started.
 
 Common pitfalls:
 
-- **Pattern matches too aggressively**, catching a promptish substring inside normal output. Use a more specific regex (anchor with `$`, include device-specific prefixes like `^Router# $`).
+- **Pattern matches too aggressively**, catching a promptish substring inside normal output. Use a more specific regex: include the device's own prefix, anchored to a line — `/^Router#\s*$/m`.
 - **Pattern doesn't match despite visible output**, because ANSI color escapes split the pattern. Remember the buffer holds stripped text — write patterns against the printable characters.
-- **First prompt never appears**, because the remote has already printed it before the script attaches. Increase `lookback` on the first wait: `await expect(/[$#] $/, { lookback: 4096 })`.
+- **First prompt never appears**, because it was already on screen when the run started — so it isn't in the script's buffer, and no `lookback` can reach it. Ask for a fresh one before the first wait: `await sendLine("")`, or, for a console that may be slow to answer, `await poll({ send: "\r", until: /[$#] $/, every: 1_000, timeout: 10_000 })`.
+- **A wait matches a spare prompt under Connect and Run Script…** On an SSH or Telnet server the run starts the moment the session registers — when the SSH shell channel opens, or the Telnet TCP connection is up — before the host has sent its banner or first prompt, so that prompt normally arrives *after* the run starts and the first wait sees it. An opening `sendLine("")` there makes a second prompt, and the wait after your first command matches it before the command has answered. In a script meant for this path, wait for the first prompt directly. The other launch paths keep the Enter: a serial port prints nothing when it opens, and **Open and Run Script…** on a Local Shell profile starts the run once the shell has been running for about five seconds, so its first prompt is already on screen, as in any open terminal.
 
 ---
 
@@ -670,7 +681,7 @@ for (let attempt = 0; attempt < 5; attempt++) {
   } catch (err) {
     if (err.code !== "Timeout") throw err;
   }
-  await sleep(500 * (attempt + 1));
+  await sleep(500 * 2 ** attempt);   // 0.5 s, 1 s, 2 s, 4 s, …
 }
 ```
 
@@ -693,7 +704,9 @@ const results = {};
 for (const cmd of ["hostname", "uptime", "uname -sr"]) {
   await sendLine(cmd);
   const m = await expect(/[$#] $/);
-  results[cmd] = m.before.split("\n").slice(1).join("\n").trim();
+  // Drop the echoed command (first line) and the start of the next prompt
+  // (last line — the pattern matched only its trailing "$ ").
+  results[cmd] = m.before.split(/\r?\n/).slice(1, -1).join("\n").trim();
 }
 ```
 
@@ -727,13 +740,15 @@ await sendLine("dir usbflash0:");
 ```js
 if (session.type === "serial") {
   // Serial: longer timeouts and poll harder.
-  await poll({ send: "\r", until: /ROMMON>/i, every: 500, timeout: 20_000 });
+  await poll({ send: "\r", until: /rommon \d+ >/i, every: 500, timeout: 20_000 });
 } else if (session.type === "local") {
-  // Local Shell: use local commands and paths.
-  await expect(/[$#>] $/, { timeout: 10_000 });
+  // Local Shell: use local commands and paths. `%` is zsh's prompt; the
+  // optional space lets Windows `C:\>` match too.
   await sendLine("pwd");
+  await expect(/[$#%>] ?$/, { timeout: 10_000 });
 } else {
-  // SSH: we expect quick responses.
+  // SSH or Telnet: we expect quick responses.
+  await sendLine("");
   await expect(/[$#] $/, { timeout: 5_000 });
 }
 ```
@@ -744,8 +759,8 @@ if (session.type === "serial") {
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `nexus.scripts.path` | string | `.nexus/scripts` | Workspace-relative directory where scripts live. Created automatically on first script command. |
-| `nexus.scripts.defaultTimeoutSeconds` | number (seconds) | `30` | Default per-wait timeout when neither the script header nor the `opts.timeout` argument specifies one. The legacy `nexus.scripts.defaultTimeout` millisecond key is still read when the seconds setting is absent. |
+| `nexus.scripts.path` | string | `.nexus/scripts` | Directory where scripts live. A relative path resolves against the workspace folder (the first one, in a multi-root workspace); an absolute path is used as-is. With no folder open, a relative path is ignored and scripts live in Nexus's global storage. Created when first needed — by **New Script**, **New Folder**, **Open Scripts Folder**, or running a script. |
+| `nexus.scripts.defaultTimeoutSeconds` | number (seconds) | `30` | Default per-wait timeout when neither the script header nor the `opts.timeout` argument specifies one. The legacy `nexus.scripts.defaultTimeout` millisecond key is still read from `settings.json` when the seconds setting is absent (values under 100 ms are ignored). |
 | `nexus.scripts.macroPolicy` | `"suspend-all"` \| `"keep-enabled"` | `"suspend-all"` | Default macro policy while a script runs. |
 | `nexus.scripts.maxReadSizeMb` | number (MiB) | `4` | Largest file `nexus.fs.readText` / `nexus.fs.readJson` will read; bigger files throw `FileTooLarge`. Range 1–16 MiB; values outside that range are clamped to the nearest bound, while non-numeric, zero, or negative values fall back to 4 MiB. Snapshotted when a run starts, so a change never applies to a script already running. |
 | `nexus.scripts.maxRuntimeSeconds` | number (seconds) | `1800` (30 min) | Overall runtime cap. When a script exceeds this, it's stopped automatically and tagged with reason `max-runtime-exceeded`. Set `0` to disable. Positive values below 10 s are raised to the minimum effective cap; values above `2147483` are clamped to the largest safe timer delay. |
@@ -757,6 +772,7 @@ Settings changes take effect on the **next** script run — they don't retroacti
 
 ## Organising scripts into folders
 
+The Scripts view groups scripts into folders, matching the Connectivity Hub.
 The scripts directory is a real filesystem folder, so the Scripts view mirrors
 whatever directory structure you put under it — subfolders show up, in any
 depth, whether or not they contain a script. Folders are yours to create — an
@@ -769,7 +785,7 @@ empty folder stays until you remove it.
 - **New Folder** — the view's title bar button, or a folder's right-click
   menu for a nested folder — creates a real directory. It shows up
   immediately, even before you put anything in it.
-- A folder's right-click menu also has **Reveal in Explorer**, which reveals
+- A folder's right-click menu also has **Reveal in Explorer View**, which reveals
   that directory in VS Code's own Explorer view (not your OS file manager —
   use **Open Scripts Folder**, below, for that).
 - Path segments are validated the same way folders are validated everywhere
@@ -822,30 +838,30 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 
 | Command | Default keybinding | What it does |
 |---|---|---|
-| `Nexus: Run Nexus Script` | `Ctrl+Alt+R` (macOS `⌘⌥R`) when an editor is focused on a `.js` file | Pick a script from a file dialog (or pass a URI argument from a CodeLens) and always show the session picker. |
-| `Nexus: Quick Run in Active Terminal` | — | Bind the script to whichever Nexus terminal is currently focused — no picker. Falls back to the session picker if no terminal is focused or the focused terminal isn't a Nexus session. Wired to the sidebar's inline ▶ button. |
+| `Nexus: Run Nexus Script` | `Ctrl+Alt+R` (macOS `⌘⌥R`) when an editor is focused on a `.js` file | Run the script in the active editor when it's a JavaScript file carrying `@nexus-script`; otherwise pick one from a file dialog opened at the scripts folder. (From a CodeLens or the Scripts view, it runs that script.) Always shows the session picker. |
+| `Nexus: Quick Run in Active Terminal` | — | Bind the script to the active terminal when it's a Nexus SSH, Telnet, Serial, or Local Shell terminal — no picker. Falls back to the session picker when there's no active terminal or it's a plain (non-Nexus) one. If the active session doesn't match the script's `@target-type` / `@target-profile`, it refuses with an error instead of offering the picker. With a Local Server terminal focused it does nothing, and says nothing. Wired to the sidebar's inline ▶ button. |
 | `Nexus: Stop Nexus Script` | `Ctrl+Alt+S` (macOS `⌘⌥S`) when a script is running | Stop a running script. Prompts if more than one is running. |
 | `Nexus: New Nexus Script` | — | Create a new script from a starter template in your configured scripts directory. Accepts a `/`-separated path (`cisco/backup`) to create it inside a folder, creating missing intermediate folders. |
 | `Nexus: New Script Folder` (Scripts view title bar, or a folder's right-click menu) | — | Create a real directory under the scripts folder. Shows up immediately, even while empty. |
 | `Nexus: Refresh Scripts` | — | Manually rescan the scripts directory, bypassing the ~300ms watcher debounce. |
 | `Nexus: Edit Script` | — | Right-click a script → Edit. Opens the file in the editor. (Clicking the row no longer auto-opens the editor — it would be noisy.) |
 | `Nexus: Delete Script` | — | Right-click a script in the sidebar. Asks for confirmation, then moves to Trash. |
-| `Nexus: Open Scripts Folder` | — | Open the configured scripts directory in the OS file manager. (Before 2.8.77 it opened the *parent* directory instead — see below.) |
-| `Connect/Open and Run Script…` (server, serial, or Local Shell right-click) | — | Pick a Nexus script, open the profile, and run the script against the new session once it registers. Scripts are filtered to those whose `@target-type` is compatible with the profile. SSH and Serial use a 90-second watchdog; Local Shell starts the run after the terminal session is created. |
+| `Nexus: Open Scripts Folder` | — | Open the configured scripts directory in the OS file manager. |
+| `Connect/Open and Run Script…` (server, serial, or Local Shell right-click) | — | Pick a Nexus script, open the profile, and run the script against the new session the moment it registers — for SSH when the shell channel opens, for Telnet when the TCP connection is up, for Serial when the port opens: in every case before the device has printed anything (see [Match window semantics](#match-window-semantics)). Scripts are filtered to those whose `@target-type` is compatible with the profile. SSH, Telnet and Serial use a 90-second watchdog; Local Shell starts the run once the shell has been running for about five seconds. |
 | `Nexus: Show Nexus Scripts Output` | — | Open the **Nexus Scripts** Output Channel. |
 | `Nexus: Open Scripting Guide` | — | Open this document in your browser. |
-| `Nexus: Open Script Examples` | — | Open the bundled script examples in your browser. |
+| `Nexus: Open Script Examples` | — | Open the example scripts on GitHub in your browser. |
 
 **UI surfaces:**
 
-- **Nexus sidebar → Scripts** — mirrors the folder structure under the configured scripts directory: subfolders render as folders (whether or not they hold a script), sorted ahead of scripts, both alphabetically. Only `.js` files that carry the `@nexus-script` marker show as script rows; a folder's own right-click menu adds New Script (into that folder), New Folder, and Reveal in Explorer. Clicking a script row does **nothing by default** (prevents accidental editor churn); use the right-click menu for Edit / Run / Stop / Reveal / Delete, or the inline **▶** button for quick-run. **Drag a script onto a folder to move it there** — onto another script to put it in that script's folder, or onto empty space to move it back to the root. Since a folder here is a real directory, the drop renames the file, so an editor you have open on it follows along and Undo puts it back. Nexus refuses and tells you why in three cases: the script is running (stop it first — a running script is tracked by its path), a file of the same name is already in the target folder (nothing is ever overwritten), or the file is not inside the scripts folder. Folders themselves are not draggable, and one script moves per drag. The view's title bar has buttons for New Script, New Folder, Refresh Scripts, Open Scripts Folder, Open Scripting Guide, and Open Script Examples. The three-link empty state (New Script / Open Scripting Guide / Open Script Examples) shows only when there isn't a single marked script anywhere in the tree, and only at the root — a folder with no scripts of its own just renders empty, the same as any empty folder in a file explorer.
-- **Editor CodeLens** — the inline `▶ Run in Nexus` action at the top of any script file. Flips to `◼ Stop` while a run is active on that file. Works on `file://`, `vscode-remote://`, and `untitled:` schemes. Always shows the session picker (the editor context is "I'm authoring" — deliberate target choice).
-- **Nexus Settings panel → Scripts** — the same four settings as in `Settings` below, surfaced in the Nexus Settings panel webview (no need to open `settings.json`).
-- **Connectivity Hub right-click → Connect/Open and Run Script…** — available on SSH, serial, and Local Shell profile items. Picks a compatible script (filtered by `@target-type`), opens the profile, then auto-runs the script once the session registers.
+- **Nexus sidebar → Scripts** — mirrors the folder structure under the configured scripts directory: subfolders render as folders (whether or not they hold a script), sorted ahead of scripts, both alphabetically. Only `.js` files that carry the `@nexus-script` marker show as script rows; a folder's own right-click menu adds New Script (into that folder), New Folder, and Reveal in Explorer View. Clicking a script row does **nothing by default** (prevents accidental editor churn); use the right-click menu for Edit / Run / Stop / Reveal / Delete, or the inline **▶** button for quick-run. **Drag a script onto a folder to move it there** — onto another script to put it in that script's folder, or onto empty space to move it back to the root. Since a folder here is a real directory, the drop renames the file, so an editor you have open on it follows along and Undo puts it back. Nexus refuses and tells you why in three cases: the script is running (stop it first — a running script is tracked by its path), a file of the same name is already in the target folder (nothing is ever overwritten), or the file is not inside the scripts folder. Folders themselves are not draggable, and one script moves per drag. The view's title bar has buttons for New Script, New Folder, Refresh Scripts, Open Scripts Folder, Open Scripting Guide, and Open Script Examples. The three-link empty state (New Script / Open Scripting Guide / Open Script Examples) shows only when there isn't a single marked script anywhere in the tree, and only at the root — a folder with no scripts of its own just renders empty, the same as any empty folder in a file explorer.
+- **Editor CodeLens** — the inline `▶ Run in Nexus` action at the top of any script file. Flips to `◼ Stop Nexus Script` while a run is active on that file. Works on `file://`, `vscode-remote://`, and `untitled:` schemes. Always shows the session picker (the editor context is "I'm authoring" — deliberate target choice).
+- **Nexus Settings panel → Scripts** — the five current settings from `Settings` below (every row except the legacy `nexus.scripts.maxRuntimeMs`), surfaced in the Nexus Settings panel webview (no need to open `settings.json`). **Scripts Folder** there exposes a native folder picker.
+- **Connectivity Hub right-click → Connect/Open and Run Script…** — available on server (SSH or Telnet), serial, and Local Shell profile items. Picks a compatible script (filtered by `@target-type`), opens the profile, then auto-runs the script once the session registers.
 - **Status bar — run indicator** — when at least one script is running, the left status bar shows the current operation + elapsed time. Click to open the Output Channel. Tooltip contains a `◼ Stop` action per running script.
 - **Status bar — input-lock indicator** — when an `@lock-input` script is running, a second left-aligned status bar item renders `$(lock) Terminal locked — click to stop`. Clicking stops the locking script. If multiple locked scripts run at once it shows a count and offers a QuickPick on click.
 - **Output Channel** — the `Nexus Scripts` channel streams timestamped events. Lines are prefixed with `[hh:mm:ss.sss] ScriptName@SessionName` so you can correlate interleaved output when multiple scripts run at once.
-- **Error toast** — if a script ends with an *unexpected* failure (syntax error, `TypeError`, worker crash — see **Error handling** above), VS Code surfaces an error toast with a **Show Output** button. Expected failures (`Timeout`, `ConnectionLost`, `Stopped`, `Cancelled`) don't toast.
+- **Error toast** — if a script ends with an *unexpected* failure (an error the script throws without an expected code, a syntax error, `TypeError`, worker crash — see **Error handling** above), VS Code surfaces an error toast with a **Show Output** button. Expected failures (an uncaught `Timeout`, a dropped session, a stop, a thrown `Cancelled`) don't toast.
 
 ---
 
@@ -854,13 +870,14 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Script won't stop / runs forever | — | Open the Command Palette → `Nexus: Stop Nexus Script` (default `Ctrl+Alt+S` / `⌘⌥S`). The status bar tooltip also has a per-script ◼ Stop link. As a last resort, `nexus.scripts.maxRuntimeSeconds` (default 30 min, `0` disables) force-stops runaways automatically. The legacy `nexus.scripts.maxRuntimeMs` setting is still honored when seconds is not configured. |
-| "▶ Run in Nexus" CodeLens doesn't appear above my file | Missing `@nexus-script` marker in the leading JSDoc block | Add it |
-| Autocomplete is missing in my script | First-time scaffolding hasn't run yet | Trigger any Nexus script command once; reopen the file. If you edited `<scriptsDir>/types/nexus-scripts.d.ts` by hand, delete it — Nexus will rewrite it from the bundled version on the next run. |
+| "▶ Run in Nexus" CodeLens doesn't appear above my file | The `@nexus-script` marker is missing, or something other than a `#!` line comes before the `/**` header | Add the marker; move the header to the very top of the file |
+| Autocomplete is missing in my script | First-time scaffolding hasn't run yet | Run any script once (cancelling the session picker is enough); reopen the file. If you edited `<scriptsDir>/types/nexus-scripts.d.ts` by hand, delete it — Nexus will rewrite it from the bundled version on the next run. |
 | `expect` always times out | Pattern doesn't match the actual output (ANSI, anchors, banner noise) | Log `await tail()` in the `catch` to see what the session actually sent; tighten the pattern accordingly |
-| First wait misses a prompt that's already on screen | Default lookback is 1 KB; output scrolled past | Pass `lookback: 4096` (or higher) on the first wait |
+| First wait misses a prompt that's already on screen | The script's buffer holds only output received after the run started, so a prompt printed before that is invisible to it — no `lookback` reaches back further | Ask for a fresh prompt before the first wait: `await sendLine("")`. See [Match window semantics](#match-window-semantics) |
+| Under **Connect and Run Script…** on an SSH or Telnet server, a command's captured output is empty — the wait after it matched at once | The run started before the host's first prompt arrived, so an opening `sendLine("")` produced a spare prompt that this wait matched | Drop the opening `sendLine("")` for that path and wait for the first prompt directly. See [Match window semantics](#match-window-semantics) |
 | A macro fires on top of my script and double-sends something | Default macro policy is `suspend-all`, but maybe `keep-enabled` was set | Check `nexus.scripts.macroPolicy` and any `@allow-macros` header |
-| Stop button feels slow (>1 sec) | A native call is blocking the worker (rare) | Reload the window; if reproducible, file an issue |
-| Web extension shows "not available in browser" | Expected — desktop-only for v1 | Use VS Code Desktop |
+| After a stop, the Output Channel logs `warning: worker did not terminate within grace` | The script was inside a blocking synchronous Node call (from an unsupported `node:` import — `execSync`, `readFileSync` on a dead mount), and a Worker can only be stopped when control returns to JavaScript. The run is marked `stopped` after 100 ms regardless; the worker ends when that call returns | Avoid synchronous Node calls in scripts. If the call never returns, reload the window |
+| In VS Code for the Web, script commands only say "Nexus runtime features are unavailable in the web extension host. Use desktop VS Code." | Expected — scripts are desktop-only | Use VS Code Desktop |
 | Can't find where my scripts are stored without a workspace | No folder is open — Nexus uses the extension's global-storage folder | Run `Nexus: Open Scripts Folder` (or check `nexus.scripts.path` — absolute paths always win). |
 | Error toast says the script "failed" on a normal `Timeout` | Shouldn't happen — expected codes are filtered | File an issue; include the Output Channel contents |
 | A library file I only meant to `include` shows up in the Scripts view (or the ▶ CodeLens, or a picker) | It carries the `@nexus-script` marker, which means "entry point" | Remove the marker from the library. Unmarked `.js` files never appear in the Scripts view, the CodeLens or any picker — and only unmarked files can be included (`IncludeIsScript` otherwise) |
@@ -880,10 +897,10 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 
 **Scripts run with the same privileges as the Nexus Terminal extension.** Treat a `.js` file you're about to run the same way you'd treat a shell script or a PowerShell script someone sent you — open it and read it first.
 
-- Scripts execute as local Node code inside a `node:worker_threads` Worker thread (separate V8 isolate), **not** a full VS Code sandbox. They have full access to Node's `process` object, `globalThis`, and the Nexus script API. They cannot import the `vscode` API. **Everything else a Node process can do, a script can do**: `await import("node:fs")` and `await import("node:child_process")` work, so a script can read or write any file your user account can and spawn processes. The worker is a cheap-termination mechanism, not a sandbox — only run scripts you have read and trust. `nexus.fs` is the *supported* way to read files: it is read-only, scoped to the scripts folder and the script's own directory, capped at a configurable size (`nexus.scripts.maxReadSizeMb`, default 4 MiB), and every access is logged to the Nexus Scripts Output Channel. Direct Node imports are possible but unsupported — no compatibility promises, and stopping a script (`worker.terminate()`) does **not** kill child processes the script spawned.
+- Scripts execute as local Node code inside a `node:worker_threads` Worker thread (separate V8 isolate), **not** a full VS Code sandbox. They have full access to Node's `process` object, `globalThis`, and the Nexus script API. They cannot import the `vscode` API. **Everything else a Node process can do, a script can do**: `await import("node:fs")` and `await import("node:child_process")` work, so a script can read or write any file your user account can and spawn processes. Each script runs in its own isolated Worker so runaway loops can be stopped in &lt;100 ms. The worker is a cheap-termination mechanism, not a sandbox — only run scripts you have read and trust. `nexus.fs` is the *supported* way to read files: it is read-only, scoped to the scripts folder and the script's own directory, capped at a configurable size (`nexus.scripts.maxReadSizeMb`, default 4 MiB), and every access is logged to the Nexus Scripts Output Channel. Direct Node imports are possible but unsupported — no compatibility promises, and stopping a script (`worker.terminate()`) does **not** kill child processes the script spawned.
 - **`nexus.include()` is a module loader, not a security boundary.** An included file runs in the same isolate, with the same privileges, as the script that included it — it can do anything the entry script can. What include *does* enforce is where files come from: only `.js` files inside the scripts folder or the entry script's own folder, each one logged to the Output Channel as it loads. Read a library before you include it, the same as you would read a script before you run it.
 - Secret prompts (`prompt(msg, { password: true })`) are masked in the input box and the returned value is never written to the Output Channel by the runtime. Anything the script explicitly logs — via `log.info(value)`, for example — is written verbatim, so don't hand-log the result of a password prompt.
-- On a script's behalf, the runtime reads files only through `nexus.fs`, which refuses paths outside the scripts folder / the script's own folder and logs every read. It does re-write the bundled `<scriptsDir>/types/nexus-scripts.d.ts` + `jsconfig.json` on first run and after version bumps. If you customise those files in place, your edits are preserved only until the bundled version string changes — then they're overwritten. Keep local customisations in separate files.
+- On a script's behalf, the runtime reads files only through `nexus.fs`, which refuses paths outside the scripts folder / the script's own folder and logs every read. It does write the bundled `<scriptsDir>/types/nexus-scripts.d.ts` + `jsconfig.json` when a script runs: the `.d.ts` is replaced whenever its first-line version marker differs from the bundled one, and `jsconfig.json` is restored on every run in which it differs from the bundled copy. Treat both as generated files — edits to them don't last.
 - **Scripts refuse to start in Restricted Mode.** Nexus Terminal declares `capabilities.untrustedWorkspaces.supported: false` and additionally hard-refuses every script-start command when `vscode.workspace.isTrusted === false`, with a **Manage Workspace Trust** button in the error message. Trust the workspace first.
 
 Bottom line: author your own scripts, or review scripts from others the same way you'd review a Bash script before running it.
@@ -894,7 +911,7 @@ Bottom line: author your own scripts, or review scripts from others the same way
 
 - **Manual-only launch.** Scripts can't be auto-triggered from terminal output today — that's tracked for a future version because the target use cases (firmware changes, config pushes) are deliberately destructive and deserve human intent.
 - **One script per session at a time.** Starting a second script on a busy session prompts you to stop the running one first. Running scripts on different sessions in parallel works fine.
-- **Desktop only.** The web variant of Nexus Terminal shows a friendly "not available in browser" message instead of registering the commands.
+- **Desktop only.** In the web variant of Nexus Terminal, the script commands only show a message that Nexus runtime features are unavailable in the web extension host.
 - **No static `import` declarations.** The script body runs as an async function body; a top-level `import`/`require` statement doesn't work. To split a script across files, use [`nexus.include()`](#modular-scripts--nexusinclude) — and note that an included file is always read from disk, so **save your library files before running**; unsaved editor changes are picked up for the entry script only. Dynamic `await import(...)` of Node builtins technically works but is unsupported — see [Security and trust](#security-and-trust).
 - **File access.** `nexus.fs` provides supported, read-only, scoped, logged reads; there is no write API. Anything beyond that runs with your full user permissions and is on you.
 

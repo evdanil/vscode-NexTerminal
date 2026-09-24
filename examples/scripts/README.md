@@ -14,19 +14,21 @@ Seven short, focused scripts that each demonstrate one facet of the scripting AP
 
 ## How to run an example
 
-1. Open a folder in VS Code and make sure you have an active SSH or Serial session in Nexus Terminal.
+1. Open a folder in VS Code and make sure you have an active Nexus Terminal session of the type the example's `@target-type` names — `ssh` for most of them, `serial` for 05 and 07.
 2. Copy one of these files into `.nexus/scripts/` inside your workspace (create the folder if it doesn't exist).
-3. `Cmd/Ctrl+Shift+P` → **Nexus: Run Nexus Script** → pick the script.
+3. `Cmd/Ctrl+Shift+P` → **Nexus: Run Nexus Script** → pick the script (with the example open in the editor, it runs that one), then the session.
 4. Watch progress in the **Nexus Scripts** Output Channel.
 
-The first time you invoke any script command, Nexus writes `types/nexus-scripts.d.ts` + `jsconfig.json` alongside your scripts so the editor gives autocomplete and JSDoc hovers for `expect`, `sendLine`, `poll`, etc.
+Every example assumes a session that is already open and sitting at a prompt — what **Run**, the Scripts view's ▶ quick-run and the CodeLens bind to — so most of them begin by pressing Enter (`sendLine("")`, or a `poll` that sends `\r` in 07). **Connect and Run Script…** on an SSH server starts the run before the host has printed its first prompt, so an opening `sendLine("")` there leaves a spare prompt that a later wait matches too early: remove it for that path. See [Match window semantics](../../docs/scripting.md#match-window-semantics).
+
+The first time you run a script, Nexus writes `types/nexus-scripts.d.ts` + `jsconfig.json` alongside your scripts so the editor gives autocomplete and JSDoc hovers for `expect`, `sendLine`, `poll`, etc.
 
 See [`docs/scripting.md`](../../docs/scripting.md) for the full user guide.
 
 ## A note about example-specific details
 
 - `01-hello.js` expects a POSIX-style shell prompt (`$` or `#`) and the `uname` command.
-- `05-poll-for-prompt.js` and `07-complete-procedure.js` use Cisco IOS XE-style prompts and commands; adapt the regexes to your hardware.
-- `02-if-branching.js` assumes you're initiating an `ssh user@jumphost` from an already-open shell — not running it on a jumphost itself.
+- `05-poll-for-prompt.js` and `07-complete-procedure.js` use Cisco IOS XE-style prompts (`Router#`, no trailing space) and commands; adapt the regexes to your hardware.
+- `02-if-branching.js` assumes you're initiating an `ssh user@jumphost` from an already-open shell — not running it on a jumphost itself — and that the jumphost's key is already known: a first connection's `continue connecting (yes/no/[fingerprint])?` question matches none of its patterns, so the wait times out. Answer it once by hand after checking the fingerprint.
 
 The patterns transfer directly to other devices; only the literal prompts and commands change.

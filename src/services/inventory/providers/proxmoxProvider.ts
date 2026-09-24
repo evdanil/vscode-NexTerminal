@@ -119,12 +119,12 @@ const PROXMOX_CONFIG_FIELDS: InventoryConfigField[] = [
       "What you open the PVE web UI at, WITH the port — PVE serves its API on 8006, so without it the request goes to 443 and finds nothing. Omit the port only when a reverse proxy fronts the cluster on 443 (a mount path in the URL is fine and is preserved)."
   },
   {
-    // The least-privilege recipe travels HERE rather than only in the README:
-    // this is where a user is staring at an empty token field. PVE splits the
-    // rights this provider needs across capabilities that do not imply one
-    // another, and the QEMU-agent privilege moved between PVE 8 and PVE 9 —
-    // naming both spellings is what keeps an addressless-guest report
-    // diagnosable from the field itself.
+    // The least-privilege recipe travels HERE rather than only in the user
+    // guide (docs/inventory/proxmox.md): this is where a user is staring at an
+    // empty token field. PVE splits the rights this provider needs across
+    // capabilities that do not imply one another, and the QEMU-agent privilege
+    // moved between PVE 8 and PVE 9 — naming both spellings is what keeps an
+    // addressless-guest report diagnosable from the field itself.
     id: "apiToken",
     label: "API Token",
     type: "password",

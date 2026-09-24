@@ -465,7 +465,7 @@ describe("createProxmoxProvider", () => {
     expect(provider.configFields.find((f) => f.id === "folderTemplate")?.placeholder).toBe(DEFAULT_FOLDER_TEMPLATE);
     // LABELS are hashed too, and this test's own title says so — leaving them
     // unpinned let a label revert pass the suite while the CHANGELOG, the
-    // README and the docs all asserted the new one AND the one-time credential
+    // user guide and the docs all asserted the new one AND the one-time credential
     // re-confirmation it costs. Same for the two field strings this release
     // rewrote, which the walkthrough quotes.
     const byId = (id: string) => provider.configFields.find((f) => f.id === id)!;

@@ -30,25 +30,29 @@ esbuild bundler, Vitest. Targets VS Code ^1.105 (Node 22 extension host,
 
 ## Build constraint: five bundles
 
-esbuild emits `dist/extension.js`, `dist/webExtension.js`, `dist/services/serial/serialSidecarWorker.js`, `dist/services/scripts/scriptWorker.js`, `dist/services/networkServers/networkServerDaemon.js`. A Node-only import reaching the browser graph breaks the web build. Worker/daemon bundles must not import `vscode` — **the build only half-enforces this**: `scriptWorker` lists `vscode` external, so the bad import bundles cleanly and fails only at runtime. When touching `scriptWorker.ts` or anything it imports, check by eye.
+esbuild emits `dist/extension.js`, `dist/webExtension.js`, `dist/services/serial/serialSidecarWorker.js`, `dist/services/scripts/scriptWorker.js`, `dist/services/networkServers/networkServerDaemon.js`. A Node-only import reaching the browser graph breaks the web build. Worker/daemon bundles must not import `vscode` — the build enforces this: each out-of-host bundle carries a plugin (`scripts/buildConfigs.mjs`) that stops the build naming the importing file, held to the real configuration by `test/unit/esbuildWorkerIsolation.test.ts`.
 
 ## Never do these
 
 - **Never put `[release]` on its own line in a commit message** — that exact line is the opt-in release trigger and publishes irreversibly to the Marketplace and Open VSX. Never write `[skip release]` (dead string, matches nothing). Two paths exist and they are not equal:
-  - The **merge commit** marker is the maintainer's own route (`auto-release.yml`, `docs/HANDOVER.md`) — legitimate, but never added on anyone else's initiative.
+  - The **merge commit** marker is the maintainer's own route (`auto-release.yml`) — legitimate, but never added on anyone else's initiative.
   - A **branch commit** must never carry it: a squash body carries branch commit body lines verbatim, so a marker written on a branch becomes a marker on the merge and releases something nobody asked to release.
   - When you are told to cut a release, push the `v{version}` tag — `release.yml` and `publish-openvsx.yml` trigger on it directly, so the job is done without writing the marker at all. Verify first: version matches the CHANGELOG's top heading, the tag does not already exist, CI on `main` is green.
+  - After a release, confirm that each publish job (Marketplace and Open VSX) succeeded and that both listing pages show the new version — the workflow's top-level green is not enough.
 - Don't bump `package.json` version on outside-contributor PRs (maintainer bumps on merge). Maintainer-authored change PRs do bump the patch version — **CI enforces it**: the `Version bump` check fails any PR whose version has not moved past `main`'s, because a later release onto an existing tag fails with an opaque "tag already exists". A docs-only or chore PR still needs the bump; it does not need a CHANGELOG entry if nothing a user can observe changed.
-- Don't commit: `.claude/`, `.specify/`, `docs/plans/`, `docs/superpowers/` (a few legacy files are still tracked — don't add new ones), `specs/` except `specs/001-scripting-support/contracts/script-api.d.ts`, `dist/`, `coverage/`, `*.vsix`, secrets or real hostnames.
+- Don't commit: `.claude/`, `.specify/`, `docs/plans/`, `docs/superpowers/`, `specs/` except `specs/001-scripting-support/contracts/script-api.d.ts`, `dist/`, `coverage/`, `*.vsix`, secrets or real hostnames.
 - No model identifiers in commit messages, PR text, or comments.
-- Don't edit published CHANGELOG entries (they ship inside installed VSIXs); corrections go in a new entry.
+- Never use `NODE_TLS_REJECT_UNAUTHORIZED` — it is process-global and the extension host is shared with every other installed extension; TLS opt-outs are per source.
+- Never dismiss CodeQL alerts on the maintainer's behalf.
+- Don't edit published CHANGELOG entries (they ship inside installed VSIXs); corrections go in a new entry that names the claims it replaces.
 - No new runtime dependency without discussion first — open an issue and justify it.
 
 ## Conventions
 
 - Conventional commit prefixes (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `perf:`, `chore:`, `ci:`); bodies explain the reasoning, not just the change.
+- Every change PR gets `@codex review`; merge only once its verdict is on the PR's current head commit (check the review's commit, not just "clean") — never before it returns.
 - Comments explain *why*, not *what*; a comment stating wrong reasoning is worse than none — update it when behavior changes.
-- User-facing changes: update `README.md` and `docs/functional-documentation.md` in the same PR; add a CHANGELOG entry. Update what is actually wrong or missing — do not pad a file with a line that documents nothing new, and say so in review if that is your conclusion.
+- User-facing changes: update the matching guide under `docs/` (and its one-line summary in `README.md` only if that summary changes) and `docs/functional-documentation.md` in the same PR; add a CHANGELOG entry. Update what is actually wrong or missing — do not pad a file with a line that documents nothing new, and say so in review if that is your conclusion.
 
 ## Shipping a user-facing change
 
@@ -58,7 +62,7 @@ Every rule here exists because it was broken and shipped. Work them explicitly a
 - **A refusal must name a remedy that can actually happen.** "Re-sync the source once it has an address" is a lie to a guest whose agent will never report one. If the remedy depends on a provider capability, make the message capability-aware, or state what is true and stop. Prefer an actionable notification (a button that runs the command) over prose describing a feature the reader then has to go find.
 - **Verify every exclusion from a sweep.** Renaming or removing a string across the codebase, anything you decide to leave gets its reason checked against the code path — never accepted from a summary or a plausible category ("that one is the other command's message"). Then pin it: see the absence rule below. *A stale "run Refresh Lab Status" toast reached Proxmox users this way, pointing at a command the same function had already run four lines later.*
 - **Reachability you create is yours.** "Pre-existing, out of scope" is a fair limit — unless your change is what made the data reachable. Rendering an unsanitized provider name into a modal that previously showed only counts is a defect you introduced, not one you inherited.
-- **Prose is part of the change.** When behaviour moves, grep the prose for claims about it: README, `docs/functional-documentation.md`, contract doc comments, and the WHY comments at each call site. A doc asserting the opposite of the code is how the next maintainer deletes a guard believing it pointless.
+- **Prose is part of the change.** When behaviour moves, grep the prose for claims about it: README, the user guides under `docs/` (index: `docs/README.md`), `docs/functional-documentation.md`, contract doc comments, and the WHY comments at each call site. A doc asserting the opposite of the code is how the next maintainer deletes a guard believing it pointless.
 - **Text from an inventory provider is untrusted.** It reaches confirmation dialogs and audit buffers. Sanitize where it *enters* a composed string (`flattenProviderText` and its neighbours in `src/models/inventory.ts`), never at the render site — a site that has to remember is a site that will forget. Never widen a character class without a test for what it must not break (ZWJ sequences, combining marks, the tag block).
 
 ## Testing standard (enforced)
@@ -81,8 +85,7 @@ Apply the broken implementation, confirm the test goes red, restore, report the 
 
 - `CLAUDE.md` — full architecture walkthrough (imports this file)
 - `CONTRIBUTING.md` — contribution bar and review expectations
-- `docs/HANDOVER.md` — maintainer's standing rules
-- `docs/release.md` — maintainer-only release checklist
+- `docs/README.md` — index of the user guides (one per feature) and the contributor references
 
 <!-- graft:start -->
 ## Graft — repo context graph

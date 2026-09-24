@@ -55,8 +55,8 @@ const NO_SOURCE_FOLLOW_GO_TO_TERMINAL_ACTION = "Go to Terminal Directory";
 const noSourceFollowNudgeShownServers = new Set<string>();
 
 /**
- * Byte-for-byte identical to the rc snippets documented in `README.md`'s
- * "Directory Sync (Follow Terminal Directory)" section and
+ * Byte-for-byte identical to the rc snippets documented in `docs/file-explorer.md`'s
+ * "Directory Sync" section and
  * `docs/functional-documentation.md`'s §4.4.2 — kept in sync deliberately so
  * "Show Me How" and the docs can never drift apart.
  *
