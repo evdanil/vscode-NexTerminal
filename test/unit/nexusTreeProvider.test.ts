@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as vscode from "vscode";
 import { FolderTreeItem, LocalShellProfileTreeItem, LocalShellSessionTreeItem, NexusTreeProvider, NoMatchesTreeItem, SerialProfileTreeItem, SerialSessionTreeItem, ServerTreeItem, SessionTreeItem } from "../../src/ui/nexusTreeProvider";
@@ -5,6 +7,10 @@ import { TUNNEL_DRAG_MIME } from "../../src/ui/dndMimeTypes";
 import type { LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile } from "../../src/models/config";
 import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
 import type { InventoryProvider } from "../../src/models/inventory";
+
+// Read for the "No matches found" tooltip check: the tooltip must name a command
+// the Hub's title bar really contributes, not a literal copied into this file.
+const packageJson = JSON.parse(readFileSync(path.resolve(__dirname, "..", "..", "package.json"), "utf8"));
 
 vi.mock("vscode", () => ({
   TreeItem: class {
@@ -440,6 +446,40 @@ describe("NexusTreeProvider folder contexts and filtering", () => {
     expect(marker.contextValue).toBeUndefined();
     expect(marker.command).toBeUndefined();
     expect(marker.collapsibleState).toBe(vscode.TreeItemCollapsibleState.None);
+  });
+
+  /**
+   * #153 — the tooltip is the row's only guidance, so the way out it names has
+   * to exist. "Filter Connectivity Hub" is only the input box's title; the
+   * palette entry is plain "Filter", so the old tooltip sent users hunting for
+   * a command that is not there. Checked against package.json rather than a
+   * literal: the tooltip must name the title of the command the Hub's own title
+   * bar shows while a filter is active. ⊘ Restoring the palette-style name
+   * fails the absence pin; ⊘ naming a button the title bar does not show fails
+   * the contribution cross-check.
+   */
+  it("names a way out of the filter that the Hub's title bar actually shows, not a palette command that does not exist", () => {
+    const provider = new NexusTreeProvider(callbacks);
+    provider.setSnapshot({
+      ...emptySnapshot(),
+      servers: [makeServer({ id: "s1", name: "Prod API", host: "prod.example" })]
+    });
+    provider.setFilter("zzz-no-match");
+    const marker = provider.getChildren(undefined)[0] as NoMatchesTreeItem;
+    const tooltip = String(marker.tooltip);
+
+    const titleMenus: Array<{ command: string; when?: string }> = packageJson.contributes.menus["view/title"];
+    const clearEntry = titleMenus.find(
+      (m) => m.when?.includes("view == nexusCommandCenter") && /(^|&&\s*)nexus\.filterActive\b/.test(m.when)
+    );
+    expect(clearEntry).toBeDefined();
+    const clearCommand = (packageJson.contributes.commands as Array<{ command: string; title: string }>).find(
+      (c) => c.command === clearEntry!.command
+    );
+    expect(clearCommand).toBeDefined();
+    expect(tooltip).toContain(clearCommand!.title);
+    expect(tooltip).not.toContain("Filter Connectivity Hub");
+    expect(tooltip).not.toMatch(/Run “Nexus:/);
   });
 
   it("shows no no-matches row while the filter still matches", () => {

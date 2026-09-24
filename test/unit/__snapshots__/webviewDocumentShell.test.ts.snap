@@ -10366,7 +10366,7 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
     Session Logging
   </label>
   
-  <div class="setting-desc">Log session transcripts for SSH and serial connections by default.</div>
+  <div class="setting-desc">Log session transcripts for SSH, telnet and serial connections by default.</div>
   <span class="save-indicator" aria-live="polite" data-for="nexus.logging.sessionTranscripts"></span>
 </div>
   <div class="form-group">
@@ -10838,7 +10838,7 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
 </div>
   <div class="form-group">
   <label for="setting-nexus-scripts-defaultTimeoutSeconds">Default Wait Timeout</label>
-  <div class="setting-desc">Used by waitFor / expect / waitAny when the call site does not pass its own timeout. Override per-script with the @default-timeout JSDoc tag.</div>
+  <div class="setting-desc">Used by waitFor / expect / waitAny / poll when the call site does not pass its own timeout (for poll, never less than its every interval). Override per-script with the @default-timeout JSDoc tag.</div>
   <div class="number-with-unit">
     <input type="number" id="setting-nexus-scripts-defaultTimeoutSeconds" data-section="nexus.scripts" data-key="defaultTimeoutSeconds" value="1" min="1" max="2147483" />
     <span class="unit-suffix">seconds</span>

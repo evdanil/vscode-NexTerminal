@@ -6,7 +6,7 @@ Everything the terminal layer gives an SSH tab it gives a telnet tab too — see
 
 ## Highlighting
 
-Configurable regex-based pattern highlighting for every Nexus terminal — SSH, telnet, serial, Local Shell and Local Server output. 22 built-in rules detect errors, warnings, status keywords, IPv4/MAC addresses, URLs, interface counters and more with inline ANSI colouring while respecting existing terminal colours.
+Configurable regex-based pattern highlighting for every Nexus session terminal — SSH, telnet, serial, Local Shell and Local Server output. 22 built-in rules detect errors, warnings, status keywords, IPv4/MAC addresses, URLs, interface counters and more with inline ANSI colouring while respecting existing terminal colours.
 
 The IPv6 and UUID rules ship **disabled** — those two patterns cost more than all the others combined — but stay in the list, ready to switch on with a per-row checkbox in the Rule Editor. Every rule can also carry its own label and description so the list stays readable without decoding regexes.
 
@@ -40,7 +40,7 @@ Customize terminal font family, size, and weight. Import color schemes from Moba
 
 ## Unread Activity
 
-Active SSH and serial sessions highlight unread terminal activity in the tree and prepend `●` to the terminal tab title until you focus that terminal again. See [Connectivity Hub](connectivity-hub.md).
+Active SSH, telnet and serial sessions highlight unread terminal activity in the tree and prepend `●` to the terminal tab title until you focus that terminal again. See [Connectivity Hub](connectivity-hub.md).
 
 ## Related settings
 

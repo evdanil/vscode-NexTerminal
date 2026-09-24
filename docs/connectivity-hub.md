@@ -38,7 +38,7 @@ Built-in filter to quickly search by name — servers also match on host, local 
 
 ## Unread Activity
 
-Active SSH and serial sessions highlight unread terminal activity in the tree and prepend `●` to the terminal tab title until you focus that terminal again.
+Active SSH, telnet and serial sessions highlight unread terminal activity in the tree and prepend `●` to the terminal tab title until you focus that terminal again.
 
 ## Settings Panel
 

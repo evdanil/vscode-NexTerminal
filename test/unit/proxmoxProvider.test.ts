@@ -422,6 +422,37 @@ describe("createProxmoxProvider", () => {
     expect(declared).not.toContain("…");
   });
 
+  /**
+   * #153 — WHERE Sys.Audit has to be granted is the half of the advice a user
+   * gets wrong. `/cluster/status` checks it on the root path `/`, and a grant on
+   * `/vms` (where the guest privileges go) does not satisfy it, so text that
+   * names only the privilege leaves that user with a token that passes Test
+   * Connection and still imports nodes without addresses — and the join-failure
+   * warning then tells them the cluster merely did not answer. Every surface
+   * that names the privilege names the path. ⊘ Restoring a path-less "and
+   * Sys.Audit to import cluster nodes" fails here; so does "on /vms".
+   */
+  it("names the root path wherever it names Sys.Audit — the token hint, the Include Cluster Nodes hint and the truncation remedy (⊘ a bare \"Sys.Audit\" sends the grant to /vms, where the cluster status read never looks)", () => {
+    const provider = createProxmoxProvider();
+    const byId = (id: string) => provider.configFields.find((f) => f.id === id)!;
+    const texts = {
+      apiToken: byId("apiToken").description ?? "",
+      includeNodes: byId("includeNodes").description ?? "",
+      remedy: resolveStatusTruncationRemedy(provider) ?? ""
+    };
+    for (const [where, text] of Object.entries(texts)) {
+      expect(text, where).toContain("Sys.Audit");
+      expect(text, where).toMatch(/Sys\.Audit on the root path \/(?!vms)/);
+      expect(text, where).not.toMatch(/Sys\.Audit (on|granted on) \/vms/);
+    }
+    // The two field hints are where the grant is typed from, so they also say
+    // which path does NOT count.
+    expect(texts.apiToken).toContain("not /vms");
+    expect(texts.includeNodes).toContain("not /vms");
+    expect(texts.apiToken).not.toContain("and Sys.Audit to import cluster nodes");
+    expect(texts.includeNodes).not.toContain("needs Sys.Audit for the node list");
+  });
+
   it("passes validateProviderShape — the same gate the registry applies at registration (⊘ a provider that only compiles still cannot be registered)", () => {
     expect(() => validateProviderShape(createProxmoxProvider())).not.toThrow();
   });
@@ -1757,6 +1788,12 @@ describe("createProxmoxProvider", () => {
       const warning = tree.warnings?.find((w) => w.includes("Cluster node status")) ?? "";
       expect(warning).toContain("Sys.Audit");
       expect(warning).toContain("last known running state");
+      // #153 — "if it has it, the cluster did not answer" is only true of a
+      // token holding the privilege WHERE the status read checks it; a user
+      // who granted it on /vms must not be told the failure was transient.
+      expect(warning).toMatch(/Sys\.Audit on the root path \/(?!vms)/);
+      expect(warning).toContain("/vms");
+      expect(warning).not.toContain("needs Sys.Audit for the node list;");
       // BOTH TITLES, and the retired one is not redundant. This hint has come
       // back twice; a pin that only knows the CURRENT title passes again the
       // day someone restores the old sentence verbatim, which is the shape the

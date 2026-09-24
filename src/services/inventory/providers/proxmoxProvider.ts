@@ -124,14 +124,18 @@ const PROXMOX_CONFIG_FIELDS: InventoryConfigField[] = [
     // empty token field. PVE splits the rights this provider needs across
     // capabilities that do not imply one another, and the QEMU-agent privilege
     // moved between PVE 8 and PVE 9 — naming both spellings is what keeps an
-    // addressless-guest report diagnosable from the field itself.
+    // addressless-guest report diagnosable from the field itself. Sys.Audit
+    // carries its PATH as well: /cluster/status checks it on `/`, while the
+    // guest privileges go on `/vms`, so a user granting it beside them gets a
+    // token that passes Test Connection and still imports nodes without
+    // addresses (#153).
     id: "apiToken",
     label: "API Token",
     type: "password",
     required: true,
     placeholder: "root@pam!nexus=8c1a4bb2-3d7f-4c22-9a51-e0f2b6c1d990",
     description:
-      "The FULL token credential in Proxmox's own one-line form: `<user@realm>!<tokenid>=<secret>` — Datacenter → API Tokens shows the id, and the secret is the value shown exactly once at creation; join them with `=`. The token needs at least VM.Audit; add VM.PowerMgmt for Start/Stop, VM.GuestAgent.Audit (PVE 9) or VM.Monitor (PVE 8) for VM addresses, and Sys.Audit to import cluster nodes."
+      "The FULL token credential in Proxmox's own one-line form: `<user@realm>!<tokenid>=<secret>` — Datacenter → API Tokens shows the id, and the secret is the value shown exactly once at creation; join them with `=`. The token needs at least VM.Audit; add VM.PowerMgmt for Start/Stop, VM.GuestAgent.Audit (PVE 9) or VM.Monitor (PVE 8) for VM addresses, and Sys.Audit on the root path / (not /vms) to import cluster nodes."
   },
   {
     // PVE's own grouping vocabulary. Status is deliberately NOT a placeholder:
@@ -217,7 +221,8 @@ const PROXMOX_CONFIG_FIELDS: InventoryConfigField[] = [
     // NODES ARE A SECOND CALL, not a row type on the guest listing: the
     // /cluster/resources node rows carry neither an address nor a name, so a
     // node import is only worth the extra request when the token can answer
-    // /cluster/status — which needs Sys.Audit, a capability the guest
+    // /cluster/status — which needs Sys.Audit on the root path `/` (not `/vms`,
+    // where the guest vocabulary is granted), a capability the guest
     // vocabulary never required.
     id: "includeNodes",
     label: "Include Cluster Nodes",
@@ -226,7 +231,7 @@ const PROXMOX_CONFIG_FIELDS: InventoryConfigField[] = [
     defaultValue: false,
     advanced: true,
     description:
-      "Also import the cluster's nodes as devices. The API token needs Sys.Audit for the node list and their addresses."
+      "Also import the cluster's nodes as devices. The API token needs Sys.Audit on the root path / (not /vms) for the node list and their addresses."
   },
   {
     // PER-SOURCE STATUS POLL — EVE-NG's field pattern, minus the
@@ -1838,7 +1843,7 @@ async function fetchInventoryImpl(
   // not a command to run: nothing re-reads the nodes but another sync.
   if (joinFailed) {
     warnings.push(
-      "Cluster node status could not be read — imported nodes arrived without addresses and keep their last known running state. The API token needs Sys.Audit for the node list; if it has it, the cluster did not answer this time and the next sync fills them in."
+      "Cluster node status could not be read — imported nodes arrived without addresses and keep their last known running state. The API token needs Sys.Audit on the root path / for the node list — a grant on /vms does not count; if it has it there, the cluster did not answer this time and the next sync fills them in."
     );
   }
   // A status-ONLY cap (the tree's device set is complete, but the report's
@@ -2456,7 +2461,7 @@ export function createProxmoxProvider(
     // failure modes themselves stay out of the string, because a remedy nobody
     // finishes reading is worse than a slightly over-confident one.
     statusTruncationRemedy:
-      "Two things can cut this short and the report does not say which: the Hard Cap (entries) that bounds the scan, and — with Include Cluster Nodes on — the cluster-status read, which needs Sys.Audit on the API token and can fail anyway.",
+      "Two things can cut this short and the report does not say which: the Hard Cap (entries) that bounds the scan, and — with Include Cluster Nodes on — the cluster-status read, which needs Sys.Audit on the root path / and can fail anyway.",
     instanceKey(config: InventorySourceValues): string | undefined {
       return proxmoxInstanceKey(config);
     },
