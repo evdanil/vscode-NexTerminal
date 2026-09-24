@@ -11,8 +11,8 @@ import type { InventorySourceConfig } from "../../src/models/inventory";
 
 /**
  * DEVICE TEMPLATES (issue #48 PR-T1) — §6.2 template deletion sweep, §8.4
- * removeAuthProfile template clause, storage round-trip, and A-M5 share
- * exclusion (fixtures 25, 26).
+ * removeAuthProfile template clause, storage round-trip, and the share export
+ * carrying templates with their sources (fixtures 25, 26).
  */
 
 function source(id: string, overrides: Partial<InventorySourceConfig> = {}): InventorySourceConfig {
@@ -175,10 +175,13 @@ describe("Fixture 26 — storage round-trip + share exclusion", () => {
     expect(core2.getServer("srv-1")?.origin?.templated?.multiplexing).toBe(false);
   });
 
-  it("the sanitized SHARE export carries no deviceTemplates bucket (A-M5, mirroring inventory sources)", () => {
-    const sanitized = sanitizeForSharing([], [], [], [], {}, [], []);
-    expect("deviceTemplates" in sanitized).toBe(false);
-    expect("inventorySources" in sanitized).toBe(false);
+  it("the sanitized SHARE export carries device templates beside the sources whose rules name them, under fresh ids (⊘ the former A-M5 exclusion, which dropped every rule on the recipient)", () => {
+    const sanitized = sanitizeForSharing([], [], [], [], {}, [], [], [source("s1", { templateRules: [{ id: "r1", templateId: "T" }] })], [
+      tmpl("T", { multiplexing: { mode: "override", value: true } })
+    ]);
+    expect(sanitized.deviceTemplates).toHaveLength(1);
+    expect(sanitized.deviceTemplates[0].id).not.toBe("T");
+    expect(sanitized.inventorySources[0].templateRules).toEqual([{ id: "r1", templateId: sanitized.deviceTemplates[0].id }]);
   });
 
   it("PR-T3 — a template carrying both IPMI id fields + a server's IPMI stamps survive a repository reload (fixture 26 / F)", async () => {

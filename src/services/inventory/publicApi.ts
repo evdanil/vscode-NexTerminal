@@ -118,7 +118,7 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  * deployment's device claim another deployment's kept server, stored credentials
  * included. Implementing `instanceKey` opts a provider back in; see its contract
  * in `models/inventory.ts`, in particular that the key is persisted and exported
- * in backups and must therefore never carry a secret.
+ * in backups and share files and must therefore never carry a secret.
  */
 export interface NexusExtensionApi {
   readonly contractVersion: 1;
