@@ -46,6 +46,7 @@ import {
 import { isLexicallyWithin, scriptFsDirname, type ScriptFsPlatform } from "./scriptFsScope";
 import {
   SCRIPT_INCLUDE_ROOT_ID,
+  makeScriptError,
   type IncludeLoadResult,
   type ScriptIncludeErrorCode
 } from "./scriptTypes";
@@ -228,7 +229,7 @@ function moduleRecordOf(state: ScriptIncludeState, moduleId: unknown): IncludeMo
     // the worker and main disagree about the module graph, and quietly
     // resolving against some other directory would turn a protocol violation
     // into a wrong-file read.
-    throw makeIncludeError(
+    throw makeScriptError(
       "IncludeInternal",
       `Unknown module id ${JSON.stringify(String(moduleId))} — this should never happen; please file an issue.`
     );
@@ -549,14 +550,6 @@ function failInclude(
   spec: { code?: string; message: string; extra?: Record<string, unknown> }
 ): Error {
   ctx.log(`include ${label} → ${code}${detail ? ` (${detail})` : ""}`);
-  return makeIncludeError(spec.code ?? code, spec.message, spec.extra);
+  return makeScriptError(spec.code ?? code, spec.message, spec.extra);
 }
 
-function makeIncludeError(code: string, message: string, extra?: Record<string, unknown>): Error & { code: string } {
-  // Extras go TOP-LEVEL, not nested under `.extra`: `extraFieldsOf` in
-  // scriptRuntimeManager.ts hoists every own enumerable property except
-  // code/message/stack/name, and the worker's `reviveError` spreads them back
-  // onto the revived Error — so `err.cycle` / `err.depth` / `err.maxModules`
-  // round-trip script-side exactly as the d.ts promises.
-  return Object.assign(new Error(message), { code }, extra) as Error & { code: string };
-}

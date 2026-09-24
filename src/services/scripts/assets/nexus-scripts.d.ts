@@ -1,19 +1,22 @@
-// Nexus Scripts API types — v7
+// Nexus Scripts API types — v8
 /**
  * Nexus Terminal — Scripts API
  *
  * Authoritative TypeScript declarations for the Nexus script runtime API.
  *
- * This file is the single source of truth. At build time it is copied to
- *   src/services/scripts/assets/nexus-scripts.d.ts
- * and at first script-command invocation in a workspace it is written to
- *   <workspaceRoot>/<nexus.scripts.path>/types/nexus-scripts.d.ts
+ * The repository keeps two byte-identical copies —
+ *   src/services/scripts/assets/nexus-scripts.d.ts (bundled with the extension)
+ *   specs/001-scripting-support/contracts/script-api.d.ts
+ * — and a unit test holds them together. The first time a script is run, the
+ * bundled copy is written to
+ *   <scripts folder>/types/nexus-scripts.d.ts
  * alongside a generated jsconfig.json so VS Code provides IntelliSense, JSDoc
- * hovers, and inline checking on every script file.
+ * hovers, and inline checking on every script file. It is rewritten whenever
+ * the version on its first line changes.
  *
- * Every API call below is async and only resolves after the runtime has
- * acknowledged the operation against the bound session (or rejected it on
- * timeout / disconnection / cancellation).
+ * Every function below except the `log` methods is async: its Promise settles
+ * once the runtime has handled the call against the bound session. What a
+ * timeout or a dropped session does is stated per function.
  */
 
 export {};
@@ -29,9 +32,17 @@ declare global {
   interface Match {
     /** Full matched text. */
     text: string;
-    /** Regex capture groups (empty array for string patterns). */
+    /**
+     * Regex capture groups (empty array for string patterns). An optional group
+     * that did not take part in the match is `""`.
+     */
     groups: string[];
-    /** Bytes between the previous cursor position and the match. */
+    /**
+     * Output from the start of the scan window up to the match: everything since
+     * the previous match (for the run's first match, everything received since
+     * the run started), plus any `lookback` characters. Characters, with ANSI
+     * escape sequences already removed.
+     */
     before: string;
   }
 
@@ -45,8 +56,18 @@ declare global {
      */
     timeout?: number;
     /**
-     * Number of bytes of recent output to scan on the first attempt.
-     * Defaults to 1024 on the very first wait of the run, 0 thereafter.
+     * Characters of already-consumed output — before the cursor, which sits at
+     * the end of the previous match — to include in this wait's scan window.
+     * Default 0.
+     *
+     * The script's buffer starts empty when the run starts: output printed
+     * before that is never in it, and no `lookback` can reach it (re-elicit a
+     * prompt with `sendLine("")` or `poll` instead). Until the first match the
+     * cursor is at the start, so the window is already the whole buffer;
+     * `lookback` matters on later waits, e.g. `lookback: 4096` to match a
+     * prompt an earlier wait already consumed. Only a match moves the cursor —
+     * a `waitFor` that times out leaves it where it was. The buffer keeps the
+     * most recent 65,536 characters; no window reaches further back than that.
      */
     lookback?: number;
   }
@@ -78,14 +99,22 @@ declare global {
    * Polling specification for `poll`.
    */
   interface PollOptions {
-    /** Text to send each tick, or a function invoked each tick. */
-    send: string | (() => Promise<void>);
-    /** Pattern that ends the poll loop on first match. */
+    /**
+     * Text sent at the start of every tick, e.g. `"\r"`. A string only: a
+     * function cannot be passed to the runtime and makes `poll` reject. For
+     * custom work between checks, loop `sendLine` + `waitFor` yourself.
+     */
+    send: string;
+    /** Pattern that ends the poll on its first match. */
     until: string | RegExp;
-    /** Tick interval in milliseconds. */
-    every: number;
-    /** Total wall-clock budget for the poll, in milliseconds. */
-    timeout: number;
+    /** Tick interval in milliseconds. Default 1000; minimum 50. */
+    every?: number;
+    /**
+     * Total wall-clock budget for the poll, in milliseconds. Defaults to the
+     * script's default wait timeout (`@default-timeout`, else the
+     * `nexus.scripts.defaultTimeoutSeconds` setting); never less than `every`.
+     */
+    timeout?: number;
   }
 
   /**
@@ -94,7 +123,10 @@ declare global {
   interface PromptOptions {
     /** Pre-fill the input box with this string. */
     default?: string;
-    /** When true, masks input characters and excludes the value from the script log. */
+    /**
+     * When true, masks the characters as they are typed. The runtime never
+     * writes a prompt's value to the Output Channel, masked or not.
+     */
     password?: boolean;
   }
 
@@ -105,25 +137,26 @@ declare global {
     /** Stable session id (matches `ActiveSession.id` in NexusCore). */
     id: string;
     /** Underlying transport. */
-    type: "ssh" | "serial" | "local";
+    type: "ssh" | "telnet" | "serial" | "local";
     /** User-visible session name (terminal title). */
     name: string;
-    /** The id of the source profile (server id for SSH, profile id for serial/local shell). */
+    /** The id of the source profile: the server id for SSH and Telnet, the profile id for Serial and Local Shell. */
     targetId: string;
   }
 
   /**
    * Macro coordination handles. All operations are scoped to the script's bound session.
+   * Awaiting them is optional: calls are applied in the order they are made.
    */
   interface MacroControl {
     /** Allow the named macro(s) to fire on this session for the rest of the run. */
-    allow(name: string | string[]): void;
+    allow(name: string | string[]): Promise<void>;
     /** Block the named macro(s) from firing on this session for the rest of the run. */
-    deny(name: string | string[]): void;
+    deny(name: string | string[]): Promise<void>;
     /** Block all macros on this session (matches the default `suspend-all` policy). */
-    disableAll(): void;
+    disableAll(): Promise<void>;
     /** Restore the policy that was active when the script started. */
-    restore(): void;
+    restore(): Promise<void>;
   }
 
   /**
@@ -141,7 +174,8 @@ declare global {
   // ---------------------------------------------------------------------------
 
   /**
-   * Wait for the first occurrence of `pattern` in the session output.
+   * Wait for the first occurrence of `pattern` in session output not yet
+   * consumed by an earlier match (see `WaitOptions.lookback`).
    * Returns the match on success, `null` on timeout.
    *
    * @example
@@ -158,6 +192,7 @@ declare global {
 
   /**
    * Wait for the first of several patterns to match. Resolves with the index of the matching pattern and the match details.
+   * Throws a `TimeoutError` if none matches within the timeout.
    */
   function waitAny(patterns: Array<string | RegExp>, opts?: WaitOptions): Promise<WaitAnyMatch>;
 
@@ -177,7 +212,8 @@ declare global {
   function sendKey(key: ControlKey): Promise<void>;
 
   /**
-   * Send text (or invoke a callback) on a fixed cadence until `until` matches or `timeout` elapses.
+   * Send `opts.send` every `opts.every` ms until `opts.until` matches (resolves
+   * with the match) or `opts.timeout` elapses (throws a `TimeoutError`).
    */
   function poll(opts: PollOptions): Promise<Match>;
 
@@ -226,7 +262,7 @@ declare global {
   const macros: MacroControl;
 
   /**
-   * Read-only metadata about the bound session.
+   * Read-only metadata about the bound session. Set before the script's first statement runs.
    */
   const session: ScriptSession;
 
@@ -235,28 +271,41 @@ declare global {
   // ---------------------------------------------------------------------------
 
   /**
-   * Thrown by `expect` when the pattern does not appear within the timeout.
+   * Thrown by `expect`, `waitAny` and `poll` when nothing matches within the
+   * timeout (`waitFor` resolves `null` instead).
    * Catch with `catch (e) { if (e.code === "Timeout") ... }`.
    */
   interface TimeoutError extends Error {
     code: "Timeout";
+    /**
+     * The pattern as the Output Channel shows it: a string pattern JSON-quoted
+     * (`"\"login:\""`), a regex as `/source/flags`. For `waitAny`, every
+     * pattern, joined with ` | `.
+     */
     pattern: string;
+    /** The timeout that applied, in milliseconds. */
     timeoutMs: number;
+    /** How long the call waited, in milliseconds. */
     elapsedMs: number;
   }
 
   /**
-   * Thrown by any pending wait/send/poll when the bound session disconnects.
+   * Thrown into a pending `waitFor`, `expect`, `waitAny` or `poll` when the
+   * bound session disconnects (`waitFor` rejects rather than resolving `null`).
+   * `send` / `sendLine` / `sendKey` do not throw it. A script waiting in
+   * `prompt`, `confirm`, `alert`, `sleep`, `nexus.fs` or `nexus.include` is not
+   * interrupted with it. About 150 ms after the disconnect the run is stopped
+   * wherever it is, so keep `catch` / `finally` work short.
    */
   interface ConnectionLostError extends Error {
     code: "ConnectionLost";
+    /** Id of the session that disconnected — the same value as `session.id`. */
     sessionId: string;
   }
 
   /**
-   * Thrown when the user dismissed an alert/confirm/prompt that was modal-required.
-   * Cancellation of `confirm` resolves to `false`; cancellation of `prompt` resolves to `""`;
-   * `alert` cannot be cancelled. This error type is reserved for future expansion.
+   * Reserved: no API throws this today. Cancelling `confirm` resolves `false`,
+   * cancelling `prompt` resolves `""`, and `alert` has only an OK button.
    */
   interface CancelledError extends Error {
     code: "Cancelled";
@@ -282,9 +331,10 @@ declare global {
         | "NoScriptDir" | "InvalidPath" | "ReadFailed" | "InvalidJson";
     /**
      * Present when `code === "FileTooLarge"`. The file's size in bytes as
-     * observed at read time — a LOWER BOUND when the true size could not be
-     * determined (a file that grew past the cap mid-read, or a provider that
-     * under-reported its size, reports the cap + 1).
+     * observed at read time. When a local file's size could not be trusted (it
+     * grew past the cap mid-read, or its reported size was wrong), this is the
+     * cap + 1 — a LOWER BOUND. On a remote filesystem whose reported size was
+     * wrong, it is the number of bytes actually received.
      */
     sizeBytes?: number;
     /**

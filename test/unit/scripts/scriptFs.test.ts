@@ -339,8 +339,9 @@ describe("scriptFsReadText — size cap (file: scheme, bounded native read — P
     // TOP-LEVEL sizeBytes/maxBytes, not nested under `.extra` — this is what
     // the docs and the d.ts promise (`err.sizeBytes`), and what
     // scriptRuntimeManager.ts's extraFieldsOf/reviveError round-trip expects
-    // to find as plain own properties on the error. ⊘ makeFsError nesting
-    // these fields under a property literally named "extra". (This file is
+    // to find as plain own properties on the error. ⊘ nexus.fs's error
+    // factory nesting these fields under a property literally named "extra"
+    // (it now builds them with the shared `makeScriptError`). (This file is
     // exactly maxBytes + 1, so it can't tell apart "reported the true size"
     // from "reported the maxBytes+1 floor" — see the next test for that.)
     await expect(scriptFsReadText("over.bin", ctx)).rejects.toMatchObject({

@@ -215,14 +215,15 @@ interface Harness {
   scriptUri: { fsPath: string; scheme: string; path: string; toString: () => string };
 }
 
-async function createHarness(scriptSource: string): Promise<Harness> {
+async function createHarness(scriptSource: string, sessionOverrides: Partial<ActiveSession> = {}): Promise<Harness> {
   const pty = makeTestPty();
   const session: ActiveSession = {
     id: "test-session",
     serverId: "srv1",
     terminalName: "test-terminal",
     startedAt: Date.now(),
-    pty
+    pty,
+    ...sessionOverrides
   };
   const core = makeMockCore(session);
   const output: string[] = [];
@@ -582,6 +583,50 @@ describe("ScriptRuntimeManager — unit fakes", () => {
     });
   });
 
+  it("a Telnet run's `session` is type \"telnet\" with the server id as targetId, exactly like SSH", async () => {
+    // ⊘ choosing targetId on `type === "ssh"` alone: a telnet session is an
+    // ActiveSession too, but it fell through to the `profileId` branch — a
+    // field ActiveSession does not have — so `session.targetId` was undefined
+    // in every telnet run.
+    const h = await createHarness(`/**\n * @nexus-script\n * @target-type telnet\n */\n`, { protocol: "telnet" });
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    const load = h.worker.posted.find((m) => m.kind === "load") as unknown as {
+      session: { id: string; type: string; name: string; targetId: string };
+    };
+    expect(load.session).toEqual({
+      id: "test-session",
+      type: "telnet",
+      name: "test-terminal",
+      targetId: "srv1"
+    });
+  });
+
+  it("header warnings (unknown tag, duplicate field) are written to the Output Channel when the run starts — and a clean header writes none", async () => {
+    // ⊘ collecting `header.warnings` and never reading them: a misspelt tag
+    // (`@lock-inputs`) silently did nothing, and the duplicate `@name` was
+    // dropped without a word, although the scripting guide promises both a
+    // warning in the Output Channel.
+    const h = await createHarness(
+      `/**\n * @nexus-script\n * @name First\n * @name Second\n * @lock-inputs\n */\n`
+    );
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    const warnings = h.output.filter((l) => l.includes("header warning:"));
+    expect(warnings).toHaveLength(2);
+    // ⊘ logging them before the run's `start (…)` line: they belong to THIS
+    // run, and a warning above its start line reads as the previous run's tail.
+    const startIndex = h.output.findIndex((l) => l.includes("start ("));
+    const firstWarningIndex = h.output.findIndex((l) => l.includes("header warning:"));
+    expect(startIndex).toBeGreaterThanOrEqual(0);
+    expect(firstWarningIndex).toBeGreaterThan(startIndex);
+    expect(warnings.some((l) => l.includes("First@test-terminal") && l.includes("header warning: unknown tag @lock-inputs"))).toBe(true);
+    expect(warnings.some((l) => l.includes("header warning: duplicate field @name; keeping first occurrence"))).toBe(true);
+
+    const clean = await createHarness(`/**\n * @nexus-script\n * @name Clean\n * @lock-input\n */\n`);
+    await clean.manager.runScript(clean.scriptUri as never, "test-session");
+    expect(clean.output.some((l) => l.includes("start ("))).toBe(true);
+    expect(clean.output.some((l) => l.includes("header warning:"))).toBe(false);
+  });
+
   it("rejects explicit sessions whose type does not match @target-type", async () => {
     const vscode = await import("vscode");
     const h = await createLocalHarness(`/**\n * @nexus-script\n * @target-type ssh\n */\n`);
@@ -630,6 +675,128 @@ describe("ScriptRuntimeManager — unit fakes", () => {
     expect(startLine).toMatch(/FromEditor@/);
 
     (vscode.workspace as unknown as { textDocuments: unknown[] }).textDocuments = [];
+  });
+});
+
+// -----------------------------------------------------------------------------
+// Runtime error fields — the wire shape `reviveError` spreads onto the error a
+// script catches. `rpc-result.error.extra` must hold the documented fields
+// DIRECTLY: the worker does `Object.assign(err, { code }, extra)`, so whatever
+// is one level down here is one level down on the script's error too.
+// -----------------------------------------------------------------------------
+
+describe("ScriptRuntimeManager — documented error fields arrive top-level", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  type ErrorResult = { ok: boolean; error?: { code: string; message: string; extra?: Record<string, unknown> } };
+
+  async function rpcError(h: Harness, id: number): Promise<ErrorResult> {
+    await waitFor(
+      () => h.worker.posted.some((m) => m.kind === "rpc-result" && (m as { id: number }).id === id),
+      2_000
+    );
+    return h.worker.posted.find(
+      (m) => m.kind === "rpc-result" && (m as { id: number }).id === id
+    ) as unknown as ErrorResult;
+  }
+
+  // ⊘ (all four) building these errors with a nested `{ extra: {...} }`
+  // property: extraFieldsOf collected the single key literally named "extra",
+  // so a script's `err.pattern` / `err.elapsedMs` / `err.sessionId` were
+  // undefined and the values sat under `err.extra` — which the contract never
+  // mentions. The guide's own catch block printed "timed out on undefined
+  // after undefinedms".
+
+  /**
+   * Fire the pending wait's timer only after the wall clock has jumped 5 s past
+   * the moment the wait started. A MEASURED `elapsedMs` is then at least 5000 —
+   * deterministically different from the nominal timeout, from 0 and from a
+   * missing field, with no real-time sleeping to flake on. (Not pinned to an
+   * exact value: whether a method arms its timer before or after the jump is a
+   * microtask-ordering detail, not the contract.) Only setTimeout/Date are
+   * faked: the harness's waitFor polls on setImmediate.
+   */
+  function expectTimeoutFields(result: ErrorResult, pattern: string, timeoutMs: number): void {
+    expect(result.ok).toBe(false);
+    expect(result.error?.code).toBe("Timeout");
+    // Exactly these three keys: nothing nested under `extra`, nothing missing.
+    expect(Object.keys(result.error?.extra ?? {}).sort()).toEqual(["elapsedMs", "pattern", "timeoutMs"]);
+    expect(result.error?.extra).toMatchObject({ pattern, timeoutMs });
+    expect(result.error?.extra?.elapsedMs).toBeGreaterThanOrEqual(5_000);
+  }
+
+  async function timeOutAfterClockJump(h: Harness, rpc: WorkerOutbound, timerMs: number): Promise<ErrorResult> {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const startedAt = Date.now();
+      h.worker.emit(rpc);
+      vi.setSystemTime(startedAt + 5_000);
+      await vi.advanceTimersByTimeAsync(timerMs);
+      return await rpcError(h, (rpc as { id: number }).id);
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  it("expect's Timeout carries pattern / timeoutMs / a MEASURED elapsedMs", async () => {
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    const result = await timeOutAfterClockJump(h, { kind: "rpc", id: 1, method: "expect", args: ["NEVER", { timeout: 30 }] }, 30);
+    expectTimeoutFields(result, '"NEVER"', 30);
+  });
+
+  it("waitAny's Timeout carries the joined pattern label / timeoutMs / a MEASURED elapsedMs", async () => {
+    // ⊘ also: reporting the nominal timeout as elapsedMs (30 here), which the
+    // d.ts's "how long the call waited" does not describe.
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    const result = await timeOutAfterClockJump(
+      h,
+      { kind: "rpc", id: 1, method: "waitAny", args: [["A-NEVER", /B-NEVER/], { timeout: 30 }] },
+      30
+    );
+    expectTimeoutFields(result, '"A-NEVER" | /B-NEVER/', 30);
+  });
+
+  it("poll's Timeout carries pattern / timeoutMs / a MEASURED elapsedMs", async () => {
+    // ⊘ also: reporting the nominal timeout as elapsedMs (60 here). The jump
+    // passes the whole budget, so the loop exits after its first tick.
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    const result = await timeOutAfterClockJump(
+      h,
+      { kind: "rpc", id: 1, method: "poll", args: [{ send: "\r", until: "NEVER", every: 50, timeout: 60 }] },
+      50
+    );
+    expectTimeoutFields(result, '"NEVER"', 60);
+  });
+
+  it("ConnectionLost carries sessionId", async () => {
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    h.worker.emit({ kind: "rpc", id: 1, method: "waitFor", args: ["NEVER", { timeout: 60_000 }] });
+    await waitNextTick();
+    h.core.removeSession();
+    h.core.emitChange();
+    const result = await rpcError(h, 1);
+    expect(result.error?.code).toBe("ConnectionLost");
+    expect(result.error?.extra).toEqual({ sessionId: "test-session" });
+  });
+
+  it("a Stopped rejection carries no extra fields at all", async () => {
+    // ⊘ assigning the fields as `{ code, extra }` even when there are none —
+    // the old makeError did — which gives the error an own `extra: undefined`
+    // key: extraFieldsOf ships it, and the script's caught error grows an
+    // `extra` property the contract never mentions.
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    h.worker.emit({ kind: "rpc", id: 1, method: "waitFor", args: ["NEVER", { timeout: 60_000 }] });
+    await h.manager.stopScript("test-session");
+    const result = await rpcError(h, 1);
+    expect(result.error?.code).toBe("Stopped");
+    expect(result.error?.extra).toBeUndefined();
   });
 });
 
@@ -1095,7 +1262,7 @@ describe("ScriptRuntimeManager — nexus.include plumbing", () => {
 
   it("a CircularInclude's `cycle` array arrives as a TOP-LEVEL extra field, ready for reviveError to spread onto err.cycle", async () => {
     // ⊘ building include errors with a nested `{ extra: {...} }` property (the
-    // manager's own local `makeError` shape): extraFieldsOf would then collect
+    // shape Timeout/ConnectionLost had before `makeScriptError`): extraFieldsOf would then collect
     // a single key literally named "extra", and the worker's reviveError would
     // spread THAT — so a script's `err.cycle` would be undefined and
     // `err.extra.cycle` would hold the array the docs promise directly.

@@ -21,7 +21,13 @@ import {
   humanizeStack,
   measureAsyncFunctionLineOffset
 } from "./scriptModuleLoader";
-import { SCRIPT_INCLUDE_ROOT_ID, type IncludeLoadResult, type WorkerInbound, type WorkerOutbound } from "./scriptTypes";
+import {
+  SCRIPT_INCLUDE_ROOT_ID,
+  makeScriptError,
+  type IncludeLoadResult,
+  type WorkerInbound,
+  type WorkerOutbound
+} from "./scriptTypes";
 
 if (!parentPort) {
   throw new Error("scriptWorker.ts must be loaded as a worker_threads Worker, not a standalone script.");
@@ -70,11 +76,13 @@ function rpc<T = unknown>(method: string, args: unknown[]): Promise<T> {
   });
 }
 
-/** Rebuild an Error on the worker side so user try/catch sees .code / .message. */
+/**
+ * Rebuild an Error on the worker side so user try/catch sees `.code`,
+ * `.message` and every documented field — with the same `makeScriptError` the
+ * main thread threw it with, so the two ends cannot drift apart.
+ */
 function reviveError(info: { code: string; message: string; extra?: Record<string, unknown> }): Error {
-  const err = new Error(info.message);
-  Object.assign(err, { code: info.code }, info.extra ?? {});
-  return err;
+  return makeScriptError(info.code, info.message, info.extra);
 }
 
 parentPort.on("message", (msg: WorkerInbound) => {

@@ -177,6 +177,18 @@ function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
   });
 }
 
+/**
+ * Resolve once the run has a wait in flight. `beginOp` publishes
+ * `currentOperation` in the same synchronous dispatch that registers the wait
+ * as rejectable, so a disconnect after this is guaranteed to reach it. A fixed
+ * sleep instead races the worker's cold start: disconnect before the wait is
+ * registered and there is nothing to reject — the worker is simply terminated
+ * and the script's `catch` never runs.
+ */
+function waitForPendingWait(manager: ScriptRuntimeManager): Promise<void> {
+  return waitFor(() => manager.getRuns()[0]?.currentOperation?.kind === "wait", 5_000);
+}
+
 describe("ScriptRuntimeManager — end-to-end integration", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -256,8 +268,8 @@ describe("ScriptRuntimeManager — end-to-end integration", () => {
     });
 
     await manager.runScript(scriptUri as never, "test-session");
-    // Let the expect register its subscription, then simulate disconnection.
-    await new Promise((r) => setTimeout(r, 200));
+    // Let the expect register, then simulate disconnection.
+    await waitForPendingWait(manager);
     core.removeSession();
     core.emitChange();
     await waitFor(() => logs.some((l) => l.startsWith("caught:")), 3_000);
@@ -357,7 +369,7 @@ describe("ScriptRuntimeManager — end-to-end integration", () => {
       if (e.kind === "ended") endEvents.push(e as never);
     });
     await manager.runScript({ fsPath: tmpFile } as never, "test-session");
-    await new Promise((r) => setTimeout(r, 200)); // let waitAny register
+    await waitForPendingWait(manager); // let waitAny register
     const before = Date.now();
     core.removeSession();
     core.emitChange();
@@ -365,6 +377,54 @@ describe("ScriptRuntimeManager — end-to-end integration", () => {
     const elapsed = Date.now() - before;
     expect(elapsed).toBeLessThan(1_000); // fast — not the 60s timeout
     expect(logs.some((l) => l === "caught:ConnectionLost")).toBe(true);
+    await fs.unlink(tmpFile).catch(() => {});
+  }, 10_000);
+
+  it("(h) a REVIVED Timeout / ConnectionLost (real worker round-trip) carries pattern / timeoutMs / elapsedMs / sessionId directly on the caught error, with no `extra` wrapper", async () => {
+    // ⊘ the manager building these errors with a nested `{ extra: {...} }`
+    // property: through dispatchRpc → extraFieldsOf → rpc-result → the REAL
+    // worker's reviveError, the script's `err.elapsedMs` was undefined and the
+    // values sat under `err.extra` — the guide's catch block printed
+    // "timed out on undefined after undefinedms".
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const tmpFile = path.join(os.tmpdir(), `nexus-script-errfields-${Date.now()}.js`);
+    await fs.writeFile(
+      tmpFile,
+      [
+        "/**",
+        " * @nexus-script",
+        " */",
+        "try { await expect(\"NEVER\", { timeout: 100 }); } catch (e) {",
+        "  log.info(\"timeout:\" + JSON.stringify({ code: e.code, pattern: e.pattern, timeoutMs: e.timeoutMs, elapsed: typeof e.elapsedMs, wrapped: \"extra\" in e }));",
+        "}",
+        "try { await waitFor(\"NEVER\", { timeout: 60_000 }); } catch (e) {",
+        "  log.info(\"lost:\" + JSON.stringify({ code: e.code, sessionId: e.sessionId, wrapped: \"extra\" in e }));",
+        "}",
+        ""
+      ].join("\n"),
+      "utf8"
+    );
+
+    const { manager, core } = runtimeFixture("basic-expect-send.js");
+    const logs: string[] = [];
+    manager.onDidChangeRun((e) => {
+      if (e.kind === "log") logs.push(e.text);
+    });
+    await manager.runScript({ fsPath: tmpFile } as never, "test-session");
+    await waitFor(() => logs.some((l) => l.startsWith("timeout:")), 3_000);
+    // Drop the session under the second wait once it is registered.
+    await waitForPendingWait(manager);
+    core.removeSession();
+    core.emitChange();
+    await waitFor(() => logs.some((l) => l.startsWith("lost:")), 3_000);
+
+    expect(logs).toContain(
+      `timeout:${JSON.stringify({ code: "Timeout", pattern: '"NEVER"', timeoutMs: 100, elapsed: "number", wrapped: false })}`
+    );
+    expect(logs).toContain(
+      `lost:${JSON.stringify({ code: "ConnectionLost", sessionId: "test-session", wrapped: false })}`
+    );
     await fs.unlink(tmpFile).catch(() => {});
   }, 10_000);
 });

@@ -21,7 +21,7 @@ import {
   scriptIncludeLoad,
   type ScriptIncludeState
 } from "./scriptInclude";
-import { SCRIPT_INCLUDE_ROOT_ID } from "./scriptTypes";
+import { SCRIPT_INCLUDE_ROOT_ID, makeScriptError } from "./scriptTypes";
 import type {
   FailureReason,
   FinalState,
@@ -78,7 +78,7 @@ export interface WorkerLike {
 
 interface PendingRpc {
   resolve: (value: unknown) => void;
-  reject: (reason: { code: string; message: string; extra?: Record<string, unknown> }) => void;
+  reject: (reason: Error & { code: string }) => void;
   cancel(): void;
 }
 
@@ -314,6 +314,11 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     record.state = "running";
     this.emit({ kind: "started", run: this.toSnapshot(record) });
     this.logEvent(record, `start (session: ${record.sessionName}, ${record.sessionType})`);
+    // Not fatal (the run goes ahead), but the only place a misspelt tag or a
+    // shadowed duplicate is ever reported — without this it silently does nothing.
+    for (const warning of header.warnings) {
+      this.logEvent(record, `header warning: ${warning}`);
+    }
     // Seed the worker's `session` global in the same message that loads the
     // user source so it is defined before the script's first statement runs.
     record.worker.postMessage({
@@ -326,8 +331,11 @@ export class ScriptRuntimeManager implements vscode.Disposable {
         id: target.session.id,
         type: target.type,
         name: target.session.terminalName,
+        // A telnet session is a server-profile session like SSH (both live in
+        // `activeSessions`), so its target is the server id, not a profileId
+        // it does not have.
         targetId:
-          target.type === "ssh"
+          target.type === "ssh" || target.type === "telnet"
             ? (target.session as ActiveSession).serverId
             : (target.session as ActiveSerialSession | ActiveLocalShellSession).profileId
       }
@@ -344,12 +352,13 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       record.worker.terminate().then(() => true),
       new Promise<boolean>((resolve) => setTimeout(() => resolve(false), graceMs))
     ]);
-    this.rejectAllPending(record, {
-      code: "Stopped",
-      message: record.stopReason === "max-runtime-exceeded"
-        ? "Script stopped — max runtime exceeded"
-        : "Script stopped by user"
-    });
+    this.rejectAllPending(
+      record,
+      makeScriptError(
+        "Stopped",
+        record.stopReason === "max-runtime-exceeded" ? "Script stopped — max runtime exceeded" : "Script stopped by user"
+      )
+    );
     if (!terminated) {
       this.logEvent(record, "warning: worker did not terminate within grace");
     }
@@ -362,7 +371,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
   public dispose(): void {
     for (const run of Array.from(this.runs.values())) {
       run.stopReason = "extension-deactivating";
-      this.rejectAllPending(run, { code: "Stopped", message: "Extension deactivating" });
+      this.rejectAllPending(run, makeScriptError("Stopped", "Extension deactivating"));
       void run.worker.terminate();
       this.cleanupRun(run, "stopped");
     }
@@ -649,7 +658,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       case "sendKey": {
         const key = String(args[0] ?? "").toLowerCase();
         const bytes = CONTROL_KEY_BYTES[key];
-        if (!bytes) throw makeError("InvalidKey", `Unknown control key: ${key}`);
+        if (!bytes) throw makeScriptError("InvalidKey", `Unknown control key: ${key}`);
         record.writeBack(bytes);
         return undefined;
       }
@@ -698,7 +707,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       case "include.load":
         return scriptIncludeLoad(args[0], args[1], this.fsContextFor(record), record.includeState);
       default:
-        throw makeError("UnknownMethod", `Unknown script RPC method: ${method}`);
+        throw makeScriptError("UnknownMethod", `Unknown script RPC method: ${method}`);
     }
   }
 
@@ -721,10 +730,11 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     }
     this.endOp(record, "timeout");
     if (throwOnTimeout) {
-      throw makeError("Timeout", `expect timed out after ${Date.now() - startedAt}ms waiting for ${patternLabel}`, {
+      const elapsedMs = Date.now() - startedAt;
+      throw makeScriptError("Timeout", `expect timed out after ${elapsedMs}ms waiting for ${patternLabel}`, {
         pattern: patternLabel,
         timeoutMs,
-        elapsedMs: Date.now() - startedAt
+        elapsedMs
       });
     }
     return null;
@@ -739,6 +749,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     const patternLabel = patterns.map(patternToLabel).join(" | ");
     const opLabel = `waitAny ${patternLabel}`;
     this.beginOp(record, "wait", opLabel);
+    const startedAt = Date.now();
     const buffer = record.outputBuffer;
     const attemptAny = (): { index: number; match: Match } | null => {
       for (let i = 0; i < patterns.length; i++) {
@@ -754,10 +765,10 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       return hit;
     }
     this.endOp(record, "timeout");
-    throw makeError("Timeout", `waitAny timed out after ${timeoutMs}ms waiting for ${patternLabel}`, {
+    throw makeScriptError("Timeout", `waitAny timed out after ${timeoutMs}ms waiting for ${patternLabel}`, {
       pattern: patternLabel,
       timeoutMs,
-      elapsedMs: timeoutMs
+      elapsedMs: Date.now() - startedAt
     });
   }
 
@@ -765,14 +776,17 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     const every = Math.max(50, Number(opts?.every ?? 1000));
     const timeout = Math.max(every, Number(opts?.timeout ?? record.defaultTimeoutMs));
     const pattern = opts?.until;
-    if (!pattern) throw makeError("InvalidArgs", "poll requires `until` pattern");
+    if (!pattern) throw makeScriptError("InvalidArgs", "poll requires `until` pattern");
     const label = `poll every=${every}ms until ${patternToLabel(pattern)}`;
     this.beginOp(record, "poll", label);
-    const deadline = Date.now() + timeout;
+    const startedAt = Date.now();
+    const deadline = startedAt + timeout;
     const sendOnTick = async (): Promise<void> => {
       const s = opts?.send;
+      // There is no function form: a function `send` never arrives here,
+      // because the worker's `rpc()` rejects the whole call when postMessage
+      // cannot clone it. A missing or other non-string `send` sends nothing.
       if (typeof s === "string") record.writeBack(s);
-      // Function-form for `send` is worker-side; not reachable via structured clone.
     };
     while (Date.now() < deadline) {
       await sendOnTick();
@@ -785,10 +799,10 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       }
     }
     this.endOp(record, "timeout");
-    throw makeError("Timeout", `poll timed out after ${timeout}ms waiting for ${patternToLabel(pattern)}`, {
+    throw makeScriptError("Timeout", `poll timed out after ${timeout}ms waiting for ${patternToLabel(pattern)}`, {
       pattern: patternToLabel(pattern),
       timeoutMs: timeout,
-      elapsedMs: timeout
+      elapsedMs: Date.now() - startedAt
     });
   }
 
@@ -874,7 +888,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
         record.pendingRpcs.delete(rpcKey);
         resolve(v);
       };
-      const doReject = (e: { code: string; message: string; extra?: Record<string, unknown> }): void => {
+      const doReject = (e: Error & { code: string }): void => {
         if (resolved) return;
         resolved = true;
         clearTimeout(timer);
@@ -918,11 +932,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       return;
     }
     record.connectionLostSignaled = true;
-    this.rejectAllPending(record, {
-      code: "ConnectionLost",
-      message: "Session disconnected",
-      extra: { sessionId: record.sessionId }
-    });
+    this.rejectAllPending(record, makeScriptError("ConnectionLost", "Session disconnected", { sessionId: record.sessionId }));
     // Give the user script a brief grace period to run its catch/finally block
     // and emit any final log messages before we force-terminate.
     const graceMs = 150;
@@ -933,10 +943,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     }, graceMs);
   }
 
-  private rejectAllPending(
-    record: RunningScriptRecord,
-    error: { code: string; message: string; extra?: Record<string, unknown> }
-  ): void {
+  private rejectAllPending(record: RunningScriptRecord, error: Error & { code: string }): void {
     for (const entry of record.pendingRpcs.values()) {
       entry.reject(error);
     }
@@ -1028,14 +1035,7 @@ function friendlyTargetType(type: ScriptTargetType): string {
   return "Local Shell";
 }
 
-function makeError(
-  code: string,
-  message: string,
-  extra?: Record<string, unknown>
-): { code: string; message: string; extra?: Record<string, unknown> } & Error {
-  return Object.assign(new Error(message), { code, extra });
-}
-
+/** Every own field of a thrown error except the ones `reviveError` rebuilds itself. */
 function extraFieldsOf(err: unknown): Record<string, unknown> | undefined {
   if (err && typeof err === "object") {
     const e = err as Record<string, unknown>;
@@ -1047,7 +1047,6 @@ function extraFieldsOf(err: unknown): Record<string, unknown> | undefined {
       any = true;
     }
     if (any) return extra;
-    if (e.extra && typeof e.extra === "object") return e.extra as Record<string, unknown>;
   }
   return undefined;
 }
