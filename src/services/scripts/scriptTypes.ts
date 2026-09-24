@@ -1,7 +1,8 @@
 /**
- * Shared types for the Nexus Scripts subsystem.
+ * Shared types for the Nexus Scripts subsystem, plus the few helpers both
+ * threads need.
  *
- * Pure types — no vscode imports so this file is safe for the worker bundle too.
+ * No vscode imports (no imports at all) so this file is safe for the worker bundle too.
  */
 
 export type RunState =
@@ -180,6 +181,26 @@ export interface IncludeLoadResult {
    * treats "cached but no entry" as `IncludeInternal`.
    */
   cached: boolean;
+}
+
+/**
+ * Build a coded script error with its fields TOP-LEVEL — the one shape the RPC
+ * error path depends on, used at both ends of it.
+ *
+ * On the main thread, `dispatchRpc` ships every own field of a thrown error
+ * except code/message/stack/name as the rpc-result's `extra`; in the worker,
+ * `reviveError` rebuilds the error with this same function, spreading `extra`
+ * back on. So a field given here as `{ sessionId }` is `err.sessionId` in the
+ * script, as the d.ts documents. Nested under a property named `extra` it would
+ * arrive as `err.extra.sessionId` with `err.sessionId` undefined — which is how
+ * `Timeout` and `ConnectionLost` shipped until the manager started using this.
+ */
+export function makeScriptError(
+  code: string,
+  message: string,
+  fields?: Record<string, unknown>
+): Error & { code: string } {
+  return Object.assign(new Error(message), { code }, fields);
 }
 
 /** IPC frame sent from main → worker. */

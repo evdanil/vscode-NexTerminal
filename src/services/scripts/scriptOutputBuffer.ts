@@ -18,7 +18,6 @@ export interface ScriptOutputBufferOptions {
 }
 
 const DEFAULT_CAPACITY = 65_536;
-const DEFAULT_FIRST_LOOKBACK = 1_024;
 
 export class ScriptOutputBuffer {
   private readonly capacity: number;
@@ -27,7 +26,6 @@ export class ScriptOutputBuffer {
   public writeHead = 0;
   /** Total-text position the next scan starts from. */
   public cursor = 0;
-  private firstScan = true;
   private readonly subscribers = new Set<() => void>();
 
   public constructor(opts: ScriptOutputBufferOptions = {}) {
@@ -46,9 +44,10 @@ export class ScriptOutputBuffer {
   }
 
   public scan(pattern: string | RegExp, opts: ScanOptions = {}): Match | null {
-    const defaultLookback = this.firstScan ? DEFAULT_FIRST_LOOKBACK : 0;
-    const lookback = opts.lookback ?? defaultLookback;
-    this.firstScan = false;
+    // No first-wait special case is needed: the cursor stays at 0 until the
+    // first match, so until then every window already starts at the oldest
+    // retained character, whatever `lookback` is.
+    const lookback = opts.lookback ?? 0;
 
     const bufferStartPosition = this.writeHead - this.text.length;
     const desiredStartPosition = Math.max(

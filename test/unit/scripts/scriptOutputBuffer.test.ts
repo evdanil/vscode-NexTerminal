@@ -29,16 +29,36 @@ describe("ScriptOutputBuffer", () => {
     expect(lost).toBeNull();
   });
 
-  it("first scan uses 1024-byte default lookback, subsequent scans use 0", () => {
+  it("first scan sees the whole buffer, subsequent scans start at the cursor (lookback 0)", () => {
     const buf = new ScriptOutputBuffer();
     buf.append("ABC");
-    // First scan — lookback default 1024 sees the whole buffer
+    // First scan — the cursor is still at 0, so the window is the whole buffer
     const first = buf.scan(/ABC/);
     expect(first).not.toBeNull();
     buf.advanceCursor(first!.endPosition);
     // Second scan — lookback default 0, cursor past "ABC", no new bytes: no match
     const second = buf.scan(/ABC/);
     expect(second).toBeNull();
+  });
+
+  it("the first scan covers the WHOLE retained buffer — not the last 1024 characters — and lookback reaches back exactly N characters from the cursor", () => {
+    // ⊘ a first-wait window limited to "the last 1 KB of output", which is
+    // what the shipped d.ts promised: a prompt that arrived more than 1024
+    // characters before the first wait would be missed. The window's start is
+    // `max(oldest retained, cursor - lookback)`, and the cursor is 0 until the
+    // first match, so the first wait always sees everything the run received.
+    const buf = new ScriptOutputBuffer();
+    buf.append("LOGIN: " + "x".repeat(5_000));
+    const first = buf.scan(/LOGIN: /);
+    expect(first?.text).toBe("LOGIN: ");
+    expect(first?.before).toBe("");
+    buf.advanceCursor(first!.endPosition);
+
+    // Later scans start at the cursor; `lookback: N` re-includes exactly the N
+    // characters before it — 6 is one short of re-reaching "LOGIN: ".
+    expect(buf.scan(/LOGIN: /)).toBeNull();
+    expect(buf.scan(/LOGIN: /, { lookback: 6 })).toBeNull();
+    expect(buf.scan(/LOGIN: /, { lookback: 7 })?.text).toBe("LOGIN: ");
   });
 
   it("respects per-call lookback override", () => {

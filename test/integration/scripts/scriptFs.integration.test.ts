@@ -258,7 +258,7 @@ describe("nexus.fs — end-to-end integration", () => {
   }, 10_000);
 
   it("(d) a REVIVED FileTooLarge error (real worker round-trip through dispatchRpc → extraFieldsOf → rpc-result → reviveError) carries sizeBytes/maxBytes as top-level properties, not nested under .extra", async () => {
-    // ⊘ makeFsError nesting extra fields under a property literally named
+    // ⊘ nexus.fs's error factory nesting extra fields under a property literally named
     // "extra" — would round-trip through the real RPC wire format as
     // err.extra.sizeBytes, contradicting docs/scripting.md and the d.ts,
     // which both promise err.sizeBytes / err.maxBytes directly. This exercises

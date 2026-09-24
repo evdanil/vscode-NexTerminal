@@ -2,7 +2,7 @@ import * as nodeFs from "node:fs/promises";
 import * as vscode from "vscode";
 import { ReadSlotScheduler } from "./readSlotScheduler";
 import { resolveScriptFsPathFrom, safeStringify, type ScriptFsScope } from "./scriptFsScope";
-import type { ScriptFsErrorCode } from "./scriptTypes";
+import { makeScriptError, type ScriptFsErrorCode } from "./scriptTypes";
 
 /**
  * Which entry point an audit line (and a refusal) is filed under.
@@ -555,7 +555,7 @@ function withGuardedLog(ctx: ScriptFsContext, logAllowed: () => boolean): Script
  */
 function readDeadlineError(ctx: ScriptFsContext, method: ScriptFsAuditMethod, loggedPath: string): Error {
   const message = `${loggedPath}: timed out after ${SCRIPT_FS_READ_TIMEOUT_MS / 1000}s`;
-  return ctx.isAborted() ? makeFsError("ReadFailed", message) : fail(ctx, method, loggedPath, "ReadFailed", message);
+  return ctx.isAborted() ? makeScriptError("ReadFailed" satisfies ScriptFsErrorCode, message) : fail(ctx, method, loggedPath, "ReadFailed", message);
 }
 
 /**
@@ -850,25 +850,6 @@ function isNotFoundStatError(err: unknown): boolean {
   return typeof code === "string" && NOT_FOUND_STAT_CODES.has(code);
 }
 
-/**
- * Local error factory — deliberately not `scriptRuntimeManager.ts`'s
- * `makeError` to avoid a manager → scriptFs import cycle. Same shape so
- * `extra` rides the existing `reviveError` channel — TOP-LEVEL, not nested
- * under an `.extra` property: `scriptRuntimeManager.ts`'s `extraFieldsOf`
- * collects every own-enumerable property except `code`/`message`/`stack`/
- * `name` into the RPC error's `extra` object, and the worker's `reviveError`
- * spreads that back onto the revived Error — so a field placed here as a
- * plain top-level property (e.g. `sizeBytes`) round-trips as
- * `err.sizeBytes` script-side, matching the docs and the d.ts. Nesting it
- * under a property literally named `extra` would round-trip as
- * `err.extra.sizeBytes` instead (double-wrapped: `extraFieldsOf` would
- * collect the single own property named `"extra"`, then `reviveError`'s
- * spread puts that whole object back under `err.extra`).
- */
-function makeFsError(code: ScriptFsErrorCode, message: string, extra?: Record<string, unknown>): Error & { code: string } {
-  return Object.assign(new Error(message), { code }, extra) as Error & { code: string };
-}
-
 function fail(
   ctx: ScriptFsContext,
   method: ScriptFsAuditMethod,
@@ -878,7 +859,8 @@ function fail(
   extra?: Record<string, unknown>
 ): Error {
   ctx.log(`${auditVerb(method)} ${loggedPath} → ${code}`);
-  return makeFsError(code, message, extra);
+  // `extra` goes on TOP-LEVEL (`err.sizeBytes`) — see `makeScriptError`.
+  return makeScriptError(code, message, extra);
 }
 
 /**

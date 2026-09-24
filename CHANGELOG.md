@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.8.241] — 2026-09-24
+
+### Fixed
+
+- **A script that catches a timeout or a dropped connection can now read the details it was promised.** On a `Timeout` error, `err.pattern`, `err.timeoutMs` and `err.elapsedMs` were always `undefined`, and so was `err.sessionId` on a `ConnectionLost` — the values sat under an undocumented `err.extra` instead, so a handler like the one in the scripting guide printed "timed out on undefined after undefinedms". They are now on the error itself, as documented, and `err.extra` is gone; a script that worked around the bug by reading `err.extra` should read the fields directly. `err.elapsedMs` is also now the time the call actually waited for `waitAny` and `poll`, as it already was for `expect`, instead of a copy of the timeout.
+
+- **Scripts run on a Telnet session get the right `session` details.** `session.targetId` was `undefined` on a Telnet session; it is now the server's id, the same as on SSH. `session.type` was already `"telnet"` there, and the editor's script types now say so, so `session.type === "telnet"` no longer shows as an error.
+
+- **Typos in a script's header are reported instead of silently ignored.** An unknown tag (a misspelt `@lock-inputs`, say) or a repeated field (only the first `@name` counts) now writes a warning to the **Nexus Scripts** Output Channel when the script starts. The script still runs.
+
+- **Autocomplete and hover help in script files now match what scripts actually do.** The corrected type definitions replace the copy in your scripts folder the next time you run a script. `poll`'s `send` is a string only — a function was never accepted and made `poll` fail — and its `every` and `timeout` are optional, with their real defaults. `lookback` is described as it works: the first wait already sees everything received since the run started, and output printed before the run started is out of reach whatever the `lookback`. The `macros` calls return promises, `waitAny` and `poll` are documented as throwing on timeout, and `ConnectionLost` is documented as interrupting waits only.
+
 ## [2.8.239] — 2026-09-24
 
 ### Fixed
