@@ -298,9 +298,10 @@ const IPMI_PASSWORD_VAR_RE = new RegExp(`\\b(?:${IPMI_PASSWORD_ENV_VARS.join("|"
 function macroMayReadIpmiPasswordEnv(text: string): boolean {
   return shellSegments(text).some((words) => {
     const segment = words.map((word) => word.raw).join(" ");
+    const args = ipmitoolArguments(words);
     return (
       IPMI_PASSWORD_VAR_RE.test(segment) ||
-      (ipmitoolArguments(words) === undefined ? usesIpmiTokens(segment) : commandReadsIpmiEnv(segment))
+      (args === undefined ? usesIpmiTokens(segment) : passesEnvFlag(args))
     );
   });
 }

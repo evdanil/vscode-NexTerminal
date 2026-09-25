@@ -1300,6 +1300,10 @@ describe("ipmiCredentialsOffNote — fires only where something reads the passwo
     expect(hint(" ipmitool -H ${profile.ipmiHost} -a sel list | grep -E Critical\n")).toBeUndefined();
   });
 
+  it("does not count a redirection target as an ipmitool flag in the credentials hint", () => {
+    expect(hint(" ipmitool -H ${profile.ipmiHost} -a >-E\n")).toBeUndefined();
+  });
+
   it("does not treat a quoted here-document body as an executable command", () => {
     expect(
       hint(" ipmitool -H ${profile.ipmiHost} -a sol activate\ncat <<'EOF'\nipmitool -E\nEOF\n")
