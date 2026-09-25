@@ -109,12 +109,14 @@ describe("scriptTypesGenerator.ensureWorkspaceScriptTypes", () => {
     expect(fsState.files.has("/globalStorage/scripts/types/nexus-scripts.d.ts")).toBe(true);
   });
 
-  it("v8 → v9 (the waitFor example): a workspace holding the OLD real v8 header is rewritten to the new bundled content on the next run", async () => {
+  it("v9 → v10 (the FileTooLarge.sizeBytes note): a workspace holding the OLD real v9 header is rewritten to the new bundled content on the next run", async () => {
     // ⊘ shipping new d.ts content (adding nexus.fs / NexusApi in v4, the fixed
     // 30-second deadline in v5, the configurable read cap in v6,
     // nexus.include + module/exports in v7, the v8 corrections — telnet
     // in `session.type`, `poll.send` string-only, the real `lookback`
-    // semantics — then v9's waitFor example without a top-level `return`)
+    // semantics — v9's waitFor example without a top-level `return`, then
+    // v10's `FileTooLarge.sizeBytes` note saying which case applies in a
+    // remote window rather than contrasting "local" with "remote")
     // without bumping BUNDLED_DTS_VERSION_HEADER to match —
     // existing users' seeded copies
     // would keep comparing equal to the (un-bumped) constant and never get
@@ -128,17 +130,17 @@ describe("scriptTypesGenerator.ensureWorkspaceScriptTypes", () => {
     fsState.files.set(
       "/workspace/.nexus/scripts/types/nexus-scripts.d.ts",
       new TextEncoder().encode(
-        "// Nexus Scripts API types — v8\ndeclare function expect(x: unknown): Promise<unknown>;\n"
+        "// Nexus Scripts API types — v9\ndeclare function expect(x: unknown): Promise<unknown>;\n"
       )
     );
     fsState.files.set("/workspace/.nexus/scripts/jsconfig.json", new TextEncoder().encode(BUNDLED_JSCONFIG));
 
-    expect(BUNDLED_DTS_VERSION_HEADER).toBe("// Nexus Scripts API types — v9");
+    expect(BUNDLED_DTS_VERSION_HEADER).toBe("// Nexus Scripts API types — v10");
     await ensureWorkspaceScriptTypes(scriptsDir("/workspace/.nexus/scripts"), getAssets);
 
     const dts = new TextDecoder().decode(fsState.files.get("/workspace/.nexus/scripts/types/nexus-scripts.d.ts")!);
     expect(dts).toBe(BUNDLED_DTS);
-    expect(dts.startsWith("// Nexus Scripts API types — v9")).toBe(true);
+    expect(dts.startsWith("// Nexus Scripts API types — v10")).toBe(true);
   });
 
   it("leaves an existing jsconfig.json alone — edits to it survive later runs, a d.ts upgrade included (#155)", async () => {

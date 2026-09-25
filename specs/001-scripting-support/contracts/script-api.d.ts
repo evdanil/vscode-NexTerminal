@@ -1,4 +1,4 @@
-// Nexus Scripts API types — v9
+// Nexus Scripts API types — v10
 /**
  * Nexus Terminal — Scripts API
  *
@@ -335,10 +335,15 @@ declare global {
         | "NoScriptDir" | "InvalidPath" | "ReadFailed" | "InvalidJson";
     /**
      * Present when `code === "FileTooLarge"`. The file's size in bytes as
-     * observed at read time. When a local file's size could not be trusted (it
-     * grew past the cap mid-read, or its reported size was wrong), this is the
-     * cap + 1 — a LOWER BOUND. On a remote filesystem whose reported size was
-     * wrong, it is the number of bytes actually received.
+     * observed at read time. When the script is a `file:` path — on your
+     * local machine, or on the remote host in an ordinary Remote-SSH, WSL or
+     * Codespaces window, where Nexus runs on that host — and the file's size
+     * could not be trusted (it grew past the cap mid-read, or its reported
+     * size was wrong), this is the cap + 1 — a LOWER BOUND. When the script's
+     * URI has any other scheme (`vscode-remote:` when `remote.extensionKind`
+     * makes Nexus run on your local machine in a remote window, or a file
+     * system another extension provides) and the reported size was wrong, it
+     * is the number of bytes actually received.
      */
     sizeBytes?: number;
     /**
