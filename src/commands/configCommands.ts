@@ -308,16 +308,17 @@ const SETTINGS_KEY_SET = new Set(SETTINGS_KEYS.map(({ section, key }) => `${sect
  * here instead of silently broadening the share format.
  */
 export const SHARE_SETTINGS_POLICY: Readonly<Record<string, "share" | "local">> = Object.freeze({
-  // Logging preferences that do not enable capture or name a local directory.
+  // Capture, retention caps, and the destination are local privacy/disk policy.
   "nexus.logging.sessionTranscripts": "local",
   "nexus.logging.sessionLogDirectory": "local",
-  "nexus.logging.maxFileSizeMb": "share",
-  "nexus.logging.maxRotatedFiles": "share",
+  "nexus.logging.maxFileSizeMb": "local",
+  "nexus.logging.maxRotatedFiles": "local",
   "nexus.logging.terminalOutputTrace": "local",
 
-  // Portable SSH behavior; host trust is this machine's security decision.
-  "nexus.ssh.multiplexing.enabled": "share",
-  "nexus.ssh.multiplexing.idleTimeout": "share",
+  // Connection pooling changes which sessions share a transport, so that
+  // isolation choice stays local; timeouts and terminal preferences travel.
+  "nexus.ssh.multiplexing.enabled": "local",
+  "nexus.ssh.multiplexing.idleTimeout": "local",
   "nexus.ssh.trustNewHosts": "local",
   "nexus.ssh.connectionTimeout": "share",
   "nexus.ssh.keepaliveInterval": "share",
@@ -325,8 +326,8 @@ export const SHARE_SETTINGS_POLICY: Readonly<Record<string, "share" | "local">> 
   "nexus.ssh.terminalType": "share",
   "nexus.ssh.proxyTimeout": "share",
 
-  // Tunnel operation is portable; the listener address belongs to this host.
-  "nexus.tunnel.defaultConnectionMode": "share",
+  // Tunnel connection reuse/isolation and listener address belong to this host.
+  "nexus.tunnel.defaultConnectionMode": "local",
   "nexus.tunnel.defaultBindAddress": "local",
   "nexus.tunnel.socks5HandshakeTimeout": "share",
 
@@ -336,32 +337,35 @@ export const SHARE_SETTINGS_POLICY: Readonly<Record<string, "share" | "local">> 
   "nexus.terminal.keyboardPassthrough": "share",
   "nexus.terminal.passthroughKeys": "share",
 
-  // SFTP behavior is portable; enabling sudo or retaining its password is not.
+  // Cache freshness and one-shot operation timeouts travel. Memory budgets,
+  // background polling/watch mode, recursive-delete ceilings, and sudo policy
+  // are local because they control this host's workload or safety boundaries.
   "nexus.sftp.cacheTtlSeconds": "share",
-  "nexus.sftp.maxCacheEntries": "share",
-  "nexus.sftp.autoRefreshInterval": "share",
-  "nexus.sftp.remoteWatchMode": "share",
-  "nexus.sftp.maxOpenFileSizeMB": "share",
+  "nexus.sftp.maxCacheEntries": "local",
+  "nexus.sftp.autoRefreshInterval": "local",
+  "nexus.sftp.remoteWatchMode": "local",
+  "nexus.sftp.maxOpenFileSizeMB": "local",
   "nexus.sftp.operationTimeout": "share",
   "nexus.sftp.commandTimeout": "share",
-  "nexus.sftp.deleteDepthLimit": "share",
-  "nexus.sftp.deleteOperationLimit": "share",
+  "nexus.sftp.deleteDepthLimit": "local",
+  "nexus.sftp.deleteOperationLimit": "local",
   "nexus.sftp.sudo.enabled": "local",
   "nexus.sftp.sudo.rememberPasswordForSession": "local",
 
-  // Highlighting rules are portable user preferences. Global auto-trigger is
-  // local because imported macros must not gain a new automatic execution path.
+  // Highlighting rules are portable user preferences. Macro activation,
+  // cooldown, and prompt context are local automation safeguards.
   "nexus.terminal.highlighting.enabled": "share",
   "nexus.terminal.macros.autoTrigger": "local",
-  "nexus.terminal.macros.defaultCooldown": "share",
-  "nexus.terminal.macros.bufferLength": "share",
+  "nexus.terminal.macros.defaultCooldown": "local",
+  "nexus.terminal.macros.bufferLength": "local",
 
-  // Serial/script resource limits are portable; paths and automation policy are not.
+  // Wait-time preference travels. Script watchdog/read budgets, paths, and
+  // automation policy stay with the recipient's machine.
   "nexus.serial.rpcTimeout": "share",
   "nexus.scripts.path": "local",
   "nexus.scripts.defaultTimeoutSeconds": "share",
-  "nexus.scripts.maxRuntimeSeconds": "share",
-  "nexus.scripts.maxReadSizeMb": "share",
+  "nexus.scripts.maxRuntimeSeconds": "local",
+  "nexus.scripts.maxReadSizeMb": "local",
   "nexus.scripts.macroPolicy": "local",
   "nexus.settingsGuard.enabled": "local",
 
@@ -401,7 +405,7 @@ export const SHARE_SETTINGS_POLICY: Readonly<Record<string, "share" | "local">> 
   // is consumed only by backup migration and is deliberately never shared.
   "nexus.terminal.highlighting.rules": "share",
   "nexus.scripts.defaultTimeout": "share",
-  "nexus.scripts.maxRuntimeMs": "share",
+  "nexus.scripts.maxRuntimeMs": "local",
   "nexus.inventory.statusPollSeconds": "local"
 });
 
