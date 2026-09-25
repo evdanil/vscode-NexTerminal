@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { Duplex } from "node:stream";
 import type { SFTPWrapper } from "ssh2";
-import type { ServerConfig } from "../../src/models/config";
+import type { ServerConfig, Socks5Proxy } from "../../src/models/config";
 import type { SecretVault, SshConnection } from "../../src/services/ssh/contracts";
 import { ProxiedSshConnection, jumpHostCleanup, socketCleanup } from "../../src/services/ssh/proxiedSshConnection";
 import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
@@ -427,6 +427,7 @@ describe("ProxySshFactory", () => {
     // Target auth gets it alongside the proxy sockFactory.
     expect(authFactory.connect).toHaveBeenNthCalledWith(2, targetServer, {
       sockFactory: expect.any(Function),
+      route: expect.any(Function),
       onAuthMessage
     });
   });
@@ -456,6 +457,7 @@ describe("ProxySshFactory", () => {
     expect(authFactory.connect).toHaveBeenNthCalledWith(1, jumpServer, { onAuthMessage });
     expect(authFactory.connect).toHaveBeenNthCalledWith(2, targetServer, {
       sockFactory: expect.any(Function),
+      route: expect.any(Function),
       onAuthMessage
     });
   });
@@ -472,8 +474,13 @@ describe("ProxySshFactory", () => {
 
     expect(authFactory.connect).toHaveBeenCalledWith(server, {
       sockFactory: expect.any(Function),
+      route: expect.any(Function),
       onAuthMessage
     });
+    // The route is the endpoint of the very proxy object the sockFactory dials.
+    const { proxyEndpointRoute } = await import("../../src/services/ssh/proxySshFactory");
+    const { route } = (authFactory.connect as ReturnType<typeof vi.fn>).mock.calls[0][1] as { route: () => string };
+    expect(route()).toBe(proxyEndpointRoute(server.proxy as Socks5Proxy));
   });
 
   it("wraps a SOCKS5 proxy-tunnel failure with proxy provenance so it classifies `proxy`, not `tcp` (PR #67 round 4)", async () => {
@@ -552,7 +559,7 @@ describe("ProxySshFactory", () => {
     // Stream should be paused to prevent banner data loss
     expect(tunnelStream.pause).toHaveBeenCalled();
     // Then connected to target with a sockFactory (not a raw sock)
-    expect(authFactory.connect).toHaveBeenCalledWith(targetServer, { sockFactory: expect.any(Function) });
+    expect(authFactory.connect).toHaveBeenCalledWith(targetServer, { sockFactory: expect.any(Function), route: expect.any(Function) });
     // Result should be a ProxiedSshConnection
     expect(connection).toBeInstanceOf(ProxiedSshConnection);
   });
@@ -662,7 +669,7 @@ describe("ProxySshFactory", () => {
 
     expect(authFactory.connect).toHaveBeenCalledTimes(2);
     expect(authFactory.connect).toHaveBeenNthCalledWith(1, jumpServer);
-    expect(authFactory.connect).toHaveBeenNthCalledWith(2, targetServer, { sockFactory: expect.any(Function) });
+    expect(authFactory.connect).toHaveBeenNthCalledWith(2, targetServer, { sockFactory: expect.any(Function), route: expect.any(Function) });
     expect(jumpConn.openDirectTcp).toHaveBeenCalledWith("target.example.com", 22);
 
     targetLease.dispose();
@@ -829,7 +836,7 @@ describe("ProxySshFactory", () => {
     expect(authFactory.connect).toHaveBeenCalledTimes(3);
     expect(authFactory.connect).toHaveBeenNthCalledWith(1, jumpServer);
     expect(authFactory.connect).toHaveBeenNthCalledWith(2, jumpServer);
-    expect(authFactory.connect).toHaveBeenNthCalledWith(3, targetServer, { sockFactory: expect.any(Function) });
+    expect(authFactory.connect).toHaveBeenNthCalledWith(3, targetServer, { sockFactory: expect.any(Function), route: expect.any(Function) });
     expect(proxiedJumpConn.openDirectTcp).toHaveBeenCalledWith("target.example.com", 22);
 
     targetLease.dispose();
@@ -880,7 +887,7 @@ describe("ProxySshFactory", () => {
 
     expect(authFactory.connect).toHaveBeenCalledTimes(3);
     expect(authFactory.connect).toHaveBeenCalledWith(jumpServer);
-    expect(authFactory.connect).toHaveBeenCalledWith(targetServer, { sockFactory: expect.any(Function) });
+    expect(authFactory.connect).toHaveBeenCalledWith(targetServer, { sockFactory: expect.any(Function), route: expect.any(Function) });
     expect(fallbackJumpConn.openDirectTcp).toHaveBeenCalledWith("target.example.com", 22);
 
     targetLease.dispose();
