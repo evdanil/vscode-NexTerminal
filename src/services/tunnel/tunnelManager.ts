@@ -5,6 +5,7 @@ import { resolveTunnelType } from "../../models/config";
 import { normalizeBoundedNumber } from "../../utils/helpers";
 import { isFatalToSshConnection } from "../ssh/channelErrors";
 import type { SshConnection, SshFactory } from "../ssh/contracts";
+import { getSshNetworkRoute, networkRouteIdentity, networkRoutesOverlap, type NetworkRouteIdentity } from "../ssh/sshNetworkRoute";
 import { handleSocks5Handshake, sendSocks5Failure, sendSocks5Success, Socks5HandshakeAbortedError } from "./socks5";
 
 export type TunnelEvent =
@@ -78,18 +79,6 @@ function waitForConnectionClose(connection: SshConnection): Promise<void> {
   });
 }
 
-interface EndpointRouteIdentity {
-  hosts: readonly string[];
-  port: number;
-}
-
-type NetworkRouteIdentity =
-  | { kind: "direct"; endpoint: EndpointRouteIdentity }
-  | { kind: "cycle"; serverId: string; endpoint: EndpointRouteIdentity }
-  | { kind: "unresolved"; serverId: string }
-  | { kind: "ssh"; endpoint: EndpointRouteIdentity; jump: NetworkRouteIdentity }
-  | { kind: "socks5" | "http"; proxyHost: string; proxyPort: number; endpoint: EndpointRouteIdentity };
-
 interface ForwardWaitEntry {
   routeIdentity: NetworkRouteIdentity;
   bindPort: number;
@@ -99,77 +88,6 @@ interface ForwardWaitEntry {
 interface ForwardWaitMatch {
   key: string;
   entry: ForwardWaitEntry;
-}
-
-function networkRouteIdentity(
-  server: ServerConfig,
-  serverLookup: ((id: string) => ServerConfig | undefined) | undefined,
-  visited = new Set<string>()
-): NetworkRouteIdentity {
-  // SshPty can populate a server-id pool entry through altHost, then reverse
-  // tunnels reuse that transport from the original server record. Treat both
-  // configured endpoints as aliases for the same remote bind namespace.
-  const hosts = [server.host, server.altHost]
-    .filter((host): host is string => typeof host === "string" && host.trim().length > 0)
-    .map((host) => host.trim().toLowerCase());
-  const endpoint: EndpointRouteIdentity = {
-    hosts: [...new Set(hosts)].sort(),
-    port: server.port
-  };
-  if (visited.has(server.id)) {
-    return { kind: "cycle", serverId: server.id, endpoint };
-  }
-  const nextVisited = new Set(visited);
-  nextVisited.add(server.id);
-
-  const proxy = server.proxy;
-  if (!proxy) {
-    return { kind: "direct", endpoint };
-  }
-  if (proxy.type === "ssh") {
-    const jumpHost = serverLookup?.(proxy.jumpHostId);
-    return {
-      kind: "ssh",
-      endpoint,
-      jump: jumpHost
-        ? networkRouteIdentity(jumpHost, serverLookup, nextVisited)
-        : { kind: "unresolved", serverId: proxy.jumpHostId }
-    };
-  }
-  // Proxy credentials may select separate egress routes, so this can
-  // serialize independent backends. The key protects the SSH server's
-  // server-wide bind namespace; omitting username avoids racing two credentials
-  // that reach the same proxy and SSH endpoint.
-  return { kind: proxy.type, proxyHost: proxy.host.toLowerCase(), proxyPort: proxy.port, endpoint };
-}
-
-function endpointRoutesOverlap(left: EndpointRouteIdentity, right: EndpointRouteIdentity): boolean {
-  return left.port === right.port && left.hosts.some((host) => right.hosts.includes(host));
-}
-
-function networkRoutesOverlap(left: NetworkRouteIdentity, right: NetworkRouteIdentity): boolean {
-  if (left.kind !== right.kind) {
-    return false;
-  }
-
-  switch (left.kind) {
-    case "direct":
-      return right.kind === "direct" && endpointRoutesOverlap(left.endpoint, right.endpoint);
-    case "cycle":
-      return right.kind === "cycle" && left.serverId === right.serverId && endpointRoutesOverlap(left.endpoint, right.endpoint);
-    case "unresolved":
-      return right.kind === "unresolved" && left.serverId === right.serverId;
-    case "ssh":
-      return right.kind === "ssh" && endpointRoutesOverlap(left.endpoint, right.endpoint) && networkRoutesOverlap(left.jump, right.jump);
-    case "socks5":
-    case "http":
-      return (
-        right.kind === left.kind &&
-        left.proxyHost === right.proxyHost &&
-        left.proxyPort === right.proxyPort &&
-        endpointRoutesOverlap(left.endpoint, right.endpoint)
-      );
-  }
 }
 
 /**
@@ -549,13 +467,13 @@ export class TunnelManager {
     try {
       const bindAddr = profile.remoteBindAddress ?? "127.0.0.1";
       const bindPort = profile.remotePort;
-      const routeIdentity = networkRouteIdentity(serverConfig, this.serverLookup);
       // OpenSSH may widen a requested address (GatewayPorts), and wildcard
       // addresses overlap specific listeners. Keep uncertain barriers scoped
       // to overlapping SSH endpoint aliases on the same route and port; bindAddr
       // remains part of forward/cancel calls.
-      const bindKey = (port: number): string => JSON.stringify([routeIdentity, port]);
-      const requestKey = bindKey(bindPort);
+      const bindKey = (route: NetworkRouteIdentity, port: number): string => JSON.stringify([route, port]);
+      let routeIdentity!: NetworkRouteIdentity;
+      let requestKey: string | undefined;
       let requestOver: (() => void) | undefined;
       let thisRequest: ForwardWaitEntry | undefined;
       let sshConnection: SshConnection;
@@ -565,45 +483,21 @@ export class TunnelManager {
           if (runtime.isStopping) {
             throw new TunnelStoppedError(profile.name);
           }
-          const retiredAfterLogin = this.findOverlappingForwardWait(
-            this.retiredForwardTransports,
-            routeIdentity,
-            bindPort
-          );
-          if (retiredAfterLogin) {
-            // The old SSH lease is gone, but a terminal may still keep its
-            // transport open. Do not request the same server-wide bind over a
-            // fresh connection until a late withdrawal succeeds or that
-            // transport closes and removes the bind.
-            await this.waitForForwardWait(runtime, retiredAfterLogin.entry.promise);
-            if (this.retiredForwardTransports.get(retiredAfterLogin.key) === retiredAfterLogin.entry) {
-              this.retiredForwardTransports.delete(retiredAfterLogin.key);
-            }
-            continue;
-          }
-          const earlierRequest = this.findOverlappingForwardWait(this.forwardRequests, routeIdentity, bindPort);
-          if (earlierRequest) {
-            // A stopped start may still be requesting or withdrawing this
-            // bind. Wait before taking a lease, because it may retire the
-            // transport if withdrawal fails. Login is outside this barrier:
-            // a replacement can authenticate independently while an earlier
-            // non-pooled login finishes.
-            await this.waitForForwardWait(runtime, earlierRequest.entry.promise);
-            if (runtime.isStopping) {
-              throw new TunnelStoppedError(profile.name);
-            }
-            continue;
-          }
-
           const candidate = await this.getOrCreateSharedConnection(runtime, activeTunnel.id);
           if (runtime.isStopping) {
             // getOrCreateSharedConnection registered the candidate before its
             // caller resumed, so stop() already released it in this case.
             throw new TunnelStoppedError(profile.name);
           }
+          // A pool entry is keyed by server ID and can outlive edits to any
+          // jump host in its proxy chain. Only the candidate's captured route
+          // tells us which remote bind namespace this lease can affect.
+          const candidateRouteIdentity =
+            getSshNetworkRoute(candidate) ?? networkRouteIdentity(runtime.serverConfig, this.serverLookup);
+          const candidateRequestKey = bindKey(candidateRouteIdentity, bindPort);
           const retiredTransport = this.findOverlappingForwardWait(
             this.retiredForwardTransports,
-            routeIdentity,
+            candidateRouteIdentity,
             bindPort
           );
           if (retiredTransport) {
@@ -621,7 +515,11 @@ export class TunnelManager {
             }
             continue;
           }
-          const competingRequest = this.findOverlappingForwardWait(this.forwardRequests, routeIdentity, bindPort);
+          const competingRequest = this.findOverlappingForwardWait(
+            this.forwardRequests,
+            candidateRouteIdentity,
+            bindPort
+          );
           if (competingRequest) {
             // Another start can reach its forward phase while this one logs
             // in. Drop our lease before waiting so a predecessor can retire
@@ -642,6 +540,8 @@ export class TunnelManager {
           }
 
           sshConnection = candidate;
+          routeIdentity = candidateRouteIdentity;
+          requestKey = candidateRequestKey;
           const requestPromise = new Promise<void>((resolve) => {
             requestOver = resolve;
           });
@@ -701,7 +601,7 @@ export class TunnelManager {
         }
       } finally {
         requestOver?.();
-        if (thisRequest && this.forwardRequests.get(requestKey) === thisRequest) {
+        if (requestKey && thisRequest && this.forwardRequests.get(requestKey) === thisRequest) {
           this.forwardRequests.delete(requestKey);
         }
       }

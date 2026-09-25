@@ -920,7 +920,78 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
     }
   });
 
-  it("does not reconnect a replacement stopped behind a pending forward", async () => {
+  it("tags a target connection with its pooled jump's actual route after live jump config changes", async () => {
+    const forwardIn = deferred();
+    const jump = { ...jumpServer, host: "jump-a.example.test" };
+    const proxy = { type: "ssh" as const, jumpHostId: jump.id };
+    const targetA = { ...targetServer(proxy), id: "srv-target-a" };
+    const targetB = { ...targetServer(proxy), id: "srv-target-b" };
+    const bindingNamespaces = new Map([
+      [targetA.id, "target-reached-via-jump-a"],
+      [targetB.id, "target-reached-via-jump-b"]
+    ]);
+    const auth = createAuthFactory(
+      { forwardIn: forwardIn.promise },
+      (server) => bindingNamespaces.get(server.id) ?? `${server.host}:${server.port}`
+    );
+    const stack = buildStack(auth, [jump, targetA, targetB], 60_000);
+    let jumpLease: SshConnection | undefined;
+    let targetLease: SshConnection | undefined;
+    let staleStart: Promise<Awaited<ReturnType<typeof stack.tunnelManager.start>>> | undefined;
+    let replacementStart: Promise<Awaited<ReturnType<typeof stack.tunnelManager.start>>> | undefined;
+
+    const reverseProfile = (id: string): TunnelProfile => ({
+      ...isolatedProfile(12345),
+      id,
+      name: id,
+      connectionMode: "shared",
+      tunnelType: "reverse",
+      remotePort: 8022
+    });
+
+    try {
+      jumpLease = await stack.pool.connect(jump);
+      // The lookup now sees B, but the pooled lease still dials through A.
+      jump.host = "jump-b.example.test";
+      targetLease = await stack.pool.connect(targetA);
+      expect(auth.callsFor(jump.id)).toEqual(["direct"]);
+      expect(auth.targets).toHaveLength(1);
+
+      // Editing a jump invalidates only its own entry; the existing target
+      // connection keeps its lease on the A transport while new targets use B.
+      stack.pool.invalidate(jump.id);
+      staleStart = stack.tunnelManager.start(reverseProfile("reverse-via-jump-a"), targetA);
+      await vi.waitFor(() => expect(auth.targets[0].requestForwardIn).toHaveBeenCalled(), SETTLE);
+
+      replacementStart = stack.tunnelManager.start(reverseProfile("reverse-via-jump-b"), targetB);
+      await vi.waitFor(() => expect(auth.targets).toHaveLength(2), SETTLE);
+      // The same configured target endpoint reached through B has a different
+      // remote bind namespace. It must not wait on A's unresolved request.
+      await vi.waitFor(
+        () => expect(auth.targets[1].requestForwardIn).toHaveBeenCalledWith("127.0.0.1", 8022),
+        SETTLE
+      );
+      expect(auth.callsFor(jump.id)).toEqual(["direct", "direct"]);
+
+      forwardIn.resolve();
+      const [staleActive, replacementActive] = await Promise.all([staleStart, replacementStart]);
+      cleanups.push(
+        () => stack.tunnelManager.stop(staleActive.id),
+        () => stack.tunnelManager.stop(replacementActive.id)
+      );
+    } finally {
+      forwardIn.resolve();
+      await stack.tunnelManager.stopAll();
+      targetLease?.dispose();
+      jumpLease?.dispose();
+      await Promise.all([
+        staleStart?.catch(() => undefined),
+        replacementStart?.catch(() => undefined)
+      ]);
+    }
+  });
+
+  it("does not forward or reconnect after stopping a replacement while it logs in behind a pending forward", async () => {
     const forwardIn = deferred();
     const nextLogin = deferred();
     const gates: { forwardIn?: Promise<void>; targetLogin?: Promise<void> } = { forwardIn: forwardIn.promise };
@@ -946,22 +1017,24 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
       () => "resolved",
       (error: unknown) => error
     );
+    await vi.waitFor(() => expect(auth.calls).toHaveLength(2), SETTLE);
     await stack.tunnelManager.stopAll();
     forwardIn.resolve();
 
     expect(await stale).toBeInstanceOf(TunnelStoppedError);
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    const callsAfterBarrier = auth.calls.length;
     nextLogin.resolve();
 
     expect(await stoppedReplacement).toBeInstanceOf(TunnelStoppedError);
-    expect(callsAfterBarrier).toBe(1);
+    expect(auth.calls).toHaveLength(2);
+    expect(auth.targets).toHaveLength(2);
+    expect(auth.targets[1].dispose).toHaveBeenCalledTimes(1);
+    expect(auth.targets[1].requestForwardIn).not.toHaveBeenCalled();
   });
 
   it.each([
     { outcome: "refuses", gates: { forwardCancelRefusal: new Error("request failed") } },
     { outcome: "never answers", gates: { forwardCancel: new Promise<void>(() => {}) } }
-  ])("holds a replacement until the retired transport's late-granted forward the server $outcome to withdraw is gone", async ({ outcome, gates }) => {
+  ])("keeps a replacement off the retired bind when the late-granted forward $outcome to withdraw", async ({ outcome, gates }) => {
     // The bind is server-wide. Keep the terminal lease usable, but do not let a
     // replacement bind until that lease is released and the old transport closes.
     const forwardIn = deferred();
@@ -998,8 +1071,9 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
       (active) => ({ active }),
       (error: unknown) => ({ error })
     );
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(auth.targets).toHaveLength(1);
+    await vi.waitFor(() => expect(auth.targets).toHaveLength(2), SETTLE);
+    expect(auth.targets[1].dispose).toHaveBeenCalledTimes(1);
+    expect(auth.targets[1].requestForwardIn).not.toHaveBeenCalled();
     expect(auth.targets[0].dispose).not.toHaveBeenCalled();
     await expect(terminalLease.exec("uptime")).resolves.toBeDefined();
 
@@ -1012,8 +1086,8 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
     }
     const active = result.active;
     cleanups.push(() => stack.tunnelManager.stop(active.id));
-    expect(auth.targets).toHaveLength(2);
-    expect(auth.targets[1].requestForwardIn).toHaveBeenCalledWith("127.0.0.1", 8022);
+    expect(auth.targets).toHaveLength(3);
+    expect(auth.targets[2].requestForwardIn).toHaveBeenCalledWith("127.0.0.1", 8022);
   });
 
   it("releases the retired-forward barrier when an unpooled transport closes before cancel rejection", async () => {
@@ -1071,11 +1145,10 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
     }
   });
 
-  it("takes a replacement start's lease only after the stopped start's request is over, so a transport it retires is not reused", async () => {
-    // The replacement used to lease the pooled transport first and wait second.
-    // When the stopped start's withdrawal was then refused, retiring that
-    // transport could not revoke the lease already taken on it, and the
-    // replacement asked for its bind over the transport still holding it.
+  it("does not forward over the stopped start's pending transport, then gets a fresh one", async () => {
+    // Route ownership is known only after acquiring a candidate lease. A
+    // candidate that reuses the pooled transport must be released before
+    // waiting, so the replacement can use a fresh transport after retirement.
     const forwardIn = deferred();
     const liveGates: Parameters<typeof createAuthFactory>[0] = {
       forwardIn: forwardIn.promise,
@@ -1092,8 +1165,9 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
     await vi.waitFor(() => expect(auth.targets[0]?.requestForwardIn).toHaveBeenCalled(), SETTLE);
     await stack.tunnelManager.stopAll();
     const replacement = stack.tunnelManager.start(profile, direct, { connectionMode: "shared" });
-    // Long enough for the replacement to lease a transport, if it does so before waiting.
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    expect(auth.targets).toHaveLength(1);
+    expect(auth.targets[0].requestForwardIn).toHaveBeenCalledTimes(1);
     forwardIn.resolve();
 
     expect(await stale).toBeInstanceOf(TunnelStoppedError);
@@ -1138,7 +1212,7 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
       await flush();
     }
 
-    it("does not lease until the predecessor has retired its transport, then gets a fresh one — within the request and cancel bounds", async () => {
+    it("does not request a forward until the predecessor retires its transport — within the request and cancel bounds", async () => {
       const run = stalePredecessor();
       const profile = { ...(await sharedProfile("reverse")), remotePort: 8022 };
       const stale = run.stack.tunnelManager.start(profile, direct, { connectionMode: "shared" }).then(
@@ -1215,7 +1289,7 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
     });
   });
 
-  it("abandons a request that does not answer, then waits for its possible late bind to disappear", async () => {
+  it("discards a candidate while an unanswered request may still bind, then waits for the old transport to close", async () => {
     // ssh2's request has no timeout. A stopped start must release its lease,
     // but the server may still grant the request later while another lease
     // keeps the transport alive; a replacement cannot race that bind.
@@ -1247,8 +1321,9 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
       (active) => ({ active }),
       (error: unknown) => ({ error })
     );
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(auth.targets).toHaveLength(1);
+    await vi.waitFor(() => expect(auth.targets).toHaveLength(2), SETTLE);
+    expect(auth.targets[1].dispose).toHaveBeenCalledTimes(1);
+    expect(auth.targets[1].requestForwardIn).not.toHaveBeenCalled();
     await expect(terminalLease.exec("uptime")).resolves.toBeDefined();
     terminalLease.dispose();
     await vi.waitFor(() => expect(auth.targets[0].dispose).toHaveBeenCalledTimes(1), SETTLE);
@@ -1258,7 +1333,8 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
       throw result.error;
     }
     cleanups.push(() => stack.tunnelManager.stop(result.active.id));
-    expect(auth.targets).toHaveLength(2);
+    expect(auth.targets).toHaveLength(3);
+    expect(auth.targets[2].requestForwardIn).toHaveBeenCalledWith("127.0.0.1", 8022);
   });
 
   it("does not hold a start of the profile on one server behind its stopped request on another", async () => {

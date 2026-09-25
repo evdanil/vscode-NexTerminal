@@ -349,6 +349,12 @@ class ControlledForwardConnection extends DirectTcpSshConnection {
   }
 }
 
+class RouteAwareForwardConnection extends ControlledForwardConnection {
+  public override async openDirectTcp(): Promise<Duplex> {
+    return new PassThrough();
+  }
+}
+
 class ObservedForwardConnection extends DirectTcpSshConnection {
   public readonly forwardRequested = deferred<void>();
   public forwardAttempts = 0;
@@ -544,7 +550,8 @@ class DelayedReplacementFactory implements SshFactory {
 }
 
 class TrackingConnectionPool extends SshConnectionPool {
-  public readonly replacementLeaseDisposed = deferred<void>();
+  public readonly replacementLeaseDisposed = [deferred<void>(), deferred<void>()];
+  private replacementLeaseDisposalCount = 0;
 
   public constructor(
     factory: SshFactory,
@@ -558,9 +565,13 @@ class TrackingConnectionPool extends SshConnectionPool {
     const lease = await super.connect(server);
     if (server.id === this.replacementServerId) {
       const dispose = lease.dispose.bind(lease);
+      let disposalObserved = false;
       lease.dispose = () => {
         dispose();
-        this.replacementLeaseDisposed.resolve(undefined);
+        if (!disposalObserved) {
+          disposalObserved = true;
+          this.replacementLeaseDisposed[this.replacementLeaseDisposalCount++]?.resolve(undefined);
+        }
       };
     }
     return lease;
@@ -1122,7 +1133,7 @@ describe("TunnelManager integration", () => {
 
       factory.finishReplacementLogin.resolve(undefined);
       const beforeRetiredTransportCloses = await Promise.race([
-        pool.replacementLeaseDisposed.promise.then(() => "candidate-disposed"),
+        pool.replacementLeaseDisposed[0].promise.then(() => "candidate-disposed"),
         replacementConnection.forwardRequested.promise.then(() => "forward-requested")
       ]);
       expect(beforeRetiredTransportCloses).toBe("candidate-disposed");
@@ -1131,32 +1142,36 @@ describe("TunnelManager integration", () => {
         `Shared SSH connection closed for tunnel ${replacementProfile.name}`
       );
 
-      // The retired-bind barrier itself is stop-aware: a start that reaches
-      // the pre-login `retiredAfterLogin` wait must not need the old terminal
-      // lease to close before its caller can stop it.
-      const preLoginWaitProfile = profile("reverse-retired-stop");
-      const preLoginWaitStart = manager.start(preLoginWaitProfile, replacementServer);
-      const preLoginWaitResult = preLoginWaitStart.then(
+      // Route ownership is known only after acquiring the candidate. A start
+      // that reaches the retired-bind wait must still be stop-aware.
+      const barrierWaitProfile = profile("reverse-retired-stop");
+      const barrierWaitStart = manager.start(barrierWaitProfile, replacementServer);
+      const barrierWaitResult = barrierWaitStart.then(
         () => "started",
         (error: unknown) => error
       );
-      const preLoginWaitId = manager.getActiveTunnelId(preLoginWaitProfile.id);
-      expect(preLoginWaitId).toBeDefined();
-      await manager.stop(preLoginWaitId!);
-      const preLoginWaitSettled = await Promise.race([
-        preLoginWaitResult.then(() => true),
+      const barrierWaitId = manager.getActiveTunnelId(barrierWaitProfile.id);
+      expect(barrierWaitId).toBeDefined();
+      // Do not stop merely after the runtime is registered: that only proves
+      // the attempt started. Wait until its authenticated candidate was
+      // discarded against the retired barrier, so stop() exercises the wait.
+      await pool.replacementLeaseDisposed[1].promise;
+      expect(factory.replacementConnections.at(-1)?.forwardAttempts).toBe(0);
+      await manager.stop(barrierWaitId!);
+      const barrierWaitSettled = await Promise.race([
+        barrierWaitResult.then(() => true),
         new Promise<boolean>((resolve) => setImmediate(() => resolve(false)))
       ]);
-      expect(preLoginWaitSettled).toBe(true);
-      expect(await preLoginWaitResult).toBeInstanceOf(Error);
-      expect((await preLoginWaitResult as Error).name).toBe("TunnelStoppedError");
+      expect(barrierWaitSettled).toBe(true);
+      expect(await barrierWaitResult).toBeInstanceOf(Error);
+      expect((await barrierWaitResult as Error).name).toBe("TunnelStoppedError");
 
       // The pooled connection remains open for the terminal lease, so the
       // replacement must wait until that lease releases the retired bind.
       terminalLease.dispose();
       await factory.replacementForwardRequested.promise;
       await expect(replacementResult).resolves.toBe("started");
-      expect(factory.replacementConnections[1]?.forwardAttempts).toBe(1);
+      expect(factory.replacementConnections.at(-1)?.forwardAttempts).toBe(1);
 
       const replacementTunnelId = manager.getActiveTunnelId(replacementProfile.id);
       expect(replacementTunnelId).toBeDefined();
@@ -1226,7 +1241,7 @@ describe("TunnelManager integration", () => {
         ]);
         expect(forwardedBeforeResolution).toBe(false);
         expect(replacementConnection.forwardAttempts).toBe(0);
-        expect(factory.connectCount).toBe(1);
+        expect(factory.connectCount).toBe(2);
 
         if (cancelOutcome === "late success") {
           retiredConnection.resolveCancel(1);
@@ -1329,7 +1344,7 @@ describe("TunnelManager integration", () => {
       ]);
       expect(forwardedWhileOwnerPending).toBe(false);
       expect(replacementConnection.forwardAttempts).toBe(0);
-      expect(factory.connectCount).toBe(1);
+      expect(factory.connectCount).toBe(2);
 
       retiredConnection.rejectForward(1, new Error("Remote forwarding refused"));
       expect(await retiredResult).toBeInstanceOf(Error);
@@ -1412,7 +1427,7 @@ describe("TunnelManager integration", () => {
       ]);
       expect(forwardedBeforeOwnerClose).toBe(false);
       expect(replacementConnection.forwardAttempts).toBe(0);
-      expect(factory.connectCount).toBe(1);
+      expect(factory.connectCount).toBe(2);
 
       terminalLease.dispose();
       terminalLease = undefined;
@@ -1568,7 +1583,7 @@ describe("TunnelManager integration", () => {
       ]);
       expect(initiallyWaiting).toBe(true);
       expect(replacementConnection.forwardAttempts).toBe(0);
-      expect(factory.connectCount).toBe(1);
+      expect(factory.connectCount).toBe(2);
 
       retiredConnection.rejectForward(1, new Error("Remote forwarding refused"));
       const proceededAfterRefusal = await Promise.race([
@@ -2093,7 +2108,7 @@ describe("TunnelManager integration", () => {
       outcomes.push(finalResult);
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(finalConnection.forwardAttempts).toBe(0);
-      expect(factory.connectCount).toBe(2);
+      expect(factory.connectCount).toBe(3);
 
       newTerminalLease.dispose();
       newTerminalLease = undefined;
@@ -2191,6 +2206,127 @@ describe("TunnelManager integration", () => {
       await manager.stopAll();
       await Promise.all([waitingResult, ...(predecessorResult ? [predecessorResult] : [])]);
       pool.dispose();
+    }
+  });
+
+  it("does not let a stale pooled jump route block a replacement on the jump host's new route", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const jumpServer: ServerConfig = { ...testServer, id: "jump-edited", host: "jump-a.example.test" };
+    const targetA: ServerConfig = {
+      ...testServer,
+      id: "target-stale-a",
+      host: "target.example.test",
+      proxy: { type: "ssh", jumpHostId: jumpServer.id }
+    };
+    const targetB: ServerConfig = {
+      ...targetA,
+      id: "target-current-b"
+    };
+    const servers = new Map<string, ServerConfig>([
+      [jumpServer.id, jumpServer],
+      [targetA.id, targetA],
+      [targetB.id, targetB]
+    ]);
+    const lookup = (id: string): ServerConfig | undefined => servers.get(id);
+    const authenticated: Array<{ server: ServerConfig; connection: RouteAwareForwardConnection }> = [];
+    const replacementAuthenticated = deferred<RouteAwareForwardConnection>();
+    const authFactory = {
+      connect: async (server: ServerConfig, options?: { sockFactory?: () => Promise<Duplex> }) => {
+        const hop = await options?.sockFactory?.();
+        hop?.destroy();
+        const connection = new RouteAwareForwardConnection();
+        authenticated.push({ server, connection });
+        if (server.id === targetB.id) {
+          replacementAuthenticated.resolve(connection);
+        }
+        return connection;
+      }
+    } as unknown as SilentAuthSshFactory;
+    const vault: SecretVault = {
+      get: async () => undefined,
+      store: async () => {},
+      delete: async () => {}
+    };
+    const proxyFactory = new ProxySshFactory(authFactory, lookup, vault);
+    const pool = new SshConnectionPool(proxyFactory, { enabled: true, idleTimeoutMs: 60_000 });
+    proxyFactory.setJumpHostConnectionFactory(pool);
+    manager = new TunnelManager(pool, proxyFactory, 10_000, lookup);
+    const reverseProfile = (id: string): TunnelProfile => ({
+      id,
+      name: id,
+      localPort: 12345,
+      remoteIP: "127.0.0.1",
+      remotePort: 23456,
+      autoStart: false,
+      tunnelType: "reverse",
+      remoteBindAddress: "127.0.0.1",
+      localTargetIP: "127.0.0.1"
+    });
+    let terminalLease: SshConnection | undefined;
+    let staleStart: Promise<unknown> | undefined;
+    let replacementStart: Promise<unknown> | undefined;
+
+    try {
+      // Model a terminal having populated target A's pool entry while the jump
+      // host still pointed to A. Editing the jump only invalidates that jump's
+      // own server-id entry; the target entry and its actual A transport live on.
+      terminalLease = await pool.connect(targetA);
+      expect(authenticated.filter(({ server }) => server.id === targetA.id)).toHaveLength(1);
+      expect(authenticated.filter(({ server }) => server.id === jumpServer.id).map(({ server }) => server.host)).toEqual([
+        "jump-a.example.test"
+      ]);
+      const staleConnection = authenticated.find(({ server }) => server.id === targetA.id)!.connection;
+      staleConnection.holdForward(1);
+
+      const editedJump = { ...jumpServer, host: "jump-b.example.test" };
+      servers.set(jumpServer.id, editedJump);
+      pool.invalidate(jumpServer.id);
+
+      const staleProfile = reverseProfile("reverse-stale-jump-a");
+      const staleStartPromise = manager.start(staleProfile, targetA);
+      staleStart = staleStartPromise.then(() => "started", (error: unknown) => error);
+      await staleConnection.waitForForwardAttempt(1);
+      const staleTunnelId = manager.getActiveTunnelId(staleProfile.id);
+      expect(staleTunnelId).toBeDefined();
+      await manager.stop(staleTunnelId!);
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(staleStartPromise).rejects.toMatchObject({ name: "TunnelStoppedError" });
+      expect(staleConnection.transportClosed).toBe(false);
+
+      const replacementProfile = reverseProfile("reverse-current-jump-b");
+      const replacementStartPromise = manager.start(replacementProfile, targetB);
+      replacementStart = replacementStartPromise.then(() => "started", (error: unknown) => error);
+      const replacementForwardedBeforeOldTransportClose = await Promise.race([
+        replacementAuthenticated.promise.then((connection) => connection.waitForForwardAttempt(1)).then(() => true),
+        new Promise<boolean>((resolve) => setImmediate(() => resolve(false)))
+      ]);
+
+      expect(replacementForwardedBeforeOldTransportClose).toBe(true);
+      expect(staleConnection.transportClosed).toBe(false);
+      expect(authenticated.filter(({ server }) => server.id === targetA.id)).toHaveLength(1);
+      expect(authenticated.filter(({ server }) => server.id === jumpServer.id).map(({ server }) => server.host)).toEqual([
+        "jump-a.example.test",
+        "jump-b.example.test"
+      ]);
+      await expect(replacementStartPromise).resolves.toMatchObject({ profileId: replacementProfile.id });
+
+      const replacementTunnelId = manager.getActiveTunnelId(replacementProfile.id);
+      expect(replacementTunnelId).toBeDefined();
+      await manager.stop(replacementTunnelId!);
+    } finally {
+      await manager.stopAll();
+      for (const { server, connection } of authenticated) {
+        if (server.id === targetA.id) {
+          connection.rejectForward(1, new Error("Test cleanup"));
+        }
+      }
+      terminalLease?.dispose();
+      pool.dispose();
+      await Promise.allSettled(
+        [staleStart, replacementStart].filter((result): result is Promise<unknown> => Boolean(result))
+      );
+      manager = undefined;
+      vi.useRealTimers();
     }
   });
 
