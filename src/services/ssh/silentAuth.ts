@@ -425,10 +425,20 @@ export class SilentAuthSshFactory implements SshFactory {
           if (promptResult.save) {
             await this.mutateCredentialIfEndpointUnchanged(provenance.serverId, provenance.record, provenance.endpointSignature, async () => {
               await this.vault.store(passphraseKey, promptResult.password);
-              if (legacyServerPassphraseKey && legacyServerPassphraseKey !== passphraseKey) {
-                await this.vault.delete(legacyServerPassphraseKey);
-              }
             });
+            // The profile-scoped value belongs to the shared prompt owner, but
+            // this server-scoped legacy duplicate belongs only to this login.
+            // Re-check its own captured record in a separate lock span: the
+            // config lock is non-reentrant, and a same-id edit while the prompt
+            // was open must not let the owner authorize deleting a new secret.
+            if (legacyServerPassphraseKey && legacyServerPassphraseKey !== passphraseKey) {
+              await this.mutateCredentialIfEndpointUnchanged(
+                promptProvenance.serverId,
+                promptProvenance.record,
+                promptProvenance.endpointSignature,
+                () => this.vault.delete(legacyServerPassphraseKey)
+              );
+            }
           } else if (!profileScoped) {
             // Declining to save replaces the stored credential for a server —
             // but a profile-scoped passphrase belongs to the whole fleet, and

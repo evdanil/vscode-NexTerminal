@@ -936,8 +936,14 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
   }
 
   /** A file that carries no seal and no secrets: the only secrets in play are the ones already on this machine. */
-  function unsealedJson(servers: unknown[]): string {
-    return JSON.stringify({ version: 2, exportType: "backup", exportedAt: new Date().toISOString(), servers });
+  function unsealedJson(servers: unknown[], authProfiles?: unknown[]): string {
+    return JSON.stringify({
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers,
+      ...(authProfiles !== undefined && { authProfiles })
+    });
   }
 
   it("a file that re-creates the server's id at another host takes none of the secrets this machine saved for it", async () => {
@@ -1198,6 +1204,30 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
       expect(dest.core.getServer("srv-1")?.host).toBe("10.0.0.1");
       expect(await savedSecrets(dest)).toEqual(GONE);
       expect(await dest.vault.get("password-jump-2")).toBe("jump-2-pw");
+    });
+
+    it.each([
+      ["recreates a profile with changed connection fields", "jump-auth", "ops-new"],
+      ["relinks the jump host to another profile", "jump-auth-replacement", "ops-old"]
+    ])("clears target secrets when Replace %s", async (_change, profileId, username) => {
+      const dest = await destWithChain();
+      const oldProfile = { id: "jump-auth", name: "Jump auth", username: "ops-old", authType: "password" as const };
+      await dest.core.addOrUpdateAuthProfile(oldProfile);
+      await dest.core.addOrUpdateServer(jump1({ authProfileId: oldProfile.id }));
+      await dest.vault.store("password-jump-1", "jump-1-pw");
+
+      // The server record and its raw username are unchanged. The effective
+      // bastion auth changes either through profile fields or its linked id.
+      const replacementProfile = { ...oldProfile, id: profileId, username };
+      await runImport(
+        dest,
+        unsealedJson([target(), jump1({ authProfileId: replacementProfile.id }), jump2()], [replacementProfile]),
+        "replace"
+      );
+
+      expect(dest.core.getAuthProfile(replacementProfile.id)?.username).toBe(username);
+      expect(await savedSecrets(dest)).toEqual(GONE);
+      expect(await dest.vault.get("password-jump-1")).toBeUndefined();
     });
 
     it("a two-hop chain whose far hop moved clears every server behind it", async () => {

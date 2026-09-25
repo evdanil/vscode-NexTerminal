@@ -4,7 +4,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, LocalShellProfile, ProxyConfig, ServerConfig, ServerOrigin, TunnelProfile, SerialProfile } from "../models/config";
-import { authProfileNeedsServerKeyPath, cloneTemplatedStamps, templatedHasAnyStamp } from "../models/config";
+import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials, cloneTemplatedStamps, templatedHasAnyStamp } from "../models/config";
 import type { InventorySourceConfig, InventorySourceValues, TemplateRule } from "../models/inventory";
 import { inventorySecretKey } from "../models/inventory";
 import type { DeviceTemplateProfile, TemplateField } from "../models/deviceTemplate";
@@ -1450,8 +1450,11 @@ async function savedServerSecretBuckets(vault: SecretVault, serverId: string): P
  *    `username` for SOCKS5/HTTP, the identity the proxy-password hygiene
  *    already keeps a secret by (`isSameAuthenticatedEndpoint`).
  * Nothing else counts: a renamed, moved or re-flagged server at the same
- * endpoint keeps its secrets. Compared exactly — a difference in case or
- * spacing costs a re-prompt, never a password sent somewhere new.
+ * endpoint keeps its secrets. SSH jump hosts additionally compare their
+ * auth-profile identity and effective connection fields: replacing a profile
+ * can change the bastion user even when its raw server record is unchanged.
+ * Compared exactly — a difference in case or spacing costs a re-prompt, never
+ * a password sent somewhere new.
  */
 function sameServerEndpoint(a: ServerConfig, b: ServerConfig): boolean {
   return a.host === b.host && a.altHost === b.altHost && a.port === b.port && a.username === b.username && sameProxy(a.proxy, b.proxy);
@@ -1467,11 +1470,33 @@ function sameProxy(a: ProxyConfig | null | undefined, b: ProxyConfig | null | un
   return isSameAuthenticatedEndpoint(a, b);
 }
 
+function effectiveSshAuthIdentity(server: ServerConfig, profiles: ReadonlyMap<string, AuthProfile>): string {
+  const profile = server.authProfileId ? profiles.get(server.authProfileId) : undefined;
+  const owned = authProfileOwnedCredentials(profile);
+  const authType = owned.authType ?? server.authType;
+  return JSON.stringify([
+    profile ? server.authProfileId : null,
+    owned.username ?? server.username,
+    authType,
+    authType === "key" ? (owned.keyPath ?? server.keyPath ?? null) : null
+  ]);
+}
+
+function sameEffectiveSshAuthIdentity(
+  before: ServerConfig,
+  after: ServerConfig,
+  beforeProfiles: ReadonlyMap<string, AuthProfile>,
+  afterProfiles: ReadonlyMap<string, AuthProfile>
+): boolean {
+  return effectiveSshAuthIdentity(before, beforeProfiles) === effectiveSshAuthIdentity(after, afterProfiles);
+}
+
 /**
  * ISSUE #175 — the servers a Replace removed whose saved secrets it may keep:
  * every valid record the file writes under the id has the same endpoint
- * (`sameServerEndpoint`), and so does every SSH jump host on its route. A jump
- * host is resolved by id when connecting (`ProxySshFactory`), so a jump host
+ * (`sameServerEndpoint`), and so does every SSH jump host on its route,
+ * including the jump host's auth-profile identity and effective connection
+ * fields. A jump host is resolved by id when connecting (`ProxySshFactory`), so a jump host
  * the file moves — or does not bring back — moves the route of every server
  * behind it, however deep the chain; the closure runs to a fixpoint, which
  * settles cycles too. Judged over the whole file before anything is written,
@@ -1479,17 +1504,42 @@ function sameProxy(a: ProxyConfig | null | undefined, b: ProxyConfig | null | un
  * servers behind it still decides them. A record that fails validation is
  * never written and so decides nothing.
  */
-function serversKeepingSecrets(removed: readonly ServerConfig[], incoming: readonly unknown[] | undefined): Set<string> {
+function serversKeepingSecrets(
+  removed: readonly ServerConfig[],
+  incoming: readonly unknown[] | undefined,
+  removedAuthProfiles: readonly unknown[],
+  incomingAuthProfiles: readonly unknown[] | undefined
+): Set<string> {
   const removedById = new Map(removed.map((server) => [server.id, server]));
+  const profilesById = (profiles: readonly unknown[]): Map<string, AuthProfile> => {
+    const result = new Map<string, AuthProfile>();
+    for (const profile of Array.isArray(profiles) ? profiles : []) {
+      if (validateAuthProfile(profile)) {
+        result.set(profile.id, profile);
+      }
+    }
+    return result;
+  };
+  const beforeProfiles = profilesById(removedAuthProfiles);
+  const afterProfiles = profilesById(incomingAuthProfiles ?? []);
+  const validIncoming: ServerConfig[] = [];
+  for (const record of incoming ?? []) {
+    if (validateServerConfig(record)) validIncoming.push(record);
+  }
+  const jumpHostIds = new Set<string>();
+  for (const server of [...removed, ...validIncoming]) {
+    if (server.proxy?.type === "ssh") jumpHostIds.add(server.proxy.jumpHostId);
+  }
   const kept = new Set<string>();
   const changed = new Set<string>();
-  for (const record of incoming ?? []) {
-    if (!validateServerConfig(record)) {
-      continue;
-    }
+  for (const record of validIncoming) {
     const before = removedById.get(record.id);
     if (before !== undefined) {
-      (sameServerEndpoint(before, record) ? kept : changed).add(record.id);
+      const sameEndpoint = sameServerEndpoint(before, record);
+      const sameJumpAuth =
+        !jumpHostIds.has(record.id) ||
+        sameEffectiveSshAuthIdentity(before, record, beforeProfiles, afterProfiles);
+      (sameEndpoint && sameJumpAuth ? kept : changed).add(record.id);
     }
   }
   for (const id of changed) {
@@ -3911,7 +3961,9 @@ export function registerConfigCommands(
     //
     // Deciding up front, over the whole file, is what lets a jump host listed
     // AFTER the servers behind it decide them before they are published.
-    const keepSecrets = mode === "replace" ? serversKeepingSecrets(snapshot.servers, data.servers) : new Set<string>();
+    const keepSecrets = mode === "replace"
+      ? serversKeepingSecrets(snapshot.servers, data.servers, snapshot.authProfiles, data.authProfiles)
+      : new Set<string>();
     // Re-created servers whose secrets saved HERE were cleared, with which ones
     // — for the completion message, which tells the user why they will be
     // asked again.

@@ -1850,6 +1850,59 @@ describe("SilentAuthSshFactory — concurrent logins share one prompt (issue #17
       expect(vault.store).toHaveBeenCalledWith(authProfilePassphraseSecretKey(profile.id), "fleet-phrase");
     });
 
+    it("does not let a profile-shared answer delete a replacement server passphrase", async () => {
+      type Answer = { password: string; save: boolean } | undefined;
+      const profile: AuthProfile = { id: "prof-key", name: "Fleet key", username: "ops", authType: "key", keyPath: "/keys/fleet" };
+      const deviceA: ServerConfig = { ...baseServer, id: "srv-a", name: "A", host: "a.example.com", authProfileId: profile.id };
+      const deviceB: ServerConfig = { ...baseServer, id: "srv-b", name: "B", host: "b.example.com", authProfileId: profile.id };
+      const standaloneB: ServerConfig = {
+        ...deviceB,
+        authProfileId: undefined,
+        authType: "key",
+        keyPath: "/keys/replacement"
+      };
+      const liveServers = new Map<string, ServerConfig>([[deviceA.id, deviceA], [deviceB.id, deviceB]]);
+      const connector = encryptedKeyConnector();
+      const vault = createVault();
+      const profileAnswer = deferred<Answer>();
+      const replacementAnswer = deferred<Answer>();
+      const prompt: PasswordPrompt = {
+        prompt: vi.fn((server: ServerConfig) =>
+          server.keyPath === profile.keyPath ? profileAnswer.promise : replacementAnswer.promise
+        )
+      };
+      const factory = new SilentAuthSshFactory(
+        connector,
+        vault,
+        prompt,
+        undefined,
+        (id) => id === profile.id ? profile : undefined,
+        (id) => liveServers.get(id)
+      );
+
+      const owner = factory.connect(deviceA);
+      const joined = factory.connect(deviceB);
+      await settle();
+      expect(prompt.prompt).toHaveBeenCalledOnce();
+
+      // B is edited while the profile prompt is still open, then connects with
+      // its replacement key and saves the new server-scoped passphrase.
+      liveServers.set(deviceB.id, standaloneB);
+      const replacementLogin = factory.connect(standaloneB);
+      await settle();
+      expect(prompt.prompt).toHaveBeenCalledTimes(2);
+      replacementAnswer.resolve({ password: "new-B-passphrase", save: true });
+      await expect(replacementLogin).resolves.toBe(fakeConnection);
+
+      // A remains the live owner of the shared profile answer. Its profile-key
+      // store is valid, but B's old joiner must not erase B's replacement key.
+      profileAnswer.resolve({ password: "fleet-passphrase", save: true });
+      await expect(Promise.all([owner, joined])).resolves.toEqual([fakeConnection, fakeConnection]);
+
+      expect(vault.store).toHaveBeenCalledWith(authProfilePassphraseSecretKey(profile.id), "fleet-passphrase");
+      await expect(vault.get(passphraseSecretKey(deviceB.id))).resolves.toBe("new-B-passphrase");
+    });
+
     it("asks once for the passphrase of one key file whatever route each login takes", async () => {
       // A passphrase only unlocks the key file here; it is never sent anywhere,
       // so the route a login takes does not change what it was typed for.
