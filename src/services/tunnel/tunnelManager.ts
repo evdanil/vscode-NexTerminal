@@ -151,12 +151,9 @@ export class TunnelManager {
   private readonly activeTunnels = new Map<string, ActiveTunnelRuntime>();
   private readonly activeByProfile = new Map<string, string>();
   /**
-   * Per reverse profile and server: settles once a start's forward request is
-   * over — the forward kept, refused, withdrawn or abandoned after stop().
-   * stop() forgets a tunnel at once, so the profile can start again on that
-   * server while a stopped start's request is still in flight on the same
-   * pooled transport; see startReverse. A start on another server cannot
-   * collide with it, and does not wait.
+   * Per reverse profile and server: tracks only the remote-forward phase, after
+   * login. A stopped start may still be authenticating, but its replacement
+   * must not wait for that login (especially when multiplexing is disabled).
    */
   private readonly forwardRequests = new Map<string, Promise<void>>();
   private trafficTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -435,32 +432,61 @@ export class TunnelManager {
       const bindAddr = profile.remoteBindAddress ?? "127.0.0.1";
       const bindPort = profile.remotePort;
       const requestKey = JSON.stringify([profile.id, serverConfig.id]);
-      const earlierRequest = this.forwardRequests.get(requestKey);
-      let requestOver!: () => void;
-      const thisRequest = new Promise<void>((resolve) => {
-        requestOver = resolve;
-      });
-      this.forwardRequests.set(requestKey, thisRequest);
+      let requestOver: (() => void) | undefined;
+      let thisRequest: Promise<void> | undefined;
       let sshConnection: SshConnection;
       let allocatedPort: number;
       try {
-        if (earlierRequest) {
-          // A stopped start of this profile may still be requesting, or
-          // withdrawing, the same bind on this server. Asked now, ours would
-          // reach the server behind it and be refused as already bound. Waited
-          // for BEFORE taking a lease: if that request ends by retiring its
-          // transport, a lease already taken on it could not be revoked, and
-          // ours would be asked over the transport still holding the bind.
-          // With no timeout of its own — giving up while the predecessor is
-          // still withdrawing leases exactly that transport. The wait is
-          // bounded by the predecessor's phases instead: its login (the same
-          // one this start would join in the pool), then its request and its
-          // withdrawal, each within LATE_FORWARD_CANCEL_TIMEOUT_MS of stop().
-          // A start stopped while it waits settles only after this wait, so a
-          // chain of them releases the next start only when the first is done.
-          await earlierRequest;
+        while (true) {
+          if (runtime.isStopping) {
+            throw new TunnelStoppedError(profile.name);
+          }
+          const earlierRequest = this.forwardRequests.get(requestKey);
+          if (earlierRequest) {
+            // A stopped start may still be requesting or withdrawing this
+            // bind. Wait before taking a lease, because it may retire the
+            // transport if withdrawal fails. Login is outside this barrier:
+            // a replacement can authenticate independently while an earlier
+            // non-pooled login finishes.
+            await earlierRequest;
+            if (runtime.isStopping) {
+              throw new TunnelStoppedError(profile.name);
+            }
+          }
+
+          const candidate = await this.getOrCreateSharedConnection(runtime, activeTunnel.id);
+          if (runtime.isStopping) {
+            // getOrCreateSharedConnection registered the candidate before its
+            // caller resumed, so stop() already released it in this case.
+            throw new TunnelStoppedError(profile.name);
+          }
+          const competingRequest = this.forwardRequests.get(requestKey);
+          if (competingRequest) {
+            // Another start can reach its forward phase while this one logs
+            // in. Drop our lease before waiting so a predecessor can retire
+            // its transport without leaving this start pinned to it.
+            runtime.sshConnections.delete(candidate);
+            if (runtime.sharedConnection === candidate) {
+              runtime.sharedConnection = undefined;
+            }
+            candidate.dispose();
+            if (runtime.isStopping) {
+              throw new TunnelStoppedError(profile.name);
+            }
+            await competingRequest!;
+            if (runtime.isStopping) {
+              throw new TunnelStoppedError(profile.name);
+            }
+            continue;
+          }
+
+          sshConnection = candidate;
+          thisRequest = new Promise<void>((resolve) => {
+            requestOver = resolve;
+          });
+          this.forwardRequests.set(requestKey, thisRequest);
+          break;
         }
-        sshConnection = await this.getOrCreateSharedConnection(runtime, activeTunnel.id);
         // The start holds the connection itself while the forward is requested,
         // out of stop()'s reach. Released under the request, a pooled lease
         // leaves the connection open for its other leases, and a forward granted
@@ -501,8 +527,8 @@ export class TunnelManager {
           throw new TunnelStoppedError(profile.name);
         }
       } finally {
-        requestOver();
-        if (this.forwardRequests.get(requestKey) === thisRequest) {
+        requestOver?.();
+        if (thisRequest && this.forwardRequests.get(requestKey) === thisRequest) {
           this.forwardRequests.delete(requestKey);
         }
       }

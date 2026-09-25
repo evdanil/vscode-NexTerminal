@@ -606,7 +606,9 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
     isHidden: false
   };
   const sharedProfile = async (tunnelType: TunnelProfile["tunnelType"]): Promise<TunnelProfile> => ({
-    ...isolatedProfile(await getFreePort()),
+    // Reverse tunnels do not bind a local port, so keep these tests independent
+    // of OS port allocation. Local and dynamic tunnels need a real free port.
+    ...isolatedProfile(tunnelType === "reverse" ? 12_345 : await getFreePort()),
     connectionMode: "shared",
     tunnelType
   });
@@ -733,6 +735,74 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
     const active = await replacement;
     cleanups.push(() => stack.tunnelManager.stop(active.id));
     expect(stack.tunnelManager.getActiveTunnelId(profile.id)).toBe(active.id);
+  });
+
+  it("does not wait for a non-pooled predecessor's login before connecting a replacement", async () => {
+    const login = deferred();
+    const auth = createAuthFactory({ targetLogin: login.promise });
+    const server: ServerConfig = { ...direct, multiplexing: false };
+    const stack = buildStack(auth, [server], 20);
+    const profile: TunnelProfile = {
+      ...isolatedProfile(12345),
+      connectionMode: "shared",
+      tunnelType: "reverse",
+      remotePort: 8022
+    };
+
+    const stale = stack.tunnelManager.start(profile, server, { connectionMode: "shared" }).then(
+      () => "resolved",
+      (error: unknown) => error
+    );
+    await vi.waitFor(() => expect(auth.calls).toHaveLength(1), SETTLE);
+    await stack.tunnelManager.stopAll();
+
+    const replacement = stack.tunnelManager.start(profile, server, { connectionMode: "shared" });
+    await vi.waitFor(() => expect(auth.calls).toHaveLength(2), SETTLE);
+    login.resolve();
+
+    expect(await stale).toBeInstanceOf(TunnelStoppedError);
+    const active = await replacement;
+    cleanups.push(() => stack.tunnelManager.stop(active.id));
+    expect(auth.targets[0].requestForwardIn).not.toHaveBeenCalled();
+    expect(auth.targets[1].requestForwardIn).toHaveBeenCalledWith("127.0.0.1", 8022);
+  });
+
+  it("does not reconnect a replacement stopped behind a pending forward", async () => {
+    const forwardIn = deferred();
+    const nextLogin = deferred();
+    const gates: { forwardIn?: Promise<void>; targetLogin?: Promise<void> } = { forwardIn: forwardIn.promise };
+    const auth = createAuthFactory(gates);
+    const server: ServerConfig = { ...direct, multiplexing: false };
+    const stack = buildStack(auth, [server], 20);
+    const profile: TunnelProfile = {
+      ...isolatedProfile(12345),
+      connectionMode: "shared",
+      tunnelType: "reverse",
+      remotePort: 8022
+    };
+
+    const stale = stack.tunnelManager.start(profile, server, { connectionMode: "shared" }).then(
+      () => "resolved",
+      (error: unknown) => error
+    );
+    await vi.waitFor(() => expect(auth.targets[0]?.requestForwardIn).toHaveBeenCalled(), SETTLE);
+    await stack.tunnelManager.stopAll();
+
+    gates.targetLogin = nextLogin.promise;
+    const stoppedReplacement = stack.tunnelManager.start(profile, server, { connectionMode: "shared" }).then(
+      () => "resolved",
+      (error: unknown) => error
+    );
+    await stack.tunnelManager.stopAll();
+    forwardIn.resolve();
+
+    expect(await stale).toBeInstanceOf(TunnelStoppedError);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const callsAfterBarrier = auth.calls.length;
+    nextLogin.resolve();
+
+    expect(await stoppedReplacement).toBeInstanceOf(TunnelStoppedError);
+    expect(callsAfterBarrier).toBe(1);
   });
 
   it.each([
