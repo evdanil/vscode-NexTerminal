@@ -229,13 +229,19 @@ export interface ScriptFsContext {
  *
  * Scheme handling (decision 5 — "all reads via `vscode.workspace.fs`,
  * remote-compat"):
- *  - `file:` scheme: paths come from `.fsPath`, platform derived from the
- *    HOST'S `process.platform` (a `file:` Uri is always local).
- *  - Any other scheme (`vscode-remote:` included — the CodeLens explicitly
- *    supports it): paths come from `.path` (always POSIX), platform "posix".
+ *  - `file:` scheme: paths come from `.fsPath`, platform derived from THIS
+ *    process's `process.platform`. A `file:` Uri names the disk of the
+ *    extension host this code runs in — the remote host's in an ordinary
+ *    Remote-SSH / WSL / Codespaces window, where Nexus runs in the remote
+ *    extension host — so this process's platform is the one that
+ *    interprets the path.
+ *  - Any other scheme: paths come from `.path` (always POSIX), platform
+ *    "posix". That includes `vscode-remote:` (the CodeLens registers for
+ *    it), which reaches Nexus when `remote.extensionKind` forces it to run
+ *    UI-side in a remote window.
  *  - `scriptsRootUri` participates in the union ONLY if its scheme AND
  *    (case-insensitive) authority match `scriptUri`'s — never compare a
- *    remote path against a local root or vice versa.
+ *    path on one file system against a root on another.
  */
 export function buildScriptFsScope(ctx: ScriptFsContext): ScriptFsScope | { code: "NoScriptDir" } {
   if (!ctx.scriptDirUri) return { code: "NoScriptDir" };
@@ -273,13 +279,17 @@ function uriOf(resolvedPath: string, scriptUri: vscode.Uri): vscode.Uri {
  * posix path semantics treat `\` as an ordinary filename character — so
  * `resolveScriptFsPath` sees `"..\\..\\etc\\passwd"` as one harmless (if
  * odd-looking) filename segment and happily contains it. But the request
- * still reaches the remote FileSystemProvider as a literal string, and if
- * that provider's actual OS is Windows (Remote-SSH / WSL to a Windows host),
- * IT normalizes `\` into a real path separator — turning our "contained"
- * lexical result into a real traversal on the far end. A local `file:` posix
- * path keeps allowing `\` (a real filename character there, and the resolver
- * and the local disk provider agree on that), so this only fires for schemes
- * where the resolver's assumption and the provider's behavior can diverge.
+ * still reaches the FileSystemProvider as a literal string, and if the
+ * machine behind it runs Windows (a `vscode-remote:` script when
+ * `remote.extensionKind` runs Nexus UI-side in a Remote-SSH window to a
+ * Windows host), IT normalizes `\` into a real path separator — turning our
+ * "contained" lexical result into a real traversal on the far end. A `file:`
+ * path is on this extension host's own disk — the remote host's, in an
+ * ordinary remote window — and takes its platform from `process.platform`:
+ * win32 treats `\` as the separator it is there, posix keeps it as a real
+ * filename character, and either way the resolver and the disk agree. So
+ * this only fires for schemes where the resolver's assumption and the
+ * provider's behavior can diverge.
  */
 function hasBackslashOnNonFileScheme(requested: unknown, scheme: string): boolean {
   return scheme !== "file" && typeof requested === "string" && requested.includes("\\");

@@ -2888,10 +2888,11 @@ describe("remote (non-file) scheme — backslash traversal guard", () => {
     // ⊘ scriptFs.ts not rejecting backslashes on non-file schemes at all —
     // buildScriptFsScope forces platform "posix" for every remote scheme, and
     // posix treats "\" as an ordinary filename character, so containment
-    // alone WOULD pass this. The danger is downstream: a real Windows remote
-    // FileSystemProvider (Remote-SSH / WSL to a Windows host) normalizes "\"
-    // into a genuine path separator, turning this into a real traversal on
-    // the far end.
+    // alone WOULD pass this. The danger is downstream: a FileSystemProvider
+    // backed by Windows (a `vscode-remote:` script when `remote.extensionKind`
+    // runs Nexus UI-side in a Remote-SSH window to a Windows host) normalizes
+    // "\" into a genuine path separator, turning this into a real traversal
+    // on the far end.
     const ctx: ScriptFsContext = {
       scriptUri: remoteUri("wsl+ubuntu", "/home/u/scripts/cisco/probe.js"),
       scriptDirUri: remoteUri("wsl+ubuntu", "/home/u/scripts/cisco"),
@@ -2987,7 +2988,7 @@ describe("remote (non-file) scheme — reads route by .path, never by the (bogus
   });
 });
 
-describe("scriptFsReadText — end-to-end with a correctly-rebased remote scripts root (P2: resolveScriptsDir on Remote-SSH)", () => {
+describe("scriptFsReadText — end-to-end with a correctly-rebased remote scripts root (P2: resolveScriptsDir with a vscode-remote workspace root)", () => {
   it("a ../shared/... read inside the configured root resolves once the root carries the SCRIPT'S remote scheme+authority — exactly what resolveScriptsDir's rebase produces", async () => {
     // ⊘ `resolveScriptsDir` handing back a LOCAL
     // `file:` Uri for an absolute `nexus.scripts.path` on a remote

@@ -1,5 +1,10 @@
 # Changelog
 
+## [2.8.263] — 2026-09-25
+
+### Fixed
+
+- **The scripting guide no longer says a script in a Remote-SSH, WSL or Codespaces window refuses `\` in a `nexus.fs` path, or loads `./Lib.js` and `./lib.js` as two modules on a Windows host.** In an ordinary remote window Nexus runs on the remote host, and a script there is an ordinary file on that host: a `\` in a `nexus.fs` path follows that host's rules, and on a Windows host the two spellings are one module, as they are on a Windows desktop. Both behaviours belong only to a script whose URI is not `file:` — a `vscode-remote:` script, which is what Nexus sees when `remote.extensionKind` makes it run on your local machine in a remote window, or a script on a file system another extension provides. The extension itself is unchanged.
 ## [2.8.255] — 2026-09-25
 
 ### Fixed

@@ -8,10 +8,12 @@ const DEFAULT_RELATIVE_PATH = ".nexus/scripts";
  * deliberately not `path.isAbsolute` (which resolves to whichever
  * convention matches THIS process's `process.platform`). An absolute
  * `nexus.scripts.path` value describes a location on the machine the
- * SCRIPTS actually live on — over Remote-SSH that's the remote host, which
- * can run a different OS than wherever this particular check happens to
- * execute (notably: this repo's own POSIX test suite, verifying a
- * Windows-drive-absolute value like `C:\scripts`). Checking both
+ * SCRIPTS actually live on — over Remote-SSH that's the remote host. This
+ * check normally runs there too (Nexus runs in the remote extension host),
+ * but not always: when `remote.extensionKind` forces Nexus to run UI-side it
+ * runs on the local machine, which can run a different OS — as does this
+ * repo's own POSIX test suite, verifying a Windows-drive-absolute value like
+ * `C:\scripts`. Checking both
  * conventions makes "is this absolute" a property of the STRING, not of the
  * local host.
  */
@@ -42,20 +44,28 @@ export function resolveScriptsDir(globalStoragePath: string): vscode.Uri {
   const root = vscode.workspace.workspaceFolders?.[0]?.uri;
 
   if (isAbsoluteAnyPlatform(configured)) {
-    // Remote workspace (root scheme is `vscode-remote:` or similar, not
-    // `file:`): `Uri.file(configured)` would silently build a LOCAL `file:`
-    // URI for a path that only makes sense on the REMOTE host.
-    // `buildScriptFsScope`'s scheme/authority guard then correctly refuses
-    // to unify that with the remote script's own scope, and the configured
+    // A `file:` URI names THIS extension host's own disk. In an ordinary
+    // Remote-SSH / WSL / Dev Containers / Codespaces window Nexus (it declares
+    // no `extensionKind`) runs in the remote extension host, so the workspace
+    // root arrives as `file:` there and `Uri.file(configured)` below already
+    // names the remote host's disk. A non-`file:` root means the workspace is
+    // on a file system this host does not reach by path — `vscode-remote:`
+    // when `remote.extensionKind` forces Nexus to run UI-side in a remote
+    // window, or a file system another extension provides. There,
+    // `Uri.file(configured)` would silently build a `file:` URI on this
+    // host's disk for a path that only makes sense on the workspace's file
+    // system. `buildScriptFsScope`'s scheme/authority guard then correctly
+    // refuses to unify that with the script's own scope, and the configured
     // root silently drops out of the union — a documented absolute-path
-    // configuration breaks on remote (fails closed, not a hole, but still
-    // wrong). Rebase onto the workspace root's OWN scheme+authority instead
-    // — everything else about the URI (query, fragment) is reset, matching
-    // a fresh root rather than inheriting the workspace folder's own.
+    // configuration breaks (fails closed, not a hole, but still wrong).
+    // Rebase onto the workspace root's OWN scheme+authority instead —
+    // everything else about the URI (query, fragment) is reset, matching a
+    // fresh root rather than inheriting the workspace folder's own.
     if (root && root.scheme !== "file") {
       return root.with({ path: toRemoteUriPath(configured), query: "", fragment: "" });
     }
-    // Local (`file:`) workspace, or no workspace at all — unchanged.
+    // `file:` workspace — local, or remote with Nexus in the remote extension
+    // host — or no workspace at all: the path is on this host's disk.
     return vscode.Uri.file(configured);
   }
 
