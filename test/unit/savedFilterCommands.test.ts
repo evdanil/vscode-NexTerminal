@@ -69,9 +69,19 @@ function providerWithFilterField(label: string, providerLabel = "Fixture"): Inve
 const DEVICE_FILTER_PROVIDER = providerWithFilterField("Device Filter", "NetBox-like");
 /** A provider whose source form has no filter field, so no Saved Filter picker (Proxmox's shape). */
 const NO_FILTER_PROVIDER: InventoryProvider = { ...DEVICE_FILTER_PROVIDER, id: "no-filter", label: "Proxmox-like", configFields: [] };
-/** The command only lists the registry's providers. */
-const registryOf = (...providers: InventoryProvider[]) =>
-  ({ list: () => providers }) as unknown as Parameters<typeof registerSavedFilterCommands>[1];
+/**
+ * The command lists the registry's providers and reads each one's fields through
+ * `configFieldsOf` alone (issue #195). The listed providers carry no
+ * `configFields` of their own, so a read of the provider's array, which the
+ * provider can change after registering, finds nothing and throws.
+ */
+const registryOf = (...providers: InventoryProvider[]) => {
+  const fieldsOf = new Map(providers.map(({ configFields, ...listed }) => [listed as InventoryProvider, configFields] as const));
+  return {
+    list: () => [...fieldsOf.keys()],
+    configFieldsOf: (provider: InventoryProvider) => fieldsOf.get(provider)!
+  } as unknown as Parameters<typeof registerSavedFilterCommands>[1];
+};
 
 describe("nexus.savedFilter.manage", () => {
   let core: NexusCore;
@@ -241,7 +251,7 @@ describe("inline 'Save current filter as…' affordance (PR-E)", () => {
   }
 
   it("saves the CURRENT Device Filter text under a prompted name and appends it to the picker", async () => {
-    const controller = createInlineSavedFilterCreation({ core, provider: DEVICE_FILTER_PROVIDER });
+    const controller = createInlineSavedFilterCreation({ core, configFields: DEVICE_FILTER_PROVIDER.configFields });
     const panel = fakePanel();
     controller.attachPanel(panel as never);
     mockShowInputBox.mockResolvedValueOnce("Reusable");
@@ -267,7 +277,7 @@ describe("inline 'Save current filter as…' affordance (PR-E)", () => {
   });
 
   it("with no Device Filter typed yet, warns and saves NOTHING (kills saving an empty definition)", async () => {
-    const controller = createInlineSavedFilterCreation({ core, provider: DEVICE_FILTER_PROVIDER });
+    const controller = createInlineSavedFilterCreation({ core, configFields: DEVICE_FILTER_PROVIDER.configFields });
     const panel = fakePanel();
     controller.attachPanel(panel as never);
 
@@ -282,7 +292,7 @@ describe("inline 'Save current filter as…' affordance (PR-E)", () => {
   // Issue #152 — the warning tells the user which field to type in, so it must
   // be the field this form actually shows.
   it("the nothing-typed warning names the form's OWN filter field (⊘ 'Type a Device Filter first' on a Project Filter form)", async () => {
-    const controller = createInlineSavedFilterCreation({ core, provider: providerWithFilterField("Project Filter") });
+    const controller = createInlineSavedFilterCreation({ core, configFields: providerWithFilterField("Project Filter").configFields });
     controller.attachPanel(fakePanel() as never);
 
     controller.handleCreateInline(SAVED_FILTER_SELECT_KEY, { [filterKey]: "" });
@@ -295,7 +305,7 @@ describe("inline 'Save current filter as…' affordance (PR-E)", () => {
 
   // Codex on #164 — the label comes from the provider, the sentence from us.
   it("the nothing-typed warning makes the field label inert (⊘ a line break, bidi override or zero-width character from a provider's label reshaping the warning)", async () => {
-    const controller = createInlineSavedFilterCreation({ core, provider: providerWithFilterField("Project\nFilter\u202E\u200B") });
+    const controller = createInlineSavedFilterCreation({ core, configFields: providerWithFilterField("Project\nFilter\u202E\u200B").configFields });
     controller.attachPanel(fakePanel() as never);
 
     controller.handleCreateInline(SAVED_FILTER_SELECT_KEY, { [filterKey]: "" });
@@ -310,7 +320,7 @@ describe("inline 'Save current filter as…' affordance (PR-E)", () => {
   // picker's key has no field behind it — neither a text to save nor a field to
   // name in the warning. Proxmox is the built-in case.
   it("does nothing for a provider with no filter field (⊘ a fallback that still prompts, saves, or warns about a field the form does not have)", async () => {
-    const controller = createInlineSavedFilterCreation({ core, provider: NO_FILTER_PROVIDER });
+    const controller = createInlineSavedFilterCreation({ core, configFields: NO_FILTER_PROVIDER.configFields });
     const panel = fakePanel();
     controller.attachPanel(panel as never);
 
@@ -325,7 +335,7 @@ describe("inline 'Save current filter as…' affordance (PR-E)", () => {
   });
 
   it("ignores a create fired by a DIFFERENT select's key (kills a handler that fires on any create)", async () => {
-    const controller = createInlineSavedFilterCreation({ core, provider: DEVICE_FILTER_PROVIDER });
+    const controller = createInlineSavedFilterCreation({ core, configFields: DEVICE_FILTER_PROVIDER.configFields });
     const panel = fakePanel();
     controller.attachPanel(panel as never);
 
@@ -337,7 +347,7 @@ describe("inline 'Save current filter as…' affordance (PR-E)", () => {
   });
 
   it("cancelling the name prompt saves nothing", async () => {
-    const controller = createInlineSavedFilterCreation({ core, provider: DEVICE_FILTER_PROVIDER });
+    const controller = createInlineSavedFilterCreation({ core, configFields: DEVICE_FILTER_PROVIDER.configFields });
     const panel = fakePanel();
     controller.attachPanel(panel as never);
     mockShowInputBox.mockResolvedValueOnce(undefined); // cancelled
@@ -426,7 +436,7 @@ describe("FIX A — saved-filter mutations serialize under configMutationLock", 
   });
 
   it("inline 'Save current filter as…' does not land while the lock is held, then lands on release", async () => {
-    const controller = createInlineSavedFilterCreation({ core, provider: DEVICE_FILTER_PROVIDER });
+    const controller = createInlineSavedFilterCreation({ core, configFields: DEVICE_FILTER_PROVIDER.configFields });
     const panel = { addSelectOption: vi.fn(), onDidDispose: vi.fn(), dispose: vi.fn() };
     controller.attachPanel(panel as never);
     const { held, release } = holdLock();

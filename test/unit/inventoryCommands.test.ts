@@ -197,6 +197,23 @@ function makeProvider(overrides: Partial<InventoryProvider> = {}): InventoryProv
   };
 }
 
+/**
+ * ISSUE #195 — makes a REGISTERED provider's own `configFields` throw when read.
+ * The registry copies the list once, as `register()` checks it, and every
+ * consumer is meant to read that copy (`InventoryProviderRegistry.configFieldsOf`).
+ * A consumer that reads the provider's own array instead reads a list whose
+ * methods and iterator the provider controls, and which it can change after the
+ * check. Sealing after `register()`, the one sanctioned reader, turns such a
+ * read into a loud failure in whichever flow the test drives.
+ */
+function sealConfigFields(provider: InventoryProvider): void {
+  Object.defineProperty(provider, "configFields", {
+    get: () => {
+      throw new Error("read the registry's copy (configFieldsOf), not the provider's own configFields");
+    }
+  });
+}
+
 function makeVault(initial: Record<string, string> = {}) {
   const store = new Map(Object.entries(initial));
   return {
@@ -388,6 +405,38 @@ describe("inventoryCommands", () => {
 
       const source = core.getSnapshot().inventorySources[0];
       expect(source.providerFingerprint).toBe(computeProviderFingerprint(provider));
+    });
+
+    it("builds the form, runs Test and saves from the registry's copy of the provider's fields, never its own array (⊘ the form definition, either parse, the password-field list or the stamped fingerprint reading `provider.configFields`, which the provider can change after registering — issue #195)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const registeredShape = computeProviderFingerprint(provider);
+      sealConfigFields(provider);
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { definition, onTest, onSubmit } = latestFormCall();
+      expect(definition.fields.flatMap((field) => ("key" in field ? [field.key] : []))).toEqual(
+        expect.arrayContaining(["cfg_host", "cfg_apiToken"])
+      );
+      const values: FormValues = {
+        name: "My NetBox",
+        targetFolder: "Infra",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: "secret-token"
+      };
+      await onTest!(values);
+      expect(provider.testConnection).toHaveBeenCalledWith({ host: "netbox.local" }, { apiToken: "secret-token" });
+      await onSubmit(values);
+
+      const [source] = core.getSnapshot().inventorySources;
+      expect(source.secretFieldIds).toEqual(["apiToken"]);
+      expect(source.providerFingerprint).toBe(registeredShape);
     });
 
     it("Save persists the source WITHOUT ever calling provider.testConnection — Test is voluntary and no longer gates Save (kills the old forced-test-before-save / Save Anyway prompt)", async () => {
@@ -1168,6 +1217,44 @@ describe("inventoryCommands", () => {
       const updated = core.getInventorySource("src-1")!;
       expect(updated.providerFingerprint).toBe(computeProviderFingerprint(provider));
       expect(updated.providerFingerprint).not.toBe("stale-fingerprint");
+    });
+
+    it("gates, builds the form, runs Test and saves from the registry's copy of the provider's fields, never its own array (⊘ the trust gate, the form definition, either parse, the secret-field list or the restamp reading `provider.configFields` — issue #195)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const registeredShape = computeProviderFingerprint(provider);
+      sealConfigFields(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "old-token" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(
+        makeSource({ config: { host: "netbox.local" }, secretFieldIds: ["apiToken"], providerFingerprint: registeredShape })
+      );
+
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      // The stamp matches the copy, so the gate asks nothing.
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+      const { definition, onTest, onSubmit } = latestFormCall();
+      expect(definition.fields.find((field) => "key" in field && field.key === "cfg_host")).toEqual(
+        expect.objectContaining({ value: "netbox.local" })
+      );
+      const values: FormValues = {
+        name: "My Source",
+        targetFolder: "Infra",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        cfg_host: "netbox.local",
+        cfg_apiToken: ""
+      };
+      await onTest!(values);
+      expect(provider.testConnection).toHaveBeenCalledWith({ host: "netbox.local" }, { apiToken: "old-token" });
+      await onSubmit(values);
+
+      const updated = core.getInventorySource("src-1")!;
+      expect(updated.secretFieldIds).toEqual(["apiToken"]);
+      expect(updated.providerFingerprint).toBe(registeredShape);
     });
 
     it("in-flight guard — editSource marks the source busy while the form is open and releases it when the form closes, whether by Save or Cancel (kills leaking the busy flag / never marking it busy at all)", async () => {
@@ -2552,6 +2639,26 @@ describe("inventoryCommands", () => {
 
       expect(mockShowWarningMessage).not.toHaveBeenCalled();
       expect(core.getInventorySource("src-1")?.providerFingerprint).toBe(computeProviderFingerprint(provider));
+    });
+
+    it("gates, checks its required secrets and stamps from the registry's copy of the provider's fields, never its own array (⊘ the gate, the required-secret loop or the stamp reading `provider.configFields` — issue #195)", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider();
+      registry.register(provider);
+      const registeredShape = computeProviderFingerprint(provider);
+      sealConfigFields(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["apiToken"] }));
+
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(mockShowErrorMessage).not.toHaveBeenCalled();
+      expect(vault.get).toHaveBeenCalledWith(inventorySecretKey("src-1", "apiToken"));
+      expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
+      expect(core.getInventorySource("src-1")?.providerFingerprint).toBe(registeredShape);
     });
 
     it("F5 — a source replaced (different targetFolder) in the gap between the sync committing and the best-effort restamp's own separate lock is left unstamped (kills stamping whoever currently holds the id)", async () => {
@@ -8439,6 +8546,16 @@ describe("inventoryCommands", () => {
       expect(info).toContain("R1");
     });
 
+    it("gates on the registry's copy of the provider's fields, never its own array (⊘ the trust gate hashing `provider.configFields` — issue #195)", async () => {
+      const { provider, start, controlSpy, server } = await setup({ providerFingerprint: computeProviderFingerprint(makeProvider()) });
+      sealConfigFields(provider);
+
+      await start({ server });
+
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+      expect(controlSpy).toHaveBeenCalledWith({}, {}, "/Lab.unl#3", "start");
+    });
+
     it("STOP dispatches controlNode with action 'stop' (⊘ reusing the start action never stops the node)", async () => {
       const { stop, controlSpy, server } = await setup();
       await stop({ server });
@@ -9061,6 +9178,17 @@ describe("nexus.inventory.openWebConsole", () => {
     });
     await open({ server });
     expect(urlSpy).toHaveBeenCalledWith({}, { apiToken: "tok" }, "107");
+    expect(openedUrl()).toBe(CONSOLE_URL);
+  });
+
+  it("gates on the registry's copy of the provider's fields, never its own array (⊘ the trust gate hashing `provider.configFields` — issue #195)", async () => {
+    const { provider, open, urlSpy, server } = await setup({ providerFingerprint: computeProviderFingerprint(makeProvider()) });
+    sealConfigFields(provider);
+
+    await open({ server });
+
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    expect(urlSpy).toHaveBeenCalledTimes(1);
     expect(openedUrl()).toBe(CONSOLE_URL);
   });
 
@@ -11981,6 +12109,28 @@ describe("nexus.inventory.refreshStatus — provider trust fingerprint", () => {
     // The absence is the load-bearing half: the old message named this command
     // for every refusal, and naming it here is the two-step path.
     expect(notifications()[0]).not.toContain("Sync Inventory Now");
+  });
+
+  it("refuses, and picks the remedy, from the registry's copy of the provider's fields, never its own array (⊘ the silent gate, or the composer's required-secret test, reading `provider.configFields` — issue #195)", async () => {
+    const { registry, refresh } = await setup([{ id: "src-1", name: "Alpha", providerFingerprint: STALE }], {
+      configFields: ADDED_REQUIRED_SECRET
+    });
+    sealConfigFields(registry.get("fake")!);
+
+    await refresh("src-1");
+
+    expect(notifications()).toHaveLength(1);
+    expect(notifications()[0]).toContain("Edit Source");
+  });
+
+  it("trusts a matching stamp by the registry's copy of the provider's fields, never its own array (⊘ the silent gate hashing `provider.configFields` — issue #195)", async () => {
+    const { registry, refresh, fetchStatus } = await setup([
+      { id: "src-1", name: "Alpha", providerFingerprint: computeProviderFingerprint(makeProvider()) }
+    ]);
+    sealConfigFields(registry.get("fake")!);
+
+    await expect(refresh()).resolves.toEqual({ unrefreshedSourceIds: [] });
+    expect(fetchStatus).toHaveBeenCalledTimes(1);
   });
 
   it("still names SYNC INVENTORY NOW when every required secret the new shape declares is already stored (\u2298 pointing every refusal at Edit Source costs the one-step remedy on the ordinary path, where a sync both confirms and restamps)", async () => {

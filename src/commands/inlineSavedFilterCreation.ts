@@ -3,15 +3,17 @@ import { randomUUID } from "node:crypto";
 import type { NexusCore } from "../core/nexusCore";
 import type { WebviewFormPanel } from "../ui/webviewFormPanel";
 import type { FormValues } from "../ui/formTypes";
-import type { InventoryProvider } from "../models/inventory";
+import type { InventoryConfigField } from "../models/inventory";
 import { configMutationLock } from "../services/configMutationLock";
 import { SAVED_FILTER_SELECT_KEY, inventoryConfigFieldPrefixedKey, savedFilterTarget } from "../ui/formDefinitions";
 
 interface InlineSavedFilterContext {
   core: NexusCore;
-  /** The source form's provider: its `savedFilterTarget` is the field this
-   *  affordance saves from, and the one its message names (by the sanitized label). */
-  provider: InventoryProvider;
+  /** The source form's provider fields, as the registry keeps them
+   *  (`InventoryProviderRegistry.configFieldsOf`): their `savedFilterTarget` is the
+   *  field this affordance saves from, and the one its message names (by the
+   *  sanitized label). */
+  configFields: readonly InventoryConfigField[];
 }
 
 export interface InlineSavedFilterCreationController {
@@ -44,7 +46,7 @@ export function createInlineSavedFilterCreation(ctx: InlineSavedFilterContext): 
     },
     handleCreateInline(key, values) {
       // No target field ⇒ the form rendered no picker, so nothing could have fired this.
-      const target = savedFilterTarget(ctx.provider);
+      const target = savedFilterTarget(ctx.configFields);
       if (key !== SAVED_FILTER_SELECT_KEY || !panel || target === undefined) {
         return;
       }
