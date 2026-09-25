@@ -94,30 +94,16 @@ vi.mock("vscode", () => ({
 }));
 
 /**
- * A fast stand-in for the backup cipher. The real one derives its key with
- * 210,000 PBKDF2 iterations per call, which put a test that encrypts and
- * decrypts a few times over the unit timeout; AES-GCM and the KDF have their
- * own suite. What THIS file asserts is which half of the file a value lands in,
- * so the fake keeps the two properties that depend on: the plaintext is not
- * readable in the output (base64 cannot hold the `-`, `_`, `.` and `:` every
- * secret fixture here contains), and a wrong password is refused.
+ * The backup cipher runs for real, with only its 210,000-iteration key
+ * derivation swapped for a fast one: that derivation put a test that encrypts
+ * and decrypts a few times over the unit timeout, and it has its own suite
+ * (`configCrypto.test.ts`). What THIS file asserts is which half of the file a
+ * value lands in and that the seal refuses an edited file — the helper keeps
+ * AES-GCM, the wrong-password refusal and the seal real.
  */
-vi.mock("../../src/utils/configCrypto", () => ({
-  encrypt: (plaintext: string, password: string) => ({
-    kdf: "pbkdf2-sha512",
-    iterations: 210_000,
-    cipher: "aes-256-gcm",
-    iv: "",
-    salt: "",
-    tag: "",
-    ciphertext: Buffer.from(JSON.stringify({ password, plaintext }), "utf8").toString("base64")
-  }),
-  decrypt: (payload: { ciphertext: string }, password: string) => {
-    const sealed = JSON.parse(Buffer.from(payload.ciphertext, "base64").toString("utf8")) as { password: string; plaintext: string };
-    if (sealed.password !== password) throw new Error("Unsupported state or unable to authenticate data");
-    return sealed.plaintext;
-  }
-}));
+vi.mock("node:crypto", async (importOriginal) =>
+  (await import("../helpers/fastBackupKdf")).withFastPbkdf2(await importOriginal<typeof import("node:crypto")>())
+);
 
 import type * as vscode from "vscode";
 import { registerConfigCommands, isValidExport, type ConfigRuntimeHooks } from "../../src/commands/configCommands";

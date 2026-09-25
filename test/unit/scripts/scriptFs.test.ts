@@ -1250,11 +1250,15 @@ describe("scriptFsReadText — read deadline (P1: a stalled I/O call must not pi
       nodeOpenSpy.mockImplementationOnce(realNodeOpen as never);
       await expect(scriptFsReadText("healthy.txt", ctx)).resolves.toBe("ok");
 
-      // Settle the orphan for real and give its (discarded) result time to
-      // land — this should decrement the orphan count back to 0.
+      // Settle the orphan for real and wait for its (discarded) result to
+      // land — this should decrement the orphan count back to 0. It lands only
+      // after real disk I/O, which a fixed sleep can outlast on a loaded host,
+      // so wait for the count itself. A count that never comes back to 0
+      // fails here, as the batch below would.
       vi.useRealTimers();
+      expect(readSlots.snapshot().orphaned).toBe(1);
       stallGate.resolve();
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await waitFor(() => readSlots.snapshot().orphaned === 0);
       vi.useFakeTimers();
 
       // Baseline-return proof: a FRESH batch of exactly
@@ -1691,10 +1695,17 @@ describe("scriptFsReadText — orphan-pool recovery via promotion (P2: a permit-
       const { orphanGates, heldGates } = await degradePool(ctx, scriptDir);
 
       // Settle ONLY the 8 originals — promotes all 4 held reads, freeing
-      // their 4 permits.
+      // their 4 permits. The originals settle only after real disk I/O, which
+      // a fixed sleep can outlast on a loaded host, so wait until all 8 have
+      // settled. That is when the orphaned and held counts add up to the 4
+      // held reads, whether or not they were promoted. The open() count below
+      // still decides whether promotion happened.
       vi.useRealTimers();
       orphanGates.forEach((g) => g.resolve());
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await waitFor(() => {
+        const { orphaned, held } = readSlots.snapshot();
+        return orphaned + held.length === SCRIPT_FS_MAX_CONCURRENT_READS;
+      });
       vi.useFakeTimers();
 
       // Re-occupy the ENTIRE pool with SCRIPT_FS_MAX_CONCURRENT_READS fresh,
@@ -3053,7 +3064,14 @@ describe("scriptFsReadSource — shares readSlots with nexus.fs.readText (P1: on
     const stalled = Array.from({ length: SCRIPT_FS_MAX_CONCURRENT_READS }, (_, i) =>
       scriptFsReadText(`stall${i}.txt`, ctx)
     );
-    await waitFor(() => readSlots.snapshot().permitsInUse === SCRIPT_FS_MAX_CONCURRENT_READS);
+    // A read takes its permit before its real stat() and reaches open() only
+    // after that I/O, so wait for the opens too. Asserting on them the moment
+    // the permits are taken failed on a loaded host.
+    await waitFor(
+      () =>
+        readSlots.snapshot().permitsInUse === SCRIPT_FS_MAX_CONCURRENT_READS &&
+        nodeOpenSpy.mock.calls.length === SCRIPT_FS_MAX_CONCURRENT_READS
+    );
     expect(nodeOpenSpy).toHaveBeenCalledTimes(SCRIPT_FS_MAX_CONCURRENT_READS);
 
     const included = scriptFsReadSource(path.join(scriptDir, "lib.js"), ctx);
