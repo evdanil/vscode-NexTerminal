@@ -12,7 +12,7 @@ import type {
 import { resolveTunnelType } from "../models/config";
 import { configMutationLock } from "../services/configMutationLock";
 import type { SshFactory } from "../services/ssh/contracts";
-import type { TunnelManager } from "../services/tunnel/tunnelManager";
+import { TunnelStoppedError, type TunnelManager } from "../services/tunnel/tunnelManager";
 import type { TunnelRegistrySync } from "../services/tunnel/tunnelRegistrySync";
 import { serverFormDefinition, tunnelFormDefinition } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
@@ -199,7 +199,16 @@ export async function startTunnel(
     }
   }
 
-  await tunnelManager.start(profile, server, { connectionMode });
+  try {
+    await tunnelManager.start(profile, server, { connectionMode });
+  } catch (error) {
+    // Stopped before it finished connecting: the stop was asked for, so there
+    // is no failure to report — the tunnel simply is not running.
+    if (error instanceof TunnelStoppedError) {
+      return;
+    }
+    throw error;
+  }
 }
 
 export async function stopTunnelByProfile(

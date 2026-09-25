@@ -5,6 +5,7 @@ import type {
   SshConnection,
   SshFactory
 } from "../../src/services/ssh/contracts";
+import { ProxiedSshConnection } from "../../src/services/ssh/proxiedSshConnection";
 import { SshConnectionPool, type PoolEvent } from "../../src/services/ssh/sshConnectionPool";
 import type { ServerConfig } from "../../src/models/config";
 
@@ -157,6 +158,31 @@ describe("SshConnectionPool", () => {
 
     expect(listener1).toHaveBeenCalled();
     expect(listener2).toHaveBeenCalled();
+  });
+
+  it("rejects a connection whose close is replayed during pool registration", async () => {
+    const conn = createMockConnection();
+    conn.onClose = vi.fn((listener: () => void) => {
+      listener();
+      return () => {};
+    });
+    const f = createMockFactory([conn]);
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 5000 });
+    const events: PoolEvent[] = [];
+    p.onDidChange((event) => events.push(event));
+
+    const result = await p.connect(testServer).then(
+      (lease) => {
+        lease.dispose();
+        return "connected" as const;
+      },
+      () => "closed" as const
+    );
+    p.dispose();
+
+    expect(result).toBe("closed");
+    expect(events).not.toContainEqual({ type: "connected", serverId: testServer.id });
+    expect(conn.dispose).toHaveBeenCalled();
   });
 
   it("concurrent connects serialize (factory called once, both callers get leases)", async () => {
@@ -403,6 +429,60 @@ describe("SshConnectionPool", () => {
     // because it was unsubscribed during lease dispose
     conn.fireClose();
     expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("retired proxied transport closes its bind barrier when the last lease is disposed", async () => {
+    const inner = createMockConnection();
+    const connection = new ProxiedSshConnection(inner, vi.fn());
+    const p = new SshConnectionPool(createMockFactory([connection]), { enabled: true, idleTimeoutMs: 5000 });
+    const lease = await p.connect(testServer);
+
+    const retirement = p.retire(lease);
+    expect(retirement).toBeDefined();
+    let settled = false;
+    void retirement?.then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    lease.dispose();
+    await Promise.resolve();
+
+    expect(settled).toBe(true);
+  });
+
+  it("retired fallback proxied transport closes its bind barrier when its lease is disposed", async () => {
+    const pooledInner = createMockConnection();
+    let shellCalls = 0;
+    pooledInner.openShell = vi.fn(async () => {
+      shellCalls++;
+      if (shellCalls > 1) {
+        throw new Error("Channel open failure: Administratively prohibited");
+      }
+      return {} as any;
+    });
+    const fallbackInner = createMockConnection();
+    const p = new SshConnectionPool(
+      createMockFactory([
+        new ProxiedSshConnection(pooledInner, vi.fn()),
+        new ProxiedSshConnection(fallbackInner, vi.fn())
+      ]),
+      { enabled: true, idleTimeoutMs: 5000 }
+    );
+
+    const pooledLease = await p.connect(testServer);
+    await pooledLease.openShell();
+    const fallbackLease = await p.connect(testServer);
+    await fallbackLease.openShell();
+
+    const retirement = p.retire(fallbackLease);
+    expect(retirement).toBeDefined();
+    let settled = false;
+    void retirement?.then(() => { settled = true; });
+    fallbackLease.dispose();
+    await Promise.resolve();
+
+    expect(settled).toBe(true);
+    pooledLease.dispose();
   });
 
   it("pool.dispose() cleans up all entries, timers, rejects future connects", async () => {

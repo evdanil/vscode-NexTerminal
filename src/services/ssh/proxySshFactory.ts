@@ -11,6 +11,7 @@ import type {
 } from "./contracts";
 import { ProxiedSshConnection, jumpHostCleanup, socketCleanup, socketCloseRelay } from "./proxiedSshConnection";
 import { underlyingConnection } from "./sshConnectionPool";
+import { getSshNetworkRoute, networkEndpointIdentity, networkRouteIdentity, rememberSshNetworkRoute } from "./sshNetworkRoute";
 import type { SilentAuthSshFactory } from "./silentAuth";
 import { proxyPasswordSecretKey } from "./silentAuth";
 import { isSameAuthenticatedEndpoint } from "../inventory/proxySecretHygiene";
@@ -153,23 +154,38 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     const credentialEndpointSignature = this.authFactory.getCredentialEndpointSignature?.(credentialSource, this.serverLookup);
     const hasCredentialGuard = typeof this.authFactory.getCredentialEndpointSignature === "function";
     if (!server.proxy) {
+      let connection: SshConnection;
       if (!context?.onAuthMessage && !hasCredentialGuard) {
-        return this.authFactory.connect(server);
+        connection = await this.authFactory.connect(server);
+      } else {
+        connection = await this.authFactory.connect(server, {
+          ...(context?.onAuthMessage && { onAuthMessage: context.onAuthMessage }),
+          ...(credentialEndpointSignature !== undefined && { credentialEndpointSignature }),
+          ...(hasCredentialGuard && { credentialRecord })
+        });
       }
-      return this.authFactory.connect(server, {
-        ...(context?.onAuthMessage && { onAuthMessage: context.onAuthMessage }),
-        ...(credentialEndpointSignature !== undefined && { credentialEndpointSignature }),
-        ...(hasCredentialGuard && { credentialRecord })
-      });
+      rememberSshNetworkRoute(
+        connection,
+        networkRouteIdentity(server, this.serverLookup, new Set<string>(), credentialSource)
+      );
+      return connection;
     }
-    return this.connectViaProxy(
+    const connection = await this.connectViaProxy(
       server,
       server.proxy,
       context?.proxyVisited ?? new Set<string>(),
       context?.onAuthMessage,
       credentialEndpointSignature,
-      credentialRecord
+      credentialRecord,
+      credentialSource
     );
+    if (server.proxy.type !== "ssh") {
+      rememberSshNetworkRoute(
+        connection,
+        networkRouteIdentity(server, this.serverLookup, new Set<string>(), credentialSource)
+      );
+    }
+    return connection;
   }
 
   private async connectViaProxy(
@@ -178,11 +194,20 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     visited: ReadonlySet<string>,
     onAuthMessage?: (text: string) => void,
     credentialEndpointSignature?: string,
-    credentialRecord?: ServerConfig | null
+    credentialRecord?: ServerConfig | null,
+    routeSource: ServerConfig = server
   ): Promise<SshConnection> {
     switch (proxy.type) {
       case "ssh":
-        return this.connectViaSshJump(server, proxy.jumpHostId, visited, onAuthMessage, credentialEndpointSignature, credentialRecord);
+        return this.connectViaSshJump(
+          server,
+          proxy.jumpHostId,
+          visited,
+          onAuthMessage,
+          credentialEndpointSignature,
+          credentialRecord,
+          routeSource
+        );
       case "socks5":
         return this.connectViaSocks5(server, proxy, onAuthMessage, credentialEndpointSignature, credentialRecord);
       case "http":
@@ -196,7 +221,8 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     visited: ReadonlySet<string>,
     onAuthMessage?: (text: string) => void,
     credentialEndpointSignature?: string,
-    credentialRecord?: ServerConfig | null
+    credentialRecord?: ServerConfig | null,
+    routeSource: ServerConfig = target
   ): Promise<SshConnection> {
     const nextVisited = this.addToVisited(visited, target);
     const jumpServer = this.serverLookup(jumpHostId);
@@ -270,11 +296,21 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       throw error;
     }
 
-    return new ProxiedSshConnection(
+    const proxiedConnection = new ProxiedSshConnection(
       targetConnection,
       jumpHostCleanup(jumpConnection),
       (listener) => jumpConnection.onClose(listener)
     );
+    // The jump connection may be a pooled lease and may have fallen back while
+    // opening the target's direct-TCP channel. Snapshot its active route only
+    // after the target authentication has successfully opened that channel.
+    const jumpRoute = getSshNetworkRoute(jumpConnection) ?? networkRouteIdentity(jumpServer, this.serverLookup);
+    rememberSshNetworkRoute(proxiedConnection, {
+      kind: "ssh",
+      endpoint: networkEndpointIdentity(target, routeSource),
+      jump: jumpRoute
+    });
+    return proxiedConnection;
   }
 
   private async connectViaSocks5(

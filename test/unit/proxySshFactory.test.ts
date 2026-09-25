@@ -17,7 +17,9 @@ const makeServer = (overrides: Partial<ServerConfig> = {}): ServerConfig => ({
   ...overrides
 });
 
-function makeFakeConnection(): SshConnection & { disposed: boolean; fireClose: () => void } {
+function makeFakeConnection(
+  options: { closeOnDispose?: boolean } = {}
+): SshConnection & { disposed: boolean; fireClose: () => void } {
   const closeListeners = new Set<() => void>();
   const conn: SshConnection & { disposed: boolean; fireClose: () => void } = {
     disposed: false,
@@ -35,12 +37,12 @@ function makeFakeConnection(): SshConnection & { disposed: boolean; fireClose: (
     getBanner: vi.fn(() => undefined),
     dispose: vi.fn(() => {
       conn.disposed = true;
-      for (const listener of closeListeners) {
-        listener();
+      if (options.closeOnDispose !== false) {
+        conn.fireClose();
       }
     }),
     fireClose: () => {
-      for (const listener of closeListeners) {
+      for (const listener of [...closeListeners]) {
         listener();
       }
     }
@@ -202,6 +204,60 @@ describe("ProxiedSshConnection", () => {
 
     expect(inner.dispose).toHaveBeenCalled();
     expect(cleanup).toHaveBeenCalled();
+  });
+
+  it("emits onClose when disposing the inner connection closes it", () => {
+    const inner = makeFakeConnection();
+    const cleanup = vi.fn();
+    const proxied = new ProxiedSshConnection(inner, cleanup);
+    const listener = vi.fn();
+    proxied.onClose(listener);
+
+    proxied.dispose();
+    proxied.dispose();
+
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a remote bind close barrier pending until the inner transport closes", async () => {
+    const inner = makeFakeConnection({ closeOnDispose: false });
+    const proxied = new ProxiedSshConnection(inner, vi.fn());
+    let barrierSettled = false;
+    const closeBarrier = new Promise<void>((resolve) => {
+      proxied.onClose(() => {
+        barrierSettled = true;
+        resolve();
+      });
+    });
+
+    proxied.dispose();
+    await Promise.resolve();
+    expect(barrierSettled).toBe(false);
+
+    inner.fireClose();
+    await closeBarrier;
+    expect(barrierSettled).toBe(true);
+  });
+
+  it("keeps the proxy close relay attached until the proxy transport closes", async () => {
+    const inner = makeFakeConnection({ closeOnDispose: false });
+    const jump = makeFakeConnection({ closeOnDispose: false });
+    const proxied = new ProxiedSshConnection(inner, () => jump.dispose(), (listener) => jump.onClose(listener));
+    let closed = false;
+    const closeBarrier = new Promise<void>((resolve) => {
+      proxied.onClose(() => {
+        closed = true;
+        resolve();
+      });
+    });
+
+    proxied.dispose();
+    await Promise.resolve();
+    expect(closed).toBe(false);
+
+    jump.fireClose();
+    await closeBarrier;
+    expect(closed).toBe(true);
   });
 
   it("jumpHostCleanup disposes the jump host connection", () => {

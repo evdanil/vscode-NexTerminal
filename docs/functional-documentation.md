@@ -187,6 +187,10 @@ Telnet is a per-server **protocol** choice, not a separate profile type: one ser
 9. Route labels indicate tunnel type with `L`, `R`, or `D`.
 10. Cross-window tunnel visibility: all three tunnel types are registered in globalState and visible across VS Code windows.
 
+Stopping a shared tunnel while its SSH connection is still opening cancels that start; it cannot later be announced as running. A refused reverse bind fails startup and releases only that tunnel's lease on a pooled SSH connection, leaving other terminal and SFTP leases intact.
+
+A tunnel is announced as started and registered cross-window only after startup succeeds; stopping it removes its active entry and unregisters it so other windows clear the remote marker on a later sync. Stopping a running reverse tunnel waits for the SSH server's remote-listener cancellation request to settle, so it can remain pending if the peer does not respond. If reverse startup is stopped while its remote-forward request is unanswered, a new start on the same SSH route and remote port waits until the earlier request is refused or withdrawn, or its SSH connection closes. A late grant for requested port `0` moves that wait to the concrete allocated port, permitting another auto-assigned start while fixed-port conflicts remain held until the old connection closes.
+
 ### 4.6 Serial Sidecar
 1. Create a serial profile with `Nexus: Add Serial Profile` (name + group + line settings).
 2. Select `Standard` or `Smart Follow` connection mode.

@@ -42,6 +42,7 @@ export interface SshConnection {
   requestForwardIn(bindAddr: string, bindPort: number): Promise<number>;
   cancelForwardIn(bindAddr: string, bindPort: number): Promise<void>;
   onTcpConnection(handler: (info: TcpConnectionInfo, accept: () => Duplex, reject: () => void) => void): () => void;
+  /** Calls the listener immediately when already closed; otherwise subscribes until close. */
   onClose(listener: () => void): () => void;
   /** Returns the SSH pre-auth banner (if any) once, then undefined on subsequent calls. */
   getBanner(): string | undefined;

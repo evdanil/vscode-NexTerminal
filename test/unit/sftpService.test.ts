@@ -353,6 +353,21 @@ describe("SftpService", () => {
     expect(failingService.isConnected("srv-1")).toBe(false);
   });
 
+  it("rejects setup when the SSH connection is already closed as its close listener is registered", async () => {
+    const unsubscribeClose = vi.fn();
+    (connection.onClose as ReturnType<typeof vi.fn>).mockImplementation((listener: () => void) => {
+      listener();
+      return unsubscribeClose;
+    });
+
+    await expect(service.connect(testServer)).rejects.toThrow("SSH connection closed before SFTP session was established");
+
+    expect(service.isConnected("srv-1")).toBe(false);
+    expect(sftp.end).toHaveBeenCalledTimes(1);
+    expect(connection.dispose).toHaveBeenCalledTimes(1);
+    expect(unsubscribeClose).toHaveBeenCalledTimes(1);
+  });
+
   it("does not reconnect if already connected", async () => {
     await service.connect(testServer);
     await service.connect(testServer);
