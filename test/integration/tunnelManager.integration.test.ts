@@ -237,6 +237,8 @@ class HeldForwardConnection extends DirectTcpSshConnection {
 class ControlledForwardConnection extends DirectTcpSshConnection {
   public forwardAttempts = 0;
   public cancelAttempts = 0;
+  public readonly forwardRequests: Array<{ bindAddr: string; bindPort: number }> = [];
+  public readonly cancelRequests: Array<{ bindAddr: string; bindPort: number }> = [];
   public transportClosed = false;
   private readonly forwardSignals = new Map<number, ReturnType<typeof deferred<void>>>();
   private readonly cancelSignals = new Map<number, ReturnType<typeof deferred<void>>>();
@@ -283,8 +285,9 @@ class ControlledForwardConnection extends DirectTcpSshConnection {
     this.heldCancels.get(attempt)?.reject(error);
   }
 
-  public override requestForwardIn(_bindAddr: string, bindPort: number): Promise<number> {
+  public override requestForwardIn(bindAddr: string, bindPort: number): Promise<number> {
     const attempt = ++this.forwardAttempts;
+    this.forwardRequests.push({ bindAddr, bindPort });
     this.signal(this.forwardSignals, attempt).resolve(undefined);
     if (!this.heldForwardAttempts.has(attempt)) {
       return Promise.resolve(bindPort);
@@ -303,8 +306,9 @@ class ControlledForwardConnection extends DirectTcpSshConnection {
     });
   }
 
-  public override cancelForwardIn(_bindAddr: string, _bindPort: number): Promise<void> {
+  public override cancelForwardIn(bindAddr: string, bindPort: number): Promise<void> {
     const attempt = ++this.cancelAttempts;
+    this.cancelRequests.push({ bindAddr, bindPort });
     this.signal(this.cancelSignals, attempt).resolve(undefined);
     if (!this.heldCancelAttempts.has(attempt)) {
       return Promise.resolve();
@@ -925,6 +929,60 @@ describe("TunnelManager integration", () => {
   });
 
   it.each([
+    ["different port", "port"],
+    ["different route", "route"]
+  ] as const)("does not serialize an uncertain reverse request with a different %s", async (_label, difference) => {
+    const firstConnection = new ControlledForwardConnection();
+    firstConnection.holdForward(1);
+    const secondConnection = new ControlledForwardConnection();
+    const factory = new OrderedConnectionFactory([firstConnection, secondConnection]);
+    const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
+    manager = new TunnelManager(pool, pool);
+    const firstServer = { ...testServer, id: "server-first-route" };
+    const secondServer = difference === "route"
+      ? { ...testServer, id: "server-second-route", host: "other.example.test" }
+      : firstServer;
+    const profile = (id: string, remotePort: number): TunnelProfile => ({
+      id,
+      name: id,
+      localPort: 12345,
+      remoteIP: "127.0.0.1",
+      remotePort,
+      autoStart: false,
+      tunnelType: "reverse",
+      remoteBindAddress: "0.0.0.0",
+      localTargetIP: "127.0.0.1"
+    });
+    const firstStart = manager.start(profile("reverse-first-scope", 23456), firstServer);
+    const secondStart = manager.start(
+      profile("reverse-second-scope", difference === "port" ? 23457 : 23456),
+      secondServer
+    );
+
+    try {
+      await firstConnection.waitForForwardAttempt(1);
+      const secondRequestObserved = await Promise.race([
+        (difference === "port"
+          ? firstConnection.waitForForwardAttempt(2)
+          : secondConnection.waitForForwardAttempt(1)
+        ).then(() => true),
+        new Promise<boolean>((resolve) => setImmediate(() => resolve(false)))
+      ]);
+      expect(secondRequestObserved).toBe(true);
+      expect(factory.connectCount).toBe(difference === "route" ? 2 : 1);
+
+      firstConnection.releaseForward(1, 23456);
+      await expect(Promise.all([firstStart, secondStart])).resolves.toHaveLength(2);
+    } finally {
+      firstConnection.releaseForward(1, 23456);
+      await manager.stopAll();
+      await Promise.allSettled([firstStart, secondStart]);
+      pool.dispose();
+      manager = undefined;
+    }
+  });
+
+  it.each([
     ["SOCKS5", "socks5", 1080],
     ["HTTP CONNECT", "http", 3128]
   ] as const)("serializes reverse binds across proxy usernames for the same %s endpoint", async (_label, proxyType, proxyPort) => {
@@ -1122,7 +1180,7 @@ describe("TunnelManager integration", () => {
       const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
       const server = { ...testServer };
       manager = new TunnelManager(pool, pool);
-      const profile = (id: string): TunnelProfile => ({
+      const profile = (id: string, remoteBindAddress = "127.0.0.1"): TunnelProfile => ({
         id,
         name: id,
         localPort: 12345,
@@ -1130,7 +1188,7 @@ describe("TunnelManager integration", () => {
         remotePort: 23456,
         autoStart: false,
         tunnelType: "reverse",
-        remoteBindAddress: "127.0.0.1",
+        remoteBindAddress,
         localTargetIP: "127.0.0.1"
       });
       let terminalLease: SshConnection | undefined;
@@ -1139,7 +1197,7 @@ describe("TunnelManager integration", () => {
 
       try {
         terminalLease = await pool.connect(server);
-        const retiredProfile = profile(`reverse-retired-${cancelOutcome.replaceAll(" ", "-")}`);
+        const retiredProfile = profile(`reverse-retired-${cancelOutcome.replaceAll(" ", "-")}`, "0.0.0.0");
         const retiredStart = manager.start(retiredProfile, server);
         retiredResult = retiredStart.then(() => "started", (error: unknown) => error);
         await retiredConnection.waitForForwardAttempt(1);
@@ -1149,6 +1207,7 @@ describe("TunnelManager integration", () => {
         await manager.stop(retiredTunnelId!);
         retiredConnection.releaseForward(1, 23456);
         await retiredConnection.waitForCancelAttempt(1);
+        expect(retiredConnection.cancelRequests).toEqual([{ bindAddr: "0.0.0.0", bindPort: 23456 }]);
         await vi.advanceTimersByTimeAsync(5_000);
 
         const retiredOutcome = await retiredResult;
@@ -1215,7 +1274,11 @@ describe("TunnelManager integration", () => {
     }
   );
 
-  it("releases an abandoned reverse bind when its request is later refused", async () => {
+  it.each([
+    ["0.0.0.0", "127.0.0.1"],
+    ["::", "::1"],
+    ["localhost", "127.0.0.1"]
+  ] as const)("releases an abandoned reverse bind across overlapping addresses (%s → %s)", async (retiredAddr, replacementAddr) => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const retiredConnection = new ControlledForwardConnection();
     retiredConnection.holdForward(1);
@@ -1224,7 +1287,7 @@ describe("TunnelManager integration", () => {
     const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
     const server = { ...testServer };
     manager = new TunnelManager(pool, pool);
-    const profile = (id: string): TunnelProfile => ({
+    const profile = (id: string, remoteBindAddress: string): TunnelProfile => ({
       id,
       name: id,
       localPort: 12345,
@@ -1232,7 +1295,7 @@ describe("TunnelManager integration", () => {
       remotePort: 23456,
       autoStart: false,
       tunnelType: "reverse",
-      remoteBindAddress: "127.0.0.1",
+      remoteBindAddress,
       localTargetIP: "127.0.0.1"
     });
     let terminalLease: SshConnection | undefined;
@@ -1241,7 +1304,7 @@ describe("TunnelManager integration", () => {
 
     try {
       terminalLease = await pool.connect(server);
-      const retiredProfile = profile("reverse-abandoned-refusal");
+      const retiredProfile = profile("reverse-abandoned-refusal", retiredAddr);
       const retiredStart = manager.start(retiredProfile, server);
       retiredResult = retiredStart.then(() => "started", (error: unknown) => error);
       await retiredConnection.waitForForwardAttempt(1);
@@ -1254,7 +1317,7 @@ describe("TunnelManager integration", () => {
       expect(retiredOutcome).toBeInstanceOf(Error);
       expect((retiredOutcome as Error).name).toBe("TunnelStoppedError");
 
-      const replacementProfile = profile("reverse-after-late-refusal");
+      const replacementProfile = profile("reverse-after-late-refusal", replacementAddr);
       const replacementStart = manager.start(replacementProfile, server);
       replacementResult = replacementStart.then(() => "started", (error: unknown) => error);
       const initiallyWaiting = await Promise.race([
@@ -1273,6 +1336,7 @@ describe("TunnelManager integration", () => {
       expect(proceededAfterRefusal).toBe(true);
       expect(retiredConnection.transportClosed).toBe(false);
       expect(factory.connectCount).toBe(2);
+      expect(replacementConnection.forwardRequests).toEqual([{ bindAddr: replacementAddr, bindPort: 23456 }]);
       await expect(replacementResult).resolves.toBe("started");
 
       const replacementTunnelId = manager.getActiveTunnelId(replacementProfile.id);

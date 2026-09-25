@@ -486,9 +486,11 @@ export class TunnelManager {
     try {
       const bindAddr = profile.remoteBindAddress ?? "127.0.0.1";
       const bindPort = profile.remotePort;
-      // Private addresses can identify different SSH servers on different jump routes.
       const routeIdentity = networkRouteIdentity(serverConfig, this.serverLookup);
-      const bindKey = (port: number): string => JSON.stringify([routeIdentity, bindAddr, port]);
+      // OpenSSH may widen a requested address (GatewayPorts), and wildcard
+      // addresses overlap specific listeners. Keep uncertain barriers scoped
+      // to the SSH route and port; bindAddr remains part of forward/cancel calls.
+      const bindKey = (port: number): string => JSON.stringify([routeIdentity, port]);
       const requestKey = bindKey(bindPort);
       let requestOver: (() => void) | undefined;
       let thisRequest: Promise<void> | undefined;
