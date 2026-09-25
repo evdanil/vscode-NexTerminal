@@ -1290,11 +1290,15 @@ describe("ipmiCredentialsOffNote — narrow local ipmitool credential hint (#151
     ["no -E flag", "ipmitool -H ${profile.ipmiHost} -a sol activate\n"],
     ["an explicit password beside -E", "ipmitool -H ${profile.ipmiHost} -E -P secret sol activate\n"],
     ["an attached -P password beside -E", "ipmitool -H ${profile.ipmiHost} -E -Psecret sol activate\n"],
+    ["a clustered -P password beside -E", "ipmitool -H ${profile.ipmiHost} -E -vPsecret sol activate\n"],
     ["a password file beside -E", "ipmitool -H ${profile.ipmiHost} -E -f /etc/bmc.pass sol activate\n"],
     ["an attached password file beside -E", "ipmitool -H ${profile.ipmiHost} -E -f/etc/bmc.pass sol activate\n"],
+    ["a clustered password-file option beside -E", "ipmitool -H ${profile.ipmiHost} -E -vf/etc/bmc.pass sol activate\n"],
+    ["an option terminator before -E", "ipmitool -H ${profile.ipmiHost} -- -E sol activate\n"],
     ["an interactive prompt beside -E", "ipmitool -H ${profile.ipmiHost} -E -a sol activate\n"],
     ["authentication disabled with -A NONE", "ipmitool -H ${profile.ipmiHost} -E -A NONE sol activate\n"],
     ["authentication disabled with attached -ANONE", "ipmitool -H ${profile.ipmiHost} -E -ANONE sol activate\n"],
+    ["authentication disabled in a short-option cluster", "ipmitool -H ${profile.ipmiHost} -E -vA NONE sol activate\n"],
     ["authentication disabled with lowercase -A none", "ipmitool -H ${profile.ipmiHost} -E -A none sol activate\n"],
     ["two terminal line endings", "ipmitool -H ${profile.ipmiHost} -E sol activate\n\n"],
     ["a bare carriage return", "ipmitool -H ${profile.ipmiHost} -E sol activate\r"],
@@ -1448,6 +1452,50 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
     expect(createdTerminals[0].sent).toEqual([" ipmitool -H 10.0.0.9 -a sol activate\n"]);
     const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
     expect(status).toContain("No IPMI gateway is configured for Target — running locally");
+  });
+
+  it("applies checked IPMI credentials on the local fallback when no gateway is configured", async () => {
+    const target = server({
+      id: "srv-1",
+      name: "Target",
+      ipmiHost: "10.0.0.9",
+      ipmiAuthProfileId: "ap-1"
+    });
+    const ctx = context({
+      core: {
+        getSnapshot: () => ({ activeSessions: [], servers: [target] }),
+        getAuthProfile: (id: string) => id === "ap-1" ? authProfile() : undefined,
+        onDidChange: () => () => {}
+      },
+      secretVault: {
+        get: async () => "stored-bmc-password",
+        store: async () => {},
+        delete: async () => {}
+      }
+    } as unknown as Partial<CommandContext>);
+    await setMacros([
+      {
+        id: "a",
+        name: "SOL",
+        text: "ipmitool -H ${profile.ipmiHost} -E sol activate\n",
+        runIn: "localTerminal",
+        route: "ipmiGateway",
+        provideIpmiCredentials: true
+      }
+    ]);
+    await pickFirst();
+
+    await runMacroOnServer(ctx, { server: target });
+
+    expect(createdTerminals).toHaveLength(1);
+    expect(createdTerminals[0].env).toEqual({
+      IPMITOOL_PASSWORD: "stored-bmc-password",
+      IPMI_PASSWORD: "stored-bmc-password"
+    });
+    expect(createdTerminals[0].sent).toEqual(["ipmitool -H 10.0.0.9 -E sol activate\n"]);
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).toContain("No IPMI gateway is configured for Target — running locally");
+    expect(status).not.toContain(IPMI_GATEWAY_INERT_CREDENTIALS_HINT);
   });
 
   /**
@@ -1878,12 +1926,12 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
 
   /**
    * Issues #174 and #189 — the gateway note depends only on what Nexus knows: the
-   * route and the "Provide IPMI credentials" flag. It used to choose between a
-   * "`-E` will fail on the gateway" warning and a "prompts via its `-a` form"
-   * assurance by parsing the command, and each review round found a shell form the
-   * parse misread. The distinction was also false: with `-E` and no password
-   * variable, ipmitool prompts rather than failing (upstream `lib/ipmi_main.c`).
-   * Every command below was misread by one version of that parse.
+   * effective route and the "Provide IPMI credentials" flag. Gateway command
+   * behavior is separate: `-E` without a password variable reports that it could
+   * not read the environment, and may prompt only if authentication remains
+   * enabled and no other password is supplied (upstream `lib/ipmi_main.c`). The
+   * same Nexus note is used for each command below so it makes no command-specific
+   * promise.
    */
   describe("one gateway note, from the route and the flag alone (#174, #189)", () => {
     const NOTE_TAIL = "may prompt in the gateway terminal";

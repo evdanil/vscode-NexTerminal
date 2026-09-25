@@ -246,6 +246,11 @@ function hasAlternativeIpmiPasswordOption(args: readonly string[]): boolean {
   });
 }
 
+/** The hint declines getopt forms whose meaning depends on clusters, attachments, or option termination. */
+function hasAmbiguousIpmiOptionToken(args: readonly string[]): boolean {
+  return args.some((arg) => arg === "--" || (arg.startsWith("-") && arg !== "-" && arg.length > 2));
+}
+
 /**
  * Whether this is one plain local ipmitool command that uses the IPMI profile
  * and opts into reading its password from the environment, without another
@@ -270,6 +275,7 @@ function simpleIpmitoolNeedsProfilePassword(text: string): boolean {
     args.includes("-E") &&
     args.some((word) => IPMI_PROFILE_TOKEN_WORD_RE.test(word)) &&
     !hasAlternativeIpmiPasswordOption(args) &&
+    !hasAmbiguousIpmiOptionToken(args) &&
     args.every((word) => SIMPLE_IPMITOOL_ARGUMENT_RE.test(word) || IPMI_PROFILE_TOKEN_WORD_RE.test(word))
   );
 }
@@ -795,12 +801,12 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
     return;
   }
   // JUMP-HOST IPMI ROUTING (issue #48 PR-C). Resolved BEFORE the credential gate
-  // and before the dispatch, because it decides both: a gateway-routed macro
-  // never prompts for a password (env injection cannot cross to the gateway
-  // shell — ipmitool's own `-a` prompt supplies it there), and it is delivered
-  // into the GATEWAY's session terminal rather than a local one. The route is
-  // meaningful only for a `localTerminal` macro; every other target stays local
-  // to its own semantics.
+  // and before the dispatch because an effective gateway route receives neither
+  // Nexus's credential environment nor a local terminal: any prompt or other
+  // credential source belongs to the command and the gateway. A selected route
+  // with no configured gateway falls back locally, where the normal credential
+  // gate still applies. The route is meaningful only for a `localTerminal`
+  // macro; every other target stays local to its own semantics.
   const route = runTarget === "localTerminal" ? resolveMacroRoute(macro) : "local";
   const gatewayResolution: IpmiGatewayResolution =
     route === "ipmiGateway" ? resolveIpmiGatewayServer(ctx, server) : { kind: "none" };
@@ -853,10 +859,12 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
   // and is never prompted, since prompting is the same disclosure decision moved
   // one dialog later.
   //
-  // SKIPPED ENTIRELY ON THE GATEWAY PATH (PR-C item 2): the secret must never be
-  // typed into a remote shell's history/scrollback, and env injection cannot
-  // reach it, so there is nothing to obtain and nothing to prompt for — ipmitool
-  // prompts on the bastion. Only a truly-local terminal reads this environment.
+  // SKIPPED ENTIRELY ON AN EFFECTIVE GATEWAY PATH (PR-C item 2): Nexus's secret
+  // must never be typed into a remote shell's history/scrollback, and its local
+  // env injection cannot reach that session. The command may use credentials
+  // available on the gateway; when authentication is enabled and no password is
+  // otherwise supplied, ipmitool may prompt there. Only a local terminal reads
+  // this environment.
   //
   // Resolved BEFORE the target is built and before the prompt walk, so a
   // cancelled credential prompt costs the user nothing: no terminal has been

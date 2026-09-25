@@ -482,20 +482,24 @@ A macro still runs if it uses `${profile.ipmiHost}` or
 IPMI password to its environment. To avoid misleading advice, the send
 confirmation suggests the checkbox only for a very simple local command: a
 bare `ipmitool` invocation with `-E` and a whole IPMI profile token argument.
-Wrappers, scripts, shell operators, quoting, multiple commands, and other
-ambiguous forms are deliberately left alone. It also stays silent when the
-command supplies another password source (`-a`, `-P`, or `-f`) or disables
-authentication with `-A NONE`. This conservative suggestion is not an
-authorization check: macro text never decides whether a stored password is
-handed over; only the checkbox does.
+Wrappers, scripts, shell operators, quoting, multiple commands, attached or
+clustered option words, the `--` option terminator, and other ambiguous forms
+are deliberately left alone.
+It also stays silent when the command supplies another password source (`-a`,
+`-P`, or `-f`) or disables authentication with `-A NONE`. This conservative
+suggestion is not an authorization check: macro text never decides whether a
+stored password is handed over; only the checkbox does.
 
-On a macro whose **Run on** is *The server's IPMI gateway*, the checkbox does
-nothing: Nexus doesn't send IPMI credentials to a gateway session. ipmitool
-there uses only what the command or the gateway supplies — `-P`, `-f`, or
-`IPMITOOL_PASSWORD`/`IPMI_PASSWORD` set on the gateway. When authentication is
-enabled and no password is otherwise supplied, `-a` or `-E` may prompt in the
-gateway terminal. The
-macro editor says so beside the ticked box, and so does the send confirmation.
+When a macro actually runs in a configured IPMI Gateway session, Nexus does not
+send IPMI credentials to that remote session, so the checkbox has no effect
+there. With no IPMI Gateway configured, this route falls back to a local
+terminal; a checked box can supply that command's environment as described
+above. On the gateway, ipmitool uses credentials supplied by the command or the
+gateway's own environment — for example, `-P`, `-f`, or
+`IPMITOOL_PASSWORD`/`IPMI_PASSWORD`. When authentication is enabled and no
+password is otherwise supplied, `-a` or `-E` may prompt in the gateway
+terminal. The macro editor says so beside the ticked box, and so does the send
+confirmation.
 
 ### Upgrading an older IPMI macro
 
