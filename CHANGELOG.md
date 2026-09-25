@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.268] — 2026-09-25
+
+### Fixed
+
+- **Share exports and imports now carry only explicitly approved profile fields.** Shared records are rebuilt from typed per-model allowlists in both directions, so unknown or hand-added fields stay out and a new model field needs an explicit sharing rule before compilation succeeds. Intended portable fields and their existing transformations remain intact; settings continue to use their separate portable-preferences allowlist.
+
 ## [2.8.267] — 2026-09-25
 
 ### Fixed

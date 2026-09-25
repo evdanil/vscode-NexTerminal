@@ -83,14 +83,15 @@ import { registerConfigCommands, sanitizeForSharing } from "../../src/commands/c
 import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
-import { setActiveMacroStore } from "../../src/macroSettings";
+import { getMacros, setActiveMacroStore } from "../../src/macroSettings";
 import { computeSyncPlan, planToApplication, type InventorySyncPlan } from "../../src/services/inventory/syncEngine";
 import { createBuiltInProviders } from "../../src/services/inventory/builtInProviders";
 import { EVE_NG_PROVIDER_ID } from "../../src/services/inventory/providers/eveNgProvider";
 import { GNS3_PROVIDER_ID } from "../../src/services/inventory/providers/gns3Provider";
 import { PROXMOX_PROVIDER_ID } from "../../src/services/inventory/providers/proxmoxProvider";
 import { inventorySecretKey, type InventoryDevice, type InventorySourceConfig, type InventoryTree } from "../../src/models/inventory";
-import type { AuthProfile, ServerConfig, ServerOrigin } from "../../src/models/config";
+import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, ServerOrigin, TunnelProfile } from "../../src/models/config";
+import type { TerminalMacro } from "../../src/models/terminalMacro";
 import type { DeviceTemplateProfile } from "../../src/models/deviceTemplate";
 import type { SecretVault } from "../../src/services/ssh/contracts";
 
@@ -727,6 +728,303 @@ describe("which fields a share carries — an allowlist, pinned", () => {
     expect(keysOf(snapshot.deviceTemplates[0].fields)).toEqual(SHIPPED_TEMPLATE_FIELD_KEYS);
     expectNestedRecordsRebuilt(snapshot.inventorySources[0], snapshot.deviceTemplates[0], snapshot.servers.find((s) => s.origin !== undefined)!);
     expect(JSON.stringify(snapshot)).not.toContain("must-not-travel");
+  });
+});
+
+/**
+ * Issue #179 — the collections the share path copied by spread until the
+ * inventory records moved onto rules tables: servers, tunnels, serial and Local
+ * Shell profiles, and macros. Same fixtures' rule as above: every field the
+ * model declares is set, plus `futureStamp`, which it does not; a macro's
+ * variable entries — the nested record a share rebuilds for macros — carry an
+ * undeclared `token`.
+ */
+const FUTURE = { futureStamp: "must-not-travel" };
+const ALL_ORIGIN_LINKS = { jump: "bastion-1", gateway: "gw-1", ssh: "ap-ssh", bmc: "ap-bmc" };
+
+function everyServerField(): ServerConfig {
+  return {
+    id: "every",
+    name: "Every field",
+    group: "Lab/Core",
+    host: "10.0.0.9",
+    port: 2222,
+    addressless: false,
+    protocol: "ssh",
+    altHost: "fd00::9",
+    username: "netops",
+    authType: "key",
+    keyPath: "/home/netops/.ssh/id_ed25519",
+    isHidden: true,
+    logSession: true,
+    multiplexing: false,
+    legacyAlgorithms: true,
+    ipmiHost: "10.9.9.9",
+    ipmiAuthProfileId: "ap-bmc",
+    bmcWebProtocol: "http",
+    ipmiGatewayServerId: "gw-1",
+    openFileExplorerOnFirstConnect: true,
+    proxy: sshVia("bastion-1"),
+    authProfileId: "ap-ssh",
+    origin: everyOriginField("src-1", ALL_ORIGIN_LINKS),
+    formerlySynced: { sourceId: "src-gone", sourceName: "Old NetBox", providerId: "netbox", externalId: "device:9", detachedAt: 1 },
+    ...FUTURE
+  } as ServerConfig;
+}
+
+function everyTunnelField(): TunnelProfile {
+  return {
+    id: "tun-1",
+    name: "Web UI",
+    localPort: 8080,
+    remoteIP: "127.0.0.1",
+    remotePort: 80,
+    defaultServerId: "every",
+    autoStart: true,
+    autoStop: true,
+    connectionMode: "shared",
+    tunnelType: "local",
+    remoteBindAddress: "127.0.0.1",
+    localTargetIP: "127.0.0.1",
+    localBindAddress: "127.0.0.1",
+    notes: "the router's web UI",
+    browserUrl: "http://localhost:8080",
+    ...FUTURE
+  } as TunnelProfile;
+}
+
+function everySerialField(): SerialProfile {
+  return {
+    id: "ser-1",
+    name: "Console",
+    group: "Bench",
+    path: "/dev/ttyUSB0",
+    baudRate: 115200,
+    dataBits: 8,
+    stopBits: 1,
+    parity: "none",
+    rtscts: false,
+    logSession: true,
+    mode: "smartFollow",
+    deviceHint: { manufacturer: "FTDI", serialNumber: "SENDER-ADAPTER", vendorId: "0403", productId: "6001" },
+    ...FUTURE
+  } as SerialProfile;
+}
+
+function everyLocalShellField(): LocalShellProfile {
+  return {
+    id: "sh-1",
+    name: "Build shell",
+    group: "Dev",
+    launchMode: "custom",
+    vscodeProfileName: "bash",
+    shellPath: "/bin/bash",
+    shellArgs: ["-l"],
+    cwd: "/home/netops/project",
+    env: { API_TOKEN: "SENDER-TOKEN" },
+    startupCommand: "make watch",
+    ...FUTURE
+  } as LocalShellProfile;
+}
+
+/** A trigger macro and a prompted-variables one (the two are exclusive on import), each with every other field set. */
+function everyMacroField(): TerminalMacro[] {
+  const common = {
+    text: "show version\n",
+    keybinding: "alt+shift+1",
+    slot: 1,
+    secret: false,
+    group: "Cisco",
+    runIn: "session" as const,
+    provideIpmiCredentials: true,
+    route: "ipmiGateway" as const,
+    ...FUTURE
+  };
+  return [
+    {
+      ...common,
+      id: "m-trigger",
+      name: "Answer prompt",
+      triggerPattern: "Press RETURN",
+      triggerCooldown: 5,
+      triggerInterval: 60,
+      triggerInitiallyDisabled: true,
+      triggerScope: "profile",
+      triggerProfileId: "every"
+    },
+    {
+      ...common,
+      id: "m-vars",
+      name: "Login",
+      keybinding: "alt+shift+2",
+      slot: 2,
+      variables: [
+        { name: "host", label: "Host", default: "10.0.0.1", remember: false, ...UNDECLARED },
+        { name: "password", label: "Password", secret: true, ...UNDECLARED }
+      ]
+    }
+  ] as TerminalMacro[];
+}
+
+const SHIPPED_SERVER_KEYS = [
+  "addressless", "altHost", "authProfileId", "authType", "bmcWebProtocol", "group", "host", "id", "ipmiAuthProfileId",
+  "ipmiGatewayServerId", "ipmiHost", "isHidden", "keyPath", "legacyAlgorithms", "logSession", "multiplexing", "name",
+  "openFileExplorerOnFirstConnect", "origin", "port", "protocol", "proxy", "username"
+];
+const SHIPPED_TUNNEL_KEYS = [
+  "autoStart", "autoStop", "browserUrl", "connectionMode", "defaultServerId", "id", "localBindAddress", "localPort",
+  "localTargetIP", "name", "notes", "remoteBindAddress", "remoteIP", "remotePort", "tunnelType"
+];
+const SHIPPED_SERIAL_KEYS = ["baudRate", "dataBits", "group", "id", "logSession", "mode", "name", "parity", "path", "rtscts", "stopBits"];
+const SHIPPED_LOCAL_SHELL_KEYS = ["group", "id", "launchMode", "name", "shellArgs", "shellPath", "vscodeProfileName"];
+const SHIPPED_MACRO_KEYS = [
+  "group", "id", "keybinding", "name", "provideIpmiCredentials", "route", "runIn", "secret", "slot", "text", "triggerCooldown",
+  "triggerInitiallyDisabled", "triggerInterval", "triggerPattern", "triggerProfileId", "triggerScope", "variables"
+];
+const TRIGGER_KEYS = ["triggerCooldown", "triggerInitiallyDisabled", "triggerInterval", "triggerPattern", "triggerProfileId", "triggerScope"];
+const CAPABILITY_KEYS = ["provideIpmiCredentials", "route"];
+const without = (keys: string[], ...removed: string[][]): string[] => keys.filter((key) => !removed.flat().includes(key));
+
+describe("which fields a share carries — servers, tunnels, serial and Local Shell profiles, macros (#179)", () => {
+  it("export: each record carries exactly the decided fields, and a macro variable exactly its declared ones (⊘ a spread, which ships a member the model does not declare — or one added to it later — by default)", () => {
+    const result = sanitizeForSharing(
+      [makeServer({ id: "bastion-1", name: "Bastion" }), makeServer({ id: "gw-1", name: "Gateway" }), everyServerField()],
+      [everyTunnelField()],
+      [everySerialField()],
+      [everyLocalShellField()],
+      {},
+      [makeProfile({ id: "ap-ssh", name: "SSH" }), makeProfile({ id: "ap-bmc", name: "BMC" })],
+      everyMacroField(),
+      [makeSource()],
+      [],
+      []
+    );
+
+    const server = result.servers.find((s) => s.name === "Every field")!;
+    expect(keysOf(server)).toEqual(SHIPPED_SERVER_KEYS);
+    expect(server).toMatchObject({ username: "user", keyPath: "" });
+    expect(keysOf(result.tunnels[0])).toEqual(SHIPPED_TUNNEL_KEYS);
+    expect(result.tunnels[0].defaultServerId).toBe(server.id);
+    expect(keysOf(result.serialProfiles[0])).toEqual(SHIPPED_SERIAL_KEYS);
+    expect(keysOf(result.localShellProfiles[0])).toEqual(SHIPPED_LOCAL_SHELL_KEYS);
+    expect(result.macros.map(keysOf)).toEqual([without(SHIPPED_MACRO_KEYS, ["variables"]), without(SHIPPED_MACRO_KEYS, TRIGGER_KEYS)]);
+    expect(result.macros[1].variables).toEqual([
+      { name: "host", label: "Host", default: "10.0.0.1", remember: false },
+      { name: "password", label: "Password", secret: true }
+    ]);
+    expect(JSON.stringify(result)).not.toMatch(/must-not-travel|SENDER-ADAPTER|SENDER-TOKEN|netops|make watch/);
+  });
+
+  it("import: a hand-edited file's records land with exactly the decided fields (⊘ spreading the file's record, which persists whatever the file put beside the declared fields)", async () => {
+    const recipient = await makeMachine();
+
+    await importShare(
+      recipient,
+      shareJson({
+        authProfiles: [makeProfile({ id: "ap-ssh", name: "SSH", username: "user" }), makeProfile({ id: "ap-bmc", name: "BMC", username: "user" })],
+        inventorySources: [makeSource({ defaultUsername: "user" })],
+        servers: [makeServer({ id: "bastion-1", name: "Bastion", username: "user" }), makeServer({ id: "gw-1", name: "Gateway", username: "user" }), everyServerField()],
+        tunnels: [everyTunnelField()],
+        serialProfiles: [everySerialField()],
+        localShellProfiles: [everyLocalShellField()],
+        macros: everyMacroField()
+      })
+    );
+
+    const snapshot = recipient.core.getSnapshot();
+    const server = snapshot.servers.find((s) => s.name === "Every field")!;
+    expect(keysOf(server)).toEqual(SHIPPED_SERVER_KEYS);
+    expect(server).toMatchObject({ username: "user", keyPath: "" });
+    expect(keysOf(snapshot.tunnels[0])).toEqual(SHIPPED_TUNNEL_KEYS);
+    expect(snapshot.tunnels[0].defaultServerId).toBe(server.id);
+    expect(keysOf(snapshot.serialProfiles[0])).toEqual(SHIPPED_SERIAL_KEYS);
+    expect(keysOf(snapshot.localShellProfiles[0])).toEqual(SHIPPED_LOCAL_SHELL_KEYS);
+    // What the macro import removes on top, as it always has: capability flags
+    // never survive an import (`sanitizeImportedMacro`).
+    const macros = getMacros();
+    expect(macros.map(keysOf)).toEqual([
+      without(SHIPPED_MACRO_KEYS, ["variables"], CAPABILITY_KEYS),
+      without(SHIPPED_MACRO_KEYS, TRIGGER_KEYS, CAPABILITY_KEYS)
+    ]);
+    expect(macros[1].variables).toEqual([
+      { name: "host", label: "Host", default: "10.0.0.1", remember: false },
+      { name: "password", label: "Password", secret: true }
+    ]);
+    expect(JSON.stringify([snapshot, macros])).not.toMatch(/must-not-travel|SENDER-ADAPTER|SENDER-TOKEN|netops|make watch/);
+  });
+
+  it("import: a macro whose variables is malformed still loses its auto-trigger — the import judges the file's value, not the export's redaction of it (⊘ `variables` made symmetric with the export's `shareMacroVariables`, which drops the value before `sanitizeImportedMacro` can count it as a declaration and lands a live `Password:` responder)", async () => {
+    const recipient = await makeMachine();
+    const responder = { text: "hunter2\n", triggerPattern: "[Pp]assword:" };
+
+    await importShare(
+      recipient,
+      shareJson({
+        macros: [
+          { ...responder, id: "m-string", name: "String variables", variables: "abc" },
+          { ...responder, id: "m-array-like", name: "Array-like variables", variables: { 0: { name: "password", secret: true }, length: 1 } }
+        ]
+      })
+    );
+
+    const landed = getMacros();
+    expect(landed.map((m) => m.name)).toEqual(["String variables", "Array-like variables"]);
+    for (const macro of landed) {
+      expect(macro).not.toHaveProperty("triggerPattern");
+      expect(macro).not.toHaveProperty("variables");
+    }
+  });
+
+  it("an older share file — the records a spread-era export wrote — imports exactly as it did (⊘ a rules table that drops or rewrites a field a share has always carried)", async () => {
+    const recipient = await makeMachine();
+    const jump = makeServer({ id: "old-jump", name: "Jump", username: "user", keyPath: "" });
+    const target = makeServer({
+      id: "old-target",
+      name: "Target",
+      group: "Old/Site",
+      username: "user",
+      authType: "key",
+      keyPath: "",
+      altHost: "fd00::2",
+      isHidden: false,
+      logSession: true,
+      multiplexing: true,
+      legacyAlgorithms: false,
+      ipmiHost: "10.9.9.2",
+      bmcWebProtocol: "https",
+      proxy: { type: "ssh", jumpHostId: "old-jump" },
+      authProfileId: "old-ap"
+    });
+    const tunnel = { id: "old-tun", name: "DB", localPort: 15432, remoteIP: "10.0.0.5", remotePort: 5432, defaultServerId: "old-target", autoStart: false, connectionMode: "isolated", tunnelType: "local", notes: "db" };
+    const serial = { id: "old-ser", name: "Switch console", group: "Bench", path: "COM3", baudRate: 9600, dataBits: 8, stopBits: 1, parity: "none", rtscts: false, mode: "standard" };
+    const shell = { id: "old-sh", name: "Pwsh", launchMode: "vscodeProfile", vscodeProfileName: "PowerShell", group: "Win" };
+    const macro = { id: "old-m", name: "Save config", text: "write memory\n", keybinding: "alt+s", group: "Cisco" };
+
+    await importShare(
+      recipient,
+      shareJson({
+        authProfiles: [makeProfile({ id: "old-ap", name: "Ops", username: "user", authType: "password" })],
+        servers: [jump, target],
+        tunnels: [tunnel],
+        serialProfiles: [serial],
+        localShellProfiles: [shell],
+        macros: [macro]
+      })
+    );
+
+    const snapshot = recipient.core.getSnapshot();
+    const byName = new Map(snapshot.servers.map((s) => [s.name, s]));
+    const landedJump = byName.get("Jump")!;
+    const [profile] = snapshot.authProfiles;
+    expect(landedJump).toEqual({ ...jump, id: expect.any(String) });
+    expect(byName.get("Target")).toEqual({ ...target, id: expect.any(String), proxy: { type: "ssh", jumpHostId: landedJump.id }, authProfileId: profile.id });
+    expect(snapshot.tunnels).toEqual([{ ...tunnel, id: expect.any(String), defaultServerId: byName.get("Target")!.id }]);
+    expect(snapshot.serialProfiles).toEqual([{ ...serial, id: expect.any(String) }]);
+    expect(snapshot.localShellProfiles).toEqual([{ ...shell, id: expect.any(String) }]);
+    expect(getMacros()).toEqual([{ ...macro, id: expect.any(String) }]);
+    for (const record of [landedJump, snapshot.tunnels[0], snapshot.serialProfiles[0], snapshot.localShellProfiles[0]]) {
+      expect(record.id).not.toMatch(/^old-/);
+    }
   });
 });
 
