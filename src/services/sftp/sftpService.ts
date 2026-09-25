@@ -1203,6 +1203,13 @@ export class SftpService {
     const unsub = connection.onClose(() => {
       this.teardownSession(server.id, session, "SSH connection closed");
     });
+    // onClose may synchronously replay for an already-closed transport. Its
+    // callback tears this session down before registration returns, so surface
+    // setup as failed and do not keep an unsubscribe after cleanup.
+    if (this.sessions.get(server.id) !== session) {
+      unsub();
+      throw new Error("SSH connection closed before SFTP session was established");
+    }
     this.unsubscribers.set(server.id, unsub);
   }
 
