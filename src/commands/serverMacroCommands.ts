@@ -416,16 +416,24 @@ interface HereDocument {
   readonly stripTabs: boolean;
 }
 
-/** Skip a here-document body and return the start of the line after its delimiter. */
-function skipHereDocumentBody(text: string, start: number, hereDocument: HereDocument): number | undefined {
+interface HereDocumentBody {
+  readonly text: string;
+  readonly afterDelimiter: number;
+}
+
+/** Read a here-document through its delimiter, including CRLF-terminated lines. */
+function readHereDocumentBody(text: string, start: number, hereDocument: HereDocument): HereDocumentBody | undefined {
   let lineStart = start;
   while (lineStart <= text.length) {
     const newline = text.indexOf("\n", lineStart);
     const lineEnd = newline < 0 ? text.length : newline;
     const line = text.slice(lineStart, lineEnd);
-    const candidate = hereDocument.stripTabs ? line.replace(/^\t+/, "") : line;
+    const candidate = (hereDocument.stripTabs ? line.replace(/^\t+/, "") : line).replace(/\r$/, "");
     if (candidate === hereDocument.delimiter) {
-      return newline < 0 ? text.length : newline + 1;
+      return {
+        text: text.slice(start, lineStart),
+        afterDelimiter: newline < 0 ? text.length : newline + 1
+      };
     }
     if (newline < 0) {
       return undefined;
@@ -448,7 +456,8 @@ function skipHereDocumentBody(text: string, start: number, hereDocument: HereDoc
  * `-U "ops;admin" -E` stays one command, `"ipmitool"`, `ip"mi"tool`, `-"E"` and
  * `\-E` read as the shell reads them, and `'\-E'` and `"\-E"` reach the command
  * as `\-E`, not `-E`. Here-document bodies are skipped through their matching
- * delimiter, with `<<-` matching after leading tabs are stripped.
+ * delimiter, with `<<-` matching after leading tabs are stripped; bodies read by
+ * a shell interpreter as its stdin script are parsed as executable code.
  */
 function shellSegments(text: string): ShellWord[][] {
   const segments: ShellWord[][] = [];
@@ -496,22 +505,32 @@ function shellSegments(text: string): ShellWord[][] {
       raw += c;
     } else if (/[;&|\n]/.test(c)) {
       endWord();
+      const shellReadsHereDocument = c === "\n" && hereDocuments.length > 0 && shellReadsStdinScript(words);
       segments.push(words);
       words = [];
       if (c === "\n" && hereDocuments.length > 0) {
         let bodyStart = i + 1;
+        let scriptBody: string | undefined;
+        let complete = true;
         for (const hereDocument of hereDocuments) {
-          const afterDelimiter = skipHereDocumentBody(text, bodyStart, hereDocument);
-          if (afterDelimiter === undefined) {
+          const body = readHereDocumentBody(text, bodyStart, hereDocument);
+          if (body === undefined) {
             i = text.length;
+            complete = false;
             break;
           }
-          bodyStart = afterDelimiter;
+          bodyStart = body.afterDelimiter;
+          if (shellReadsHereDocument) {
+            scriptBody = body.text;
+          }
         }
         if (bodyStart > i + 1) {
           i = bodyStart - 1;
         }
         hereDocuments.length = 0;
+        if (complete && scriptBody !== undefined) {
+          segments.push(...shellSegments(scriptBody));
+        }
       }
     } else if (c === "<" || c === ">") {
       endWord();
@@ -547,16 +566,12 @@ function shellSegments(text: string): ShellWord[][] {
 }
 
 /**
- * The ARGUMENT WORDS of a segment whose COMMAND is ipmitool — the words after
- * the command word — or `undefined` when its command is not ipmitool. The
- * command word is the first after a subshell's opening `(`, `NAME=value`
+ * The command and argument words after a subshell's opening `(`, `NAME=value`
  * assignments and `COMMAND_PREFIXES` (their options AND those options' operands
  * consumed, getopt-style, then any positional operand such as timeout's
- * DURATION), with a basename of exactly `ipmitool` — `/usr/bin/ipmitool`,
- * `"ipmitool"`, `sudo -E ipmitool`, `sudo -u root ipmitool`, `LANG=C ipmitool`,
- * `timeout 30 ipmitool`, `(ipmitool …)`. Returning the arguments, not a yes/no,
- * is what keeps a flag scan off the prefix: in `sudo -u ipmitool -E ipmitool -a`
- * the `-E` is sudo's.
+ * DURATION). The command is the basename of the first word left after that
+ * parsing. Returning its arguments separately is what keeps an ipmitool flag
+ * scan off a prefix: in `sudo -u ipmitool -E ipmitool -a` the `-E` is sudo's.
  *
  * COMMAND POSITION, NOT "THE WORD APPEARS". `\bipmitool\b` also matches inside
  * `my-ipmitool-wrapper`, `ipmitool.sh` and a quoted `echo "use ipmitool -E"`,
@@ -564,9 +579,15 @@ function shellSegments(text: string): ShellWord[][] {
  * bmc-login` or `exec -a ipmitool bmc-login` for the command. Either mistake
  * classed a token consumer as ipmitool and dropped a hint it may need (#151).
  * Any word this cannot place — an unknown option, env's `-S`, a nested
- * `bash -c "ipmitool …"` — answers "not ipmitool", which can only keep the hint.
+ * `bash -c "ipmitool …"` — is left ambiguous, keeping the hint conservative.
  */
-function ipmitoolArguments(segment: readonly ShellWord[]): ShellWord[] | undefined {
+interface ShellInvocation {
+  readonly command: string;
+  readonly args: ShellWord[];
+}
+
+/** Resolve one shell segment's command word after assignments and known prefixes. */
+function shellInvocation(segment: readonly ShellWord[]): ShellInvocation | undefined {
   const words = segment.filter((word) => !word.redirectionTarget);
   // A subshell's opening "(" (repeatable: "( (") is not a word of the command;
   // "((" opens arithmetic, which runs no command.
@@ -609,12 +630,64 @@ function ipmitoolArguments(segment: readonly ShellWord[]): ShellWord[] | undefin
       positionals--;
       continue;
     }
-    // The basename is cut from the word AS WRITTEN, so a Windows-style
-    // `C:\tools\ipmitool` keeps its separators, and only then read as a word.
+    // The basename is cut from the word AS WRITTEN, so a Windows-style path
+    // keeps its separators, and only then read as a word.
     const basename = shellSegments(raw.split(/[\\/]/).pop() ?? "")[0][0]?.value;
-    return basename === "ipmitool" ? words.slice(i + 1) : undefined;
+    return basename ? { command: basename, args: words.slice(i + 1) } : undefined;
   }
   return undefined;
+}
+
+/** The argument words only when the parsed command is `ipmitool`. */
+function ipmitoolArguments(segment: readonly ShellWord[]): ShellWord[] | undefined {
+  const invocation = shellInvocation(segment);
+  return invocation?.command === "ipmitool" ? invocation.args : undefined;
+}
+
+const SHELL_INTERPRETERS = new Set(["ash", "bash", "dash", "ksh", "sh", "zsh"]);
+
+/** Whether a shell invocation consumes a here-document as its script on stdin. */
+function shellReadsStdinScript(segment: readonly ShellWord[]): boolean {
+  const invocation = shellInvocation(segment);
+  if (!invocation || !SHELL_INTERPRETERS.has(invocation.command)) {
+    return false;
+  }
+
+  const args = invocation.args;
+  let scriptFromStdin = false;
+  for (let i = 0; i < args.length; i++) {
+    const value = args[i].value;
+    if (value === "--") {
+      return i === args.length - 1 || (i === args.length - 2 && args[i + 1].value === "-");
+    }
+    if (value === "-") {
+      return true;
+    }
+    if (value.startsWith("--")) {
+      if (value === "--command" || value.startsWith("--command=")) {
+        return false;
+      }
+      if (value === "--rcfile" || value === "--init-file") {
+        i++;
+      }
+      continue;
+    }
+    if (value.startsWith("-")) {
+      const options = value.slice(1);
+      if (options.includes("c")) {
+        return false;
+      }
+      if (options.includes("s")) {
+        scriptFromStdin = true;
+      }
+      if (options === "o" || options === "O" || /[oO]$/.test(options)) {
+        i++;
+      }
+      continue;
+    }
+    return scriptFromStdin;
+  }
+  return true;
 }
 
 /** An `ipmitool …` invocation in a macro's text — at line start or after whitespace. */

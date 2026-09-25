@@ -1306,8 +1306,14 @@ describe("ipmiCredentialsOffNote — fires only where something reads the passwo
 
   it("does not treat a quoted here-document body as an executable command", () => {
     expect(
-      hint(" ipmitool -H ${profile.ipmiHost} -a sol activate\ncat <<'EOF'\nipmitool -E\nEOF\n")
+      hint(" ipmitool -H ${profile.ipmiHost} -a sol activate\ncat <<'EOF'\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n")
     ).toBeUndefined();
+  });
+
+  it("checks an executable shell here-document body for IPMI environment reads", () => {
+    expect(
+      hint("sh <<'EOF'\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n")
+    ).toContain('tick "Provide IPMI credentials"');
   });
 
   it("matches tab-stripped `<<-` terminators before parsing following commands", () => {
@@ -2262,6 +2268,12 @@ describe("commandReadsIpmiEnv — ipmitool `-E` env-password flag detection", ()
     // The operator starts after this argument, so the real `-E` still belongs
     // to ipmitool; the output path does not.
     expect(commandReadsIpmiEnv("ipmitool -E>/tmp/ipmi.log sol")).toBe(true);
+  });
+
+  it("recognizes a CRLF here-document delimiter before parsing following commands (PR #191 P2)", () => {
+    expect(
+      commandReadsIpmiEnv("cat <<'EOF'\r\nipmitool -a sol activate\r\nEOF\r\nipmitool -E sol activate\r\n")
+    ).toBe(true);
   });
 
   it("ignores unquoted comments and starts a fresh command after their newline", () => {
