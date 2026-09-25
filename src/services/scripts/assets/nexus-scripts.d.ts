@@ -335,15 +335,16 @@ declare global {
         | "NoScriptDir" | "InvalidPath" | "ReadFailed" | "InvalidJson";
     /**
      * Present when `code === "FileTooLarge"`. The file's size in bytes as
-     * observed at read time. When the script is a `file:` path — on your
-     * local machine, or on the remote host in an ordinary Remote-SSH, WSL or
-     * Codespaces window, where Nexus runs on that host — and the file's size
-     * could not be trusted (it grew past the cap mid-read, or its reported
-     * size was wrong), this is the cap + 1 — a LOWER BOUND. When the script's
-     * URI has any other scheme (`vscode-remote:` when `remote.extensionKind`
-     * makes Nexus run on your local machine in a remote window, or a file
-     * system another extension provides) and the reported size was wrong, it
-     * is the number of bytes actually received.
+     * observed at read time — normally the size the file system reports,
+     * which is checked before anything is read. When the file turns out
+     * bigger than that report (it grew past the cap mid-read, or the file
+     * system under-reported its size), the value depends on the script's URI.
+     * For a `file:` script — on your local machine, or on the remote host in
+     * an ordinary Remote-SSH, WSL or Codespaces window, where Nexus runs on
+     * that host — it is the cap + 1, a LOWER BOUND. For any other scheme
+     * (`vscode-remote:` when `remote.extensionKind` makes Nexus run on your
+     * local machine in a remote window, or a file system another extension
+     * provides) it is the number of bytes actually received.
      */
     sizeBytes?: number;
     /**

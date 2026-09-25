@@ -2843,8 +2843,8 @@ describe("InvalidPath messages name the offending path", () => {
 
 describe("buildScriptFsScope — scheme guard (decision 5, remote compat)", () => {
   it("drops the scripts root from the union when its scheme differs from the script's, and refuses a root-scoped read", () => {
-    // ⊘ comparing a remote `.path` against a local `.fsPath` (or vice versa) as
-    // if they were on the same filesystem.
+    // ⊘ comparing a non-`file:` `.path` against a `file:` `.fsPath` (or vice
+    // versa) as if they were on the same filesystem.
     const remoteScriptUri = { scheme: "vscode-remote", authority: "wsl+ubuntu", path: "/home/u/scripts/a.js", fsPath: "/home/u/scripts/a.js" } as unknown as vscode.Uri;
     const remoteScriptDirUri = { scheme: "vscode-remote", authority: "wsl+ubuntu", path: "/home/u/scripts", fsPath: "/home/u/scripts" } as unknown as vscode.Uri;
     const localRootUri = fileUri("/ws/.nexus/scripts");
@@ -2990,9 +2990,9 @@ describe("remote (non-file) scheme — reads route by .path, never by the (bogus
 
 describe("scriptFsReadText — end-to-end with a correctly-rebased remote scripts root (P2: resolveScriptsDir with a vscode-remote workspace root)", () => {
   it("a ../shared/... read inside the configured root resolves once the root carries the SCRIPT'S remote scheme+authority — exactly what resolveScriptsDir's rebase produces", async () => {
-    // ⊘ `resolveScriptsDir` handing back a LOCAL
-    // `file:` Uri for an absolute `nexus.scripts.path` on a remote
-    // workspace. Passing THAT shape here (scriptsRootUri.scheme === "file"
+    // ⊘ `resolveScriptsDir` handing back a `file:` Uri for an absolute
+    // `nexus.scripts.path` on a `vscode-remote:` workspace (Nexus forced
+    // UI-side by `remote.extensionKind`). Passing THAT shape here (scriptsRootUri.scheme === "file"
     // while the script itself is `vscode-remote:`) reproduces that bug —
     // buildScriptFsScope's scheme/authority guard (already
     // covered directly in the "buildScriptFsScope — scheme guard" describe
@@ -3008,8 +3008,8 @@ describe("scriptFsReadText — end-to-end with a correctly-rebased remote script
     const ctx: ScriptFsContext = {
       scriptUri: remoteUri(authority, `${scriptDirPath}/probe.js`),
       scriptDirUri: remoteUri(authority, scriptDirPath),
-      // Exactly the shape resolveScriptsDir produces for
-      // an absolute nexus.scripts.path on a remote workspace: the WORKSPACE
+      // Exactly the shape resolveScriptsDir produces for an absolute
+      // nexus.scripts.path on a `vscode-remote:` workspace: the WORKSPACE
       // ROOT's own scheme+authority (here, deliberately the SAME authority
       // as the script — a real workspace root and its scripts necessarily
       // share one remote host), rebased onto the configured absolute path.
