@@ -78,35 +78,98 @@ function waitForConnectionClose(connection: SshConnection): Promise<void> {
   });
 }
 
+interface EndpointRouteIdentity {
+  hosts: readonly string[];
+  port: number;
+}
+
+type NetworkRouteIdentity =
+  | { kind: "direct"; endpoint: EndpointRouteIdentity }
+  | { kind: "cycle"; serverId: string; endpoint: EndpointRouteIdentity }
+  | { kind: "unresolved"; serverId: string }
+  | { kind: "ssh"; endpoint: EndpointRouteIdentity; jump: NetworkRouteIdentity }
+  | { kind: "socks5" | "http"; proxyHost: string; proxyPort: number; endpoint: EndpointRouteIdentity };
+
+interface ForwardWaitEntry {
+  routeIdentity: NetworkRouteIdentity;
+  bindPort: number;
+  promise: Promise<void>;
+}
+
+interface ForwardWaitMatch {
+  key: string;
+  entry: ForwardWaitEntry;
+}
+
 function networkRouteIdentity(
   server: ServerConfig,
   serverLookup: ((id: string) => ServerConfig | undefined) | undefined,
   visited = new Set<string>()
-): readonly unknown[] {
-  const endpoint = [server.host.toLowerCase(), server.port];
+): NetworkRouteIdentity {
+  // SshPty can populate a server-id pool entry through altHost, then reverse
+  // tunnels reuse that transport from the original server record. Treat both
+  // configured endpoints as aliases for the same remote bind namespace.
+  const hosts = [server.host, server.altHost]
+    .filter((host): host is string => typeof host === "string" && host.trim().length > 0)
+    .map((host) => host.trim().toLowerCase());
+  const endpoint: EndpointRouteIdentity = {
+    hosts: [...new Set(hosts)].sort(),
+    port: server.port
+  };
   if (visited.has(server.id)) {
-    return ["cycle", server.id, endpoint];
+    return { kind: "cycle", serverId: server.id, endpoint };
   }
   const nextVisited = new Set(visited);
   nextVisited.add(server.id);
 
   const proxy = server.proxy;
   if (!proxy) {
-    return ["direct", endpoint];
+    return { kind: "direct", endpoint };
   }
   if (proxy.type === "ssh") {
     const jumpHost = serverLookup?.(proxy.jumpHostId);
-    return [
-      "ssh",
+    return {
+      kind: "ssh",
       endpoint,
-      jumpHost ? networkRouteIdentity(jumpHost, serverLookup, nextVisited) : ["unresolved", proxy.jumpHostId]
-    ];
+      jump: jumpHost
+        ? networkRouteIdentity(jumpHost, serverLookup, nextVisited)
+        : { kind: "unresolved", serverId: proxy.jumpHostId }
+    };
   }
   // Proxy credentials may select separate egress routes, so this can
   // serialize independent backends. The key protects the SSH server's
   // server-wide bind namespace; omitting username avoids racing two credentials
   // that reach the same proxy and SSH endpoint.
-  return [proxy.type, proxy.host.toLowerCase(), proxy.port, endpoint];
+  return { kind: proxy.type, proxyHost: proxy.host.toLowerCase(), proxyPort: proxy.port, endpoint };
+}
+
+function endpointRoutesOverlap(left: EndpointRouteIdentity, right: EndpointRouteIdentity): boolean {
+  return left.port === right.port && left.hosts.some((host) => right.hosts.includes(host));
+}
+
+function networkRoutesOverlap(left: NetworkRouteIdentity, right: NetworkRouteIdentity): boolean {
+  if (left.kind !== right.kind) {
+    return false;
+  }
+
+  switch (left.kind) {
+    case "direct":
+      return right.kind === "direct" && endpointRoutesOverlap(left.endpoint, right.endpoint);
+    case "cycle":
+      return right.kind === "cycle" && left.serverId === right.serverId && endpointRoutesOverlap(left.endpoint, right.endpoint);
+    case "unresolved":
+      return right.kind === "unresolved" && left.serverId === right.serverId;
+    case "ssh":
+      return right.kind === "ssh" && endpointRoutesOverlap(left.endpoint, right.endpoint) && networkRoutesOverlap(left.jump, right.jump);
+    case "socks5":
+    case "http":
+      return (
+        right.kind === left.kind &&
+        left.proxyHost === right.proxyHost &&
+        left.proxyPort === right.proxyPort &&
+        endpointRoutesOverlap(left.endpoint, right.endpoint)
+      );
+  }
 }
 
 /**
@@ -205,9 +268,9 @@ export class TunnelManager {
    * stopped start may still be authenticating, but a replacement for the same
    * bind must wait for this request to settle.
    */
-  private readonly forwardRequests = new Map<string, Promise<void>>();
+  private readonly forwardRequests = new Map<string, ForwardWaitEntry>();
   /** A retired transport may still own a server-wide bind while other leases use it. */
-  private readonly retiredForwardTransports = new Map<string, Promise<void>>();
+  private readonly retiredForwardTransports = new Map<string, ForwardWaitEntry>();
   /** Only explicitly discarded candidates are quiet; a superseded transport may still be in use. */
   private readonly intentionallyDiscardedSharedConnections = new WeakSet<SshConnection>();
   private trafficTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -489,11 +552,12 @@ export class TunnelManager {
       const routeIdentity = networkRouteIdentity(serverConfig, this.serverLookup);
       // OpenSSH may widen a requested address (GatewayPorts), and wildcard
       // addresses overlap specific listeners. Keep uncertain barriers scoped
-      // to the SSH route and port; bindAddr remains part of forward/cancel calls.
+      // to overlapping SSH endpoint aliases on the same route and port; bindAddr
+      // remains part of forward/cancel calls.
       const bindKey = (port: number): string => JSON.stringify([routeIdentity, port]);
       const requestKey = bindKey(bindPort);
       let requestOver: (() => void) | undefined;
-      let thisRequest: Promise<void> | undefined;
+      let thisRequest: ForwardWaitEntry | undefined;
       let sshConnection: SshConnection;
       let allocatedPort: number;
       try {
@@ -501,26 +565,30 @@ export class TunnelManager {
           if (runtime.isStopping) {
             throw new TunnelStoppedError(profile.name);
           }
-          const retiredAfterLogin = this.retiredForwardTransports.get(requestKey);
+          const retiredAfterLogin = this.findOverlappingForwardWait(
+            this.retiredForwardTransports,
+            routeIdentity,
+            bindPort
+          );
           if (retiredAfterLogin) {
             // The old SSH lease is gone, but a terminal may still keep its
             // transport open. Do not request the same server-wide bind over a
             // fresh connection until a late withdrawal succeeds or that
             // transport closes and removes the bind.
-            await this.waitForForwardWait(runtime, retiredAfterLogin);
-            if (this.retiredForwardTransports.get(requestKey) === retiredAfterLogin) {
-              this.retiredForwardTransports.delete(requestKey);
+            await this.waitForForwardWait(runtime, retiredAfterLogin.entry.promise);
+            if (this.retiredForwardTransports.get(retiredAfterLogin.key) === retiredAfterLogin.entry) {
+              this.retiredForwardTransports.delete(retiredAfterLogin.key);
             }
             continue;
           }
-          const earlierRequest = this.forwardRequests.get(requestKey);
+          const earlierRequest = this.findOverlappingForwardWait(this.forwardRequests, routeIdentity, bindPort);
           if (earlierRequest) {
             // A stopped start may still be requesting or withdrawing this
             // bind. Wait before taking a lease, because it may retire the
             // transport if withdrawal fails. Login is outside this barrier:
             // a replacement can authenticate independently while an earlier
             // non-pooled login finishes.
-            await this.waitForForwardWait(runtime, earlierRequest);
+            await this.waitForForwardWait(runtime, earlierRequest.entry.promise);
             if (runtime.isStopping) {
               throw new TunnelStoppedError(profile.name);
             }
@@ -533,7 +601,11 @@ export class TunnelManager {
             // caller resumed, so stop() already released it in this case.
             throw new TunnelStoppedError(profile.name);
           }
-          const retiredTransport = this.retiredForwardTransports.get(requestKey);
+          const retiredTransport = this.findOverlappingForwardWait(
+            this.retiredForwardTransports,
+            routeIdentity,
+            bindPort
+          );
           if (retiredTransport) {
             // Retirement can begin while this start is authenticating. Drop
             // the candidate lease before waiting so it cannot keep the old
@@ -543,13 +615,13 @@ export class TunnelManager {
               runtime.sharedConnection = undefined;
             }
             this.discardSharedConnection(candidate);
-            await this.waitForForwardWait(runtime, retiredTransport);
-            if (this.retiredForwardTransports.get(requestKey) === retiredTransport) {
-              this.retiredForwardTransports.delete(requestKey);
+            await this.waitForForwardWait(runtime, retiredTransport.entry.promise);
+            if (this.retiredForwardTransports.get(retiredTransport.key) === retiredTransport.entry) {
+              this.retiredForwardTransports.delete(retiredTransport.key);
             }
             continue;
           }
-          const competingRequest = this.forwardRequests.get(requestKey);
+          const competingRequest = this.findOverlappingForwardWait(this.forwardRequests, routeIdentity, bindPort);
           if (competingRequest) {
             // Another start can reach its forward phase while this one logs
             // in. Drop our lease before waiting so a predecessor can retire
@@ -562,7 +634,7 @@ export class TunnelManager {
             if (runtime.isStopping) {
               throw new TunnelStoppedError(profile.name);
             }
-            await this.waitForForwardWait(runtime, competingRequest!);
+            await this.waitForForwardWait(runtime, competingRequest.entry.promise);
             if (runtime.isStopping) {
               throw new TunnelStoppedError(profile.name);
             }
@@ -570,9 +642,14 @@ export class TunnelManager {
           }
 
           sshConnection = candidate;
-          thisRequest = new Promise<void>((resolve) => {
+          const requestPromise = new Promise<void>((resolve) => {
             requestOver = resolve;
           });
+          thisRequest = {
+            routeIdentity,
+            bindPort,
+            promise: requestPromise
+          };
           this.forwardRequests.set(requestKey, thisRequest);
           break;
         }
@@ -591,9 +668,9 @@ export class TunnelManager {
           // transport closes. A late port-zero grant moves the uncertain bind
           // barrier to its allocated port so another automatic allocation can proceed.
           if (bindPort === 0) {
-            this.retireUnknownPortForwardTransport(bindKey, sshConnection, outcome.lateOutcome);
+            this.retireUnknownPortForwardTransport(routeIdentity, sshConnection, outcome.lateOutcome);
           } else {
-            this.retireForwardTransport(requestKey, sshConnection, outcome.lateRefusal);
+            this.retireForwardTransport(routeIdentity, bindPort, sshConnection, outcome.lateRefusal);
           }
           sshConnection.dispose();
           throw new TunnelStoppedError(profile.name);
@@ -617,7 +694,7 @@ export class TunnelManager {
           const cancellation = Promise.resolve().then(() => sshConnection.cancelForwardIn(bindAddr, allocatedPort));
           const withdrawn = await fulfilledWithin(cancellation, LATE_FORWARD_CANCEL_TIMEOUT_MS);
           if (!withdrawn) {
-            this.retireForwardTransport(bindKey(allocatedPort), sshConnection, cancellation);
+            this.retireForwardTransport(routeIdentity, allocatedPort, sshConnection, cancellation);
           }
           sshConnection.dispose();
           throw new TunnelStoppedError(profile.name);
@@ -715,7 +792,8 @@ export class TunnelManager {
   }
 
   private retireForwardTransport(
-    bindKey: string,
+    routeIdentity: NetworkRouteIdentity,
+    bindPort: number,
     connection: SshConnection,
     lateRelease?: Promise<unknown>
   ): void {
@@ -726,14 +804,14 @@ export class TunnelManager {
     const barrier = new Promise<void>((resolve) => {
       releaseBarrier = resolve;
     });
-    this.holdRetiredForwardTransport(bindKey, barrier);
+    this.holdRetiredForwardTransport(routeIdentity, bindPort, barrier);
     const release = (): void => releaseBarrier();
     void closed.then(release, () => {});
     void lateRelease?.then(release, () => {});
   }
 
   private retireUnknownPortForwardTransport(
-    bindKey: (port: number) => string,
+    routeIdentity: NetworkRouteIdentity,
     connection: SshConnection,
     lateOutcome: Promise<{ port: number } | { error: unknown }>
   ): void {
@@ -742,7 +820,7 @@ export class TunnelManager {
     const unknownPortBarrier = new Promise<void>((resolve) => {
       releaseUnknownPort = resolve;
     });
-    this.holdRetiredForwardTransport(bindKey(0), unknownPortBarrier);
+    this.holdRetiredForwardTransport(routeIdentity, 0, unknownPortBarrier);
     const release = (): void => releaseUnknownPort();
     void closed.then(release, () => {});
     void lateOutcome.then((outcome) => {
@@ -758,23 +836,45 @@ export class TunnelManager {
       const allocatedPortBarrier = new Promise<void>((resolve) => {
         releaseAllocatedPort = resolve;
       });
-      this.holdRetiredForwardTransport(bindKey(outcome.port), allocatedPortBarrier);
+      this.holdRetiredForwardTransport(routeIdentity, outcome.port, allocatedPortBarrier);
       void closed.then(releaseAllocatedPort, () => {});
       release();
     }, () => {});
   }
 
-  private holdRetiredForwardTransport(bindKey: string, barrier: Promise<void>): void {
+  private holdRetiredForwardTransport(
+    routeIdentity: NetworkRouteIdentity,
+    bindPort: number,
+    barrier: Promise<void>
+  ): void {
+    const bindKey = JSON.stringify([routeIdentity, bindPort]);
     const earlierBarrier = this.retiredForwardTransports.get(bindKey);
-    const publishedBarrier = earlierBarrier
-      ? Promise.all([earlierBarrier, barrier]).then(() => undefined)
-      : barrier;
+    const publishedBarrier: ForwardWaitEntry = earlierBarrier
+      ? {
+          routeIdentity,
+          bindPort,
+          promise: Promise.all([earlierBarrier.promise, barrier]).then(() => undefined)
+        }
+      : { routeIdentity, bindPort, promise: barrier };
     this.retiredForwardTransports.set(bindKey, publishedBarrier);
-    void publishedBarrier.then(() => {
+    void publishedBarrier.promise.then(() => {
       if (this.retiredForwardTransports.get(bindKey) === publishedBarrier) {
         this.retiredForwardTransports.delete(bindKey);
       }
     });
+  }
+
+  private findOverlappingForwardWait(
+    entries: ReadonlyMap<string, ForwardWaitEntry>,
+    routeIdentity: NetworkRouteIdentity,
+    bindPort: number
+  ): ForwardWaitMatch | undefined {
+    for (const [key, entry] of entries) {
+      if (entry.bindPort === bindPort && networkRoutesOverlap(routeIdentity, entry.routeIdentity)) {
+        return { key, entry };
+      }
+    }
+    return undefined;
   }
 
   private async waitForForwardWait(runtime: ActiveTunnelRuntime, pending: Promise<void>): Promise<void> {
