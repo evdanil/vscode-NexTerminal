@@ -431,7 +431,7 @@ async function confirmLocalShellAutoTriggers(ctx: CommandContext): Promise<boole
   }
 
   const choice = await vscode.window.showWarningMessage(
-    "Local Shell auto-trigger is now available. Existing \"All terminals\" macros can also run in Local Shell sessions. Disabling here turns off auto-trigger macros globally for SSH, Serial, and Local Shell.",
+    "Local Shell auto-trigger is now available. Existing \"All terminals\" macros can also run in Local Shell sessions. Disabling here turns off auto-trigger macros globally for SSH, Telnet, Serial, and Local Shell.",
     REVIEW_MACROS_ACTION,
     DISABLE_AUTOTRIGGER_ACTION,
     CONTINUE_ACTION

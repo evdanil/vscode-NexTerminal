@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Full SSH + serial + telnet + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial and telnet consoles, jump-host chains, SFTP, tunnels, expect/send macros with prompted variables, and a JS scripting engine, all in one sidebar. Bulk-import devices from CSV or a plain host list, save root-owned files over SFTP with sudo, import from MobaXterm/SecureCRT/SSH Config, NetBox, EVE-NG, Proxmox and GNS3 inventory sync with auth profiles and device templates, IPv6/IPv4 dual-address connect-fallback, 2FA, legacy KEX for old Cisco gear.",
-  "version": "2.8.248",
+  "version": "2.8.249",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -3719,7 +3719,7 @@
           "type": "boolean",
           "default": true,
           "order": 3,
-          "markdownDescription": "Log session transcripts for SSH and serial connections by default. Can be overridden per profile."
+          "markdownDescription": "Log session transcripts for SSH, telnet and serial connections by default. Can be overridden per profile."
         },
         "nexus.logging.sessionLogDirectory": {
           "type": "string",
@@ -3781,7 +3781,7 @@
           ],
           "default": "editor",
           "order": 6,
-          "markdownDescription": "Where to open SSH and serial terminals.",
+          "markdownDescription": "Where to open Nexus session terminals: SSH, telnet, serial, Local Shell and Local Server.",
           "enumDescriptions": [
             "Open in the terminal panel",
             "Open as an editor tab (default)"
@@ -3844,7 +3844,7 @@
           "type": "boolean",
           "default": true,
           "order": 10,
-          "markdownDescription": "Enable regex-based pattern highlighting in SSH, serial, and Local Shell terminal output. Matches are coloured inline using ANSI SGR codes while respecting existing terminal colours."
+          "markdownDescription": "Enable regex-based pattern highlighting in SSH, telnet, serial, Local Shell and Local Server terminal output. Matches are coloured inline using ANSI SGR codes while respecting existing terminal colours."
         },
         "nexus.terminal.highlighting.rules": {
           "type": "array",
@@ -4061,7 +4061,7 @@
               }
             }
           },
-          "markdownDescription": "Highlighting rules applied to SSH, serial, and Local Shell terminal output. Each rule specifies a regex `pattern`, a `color` (named or SGR code), optional `flags`, and optional `bold`/`underline` styles. A rule can also carry an optional `label` and `description` for its own entry in the Highlighting Rules editor, and an optional `enabled` flag (omitted/`true` means enabled) to keep a rule saved without applying it. Text already coloured by the terminal program is never re-highlighted.\n\nThe IPv6 and UUID rules ship **disabled** by default: those two patterns cost more than every other rule combined, because they have to be tried at nearly every character of every line. Switch either one on with its per-rule enable checkbox in the Highlighting Rules editor — no need to retype the regex."
+          "markdownDescription": "Highlighting rules applied to SSH, telnet, serial, Local Shell and Local Server terminal output. Each rule specifies a regex `pattern`, a `color` (named or SGR code), optional `flags`, and optional `bold`/`underline` styles. A rule can also carry an optional `label` and `description` for its own entry in the Highlighting Rules editor, and an optional `enabled` flag (omitted/`true` means enabled) to keep a rule saved without applying it. Text already coloured by the terminal program is never re-highlighted.\n\nThe IPv6 and UUID rules ship **disabled** by default: those two patterns cost more than every other rule combined, because they have to be tried at nearly every character of every line. Switch either one on with its per-rule enable checkbox in the Highlighting Rules editor — no need to retype the regex."
         },
         "nexus.sftp.cacheTtlSeconds": {
           "type": "number",
@@ -4245,7 +4245,7 @@
           "minimum": 1,
           "maximum": 2147483,
           "order": 21,
-          "markdownDescription": "Default per-wait timeout in seconds, used by `waitFor` / `expect` / `waitAny` when a script doesn't pass its own `timeout`. Override per script via the `@default-timeout` JSDoc tag, or per call via the `timeout` option."
+          "markdownDescription": "Default per-wait timeout in seconds, used by `waitFor` / `expect` / `waitAny` / `poll` when a script doesn't pass its own `timeout` (for `poll`, never less than its `every` interval). Override per script via the `@default-timeout` JSDoc tag, or per call via the `timeout` option."
         },
         "nexus.scripts.macroPolicy": {
           "type": "string",

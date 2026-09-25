@@ -373,7 +373,7 @@ const DIGITS_ONLY = /^[0-9]+$/;
 const USERNAME_CHARSET = /^[A-Za-z0-9._\-]+(?:@[A-Za-z0-9._\-]+)?$/;
 /**
  * `name` IS A POSITIVE CHARSET — Unicode letters, marks and digits, a space, and
- * eight punctuation marks that survive bash, zsh, PowerShell and cmd.exe. It was
+ * seven punctuation marks that survive bash, zsh, PowerShell and cmd.exe. It was
  * a BLACKLIST until the review finding recorded at the bottom of this comment,
  * and the flip is the finding's real conclusion; the blacklist's history is kept
  * below because it is the evidence for why.
@@ -504,7 +504,7 @@ const USERNAME_CHARSET = /^[A-Za-z0-9._\-]+(?:@[A-Za-z0-9._\-]+)?$/;
  *   differently" is the last property this rule should have.
  *
  *   CONTROL CHARACTERS fall out for free — none of them is a letter, a mark, a
- *   digit or one of the eight punctuation marks. `validateTokenValue()` still
+ *   digit or one of the seven punctuation marks. `validateTokenValue()` still
  *   checks `CONTROL_CHARS` first for every token, so the refusal does not depend
  *   on this observation, but the two now agree instead of overlapping by luck.
  *
@@ -559,7 +559,7 @@ const CONTROL_CHARS_GLOBAL = /[\u0000-\u001F\u007F-\u009F]/g;
  * metacharacter required), and so are `$` and a backtick (see
  * `SHELL_EXPANSION_CHARS`). On top of that each token gets the narrowest rule
  * its content allows: an address charset for `host`/`ipmiHost`, digits for
- * `port`, a real-username charset for `username`, and a letters-digits-and-eight-
+ * `port`, a real-username charset for `username`, and a letters-digits-and-seven-
  * punctuation-marks charset for the free-form `name` (see `NAME_CHARSET` — it
  * used to be a blacklist, and the four rounds of holes that cost are recorded
  * there). EVERY token is now a positive charset; nothing here is a blacklist.

@@ -388,7 +388,10 @@ export class NoMatchesTreeItem extends vscode.TreeItem {
     super("No matches found", vscode.TreeItemCollapsibleState.None);
     this.id = "no-matches";
     this.iconPath = new vscode.ThemeIcon("filter");
-    this.tooltip = "Nothing matches the active filter. Run \u201CNexus: Filter Connectivity Hub\u201D and clear the query to see all profiles.";
+    // Names the title-bar button (`nexus.filter.clear`, shown while
+    // nexus.filterActive) rather than a palette entry: "Filter Connectivity Hub"
+    // is only the input box's title, and no command carries that name (#153).
+    this.tooltip = "Nothing matches the active filter. Click Clear Filter in the Connectivity Hub title bar to see all profiles.";
     // Deliberately no contextValue and no command: no context-menu entry can
     // attach to the row (menus are gated on the /^nexus\./ contextValue
     // prefix), and handleDrag/handleDrop only act on the concrete item types

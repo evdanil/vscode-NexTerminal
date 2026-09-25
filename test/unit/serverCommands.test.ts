@@ -4428,11 +4428,32 @@ describe("nexus.server.edit — addressless placeholder is editable (P2-a)", () 
     expect(saved.port).toBe(22);
   });
 
-  // P2-3 fallback (Fable) — there is no syncedHost ownership stamp, so the next
-  // sync of a still-consoleless device will blank a hand-typed host. Warn the user
-  // at save so the impending revert is not a silent surprise. ⊘ Saving silently
-  // lets the address vanish on the next sync with no disclosure.
-  it("P2-3 — warns that the next sync may revert a host typed into an addressless placeholder", async () => {
+  // What a hand-typed address on a placeholder is FOR the sync: since the
+  // syncedHost/syncedPort stamps (task #29) the sync keeps it — a still-
+  // consoleless device no longer blanks it (`blanksAddress` is false for a hand
+  // value), and a device that later reports its own address does not replace it
+  // either (`syncOwnsHost` answers no unless the two are equal). The save-time
+  // notice discloses THAT hand-off, which is the one consequence a user cannot
+  // see: the server will not start following its source when the device gets an
+  // address. It used to promise a revert the sync no longer performs (#153).
+  // ⊘ Restoring the old "will revert it to a placeholder" text tells the user to
+  // expect the opposite of what the next sync does; ⊘ deleting the notice
+  // leaves the stop-following consequence undisclosed. It is an ownership
+  // disclosure, not a warning — nothing is lost — so it is an information
+  // message; ⊘ leaving it a warning dresses a hand-off up as a hazard.
+  //
+  // It PRESCRIBES NOTHING (PR #171 review). Whether the source will ever
+  // report an address for this device is unknowable here — an EVE-NG
+  // HTML5/VNC-only node never will, and nothing on the record says which kind
+  // of placeholder it was — so "set it to exactly the host and port the source
+  // reports" was an instruction some users can never carry out. What it states
+  // instead holds for every device: a status refresh never touches a hand
+  // value (`healSyncedConsolePorts` heals owned values only, and skips an equal
+  // one without stamping it), and only an INVENTORY SYNC that finds the source
+  // reporting a value exactly takes that component back, per component
+  // (`syncOwnsHost`/`syncOwnsPort`, row 5a). ⊘ Restoring the instruction fails
+  // the absence pin; ⊘ saying a refresh hands it back fails the sync-only pin.
+  it("#153 — typing a host into an addressless placeholder says syncs and refreshes leave it as set, that only an inventory sync takes a value back, and prescribes nothing (⊘ a revert promise; ⊘ an instruction the source may never make possible)", async () => {
     const { ctx } = setupHarness({
       profiles: [],
       activeTunnels: [],
@@ -4443,10 +4464,27 @@ describe("nexus.server.edit — addressless placeholder is editable (P2-a)", () 
     const panel = await openEdit(ctx);
     await panel.onSubmit(addresslessSubmit({ host: "10.0.0.5", port: 22 }));
 
-    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("next sync"));
+    const notices = vi
+      .mocked(vscode.window.showInformationMessage)
+      .mock.calls.map((call) => String(call[0]))
+      .filter((text) => text.includes("console address by hand"));
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("console address by hand"));
+    expect(notices).toHaveLength(1);
+    const [notice] = notices;
+    expect(notice).toContain('"stopped-node"');
+    expect(notice).toMatch(/syncs and status refreshes leave it as you set it/i);
+    // The one exception, stated as the rule it is, and attributed to the only
+    // path that performs it.
+    const takeover = notice.split(/(?<=\.)\s+/).find((sentence) => /takes over/i.test(sentence)) ?? "";
+    expect(takeover).toMatch(/only once an inventory sync finds it reporting that exact value/i);
+    expect(takeover).not.toMatch(/refresh/i);
+    // No instruction the user may be unable to follow.
+    expect(notice).not.toMatch(/set it to/i);
+    expect(notice).not.toMatch(/revert/i);
+    expect(notice).not.toContain("placeholder unless");
   });
 
-  it("P2-3 control — editing an addressless placeholder WITHOUT giving it a host does not warn about a revert (⊘ warning on every placeholder edit is noise)", async () => {
+  it("P2-3 control — editing an addressless placeholder WITHOUT giving it a host shows no hand-typed-address notice (⊘ a notice on every placeholder edit is noise)", async () => {
     const { ctx } = setupHarness({
       profiles: [],
       activeTunnels: [],
@@ -4457,7 +4495,8 @@ describe("nexus.server.edit — addressless placeholder is editable (P2-a)", () 
     const panel = await openEdit(ctx);
     await panel.onSubmit(addresslessSubmit({ ipmiAuthProfileId: "ap-bmc" }));
 
-    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("next sync"));
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("console address by hand"));
+    expect(vscode.window.showInformationMessage).not.toHaveBeenCalledWith(expect.stringContaining("console address by hand"));
   });
 });
 

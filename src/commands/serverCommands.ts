@@ -2132,14 +2132,28 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
               "Server profile updated. Existing sessions keep current connection settings until reconnect."
             );
           }
-          // P2-3 fallback (Fable) — the user gave an addressless placeholder a host
-          // in the form (`existing` was addressless, the saved record is not). There
-          // is no host-ownership stamp yet, so the NEXT sync of a still-consoleless
-          // device will blank this hand-typed host. Warn so the revert is disclosed
-          // rather than a silent surprise.
+          // The user gave an addressless placeholder a host in the form (`existing`
+          // was addressless, the saved record is not). A placeholder carries no
+          // syncedHost/syncedPort stamp, so the sync reads this address as hand-typed
+          // and keeps it (syncEngine.ts `syncOwnsHost`/`syncOwnsPort`): a
+          // still-consoleless device does not blank it, a device that later
+          // reports a different address does not replace it, and a status
+          // refresh never touches it (`healSyncedConsolePorts` heals owned values
+          // only, and skips an equal one without stamping it). The one way back is
+          // an INVENTORY SYNC finding the source reporting a value exactly: that
+          // component is re-stamped as sync-owned on its own (matrix row 5a).
+          //
+          // The notice STATES that rule and prescribes nothing. Whether the source
+          // will ever report an address for this device cannot be known here —
+          // an EVE-NG HTML5/VNC-only node never will, and the record does not say
+          // which kind of placeholder it was — so an instruction to "set it to the
+          // address the source reports" would be one some users can never carry
+          // out (PR #171 review). An information message, because nothing is
+          // lost: this is a hand-off, not a hazard. (It used to be a warning
+          // promising a revert to a placeholder — true before the stamps, #153.)
           if (existing.addressless === true && candidate.addressless !== true) {
-            void vscode.window.showWarningMessage(
-              `You gave "${existing.name}" a console address by hand. Its inventory source did not assign one, so the next sync will revert it to a placeholder unless the device has an address by then.`
+            void vscode.window.showInformationMessage(
+              `You gave "${existing.name}" a console address by hand, and syncs and status refreshes leave it as you set it. Its inventory source takes over the host or the port only once an inventory sync finds it reporting that exact value.`
             );
           }
         },

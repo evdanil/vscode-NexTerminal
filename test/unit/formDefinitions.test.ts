@@ -273,10 +273,15 @@ describe("formDefinitions keyPath visibility", () => {
       label: "Open File Explorer on first connection",
       value: true,
       advanced: true,
-      hint: "After a normal Connect, opens the File Explorer when it is not already showing this server. Saving this checked disables it on any other SSH profile. Ignored for jump hosts, tunnels, group Connect, and Connect and Run Script.",
+      hint: "After a normal Connect, opens the File Explorer when it is not already showing this server. Saving this checked disables it on any other SSH profile. Ignored for jump hosts, tunnels, group Connect, Connect and Run Script, and Run Macro on Server….",
       // TELNET (Phase 0) — the SFTP file explorer is SSH-only machinery.
       visibleWhen: { field: "protocol", value: "ssh" }
     }));
+
+    // #153 — every connect path that passes `allowAutoFileExplorer: false` is
+    // named; Run Macro on Server… is one of them (serverMacroCommands.ts) and was
+    // the one the hint left out. ⊘ Dropping it again fails here.
+    expect((editField as { hint?: string }).hint).toContain("Run Macro on Server…");
 
     const unifiedField = keyedField(unifiedProfileFormDefinition(), "openFileExplorerOnFirstConnect");
     expect(unifiedField).toEqual(expect.objectContaining({
@@ -350,6 +355,25 @@ describe("formDefinitions keyPath visibility", () => {
       expect(profileType.options).toContainEqual({ label: "Network Device Profile", value: "ssh" });
       expect(profileType.options.map((o) => o.label)).not.toContain("SSH Server Profile");
     }
+  });
+
+  /**
+   * #153 — the tunnel form's "Create new server…" opens `serverFormDefinition`
+   * with no seed, and it was the last entry point still titled "Add Server
+   * Profile" for the profile every other entry point calls a Network Device
+   * Profile. Compared against the unified form's own SSH title, so the two
+   * cannot drift apart again. The edit title is the same form and says the same
+   * name. ⊘ Restoring either "Server Profile" title fails the absence pins.
+   */
+  it("titles the stand-alone server form a Network Device Profile, the same as every other entry point (\u2298 \"Add Server Profile\" on the tunnel form's Create new server\u2026)", () => {
+    const add = serverFormDefinition();
+    const edit = serverFormDefinition({ id: "srv-1", name: "Server" });
+
+    expect(add.title).toBe(unifiedProfileFormDefinition({ addMode: "ssh" }).title);
+    expect(add.title).toBe("Add Network Device Profile");
+    expect(edit.title).toBe("Edit Network Device Profile");
+    expect(add.title).not.toContain("Server Profile");
+    expect(edit.title).not.toContain("Server Profile");
   });
 
   it("locks the profile type selector for explicit SSH, serial, and local shell add forms", () => {

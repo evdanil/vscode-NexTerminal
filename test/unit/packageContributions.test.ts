@@ -2000,3 +2000,105 @@ describe("Local Servers environment-variable contract is documented", () => {
     expect(step).toMatch(/unsets? it/i);
   });
 });
+
+/**
+ * #153 — setting descriptions that named fewer terminals than the setting
+ * governs. Each list below is what the connect paths actually wire, read from
+ * the code, not from the old text:
+ * - transcripts: `createSessionTranscript` is passed by the SSH and telnet
+ *   paths (serverCommands.ts) and both serial paths (serialCommands.ts); Local
+ *   Shell and Local Server write none;
+ * - highlighting: `ctx.highlighter` reaches SshPty, TelnetPty, both serial PTYs
+ *   and LocalShellPty, which Local Server terminals run in (localServerManager.ts);
+ * - open location: every one of those connect paths reads
+ *   `nexus.terminal.openLocation`;
+ * - the default wait timeout: `poll` falls back to it too, raised to at least
+ *   its `every` (scriptRuntimeManager.ts `doPoll`).
+ * The Settings panel carries its own copy of two of these (settingsMetadata.ts),
+ * so both copies are checked. ⊘ Restoring any of the old narrower lists fails
+ * the absence pins below.
+ */
+describe("#153 — setting descriptions name everything the setting governs", () => {
+  const props = packageJson.contributes.configuration?.properties ?? {};
+  const describedAs = (key: string): string => String(props[key]?.markdownDescription ?? props[key]?.description ?? "");
+
+  it("session transcripts: telnet is logged too", () => {
+    const description = describedAs("nexus.logging.sessionTranscripts");
+    expect(description).toMatch(/\bSSH\b/);
+    expect(description).toMatch(/\btelnet\b/i);
+    expect(description).toMatch(/\bserial\b/i);
+    expect(description).not.toContain("SSH and serial connections");
+  });
+
+  it("highlighting: telnet and Local Server output are highlighted too, in both the switch and the rules", () => {
+    for (const key of ["nexus.terminal.highlighting.enabled", "nexus.terminal.highlighting.rules"]) {
+      const description = describedAs(key);
+      expect(description, key).toMatch(/\btelnet\b/i);
+      expect(description, key).toContain("Local Shell");
+      expect(description, key).toContain("Local Server");
+      expect(description, key).not.toContain("SSH, serial, and Local Shell terminal output");
+    }
+  });
+
+  it("open location: applies to every Nexus session terminal, not just SSH and serial", () => {
+    const description = describedAs("nexus.terminal.openLocation");
+    expect(description).toMatch(/\btelnet\b/i);
+    expect(description).toContain("Local Shell");
+    expect(description).toContain("Local Server");
+    expect(description).not.toContain("Where to open SSH and serial terminals");
+    // Session terminals only: the BMC SOL and local macro terminals are plain
+    // `createTerminal` calls that never read the setting, so "every Nexus
+    // terminal" would over-claim.
+    expect(description).not.toMatch(/every Nexus terminal/i);
+  });
+
+  it("default wait timeout: poll uses it as well, never below its interval", () => {
+    const description = describedAs("nexus.scripts.defaultTimeoutSeconds");
+    expect(description).toContain("`poll`");
+    expect(description).toMatch(/`every`/);
+    expect(description).not.toContain("`waitFor` / `expect` / `waitAny` when");
+    const settingsRow = userDoc("docs/settings.md")
+      .split("\n")
+      .find((line) => line.startsWith("| `nexus.scripts.defaultTimeoutSeconds`"));
+    expect(settingsRow).toBeDefined();
+    expect(settingsRow).toContain("`poll`");
+  });
+
+  // Same omission in prose: telnet sessions get the unread marker too — the
+  // telnet connect path calls `markSessionActivity` and TelnetPty's
+  // `setActivityIndicator` exactly as the SSH path does.
+  it("unread activity: the guides and the README count telnet sessions in", () => {
+    for (const [name, section] of [
+      ["README.md", "**Unread activity**"],
+      ["docs/connectivity-hub.md", "## Unread Activity"],
+      ["docs/terminal.md", "## Unread Activity"]
+    ] as const) {
+      const lines = userDoc(name).split("\n");
+      const at = lines.findIndex((line) => line.includes(section));
+      expect(at, name).toBeGreaterThanOrEqual(0);
+      // A heading's claim is the first paragraph under it; a README bullet is
+      // its own line.
+      const claim = lines[at].startsWith("#") ? lines.slice(at + 1).find((line) => line.trim() !== "") : lines[at];
+      expect(claim, name).toMatch(/\btelnet\b/i);
+    }
+    for (const [name, text] of userDocs) {
+      expect(text, name).not.toContain("Active SSH and serial sessions highlight unread");
+      expect(text, name).not.toContain("SSH and serial sessions with output you haven't seen");
+    }
+  });
+
+  it("the Settings panel's own copies say the same", async () => {
+    const { SETTINGS_META } = await import("../../src/ui/settingsMetadata");
+    const meta = (section: string, key: string): string =>
+      SETTINGS_META.find((item) => item.section === section && item.key === key)?.description ?? "";
+
+    const transcripts = meta("nexus.logging", "sessionTranscripts");
+    expect(transcripts).toMatch(/\btelnet\b/i);
+    expect(transcripts).not.toContain("SSH and serial connections");
+
+    const timeout = meta("nexus.scripts", "defaultTimeoutSeconds");
+    expect(timeout).toMatch(/\bpoll\b/);
+    expect(timeout).toMatch(/\bevery\b/);
+    expect(timeout).not.toContain("waitFor / expect / waitAny when");
+  });
+});

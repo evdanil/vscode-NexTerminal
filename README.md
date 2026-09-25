@@ -76,7 +76,7 @@ Then open the **Nexus** sidebar (activity bar icon).
 
 - **Connectivity Hub** — one sidebar tree of servers, serial devices, local shells, and local servers in nested folders, with a filter and drag and drop. → [Connectivity Hub](docs/connectivity-hub.md)
 - **Profile actions** — click a profile for Connect, **Test Connection**, Connect and Run Script, Duplicate, Copy Connection Info, and more; right-click a folder to connect or disconnect the servers in it. → [Profile Actions](docs/connectivity-hub.md#profile-actions)
-- **Unread activity** — SSH and serial sessions with output you haven't seen are marked in the tree and with `●` on the tab. → [Unread Activity](docs/connectivity-hub.md#unread-activity)
+- **Unread activity** — SSH, telnet and serial sessions with output you haven't seen are marked in the tree and with `●` on the tab. → [Unread Activity](docs/connectivity-hub.md#unread-activity)
 - **Inventory sources** — add and manage sources from one command or **Settings → Inventory Sources**, with reusable saved filters and a per-source opt-in for self-signed certificates. → [Add a Source](docs/inventory/README.md#add-a-source)
 - **NetBox sync** — devices become server profiles under a folder template, narrowed by any device filter; out-of-band IPs fill the BMC host. → [NetBox](docs/inventory/netbox.md)
 - **EVE-NG sync** — labs become folders and nodes become telnet servers on their own consoles. → [EVE-NG](docs/inventory/eve-ng.md)

@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.8.249] — 2026-09-25
+
+### Fixed
+
+- **Giving an addressless server a console address by hand no longer warns of a revert that does not happen.** The notice said the next sync would turn the server back into a placeholder unless the device had an address by then. It does not: an address you type is yours, and syncs keep it. The notice — now an information message rather than a warning, since nothing is lost — tells you what actually happens: syncs and status refreshes leave your address as you set it, and a device that later reports a different one does not replace it. The source takes the host or the port back only once an inventory sync finds it reporting that exact value; a device that never reports an address, such as an HTML5/VNC-only EVE-NG node, leaves it yours for good.
+- **The Proxmox token hints say where Sys.Audit goes.** The **API Token** and **Include Cluster Nodes** hints named Sys.Audit without its path. It has to be granted on the root path `/`, where the cluster status read checks it; a grant on `/vms`, beside the guest privileges, lets the token pass **Test Connection** and still import nodes without addresses. The warning a sync shows when that read fails and the partial-status warning of **Refresh Inventory Status** now say the same — the first no longer suggests that a token holding Sys.Audit anywhere means the cluster just did not answer.
+- **The "No matches found" row points at a button that exists.** Its tooltip said to run "Nexus: Filter Connectivity Hub", which is not a command anywhere. It now names **Clear Filter**, the button in the Connectivity Hub title bar while a filter is active.
+- **The tunnel form's Create new server… opens a Network Device Profile form.** It was the last place still titled "Add Server Profile" (and editing a server said "Edit Server Profile"); both now use the name every other entry point gives this profile.
+- **Setting descriptions cover everything the setting applies to.** Session transcripts are written for telnet sessions as well as SSH and serial; highlighting and its rules apply to telnet and Local Server output too; **Open Location** decides where every Nexus session terminal — SSH, telnet, serial, Local Shell and Local Server — opens, not only SSH and serial ones; and the scripts' default wait timeout is also used by `poll`, which never waits less than its `every` interval. The Settings panel's copies of the transcript and timeout descriptions say the same.
+- **Smaller wording fixes.** The **Open File Explorer on first connection** hint now lists **Run Macro on Server…** among the connections it does not run for. The one-time notice before a Local Shell with auto-trigger macros now counts telnet among the terminals **Disable Globally** switches auto-trigger off for. The unread-activity marker is documented for telnet sessions too, which have always had it.
+
 ## [2.8.248] — 2026-09-25
 
 ### Fixed

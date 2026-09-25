@@ -33,12 +33,14 @@ import type { CommandContext } from "./types";
  * import, share or restore, so `IMPORTED_CAPABILITY_FIELDS` and its reasoning
  * are untouched and unaffected by these commands.
  *
- * MENU PLACEMENT: unconditional on server items, like "Run Macro on Server…".
- * Hiding the entry on a server with no BMC configured would mean encoding IPMI
- * state into the tree item's `contextValue`, which ~15 anchored `when` regexes
- * match against (the B5 constraint in ui/nexusTreeProvider.ts). The standing
- * rule is "pickers flag, menus don't hide", so an unconfigured server gets an
- * actionable refusal naming the field and where to set it.
+ * MENU PLACEMENT: the right-click entries are gated on the `.ipmi` marker that
+ * ui/nexusTreeProvider.ts appends to a server's `contextValue` when its IPMI /
+ * BMC Host is set (task #27), so they show only on servers that have a BMC
+ * address. The Command Palette entries are not gated and pick from every
+ * server, and a server that does carry the marker can still lack the rest (the
+ * SOL console's BMC username, or an address that is not usable), so the
+ * commands still refuse with an actionable message naming the field and where
+ * to set it.
  */
 
 /**

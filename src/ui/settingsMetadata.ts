@@ -38,7 +38,7 @@ export const SETTINGS_META: SettingMeta[] = [
     label: "Session Logging",
     type: "boolean",
     category: "logging",
-    description: "Log session transcripts for SSH and serial connections by default."
+    description: "Log session transcripts for SSH, telnet and serial connections by default."
   },
   {
     key: "sessionLogDirectory",
@@ -478,7 +478,7 @@ export const SETTINGS_META: SettingMeta[] = [
     type: "number",
     category: "scripts",
     description:
-      "Used by waitFor / expect / waitAny when the call site does not pass its own timeout. Override per-script with the @default-timeout JSDoc tag.",
+      "Used by waitFor / expect / waitAny / poll when the call site does not pass its own timeout (for poll, never less than its every interval). Override per-script with the @default-timeout JSDoc tag.",
     min: 1,
     max: 2147483,
     unit: "seconds",

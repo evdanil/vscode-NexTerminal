@@ -512,6 +512,24 @@ describe("registerLocalShellCommands", () => {
     expect(ctx.localShellTerminals.size).toBe(0);
   });
 
+  // #153 — "Disable Globally" flips `nexus.terminal.macros.autoTrigger`, which
+  // every auto-trigger observer reads — telnet's included (connectTelnetServer
+  // creates one exactly as the SSH path does). The notice has to say what the
+  // button switches off. ⊘ Restoring the telnet-less list fails the pins.
+  it("#153 — the notice lists telnet among the terminals Disable Globally turns auto-trigger off for", async () => {
+    mockMacros.push({ name: "Password prompt", text: "secret\n", triggerPattern: "[Pp]assword:" });
+    mockShowWarningMessage.mockResolvedValueOnce("Review Macros");
+    const ctx = makeCtx();
+
+    registerLocalShellCommands(ctx);
+    await registeredCommands.get("nexus.localShell.connect")!("local-1");
+
+    const notice = String(mockShowWarningMessage.mock.calls[0]?.[0] ?? "");
+    expect(notice).toContain("Existing \"All terminals\" macros can also run in Local Shell sessions.");
+    expect(notice).toMatch(/globally for SSH, Telnet, Serial,? and Local Shell/);
+    expect(notice).not.toContain("globally for SSH, Serial, and Local Shell");
+  });
+
   it("Fix 3 — does not warn when the only all-terminal auto-trigger macro also declares variables (it can never compile to a trigger rule)", async () => {
     mockMacros.push({
       name: "Password prompt",

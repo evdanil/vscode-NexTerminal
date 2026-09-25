@@ -463,7 +463,7 @@ function openFileExplorerOnFirstConnectField(seed?: Partial<ServerConfig>, vw?: 
     key: "openFileExplorerOnFirstConnect",
     label: "Open File Explorer on first connection",
     value: seed?.openFileExplorerOnFirstConnect ?? false,
-    hint: "After a normal Connect, opens the File Explorer when it is not already showing this server. Saving this checked disables it on any other SSH profile. Ignored for jump hosts, tunnels, group Connect, and Connect and Run Script.",
+    hint: "After a normal Connect, opens the File Explorer when it is not already showing this server. Saving this checked disables it on any other SSH profile. Ignored for jump hosts, tunnels, group Connect, Connect and Run Script, and Run Macro on Server….",
     advanced: true,
     visibleWhen: vw
   };
@@ -1076,8 +1076,12 @@ export function serverFormDefinition(
 
   return {
     // TELNET (Phase 0) — the title stays protocol-neutral: one form now produces
-    // either kind of record, and the Protocol select inside it says which.
-    title: isEdit ? "Edit Server Profile" : "Add Server Profile",
+    // either kind of record, and the Protocol select inside it says which. It
+    // uses the name every other entry point gives this profile (see
+    // `unifiedProfileFormTitle`). Two callers open this form — the tunnel form's
+    // "Create new server…" (the add title) and `nexus.server.edit` (the edit
+    // title) — and both still said "Server Profile" (#153).
+    title: isEdit ? "Edit Network Device Profile" : "Add Network Device Profile",
     fields: withTemplateAppliedHints(seed, [
       { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server", value: seed?.name },
       // TELNET (Phase 0) — credentials, proxies/jump hosts and the SFTP file
