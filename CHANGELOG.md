@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.272] — 2026-09-25
+
+### Fixed
+
+- **Nexus Settings now recommends the Rust network server engine, matching the Rust default and Node fallback.**
+
 ## [2.8.271] — 2026-09-25
 
 ### Fixed

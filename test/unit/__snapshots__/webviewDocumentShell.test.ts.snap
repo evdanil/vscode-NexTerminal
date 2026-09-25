@@ -10906,8 +10906,8 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
       <span class="custom-select-text">Node</span>
     </div>
     <div class="custom-select-dropdown" role="listbox" aria-labelledby="setting-nexus-networkServers-engine-label">
-      <div class="custom-select-option selected" data-value="node" role="option" aria-selected="true">Node <span class="recommended-badge">recommended</span></div>
-        <div class="custom-select-option" data-value="rust" role="option" aria-selected="false">Rust</div>
+      <div class="custom-select-option selected" data-value="node" role="option" aria-selected="true">Node</div>
+        <div class="custom-select-option" data-value="rust" role="option" aria-selected="false">Rust <span class="recommended-badge">recommended</span></div>
     </div>
   </div>
   <span class="save-indicator" aria-live="polite" data-for="nexus.networkServers.engine"></span>

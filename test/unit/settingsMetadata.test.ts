@@ -105,6 +105,13 @@ describe("SETTINGS_META", () => {
     expect(openLocation?.enumOptions?.find((option) => option.value === "editor")?.recommended).toBe(true);
   });
 
+  it("recommends Rust for the network server engine and leaves Node as the fallback", () => {
+    const engine = SETTINGS_META.find((item) => item.section === "nexus.networkServers" && item.key === "engine");
+    expect(engine?.default).toBe("rust");
+    expect(engine?.enumOptions?.find((option) => option.value === "rust")?.recommended).toBe(true);
+    expect(engine?.enumOptions?.find((option) => option.value === "node")?.recommended).not.toBe(true);
+  });
+
   it("keeps Trust New Hosts on the same key but groups it under Security & Data", () => {
     const trustNewHosts = SETTINGS_META.find((item) => item.section === "nexus.ssh" && item.key === "trustNewHosts");
     expect(trustNewHosts).toBeDefined();
