@@ -338,6 +338,88 @@ export function describeFilterConditions(parsed: ParsedFilter): string {
   return parts.join(" AND ");
 }
 
+/** A declared attribute key as the filter parser spells it: trimmed, case-folded, `tag` → `tags` (m10). */
+function normalizeDeclaredKey(key: string): string {
+  const k = key.trim().toLowerCase();
+  return k === "tag" ? "tags" : k;
+}
+
+/**
+ * Whether a key SHOWN as `shown`, typed exactly that way into a filter, is read back
+ * as the declared key `declared` — through the real parser, so everything the filter
+ * syntax does to a typed key counts: trimming, case-folding and the `tag` alias (all
+ * harmless), and URLSearchParams decoding, which splits on `&` and `=` and turns `+`
+ * and `%xx` into other characters. An empty `shown` parses to no key at all.
+ */
+function typesAs(shown: string, declared: string): boolean {
+  return parseTemplateFilter(`${shown}=x`).conditions.has(normalizeDeclaredKey(declared));
+}
+
+/**
+ * A key shown AS DECLARED must be plain ASCII letters, digits, `_`, `.` or `-` —
+ * every built-in provider's keys are. A conservative allowlist rather than a list of
+ * dangers: Unicode keeps producing characters that render blank (U+3164 Hangul
+ * Filler, U+2800 Braille blank) or pose as the lists' own punctuation (", ", the
+ * prompt's " — "), and plain ASCII is none of those by construction.
+ */
+const PLAIN_KEY_RE = /^[A-Za-z0-9_.-]+$/;
+
+/**
+ * How a declared key is SHOWN in a key list, or `undefined` when no spelling of it
+ * can be typed into a filter. The first spelling that types back as the key wins:
+ *  1. The key as declared, trimmed (the parser trims a typed key too), when it is
+ *     plain (`PLAIN_KEY_RE`). Case and `tag` are kept, since the parser folds those.
+ *  2. Otherwise its percent-encoded spelling (`encodeURIComponent`, with the
+ *     `! ' ( ) * ~` it leaves alone escaped too): `a+b` → `a%2Bb`, `rack, zone` →
+ *     `rack%2C%20zone`, `café` → `caf%C3%A9`, a line break or bidi control →
+ *     `%0A` / `%E2%80%AE`. Always printable ASCII with no comma, no space and no
+ *     em dash, so it can neither render blank nor blend into the list's ", " or the
+ *     prompt's " — ", and the parser decodes it back to the key. Provider text in any other form never
+ *     reaches the list, which is why no `flattenProviderText` is needed here.
+ *  3. Neither — a key that is only whitespace (no typed key can be empty) or holds
+ *     a lone surrogate (`encodeURIComponent` throws on one). Nothing could type it.
+ */
+function displayKeySpelling(declared: string): string | undefined {
+  const trimmed = declared.trim();
+  if (PLAIN_KEY_RE.test(trimmed) && typesAs(trimmed, declared)) {
+    return trimmed;
+  }
+  let encoded: string;
+  try {
+    // `encodeURIComponent` leaves `! ' ( ) * ~` as they are; escape them too, so a
+    // key outside the allowlist is always shown fully percent-encoded (`a*b` →
+    // `a%2Ab`), never raw. The parser decodes them back all the same.
+    encoded = encodeURIComponent(declared).replace(/[!'()*~]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+  } catch {
+    return undefined; // URIError: a lone surrogate has no percent-encoding
+  }
+  return typesAs(encoded, declared) ? encoded : undefined;
+}
+
+/**
+ * The keys a user is told a filter on this source may use: the provider's declared
+ * `attributeKeys`, plus `name` when the provider left it out, because
+ * `unknownFilterKeys` always accepts it (issue #163). Every place that prints the
+ * keys (the Rule Filter prompt, the live "Known keys: …" warning, the save-time
+ * toast) goes through here, which is why the sanitizing lives here too: a provider
+ * registered through the public API supplies these strings, and they land in
+ * sentences this extension writes.
+ *
+ * THE INVARIANT: every key listed is either plain ASCII or percent-encoded, so it
+ * reads as one visible entry, and typed exactly as shown it is accepted — and every
+ * key that CAN be typed is listed. `displayKeySpelling` picks the spelling; a key
+ * with none is left out. Matching (`unknownFilterKeys`) is untouched: it still
+ * compares the raw declared values, so this changes what is shown, never which
+ * filters are accepted.
+ */
+export function knownKeysList(attributeKeys: readonly string[]): string {
+  const declaresName = attributeKeys.some((k) => normalizeDeclaredKey(k) === "name");
+  return (declaresName ? attributeKeys : [...attributeKeys, "name"])
+    .map((declared) => displayKeySpelling(declared))
+    .filter((shown): shown is string => shown !== undefined)
+    .join(", ");
+}
+
 /**
  * §2.2 — the filter keys used by a filter that are NOT in the provider's declared
  * `attributeKeys` (case-insensitive). `name` is always known (provider-agnostic).
@@ -347,7 +429,7 @@ export function unknownFilterKeys(parsed: ParsedFilter, attributeKeys: readonly 
   if (attributeKeys === undefined) {
     return [];
   }
-  const known = new Set(attributeKeys.map((k) => (k.trim().toLowerCase() === "tag" ? "tags" : k.trim().toLowerCase())));
+  const known = new Set(attributeKeys.map(normalizeDeclaredKey));
   known.add("name");
   const unknown: string[] = [];
   for (const key of parsed.conditions.keys()) {

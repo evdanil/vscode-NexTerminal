@@ -971,8 +971,49 @@ describe("inventorySourceFormDefinition — saved-filter picker (PR-E)", () => {
     expect(picker.options.map((o) => o.value)).toContain(SAVED_FILTER_SAVE_CURRENT_SENTINEL);
   });
 
+  // Issue #152 — EVE-NG's field is "Lab Filter" and GNS3's "Project Filter"; a
+  // hint pointing at "the Device Filter below" names a field those forms do not
+  // have. The id here matches no built-in provider, so only a hint built from the
+  // field's own label passes.
+  const withFilterLabel = (label: string): InventoryProvider => ({
+    ...noFilterProvider,
+    id: "lab-like",
+    configFields: [{ id: "filter", label, type: "string" }]
+  });
+  const hintOf = (provider: InventoryProvider) =>
+    (keyedField(inventorySourceFormDefinition(provider, undefined, undefined, [], [], savedFilters), SAVED_FILTER_SELECT_KEY) as {
+      hint?: string;
+    }).hint ?? "";
+
+  it("the picker's hint names the provider's OWN filter field (⊘ 'fill the Device Filter below' on a Lab Filter form)", () => {
+    const labLike = withFilterLabel("Lab Filter");
+
+    expect(hintOf(labLike)).toContain("Lab Filter");
+    expect(hintOf(labLike)).not.toContain("Device Filter");
+    expect(hintOf(netboxLike)).toContain("Device Filter");
+  });
+
+  // Codex on #164 — a provider registered through the public API supplies the
+  // label, and the hint splices it into a sentence this extension writes.
+  it("the picker's hint makes the field label inert, and names a neutral 'filter field' when nothing visible is left (⊘ a label's line break, bidi override or zero-width character reaching the hint)", () => {
+    const hint = hintOf(withFilterLabel("Lab\nFilter\u202E\u200B"));
+
+    expect(hint).toContain("fill the Lab Filter below");
+    expect(hint).not.toMatch(/[\n\u202E\u200B]/);
+    expect(hintOf(withFilterLabel("\u200B\u202E"))).toContain("fill the filter field below");
+  });
+
   it("does NOT render the picker for a provider with no Device Filter field (kills showing a fill-nothing picker)", () => {
     const definition = inventorySourceFormDefinition(noFilterProvider, undefined, undefined, [], [], savedFilters);
+    expect(maybeKeyedField(definition, SAVED_FILTER_SELECT_KEY)).toBeUndefined();
+  });
+
+  it("P8 — does NOT render the picker over a `filter` field that is not a string (kills a gate on the id alone, which writes a filter string into a checkbox)", () => {
+    const booleanFilter: InventoryProvider = {
+      ...noFilterProvider,
+      configFields: [{ id: "filter", label: "Filter Enabled", type: "boolean" }]
+    };
+    const definition = inventorySourceFormDefinition(booleanFilter, undefined, undefined, [], [], savedFilters);
     expect(maybeKeyedField(definition, SAVED_FILTER_SELECT_KEY)).toBeUndefined();
   });
 

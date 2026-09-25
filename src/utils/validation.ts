@@ -599,8 +599,8 @@ export function validateDeviceTemplate(item: unknown): item is DeviceTemplatePro
  * SAVED FILTER DEFINITIONS (issue #48 PR-E) — shape guard for a persisted
  * `SavedFilterDefinition`. Same trust boundary and tolerant disposition as the
  * other config-store guards: `id`/`name` non-empty strings, `filter` a string
- * (empty allowed — a saved definition MAY be a catch-all, and the source's own
- * Device Filter field admits ""). A whole definition is skipped by the storage
+ * (empty allowed — a saved definition MAY be a catch-all, and every provider's
+ * filter field admits ""). A whole definition is skipped by the storage
  * getter if this fails — never a partial one.
  *
  * RESERVED SENTINEL NAMESPACE (PR #64 Codex review round 5, P2 — issue #48

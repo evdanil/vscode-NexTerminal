@@ -7,6 +7,7 @@ import {
   filterSpecificity,
   parseTemplateFilter,
   TEMPLATE_FIELD_SHORT_LABELS,
+  knownKeysList,
   unknownFilterKeys,
   type TemplatableField
 } from "./templateApply";
@@ -126,10 +127,9 @@ export function filterFeedback(filterInput: string, attributeKeys: readonly stri
   }
   const unknown = unknownFilterKeys(parsed, attributeKeys);
   if (unknown.length > 0) {
-    const known = (attributeKeys ?? []).join(", ");
     return {
       severity: "warning",
-      message: `Key '${unknown[0]}' is not one this source's provider reports — this rule will never match. Known keys: ${known}`,
+      message: `Key '${unknown[0]}' is not one this source's provider reports — this rule will never match. Known keys: ${knownKeysList(attributeKeys ?? [])}`,
       blocking: false
     };
   }

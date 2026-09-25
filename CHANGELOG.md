@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.8.252] — 2026-09-25
+
+### Fixed
+
+- **The Rule Filter box lists the keys your source actually has.** Adding a template rule showed NetBox's keys (`role, site, location, rack, tenant, status, platform, tag, name`) on every source, so on an EVE-NG, Proxmox or GNS3 source it offered keys that the same box then flagged as never matching. It now lists the keys that source's provider reports, with an example that works on every source (`name=core-*`). `name` is always listed, there and in the *Known keys* list a mistyped key shows, since every source accepts it — a provider that did not declare it used to get a list without it, or an empty one. A key a third-party provider declares with anything beyond plain letters, digits, `_`, `.` and `-` is listed percent-encoded (`a+b` as `a%2Bb`), which is how it has to be typed; a key that is only whitespace, or that cannot be encoded at all, is left out of the list.
+
+- **Saved-filter hints name the field on the form in front of you.** On EVE-NG and GNS3 sources the **Saved Filter** hint and the *"Type a Device Filter first"* warning pointed at a Device Filter those forms do not have; they now name the **Lab Filter** or **Project Filter** the form shows. **Manage Saved Filters** no longer offers a NetBox query (`role=core-switch&site=syd`) as its example — a saved filter can be copied into any provider's filter field — and its empty state names the sources whose forms have the **Saved Filter** picker (NetBox, EVE-NG and GNS3 — a Proxmox source has no filter field) instead of pointing everyone at a Device Filter.
+
 ## [2.8.249] — 2026-09-25
 
 ### Fixed

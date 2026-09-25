@@ -3,15 +3,15 @@ import { randomUUID } from "node:crypto";
 import type { NexusCore } from "../core/nexusCore";
 import type { WebviewFormPanel } from "../ui/webviewFormPanel";
 import type { FormValues } from "../ui/formTypes";
+import type { InventoryProvider } from "../models/inventory";
 import { configMutationLock } from "../services/configMutationLock";
-import {
-  SAVED_FILTER_SELECT_KEY,
-  inventoryConfigFieldPrefixedKey,
-  SAVED_FILTER_TARGET_FIELD_ID
-} from "../ui/formDefinitions";
+import { SAVED_FILTER_SELECT_KEY, inventoryConfigFieldPrefixedKey, savedFilterTarget } from "../ui/formDefinitions";
 
 interface InlineSavedFilterContext {
   core: NexusCore;
+  /** The source form's provider: its `savedFilterTarget` is the field this
+   *  affordance saves from, and the one its message names (by the sanitized label). */
+  provider: InventoryProvider;
 }
 
 export interface InlineSavedFilterCreationController {
@@ -22,14 +22,15 @@ export interface InlineSavedFilterCreationController {
 /**
  * SAVED FILTER DEFINITIONS (issue #48 PR-E) — the source form's "Save current
  * filter as…" affordance. Fired by the saved-filter select's `__create__`
- * sentinel, it reads the Device Filter text the user has typed so far (carried on
- * the `createInline` message's `values` snapshot), prompts for a name, saves a
- * new `SavedFilterDefinition`, and appends it to the picker so the user sees it
- * land — mirroring `createInlineAuthProfileCreation`'s shape, but with a plain
- * prompt flow (no separate editor panel).
+ * sentinel, it reads the text the user has typed so far into the provider's
+ * filter field (carried on the `createInline` message's `values` snapshot),
+ * prompts for a name, saves a new `SavedFilterDefinition`, and appends it to the
+ * picker so the user sees it land — mirroring `createInlineAuthProfileCreation`'s
+ * shape, but with a plain prompt flow (no separate editor panel).
  *
- * The empty-state is constructive: with no Device Filter typed yet, it explains
- * what to do rather than saving an empty definition.
+ * The empty-state is constructive: with nothing typed yet, it explains what to do
+ * rather than saving an empty definition — naming the field by the label this
+ * provider gives it, since that is the field the user sees (issue #152).
  */
 export function createInlineSavedFilterCreation(ctx: InlineSavedFilterContext): InlineSavedFilterCreationController {
   let panel: WebviewFormPanel | undefined;
@@ -42,16 +43,18 @@ export function createInlineSavedFilterCreation(ctx: InlineSavedFilterContext): 
       });
     },
     handleCreateInline(key, values) {
-      if (key !== SAVED_FILTER_SELECT_KEY || !panel) {
+      // No target field ⇒ the form rendered no picker, so nothing could have fired this.
+      const target = savedFilterTarget(ctx.provider);
+      if (key !== SAVED_FILTER_SELECT_KEY || !panel || target === undefined) {
         return;
       }
       const capturedPanel = panel;
-      const rawFilter = values?.[inventoryConfigFieldPrefixedKey(SAVED_FILTER_TARGET_FIELD_ID)];
+      const rawFilter = values?.[inventoryConfigFieldPrefixedKey(target.field.id)];
       const currentFilter = typeof rawFilter === "string" ? rawFilter.trim() : "";
       void (async (): Promise<void> => {
         if (currentFilter === "") {
           void vscode.window.showWarningMessage(
-            "Type a Device Filter first, then choose “Save current filter as…” to save it for reuse."
+            `${target.label} is empty — type a filter there first, then choose “Save current filter as…” to save it for reuse.`
           );
           return;
         }
@@ -95,12 +98,12 @@ export function createInlineSavedFilterCreation(ctx: InlineSavedFilterContext): 
           return;
         }
         // Append + select it in the picker (its synchronous fill re-affirms the
-        // Device Filter with the same value it was saved from — a harmless no-op).
+        // filter field with the same value it was saved from — a harmless no-op).
         // P1 — carry the definition's query as the option's description so the
         // just-saved row shows its query line immediately, like every other row,
         // rather than being the one row missing it until the form reopens.
         // FIX B — also carry the raw filter as the option's fillValue so re-picking
-        // the just-saved row fills the Device Filter synchronously like any other.
+        // the just-saved row fills the filter field synchronously like any other.
         capturedPanel.addSelectOption(
           SAVED_FILTER_SELECT_KEY,
           definition.id,

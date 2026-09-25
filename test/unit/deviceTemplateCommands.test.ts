@@ -1315,6 +1315,85 @@ describe("Edit Template Rules… flow (§7.2)", () => {
     expect(keyWarn).toContain("Known keys: role, site, name");
   });
 
+  it("the save-time 'Known keys' list includes `name` for a provider that leaves it out (issue #163 item 1 — ⊘ the declared list joined as-is)", async () => {
+    const core = makeCore();
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "T", fields: { proxy: { mode: "override", value: PROXY } } });
+    await seedSource(core, { providerId: "acme-cmdb" });
+    registerWithRegistry(core, regWith(["zone"]));
+    mockShowWarningMessage.mockResolvedValue(undefined);
+    mockShowQuickPick
+      .mockImplementationOnce(async (items: Array<{ add?: boolean }>) => items.find((i) => i.add))
+      .mockImplementationOnce(async (items: Array<{ template?: { id: string } }>) => items.find((i) => i.template?.id === "t1"))
+      .mockResolvedValueOnce(undefined); // loop → exit
+    mockShowInputBox.mockResolvedValueOnce("rack=1"); // 'rack' is unknown to this provider
+
+    await editRules();
+
+    const keyWarn = mockShowWarningMessage.mock.calls.map((c) => String(c[0])).find((w) => w.includes("is not one this source's provider reports"));
+    expect(keyWarn).toContain("Known keys: zone, name");
+  });
+
+  // Issue #152 — the Rule Filter prompt is the first place a user learns which
+  // keys a rule can use. It used to list NetBox's keys on every source, so on an
+  // EVE-NG, Proxmox or GNS3 source it advertised keys that trip the "never
+  // matches" warning the moment they are typed.
+  /** Walk list → Add rule… → template → the filter InputBox, and return its options (the box is cancelled). */
+  async function ruleFilterPromptFor(providerId: string, keys: string[] | undefined): Promise<{ prompt?: string; placeHolder?: string }> {
+    const core = makeCore();
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "T", fields: { proxy: { mode: "override", value: PROXY } } });
+    await seedSource(core, { providerId });
+    registerWithRegistry(core, regWith(keys));
+    mockShowQuickPick
+      .mockImplementationOnce(async (items: Array<{ add?: boolean }>) => items.find((i) => i.add))
+      .mockImplementationOnce(async (items: Array<{ template?: { id: string } }>) => items.find((i) => i.template?.id === "t1"))
+      .mockResolvedValueOnce(undefined); // loop → exit
+    mockShowInputBox.mockResolvedValueOnce(undefined); // cancel the filter box — nothing is saved
+
+    await editRules();
+
+    expect(mockShowInputBox).toHaveBeenCalledTimes(1);
+    return mockShowInputBox.mock.calls[0][0] as { prompt?: string; placeHolder?: string };
+  }
+  const NETBOX_KEY_LIST = "role, site, location, rack, tenant, status, platform, tag, name";
+
+  // The second row is a key list no built-in provider declares: it passes only
+  // when the prompt is built from the registry's `attributeKeys`, not from text
+  // written per provider.
+  it.each([
+    ["eve-ng", ["lab", "template", "type", "console", "status", "image", "name"]],
+    ["acme-cmdb", ["zone", "rack-unit", "name"]]
+  ])(
+    "the Rule Filter prompt for a `%s` source lists that provider's own keys and none of NetBox's (⊘ the hard-coded 'Keys: role, site, …' shown on every provider)",
+    async (providerId, keys) => {
+      const { prompt } = await ruleFilterPromptFor(providerId, keys);
+
+      expect(prompt).toContain(`Keys: ${keys.join(", ")}`);
+      expect(prompt).not.toContain(NETBOX_KEY_LIST);
+      expect(prompt).not.toMatch(/\brole\b|\bsite\b/);
+    }
+  );
+
+  it("a provider that declares no key list gets a prompt naming no keys, not NetBox's as a fallback (⊘ `attributeKeys ?? NETBOX_KEYS`)", async () => {
+    const { prompt } = await ruleFilterPromptFor("acme-cmdb", undefined);
+
+    expect(prompt).not.toContain("Keys:");
+    expect(prompt).not.toMatch(/\brole\b|\bsite\b/);
+    // Still says how to write a filter: `name` is known to every provider.
+    expect(prompt).toContain("name=");
+  });
+
+  // Issue #163 (item 1) — the example is `name=core-*` and the validator always
+  // accepts `name`, so a declared list that leaves it out still lists it; so does
+  // `[]`, which the contract allows for a provider that matches on name alone.
+  it.each([
+    [["zone", "rack-unit"], "Keys: zone, rack-unit, name —"],
+    [[], "Keys: name —"]
+  ])("the Rule Filter prompt for keys %j lists `name` too (⊘ 'Keys: zone' beside a name= example, ⊘ an empty 'Keys: —')", async (keys, expected) => {
+    const { prompt } = await ruleFilterPromptFor("acme-cmdb", keys as string[]);
+
+    expect(prompt).toContain(expected);
+  });
+
   it("M3 — a concurrent rule added in another window between the picker and the save is PRESERVED, not clobbered (resolve-under-lock delta; kills the wholesale overwrite from the pre-QuickPick snapshot)", async () => {
     const core = makeCore();
     await core.addOrUpdateDeviceTemplate({ id: "t1", name: "T", fields: { proxy: { mode: "override", value: PROXY } } });

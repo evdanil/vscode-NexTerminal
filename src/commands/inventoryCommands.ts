@@ -1194,7 +1194,7 @@ function authProfileUsernameMirror(profile: AuthProfile | undefined): Record<str
 }
 
 // SAVED FILTER DEFINITIONS (issue #48 PR-E) — the saved-filter picker fills the
-// Device Filter field SYNCHRONOUSLY in the webview from each option's raw
+// provider's filter field SYNCHRONOUSLY in the webview from each option's raw
 // `fillValue` (see `savedFilterSelectField` in formDefinitions.ts). FIX B (PR #64
 // Codex review round 2) dropped the async `onAutofill` → `fillFields` round trip
 // this picker used to rely on: it could be outrun by a Save clicked before the
@@ -2886,7 +2886,7 @@ export function registerInventoryCommands(
     const inlineDeviceTemplate = createInlineDeviceTemplateCreation({ core });
     // SAVED FILTER DEFINITIONS (PR-E) — the "Save current filter as…" affordance
     // on the saved-filter picker.
-    const inlineSavedFilter = createInlineSavedFilterCreation({ core });
+    const inlineSavedFilter = createInlineSavedFilterCreation({ core, provider });
     // REVIEW FINDING (P2) — the profile whose username this form is currently
     // showing, checked against live state at Save by
     // `inventoryAuthProfileRejection`. Seeded as `undefined` and NOT from any
@@ -3099,7 +3099,7 @@ export function registerInventoryCommands(
     // in. The marker machinery below is untouched by this wiring.
     const inlineAuthProfile = createInlineAuthProfileCreation({ core, secretVault: vault });
     const inlineDeviceTemplate = createInlineDeviceTemplateCreation({ core });
-    const inlineSavedFilter = createInlineSavedFilterCreation({ core });
+    const inlineSavedFilter = createInlineSavedFilterCreation({ core, provider });
     let panel: ReturnType<typeof WebviewFormPanel.open>;
     try {
       // F6 — WebviewFormPanel.open can throw synchronously (or reject — see
