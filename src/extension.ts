@@ -40,8 +40,7 @@ import { registerEditAsRootHint } from "./services/sftp/editAsRootHint";
 import { SftpService } from "./services/sftp/sftpService";
 import { SudoElevationBroker } from "./services/sftp/sudoElevationBroker";
 import { SilentAuthSshFactory, proxyPasswordSecretKey } from "./services/ssh/silentAuth";
-import { ProxySshFactory } from "./services/ssh/proxySshFactory";
-import { SshConnectionPool } from "./services/ssh/sshConnectionPool";
+import { createSshTransportStack } from "./services/ssh/sshTransportStack";
 import { pooledConnectionParamsChanged } from "./services/ssh/pooledConnectionParams";
 import { Ssh2Connector } from "./services/ssh/ssh2Connector";
 import { VscodeHostKeyVerifier } from "./services/ssh/vscodeHostKeyVerifier";
@@ -51,7 +50,6 @@ import { MacroAutoTrigger } from "./services/macroAutoTrigger";
 import { TerminalHighlighter } from "./services/terminalHighlighter";
 import { VscodeMacroStore } from "./storage/vscodeMacroStore";
 import { setActiveMacroStore } from "./macroSettings";
-import { TunnelManager } from "./services/tunnel/tunnelManager";
 import { VscodeConfigRepository } from "./storage/vscodeConfigRepository";
 import { VscodeTunnelRegistryStore } from "./storage/vscodeTunnelRegistryStore";
 import { TunnelRegistrySync } from "./services/tunnel/tunnelRegistrySync";
@@ -492,11 +490,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
       ),
     (id) => core.getAuthProfile(id)
   );
-  const proxiedFactory = new ProxySshFactory(
-    sshFactory,
-    (id) => core.getServer(id),
-    secretVault,
-    readBoundedMs("nexus.ssh", "proxyTimeout", 60, 5, 300),
+  const multiplexingConfig = vscode.workspace.getConfiguration("nexus.ssh.multiplexing");
+  const { proxiedFactory, pool, tunnelManager } = createSshTransportStack(sshFactory, {
+    serverLookup: (id) => core.getServer(id),
+    vault: secretVault,
+    proxyTimeoutMs: readBoundedMs("nexus.ssh", "proxyTimeout", 60, 5, 300),
     // Per-connect proxy-password prompt (design doc §5.3; §11 OQ2) — realizes the
     // prompt §5.3 assumed for a template's authenticated socks5/http proxy, which
     // carries no secret. Fired by ProxySshFactory only for a username-bearing proxy
@@ -504,7 +502,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     // VscodePasswordPrompt discipline); on entry it stores the secret per-server so
     // it is one-time (the per-server vault entry IS the §5.3 model), and returns
     // undefined on cancel (ProxySshFactory then falls back to the prior behavior).
-    async (server, proxy) => {
+    promptProxyPassword: async (server, proxy) => {
       const label = proxy.type === "socks5" ? "SOCKS5" : "HTTP";
       const endpoint = proxy.username
         ? `${proxy.username}@${proxy.host}:${proxy.port}`
@@ -519,19 +517,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
         return undefined;
       }
       return { password, save: true };
-    }
-  );
-  const multiplexingConfig = vscode.workspace.getConfiguration("nexus.ssh.multiplexing");
-  const pool = new SshConnectionPool(proxiedFactory, {
-    enabled: multiplexingConfig.get<boolean>("enabled", true),
-    idleTimeoutMs: readBoundedMs("nexus.ssh.multiplexing", "idleTimeout", 300, 0, 3600)
+    },
+    pool: {
+      enabled: multiplexingConfig.get<boolean>("enabled", true),
+      idleTimeoutMs: readBoundedMs("nexus.ssh.multiplexing", "idleTimeout", 300, 0, 3600)
+    },
+    socks5HandshakeTimeoutMs: readBoundedMs("nexus.tunnel", "socks5HandshakeTimeout", 10, 2, 60)
   });
-  proxiedFactory.setJumpHostConnectionFactory(pool);
-  const tunnelManager = new TunnelManager(
-    pool,
-    sshFactory,
-    readBoundedMs("nexus.tunnel", "socks5HandshakeTimeout", 10, 2, 60)
-  );
   const extensionRoot = path.resolve(__dirname, "..");
   const sidecarPath = path.join(__dirname, "services", "serial", "serialSidecarWorker.js");
   const serialSidecar = new SerialSidecarManager(

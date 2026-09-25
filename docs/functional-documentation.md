@@ -24,7 +24,7 @@ Nexus Terminal provides one operational surface in VS Code for:
 
 ### 2.2 Isolation Model
 - Interactive SSH terminals use `SshPty` shell channels. When SSH multiplexing is enabled, those channels can share a pooled underlying SSH connection; per-server disable and automatic standalone fallback are supported.
-- Tunnels default to shared mode: all TCP clients reuse a single SSH connection. Isolated mode (one SSH connection per client) is available as a per-profile or global setting.
+- Tunnels default to shared mode: all TCP clients reuse a single SSH connection. Isolated mode (one SSH connection per client) is available as a per-profile or global setting. Both modes connect through the server's proxy or jump host; an isolated client's connection is never a pool lease, but its jump-host hop is (`createSshTransportStack`, `src/services/ssh/sshTransportStack.ts`).
 - SFTP reuses the shared SSH pool when connected to the same server.
 - Serial code executes outside the extension host process.
 - Telnet terminals run in-process on a plain `net.Socket`, like SSH — there is no native module to isolate.
@@ -176,7 +176,7 @@ Telnet is a per-server **protocol** choice, not a separate profile type: one ser
 4. In shared mode (default), the SSH connection is established eagerly at tunnel start - 2FA happens once upfront.
 5. Active tunnels show traffic counters (bytes in/out).
 6. The **Port Forwarding** view shows live route and traffic counters for active tunnels, and marks tunnels owned by another VS Code window separately.
-7. Connection mode can be profile-based: `isolated`, `shared`, or `ask every start`. Reverse tunnels always use shared mode.
+7. Connection mode can be profile-based: `isolated`, `shared`, or `ask every start`. Reverse tunnels always use shared mode. Either mode reaches the server through its proxy (SSH jump host, SOCKS5 or HTTP CONNECT), as a terminal does; in isolated mode each client gets its own connection to the server, while a jump-host hop is shared through multiplexing unless multiplexing is off for the jump server.
 8. Right-click tunnel item to start/stop/restart/edit/remove/duplicate/copy info/open in browser.
 9. Route labels indicate tunnel type with `L`, `R`, or `D`.
 10. Cross-window tunnel visibility: all three tunnel types are registered in globalState and visible across VS Code windows.

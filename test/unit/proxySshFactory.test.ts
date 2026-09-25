@@ -1152,6 +1152,165 @@ describe("ProxySshFactory", () => {
     expect(vault.store).not.toHaveBeenCalled();
   });
 
+  // Issue #148 — isolated-mode tunnel clients connect in parallel through this
+  // factory, not through the pool's single pending connect per server. VS Code
+  // shows one input box at a time, so a second first-time proxy-password prompt
+  // dismissed the first, whose connect then sent an empty password and failed.
+  // The first-time answer is now shared per server and authenticated endpoint
+  // until a connection that used it settles.
+  describe("first-time proxy password shared across concurrent connects", () => {
+    const authenticated = { type: "socks5" as const, host: "proxy.local", port: 1080, username: "puser" };
+
+    async function mockSocks() {
+      const socksMod = await import("socks");
+      const createConnection = socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>;
+      createConnection.mockImplementation(async () => ({ socket: makeSimpleSocks5Socket() }));
+      return () => createConnection.mock.calls.map((call) => (call[0] as { proxy: { password?: string } }).proxy.password);
+    }
+
+    /** Lets both connects run up to their vault read and prompt before anything is answered. */
+    const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    it("asks once when a second connect arrives while the prompt is open, and both use the answer", async () => {
+      const server = makeServer({ proxy: authenticated });
+      servers.set(server.id, server);
+      const sentPasswords = await mockSocks();
+      const answers: Array<(value: { password: string; save: boolean }) => void> = [];
+      const prompt = vi.fn(() => new Promise<{ password: string; save: boolean } | undefined>((resolve) => answers.push(resolve)));
+      const factory = await createFactoryWithPrompt(prompt);
+
+      const first = factory.connect(server);
+      const second = factory.connect(server);
+      await settle();
+      for (const answer of answers) {
+        answer({ password: "pw", save: true });
+      }
+      await Promise.all([first, second]);
+
+      expect(prompt).toHaveBeenCalledTimes(1);
+      expect(sentPasswords()).toEqual(["pw", "pw"]);
+    });
+
+    it("reuses an answer that a still-connecting connect has not stored yet", async () => {
+      const server = makeServer({ proxy: authenticated });
+      servers.set(server.id, server);
+      const sentPasswords = await mockSocks();
+      let finishLogin!: () => void;
+      const loginGate = new Promise<void>((resolve) => { finishLogin = resolve; });
+      authFactory.connect = vi.fn(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+        await opts?.sockFactory?.();
+        await loginGate;
+        return makeFakeConnection();
+      });
+      const prompt = vi.fn(async () => ({ password: "pw", save: true }));
+      const factory = await createFactoryWithPrompt(prompt);
+
+      const first = factory.connect(server);
+      await vi.waitFor(() => expect(sentPasswords()).toHaveLength(1));
+      const second = factory.connect(server);
+      await vi.waitFor(() => expect(sentPasswords()).toHaveLength(2));
+      finishLogin();
+      await Promise.all([first, second]);
+
+      expect(prompt).toHaveBeenCalledTimes(1);
+      expect(sentPasswords()).toEqual(["pw", "pw"]);
+      expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
+    });
+
+    it("asks again after a cancelled prompt", async () => {
+      const server = makeServer({ proxy: authenticated });
+      servers.set(server.id, server);
+      const sentPasswords = await mockSocks();
+      const prompt = vi.fn()
+        .mockResolvedValueOnce(undefined)
+        .mockResolvedValueOnce({ password: "pw", save: true });
+      const factory = await createFactoryWithPrompt(prompt);
+
+      await factory.connect(server);
+      await factory.connect(server);
+
+      expect(prompt).toHaveBeenCalledTimes(2);
+      expect(sentPasswords()).toEqual(["", "pw"]);
+    });
+
+    it("asks again after a connection that used the answer fails", async () => {
+      // The answer may be what failed; the next client must not inherit it.
+      const server = makeServer({ proxy: authenticated });
+      servers.set(server.id, server);
+      const sentPasswords = await mockSocks();
+      authFactory.connect = vi.fn()
+        .mockRejectedValueOnce(new Error("All configured authentication methods failed"))
+        .mockImplementation(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+          await opts?.sockFactory?.();
+          return makeFakeConnection();
+        });
+      const prompt = vi.fn()
+        .mockResolvedValueOnce({ password: "wrong", save: true })
+        .mockResolvedValueOnce({ password: "pw", save: true });
+      const factory = await createFactoryWithPrompt(prompt);
+
+      await expect(factory.connect(server)).rejects.toThrow("authentication methods failed");
+      await factory.connect(server);
+
+      expect(prompt).toHaveBeenCalledTimes(2);
+      expect(sentPasswords()).toEqual(["pw"]);
+      expect(vault.store).not.toHaveBeenCalledWith("proxy-password-srv-target", "wrong");
+    });
+
+    it("asks again once the stored password is gone, rather than reusing an answer already stored", async () => {
+      // After a success the vault is the source of truth; a password removed
+      // from it (hygiene on a template apply, a credentials edit) must be asked
+      // for, not resurrected from the first-time answer.
+      const server = makeServer({ proxy: authenticated });
+      servers.set(server.id, server);
+      const sentPasswords = await mockSocks();
+      const prompt = vi.fn()
+        .mockResolvedValueOnce({ password: "old", save: true })
+        .mockResolvedValueOnce({ password: "new", save: true });
+      const factory = await createFactoryWithPrompt(prompt);
+
+      await factory.connect(server);
+      await vault.delete("proxy-password-srv-target");
+      await factory.connect(server);
+
+      expect(prompt).toHaveBeenCalledTimes(2);
+      expect(sentPasswords()).toEqual(["old", "new"]);
+    });
+
+    it("never gives an answer typed for one proxy endpoint to a connect through another", async () => {
+      // A template apply can repoint the server's proxy while a first-time
+      // answer is still in flight; the old endpoint's password must not reach
+      // the new proxy.
+      const server = makeServer({ proxy: authenticated });
+      const repointed = makeServer({ proxy: { ...authenticated, host: "proxy2.local" } });
+      servers.set(server.id, server);
+      const sentPasswords = await mockSocks();
+      let finishLogin!: () => void;
+      const loginGate = new Promise<void>((resolve) => { finishLogin = resolve; });
+      authFactory.connect = vi.fn(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+        await opts?.sockFactory?.();
+        await loginGate;
+        return makeFakeConnection();
+      });
+      const prompt = vi.fn(async (_server: ServerConfig, proxy: { host: string }) => ({
+        password: proxy.host === "proxy2.local" ? "pw-for-proxy2" : "pw-for-proxy1",
+        save: true
+      }));
+      const factory = await createFactoryWithPrompt(prompt);
+
+      const first = factory.connect(server);
+      await vi.waitFor(() => expect(sentPasswords()).toHaveLength(1));
+      servers.set(repointed.id, repointed);
+      const second = factory.connect(repointed);
+      await vi.waitFor(() => expect(sentPasswords()).toHaveLength(2));
+      finishLogin();
+      await Promise.all([first, second]);
+
+      expect(prompt).toHaveBeenCalledTimes(2);
+      expect(sentPasswords()).toEqual(["pw-for-proxy1", "pw-for-proxy2"]);
+    });
+  });
+
   // Fix B (issue #48 PR-T1b / PR #62 Codex round 7) — the round-6 prompt stored the
   // prompted password BEFORE the handshake, so a mistyped first-time password was
   // persisted and every later connect took the `stored !== undefined` early-return

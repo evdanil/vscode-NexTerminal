@@ -85,7 +85,7 @@ A per-server legacy algorithm toggle is there for older devices (Cisco IOS, embe
 
 ## Connection Multiplexing
 
-Share SSH connections across terminals, tunnels (in their default shared mode), and SFTP for the same server. Reduces connection overhead with automatic ref-counting and configurable idle timeout.
+Share SSH connections across terminals, tunnels (in their default shared mode), and SFTP for the same server. A jump host's connection is shared the same way by everything routed through it, isolated-mode tunnels included, unless multiplexing is off for the jump host. Reduces connection overhead with automatic ref-counting and configurable idle timeout.
 
 Per-server toggle lets you disable multiplexing for devices that don't support multiple channels (e.g. Cisco).
 

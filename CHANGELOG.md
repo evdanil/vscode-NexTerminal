@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.8.246] — 2026-09-25
+
+### Fixed
+
+- **Isolated-mode tunnels now go through the server's jump host or proxy.** A tunnel in isolated mode (one SSH connection per client) connected straight to the server's Host and ignored its **Proxy** setting — SSH jump host, SOCKS5 or HTTP CONNECT. So it failed where the server can only be reached through that proxy, or, worse, reached the server by the direct route the proxy was set up to avoid. It now takes the same route as the server's terminals and shared-mode tunnels. Each client still gets its own connection to the server, and a jump-host hop underneath it is shared through [connection multiplexing](https://github.com/evdanil/vscode-NexTerminal/blob/main/docs/ssh-and-telnet.md#connection-multiplexing), as a terminal's is. When the proxy needs a password you haven't saved, clients connecting at the same time share one prompt. Shared mode, the default, was not affected.
+
+- **A tunnel client that disconnects while its connection is still being set up no longer leaves it open.** Logging in can take a while — a jump host, a password or 2FA prompt. If the client disconnected, or the tunnel was stopped, before that finished, the SSH connection — or, in shared mode, the channel opened for that client — was left open when it did. It is now closed as soon as it finishes, releasing its hold on any jump-host connection too.
+
 ## [2.8.245] — 2026-09-25
 
 ### Fixed

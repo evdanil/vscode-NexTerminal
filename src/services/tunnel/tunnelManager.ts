@@ -49,6 +49,62 @@ function normalizeSocks5HandshakeTimeoutMs(timeoutMs: number): number {
   return normalizeBoundedNumber(timeoutMs, 10_000, 2_000, 60_000);
 }
 
+/** One tunnel client and the SSH resources opened on its behalf. */
+interface TunnelClient {
+  /** The client has left, or its tunnel is stopping — nothing more should be opened for it. */
+  gone(): boolean;
+  /**
+   * Gives the client its isolated connection, to be disposed with it. Returns
+   * false, having disposed the connection already, when the client is gone.
+   */
+  own(connection: SshConnection): boolean;
+  /** Forgets the client and disposes the connection it owns. Idempotent. */
+  release(): void;
+}
+
+/**
+ * Watches a client from the moment it arrives, not from when its stream is up.
+ * Connecting can take seconds — a jump-host hop, a password or 2FA prompt — and
+ * the client can leave, or stop() destroy it, meanwhile. A 'close' that fired
+ * before anyone listened is never seen again: listeners attached once the
+ * stream was up missed it, and the connection that finished afterwards stayed
+ * open for good, holding the pooled jump-host lease under an isolated one so
+ * the bastion was never idle-evicted. Listening from arrival also keeps a
+ * client's reset from surfacing as an unhandled 'error'.
+ */
+function trackClient(runtime: ActiveTunnelRuntime, socket: net.Socket): TunnelClient {
+  let released = false;
+  let owned: SshConnection | undefined;
+  const gone = (): boolean => released || socket.destroyed || runtime.isStopping;
+  const release = (): void => {
+    if (released) {
+      return;
+    }
+    released = true;
+    runtime.sockets.delete(socket);
+    if (owned) {
+      runtime.sshConnections.delete(owned);
+      owned.dispose();
+    }
+  };
+  socket.on("error", release);
+  socket.on("close", release);
+  return {
+    gone,
+    own(connection) {
+      if (gone()) {
+        connection.dispose();
+        release();
+        return false;
+      }
+      owned = connection;
+      runtime.sshConnections.add(connection);
+      return true;
+    },
+    release
+  };
+}
+
 export class TunnelManager {
   private readonly listeners = new Set<TunnelListener>();
   private readonly activeTunnels = new Map<string, ActiveTunnelRuntime>();
@@ -225,19 +281,25 @@ export class TunnelManager {
       return;
     }
     runtime.sockets.add(socket);
+    const client = trackClient(runtime, socket);
     let sshConnection: SshConnection | undefined;
-    let shouldDisposeConnection = true;
     const useSharedConnection = runtime.active.connectionMode === "shared";
-    let cleaned = false;
     try {
       if (useSharedConnection) {
         sshConnection = await this.getOrCreateSharedConnection(runtime, activeTunnelId);
-        shouldDisposeConnection = false;
       } else {
         sshConnection = await this.isolatedFactory.connect(runtime.serverConfig);
-        runtime.sshConnections.add(sshConnection);
+        if (!client.own(sshConnection)) {
+          return;
+        }
       }
       const remoteStream = await sshConnection.openDirectTcp(runtime.profile.remoteIP, runtime.profile.remotePort);
+      if (client.gone()) {
+        // Opened for a client that has already left: nothing else would close it.
+        remoteStream.destroy();
+        client.release();
+        return;
+      }
 
       socket.on("data", (chunk: Buffer) => {
         runtime.active.bytesOut += chunk.length;
@@ -247,31 +309,12 @@ export class TunnelManager {
         runtime.active.bytesIn += chunk.length;
         this.scheduleTrafficEmit(activeTunnelId, runtime);
       });
-
-      const cleanup = (): void => {
-        if (cleaned) {
-          return;
-        }
-        cleaned = true;
-        runtime.sockets.delete(socket);
-        if (shouldDisposeConnection && sshConnection) {
-          runtime.sshConnections.delete(sshConnection);
-          sshConnection.dispose();
-        }
-      };
-
-      socket.on("error", cleanup);
-      socket.on("close", cleanup);
-      remoteStream.on("error", cleanup);
-      remoteStream.on("close", cleanup);
+      remoteStream.on("error", client.release);
+      remoteStream.on("close", client.release);
 
       socket.pipe(remoteStream);
       remoteStream.pipe(socket);
     } catch (error) {
-      runtime.sockets.delete(socket);
-      if (sshConnection && shouldDisposeConnection) {
-        runtime.sshConnections.delete(sshConnection);
-      }
       // Only a dead transport justifies tearing down the shared connection. A
       // channel-open refusal means the remote could not reach THIS destination;
       // disposing on it would kill every other stream currently multiplexed on
@@ -286,16 +329,18 @@ export class TunnelManager {
         runtime.sshConnections.delete(sshConnection);
         sshConnection.dispose();
       }
-      this.emit({
-        type: "error",
-        tunnelId: activeTunnelId,
-        message: `Tunnel ${runtime.profile.name} failed to proxy connection`,
-        error
-      });
-      socket.destroy();
-      if (shouldDisposeConnection) {
-        sshConnection?.dispose();
+      // A client that already left, or a tunnel being stopped, has no one
+      // waiting on this connection — and its own release may be what failed it.
+      if (!client.gone()) {
+        this.emit({
+          type: "error",
+          tunnelId: activeTunnelId,
+          message: `Tunnel ${runtime.profile.name} failed to proxy connection`,
+          error
+        });
       }
+      socket.destroy();
+      client.release();
     }
   }
 
@@ -463,11 +508,9 @@ export class TunnelManager {
       return;
     }
     runtime.sockets.add(socket);
-
+    const client = trackClient(runtime, socket);
     let sshConnection: SshConnection | undefined;
-    let shouldDisposeConnection = true;
     const useSharedConnection = runtime.active.connectionMode === "shared";
-    let cleaned = false;
 
     try {
       // SOCKS5 handshake to determine destination
@@ -475,13 +518,20 @@ export class TunnelManager {
 
       if (useSharedConnection) {
         sshConnection = await this.getOrCreateSharedConnection(runtime, activeTunnelId);
-        shouldDisposeConnection = false;
       } else {
         sshConnection = await this.isolatedFactory.connect(runtime.serverConfig);
-        runtime.sshConnections.add(sshConnection);
+        if (!client.own(sshConnection)) {
+          return;
+        }
       }
 
       const remoteStream = await sshConnection.openDirectTcp(target.destAddr, target.destPort);
+      if (client.gone()) {
+        // Opened for a client that has already left: nothing else would close it.
+        remoteStream.destroy();
+        client.release();
+        return;
+      }
 
       // Tell the SOCKS5 client we're connected
       sendSocks5Success(socket);
@@ -494,35 +544,16 @@ export class TunnelManager {
         runtime.active.bytesIn += chunk.length;
         this.scheduleTrafficEmit(activeTunnelId, runtime);
       });
-
-      const cleanup = (): void => {
-        if (cleaned) {
-          return;
-        }
-        cleaned = true;
-        runtime.sockets.delete(socket);
-        if (shouldDisposeConnection && sshConnection) {
-          runtime.sshConnections.delete(sshConnection);
-          sshConnection.dispose();
-        }
-      };
-
-      socket.on("error", cleanup);
-      socket.on("close", cleanup);
-      remoteStream.on("error", cleanup);
-      remoteStream.on("close", cleanup);
+      remoteStream.on("error", client.release);
+      remoteStream.on("close", client.release);
 
       socket.pipe(remoteStream);
       remoteStream.pipe(socket);
     } catch (error) {
       if (error instanceof Socks5HandshakeAbortedError) {
-        runtime.sockets.delete(socket);
         socket.destroy();
+        client.release();
         return;
-      }
-      runtime.sockets.delete(socket);
-      if (sshConnection && shouldDisposeConnection) {
-        runtime.sshConnections.delete(sshConnection);
       }
       // Same rule as the local-forward path: one browser tab asking for an
       // unreachable host must not disconnect every other tab proxied through
@@ -537,17 +568,18 @@ export class TunnelManager {
         runtime.sshConnections.delete(sshConnection);
         sshConnection.dispose();
       }
-      this.emit({
-        type: "error",
-        tunnelId: activeTunnelId,
-        message: `Tunnel ${runtime.profile.name} SOCKS5 proxy failed`,
-        error
-      });
-      sendSocks5Failure(socket);
-      socket.destroy();
-      if (shouldDisposeConnection) {
-        sshConnection?.dispose();
+      // As on the local-forward path: a client that left has no one to tell.
+      if (!client.gone()) {
+        this.emit({
+          type: "error",
+          tunnelId: activeTunnelId,
+          message: `Tunnel ${runtime.profile.name} SOCKS5 proxy failed`,
+          error
+        });
+        sendSocks5Failure(socket);
       }
+      socket.destroy();
+      client.release();
     }
   }
 

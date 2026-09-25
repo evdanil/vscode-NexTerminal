@@ -29,7 +29,8 @@ const MAX_HTTP_RESPONSE_SIZE = 65536; // 64KB — more than enough for CONNECT h
  * OPTIONAL dependency realizes that prompt: when present it is fired only for a
  * username-bearing proxy whose vault lookup returned nothing, at the SAME await
  * point the `vault.get` already happens (preserving the socket/banner IPC
- * ordering). Absent ⇒ exactly the prior behavior (backward-compatible). On a
+ * ordering) — and once for concurrent connects to the same server and endpoint,
+ * which share the answer (`sharedProxyPasswords`). Absent ⇒ exactly the prior behavior (backward-compatible). On a
  * saved success the password is stored under `proxyPasswordSecretKey(id)` so it
  * is one-time; a later template endpoint change re-clears it via the existing
  * hygiene → re-prompt next connect, exactly §5.3.
@@ -51,6 +52,14 @@ export type ProxyPasswordPrompt = (
 interface ResolvedProxyPassword {
   password: string | undefined;
   storeOnSuccess?: { key: string; value: string };
+  /** Called once the connection that used a prompted password has succeeded or failed. */
+  settle?: () => void;
+}
+
+/** A first-time proxy password being asked for, or answered and not yet settled. */
+interface SharedProxyPasswordAnswer {
+  proxy: Socks5Proxy | HttpConnectProxy;
+  answer: Promise<{ password: string; save: boolean } | undefined>;
 }
 
 function normalizeProxyTimeoutMs(timeoutMs: number): number {
@@ -60,6 +69,15 @@ function normalizeProxyTimeoutMs(timeoutMs: number): number {
 export class ProxySshFactory implements ContextAwareSshFactory {
   private proxyTimeoutMs: number;
   private jumpHostFactory?: ContextAwareSshFactory;
+  /**
+   * Per server: the first-time proxy password shared by every connect that
+   * arrives before one that used it settles. Pooled consumers never race here —
+   * the pool joins them onto one pending connect — but isolated-mode tunnel
+   * clients each connect on their own, in parallel. VS Code shows one input box
+   * at a time, so a second prompt dismissed the first, and that connect went on
+   * with an empty password and failed.
+   */
+  private readonly sharedProxyPasswords = new Map<string, SharedProxyPasswordAnswer>();
 
   public constructor(
     private readonly authFactory: SilentAuthSshFactory,
@@ -201,7 +219,8 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     proxy: Socks5Proxy,
     onAuthMessage?: (text: string) => void
   ): Promise<SshConnection> {
-    const { password: proxyPassword, storeOnSuccess } = await this.resolveProxyPassword(target, proxy);
+    const resolved = await this.resolveProxyPassword(target, proxy);
+    const proxyPassword = resolved.password;
 
     // Track the most recently opened socket so the ProxiedSshConnection wrapper
     // can relay close events from whichever socket backed the successful attempt.
@@ -256,18 +275,7 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       return socket;
     };
 
-    const connection = await this.authFactory.connect(target, {
-      sockFactory,
-      ...(onAuthMessage && { onAuthMessage })
-    });
-    // The connection succeeded (proxy handshake + ssh auth). Now persist a freshly
-    // prompted, save-flagged password — deferred to here so a mistyped first-time
-    // secret is never stored before the handshake, and kept OUT of the timing-
-    // sensitive sockFactory (setImmediate/resume banner-loss path). Best-effort: a
-    // keychain-store failure must not abort an already-established connection.
-    if (storeOnSuccess) {
-      await this.persistProxyPasswordIfEndpointUnchanged(target, proxy, storeOnSuccess);
-    }
+    const connection = await this.authenticateThroughProxy(target, proxy, resolved, sockFactory, onAuthMessage);
     // lastSock is guaranteed to be defined here: a successful authFactory.connect
     // means sockFactory was called and resolved at least once.
     return new ProxiedSshConnection(connection, socketCleanup(lastSock!), socketCloseRelay(lastSock!));
@@ -278,7 +286,8 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     proxy: HttpConnectProxy,
     onAuthMessage?: (text: string) => void
   ): Promise<SshConnection> {
-    const { password: proxyPassword, storeOnSuccess } = await this.resolveProxyPassword(target, proxy);
+    const resolved = await this.resolveProxyPassword(target, proxy);
+    const proxyPassword = resolved.password;
 
     // Track the most recently opened socket so the ProxiedSshConnection wrapper
     // can relay close events from whichever socket backed the successful attempt.
@@ -312,21 +321,43 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       return socket;
     };
 
-    const connection = await this.authFactory.connect(target, {
-      sockFactory,
-      ...(onAuthMessage && { onAuthMessage })
-    });
+    const connection = await this.authenticateThroughProxy(target, proxy, resolved, sockFactory, onAuthMessage);
+    // lastSock is guaranteed to be defined here: a successful authFactory.connect
+    // means sockFactory was called and resolved at least once.
+    return new ProxiedSshConnection(connection, socketCleanup(lastSock!), socketCloseRelay(lastSock!));
+  }
+
+  private async authenticateThroughProxy(
+    target: ServerConfig,
+    proxy: Socks5Proxy | HttpConnectProxy,
+    resolved: ResolvedProxyPassword,
+    sockFactory: () => Promise<Duplex>,
+    onAuthMessage?: (text: string) => void
+  ): Promise<SshConnection> {
+    let connection: SshConnection;
+    try {
+      connection = await this.authFactory.connect(target, {
+        sockFactory,
+        ...(onAuthMessage && { onAuthMessage })
+      });
+    } catch (error) {
+      // The shared answer may be what failed: the next connect asks afresh.
+      resolved.settle?.();
+      throw error;
+    }
     // The connection succeeded (proxy handshake + ssh auth). Now persist a freshly
     // prompted, save-flagged password — deferred to here so a mistyped first-time
     // secret is never stored before the handshake, and kept OUT of the timing-
     // sensitive sockFactory (setImmediate/resume banner-loss path). Best-effort: a
     // keychain-store failure must not abort an already-established connection.
-    if (storeOnSuccess) {
-      await this.persistProxyPasswordIfEndpointUnchanged(target, proxy, storeOnSuccess);
+    if (resolved.storeOnSuccess) {
+      await this.persistProxyPasswordIfEndpointUnchanged(target, proxy, resolved.storeOnSuccess);
     }
-    // lastSock is guaranteed to be defined here: a successful authFactory.connect
-    // means sockFactory was called and resolved at least once.
-    return new ProxiedSshConnection(connection, socketCleanup(lastSock!), socketCloseRelay(lastSock!));
+    // Settled only after the store, so a connect arriving in between still finds
+    // the answer. From here the vault is the source of truth: a password removed
+    // from it later is asked for again, not revived from this answer.
+    resolved.settle?.();
+    return connection;
   }
 
   /**
@@ -424,18 +455,53 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     if (stored !== undefined) {
       return { password: stored };
     }
-    if (this.promptProxyPassword) {
-      const result = await this.promptProxyPassword(target, proxy);
-      if (result) {
-        return {
-          password: result.password,
-          ...(result.save && {
-            storeOnSuccess: { key: proxyPasswordSecretKey(target.id), value: result.password }
-          })
-        };
+    if (!this.promptProxyPassword) {
+      return { password: undefined };
+    }
+    const shared = this.shareProxyPasswordPrompt(target, proxy, this.promptProxyPassword);
+    let result: { password: string; save: boolean } | undefined;
+    try {
+      result = await shared.answer;
+    } finally {
+      // Cancelled (or the prompt threw): nothing to share, so the next connect asks again.
+      if (!result) {
+        this.forgetSharedProxyPassword(target.id, shared);
       }
     }
-    return { password: undefined };
+    if (!result) {
+      return { password: undefined };
+    }
+    return {
+      password: result.password,
+      ...(result.save && {
+        storeOnSuccess: { key: proxyPasswordSecretKey(target.id), value: result.password }
+      }),
+      settle: () => this.forgetSharedProxyPassword(target.id, shared)
+    };
+  }
+
+  private shareProxyPasswordPrompt(
+    target: ServerConfig,
+    proxy: Socks5Proxy | HttpConnectProxy,
+    prompt: ProxyPasswordPrompt
+  ): SharedProxyPasswordAnswer {
+    const existing = this.sharedProxyPasswords.get(target.id);
+    // Shared only while the server names the same authenticated endpoint: a
+    // password typed for one proxy is never sent to another (a template apply
+    // can repoint the proxy while an answer is still in flight).
+    if (existing && isSameAuthenticatedEndpoint(existing.proxy, proxy)) {
+      return existing;
+    }
+    const shared: SharedProxyPasswordAnswer = { proxy, answer: prompt(target, proxy) };
+    this.sharedProxyPasswords.set(target.id, shared);
+    return shared;
+  }
+
+  private forgetSharedProxyPassword(serverId: string, shared: SharedProxyPasswordAnswer): void {
+    // Only our own entry: a newer one for a repointed proxy may have replaced it.
+    if (this.sharedProxyPasswords.get(serverId) === shared) {
+      this.sharedProxyPasswords.delete(serverId);
+    }
   }
 
   private addToVisited(visited: ReadonlySet<string>, server: ServerConfig): Set<string> {
