@@ -22,6 +22,7 @@ import { SshPty } from "../../src/services/ssh/sshPty";
 import { TelnetPty } from "../../src/services/telnet/telnetPty";
 import { AsyncMutex, configMutationLock } from "../../src/services/configMutationLock";
 import { validateServerConfig } from "../../src/utils/validation";
+import { computeSyncPlan } from "../../src/services/inventory/syncEngine";
 import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import type { CommandContext as CmdCtx } from "../../src/commands/types";
@@ -4509,6 +4510,45 @@ describe("nexus.server.edit — addressless placeholder is editable (P2-a)", () 
     const telnet = await noticeFor({ host: "10.0.0.5", port: 23, protocol: "telnet" });
     expect(telnet).toContain("If an inventory sync finds it reporting a different telnet address, the sync's warnings name it.");
     expect(telnet).not.toContain("SSH");
+  });
+
+  // #170 (Codex P2 on #202) — the notice's last sentence promises that a sync
+  // reporting a different address names it. The warning stays quiet for a value
+  // equal to the record's stamp, so a placeholder that still carried stamps (a
+  // hand-edited backup can: validation admits the shape) would keep them through
+  // the edit and a device reporting the OLD stamped address would be silent — the
+  // promise broken. The save drops both address stamps when it turns a
+  // placeholder into an addressed server, so the typed address is unstamped and
+  // any different address the device reports is news.
+  it("#170 — typing a host onto a placeholder that carried address stamps drops both, so a sync reporting the old stamped address names it (⊘ keeping the live origin verbatim leaves the promised warning silent; ⊘ clearing only syncedHost leaves the port half silent)", async () => {
+    const stamped = makeServer({
+      ...placeholder(),
+      origin: { sourceId: "s", externalId: "e", syncedAt: 1, syncedHost: "10.0.0.1", syncedPort: 2200 }
+    });
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [stamped], authProfiles: [] });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(addresslessSubmit({ host: "10.0.0.5", port: 22 }));
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.host).toBe("10.0.0.5");
+    expect(saved.origin?.sourceId).toBe("s");
+    expect(saved.origin?.externalId).toBe("e");
+    expect(saved.origin).not.toHaveProperty("syncedHost");
+    expect(saved.origin).not.toHaveProperty("syncedPort");
+    // The live record the form was opened on is not mutated by the save.
+    expect(stamped.origin?.syncedHost).toBe("10.0.0.1");
+
+    // The next sync: the device reports exactly the address the stale stamps held.
+    const plan = computeSyncPlan({
+      source: { id: "s", providerId: "netbox", name: "NetBox", targetFolder: "NetBox", prunePolicy: "orphan", config: {}, secretFieldIds: [] },
+      tree: { contractVersion: 1, devices: [{ externalId: "e", name: "stopped-node", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 2200 }] }] },
+      currentServers: [saved],
+      now: 2000
+    });
+    expect(plan.warnings.filter((w) => w.includes("kept your"))).toEqual([
+      '"stopped-node": kept your host 10.0.0.5 and port 22; the source now reports host 10.0.0.1 and port 2200 — set the host and port to those to let the source manage them.'
+    ]);
   });
 
   it("P2-3 control — editing an addressless placeholder WITHOUT giving it a host shows no hand-typed-address notice (⊘ a notice on every placeholder edit is noise)", async () => {
