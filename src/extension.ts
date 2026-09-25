@@ -42,6 +42,7 @@ import { SudoElevationBroker } from "./services/sftp/sudoElevationBroker";
 import { SilentAuthSshFactory, proxyPasswordSecretKey } from "./services/ssh/silentAuth";
 import { createSshTransportStack } from "./services/ssh/sshTransportStack";
 import { pooledConnectionParamsChanged } from "./services/ssh/pooledConnectionParams";
+import { watchSshPoolServerRemovals } from "./services/ssh/sshPoolServerRemovalObserver";
 import { Ssh2Connector } from "./services/ssh/ssh2Connector";
 import { VscodeHostKeyVerifier } from "./services/ssh/vscodeHostKeyVerifier";
 import { VscodePasswordPrompt } from "./services/ssh/vscodePasswordPrompt";
@@ -1273,6 +1274,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const unsubscribeProviderRegistry = inventoryProviderRegistry.onDidChange(() => {
     syncViews();
   });
+  const unsubscribeRemovedSshServerPoolEntries = watchSshPoolServerRemovals(core, pool);
   const unsubscribeCore = core.onDidChange((snapshot) => {
     syncViews();
     for (const server of snapshot.servers) {
@@ -1700,6 +1702,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     },
     {
       dispose: () => {
+        unsubscribeRemovedSshServerPoolEntries();
         unsubscribeCore();
         unsubscribeTunnel();
         unsubscribeProviderRegistry();

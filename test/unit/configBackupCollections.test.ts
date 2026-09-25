@@ -119,6 +119,8 @@ import type { DhcpConfigProfile, TftpConfigProfile } from "../../src/models/netw
 import type { AuthProfile, LocalShellProfile, ServerConfig } from "../../src/models/config";
 import { ProxySshFactory } from "../../src/services/ssh/proxySshFactory";
 import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
+import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
+import { watchSshPoolServerRemovals } from "../../src/services/ssh/sshPoolServerRemovalObserver";
 
 const KNOWN_HOSTS_KEY = "nexus.ssh.knownHostFingerprints.v1";
 const PASSWORD = "backup-pass-1";
@@ -1134,6 +1136,166 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
     expect(connectorCalls[0]?.server.username).toBe("safe-user");
     expect(connectorCalls[1]?.auth.password).toBe("target-secret");
     expect(await dest.vault.get("password-srv-1")).toBe("target-secret");
+  });
+
+  it("Replace retires a removed jump pool entry before restored target credentials can use it", async () => {
+    const dest = await makeMachine();
+    const oldProfile: AuthProfile = {
+      id: "jump-auth",
+      name: "Jump auth",
+      username: "old-jump-user",
+      authType: "key",
+      keyPath: "/keys/old-jump"
+    };
+    const oldJump = makeServer({
+      id: "jump-1",
+      name: "Bastion",
+      host: "bastion.example",
+      username: "raw-user",
+      authType: "key",
+      keyPath: "/keys/old-jump",
+      authProfileId: oldProfile.id
+    });
+    const oldTarget = makeServer({
+      id: "srv-1",
+      name: "Router",
+      host: "10.0.0.1",
+      username: "target-user",
+      authType: "password",
+      proxy: { type: "ssh", jumpHostId: oldJump.id }
+    });
+    await dest.core.addOrUpdateAuthProfile(oldProfile);
+    await dest.core.addOrUpdateServer(oldJump);
+    await dest.core.addOrUpdateServer(oldTarget);
+    await dest.vault.store("password-srv-1", "old-target-password");
+
+    const replacement = await makeMachine();
+    const newProfile: AuthProfile = { ...oldProfile, username: "new-jump-user", keyPath: "/keys/new-jump" };
+    const newJump = { ...oldJump, keyPath: "/keys/new-jump" };
+    const newTarget = { ...oldTarget };
+    await replacement.core.addOrUpdateAuthProfile(newProfile);
+    await replacement.core.addOrUpdateServer(newJump);
+    await replacement.core.addOrUpdateServer(newTarget);
+    await replacement.vault.store("password-srv-1", "backup-target-password");
+    const backup = await exportBackup(replacement);
+
+    let nextConnectionId = 0;
+    const tunnelOwners = new WeakMap<object, number>();
+    const connections: Array<SshConnection & { id: number; serverId: string; disposed: boolean }> = [];
+    const connectorCalls: Array<{
+      serverId: string;
+      username: string;
+      password: string | undefined;
+      tunnelOwner: number | undefined;
+    }> = [];
+    const connector: SshConnector = {
+      connect: async (server, auth) => {
+        connectorCalls.push({
+          serverId: server.id,
+          username: server.username,
+          password: auth.password,
+          tunnelOwner: auth.sock ? tunnelOwners.get(auth.sock) : undefined
+        });
+        let connection!: SshConnection & { id: number; serverId: string; disposed: boolean };
+        connection = {
+          id: ++nextConnectionId,
+          serverId: server.id,
+          disposed: false,
+          openDirectTcp: async () => {
+            const socket = new PassThrough();
+            tunnelOwners.set(socket, connection.id);
+            return socket;
+          },
+          onClose: () => () => undefined,
+          dispose: () => { connection.disposed = true; },
+          getBanner: () => undefined
+        } as unknown as SshConnection & { id: number; serverId: string; disposed: boolean };
+        connections.push(connection);
+        return connection;
+      }
+    };
+    const authFactory = new SilentAuthSshFactory(
+      connector,
+      dest.vault,
+      { prompt: async () => undefined },
+      undefined,
+      (id) => dest.core.getAuthProfile(id),
+      (id) => dest.core.getServer(id)
+    );
+    const proxyFactory = new ProxySshFactory(authFactory, (id) => dest.core.getServer(id), dest.vault);
+    const pool = new SshConnectionPool(proxyFactory, { enabled: true, idleTimeoutMs: 0 });
+    proxyFactory.setJumpHostConnectionFactory(pool);
+    const unsubscribeRemovedServerPoolEntries = watchSshPoolServerRemovals(dest.core, pool);
+
+    let oldTargetConnection: SshConnection | undefined;
+    let newTargetConnection: SshConnection | undefined;
+    try {
+      oldTargetConnection = await proxyFactory.connectWithContext(oldTarget);
+      const oldJumpConnection = connections.find((connection) => connection.serverId === oldJump.id);
+      expect(oldJumpConnection).toBeDefined();
+      expect(connectorCalls.find((call) => call.serverId === oldTarget.id)?.tunnelOwner).toBe(oldJumpConnection?.id);
+
+      await runImport(dest, backup, "replace");
+      expect(await dest.vault.get("password-srv-1")).toBe("backup-target-password");
+
+      newTargetConnection = await proxyFactory.connectWithContext(dest.core.getServer(oldTarget.id)!);
+
+      const jumpCalls = connectorCalls.filter((call) => call.serverId === oldJump.id);
+      const targetCalls = connectorCalls.filter((call) => call.serverId === oldTarget.id);
+      expect(jumpCalls.map((call) => call.username)).toEqual(["old-jump-user", "new-jump-user"]);
+      expect(targetCalls.at(-1)?.password).toBe("backup-target-password");
+      expect(targetCalls.at(-1)?.tunnelOwner).toBe(connections.filter((connection) => connection.serverId === oldJump.id).at(-1)?.id);
+      expect(connections.find((connection) => connection.id === oldJumpConnection?.id)?.disposed).toBe(false);
+
+      oldTargetConnection.dispose();
+      oldTargetConnection = undefined;
+      expect(connections.find((connection) => connection.id === oldJumpConnection?.id)?.disposed).toBe(true);
+    } finally {
+      unsubscribeRemovedServerPoolEntries();
+      oldTargetConnection?.dispose();
+      newTargetConnection?.dispose();
+      pool.dispose();
+    }
+  });
+
+  it("a removed server retires its idle pooled connection before the same id is added again", async () => {
+    const machine = await makeMachine();
+    const server = makeServer({ id: "jump-1", name: "Bastion" });
+    await machine.core.addOrUpdateServer(server);
+
+    const connections: Array<{ disposed: boolean }> = [];
+    const factory = {
+      connect: async () => {
+        const connection = {
+          disposed: false,
+          onClose: () => () => undefined,
+          dispose: () => { connection.disposed = true; },
+          getBanner: () => undefined
+        } as unknown as SshConnection & { disposed: boolean };
+        connections.push(connection);
+        return connection;
+      }
+    };
+    const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
+    const unsubscribeRemovedServerPoolEntries = watchSshPoolServerRemovals(machine.core, pool);
+
+    try {
+      const idleLease = await pool.connect(server);
+      idleLease.dispose();
+      expect(connections[0]?.disposed).toBe(false);
+
+      await machine.core.removeServer(server.id);
+      expect(connections[0]?.disposed).toBe(true);
+
+      await machine.core.addOrUpdateServer(server);
+      const freshLease = await pool.connect(server);
+      expect(connections).toHaveLength(2);
+      expect(connections[1]?.disposed).toBe(false);
+      freshLease.dispose();
+    } finally {
+      unsubscribeRemovedServerPoolEntries();
+      pool.dispose();
+    }
   });
 
   it("a sealed backup still restores the secrets it carries onto its own record, and a secret it lacks is not kept from this machine", async () => {
