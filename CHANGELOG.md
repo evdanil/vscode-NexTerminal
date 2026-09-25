@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.266] — 2026-09-25
+
+### Fixed
+
+- **A third-party inventory provider with a malformed config field is refused when it registers, not when you open its source form.** Nexus did not check four of the members an extension registering its own inventory provider can give each config field. A `placeholder` or `description` that was not text, a number for example, made **Add Inventory Source** and **Edit Inventory Source** fail with an error as the form opened. A `required` or `advanced` flag that was not `true` or `false` was read loosely, so `advanced: "no"` put the field under **Advanced options** and `required: "no"` made it mandatory. Registration now refuses such a provider, and the error names the field and the member. Its sources then behave as those of any provider that is not installed, until the extension is fixed.
+- **A third-party inventory provider can no longer break the source form, Sync or the credential check by changing its field list after it registers.** Nexus checked a provider's config fields when it registered and then went on reading the provider's own list. A list that passed the check could still fail later, in the source form, in **Sync Inventory Now**, or in the check that runs before a source's saved credentials are handed to a provider, through code the extension controls or through an edit it made after registering. Nexus now keeps its own copy of the fields, taken as they are checked, and everything reads that copy. So the fields a provider registers with are the ones Nexus shows, saves against and compares with what you confirmed, and changing them takes a new registration. Only the members the field contract defines are kept, and a select option keeps only its label and value. The four built-in providers are unaffected, and none of their sources is asked to confirm its credentials again.
 ## [2.8.260] — 2026-09-25
 
 ### Fixed

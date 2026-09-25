@@ -26,7 +26,8 @@ import { naturalCompare } from "../utils/naturalCompare";
  * picker rather than a field, because each provider titles its filter field its
  * own way (e.g. NetBox's Device Filter, EVE-NG's Lab Filter). Codex on #164 — and
  * it names which providers' forms HAVE that picker, read from the registry (the
- * same `savedFilterTarget` the form renders it by), so a user with only Proxmox
+ * same `savedFilterTarget` the form renders it by, over the same copy of each
+ * provider's fields, `configFieldsOf`), so a user with only Proxmox
  * sources, whose form has no filter field, is not sent looking for one. Each label
  * enters the sentence through `flattenProviderText` — a provider registered through
  * the public API supplies it — and one with nothing visible left is left out.
@@ -34,7 +35,7 @@ import { naturalCompare } from "../utils/naturalCompare";
 function emptyStateMessage(registry: InventoryProviderRegistry): string {
   const withPicker = registry
     .list()
-    .filter((provider) => savedFilterTarget(provider) !== undefined)
+    .filter((provider) => savedFilterTarget(registry.configFieldsOf(provider)) !== undefined)
     .map((provider) => flattenProviderText(provider.label))
     .filter((label) => label !== "");
   if (withPicker.length === 0) {

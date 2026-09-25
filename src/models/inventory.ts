@@ -331,6 +331,25 @@ export type InventorySourceSecrets = Record<string, string>; // from SecretStora
 export interface InventoryProvider {
   id: string; // e.g. "netbox"; unique in registry
   label: string;
+  /**
+   * The fields the Add/Edit Source form shows for this provider, in order.
+   *
+   * Every member a field declares is type-checked at registration
+   * (`validateProviderShape`, providerRegistry.ts, issues #187 and #195), and
+   * a provider with a malformed field is refused with an error that names the
+   * entry. `placeholder` and `description` must be strings, and `required`,
+   * `advanced`, `integer` and `defaultValue` must be booleans when present.
+   *
+   * The list is read once, when the provider registers. The registry keeps a
+   * frozen copy, and every consumer reads that copy
+   * (`InventoryProviderRegistry.configFieldsOf`): the form, the parse of what it
+   * posts, the sync's required-secret check, and `computeProviderFingerprint`.
+   * Changing this array, a field or an option afterwards therefore changes
+   * nothing. A provider that needs a different shape registers again, and the
+   * new shape is then checked against every source's stamp like any other
+   * change. The copy holds only the members declared below, and a select's
+   * options only their `label` and `value`.
+   */
   configFields: InventoryConfigField[];
   /**
    * DEVICE TEMPLATES (issue #48 PR-T2, §2.2 A-M4) — OPTIONAL. The filter keys
@@ -1320,8 +1339,8 @@ function templateRulesEqual(a: TemplateRule[] | undefined, b: TemplateRule[] | u
  * the id would make every mismatch invisible). It also excludes every field
  * member that describes HOW a value is entered rather than WHAT the source is
  * configured with — `advanced`, `defaultValue`, `min`/`max`, `integer`,
- * `placeholder` — each documented at its declaration above and each
- * constraint among them PINNED by a test. The pins are the point: this hash
+ * `placeholder`, `description` — each documented at its declaration above and
+ * each constraint among them PINNED by a test. The pins are the point: this hash
  * gates the two outcomes publicApi.ts's trust-model doc describes, so getting
  * an exclusion wrong is a latent bug in BOTH directions at once — a modal
  * every user has to answer, and the silent half where live status simply stops
@@ -1330,12 +1349,21 @@ function templateRulesEqual(a: TemplateRule[] | undefined, b: TemplateRule[] | u
  * exclusion is not allowed to rest on this comment alone. No `vscode` import —
  * callable from models/ and safe for both the command layer and tests.
  *
+ * WHICH `configFields` (issue #195): the registry's copy
+ * (`InventoryProviderRegistry.configFieldsOf`), which is what every caller in
+ * the command layer passes, never the provider's own array. The copy is the
+ * list registration checked, so the hash describes fields that were checked,
+ * and a provider cannot change the fields behind a stamp without registering
+ * again. The copy keeps every member hashed here exactly as the provider
+ * declared it, so it changes no stamp a source already carries;
+ * builtInProviders.test.ts pins the four built-ins' values.
+ *
  * sha256, hex-encoded, truncated to the first 16 characters — this is a
  * drift-detection fingerprint, not a security credential, so collision
  * resistance at full sha256 strength is unnecessary; 16 hex chars (64 bits)
  * is already far more than this UI-facing comparison needs.
  */
-export function computeProviderFingerprint(provider: Pick<InventoryProvider, "label" | "configFields">): string {
+export function computeProviderFingerprint(provider: { label: string; configFields: readonly InventoryConfigField[] }): string {
   const shape = {
     label: provider.label,
     configFields: provider.configFields.map((field) => ({
@@ -1351,8 +1379,9 @@ export function computeProviderFingerprint(provider: Pick<InventoryProvider, "la
       // their order matter, and any future extra option member cannot perturb the
       // hash. Gated on `type === "select"` because `options` is documented-IGNORED
       // (and never rendered) on non-select fields, yet `validateProviderShape`
-      // ACCEPTS a stray `options` member there — so a non-select field always
-      // projects `options: undefined` regardless of whether it carries one.
+      // ACCEPTS a stray `options` member there. The registry's copy drops it,
+      // and the gate keeps the hash of any list that still has one the same, so
+      // a non-select field always projects `options: undefined`.
       // JSON.stringify drops undefined members, keeping every non-select field
       // BYTE-IDENTICAL to the pre-round-3 shape — no spurious re-confirmation for
       // existing sources.

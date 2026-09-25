@@ -35,11 +35,15 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  * the provider's `label`, and its `configFields` — each field's `id`, `label`,
  * `type` and `required` flag, plus a select field's `options` — in the
  * provider's own declared ORDER, so reordering the list is a new shape just as
- * renaming a field is. What it does NOT hash is everything that describes how a
+ * renaming a field is. The `configFields` hashed are the ones the provider
+ * REGISTERED with: the registry checks the list and keeps a copy of it when
+ * `registerInventoryProvider` is called, and the form, the sync and this hash
+ * all read that copy. An edit the provider makes to its array afterwards
+ * reaches none of them. What it does NOT hash is everything that describes how a
  * value is entered rather than what the source is configured with (`advanced`,
- * `defaultValue`, `min`/`max`, `integer`, `placeholder`) and the `id` itself:
- * hashing the id would make every mismatch invisible, since a different
- * provider answering to the SAME id is the whole thing being detected.
+ * `defaultValue`, `min`/`max`, `integer`, `placeholder`, `description`) and the
+ * `id` itself: hashing the id would make every mismatch invisible, since a
+ * different provider answering to the SAME id is the whole thing being detected.
  *
  * Every path that PASSES a source's saved credentials TO A PROVIDER recomputes
  * that fingerprint against the current registrant for the source's
@@ -99,7 +103,8 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  *
  * The practical consequence for a provider author: DO NOT CHANGE `label` or
  * `configFields` casually on an id that already has sources configured against
- * it. Every such change is a new shape, and every existing STAMPED source
+ * it. A `configFields` change takes effect only through a new registration
+ * (dispose, then register again). Every such change is a new shape, and every existing STAMPED source
  * stops reporting live status until its user has confirmed the change once —
  * so the blast radius is every source saved by a current build, which in
  * practice is all of them. ADDING A REQUIRED SECRET FIELD is worse than the

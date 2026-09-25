@@ -311,9 +311,10 @@ async function restampProviderFingerprintBestEffort(core: NexusCore, syncSnapsho
 async function checkProviderFingerprint(
   source: InventorySourceConfig,
   provider: InventoryProvider,
+  configFields: readonly InventoryConfigField[],
   confirmedProviderShapes: Map<string, ProviderShapeConfirmation>
 ): Promise<{ outcome: "ok"; fingerprintToStamp: string | undefined } | { outcome: "cancelled" }> {
-  const currentProviderFingerprint = computeProviderFingerprint(provider);
+  const currentProviderFingerprint = computeProviderFingerprint({ label: provider.label, configFields });
   if (sourceTrustsProviderShape(source, currentProviderFingerprint)) {
     // Unstamped => there is nothing to compare against, and the stamp is the
     // caller's to write on its own success path. Matching => already stamped
@@ -430,9 +431,10 @@ type ProviderShapeConfirmation = { fingerprint: string; revision: string | undef
 function providerShapeIsTrusted(
   source: InventorySourceConfig,
   provider: InventoryProvider,
+  configFields: readonly InventoryConfigField[],
   confirmedProviderShapes: ReadonlyMap<string, ProviderShapeConfirmation>
 ): boolean {
-  const currentProviderFingerprint = computeProviderFingerprint(provider);
+  const currentProviderFingerprint = computeProviderFingerprint({ label: provider.label, configFields });
   if (sourceTrustsProviderShape(source, currentProviderFingerprint)) {
     return true;
   }
@@ -478,10 +480,11 @@ function providerShapeIsTrusted(
 async function providerStillTrustedSilently(
   source: InventorySourceConfig,
   provider: InventoryProvider,
+  configFields: readonly InventoryConfigField[],
   vault: SecretVault,
   confirmedProviderShapes: ReadonlyMap<string, ProviderShapeConfirmation>
 ): Promise<SilentProviderTrust> {
-  if (!providerShapeIsTrusted(source, provider, confirmedProviderShapes)) {
+  if (!providerShapeIsTrusted(source, provider, configFields, confirmedProviderShapes)) {
     return { trusted: false };
   }
   const secrets: InventorySourceSecrets = {};
@@ -640,7 +643,7 @@ interface ProviderConfigFormResult {
  * field newly required by a provider schema change since the form opened).
  */
 function formValuesToProviderConfig(
-  fields: InventoryConfigField[],
+  fields: readonly InventoryConfigField[],
   values: FormValues,
   existingSecretFieldIds: ReadonlySet<string> = new Set()
 ): ProviderConfigFormResult {
@@ -755,7 +758,7 @@ interface ParsedSourceFormValues {
  */
 async function parseSourceFormValues(
   values: FormValues,
-  provider: InventoryProvider,
+  configFields: readonly InventoryConfigField[],
   existingSecretFieldIds: ReadonlySet<string> = new Set()
 ): Promise<ParsedSourceFormValues> {
   const name = typeof values.name === "string" ? values.name.trim() : "";
@@ -806,7 +809,7 @@ async function parseSourceFormValues(
   const prunePolicy: InventoryPrunePolicy =
     rawPrunePolicy === "delete" || rawPrunePolicy === "keep" ? rawPrunePolicy : "orphan";
 
-  const { config, secrets } = formValuesToProviderConfig(provider.configFields, values, existingSecretFieldIds);
+  const { config, secrets } = formValuesToProviderConfig(configFields, values, existingSecretFieldIds);
 
   return { name, targetFolder, authProfileId, defaultUsername, prunePolicy, config, secrets };
 }
@@ -1200,6 +1203,8 @@ export interface NewInventorySourceInput {
   defaultUsername: string;
   prunePolicy: InventoryPrunePolicy;
   provider: InventoryProvider;
+  /** `provider`'s fields as the registry keeps them (`configFieldsOf`) — the list the form was built from. */
+  configFields: readonly InventoryConfigField[];
   config: InventorySourceValues;
   secrets: InventorySourceSecrets;
   /** DEVICE TEMPLATES (PR-T1b) — the catch-all rule (or `[]`) the Device
@@ -1225,9 +1230,9 @@ async function persistNewInventorySource(
   vault: SecretVault,
   input: NewInventorySourceInput
 ): Promise<InventorySourceConfig> {
-  const { name, targetFolder, authProfileId, renderedAuthProfile, defaultUsername, prunePolicy, provider, config, secrets, templateRules } = input;
+  const { name, targetFolder, authProfileId, renderedAuthProfile, defaultUsername, prunePolicy, provider, configFields, config, secrets, templateRules } = input;
   const id = randomUUID();
-  const passwordFieldIds = provider.configFields.filter((f) => f.type === "password").map((f) => f.id);
+  const passwordFieldIds = configFields.filter((f) => f.type === "password").map((f) => f.id);
 
   // FINDING 2 — secretFieldIds records only ids ACTUALLY stored to the vault
   // this run. A password field that is optional and left blank never gets a
@@ -1342,7 +1347,7 @@ async function persistNewInventorySource(
       defaultUsername: fallbackUsernameForSource(linkedProfile, defaultUsername),
       config,
       secretFieldIds,
-      providerFingerprint: computeProviderFingerprint(provider),
+      providerFingerprint: computeProviderFingerprint({ label: provider.label, configFields }),
       // DEVICE TEMPLATES (PR-T1b) — a representable select resolved to `[]` or one
       // catch-all rule; `undefined` (fallback shown / never touched) stores none.
       ...(templateRules !== undefined ? { templateRules } : {})
@@ -1380,6 +1385,8 @@ export interface UpdatedInventorySourceInput {
   defaultUsername: string;
   prunePolicy: InventoryPrunePolicy;
   provider: InventoryProvider;
+  /** As `NewInventorySourceInput`. */
+  configFields: readonly InventoryConfigField[];
   config: InventorySourceValues;
   /** Only fields the user actually re-typed this run — a blank/kept field is omitted. */
   reenteredSecrets: InventorySourceSecrets;
@@ -1407,7 +1414,7 @@ async function persistUpdatedInventorySource(
   source: InventorySourceConfig,
   input: UpdatedInventorySourceInput
 ): Promise<InventorySourceConfig> {
-  const { name, targetFolder, authProfileId, renderedAuthProfile, defaultUsername, prunePolicy, provider, config, reenteredSecrets, templateRules } = input;
+  const { name, targetFolder, authProfileId, renderedAuthProfile, defaultUsername, prunePolicy, provider, configFields, config, reenteredSecrets, templateRules } = input;
   const existingSecretFieldIds = new Set(source.secretFieldIds);
 
   return configMutationLock.runExclusive(async (): Promise<InventorySourceConfig> => {
@@ -1453,7 +1460,7 @@ async function persistUpdatedInventorySource(
     // merely because the schema declares it. A field dropped from the
     // schema entirely, or an optional field that has never had a value
     // saved, is excluded.
-    const newSecretFieldIds = provider.configFields
+    const newSecretFieldIds = configFields
       .filter((f) => f.type === "password" && (reenteredSecrets[f.id] !== undefined || existingSecretFieldIds.has(f.id)))
       .map((f) => f.id);
 
@@ -1535,7 +1542,7 @@ async function persistUpdatedInventorySource(
       defaultUsername: fallbackUsernameForSource(linkedProfile, defaultUsername),
       config,
       secretFieldIds: newSecretFieldIds,
-      providerFingerprint: computeProviderFingerprint(provider),
+      providerFingerprint: computeProviderFingerprint({ label: provider.label, configFields }),
       // DEVICE TEMPLATES (PR-T1b) — a representable select supplies the new rule
       // list; `undefined` (fallback shown / non-representable) keeps the source's
       // existing rules, which `...source` above already carried forward. Assigned
@@ -2792,12 +2799,13 @@ export function registerInventoryCommands(
   async function handleFormTest(
     values: FormValues,
     provider: InventoryProvider,
+    configFields: readonly InventoryConfigField[],
     fallbackName: string,
     hydrateFrom?: InventorySourceConfig
   ): Promise<void> {
     let parsed: ProviderConfigFormResult;
     try {
-      parsed = formValuesToProviderConfig(provider.configFields, values, new Set(hydrateFrom?.secretFieldIds ?? []));
+      parsed = formValuesToProviderConfig(configFields, values, new Set(hydrateFrom?.secretFieldIds ?? []));
     } catch (error) {
       void vscode.window.showWarningMessage(error instanceof Error ? error.message : String(error));
       return;
@@ -2835,6 +2843,10 @@ export function registerInventoryCommands(
     const pickResult = await promptProviderPick(registry);
     if (!pickResult) return;
     const { provider } = pickResult;
+    // Issue #195 — the copy registration checked, read once for the whole flow:
+    // the form is built from it, Test and Save parse against it, and Save stamps
+    // its fingerprint. The provider's own array is never read.
+    const configFields = registry.configFieldsOf(provider);
 
     // VERIFIED (post-#52 review) — addSource has no editSource-style
     // dispose-vs-in-flight-submit race to guard against: there is no id to
@@ -2854,7 +2866,7 @@ export function registerInventoryCommands(
     // no part in that sequencing. No closure-local tracking is needed here.
     const snapshot = core.getSnapshot();
     const definition = inventorySourceFormDefinition(
-      provider,
+      { label: provider.label, configFields },
       undefined,
       mostCommonUsername(snapshot.servers),
       snapshot.authProfiles,
@@ -2871,7 +2883,7 @@ export function registerInventoryCommands(
     const inlineDeviceTemplate = createInlineDeviceTemplateCreation({ core });
     // SAVED FILTER DEFINITIONS (PR-E) — the "Save current filter as…" affordance
     // on the saved-filter picker.
-    const inlineSavedFilter = createInlineSavedFilterCreation({ core, provider });
+    const inlineSavedFilter = createInlineSavedFilterCreation({ core, configFields });
     // REVIEW FINDING (P2) — the profile whose username this form is currently
     // showing, checked against live state at Save by
     // `inventoryAuthProfileRejection`. Seeded as `undefined` and NOT from any
@@ -2883,7 +2895,7 @@ export function registerInventoryCommands(
     let renderedAuthProfile: RenderedSourceAuthProfile | undefined = undefined;
     const panel = WebviewFormPanel.open(`inventory-source-add-${provider.id}`, definition, {
       onSubmit: async (values) => {
-        const parsed = await parseSourceFormValues(values, provider);
+        const parsed = await parseSourceFormValues(values, configFields);
         const created = await persistNewInventorySource(core, vault, {
           name: parsed.name,
           targetFolder: parsed.targetFolder,
@@ -2892,6 +2904,7 @@ export function registerInventoryCommands(
           defaultUsername: parsed.defaultUsername,
           prunePolicy: parsed.prunePolicy,
           provider,
+          configFields,
           config: parsed.config,
           secrets: parsed.secrets,
           // No existing rules on an Add — a representable submit either stores
@@ -2914,7 +2927,7 @@ export function registerInventoryCommands(
           }
         })();
       },
-      onTest: (values) => handleFormTest(values, provider, provider.label),
+      onTest: (values) => handleFormTest(values, provider, configFields, provider.label),
       onCreateInline: (key, values) => {
         inlineAuthProfile.handleCreateInline(key);
         inlineDeviceTemplate.handleCreateInline(key);
@@ -3040,6 +3053,9 @@ export function registerInventoryCommands(
       void vscode.window.showErrorMessage(providerMissingMessage(source.providerId));
       return;
     }
+    // Issue #195 — read once, beside `provider`, and used for the gate, the
+    // form, Test and Save alike (see addSource's).
+    const configFields = registry.configFieldsOf(provider);
 
     // F3 — gated BEFORE the form ever opens: the Edit form's Test button
     // hydrates kept (blank) secret fields straight from the vault (see
@@ -3051,7 +3067,7 @@ export function registerInventoryCommands(
     // gate only needs to decide whether editing may proceed at all, never a
     // fingerprintToStamp to carry forward.) The marker was already claimed
     // above, so a Cancel here must release it before returning.
-    const fingerprintCheck = await checkProviderFingerprint(source, provider, confirmedProviderShapes);
+    const fingerprintCheck = await checkProviderFingerprint(source, provider, configFields, confirmedProviderShapes);
     if (fingerprintCheck.outcome === "cancelled") {
       releaseInFlight();
       return;
@@ -3065,7 +3081,14 @@ export function registerInventoryCommands(
     const authProfiles = core.getSnapshot().authProfiles;
     const deviceTemplates = core.getSnapshot().deviceTemplates;
     const savedFilters = core.getSnapshot().savedFilters;
-    const definition = inventorySourceFormDefinition(provider, source, undefined, authProfiles, deviceTemplates, savedFilters);
+    const definition = inventorySourceFormDefinition(
+      { label: provider.label, configFields },
+      source,
+      undefined,
+      authProfiles,
+      deviceTemplates,
+      savedFilters
+    );
     // REVIEW FINDING (P2) — as addSource's, but seeded: this form opens already
     // showing the LINKED profile's username in Default SSH Username, locked
     // (`inventorySourceFormDefinition`'s render rule), so on Edit "rendered"
@@ -3084,7 +3107,7 @@ export function registerInventoryCommands(
     // in. The marker machinery below is untouched by this wiring.
     const inlineAuthProfile = createInlineAuthProfileCreation({ core, secretVault: vault });
     const inlineDeviceTemplate = createInlineDeviceTemplateCreation({ core });
-    const inlineSavedFilter = createInlineSavedFilterCreation({ core, provider });
+    const inlineSavedFilter = createInlineSavedFilterCreation({ core, configFields });
     let panel: ReturnType<typeof WebviewFormPanel.open>;
     try {
       // F6 — WebviewFormPanel.open can throw synchronously (or reject — see
@@ -3109,7 +3132,7 @@ export function registerInventoryCommands(
         // control to WebviewFormPanel — closing that gap.
         onSubmit: (values) => {
           const submitPromise = (async (): Promise<void> => {
-            const parsed = await parseSourceFormValues(values, provider, existingSecretFieldIds);
+            const parsed = await parseSourceFormValues(values, configFields, existingSecretFieldIds);
             const updated = await persistUpdatedInventorySource(core, vault, source, {
               name: parsed.name,
               targetFolder: parsed.targetFolder,
@@ -3118,6 +3141,7 @@ export function registerInventoryCommands(
               defaultUsername: parsed.defaultUsername,
               prunePolicy: parsed.prunePolicy,
               provider,
+              configFields,
               config: parsed.config,
               reenteredSecrets: parsed.secrets,
               // Representable submit → new rule list; fallback shown → undefined
@@ -3181,7 +3205,7 @@ export function registerInventoryCommands(
             });
           return submitPromise;
         },
-        onTest: (values) => handleFormTest(values, provider, source.name, source),
+        onTest: (values) => handleFormTest(values, provider, configFields, source.name, source),
         onCreateInline: (key, values) => {
           inlineAuthProfile.handleCreateInline(key);
           inlineDeviceTemplate.handleCreateInline(key);
@@ -3729,6 +3753,9 @@ export function registerInventoryCommands(
       void vscode.window.showErrorMessage(providerMissingMessage(source.providerId));
       return;
     }
+    // Issue #195 — the copy registration checked: the gate hashes it and the
+    // required-secret loop below walks it.
+    const configFields = registry.configFieldsOf(provider);
 
     // Marked busy synchronously right after the last check above (no await in
     // between) so a second invocation arriving on the next microtask sees it.
@@ -3751,7 +3778,7 @@ export function registerInventoryCommands(
       // checkProviderFingerprint is the same helper editSource's own
       // pre-open gate uses, so the two flows can't drift on wording or on
       // when this confirmation fires.
-      const fingerprintCheck = await checkProviderFingerprint(source, provider, confirmedProviderShapes);
+      const fingerprintCheck = await checkProviderFingerprint(source, provider, configFields, confirmedProviderShapes);
       if (fingerprintCheck.outcome === "cancelled") {
         // Cancel (or dismiss) aborts before ANY vault.get for this source —
         // the required-secret loop and every other vault read below never run.
@@ -3759,15 +3786,16 @@ export function registerInventoryCommands(
       }
       const fingerprintToStamp = fingerprintCheck.fingerprintToStamp;
 
-      // FINDING 2 — the required-secret check is driven by the provider's
-      // CURRENT configFields schema, not by the stored source.secretFieldIds.
+      // FINDING 2 — the required-secret check is driven by the CURRENT
+      // registrant's configFields schema (as it registered it), not by the
+      // stored source.secretFieldIds.
       // A provider upgrade that adds a new required password field (or flips
       // a blank optional field to required) must be caught here even though
       // the stored source predates that schema change and its
       // secretFieldIds never mention the new field id. `provider` is
       // guaranteed registered here (checked above), so "provider unavailable"
       // never applies within this call.
-      for (const field of provider.configFields) {
+      for (const field of configFields) {
         if (field.type !== "password" || !field.required) continue;
         const value = await vault.get(inventorySecretKey(source.id, field.id));
         if (!value) {
@@ -5384,7 +5412,8 @@ export function registerInventoryCommands(
         if (!provider || typeof provider.fetchStatus !== "function") {
           return [];
         }
-        if (providerShapeIsTrusted(liveSource, provider, confirmedProviderShapes)) {
+        const configFields = registry.configFieldsOf(provider);
+        if (providerShapeIsTrusted(liveSource, provider, configFields, confirmedProviderShapes)) {
           return [];
         }
         // WHICH REMEDY THIS SOURCE CAN ACTUALLY FINISH. Sync Inventory Now is
@@ -5419,7 +5448,7 @@ export function registerInventoryCommands(
         // So the Sync clause below stops asserting the outcome, and the case
         // this cannot detect is handed to the one message that can name the
         // field: syncNow's own missing-credential error, which has it.
-        const syncWouldStopShort = provider.configFields.some(
+        const syncWouldStopShort = configFields.some(
           (field) => field.type === "password" && field.required === true && !liveSource.secretFieldIds.includes(field.id)
         );
         return [{ ...refused, syncWouldStopShort }];
@@ -5570,7 +5599,7 @@ export function registerInventoryCommands(
       // `providerStillTrustedSilently`.
       let trust: SilentProviderTrust;
       try {
-        trust = await providerStillTrustedSilently(source, provider, vault, confirmedProviderShapes);
+        trust = await providerStillTrustedSilently(source, provider, registry.configFieldsOf(provider), vault, confirmedProviderShapes);
       } catch {
         // A REJECTING VAULT READ — the only failure this call can produce, and
         // non-fatal per source exactly like the catch around the rest of the
@@ -5972,7 +6001,7 @@ export function registerInventoryCommands(
       // seconds after the user authorised it, and — on the manual form — warn
       // them to confirm a change they had only just confirmed, breaking the
       // promise the success toast makes.
-      const fingerprintCheck = await checkProviderFingerprint(source, provider, confirmedProviderShapes);
+      const fingerprintCheck = await checkProviderFingerprint(source, provider, registry.configFieldsOf(provider), confirmedProviderShapes);
       if (fingerprintCheck.outcome === "cancelled") {
         // Cancel (or dismiss) aborts before ANY vault read for this source and
         // before anything is dispatched at the node. Silent, like its siblings:
@@ -6151,7 +6180,7 @@ export function registerInventoryCommands(
     // so the latch here is simply what the shared gate does, not something this
     // path needs. Worth knowing before anyone reads it as a second blessing:
     // nothing persists, and no later interactive flow stops asking.
-    const fingerprintCheck = await checkProviderFingerprint(source, provider, confirmedProviderShapes);
+    const fingerprintCheck = await checkProviderFingerprint(source, provider, registry.configFieldsOf(provider), confirmedProviderShapes);
     if (fingerprintCheck.outcome === "cancelled") {
       // Cancel (or dismiss) aborts before ANY vault read for this source — the
       // capture below never runs. Silent, like its siblings: the modal the user

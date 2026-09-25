@@ -12,7 +12,6 @@ import { DHCP_CIDR_FIELD_KEY, dhcpCurrentCidr } from "../commands/networkServerS
 import {
   flattenProviderText,
   type InventoryConfigField,
-  type InventoryProvider,
   type InventorySourceConfig,
   type InventorySourceValues,
   type TemplateRule
@@ -1609,9 +1608,12 @@ export interface SavedFilterTarget {
  * P8 — gated on field TYPE, not just id: the picker writes a filter STRING into
  * its target, so it may only attach to a string field. A third-party provider that
  * named a boolean / password / number / select field `filter` gets no picker.
+ *
+ * `configFields` is the registry's copy (`InventoryProviderRegistry.configFieldsOf`),
+ * never the provider's own array.
  */
-export function savedFilterTarget(provider: InventoryProvider): SavedFilterTarget | undefined {
-  const field = provider.configFields.find((f) => f.id === SAVED_FILTER_TARGET_FIELD_ID && f.type === "string");
+export function savedFilterTarget(configFields: readonly InventoryConfigField[]): SavedFilterTarget | undefined {
+  const field = configFields.find((f) => f.id === SAVED_FILTER_TARGET_FIELD_ID && f.type === "string");
   return field === undefined ? undefined : { field, label: flattenProviderText(field.label) || "filter field" };
 }
 /** The picker's own form key. NOT a persisted source field — `parseSourceFormValues`
@@ -1796,9 +1798,14 @@ const INVENTORY_SOURCE_AUTH_PROFILE_HINT =
  * `authProfiles` populates the Auth Profile select AND decides whether the
  * seeded `authProfileId` still resolves — pass the live snapshot, never a
  * cached list.
+ *
+ * `provider.configFields` must be the registry's copy
+ * (`InventoryProviderRegistry.configFieldsOf`), never the provider's own array:
+ * that copy is the list registration checked, and the one the Save and Test
+ * handlers parse the posted values against.
  */
 export function inventorySourceFormDefinition(
-  provider: InventoryProvider,
+  provider: { label: string; configFields: readonly InventoryConfigField[] },
   seed?: InventorySourceConfig,
   defaultUsernameSeed?: string,
   authProfiles?: AuthProfile[],
@@ -1808,7 +1815,7 @@ export function inventorySourceFormDefinition(
   const isEdit = Boolean(seed);
   const existingSecretFieldIds = new Set(seed?.secretFieldIds ?? []);
   const existingConfig = seed?.config ?? {};
-  const filterTarget = savedFilterTarget(provider);
+  const filterTarget = savedFilterTarget(provider.configFields);
 
   // A seeded id whose profile is gone must seed as `(None)`, not merely LOOK
   // like it. `renderField`'s select case resolves the displayed LABEL by

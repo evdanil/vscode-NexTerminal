@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { InventoryProviderRegistry, validateProviderShape } from "../../src/services/inventory/providerRegistry";
-import { MAX_INVENTORY_INSTANCE_KEY_LENGTH, resolveProviderInstanceKey } from "../../src/models/inventory";
-import type { InventoryProvider } from "../../src/models/inventory";
+import { MAX_INVENTORY_INSTANCE_KEY_LENGTH, computeProviderFingerprint, resolveProviderInstanceKey } from "../../src/models/inventory";
+import type { InventoryConfigField, InventoryProvider } from "../../src/models/inventory";
 import { createNetboxProvider } from "../../src/services/inventory/providers/netboxProvider";
 import { knownKeysList, parseTemplateFilter, unknownFilterKeys } from "../../src/services/inventory/templateApply";
+import { inventorySourceFormDefinition, savedFilterTarget } from "../../src/ui/formDefinitions";
+import { renderFormHtml } from "../../src/ui/formHtml";
 
 function makeProvider(overrides: Partial<InventoryProvider> = {}): InventoryProvider {
   return {
@@ -150,6 +152,247 @@ describe("InventoryProviderRegistry attributeKeysOf", () => {
     withList.dispose();
 
     expect(registry.attributeKeysOf("with-list")).toBeUndefined();
+  });
+});
+
+/**
+ * configFields AS THE REGISTRY KEEPS IT (issue #195) — `attributeKeys`' gap, with
+ * more consumers: the Add/Edit Source form, the collection parse, the sync's
+ * required-secret loop, and the trust-model fingerprint that runs on every path
+ * that spends a source's credentials. The check used to walk the list with
+ * `for…of` and then keep the provider's own array, so the check and the consumers
+ * could see different lists, and the consumers ran methods the provider controls.
+ * These pin that the registry keeps a deep, frozen, plain copy holding exactly
+ * what was checked, and that every consumer outside the command layer takes it
+ * (the command layer's are pinned in inventoryCommands.test.ts).
+ */
+describe("InventoryProviderRegistry configFieldsOf", () => {
+  const host = (): InventoryConfigField => ({ id: "host", label: "Host", type: "string", required: true, placeholder: "netbox.example.com" });
+  const token = (): InventoryConfigField => ({ id: "apiToken", label: "API Token", type: "password", required: true, description: "A read-only token." });
+  const family = (): InventoryConfigField => ({
+    id: "family",
+    label: "Family",
+    type: "select",
+    options: [
+      { label: "Auto", value: "auto" },
+      { label: "IPv4", value: "v4" }
+    ]
+  });
+  /** The three fields as a well-behaved provider would have declared them. */
+  const EXPECTED: InventoryConfigField[] = [host(), token(), family()];
+
+  /** Array subclasses whose iterator disagrees with their indices. */
+  class IteratesToNull extends Array<unknown> {}
+  Object.defineProperty(IteratesToNull.prototype, Symbol.iterator, {
+    value: function* () {
+      yield null;
+    }
+  });
+  class IteratesToAValidField extends Array<unknown> {}
+  Object.defineProperty(IteratesToAValidField.prototype, Symbol.iterator, {
+    value: function* () {
+      yield host();
+    }
+  });
+
+  /**
+   * Every consumer outside the command layer, over the copy. Each of them threw on
+   * at least one of the provider arrays below, and the fingerprint comparison
+   * proves the copy is exactly what was checked, not merely something that does
+   * not throw.
+   */
+  function expectConsumersTakeTheCopy(registry: InventoryProviderRegistry, provider: InventoryProvider): void {
+    const configFields = registry.configFieldsOf(provider);
+    // Member for member. `family()` declares no `required`, so this is also what
+    // catches a copy that adds `required: false`, which the fingerprint below
+    // normalises away.
+    expect(configFields).toEqual(EXPECTED);
+    expect(computeProviderFingerprint({ label: provider.label, configFields })).toBe(
+      computeProviderFingerprint({ label: provider.label, configFields: EXPECTED })
+    );
+    expect(() => renderFormHtml(inventorySourceFormDefinition({ label: provider.label, configFields }))).not.toThrow();
+    expect(() => savedFilterTarget(configFields)).not.toThrow();
+  }
+
+  /** Plain arrays and objects all the way down, frozen, with no accessor left to answer twice. */
+  function expectPlainFrozenCopy(stored: readonly InventoryConfigField[]): void {
+    const indexNames = (list: readonly unknown[]): string[] => [...Array(list.length).keys()].map(String).concat("length");
+    expect(Object.getPrototypeOf(stored)).toBe(Array.prototype);
+    expect(Object.getOwnPropertyNames(stored)).toEqual(indexNames(stored)); // no own `map`, `some` or accessor
+    expect(Object.isFrozen(stored)).toBe(true);
+    for (const field of stored) {
+      expect(Object.getPrototypeOf(field)).toBe(Object.prototype);
+      expect(Object.isFrozen(field)).toBe(true);
+      for (const key of Object.keys(field)) {
+        expect(Object.getOwnPropertyDescriptor(field, key)).toHaveProperty("value");
+      }
+      if (field.options !== undefined) {
+        expect(Object.getPrototypeOf(field.options)).toBe(Array.prototype);
+        expect(Object.getOwnPropertyNames(field.options)).toEqual(indexNames(field.options));
+        expect(Object.isFrozen(field.options)).toBe(true);
+        for (const option of field.options) {
+          expect(Object.getPrototypeOf(option)).toBe(Object.prototype);
+          expect(Object.isFrozen(option)).toBe(true);
+          // Exactly the contract's two members: anything else an option carries
+          // never reaches the form, which renders an option's `description` and
+          // `fillValue` through `escapeHtml` when present.
+          expect(Object.keys(option).sort()).toEqual(["label", "value"]);
+        }
+      }
+    }
+  }
+
+  const ownMethodsNotCallable = (): unknown[] => {
+    const fields = [host(), token(), family()];
+    for (const name of ["map", "some", "find", "filter", "flatMap", "forEach"]) {
+      Object.defineProperty(fields, name, { value: undefined });
+    }
+    return fields;
+  };
+  const subclassIteratingToNull = (): unknown[] => {
+    const fields = new IteratesToNull();
+    fields.push(host(), token(), family());
+    return fields;
+  };
+  const entryAnswersTwice = (): unknown[] => {
+    const fields: unknown[] = [host(), token(), family()];
+    const checked = fields[1];
+    let reads = 0;
+    Object.defineProperty(fields, 1, { get: () => (reads++ === 0 ? checked : null), enumerable: true, configurable: true });
+    return fields;
+  };
+  const memberAnswersTwice = (): unknown[] => {
+    const answering = token();
+    let reads = 0;
+    Object.defineProperty(answering, "label", { get: () => (reads++ === 0 ? "API Token" : 42), enumerable: true });
+    return [host(), answering, family()];
+  };
+  const optionsWithOwnMethodsNotCallable = (): unknown[] => {
+    const select = family();
+    for (const name of ["map", "some", "find"]) {
+      Object.defineProperty(select.options, name, { value: undefined });
+    }
+    return [host(), token(), select];
+  };
+  const optionsSubclassIteratingToNull = (): unknown[] => {
+    const options = new IteratesToNull();
+    options.push({ label: "Auto", value: "auto" }, { label: "IPv4", value: "v4" });
+    return [host(), token(), { ...family(), options }];
+  };
+  const optionAnswersTwice = (): unknown[] => {
+    const select = family();
+    const checked = select.options![0];
+    let reads = 0;
+    Object.defineProperty(select.options, 0, { get: () => (reads++ === 0 ? checked : null), enumerable: true, configurable: true });
+    return [host(), token(), select];
+  };
+  const optionMembersOutsideTheContract = (): unknown[] => [
+    host(),
+    token(),
+    { ...family(), options: [{ label: "Auto", value: "auto", description: 42, fillValue: 7 }, { label: "IPv4", value: "v4" }] }
+  ];
+
+  it.each([
+    ["own `map`, `some`, `find`, `filter`, `flatMap` and `forEach` that are not callable", ownMethodsNotCallable],
+    ["an Array subclass whose iterator yields null while its indices hold the fields", subclassIteratingToNull],
+    ["an entry that answers a field when read once and null after", entryAnswersTwice],
+    ["a field whose label answers a string when read once and a number after", memberAnswersTwice],
+    ["select options with own `map`, `some` and `find` that are not callable", optionsWithOwnMethodsNotCallable],
+    ["select options in an Array subclass whose iterator yields null", optionsSubclassIteratingToNull],
+    ["a select option that answers an option when read once and null after", optionAnswersTwice],
+    ["a select option carrying a non-string `description` and `fillValue`", optionMembersOutsideTheContract]
+  ])(
+    "registers configFields with %s and keeps a plain frozen copy of exactly what it checked, which every consumer takes (⊘ keeping the provider's array; ⊘ `[...fields]` / `Array.from(fields)`, which run its iterator; ⊘ `fields.slice()`, which builds the subclass again; ⊘ checking and copying in two reads; ⊘ a shallow copy that keeps the provider's `options`)",
+    (_label, make) => {
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({ configFields: make() as InventoryConfigField[] });
+      registry.register(provider);
+
+      expectPlainFrozenCopy(registry.configFieldsOf(provider));
+      expectConsumersTakeTheCopy(registry, provider);
+    }
+  );
+
+  const subclassIteratingValidOverANull = (): unknown[] => {
+    const fields = new IteratesToAValidField();
+    fields.push(host(), null);
+    return fields;
+  };
+  const sparse = (): unknown[] => {
+    const fields: unknown[] = [host()];
+    fields[2] = token();
+    return fields;
+  };
+  it.each([
+    [
+      "an Array subclass whose iterator yields a valid field while index 1 holds null",
+      "the `for…of` check, which passes it and leaves `.map` to throw out of the fingerprint on every credential-bearing path",
+      subclassIteratingValidOverANull
+    ],
+    [
+      "a sparse array with a hole at index 1",
+      "a refusal that names no entry, as the `for…of` check's \"entries must be objects\" did; ⊘ a walk that skips holes, such as `forEach`, which registers it",
+      sparse
+    ]
+  ])(
+    "refuses configFields that is %s, naming the entry's index (⊘ %s)",
+    (_label, _killed, make) => {
+      const registry = new InventoryProviderRegistry();
+      expect(() => registry.register(makeProvider({ configFields: make() as InventoryConfigField[] }))).toThrow(
+        "Inventory provider configFields entry 1 must be an object."
+      );
+      expect(registry.get("netbox")).toBeUndefined();
+    }
+  );
+
+  it("refuses select options whose iterator yields valid options while an index holds null, naming the field (⊘ the `for…of` check over `options`)", () => {
+    const options: unknown[] = [{ label: "Auto", value: "auto" }, null];
+    Object.defineProperty(options, Symbol.iterator, {
+      value: function* () {
+        yield { label: "Auto", value: "auto" };
+      }
+    });
+    expect(() => validateProviderShape(makeProvider({ configFields: [{ ...family(), options: options as never }] }))).toThrow(
+      /"family".*invalid select option/
+    );
+  });
+
+  it("is the list as it stood at registration: a push, a replaced entry, or an edit to a field or an option afterwards reaches no consumer (⊘ keeping the provider's array; ⊘ a shallow copy that keeps the provider's field objects or its `options`)", () => {
+    const registry = new InventoryProviderRegistry();
+    const fields = [host(), token(), family()];
+    const provider = makeProvider({ configFields: fields });
+    registry.register(provider);
+
+    const [, tokenField, selectField] = fields;
+    fields.push(null as never);
+    fields[0] = { id: "late", label: "Late", type: "password", required: true };
+    (tokenField as { label: unknown }).label = 42;
+    selectField.options!.push(null as never);
+    (selectField.options![0] as { label: unknown }).label = 42;
+
+    expectConsumersTakeTheCopy(registry, provider);
+  });
+
+  it("belongs to the provider OBJECT, not to its id: a flow still holding a provider that was disposed and replaced under the same id reads that provider's own fields (⊘ looking the copy up by id, which answers that flow — an open form, a pending modal — with the replacement's fields, so a fingerprint mixes one registrant's label with another's fields, or with nothing at all)", () => {
+    const registry = new InventoryProviderRegistry();
+    const original = makeProvider({ configFields: [host()] });
+    const registration = registry.register(original);
+    registration.dispose();
+    const replacement = makeProvider({ configFields: [token()] });
+    registry.register(replacement);
+
+    expect(registry.configFieldsOf(original)).toEqual([host()]);
+    expect(registry.configFieldsOf(replacement)).toEqual([token()]);
+  });
+
+  it("throws for a provider this registry never accepted, including one refused as a duplicate (⊘ `?? []`, which would render a form with no provider fields and fingerprint an empty shape)", () => {
+    const registry = new InventoryProviderRegistry();
+    registry.register(makeProvider());
+    const duplicate = makeProvider({ configFields: [token()] });
+    expect(() => registry.register(duplicate)).toThrow(/already registered/i);
+
+    expect(() => registry.configFieldsOf(duplicate)).toThrow('Inventory provider "netbox" was never registered with this registry.');
+    expect(() => registry.configFieldsOf(makeProvider())).toThrow('Inventory provider "netbox" was never registered with this registry.');
   });
 });
 
@@ -480,6 +723,43 @@ describe("validateProviderShape", () => {
     expect(() =>
       validateProviderShape(makeProvider({ configFields: [{ id: "flag", label: "Flag", type: "boolean", defaultValue: 1 as never }] }))
     ).toThrow(/"flag".*non-boolean defaultValue/i);
+  });
+
+  /**
+   * ISSUE #187 — the four field members that had no clause. Each is read by the
+   * source form: `placeholder` and `description` are rendered through
+   * `escapeHtml`, which calls `replaceAll` on its argument, so a number there made
+   * the Add/Edit Source form throw as it rendered; `required` and `advanced` are
+   * read as truthy flags, so `advanced: "no"` filed a field under Advanced options
+   * and `required: "no"` made it mandatory.
+   */
+  it.each([
+    ["placeholder", 42, "non-string placeholder"],
+    ["placeholder", null, "non-string placeholder"],
+    ["description", { text: "A token." }, "non-string description"],
+    ["description", 7, "non-string description"],
+    ["required", "no", "non-boolean required flag"],
+    ["required", 1, "non-boolean required flag"],
+    ["advanced", "no", "non-boolean advanced flag"],
+    ["advanced", 0, "non-boolean advanced flag"]
+  ])(
+    "refuses a field whose %s is %o, naming the field (⊘ no clause, which lets a number reach `escapeHtml` and throw out of the source form as it renders, or a truthy string flip a flag the provider meant off)",
+    (member, value, message) => {
+      expect(() =>
+        validateProviderShape(makeProvider({ configFields: [{ id: "token", label: "Token", type: "string", [member]: value } as never] }))
+      ).toThrow(`Inventory provider configFields entry "token" has a ${message}.`);
+    }
+  );
+
+  it("accepts each of those four members when absent, and when it has its declared type (⊘ a clause that refuses the shape every built-in provider declares)", () => {
+    expect(() => validateProviderShape(makeProvider({ configFields: [{ id: "token", label: "Token", type: "string" }] }))).not.toThrow();
+    expect(() =>
+      validateProviderShape(
+        makeProvider({
+          configFields: [{ id: "token", label: "Token", type: "string", placeholder: "", description: "What it is.", required: false, advanced: true }]
+        })
+      )
+    ).not.toThrow();
   });
 
   it("accepts a boolean field with a real boolean defaultValue, and one with none", () => {

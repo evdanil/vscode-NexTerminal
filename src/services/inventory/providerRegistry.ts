@@ -1,4 +1,4 @@
-import type { InventoryConfigFieldType, InventoryProvider } from "../../models/inventory";
+import type { InventoryConfigField, InventoryConfigFieldType, InventoryProvider } from "../../models/inventory";
 
 /** vscode.Disposable-shaped without importing vscode — this module runs in tests without the API. */
 export interface ProviderRegistration {
@@ -26,12 +26,18 @@ export function validateProviderShape(provider: unknown): asserts provider is In
   checkProviderShape(provider);
 }
 
+/** The data members the registry keeps a copy of, each exactly as it was checked. */
+interface CheckedProviderData {
+  readonly configFields: readonly InventoryConfigField[];
+  readonly attributeKeys: readonly string[] | undefined;
+}
+
 /**
- * `validateProviderShape`'s checks, returning the copy of `attributeKeys` the
- * registry keeps (`copyAttributeKeys`), so that `register()` reads the member once
- * and stores exactly what was checked.
+ * `validateProviderShape`'s checks, returning the copies of `configFields` and
+ * `attributeKeys` the registry keeps (`copyConfigFields`, `copyAttributeKeys`), so
+ * that `register()` reads each member once and stores exactly what was checked.
  */
-function checkProviderShape(provider: unknown): readonly string[] | undefined {
+function checkProviderShape(provider: unknown): CheckedProviderData {
   if (typeof provider !== "object" || provider === null) {
     throw new Error("Inventory provider must be an object.");
   }
@@ -42,90 +48,7 @@ function checkProviderShape(provider: unknown): readonly string[] | undefined {
   if (typeof obj.label !== "string" || obj.label.length === 0) {
     throw new Error("Inventory provider label must be a non-empty string.");
   }
-  if (!Array.isArray(obj.configFields)) {
-    throw new Error("Inventory provider configFields must be an array.");
-  }
-  const seenFieldIds = new Set<string>();
-  for (const field of obj.configFields) {
-    if (typeof field !== "object" || field === null) {
-      throw new Error("Inventory provider configFields entries must be objects.");
-    }
-    const f = field as Record<string, unknown>;
-    if (typeof f.id !== "string" || f.id.length === 0) {
-      throw new Error("Inventory provider configFields entries must have a non-empty id.");
-    }
-    if (typeof f.label !== "string" || f.label.length === 0) {
-      throw new Error(`Inventory provider configFields entry "${f.id}" must have a non-empty label.`);
-    }
-    if (typeof f.type !== "string" || !VALID_FIELD_TYPES.has(f.type as InventoryConfigFieldType)) {
-      throw new Error(`Inventory provider configFields entry "${f.id}" has an invalid type "${String(f.type)}".`);
-    }
-    // MINOR-14 (EVE-NG review) — `defaultValue` is part of the field contract
-    // (the Add form seeds a boolean field from it). A non-boolean value would be
-    // silently coerced by the form's `=== true` read, so a documented default of
-    // "yes" becomes an unchecked box — reject it at the boundary.
-    if (f.defaultValue !== undefined && typeof f.defaultValue !== "boolean") {
-      throw new Error(`Inventory provider configFields entry "${f.id}" has a non-boolean defaultValue.`);
-    }
-    // REVIEW L3 — the twin of the `defaultValue` clause above, for the same
-    // class of typo and on the same public boundary. Checked for EVERY field
-    // type, exactly as `defaultValue` is: a bound is ignored on a non-number
-    // field, but a malformed one there is still a typo worth naming rather than
-    // a shape worth accepting.
-    //
-    // Two things go wrong silently without this. A NON-FINITE bound makes the
-    // collection-side re-check in `formValuesToProviderConfig` INERT — `numeric
-    // < min` is false when `min` is NaN, so the bound the provider documented is
-    // not enforced anywhere — while still rendering into the input's native
-    // `min`/`max` attribute, where the browser reads it as no bound either. And
-    // a TRANSPOSED pair declares a field no value can ever satisfy: every save
-    // is refused, by both layers, with nothing to say the schema is at fault.
-    for (const bound of ["min", "max"] as const) {
-      if (f[bound] !== undefined && (typeof f[bound] !== "number" || !Number.isFinite(f[bound]))) {
-        throw new Error(`Inventory provider configFields entry "${f.id}" has a non-finite ${bound} (a bound must be a finite number when present).`);
-      }
-    }
-    // REVIEW D2 — the third member of the `defaultValue` / `min`-`max` family,
-    // on the same public boundary and failing the same silent way: the
-    // collection-side check reads this as a truthy flag, so `integer: "yes"`
-    // constrains a field the provider never meant to constrain, and `integer: 0`
-    // leaves one it did mean to constrain wide open — with nothing naming the
-    // schema either way.
-    if (f.integer !== undefined && typeof f.integer !== "boolean") {
-      throw new Error(`Inventory provider configFields entry "${f.id}" has a non-boolean integer flag.`);
-    }
-    if (typeof f.min === "number" && typeof f.max === "number" && f.min > f.max) {
-      throw new Error(`Inventory provider configFields entry "${f.id}" declares min ${f.min} greater than max ${f.max}, which no value can satisfy.`);
-    }
-    if (f.type === "select") {
-      if (!Array.isArray(f.options) || f.options.length === 0) {
-        throw new Error(`Inventory provider configFields entry "${f.id}" of type "select" must declare a non-empty options array.`);
-      }
-      for (const opt of f.options) {
-        if (typeof opt !== "object" || opt === null
-            || typeof (opt as { label?: unknown }).label !== "string" || (opt as { label: string }).label.length === 0
-            || typeof (opt as { value?: unknown }).value !== "string") {
-          throw new Error(`Inventory provider configFields entry "${f.id}" has an invalid select option (each option needs a non-empty string label and a string value).`);
-        }
-        // RESERVED SENTINEL NAMESPACE (PR #64 Codex review round 3, P2 — issue #48
-        // PR-E). The webview treats ANY select option whose value starts with
-        // `__create__` as an inline-create sentinel (isCreateOption in
-        // ui/shared/webviewScripts.ts / filterableSelectLogic.ts) — the click
-        // handler returns without selecting it. Provider `type:"select"` fields
-        // have no inline-create handler, so such an option is impossible to choose
-        // or persist (silently inert). Reject it at the registration boundary.
-        // Empty-string value (the "(None)" sentinel) is still allowed — only the
-        // reserved prefix is off-limits.
-        if ((opt as { value: string }).value.startsWith("__create__")) {
-          throw new Error(`Inventory provider configFields entry "${f.id}" has a select option whose value uses the reserved "__create__" prefix.`);
-        }
-      }
-    }
-    if (seenFieldIds.has(f.id)) {
-      throw new Error(`Inventory provider configFields has a duplicate field id "${f.id}".`);
-    }
-    seenFieldIds.add(f.id);
-  }
+  const configFields = copyConfigFields(obj.configFields);
   if (typeof obj.testConnection !== "function") {
     throw new Error("Inventory provider must implement testConnection().");
   }
@@ -209,7 +132,169 @@ function checkProviderShape(provider: unknown): readonly string[] | undefined {
   // leaves it out of every list it builds, and a duplicate is one entry in the
   // matcher's Set (and at worst a repeated word in that list) — so refusing the
   // provider's whole registration, sync and all, would cost far more than the entry.
-  return copyAttributeKeys(obj.attributeKeys);
+  return { configFields, attributeKeys: copyAttributeKeys(obj.attributeKeys) };
+}
+
+/**
+ * `configFields` as the registry keeps it: a frozen plain array of frozen plain
+ * field objects, a select's `options` included, holding only the members
+ * `InventoryConfigField` declares. Throws, naming the entry's index or the
+ * field's id, on anything a consumer could not take.
+ *
+ * WHY A COPY (issue #195) — `copyAttributeKeys`' reason, with more riding on it.
+ * Every consumer calls the list's methods: the source form's `some`, `find` and
+ * `flatMap`, the collection parse's `for…of`, the sync's required-secret loop,
+ * and `computeProviderFingerprint`'s `map`, which runs on every path that spends
+ * a source's credentials. On the provider's own array each of those is code the
+ * provider controls, and the array, its field objects and each select's
+ * `options` are data it can change after this check. So a list that passed here
+ * could still throw out of the form or the fingerprint later, far from the
+ * registration that caused it, and a provider could change the fields a user had
+ * confirmed without registering again.
+ *
+ * WHAT IT KEEPS, and why no more: the members `InventoryConfigField` declares,
+ * each one checked below, and a select's options as `{ label, value }`. Any
+ * other member of an option is dropped because the form renders an option's
+ * `description` and `fillValue` through `escapeHtml` when present, and a
+ * non-select field's stray `options` is dropped because nothing reads it. The
+ * checks therefore cover exactly what the copy holds.
+ *
+ * HOW: `copyAttributeKeys`' rules at every level — one pass by index over
+ * `length` read once, and each entry, each member and each option read once and
+ * checked as it is copied. That function says why not spread, `Array.from`,
+ * `slice` or a check loop followed by a separate copy.
+ */
+function copyConfigFields(value: unknown): readonly InventoryConfigField[] {
+  if (!Array.isArray(value)) {
+    throw new Error("Inventory provider configFields must be an array.");
+  }
+  const length = value.length;
+  const fields: InventoryConfigField[] = [];
+  const seenFieldIds = new Set<string>();
+  for (let i = 0; i < length; i++) {
+    const entry: unknown = value[i];
+    if (typeof entry !== "object" || entry === null) {
+      throw new Error(`Inventory provider configFields entry ${i} must be an object.`);
+    }
+    const f = entry as Record<string, unknown>;
+    const id = f.id;
+    if (typeof id !== "string" || id.length === 0) {
+      throw new Error(`Inventory provider configFields entry ${i} must have a non-empty id.`);
+    }
+    const label = f.label;
+    if (typeof label !== "string" || label.length === 0) {
+      throw new Error(`Inventory provider configFields entry "${id}" must have a non-empty label.`);
+    }
+    const type = f.type;
+    if (typeof type !== "string" || !VALID_FIELD_TYPES.has(type as InventoryConfigFieldType)) {
+      throw new Error(`Inventory provider configFields entry "${id}" has an invalid type "${String(type)}".`);
+    }
+    const field: InventoryConfigField = { id, label, type: type as InventoryConfigFieldType };
+    // ISSUE #187 — the source form renders both through `escapeHtml`, which
+    // calls `replaceAll` on its argument, so a number here made the Add/Edit
+    // Source form throw as it rendered.
+    for (const member of ["placeholder", "description"] as const) {
+      const text = f[member];
+      if (text !== undefined) {
+        if (typeof text !== "string") {
+          throw new Error(`Inventory provider configFields entry "${id}" has a non-string ${member}.`);
+        }
+        field[member] = text;
+      }
+    }
+    // ISSUE #187 — read as truthy flags by the form and the collection parse,
+    // so `advanced: "no"` filed a field under Advanced options and
+    // `required: "no"` made it mandatory, with nothing naming the schema.
+    //
+    // REVIEW D2 — `integer` fails the same silent way: `integer: "yes"`
+    // constrains a field the provider never meant to constrain, and `integer: 0`
+    // leaves one it did mean to constrain wide open.
+    for (const member of ["required", "advanced", "integer"] as const) {
+      const flag = f[member];
+      if (flag !== undefined) {
+        if (typeof flag !== "boolean") {
+          throw new Error(`Inventory provider configFields entry "${id}" has a non-boolean ${member} flag.`);
+        }
+        field[member] = flag;
+      }
+    }
+    // MINOR-14 (EVE-NG review) — `defaultValue` is part of the field contract
+    // (the Add form seeds a boolean field from it). A non-boolean value would be
+    // silently coerced by the form's `=== true` read, so a documented default of
+    // "yes" becomes an unchecked box — reject it at the boundary.
+    const defaultValue = f.defaultValue;
+    if (defaultValue !== undefined) {
+      if (typeof defaultValue !== "boolean") {
+        throw new Error(`Inventory provider configFields entry "${id}" has a non-boolean defaultValue.`);
+      }
+      field.defaultValue = defaultValue;
+    }
+    // REVIEW L3 — the twin of the `defaultValue` clause above, for the same
+    // class of typo and on the same public boundary. Checked for EVERY field
+    // type, exactly as `defaultValue` is: a bound is ignored on a non-number
+    // field, but a malformed one there is still a typo worth naming rather than
+    // a shape worth accepting.
+    //
+    // Two things go wrong silently without this. A NON-FINITE bound makes the
+    // collection-side re-check in `formValuesToProviderConfig` INERT — `numeric
+    // < min` is false when `min` is NaN, so the bound the provider documented is
+    // not enforced anywhere — while still rendering into the input's native
+    // `min`/`max` attribute, where the browser reads it as no bound either. And
+    // a TRANSPOSED pair declares a field no value can ever satisfy: every save
+    // is refused, by both layers, with nothing to say the schema is at fault.
+    for (const bound of ["min", "max"] as const) {
+      const limit = f[bound];
+      if (limit !== undefined) {
+        if (typeof limit !== "number" || !Number.isFinite(limit)) {
+          throw new Error(`Inventory provider configFields entry "${id}" has a non-finite ${bound} (a bound must be a finite number when present).`);
+        }
+        field[bound] = limit;
+      }
+    }
+    if (field.min !== undefined && field.max !== undefined && field.min > field.max) {
+      throw new Error(`Inventory provider configFields entry "${id}" declares min ${field.min} greater than max ${field.max}, which no value can satisfy.`);
+    }
+    if (type === "select") {
+      const rawOptions = f.options;
+      const optionCount = Array.isArray(rawOptions) ? rawOptions.length : 0;
+      if (optionCount === 0) {
+        throw new Error(`Inventory provider configFields entry "${id}" of type "select" must declare a non-empty options array.`);
+      }
+      const invalidOption = `Inventory provider configFields entry "${id}" has an invalid select option (each option needs a non-empty string label and a string value).`;
+      const options: { label: string; value: string }[] = [];
+      for (let j = 0; j < optionCount; j++) {
+        const option: unknown = (rawOptions as unknown[])[j];
+        if (typeof option !== "object" || option === null) {
+          throw new Error(invalidOption);
+        }
+        const { label: optionLabel, value: optionValue } = option as Record<string, unknown>;
+        if (typeof optionLabel !== "string" || optionLabel.length === 0 || typeof optionValue !== "string") {
+          throw new Error(invalidOption);
+        }
+        // RESERVED SENTINEL NAMESPACE (PR #64 Codex review round 3, P2 — issue #48
+        // PR-E). The webview treats ANY select option whose value starts with
+        // `__create__` as an inline-create sentinel (isCreateOption in
+        // ui/shared/webviewScripts.ts / filterableSelectLogic.ts) — the click
+        // handler returns without selecting it. Provider `type:"select"` fields
+        // have no inline-create handler, so such an option is impossible to choose
+        // or persist (silently inert). Reject it at the registration boundary.
+        // Empty-string value (the "(None)" sentinel) is still allowed — only the
+        // reserved prefix is off-limits.
+        if (optionValue.startsWith("__create__")) {
+          throw new Error(`Inventory provider configFields entry "${id}" has a select option whose value uses the reserved "__create__" prefix.`);
+        }
+        options.push(Object.freeze({ label: optionLabel, value: optionValue }));
+      }
+      field.options = options;
+      Object.freeze(options);
+    }
+    if (seenFieldIds.has(id)) {
+      throw new Error(`Inventory provider configFields has a duplicate field id "${id}".`);
+    }
+    seenFieldIds.add(id);
+    fields.push(Object.freeze(field));
+  }
+  return Object.freeze(fields);
 }
 
 /**
@@ -268,6 +353,8 @@ interface RegisteredProvider {
  */
 export class InventoryProviderRegistry {
   private readonly providers = new Map<string, RegisteredProvider>();
+  /** Keyed by the provider object, not its id — see `configFieldsOf`. */
+  private readonly configFieldsByProvider = new WeakMap<InventoryProvider, readonly InventoryConfigField[]>();
   private readonly listeners = new Set<ProviderRegistryListener>();
 
   /**
@@ -298,11 +385,13 @@ export class InventoryProviderRegistry {
   }
 
   public register(provider: InventoryProvider): ProviderRegistration {
-    const registration: RegisteredProvider = { provider, attributeKeys: checkProviderShape(provider) };
+    const { configFields, attributeKeys } = checkProviderShape(provider);
+    const registration: RegisteredProvider = { provider, attributeKeys };
     if (this.providers.has(provider.id)) {
       throw new Error(`An inventory provider with id "${provider.id}" is already registered.`);
     }
     this.providers.set(provider.id, registration);
+    this.configFieldsByProvider.set(provider, configFields);
     // AFTER the map write, so a listener that repaints from the registry sees
     // the provider it was just told about. A rejected registration (duplicate
     // id, bad shape) throws above and never reaches here — nothing changed, so
@@ -357,6 +446,38 @@ export class InventoryProviderRegistry {
    */
   public attributeKeysOf(id: string): readonly string[] | undefined {
     return this.providers.get(id)?.attributeKeys;
+  }
+
+  /**
+   * The `configFields` of `provider`, as copied when it registered
+   * (`copyConfigFields`): a frozen plain array of frozen field objects. Read the
+   * fields here, never off the provider — its own array is the one whose methods
+   * and iterator it controls, and whose contents it can change after the check.
+   * That includes `computeProviderFingerprint`'s input: the fingerprint hashes
+   * this copy, so it describes the fields that were checked, and a provider
+   * cannot change the fields a user confirmed without registering again.
+   *
+   * KEYED BY THE PROVIDER OBJECT, NOT BY ITS ID, unlike `attributeKeysOf`,
+   * because of how the consumers hold a provider. Add Source picks one and then
+   * waits on a form; Edit Source, Sync, node control and the web console resolve
+   * one and then wait on the trust modal. The id can be disposed or registered
+   * again while they wait. A lookup by id would then answer with nothing, or with
+   * the replacement's fields, so a form would be parsed against a schema other
+   * than the one it rendered, and a fingerprint would combine one registrant's
+   * label with another's fields. Looked up by the object, the answer is always
+   * the copy taken when that provider object last registered. It lasts as long as something
+   * still holds the provider, including after the registration is disposed.
+   *
+   * Throws for a provider this registry never accepted. The command layer only
+   * ever holds providers that `get` or `list` returned, so this is a bug in the
+   * caller, and `[]` would hide it behind a form with no provider fields.
+   */
+  public configFieldsOf(provider: InventoryProvider): readonly InventoryConfigField[] {
+    const configFields = this.configFieldsByProvider.get(provider);
+    if (configFields === undefined) {
+      throw new Error(`Inventory provider "${provider.id}" was never registered with this registry.`);
+    }
+    return configFields;
   }
 
   public list(): InventoryProvider[] {
