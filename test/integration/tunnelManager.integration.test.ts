@@ -200,27 +200,50 @@ class ObservedForwardConnection extends DirectTcpSshConnection {
   }
 }
 
+class RefusedForwardConnection extends DirectTcpSshConnection {
+  public override async requestForwardIn(_bindAddr: string, _bindPort: number): Promise<number> {
+    throw new Error("Remote forwarding refused");
+  }
+}
+
 class DelayedReplacementFactory implements SshFactory {
   public readonly replacementLoginStarted = deferred<void>();
   public readonly finishReplacementLogin = deferred<void>();
+  public readonly replacementForwardRequested = deferred<void>();
+  public readonly replacementConnections: ObservedForwardConnection[];
+  private firstReplacementLogin = true;
 
   public constructor(
     private readonly retiredServerId: string,
     private readonly replacementServerId: string,
     public readonly retiredConnection: HeldForwardConnection,
     public readonly replacementConnection: ObservedForwardConnection
-  ) {}
+  ) {
+    this.replacementConnections = [replacementConnection];
+    this.observeReplacementForward(replacementConnection);
+  }
 
   public async connect(server: ServerConfig): Promise<SshConnection> {
     if (server.id === this.retiredServerId) {
       return this.retiredConnection;
     }
     if (server.id === this.replacementServerId) {
-      this.replacementLoginStarted.resolve(undefined);
-      await this.finishReplacementLogin.promise;
-      return this.replacementConnection;
+      if (this.firstReplacementLogin) {
+        this.firstReplacementLogin = false;
+        this.replacementLoginStarted.resolve(undefined);
+        await this.finishReplacementLogin.promise;
+        return this.replacementConnection;
+      }
+      const connection = new ObservedForwardConnection();
+      this.replacementConnections.push(connection);
+      this.observeReplacementForward(connection);
+      return connection;
     }
     throw new Error(`Unexpected server ${server.id}`);
+  }
+
+  private observeReplacementForward(connection: ObservedForwardConnection): void {
+    void connection.forwardRequested.promise.then(() => this.replacementForwardRequested.resolve(undefined));
   }
 }
 
@@ -451,6 +474,30 @@ describe("TunnelManager integration", () => {
     await manager.stop(activeTunnel.id);
   });
 
+  it("reports an unexpected close of the active shared SSH connection", async () => {
+    const profile: TunnelProfile = {
+      id: "tunnel-shared-close",
+      name: "Shared Close Tunnel",
+      localPort: await getFreePort(),
+      remoteIP: "127.0.0.1",
+      remotePort: 22,
+      autoStart: false,
+      connectionMode: "shared"
+    };
+    const sshFactory = new DirectTcpSshFactory();
+    manager = new TunnelManager(sshFactory, sshFactory);
+    const events: TunnelEvent[] = [];
+    manager.onDidChange((event) => events.push(event));
+
+    const activeTunnel = await manager.start(profile, testServer, { connectionMode: "shared" });
+    sshFactory.lastConnection?.dispose();
+
+    expect(events.filter((event) => event.type === "error").map((event) => event.message)).toContain(
+      `Shared SSH connection closed for tunnel ${profile.name}`
+    );
+    await manager.stop(activeTunnel.id);
+  });
+
   it("starts and stops a reverse tunnel", async () => {
     const localPort = await getFreePort();
     echoServer = await startEchoServer(localPort);
@@ -483,7 +530,7 @@ describe("TunnelManager integration", () => {
 
   it("waits for a retired bind when a same-route reverse start finishes logging in", async () => {
     const retiredServer = { ...testServer, id: "server-retired" };
-    const replacementServer = { ...testServer, id: "server-replacement" };
+    const replacementServer = { ...testServer, id: "server-replacement", multiplexing: false };
     const retiredConnection = new HeldForwardConnection();
     const replacementConnection = new ObservedForwardConnection();
     const factory = new DelayedReplacementFactory(
@@ -494,6 +541,8 @@ describe("TunnelManager integration", () => {
     );
     const pool = new TrackingConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 }, replacementServer.id);
     manager = new TunnelManager(pool, pool);
+    const events: TunnelEvent[] = [];
+    manager.onDidChange((event) => events.push(event));
     const terminalLease = await pool.connect(retiredServer);
 
     const profile = (id: string): TunnelProfile => ({
@@ -537,12 +586,16 @@ describe("TunnelManager integration", () => {
       ]);
       expect(beforeRetiredTransportCloses).toBe("candidate-disposed");
       expect(replacementConnection.forwardAttempts).toBe(0);
+      expect(events.filter((event) => event.type === "error").map((event) => event.message)).not.toContain(
+        `Shared SSH connection closed for tunnel ${replacementProfile.name}`
+      );
 
       // The pooled connection remains open for the terminal lease, so the
       // replacement must wait until that lease releases the retired bind.
       terminalLease.dispose();
-      await replacementConnection.forwardRequested.promise;
+      await factory.replacementForwardRequested.promise;
       await expect(replacementResult).resolves.toBe("started");
+      expect(factory.replacementConnections[1]?.forwardAttempts).toBe(1);
 
       const replacementTunnelId = manager.getActiveTunnelId(replacementProfile.id);
       expect(replacementTunnelId).toBeDefined();
@@ -553,6 +606,38 @@ describe("TunnelManager integration", () => {
       terminalLease.dispose();
       await manager.stopAll();
       await Promise.all([retiredResult, replacementResult]);
+      pool.dispose();
+    }
+  });
+
+  it("does not report an expected close when a reverse forward is refused", async () => {
+    const connection = new RefusedForwardConnection();
+    const factory: SshFactory = { connect: async () => connection };
+    const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
+    manager = new TunnelManager(pool, pool);
+    const events: TunnelEvent[] = [];
+    manager.onDidChange((event) => events.push(event));
+    const profile: TunnelProfile = {
+      id: "reverse-refused",
+      name: "Refused reverse tunnel",
+      localPort: 12345,
+      remoteIP: "127.0.0.1",
+      remotePort: 23456,
+      autoStart: false,
+      tunnelType: "reverse",
+      remoteBindAddress: "127.0.0.1",
+      localTargetIP: "127.0.0.1"
+    };
+    const server = { ...testServer, multiplexing: false };
+    const closeMessage = `Shared SSH connection closed for tunnel ${profile.name}`;
+
+    try {
+      await expect(manager.start(profile, server)).rejects.toThrow("Remote forwarding refused");
+      expect(events.filter((event) => event.type === "error").map((event) => event.message)).not.toContain(
+        closeMessage
+      );
+    } finally {
+      await manager.stopAll();
       pool.dispose();
     }
   });

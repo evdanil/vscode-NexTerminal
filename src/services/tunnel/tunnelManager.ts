@@ -584,7 +584,11 @@ export class TunnelManager {
           throw new TunnelStoppedError(profile.name);
         }
         if ("error" in outcome) {
-          // Refused, or stopped meanwhile: either way nobody else will release it.
+          // Refused, or stopped meanwhile: discard this start and do not let
+          // its expected close be reported as an unexpected shared-transport loss.
+          if (runtime.sharedConnection === sshConnection) {
+            runtime.sharedConnection = undefined;
+          }
           sshConnection.dispose();
           throw runtime.isStopping ? new TunnelStoppedError(profile.name) : outcome.error;
         }
@@ -912,10 +916,13 @@ export class TunnelManager {
     runtime.sshConnections.add(sharedConnection);
     sharedConnection.onClose(() => {
       runtime.sshConnections.delete(sharedConnection);
-      if (runtime.sharedConnection === sharedConnection) {
+      const wasCurrentConnection = runtime.sharedConnection === sharedConnection;
+      if (wasCurrentConnection) {
         runtime.sharedConnection = undefined;
       }
-      if (!runtime.isStopping && this.activeTunnels.has(activeTunnelId)) {
+      // A discarded candidate can close while its runtime remains active; it
+      // is an error only when the connection that just closed was still current.
+      if (wasCurrentConnection && !runtime.isStopping && this.activeTunnels.has(activeTunnelId)) {
         this.emit({
           type: "error",
           tunnelId: activeTunnelId,
