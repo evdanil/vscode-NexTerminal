@@ -74,7 +74,6 @@ import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { setActiveMacroStore } from "../../src/macroSettings";
 import {
   buildServerMacroPicks,
-  commandReadsIpmiEnv,
   ipmiCredentialsOffNote,
   runMacroOnServer,
   sessionIpmiHintNote
@@ -1071,20 +1070,21 @@ describe("nexus.server.runMacro — IPMI credential injection (issue #48 §3.3)"
     expect("env" in createdTerminals[0].options).toBe(false);
   });
 
-  it("tells the user why an unflagged IPMI macro will fail, and still runs it", async () => {
+  it("suggests the checkbox for a simple unflagged local `-E` macro, and still runs it", async () => {
     await setMacros([{ id: "a", name: "SOL", text: SOL_TEXT, runIn: "localTerminal" }]);
     await pickFirst();
 
     await runMacroOnServer(ipmiContext(VAULTED), { server: ipmiServer() });
 
-    // Runs (a silent no-op would be worse than the failure it is warning about)…
+    // The note is a suggestion; the terminal command still runs.
     expect(createdTerminals).toHaveLength(1);
-    // …and says what to do about it, in the channel that survives to the end of
-    // the run.
+    // It says where the checkbox lives in the channel that survives to the end
+    // of the run.
     const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join(" ");
     // C4 — shortened so the actionable tail survives the 4s status-bar clip.
     expect(status).toContain("IPMI credentials were not provided");
     expect(status).toContain("Provide IPMI credentials");
+    expect(status).not.toMatch(/will fail|fail on/);
   });
 
   it("says nothing when a flagged macro runs, or when a local macro has nothing to do with IPMI", async () => {
@@ -1269,252 +1269,62 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
 });
 
 /**
- * Issue #151 — the credentials hint names a remedy ("tick Provide IPMI
- * credentials"), so it may only fire where that remedy can change the run: where
- * something in the macro reads the password from the environment the checkbox
- * fills. ipmitool reads it ONLY under `-E` (upstream ipmi_main.c: the one
- * `getenv("IPMITOOL_PASSWORD"/"IPMI_PASSWORD")` is in the `-E` branch); `-P`,
- * `-f` and `-a` supply it themselves, and with none of them ipmitool prompts. A
- * command that names the variable reads it too, and a non-ipmitool command using
- * the IPMI tokens may (a script can read it internally), so both keep the hint.
+ * Issue #151 — the checkbox advice is intentionally narrow. It is shown only
+ * for one plain local ipmitool command with -E and a standalone IPMI profile
+ * token; complex shell text does not make the detector guess.
  */
-describe("ipmiCredentialsOffNote — fires only where something reads the password environment (#151)", () => {
+describe("ipmiCredentialsOffNote — narrow local ipmitool credential hint (#151)", () => {
   const local = (text: string): TerminalMacro => ({ id: "a", name: "SOL", text, runIn: "localTerminal" });
   const hint = (text: string): string | undefined => ipmiCredentialsOffNote(local(text));
 
-  it("still hints for an unflagged local `-E` command — the one ipmitool form the checkbox repairs", () => {
-    expect(hint(" ipmitool -H ${profile.ipmiHost} -E sol activate\n")).toContain('tick "Provide IPMI credentials"');
-  });
-
-  it("returns nothing for every ipmitool form that gets its password another way — ⊘ special-casing only `-a`", () => {
-    expect(hint(" ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
-    expect(hint(" ipmitool -H ${profile.ipmiHost} -P hunter2 sol activate\n")).toBeUndefined();
-    expect(hint(" ipmitool -H ${profile.ipmiHost} -f ~/.bmcpass sol activate\n")).toBeUndefined();
-    // No password option at all: in its default auth mode, ipmitool prompts ("Password: ") when -H is given.
-    expect(hint(" ipmitool -I lanplus -H ${profile.ipmiHost} -U ${profile.ipmiUsername} sol activate\n")).toBeUndefined();
-  });
-
-  it("returns nothing when the only `-E` belongs to a wrapper or a piped command — ⊘ an unscoped `-E` check", () => {
-    // sudo's preserve-environment flag and grep's extended-regex flag, not ipmitool's.
-    expect(hint(" sudo -E ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
-    expect(hint(" ipmitool -H ${profile.ipmiHost} -a sel list | grep -E Critical\n")).toBeUndefined();
-  });
-
-  it("does not count a redirection target as an ipmitool flag in the credentials hint", () => {
-    expect(hint(" ipmitool -H ${profile.ipmiHost} -a >-E\n")).toBeUndefined();
-  });
-
-  it("does not treat a quoted here-document body as an executable command", () => {
-    expect(
-      hint(" ipmitool -H ${profile.ipmiHost} -a sol activate\ncat <<'EOF'\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n")
-    ).toBeUndefined();
-  });
-
-  it("checks an executable shell here-document body for IPMI environment reads", () => {
-    expect(
-      hint("sh <<'EOF'\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n")
-    ).toContain('tick "Provide IPMI credentials"');
+  it.each([
+    ["no line ending", "ipmitool -H ${profile.ipmiHost} -E sol activate"],
+    ["one LF", " ipmitool -H ${profile.ipmiHost} -U ${profile.ipmiUsername} -E sol activate\n"],
+    ["one CRLF after horizontal whitespace", "  ipmitool -H ${profile.ipmiHost} -E sol activate \t\r\n"]
+  ])("suggests credentials for one simple command ending with %s", (_ending, text) => {
+    expect(hint(text)).toContain('tick "Provide IPMI credentials"');
   });
 
   it.each([
-    ["stdin dup of fd 0", "sh <<'EOF' 0<&0\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n"],
-    ["stdin dup of fd 3", "sh 3<<'EOF' 0<&3\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n"],
-    ["cat pipeline into sh", "cat <<'EOF' | sh\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n"]
-  ])("keeps the credential hint when here-document stdin reaches a shell through %s", (_route, text) => {
-    expect(hint(text as string) ?? "", text).toContain('tick "Provide IPMI credentials"');
+    ["no IPMI profile token", "ipmitool -H 10.0.0.9 -E sol activate\n"],
+    ["no -E flag", "ipmitool -H ${profile.ipmiHost} -a sol activate\n"],
+    ["an explicit password beside -E", "ipmitool -H ${profile.ipmiHost} -E -P secret sol activate\n"],
+    ["an attached -P password beside -E", "ipmitool -H ${profile.ipmiHost} -E -Psecret sol activate\n"],
+    ["a password file beside -E", "ipmitool -H ${profile.ipmiHost} -E -f /etc/bmc.pass sol activate\n"],
+    ["an attached password file beside -E", "ipmitool -H ${profile.ipmiHost} -E -f/etc/bmc.pass sol activate\n"],
+    ["an interactive prompt beside -E", "ipmitool -H ${profile.ipmiHost} -E -a sol activate\n"],
+    ["authentication disabled with -A NONE", "ipmitool -H ${profile.ipmiHost} -E -A NONE sol activate\n"],
+    ["authentication disabled with attached -ANONE", "ipmitool -H ${profile.ipmiHost} -E -ANONE sol activate\n"],
+    ["authentication disabled with lowercase -A none", "ipmitool -H ${profile.ipmiHost} -E -A none sol activate\n"],
+    ["two terminal line endings", "ipmitool -H ${profile.ipmiHost} -E sol activate\n\n"],
+    ["a bare carriage return", "ipmitool -H ${profile.ipmiHost} -E sol activate\r"],
+    ["an executable path", "/usr/bin/ipmitool -H ${profile.ipmiHost} -E sol activate\n"],
+    ["a wrapper", "sudo ipmitool -H ${profile.ipmiHost} -E sol activate\n"],
+    ["a shell script", "sh -c 'ipmitool -H ${profile.ipmiHost} -E sol activate'\n"],
+    ["a quoted token", 'ipmitool -H "${profile.ipmiHost}" -E sol activate\n'],
+    ["a token embedded in an argument", "ipmitool -H host${profile.ipmiHost} -E sol activate\n"],
+    ["a pipeline", "ipmitool -H ${profile.ipmiHost} -E sol activate | tee log\n"],
+    ["a redirection", "ipmitool -H ${profile.ipmiHost} -E sol activate >log\n"],
+    ["a command substitution", "ipmitool -H ${profile.ipmiHost} -E $(echo sol) activate\n"],
+    ["a line continuation", "ipmitool -H ${profile.ipmiHost} " + "\\" + "\n-E sol activate\n"],
+    ["multiple commands", "ipmitool -H ${profile.ipmiHost} -E sol activate; echo done\n"],
+    ["an additional line", "ipmitool -H ${profile.ipmiHost} -E sol activate\necho done\n"],
+    ["an executable here-document", "sh <<'EOF'\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n"],
+    ["a textual mention", "echo 'use ipmitool -H ${profile.ipmiHost} -E'\n"],
+    ["a comment with a command-like phrase", "# ipmitool -H ${profile.ipmiHost} -E sol activate\n"]
+  ])("does not suggest credentials for %s", (_shape, text) => {
+    expect(hint(text)).toBeUndefined();
   });
 
-  it("keeps later pipeline routing aligned after parsing an earlier executable here-document", () => {
-    expect(
-      hint(
-        "sh <<'FIRST'\necho first\nFIRST\ncat <<'SECOND' | sh\nipmitool -H ${profile.ipmiHost} -E sol activate\nSECOND\n"
-      ) ?? ""
-    ).toContain('tick "Provide IPMI credentials"');
-  });
-
-  it("keeps executable here-documents with their shell command across pipelines and separators", () => {
-    for (const text of [
-      "sh <<'EOF' | cat\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n",
-      "sh <<'EOF'; echo done\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n"
-    ]) {
-      expect(hint(text) ?? "", text).toContain('tick "Provide IPMI credentials"');
-    }
-  });
-
-  it("does not scan a cat here-document just because a later shell command is present", () => {
-    expect(
-      hint("cat <<'EOF'; sh </dev/null\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n")
-    ).toBeUndefined();
-  });
-
-  it("does not count an I/O descriptor as a shell script argument", () => {
-    for (const text of [
-      "sh <<'EOF' 2>/dev/null\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n",
-      "sh 0<<'EOF'\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n"
-    ]) {
-      expect(hint(text) ?? "", text).toContain('tick "Provide IPMI credentials"');
-    }
-  });
-
-  it("does not scan a shell here-document when a later stdin redirection replaces it", () => {
-    expect(
-      hint("sh <<'EOF' </dev/null\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n")
-    ).toBeUndefined();
-  });
-
-  it("recognizes `-s -- arguments` as a shell script read from stdin", () => {
-    expect(
-      hint("sh -s -- argument <<'EOF'\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n")
-      ?? ""
-    ).toContain('tick "Provide IPMI credentials"');
-  });
-
-  it("matches tab-stripped `<<-` terminators before parsing following commands", () => {
-    expect(
-      hint(" ipmitool -H ${profile.ipmiHost} -a sol activate\ncat <<-EOF\n\tipmitool -a sol activate\n\tEOF\nipmitool -E sol activate\n")
-    ).toContain("Provide IPMI credentials");
-  });
-
-  /**
-   * "Is this segment an ipmitool invocation?" is decided by the COMMAND POSITION
-   * — the first word after `NAME=value` assignments and the known prefixes
-   * (`sudo`, `env`, `exec`, `time`, `nice`, `timeout`, with their options), basename exactly
-   * `ipmitool` — never by the word appearing somewhere in the segment.
-   */
-  it("treats a WRAPPER whose name merely contains 'ipmitool' as a token consumer that keeps the hint — ⊘ a `\\bipmitool\\b` word match", () => {
-    // `-`, `.` and `/` are word boundaries, so `\bipmitool\b` finds "ipmitool" in
-    // each name — and classing a wrapper as ipmitool suppressed the hint for a
-    // script that may read the env itself.
-    expect(hint(" /opt/bin/my-ipmitool-wrapper ${profile.ipmiHost} sol\n")).toContain("Provide IPMI credentials");
-    expect(hint(" ipmitool.sh ${profile.ipmiHost} ${profile.ipmiUsername}\n")).toContain("Provide IPMI credentials");
-  });
-
-  it("does not treat a QUOTED mention of `ipmitool -E` as an ipmitool invocation that reads the env", () => {
-    // The echo reads nothing; the only real invocation is `-a`. ⊘ the word match,
-    // which saw "ipmitool -E" inside the quotes and restored the dead-end hint.
-    expect(hint(' ipmitool -H ${profile.ipmiHost} -a sol activate; echo "next time use ipmitool -E"\n')).toBeUndefined();
-  });
-
-  it("finds ipmitool in command position behind assignments, prefixes and a path — ⊘ first-word-only / no-basename parsing", () => {
-    expect(hint(" sudo -E ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
-    expect(hint(" LANG=C ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
-    expect(hint(" /usr/bin/ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
-    // A subshell's `(` is not the command (#174): ⊘ taking `(ipmitool` as the command word.
-    expect(hint(" (ipmitool -H ${profile.ipmiHost} -a sol activate)\n")).toBeUndefined();
-    expect(hint(" ( ipmitool -H ${profile.ipmiHost} -a sol activate )\n")).toBeUndefined();
-    // `timeout` and its DURATION are looked through (Codex on #191).
-    expect(hint(" timeout 30 ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
-    // sudo's `-E` after an operand named "ipmitool" is not ipmitool's (Codex on #191).
-    expect(hint(" sudo -u ipmitool -E ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
-    // A quoted command word is the same command to the shell (Codex on #191).
-    expect(hint(' sudo "ipmitool" -H ${profile.ipmiHost} -a sol activate\n')).toBeUndefined();
-    // …and still reads ipmitool's own `-E` once it is found there.
-    expect(hint(" sudo -E /usr/bin/ipmitool -H ${profile.ipmiHost} -E sol activate\n")).toContain(
-      "Provide IPMI credentials"
-    );
-  });
-
-  it("consumes a prefix option's OPERAND, so a user or argv[0] named 'ipmitool' is not the command — ⊘ skipping only option-shaped words", () => {
-    // sudo runs bmc-login AS the user "ipmitool"; exec runs bmc-login with argv[0] "ipmitool".
-    expect(hint(" sudo -u ipmitool /opt/bin/bmc-login ${profile.ipmiHost}\n")).toContain("Provide IPMI credentials");
-    expect(hint(" exec -a ipmitool bmc-login ${profile.ipmiHost}\n")).toContain("Provide IPMI credentials");
-    // …and the command AFTER the operand is still found.
-    expect(hint(" sudo -u root ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
-    expect(hint(" nice -n 10 ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
-  });
-
-  it("reads option clusters and inline operands the way getopt does — ⊘ first-letter-only / always-next-word", () => {
-    // `-Eu root`: E is a flag, u takes the NEXT word. `-uroot`: u's operand is inline.
-    expect(hint(" sudo -Eu root ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
-    expect(hint(" sudo -uroot ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
-    expect(hint(" sudo --user=root ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
-  });
-
-  it("keeps the hint when a prefix option rewrites the command line (`env -S`) — ⊘ treating it as an ordinary operand or flag", () => {
-    // `env -S bmc-wrap ipmitool …` runs `bmc-wrap ipmitool …`: the command is
-    // bmc-wrap, which may read the env. Ambiguous prefix parsing must keep the hint.
-    expect(hint(" env -S bmc-wrap ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toContain(
-      "Provide IPMI credentials"
-    );
-    expect(hint(" env --split-string=bmc-wrap ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toContain(
-      "Provide IPMI credentials"
-    );
-  });
-
-  /**
-   * Codex on #191 — quotes and backslashes are read the way a POSIX shell reads
-   * them (`shellSegments`): inside single quotes a backslash is literal, inside
-   * double quotes it escapes only `$`, `` ` ``, `"`, `\` and newline, and a `;`,
-   * `&` or `|` splits commands only outside quotes.
-   */
-  it("reads a backslash inside quotes as literal, so `'\\-E'` is not ipmitool's `-E` — ⊘ treating every backslash as an escape", () => {
-    expect(hint(" ipmitool -H ${profile.ipmiHost} '\\-E' sol activate\n")).toBeUndefined();
-  });
-
-  it("reads `\"\\-E\"` as a literal backslash too — ⊘ escaping any character inside double quotes", () => {
-    expect(hint(' ipmitool -H ${profile.ipmiHost} "\\-E" sol activate\n')).toBeUndefined();
-  });
-
-  it("reads an unquoted `\\-E` as `-E` — ⊘ never treating a backslash as an escape", () => {
-    expect(hint(" ipmitool -H ${profile.ipmiHost} \\-E sol activate\n")).toContain("Provide IPMI credentials");
-  });
-
-  it("keeps `-U \"ops;admin\" -E` one command — ⊘ splitting segments at a quoted separator", () => {
-    expect(hint(' ipmitool -H ${profile.ipmiHost} -U "ops;admin" -E sol activate\n')).toContain("Provide IPMI credentials");
-  });
-
-  it("still splits at the `;` after a closed quote — ⊘ a quote state that never closes", () => {
-    expect(hint(" echo 'a;b'; ipmitool -H ${profile.ipmiHost} -E sol activate\n")).toContain("Provide IPMI credentials");
-    // With `-a` the ipmitool segment needs no hint; an unclosed quote would merge it
-    // into the echo segment and bring the token-consumer hint back.
-    expect(hint(" echo 'a;b'; ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
-  });
-
-  it("does not let an apostrophe in a shell comment hide a later env-reading command", () => {
-    const text =
-      " ipmitool -H ${profile.ipmiHost} -a # don't inspect the next command\n bmc-helper ${profile.ipmiHost}\n";
-    expect(hint(text)).toContain("Provide IPMI credentials");
-  });
-
-  it("still hints when an ipmitool command takes the password from the variable by name — ⊘ 'no -E ⇒ never reads the env'", () => {
-    // The shell expands it into argv: the checkbox is exactly what makes this work.
-    expect(hint(' ipmitool -H ${profile.ipmiHost} -P "$IPMI_PASSWORD" sol activate\n')).toContain(
-      "Provide IPMI credentials"
-    );
-  });
-
-  it("still hints when another ipmitool line in the same macro reads the env (`-E`) — ⊘ 'any -a silences it'", () => {
-    const text = " ipmitool -H ${profile.ipmiHost} -a chassis power status\n ipmitool -H ${profile.ipmiHost} -E sol activate\n";
-    expect(hint(text)).toContain("Provide IPMI credentials");
-  });
-
-  it("still hints when a NON-ipmitool command beside an `-a` line uses the IPMI tokens — it may read the env itself", () => {
-    // ⊘ a macro-wide stand-down keyed on the ipmitool line alone.
-    const text = " ipmitool -H ${profile.ipmiHost} -a sol activate\n bmc-login.sh ${profile.ipmiHost} ${profile.ipmiUsername}\n";
-    expect(hint(text)).toContain("Provide IPMI credentials");
-  });
-
-  it("still hints when a command beside an `-a` line names the variable in any shell's syntax — ⊘ token-only detection", () => {
-    // No IPMI token in the second command, so only the variable's NAME says it reads the env.
-    for (const reader of [
-      "curl -u admin:${IPMI_PASSWORD} https://bmc.example/redfish/v1/",
-      "curl -u admin:$env:IPMITOOL_PASSWORD https://bmc.example/redfish/v1/",
-      "curl -u admin:%IPMI_PASSWORD% https://bmc.example/redfish/v1/"
-    ]) {
-      expect(hint(` ipmitool -H \${profile.ipmiHost} -a sol activate\n ${reader}\n`), reader).toContain(
-        "Provide IPMI credentials"
-      );
-    }
+  it.each([
+    ["-a", "ipmitool -H ${profile.ipmiHost} -a sol activate\n"],
+    ["-P", "ipmitool -H ${profile.ipmiHost} -P secret sol activate\n"],
+    ["-f", "ipmitool -H ${profile.ipmiHost} -f /etc/bmc.pass sol activate\n"]
+  ])("does not suggest credentials when ipmitool supplies its password with %s", (_flag, text) => {
+    expect(hint(text)).toBeUndefined();
   });
 });
 
-/**
- * Issue #48 PR-C — jump-host IPMI routing (Path B). Every fixture here is built
- * to fail against a specific wrong implementation: the withdrawn "gateway set ⇒
- * route everything" design, tokens resolved on the wrong server, a routing that
- * refuses the run instead of falling back, and a hint keyed on the server's
- * gateway rather than on IPMI-token usage.
- */
 describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", () => {
   const GW_SOL = " ipmitool -H ${profile.ipmiHost} -a sol activate\n";
 
@@ -2160,202 +1970,5 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
       expect(IPMI_GATEWAY_INERT_CREDENTIALS_HINT).not.toContain("makes it ask in the gateway terminal");
       expect(IPMI_GATEWAY_INERT_CREDENTIALS_HINT).toContain("when authentication is enabled");
     });
-  });
-});
-
-describe("commandReadsIpmiEnv — ipmitool `-E` env-password flag detection", () => {
-  it("matches a standalone `-E` that is an argument of an ipmitool invocation", () => {
-    expect(commandReadsIpmiEnv("ipmitool -I lanplus -H x -U y -E sol activate")).toBe(true);
-    expect(commandReadsIpmiEnv("ipmitool -H 10.0.0.9 -E sol activate")).toBe(true);
-    expect(commandReadsIpmiEnv("ipmitool -E chassis power status")).toBe(true);
-    // A prefix before ipmitool is looked through — ipmitool is still the command.
-    expect(commandReadsIpmiEnv("sudo ipmitool -E sol activate")).toBe(true);
-    // A path is fine — the command's basename is ipmitool.
-    expect(commandReadsIpmiEnv("/usr/bin/ipmitool -H 10.0.0.9 -E sol activate")).toBe(true);
-  });
-
-  it("matches a QUOTED standalone `-E` the shell strips to `-E` (Codex round 7 P2)", () => {
-    // `ipmitool '-E' sol activate` / `ipmitool "-E" sol activate`: the shell strips
-    // the quotes and ipmitool receives a standalone `-E`. Round 6 required
-    // horizontal whitespace immediately before the dash and returned false here —
-    // this asserts a quote delimiter around `-E` is accepted too.
-    expect(commandReadsIpmiEnv("ipmitool '-E' sol activate")).toBe(true);
-    expect(commandReadsIpmiEnv('ipmitool "-E" sol activate')).toBe(true);
-  });
-
-  it("matches `-E` at end of line and before a trailing newline (same segment)", () => {
-    expect(commandReadsIpmiEnv("ipmitool sol activate -E")).toBe(true);
-    expect(commandReadsIpmiEnv("ipmitool sol activate -E\n")).toBe(true);
-  });
-
-  it("matches a compact `-E` bounded by a shell metacharacter, not just whitespace/quote (Codex round 8 P2)", () => {
-    // The shell treats `-E` as a standalone flag and the following metacharacter
-    // as its own token, so ipmitool still receives a bare `-E`. Round 7's
-    // `(?=[\s'"]|$)` accepted only whitespace/quote/end and returned false for
-    // `-E>` etc. — red against 3c38972, green after closing the terminator class.
-    expect(commandReadsIpmiEnv("ipmitool -E>/tmp/ipmi.log chassis power status")).toBe(true);
-    expect(commandReadsIpmiEnv("ipmitool -E</dev/null sol")).toBe(true);
-    expect(commandReadsIpmiEnv("ipmitool -E;echo done")).toBe(true);
-    expect(commandReadsIpmiEnv("ipmitool -E|tee log")).toBe(true);
-    expect(commandReadsIpmiEnv("(ipmitool -E)")).toBe(true);
-  });
-
-  it("matches a `-E` on a backslash-CONTINUED line of the ipmitool command (Codex round 6 P2)", () => {
-    // A backslash-newline joins the lines into one command; the continued `-E` is
-    // still an ipmitool argument. Round 5's `[^;&|\n]*` stopped at the newline and
-    // returned false here — this asserts the normalized predicate returns true.
-    expect(commandReadsIpmiEnv("ipmitool -I lanplus \\\n  -E sol activate")).toBe(true);
-    // Multi-line continuation.
-    expect(commandReadsIpmiEnv("ipmitool -I lanplus \\\n  -H x -U y \\\n  -E sol activate")).toBe(true);
-    // CRLF continuation.
-    expect(commandReadsIpmiEnv("ipmitool -I lanplus \\\r\n  -E sol activate")).toBe(true);
-  });
-
-  it("does NOT match a `-E` that starts the line after an ipmitool command at a BARE (unescaped) newline (round-6 residual false positive)", () => {
-    // An unescaped newline is a real command boundary; the next-line `-E` is not an
-    // argument of the ipmitool call above it. Round 5's `\s`-before-`-E` spanned the
-    // bare newline and returned TRUE here — this asserts the horizontal-whitespace
-    // predicate returns false.
-    expect(commandReadsIpmiEnv("ipmitool -a sol activate\n-E foo")).toBe(false);
-    expect(commandReadsIpmiEnv("ipmitool -a sol activate\r\n-E foo")).toBe(false);
-  });
-
-  it("does NOT match a `-E` owned by a WRAPPER before ipmitool (the round-5 false positive)", () => {
-    // `sudo -E ipmitool … -a`: the `-E` is sudo's preserve-environment and comes
-    // BEFORE ipmitool; ipmitool itself uses `-a` and prompts. Round 4's predicate
-    // returned true here — this asserts the scoped predicate returns false.
-    expect(commandReadsIpmiEnv("sudo -E ipmitool -I lanplus -H x -U y -a sol activate")).toBe(false);
-    // Leading `-E` with no ipmitool argument of its own.
-    expect(commandReadsIpmiEnv("-E ipmitool -a")).toBe(false);
-  });
-
-  it("does NOT match a `-E` in a PIPED non-ipmitool segment", () => {
-    // `[^;&|\n]*` stops at the `|`, so the `grep -E` on the far side is out of scope.
-    expect(commandReadsIpmiEnv("ipmitool -a sol activate | grep -E foo")).toBe(false);
-  });
-
-  it("does NOT match a `-E` behind a `;`/`&` command separator from the ipmitool call", () => {
-    // `[^;&|\n]*` cannot cross a `;`, `&` or `|`, so a `-E` in a following command
-    // is out of the ipmitool segment's scope.
-    expect(commandReadsIpmiEnv("ipmitool -a sol; -E chassis")).toBe(false);
-    expect(commandReadsIpmiEnv("ipmitool -a sol && -E chassis")).toBe(false);
-    // No ipmitool token at all.
-    expect(commandReadsIpmiEnv("first line\n-E chassis")).toBe(false);
-  });
-
-  it("does NOT match when the command word is not ipmitool (`ipmitoolx`)", () => {
-    expect(commandReadsIpmiEnv("ipmitoolx -E")).toBe(false);
-  });
-
-  it("does NOT match where 'ipmitool' is a word but not the COMMAND (#174) — ⊘ the `\\bipmitool\\b` word match", () => {
-    // A wrapper's name, a quoted mention, a prefix option's operand: each has
-    // "ipmitool" followed by a standalone `-E` in one segment.
-    expect(commandReadsIpmiEnv("/opt/bin/my-ipmitool-wrapper -H x -E sol activate")).toBe(false);
-    expect(commandReadsIpmiEnv('echo "use ipmitool -E"')).toBe(false);
-    expect(commandReadsIpmiEnv("sudo -u ipmitool bmc-login -E")).toBe(false);
-    // …while the ipmitool invocation beside them is still read.
-    expect(commandReadsIpmiEnv('echo "use ipmitool -E"; ipmitool -H x -E sol activate')).toBe(true);
-  });
-
-  it("reads `-E` only after the command word, and a subshell `(` but not arithmetic `((` (Codex on #191)", () => {
-    // sudo's `-E` after an operand named "ipmitool" is not ipmitool's.
-    expect(commandReadsIpmiEnv("sudo -u ipmitool -E ipmitool -a sol activate")).toBe(false);
-    expect(commandReadsIpmiEnv("sudo -u ipmitool ipmitool -E sol activate")).toBe(true);
-    // `((…))` is arithmetic, not a command; nested subshells `( (…) )` are.
-    expect(commandReadsIpmiEnv("((ipmitool -E))")).toBe(false);
-    expect(commandReadsIpmiEnv("( (ipmitool -E) )")).toBe(true);
-    // `timeout` runs its argument after its options and DURATION.
-    expect(commandReadsIpmiEnv("timeout 30 ipmitool -H x -E sol activate")).toBe(true);
-    expect(commandReadsIpmiEnv("timeout --signal=KILL 30 ipmitool -H x -E sol activate")).toBe(true);
-  });
-
-  it("reads command words, prefix names and `-E` the way the shell does, quotes and escapes removed (Codex on #191)", () => {
-    for (const word of ['"ipmitool"', "'ipmitool'", "ipmitool''", 'ip"mi"tool', "\\ipmitool", '/usr/bin/"ipmitool"']) {
-      expect(commandReadsIpmiEnv(`${word} -H x -E sol activate`), word).toBe(true);
-    }
-    expect(commandReadsIpmiEnv('"sudo" -u x ipmitool -E sol activate')).toBe(true);
-    expect(commandReadsIpmiEnv("'timeout' 30 ipmitool -E sol activate")).toBe(true);
-    // A quoted or escaped `-E` is still `-E` to ipmitool…
-    for (const flag of ['-"E"', "\\-E", "-E''"]) {
-      expect(commandReadsIpmiEnv(`ipmitool -H x ${flag} sol activate`), flag).toBe(true);
-    }
-    // …and a quoted prefix option is still the prefix's: sudo's `-E`, ipmitool's `-a`.
-    expect(commandReadsIpmiEnv('sudo "-E" ipmitool -a sol activate')).toBe(false);
-    expect(commandReadsIpmiEnv("sudo '-E' ipmitool -E sol activate")).toBe(true);
-    // The basename is taken before dequoting, so a Windows path keeps its separators
-    // (⊘ dequoting first, which reads `C:toolsipmitool`)…
-    expect(commandReadsIpmiEnv("C:\\tools\\ipmitool -H x -E sol activate")).toBe(true);
-    // …and an assignment is recognised as written: a quoted one is the command name.
-    expect(commandReadsIpmiEnv('"LANG=C" ipmitool -E sol activate')).toBe(false);
-  });
-
-  it("follows POSIX quoting for backslashes and separators (Codex on #191)", () => {
-    // A backslash is literal inside single quotes and escapes only $ ` " \ and
-    // newline inside double quotes, so ipmitool receives `\-E`, not `-E`…
-    expect(commandReadsIpmiEnv("ipmitool -H x '\\-E' sol activate")).toBe(false);
-    expect(commandReadsIpmiEnv('ipmitool -H x "\\-E" sol activate')).toBe(false);
-    // …and a `;`, `&` or `|` inside quotes or escaped does not end the command.
-    expect(commandReadsIpmiEnv('ipmitool -H x -U "ops;admin" -E sol activate')).toBe(true);
-    expect(commandReadsIpmiEnv("ipmitool -H x -U 'a|b&c' -E sol activate")).toBe(true);
-    expect(commandReadsIpmiEnv("ipmitool -H x -U ops\\;admin -E sol activate")).toBe(true);
-    expect(commandReadsIpmiEnv("echo 'a;b'; ipmitool -H x -E sol activate")).toBe(true);
-  });
-
-  it("does NOT match `-E` embedded in another word", () => {
-    expect(commandReadsIpmiEnv("ipmitool -Example sol")).toBe(false);
-    expect(commandReadsIpmiEnv("foo-E bar")).toBe(false);
-    expect(commandReadsIpmiEnv("ipmitool -Env")).toBe(false);
-    // A quoted `-Example` must not match either — the char after -E is `x`, a
-    // word-continuation char, so the trailing negative lookahead rejects it
-    // (Codex round 7/8 P2).
-    expect(commandReadsIpmiEnv("ipmitool '-Example'")).toBe(false);
-  });
-
-  it("does NOT match a `-E` immediately glued to a word-continuation char (`=`/`/`), Codex round 8 P2", () => {
-    // `-E=foo` and `-E/path` are single ipmitool tokens, NOT a standalone `-E`
-    // followed by a redirection — the char after -E (`=`/`/`) is a
-    // word-continuation char, so the closed terminator class rejects them. This
-    // is the pair the round-8 lookahead must NOT over-accept while it starts
-    // accepting `-E>`.
-    expect(commandReadsIpmiEnv("ipmitool -E=foo sol")).toBe(false);
-    expect(commandReadsIpmiEnv("ipmitool -E/path sol")).toBe(false);
-  });
-
-  it("does not count redirection targets as ipmitool arguments, but keeps a flag before redirection (PR #191 P2)", () => {
-    expect(commandReadsIpmiEnv("ipmitool -H x -a >-E")).toBe(false);
-    expect(commandReadsIpmiEnv("ipmitool -H x -a <-E")).toBe(false);
-    expect(commandReadsIpmiEnv("ipmitool -H x -a <<-E\n")).toBe(false);
-    // The operator starts after this argument, so the real `-E` still belongs
-    // to ipmitool; the output path does not.
-    expect(commandReadsIpmiEnv("ipmitool -E>/tmp/ipmi.log sol")).toBe(true);
-  });
-
-  it("recognizes a CRLF here-document delimiter before parsing following commands (PR #191 P2)", () => {
-    expect(
-      commandReadsIpmiEnv("cat <<'EOF'\r\nipmitool -a sol activate\r\nEOF\r\nipmitool -E sol activate\r\n")
-    ).toBe(true);
-  });
-
-  it("ignores unquoted comments and starts a fresh command after their newline", () => {
-    expect(commandReadsIpmiEnv("ipmitool -H x -a # ipmitool -E\n")).toBe(false);
-    expect(commandReadsIpmiEnv("ipmitool -H x -a # don't parse this quote\nipmitool -H x -E sol")).toBe(true);
-  });
-
-  it("keeps escaped, quoted and word-internal hash characters in shell words", () => {
-    for (const user of ["\\#ops", "'#ops'", '"#ops"', "ops#admin"]) {
-      expect(commandReadsIpmiEnv(`ipmitool -H x -U ${user} -E sol`), user).toBe(true);
-    }
-  });
-
-  it("does NOT match a QUOTED `-E` owned by a wrapper before ipmitool (round 7 P2)", () => {
-    // `sudo '-E' ipmitool … -a`: the quoted `-E` is still BEFORE ipmitool; ipmitool
-    // itself uses `-a`. Dequoted, `'-E'` is sudo's own flag, and `-E` is read only
-    // among the arguments AFTER the command word.
-    expect(commandReadsIpmiEnv("sudo '-E' ipmitool -I lanplus -H x -U y -a sol activate")).toBe(false);
-  });
-
-  it("does NOT match a command with no `-E` flag", () => {
-    expect(commandReadsIpmiEnv("ipmitool -H 10.0.0.9 -a sol activate")).toBe(false);
-    expect(commandReadsIpmiEnv("show version")).toBe(false);
   });
 });

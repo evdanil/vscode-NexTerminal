@@ -477,19 +477,17 @@ checkbox fills in from that same auth profile. Right-click a server in the
 Connectivity Hub → **Run Macro on Server…**, pick the macro, and the completed
 command runs in a fresh local terminal.
 
-A macro that uses `${profile.ipmiHost}` or `${profile.ipmiUsername}` **without**
-the checkbox still runs. `ipmitool -E` then prompts or fails on its own, and the
-send confirmation tells you which switch is missing. It says so only when
-something in the macro would read the password from the environment: ipmitool
-with `-E`, a command that uses `IPMI_PASSWORD` or `IPMITOOL_PASSWORD` itself, or
-another command that uses the IPMI tokens. An ipmitool command that gets its
-password another way is not told to tick it, because the checkbox would change
-nothing: `-P` and `-f` supply the password, `-a` makes ipmitool ask for it, and
-so does leaving out every password option on a command that reaches the BMC
-with `-H` — unless `-A NONE` turns authentication off, in which case no password
-is used at all. Token usage is a hint, never an authorization: a macro's text is
-something anyone can write, so it can never be what decides that a stored
-password is handed over.
+A macro still runs if it uses `${profile.ipmiHost}` or
+`${profile.ipmiUsername}` without the checkbox; Nexus simply does not add the
+IPMI password to its environment. To avoid misleading advice, the send
+confirmation suggests the checkbox only for a very simple local command: a
+bare `ipmitool` invocation with `-E` and a whole IPMI profile token argument.
+Wrappers, scripts, shell operators, quoting, multiple commands, and other
+ambiguous forms are deliberately left alone. It also stays silent when the
+command supplies another password source (`-a`, `-P`, or `-f`) or disables
+authentication with `-A NONE`. This conservative suggestion is not an
+authorization check: macro text never decides whether a stored password is
+handed over; only the checkbox does.
 
 On a macro whose **Run on** is *The server's IPMI gateway*, the checkbox does
 nothing: Nexus doesn't send IPMI credentials to a gateway session. ipmitool
@@ -533,8 +531,8 @@ afterwards, in a notification that names both.
 
 The macro text does not change, which is what makes the reset easy to miss. A
 restored **IPMI SOL console** still says `-E`, but no password reaches its
-environment, so ipmitool prompts or fails on its own. A restored **IPMI SOL
-console (via jump host)** now runs its `-a` command on *this* machine, against a
+environment. A restored **IPMI SOL console (via jump host)** now runs its `-a`
+command on *this* machine, against a
 BMC that may only be reachable from the gateway — the send confirmation points
 you back at **Run on**, but only once the command has gone out. So after a
 restore, open the IPMI macros you trust and put back what they had: tick

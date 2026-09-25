@@ -15,7 +15,7 @@ import { bindingToDisplayLabel } from "../macroBindings";
 import { sanitizeMacroGroup } from "../services/macroFolders";
 import { formatProfileTokenErrorForCommand, hasProfileTokens, profileTokenLabel, profileTokensUsed, resolveProfileTokens } from "../services/profileTokens";
 import type { ProfileTokenError, ProfileTokenErrorCommandSubject, ProfileTokenForm } from "../services/profileTokens";
-import { IPMI_PASSWORD_ENV_VARS, profileTokenServer, resolveIpmiTerminalEnv, type ProfileTokenServer } from "./ipmiCredentials";
+import { profileTokenServer, resolveIpmiTerminalEnv, type ProfileTokenServer } from "./ipmiCredentials";
 import { VARIABLE_MARKER } from "../ui/macroVariableMarker";
 import { resolveMacroBrowserUrl } from "../utils/browserUrl";
 import { macroWillPrompt } from "./macroCommands";
@@ -228,585 +228,68 @@ function usesIpmiTokens(text: string): boolean {
   return profileTokensUsed(text).some((token) => token === "ipmiHost" || token === "ipmiUsername");
 }
 
+const IPMI_PROFILE_TOKEN_WORD_RE = /^\$\{profile\.ipmi(?:Host|Username)\}$/;
+const SIMPLE_IPMITOOL_ARGUMENT_RE = /^[A-Za-z0-9._:/=-]+$/;
+
+function hasAlternativeIpmiPasswordOption(args: readonly string[]): boolean {
+  return args.some((arg, index) => {
+    if (arg === "-a" || /^-[A-Za-z0-9]*a[A-Za-z0-9]*$/.test(arg)) {
+      return true;
+    }
+    if (arg.startsWith("-P") || arg.startsWith("-f")) {
+      return true;
+    }
+    if (arg === "-A") {
+      return args[index + 1]?.toUpperCase() === "NONE";
+    }
+    return /^-A(?:=)?NONE$/i.test(arg);
+  });
+}
+
 /**
- * The caveat for a local-terminal macro that reaches for a BMC but was never
- * ticked to receive its password — appended to the delivery report, exactly like
- * the unknown-token note.
- *
- * DISCOVERABILITY, NOT SILENCE. Such a run is not broken: `ipmitool -E` with no
- * variable in the environment says so itself, in the user's own visible
- * terminal, and may ask for the password if a remote host is named with `-H`
- * and authentication is not disabled with `-A NONE`. What it cannot say is that
- * Nexus has the password and was not asked to hand it over, which is the one
- * thing the user needs to fix — and where.
- *
- * ONLY WHERE SOMETHING READS THAT ENVIRONMENT (#151). The note names a remedy, so
- * it fires only where ticking the box can change the run —
- * `macroMayReadIpmiPasswordEnv`. ipmitool reads the variable only under `-E`;
- * `-a`, `-P` and `-f` supply the password themselves, and with none of them a
- * remote (`-H`) command prompts (upstream ipmi_main.c, "If no password was
- * specified by any other method … then prompt the user") unless `-A NONE` turns
- * authentication off and no password is used at all — so for all of those the
- * advice is a dead end. The case that
- * exposed it is a RESTORED "IPMI SOL console (via jump host)": import strips its
- * `route`, so its `-a` command runs here, and the remedy that works is "Run on" —
- * which `routeReconsentNote` names when the server has a gateway. The command is
- * the signal, not the missing route: the strip leaves no marker, and the shipped
- * jump-host macro falling back to local on a gateway-less server has the same
- * dead end with its route intact.
- *
- * Lowercase, unpunctuated: it is appended as a clause.
+ * Whether this is one plain local ipmitool command that uses the IPMI profile
+ * and opts into reading its password from the environment, without another
+ * password source or disabled authentication. The hint is useful only when the
+ * checkbox is a clear remedy, so ambiguous shell text deliberately gets none.
+ */
+function simpleIpmitoolNeedsProfilePassword(text: string): boolean {
+  const command = text.endsWith("\r\n") ? text.slice(0, -2) : text.endsWith("\n") ? text.slice(0, -1) : text;
+  if (/[\r\n]/.test(command)) {
+    return false;
+  }
+
+  const normalized = command.replace(/^[\t ]+|[\t ]+$/g, "");
+  if (!normalized) {
+    return false;
+  }
+
+  const words = normalized.split(/[\t ]+/);
+  const args = words.slice(1);
+  return (
+    words[0] === "ipmitool" &&
+    args.includes("-E") &&
+    args.some((word) => IPMI_PROFILE_TOKEN_WORD_RE.test(word)) &&
+    !hasAlternativeIpmiPasswordOption(args) &&
+    args.every((word) => SIMPLE_IPMITOOL_ARGUMENT_RE.test(word) || IPMI_PROFILE_TOKEN_WORD_RE.test(word))
+  );
+}
+
+/**
+ * A concise suggestion for the one command shape where the checkbox is an
+ * obvious remedy: one local, unquoted `ipmitool` command with an IPMI profile
+ * token and `-E`. Complex shell text is left to the terminal, which can explain
+ * its own behavior more accurately than a text scan can.
  */
 export function ipmiCredentialsOffNote(macro: TerminalMacro): string | undefined {
   if (resolveMacroRunTarget(macro) !== "localTerminal" || macroProvidesIpmiCredentials(macro)) {
     return undefined;
   }
-  // C4 — kept short so the actionable tail survives the 4s status bar clip; the
-  // fuller explanation now lives in the persistent macro-editor hint (B1). No
-  // trailing period: the status line (macroVariablePrompt.ts) adds its own.
-  return usesIpmiTokens(macro.text) && macroMayReadIpmiPasswordEnv(macro.text)
+  // C4 — keep the actionable tail short so it survives the status-bar clip.
+  return simpleIpmitoolNeedsProfilePassword(macro.text)
     ? 'IPMI credentials were not provided — tick "Provide IPMI credentials" in the macro editor'
     : undefined;
 }
 
-/**
- * The password variables named in a command, in any shell's syntax —
- * `$IPMI_PASSWORD`, `${IPMITOOL_PASSWORD}`, PowerShell's `$env:IPMI_PASSWORD`,
- * cmd's `%IPMI_PASSWORD%`, `printenv IPMI_PASSWORD` — so the NAME is what is
- * matched, not a syntax. Case-insensitive because Windows environment names
- * are; the cost of an over-match is only the pre-#151 hint.
- */
-const IPMI_PASSWORD_VAR_RE = new RegExp(`\\b(?:${IPMI_PASSWORD_ENV_VARS.join("|")})\\b`, "i");
-
-/**
- * Could ticking "Provide IPMI credentials" change this macro's run? Decided per
- * command segment (`shellSegments`), and true if ANY segment may read the
- * password environment:
- *
- *  - it names a password variable (`ipmitool -P "$IPMI_PASSWORD"` reads it
- *    through the shell, whatever ipmitool's own flags say);
- *  - its command is ipmitool and its arguments use `-E` (`commandReadsIpmiEnv`) —
- *    ipmitool's ONLY environment read (upstream ipmi_main.c keeps `getenv` of
- *    both names inside its `-E` branch);
- *  - its command is anything else and it uses an IPMI token — a script may read
- *    the variable internally, invisible in the text, so it keeps the generic hint.
- *
- * Per segment rather than macro-wide, so one `ipmitool -a` line cannot silence
- * the hint for a different command in the same terminal that does read it. A
- * text-derived HINT only (§3.3), never an authorization input.
- */
-function macroMayReadIpmiPasswordEnv(text: string): boolean {
-  return shellSegments(text).segments.some((words) => {
-    const segment = words.map((word) => word.raw).join(" ");
-    const args = ipmitoolArguments(words);
-    return (
-      IPMI_PASSWORD_VAR_RE.test(segment) ||
-      (args === undefined ? usesIpmiTokens(segment) : passesEnvFlag(args))
-    );
-  });
-}
-
-/**
- * The options of a word that runs the word after them as the command, as far as
- * this parser needs to know them: single-letter flags, single-letter options
- * taking an operand (getopt: the rest of the word, else the next word), and the
- * long forms of each (`--name=value` or `--name value`), plus how many
- * positional operands come between those options and the command (timeout's
- * DURATION).
- */
-interface PrefixOptions {
-  readonly flags: string;
-  readonly operands: string;
-  readonly longFlags: readonly string[];
-  readonly longOperands: readonly string[];
-  readonly positionals?: number;
-}
-
-/**
- * The prefixes `ipmitoolArguments` looks through. Deliberately partial: an
- * option not listed makes the parse AMBIGUOUS, and ambiguity keeps the hint.
- * Left out on purpose: sudo's `-e`/`-l`/`-v`/`-V`/`-K` (the next word is then a
- * file or nothing, not a command run) and env's `-S`/`--split-string` (it
- * rewrites argv, so the word after it is not necessarily the command).
- * `nice -10` (the legacy adjustment) is read as flags `1` and `0`.
- */
-const COMMAND_PREFIXES: ReadonlyMap<string, PrefixOptions> = new Map([
-  [
-    "sudo",
-    {
-      flags: "AbBEHiknNPSs",
-      operands: "aCcDghpRrTtUu",
-      longFlags: [
-        "askpass",
-        "background",
-        "bell",
-        "preserve-env",
-        "set-home",
-        "login",
-        "reset-timestamp",
-        "non-interactive",
-        "no-update",
-        "preserve-groups",
-        "stdin",
-        "shell"
-      ],
-      longOperands: [
-        "user",
-        "group",
-        "close-from",
-        "chdir",
-        "host",
-        "prompt",
-        "role",
-        "type",
-        "other-user",
-        "command-timeout",
-        "chroot",
-        "login-class",
-        "auth-type"
-      ]
-    }
-  ],
-  ["env", { flags: "i0v", operands: "Cu", longFlags: ["ignore-environment", "null", "debug"], longOperands: ["chdir", "unset"] }],
-  ["exec", { flags: "cl", operands: "a", longFlags: [], longOperands: [] }],
-  ["nice", { flags: "0123456789", operands: "n", longFlags: [], longOperands: ["adjustment"] }],
-  ["time", { flags: "apqv", operands: "fo", longFlags: ["append", "portability", "quiet", "verbose"], longOperands: ["format", "output"] }],
-  [
-    "timeout",
-    { flags: "fpv", operands: "ks", longFlags: ["foreground", "preserve-status", "verbose"], longOperands: ["kill-after", "signal"], positionals: 1 }
-  ]
-]);
-
-/**
- * How many FOLLOWING words an option word of a prefix consumes (0 or 1), or
- * `undefined` when this parser cannot place it — an unknown option, or a known
- * one whose operand rewrites the command line.
- */
-function prefixOptionOperandWords(options: PrefixOptions, word: string): 0 | 1 | undefined {
-  if (word.startsWith("--")) {
-    const [name, ...inline] = word.slice(2).split("=");
-    if (options.longFlags.includes(name)) {
-      return 0;
-    }
-    if (options.longOperands.includes(name)) {
-      return inline.length > 0 ? 0 : 1;
-    }
-    return undefined;
-  }
-  for (let i = 1; i < word.length; i++) {
-    if (options.operands.includes(word[i])) {
-      return i === word.length - 1 ? 1 : 0;
-    }
-    if (!options.flags.includes(word[i])) {
-      return undefined;
-    }
-  }
-  return 0;
-}
-
-/** A shell word as written (`raw`) and as the command receives it (`value`). */
-interface ShellWord {
-  readonly raw: string;
-  readonly value: string;
-  readonly redirectionTarget?: boolean;
-  readonly redirection?: ShellRedirection;
-}
-
-interface ShellRedirection {
-  readonly fileDescriptor: number;
-  readonly operator: string;
-  readonly hereDocumentStripTabs?: boolean;
-}
-
-interface HereDocument {
-  readonly delimiter: string;
-  readonly stripTabs: boolean;
-  readonly ownerWords: ShellWord[];
-  readonly target: ShellWord;
-}
-
-interface HereDocumentBody {
-  readonly text: string;
-  readonly afterDelimiter: number;
-}
-
-/** Read a here-document through its delimiter, including CRLF-terminated lines. */
-function readHereDocumentBody(text: string, start: number, hereDocument: HereDocument): HereDocumentBody | undefined {
-  let lineStart = start;
-  while (lineStart <= text.length) {
-    const newline = text.indexOf("\n", lineStart);
-    const lineEnd = newline < 0 ? text.length : newline;
-    const line = text.slice(lineStart, lineEnd);
-    const candidate = (hereDocument.stripTabs ? line.replace(/^\t+/, "") : line).replace(/\r$/, "");
-    if (candidate === hereDocument.delimiter) {
-      return {
-        text: text.slice(start, lineStart),
-        afterDelimiter: newline < 0 ? text.length : newline + 1
-      };
-    }
-    if (newline < 0) {
-      return undefined;
-    }
-    lineStart = newline + 1;
-  }
-  return undefined;
-}
-
-/**
- * A macro's command segments, each a list of words, read with POSIX quoting and
- * nothing more — no expansion, no general parse (Codex on #191). A `;`, `&`, `|`
- * or newline ends a segment only outside quotes and unescaped; `<` and `>`
- * redirection operators end a word and mark their following word as a target,
- * so `>-E` is not an ipmitool flag while `-E>/tmp/log` still is. A `#` at a
- * word boundary outside quotes skips to the newline. Inside single quotes
- * everything is literal; inside double quotes a backslash escapes only `$`,
- * `` ` ``, `"`, `\` and newline; outside quotes it escapes the next character;
- * a backslash-newline joins the lines except inside single quotes. So
- * `-U "ops;admin" -E` stays one command, `"ipmitool"`, `ip"mi"tool`, `-"E"` and
- * `\-E` read as the shell reads them, and `'\-E'` and `"\-E"` reach the command
- * as `\-E`, not `-E`. Here-document bodies are skipped through their matching
- * delimiter, with `<<-` matching after leading tabs are stripped; executable
- * shell-script bodies are parsed, and only routes known to be inert are skipped.
- */
-interface ShellSegmentParseResult {
-  readonly segments: ShellWord[][];
-  readonly separators: string[];
-}
-
-function shellSegments(text: string): ShellSegmentParseResult {
-  const segments: ShellWord[][] = [];
-  const segmentSeparators: string[] = [];
-  let words: ShellWord[] = [];
-  let raw = "";
-  let value = "";
-  let quote = "";
-  let redirectionTarget = false;
-  let pendingRedirection: ShellRedirection | undefined;
-  const hereDocuments: HereDocument[] = [];
-  const endWord = (): void => {
-    if (raw) {
-      const word: ShellWord = {
-        raw,
-        value,
-        redirectionTarget,
-        ...(pendingRedirection ? { redirection: pendingRedirection } : {})
-      };
-      words.push(word);
-      if (redirectionTarget && pendingRedirection?.hereDocumentStripTabs !== undefined) {
-        hereDocuments.push({
-          delimiter: value,
-          stripTabs: pendingRedirection.hereDocumentStripTabs,
-          ownerWords: words,
-          target: word
-        });
-      }
-      redirectionTarget = false;
-      pendingRedirection = undefined;
-    }
-    raw = value = "";
-  };
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    const next = text[i + 1] ?? "";
-    if (quote === "'") {
-      quote = c === "'" ? "" : quote;
-      value += c === "'" ? "" : c;
-      raw += c;
-    } else if (c === "\\" && /^\r?\n/.test(text.slice(i + 1, i + 3))) {
-      i += next === "\r" ? 2 : 1;
-    } else if (c === "\\" && next && (!quote || '$`"\\'.includes(next))) {
-      raw += c + next;
-      value += next;
-      i++;
-    } else if (quote === '"') {
-      quote = c === '"' ? "" : quote;
-      value += c === '"' ? "" : c;
-      raw += c;
-    } else if (!quote && c === "#" && !raw) {
-      const newline = text.indexOf("\n", i);
-      if (newline < 0) break;
-      i = newline - 1;
-    } else if (c === "'" || c === '"') {
-      quote = c;
-      raw += c;
-    } else if (/[;&|\n]/.test(c)) {
-      endWord();
-      segments.push(words);
-      segmentSeparators.push(c);
-      words = [];
-      if (c === "\n" && hereDocuments.length > 0) {
-        let bodyStart = i + 1;
-        const scriptBodies: string[] = [];
-        let complete = true;
-        for (const hereDocument of hereDocuments) {
-          const body = readHereDocumentBody(text, bodyStart, hereDocument);
-          if (body === undefined) {
-            i = text.length;
-            complete = false;
-            break;
-          }
-          bodyStart = body.afterDelimiter;
-          if (hereDocumentDisposition(hereDocument, segments, segmentSeparators) !== "inert") {
-            scriptBodies.push(body.text);
-          }
-        }
-        if (bodyStart > i + 1) {
-          i = bodyStart - 1;
-        }
-        hereDocuments.length = 0;
-        if (complete) {
-          for (const scriptBody of scriptBodies) {
-            const parsedBody = shellSegments(scriptBody);
-            segments.push(...parsedBody.segments);
-            segmentSeparators.push(...parsedBody.separators);
-          }
-        }
-      }
-    } else if (c === "<" || c === ">") {
-      let fileDescriptor = c === "<" ? 0 : 1;
-      if (/^\d+$/.test(raw)) {
-        fileDescriptor = Number(raw);
-        raw = value = "";
-      } else {
-        endWord();
-      }
-      let operator = c;
-      if (next === c) {
-        i++;
-        if (c === "<" && text[i + 1] === "-") {
-          i++;
-          operator = "<<-";
-        } else if (c === "<" && text[i + 1] === "<") {
-          i++;
-          operator = "<<<";
-        } else {
-          operator += c;
-        }
-      } else if (
-        (c === "<" && (next === ">" || next === "&")) ||
-        (c === ">" && (next === "&" || next === "|"))
-      ) {
-        i++;
-        operator += next;
-      }
-      redirectionTarget = true;
-      pendingRedirection = {
-        fileDescriptor,
-        operator,
-        ...((operator === "<<" || operator === "<<-") ? { hereDocumentStripTabs: operator === "<<-" } : {})
-      };
-    } else if (/[\s)]/.test(c)) {
-      endWord();
-    } else {
-      raw += c;
-      value += c;
-    }
-  }
-  endWord();
-  segments.push(words);
-  segmentSeparators.push("");
-  return { segments, separators: segmentSeparators };
-}
-
-/**
- * The command and argument words after a subshell's opening `(`, `NAME=value`
- * assignments and `COMMAND_PREFIXES` (their options AND those options' operands
- * consumed, getopt-style, then any positional operand such as timeout's
- * DURATION). The command is the basename of the first word left after that
- * parsing. Returning its arguments separately is what keeps an ipmitool flag
- * scan off a prefix: in `sudo -u ipmitool -E ipmitool -a` the `-E` is sudo's.
- *
- * COMMAND POSITION, NOT "THE WORD APPEARS". `\bipmitool\b` also matches inside
- * `my-ipmitool-wrapper`, `ipmitool.sh` and a quoted `echo "use ipmitool -E"`,
- * and skipping only option-SHAPED words took the operand of `sudo -u ipmitool
- * bmc-login` or `exec -a ipmitool bmc-login` for the command. Either mistake
- * classed a token consumer as ipmitool and dropped a hint it may need (#151).
- * Any word this cannot place — an unknown option, env's `-S`, a nested
- * `bash -c "ipmitool …"` — is left ambiguous, keeping the hint conservative.
- */
-interface ShellInvocation {
-  readonly command: string;
-  readonly args: ShellWord[];
-}
-
-/** Resolve one shell segment's command word after assignments and known prefixes. */
-function shellInvocation(segment: readonly ShellWord[]): ShellInvocation | undefined {
-  const words = segment.filter((word) => !word.redirectionTarget);
-  // A subshell's opening "(" (repeatable: "( (") is not a word of the command;
-  // "((" opens arithmetic, which runs no command.
-  while (words.length > 0 && /^\((?!\()/.test(words[0].raw)) {
-    const rest = words[0].raw.slice(1);
-    if (rest) {
-      words[0] = { ...words[0], raw: rest, value: words[0].value.slice(1) };
-    } else {
-      words.shift();
-    }
-  }
-  let options: PrefixOptions | undefined;
-  let positionals = 0;
-  for (let i = 0; i < words.length; i++) {
-    const { raw, value } = words[i];
-    // An assignment is recognised as written — a quoted `"NAME=value"` is a
-    // command name to the shell, not an assignment.
-    if (/^[A-Za-z_]\w*=/.test(raw)) {
-      continue;
-    }
-    const prefix = COMMAND_PREFIXES.get(value);
-    if (prefix) {
-      options = prefix;
-      positionals = prefix.positionals ?? 0;
-      continue;
-    }
-    if (value.startsWith("-")) {
-      if (value === "--" && options) {
-        options = undefined;
-        continue;
-      }
-      const consumed = options ? prefixOptionOperandWords(options, value) : undefined;
-      if (consumed === undefined) {
-        return undefined;
-      }
-      i += consumed;
-      continue;
-    }
-    if (positionals > 0) {
-      positionals--;
-      continue;
-    }
-    // The basename is cut from the word AS WRITTEN, so a Windows-style path
-    // keeps its separators, and only then read as a word.
-    const basename = shellSegments(raw.split(/[\\/]/).pop() ?? "").segments[0][0]?.value;
-    return basename ? { command: basename, args: words.slice(i + 1) } : undefined;
-  }
-  return undefined;
-}
-
-/** The argument words only when the parsed command is `ipmitool`. */
-function ipmitoolArguments(segment: readonly ShellWord[]): ShellWord[] | undefined {
-  const invocation = shellInvocation(segment);
-  return invocation?.command === "ipmitool" ? invocation.args : undefined;
-}
-
-const SHELL_INTERPRETERS = new Set(["ash", "bash", "dash", "ksh", "sh", "zsh"]);
-
-/** Whether a shell invocation consumes a here-document as its script on stdin. */
-function shellReadsStdinScript(segment: readonly ShellWord[]): boolean {
-  const invocation = shellInvocation(segment);
-  if (!invocation || !SHELL_INTERPRETERS.has(invocation.command)) {
-    return false;
-  }
-
-  const args = invocation.args;
-  let scriptFromStdin = false;
-  let optionsEnded = false;
-  for (let i = 0; i < args.length; i++) {
-    const value = args[i].value;
-    if (!optionsEnded && value === "--") {
-      optionsEnded = true;
-      continue;
-    }
-    if (!optionsEnded && value === "-") {
-      return true;
-    }
-    if (!optionsEnded && value.startsWith("--")) {
-      if (value === "--command" || value.startsWith("--command=")) {
-        return false;
-      }
-      if (value === "--rcfile" || value === "--init-file") {
-        i++;
-      }
-      continue;
-    }
-    if (!optionsEnded && value.startsWith("-")) {
-      const options = value.slice(1);
-      if (options.includes("c")) {
-        return false;
-      }
-      if (options.includes("s")) {
-        scriptFromStdin = true;
-      }
-      if (options === "o" || options === "O" || /[oO]$/.test(options)) {
-        i++;
-      }
-      continue;
-    }
-    if (!scriptFromStdin) {
-      return value === "-";
-    }
-  }
-  return true;
-}
-
-type HereDocumentDisposition = "executable" | "inert" | "unknown";
-
-/** Whether this body executes, is known data, or has routing this small parser cannot prove. */
-function hereDocumentDisposition(
-  hereDocument: HereDocument,
-  segments: readonly ShellWord[][],
-  separators: readonly string[]
-): HereDocumentDisposition {
-  const ownerIndex = segments.indexOf(hereDocument.ownerWords);
-  if (ownerIndex < 0) {
-    return "unknown";
-  }
-
-  const owner = hereDocument.ownerWords;
-  const invocation = shellInvocation(owner);
-  if (invocation && SHELL_INTERPRETERS.has(invocation.command)) {
-    const effectiveStdinRedirection = owner
-      .filter(
-        (word) => word.redirection?.fileDescriptor === 0 && word.redirection.operator.startsWith("<")
-      )
-      .at(-1);
-    if (effectiveStdinRedirection?.redirection?.operator === "<&") {
-      // A descriptor duplicate may keep this body connected to stdin. Since
-      // the source descriptor is not part of the command grammar, do not treat
-      // an unfamiliar duplicate as proof that the body cannot execute.
-      return "unknown";
-    }
-    if (hereDocument.target.redirection?.fileDescriptor === 0) {
-      if (effectiveStdinRedirection === hereDocument.target) {
-        return shellReadsStdinScript(owner) ? "executable" : "unknown";
-      }
-      // A later non-duplicating stdin source replaces this queued body.
-      if (effectiveStdinRedirection) {
-        return "inert";
-      }
-    }
-    return "unknown";
-  }
-
-  // A non-shell command in a pipeline can pass this body to a later shell.
-  // Recognize the direct case, but leave other pipeline transformations
-  // unknown rather than assuming their stdin is harmless data.
-  let pipelineIndex = ownerIndex;
-  while (separators[pipelineIndex] === "|") {
-    pipelineIndex++;
-    const pipedSegment = segments[pipelineIndex];
-    if (!pipedSegment) {
-      return "unknown";
-    }
-    const pipedInvocation = shellInvocation(pipedSegment);
-    if (pipedInvocation && SHELL_INTERPRETERS.has(pipedInvocation.command)) {
-      const stdinRedirection = pipedSegment
-        .filter(
-          (word) => word.redirection?.fileDescriptor === 0 && word.redirection.operator.startsWith("<")
-        )
-        .at(-1);
-      if (stdinRedirection) {
-        return stdinRedirection.redirection?.operator === "<&" ? "unknown" : "inert";
-      }
-      return shellReadsStdinScript(pipedSegment) ? "executable" : "unknown";
-    }
-  }
-
-  if (invocation?.command === "cat" && separators[ownerIndex] !== "|") {
-    return "inert";
-  }
-  return "unknown";
-}
-
-/** An `ipmitool …` invocation in a macro's text — at line start or after whitespace. */
 const IPMITOOL_COMMAND_RE = /(^|\s)ipmitool\b/;
 
 /**
@@ -1000,38 +483,6 @@ export function routeReconsentNote(
  */
 export function gatewayInertCredentialsNote(macro: TerminalMacro): string | undefined {
   return (macro.provideIpmiCredentials as unknown) === true ? IPMI_GATEWAY_INERT_CREDENTIALS_HINT : undefined;
-}
-
-/**
- * Whether an ipmitool invocation's ARGUMENTS (`ipmitoolArguments`) pass `-E` —
- * its "read the password from the environment" flag (`IPMITOOL_PASSWORD` /
- * `IPMI_PASSWORD`): a word the shell hands over as exactly `-E` (`shellSegments`
- * — `-E`, `'-E'`, `-"E"`, `\-E`, `-E>/tmp/log`, `-E)`), never `-Example`, `-Env`,
- * `-E=foo`, `-E/path`, `'\-E'` or `"\-E"`.
- *
- * WHERE it looks is the other half: only the words after a command word placed
- * as ipmitool can be ipmitool's flags. A `-E` anywhere in the text would count
- * a WRAPPER's (`sudo -E ipmitool … -a`, sudo's preserve-environment), a PIPED
- * command's (`ipmitool -a … | grep -E …`) or a prefix's after an operand named
- * ipmitool (`sudo -u ipmitool -E ipmitool -a`).
- */
-function passesEnvFlag(args: readonly ShellWord[]): boolean {
-  return args.some((word) => word.value === "-E");
-}
-
-/**
- * Whether a command reads the IPMI password from the environment via ipmitool's
- * `-E` flag: some segment's COMMAND is ipmitool (`ipmitoolArguments`) and its
- * arguments pass `-E` (`passesEnvFlag`). The local credentials hint asks this of
- * each ipmitool segment (`macroMayReadIpmiPasswordEnv`); exported for its unit
- * tests. A text-derived HINT only (§3.3) — never used for authorization, and the
- * command is neither blocked nor rewritten on its account.
- */
-export function commandReadsIpmiEnv(text: string): boolean {
-  return shellSegments(text).segments.some((words) => {
-    const args = ipmitoolArguments(words);
-    return args !== undefined && passesEnvFlag(args);
-  });
 }
 
 /**
