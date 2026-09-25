@@ -42,6 +42,7 @@ import { formatAuthProfileLabel, formatKeyPathDisplayName, normalizeKeyPathForCo
 import { naturalCompare, naturalComparePath } from "../utils/naturalCompare";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 import { pickScriptFromWorkspace } from "../services/scripts/scriptPicker";
+import { captureSessionOutput } from "../services/scripts/sessionOutputCapture";
 import { configMutationLock } from "../services/configMutationLock";
 import { addresslessUnavailableMessage, telnetUnsupportedMessage } from "../utils/protocolGuards";
 
@@ -1501,8 +1502,13 @@ async function connectAndRunScript(ctx: CommandContext, arg?: unknown): Promise<
     resolved = true;
     clearTimeout(timer);
     unsubscribe();
+    // Keep the session's output from now — this change event is its
+    // registration, and nothing has been received yet. runScript reads the
+    // script file before it could watch the output itself, and a device that
+    // answers at once (a Telnet login prompt) would print into that gap.
+    const capture = newSession.pty ? captureSessionOutput(newSession.pty) : undefined;
     // Fire the script — runScript itself logs to the Scripts output channel.
-    void ctx.scriptRuntimeManager!.runScript(scriptUri, newSession.id).catch((err) => {
+    void ctx.scriptRuntimeManager!.runScript(scriptUri, newSession.id, capture).catch((err) => {
       const message = err instanceof Error ? err.message : String(err);
       void vscode.window.showErrorMessage(`Failed to start script after connect: ${message}`);
     });

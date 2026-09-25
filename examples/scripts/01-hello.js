@@ -13,12 +13,13 @@
 // `before` (the output between the previous cursor and this match).
 // On timeout it THROWS. Use `waitFor` if you'd rather get `null`.
 
-// The script only sees output that arrives after it starts. On a terminal that
-// is already open, the prompt is on screen and won't come again; under Connect
-// and Run Script… it usually arrives just after the start. So wait briefly for
-// it (`waitFor` returns null on timeout), and press Enter for a fresh one only
-// if none came — an Enter while the first prompt is on its way would leave a
-// spare prompt for a later wait to match too early.
+// Started on a terminal that is already open, a script sees only output that
+// arrives after it starts, so the prompt on screen won't come again; under
+// Connect and Run Script… on a server it gets everything since the session
+// opened, first prompt included. So wait briefly for it (`waitFor` returns
+// null on timeout), and press Enter for a fresh one only if none came — an
+// Enter while the first prompt is on its way would leave a spare prompt for a
+// later wait to match too early.
 let ready = await waitFor(/[$#] $/, { timeout: 2_000 });
 if (!ready) {
   await sendLine("");

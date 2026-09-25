@@ -4,7 +4,7 @@ import * as vscode from "vscode";
 import type { NexusCore } from "../../core/nexusCore";
 import type { ActiveLocalShellSession, ActiveSession, ActiveSerialSession, SessionPtyHandle } from "../../models/config";
 import { resolveSessionProtocol } from "../../models/config";
-import type { MacroAutoTrigger, PtyOutputObserver } from "../macroAutoTrigger";
+import type { MacroAutoTrigger } from "../macroAutoTrigger";
 import { parseScriptHeader, type ScriptHeader } from "./scriptHeader";
 import { ScriptMacroFilter } from "./scriptMacroFilter";
 import { resolveScriptsDir } from "./resolveScriptsDir";
@@ -12,6 +12,7 @@ import { resolveScriptDefaultTimeoutMs } from "./defaultTimeout";
 import { resolveScriptMaxReadBytes } from "./maxReadSize";
 import { ensureWorkspaceScriptTypes, type BundledAssets } from "./scriptTypesGenerator";
 import { ScriptOutputBuffer, type Match } from "./scriptOutputBuffer";
+import { outputBufferObserver, type SessionOutputCapture } from "./sessionOutputCapture";
 import { pickTarget, type ScriptTargetDescriptor } from "./scriptTarget";
 import { scriptFsExists, scriptFsReadText, type ScriptFsContext } from "./scriptFs";
 import {
@@ -163,7 +164,29 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     return Array.from(this.runs.values(), (r) => this.toSnapshot(r));
   }
 
-  public async runScript(uri: vscode.Uri, sessionId?: string): Promise<string | undefined> {
+  /**
+   * @param capture - Connect and Run Script… only: the new session's output,
+   * kept since it opened (see `SessionOutputCapture`). The run takes it over
+   * as its own buffer and observer; on any path where the run does not start
+   * it is released, so it never outlives this call unowned.
+   */
+  public async runScript(uri: vscode.Uri, sessionId?: string, capture?: SessionOutputCapture): Promise<string | undefined> {
+    let captureTaken = false;
+    try {
+      return await this.startRun(uri, sessionId, capture, () => {
+        captureTaken = true;
+      });
+    } finally {
+      if (!captureTaken) capture?.subscription.dispose();
+    }
+  }
+
+  private async startRun(
+    uri: vscode.Uri,
+    sessionId: string | undefined,
+    capture: SessionOutputCapture | undefined,
+    takeCapture: () => void
+  ): Promise<string | undefined> {
     // Workspace Trust gate — the single choke point all five script-start entry
     // points funnel through. Hard refuse, not a requestWorkspaceTrust() prompt:
     // a trust prompt raised at the moment of running a script invites
@@ -241,6 +264,8 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       return undefined;
     }
     const pty = target.session.pty;
+    // A capture holds one PTY's output; a run on any other starts empty.
+    const seed = capture?.pty === pty ? capture : undefined;
 
     const scriptsConfig = vscode.workspace.getConfiguration("nexus.scripts");
     const defaultTimeoutMs = header.defaultTimeoutMs ?? resolveScriptDefaultTimeoutMs(scriptsConfig);
@@ -262,7 +287,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       startedAt: Date.now(),
       state: "starting",
       currentOperation: null,
-      outputBuffer: new ScriptOutputBuffer(),
+      outputBuffer: seed?.buffer ?? new ScriptOutputBuffer(),
       defaultTimeoutMs,
       maxReadBytes,
       // Replaced immediately below, once `fsContextFor(record)` can close over
@@ -283,11 +308,14 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     // name the entry script.
     record.includeState = createScriptIncludeState(this.fsContextFor(record));
 
-    record.observerSubscription = pty.addOutputObserver({
-      onOutput: (text) => record.outputBuffer.append(text),
-      pauseIntervalMacros: () => {},
-      dispose: () => {}
-    });
+    // Taken over, not replaced: the capture's observer has been filling this
+    // very buffer since the session opened, so it simply becomes the run's.
+    if (seed) {
+      record.observerSubscription = seed.subscription;
+      takeCapture();
+    } else {
+      record.observerSubscription = pty.addOutputObserver(outputBufferObserver(record.outputBuffer));
+    }
 
     // US4: install the macro filter for this session.
     const macroPolicy = vscode.workspace

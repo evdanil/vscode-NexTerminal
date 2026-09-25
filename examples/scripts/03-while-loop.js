@@ -11,8 +11,11 @@
 //   2. "Run this command, if it fails retry N times with backoff" — a plain
 //      `while` + `try/catch` around `expect`, shown here.
 
-// Get a fresh prompt first — the one already on screen was printed before the
-// script started, so the script can't see it (see 01-hello.js).
+// Get a fresh prompt first: on a terminal that is already open, the one on
+// screen was printed before the script started, so the script can't see it.
+// (Under Connect and Run Script… on a server the script already has the first
+// prompt, and this Enter adds a spare one — 01-hello.js opens in a way that
+// suits both.)
 await sendLine("");
 await expect(/[$#] $/);
 
