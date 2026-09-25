@@ -503,7 +503,8 @@ export class TunnelManager {
           if (retiredAfterLogin) {
             // The old SSH lease is gone, but a terminal may still keep its
             // transport open. Do not request the same server-wide bind over a
-            // fresh connection until that transport's close removes the bind.
+            // fresh connection until a late withdrawal succeeds or that
+            // transport closes and removes the bind.
             await this.waitForForwardWait(runtime, retiredAfterLogin);
             if (this.retiredForwardTransports.get(requestKey) === retiredAfterLogin) {
               this.retiredForwardTransports.delete(requestKey);
@@ -603,8 +604,8 @@ export class TunnelManager {
           // Granted after stop(): withdraw it, then let the connection go, and
           // do not announce a tunnel that is gone. A withdrawal refused or not
           // answered may leave the bind on a transport other leases keep open.
-          // Retire it from reuse and hold a replacement until the old transport
-          // closes and the server releases that bind.
+          // Retire it from reuse and hold a replacement until withdrawal is
+          // confirmed or the old transport closes and releases that bind.
           const cancellation = Promise.resolve().then(() => sshConnection.cancelForwardIn(bindAddr, allocatedPort));
           const withdrawn = await fulfilledWithin(cancellation, LATE_FORWARD_CANCEL_TIMEOUT_MS);
           if (!withdrawn) {
