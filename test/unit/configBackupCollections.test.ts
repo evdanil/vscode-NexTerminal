@@ -1054,8 +1054,30 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
 
     expect(dest.core.getServer("srv-1")?.host).toBe("10.9.9.9");
     expect(await savedSecrets(dest)).toEqual(["file-pw", undefined, undefined]);
-    // It got the backup's password, so nothing will ask for one: not counted.
-    expect(lastInfoMessage()).not.toContain("different address");
+  });
+
+  it("the message counts a server whose backup put back its password but not its proxy password, and not one whose backup put back everything cleared", async () => {
+    const source = await makeMachine();
+    await source.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, host: "10.9.9.9" }));
+    await source.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, id: "srv-2", name: "srv-2", host: "10.9.9.10" }));
+    await source.vault.store("password-srv-1", "file-pw");
+    await source.vault.store("password-srv-2", "file-pw-2");
+    const json = await exportBackup(source);
+    const dest = await makeMachine();
+    await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT }));
+    await dest.vault.store("password-srv-1", "router-pw");
+    await dest.vault.store("proxy-password-srv-1", "proxy-pw");
+    await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, id: "srv-2", name: "srv-2" }));
+    await dest.vault.store("password-srv-2", "router-pw-2");
+
+    await runImport(dest, json, "replace");
+
+    // srv-1 will still ask for its proxy password; srv-2 got everything it lost back.
+    expect(await dest.vault.get("proxy-password-srv-1")).toBeUndefined();
+    expect(await dest.vault.get("password-srv-2")).toBe("file-pw-2");
+    expect(lastInfoMessage()).toContain(
+      "1 server came back at a different address or route; the passwords saved for it here were cleared and will be asked for on the next connect."
+    );
   });
 
   it("a sealed backup of the same endpoint keeps what this machine saved and overwrites only what the backup carries", async () => {
@@ -1129,6 +1151,145 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
     await expect(registeredCommands.get("nexus.config.import")!()).rejects.toThrow("keychain locked");
 
     expect(dest.core.getServer("srv-1")).toBeUndefined();
+    expect(await savedSecrets(dest)).toEqual(GONE);
+  });
+
+  describe("a server behind an SSH jump host — the jump host is part of its route", () => {
+    const via = (jumpHostId: string): Partial<ServerConfig> => ({ proxy: { type: "ssh", jumpHostId } });
+
+    async function destWithChain(): Promise<Machine> {
+      const dest = await destWithSavedSecrets(via("jump-1"));
+      await dest.core.addOrUpdateServer(makeServer({ id: "jump-1", name: "Jump 1", host: "10.1.0.1", ...via("jump-2") }));
+      await dest.core.addOrUpdateServer(makeServer({ id: "jump-2", name: "Jump 2", host: "10.2.0.1" }));
+      for (const id of ["jump-1", "jump-2"]) await dest.vault.store(`password-${id}`, `${id}-pw`);
+      return dest;
+    }
+    const target = () => makeServer({ ...LOCAL_ENDPOINT, ...via("jump-1") });
+    const jump1 = (overrides: Partial<ServerConfig> = {}) => makeServer({ id: "jump-1", name: "Jump 1", host: "10.1.0.1", ...via("jump-2"), ...overrides });
+    const jump2 = (overrides: Partial<ServerConfig> = {}) => makeServer({ id: "jump-2", name: "Jump 2", host: "10.2.0.1", ...overrides });
+
+    it("a target that comes back unchanged loses its secrets when its jump host comes back somewhere else", async () => {
+      const dest = await destWithChain();
+
+      await runImport(dest, unsealedJson([jump1({ host: "attacker.example" }), target(), jump2()]), "replace");
+
+      expect(dest.core.getServer("srv-1")?.host).toBe("10.0.0.1");
+      expect(await savedSecrets(dest)).toEqual(GONE);
+      expect(await dest.vault.get("password-jump-2")).toBe("jump-2-pw");
+    });
+
+    it("a two-hop chain whose far hop moved clears every server behind it", async () => {
+      const dest = await destWithChain();
+
+      await runImport(dest, unsealedJson([target(), jump1(), jump2({ host: "attacker.example" })]), "replace");
+
+      expect(await savedSecrets(dest)).toEqual(GONE);
+      expect(await dest.vault.get("password-jump-1")).toBeUndefined();
+      expect(await dest.vault.get("password-jump-2")).toBeUndefined();
+    });
+
+    it("a jump host listed after its target still decides the target, before the target is published", async () => {
+      const hostAtDelete: Array<string | undefined> = [];
+      let dest: Machine | undefined;
+      class WatchingVault extends MockVault {
+        async delete(key: string) {
+          if (key === "password-srv-1") hostAtDelete.push(dest?.core.getServer("srv-1")?.host);
+          await super.delete(key);
+        }
+      }
+      dest = await destWithSavedSecrets(via("jump-1"), new WatchingVault());
+      await dest.core.addOrUpdateServer(jump1({ proxy: undefined }));
+
+      await runImport(dest, unsealedJson([target(), jump1({ proxy: undefined, host: "attacker.example" })]), "replace");
+
+      expect(hostAtDelete).toEqual([undefined]);
+      expect(await savedSecrets(dest)).toEqual(GONE);
+    });
+
+    it("a jump host the file does not bring back clears the servers behind it", async () => {
+      const dest = await destWithChain();
+
+      await runImport(dest, unsealedJson([target(), jump2()]), "replace");
+
+      expect(dest.core.getServer("jump-1")).toBeUndefined();
+      expect(await savedSecrets(dest)).toEqual(GONE);
+    });
+
+    it("an unchanged chain, or an unchanged cycle, keeps every hop's secrets", async () => {
+      const dest = await destWithChain();
+      await dest.core.addOrUpdateServer(makeServer({ id: "cyc-a", name: "Cycle A", host: "10.3.0.1", ...via("cyc-b") }));
+      await dest.core.addOrUpdateServer(makeServer({ id: "cyc-b", name: "Cycle B", host: "10.3.0.2", ...via("cyc-a") }));
+      for (const id of ["cyc-a", "cyc-b"]) await dest.vault.store(`password-${id}`, `${id}-pw`);
+
+      await runImport(dest, unsealedJson([
+        target(),
+        jump1(),
+        jump2(),
+        makeServer({ id: "cyc-a", name: "Cycle A", host: "10.3.0.1", ...via("cyc-b") }),
+        makeServer({ id: "cyc-b", name: "Cycle B", host: "10.3.0.2", ...via("cyc-a") })
+      ]), "replace");
+
+      expect(await savedSecrets(dest)).toEqual(KEPT);
+      for (const id of ["jump-1", "jump-2", "cyc-a", "cyc-b"]) {
+        expect(await dest.vault.get(`password-${id}`)).toBe(`${id}-pw`);
+      }
+      expect(lastInfoMessage()).not.toContain("different address");
+    });
+  });
+
+  it("a wipe step that fails after the servers are removed still sweeps their secrets, and the original error is the one reported", async () => {
+    class FailingVault extends MockVault {
+      async delete(key: string) {
+        if (key === "auth-profile-password-ap-1" || key === "passphrase-srv-1") throw new Error(`cannot delete ${key}`);
+        await super.delete(key);
+      }
+    }
+    const dest = await destWithSavedSecrets({}, new FailingVault());
+    await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, id: "srv-2", name: "srv-2" }));
+    await dest.vault.store("password-srv-2", "srv-2-pw");
+    await dest.vault.store("proxy-password-srv-2", "srv-2-proxy");
+    await dest.core.addOrUpdateAuthProfile({ id: "ap-1", name: "Ops", username: "ops", authType: "password" });
+
+    register(dest);
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }).mockResolvedValueOnce({ label: "Replace", value: "replace" });
+    mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/nexus-backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValueOnce(Buffer.from(unsealedJson([makeServer({ ...LOCAL_ENDPOINT })]), "utf8"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await expect(registeredCommands.get("nexus.config.import")!()).rejects.toThrow("cannot delete auth-profile-password-ap-1");
+    warn.mockRestore();
+
+    // Every key that can be deleted is: the one that cannot does not stop the rest.
+    expect(await savedSecrets(dest)).toEqual([undefined, "router-pp", undefined]);
+    expect(await dest.vault.get("password-srv-2")).toBeUndefined();
+    expect(await dest.vault.get("proxy-password-srv-2")).toBeUndefined();
+  });
+
+  it("a failed delete for one server the file leaves out does not stop the others' being cleared", async () => {
+    let failOnce = true;
+    class FlakyVault extends MockVault {
+      async delete(key: string) {
+        if (key === "password-srv-1" && failOnce) {
+          failOnce = false;
+          throw new Error("keychain locked");
+        }
+        await super.delete(key);
+      }
+    }
+    const dest = await destWithSavedSecrets({}, new FlakyVault());
+    for (const id of ["srv-2", "srv-3"]) {
+      await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, id, name: id }));
+      await dest.vault.store(`password-${id}`, `${id}-pw`);
+    }
+
+    register(dest);
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }).mockResolvedValueOnce({ label: "Replace", value: "replace" });
+    mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/nexus-backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValueOnce(Buffer.from(unsealedJson([makeServer({ id: "other", name: "Other" })]), "utf8"));
+    await expect(registeredCommands.get("nexus.config.import")!()).rejects.toThrow("keychain locked");
+
+    expect(await dest.vault.get("password-srv-2")).toBeUndefined();
+    expect(await dest.vault.get("password-srv-3")).toBeUndefined();
+    // The one that failed stays waiting, and the sweep clears it.
     expect(await savedSecrets(dest)).toEqual(GONE);
   });
 

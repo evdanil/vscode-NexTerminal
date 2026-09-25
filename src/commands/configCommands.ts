@@ -1405,14 +1405,29 @@ async function restoreSecrets(
   }
 }
 
-/** Whether any secret is saved under a server's own id (see `deleteServerSecrets`). */
-async function hasServerSecrets(vault: SecretVault, serverId: string): Promise<boolean> {
-  for (const key of [passwordSecretKey(serverId), passphraseSecretKey(serverId), proxyPasswordSecretKey(serverId)]) {
-    if ((await vault.get(key)) !== undefined) {
-      return true;
+/**
+ * The secrets saved under a server's own id (see `deleteServerSecrets`), each
+ * with the bucket of a backup's encrypted section that restores it. One table,
+ * so a backup restore and the Replace completion message (which says whose
+ * cleared secrets the backup did NOT put back) cannot disagree about which is
+ * which.
+ */
+const SERVER_SECRETS = [
+  { key: passwordSecretKey, bucket: "passwords" },
+  { key: passphraseSecretKey, bucket: "passphrases" },
+  { key: proxyPasswordSecretKey, bucket: "proxyPasswords" }
+] as const;
+type ServerSecretBucket = (typeof SERVER_SECRETS)[number]["bucket"];
+
+/** The buckets of the secrets actually saved under a server's own id. */
+async function savedServerSecretBuckets(vault: SecretVault, serverId: string): Promise<ServerSecretBucket[]> {
+  const saved: ServerSecretBucket[] = [];
+  for (const { key, bucket } of SERVER_SECRETS) {
+    if ((await vault.get(key(serverId))) !== undefined) {
+      saved.push(bucket);
     }
   }
-  return false;
+  return saved;
 }
 
 /**
@@ -1421,8 +1436,9 @@ async function hasServerSecrets(vault: SecretVault, serverId: string): Promise<b
  * Replace removes every local server and re-imports the file's with their ids,
  * so a file carrying no seal (an older backup, a hand-written export, a backup
  * with its encrypted part removed) can re-create id X anywhere; the secrets are
- * kept only when this returns true. The endpoint is everything that decides
- * where those secrets go:
+ * kept only when this returns true — for the server and every jump host on its
+ * route (`serversKeepingSecrets`). The endpoint is everything in the record
+ * itself that decides where those secrets go:
  *  - `host`, and `altHost` — the SSH connect retries the same credentials
  *    against the alternate address (`SshPty.start`), which is why the
  *    connection pool compares it too (`pooledConnectionParamsChanged`);
@@ -1449,6 +1465,48 @@ function sameProxy(a: ProxyConfig | null | undefined, b: ProxyConfig | null | un
     return a.type === "ssh" && b.type === "ssh" && a.jumpHostId === b.jumpHostId;
   }
   return isSameAuthenticatedEndpoint(a, b);
+}
+
+/**
+ * ISSUE #175 — the servers a Replace removed whose saved secrets it may keep:
+ * every valid record the file writes under the id has the same endpoint
+ * (`sameServerEndpoint`), and so does every SSH jump host on its route. A jump
+ * host is resolved by id when connecting (`ProxySshFactory`), so a jump host
+ * the file moves — or does not bring back — moves the route of every server
+ * behind it, however deep the chain; the closure runs to a fixpoint, which
+ * settles cycles too. Judged over the whole file before anything is written,
+ * so the order of its records does not matter: a jump host listed after the
+ * servers behind it still decides them. A record that fails validation is
+ * never written and so decides nothing.
+ */
+function serversKeepingSecrets(removed: readonly ServerConfig[], incoming: readonly unknown[] | undefined): Set<string> {
+  const removedById = new Map(removed.map((server) => [server.id, server]));
+  const kept = new Set<string>();
+  const changed = new Set<string>();
+  for (const record of incoming ?? []) {
+    if (!validateServerConfig(record)) {
+      continue;
+    }
+    const before = removedById.get(record.id);
+    if (before !== undefined) {
+      (sameServerEndpoint(before, record) ? kept : changed).add(record.id);
+    }
+  }
+  for (const id of changed) {
+    kept.delete(id);
+  }
+  let shrank = true;
+  while (shrank) {
+    shrank = false;
+    for (const id of kept) {
+      const proxy = removedById.get(id)!.proxy;
+      if (proxy?.type === "ssh" && !kept.has(proxy.jumpHostId)) {
+        kept.delete(id);
+        shrank = true;
+      }
+    }
+  }
+  return kept;
 }
 
 interface SanitizedSnapshot {
@@ -3674,10 +3732,38 @@ export function registerConfigCommands(
     await configMutationLock.runExclusive(() => importMergeReplaceLocked(data, mode, decryptedSecrets));
   }
 
+  /**
+   * ISSUE #175 — FAIL-SAFE SWEEP. A server Replace removes joins
+   * `awaitingVerdict` the moment it is removed, and leaves it only once its
+   * saved secrets are either deleted or known to be kept (see
+   * `serversKeepingSecrets`). Whatever throws in between — a later wipe step's
+   * vault delete, a record write, a secret delete — the secrets of every server
+   * still waiting are deleted before the error propagates: best effort, so one
+   * failed key neither strands the rest nor replaces the ORIGINAL error, which
+   * is rethrown. The direction costs a re-prompt, never a password left for the
+   * next record that brings the id.
+   */
   async function importMergeReplaceLocked(
     data: NexusConfigExport,
     mode: "merge" | "replace",
     decryptedSecrets?: Record<string, unknown>
+  ): Promise<void> {
+    const awaitingVerdict = new Set<string>();
+    try {
+      await applyMergeReplace(data, mode, decryptedSecrets, awaitingVerdict);
+    } catch (error) {
+      for (const id of awaitingVerdict) {
+        await deleteServerSecrets(vault, id, { bestEffort: true });
+      }
+      throw error;
+    }
+  }
+
+  async function applyMergeReplace(
+    data: NexusConfigExport,
+    mode: "merge" | "replace",
+    decryptedSecrets: Record<string, unknown> | undefined,
+    awaitingVerdict: Set<string>
   ): Promise<void> {
     const snapshot = core.getSnapshot();
 
@@ -3701,6 +3787,7 @@ export function registerConfigCommands(
     if (mode === "replace") {
       for (const server of snapshot.servers) {
         await core.removeServer(server.id);
+        awaitingVerdict.add(server.id);
       }
       for (const tunnel of snapshot.tunnels) {
         await core.removeTunnel(tunnel.id);
@@ -3808,52 +3895,45 @@ export function registerConfigCommands(
     // its id and is skipped when that id already exists. Same shape across every bucket.
     // ISSUE #175 — the servers Replace removed above still have their saved
     // secrets in the vault, filed under ids the file may re-create at another
-    // endpoint (see `sameServerEndpoint`). Each re-created record is judged as
-    // it is written, so every one counts — a file can carry the same id twice,
-    // and the last write is the record that connects. A changed endpoint loses
-    // the secrets BEFORE the record is published: `nexus.server.connect` does
-    // not take `configMutationLock`, so a connect landing after the publish
-    // would otherwise pair the new host with the old password (the ordering
-    // proxySecretHygiene.ts gives for proxy passwords). A removed server the
-    // file does not re-create loses them after the loop: left behind, they
-    // wait for the next record that brings its id. Secrets a backup carries
-    // are restored after all this (`restoreSecrets` below), so they still win.
+    // endpoint or behind a moved jump host (see `serversKeepingSecrets`). A
+    // server not kept loses them BEFORE its record is published:
+    // `nexus.server.connect` does not take `configMutationLock`, so a connect
+    // landing after the publish would otherwise pair the new route with the
+    // old password (the ordering proxySecretHygiene.ts gives for proxy
+    // passwords). A removed server the file does not re-create loses them after
+    // the loop: left behind, they wait for the next record that brings its id.
+    // Secrets a backup carries are restored after all this (`restoreSecrets`
+    // below), so they still win. `awaitingVerdict` and its sweep are described
+    // on `importMergeReplaceLocked`.
     //
-    // An id leaves the map only once its secrets are gone, so if anything in
-    // the loop throws — a vault delete, a record write — every id still in it
-    // loses its secrets before the error propagates, re-created unchanged or
-    // not: the fail-safe direction, which costs a re-prompt and never sends a
-    // password anywhere. Best effort there, so one failed key does not strand
-    // the rest or mask the error that stopped the import.
-    const removedServersWithSecrets = new Map<string, ServerConfig>(mode === "replace" ? snapshot.servers.map((s) => [s.id, s]) : []);
-    // Re-created servers whose secrets saved HERE were cleared for a changed
-    // endpoint — for the completion message, which tells the user why they
-    // will be asked for them again.
-    const serversClearedForNewEndpoint = new Set<string>();
-    let serverTally: ImportTally;
-    try {
-      serverTally = await importPreservingIds(data.servers, existingIds, validateServerConfig, async (e) => {
-        const removed = removedServersWithSecrets.get(e.id);
-        if (removed !== undefined && !sameServerEndpoint(removed, e)) {
-          if (await hasServerSecrets(vault, e.id)) {
-            serversClearedForNewEndpoint.add(e.id);
-          }
-          await deleteServerSecrets(vault, e.id);
-          removedServersWithSecrets.delete(e.id);
+    // Deciding up front, over the whole file, is what lets a jump host listed
+    // AFTER the servers behind it decide them before they are published.
+    const keepSecrets = mode === "replace" ? serversKeepingSecrets(snapshot.servers, data.servers) : new Set<string>();
+    // Re-created servers whose secrets saved HERE were cleared, with which ones
+    // — for the completion message, which tells the user why they will be
+    // asked again.
+    const clearedSecretBuckets = new Map<string, ServerSecretBucket[]>();
+    const serverTally = await importPreservingIds(data.servers, existingIds, validateServerConfig, async (e) => {
+      if (awaitingVerdict.has(e.id) && !keepSecrets.has(e.id)) {
+        const saved = await savedServerSecretBuckets(vault, e.id);
+        if (saved.length > 0) {
+          clearedSecretBuckets.set(e.id, saved);
         }
-        await addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s));
-      });
-    } catch (error) {
-      for (const id of removedServersWithSecrets.keys()) {
-        await deleteServerSecrets(vault, id, { bestEffort: true });
+        await deleteServerSecrets(vault, e.id);
+        awaitingVerdict.delete(e.id);
       }
-      throw error;
+      await addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s));
+    });
+    // Every id still waiting was either re-created and kept — its verdict is
+    // final — or not re-created at all. A failed delete for one of the latter
+    // throws with it still waiting, so the sweep in `importMergeReplaceLocked`
+    // goes on to clear it and every other one before the error propagates.
+    for (const id of serverTally.importedIds) {
+      awaitingVerdict.delete(id);
     }
-    const recreatedServerIds = new Set(serverTally.importedIds);
-    for (const id of removedServersWithSecrets.keys()) {
-      if (!recreatedServerIds.has(id)) {
-        await deleteServerSecrets(vault, id);
-      }
+    for (const id of [...awaitingVerdict]) {
+      await deleteServerSecrets(vault, id);
+      awaitingVerdict.delete(id);
     }
     const tunnelTally = await importPreservingIds(data.tunnels, existingIds, validateTunnelProfile, (e) => core.addOrUpdateTunnel(e));
     const serialTally = await importPreservingIds(data.serialProfiles, existingIds, validateSerialProfile, (e) => core.addOrUpdateSerialProfile(e));
@@ -4338,9 +4418,9 @@ export function registerConfigCommands(
       // this applies in both merge and replace mode.
       const importedServerIds = new Set(serverTally.importedIds);
       const importedAuthProfileIds = new Set(authProfileTally.importedIds);
-      await restoreSecrets(decryptedSecrets.passwords as Record<string, string> | undefined, passwordSecretKey, vault, importedServerIds);
-      await restoreSecrets(decryptedSecrets.passphrases as Record<string, string> | undefined, passphraseSecretKey, vault, importedServerIds);
-      await restoreSecrets(decryptedSecrets.proxyPasswords as Record<string, string> | undefined, proxyPasswordSecretKey, vault, importedServerIds);
+      for (const { key, bucket } of SERVER_SECRETS) {
+        await restoreSecrets(decryptedSecrets[bucket] as Record<string, string> | undefined, key, vault, importedServerIds);
+      }
       await restoreSecrets(decryptedSecrets.authProfilePasswords as Record<string, string> | undefined, authProfilePasswordSecretKey, vault, importedAuthProfileIds);
       await restoreSecrets(decryptedSecrets.authProfilePassphrases as Record<string, string> | undefined, authProfilePassphraseSecretKey, vault, importedAuthProfileIds);
       // Nested (sourceId -> fieldId -> secret) shape, unlike the flat id->secret buckets
@@ -4673,13 +4753,15 @@ export function registerConfigCommands(
       ? ` Kept the locally trusted SSH host key for ${plural(hostKeyConflicts, "host")} where the backup holds a different key.`
       : "";
     // ISSUE #175 — say why the next connect asks for a password this machine
-    // had saved. A server whose backup carried secrets of its own got those
-    // instead (`restoreSecrets` above), so it is not counted.
-    const carriedByBackup = (id: string): boolean =>
-      [decryptedSecrets?.passwords, decryptedSecrets?.passphrases, decryptedSecrets?.proxyPasswords].some(
-        (bucket) => typeof bucket === "object" && bucket !== null && Object.prototype.hasOwnProperty.call(bucket, id)
-      );
-    const clearedCount = [...serversClearedForNewEndpoint].filter((id) => !carriedByBackup(id)).length;
+    // had saved. A server counts when ANY secret cleared for it was not put
+    // back by the backup (`restoreSecrets` above): a restored password does not
+    // stop the prompt for a cleared proxy password. A secret the backup carries
+    // for an id is restored, so carrying it is the test.
+    const restoredByBackup = (id: string, bucket: ServerSecretBucket): boolean => {
+      const restored = decryptedSecrets?.[bucket];
+      return typeof restored === "object" && restored !== null && Object.prototype.hasOwnProperty.call(restored, id);
+    };
+    const clearedCount = [...clearedSecretBuckets].filter(([id, buckets]) => buckets.some((bucket) => !restoredByBackup(id, bucket))).length;
     const clearedNote = clearedCount > 0
       ? ` ${plural(clearedCount, "server")} came back at a different address or route; the passwords saved for ${clearedCount === 1 ? "it" : "them"} here were cleared and will be asked for on the next connect.`
       : "";
