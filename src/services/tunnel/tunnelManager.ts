@@ -605,12 +605,10 @@ export class TunnelManager {
           // answered may leave the bind on a transport other leases keep open.
           // Retire it from reuse and hold a replacement until the old transport
           // closes and the server releases that bind.
-          const withdrawn = await fulfilledWithin(
-            Promise.resolve().then(() => sshConnection.cancelForwardIn(bindAddr, allocatedPort)),
-            LATE_FORWARD_CANCEL_TIMEOUT_MS
-          );
+          const cancellation = Promise.resolve().then(() => sshConnection.cancelForwardIn(bindAddr, allocatedPort));
+          const withdrawn = await fulfilledWithin(cancellation, LATE_FORWARD_CANCEL_TIMEOUT_MS);
           if (!withdrawn) {
-            this.retireForwardTransport(bindKey(allocatedPort), sshConnection);
+            this.retireForwardTransport(bindKey(allocatedPort), sshConnection, cancellation);
           }
           sshConnection.dispose();
           throw new TunnelStoppedError(profile.name);
@@ -686,14 +684,27 @@ export class TunnelManager {
     }
   }
 
-  private retireForwardTransport(bindKey: string, connection: SshConnection): void {
+  private retireForwardTransport(
+    bindKey: string,
+    connection: SshConnection,
+    lateRelease?: Promise<unknown>
+  ): void {
     const closed = this.sharedFactory.retire?.(connection) ?? waitForConnectionClose(connection);
-    this.retiredForwardTransports.set(bindKey, closed);
-    void closed.then(() => {
-      if (this.retiredForwardTransports.get(bindKey) === closed) {
+    // Keep the transport retired, but let a successful late withdrawal release
+    // this bind while existing leases keep the old connection alive.
+    let releaseBarrier!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
+    });
+    this.retiredForwardTransports.set(bindKey, barrier);
+    const release = (): void => {
+      if (this.retiredForwardTransports.get(bindKey) === barrier) {
         this.retiredForwardTransports.delete(bindKey);
       }
-    });
+      releaseBarrier();
+    };
+    void closed.then(release, () => {});
+    void lateRelease?.then(release, () => {});
   }
 
   private async waitForForwardWait(runtime: ActiveTunnelRuntime, pending: Promise<void>): Promise<void> {
