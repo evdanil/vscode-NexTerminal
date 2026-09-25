@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.262] — 2026-09-25
+
+### Fixed
+
+- **A sync warns when it keeps a hand-set address and reads a different value on the endpoint for the server's protocol.** Since 2.8.189 a host or port you typed yourself — onto a placeholder, or over the address a sync gave a server — is kept by later syncs, and the one way to hand it back to the source is to set it to exactly what the source reports. Nothing told you what that was: when a device later reported a different address, the sync kept yours without a word. When a sync keeps a host or port you set and reads a different address for the server's protocol, its warnings now name both — *"web-01": kept your host 10.0.0.5; the source now reports host 10.0.0.9 — set the host to that to let the source manage it.* — behind **Show Warnings** in the sync confirmation, or **Show Details** on the warning a sync with nothing to change shows. A reported host stays visible in sanitized form; when its text is changed for display, the warning says, `The displayed host was sanitized; setting it as shown will not hand the field back.` It includes a host in the set-value remedy only when warning flattening followed by the edit form's Host trim leaves the displayed value equal to the raw value the sync compares; a port can still be named independently. If the sync reads the other protocol's endpoint instead, no warning names that address, because setting it would not hand the field back. The server itself is left as you set it. An address you replaced while the source still reports the one the sync gave you is not repeated on every sync; the warning appears when the sync reads a different value for the server's protocol. An address typed onto a placeholder, or kept from a sync before 2.8.189, has no record of what the source reported before, so each different value is new and its warning repeats on every sync that reads an endpoint for the server's protocol until you act. The notice shown when you type an address onto a placeholder now says where the source's address will appear.
+
 ## [2.8.261] — 2026-09-25
 
 ### Fixed

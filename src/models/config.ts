@@ -270,6 +270,11 @@ export interface ServerOrigin {
    * addressless downgrade only when it OWNS the value it is about to blank. Never
    * inferred from the record's current value, which would launder a hand edit
    * into "as stamped" one sync later.
+   *
+   * Also read by the plan's kept-address warning (`keptHandAddressWarning`,
+   * #170, and `syncedPort` likewise): a kept hand value is reported only while
+   * the device reports something other than this stamp, so an override of the
+   * address the sync wrote stays quiet until the device moves.
    */
   syncedHost?: string;
   /**

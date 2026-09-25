@@ -619,6 +619,94 @@ export function syncOwnsPort(current: number, stamp: number | undefined, dev: nu
 }
 
 /**
+ * #170 — the plan warning for a console address the sync KEEPS because the user
+ * set it by hand (matrix rows 4/5 of `syncOwnsHost`/`syncOwnsPort`) while the
+ * device reports a different one. Without it the keep is silent, and the only way
+ * to hand a field back — set it to exactly what the source reports, so row 5a
+ * re-stamps it — needs a value the user has no way to see short of opening the
+ * source. The warning names that value; it changes nothing.
+ *
+ * Per component, because ownership is: each half is named only when it was kept
+ * AND the device reports something other than what the sync last wrote into it.
+ * The second test is what keeps a deliberate override quiet — a user who replaced
+ * the address the sync wrote, while the device still reports that address, has
+ * seen it already, and a line repeated on every sync for every such server would
+ * bury the warnings that are news. The quiet is only as good as the stamp, though:
+ * a record with none — a placeholder the user typed onto, or a server synced
+ * before the stamps existed — has nothing to compare against, so its line is
+ * repeated on every sync until the field and the device agree.
+ *
+ * It speaks for the transport the record KEEPS. A kept address means the endpoint
+ * was not accepted, so the record keeps its own protocol as well (`takesEndpoint`
+ * gates the protocol write) and an address of the other transport cannot be typed
+ * into it. The caller therefore calls this only when the sync read the endpoint of
+ * the record's own protocol — never when it owns the protocol and the device now
+ * prefers the other transport. In that case even the kept transport's address, if
+ * the device offers one, is not a remedy: the row-5a match is checked against the
+ * endpoint the sync reads, the other transport's, so typing it in would hand
+ * nothing back. No endpoint of the record's transport means no warning either. It
+ * also skips an addressless record, which has no address of its own to keep — one
+ * carrying stamps (a hand-edited backup can) would otherwise be told about its
+ * blank host and sentinel port.
+ */
+function keptHandAddressWarning(
+  serverName: string,
+  record: ServerConfig,
+  reported: { host: string; port: number },
+  takes: { host: boolean; port: boolean }
+): string | undefined {
+  const kept: Array<{ field: "host" | "port"; yours: string; theirs: string }> = [];
+  const actionable: Array<{ field: "host" | "port"; yours: string; theirs: string }> = [];
+  let nonRoundTrippableHost = false;
+  // The plan's final warning pass flattens provider text. A host recommendation
+  // is only actionable when the displayed value, after the edit form's Host trim,
+  // is exactly what row 5a compares on the next sync. Still report the changed
+  // host in sanitized form so the address change is visible, but do not include
+  // it in the settable fields when that round trip would change it.
+  if (!takes.host && reported.host !== record.origin?.syncedHost) {
+    const displayHost = flattenProviderText(reported.host);
+    // `formValuesToServer` trims Host on save. The value a user can hand back by
+    // setting the displayed text must therefore match the original report after
+    // both warning flattening and form normalization.
+    const savedDisplayHost = displayHost.trim();
+    const hostCanBeHandedBack = savedDisplayHost === reported.host;
+    const host = {
+      field: "host" as const,
+      yours: record.host,
+      theirs: hostCanBeHandedBack ? reported.host : `${displayHost || "(no visible text)"} (sanitized for display)`
+    };
+    kept.push(host);
+    if (hostCanBeHandedBack) {
+      actionable.push(host);
+    } else {
+      nonRoundTrippableHost = true;
+    }
+  }
+  if (!takes.port && reported.port !== record.origin?.syncedPort) {
+    const port = { field: "port" as const, yours: String(record.port), theirs: String(reported.port) };
+    kept.push(port);
+    actionable.push(port);
+  }
+  if (kept.length === 0) {
+    return undefined;
+  }
+  const yours = kept.map((k) => `${k.field} ${k.yours}`).join(" and ");
+  const theirs = kept.map((k) => `${k.field} ${k.theirs}`).join(" and ");
+  let warning = `"${serverName}": kept your ${yours}; the source now reports ${theirs}`;
+  if (actionable.length > 0) {
+    const fields = actionable.map((k) => k.field).join(" and ");
+    const [those, them] = actionable.length === 1 ? ["that", "it"] : ["those", "them"];
+    warning += ` — set the ${fields} to ${those} to let the source manage ${them}`;
+  }
+  if (nonRoundTrippableHost) {
+    warning += ". The displayed host was sanitized; setting it as shown will not hand the field back.";
+  } else {
+    warning += ".";
+  }
+  return warning;
+}
+
+/**
  * AUTH 2b (REVIEW FINDING, P1) — "can this server supply the key file the
  * profile does not?". The server-side half of `authProfileNeedsServerKeyPath`
  * (models/config.ts), which asks the same question of the profile.
@@ -1942,6 +2030,17 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // per-component ownership (`takesHost`/`takesPort`); this gates the fields
       // that ride the endpoint without an ownership signal of their own.
       const takesEndpoint = takesHost && takesPort;
+      // #170 — a kept hand address is reported, not acted on: pushed whether or
+      // not anything else makes this an update, so an unchanged server says so too.
+      // Only when the endpoint read is of the protocol the record keeps (see the
+      // helper): resolved, since an absent protocol is SSH.
+      const readsOwnTransport = (effectiveProtocol === "telnet") === (ownedServer.protocol === "telnet");
+      if (ownedEndpoint !== undefined && readsOwnTransport && ownedServer.addressless !== true) {
+        const kept = keptHandAddressWarning(device.name, ownedServer, { host: ownedHost, port: ownedPort }, { host: takesHost, port: takesPort });
+        if (kept !== undefined) {
+          warnings.push(kept);
+        }
+      }
       // The username rides the SAME endpoint the address came from, and is
       // `undefined` when no endpoint of the record's transport was found — a
       // username belongs to an endpoint, so taking one from an endpoint whose

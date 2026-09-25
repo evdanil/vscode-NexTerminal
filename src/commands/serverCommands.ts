@@ -1696,6 +1696,10 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           if (!candidate) {
             return;
           }
+          // The user typed an address onto an addressless placeholder. Decides both
+          // the address-stamp drop below and the notice after the save, which
+          // promises what that drop makes true.
+          const gainsHandAddress = existing.addressless === true && candidate.addressless !== true;
           // P1 — the edit form has no field for `origin` (it's an inventory-sync
           // ownership marker, not a user-editable setting), so formValuesToServer's
           // reconstruction never carries it. Without restoring it here, saving any
@@ -1899,9 +1903,36 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             // `candidate.authProfileId` and the hidden select produced no
             // candidate. Synchronous, so the "nothing may await between the
             // liveRecord capture and the write" rule above still holds.
+            // #170 — an address typed onto a placeholder is the user's console
+            // endpoint, recorded as such by carrying no stamp that describes an
+            // endpoint: syncedHost/syncedPort (whose address the sync wrote) and
+            // syncedProtocol (which transport it wrote). A real placeholder
+            // carries none of the three (the addressless add writes none, and
+            // the downgrade drops them), so this loses nothing there; a
+            // hand-edited backup can still carry them, and either kind would
+            // break the notice's promise below. A kept host/port stamp makes the
+            // kept-address warning treat the stamped value as already seen. A
+            // kept telnet stamp on a telnet record makes the protocol read as
+            // sync-owned, so a device that prefers SSH has the sync read its SSH
+            // endpoint — and the warning, which speaks only when the sync reads
+            // the transport the record keeps (`keptHandAddressWarning`), then
+            // names no telnet address at all. syncedUsername stays: it records
+            // who wrote the username, picks no endpoint, and the auth
+            // retro-apply rule reads it. Identity (source, device, deployment)
+            // stays too. Keyed on the form-open placeholder, as the notice is: if
+            // a sync gave the live record an address while the form sat open,
+            // the typed value overrides it and the same holds. A copy, so the
+            // live record is never mutated.
+            let liveOrigin = liveRecord?.origin;
+            if (liveOrigin !== undefined && gainsHandAddress) {
+              liveOrigin = { ...liveOrigin };
+              delete liveOrigin.syncedHost;
+              delete liveOrigin.syncedPort;
+              delete liveOrigin.syncedProtocol;
+            }
             const updated: ServerConfig = {
               ...preserveDormantSshConfig(liveRecord ?? existing, linked),
-              ...(liveRecord?.origin !== undefined ? { origin: liveRecord.origin } : {}),
+              ...(liveOrigin !== undefined ? { origin: liveOrigin } : {}),
               ...(liveRecord?.formerlySynced !== undefined ? { formerlySynced: liveRecord.formerlySynced } : {})
             };
             // FINDINGS 2+3 (P2, edit-rollback review) — addOrUpdateServer
@@ -2144,7 +2175,8 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           }
           // The user gave an addressless placeholder a host in the form (`existing`
           // was addressless, the saved record is not). A placeholder carries no
-          // syncedHost/syncedPort stamp, so the sync reads this address as hand-typed
+          // syncedHost/syncedPort stamp (and the save above drops any a hand-edited
+          // backup left on one), so the sync reads this address as hand-typed
           // and keeps it (syncEngine.ts `syncOwnsHost`/`syncOwnsPort`): a
           // still-consoleless device does not blank it, a device that later
           // reports a different address does not replace it, and a status
@@ -2158,12 +2190,22 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           // an EVE-NG HTML5/VNC-only node never will, and the record does not say
           // which kind of placeholder it was — so an instruction to "set it to the
           // address the source reports" would be one some users can never carry
-          // out (PR #171 review). An information message, because nothing is
-          // lost: this is a hand-off, not a hazard. (It used to be a warning
-          // promising a revert to a placeholder — true before the stamps, #153.)
-          if (existing.addressless === true && candidate.addressless !== true) {
+          // out (PR #171 review). The prescription lives in the sync plan instead
+          // (`keptHandAddressWarning`, #170), which names an address of this
+          // server's transport only once the source reports one — the one
+          // moment it can be carried out — and the notice's last sentence says
+          // where to look. It names the protocol because the sync does: it
+          // reports only an address of the transport this server keeps, so for
+          // a protocol set here that the device does not offer it reports
+          // nothing, and an unqualified promise would be false. (The stamp drop
+          // above is what makes the promise hold for either protocol.) An
+          // information message, because nothing is lost: this is a hand-off,
+          // not a hazard. (It used to be a warning promising a revert to a
+          // placeholder — true before the stamps, #153.)
+          if (gainsHandAddress) {
+            const protocolName = candidate.protocol === "telnet" ? "telnet" : "SSH";
             void vscode.window.showInformationMessage(
-              `You gave "${existing.name}" a console address by hand, and syncs and status refreshes leave it as you set it. Its inventory source takes over the host or the port only once an inventory sync finds it reporting that exact value.`
+              `You gave "${existing.name}" a console address by hand, and syncs and status refreshes leave it as you set it. Its inventory source takes over the host or the port only once an inventory sync finds it reporting that exact value. The sync's warnings name a different address only when it reads an endpoint for this server's protocol (${protocolName}); a different address from the other transport is not named because setting it would not hand the field back.`
             );
           }
         },
