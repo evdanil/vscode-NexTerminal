@@ -28,7 +28,7 @@ You can also drag a tunnel profile onto a server in the [Connectivity Hub](conne
 
 Stopping a shared tunnel while its SSH connection is still opening cancels that start; it cannot later be announced as running. If the SSH server refuses a reverse bind, startup fails and Nexus releases only that tunnel's lease on a pooled SSH connection, leaving other terminal and SFTP leases intact.
 
-For a running reverse tunnel, Stop asks the SSH server to remove its remote listener and waits for that request to settle; if the peer does not respond, Stop can remain pending. If a reverse start is stopped while its remote-bind request is unanswered, Nexus holds another start on the same SSH route and remote port until the earlier request is refused or withdrawn, or its SSH connection closes. Stopping unregisters the tunnel from cross-window visibility; other windows clear its remote marker on a later sync.
+For a running reverse tunnel, Stop asks the SSH server to remove its remote listener and waits for that request to settle; if the peer does not respond, Stop can remain pending. If a reverse start is stopped while its remote-bind request is unanswered, Nexus holds another start on the same SSH route and remote port until the earlier request is refused or withdrawn, or its SSH connection closes. When the requested port was `0`, a late grant moves that hold to the allocated port, allowing another automatic allocation while starts targeting the allocated port still wait for the old connection to close. Stopping unregisters the tunnel from cross-window visibility; other windows clear its remote marker on a later sync.
 
 ## Which Servers Can Carry a Tunnel
 
