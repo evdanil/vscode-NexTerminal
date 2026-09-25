@@ -6,6 +6,7 @@ import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigReposi
 import { registerTunnelCommands, startTunnel } from "../../src/commands/tunnelCommands";
 import type { ServerConfig } from "../../src/models/config";
 import { configMutationLock } from "../../src/services/configMutationLock";
+import { TunnelStoppedError } from "../../src/services/tunnel/tunnelManager";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowQuickPick = vi.fn();
@@ -482,5 +483,49 @@ describe("startTunnel — telnet servers", () => {
 
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
     expect(start).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("startTunnel — a tunnel stopped before it finished starting", () => {
+  const sshServer: ServerConfig = {
+    id: "srv-ssh",
+    name: "bastion",
+    host: "10.0.0.2",
+    port: 22,
+    username: "ops",
+    authType: "password",
+    isHidden: false
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+  });
+
+  // The manager rejects start() when stop() swept the tunnel mid-connect (issue
+  // #176). That stop was asked for, so it is a cancel: every route that starts
+  // a tunnel funnels through here, and none of them may report it as a failure.
+  it("resolves quietly, as a cancel", async () => {
+    const ctx = await setupContext([makeTunnel()]);
+    const start = vi.fn(async () => {
+      throw new TunnelStoppedError("Tunnel 1");
+    });
+
+    await expect(
+      startTunnel(ctx.core, { start } as never, { connect: vi.fn() } as never, makeTunnel(), sshServer, "isolated")
+    ).resolves.toBeUndefined();
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    expect(mockShowInformationMessage).not.toHaveBeenCalled();
+  });
+
+  it("still fails on any other start error", async () => {
+    const ctx = await setupContext([makeTunnel()]);
+    const start = vi.fn(async () => {
+      throw new Error("listen EADDRINUSE: address already in use 127.0.0.1:8080");
+    });
+
+    await expect(
+      startTunnel(ctx.core, { start } as never, { connect: vi.fn() } as never, makeTunnel(), sshServer, "isolated")
+    ).rejects.toThrow("EADDRINUSE");
   });
 });

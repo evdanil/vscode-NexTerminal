@@ -42,8 +42,14 @@ class PooledSshConnection implements SshConnection {
     private readonly inner: SshConnection,
     private onRelease: () => void,
     private readonly createFallback?: () => Promise<SshConnection>,
-    private readonly isReused = false
+    private readonly isReused = false,
+    private readonly retireEntry: () => void = () => {}
   ) {}
+
+  /** See `SshConnectionPool.retire`. */
+  public retireTransport(): void {
+    this.retireEntry();
+  }
 
   private get active(): SshConnection {
     return this.fallbackUsed && this.fallbackConnection ? this.fallbackConnection : this.inner;
@@ -281,7 +287,28 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
           entry.connection.dispose();
         }
       }
-    }, createFallback, isReused);
+    }, createFallback, isReused, () => {
+      if (this.entries.get(server.id) === entry) {
+        this.softRemoveEntry(server.id, entry);
+      }
+    });
+  }
+
+  /**
+   * Stops handing the transport `lease` rides to new consumers, without
+   * closing it under the leases already on it: it closes when the last of them
+   * is released. For a transport left in a state no new consumer should
+   * inherit — a remote forward it may still hold, say. Only that transport: if
+   * the server's pooled entry has been replaced since the lease was taken — or
+   * the lease fell back to a connection of its own, which takes its entry out
+   * of the pool — the lease's own entry has already left the pool and closes on
+   * its own, and the replacement is left alone. A no-op for a lease this pool
+   * did not hand out.
+   */
+  public retire(lease: SshConnection): void {
+    if (lease instanceof PooledSshConnection) {
+      lease.retireTransport();
+    }
   }
 
   public disconnect(serverId: string): void {

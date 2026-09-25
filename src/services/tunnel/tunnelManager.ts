@@ -15,6 +15,18 @@ export type TunnelEvent =
 
 type TunnelListener = (event: TunnelEvent) => void;
 
+/**
+ * stop() swept the tunnel while it was still connecting. start() rejects with
+ * this rather than report a tunnel that no longer exists as started; the stop
+ * was asked for, so callers treat it as a cancel, not a failure.
+ */
+export class TunnelStoppedError extends Error {
+  public constructor(profileName: string) {
+    super(`Tunnel ${profileName} was stopped while connecting`);
+    this.name = "TunnelStoppedError";
+  }
+}
+
 interface ActiveTunnelRuntime {
   active: ActiveTunnel;
   profile: TunnelProfile;
@@ -27,6 +39,8 @@ interface ActiveTunnelRuntime {
   reverseBindAddr?: string;
   reverseBindPort?: number;
   isStopping: boolean;
+  /** Called by stop(): a start still waiting on the server bounds that wait from then on. */
+  onStop?: () => void;
 }
 
 function listen(server: net.Server, port: number, host: string): Promise<void> {
@@ -43,6 +57,33 @@ function closeServer(server: net.Server): Promise<void> {
   return new Promise((resolve) => {
     server.close(() => resolve());
   });
+}
+
+/**
+ * How long a start stopped mid-request waits for the server to answer that
+ * request, and then to withdraw a forward it granted too late. Bounded
+ * because a start's caller is waiting on it and ssh2 has no timeout for
+ * either (issue #184). A replacement start waits for its stopped predecessor
+ * without a timeout of its own: these two phases are what bound that wait.
+ */
+const LATE_FORWARD_CANCEL_TIMEOUT_MS = 5_000;
+
+/** Whether `work` fulfilled within `timeoutMs`; false if it rejected or is still pending. */
+async function fulfilledWithin(work: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work.then(
+        () => true,
+        () => false
+      ),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function normalizeSocks5HandshakeTimeoutMs(timeoutMs: number): number {
@@ -109,11 +150,22 @@ export class TunnelManager {
   private readonly listeners = new Set<TunnelListener>();
   private readonly activeTunnels = new Map<string, ActiveTunnelRuntime>();
   private readonly activeByProfile = new Map<string, string>();
+  /**
+   * Per reverse profile and server: settles once a start's forward request is
+   * over — the forward kept, refused, withdrawn or abandoned after stop().
+   * stop() forgets a tunnel at once, so the profile can start again on that
+   * server while a stopped start's request is still in flight on the same
+   * pooled transport; see startReverse. A start on another server cannot
+   * collide with it, and does not wait.
+   */
+  private readonly forwardRequests = new Map<string, Promise<void>>();
   private trafficTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private socks5HandshakeTimeoutMs: number;
 
   public constructor(
-    private readonly sharedFactory: SshFactory,
+    // The pool, in production: `retire` takes the transport a lease rides out
+    // of reuse without closing it under the leases already on it.
+    private readonly sharedFactory: SshFactory & { retire?(lease: SshConnection): void },
     private readonly isolatedFactory: SshFactory,
     socks5HandshakeTimeoutMs: number = 10_000
   ) {
@@ -131,6 +183,19 @@ export class TunnelManager {
 
   public getActiveTunnelId(profileId: string): string | undefined {
     return this.activeByProfile.get(profileId);
+  }
+
+  /**
+   * Undoes a failed start's registration. Only its own: a start stopped while
+   * connecting fails after stop() let the profile start again, and dropping
+   * that newer tunnel's mapping would hide it from start(), which would then
+   * open a second tunnel for the profile.
+   */
+  private unregisterFailedStart(activeTunnel: ActiveTunnel): void {
+    this.activeTunnels.delete(activeTunnel.id);
+    if (this.activeByProfile.get(activeTunnel.profileId) === activeTunnel.id) {
+      this.activeByProfile.delete(activeTunnel.profileId);
+    }
   }
 
   public async start(
@@ -181,6 +246,7 @@ export class TunnelManager {
       return;
     }
     runtime.isStopping = true;
+    runtime.onStop?.();
     this.activeByProfile.delete(runtime.profile.id);
     this.activeTunnels.delete(activeTunnelId);
 
@@ -262,9 +328,9 @@ export class TunnelManager {
       try {
         await this.getOrCreateSharedConnection(runtime, activeTunnel.id);
       } catch (error) {
-        // Auth failed or was canceled — tear down the listener
-        this.activeTunnels.delete(activeTunnel.id);
-        this.activeByProfile.delete(profile.id);
+        // Auth failed or was canceled, or stop() swept the tunnel meanwhile —
+        // tear down the listener (a second close after stop() is harmless)
+        this.unregisterFailedStart(activeTunnel);
         await closeServer(listenerServer);
         throw error;
       }
@@ -366,11 +432,81 @@ export class TunnelManager {
     this.activeByProfile.set(profile.id, activeTunnel.id);
 
     try {
-      const sshConnection = await this.getOrCreateSharedConnection(runtime, activeTunnel.id);
-
       const bindAddr = profile.remoteBindAddress ?? "127.0.0.1";
       const bindPort = profile.remotePort;
-      const allocatedPort = await sshConnection.requestForwardIn(bindAddr, bindPort);
+      const requestKey = JSON.stringify([profile.id, serverConfig.id]);
+      const earlierRequest = this.forwardRequests.get(requestKey);
+      let requestOver!: () => void;
+      const thisRequest = new Promise<void>((resolve) => {
+        requestOver = resolve;
+      });
+      this.forwardRequests.set(requestKey, thisRequest);
+      let sshConnection: SshConnection;
+      let allocatedPort: number;
+      try {
+        if (earlierRequest) {
+          // A stopped start of this profile may still be requesting, or
+          // withdrawing, the same bind on this server. Asked now, ours would
+          // reach the server behind it and be refused as already bound. Waited
+          // for BEFORE taking a lease: if that request ends by retiring its
+          // transport, a lease already taken on it could not be revoked, and
+          // ours would be asked over the transport still holding the bind.
+          // With no timeout of its own — giving up while the predecessor is
+          // still withdrawing leases exactly that transport. The wait is
+          // bounded by the predecessor's phases instead: its login (the same
+          // one this start would join in the pool), then its request and its
+          // withdrawal, each within LATE_FORWARD_CANCEL_TIMEOUT_MS of stop().
+          // A start stopped while it waits settles only after this wait, so a
+          // chain of them releases the next start only when the first is done.
+          await earlierRequest;
+        }
+        sshConnection = await this.getOrCreateSharedConnection(runtime, activeTunnel.id);
+        // The start holds the connection itself while the forward is requested,
+        // out of stop()'s reach. Released under the request, a pooled lease
+        // leaves the connection open for its other leases, and a forward granted
+        // afterwards would stay bound on it with nothing left to withdraw it: the
+        // tunnel's next start would fail as already bound until that connection
+        // closed. So the forward's outcome decides what happens to it here.
+        runtime.sshConnections.delete(sshConnection);
+        const outcome = await this.requestForward(runtime, sshConnection, bindAddr, bindPort);
+        if (outcome === "abandoned") {
+          // Stopped, and the server has not answered: no telling whether it
+          // will still grant the forward. Retire the transport so no later
+          // start asks over it, and let the connection go.
+          this.sharedFactory.retire?.(sshConnection);
+          sshConnection.dispose();
+          throw new TunnelStoppedError(profile.name);
+        }
+        if ("error" in outcome) {
+          // Refused, or stopped meanwhile: either way nobody else will release it.
+          sshConnection.dispose();
+          throw runtime.isStopping ? new TunnelStoppedError(profile.name) : outcome.error;
+        }
+        allocatedPort = outcome.port;
+        if (runtime.isStopping) {
+          // Granted after stop(): withdraw it, then let the connection go, and
+          // do not announce a tunnel that is gone. A withdrawal refused or not
+          // answered may leave the bind on a transport other leases keep open:
+          // retire that transport from reuse, so the next start gets a fresh
+          // one rather than a refusal; it closes, and the bind with it, when
+          // its last lease is returned.
+          const withdrawn = await fulfilledWithin(
+            Promise.resolve().then(() => sshConnection.cancelForwardIn(bindAddr, allocatedPort)),
+            LATE_FORWARD_CANCEL_TIMEOUT_MS
+          );
+          if (!withdrawn) {
+            this.sharedFactory.retire?.(sshConnection);
+          }
+          sshConnection.dispose();
+          throw new TunnelStoppedError(profile.name);
+        }
+      } finally {
+        requestOver();
+        if (this.forwardRequests.get(requestKey) === thisRequest) {
+          this.forwardRequests.delete(requestKey);
+        }
+      }
+      runtime.sshConnections.add(sshConnection);
 
       runtime.reverseBindAddr = bindAddr;
       runtime.reverseBindPort = allocatedPort;
@@ -390,13 +526,49 @@ export class TunnelManager {
       });
       runtime.reverseUnsubscribe = unsubscribe;
     } catch (error) {
-      this.activeTunnels.delete(activeTunnel.id);
-      this.activeByProfile.delete(profile.id);
+      this.unregisterFailedStart(activeTunnel);
       throw error;
     }
 
     this.emit({ type: "started", tunnel: activeTunnel });
     return activeTunnel;
+  }
+
+  /**
+   * The forward request's outcome — or "abandoned" once stop() has come and
+   * the server has still not answered within the bound. ssh2's request has no
+   * timeout of its own, and a stopped start holds a lease stop() cannot reach:
+   * it must not wait on the server for ever.
+   */
+  private async requestForward(
+    runtime: ActiveTunnelRuntime,
+    connection: SshConnection,
+    bindAddr: string,
+    bindPort: number
+  ): Promise<{ port: number } | { error: unknown } | "abandoned"> {
+    const request = Promise.resolve()
+      .then(() => connection.requestForwardIn(bindAddr, bindPort))
+      .then(
+        (port) => ({ port }),
+        (error: unknown) => ({ error })
+      );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const abandoned = new Promise<"abandoned">((resolve) => {
+      const startClock = (): void => {
+        timer = setTimeout(() => resolve("abandoned"), LATE_FORWARD_CANCEL_TIMEOUT_MS);
+      };
+      if (runtime.isStopping) {
+        startClock();
+      } else {
+        runtime.onStop = startClock;
+      }
+    });
+    try {
+      return await Promise.race([request, abandoned]);
+    } finally {
+      runtime.onStop = undefined;
+      clearTimeout(timer);
+    }
   }
 
   private handleReverseConnection(
@@ -490,8 +662,7 @@ export class TunnelManager {
       try {
         await this.getOrCreateSharedConnection(runtime, activeTunnel.id);
       } catch (error) {
-        this.activeTunnels.delete(activeTunnel.id);
-        this.activeByProfile.delete(profile.id);
+        this.unregisterFailedStart(activeTunnel);
         await closeServer(listenerServer);
         throw error;
       }
@@ -593,6 +764,14 @@ export class TunnelManager {
       return runtime.sharedConnection;
     }
     const sharedConnection = await this.sharedFactory.connect(runtime.serverConfig);
+    if (runtime.isStopping) {
+      // stop() swept the tunnel while this connect was in flight, so its sweep
+      // could not include this connection and nothing else ever will. Kept, it
+      // would stay logged in until shutdown — and, as a pooled lease, keep the
+      // server's multiplexed connection from ever closing as idle.
+      sharedConnection.dispose();
+      throw new TunnelStoppedError(runtime.profile.name);
+    }
     runtime.sharedConnection = sharedConnection;
     runtime.sshConnections.add(sharedConnection);
     sharedConnection.onClose(() => {

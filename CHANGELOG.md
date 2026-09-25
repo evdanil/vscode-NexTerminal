@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.259] — 2026-09-25
+
+### Fixed
+
+- **A shared-mode tunnel stopped while it is logging in no longer leaves that connection open.** A shared tunnel logs in again when a client arrives after its connection has dropped. Stopping the tunnel before that login finished left the connection it produced attached to the stopped tunnel, logged in until VS Code closed — and, with connection multiplexing on, holding the server's shared connection open long after it should have closed as idle. The connection is now closed the moment its login completes.
+- **A reverse tunnel the server refuses no longer leaves its connection open.** When the server refused the tunnel's remote port — already in use, or remote forwarding not allowed — the start failed, but the connection it had logged in with stayed open until VS Code closed, and with connection multiplexing on it kept the server's shared connection from ever closing as idle.
 ## [2.8.268] — 2026-09-25
 
 ### Fixed
