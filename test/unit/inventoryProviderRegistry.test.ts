@@ -3,6 +3,7 @@ import { InventoryProviderRegistry, validateProviderShape } from "../../src/serv
 import { MAX_INVENTORY_INSTANCE_KEY_LENGTH, resolveProviderInstanceKey } from "../../src/models/inventory";
 import type { InventoryProvider } from "../../src/models/inventory";
 import { createNetboxProvider } from "../../src/services/inventory/providers/netboxProvider";
+import { knownKeysList, parseTemplateFilter, unknownFilterKeys } from "../../src/services/inventory/templateApply";
 
 function makeProvider(overrides: Partial<InventoryProvider> = {}): InventoryProvider {
   return {
@@ -66,6 +67,89 @@ describe("InventoryProviderRegistry", () => {
     registry.register(b);
     registry.register(c);
     expect(registry.list().map((p) => p.id)).toEqual(["provider-a", "provider-b", "provider-c"]);
+  });
+});
+
+/**
+ * attributeKeys AS THE REGISTRY KEEPS IT (issue #163 item 2, PR #188 review). The
+ * shape check passing proves only that every INDEXED entry is a string. The
+ * consumers do more with the list than index it — `knownKeysList` calls `some`
+ * and spreads it, `unknownFilterKeys` calls `map` — and on the provider's own
+ * array each of those runs code the provider controls. So the registry keeps a
+ * copy, and these pin that the copy is a plain array holding exactly the entries
+ * that were checked.
+ */
+describe("InventoryProviderRegistry attributeKeysOf", () => {
+  // Every entry is a string, so the shape check passes all three.
+  const ownMethodsNotCallable = (): string[] => {
+    const keys = ["role", "site"];
+    Object.defineProperty(keys, "map", { value: undefined });
+    Object.defineProperty(keys, "some", { value: undefined });
+    return keys;
+  };
+  class YieldsANumber extends Array<string> {}
+  Object.defineProperty(YieldsANumber.prototype, Symbol.iterator, {
+    value: function* () {
+      yield 42;
+    }
+  });
+  const subclassWithHostileIterator = (): string[] => {
+    const keys = new YieldsANumber();
+    keys.push("role", "site");
+    return keys;
+  };
+  const entryAnswersTwice = (): string[] => {
+    const keys = ["role", "site"];
+    let reads = 0;
+    Object.defineProperty(keys, 1, { get: () => (reads++ === 0 ? "site" : 42), enumerable: true, configurable: true });
+    return keys;
+  };
+
+  it.each([
+    ["own `map` and `some` that are not callable", ownMethodsNotCallable],
+    ["an Array subclass whose iterator yields a number", subclassWithHostileIterator],
+    ["an entry that answers a string when read once and a number after", entryAnswersTwice]
+  ])(
+    "keeps a plain frozen copy of attributeKeys with %s, holding exactly the entries it checked (⊘ keeping the provider's array; ⊘ `[...keys]` / `Array.from(keys)`, which run its iterator; ⊘ `keys.slice()`, which builds the subclass again; ⊘ checking and copying in two reads)",
+    (_label, make) => {
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ attributeKeys: make() }));
+
+      const stored = registry.attributeKeysOf("netbox")!;
+      expect(Array.isArray(stored)).toBe(true);
+      expect(Object.getPrototypeOf(stored)).toBe(Array.prototype);
+      expect(Object.getOwnPropertyNames(stored)).toEqual(["0", "1", "length"]); // no own `map`, `some` or accessor
+      expect(Object.isFrozen(stored)).toBe(true);
+      expect(stored[0]).toBe("role");
+      expect(stored[1]).toBe("site");
+      // ...so the consumers that threw on the provider's own array take it.
+      expect(knownKeysList(stored)).toBe("role, site, name");
+      expect(unknownFilterKeys(parseTemplateFilter("rack=1&role=x"), stored)).toEqual(["rack"]);
+    }
+  );
+
+  it("is the list as it stood at registration, whatever the provider does to its array afterwards (⊘ keeping the provider's array, which a later `push(42)` reaches)", () => {
+    const registry = new InventoryProviderRegistry();
+    const keys = ["role"];
+    registry.register(makeProvider({ attributeKeys: keys }));
+
+    keys.push(42 as never);
+    keys[0] = "zone";
+
+    expect(registry.attributeKeysOf("netbox")).toEqual(["role"]);
+  });
+
+  it("answers undefined for a provider that declares no list, and for an id no provider holds, including once disposed (⊘ `?? []`, which turns 'no list to check against' into 'only `name` is known'; ⊘ a copy that outlives its registration)", () => {
+    const registry = new InventoryProviderRegistry();
+    registry.register(makeProvider({ id: "no-list" }));
+    const withList = registry.register(makeProvider({ id: "with-list", attributeKeys: ["role"] }));
+    expect(registry.attributeKeysOf("no-list")).toBeUndefined();
+    expect(registry.attributeKeysOf("unknown")).toBeUndefined();
+    expect(registry.attributeKeysOf("with-list")).toEqual(["role"]);
+
+    withList.dispose();
+
+    expect(registry.attributeKeysOf("with-list")).toBeUndefined();
   });
 });
 
@@ -329,6 +413,60 @@ describe("validateProviderShape", () => {
   it("rejects a non-function canWebConsole loudly (kills a silent survive-at-registration for a typo'd `canWebConsole` that is not callable — the marker gate invokes it during tree render, where a string value would throw TypeError on every repaint of a row)", () => {
     expect(() => validateProviderShape(makeProvider({ canWebConsole: "nope" as never }))).toThrow(/canWebConsole/);
     expect(() => validateProviderShape(makeProvider({ canWebConsole: 42 as never }))).toThrow(/canWebConsole/);
+  });
+
+  // attributeKeys (issue #163 item 2) — the one optional member that is DATA, and
+  // the one the registry used to let through unchecked. Every consumer
+  // (`unknownFilterKeys`, `knownKeysList`) iterates it and calls string methods on
+  // each entry, so a malformed list surfaced as a TypeError out of Edit Template
+  // Rules, before the Rule Filter box could open, instead of here.
+  it("accepts a provider with NO attributeKeys — it is optional (⊘ making it required, which would refuse every provider that declares no key list)", () => {
+    const provider = makeProvider();
+    expect(provider.attributeKeys).toBeUndefined();
+    expect(() => validateProviderShape(provider)).not.toThrow();
+  });
+
+  it.each([
+    ["a comma-joined string", "role,site"],
+    ["null", null],
+    ["an array-like object", { 0: "role", length: 1 }],
+    ["a Set", new Set(["role"])]
+  ])("rejects attributeKeys that is %s, naming the member (⊘ no clause, which hands the list to `knownKeysList` / `unknownFilterKeys`, both of which throw TypeError on it)", (_label, bad) => {
+    expect(() => validateProviderShape(makeProvider({ attributeKeys: bad as never }))).toThrow(
+      "Inventory provider attributeKeys must be an array of strings when present."
+    );
+  });
+
+  // A hole in a sparse array reads as `undefined` once `knownKeysList` spreads the
+  // list to append `name`, and throws there exactly as a stored `undefined` would — but
+  // `Array.prototype.every` SKIPS holes, so a check written with it lets one through.
+  const sparse: unknown[] = ["role"];
+  sparse[2] = "site";
+  it.each([
+    ["a number", ["role", 42], 1],
+    ["null", ["role", "site", null], 2],
+    ["undefined", [undefined, "role"], 0],
+    ["a nested array", ["role", ["site"]], 1],
+    ["a hole (sparse array)", sparse, 1]
+  ])("rejects an attributeKeys entry that is %s, naming the entry's index (⊘ checking only `Array.isArray`; ⊘ `.every(isString)`, which skips holes)", (_label, bad, index) => {
+    expect(() => validateProviderShape(makeProvider({ attributeKeys: bad as never }))).toThrow(
+      `Inventory provider attributeKeys entry ${index} must be a string.`
+    );
+  });
+
+  it.each([
+    ["an empty list (a provider that matches on `name` alone)", []],
+    ["a list of keys", ["role", "site", "name"]],
+    // Neither throws anywhere: a blank key matches nothing and `knownKeysList`
+    // leaves it out, and a duplicate is one entry to the matcher's Set. Refusing
+    // the provider's whole registration over one would cost far more than the entry.
+    ["blank, whitespace-only and duplicate keys", ["", "   ", "role", "role", "Role"]]
+  ])("accepts attributeKeys that is %s (⊘ an over-strict clause that refuses a whole provider over an entry every consumer already copes with)", (_label, keys) => {
+    expect(() => validateProviderShape(makeProvider({ attributeKeys: keys }))).not.toThrow();
+    // ...and the premise of accepting it: both consumers take the list as it is,
+    // with no blank slot in the list a user is shown.
+    expect(() => unknownFilterKeys(parseTemplateFilter("role=x"), keys)).not.toThrow();
+    expect(knownKeysList(keys).split(", ")).not.toContain("");
   });
 
   // MINOR-14 (EVE-NG review) — `InventoryConfigField.defaultValue` is part of

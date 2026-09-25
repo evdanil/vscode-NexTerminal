@@ -4,6 +4,8 @@ import { NexusCore } from "../../src/core/nexusCore";
 import type { ProxyConfig, ServerConfig } from "../../src/models/config";
 import type { DeviceTemplateProfile } from "../../src/models/deviceTemplate";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
+import { createNexusExtensionApi } from "../../src/services/inventory/publicApi";
 import type { FormValues } from "../../src/ui/formTypes";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
@@ -1173,8 +1175,10 @@ describe("Fix C (PR #62 Codex round 5) — template save/delete serialize under 
 // ---------------------------------------------------------------------------
 describe("Edit Template Rules… flow (§7.2)", () => {
   const PROXY: ProxyConfig = { type: "socks5", host: "10.9.9.1", port: 1080 };
+  // Only `attributeKeysOf`: the flow reads the registry's copy of the keys, and a
+  // stub without `get` makes a return to the provider's own array fail loudly here.
   const regWith = (keys?: string[]) =>
-    ({ get: () => (keys ? { attributeKeys: keys } : undefined) }) as unknown as Parameters<typeof registerDeviceTemplateCommands>[1];
+    ({ attributeKeysOf: () => keys }) as unknown as Parameters<typeof registerDeviceTemplateCommands>[1];
   function registerWithRegistry(core: NexusCore, registry: Parameters<typeof registerDeviceTemplateCommands>[1]): void {
     registeredCommands.clear();
     registerDeviceTemplateCommands(ctxFor(core), registry);
@@ -1393,6 +1397,134 @@ describe("Edit Template Rules… flow (§7.2)", () => {
 
     expect(prompt).toContain(expected);
   });
+
+  // Issue #163 (item 2) — the list the Rule Filter box is built from comes straight
+  // off whichever provider holds the source's id, and a third party registers
+  // through the public API. With no registry check, `"role,site"` reached
+  // `knownKeysList` and threw before the box opened; `unknownFilterKeys`, behind
+  // the box's live check and its save, throws on the same lists. Driven through
+  // the REAL registry and the real public API, not the `regWith` stub, because
+  // the registry is the fix.
+  const sparseKeys: unknown[] = ["zone"];
+  sparseKeys[2] = "rack";
+  it.each([
+    ["a comma-joined string", "zone,rack"],
+    ["an array holding a number", ["zone", 42]],
+    ["a sparse array", sparseKeys]
+  ])(
+    "a provider whose attributeKeys is %s is refused at the public API, so the Rule Filter box opens, validates and saves without throwing (⊘ no registry clause: TypeError before the box opens)",
+    async (_label, bad) => {
+      const registry = new InventoryProviderRegistry();
+      const api = createNexusExtensionApi(registry);
+      expect(() =>
+        api.registerInventoryProvider({
+          id: "acme-cmdb",
+          label: "Acme CMDB",
+          configFields: [],
+          attributeKeys: bad as never,
+          testConnection: async () => {},
+          fetchInventory: async () => ({ contractVersion: 1, devices: [] })
+        })
+      ).toThrow(/attributeKeys/);
+
+      const core = makeCore();
+      await core.addOrUpdateDeviceTemplate({ id: "t1", name: "T", fields: { proxy: { mode: "override", value: PROXY } } });
+      await seedSource(core, { providerId: "acme-cmdb" });
+      registerWithRegistry(core, registry);
+      mockShowWarningMessage.mockResolvedValue(undefined);
+      mockShowQuickPick
+        .mockImplementationOnce(async (items: Array<{ add?: boolean }>) => items.find((i) => i.add))
+        .mockImplementationOnce(async (items: Array<{ template?: { id: string } }>) => items.find((i) => i.template?.id === "t1"))
+        .mockResolvedValueOnce(undefined); // loop → exit
+      let liveFeedback: unknown;
+      mockShowInputBox.mockImplementationOnce(async (options: { validateInput: (value: string) => unknown }) => {
+        liveFeedback = options.validateInput("rack=1"); // a keystroke
+        return "rack=1";
+      });
+
+      await editRules();
+
+      // The box opened, with the no-key-list prompt: no provider holds the id.
+      expect(mockShowInputBox).toHaveBeenCalledTimes(1);
+      expect((mockShowInputBox.mock.calls[0][0] as { prompt: string }).prompt).toBe(
+        "Filter by key=value, conditions joined with &, e.g. name=core-*"
+      );
+      expect(liveFeedback).toMatchObject({ message: expect.stringContaining("Matches devices where") });
+      // Saved, with no unknown-key toast built from the refused list.
+      expect(core.getInventorySource("src-1")!.templateRules).toMatchObject([{ templateId: "t1", filter: "rack=1" }]);
+      const warned = mockShowWarningMessage.mock.calls.map((c) => String(c[0]));
+      expect(warned.some((w) => w.includes("Known keys"))).toBe(false);
+    }
+  );
+
+  // PR #188 review — a list can pass that check entry by entry and still throw in
+  // this flow, which calls the list's own `some`, `map` and iterator: an array
+  // with an own `map`, or a subclass whose iterator yields something else. The
+  // registry keeps a plain copy, and the flow has to be handed that copy.
+  class YieldsANumber extends Array<string> {}
+  Object.defineProperty(YieldsANumber.prototype, Symbol.iterator, {
+    value: function* () {
+      yield 42;
+    }
+  });
+  it.each([
+    [
+      "an array with own `map` and `some` that are not callable",
+      (): string[] => {
+        const keys = ["role", "site"];
+        Object.defineProperty(keys, "map", { value: undefined });
+        Object.defineProperty(keys, "some", { value: undefined });
+        return keys;
+      }
+    ],
+    [
+      "an Array subclass whose iterator yields a number",
+      (): string[] => {
+        const keys = new YieldsANumber();
+        keys.push("role", "site");
+        return keys;
+      }
+    ]
+  ])(
+    "a provider whose attributeKeys is %s registers, and the Rule Filter box is built, checked and saved from the registry's copy (⊘ reading `registry.get(id).attributeKeys`, the provider's own array: TypeError before the box opens)",
+    async (_label, make) => {
+      const registry = new InventoryProviderRegistry();
+      createNexusExtensionApi(registry).registerInventoryProvider({
+        id: "acme-cmdb",
+        label: "Acme CMDB",
+        configFields: [],
+        attributeKeys: make(),
+        testConnection: async () => {},
+        fetchInventory: async () => ({ contractVersion: 1, devices: [] })
+      });
+
+      const core = makeCore();
+      await core.addOrUpdateDeviceTemplate({ id: "t1", name: "T", fields: { proxy: { mode: "override", value: PROXY } } });
+      await seedSource(core, { providerId: "acme-cmdb" });
+      registerWithRegistry(core, registry);
+      mockShowWarningMessage.mockResolvedValue(undefined);
+      mockShowQuickPick
+        .mockImplementationOnce(async (items: Array<{ add?: boolean }>) => items.find((i) => i.add))
+        .mockImplementationOnce(async (items: Array<{ template?: { id: string } }>) => items.find((i) => i.template?.id === "t1"))
+        .mockResolvedValueOnce(undefined); // loop → exit
+      let liveFeedback: unknown;
+      mockShowInputBox.mockImplementationOnce(async (options: { validateInput: (value: string) => unknown }) => {
+        liveFeedback = options.validateInput("rack=1"); // a keystroke, with a key the provider does not report
+        return "rack=1";
+      });
+
+      await editRules();
+
+      expect(mockShowInputBox).toHaveBeenCalledTimes(1);
+      expect((mockShowInputBox.mock.calls[0][0] as { prompt: string }).prompt).toBe(
+        "Keys: role, site, name — key=value, conditions joined with &, e.g. name=core-*"
+      );
+      expect(liveFeedback).toMatchObject({ message: expect.stringContaining("Known keys: role, site, name") });
+      expect(core.getInventorySource("src-1")!.templateRules).toMatchObject([{ templateId: "t1", filter: "rack=1" }]);
+      const keyWarn = mockShowWarningMessage.mock.calls.map((c) => String(c[0])).find((w) => w.includes("is not one this source's provider reports"));
+      expect(keyWarn).toContain("Known keys: role, site, name");
+    }
+  );
 
   it("M3 — a concurrent rule added in another window between the picker and the save is PRESERVED, not clobbered (resolve-under-lock delta; kills the wholesale overwrite from the pre-QuickPick snapshot)", async () => {
     const core = makeCore();

@@ -23,6 +23,15 @@ const PROVIDER_ID_RE = /^[a-z0-9][a-z0-9-]*$/i;
  * need to know exactly what's wrong with the shape they registered.
  */
 export function validateProviderShape(provider: unknown): asserts provider is InventoryProvider {
+  checkProviderShape(provider);
+}
+
+/**
+ * `validateProviderShape`'s checks, returning the copy of `attributeKeys` the
+ * registry keeps (`copyAttributeKeys`), so that `register()` reads the member once
+ * and stores exactly what was checked.
+ */
+function checkProviderShape(provider: unknown): readonly string[] | undefined {
   if (typeof provider !== "object" || provider === null) {
     throw new Error("Inventory provider must be an object.");
   }
@@ -185,6 +194,69 @@ export function validateProviderShape(provider: unknown): asserts provider is In
   if (obj.canWebConsole !== undefined && typeof obj.canWebConsole !== "function") {
     throw new Error("Inventory provider canWebConsole must be a function when present.");
   }
+  // TEMPLATE-RULE FILTER KEYS (issue #163) — the twin of the clauses above, for
+  // the one optional member that is data rather than a function. `attributeKeys`
+  // is OPTIONAL (a provider that declares no list has its filters checked
+  // against none), but a present value that is not an array of strings IS an
+  // error, named here: `unknownFilterKeys` and `knownKeysList`
+  // (templateApply.ts) iterate it and call string methods on every entry, so a
+  // `"role,site"` or a `[1]` that survived registration would throw TypeError out
+  // of Edit Template Rules before the Rule Filter box could open, far from the
+  // registration that caused it.
+  //
+  // DELIBERATELY ACCEPTED: a blank or whitespace-only entry, and a duplicate.
+  // Neither throws anywhere — a blank key matches nothing and `knownKeysList`
+  // leaves it out of every list it builds, and a duplicate is one entry in the
+  // matcher's Set (and at worst a repeated word in that list) — so refusing the
+  // provider's whole registration, sync and all, would cost far more than the entry.
+  return copyAttributeKeys(obj.attributeKeys);
+}
+
+/**
+ * `attributeKeys` as the registry keeps it: `undefined` when the provider declares
+ * none, otherwise a frozen plain array of its entries. Throws, naming the member or
+ * the entry's index, on anything that is not an array of strings.
+ *
+ * WHY A COPY (PR #188 review). Every entry being a string at its index is all the
+ * check can prove, and the consumers do more with the list than index it:
+ * `knownKeysList` calls `some` and spreads it, `unknownFilterKeys` calls `map`. On
+ * the provider's own array each of those is code the provider controls — an own
+ * `map`, an Array subclass's iterator or methods — so a list that passed here
+ * could still throw out of Edit Template Rules, or change after registration.
+ * The copy's behaviour is Array.prototype's and its contents are exactly what
+ * was checked.
+ *
+ * HOW, and why not the shorter spellings: one pass by index over `length` read
+ * once, each entry read once and checked as it is copied. `[...value]` and
+ * `Array.from(value)` run the provider's iterator; `value.slice()` runs its
+ * `slice`, or builds its subclass again; a check loop followed by a separate copy
+ * reads every entry twice, and a getter can answer differently the second time.
+ * An index loop rather than `.every` also because `.every` skips the holes of a
+ * sparse array, which `knownKeysList`'s spread would turn into `undefined`.
+ */
+function copyAttributeKeys(value: unknown): readonly string[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    throw new Error("Inventory provider attributeKeys must be an array of strings when present.");
+  }
+  const length = value.length;
+  const keys: string[] = [];
+  for (let i = 0; i < length; i++) {
+    const key: unknown = value[i];
+    if (typeof key !== "string") {
+      throw new Error(`Inventory provider attributeKeys entry ${i} must be a string.`);
+    }
+    keys.push(key);
+  }
+  return Object.freeze(keys);
+}
+
+/** One registration: the provider, and the copy of its `attributeKeys` taken when it registered. */
+interface RegisteredProvider {
+  readonly provider: InventoryProvider;
+  readonly attributeKeys: readonly string[] | undefined;
 }
 
 /**
@@ -195,7 +267,7 @@ export function validateProviderShape(provider: unknown): asserts provider is In
  * remove a later registration B that happens to share A's id or label.
  */
 export class InventoryProviderRegistry {
-  private readonly providers = new Map<string, InventoryProvider>();
+  private readonly providers = new Map<string, RegisteredProvider>();
   private readonly listeners = new Set<ProviderRegistryListener>();
 
   /**
@@ -226,11 +298,11 @@ export class InventoryProviderRegistry {
   }
 
   public register(provider: InventoryProvider): ProviderRegistration {
-    validateProviderShape(provider);
+    const registration: RegisteredProvider = { provider, attributeKeys: checkProviderShape(provider) };
     if (this.providers.has(provider.id)) {
       throw new Error(`An inventory provider with id "${provider.id}" is already registered.`);
     }
-    this.providers.set(provider.id, provider);
+    this.providers.set(provider.id, registration);
     // AFTER the map write, so a listener that repaints from the registry sees
     // the provider it was just told about. A rejected registration (duplicate
     // id, bad shape) throws above and never reaches here — nothing changed, so
@@ -245,7 +317,7 @@ export class InventoryProviderRegistry {
         disposed = true;
         // Only remove if this exact registration still owns the id — a
         // disposed-then-re-registered id must survive a stale dispose() call.
-        if (this.providers.get(provider.id) === provider) {
+        if (this.providers.get(provider.id) === registration) {
           this.providers.delete(provider.id);
           // Inside the guard: a stale dispose evicts nothing, and an event for
           // it would announce a removal that did not happen.
@@ -273,10 +345,21 @@ export class InventoryProviderRegistry {
   }
 
   public get(id: string): InventoryProvider | undefined {
-    return this.providers.get(id);
+    return this.providers.get(id)?.provider;
+  }
+
+  /**
+   * The `attributeKeys` of the provider holding `id`, as copied when it registered
+   * (`copyAttributeKeys`): a frozen plain array, or `undefined` when that provider
+   * declares no list or no provider holds the id. Read the keys here, never off
+   * `get(id)` — the provider's own array is the one whose methods and iterator it
+   * controls, and whose contents it can change after the check.
+   */
+  public attributeKeysOf(id: string): readonly string[] | undefined {
+    return this.providers.get(id)?.attributeKeys;
   }
 
   public list(): InventoryProvider[] {
-    return [...this.providers.values()];
+    return [...this.providers.values()].map((registration) => registration.provider);
   }
 }

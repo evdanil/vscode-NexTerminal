@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.255] — 2026-09-25
+
+### Fixed
+
+- **A third-party inventory provider with a malformed filter-key list is refused when it registers, not when you add a template rule.** Nexus did not check the list of filter keys (`attributeKeys`) that an extension registering its own inventory provider declares. A list written as one comma-joined string (`"role,site"`), or one holding something other than text, made adding a template rule, or editing a rule's filter, in **Edit Template Rules** fail with an error before the Rule Filter box opened. Registration now refuses such a provider, and the error tells its author what is wrong, naming the entry when one is. Its sources then behave as those of any provider that is not installed, until the extension is fixed. Blank and repeated keys are still accepted: neither breaks anything, and a blank key is left out of the lists the box shows. A list that passes is read once, at registration: Nexus keeps its own copy, so changes the extension makes to the list afterwards are not picked up. The four built-in providers are unaffected.
+
 ## [2.8.254] — 2026-09-25
 
 ### Fixed
