@@ -10,6 +10,7 @@ import type {
   SshConnection
 } from "./contracts";
 import { ProxiedSshConnection, jumpHostCleanup, socketCleanup, socketCloseRelay } from "./proxiedSshConnection";
+import { underlyingConnection } from "./sshConnectionPool";
 import type { SilentAuthSshFactory } from "./silentAuth";
 import { proxyPasswordSecretKey } from "./silentAuth";
 import { isSameAuthenticatedEndpoint } from "../inventory/proxySecretHygiene";
@@ -60,6 +61,40 @@ interface ResolvedProxyPassword {
 interface SharedProxyPasswordAnswer {
   proxy: Socks5Proxy | HttpConnectProxy;
   answer: Promise<{ password: string; save: boolean } | undefined>;
+}
+
+/**
+ * The route a login through a SOCKS5 or HTTP proxy takes, for
+ * `SilentAuthSshFactory` to share a typed password only between logins on the
+ * same route (issue #177): the endpoint of the exact proxy config the
+ * connection's sockFactory dials, never a fresh lookup.
+ */
+export function proxyEndpointRoute(proxy: Socks5Proxy | HttpConnectProxy): string {
+  return JSON.stringify([proxy.type, proxy.host, proxy.port, proxy.username ?? ""]);
+}
+
+const transportIds = new WeakMap<SshConnection, number>();
+let lastTransportId = 0;
+
+/**
+ * The route a login through a jump host takes: the jump connection its socket
+ * is actually opened through — the pooled transport, shared by every lease on
+ * it — rather than the jump host's configuration. A configuration can change
+ * before the pool lets go of the connection made with the old one (NexusCore
+ * updates its servers before the change reaches the pool), and a hop's login
+ * may come from an auth profile. The connection embodies its own route —
+ * address, login and every hop beyond — so logins share an answer only while
+ * they tunnel through the same one; a replacement, after an edit, a sync or a
+ * dropped connection, is a new route.
+ */
+function jumpConnectionRoute(jumpConnection: SshConnection): string {
+  const transport = underlyingConnection(jumpConnection);
+  let id = transportIds.get(transport);
+  if (id === undefined) {
+    id = ++lastTransportId;
+    transportIds.set(transport, id);
+  }
+  return `ssh:${id}`;
 }
 
 function normalizeProxyTimeoutMs(timeoutMs: number): number {
@@ -200,6 +235,7 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     try {
       targetConnection = await this.authFactory.connect(target, {
         sockFactory,
+        route: () => jumpConnectionRoute(jumpConnection),
         ...(onAuthMessage && { onAuthMessage })
       });
     } catch (error) {
@@ -338,6 +374,7 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     try {
       connection = await this.authFactory.connect(target, {
         sockFactory,
+        route: () => proxyEndpointRoute(proxy),
         ...(onAuthMessage && { onAuthMessage })
       });
     } catch (error) {

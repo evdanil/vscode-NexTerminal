@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.260] — 2026-09-25
+
+### Fixed
+
+- **Logging in to a server several times at once asks for its password once.** With no saved password, logins that happened together — isolated-mode tunnel clients, such as a browser opening several connections at once, or terminals with connection multiplexing off — each opened their own password prompt. VS Code shows one prompt at a time, so each new prompt dismissed the one before it, and that login failed as if you had cancelled. They now share one prompt and your answer. A password is shared only between logins to the same server, user and address, reached the same way: servers that use one password auth profile are still asked once each, and a login that reaches the server another way while you are typing — through another proxy, or a new connection to its jump host — is asked again, since a password typed for one machine is never sent to another. Behind a jump host with connection multiplexing turned off, each login still asks for the server password on its own; save the password there, or keep multiplexing on for the jump host. If a waiting login's connection to the jump host is replaced while you type, that login fails with a message to connect again instead of sending your password over the new connection. A private key's passphrase is shared the same way, and across every server that uses one key auth profile. Cancelling the prompt cancels every login waiting on it, and a password that was rejected, or that you chose not to save, is asked for again at the next login.
+
 ## [2.8.258] — 2026-09-25
 
 ### Fixed

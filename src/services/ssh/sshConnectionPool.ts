@@ -196,6 +196,11 @@ class PooledSshConnection implements SshConnection {
     }
   }
 
+  /** The connection this lease rides now: the pooled transport, or its own fallback. */
+  public get transport(): SshConnection {
+    return this.active;
+  }
+
   private assertNotDisposed(): void {
     if (this.disposed) {
       throw new Error("Cannot use a disposed SSH connection lease");
@@ -452,4 +457,14 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
     }
     return this.innerFactory.connect(server);
   }
+}
+
+/**
+ * The connection `connection` actually rides: for a lease from a pool, the
+ * pooled transport it shares with every other lease on it (or its own
+ * fallback); anything else is its own. Two leases on one transport reach the
+ * server by the same path.
+ */
+export function underlyingConnection(connection: SshConnection): SshConnection {
+  return connection instanceof PooledSshConnection ? connection.transport : connection;
 }

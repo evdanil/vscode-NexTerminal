@@ -1,7 +1,15 @@
 import type { Duplex } from "node:stream";
 import type { AuthProfile, ServerConfig } from "../../models/config";
 import { authProfileOwnedCredentials } from "../../models/config";
-import type { KeyboardInteractiveHandler, PasswordPrompt, SecretVault, SshConnection, SshConnector, SshFactory } from "./contracts";
+import type {
+  KeyboardInteractiveHandler,
+  PasswordPrompt,
+  PasswordPromptResult,
+  SecretVault,
+  SshConnection,
+  SshConnector,
+  SshFactory
+} from "./contracts";
 
 export type InputPromptFn = (message: string, password: boolean) => Promise<string | undefined>;
 
@@ -73,7 +81,42 @@ function isPassphraseError(error: unknown): boolean {
   return message.includes("encrypted") || message.includes("passphrase") || message.includes("bad decrypt");
 }
 
+/** A prompted password or passphrase being asked for, or answered and not yet settled. */
+interface SharedPromptAnswer {
+  /** What it was typed for: a password's `user@host:port` and route, a passphrase's key file. */
+  typedFor: string;
+  answer: Promise<PasswordPromptResult | undefined>;
+}
+
 export class SilentAuthSshFactory implements SshFactory {
+  /**
+   * Per vault key: the prompted answer shared by every login that reaches the
+   * prompt before one that used it settles. The pool joins its own consumers
+   * onto one pending connect per server, but isolated-mode tunnel clients — and
+   * any consumer when multiplexing is off — log in on their own, in parallel.
+   * VS Code shows one input box at a time, so a second prompt dismissed the
+   * first, which read as a cancel and failed that login (issue #177).
+   *
+   * Keyed by the vault key the answer would be saved under, so only logins
+   * that already share a credential share its answer: one server, or the
+   * servers linked to one auth profile. `typedFor` then keeps a password on the
+   * endpoint it was typed for — an edit or a sync can repoint a server while
+   * its prompt is open, and the servers on a profile are different devices —
+   * and a passphrase on its key file.
+   *
+   * A password is also kept on its route, as `ProxySshFactory` gives it: the
+   * live jump-host connection the login's socket is opened through, or the
+   * endpoint of the SOCKS5/HTTP proxy it dials. The same `user@host:port`
+   * reached another way can be another machine — lab networks reuse private
+   * addresses — and a password the user typed for one, perhaps choosing not to
+   * save it, must not reach the other because an edit or a sync re-pointed the
+   * server, or one of its jump hosts, while the prompt was open. A login
+   * through a proxy whose route the caller did not give is never shared. A
+   * passphrase has no route: it unlocks the key file here and is never sent
+   * anywhere.
+   */
+  private readonly sharedAnswers = new Map<string, SharedPromptAnswer>();
+
   public constructor(
     private readonly connector: SshConnector,
     private readonly vault: SecretVault,
@@ -196,7 +239,17 @@ export class SilentAuthSshFactory implements SshFactory {
    */
   public async connect(
     server: ServerConfig,
-    options?: { sockFactory?: () => Promise<Duplex>; onAuthMessage?: (text: string) => void }
+    options?: {
+      sockFactory?: () => Promise<Duplex>;
+      onAuthMessage?: (text: string) => void;
+      /**
+       * The route this login takes to the server, as `ProxySshFactory`
+       * identifies it; see `sharedAnswers`. Asked again once the socket is
+       * open, because opening it can move a pooled jump connection onto a
+       * fallback of its own.
+       */
+      route?: () => string;
+    }
   ): Promise<SshConnection> {
     const { resolved, passwordKey, passphraseKey, legacyServerPassphraseKey, profileScoped } = this.resolveServer(server);
 
@@ -228,65 +281,72 @@ export class SilentAuthSshFactory implements SshFactory {
         }
       }
 
-      // Prompt user for passphrase.
-      const promptResult = await this.prompt.prompt({
-        ...resolved,
-        name: `${server.name} (key passphrase)`
-      });
-      if (!promptResult) {
+      // Prompt user for passphrase — or join the prompt already open for it.
+      const prompted = await this.promptShared(passphraseKey, resolved.keyPath ?? "", () =>
+        this.prompt.prompt({
+          ...resolved,
+          name: `${server.name} (key passphrase)`
+        })
+      );
+      if (!prompted) {
         throw new Error(`Passphrase entry canceled for ${server.name}`);
       }
+      const { result: promptResult, settle } = prompted;
 
-      const secondSock = await options?.sockFactory?.();
-
-      // Stage A — establish connection. Narrow try scope so vault ops cannot
-      // trigger the catch that destroys the live sock.
-      // Note: onAuthMessage may render the banner/KI context a second time
-      // here (once for the failed saved-passphrase attempt, once for this
-      // prompted retry) — intentional, mirrors re-running ssh by hand.
-      let connection: SshConnection;
       try {
-        connection = await this.connector.connect(resolved, {
-          passphrase: promptResult.password,
-          ...(handler && { onKeyboardInteractive: handler }),
-          ...(secondSock && { sock: secondSock }),
-          ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage })
-        });
-      } catch (error) {
-        secondSock?.destroy();
-        throw error;
-      }
+        const secondSock = await options?.sockFactory?.();
 
-      // Stage B — persist credentials, best-effort. A transient SecretStorage
-      // failure must not destroy the live SSH connection the user just
-      // authenticated; the natural fallback is being re-prompted next time.
-      // Note: if the legacy vault.delete throws after the primary vault.store
-      // succeeded, the entire catch fires and Stage B is abandoned. That is
-      // acceptable — the legacy delete is cleanup of a stale key and missing
-      // it is not security-relevant.
-      try {
-        if (promptResult.save) {
-          await this.vault.store(passphraseKey, promptResult.password);
-          if (legacyServerPassphraseKey && legacyServerPassphraseKey !== passphraseKey) {
-            await this.vault.delete(legacyServerPassphraseKey);
-          }
-        } else if (!profileScoped) {
-          // Declining to save replaces the stored credential for a server —
-          // but a profile-scoped passphrase belongs to the whole fleet, and
-          // "don't save this one" must not erase what other servers still
-          // authenticate with. Clearing a profile passphrase is done through
-          // the profile editor, not here.
-          await this.vault.delete(passphraseKey);
+        // Stage A — establish connection. Narrow try scope so vault ops cannot
+        // trigger the catch that destroys the live sock.
+        // Note: onAuthMessage may render the banner/KI context a second time
+        // here (once for the failed saved-passphrase attempt, once for this
+        // prompted retry) — intentional, mirrors re-running ssh by hand.
+        let connection: SshConnection;
+        try {
+          connection = await this.connector.connect(resolved, {
+            passphrase: promptResult.password,
+            ...(handler && { onKeyboardInteractive: handler }),
+            ...(secondSock && { sock: secondSock }),
+            ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage })
+          });
+        } catch (error) {
+          secondSock?.destroy();
+          throw error;
         }
-      } catch (vaultErr) {
-        console.error(
-          `[Nexus SSH] Could not ${promptResult.save ? "save" : "clear"} passphrase for ${server.name}; ` +
-            "the session is connected but credentials may not be persisted.",
-          vaultErr
-        );
-      }
 
-      return connection;
+        // Stage B — persist credentials, best-effort. A transient SecretStorage
+        // failure must not destroy the live SSH connection the user just
+        // authenticated; the natural fallback is being re-prompted next time.
+        // Note: if the legacy vault.delete throws after the primary vault.store
+        // succeeded, the entire catch fires and Stage B is abandoned. That is
+        // acceptable — the legacy delete is cleanup of a stale key and missing
+        // it is not security-relevant.
+        try {
+          if (promptResult.save) {
+            await this.vault.store(passphraseKey, promptResult.password);
+            if (legacyServerPassphraseKey && legacyServerPassphraseKey !== passphraseKey) {
+              await this.vault.delete(legacyServerPassphraseKey);
+            }
+          } else if (!profileScoped) {
+            // Declining to save replaces the stored credential for a server —
+            // but a profile-scoped passphrase belongs to the whole fleet, and
+            // "don't save this one" must not erase what other servers still
+            // authenticate with. Clearing a profile passphrase is done through
+            // the profile editor, not here.
+            await this.vault.delete(passphraseKey);
+          }
+        } catch (vaultErr) {
+          console.error(
+            `[Nexus SSH] Could not ${promptResult.save ? "save" : "clear"} passphrase for ${server.name}; ` +
+              "the session is connected but credentials may not be persisted.",
+            vaultErr
+          );
+        }
+
+        return connection;
+      } finally {
+        settle();
+      }
     }
 
     if (resolved.authType !== "password") {
@@ -332,55 +392,123 @@ export class SilentAuthSshFactory implements SshFactory {
       }
     }
 
-    const promptResult = await this.prompt.prompt({ ...resolved, name: server.name });
-    if (!promptResult) {
+    // Prompt user for the password — or join the prompt already open for it.
+    const route = options?.route?.() ?? (resolved.proxy ? undefined : "direct");
+    const prompted = await this.promptShared(
+      passwordKey,
+      route === undefined ? undefined : `${resolved.username}@${resolved.host}:${resolved.port} via ${route}`,
+      () => this.prompt.prompt({ ...resolved, name: server.name })
+    );
+    if (!prompted) {
       throw new Error(`Password entry canceled for ${server.name}`);
     }
+    const { result: promptResult, settle, joined } = prompted;
 
-    const handler = this.buildKeyboardInteractiveHandler(promptResult.password, options?.onAuthMessage);
-    const secondSock = await options?.sockFactory?.();
-
-    // Stage A — establish connection. Narrow try scope so vault ops cannot
-    // trigger the catch that destroys the live sock.
-    // Note: onAuthMessage may render the banner/KI context a second time
-    // here (once for the failed saved-password attempt, once for this
-    // prompted retry) — intentional, mirrors re-running ssh by hand.
-    let connection: SshConnection;
     try {
-      connection = await this.connector.connect(resolved, {
-        password: promptResult.password,
-        ...(handler && { onKeyboardInteractive: handler }),
-        ...(secondSock && { sock: secondSock }),
-        ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage })
-      });
-    } catch (error) {
-      secondSock?.destroy();
-      throw error;
-    }
-
-    // Stage B — persist credentials, best-effort. A transient SecretStorage
-    // failure must not destroy the live SSH connection the user just
-    // authenticated; the natural fallback is being re-prompted next time.
-    try {
-      if (promptResult.save) {
-        await this.vault.store(passwordKey, promptResult.password);
-      } else if (!profileScoped) {
-        // Declining to save replaces the stored credential for a server —
-        // but a profile-scoped password belongs to the whole fleet, and
-        // "don't save this one" must not erase what other servers still
-        // authenticate with. Clearing a profile password is done through the
-        // profile editor, not here.
-        await this.vault.delete(passwordKey);
+      const handler = this.buildKeyboardInteractiveHandler(promptResult.password, options?.onAuthMessage);
+      const secondSock = await options?.sockFactory?.();
+      if (joined && options?.route && options.route() !== route) {
+        // Opening the socket moved this login onto another route — a pooled
+        // jump connection falling back to one of its own, made from the jump
+        // host's configuration as the lease found it. The answer it joined was
+        // typed for another login's route and is not sent. Failed rather than
+        // asked again: a second prompt here is the one the sharing exists to
+        // avoid, and a retry leases a fresh jump connection of its own.
+        secondSock?.destroy();
+        throw new Error(
+          `The route to ${server.name} changed while its password was being entered, so the password was not sent. Connect again.`
+        );
       }
-    } catch (vaultErr) {
-      console.error(
-        `[Nexus SSH] Could not ${promptResult.save ? "save" : "clear"} password for ${server.name}; ` +
-          "the session is connected but credentials may not be persisted.",
-        vaultErr
-      );
-    }
 
-    return connection;
+      // Stage A — establish connection. Narrow try scope so vault ops cannot
+      // trigger the catch that destroys the live sock.
+      // Note: onAuthMessage may render the banner/KI context a second time
+      // here (once for the failed saved-password attempt, once for this
+      // prompted retry) — intentional, mirrors re-running ssh by hand.
+      let connection: SshConnection;
+      try {
+        connection = await this.connector.connect(resolved, {
+          password: promptResult.password,
+          ...(handler && { onKeyboardInteractive: handler }),
+          ...(secondSock && { sock: secondSock }),
+          ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage })
+        });
+      } catch (error) {
+        secondSock?.destroy();
+        throw error;
+      }
+
+      // Stage B — persist credentials, best-effort. A transient SecretStorage
+      // failure must not destroy the live SSH connection the user just
+      // authenticated; the natural fallback is being re-prompted next time.
+      try {
+        if (promptResult.save) {
+          await this.vault.store(passwordKey, promptResult.password);
+        } else if (!profileScoped) {
+          // Declining to save replaces the stored credential for a server —
+          // but a profile-scoped password belongs to the whole fleet, and
+          // "don't save this one" must not erase what other servers still
+          // authenticate with. Clearing a profile password is done through the
+          // profile editor, not here.
+          await this.vault.delete(passwordKey);
+        }
+      } catch (vaultErr) {
+        console.error(
+          `[Nexus SSH] Could not ${promptResult.save ? "save" : "clear"} password for ${server.name}; ` +
+            "the session is connected but credentials may not be persisted.",
+          vaultErr
+        );
+      }
+
+      return connection;
+    } finally {
+      settle();
+    }
   }
 
+  /**
+   * Asks for the credential saved under `vaultKey`, or joins the prompt already
+   * open — or answered, with its login still in flight — for the same key and
+   * the same `typedFor` (see `sharedAnswers`); an undefined `typedFor` is
+   * never shared. A cancel is every waiting
+   * login's cancel, and the next login asks again. An answer is shared until
+   * `settle()`, which each login that used it calls once it has succeeded (and
+   * saved it, if asked to) or failed: settled only after the save, so a login
+   * arriving in between still finds the answer; from then on the vault is the
+   * source of truth, and a failed answer — which may be what failed — or one
+   * the user chose not to save is asked for afresh.
+   */
+  private async promptShared(
+    vaultKey: string,
+    typedFor: string | undefined,
+    ask: () => Promise<PasswordPromptResult | undefined>
+  ): Promise<{ result: PasswordPromptResult; settle: () => void; joined: boolean } | undefined> {
+    if (typedFor === undefined) {
+      const result = await ask();
+      return result ? { result, settle: () => {}, joined: false } : undefined;
+    }
+    let shared = this.sharedAnswers.get(vaultKey);
+    const joined = shared !== undefined && shared.typedFor === typedFor;
+    if (!shared || !joined) {
+      shared = { typedFor, answer: ask() };
+      this.sharedAnswers.set(vaultKey, shared);
+    }
+    const own = shared;
+    // Only our own entry: one asked for another endpoint may have replaced it.
+    const settle = (): void => {
+      if (this.sharedAnswers.get(vaultKey) === own) {
+        this.sharedAnswers.delete(vaultKey);
+      }
+    };
+    let result: PasswordPromptResult | undefined;
+    try {
+      result = await own.answer;
+    } finally {
+      // Cancelled (or the prompt threw): nothing to share, so the next login asks again.
+      if (!result) {
+        settle();
+      }
+    }
+    return result ? { result, settle, joined } : undefined;
+  }
 }

@@ -38,7 +38,7 @@ Observer pattern hub. Holds servers, tunnel profiles, serial profiles, and all a
 - **Scripts** (`ScriptRuntimeManager`): Each running script lives in its own `node:worker_threads` Worker (separate V8 isolate, same process). IPC is structured-clone `postMessage` with a pending-Promise map keyed by monotonic request id. Workers are killed via `worker.terminate()` — preempts tight JS loops at V8 safe points in single-digit ms. Three isolation tiers: in-process (SSH), worker-thread (Scripts — cheap, fast-kill), child-process (Serial — crash-isolates native addons)
 
 ### Auth flow: `SilentAuthSshFactory`
-Tries saved password from `VscodeSecretVault` → falls back to `VscodePasswordPrompt` → optionally saves to vault. On auth failure, invalidates cached password and re-prompts.
+Tries saved password from `VscodeSecretVault` → falls back to `VscodePasswordPrompt` → optionally saves to vault. On auth failure, invalidates cached password and re-prompts. Concurrent logins needing the same unsaved password (same endpoint, through the same live jump connection or proxy endpoint) or passphrase (same key file) share one prompt and its answer until one of them settles (`promptShared`).
 
 ### Storage
 `ConfigRepository` interface with two implementations:

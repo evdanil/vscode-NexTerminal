@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { AuthProfile, ServerConfig } from "../../src/models/config";
+import type { AuthProfile, HttpConnectProxy, ServerConfig, Socks5Proxy } from "../../src/models/config";
 import type { KeyboardInteractiveHandler, PasswordPrompt, SecretVault, SshConnection, SshConnector } from "../../src/services/ssh/contracts";
 import {
   SilentAuthSshFactory,
@@ -10,6 +10,9 @@ import {
   passphraseSecretKey,
   proxyPasswordSecretKey
 } from "../../src/services/ssh/silentAuth";
+import { ProxySshFactory, proxyEndpointRoute } from "../../src/services/ssh/proxySshFactory";
+import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
+import { PassThrough } from "node:stream";
 
 const baseServer: ServerConfig = {
   id: "srv-1",
@@ -1009,5 +1012,630 @@ describe("deleteServerSecrets", () => {
     expect(attempted).toEqual([passwordSecretKey("srv-1"), passphraseSecretKey("srv-1"), proxyPasswordSecretKey("srv-1")]);
     expect(warn).toHaveBeenCalledTimes(1);
     warn.mockRestore();
+  });
+});
+
+// Issue #177 — with nothing saved, concurrent logins that need the same
+// password (or key passphrase) each opened their own prompt. VS Code shows one
+// input box at a time, so the later prompt dismissed the earlier one, which
+// then read as a cancel and failed that login — most visibly with isolated
+// tunnels, where every client logs in on its own. The answer is now shared by
+// the logins that would save it under the same key, for the same endpoint (a
+// password) or key file (a passphrase), until one login that used it settles.
+describe("SilentAuthSshFactory — concurrent logins share one prompt (issue #177)", () => {
+  type Answer = { password: string; save: boolean } | undefined;
+
+  /** A prompt that stays open until the test answers it. */
+  function openPrompt(): { prompt: PasswordPrompt; answer: (value: Answer) => void } {
+    const pending: Array<(value: Answer) => void> = [];
+    return {
+      prompt: { prompt: vi.fn(() => new Promise<Answer>((resolve) => pending.push(resolve))) },
+      answer: (value) => {
+        for (const resolve of pending.splice(0)) {
+          resolve(value);
+        }
+      }
+    };
+  }
+
+  /** Lets every login run up to its vault read and prompt before anything is answered. */
+  const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+  function gate(): { promise: Promise<void>; open: () => void } {
+    let open!: () => void;
+    const promise = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    return { promise, open };
+  }
+
+  const sentPasswords = (connector: SshConnector) =>
+    (connector.connect as ReturnType<typeof vi.fn>).mock.calls.map((call) => (call[1] as { password?: string }).password);
+
+  describe("server password", () => {
+    it("asks once when a second login arrives while the prompt is open, and both log in with the answer", async () => {
+      const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+      const vault = createVault();
+      const { prompt, answer } = openPrompt();
+      const factory = new SilentAuthSshFactory(connector, vault, prompt);
+
+      const first = factory.connect(baseServer);
+      const second = factory.connect(baseServer);
+      await settle();
+      answer({ password: "pw", save: true });
+
+      await expect(Promise.all([first, second])).resolves.toEqual([fakeConnection, fakeConnection]);
+      expect(prompt.prompt).toHaveBeenCalledTimes(1);
+      expect(sentPasswords(connector)).toEqual(["pw", "pw"]);
+    });
+
+    it("reuses an answer whose login is still in flight and has not saved it yet", async () => {
+      const login = gate();
+      const connector: SshConnector = {
+        connect: vi.fn(async () => {
+          await login.promise;
+          return fakeConnection;
+        })
+      };
+      const vault = createVault();
+      const prompt: PasswordPrompt = { prompt: vi.fn(async () => ({ password: "pw", save: true })) };
+      const factory = new SilentAuthSshFactory(connector, vault, prompt);
+
+      const first = factory.connect(baseServer);
+      await vi.waitFor(() => expect(connector.connect).toHaveBeenCalledTimes(1));
+      const second = factory.connect(baseServer);
+      await vi.waitFor(() => expect(connector.connect).toHaveBeenCalledTimes(2));
+      login.open();
+      await Promise.all([first, second]);
+
+      expect(prompt.prompt).toHaveBeenCalledTimes(1);
+      expect(sentPasswords(connector)).toEqual(["pw", "pw"]);
+      expect(vault.store).toHaveBeenCalledWith(passwordSecretKey(baseServer.id), "pw");
+    });
+
+    it("still shares the answer while the login that used it is saving it", async () => {
+      // Until the save completes the vault has nothing to offer a new login;
+      // forgetting the answer before then would open a second prompt.
+      const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+      const vault = createVault();
+      const saving = gate();
+      const store = vault.store;
+      vault.store = vi.fn(async (key: string, value: string) => {
+        await saving.promise;
+        await store(key, value);
+      });
+      const prompt: PasswordPrompt = { prompt: vi.fn(async () => ({ password: "pw", save: true })) };
+      const factory = new SilentAuthSshFactory(connector, vault, prompt);
+
+      const first = factory.connect(baseServer);
+      await vi.waitFor(() => expect(vault.store).toHaveBeenCalledTimes(1));
+      const second = factory.connect(baseServer);
+      await vi.waitFor(() => expect(connector.connect).toHaveBeenCalledTimes(2));
+      saving.open();
+      await Promise.all([first, second]);
+
+      expect(prompt.prompt).toHaveBeenCalledTimes(1);
+      expect(sentPasswords(connector)).toEqual(["pw", "pw"]);
+    });
+
+    it("cancels every login waiting on a prompt the user cancelled, then asks again at the next login", async () => {
+      const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+      const vault = createVault();
+      const { prompt, answer } = openPrompt();
+      const factory = new SilentAuthSshFactory(connector, vault, prompt);
+
+      const first = factory.connect(baseServer);
+      const second = factory.connect(baseServer);
+      await settle();
+      answer(undefined);
+      await expect(first).rejects.toThrow("Password entry canceled");
+      await expect(second).rejects.toThrow("Password entry canceled");
+      expect(prompt.prompt).toHaveBeenCalledTimes(1);
+
+      const third = factory.connect(baseServer);
+      await settle();
+      answer({ password: "pw", save: false });
+      await expect(third).resolves.toBe(fakeConnection);
+      expect(prompt.prompt).toHaveBeenCalledTimes(2);
+    });
+
+    it("fails every login waiting on a prompt that itself fails, then asks again at the next login", async () => {
+      const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+      const vault = createVault();
+      let failPrompt!: (error: Error) => void;
+      const prompt: PasswordPrompt = {
+        prompt: vi.fn()
+          .mockImplementationOnce(() => new Promise<Answer>((_resolve, reject) => {
+            failPrompt = reject;
+          }))
+          .mockResolvedValueOnce({ password: "pw", save: false })
+      };
+      const factory = new SilentAuthSshFactory(connector, vault, prompt);
+
+      const first = factory.connect(baseServer);
+      const second = factory.connect(baseServer);
+      await settle();
+      failPrompt(new Error("input box failed"));
+      await expect(first).rejects.toThrow("input box failed");
+      await expect(second).rejects.toThrow("input box failed");
+      expect(prompt.prompt).toHaveBeenCalledTimes(1);
+
+      await expect(factory.connect(baseServer)).resolves.toBe(fakeConnection);
+      expect(prompt.prompt).toHaveBeenCalledTimes(2);
+    });
+
+    it("asks again after a login that used the answer fails, and never saves the rejected password", async () => {
+      // The answer may be what failed; the next login must not inherit it.
+      const connector: SshConnector = {
+        connect: vi.fn()
+          .mockRejectedValueOnce(new Error("All configured authentication methods failed"))
+          .mockResolvedValue(fakeConnection)
+      };
+      const vault = createVault();
+      const prompt: PasswordPrompt = {
+        prompt: vi.fn()
+          .mockResolvedValueOnce({ password: "wrong", save: true })
+          .mockResolvedValueOnce({ password: "pw", save: true })
+      };
+      const factory = new SilentAuthSshFactory(connector, vault, prompt);
+
+      await expect(factory.connect(baseServer)).rejects.toThrow("authentication methods failed");
+      await factory.connect(baseServer);
+
+      expect(prompt.prompt).toHaveBeenCalledTimes(2);
+      expect(sentPasswords(connector)).toEqual(["wrong", "pw"]);
+      expect(vault.store).not.toHaveBeenCalledWith(passwordSecretKey(baseServer.id), "wrong");
+    });
+
+    it("asks again at the next login for a password the user chose not to save", async () => {
+      // Declining to save means nothing outlives the logins it was typed for —
+      // not the vault, and not an answer kept in memory.
+      const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+      const vault = createVault();
+      const prompt: PasswordPrompt = {
+        prompt: vi.fn()
+          .mockResolvedValueOnce({ password: "first", save: false })
+          .mockResolvedValueOnce({ password: "second", save: false })
+      };
+      const factory = new SilentAuthSshFactory(connector, vault, prompt);
+
+      await factory.connect(baseServer);
+      await factory.connect(baseServer);
+
+      expect(prompt.prompt).toHaveBeenCalledTimes(2);
+      expect(sentPasswords(connector)).toEqual(["first", "second"]);
+    });
+
+    it("asks again once the saved password is gone, rather than reviving an answer already saved", async () => {
+      const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+      const vault = createVault();
+      const prompt: PasswordPrompt = {
+        prompt: vi.fn()
+          .mockResolvedValueOnce({ password: "old", save: true })
+          .mockResolvedValueOnce({ password: "new", save: true })
+      };
+      const factory = new SilentAuthSshFactory(connector, vault, prompt);
+
+      await factory.connect(baseServer);
+      await vault.delete(passwordSecretKey(baseServer.id));
+      await factory.connect(baseServer);
+
+      expect(prompt.prompt).toHaveBeenCalledTimes(2);
+      expect(sentPasswords(connector)).toEqual(["old", "new"]);
+    });
+
+    // A password is only ever sent to the endpoint it was typed for. An edit or
+    // an inventory sync can repoint a server while its prompt is open.
+    it.each([
+      ["host", { host: "other.example.com" }],
+      ["port", { port: 2222 }],
+      ["username", { username: "admin" }]
+    ] as const)("never gives an answer to a login whose %s has changed since it was asked for", async (_field, change) => {
+      const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+      const vault = createVault();
+      const prompt: PasswordPrompt = {
+        prompt: vi.fn(async (server: ServerConfig) => ({
+          password: `pw-for-${server.username}@${server.host}:${server.port}`,
+          save: false
+        }))
+      };
+      const factory = new SilentAuthSshFactory(connector, vault, prompt);
+      const repointed: ServerConfig = { ...baseServer, ...change };
+
+      await Promise.all([factory.connect(baseServer), factory.connect(repointed)]);
+
+      expect(prompt.prompt).toHaveBeenCalledTimes(2);
+      expect(sentPasswords(connector)).toEqual([
+        "pw-for-root@example.com:22",
+        `pw-for-${repointed.username}@${repointed.host}:${repointed.port}`
+      ]);
+    });
+
+    // The caller resolves the route (ProxySshFactory: see the "resolved route"
+    // tests below); this factory only compares it.
+    it("shares an answer only between logins on the same route", async () => {
+      const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+      const vault = createVault();
+      const prompt: PasswordPrompt = {
+        prompt: vi.fn()
+          .mockResolvedValueOnce({ password: "pw-route-a", save: false })
+          .mockResolvedValueOnce({ password: "pw-route-b", save: false })
+      };
+      const factory = new SilentAuthSshFactory(connector, vault, prompt);
+      const viaBastion: ServerConfig = { ...baseServer, proxy: { type: "ssh", jumpHostId: "bastion-1" } };
+
+      await Promise.all([
+        factory.connect(viaBastion, { route: () => "route-a" }),
+        factory.connect({ ...viaBastion }, { route: () => "route-a" }),
+        factory.connect({ ...viaBastion }, { route: () => "route-b" })
+      ]);
+
+      expect(prompt.prompt).toHaveBeenCalledTimes(2);
+      expect(sentPasswords(connector)).toEqual(["pw-route-a", "pw-route-a", "pw-route-b"]);
+    });
+
+    it("never shares an answer for a login through a proxy whose route the caller did not resolve", async () => {
+      // Its jump host's address is unknown here, so there is nothing to compare.
+      const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+      const vault = createVault();
+      const { prompt, answer } = openPrompt();
+      const factory = new SilentAuthSshFactory(connector, vault, prompt);
+      const viaBastion = (): ServerConfig => ({ ...baseServer, proxy: { type: "ssh", jumpHostId: "bastion-1" } });
+
+      const first = factory.connect(viaBastion());
+      const second = factory.connect(viaBastion());
+      await settle();
+      answer({ password: "pw", save: false });
+      await Promise.all([first, second]);
+
+      expect(prompt.prompt).toHaveBeenCalledTimes(2);
+    });
+
+    it("never gives an answer to another server on the same auth profile unless it is the same endpoint", async () => {
+      // A profile-scoped password is saved under one key for the whole fleet,
+      // but a password typed for one device is not sent to another.
+      const profile: AuthProfile = { id: "prof-fleet", name: "Fleet", username: "ops", authType: "password" };
+      const lookup = (id: string) => (id === profile.id ? profile : undefined);
+      const deviceA: ServerConfig = { ...baseServer, id: "srv-a", name: "A", host: "a.example.com", authProfileId: profile.id };
+      const deviceB: ServerConfig = { ...baseServer, id: "srv-b", name: "B", host: "b.example.com", authProfileId: profile.id };
+      const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+      const vault = createVault();
+      const prompt: PasswordPrompt = {
+        prompt: vi.fn(async (server: ServerConfig) => ({ password: `pw-for-${server.host}`, save: false }))
+      };
+      const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, lookup);
+
+      await Promise.all([factory.connect(deviceA), factory.connect(deviceB)]);
+
+      expect(prompt.prompt).toHaveBeenCalledTimes(2);
+      expect(sentPasswords(connector)).toEqual(["pw-for-a.example.com", "pw-for-b.example.com"]);
+    });
+
+    it("does not share between two servers that name the same address through different jump hosts", async () => {
+      // Lab devices commonly reuse management addresses: the same user@host:port
+      // reached through another jump host is another machine.
+      const labOne: ServerConfig = { ...baseServer, id: "srv-lab1-r1", name: "lab1-r1", proxy: { type: "ssh", jumpHostId: "bastion-1" } };
+      const labTwo: ServerConfig = { ...baseServer, id: "srv-lab2-r1", name: "lab2-r1", proxy: { type: "ssh", jumpHostId: "bastion-2" } };
+      const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+      const vault = createVault();
+      const prompt: PasswordPrompt = {
+        prompt: vi.fn(async (server: ServerConfig) => ({ password: `pw-for-${server.name}`, save: false }))
+      };
+      const factory = new SilentAuthSshFactory(connector, vault, prompt);
+
+      await Promise.all([factory.connect(labOne), factory.connect(labTwo)]);
+
+      expect(prompt.prompt).toHaveBeenCalledTimes(2);
+      expect(sentPasswords(connector)).toEqual(["pw-for-lab1-r1", "pw-for-lab2-r1"]);
+    });
+  });
+
+  // A login can fail after the prompt without ever reaching the server: its
+  // transport (a proxy or jump-host hop) fails to open. The answer was never
+  // tried, but that login is over, and it must not leave the answer behind.
+  it.each([
+    { credential: "password", server: baseServer, failing: 1 },
+    // The saved-passphrase attempt opens the first transport; the prompted retry opens the second.
+    { credential: "passphrase", server: { ...baseServer, authType: "key" as const, keyPath: "/keys/id_ed25519" }, failing: 2 }
+  ])("asks again for the $credential after a login whose transport failed once it was answered", async ({ server, failing }) => {
+    const connector: SshConnector = {
+      connect: vi.fn(async (_server: ServerConfig, auth: { passphrase?: string }) => {
+        if (server.authType === "key" && !auth.passphrase) {
+          throw new Error("Encrypted private OpenSSH key detected, but no passphrase given");
+        }
+        return fakeConnection;
+      })
+    };
+    const vault = createVault();
+    const prompt: PasswordPrompt = { prompt: vi.fn(async () => ({ password: "secret", save: false })) };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt);
+    let opened = 0;
+    const sockFactory = vi.fn(async () => {
+      opened += 1;
+      if (opened === failing) {
+        throw new Error("proxy hop failed");
+      }
+      return makeMockStream() as never;
+    });
+
+    await expect(factory.connect(server, { sockFactory })).rejects.toThrow("proxy hop failed");
+    await expect(factory.connect(server)).resolves.toBe(fakeConnection);
+
+    expect(prompt.prompt).toHaveBeenCalledTimes(2);
+  });
+
+  describe("key passphrase", () => {
+    /** An encrypted key: a login without a passphrase is refused the way ssh2 refuses it. */
+    function encryptedKeyConnector(): SshConnector {
+      return {
+        connect: vi.fn(async (_server: ServerConfig, auth: { passphrase?: string }) => {
+          if (!auth.passphrase) {
+            throw new Error("Encrypted private OpenSSH key detected, but no passphrase given");
+          }
+          return fakeConnection;
+        })
+      };
+    }
+    const sentPassphrases = (connector: SshConnector) =>
+      (connector.connect as ReturnType<typeof vi.fn>).mock.calls
+        .map((call) => (call[1] as { passphrase?: string }).passphrase)
+        .filter((passphrase) => passphrase !== undefined);
+    const keyServer: ServerConfig = { ...baseServer, authType: "key", keyPath: "/keys/id_ed25519" };
+
+    it("asks once when concurrent logins need the passphrase, and both log in with it", async () => {
+      const connector = encryptedKeyConnector();
+      const vault = createVault();
+      const { prompt, answer } = openPrompt();
+      const factory = new SilentAuthSshFactory(connector, vault, prompt);
+
+      const first = factory.connect(keyServer);
+      const second = factory.connect(keyServer);
+      await settle();
+      answer({ password: "phrase", save: true });
+
+      await expect(Promise.all([first, second])).resolves.toEqual([fakeConnection, fakeConnection]);
+      expect(prompt.prompt).toHaveBeenCalledTimes(1);
+      expect(sentPassphrases(connector)).toEqual(["phrase", "phrase"]);
+    });
+
+    it("asks once for servers sharing a key auth profile, whose passphrase is saved under one key", async () => {
+      const profile: AuthProfile = { id: "prof-key", name: "Fleet key", username: "ops", authType: "key", keyPath: "/keys/fleet" };
+      const lookup = (id: string) => (id === profile.id ? profile : undefined);
+      const deviceA: ServerConfig = { ...baseServer, id: "srv-a", name: "A", host: "a.example.com", authProfileId: profile.id };
+      const deviceB: ServerConfig = { ...baseServer, id: "srv-b", name: "B", host: "b.example.com", authProfileId: profile.id };
+      const connector = encryptedKeyConnector();
+      const vault = createVault();
+      const { prompt, answer } = openPrompt();
+      const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, lookup);
+
+      const first = factory.connect(deviceA);
+      const second = factory.connect(deviceB);
+      await settle();
+      answer({ password: "fleet-phrase", save: true });
+      await Promise.all([first, second]);
+
+      expect(prompt.prompt).toHaveBeenCalledTimes(1);
+      expect(sentPassphrases(connector)).toEqual(["fleet-phrase", "fleet-phrase"]);
+      expect(vault.store).toHaveBeenCalledWith(authProfilePassphraseSecretKey(profile.id), "fleet-phrase");
+    });
+
+    it("asks once for the passphrase of one key file whatever route each login takes", async () => {
+      // A passphrase only unlocks the key file here; it is never sent anywhere,
+      // so the route a login takes does not change what it was typed for.
+      const profile: AuthProfile = { id: "prof-key", name: "Fleet key", username: "ops", authType: "key", keyPath: "/keys/fleet" };
+      const lookup = (id: string) => (id === profile.id ? profile : undefined);
+      const lab1: ServerConfig = { ...baseServer, id: "srv-lab1", name: "lab1", authProfileId: profile.id, proxy: { type: "ssh", jumpHostId: "bastion-1" } };
+      const lab2: ServerConfig = { ...baseServer, id: "srv-lab2", name: "lab2", authProfileId: profile.id, proxy: { type: "socks5", host: "proxy.local", port: 1080 } };
+      const connector = encryptedKeyConnector();
+      const vault = createVault();
+      const { prompt, answer } = openPrompt();
+      const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, lookup);
+
+      const first = factory.connect(lab1);
+      const second = factory.connect(lab2);
+      await settle();
+      answer({ password: "fleet-phrase", save: false });
+      await Promise.all([first, second]);
+
+      expect(prompt.prompt).toHaveBeenCalledTimes(1);
+    });
+
+    it("never gives a passphrase typed for one key file to a login that now uses another", async () => {
+      const connector = encryptedKeyConnector();
+      const vault = createVault();
+      const prompt: PasswordPrompt = {
+        prompt: vi.fn(async (server: ServerConfig) => ({ password: `phrase-for-${server.keyPath}`, save: false }))
+      };
+      const factory = new SilentAuthSshFactory(connector, vault, prompt);
+      const rekeyed: ServerConfig = { ...keyServer, keyPath: "/keys/id_rsa" };
+
+      await Promise.all([factory.connect(keyServer), factory.connect(rekeyed)]);
+
+      expect(prompt.prompt).toHaveBeenCalledTimes(2);
+      expect(sentPassphrases(connector)).toEqual(["phrase-for-/keys/id_ed25519", "phrase-for-/keys/id_rsa"]);
+    });
+
+    it("asks again after a login that used the passphrase fails", async () => {
+      const connector: SshConnector = {
+        connect: vi.fn(async (_server: ServerConfig, auth: { passphrase?: string }) => {
+          if (auth.passphrase !== "right") {
+            throw new Error("Cannot parse privateKey: bad decrypt");
+          }
+          return fakeConnection;
+        })
+      };
+      const vault = createVault();
+      const prompt: PasswordPrompt = {
+        prompt: vi.fn()
+          .mockResolvedValueOnce({ password: "wrong", save: true })
+          .mockResolvedValueOnce({ password: "right", save: true })
+      };
+      const factory = new SilentAuthSshFactory(connector, vault, prompt);
+
+      await expect(factory.connect(keyServer)).rejects.toThrow("bad decrypt");
+      await factory.connect(keyServer);
+
+      expect(prompt.prompt).toHaveBeenCalledTimes(2);
+      expect(vault.store).not.toHaveBeenCalledWith(passphraseSecretKey(keyServer.id), "wrong");
+    });
+  });
+});
+
+// Issue #177 (review) — the route a password is shared on is the jump
+// connection a login actually tunnels through, not the jump host's
+// configuration: NexusCore updates a server before the change reaches the pool,
+// so for a moment a changed configuration still rides the old pooled
+// connection — and a replaced connection can carry an unchanged one. These
+// drive the real ProxySshFactory, with the real pool as its jump-host factory,
+// over the real SilentAuthSshFactory; only the SSH transport is faked.
+describe("ProxySshFactory + SilentAuthSshFactory — a password is shared only through the same jump connection (issue #177)", () => {
+  type Answer = { password: string; save: boolean } | undefined;
+  const bastion: ServerConfig = { ...baseServer, id: "bastion", name: "Bastion", host: "10.0.0.1", username: "ops" };
+  const target: ServerConfig = { ...baseServer, id: "srv-target", name: "Target", host: "172.16.0.5", proxy: { type: "ssh", jumpHostId: bastion.id } };
+
+  /**
+   * `firstBastionTunnels` caps how many tunnels the first bastion connection
+   * opens before it reports itself gone ("Not connected"), which makes the pool
+   * move that lease onto a fallback connection of its own.
+   */
+  function setUp(firstBastionTunnels = Infinity) {
+    const servers = new Map([bastion, target].map((server) => [server.id, server]));
+    // The bastion's password is saved, so the target's prompt is the only one.
+    const vault = createVault({ [passwordSecretKey(bastion.id)]: "saved-bastion" });
+    let bastionConnections = 0;
+    const connector: SshConnector = {
+      connect: vi.fn(async (server: ServerConfig) => {
+        let budget = server.id === bastion.id && ++bastionConnections === 1 ? firstBastionTunnels : Infinity;
+        return {
+          ...fakeConnection,
+          openDirectTcp: vi.fn(async () => {
+            if (budget-- <= 0) {
+              throw new Error("Not connected");
+            }
+            return new PassThrough();
+          }),
+          dispose: vi.fn()
+        };
+      })
+    };
+    const pending: Array<(value: Answer) => void> = [];
+    const prompt: PasswordPrompt = { prompt: vi.fn(() => new Promise<Answer>((resolve) => pending.push(resolve))) };
+    const factory = new ProxySshFactory(new SilentAuthSshFactory(connector, vault, prompt), (id) => servers.get(id), vault);
+    const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 0 });
+    factory.setJumpHostConnectionFactory(pool);
+    const calls = (connector.connect as ReturnType<typeof vi.fn>).mock.calls;
+    let reachedPrompt = 0;
+    return {
+      servers,
+      pool,
+      prompt,
+      /** Starts a login to the target and waits until it is at its prompt, or joined another; `done` is the login. */
+      login: async (): Promise<{ done: Promise<SshConnection> }> => {
+        const login = factory.connect({ ...target, proxy: { type: "ssh", jumpHostId: bastion.id } });
+        reachedPrompt += 1;
+        const expected = reachedPrompt;
+        await vi.waitFor(() =>
+          expect((vault.get as ReturnType<typeof vi.fn>).mock.calls.filter(([key]) => key === passwordSecretKey(target.id))).toHaveLength(expected)
+        );
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        return { done: login };
+      },
+      answerEach: () => pending.splice(0).forEach((resolve, i) => resolve({ password: `pw-${i + 1}`, save: false })),
+      answerAll: (answer: Answer) => pending.splice(0).forEach((resolve) => resolve(answer)),
+      targetPasswords: () =>
+        calls.filter((call) => (call[0] as ServerConfig).id === target.id).map((call) => (call[1] as { password?: string }).password).sort(),
+      bastionLogins: () => calls.filter((call) => (call[0] as ServerConfig).id === bastion.id).length
+    };
+  }
+
+  it("asks once for logins that tunnel through the same pooled jump connection", async () => {
+    const run = setUp();
+    const first = await run.login();
+    const second = await run.login();
+    run.answerEach();
+    await Promise.all([first.done, second.done]);
+
+    expect(run.bastionLogins()).toBe(1);
+    expect(run.prompt.prompt).toHaveBeenCalledTimes(1);
+    expect(run.targetPasswords()).toEqual(["pw-1", "pw-1"]);
+  });
+
+  it("asks again for a login through a replacement jump connection, even with the configuration unchanged", async () => {
+    const run = setUp();
+    const first = await run.login();
+    run.pool.invalidate(bastion.id);
+    const second = await run.login();
+    run.answerEach();
+    await Promise.all([first.done, second.done]);
+
+    expect(run.bastionLogins()).toBe(2);
+    expect(run.prompt.prompt).toHaveBeenCalledTimes(2);
+    expect(run.targetPasswords()).toEqual(["pw-1", "pw-2"]);
+  });
+
+  it("does not send a shared answer through a jump connection its login fell back to after joining", async () => {
+    // The route is checked again once the login's socket is open: a pooled
+    // jump connection that fails to open a tunnel moves the lease onto a
+    // fallback connection of its own, made from the jump host's configuration
+    // as the lease found it — which may no longer be the host the answer was
+    // typed for.
+    const run = setUp(1);
+    const first = await run.login();
+    const second = await run.login();
+    run.answerEach();
+
+    await expect(first.done).resolves.toBeDefined();
+    await expect(second.done).rejects.toThrow(/was not sent/);
+    expect(run.bastionLogins()).toBe(2);
+    expect(run.prompt.prompt).toHaveBeenCalledTimes(1);
+    expect(run.targetPasswords()).toEqual(["pw-1"]);
+  });
+
+  it("still sends its own answer through a fallback jump connection, as before", async () => {
+    // Only an answer typed for another login's route is held back: a login
+    // that asked for its own password is not failed by the pool's fallback.
+    const run = setUp(0);
+    const only = await run.login();
+    run.answerAll({ password: "pw", save: false });
+
+    await expect(only.done).resolves.toBeDefined();
+    expect(run.bastionLogins()).toBe(2);
+    expect(run.targetPasswords()).toEqual(["pw"]);
+  });
+
+  it("shares an answer with a login still riding the old jump connection after its configuration changed, and only with those", async () => {
+    // The edit has landed in the configuration but not yet reached the pool:
+    // the second login still tunnels through the connection the first did.
+    // Once the pool lets that go, the next login's route is a new one.
+    const run = setUp();
+    const first = await run.login();
+    run.servers.set(bastion.id, { ...bastion, host: "10.0.0.2" });
+    const second = await run.login();
+    run.pool.invalidate(bastion.id);
+    const third = await run.login();
+    run.answerEach();
+    await Promise.all([first.done, second.done, third.done]);
+
+    expect(run.bastionLogins()).toBe(2);
+    expect(run.prompt.prompt).toHaveBeenCalledTimes(2);
+    expect(run.targetPasswords()).toEqual(["pw-1", "pw-1", "pw-2"]);
+  });
+});
+
+describe("proxyEndpointRoute", () => {
+  it.each<[string, Socks5Proxy | HttpConnectProxy, Socks5Proxy | HttpConnectProxy]>([
+    ["SOCKS5 proxies on different hosts", { type: "socks5", host: "p1", port: 1080 }, { type: "socks5", host: "p2", port: 1080 }],
+    ["SOCKS5 proxies on different ports", { type: "socks5", host: "p1", port: 1080 }, { type: "socks5", host: "p1", port: 1081 }],
+    ["SOCKS5 proxies as different users", { type: "socks5", host: "p1", port: 1080, username: "a" }, { type: "socks5", host: "p1", port: 1080, username: "b" }],
+    ["a SOCKS5 and an HTTP proxy at one address", { type: "socks5", host: "p1", port: 8080 }, { type: "http", host: "p1", port: 8080 }],
+    ["HTTP proxies on different hosts", { type: "http", host: "p1", port: 8080 }, { type: "http", host: "p2", port: 8080 }]
+  ])("tells apart %s", (_name, a, b) => {
+    expect(proxyEndpointRoute(a)).not.toBe(proxyEndpointRoute(b));
+  });
+
+  it("is the same for equal endpoints held in separate objects", () => {
+    expect(proxyEndpointRoute({ type: "http", host: "p1", port: 8080, username: "u" })).toBe(
+      proxyEndpointRoute({ username: "u", port: 8080, host: "p1", type: "http" })
+    );
   });
 });
