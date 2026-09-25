@@ -80,6 +80,55 @@ describe("collectIncomingMacros (direct)", () => {
     expect(result!.macros.find(m => m.name === "Secret")?.text).toBe("real-secret");
   });
 
+  it("skips null entries in the v2 macro list and continues importing later macros", () => {
+    const payload = {
+      version: 2 as const,
+      exportedAt: "",
+      macros: [null, [], { id: "m1", name: "Public", text: "echo hi" }] as unknown as TerminalMacro[]
+    };
+
+    const result = collectIncomingMacros(payload);
+
+    expect(result?.macros.map((macro) => macro.name)).toEqual(["Public"]);
+    expect(result).toMatchObject({ invalidCount: 2 });
+  });
+
+  it("counts malformed legacy macro rows without counting valid secret macros as invalid", () => {
+    const payload = {
+      version: 1 as const,
+      exportedAt: "",
+      servers: [] as import("../../src/models/config").ServerConfig[],
+      settings: {
+        "nexus.terminal.macros": [
+          null,
+          [],
+          { name: "Public", text: "echo hi" },
+          { name: "Secret", text: "already readable", secret: true }
+        ]
+      }
+    };
+
+    const result = collectIncomingMacros(payload as unknown as Parameters<typeof collectIncomingMacros>[0]);
+
+    expect(result?.macros.map((macro) => macro.name)).toEqual(["Public", "Secret"]);
+    expect(result).toMatchObject({ invalidCount: 2 });
+  });
+
+  it("skips null entries in encrypted secret macro blobs and resolves later blobs", () => {
+    const payload = {
+      version: 2 as const,
+      exportedAt: "",
+      macros: [{ id: "secret-1", name: "Secret", text: "", secret: true }] as TerminalMacro[]
+    };
+
+    const result = collectIncomingMacros(payload, {
+      secretMacros: [null, { id: "secret-1", text: "real-secret" }]
+    });
+
+    expect(result?.unresolvedCount).toBe(0);
+    expect(result?.macros[0].text).toBe("real-secret");
+  });
+
   it("v2 with missing-id secret — increments unresolvedCount", () => {
     const payload = {
       version: 2 as const,

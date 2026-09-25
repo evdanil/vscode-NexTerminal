@@ -983,6 +983,10 @@ function ensureId(item: Record<string, unknown>): void {
   }
 }
 
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 interface ImportTally {
   imported: number;
   skipped: number;
@@ -1141,20 +1145,29 @@ async function addServerSanitizingOrigin(server: ServerConfig, add: (entity: Ser
  * wrongly-trusted one; it is never deleted on the strength of imported
  * metadata alone.
  *
- * Mutates each element in place (deleting the property outright, regardless
- * of its type) and returns the same array reference: callers downstream of
- * this (the secret-restore loop's `importedSourceById` lookup keyed off
- * `data.inventorySources`) only ever read `id`/`secretFieldIds`, which this
- * never touches.
+ * Mutates each record in place (deleting the property outright, regardless of
+ * its type), while dropping non-record rows and reporting them to the caller.
+ * `data.inventorySources` is also used later to build `importedSourceById`, so
+ * malformed rows must be removed before that lookup as well as before
+ * validation/import.
  */
-function sanitizeImportedInventorySources(sources: InventorySourceConfig[] | undefined): InventorySourceConfig[] | undefined {
+function sanitizeImportedInventorySources(
+  sources: InventorySourceConfig[] | undefined
+): { sources: InventorySourceConfig[] | undefined; skipped: number } {
   if (!sources) {
-    return sources;
+    return { sources, skipped: 0 };
   }
+  const records: InventorySourceConfig[] = [];
+  let skipped = 0;
   for (const source of sources) {
-    delete (source as unknown as Record<string, unknown>).managedFolders;
+    if (!isRecordValue(source)) {
+      skipped++;
+      continue;
+    }
+    delete source.managedFolders;
+    records.push(source);
   }
-  return sources;
+  return { sources: records, skipped };
 }
 
 /**
@@ -2729,22 +2742,28 @@ function sanitizeImportedMacro(raw: TerminalMacro): TerminalMacro {
 export function collectIncomingMacros(
   data: NexusConfigExport,
   decryptedSecrets?: Record<string, unknown>
-): { macros: TerminalMacro[]; unresolvedCount: number; capabilityStripped: boolean } | undefined {
+): { macros: TerminalMacro[]; unresolvedCount: number; capabilityStripped: boolean; invalidCount: number } | undefined {
+  const secretBlobs = (Array.isArray(decryptedSecrets?.secretMacros) ? decryptedSecrets.secretMacros : []).filter(
+    (blob): blob is { id?: string; name?: string; text?: string } =>
+      typeof blob === "object" && blob !== null && !Array.isArray(blob)
+  );
+
   // New format (version 2): top-level `macros` + id-keyed secret blobs
   if (Array.isArray(data.macros)) {
-    const secretBlobs = (decryptedSecrets?.secretMacros as Array<{ id?: string; name?: string; text?: string }> | undefined) ?? [];
     const byId = new Map<string, string>();
     const byName = new Map<string, string>();
     for (const blob of secretBlobs) {
-      if (blob.id && typeof blob.text === "string") byId.set(blob.id, blob.text);
-      if (blob.name && typeof blob.text === "string") byName.set(blob.name, blob.text);
+      if (typeof blob.id === "string" && blob.id && typeof blob.text === "string") byId.set(blob.id, blob.text);
+      if (typeof blob.name === "string" && blob.name && typeof blob.text === "string") byName.set(blob.name, blob.text);
     }
+    const macroEntries = data.macros.filter((macro): macro is TerminalMacro => isRecordValue(macro));
+    const invalidCount = data.macros.length - macroEntries.length;
     // S3 — recorded off the RAW records, before sanitizeImportedMacro strips them,
     // so an imported gateway-routed/credentialed macro is reset-with-notice rather
     // than reset-silently. Presence, not per-macro count: the notice fires once.
-    const capabilityStripped = data.macros.some((m) => hasImportedCapabilityField(m));
+    const capabilityStripped = macroEntries.some((m) => hasImportedCapabilityField(m));
     let unresolvedCount = 0;
-    const macros = data.macros.map<TerminalMacro>((m) => {
+    const macros = macroEntries.map<TerminalMacro>((m) => {
       if (m.secret) {
         const plain = (m.id && byId.get(m.id)) ?? (m.name && byName.get(m.name)) ?? "";
         if (!plain) unresolvedCount++;
@@ -2752,21 +2771,22 @@ export function collectIncomingMacros(
       }
       return sanitizeImportedMacro({ ...m });
     });
-    return { macros, unresolvedCount, capabilityStripped };
+    return { macros, unresolvedCount, capabilityStripped, invalidCount };
   }
 
   // Legacy format (version 1): macros under `settings.nexus.terminal.macros`;
   // secret text carried separately by name.
   const legacy = (data.settings?.["nexus.terminal.macros"] as TerminalMacro[] | undefined);
   if (Array.isArray(legacy)) {
-    const secretBlobs = (decryptedSecrets?.secretMacros as Array<{ name?: string; text?: string; secret?: boolean }> | undefined) ?? [];
+    const macroEntries = legacy.filter((macro): macro is TerminalMacro => isRecordValue(macro));
+    const invalidCount = legacy.length - macroEntries.length;
     const byName = new Map<string, string>();
     for (const blob of secretBlobs) {
-      if (blob.name && typeof blob.text === "string") byName.set(blob.name, blob.text);
+      if (typeof blob.name === "string" && blob.name && typeof blob.text === "string") byName.set(blob.name, blob.text);
     }
-    const capabilityStripped = legacy.some((m) => hasImportedCapabilityField(m));
+    const capabilityStripped = macroEntries.some((m) => hasImportedCapabilityField(m));
     let unresolvedCount = 0;
-    const macros = legacy.map<TerminalMacro>((m) => {
+    const macros = macroEntries.map<TerminalMacro>((m) => {
       if (m.secret) {
         const plain = byName.get(m.name ?? "") ?? m.text ?? "";
         if (plain === "") unresolvedCount++;
@@ -2774,7 +2794,7 @@ export function collectIncomingMacros(
       }
       return sanitizeImportedMacro({ ...m });
     });
-    return { macros, unresolvedCount, capabilityStripped };
+    return { macros, unresolvedCount, capabilityStripped, invalidCount };
   }
 
   return undefined;
@@ -3331,12 +3351,31 @@ export function registerConfigCommands(
   async function importShareData(data: NexusConfigExport): Promise<void> {
     // Generate fresh IDs to prevent duplicates on re-import
     const idMap = new Map<string, string>();
+    let imported = 0;
+    let skipped = 0;
+    const recordRows = <T>(items: unknown): T[] => {
+      if (!Array.isArray(items)) return [];
+      const records: T[] = [];
+      for (const item of items) {
+        if (isRecordValue(item)) records.push(item as T);
+        else skipped++;
+      }
+      return records;
+    };
 
-    const authProfiles = data.authProfiles ?? [];
-    const servers = data.servers ?? [];
-    const tunnels = data.tunnels ?? [];
-    const serialProfiles = data.serialProfiles ?? [];
-    const localShellProfiles = data.localShellProfiles ?? [];
+    // These are file-controlled lists. Filter before the ID pre-pass or any
+    // earlier collection writes, and carry each bad row into the one summary.
+    const authProfiles = recordRows<AuthProfile>(data.authProfiles);
+    const servers = recordRows<ServerConfig>(data.servers);
+    const tunnels = recordRows<TunnelProfile>(data.tunnels);
+    const serialProfiles = recordRows<SerialProfile>(data.serialProfiles);
+    const localShellProfiles = recordRows<LocalShellProfile>(data.localShellProfiles);
+    const rawMacros = Array.isArray(data.macros)
+      ? data.macros
+      : Array.isArray(data.settings?.["nexus.terminal.macros"])
+        ? data.settings!["nexus.terminal.macros"]
+        : [];
+    const macros = recordRows<TerminalMacro>(rawMacros);
     const deviceTemplates = data.deviceTemplates ?? [];
     const inventorySources = data.inventorySources ?? [];
     const savedFilters = data.savedFilters ?? [];
@@ -3350,9 +3389,6 @@ export function registerConfigCommands(
       ensureId(server as unknown as Record<string, unknown>);
       idMap.set(server.id, randomUUID());
     }
-
-    let imported = 0;
-    let skipped = 0;
 
     // Each block remaps ids inline (semantics differ per entity), then defers the
     // validate-then-add-or-skip tally to addIfValid to keep that mechanical part DRY.
@@ -3784,13 +3820,10 @@ export function registerConfigCommands(
     // Apply macros (share = non-secret only)
     // v2 shape: top-level `data.macros` array
     // v1 shape: macros under `data.settings["nexus.terminal.macros"]`
-    const rawMacros: TerminalMacro[] = Array.isArray(data.macros)
-      ? data.macros
-      : Array.isArray(data.settings?.["nexus.terminal.macros"])
-        ? (data.settings!["nexus.terminal.macros"] as TerminalMacro[])
-        : [];
-    if (rawMacros.length > 0) {
-      const incoming = rawMacros.filter((m) => !m.secret);
+    if (macros.length > 0) {
+      // Secret macros are intentionally not part of a share; malformed rows were
+      // already counted separately when the raw list was filtered above.
+      const incoming = macros.filter((m) => !m.secret);
       // S3 — recorded off the RAW non-secret records (the ones actually imported)
       // before sanitizeImportedMacro strips them, so a shared gateway-routed /
       // credentialed macro is reset-with-notice, not silently. Fired once below.
@@ -4126,7 +4159,9 @@ export function registerConfigCommands(
     // see `sanitizeImportedInventorySources`'s doc for why the strip can't
     // live inside `validateInventorySource`, nor after it (a malformed value
     // must not be able to reject the whole source).
-    data.inventorySources = sanitizeImportedInventorySources(data.inventorySources);
+    const sanitizedInventorySources = sanitizeImportedInventorySources(data.inventorySources);
+    data.inventorySources = sanitizedInventorySources.sources;
+    skipped += sanitizedInventorySources.skipped;
     const inventorySourceTally = await importPreservingIds(data.inventorySources, existingIds, validateInventorySource, (e) =>
       core.addOrUpdateInventorySource(e)
     );
@@ -4390,7 +4425,8 @@ export function registerConfigCommands(
 
     // Apply macros from import payload
     if (incomingResult !== undefined) {
-      const { macros: incomingMacros, unresolvedCount, capabilityStripped } = incomingResult;
+      const { macros: incomingMacros, unresolvedCount, capabilityStripped, invalidCount } = incomingResult;
+      skipped += invalidCount;
       if (mode === "replace") {
         // `replaceMacros`, not `saveMacros`: this is the one macro write in the extension whose
         // input is a wholesale external list, and the store's two entry points exist for

@@ -112,6 +112,8 @@ The password also seals the readable part. A backup made by this version records
 
 **Replace refuses a list it could not restore.** If the backup's Local Server, saved TFTP or saved DHCP profile list has entries but none of them can be imported, Replace stops before deleting anything and says which list; Merge imports what it can. An empty list is a real answer and still clears yours.
 
+For JSON imports, a null or other non-record row in the shared auth-profile, server, tunnel, serial-profile, Local Shell profile, or macro lists is skipped and counted in the completion message. Backup imports apply the same skip-and-count behavior to inventory sources and macro lists. A valid row later in the file still imports; a secret macro omitted from a share is intentional and is not counted as malformed.
+
 **Local Servers, TFTP/DHCP profiles and host keys on restore:** Merge adds the ones you don't have and keeps the ones you do; where the backup trusts a different SSH host key than this machine does, your current key is kept and the import summary says how many hosts that affected. Replace swaps in the backup's, stopping any running Local Server it removes first. A restore starts nothing — Local Servers come back stopped, and a TFTP/DHCP profile isn't applied until you load it. A backup made before 2.8.243 has none of these, and restoring it leaves yours untouched, Replace included. Export for Sharing never includes them. Session logs are not backed up.
 
 To bring either file back in, run `Nexus: Import…` and choose **Nexus Export File…** — see [Import](#import) for how Merge and Replace treat local `.ssh` and script files.

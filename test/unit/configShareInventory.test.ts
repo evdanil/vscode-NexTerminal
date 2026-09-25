@@ -2175,4 +2175,79 @@ describe("share round trip — the recipient's first sync adopts the cached tree
       expect(plan.prunes).toEqual([]);
     }
   });
+
+  it.each([
+    {
+      label: "auth profiles",
+      field: "authProfiles",
+      record: makeProfile({ id: "shared-auth", name: "Shared auth" }),
+      names: (machine: Machine) => machine.core.getSnapshot().authProfiles.map((profile) => profile.name),
+      expectedName: "Shared auth"
+    },
+    {
+      label: "servers",
+      field: "servers",
+      record: makeServer({ id: "shared-server", name: "Shared server" }),
+      names: (machine: Machine) => machine.core.getSnapshot().servers.map((server) => server.name),
+      expectedName: "Shared server"
+    },
+    {
+      label: "tunnels",
+      field: "tunnels",
+      record: everyTunnelField(),
+      names: (machine: Machine) => machine.core.getSnapshot().tunnels.map((profile) => profile.name),
+      expectedName: "Web UI"
+    },
+    {
+      label: "serial profiles",
+      field: "serialProfiles",
+      record: everySerialField(),
+      names: (machine: Machine) => machine.core.getSnapshot().serialProfiles.map((profile) => profile.name),
+      expectedName: "Console"
+    },
+    {
+      label: "Local Shell profiles",
+      field: "localShellProfiles",
+      record: everyLocalShellField(),
+      names: (machine: Machine) => machine.core.getSnapshot().localShellProfiles.map((profile) => profile.name),
+      expectedName: "Build shell"
+    }
+  ])("skips and counts non-record entries before importing later $label", async ({ field, record, names, expectedName }) => {
+    const recipient = await makeMachine();
+
+    await importShare(recipient, shareJson({ [field]: [null, [], record] }));
+
+    expect(names(recipient)).toContain(expectedName);
+    expect(lastInfoMessage()).toContain("(2 skipped).");
+  });
+
+  it.each([
+    {
+      label: "v2 top-level macros",
+      payload: {
+        macros: [null, [], { name: "Shared macro", text: "echo hi" }, { name: "Secret macro", text: "hidden", secret: true }]
+      }
+    },
+    {
+      label: "legacy settings macros",
+      payload: {
+        settings: {
+          "nexus.terminal.macros": [
+            null,
+            [],
+            { name: "Shared macro", text: "echo hi" },
+            { name: "Secret macro", text: "hidden", secret: true }
+          ]
+        }
+      }
+    }
+  ])("skips and counts malformed $label rows without counting intentionally excluded secrets", async ({ payload }) => {
+    const recipient = await makeMachine();
+
+    await importShare(recipient, shareJson(payload));
+
+    expect(getMacros().map((macro) => macro.name)).toContain("Shared macro");
+    expect(getMacros().map((macro) => macro.name)).not.toContain("Secret macro");
+    expect(lastInfoMessage()).toContain("(2 skipped).");
+  });
 });
