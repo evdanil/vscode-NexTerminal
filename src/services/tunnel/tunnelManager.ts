@@ -204,6 +204,8 @@ export class TunnelManager {
   private readonly forwardRequests = new Map<string, Promise<void>>();
   /** A retired transport may still own a server-wide bind while other leases use it. */
   private readonly retiredForwardTransports = new Map<string, Promise<void>>();
+  /** Only explicitly discarded candidates are quiet; a superseded transport may still be in use. */
+  private readonly intentionallyDiscardedSharedConnections = new WeakSet<SshConnection>();
   private trafficTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private socks5HandshakeTimeoutMs: number;
 
@@ -498,7 +500,7 @@ export class TunnelManager {
             // The old SSH lease is gone, but a terminal may still keep its
             // transport open. Do not request the same server-wide bind over a
             // fresh connection until that transport's close removes the bind.
-            await this.waitForRetiredForward(runtime, retiredAfterLogin);
+            await this.waitForForwardWait(runtime, retiredAfterLogin);
             if (this.retiredForwardTransports.get(requestKey) === retiredAfterLogin) {
               this.retiredForwardTransports.delete(requestKey);
             }
@@ -511,7 +513,7 @@ export class TunnelManager {
             // transport if withdrawal fails. Login is outside this barrier:
             // a replacement can authenticate independently while an earlier
             // non-pooled login finishes.
-            await earlierRequest;
+            await this.waitForForwardWait(runtime, earlierRequest);
             if (runtime.isStopping) {
               throw new TunnelStoppedError(profile.name);
             }
@@ -533,8 +535,8 @@ export class TunnelManager {
             if (runtime.sharedConnection === candidate) {
               runtime.sharedConnection = undefined;
             }
-            candidate.dispose();
-            await this.waitForRetiredForward(runtime, retiredTransport);
+            this.discardSharedConnection(candidate);
+            await this.waitForForwardWait(runtime, retiredTransport);
             if (this.retiredForwardTransports.get(requestKey) === retiredTransport) {
               this.retiredForwardTransports.delete(requestKey);
             }
@@ -549,11 +551,11 @@ export class TunnelManager {
             if (runtime.sharedConnection === candidate) {
               runtime.sharedConnection = undefined;
             }
-            candidate.dispose();
+            this.discardSharedConnection(candidate);
             if (runtime.isStopping) {
               throw new TunnelStoppedError(profile.name);
             }
-            await competingRequest!;
+            await this.waitForForwardWait(runtime, competingRequest!);
             if (runtime.isStopping) {
               throw new TunnelStoppedError(profile.name);
             }
@@ -589,7 +591,7 @@ export class TunnelManager {
           if (runtime.sharedConnection === sshConnection) {
             runtime.sharedConnection = undefined;
           }
-          sshConnection.dispose();
+          this.discardSharedConnection(sshConnection);
           throw runtime.isStopping ? new TunnelStoppedError(profile.name) : outcome.error;
         }
         allocatedPort = outcome.port;
@@ -690,7 +692,7 @@ export class TunnelManager {
     });
   }
 
-  private async waitForRetiredForward(runtime: ActiveTunnelRuntime, closed: Promise<void>): Promise<void> {
+  private async waitForForwardWait(runtime: ActiveTunnelRuntime, pending: Promise<void>): Promise<void> {
     if (runtime.isStopping) {
       throw new TunnelStoppedError(runtime.profile.name);
     }
@@ -700,7 +702,7 @@ export class TunnelManager {
     });
     runtime.onStop = signalStop;
     try {
-      await Promise.race([closed, stopped]);
+      await Promise.race([pending, stopped]);
     } finally {
       if (runtime.onStop === signalStop) {
         runtime.onStop = undefined;
@@ -916,13 +918,17 @@ export class TunnelManager {
     runtime.sshConnections.add(sharedConnection);
     sharedConnection.onClose(() => {
       runtime.sshConnections.delete(sharedConnection);
-      const wasCurrentConnection = runtime.sharedConnection === sharedConnection;
-      if (wasCurrentConnection) {
+      if (runtime.sharedConnection === sharedConnection) {
         runtime.sharedConnection = undefined;
       }
-      // A discarded candidate can close while its runtime remains active; it
-      // is an error only when the connection that just closed was still current.
-      if (wasCurrentConnection && !runtime.isStopping && this.activeTunnels.has(activeTunnelId)) {
+      // Supersession alone does not make a close expected: another client may
+      // still be using this transport. Only candidates deliberately discarded
+      // before use are quiet; real transport loss remains visible.
+      if (
+        !this.intentionallyDiscardedSharedConnections.has(sharedConnection)
+        && !runtime.isStopping
+        && this.activeTunnels.has(activeTunnelId)
+      ) {
         this.emit({
           type: "error",
           tunnelId: activeTunnelId,
@@ -931,6 +937,11 @@ export class TunnelManager {
       }
     });
     return sharedConnection;
+  }
+
+  private discardSharedConnection(connection: SshConnection): void {
+    this.intentionallyDiscardedSharedConnections.add(connection);
+    connection.dispose();
   }
 
   private scheduleTrafficEmit(tunnelId: string, runtime: ActiveTunnelRuntime): void {

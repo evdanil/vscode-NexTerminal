@@ -206,6 +206,90 @@ class RefusedForwardConnection extends DirectTcpSshConnection {
   }
 }
 
+class DelayedCloseSharedConnection extends DirectTcpSshConnection {
+  public readonly firstOpenStarted = deferred<void>();
+  public readonly secondStreamActive = deferred<void>();
+  public readonly disposeRequested = deferred<void>();
+  private readonly firstOpenResult: Promise<Duplex>;
+  private rejectFirstOpen!: (error: Error) => void;
+  private openCount = 0;
+  private transportClosed = false;
+  private readonly streams = new Set<PassThrough>();
+
+  public constructor() {
+    super();
+    this.firstOpenResult = new Promise<Duplex>((_resolve, reject) => {
+      this.rejectFirstOpen = reject;
+    });
+  }
+
+  public override async openDirectTcp(_remoteIP: string, _remotePort: number): Promise<Duplex> {
+    this.openCount += 1;
+    if (this.openCount === 1) {
+      this.firstOpenStarted.resolve(undefined);
+      return this.firstOpenResult;
+    }
+    if (this.openCount === 2) {
+      const stream = new PassThrough();
+      stream.once("pipe", () => this.secondStreamActive.resolve(undefined));
+      this.streams.add(stream);
+      return stream;
+    }
+    throw new Error(`Unexpected direct TCP open ${this.openCount}`);
+  }
+
+  public failFirstOpen(error: Error): void {
+    this.rejectFirstOpen(error);
+  }
+
+  public override dispose(): void {
+    // Model a transport whose close event is delayed while another client is
+    // still using a stream that was opened on it.
+    this.disposeRequested.resolve(undefined);
+  }
+
+  public finishTransportClose(): void {
+    if (this.transportClosed) {
+      return;
+    }
+    this.transportClosed = true;
+    for (const stream of this.streams) {
+      stream.destroy();
+    }
+    this.streams.clear();
+    super.dispose();
+  }
+}
+
+class ActiveStreamConnection extends DirectTcpSshConnection {
+  public readonly streamActive = deferred<void>();
+  private readonly stream = new PassThrough();
+
+  public constructor() {
+    super();
+    this.stream.once("pipe", () => this.streamActive.resolve(undefined));
+  }
+
+  public override async openDirectTcp(_remoteIP: string, _remotePort: number): Promise<Duplex> {
+    return this.stream;
+  }
+}
+
+class OrderedConnectionFactory implements SshFactory {
+  public connectCount = 0;
+
+  public constructor(private readonly connections: SshConnection[]) {}
+
+  public async connect(_server: ServerConfig): Promise<SshConnection> {
+    const connection = this.connections[this.connectCount];
+    this.connectCount += 1;
+    if (!connection) {
+      throw new Error("Unexpected SSH connection request");
+    }
+    return connection;
+  }
+}
+
 class DelayedReplacementFactory implements SshFactory {
   public readonly replacementLoginStarted = deferred<void>();
   public readonly finishReplacementLogin = deferred<void>();
@@ -498,6 +582,73 @@ describe("TunnelManager integration", () => {
     await manager.stop(activeTunnel.id);
   });
 
+  it("reports a superseded shared transport closing while another client still uses it", async () => {
+    const profile: TunnelProfile = {
+      id: "tunnel-shared-reconnect",
+      name: "Shared Reconnect Tunnel",
+      localPort: await getFreePort(),
+      remoteIP: "127.0.0.1",
+      remotePort: 22,
+      autoStart: false,
+      connectionMode: "shared"
+    };
+    const supersededConnection = new DelayedCloseSharedConnection();
+    const currentConnection = new ActiveStreamConnection();
+    const sshFactory = new OrderedConnectionFactory([supersededConnection, currentConnection]);
+    const pool = new SshConnectionPool(sshFactory, { enabled: true, idleTimeoutMs: 60_000 });
+    const server = { ...testServer, multiplexing: false };
+    manager = new TunnelManager(pool, pool);
+    const events: TunnelEvent[] = [];
+    manager.onDidChange((event) => events.push(event));
+    const activeTunnel = await manager.start(profile, server, { connectionMode: "shared" });
+    const connectClient = async (): Promise<net.Socket> => {
+      const socket = net.createConnection({ host: "127.0.0.1", port: profile.localPort });
+      socket.on("error", () => {});
+      await new Promise<void>((resolve, reject) => {
+        socket.once("connect", resolve);
+        socket.once("error", reject);
+      });
+      return socket;
+    };
+    const firstClient = await connectClient();
+    await supersededConnection.firstOpenStarted.promise;
+    const secondClient = await connectClient();
+    await supersededConnection.secondStreamActive.promise;
+
+    const transportError = transportFailure();
+    supersededConnection.failFirstOpen(transportError);
+    try {
+      await supersededConnection.disposeRequested.promise;
+      expect(events.some((event) =>
+        event.type === "error"
+        && event.message === `Tunnel ${profile.name} failed to proxy connection`
+        && event.error === transportError
+      )).toBe(true);
+
+      // The second client is still using the not-yet-closed first transport;
+      // the next client reconnects through a new shared connection meanwhile.
+      const thirdClient = await connectClient();
+      try {
+        await currentConnection.streamActive.promise;
+        expect(sshFactory.connectCount).toBe(2);
+
+        supersededConnection.finishTransportClose();
+
+        expect(events.filter((event) => event.type === "error").map((event) => event.message)).toContain(
+          `Shared SSH connection closed for tunnel ${profile.name}`
+        );
+      } finally {
+        thirdClient.destroy();
+      }
+    } finally {
+      firstClient.destroy();
+      secondClient.destroy();
+      supersededConnection.finishTransportClose();
+      await manager.stop(activeTunnel.id);
+      pool.dispose();
+    }
+  });
+
   it("starts and stops a reverse tunnel", async () => {
     const localPort = await getFreePort();
     echoServer = await startEchoServer(localPort);
@@ -590,6 +741,26 @@ describe("TunnelManager integration", () => {
         `Shared SSH connection closed for tunnel ${replacementProfile.name}`
       );
 
+      // The retired-bind barrier itself is stop-aware: a start that reaches
+      // the pre-login `retiredAfterLogin` wait must not need the old terminal
+      // lease to close before its caller can stop it.
+      const preLoginWaitProfile = profile("reverse-retired-stop");
+      const preLoginWaitStart = manager.start(preLoginWaitProfile, replacementServer);
+      const preLoginWaitResult = preLoginWaitStart.then(
+        () => "started",
+        (error: unknown) => error
+      );
+      const preLoginWaitId = manager.getActiveTunnelId(preLoginWaitProfile.id);
+      expect(preLoginWaitId).toBeDefined();
+      await manager.stop(preLoginWaitId!);
+      const preLoginWaitSettled = await Promise.race([
+        preLoginWaitResult.then(() => true),
+        new Promise<boolean>((resolve) => setImmediate(() => resolve(false)))
+      ]);
+      expect(preLoginWaitSettled).toBe(true);
+      expect(await preLoginWaitResult).toBeInstanceOf(Error);
+      expect((await preLoginWaitResult as Error).name).toBe("TunnelStoppedError");
+
       // The pooled connection remains open for the terminal lease, so the
       // replacement must wait until that lease releases the retired bind.
       terminalLease.dispose();
@@ -606,6 +777,76 @@ describe("TunnelManager integration", () => {
       terminalLease.dispose();
       await manager.stopAll();
       await Promise.all([retiredResult, replacementResult]);
+      pool.dispose();
+    }
+  });
+
+  it("settles a stopped reverse start waiting for a competing forward request", async () => {
+    const predecessorServer = { ...testServer, id: "server-forward-predecessor", multiplexing: false };
+    const waitingServer = { ...testServer, id: "server-forward-waiter", multiplexing: false };
+    const predecessorConnection = new HeldForwardConnection();
+    const waitingConnection = new ObservedForwardConnection();
+    const factory = new DelayedReplacementFactory(
+      predecessorServer.id,
+      waitingServer.id,
+      predecessorConnection,
+      waitingConnection
+    );
+    const pool = new TrackingConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 }, waitingServer.id);
+    manager = new TunnelManager(pool, pool);
+    const profile = (id: string): TunnelProfile => ({
+      id,
+      name: id,
+      localPort: 12345,
+      remoteIP: "127.0.0.1",
+      remotePort: 23456,
+      autoStart: false,
+      tunnelType: "reverse",
+      remoteBindAddress: "127.0.0.1",
+      localTargetIP: "127.0.0.1"
+    });
+    const predecessorProfile = profile("reverse-forward-predecessor");
+    const waitingProfile = profile("reverse-forward-waiter");
+    const waitingStart = manager.start(waitingProfile, waitingServer);
+    const waitingResult = waitingStart.then(
+      () => "started",
+      (error: unknown) => error
+    );
+    let predecessorResult: Promise<"started" | unknown> | undefined;
+
+    try {
+      await factory.replacementLoginStarted.promise;
+      const predecessorStart = manager.start(predecessorProfile, predecessorServer);
+      predecessorResult = predecessorStart.then(
+        () => "started",
+        (error: unknown) => error
+      );
+      await predecessorConnection.forwardRequested.promise;
+
+      factory.finishReplacementLogin.resolve(undefined);
+      await pool.replacementLeaseDisposed.promise;
+
+      const waitingId = manager.getActiveTunnelId(waitingProfile.id);
+      expect(waitingId).toBeDefined();
+      await manager.stop(waitingId!);
+      const waitingSettled = await Promise.race([
+        waitingResult.then(() => true),
+        new Promise<boolean>((resolve) => setImmediate(() => resolve(false)))
+      ]);
+      expect(waitingSettled).toBe(true);
+      expect(await waitingResult).toBeInstanceOf(Error);
+      expect((await waitingResult as Error).name).toBe("TunnelStoppedError");
+
+      predecessorConnection.releaseForward(23456);
+      expect(await predecessorResult).toBe("started");
+      const predecessorId = manager.getActiveTunnelId(predecessorProfile.id);
+      expect(predecessorId).toBeDefined();
+      await manager.stop(predecessorId!);
+    } finally {
+      factory.finishReplacementLogin.resolve(undefined);
+      predecessorConnection.releaseForward(23456);
+      await manager.stopAll();
+      await Promise.all([waitingResult, ...(predecessorResult ? [predecessorResult] : [])]);
       pool.dispose();
     }
   });
