@@ -3751,9 +3751,22 @@ describe("backup import", () => {
 describe("share import", () => {
   let core: NexusCore;
   let vault: MockVault;
+  /**
+   * The source a synced server's `origin` names in the fixtures below. A share
+   * import keeps an origin only when the source it names lands in the same file
+   * (`linkToImportedSource`), so every fixture whose origin must SURVIVE carries
+   * it — without it, each assertion about a remapped stamp would be about an
+   * origin that no longer exists.
+   */
+  const remoteSource = (): InventorySourceConfig =>
+    makeInventorySource({ id: "src-on-the-other-machine", defaultUsername: "user", secretFieldIds: [] });
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    // A share that lands a source answers with an "Edit Inventory Source"
+    // button, so the notification's Thenable is followed up; VS Code always
+    // returns one.
+    mockShowInformationMessage.mockResolvedValue(undefined);
     registeredCommands.clear();
     configStore.clear();
     vault = new MockVault();
@@ -3989,9 +4002,10 @@ describe("share import", () => {
       tunnels: [],
       serialProfiles: [],
       authProfiles: [
-        // `keyPath` must be a string; only a hand-edited file can carry this, which
-        // is precisely why the guard that rejects it must not strand the servers.
-        { ...makeAuthProfile({ id: "ap-rejected", name: "Rejected" }), keyPath: 12345 },
+        // `authType` must be one this build knows; only a hand-edited file can carry
+        // another, which is precisely why the guard that rejects it must not strand
+        // the servers.
+        { ...makeAuthProfile({ id: "ap-rejected", name: "Rejected" }), authType: "sometimes" },
         makeAuthProfile({ id: "ap-ok", name: "Kept" })
       ]
     });
@@ -4045,6 +4059,7 @@ describe("share import", () => {
 
     const exportData = makeExportData({
       exportType: "share",
+      inventorySources: [remoteSource()],
       servers: [
         makeServer({ id: "share-s-live", name: "Live Link", authProfileId: "ap-ok", origin: remoteOrigin("ap-ok") }),
         makeServer({ id: "share-s-dead", name: "Dead Link", authProfileId: "ap-rejected", origin: remoteOrigin("ap-rejected") }),
@@ -4053,7 +4068,7 @@ describe("share import", () => {
       tunnels: [],
       serialProfiles: [],
       authProfiles: [
-        { ...makeAuthProfile({ id: "ap-rejected", name: "Rejected" }), keyPath: 12345 },
+        { ...makeAuthProfile({ id: "ap-rejected", name: "Rejected" }), authType: "sometimes" },
         makeAuthProfile({ id: "ap-ok", name: "Kept" })
       ]
     });
@@ -4087,9 +4102,11 @@ describe("share import", () => {
     expect(dead.origin?.syncedAuthProfileId).toBeUndefined();
 
     // And a server that never carried a stamp does not acquire one, nor lose the
-    // rest of its origin.
+    // rest of its origin. (Its username stamp is kept — as "user", with the
+    // username beside it: a share rewrites both on the way in, as on the way out.)
     expect(none.origin?.syncedAuthProfileId).toBeUndefined();
-    expect(none.origin?.syncedUsername).toBe("dev");
+    expect(none.origin?.syncedUsername).toBe("user");
+    expect(none.username).toBe("user");
   });
 
   /**
@@ -4109,6 +4126,7 @@ describe("share import", () => {
   it("share import keeps a server whose payload `origin` is null, stripping only the marker (kills reading `origin.syncedAuthProfileId` before the origin is known to be one)", async () => {
     const exportData = makeExportData({
       exportType: "share",
+      inventorySources: [remoteSource()],
       servers: [
         { ...makeServer({ id: "share-s-null", name: "Null Origin", authProfileId: "ap-ok" }), origin: null },
         makeServer({
@@ -4152,7 +4170,7 @@ describe("share import", () => {
   /**
    * PR #66 Codex review round 7 (P2) — the two `origin.templated` IPMI stamps are
    * the template-ownership half of the same references the VALUES carry, and the
-   * share path remapped only the values. `remapOriginStamp` remapped
+   * share path remapped only the values. The stamp remap (then `remapOriginStamp`) remapped
    * `syncedAuthProfileId` alone AND early-returned whenever that field was absent,
    * so both templated IPMI stamps stayed in the EXPORTER's id namespace. Left
    * there, `cur` (the remapped local value) `!==` `stamp` (the old foreign id), and
@@ -4174,6 +4192,7 @@ describe("share import", () => {
 
     const exportData = makeExportData({
       exportType: "share",
+      inventorySources: [remoteSource()],
       servers: [
         makeServer({
           id: "src-A",
@@ -4225,7 +4244,7 @@ describe("share import", () => {
 
   /**
    * PR #66 Codex review round 7 (P2) — the gateway stamp is FINALIZED like its
-   * value: raw-remapped in `remapOriginStamp`, then narrowed to the surviving set
+   * value: raw-remapped with the origin (now `shareOrigin`), then narrowed to the surviving set
    * by `linkToImportedServer` in the finalize loop. So a template-owned gateway
    * whose target is NOT in the bundle collapses BOTH value and stamp to
    * `undefined` — cleared together, no false divergence. Under HEAD 99207c5 the
@@ -4237,6 +4256,7 @@ describe("share import", () => {
 
     const exportData = makeExportData({
       exportType: "share",
+      inventorySources: [remoteSource()],
       servers: [
         makeServer({
           id: "src-A",
@@ -4282,6 +4302,7 @@ describe("share import", () => {
 
     const exportData = makeExportData({
       exportType: "share",
+      inventorySources: [remoteSource()],
       servers: [
         makeServer({
           id: "src-A",
@@ -4319,14 +4340,15 @@ describe("share import", () => {
   });
 
   /**
-   * ADOPT 1 — the share path keeps `origin` (it only remaps the stamp inside it),
-   * and by that same spread it used to keep `formerlySynced`. The two must NOT be
-   * handled alike. A stale `origin` is inert on the recipient — no source here
-   * holds that id and nothing dereferences it — while the marker IS the adoption
-   * key, matched on `providerId`/`externalId` plus the server's current address
-   * and never on `sourceId`. Left on a shared record it is a live claim on THIS
-   * machine: the recipient's own same-provider source takes the record over
-   * whole, prune policy included, for a source the recipient never removed.
+   * ADOPT 1 — the share path keeps an `origin` whose source travels in the same
+   * file (re-pointed at that source's fresh id), and by that same spread it used
+   * to keep `formerlySynced`. The two must NOT be handled alike. A kept origin
+   * gives the imported source exactly the rows it owned on the sender's machine,
+   * while the marker IS the adoption key, matched on `providerId`/`externalId`
+   * plus the server's current address and never on `sourceId`. Left on a shared
+   * record it is a live claim on THIS machine: the recipient's own pre-existing
+   * same-provider source takes the record over whole, prune policy included, for
+   * a source the recipient never removed.
    *
    * `sanitizeForSharing` strips it on the way out, so the route this closes is the
    * untrusted one — a hand-edited share file, or one written by a build predating
@@ -4356,6 +4378,7 @@ describe("share import", () => {
 
     const exportData = makeExportData({
       exportType: "share",
+      inventorySources: [remoteSource()],
       servers: [
         makeServer({
           id: "share-s-kept",
@@ -4399,11 +4422,12 @@ describe("share import", () => {
     expect(kept.authProfileId).toBe(snapshot.authProfiles[0].id);
     expect(kept.authProfileId).not.toBe("ap-ok");
 
-    // And the strip is specific to the marker — a dangling `origin` still crosses,
-    // as it always has (it is inert here, and the stamp remap depends on it), so
-    // this cannot pass by blanking both fields.
+    // And the strip is specific to the marker — an `origin` whose source came
+    // with it still crosses, owned by that source, so this cannot pass by
+    // blanking both fields.
     const owned = snapshot.servers.find((s) => s.name === "Owned Elsewhere")!;
     expect(owned.origin?.externalId).toBe("device:2");
+    expect(owned.origin?.sourceId).toBe(snapshot.inventorySources[0].id);
   });
 
   /**
@@ -6626,12 +6650,16 @@ describe("sanitizeForSharing", () => {
     expect(result.servers[0].bmcWebProtocol).toBe("http");
   });
 
-  it("ADDRESSLESS (Codex P1 review MINOR-1) — DROPS addressless placeholder servers from a shared export entirely (⊘ the `...s` spread ships an origin-less `addressless:true, host:\"\"` record the recipient can never connect to, re-address, or upgrade)", () => {
+  it("ADDRESSLESS (Codex P1 review MINOR-1) — DROPS an addressless placeholder whose source is not in the export, and ships one whose source is, WITH its origin (⊘ the `...s` spread ships an origin-less `addressless:true, host:\"\"` record the recipient can never connect to, re-address, or upgrade; ⊘ a blanket placeholder filter drops the cached rows the shipped source owns)", () => {
     const normal = makeServer({ id: "srv-normal", name: "Prod", host: "10.0.0.1" });
-    const placeholder = makeServer({ id: "srv-addr", name: "Stopped Node", host: "", addressless: true, origin: { sourceId: "src", externalId: "e1", syncedAt: 1 } });
-    const result = sanitizeForSharing([normal, placeholder], [], [], [], {}, [], []);
-    expect(result.servers.map((s) => s.name)).toEqual(["Prod"]);
-    expect(result.servers.some((s) => s.addressless)).toBe(false);
+    const orphanedPlaceholder = makeServer({ id: "srv-addr", name: "Stopped Node", host: "", port: 0, addressless: true, origin: { sourceId: "src-gone", externalId: "e1", syncedAt: 1 } });
+    const ownedPlaceholder = makeServer({ id: "srv-owned", name: "Owned Stopped Node", host: "", port: 0, addressless: true, origin: { sourceId: "src1", externalId: "e2", syncedAt: 1 } });
+    const result = sanitizeForSharing([normal, orphanedPlaceholder, ownedPlaceholder], [], [], [], {}, [], [], [makeInventorySource({ id: "src1" })]);
+
+    expect(result.servers.map((s) => s.name)).toEqual(["Prod", "Owned Stopped Node"]);
+    const shipped = result.servers.find((s) => s.name === "Owned Stopped Node")!;
+    expect(shipped).toMatchObject({ addressless: true, host: "", port: 0 });
+    expect(shipped.origin?.sourceId).toBe(result.inventorySources[0].id);
   });
 
   it("clears defaultServerId when server not in export", () => {
@@ -7060,7 +7088,7 @@ describe("share export round-trip", () => {
     expect(snapshot.servers[0].authProfileId).not.toBe("ap1");
   });
 
-  it("B6 — share export carries NO inventorySources key and strips origin from every server (fixture server WITH origin)", async () => {
+  it("share export carries the inventory source, and each synced server keeps its origin re-pointed at the source's id IN THE FILE (⊘ the former §B6 strip, which shipped cached rows owned by nothing; ⊘ an origin still naming the sender's source id)", async () => {
     vi.clearAllMocks();
     registeredCommands.clear();
     configStore.clear();
@@ -7085,24 +7113,20 @@ describe("share export round-trip", () => {
     await registeredCommands.get("nexus.config.export")!();
 
     const exported = JSON.parse(exportedJson);
-    expect(exported.inventorySources).toBeUndefined();
+    expect(exported.inventorySources).toHaveLength(1);
+    expect(exported.inventorySources[0].id).not.toBe("src1");
     expect(exported.servers).toHaveLength(1);
-    expect(exported.servers[0].origin).toBeUndefined();
+    expect(exported.servers[0].origin).toMatchObject({ externalId: "device:1", syncedAt: 1000 });
+    expect(exported.servers[0].origin.sourceId).toBe(exported.inventorySources[0].id);
   });
 
   /**
-   * T-M1 (PR-E) — share export EXCLUDES saved filters. Mirrors §B6: a real saved
-   * filter is populated on the exporting core, the ACTUAL share command path
-   * (`nexus.config.export`) produces the bundle, and the serialized payload is
-   * asserted to carry no `savedFilters` key.
-   *
-   * Non-vacuous: the premise is asserted (the store DID hold a saved filter on the
-   * way in, so the exclusion cannot pass merely because there was nothing to
-   * exclude), and the assertion is on the serialized JSON that actually travels.
-   * Under the realistic break — adding `savedFilters: snapshot.savedFilters` to
-   * `exportShare`'s `exportData` literal — the key is present and this fails.
+   * Saved filters travel on a share: a name and a query string, the same data
+   * as a source's own Device Filter field, which the share carries anyway. The
+   * ACTUAL share command path (`nexus.config.export`) produces the bundle, and
+   * the serialized payload is what is asserted on.
    */
-  it("(T-M1) share export carries NO savedFilters key even when the store holds one (kills leaking saved filters into a shared bundle)", async () => {
+  it("share export carries saved filters, each with a fresh id (⊘ `exportShare` leaving the key out of its literal; ⊘ the sender's id travelling)", async () => {
     vi.clearAllMocks();
     registeredCommands.clear();
     configStore.clear();
@@ -7126,8 +7150,8 @@ describe("share export round-trip", () => {
     await registeredCommands.get("nexus.config.export")!();
 
     const exported = JSON.parse(exportedJson);
-    expect(exported.savedFilters).toBeUndefined();
-    expect(Object.prototype.hasOwnProperty.call(exported, "savedFilters")).toBe(false);
+    expect(exported.savedFilters).toEqual([{ id: expect.any(String), name: "Syd core", filter: "role=core&site=syd" }]);
+    expect(exported.savedFilters[0].id).not.toBe("sf1");
   });
 
   /**

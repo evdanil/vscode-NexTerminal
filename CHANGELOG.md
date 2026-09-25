@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.8.253] — 2026-09-25
+
+### Added
+
+- **Export for Sharing now carries your inventory sources, as a cache of the servers they synced.** The file includes each source, the servers it synced — placeholders with no address included — the device templates its rules use, and your saved filters, so a colleague gets the tree you see rather than a pile of servers no source will ever update. The servers arrive already belonging to their source, so the recipient's first sync updates them in place: no adoption question, no second copy of every device. Nothing secret travels. A source leaves behind its saved token or password, any login typed into its URL, when it last synced and the record of which folders its syncs created. A NetBox, EVE-NG, Proxmox or GNS3 source also arrives with **Allow a Self-Signed or Mismatched Certificate** turned off, an EVE-NG, Proxmox or GNS3 source without its status poll interval, and an EVE-NG or GNS3 source without your provider login — the recipient decides those for themselves. Usernames become `user`, as they always have on a share. Auth profiles still travel without their passwords and key files, and a key profile your source or its device templates linked arrives unlinked from them and from the servers they synced — without a key file it cannot log in — so the recipient gives it their own key file, or picks another profile, and links it on the source. The import's notification asks the recipient to add their own credentials in **Edit Inventory Source** — or, for a source that uses none, such as a GNS3 server without authentication, to review it there — with a button that opens it. A source set to delete servers whose device disappears arrives set to move them to `_orphaned` instead, and the notification says so: the recipient's credentials may see less of the source than yours, and their first sync must not delete what it merely cannot see. A source that already exists on the recipient's machine is added a second time rather than merged. Someone on a version before 2.8.253 gets the servers without their sources — the servers show as synced but never sync — so ask them to update first.
+
+### Fixed
+
+- **Importing a shared file now strips what Export for Sharing strips.** A hand-edited or older share file could still bring in a server's key path and login, a Local Shell profile's startup command — which runs the moment the profile opens — with its working directory and environment variables, the identity of the sender's serial adapter, or a folder for your session logs. An import now clears them just as an export does. A file written by Export for Sharing in 2.8.243 or later contains none of them and imports exactly as before; an older one arrives without the Local Shell environment variables it still carried.
+
 ## [2.8.252] — 2026-09-25
 
 ### Fixed

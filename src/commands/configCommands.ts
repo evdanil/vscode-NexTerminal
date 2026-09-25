@@ -3,11 +3,11 @@ import { chmod } from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
-import type { AuthProfile, LocalShellProfile, ServerConfig, ServerOrigin, TunnelProfile, SerialProfile } from "../models/config";
-import { cloneTemplatedStamps, templatedHasAnyStamp } from "../models/config";
-import type { InventorySourceConfig } from "../models/inventory";
+import type { AuthProfile, LocalShellProfile, ProxyConfig, ServerConfig, ServerOrigin, TunnelProfile, SerialProfile } from "../models/config";
+import { authProfileNeedsServerKeyPath, cloneTemplatedStamps, templatedHasAnyStamp } from "../models/config";
+import type { InventorySourceConfig, InventorySourceValues, TemplateRule } from "../models/inventory";
 import { inventorySecretKey } from "../models/inventory";
-import type { DeviceTemplateProfile } from "../models/deviceTemplate";
+import type { DeviceTemplateProfile, TemplateField } from "../models/deviceTemplate";
 import type { LocalServerConfig } from "../models/localServer";
 import type { DhcpConfigProfile, TftpConfigProfile } from "../models/networkServerProfile";
 import type { SavedFilterDefinition } from "../models/savedFilter";
@@ -100,6 +100,10 @@ import {
   EVE_NG_STATUS_POLL_MAX_SECONDS,
   EVE_NG_STATUS_POLL_MIN_SECONDS
 } from "../services/inventory/providers/eveNgProvider";
+import { ORPHAN_FOLDER_NAME } from "../services/inventory/syncEngine";
+import { GNS3_PROVIDER_ID, GNS3_STATUS_POLL_FIELD_ID } from "../services/inventory/providers/gns3Provider";
+import { NETBOX_PROVIDER_ID } from "../services/inventory/providers/netboxProvider";
+import { PROXMOX_PROVIDER_ID, PROXMOX_STATUS_POLL_FIELD_ID } from "../services/inventory/providers/proxmoxProvider";
 
 interface NexusConfigExport {
   version: 1 | 2;
@@ -116,21 +120,42 @@ interface NexusConfigExport {
    */
   localShellProfiles?: LocalShellProfile[];
   authProfiles?: AuthProfile[];
-  /** Backup-only (§B6) — never present on a share export; secrets live under `encryptedSecrets.inventorySourceSecrets`. */
+  /**
+   * INVENTORY SOURCES. A backup carries them at full fidelity, with their
+   * secrets under `encryptedSecrets.inventorySourceSecrets`.
+   *
+   * A share export carries them too, as a CACHE of the sender's synced tree:
+   * each synced server keeps its `origin`, remapped onto the shipped source's
+   * fresh id, so the recipient's source OWNS those rows from the moment of
+   * import and its first sync updates them in place instead of adding copies.
+   * What the source record loses on the way is everything that is the
+   * sender's rather than the source's — credentials (never in this file at
+   * all), the sender's usernames, trust stamps and bookkeeping, and the
+   * sender's opt-ins to insecure TLS and unattended polling. A link to a key
+   * profile — on the source, a template or a row the sync linked — is left out
+   * with its stamp, because the profile arrives with no key file
+   * (`linkSyncAuthProfile`). Which fields travel at all is the `SHARED_*_RULES`
+   * tables; what is rewritten, and why, is in `sanitizeForSharing`. The import
+   * applies the same rules and the config rule (`sanitizeSharedSourceConfig`)
+   * again, since a share file is untrusted input.
+   */
   inventorySources?: InventorySourceConfig[];
   /**
-   * DEVICE TEMPLATES (issue #48 PR-T1) — backup-only, EXCLUDED from a share
-   * export exactly like `inventorySources` (A-M5): a template is fleet-specific
-   * wiring (jump-host ids, auth-profile ids) with no meaning in a stranger's
-   * workspace. No secrets, so no vault section.
+   * DEVICE TEMPLATES (issue #48 PR-T1). No secrets, so no vault section. A
+   * backup carries them verbatim. A share carries only the ones the shipped
+   * sources' `templateRules` name, and the import lands only the ones named by
+   * a source it imports (`templateIdsNamedBySources`) — with fresh ids, so those rules still
+   * resolve, every id reference (auth profile, IPMI gateway, jump host)
+   * remapped into the bundle or dropped — the auth profile also when it is a
+   * key profile, which arrives with no key file (`linkSyncAuthProfile`) — and a
+   * proxy's username removed as it is on a server's proxy.
    */
   deviceTemplates?: DeviceTemplateProfile[];
   /**
-   * SAVED FILTER DEFINITIONS (issue #48 PR-E) — backup-only, EXCLUDED from a
-   * share export like `inventorySources`/`deviceTemplates`: a saved filter is
-   * workspace-specific inventory-import wiring with no meaning in a stranger's
-   * workspace. No secrets, so no vault section — the query string is the same
-   * non-secret data as a source's own Device Filter field.
+   * SAVED FILTER DEFINITIONS (issue #48 PR-E). No secrets, so no vault section —
+   * the query string is the same non-secret data as a source's own Device
+   * Filter field, which a share carries anyway. Both export paths carry them;
+   * a share gives each a fresh id.
    */
   savedFilters?: SavedFilterDefinition[];
   /**
@@ -1273,22 +1298,520 @@ interface SanitizedSnapshot {
   authProfiles: AuthProfile[];
   macros: TerminalMacro[];
   settings: Record<string, unknown>;
+  inventorySources: InventorySourceConfig[];
+  deviceTemplates: DeviceTemplateProfile[];
+  savedFilters: SavedFilterDefinition[];
 }
 
-function remapProxy(proxy: import("../models/config").ProxyConfig | undefined, idMap: Map<string, string>): import("../models/config").ProxyConfig | undefined {
-  if (!proxy) return undefined;
-  if (proxy.type === "ssh") {
-    const newJumpHostId = idMap.get(proxy.jumpHostId);
-    if (!newJumpHostId) return undefined; // Jump host not in export
-    return { ...proxy, jumpHostId: newJumpHostId };
+/**
+ * A proxy as a share carries it, in BOTH directions — one rule for a server's
+ * own proxy, its `origin.templated.proxy` stamp and a device template's, so a
+ * template-owned proxy still equals its stamp on the other side. Rebuilt from
+ * its declared members only: an SSH jump host re-pointed through `linkServer`
+ * (the proxy is dropped when the jump host is not in the bundle); a SOCKS5 or
+ * HTTP proxy reduced to type, host and port, so the proxy login never travels
+ * and a hand-edited file cannot land one either. Anything that is not a proxy
+ * this build knows is returned as it is, for the validators to judge.
+ */
+function remapProxy(proxy: ProxyConfig | undefined, linkServer: (id: string) => string | undefined): ProxyConfig | undefined {
+  if (typeof proxy !== "object" || proxy === null) {
+    return proxy;
   }
-  if (proxy.type === "socks5") {
-    return { type: "socks5", host: proxy.host, port: proxy.port };
+  switch (proxy.type) {
+    case "ssh": {
+      const jumpHostId = typeof proxy.jumpHostId === "string" ? linkServer(proxy.jumpHostId) : undefined;
+      return jumpHostId ? { type: "ssh", jumpHostId } : undefined; // Jump host not in the bundle
+    }
+    case "socks5":
+    case "http":
+      return { type: proxy.type, host: proxy.host, port: proxy.port };
+    default:
+      return proxy;
   }
-  if (proxy.type === "http") {
-    return { type: "http", host: proxy.host, port: proxy.port };
+}
+
+/**
+ * The username a share writes wherever the sender's own would have gone: each
+ * server's `username`, each shipped auth profile's, an inventory source's
+ * `defaultUsername`, and a synced server's `origin.syncedUsername`. One value,
+ * because the stamp and the field it describes must stay EQUAL: a cached row
+ * whose username differs from its stamp reads as hand-edited on the recipient,
+ * and never takes the auth profile they later link on its source.
+ */
+const SHARED_USERNAME = "user";
+
+/**
+ * SHARE SCRUBS — what a share clears from the records it still carries whole
+ * (servers, serial and Local Shell profiles, settings; rebuilding them from
+ * rules tables like the inventory records is #179). Applied in BOTH
+ * directions: `sanitizeForSharing` on the way out, and `importShareData` again
+ * before validation, because a share file is untrusted and a hand-edited or
+ * older one could carry anything the export clears. One function per record,
+ * so the two sides cannot drift apart.
+ *
+ * Tunnels need none, and macros are already symmetric: a secret macro is left
+ * out in both directions, and a masked variable's default is removed by
+ * `withRedactedVariables` on the way out and by `sanitizeImportedMacro`, which
+ * removes more, on the way in.
+ */
+
+/**
+ * A server: every `username` becomes SHARED_USERNAME and `keyPath` is blanked —
+ * the sender's login and where their key file is — and `formerlySynced`, the
+ * adoption key, never travels (see the ADOPT 1 note in `importShareData`).
+ */
+function scrubSharedServer(server: ServerConfig): ServerConfig {
+  const { formerlySynced: _adoptionKey, ...kept } = server;
+  return { ...kept, username: SHARED_USERNAME, keyPath: "" };
+}
+
+/** A serial profile: `deviceHint`, the identity of the sender's USB adapter that Smart Follow learned. */
+function scrubSharedSerialProfile(profile: SerialProfile): SerialProfile {
+  const { deviceHint: _learned, ...kept } = profile;
+  return kept;
+}
+
+/**
+ * A Local Shell profile: the working directory, the startup command — which
+ * runs the moment the profile opens — and the environment variables, which
+ * routinely carry tokens (issue #159).
+ */
+function scrubSharedLocalShellProfile(profile: LocalShellProfile): LocalShellProfile {
+  const { cwd: _cwd, startupCommand: _startupCommand, env: _env, ...kept } = profile;
+  return kept;
+}
+
+/** Settings: a session log directory is a path on the sender's machine; it becomes "" (the default). */
+function scrubSharedSettings(settings: Record<string, unknown>): Record<string, unknown> {
+  const scrubbed = { ...settings };
+  if (scrubbed["nexus.logging.sessionLogDirectory"]) {
+    scrubbed["nexus.logging.sessionLogDirectory"] = "";
   }
-  return undefined;
+  return scrubbed;
+}
+
+/**
+ * What a share does with each field of the inventory records it carries, in
+ * BOTH directions — the export applies it, and the import applies it again,
+ * because a share file is untrusted and a hand-edited one could put back
+ * anything the export removed.
+ *
+ *  - `"keep"` — copied as it is;
+ *  - `"drop"` — never travels;
+ *  - a function — a rewrite that needs nothing but the record, applied by
+ *    `shareRecord` itself, identically on both sides, so neither can forget it;
+ *  - `"link"` — a rewrite that needs the side's own context (a fresh id, an id
+ *    map, a policy only the import applies). `shareRecord` demands a linker for
+ *    every `"link"` field from each caller, and the compiler enforces it.
+ *
+ * An ALLOWLIST, and typed so that a field added to one of these models fails
+ * the build here until someone decides what a share does with it. A spread
+ * would ship it by default — and the fields most likely to be added are
+ * exactly the kind that must not travel: another trust stamp, another consent
+ * record, more sync bookkeeping. A key the model does not declare is not copied
+ * in either direction, and neither is one inside the nested records rebuilt
+ * here (template rules, template field wrappers, proxies).
+ */
+type ShareRule<T, K extends keyof T> = "keep" | "drop" | "link" | ((value: T[K], record: T) => T[K] | undefined);
+type ShareRules<T> = { readonly [K in keyof T]-?: ShareRule<T, K> };
+type LinkedKeys<T, R> = { [K in keyof T & keyof R]-?: R[K] extends "link" ? K : never }[keyof T & keyof R];
+type ShareLinks<T, R> = { [K in LinkedKeys<T, R>]: (value: T[K], record: T) => T[K] | undefined };
+
+/** `record` rebuilt by `rules` (see `ShareRule`); a field whose outcome is `undefined` is left out. */
+function shareRecord<T extends object, R extends ShareRules<T>>(record: T, rules: R, links: ShareLinks<T, R>): Partial<T> {
+  const shared: Partial<T> = {};
+  const linkers = links as unknown as Record<keyof T, (value: unknown, record: T) => unknown>;
+  for (const key of Object.keys(rules) as Array<keyof T>) {
+    const rule = rules[key] as ShareRule<T, keyof T>;
+    if (rule === "drop") {
+      continue;
+    }
+    const value = Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
+    const next = rule === "keep" ? value : rule === "link" ? linkers[key](value, record) : rule(value as T[keyof T], record);
+    if (next !== undefined) {
+      shared[key] = next as T[keyof T];
+    }
+  }
+  return shared;
+}
+
+/** How a share reaches the records it links to, on the side applying the rules. */
+interface ShareLenses {
+  linkProfile(id: string): string | undefined;
+  linkServer(id: string): string | undefined;
+  /**
+   * Whether the profile arrives as a key profile with no key file —
+   * `authProfileNeedsServerKeyPath` asked of the profile as it lands on the
+   * other side, not as it is here. See `linkSyncAuthProfile`.
+   */
+  arrivesNeedingServerKey(id: string): boolean;
+}
+
+/**
+ * KEY PROFILES — a profile link the inventory sync acts on (a source's
+ * `authProfileId`, a device template's `fields.authProfileId`), through
+ * `linkProfile`, or `undefined` when that profile arrives with no key file.
+ *
+ * A share strips every key path, so every key profile it carries arrives with
+ * no key file, and the sync engine treats one as unusable: it refuses to link
+ * it, warns on every sync that it has no key file, and unlinks every server an
+ * earlier sync linked to it (AUTH 2b, `decideSourceAuthRollback` in
+ * services/inventory/syncEngine.ts). Shipped, the source's or a template's link
+ * would make the recipient's first sync unlink every cached row it reaches.
+ * Left out, the rows stay as they are, and the recipient links a profile with
+ * a key file on the source or the template — the profile itself still travels
+ * (see `sanitizeForSharing`), so that can be this one once they give it theirs.
+ *
+ * Decided by the engine's own predicate on the profile as it LANDS — rebuilt
+ * by `SHARED_AUTH_PROFILE_RULES`, so with no key path in either direction — so
+ * the share and the engine cannot disagree about which profiles those are. A
+ * password profile never matches — the engine does not read the saved
+ * password, so one that lands without it (they never travel) is linked
+ * exactly as before.
+ */
+function linkSyncAuthProfile(id: string | undefined, lenses: ShareLenses): string | undefined {
+  return id === undefined || lenses.arrivesNeedingServerKey(id) ? undefined : lenses.linkProfile(id);
+}
+
+/**
+ * KEY PROFILES — whether a cached row's own sync link is one the engine would
+ * unlink on arrival, so the share leaves it out: the link still exactly as the
+ * sync wrote it (`authProfileId` equal to `origin.syncedAuthProfileId`, AUTH
+ * 2b's ownership clause) to a profile that arrives with no key file. AUTH 2b
+ * spares a server that brings a key file of its own, but a share blanks every
+ * server's key path, so no cached row does.
+ *
+ * The link and its stamp go TOGETHER, so the row arrives as one the sync never
+ * linked — the state retro-apply fills when the recipient links a profile on
+ * the source. Without its stamp, the link would read as one made by hand, which
+ * no sync moves; without the link, the stamp would read as a per-server opt-out,
+ * which no sync fills. Every other link to such a profile travels: a hand-made
+ * one, or a stamp whose link the sender removed (an opt-out), is not the
+ * engine's to undo, and the IPMI profile link is never checked for a key file.
+ */
+function syncAuthLinkArrivesNeedingServerKey(server: Pick<ServerConfig, "authProfileId" | "origin">, lenses: ShareLenses): boolean {
+  const id = server.authProfileId;
+  return typeof id === "string" && server.origin?.syncedAuthProfileId === id && lenses.arrivesNeedingServerKey(id);
+}
+
+/**
+ * An auth profile as a share carries it, in both directions. Its secrets
+ * (password, passphrase) live in the vault and never in the record; what the
+ * record itself gives away is the sender's login and where their key file is,
+ * so `username` becomes SHARED_USERNAME, like every username a share carries,
+ * and `keyPath` never travels — which is also why every key profile arrives
+ * with no key file (`linkSyncAuthProfile`). A member the model does not declare
+ * (a stored `token`, a field a later build adds) is copied in neither
+ * direction.
+ */
+const SHARED_AUTH_PROFILE_RULES = {
+  id: "link",
+  name: "keep",
+  username: () => SHARED_USERNAME,
+  authType: "keep",
+  keyPath: "drop"
+} satisfies ShareRules<AuthProfile>;
+
+const SHARED_SOURCE_RULES = {
+  id: "link",
+  providerId: "keep",
+  name: "keep",
+  targetFolder: "keep",
+  // The export keeps it; the import turns `delete` into `orphan` (and counts
+  // it for the completion message) — see `importShareData`.
+  prunePolicy: "link",
+  defaultUsername: () => SHARED_USERNAME,
+  config: (config, source) =>
+    typeof config === "object" && config !== null && !Array.isArray(config)
+      ? sanitizeSharedSourceConfig(source.providerId, config, source.secretFieldIds)
+      : config,
+  secretFieldIds: "keep",
+  lastSyncAt: "drop",
+  revision: "drop",
+  providerFingerprint: "drop",
+  managedFolders: "drop",
+  authProfileId: "link",
+  templateRules: "link"
+} satisfies ShareRules<InventorySourceConfig>;
+
+const SHARED_ORIGIN_RULES = {
+  sourceId: "link",
+  externalId: "keep",
+  syncedAt: "keep",
+  // The contract says a provider must never put a secret here, but nothing
+  // enforces it: a third-party `instanceKey` can hand back `https://user:token@…`.
+  // Cleaned rather than dropped — dropped, the recipient's first sync would
+  // stamp every cached row afresh, an update apiece.
+  syncedInstanceKey: (key) => (typeof key === "string" ? stripUrlUserinfo(key) : key),
+  // In lockstep with `username`, which becomes SHARED_USERNAME beside it.
+  syncedUsername: (username) => (username === undefined ? undefined : SHARED_USERNAME),
+  syncedAuthProfileId: "link",
+  syncedIpmiHost: "keep",
+  syncedAltHost: "keep",
+  syncedProtocol: "keep",
+  syncedHost: "keep",
+  syncedPort: "keep",
+  templated: "link"
+} satisfies ShareRules<ServerOrigin>;
+
+const SHARED_TEMPLATED_STAMP_RULES = {
+  proxy: "link",
+  multiplexing: "keep",
+  legacyAlgorithms: "keep",
+  logSession: "keep",
+  ipmiAuthProfileId: "link",
+  ipmiGatewayServerId: "link"
+} satisfies ShareRules<NonNullable<ServerOrigin["templated"]>>;
+
+const SHARED_TEMPLATE_RULES = {
+  id: "link",
+  name: "keep",
+  revision: "drop",
+  fields: "link"
+} satisfies ShareRules<DeviceTemplateProfile>;
+
+const SHARED_TEMPLATE_FIELD_WRAPPER_RULES = {
+  mode: "keep",
+  value: "link"
+} satisfies ShareRules<TemplateField<unknown>>;
+
+/** A boolean template field: its wrapper rebuilt, its value as it is. */
+const shareTemplateFlag = (field: TemplateField<boolean> | undefined): TemplateField<boolean> | undefined =>
+  shareTemplateField(field, (value) => value);
+
+const SHARED_TEMPLATE_FIELD_RULES = {
+  proxy: "link",
+  authProfileId: "link",
+  multiplexing: shareTemplateFlag,
+  legacyAlgorithms: shareTemplateFlag,
+  logSession: shareTemplateFlag,
+  ipmiAuthProfileId: "link",
+  ipmiGatewayServerId: "link"
+} satisfies ShareRules<DeviceTemplateProfile["fields"]>;
+
+const SHARED_TEMPLATE_RULE_RULES = {
+  id: "keep",
+  filter: "keep",
+  templateId: "link"
+} satisfies ShareRules<TemplateRule>;
+
+const SHARED_SAVED_FILTER_RULES = {
+  id: "link",
+  name: "keep",
+  filter: "keep"
+} satisfies ShareRules<SavedFilterDefinition>;
+
+/**
+ * The built-in inventory providers — the only ones whose config field ids
+ * `sanitizeSharedSourceConfig` may interpret. A field id is not a reserved word:
+ * provider registration is a public API, so a third-party provider's
+ * `allowInsecureTls` or `username` can mean something else entirely and is
+ * carried verbatim (the reason `importPredatesPerSourceStatusPoll` scopes
+ * `statusPollSeconds` to EVE-NG). Held to `createBuiltInProviders` by test, so
+ * a new built-in cannot ship outside it.
+ */
+const BUILT_IN_INVENTORY_PROVIDER_IDS: ReadonlySet<string> = new Set([
+  NETBOX_PROVIDER_ID,
+  EVE_NG_PROVIDER_ID,
+  PROXMOX_PROVIDER_ID,
+  GNS3_PROVIDER_ID
+]);
+
+/**
+ * A string that parses as a URL carrying userinfo, without it — anything else
+ * untouched. `https://user:token@netbox` is a credential typed into a
+ * NON-secret field (`netboxInstanceKey` names the case), and a share file
+ * promises its credentials are stripped. `href` normalizes on the way out (a
+ * lower-cased host, a bare origin gaining its "/"), which every provider's own
+ * base-URL normalizer already absorbs.
+ */
+function stripUrlUserinfo(value: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return value;
+  }
+  if (parsed.username === "" && parsed.password === "") {
+    return value;
+  }
+  parsed.username = "";
+  parsed.password = "";
+  return parsed.href;
+}
+
+/**
+ * An inventory source's non-secret provider config as it may cross a share, in
+ * either direction: `sanitizeForSharing` applies it on the way out, and
+ * `importShareData` applies it again on the way in, because a share file is
+ * untrusted input and a hand-edited one could restore anything the export
+ * removed. Returns a copy.
+ *
+ * Every provider: URL userinfo is removed from any string value, and a value
+ * under one of the source's own `secretFieldIds` is removed outright. Secrets
+ * live in the vault and never in `config`, so that second rule removes nothing
+ * a working source holds; it is there so a value that ever did land there (a
+ * hand-edited record, a provider that once declared the field as plain text)
+ * cannot ride out in a file promised to carry no credentials.
+ *
+ * Built-in providers only (see `BUILT_IN_INVENTORY_PROVIDER_IDS`), three fields
+ * that record the SENDER's decisions rather than anything about the source:
+ *  - `allowInsecureTls` is reset to `false`. Carried as `true`, a file could
+ *    switch certificate checking off for the credentials the recipient is about
+ *    to type into Edit Source. A self-signed server fails the first sync with
+ *    the certificate hint, which names the option, so turning it back on is a
+ *    decision the recipient makes knowingly.
+ *  - `statusPollSeconds` is removed (absent = off). Polling is an opt-in to
+ *    unattended requests from this machine to a lab server — the field sits
+ *    under Advanced for that reason — and the sender's opt-in is not the
+ *    recipient's. For a GNS3 2.2 server without authentication, nothing else
+ *    would stand between the import and the first poll.
+ *  - `username` (EVE-NG, GNS3) is removed. It is a login name, and a share
+ *    rewrites every username it carries; the recipient enters their own in Edit
+ *    Source with the password they must supply there anyway.
+ */
+function sanitizeSharedSourceConfig(providerId: unknown, config: InventorySourceValues, secretFieldIds: unknown): InventorySourceValues {
+  const next: InventorySourceValues = { ...config };
+  if (Array.isArray(secretFieldIds)) {
+    for (const fieldId of secretFieldIds) {
+      if (typeof fieldId === "string") {
+        delete next[fieldId];
+      }
+    }
+  }
+  for (const [key, value] of Object.entries(next)) {
+    if (typeof value === "string") {
+      const stripped = stripUrlUserinfo(value);
+      if (stripped !== value) {
+        next[key] = stripped;
+      }
+    }
+  }
+  if (typeof providerId === "string" && BUILT_IN_INVENTORY_PROVIDER_IDS.has(providerId)) {
+    if (next.allowInsecureTls !== undefined) {
+      next.allowInsecureTls = false;
+    }
+    for (const fieldId of [EVE_NG_STATUS_POLL_FIELD_ID, PROXMOX_STATUS_POLL_FIELD_ID, GNS3_STATUS_POLL_FIELD_ID]) {
+      delete next[fieldId];
+    }
+    delete next.username;
+  }
+  return next;
+}
+
+/**
+ * The template ids the sources' `templateRules` name — the only device
+ * templates a share carries, in either direction: the export asks it of the
+ * sources it ships, the import of the sources it will import, already rebuilt
+ * and validated. A template no source uses does nothing on the other side, and
+ * its name, proxy and profile links are the sender's business rather than part
+ * of the cache.
+ */
+function templateIdsNamedBySources(sources: readonly InventorySourceConfig[]): Set<string> {
+  return new Set(sources.flatMap((source) => (source.templateRules ?? []).map((rule) => rule.templateId)));
+}
+
+/**
+ * A source's `templateRules` with each rule rebuilt from its declared members
+ * and re-pointed at its template's id in the bundle, and a rule whose template
+ * did not travel (or did not land) dropped: the engine skips-and-warns on a
+ * rule it cannot resolve on every sync, which is noise about a template the
+ * recipient never had. `undefined` when nothing is left — absent and `[]` both
+ * mean "no rules". A non-array value is returned as-is for
+ * `validateInventorySource` to judge.
+ */
+function remapSharedTemplateRules(
+  rules: TemplateRule[] | undefined,
+  linkTemplate: (id: string) => string | undefined
+): TemplateRule[] | undefined {
+  if (!Array.isArray(rules)) {
+    return rules;
+  }
+  const kept = rules.flatMap((rule: unknown) => {
+    if (typeof rule !== "object" || rule === null) {
+      return [];
+    }
+    const templateId = (rule as TemplateRule).templateId;
+    const linked = typeof templateId === "string" ? linkTemplate(templateId) : undefined;
+    return linked === undefined
+      ? []
+      : [shareRecord(rule as TemplateRule, SHARED_TEMPLATE_RULE_RULES, { templateId: () => linked }) as TemplateRule];
+  });
+  return kept.length > 0 ? kept : undefined;
+}
+
+/**
+ * One device-template field's `{ mode, value }` wrapper, rebuilt from its
+ * declared members with `mapValue` applied to the value — or `undefined`, which
+ * removes the field ("this template says nothing about it"), when the value
+ * maps to nothing. A wrapper that is not an object is returned as it is, for
+ * `validateDeviceTemplate` to judge.
+ */
+function shareTemplateField<V>(field: TemplateField<V> | undefined, mapValue: (value: V) => V | undefined): TemplateField<V> | undefined {
+  if (typeof field !== "object" || field === null) {
+    return field;
+  }
+  const value = mapValue(field.value);
+  return value === undefined
+    ? undefined
+    : (shareRecord(field as TemplateField<unknown>, SHARED_TEMPLATE_FIELD_WRAPPER_RULES, { value: () => value }) as TemplateField<V>);
+}
+
+/**
+ * A device template's `fields`, every wrapper rebuilt and every id reference
+ * re-pointed through `lenses` — profile links through `linkProfile`, the IPMI
+ * gateway and a jump host through `linkServer` — or the field removed. A value
+ * of the wrong type is left in place for `validateDeviceTemplate` to judge.
+ */
+function remapSharedTemplateFields(fields: DeviceTemplateProfile["fields"], lenses: ShareLenses): DeviceTemplateProfile["fields"] {
+  if (typeof fields !== "object" || fields === null || Array.isArray(fields)) {
+    return fields;
+  }
+  const linkId = (link: (id: string) => string | undefined) => (value: string) => (typeof value === "string" ? link(value) : value);
+  return shareRecord(fields, SHARED_TEMPLATE_FIELD_RULES, {
+    proxy: (field) => shareTemplateField(field, (proxy) => remapProxy(proxy, lenses.linkServer)),
+    authProfileId: (field) => shareTemplateField(field, linkId((id) => linkSyncAuthProfile(id, lenses))),
+    ipmiAuthProfileId: (field) => shareTemplateField(field, linkId(lenses.linkProfile)),
+    ipmiGatewayServerId: (field) => shareTemplateField(field, linkId(lenses.linkServer))
+  });
+}
+
+/**
+ * A synced server's `origin` as a share carries it, in BOTH directions — the
+ * export calls this with the file's ids, the import with this machine's.
+ * `sourceId` becomes the id the source has on the other side (which is what
+ * makes that source own the row), and every stamp moves in LOCKSTEP with the
+ * value beside it, since a stamp is the sync's record of what it last wrote and
+ * a value that no longer equals its stamp reads as a hand edit the sync then
+ * leaves alone for good:
+ *  - `syncedUsername` becomes SHARED_USERNAME where present, because `username`
+ *    does; an absent stamp falls back to the source's `defaultUsername`, which
+ *    is SHARED_USERNAME too;
+ *  - `syncedAuthProfileId` and the `templated` IPMI stamps go through the lens
+ *    their values use, and `templated.proxy` through `remapProxy`, exactly as
+ *    the server's own proxy does; `syncedAuthProfileId` is dropped with the
+ *    link it records when `dropAuthLink` says the server's link is left out
+ *    (`syncAuthLinkArrivesNeedingServerKey`);
+ *  - `syncedInstanceKey` loses any URL userinfo (see `SHARED_ORIGIN_RULES`);
+ *  - the address stamps, `externalId` and `syncedAt` are kept as they are.
+ * A `templated` bag with nothing left in it is dropped.
+ */
+function shareOrigin(origin: ServerOrigin, sourceId: string, lenses: ShareLenses, dropAuthLink: boolean): ServerOrigin {
+  return shareRecord(origin, SHARED_ORIGIN_RULES, {
+    sourceId: () => sourceId,
+    syncedAuthProfileId: (id) => (id === undefined || dropAuthLink ? undefined : lenses.linkProfile(id)),
+    templated: (stamps) => {
+      if (stamps === undefined) {
+        return undefined;
+      }
+      const shared = shareRecord(stamps, SHARED_TEMPLATED_STAMP_RULES, {
+        proxy: (proxy) => remapProxy(proxy, lenses.linkServer),
+        ipmiAuthProfileId: (id) => (id === undefined ? undefined : lenses.linkProfile(id)),
+        ipmiGatewayServerId: (id) => (id === undefined ? undefined : lenses.linkServer(id))
+      });
+      return templatedHasAnyStamp(shared) ? shared : undefined;
+    }
+  }) as ServerOrigin;
 }
 
 export function sanitizeForSharing(
@@ -1298,7 +1821,10 @@ export function sanitizeForSharing(
   localShellProfiles: LocalShellProfile[],
   settings: Record<string, unknown> = {},
   authProfiles: AuthProfile[] = [],
-  macros: TerminalMacro[] = []
+  macros: TerminalMacro[] = [],
+  inventorySources: InventorySourceConfig[] = [],
+  deviceTemplates: DeviceTemplateProfile[] = [],
+  savedFilters: SavedFilterDefinition[] = []
 ): SanitizedSnapshot {
   const idMap = new Map<string, string>();
 
@@ -1307,13 +1833,30 @@ export function sanitizeForSharing(
     idMap.set(p.id, randomUUID());
   }
 
-  // ADDRESSLESS (Codex P1 review MINOR-1) — DROP addressless placeholders from a
-  // shared export entirely. A share strips `origin` (a synced marker is local
-  // only), which would leave an `addressless:true, host:""` record the recipient
-  // can never connect to, re-address, or upgrade — and one that violates the
-  // "addressless is written ONLY by inventory sync" invariant on their machine.
-  // They are meaningless without their source, so they do not travel.
-  servers = servers.filter((s) => s.addressless !== true);
+  // Sources and templates get fresh ids BEFORE any server is built, so a synced
+  // server's `origin.sourceId` and a source's `templateRules` can be re-pointed
+  // at them. Maps of their own rather than `idMap`: nothing in the server or
+  // profile buckets may ever resolve to one of these.
+  const sourceIdMap = new Map(inventorySources.map((source) => [source.id, randomUUID()] as const));
+  // Only the templates a source's rule names travel (`templateIdsNamedBySources`),
+  // filtered before anything is collected from them — a profile only an unused
+  // template links then stays behind too.
+  const usedTemplateIds = templateIdsNamedBySources(inventorySources);
+  deviceTemplates = deviceTemplates.filter((template) => usedTemplateIds.has(template.id));
+  const templateIdMap = new Map(deviceTemplates.map((template) => [template.id, randomUUID()] as const));
+
+  // A synced server keeps its `origin` only when the source it names travels
+  // with it. One whose source is gone on THIS machine (a dangling origin) would
+  // arrive owned by nothing, and could never be owned or adopted there either.
+  const originShips = (s: ServerConfig): boolean => s.origin !== undefined && sourceIdMap.has(s.origin.sourceId);
+
+  // ADDRESSLESS (Codex P1 review MINOR-1) — a placeholder travels only WITH its
+  // origin. Its source then owns it on the recipient, whose first sync fills in
+  // the address when the device has one. Without the origin it would be an
+  // `addressless: true, host: ""` record nothing can ever connect to, re-address
+  // or upgrade, and it would break the "addressless is written ONLY by inventory
+  // sync" invariant on the recipient's machine — so it is dropped.
+  servers = servers.filter((s) => s.addressless !== true || originShips(s));
 
   // Second pass: assign new IDs for servers
   for (const s of servers) {
@@ -1322,32 +1865,102 @@ export function sanitizeForSharing(
 
   // Build sanitized auth profiles (redact credentials, keep name)
   //
-  // BOTH links are collected (issue #48 §3.1). A profile used ONLY as a server's
-  // IPMI credentials is referenced exactly as much as one used for SSH, and
-  // collecting only `authProfileId` would leave every such profile out of the
-  // bundle while the servers that name it still ship — a link the recipient
-  // cannot resolve, on the field the export exists to carry.
+  // EVERY reference is collected, because a link to a profile left out of the
+  // bundle arrives as a link to nothing. Both server links (issue #48 §3.1 — a
+  // profile used ONLY as a server's IPMI credentials is referenced exactly as
+  // much as one used for SSH); a source's link, which a server-only collection
+  // would miss whenever no server names that profile yet; each template's two;
+  // and the sync's two stamps on a shipped origin — dropped rather than
+  // remapped, a stamp naming a profile the sync linked would read as "the sync
+  // never linked one", and undo the per-server opt-out it records.
+  //
+  // A key profile ships even when the only links to it are the ones the share
+  // leaves out because it arrives with no key file (`linkSyncAuthProfile`):
+  // it is what the recipient gives their own key file and links on the source.
   const referencedProfileIds = new Set(
-    servers.flatMap((s) => [s.authProfileId, s.ipmiAuthProfileId]).filter(Boolean) as string[]
+    [
+      ...servers.flatMap((s) => [
+        s.authProfileId,
+        s.ipmiAuthProfileId,
+        ...(originShips(s) ? [s.origin?.syncedAuthProfileId, s.origin?.templated?.ipmiAuthProfileId] : [])
+      ]),
+      ...inventorySources.map((source) => source.authProfileId),
+      ...deviceTemplates.flatMap((template) => [template.fields.authProfileId?.value, template.fields.ipmiAuthProfileId?.value])
+    ].filter(Boolean) as string[]
   );
+  const shippedProfiles = new Map<string, AuthProfile>(); // this machine's id → the profile as the file carries it
   const newAuthProfiles = authProfiles
     .filter((p) => referencedProfileIds.has(p.id))
-    .map((p) => ({
-      ...p,
-      id: idMap.get(p.id)!,
-      username: "user",
-      keyPath: undefined
-    }));
+    .map((p) => {
+      const shipped = shareRecord(p, SHARED_AUTH_PROFILE_RULES, { id: () => idMap.get(p.id)! }) as AuthProfile;
+      shippedProfiles.set(p.id, shipped);
+      return shipped;
+    });
+  /**
+   * Every profile reference passes through here: the profile's id in the
+   * bundle, or `undefined` when the profile is not in it — the sender's id
+   * verbatim would, on the receiving side, resolve to nothing or (worse) to an
+   * unrelated local profile that happens to hold it.
+   */
+  const linkToShippedProfile = (id: string | undefined): string | undefined => (id ? shippedProfiles.get(id)?.id : undefined);
+  /** The file's ids: a profile in the bundle, a server in the bundle, or nothing — and each profile as the file carries it. */
+  const lenses: ShareLenses = {
+    linkProfile: linkToShippedProfile,
+    linkServer: (id) => idMap.get(id),
+    arrivesNeedingServerKey: (id) => authProfileNeedsServerKeyPath(shippedProfiles.get(id))
+  };
+
+  // DEVICE TEMPLATES — fresh ids, no `revision` (NexusCore mints one on every
+  // write), every reference re-pointed into the bundle or removed, and a proxy
+  // through `remapProxy`, the rule a server's own proxy takes.
+  const newDeviceTemplates: DeviceTemplateProfile[] = deviceTemplates.map(
+    (template) =>
+      shareRecord(template, SHARED_TEMPLATE_RULES, {
+        id: () => templateIdMap.get(template.id)!,
+        fields: (fields) => remapSharedTemplateFields(fields, lenses)
+      }) as DeviceTemplateProfile
+  );
+
+  // INVENTORY SOURCES — see `NexusConfigExport.inventorySources`; which fields
+  // travel at all, and what the rewrites are, is `SHARED_SOURCE_RULES`. Why:
+  //  - `lastSyncAt`: the recipient's tree would say "synced 3d ago" of a source
+  //    that has never synced there. How old the cache is lives on each row's
+  //    `origin.syncedAt`, which does travel.
+  //  - `providerFingerprint`: the sender's answer about the provider extension
+  //    registered on the SENDER's machine. Absent means ungated, and the
+  //    recipient's first successful sync stamps their own; carried, it could
+  //    raise "Provider looks different…" about a source that holds no
+  //    credentials at all.
+  //  - `managedFolders`: which folders the sender's syncs created, i.e. which
+  //    ones they may delete when empty. The recipient's first sync records its
+  //    own, exactly as the backup import's `sanitizeImportedInventorySources`
+  //    arranges.
+  //  - `revision`: an incarnation token; NexusCore mints one on every write.
+  //  - `defaultUsername` becomes SHARED_USERNAME, matching the servers.
+  //  - `config` passes `sanitizeSharedSourceConfig`.
+  // `secretFieldIds` travels: it names the credential fields (never their
+  // values), and the recipient's Sync Now and status poll read it to know which
+  // credentials are still missing. `prunePolicy` travels as it is; the import
+  // decides what a `delete` becomes.
+  const newInventorySources: InventorySourceConfig[] = inventorySources.map(
+    (source) =>
+      shareRecord(source, SHARED_SOURCE_RULES, {
+        id: () => sourceIdMap.get(source.id)!,
+        prunePolicy: (policy) => policy,
+        authProfileId: (id) => linkSyncAuthProfile(id, lenses),
+        templateRules: (rules) => remapSharedTemplateRules(rules, (id) => templateIdMap.get(id))
+      }) as InventorySourceConfig
+  );
 
   const newServers = servers.map((s) => {
     const newId = idMap.get(s.id)!;
-    const newAuthProfileId = s.authProfileId ? idMap.get(s.authProfileId) : undefined;
-    // Remapped through the SAME idMap, and dropped to `undefined` when the
-    // target is not in the export — `remapProxy`'s rule for an out-of-export
-    // jump host, for the same reason: the spread below would otherwise carry the
-    // SENDER's id verbatim, which on the receiving side either resolves to
-    // nothing or (worse) to an unrelated local profile that happens to hold it.
-    const newIpmiAuthProfileId = s.ipmiAuthProfileId ? idMap.get(s.ipmiAuthProfileId) : undefined;
+    // A row whose origin travels loses the sync's own link to a key profile
+    // together with its stamp (`syncAuthLinkArrivesNeedingServerKey`). A row
+    // whose origin does not arrives as a server no source owns, which the sync
+    // never unlinks, so it keeps its link as any hand-made server does.
+    const dropAuthLink = originShips(s) && syncAuthLinkArrivesNeedingServerKey(s, lenses);
+    const newAuthProfileId = dropAuthLink ? undefined : linkToShippedProfile(s.authProfileId);
+    const newIpmiAuthProfileId = linkToShippedProfile(s.ipmiAuthProfileId);
     // JUMP-HOST IPMI ROUTING (issue #48 PR-C) — an id reference INTO THE SERVER
     // LIST, so it remaps through the SAME idMap as `proxy.jumpHostId` (every
     // server's new id is already assigned in the second pass above), and takes
@@ -1356,31 +1969,33 @@ export function sanitizeForSharing(
     // unset gateway means "the BMC is reachable locally" — a safe working default
     // on the recipient — whereas a stale id can only fail confusingly at run time.
     const newIpmiGatewayServerId = s.ipmiGatewayServerId ? idMap.get(s.ipmiGatewayServerId) : undefined;
-    // §B6 — a share export travels to another person/machine; a synced-server marker
-    // (sourceId/externalId) names an inventory source that only exists locally and
-    // would be meaningless (and misleading) on the receiving end.
+    // `origin` travels when its source does (`shareOrigin`); a dangling one is
+    // dropped (see `originShips`).
     //
-    // ADOPT 1 — `formerlySynced` goes with it, for exactly that reason and one
-    // more. It is the same kind of local-only reference (sourceId/sourceName name
-    // a source that was removed on the EXPORTING machine and never existed on the
-    // receiving one), but unlike a dangling `origin` it is not inert: it is the
-    // adoption key. Left on a shared record, the recipient's own source — same
-    // provider, same device — would silently claim a server it never synced, and
-    // take its whole lifecycle including the prune policy. Backups keep the marker
-    // (full fidelity, same machine); a share never does.
+    // ADOPT 1 — `formerlySynced` never travels, and the two are deliberately not
+    // treated alike. A shipped origin names a source that travels in the SAME
+    // file and lands with a fresh id, so on the recipient it owns exactly the rows
+    // it owned here, and nothing else. The marker is the adoption key: it names a
+    // source removed on THIS machine, and on the recipient's it would let their
+    // OWN pre-existing source of the same provider silently claim a server it
+    // never synced — and take its whole lifecycle, prune policy included. Backups
+    // keep the marker (full fidelity, same machine); a share never does.
     return {
-      ...s,
+      ...scrubSharedServer(s),
       id: newId,
-      username: "user",
-      keyPath: "",
-      proxy: remapProxy(s.proxy, idMap),
+      proxy: remapProxy(s.proxy, lenses.linkServer),
       authProfileId: newAuthProfileId,
       ipmiAuthProfileId: newIpmiAuthProfileId,
       ipmiGatewayServerId: newIpmiGatewayServerId,
-      origin: undefined,
-      formerlySynced: undefined
+      origin: originShips(s) ? shareOrigin(s.origin!, sourceIdMap.get(s.origin!.sourceId)!, lenses, dropAuthLink) : undefined
     };
   });
+
+  // SAVED FILTERS — a name and a query string, both the same class of data as a
+  // source's own filter field; only the id is new.
+  const newSavedFilters: SavedFilterDefinition[] = savedFilters.map(
+    (filter) => shareRecord(filter, SHARED_SAVED_FILTER_RULES, { id: () => randomUUID() }) as SavedFilterDefinition
+  );
 
   const newTunnels = tunnels.map((t) => {
     const newId = randomUUID();
@@ -1395,22 +2010,13 @@ export function sanitizeForSharing(
   const newSerialProfiles = serialProfiles.map((p) => {
     const newId = randomUUID();
     idMap.set(p.id, newId);
-    return { ...p, id: newId, deviceHint: undefined };
+    return { ...scrubSharedSerialProfile(p), id: newId };
   });
 
-  // Issue #159 — `env` goes with `cwd` and `startupCommand`: variables
-  // routinely carry tokens (the backup keeps them in its encrypted section for
-  // exactly that reason), and a share file promises "credentials stripped".
   const newLocalShellProfiles = localShellProfiles.map((p) => {
     const newId = randomUUID();
     idMap.set(p.id, newId);
-    return {
-      ...p,
-      id: newId,
-      cwd: undefined,
-      startupCommand: undefined,
-      env: undefined
-    };
+    return { ...scrubSharedLocalShellProfile(p), id: newId };
   });
 
   const sanitizedMacros = macros
@@ -1420,10 +2026,7 @@ export function sanitizeForSharing(
     .map((m) => withRedactedVariables({ ...m, id: randomUUID() }));
 
   // Sanitize paths from the settings snapshot.
-  const sanitizedSettings = { ...settings };
-  if (sanitizedSettings["nexus.logging.sessionLogDirectory"]) {
-    sanitizedSettings["nexus.logging.sessionLogDirectory"] = "";
-  }
+  const sanitizedSettings = scrubSharedSettings(settings);
 
   return {
     servers: newServers,
@@ -1432,7 +2035,10 @@ export function sanitizeForSharing(
     localShellProfiles: newLocalShellProfiles,
     authProfiles: newAuthProfiles,
     macros: sanitizedMacros,
-    settings: sanitizedSettings
+    settings: sanitizedSettings,
+    inventorySources: newInventorySources,
+    deviceTemplates: newDeviceTemplates,
+    savedFilters: newSavedFilters
   };
 }
 
@@ -2099,28 +2705,34 @@ export function registerConfigCommands(
       snapshot.localShellProfiles,
       settings,
       snapshot.authProfiles,
-      allMacros
+      allMacros,
+      snapshot.inventorySources,
+      snapshot.deviceTemplates,
+      snapshot.savedFilters
     );
 
-    // Backup-only, deliberately absent here: inventory sources, device templates
-    // and saved filters (workspace wiring), Local Server profiles (this
+    // Backup-only, deliberately absent here: Local Server profiles (this
     // machine's executables, paths and environment), saved TFTP/DHCP profiles
     // (this bench's interfaces and address plan) and trusted SSH host keys
-    // (this machine's trust decisions). See each field on NexusConfigExport.
+    // (this machine's trust decisions). Inventory sources, the device templates
+    // their rules use and saved filters DO travel, sanitized, as a cache of the
+    // synced tree. See each field on NexusConfigExport.
     const exportData: NexusConfigExport = {
       version: 2,
       exportType: "share",
       exportedAt: new Date().toISOString(),
-      // Stamped like a backup (review D3). A share export carries no
-      // `inventorySources`, so nothing in it can receive the retired interval —
-      // it is stamped anyway so this build has ONE rule about what its exports
-      // say about themselves, not a per-path exemption to remember.
+      // Stamped like a backup (review D3): every export this build writes says
+      // it knows the per-source Lab Status Poll Interval, which is also why the
+      // share import can discard the retired global interval outright.
       inventoryStatusPollPerSource: true,
       servers: sanitized.servers,
       tunnels: sanitized.tunnels,
       serialProfiles: sanitized.serialProfiles,
       localShellProfiles: sanitized.localShellProfiles,
       authProfiles: sanitized.authProfiles.length > 0 ? sanitized.authProfiles : undefined,
+      inventorySources: sanitized.inventorySources.length > 0 ? sanitized.inventorySources : undefined,
+      deviceTemplates: sanitized.deviceTemplates.length > 0 ? sanitized.deviceTemplates : undefined,
+      savedFilters: sanitized.savedFilters.length > 0 ? sanitized.savedFilters : undefined,
       groups: snapshot.explicitGroups,
       macros: sanitized.macros.length > 0 ? sanitized.macros : undefined,
       macroFolders: getMacroFolders(),
@@ -2137,9 +2749,20 @@ export function registerConfigCommands(
     const json = JSON.stringify(exportData, null, 2);
     await vscode.workspace.fs.writeFile(uri, Buffer.from(json, "utf8"));
 
-    const count = snapshot.servers.length + snapshot.tunnels.length + snapshot.serialProfiles.length + snapshot.localShellProfiles.length + sanitized.authProfiles.length;
+    // Counted off what was WRITTEN: a placeholder whose source is gone here is
+    // left out of the file, so the snapshot would over-count.
+    const count =
+      sanitized.servers.length +
+      sanitized.tunnels.length +
+      sanitized.serialProfiles.length +
+      sanitized.localShellProfiles.length +
+      sanitized.authProfiles.length;
     const excludedSecretCount = allMacros.filter((m) => m.secret).length;
-    const base = `Exported ${count} profiles for sharing to ${uri.fsPath}`;
+    const sourceNote =
+      sanitized.inventorySources.length > 0
+        ? ` and ${plural(sanitized.inventorySources.length, "inventory source")} (without credentials)`
+        : "";
+    const base = `Exported ${count} profiles${sourceNote} for sharing to ${uri.fsPath}`;
     const suffix = excludedSecretCount > 0
       ? ` (${excludedSecretCount} secret macro${excludedSecretCount === 1 ? "" : "s"} excluded)`
       : "";
@@ -2316,6 +2939,9 @@ export function registerConfigCommands(
     const tunnels = data.tunnels ?? [];
     const serialProfiles = data.serialProfiles ?? [];
     const localShellProfiles = data.localShellProfiles ?? [];
+    const deviceTemplates = data.deviceTemplates ?? [];
+    const inventorySources = data.inventorySources ?? [];
+    const savedFilters = data.savedFilters ?? [];
 
     // First pass: assign new IDs for auth profiles and servers so links can be remapped.
     for (const profile of authProfiles) {
@@ -2337,7 +2963,7 @@ export function registerConfigCommands(
       else skipped++;
     };
 
-    // REVIEW FINDING (P2) — the ids of the profiles that actually LANDED, which is
+    // REVIEW FINDING (P2) — the profiles that actually LANDED, by id, which is
     // NOT the auth-profile half of `idMap`. `idMap` is filled in the first pass,
     // before a single record has been validated, so a profile rejected by
     // `validateAuthProfile` still holds a fresh id there — and a server remapped
@@ -2345,8 +2971,8 @@ export function registerConfigCommands(
     // Nothing downstream notices: the server persists with a link that resolves to
     // nothing, `SilentAuthSshFactory` finds no profile and silently falls back to
     // the server's own credentials, and no message anywhere says the link is dead.
-    // The reachable shape is the one `validateAuthProfile` was taught to reject a
-    // round ago (a non-string `keyPath`), but nothing about this is specific to it.
+    // A reachable shape is an `authType` this build does not know; nothing about
+    // this is specific to it.
     //
     // WHY AT CONSTRUCTION rather than a post-import sweep like the backup path's:
     // both reach the same end state — no record left pointing at a profile that
@@ -2357,17 +2983,18 @@ export function registerConfigCommands(
     // in preference to the payload's. The share path builds every link value itself
     // from a map it owns, so the check belongs there — and keeping it there means a
     // share import still never rewrites a local record the payload never mentioned.
-    const importedProfileIds = new Set<string>();
+    const importedProfiles = new Map<string, AuthProfile>();
 
+    // Each profile is rebuilt by the export's own rules (`SHARED_AUTH_PROFILE_RULES`)
+    // before validation: a hand-edited file cannot land a login, a key path or a
+    // member the model does not declare, and a malformed key path cannot cost
+    // the profile.
     for (const profile of authProfiles) {
       const newId = idMap.get(profile.id)!;
-      const remappedProfile: AuthProfile = {
-        ...profile,
-        id: newId
-      };
+      const remappedProfile = shareRecord(profile, SHARED_AUTH_PROFILE_RULES, { id: () => newId }) as AuthProfile;
       const added = await addIfValid(remappedProfile, validateAuthProfile, (e) => core.addOrUpdateAuthProfile(e));
       if (added) {
-        importedProfileIds.add(newId);
+        importedProfiles.set(newId, remappedProfile);
       }
       tally(added);
     }
@@ -2384,79 +3011,178 @@ export function registerConfigCommands(
         return undefined;
       }
       const remapped = idMap.get(id);
-      return remapped !== undefined && importedProfileIds.has(remapped) ? remapped : undefined;
+      return remapped !== undefined && importedProfiles.has(remapped) ? remapped : undefined;
     };
 
     /**
-     * `origin.syncedAuthProfileId` is a profile reference too — the sync's record of
-     * which profile IT linked — and it is the only one nothing here used to remap,
-     * so on a payload carrying an origin it named a stranger's id unconditionally.
-     * It goes through the same lens as the link for the reason the backup path's
-     * sweep drops the two together: a stamp naming a profile that is not here reads
-     * as a per-server opt-out nobody chose and locks that server out of retro-apply
-     * for good. Passed through untouched when there is no stamp, so a server that
-     * never carried one does not acquire the field.
-     *
-     * REVIEW FINDING (P2) — the gate is `isValidServerOrigin`, not `!== undefined`.
-     * `ServerOrigin | undefined` is what the payload DECLARES, not what it can
-     * contain: `isValidExport` only checks that `servers` is an array, and
-     * `validateServerConfig` deliberately accepts a row whose `origin` is
-     * malformed (F13/FIX 5 — a bookkeeping field must not cost a server its
-     * record). So `"origin": null` on an otherwise-valid server reaches here, and
-     * `origin.syncedAuthProfileId` threw a TypeError that aborted the whole
-     * import — with everything imported before it already persisted.
-     *
-     * Anything this guard rejects is returned UNTOUCHED rather than dropped or
-     * repaired here: `addServerSanitizingOrigin` below is the one place that
-     * decides what a malformed marker costs (the origin, never the server), and
-     * it already handles null the same way it handles a numeric `externalId`.
-     * Remapping a stamp on an origin that is about to be stripped whole would be
-     * work with no reader anyway.
+     * This machine's ids, for the share rules (`ShareLenses`): a profile that
+     * LANDED, and a server's fresh id, raw — the IPMI gateway is narrowed to the
+     * servers that survive in the finalize loop below; a jump host, like the
+     * value it mirrors, is not. A profile is judged for a key file as it landed:
+     * rebuilt by `SHARED_AUTH_PROFILE_RULES`, so with none.
      */
-    const remapOriginStamp = (origin: ServerOrigin | undefined): ServerOrigin | undefined => {
-      // REVIEW FINDING (P2, PR #66 Codex round 7) — the guard used to early-return
-      // whenever `syncedAuthProfileId === undefined`, which left BOTH
-      // `origin.templated` IPMI stamps in the EXPORTER's id namespace on any origin
-      // that carried only templated stamps. Proceed when EITHER the SSH auth stamp
-      // is set OR the origin carries any templated stamp — an origin whose ONLY
-      // stamps are the templated IPMI ones must still be remapped, or its stamps
-      // survive import as foreign ids and the template matrix reads a PERMANENT
-      // hand divergence (row 6), locking a field that was actually template-owned.
-      if (
-        !isValidServerOrigin(origin) ||
-        (origin.syncedAuthProfileId === undefined && !templatedHasAnyStamp(origin.templated))
-      ) {
-        return origin;
+    const lenses: ShareLenses = {
+      linkProfile: (id) => linkToImportedProfile(id),
+      linkServer: (id) => idMap.get(id),
+      arrivesNeedingServerKey: (id) => {
+        const landed = linkToImportedProfile(id);
+        return landed !== undefined && authProfileNeedsServerKeyPath(importedProfiles.get(landed));
       }
-      // `syncedAuthProfileId` through the SAME lens the SSH auth VALUE uses
-      // (`linkToImportedProfile`); `linkToImportedProfile(undefined)` is `undefined`,
-      // so an origin carrying only templated stamps keeps `syncedAuthProfileId`
-      // absent, exactly as before.
-      const next: ServerOrigin = { ...origin, syncedAuthProfileId: linkToImportedProfile(origin.syncedAuthProfileId) };
-      // Each templated stamp is remapped through the SAME lens its VALUE passes
-      // through on the remapped server below: the auth stamp through
-      // `linkToImportedProfile` (FINAL — profiles are fully resolved here), the
-      // gateway stamp RAW through `idMap` (mirroring the value's raw remap at the
-      // `ipmiGatewayServerId:` line below; the final `linkToImportedServer`
-      // narrowing happens in the finalize loop, since the surviving-server set is
-      // not known at this point). Collapse the rebuilt bag via `templatedHasAnyStamp`
-      // so a template-owned field survives as `cur === stamp` in LOCAL ids and a
-      // real divergence is preserved. `formerlySynced` is dropped whole on share
-      // import below, so no twin remap is needed here.
-      if (origin.templated !== undefined) {
-        const templated = cloneTemplatedStamps(origin.templated);
-        templated.ipmiAuthProfileId = linkToImportedProfile(origin.templated.ipmiAuthProfileId);
-        templated.ipmiGatewayServerId = origin.templated.ipmiGatewayServerId
-          ? (idMap.get(origin.templated.ipmiGatewayServerId) ?? undefined)
-          : undefined;
-        next.templated = templatedHasAnyStamp(templated) ? templated : undefined;
+    };
+
+    // DEVICE TEMPLATES and INVENTORY SOURCES — decided before either is written,
+    // because a template comes in only when a source that LANDS names it (the
+    // export's own rule, `templateIdsNamedBySources`), and a source lands with
+    // its rules pointing at the templates that land. So, in three steps:
+    //  1. every template is rebuilt and validated: the ones that could land;
+    //  2. every source is rebuilt, its rules linked to those, and validated: the
+    //     ones that will land;
+    //  3. the templates those sources name are written, then the sources.
+    // A template no landing source names — named by no source, or only by one
+    // the import rejects — is skipped and counted, rather than left behind with
+    // a name, a proxy and profile links nothing uses. Deciding from the file's
+    // sources before validating them is what let one through.
+    //
+    // A template gets a fresh id and loses `revision` before validation
+    // (NexusCore mints one on every write, and a malformed one must not cost the
+    // template); every reference is re-pointed through the lens its bucket uses.
+    // The IPMI gateway is remapped raw, not narrowed to the servers that
+    // survive: templates land before servers, and a template naming a server
+    // that is not here is skip-and-warn at sync time — the disposition the
+    // backup import relies on.
+    const validTemplates = new Map<string, DeviceTemplateProfile>(); // payload id → the template as it would land
+    for (const template of deviceTemplates) {
+      if (typeof template !== "object" || template === null || typeof template.id !== "string" || validTemplates.has(template.id)) {
+        skipped++;
+        continue;
       }
-      return next;
+      const newTemplateId = randomUUID();
+      const remappedTemplate = shareRecord(template, SHARED_TEMPLATE_RULES, {
+        id: () => newTemplateId,
+        fields: (fields) => remapSharedTemplateFields(fields, lenses)
+      }) as DeviceTemplateProfile;
+      if (validateDeviceTemplate(remappedTemplate)) {
+        validTemplates.set(template.id, remappedTemplate);
+      } else {
+        skipped++;
+      }
+    }
+
+    // INVENTORY SOURCES — before the servers, whose `origin` must name a source
+    // that LANDED (`linkToImportedSource`). Each arrives with a fresh id and no
+    // credentials: nothing below writes the vault, so the recipient's Sync Now
+    // refuses with "Missing saved credential … edit the source to re-enter it"
+    // until they have typed their own into Edit Source.
+    //
+    // `SHARED_SOURCE_RULES` — the export's own rules — rebuild each source, so
+    // `lastSyncAt`, `revision`, `managedFolders` and `providerFingerprint` are
+    // gone BEFORE validation — as `sanitizeImportedInventorySources` arranges
+    // for a backup — and a malformed one cannot cost the source. A share file is
+    // untrusted, and a hand-edited one must not be able to smuggle a trust stamp
+    // or folder-deletion authority onto this machine. `sanitizeForSharing` never
+    // writes them; applying the same rules here is what makes that a guarantee
+    // rather than a habit of our own exporter — `defaultUsername` becomes
+    // SHARED_USERNAME and the config rule runs again for the same reason.
+    //
+    // REMOVED-DEVICE POLICY: `delete` arrives as `orphan`. The rows arrive OWNED,
+    // and the recipient's credentials may see less of the source than the
+    // sender's did — so their first sync could prune cached rows whose devices
+    // they simply cannot see, and `delete` would delete them. `orphan` moves them
+    // aside instead, and a device that reappears moves back. `keep` and `orphan`
+    // travel as they are. The completion message says when this happened.
+    //
+    // A source whose id in the file is already held by one that will land is
+    // skipped and counted — the first valid one wins, as for templates. The
+    // file's rows name their source by that id, so two landing under it would
+    // split the cache: the rows follow one, and the other's first sync adds
+    // every device again.
+    const landingSources: Array<{ payloadId: unknown; record: InventorySourceConfig; deletePolicy: boolean }> = [];
+    const landingPayloadIds = new Set<string>();
+    for (const source of inventorySources) {
+      if (typeof source !== "object" || source === null || (typeof source.id === "string" && landingPayloadIds.has(source.id))) {
+        skipped++;
+        continue;
+      }
+      const newSourceId = randomUUID();
+      const remappedSource = shareRecord(source, SHARED_SOURCE_RULES, {
+        id: () => newSourceId,
+        prunePolicy: (policy) => (policy === "delete" ? "orphan" : policy),
+        authProfileId: (id) => linkSyncAuthProfile(id, lenses),
+        templateRules: (rules) => remapSharedTemplateRules(rules, (id) => validTemplates.get(id)?.id)
+      }) as InventorySourceConfig;
+      if (validateInventorySource(remappedSource)) {
+        landingSources.push({ payloadId: source.id, record: remappedSource, deletePolicy: source.prunePolicy === "delete" });
+        if (typeof source.id === "string") {
+          landingPayloadIds.add(source.id);
+        }
+      } else {
+        skipped++;
+      }
+    }
+
+    // Every rule a landing source kept names a template in `validTemplates`, and
+    // all of those are written here, so each of its rules resolves.
+    const usedTemplateIds = templateIdsNamedBySources(landingSources.map((landing) => landing.record));
+    let importedTemplateCount = 0;
+    for (const template of validTemplates.values()) {
+      if (usedTemplateIds.has(template.id)) {
+        await core.addOrUpdateDeviceTemplate(template);
+        importedTemplateCount++;
+      } else {
+        skipped++;
+      }
+    }
+
+    const sourceIdMap = new Map<string, string>(); // payload id → id of a source that LANDED
+    const importedSourceIds: string[] = [];
+    let deletePoliciesOrphaned = 0;
+    for (const { payloadId, record, deletePolicy } of landingSources) {
+      await core.addOrUpdateInventorySource(record);
+      if (typeof payloadId === "string") {
+        sourceIdMap.set(payloadId, record.id);
+      }
+      importedSourceIds.push(record.id);
+      if (deletePolicy) {
+        deletePoliciesOrphaned++;
+      }
+    }
+
+    /**
+     * The one rule a share import applies to a server's `origin`, and the
+     * `linkToImportedProfile` lens one bucket over: the origin is KEPT only when
+     * the source it names LANDED in this same import, re-pointed at that source's
+     * fresh id (with every stamp rebuilt by `shareOrigin`), and dropped
+     * whole otherwise. Kept, it makes the imported source own the row, so that
+     * source's first sync updates it in place. Dropped are a malformed origin, one
+     * whose source was rejected, and one naming a source the file does not carry
+     * at all — a hand-edited file, or a share written before shares carried
+     * sources — each of which would otherwise leave a row owned by nothing: never
+     * synced, never pruned, never adoptable, for as long as it lives.
+     *
+     * The stamps are rebuilt by `shareOrigin`, the function the export uses, so
+     * a hand-edited file cannot put back what the export removes, and each stamp
+     * passes through the lens its value does — the reason a stamp naming a
+     * profile that did not land is dropped with the link it records, rather than
+     * left as a per-server opt-out nobody chose. The gate is `isValidServerOrigin`
+     * and not `!== undefined`: `"origin": null` on an otherwise-valid server
+     * reaches here (`validateServerConfig` accepts a malformed origin so a
+     * bookkeeping field cannot cost a server its record), and reading a stamp off
+     * it threw a TypeError that aborted the whole import halfway.
+     */
+    const linkToImportedSource = (origin: ServerOrigin | undefined, dropAuthLink: boolean): ServerOrigin | undefined => {
+      if (!isValidServerOrigin(origin)) {
+        return undefined;
+      }
+      const sourceId = sourceIdMap.get(origin.sourceId);
+      if (sourceId === undefined) {
+        return undefined;
+      }
+      return shareOrigin(origin, sourceId, lenses, dropAuthLink);
     };
 
     /**
      * The NEW ids of the servers that SURVIVE import — the server analogue of
-     * `importedProfileIds`, and the lens the IPMI gateway link passes through (see
+     * `importedProfiles`, and the lens the IPMI gateway link passes through (see
      * `linkToImportedServer` below). Built in FULL before any gateway link is
      * finalized so a FORWARD reference (target A whose gateway B sits LATER in the
      * `servers` array) still resolves: the gate is "B survived import", never "B was
@@ -2475,28 +3201,34 @@ export function registerConfigCommands(
     const remappedServers: ServerConfig[] = [];
     const importedServerIds = new Set<string>();
     for (const server of servers) {
-      let remappedProxy = server.proxy;
-      if (remappedProxy?.type === "ssh") {
-        const remapped = idMap.get(remappedProxy.jumpHostId);
-        if (remapped) {
-          remappedProxy = { ...remappedProxy, jumpHostId: remapped };
-        } else {
-          remappedProxy = undefined; // Jump host not in export
-        }
+      // The sync's own link to a key profile that landed with no key file is
+      // left out with its stamp, exactly as on export — and only on a row that
+      // keeps its origin, the one kind of row the sync would unlink.
+      const syncAuthLinkUnusable = syncAuthLinkArrivesNeedingServerKey(server, lenses);
+      const origin = linkToImportedSource(server.origin, syncAuthLinkUnusable);
+      // ADDRESSLESS — a placeholder lands only WITH an origin. Without one it is
+      // an `addressless: true, host: ""` record nothing can connect to or fill
+      // in, and one that breaks "addressless is written ONLY by inventory sync"
+      // on this machine. So it is skipped, and counted in the completion message.
+      if (server.addressless === true && origin === undefined) {
+        skipped++;
+        continue;
       }
       /**
-       * ADOPT 1 — the one field a share import DROPS rather than remaps, and
-       * deliberately NOT symmetric with `origin` one line below it.
+       * ADOPT 1 — `formerlySynced`, which `scrubSharedServer` drops rather than
+       * remaps, deliberately NOT symmetric with `origin` below.
        *
-       * A stale `origin` is inert on the recipient: no source here holds that
-       * id, nothing on this machine dereferences it, and no sync can act
-       * through it. `formerlySynced` is the opposite — it is the adoption key,
-       * and `planInventorySync` matches it on `providerId` + `externalId` + the
-       * server's CURRENT address, never on `sourceId`. So a marker riding in on
-       * a share file is a live claim here: the recipient's own same-provider
-       * source would silently take a shared record over whole — name, address,
-       * folder, and the prune policy that can later delete it — for a source
-       * the recipient never removed and a device they never synced.
+       * An `origin` that survives `linkToImportedSource` names a source that
+       * travelled in this same file and has just landed with a fresh id, so it
+       * gives that source exactly the rows it owned on the sender's machine and
+       * nothing else. `formerlySynced` is different in kind — it is the adoption
+       * key, and `planInventorySync` matches it on `providerId` + `externalId` +
+       * the server's CURRENT address, never on `sourceId`. So a marker riding in
+       * on a share file is a live claim on records it never names: the
+       * recipient's own PRE-EXISTING same-provider source would silently take a
+       * shared record over whole — name, address, folder, and the prune policy
+       * that can later delete it — for a source the recipient never removed and
+       * a device they never synced.
        *
        * The provenance it asserts is also false on this machine. The marker
        * means "a source HERE synced this server, and you kept it when you
@@ -2504,8 +3236,8 @@ export function registerConfigCommands(
        * accept a file from someone else, which makes the record theirs by hand
        * — and the governing rule is that a server the user made by hand is
        * never adopted. A share file is untrusted third-party content by
-       * construction (this path already replaces `username`/`keyPath` for that
-       * reason), so the marker is exactly the kind of assertion a trust
+       * construction (the same scrub replaces every server's `username` and
+       * `keyPath` for that reason), so the marker is exactly the kind of assertion a trust
        * boundary exists to refuse.
        *
        * `sanitizeForSharing` already strips it on the way out, so a file this
@@ -2525,10 +3257,13 @@ export function registerConfigCommands(
        * every restored kept server permanently unadoptable.
        */
       const remappedServer: ServerConfig = {
-        ...server,
+        // The export's own scrub, again: every username becomes SHARED_USERNAME —
+        // a cached row's moving with the `syncedUsername` stamp `shareOrigin` has
+        // just rewritten — the key path is blanked, and `formerlySynced` dropped.
+        ...scrubSharedServer(server),
         id: idMap.get(server.id)!,
-        proxy: remappedProxy,
-        authProfileId: linkToImportedProfile(server.authProfileId),
+        proxy: remapProxy(server.proxy, lenses.linkServer),
+        authProfileId: origin !== undefined && syncAuthLinkUnusable ? undefined : linkToImportedProfile(server.authProfileId),
         // The BMC credential link goes through the same lens: it is a profile
         // reference like any other, and a share bundle's ids are the sender's.
         ipmiAuthProfileId: linkToImportedProfile(server.ipmiAuthProfileId),
@@ -2538,8 +3273,7 @@ export function registerConfigCommands(
         // full surviving-server set is known (`linkToImportedServer`), because a
         // raw remap alone keeps a fresh id even for a gateway that failed import.
         ipmiGatewayServerId: server.ipmiGatewayServerId ? (idMap.get(server.ipmiGatewayServerId) ?? undefined) : undefined,
-        origin: remapOriginStamp(server.origin),
-        formerlySynced: undefined
+        origin
       };
       remappedServers.push(remappedServer);
       if (validateServerConfig(remappedServer)) {
@@ -2568,7 +3302,7 @@ export function registerConfigCommands(
 
     for (const remappedServer of remappedServers) {
       // Narrow the gateway VALUE and, the SAME way, its STAMP (PR #66 Codex round
-      // 7). `remapOriginStamp` above raw-remapped `origin.templated.ipmiGatewayServerId`
+      // 7). `shareOrigin` above raw-remapped `origin.templated.ipmiGatewayServerId`
       // through `idMap`, mirroring the value's raw remap; both are FINALIZED here
       // through `linkToImportedServer`, so a gateway whose target did not survive
       // import collapses BOTH value and stamp to `undefined` (no false divergence),
@@ -2600,19 +3334,28 @@ export function registerConfigCommands(
     }
     for (const profile of serialProfiles) {
       ensureId(profile as unknown as Record<string, unknown>);
-      const remappedProfile: SerialProfile = {
-        ...profile,
-        id: randomUUID()
-      };
+      const remappedProfile: SerialProfile = { ...scrubSharedSerialProfile(profile), id: randomUUID() };
       tally(await addIfValid(remappedProfile, validateSerialProfile, (e) => core.addOrUpdateSerialProfile(e)));
     }
     for (const profile of localShellProfiles) {
       ensureId(profile as unknown as Record<string, unknown>);
-      const remappedProfile: LocalShellProfile = {
-        ...profile,
-        id: randomUUID()
-      };
+      const remappedProfile: LocalShellProfile = { ...scrubSharedLocalShellProfile(profile), id: randomUUID() };
       tally(await addIfValid(remappedProfile, validateLocalShellProfile, (e) => core.addOrUpdateLocalShellProfile(e)));
+    }
+    // SAVED FILTERS — a name and a query string; only the id is new. Built field
+    // by field so nothing else a hand-edited file puts beside them lands.
+    let importedFilterCount = 0;
+    for (const filter of savedFilters) {
+      if (typeof filter !== "object" || filter === null) {
+        skipped++;
+        continue;
+      }
+      const remappedFilter: SavedFilterDefinition = { id: randomUUID(), name: filter.name, filter: filter.filter };
+      if (await addIfValid(remappedFilter, validateSavedFilter, (e) => core.addOrUpdateSavedFilter(e))) {
+        importedFilterCount++;
+      } else {
+        skipped++;
+      }
     }
 
     if (Array.isArray(data.groups)) {
@@ -2635,12 +3378,17 @@ export function registerConfigCommands(
 
     if (data.settings && typeof data.settings === "object") {
       // The retired poll interval this may extract is DROPPED on the share
-      // path, and that is the whole point of dropping it: a share export never
-      // carries `inventorySources` (§B6/A-M5), so this import creates no
-      // source it could belong to, and the only sources on the machine are the
-      // importer's own — the exact records the "never re-arm a field the user
-      // blanked" rule protects. There is nothing here it may be written to.
-      await applySettings(data.settings);
+      // path. A share carries sources now, but every build that writes them
+      // also stamps the file `inventoryStatusPollPerSource` — so for any share
+      // this build wrote, `importPredatesPerSourceStatusPoll` would refuse the
+      // carry anyway, and the sources' intervals are removed on the way out
+      // regardless (`sanitizeSharedSourceConfig`). What is left is a
+      // hand-edited file, and for that the choice falls where the carry's own
+      // doc says it must: not carrying is recoverable, while re-enabling
+      // polling on a lab box behind somebody's back is not. The sources already
+      // on this machine are the importer's own — the exact records the "never
+      // re-arm a field the user blanked" rule protects.
+      await applySettings(scrubSharedSettings(data.settings));
     }
 
     // Apply macros (share = non-secret only)
@@ -2685,7 +3433,57 @@ export function registerConfigCommands(
     }
 
     const skipNote = skipped > 0 ? ` (${skipped} skipped)` : "";
-    void vscode.window.showInformationMessage(`Imported ${imported} profiles${skipNote}.`);
+    // Counts only — a name from the file never reaches this message. Profiles
+    // lead, as they always have, unless the file landed only inventory records,
+    // where "0 profiles" would read as if nothing had.
+    const landed: string[] = [];
+    if (imported > 0 || importedSourceIds.length + importedTemplateCount + importedFilterCount === 0) {
+      landed.push(`${imported} profiles`);
+    }
+    if (importedSourceIds.length > 0) landed.push(plural(importedSourceIds.length, "inventory source"));
+    if (importedTemplateCount > 0) landed.push(plural(importedTemplateCount, "device template"));
+    if (importedFilterCount > 0) landed.push(plural(importedFilterCount, "saved filter"));
+    const summary = `Imported ${
+      landed.length > 1 ? `${landed.slice(0, -1).join(", ")} and ${landed[landed.length - 1]}` : landed[0]
+    }${skipNote}.`;
+    if (importedSourceIds.length === 0) {
+      void vscode.window.showInformationMessage(summary);
+      return;
+    }
+    // Sources arrive with no credentials, so the one thing the recipient has to
+    // do next is Edit Source — offered as a button (with the source already
+    // chosen when there is only one) rather than described. Never awaited: the
+    // configMutationLock is held across this function, and a notification with a
+    // button stays up until someone answers it.
+    //
+    // Credentials are asked for only from a source that uses saved ones — its
+    // `secretFieldIds`, the credential fields the sender actually saved. One that
+    // declares none (a GNS3 2.2 server without authentication) syncs as it
+    // arrives, so for it the remedy is a review, not credentials it has none of.
+    // Counts only: nothing from the file reaches this message.
+    const sourceCount = importedSourceIds.length;
+    const needingCredentials = landingSources.filter((landing) => landing.record.secretFieldIds.length > 0).length;
+    const credentialNote =
+      needingCredentials === sourceCount
+        ? `${sourceCount === 1 ? "The source arrives" : "Sources arrive"} without credentials — add yours in Edit Inventory Source before syncing.`
+        : needingCredentials === 0
+          ? `${sourceCount === 1 ? "The source uses" : "The sources use"} no saved credentials — review ${sourceCount === 1 ? "it" : "them"} in Edit Inventory Source before syncing.`
+          : `${needingCredentials} of the ${sourceCount} sources ${needingCredentials === 1 ? "arrives without the credentials it uses" : "arrive without the credentials they use"} — add yours in Edit Inventory Source before syncing, and review the other ${sourceCount - needingCredentials === 1 ? "one" : sourceCount - needingCredentials} there too.`;
+    const policyNote =
+      deletePoliciesOrphaned > 0
+        ? ` Removed-Device Policy arrived${sourceCount === 1 ? "" : ` on ${plural(deletePoliciesOrphaned, "source")}`} as Delete and was set to move servers to the "${ORPHAN_FOLDER_NAME}" subfolder instead, so a first sync that sees fewer devices than the sender's did deletes nothing — change it in Edit Inventory Source.`
+        : "";
+    const editSource = "Edit Inventory Source";
+    void vscode.window
+      .showInformationMessage(
+        `${summary} ${credentialNote}${policyNote}`,
+        editSource
+      )
+      .then((choice) => {
+        if (choice === editSource) {
+          void vscode.commands.executeCommand("nexus.inventory.editSource", sourceCount === 1 ? importedSourceIds[0] : undefined);
+        }
+      });
   }
 
   /**

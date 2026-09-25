@@ -366,7 +366,8 @@ export interface InventoryProvider {
    * cannot reach into `InventorySourceValues` generically.
    *
    * NEVER PUT A SECRET IN IT. The returned key is PERSISTED verbatim on every
-   * server the source keeps when it is removed, and travels in exported backups.
+   * server the source syncs or keeps when it is removed, and travels in exported
+   * backups and in Export for Sharing files.
    * `secrets` is deliberately not a parameter — the method cannot see the vault
    * — but a non-secret field can still carry one (a base URL typed as
    * `https://user:token@host`), so derive the key from the connection IDENTITY

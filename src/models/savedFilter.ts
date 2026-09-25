@@ -20,9 +20,8 @@
  *
  * Pure model — no `vscode` import, no secrets. Filter text is exactly the same
  * non-secret data as the source's own filter field, so a saved filter travels
- * through the full backup but is EXCLUDED from the sanitized share bundle,
- * mirroring inventory sources / device templates (all workspace-specific wiring
- * with no meaning in a stranger's workspace).
+ * in the full backup and, with a fresh id, in the sanitized share bundle beside
+ * the inventory sources and device templates it is used with.
  */
 export interface SavedFilterDefinition {
   id: string; // randomUUID at creation

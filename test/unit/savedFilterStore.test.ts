@@ -9,11 +9,9 @@ import type { InventorySourceConfig } from "../../src/models/inventory";
  * rollback + snapshot exposure, and the load-bearing invariant that deleting a
  * saved filter does NOT sweep any source's stored `config.filter`.
  *
- * The share-export exclusion is now covered by a non-vacuous end-to-end test in
- * `configImportExport.test.ts` (T-M1), which drives the real share command path
- * with a populated store — the old `sanitizeForSharing`-only assertion here was
- * vacuous (that function's signature cannot receive saved filters, so it passed
- * against any implementation, including one that leaked them via `exportShare`).
+ * Saved filters travel on a share export, each with a fresh id; that is covered
+ * end to end in `configImportExport.test.ts` and `configShareInventory.test.ts`,
+ * which drive the real share commands with a populated store.
  */
 
 function source(id: string, overrides: Partial<InventorySourceConfig> = {}): InventorySourceConfig {
