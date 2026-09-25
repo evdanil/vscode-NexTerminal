@@ -1433,10 +1433,39 @@ describe("ProxySshFactory", () => {
 
     const prompt = vi.fn(async () => ({ password: "pw", save: true }));
     const factory = await createFactoryWithPrompt(prompt);
-    await factory.connect(server);
+    await factory.connect({ ...server });
 
     expect(vault.store).toHaveBeenCalledTimes(1);
     expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
+  });
+
+  it("does NOT store a proxy password after the same server id is re-added with identical values", async () => {
+    const { configMutationLock } = await import("../../src/services/configMutationLock");
+    const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    servers.set(server.id, server);
+    const socket = makeSimpleSocks5Socket();
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
+
+    const prompt = vi.fn(async () => ({ password: "old-record-proxy-password", save: true }));
+    const factory = await createFactoryWithPrompt(prompt);
+    let releaseLock!: () => void;
+    const lockHeld = new Promise<void>((resolve) => { releaseLock = resolve; });
+    const lockDone = configMutationLock.runExclusive(() => lockHeld);
+    const connectPromise = factory.connect(server);
+    for (let i = 0; i < 10; i++) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    // Re-add the same values as a new live object while the deferred store is
+    // queued behind Replace's lock; endpoint-only comparison would pass.
+    servers.set(server.id, { ...server });
+    await vault.delete("proxy-password-srv-target");
+    releaseLock();
+    await lockDone;
+    await connectPromise;
+
+    expect(vault.store).not.toHaveBeenCalledWith("proxy-password-srv-target", "old-record-proxy-password");
   });
 
   it("Fix C — live server moved off an authenticated proxy (ssh) does NOT store", async () => {

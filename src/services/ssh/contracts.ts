@@ -51,6 +51,12 @@ export interface SshConnection {
 export interface SshConnectContext {
   proxyVisited?: ReadonlySet<string>;
   /**
+   * The config record whose credentials this connect attempt belongs to. The
+   * transport target may be a host-only clone (for alternate-host fallback),
+   * but credential persistence must continue to check the original endpoint.
+   */
+  credentialSource?: ServerConfig;
+  /**
    * Called during authentication with human-readable server messages
    * (USERAUTH_BANNER, keyboard-interactive `name`/`instructions`). May be
    * called multiple times before the connection is established. The caller

@@ -176,6 +176,7 @@ export class SilentAuthSshFactory implements SshFactory {
 
   private async mutateCredentialIfEndpointUnchanged(
     serverId: string,
+    expectedRecord: ServerConfig | undefined,
     expectedEndpoint: string,
     mutate: () => Promise<void>
   ): Promise<void> {
@@ -184,11 +185,12 @@ export class SilentAuthSshFactory implements SshFactory {
     }
 
     // Replace/reset and this deferred credential mutation share one lock. The
-    // live route check and vault operation stay together so a clear+publish
-    // cannot slip between them and leave an old credential under a reused id.
+    // record identity catches same-value delete/re-adds that an endpoint
+    // signature alone cannot distinguish; the signature still catches edits
+    // to the captured record. Both checks and the vault operation stay atomic.
     await configMutationLock.runExclusive(async () => {
       const live = this.liveServerLookup?.(serverId);
-      if (live && this.getCredentialEndpointSignature(live) === expectedEndpoint) {
+      if (live && live === expectedRecord && this.getCredentialEndpointSignature(live) === expectedEndpoint) {
         await mutate();
       }
     });
@@ -319,10 +321,16 @@ export class SilentAuthSshFactory implements SshFactory {
        */
       route?: () => string;
       credentialEndpointSignature?: string;
+      /** Exact live record captured before async connection work; null means absent at start. */
+      credentialRecord?: ServerConfig | null;
     }
   ): Promise<SshConnection> {
     const credentialEndpointSignature =
       options?.credentialEndpointSignature ?? this.getCredentialEndpointSignature(server);
+    const credentialRecord =
+      options && "credentialRecord" in options
+        ? options.credentialRecord ?? undefined
+        : this.liveServerLookup?.(server.id) ?? server;
     const { resolved, passwordKey, passphraseKey, legacyServerPassphraseKey, profileScoped } = this.resolveServer(server);
 
     if (resolved.authType === "key") {
@@ -395,7 +403,7 @@ export class SilentAuthSshFactory implements SshFactory {
         // it is not security-relevant.
         try {
           if (promptResult.save) {
-            await this.mutateCredentialIfEndpointUnchanged(server.id, credentialEndpointSignature, async () => {
+            await this.mutateCredentialIfEndpointUnchanged(server.id, credentialRecord, credentialEndpointSignature, async () => {
               await this.vault.store(passphraseKey, promptResult.password);
               if (legacyServerPassphraseKey && legacyServerPassphraseKey !== passphraseKey) {
                 await this.vault.delete(legacyServerPassphraseKey);
@@ -407,7 +415,7 @@ export class SilentAuthSshFactory implements SshFactory {
             // "don't save this one" must not erase what other servers still
             // authenticate with. Clearing a profile passphrase is done through
             // the profile editor, not here.
-            await this.mutateCredentialIfEndpointUnchanged(server.id, credentialEndpointSignature, () =>
+            await this.mutateCredentialIfEndpointUnchanged(server.id, credentialRecord, credentialEndpointSignature, () =>
               this.vault.delete(passphraseKey)
             );
           }
@@ -519,7 +527,7 @@ export class SilentAuthSshFactory implements SshFactory {
       // authenticated; the natural fallback is being re-prompted next time.
       try {
         if (promptResult.save) {
-          await this.mutateCredentialIfEndpointUnchanged(server.id, credentialEndpointSignature, () =>
+          await this.mutateCredentialIfEndpointUnchanged(server.id, credentialRecord, credentialEndpointSignature, () =>
             this.vault.store(passwordKey, promptResult.password)
           );
         } else if (!profileScoped) {
@@ -528,7 +536,7 @@ export class SilentAuthSshFactory implements SshFactory {
           // "don't save this one" must not erase what other servers still
           // authenticate with. Clearing a profile password is done through the
           // profile editor, not here.
-          await this.mutateCredentialIfEndpointUnchanged(server.id, credentialEndpointSignature, () =>
+          await this.mutateCredentialIfEndpointUnchanged(server.id, credentialRecord, credentialEndpointSignature, () =>
             this.vault.delete(passwordKey)
           );
         }

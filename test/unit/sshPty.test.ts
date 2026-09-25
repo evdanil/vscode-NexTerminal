@@ -163,7 +163,10 @@ describe("SshPty", () => {
 
     expect(sshFactory.connectWithContext).toHaveBeenCalledWith(
       server,
-      expect.objectContaining({ onAuthMessage: expect.any(Function) })
+      expect.objectContaining({
+        onAuthMessage: expect.any(Function),
+        credentialSource: server
+      })
     );
     expect(sshFactory.connect).not.toHaveBeenCalled();
 
@@ -970,6 +973,35 @@ describe("SshPty", () => {
     function econnrefused(host: string): Error {
       return Object.assign(new Error(`connect ECONNREFUSED ${host}:22`), { code: "ECONNREFUSED" });
     }
+
+    it("preserves the original credential source across the alternate-host clone", async () => {
+      const stream = new PassThrough();
+      const { connection } = createConnection(stream);
+      const server = makeServer({ host: "primary.example.com", altHost: "10.0.0.2" });
+      const contexts: unknown[] = [];
+      const sshFactory = {
+        connect: vi.fn(async () => connection),
+        connectWithContext: vi.fn(async (cfg: ServerConfig, context?: { credentialSource?: ServerConfig }) => {
+          contexts.push(context);
+          if (cfg.host === server.host) throw econnrefused(server.host);
+          return connection;
+        })
+      };
+      const pty = new SshPty(server, sshFactory as any, {
+        onSessionOpened: vi.fn(),
+        onSessionClosed: vi.fn(),
+        onConnectFailed: vi.fn()
+      }, { log: vi.fn(), close: vi.fn() } as any);
+
+      pty.open();
+      await flushAsync();
+
+      expect(sshFactory.connectWithContext).toHaveBeenCalledTimes(2);
+      expect(contexts).toHaveLength(2);
+      expect((contexts[0] as { credentialSource?: ServerConfig }).credentialSource).toBe(server);
+      expect((contexts[1] as { credentialSource?: ServerConfig }).credentialSource).toBe(server);
+      pty.dispose();
+    });
 
     it("falls back to altHost on a TCP-level (ECONNREFUSED) primary failure, opens the session, and names the winning address", async () => {
       const stream = new PassThrough();
