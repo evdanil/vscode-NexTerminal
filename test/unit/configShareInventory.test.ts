@@ -83,7 +83,7 @@ import { registerConfigCommands, sanitizeForSharing } from "../../src/commands/c
 import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
-import { getMacros, setActiveMacroStore } from "../../src/macroSettings";
+import { getMacros, saveMacros, setActiveMacroStore } from "../../src/macroSettings";
 import { computeSyncPlan, planToApplication, type InventorySyncPlan } from "../../src/services/inventory/syncEngine";
 import { createBuiltInProviders } from "../../src/services/inventory/builtInProviders";
 import { EVE_NG_PROVIDER_ID } from "../../src/services/inventory/providers/eveNgProvider";
@@ -1934,6 +1934,142 @@ describe("share round trip — the recipient's first sync adopts the cached tree
     expect(sources).toHaveLength(1);
     return { recipient, json, sourceId: sources[0].id };
   }
+
+  it("remaps profile-scoped macro triggers to the imported server, serial and Local Shell profiles", async () => {
+    const sender = await makeMachine();
+    await sender.core.addOrUpdateServer(makeServer({ id: "sender-server", name: "Scoped SSH" }));
+    await sender.core.addOrUpdateSerialProfile(everySerialField());
+    await sender.core.addOrUpdateLocalShellProfile(everyLocalShellField());
+    await saveMacros([
+      {
+        id: "server-trigger",
+        name: "SSH prompt",
+        text: "answer\n",
+        triggerPattern: "Password:",
+        triggerScope: "profile",
+        triggerProfileId: "sender-server"
+      },
+      {
+        id: "serial-trigger",
+        name: "Serial prompt",
+        text: "answer\n",
+        triggerPattern: "Password:",
+        triggerScope: "profile",
+        triggerProfileId: "ser-1"
+      },
+      {
+        id: "local-shell-trigger",
+        name: "Local Shell prompt",
+        text: "answer\n",
+        triggerPattern: "Password:",
+        triggerScope: "profile",
+        triggerProfileId: "sh-1"
+      }
+    ]);
+
+    const json = await exportShare(sender);
+    const recipient = await makeMachine();
+    const recipientMacroStore = new InMemoryMacroStore();
+    await recipientMacroStore.initialize();
+    setActiveMacroStore(recipientMacroStore);
+    await importShare(recipient, json);
+
+    const snapshot = recipient.core.getSnapshot();
+    const server = snapshot.servers.find((profile) => profile.name === "Scoped SSH")!;
+    const serial = snapshot.serialProfiles.find((profile) => profile.name === "Console")!;
+    const localShell = snapshot.localShellProfiles.find((profile) => profile.name === "Build shell")!;
+    expect(getMacros().map((macro) => macro.triggerProfileId)).toEqual([server.id, serial.id, localShell.id]);
+  });
+
+  it("remaps a Local Shell profile trigger from a direct share payload", async () => {
+    const recipient = await makeMachine();
+    await importShare(
+      recipient,
+      shareJson({
+        localShellProfiles: [{ ...everyLocalShellField(), id: "shared-shell" }],
+        macros: [{
+          id: "shell-trigger",
+          name: "Shared shell prompt",
+          text: "answer\n",
+          triggerPattern: "Password:",
+          triggerScope: "profile",
+          triggerProfileId: "shared-shell"
+        }]
+      })
+    );
+
+    const shell = recipient.core.getSnapshot().localShellProfiles.find((profile) => profile.name === "Build shell")!;
+    expect(getMacros()[0]).toMatchObject({ triggerPattern: "Password:", triggerScope: "profile", triggerProfileId: shell.id });
+  });
+
+  it("does not export a sender profile id when the target profile is outside the share", async () => {
+    const sender = await makeMachine();
+    await saveMacros([{
+      id: "unshared-trigger",
+      name: "Unshared profile prompt",
+      text: "answer\n",
+      keybinding: "alt+shift+1",
+      triggerPattern: "Password:",
+      triggerCooldown: 7,
+      triggerInterval: 45,
+      triggerInitiallyDisabled: true,
+      triggerScope: "profile",
+      triggerProfileId: "not-shared"
+    }]);
+
+    const json = await exportShare(sender);
+    const [sharedMacro] = JSON.parse(json).macros as TerminalMacro[];
+    expect(sharedMacro).not.toHaveProperty("triggerProfileId");
+    expect(sharedMacro).toMatchObject({ name: "Unshared profile prompt", text: "answer\n", triggerPattern: "Password:", triggerScope: "profile" });
+
+    const recipient = await makeMachine();
+    const recipientMacroStore = new InMemoryMacroStore();
+    await recipientMacroStore.initialize();
+    setActiveMacroStore(recipientMacroStore);
+    await importShare(recipient, json);
+    const imported = getMacros().find((macro) => macro.name === "Unshared profile prompt")!;
+    for (const field of TRIGGER_KEYS) expect(imported).not.toHaveProperty(field);
+    expect(imported).toMatchObject({ text: "answer\n", keybinding: "alt+shift+1" });
+  });
+
+  const unavailableTriggerTargets: {
+    label: string;
+    bucket: "servers" | "serialProfiles" | "localShellProfiles";
+    id: string;
+    record?: (id: string) => unknown;
+  }[] = [
+    { label: "absent server", bucket: "servers", id: "missing-server" },
+    { label: "rejected server", bucket: "servers", id: "rejected-server", record: (id) => makeServer({ id, host: "" }) },
+    { label: "absent serial profile", bucket: "serialProfiles", id: "missing-serial" },
+    { label: "rejected serial profile", bucket: "serialProfiles", id: "rejected-serial", record: (id) => ({ ...everySerialField(), id, path: "" }) },
+    { label: "absent Local Shell profile", bucket: "localShellProfiles", id: "missing-shell" },
+    { label: "rejected Local Shell profile", bucket: "localShellProfiles", id: "rejected-shell", record: (id) => ({ ...everyLocalShellField(), id, shellPath: "" }) }
+  ];
+
+  it.each(unavailableTriggerTargets)("strips every trigger setting for a direct share with an $label target, preserving the macro", async ({ bucket, id, record }) => {
+    const recipient = await makeMachine();
+    const payload: Record<string, unknown> = {
+      [bucket]: record ? [record(id)] : [],
+      macros: [{
+        id: "unavailable-target-trigger",
+        name: "Recoverable prompt",
+        text: "answer\n",
+        keybinding: "alt+shift+1",
+        group: "Lab",
+        triggerPattern: "Password:",
+        triggerCooldown: 7,
+        triggerInterval: 45,
+        triggerInitiallyDisabled: true,
+        triggerScope: "profile",
+        triggerProfileId: id
+      }]
+    };
+    await importShare(recipient, shareJson(payload));
+
+    const [imported] = getMacros();
+    for (const field of TRIGGER_KEYS) expect(imported).not.toHaveProperty(field);
+    expect(imported).toMatchObject({ name: "Recoverable prompt", text: "answer\n", keybinding: "alt+shift+1", group: "Lab" });
+  });
 
   it("THE LOAD-BEARING ONE — the recipient's first sync against the unchanged source adds nothing, prunes nothing, adopts nothing and changes nothing (⊘ any origin that does not make the cached rows OWNED — stripped, left on the sender's source id, or a stamp out of lockstep)", async () => {
     const { recipient, sourceId } = await roundTrip();

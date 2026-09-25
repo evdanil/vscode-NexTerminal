@@ -754,6 +754,13 @@ If the profile is deleted or the macro has no stored profile id, the trigger
 does not run in **Matching profile only** scope. Reopen the macro and select the
 profile again.
 
+Export for Sharing relinks this scope to the matching server, serial, or Local
+Shell profile in the bundle, and import relinks it to that profile's new local
+id. If the profile is not included or does not import, the imported macro loses
+all of its auto-trigger settings, including its pattern, cooldown, interval,
+initial pause, scope, and profile match. To use auto-trigger again, recreate
+those settings and select the intended profile.
+
 ## Cooldown vs Interval
 
 Cooldown and interval solve different problems.
