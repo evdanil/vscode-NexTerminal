@@ -1906,23 +1906,23 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             // #170 — an address typed onto a placeholder is the user's console
             // endpoint, recorded as such by carrying no stamp that describes an
             // endpoint: syncedHost/syncedPort (whose address the sync wrote) and
-            // syncedProtocol (which transport it wrote, and so which endpoint
-            // the next sync reads). A real placeholder carries none of the three
-            // (the addressless add writes none, and the downgrade drops them),
-            // so this loses nothing there; a hand-edited backup can still carry
-            // them. A kept host/port stamp
-            // would make the kept-address warning treat the stamped value as
-            // already seen, and a kept protocol stamp equal to the record's
-            // protocol would let a device's other transport move the next sync
-            // onto that endpoint — either way the warning the notice below
-            // promises would not come, or would name another transport's
-            // address. syncedUsername stays: it records who wrote the username,
-            // which picks no endpoint and which the auth retro-apply rule reads.
-            // Identity (source, device, deployment) stays too. Keyed on the
-            // form-open placeholder, as the notice is: if a sync gave the live
-            // record an address while the form sat open, the typed value
-            // overrides it and the same holds. A copy, so the live record is
-            // never mutated.
+            // syncedProtocol (which transport it wrote). A real placeholder
+            // carries none of the three (the addressless add writes none, and
+            // the downgrade drops them), so this loses nothing there; a
+            // hand-edited backup can still carry them, and either kind would
+            // break the notice's promise below. A kept host/port stamp makes the
+            // kept-address warning treat the stamped value as already seen. A
+            // kept telnet stamp on a telnet record makes the protocol read as
+            // sync-owned, so a device that prefers SSH has the sync read its SSH
+            // endpoint — and the warning, which speaks only when the sync reads
+            // the transport the record keeps (`keptHandAddressWarning`), then
+            // names no telnet address at all. syncedUsername stays: it records
+            // who wrote the username, picks no endpoint, and the auth
+            // retro-apply rule reads it. Identity (source, device, deployment)
+            // stays too. Keyed on the form-open placeholder, as the notice is: if
+            // a sync gave the live record an address while the form sat open,
+            // the typed value overrides it and the same holds. A copy, so the
+            // live record is never mutated.
             let liveOrigin = liveRecord?.origin;
             if (liveOrigin !== undefined && gainsHandAddress) {
               liveOrigin = { ...liveOrigin };
@@ -2195,9 +2195,10 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           // source reports one — the one moment it can be carried out — and the
           // notice's last sentence says where to look. It names the protocol
           // because the sync does: it reports only an address of the transport
-          // this server will use, so for a protocol set here that the device does
+          // this server keeps, so for a protocol set here that the device does
           // not offer it reports nothing, and an unqualified promise would be
-          // false. An information message, because nothing is lost: this is a
+          // false. (The stamp drop above is what makes the promise hold for
+          // either protocol.) An information message, because nothing is lost: this is a
           // hand-off, not a hazard. (It used to be a warning promising a revert to
           // a placeholder — true before the stamps, #153.)
           if (gainsHandAddress) {

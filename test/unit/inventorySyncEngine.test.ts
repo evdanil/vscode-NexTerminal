@@ -6358,6 +6358,55 @@ describe("computeSyncPlan — a kept hand-typed address the source reports diffe
     expect(keptLines(plan)).toEqual([]);
   });
 
+  // The warning speaks for the transport the record KEEPS. A kept address means
+  // the endpoint was not accepted, so the record keeps its protocol too
+  // (`takesEndpoint` gates it) — an address of the other transport could not be
+  // typed into it. And its remedy only works when the sync compared the address
+  // against that same transport's endpoint: row 5a is checked against the
+  // endpoint the sync reads.
+  it("names nothing when a record on the SSH default keeps its typed address and the device offers only telnet (kills naming the endpoint the sync reads for a protocol it owns — a telnet address for a server that stays on SSH)", () => {
+    const before = handTypedPlaceholder();
+    const tree = makeTree([makeDevice({ endpoints: [{ kind: "telnet", host: "10.0.0.9", port: 23 }] })]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 2000 });
+
+    expect(keptLines(plan)).toEqual([]);
+    expect(plan.warnings.some((w) => w.includes("10.0.0.9"))).toBe(false);
+    // The record keeps its own transport and address.
+    const after = plan.updates[0]?.after ?? before;
+    expect(after.protocol).toBeUndefined();
+    expect(after.host).toBe("10.0.0.5");
+  });
+
+  it("names the SSH address when the same record's device offers both SSH and telnet (control: kills suppressing the warning whenever the device offers another transport)", () => {
+    const before = handTypedPlaceholder();
+    const tree = makeTree([
+      makeDevice({ endpoints: [{ kind: "telnet", host: "10.0.0.7", port: 23 }, { kind: "ssh", host: "10.0.0.9", port: 22 }] })
+    ]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 2000 });
+
+    expect(keptLines(plan)).toEqual([
+      '"core-sw-1": kept your host 10.0.0.5; the source now reports host 10.0.0.9 — set the host to that to let the source manage it.'
+    ]);
+  });
+
+  it("names nothing when a sync-owned telnet record keeps a typed host and the device now prefers SSH — not the SSH address (another transport), and not the telnet one, which would not hand the field back because the sync compares against the SSH endpoint it would move to (kills naming the endpoint the sync reads; kills naming the kept transport's endpoint regardless)", () => {
+    const before = makeOwnedServer({
+      protocol: "telnet",
+      host: "10.0.0.50",
+      port: 23,
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedProtocol: "telnet", syncedHost: "10.0.0.1", syncedPort: 23 }
+    });
+    const tree = makeTree([
+      makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.9", port: 22 }, { kind: "telnet", host: "10.0.0.7", port: 2323 }] })
+    ]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 2000 });
+
+    expect(keptLines(plan)).toEqual([]);
+    const after = plan.updates[0]?.after ?? before;
+    expect(after.protocol).toBe("telnet");
+    expect(after.host).toBe("10.0.0.50");
+  });
+
   it("keeps a device name and a reported host that carry a line break or a bidi override inside the one sentence (kills adding the line past the plan's sanitizing choke point)", () => {
     const before = handTypedPlaceholder({ name: "core\u202esw\nfake line" });
     const tree = makeTree([

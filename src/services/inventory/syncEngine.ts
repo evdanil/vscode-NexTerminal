@@ -636,12 +636,18 @@ export function syncOwnsPort(current: number, stamp: number | undefined, dev: nu
  * before the stamps existed — has nothing to compare against, so its line is
  * repeated on every sync until the field and the device agree.
  *
- * The caller passes the endpoint of the record's OWN transport and calls this only
- * when there is one: an address of the other transport would not hand the field
- * back if typed in, so naming it would be a remedy that cannot work. It also skips
- * an addressless record, which has no address of its own to keep — one carrying
- * stamps (a hand-edited backup can) would otherwise be told about its blank host
- * and sentinel port.
+ * It speaks for the transport the record KEEPS. A kept address means the endpoint
+ * was not accepted, so the record keeps its own protocol as well (`takesEndpoint`
+ * gates the protocol write) and an address of the other transport cannot be typed
+ * into it. The caller therefore calls this only when the sync read the endpoint of
+ * the record's own protocol — never when it owns the protocol and the device now
+ * prefers the other transport. In that case even the kept transport's address, if
+ * the device offers one, is not a remedy: the row-5a match is checked against the
+ * endpoint the sync reads, the other transport's, so typing it in would hand
+ * nothing back. No endpoint of the record's transport means no warning either. It
+ * also skips an addressless record, which has no address of its own to keep — one
+ * carrying stamps (a hand-edited backup can) would otherwise be told about its
+ * blank host and sentinel port.
  */
 function keptHandAddressWarning(
   serverName: string,
@@ -1992,7 +1998,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       const takesEndpoint = takesHost && takesPort;
       // #170 — a kept hand address is reported, not acted on: pushed whether or
       // not anything else makes this an update, so an unchanged server says so too.
-      if (ownedEndpoint !== undefined && ownedServer.addressless !== true) {
+      // Only when the endpoint read is of the protocol the record keeps (see the
+      // helper): resolved, since an absent protocol is SSH.
+      const readsOwnTransport = (effectiveProtocol === "telnet") === (ownedServer.protocol === "telnet");
+      if (ownedEndpoint !== undefined && readsOwnTransport && ownedServer.addressless !== true) {
         const kept = keptHandAddressWarning(device.name, ownedServer, { host: ownedHost, port: ownedPort }, { host: takesHost, port: takesPort });
         if (kept !== undefined) {
           warnings.push(kept);
