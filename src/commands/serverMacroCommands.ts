@@ -246,9 +246,14 @@ function hasAlternativeIpmiPasswordOption(args: readonly string[]): boolean {
   });
 }
 
-/** The hint declines getopt forms whose meaning depends on clusters, attachments, or option termination. */
+/** Keep getopt handling conservative: the hint does not decode clusters, attachments, option termination, or operands. */
 function hasAmbiguousIpmiOptionToken(args: readonly string[]): boolean {
-  return args.some((arg) => arg === "--" || (arg.startsWith("-") && arg !== "-" && arg.length > 2));
+  return args.some(
+    (arg, index) =>
+      arg === "--" ||
+      (arg.startsWith("-") && arg !== "-" && arg.length > 2) ||
+      (arg === "-E" && /^-[A-Za-z0-9]$/.test(args[index - 1] ?? ""))
+  );
 }
 
 /**

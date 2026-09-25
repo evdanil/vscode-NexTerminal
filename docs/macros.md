@@ -485,6 +485,8 @@ bare `ipmitool` invocation with `-E` and a whole IPMI profile token argument.
 Wrappers, scripts, shell operators, quoting, multiple commands, attached or
 clustered option words, the `--` option terminator, and other ambiguous forms
 are deliberately left alone.
+The detector also stays silent when `-E` immediately follows another
+single-letter option; it does not guess whether `-E` is that option's operand.
 It also stays silent when the command supplies another password source (`-a`,
 `-P`, or `-f`) or disables authentication with `-A NONE`. This conservative
 suggestion is not an authorization check: macro text never decides whether a
