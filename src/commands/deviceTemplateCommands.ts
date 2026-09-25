@@ -912,7 +912,9 @@ async function editTemplateRules(ctx: CommandContext, registry: InventoryProvide
   if (chosen === undefined) {
     return;
   }
-  const attributeKeys = registry.get(chosen.providerId)?.attributeKeys;
+  // The registry's copy, not `registry.get(id)?.attributeKeys`: the provider's own
+  // array runs its own `some` / `map` / iterator in every consumer below.
+  const attributeKeys = registry.attributeKeysOf(chosen.providerId);
   for (;;) {
     const live = ctx.core.getInventorySource(chosen.id);
     if (live === undefined) {

@@ -1175,8 +1175,10 @@ describe("Fix C (PR #62 Codex round 5) — template save/delete serialize under 
 // ---------------------------------------------------------------------------
 describe("Edit Template Rules… flow (§7.2)", () => {
   const PROXY: ProxyConfig = { type: "socks5", host: "10.9.9.1", port: 1080 };
+  // Only `attributeKeysOf`: the flow reads the registry's copy of the keys, and a
+  // stub without `get` makes a return to the provider's own array fail loudly here.
   const regWith = (keys?: string[]) =>
-    ({ get: () => (keys ? { attributeKeys: keys } : undefined) }) as unknown as Parameters<typeof registerDeviceTemplateCommands>[1];
+    ({ attributeKeysOf: () => keys }) as unknown as Parameters<typeof registerDeviceTemplateCommands>[1];
   function registerWithRegistry(core: NexusCore, registry: Parameters<typeof registerDeviceTemplateCommands>[1]): void {
     registeredCommands.clear();
     registerDeviceTemplateCommands(ctxFor(core), registry);
@@ -1452,6 +1454,75 @@ describe("Edit Template Rules… flow (§7.2)", () => {
       expect(core.getInventorySource("src-1")!.templateRules).toMatchObject([{ templateId: "t1", filter: "rack=1" }]);
       const warned = mockShowWarningMessage.mock.calls.map((c) => String(c[0]));
       expect(warned.some((w) => w.includes("Known keys"))).toBe(false);
+    }
+  );
+
+  // PR #188 review — a list can pass that check entry by entry and still throw in
+  // this flow, which calls the list's own `some`, `map` and iterator: an array
+  // with an own `map`, or a subclass whose iterator yields something else. The
+  // registry keeps a plain copy, and the flow has to be handed that copy.
+  class YieldsANumber extends Array<string> {}
+  Object.defineProperty(YieldsANumber.prototype, Symbol.iterator, {
+    value: function* () {
+      yield 42;
+    }
+  });
+  it.each([
+    [
+      "an array with own `map` and `some` that are not callable",
+      (): string[] => {
+        const keys = ["role", "site"];
+        Object.defineProperty(keys, "map", { value: undefined });
+        Object.defineProperty(keys, "some", { value: undefined });
+        return keys;
+      }
+    ],
+    [
+      "an Array subclass whose iterator yields a number",
+      (): string[] => {
+        const keys = new YieldsANumber();
+        keys.push("role", "site");
+        return keys;
+      }
+    ]
+  ])(
+    "a provider whose attributeKeys is %s registers, and the Rule Filter box is built, checked and saved from the registry's copy (⊘ reading `registry.get(id).attributeKeys`, the provider's own array: TypeError before the box opens)",
+    async (_label, make) => {
+      const registry = new InventoryProviderRegistry();
+      createNexusExtensionApi(registry).registerInventoryProvider({
+        id: "acme-cmdb",
+        label: "Acme CMDB",
+        configFields: [],
+        attributeKeys: make(),
+        testConnection: async () => {},
+        fetchInventory: async () => ({ contractVersion: 1, devices: [] })
+      });
+
+      const core = makeCore();
+      await core.addOrUpdateDeviceTemplate({ id: "t1", name: "T", fields: { proxy: { mode: "override", value: PROXY } } });
+      await seedSource(core, { providerId: "acme-cmdb" });
+      registerWithRegistry(core, registry);
+      mockShowWarningMessage.mockResolvedValue(undefined);
+      mockShowQuickPick
+        .mockImplementationOnce(async (items: Array<{ add?: boolean }>) => items.find((i) => i.add))
+        .mockImplementationOnce(async (items: Array<{ template?: { id: string } }>) => items.find((i) => i.template?.id === "t1"))
+        .mockResolvedValueOnce(undefined); // loop → exit
+      let liveFeedback: unknown;
+      mockShowInputBox.mockImplementationOnce(async (options: { validateInput: (value: string) => unknown }) => {
+        liveFeedback = options.validateInput("rack=1"); // a keystroke, with a key the provider does not report
+        return "rack=1";
+      });
+
+      await editRules();
+
+      expect(mockShowInputBox).toHaveBeenCalledTimes(1);
+      expect((mockShowInputBox.mock.calls[0][0] as { prompt: string }).prompt).toBe(
+        "Keys: role, site, name — key=value, conditions joined with &, e.g. name=core-*"
+      );
+      expect(liveFeedback).toMatchObject({ message: expect.stringContaining("Known keys: role, site, name") });
+      expect(core.getInventorySource("src-1")!.templateRules).toMatchObject([{ templateId: "t1", filter: "rack=1" }]);
+      const keyWarn = mockShowWarningMessage.mock.calls.map((c) => String(c[0])).find((w) => w.includes("is not one this source's provider reports"));
+      expect(keyWarn).toContain("Known keys: role, site, name");
     }
   );
 

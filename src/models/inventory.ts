@@ -344,7 +344,10 @@ export interface InventoryProvider {
    *
    * A present value that is not an array of strings is refused at registration
    * (`validateProviderShape`, providerRegistry.ts, issue #163); a blank or
-   * duplicate entry is accepted, since no consumer breaks on either.
+   * duplicate entry is accepted, since no consumer breaks on either. The list is
+   * read once, when the provider registers: the registry keeps a frozen copy and
+   * every consumer reads that (`InventoryProviderRegistry.attributeKeysOf`), so
+   * changing this array afterwards changes nothing.
    */
   attributeKeys?: string[];
   testConnection(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<void>;

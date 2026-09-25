@@ -71,6 +71,89 @@ describe("InventoryProviderRegistry", () => {
 });
 
 /**
+ * attributeKeys AS THE REGISTRY KEEPS IT (issue #163 item 2, PR #188 review). The
+ * shape check passing proves only that every INDEXED entry is a string. The
+ * consumers do more with the list than index it — `knownKeysList` calls `some`
+ * and spreads it, `unknownFilterKeys` calls `map` — and on the provider's own
+ * array each of those runs code the provider controls. So the registry keeps a
+ * copy, and these pin that the copy is a plain array holding exactly the entries
+ * that were checked.
+ */
+describe("InventoryProviderRegistry attributeKeysOf", () => {
+  // Every entry is a string, so the shape check passes all three.
+  const ownMethodsNotCallable = (): string[] => {
+    const keys = ["role", "site"];
+    Object.defineProperty(keys, "map", { value: undefined });
+    Object.defineProperty(keys, "some", { value: undefined });
+    return keys;
+  };
+  class YieldsANumber extends Array<string> {}
+  Object.defineProperty(YieldsANumber.prototype, Symbol.iterator, {
+    value: function* () {
+      yield 42;
+    }
+  });
+  const subclassWithHostileIterator = (): string[] => {
+    const keys = new YieldsANumber();
+    keys.push("role", "site");
+    return keys;
+  };
+  const entryAnswersTwice = (): string[] => {
+    const keys = ["role", "site"];
+    let reads = 0;
+    Object.defineProperty(keys, 1, { get: () => (reads++ === 0 ? "site" : 42), enumerable: true, configurable: true });
+    return keys;
+  };
+
+  it.each([
+    ["own `map` and `some` that are not callable", ownMethodsNotCallable],
+    ["an Array subclass whose iterator yields a number", subclassWithHostileIterator],
+    ["an entry that answers a string when read once and a number after", entryAnswersTwice]
+  ])(
+    "keeps a plain frozen copy of attributeKeys with %s, holding exactly the entries it checked (⊘ keeping the provider's array; ⊘ `[...keys]` / `Array.from(keys)`, which run its iterator; ⊘ `keys.slice()`, which builds the subclass again; ⊘ checking and copying in two reads)",
+    (_label, make) => {
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({ attributeKeys: make() }));
+
+      const stored = registry.attributeKeysOf("netbox")!;
+      expect(Array.isArray(stored)).toBe(true);
+      expect(Object.getPrototypeOf(stored)).toBe(Array.prototype);
+      expect(Object.getOwnPropertyNames(stored)).toEqual(["0", "1", "length"]); // no own `map`, `some` or accessor
+      expect(Object.isFrozen(stored)).toBe(true);
+      expect(stored[0]).toBe("role");
+      expect(stored[1]).toBe("site");
+      // ...so the consumers that threw on the provider's own array take it.
+      expect(knownKeysList(stored)).toBe("role, site, name");
+      expect(unknownFilterKeys(parseTemplateFilter("rack=1&role=x"), stored)).toEqual(["rack"]);
+    }
+  );
+
+  it("is the list as it stood at registration, whatever the provider does to its array afterwards (⊘ keeping the provider's array, which a later `push(42)` reaches)", () => {
+    const registry = new InventoryProviderRegistry();
+    const keys = ["role"];
+    registry.register(makeProvider({ attributeKeys: keys }));
+
+    keys.push(42 as never);
+    keys[0] = "zone";
+
+    expect(registry.attributeKeysOf("netbox")).toEqual(["role"]);
+  });
+
+  it("answers undefined for a provider that declares no list, and for an id no provider holds, including once disposed (⊘ `?? []`, which turns 'no list to check against' into 'only `name` is known'; ⊘ a copy that outlives its registration)", () => {
+    const registry = new InventoryProviderRegistry();
+    registry.register(makeProvider({ id: "no-list" }));
+    const withList = registry.register(makeProvider({ id: "with-list", attributeKeys: ["role"] }));
+    expect(registry.attributeKeysOf("no-list")).toBeUndefined();
+    expect(registry.attributeKeysOf("unknown")).toBeUndefined();
+    expect(registry.attributeKeysOf("with-list")).toEqual(["role"]);
+
+    withList.dispose();
+
+    expect(registry.attributeKeysOf("with-list")).toBeUndefined();
+  });
+});
+
+/**
  * REGISTRATION EVENT — the registry is read at PAINT TIME by capability gates
  * (the tree's node-control and web-console markers, the Settings tree's
  * provider label), so a registration that lands after a surface has painted is
