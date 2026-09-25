@@ -258,13 +258,18 @@ export class ScriptTreeProvider
         ? target.uri
         // `joinPath(uri, "..")` rather than `Uri.file(dirname(uri.fsPath))`:
         // the parent has to keep the dropped-on row's own scheme and authority.
-        // In a Remote-SSH or Codespaces window with the default relative scripts
-        // path, every scanned node carries the workspace's scheme
-        // (`vscode-remote://…`), and rebuilding the directory as a `file:` URI
-        // would hand `renameFile` a remote source and a local destination — so
-        // dropping onto a script would fail with the generic "Could not move"
-        // while folder and root drops worked. `joinPath` normalizes `..` and
-        // preserves everything else about the URI.
+        // Every scanned node carries the scripts root's scheme, which is the
+        // workspace root's (`file:` with no workspace). In an ordinary
+        // Remote-SSH or Codespaces window that is `file:` — Nexus runs in the
+        // remote extension host, where the remote disk is its own — but it is
+        // `vscode-remote://…` when `remote.extensionKind` forces Nexus to run
+        // UI-side, and another extension's scheme for a workspace on the file
+        // system it provides.
+        // There, rebuilding the directory as a `file:` URI would hand
+        // `renameFile` a source on that file system and a destination on this
+        // host's disk — so dropping onto a script would fail with the generic
+        // "Could not move" while folder and root drops worked. `joinPath`
+        // normalizes `..` and preserves everything else about the URI.
         : target?.kind === "script"
           ? vscode.Uri.joinPath(target.uri, "..")
           : root;

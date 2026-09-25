@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.256] — 2026-09-25
+
+### Fixed
+
+- **The scripting guide and the script types now describe a script in a Remote-SSH, WSL or Codespaces window correctly.** In an ordinary remote window Nexus runs on the remote host, and a script there is an ordinary file on that host. The guide said such a script refuses `\` in a `nexus.fs` path and loads `./Lib.js` and `./lib.js` as two modules on a Windows host. In fact a `\` follows that host's rules, and on a Windows host the two spellings are one module, as they are on a Windows desktop. Both behaviours belong only to a script whose URI is not `file:` — a `vscode-remote:` script, which is what Nexus sees when `remote.extensionKind` makes it run on your local machine in a remote window, or a script on a file system another extension provides. The guide's `FileTooLarge` entry and the types' note on `err.sizeBytes` contrasted a local file with a remote file system in the same way; in an ordinary remote window you get the local answer, and both now say so. The corrected types replace the copy in your scripts folder the next time you run a script. Scripts behave exactly as before.
+
 ## [2.8.255] — 2026-09-25
 
 ### Fixed

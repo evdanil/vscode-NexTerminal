@@ -587,7 +587,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     dragAndDropController: scriptTreeProvider
   });
   // F11 — register CodeLens for file://, vscode-remote://, and untitled:// so the
-  // ▶ Run / ◼ Stop lens surfaces for scripts opened over Remote-SSH or as untitled drafts.
+  // ▶ Run / ◼ Stop lens surfaces for scripts on disk, over a remote, and as
+  // untitled drafts. Over Remote-SSH a script is normally `file:` — Nexus runs
+  // in the remote extension host, where the remote disk is its own — and
+  // `vscode-remote:` when `remote.extensionKind` forces Nexus to run UI-side.
   const scriptCodeLensRegistration = vscode.languages.registerCodeLensProvider(
     [
       { language: "javascript", scheme: "file" },

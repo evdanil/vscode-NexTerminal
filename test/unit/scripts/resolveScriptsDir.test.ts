@@ -9,7 +9,8 @@ vi.mock("vscode", () => {
   /**
    * Mirrors `scriptFs.test.ts`'s `FakeUri` — specifically, `.with()` is a
    * real (if minimal) implementation, not a stub, since round 14's fix
-   * depends on it to rebase onto a remote workspace root's scheme+authority.
+   * depends on it to rebase onto a non-`file:` workspace root's
+   * scheme+authority.
    */
   class FakeUri {
     public constructor(
@@ -108,14 +109,18 @@ describe("resolveScriptsDir", () => {
     expect(dir.fsPath).toBe("/project/my-scripts");
   });
 
-  it("round 14 — remote workspace + absolute configured path: rebases onto the workspace root's scheme+authority, preserving the POSIX path", () => {
+  it("round 14 — vscode-remote (UI-side) workspace + absolute configured path: rebases onto the workspace root's scheme+authority, preserving the POSIX path", () => {
+    // A `vscode-remote:` workspace root is what Nexus sees when
+    // `remote.extensionKind` forces it to run UI-side in a remote window (in
+    // the ordinary placement Nexus runs in the remote extension host and the
+    // root is `file:`, covered by the `file:` case below).
     // ⊘ the pre-round-14 implementation (`vscode.Uri.file(configured)`
-    // unconditionally for any absolute path): this would return a LOCAL
-    // `file:` Uri for a path that only makes sense on the remote host —
-    // `buildScriptFsScope`'s scheme/authority guard then refuses to unify
-    // it with the remote script's own scope (see scriptFs.test.ts's
-    // "buildScriptFsScope — scheme guard" tests), and a documented
-    // absolute-path configuration silently breaks on remote.
+    // unconditionally for any absolute path): this would return a `file:`
+    // Uri on the UI-side machine for a path that only makes sense on the
+    // remote host — `buildScriptFsScope`'s scheme/authority guard then
+    // refuses to unify it with the `vscode-remote:` script's own scope (see
+    // scriptFs.test.ts's "buildScriptFsScope — scheme guard" tests), and a
+    // documented absolute-path configuration silently breaks there.
     state.configuredPath = "/remote/shared/scripts";
     state.workspaceFolders = [{ uri: remoteUri("vscode-remote", "ssh-remote+host", "/home/user/project") }];
 
@@ -126,12 +131,14 @@ describe("resolveScriptsDir", () => {
     expect(dir.path).toBe("/remote/shared/scripts");
   });
 
-  it("round 14 — Windows-drive-absolute configured path on a remote workspace: posixifies to /C:/scripts, same scheme+authority", () => {
-    // A Windows-drive absolute (C:\...) is a real scenario over Remote-SSH
-    // into a Windows host — Node's platform-default `path.isAbsolute` alone
-    // wouldn't even recognize this as absolute when the CHECK happens to run
-    // on a POSIX host (this repo's own CI), which is exactly why the fix
-    // checks both path conventions rather than relying on `process.platform`.
+  it("round 14 — Windows-drive-absolute configured path on a vscode-remote (UI-side) workspace: posixifies to /C:/scripts, same scheme+authority", () => {
+    // A Windows-drive absolute (C:\...) on a `vscode-remote:` root is a real
+    // scenario when `remote.extensionKind` forces Nexus UI-side in a
+    // Remote-SSH window to a Windows host — Node's platform-default
+    // `path.isAbsolute` alone wouldn't even recognize this as absolute when
+    // the CHECK runs on a POSIX host (a Linux or macOS UI side, or this
+    // repo's own CI), which is exactly why the fix checks both path
+    // conventions rather than relying on `process.platform`.
     state.configuredPath = "C:\\scripts";
     state.workspaceFolders = [{ uri: remoteUri("vscode-remote", "ssh-remote+winbox", "/C:/Users/dev/project") }];
 
@@ -142,7 +149,7 @@ describe("resolveScriptsDir", () => {
     expect(dir.path).toBe("/C:/scripts");
   });
 
-  it("round 14 — local (file:) absolute configured path is unchanged: still a plain Uri.file result, even with a workspace open", () => {
+  it("round 14 — file: workspace (local, or remote with Nexus in the remote extension host) + absolute configured path is unchanged: still a plain Uri.file result", () => {
     state.configuredPath = "/custom/absolute/scripts";
     state.workspaceFolders = [{ uri: { fsPath: "/ws", scheme: "file", path: "/ws" } }];
 

@@ -1186,12 +1186,14 @@ describe("ScriptTreeProvider", () => {
     });
 
     it("keeps the workspace's scheme when the drop target is another script", async () => {
-      // Remote-SSH / Codespaces with the default RELATIVE scripts path: every
-      // scanned node carries the workspace's scheme. Deriving the target folder
-      // as `Uri.file(dirname(uri.fsPath))` hands `renameFile` a remote source
-      // and a LOCAL destination, so this one drop shape fails with the generic
-      // "Could not move" while folder and root drops work. `joinPath(uri, "..")`
-      // preserves scheme and authority.
+      // A `vscode-remote:` workspace (Nexus forced UI-side by
+      // `remote.extensionKind` in a Remote-SSH window; in the ordinary
+      // placement the rows are `file:`) with the default RELATIVE scripts path:
+      // every scanned node carries the workspace's scheme. Deriving the target
+      // folder as `Uri.file(dirname(uri.fsPath))` hands `renameFile` a remote
+      // source and a LOCAL destination, so this one drop shape fails with the
+      // generic "Could not move" while folder and root drops work.
+      // `joinPath(uri, "..")` preserves scheme and authority.
       const remote = (p: string): vscode.Uri =>
         ({
           fsPath: p,

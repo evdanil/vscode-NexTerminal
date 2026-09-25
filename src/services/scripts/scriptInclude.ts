@@ -198,9 +198,12 @@ export function createScriptIncludeState(ctx: ScriptFsContext): ScriptIncludeSta
  * spellings the DISK considers one file can be two modules here — the body
  * runs twice, exports are two objects. Three ways to get there: a
  * case-insensitive posix volume (macOS APFS's default — posix folding keeps
- * them distinct); a remote-Windows host (non-`file:` schemes are forced to
- * posix by `buildScriptFsScope`, a Uri carries no way to know the far host's
- * OS); two symlinked paths to one file (symlinks are followed, never
+ * them distinct); a Windows host behind a non-`file:` scheme, such as a
+ * `vscode-remote:` script when `remote.extensionKind` runs Nexus UI-side
+ * (non-`file:` schemes are forced to posix by `buildScriptFsScope`, a Uri
+ * carries no way to know the far host's OS — whereas in an ordinary remote
+ * window Nexus runs on that host, the script is `file:`, and win32 folding
+ * applies); two symlinked paths to one file (symlinks are followed, never
  * resolved). A stat/realpath-based canonical identity would collapse all
  * three, but it would put I/O (and a TOCTOU window) inside the identity
  * check, and inode identity does not exist on non-`file:` providers at all —
