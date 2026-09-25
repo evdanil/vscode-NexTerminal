@@ -922,10 +922,11 @@ export function routeReconsentNote(
  * shell form that parse got wrong (a quoted separator, `"$n"tool`,
  * `bash -c 'ipmitool -"E"'`). The distinction was also mostly false: upstream
  * ipmitool (`lib/ipmi_main.c`) answers an `-E` that finds no password variable
- * by logging "Unable to read password from environment" and then prompting, as
- * `-a` does (#189). So the note states only what Nexus knows, and with the box
- * unticked there is nothing to explain — the prompt appears in the gateway
- * terminal the run reveals.
+ * by logging "Unable to read password from environment" and may prompt when
+ * authentication is enabled and no password is otherwise supplied (#189). So
+ * the note states only what Nexus knows. With the box unticked, Nexus injects
+ * no password; an implicit prompt after `-E` appears in the gateway terminal
+ * only while authentication remains enabled. Explicit `-A NONE` suppresses it.
  */
 export function gatewayInertCredentialsNote(macro: TerminalMacro): string | undefined {
   return (macro.provideIpmiCredentials as unknown) === true ? IPMI_GATEWAY_INERT_CREDENTIALS_HINT : undefined;

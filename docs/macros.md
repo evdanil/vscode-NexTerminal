@@ -494,8 +494,9 @@ password is handed over.
 On a macro whose **Run on** is *The server's IPMI gateway*, the checkbox does
 nothing: Nexus doesn't send IPMI credentials to a gateway session. ipmitool
 there uses only what the command or the gateway supplies — `-P`, `-f`, or
-`IPMITOOL_PASSWORD`/`IPMI_PASSWORD` set on the gateway — and with none of
-those, `-a` or `-E` makes it ask for the password in the gateway terminal. The
+`IPMITOOL_PASSWORD`/`IPMI_PASSWORD` set on the gateway. When authentication is
+enabled and no password is otherwise supplied, `-a` or `-E` may prompt in the
+gateway terminal. The
 macro editor says so beside the ticked box, and so does the send confirmation.
 
 ### Upgrading an older IPMI macro

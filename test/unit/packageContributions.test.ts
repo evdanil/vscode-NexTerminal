@@ -598,6 +598,26 @@ describe("package contributions", () => {
     expect(functionalDocs).toContain("nexus.macro.openDocs");
   });
 
+  it("qualifies gateway prompt copy with auth state and keeps the template-specific `-a` explanation", () => {
+    const promptCopy = [
+      ["docs/macros.md", userDoc("docs/macros.md")],
+      ["docs/functional-documentation.md", functionalDocs],
+      ["CHANGELOG.md", readDoc("CHANGELOG.md")]
+    ] as const;
+    for (const [source, text] of promptCopy) {
+      expect(text, source).not.toMatch(/with none of\s+those,?\s+`-a` or `-E` makes it ask/i);
+      expect(text, source).not.toContain("then asks for the password, just as with `-a`");
+      expect(text, source).toMatch(/authentication is\s+enabled/i);
+    }
+
+    const runNoteRationale = readDoc("src/commands/serverMacroCommands.ts");
+    expect(runNoteRationale).not.toContain("then prompting, as `-a` does (#189)");
+    expect(runNoteRationale).toMatch(/authentication is\s+enabled/i);
+    // This sentence describes the built-in jump-host template's actual `-a`
+    // command, not a guarantee about all possible authentication modes.
+    expect(functionalDocs).toContain("ipmitool prompts for the password on the gateway");
+  });
+
   it("orders Macros welcome links by guided setup path", () => {
     const entry = packageJson.contributes.viewsWelcome?.find((item) => item.view === "nexusMacros");
     expect(entry).toBeDefined();
