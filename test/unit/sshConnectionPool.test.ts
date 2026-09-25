@@ -5,6 +5,7 @@ import type {
   SshConnection,
   SshFactory
 } from "../../src/services/ssh/contracts";
+import { ProxiedSshConnection } from "../../src/services/ssh/proxiedSshConnection";
 import { SshConnectionPool, type PoolEvent } from "../../src/services/ssh/sshConnectionPool";
 import type { ServerConfig } from "../../src/models/config";
 
@@ -403,6 +404,60 @@ describe("SshConnectionPool", () => {
     // because it was unsubscribed during lease dispose
     conn.fireClose();
     expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("retired proxied transport closes its bind barrier when the last lease is disposed", async () => {
+    const inner = createMockConnection();
+    const connection = new ProxiedSshConnection(inner, vi.fn());
+    const p = new SshConnectionPool(createMockFactory([connection]), { enabled: true, idleTimeoutMs: 5000 });
+    const lease = await p.connect(testServer);
+
+    const retirement = p.retire(lease);
+    expect(retirement).toBeDefined();
+    let settled = false;
+    void retirement?.then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    lease.dispose();
+    await Promise.resolve();
+
+    expect(settled).toBe(true);
+  });
+
+  it("retired fallback proxied transport closes its bind barrier when its lease is disposed", async () => {
+    const pooledInner = createMockConnection();
+    let shellCalls = 0;
+    pooledInner.openShell = vi.fn(async () => {
+      shellCalls++;
+      if (shellCalls > 1) {
+        throw new Error("Channel open failure: Administratively prohibited");
+      }
+      return {} as any;
+    });
+    const fallbackInner = createMockConnection();
+    const p = new SshConnectionPool(
+      createMockFactory([
+        new ProxiedSshConnection(pooledInner, vi.fn()),
+        new ProxiedSshConnection(fallbackInner, vi.fn())
+      ]),
+      { enabled: true, idleTimeoutMs: 5000 }
+    );
+
+    const pooledLease = await p.connect(testServer);
+    await pooledLease.openShell();
+    const fallbackLease = await p.connect(testServer);
+    await fallbackLease.openShell();
+
+    const retirement = p.retire(fallbackLease);
+    expect(retirement).toBeDefined();
+    let settled = false;
+    void retirement?.then(() => { settled = true; });
+    fallbackLease.dispose();
+    await Promise.resolve();
+
+    expect(settled).toBe(true);
+    pooledLease.dispose();
   });
 
   it("pool.dispose() cleans up all entries, timers, rejects future connects", async () => {

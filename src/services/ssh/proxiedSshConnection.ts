@@ -68,6 +68,7 @@ export class ProxiedSshConnection implements SshConnection {
     this.proxyCloseUnsubscribe?.();
     this.inner.dispose();
     this.proxyCleanup();
+    this.emitClose();
   }
 
   private emitClose(): void {

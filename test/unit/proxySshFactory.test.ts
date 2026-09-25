@@ -204,6 +204,19 @@ describe("ProxiedSshConnection", () => {
     expect(cleanup).toHaveBeenCalled();
   });
 
+  it("emits onClose when explicitly disposed", () => {
+    const inner = makeFakeConnection();
+    const cleanup = vi.fn();
+    const proxied = new ProxiedSshConnection(inner, cleanup);
+    const listener = vi.fn();
+    proxied.onClose(listener);
+
+    proxied.dispose();
+    proxied.dispose();
+
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
   it("jumpHostCleanup disposes the jump host connection", () => {
     const jumpConn = makeFakeConnection();
     const cleanup = jumpHostCleanup(jumpConn);
