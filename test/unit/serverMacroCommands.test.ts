@@ -1290,7 +1290,7 @@ describe("ipmiCredentialsOffNote — fires only where something reads the passwo
     expect(hint(" ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
     expect(hint(" ipmitool -H ${profile.ipmiHost} -P hunter2 sol activate\n")).toBeUndefined();
     expect(hint(" ipmitool -H ${profile.ipmiHost} -f ~/.bmcpass sol activate\n")).toBeUndefined();
-    // No password option at all: ipmitool prompts ("Password: ") when -H is given.
+    // No password option at all: in its default auth mode, ipmitool prompts ("Password: ") when -H is given.
     expect(hint(" ipmitool -I lanplus -H ${profile.ipmiHost} -U ${profile.ipmiUsername} sol activate\n")).toBeUndefined();
   });
 
@@ -1393,6 +1393,12 @@ describe("ipmiCredentialsOffNote — fires only where something reads the passwo
     // With `-a` the ipmitool segment needs no hint; an unclosed quote would merge it
     // into the echo segment and bring the token-consumer hint back.
     expect(hint(" echo 'a;b'; ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
+  });
+
+  it("does not let an apostrophe in a shell comment hide a later env-reading command", () => {
+    const text =
+      " ipmitool -H ${profile.ipmiHost} -a # don't inspect the next command\n bmc-helper ${profile.ipmiHost}\n";
+    expect(hint(text)).toContain("Provide IPMI credentials");
   });
 
   it("still hints when an ipmitool command takes the password from the variable by name — ⊘ 'no -E ⇒ never reads the env'", () => {
@@ -2231,6 +2237,26 @@ describe("commandReadsIpmiEnv — ipmitool `-E` env-password flag detection", ()
     // accepting `-E>`.
     expect(commandReadsIpmiEnv("ipmitool -E=foo sol")).toBe(false);
     expect(commandReadsIpmiEnv("ipmitool -E/path sol")).toBe(false);
+  });
+
+  it("does not count redirection targets as ipmitool arguments, but keeps a flag before redirection (PR #191 P2)", () => {
+    expect(commandReadsIpmiEnv("ipmitool -H x -a >-E")).toBe(false);
+    expect(commandReadsIpmiEnv("ipmitool -H x -a <-E")).toBe(false);
+    expect(commandReadsIpmiEnv("ipmitool -H x -a <<-E\n")).toBe(false);
+    // The operator starts after this argument, so the real `-E` still belongs
+    // to ipmitool; the output path does not.
+    expect(commandReadsIpmiEnv("ipmitool -E>/tmp/ipmi.log sol")).toBe(true);
+  });
+
+  it("ignores unquoted comments and starts a fresh command after their newline", () => {
+    expect(commandReadsIpmiEnv("ipmitool -H x -a # ipmitool -E\n")).toBe(false);
+    expect(commandReadsIpmiEnv("ipmitool -H x -a # don't parse this quote\nipmitool -H x -E sol")).toBe(true);
+  });
+
+  it("keeps escaped, quoted and word-internal hash characters in shell words", () => {
+    for (const user of ["\\#ops", "'#ops'", '"#ops"', "ops#admin"]) {
+      expect(commandReadsIpmiEnv(`ipmitool -H x -U ${user} -E sol`), user).toBe(true);
+    }
   });
 
   it("does NOT match a QUOTED `-E` owned by a wrapper before ipmitool (round 7 P2)", () => {

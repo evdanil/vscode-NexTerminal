@@ -235,9 +235,10 @@ function usesIpmiTokens(text: string): boolean {
  *
  * DISCOVERABILITY, NOT SILENCE. Such a run is not broken: `ipmitool -E` with no
  * variable in the environment says so itself, in the user's own visible
- * terminal, and asks for the password. What it cannot say is that Nexus has the
- * password and was not asked to hand it over, which is the one thing the user
- * needs in order to fix it — and where.
+ * terminal, and may ask for the password if a remote host is named with `-H`
+ * and authentication is not disabled with `-A NONE`. What it cannot say is that
+ * Nexus has the password and was not asked to hand it over, which is the one
+ * thing the user needs to fix — and where.
  *
  * ONLY WHERE SOMETHING READS THAT ENVIRONMENT (#151). The note names a remedy, so
  * it fires only where ticking the box can change the run —
@@ -406,19 +407,22 @@ function prefixOptionOperandWords(options: PrefixOptions, word: string): 0 | 1 |
 interface ShellWord {
   readonly raw: string;
   readonly value: string;
+  readonly redirectionTarget?: boolean;
 }
 
 /**
  * A macro's command segments, each a list of words, read with POSIX quoting and
  * nothing more — no expansion, no general parse (Codex on #191). A `;`, `&`, `|`
- * or newline ends a segment only outside quotes and unescaped; whitespace, `<`,
- * `>` and `)` end a word there, so `-E>/tmp/log` and `(ipmitool -E)` give a bare
- * `-E`. Inside single quotes everything is literal; inside double quotes a
- * backslash escapes only `$`, `` ` ``, `"`, `\` and newline; outside quotes it
- * escapes the next character; a backslash-newline joins the lines except inside
- * single quotes. So `-U "ops;admin" -E` stays one command, `"ipmitool"`,
- * `ip"mi"tool`, `-"E"` and `\-E` read as the shell reads them, and `'\-E'` and
- * `"\-E"` reach the command as `\-E`, not `-E`.
+ * or newline ends a segment only outside quotes and unescaped; `<` and `>`
+ * redirection operators end a word and mark their following word as a target,
+ * so `>-E` is not an ipmitool flag while `-E>/tmp/log` still is. A `#` at a
+ * word boundary outside quotes skips to the newline. Inside single quotes
+ * everything is literal; inside double quotes a backslash escapes only `$`,
+ * `` ` ``, `"`, `\` and newline; outside quotes it escapes the next character;
+ * a backslash-newline joins the lines except inside single quotes. So
+ * `-U "ops;admin" -E` stays one command, `"ipmitool"`, `ip"mi"tool`, `-"E"` and
+ * `\-E` read as the shell reads them, and `'\-E'` and `"\-E"` reach the command
+ * as `\-E`, not `-E`.
  */
 function shellSegments(text: string): ShellWord[][] {
   const segments: ShellWord[][] = [];
@@ -426,9 +430,11 @@ function shellSegments(text: string): ShellWord[][] {
   let raw = "";
   let value = "";
   let quote = "";
+  let redirectionTarget = false;
   const endWord = (): void => {
     if (raw) {
-      words.push({ raw, value });
+      words.push({ raw, value, redirectionTarget });
+      redirectionTarget = false;
     }
     raw = value = "";
   };
@@ -449,6 +455,10 @@ function shellSegments(text: string): ShellWord[][] {
       quote = c === '"' ? "" : quote;
       value += c === '"' ? "" : c;
       raw += c;
+    } else if (!quote && c === "#" && !raw) {
+      const newline = text.indexOf("\n", i);
+      if (newline < 0) break;
+      i = newline - 1;
     } else if (c === "'" || c === '"') {
       quote = c;
       raw += c;
@@ -456,7 +466,19 @@ function shellSegments(text: string): ShellWord[][] {
       endWord();
       segments.push(words);
       words = [];
-    } else if (/[\s<>)]/.test(c)) {
+    } else if (c === "<" || c === ">") {
+      endWord();
+      if (next === c) {
+        i++;
+        if (c === "<" && text[i + 1] === "-") i++;
+      } else if (
+        (c === "<" && (next === ">" || next === "&")) ||
+        (c === ">" && (next === "&" || next === "|"))
+      ) {
+        i++;
+      }
+      redirectionTarget = true;
+    } else if (/[\s)]/.test(c)) {
       endWord();
     } else {
       raw += c;
@@ -489,13 +511,13 @@ function shellSegments(text: string): ShellWord[][] {
  * `bash -c "ipmitool …"` — answers "not ipmitool", which can only keep the hint.
  */
 function ipmitoolArguments(segment: readonly ShellWord[]): ShellWord[] | undefined {
-  const words = [...segment];
+  const words = segment.filter((word) => !word.redirectionTarget);
   // A subshell's opening "(" (repeatable: "( (") is not a word of the command;
   // "((" opens arithmetic, which runs no command.
   while (words.length > 0 && /^\((?!\()/.test(words[0].raw)) {
     const rest = words[0].raw.slice(1);
     if (rest) {
-      words[0] = { raw: rest, value: words[0].value.slice(1) };
+      words[0] = { ...words[0], raw: rest, value: words[0].value.slice(1) };
     } else {
       words.shift();
     }
