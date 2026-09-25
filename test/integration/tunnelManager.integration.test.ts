@@ -237,6 +237,7 @@ class HeldForwardConnection extends DirectTcpSshConnection {
 class ControlledForwardConnection extends DirectTcpSshConnection {
   public forwardAttempts = 0;
   public cancelAttempts = 0;
+  public zeroPortAllocation: number | undefined;
   public readonly forwardRequests: Array<{ bindAddr: string; bindPort: number }> = [];
   public readonly cancelRequests: Array<{ bindAddr: string; bindPort: number }> = [];
   public transportClosed = false;
@@ -290,7 +291,7 @@ class ControlledForwardConnection extends DirectTcpSshConnection {
     this.forwardRequests.push({ bindAddr, bindPort });
     this.signal(this.forwardSignals, attempt).resolve(undefined);
     if (!this.heldForwardAttempts.has(attempt)) {
-      return Promise.resolve(bindPort);
+      return Promise.resolve(bindPort === 0 ? this.zeroPortAllocation ?? bindPort : bindPort);
     }
     return new Promise<number>((resolve, reject) => {
       this.heldForwards.set(attempt, {
@@ -1350,6 +1351,400 @@ describe("TunnelManager integration", () => {
       await Promise.allSettled(
         [retiredResult, replacementResult].filter((result): result is Promise<unknown> => Boolean(result))
       );
+      manager = undefined;
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["late grant", "no answer"] as const)(
+    "keeps an abandoned port-zero request blocked through %s, then scopes a late grant to its allocated port",
+    async (lateOutcome) => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const retiredConnection = new ControlledForwardConnection();
+      retiredConnection.holdForward(1);
+      const replacementConnection = new ControlledForwardConnection();
+      replacementConnection.zeroPortAllocation = 23457;
+      const factory = new OrderedConnectionFactory([retiredConnection, replacementConnection]);
+      const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
+      const server = { ...testServer };
+      manager = new TunnelManager(pool, pool);
+      const profile = (id: string, remotePort: number): TunnelProfile => ({
+        id,
+        name: id,
+        localPort: 12345,
+        remoteIP: "127.0.0.1",
+        remotePort,
+        autoStart: false,
+        tunnelType: "reverse",
+        remoteBindAddress: "127.0.0.1",
+        localTargetIP: "127.0.0.1"
+      });
+      let terminalLease: SshConnection | undefined;
+      let retiredResult: Promise<unknown> | undefined;
+      let replacementResult: Promise<unknown> | undefined;
+      let fixedPortResult: Promise<unknown> | undefined;
+
+      try {
+        terminalLease = await pool.connect(server);
+        const retiredStart = manager.start(profile("reverse-retired-zero", 0), server);
+        retiredResult = retiredStart.then(() => "started", (error: unknown) => error);
+        await retiredConnection.waitForForwardAttempt(1);
+        const retiredTunnelId = manager.getActiveTunnelId("reverse-retired-zero");
+        expect(retiredTunnelId).toBeDefined();
+        await manager.stop(retiredTunnelId!);
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(await retiredResult).toBeInstanceOf(Error);
+
+        const replacementStart = manager.start(profile("reverse-replacement-zero", 0), server);
+        replacementResult = replacementStart.then(() => "started", (error: unknown) => error);
+        const forwardedBeforeResponse = await Promise.race([
+          replacementConnection.waitForForwardAttempt(1).then(() => true),
+          new Promise<boolean>((resolve) => setImmediate(() => resolve(false)))
+        ]);
+        expect(forwardedBeforeResponse).toBe(false);
+        expect(replacementConnection.forwardAttempts).toBe(0);
+
+        if (lateOutcome === "late grant") {
+          retiredConnection.releaseForward(1, 23456);
+          const forwardedAfterGrant = await Promise.race([
+            replacementConnection.waitForForwardAttempt(1).then(() => true),
+            new Promise<boolean>((resolve) => setImmediate(() => resolve(false)))
+          ]);
+          expect(forwardedAfterGrant).toBe(true);
+          await expect(replacementStart).resolves.toMatchObject({ remotePort: 23457 });
+          expect(retiredConnection.cancelAttempts).toBe(0);
+          expect(retiredConnection.cancelRequests).toEqual([]);
+          expect(replacementConnection.forwardRequests[0]).toEqual({ bindAddr: "127.0.0.1", bindPort: 0 });
+
+          const fixedPortStart = manager.start(profile("reverse-fixed-conflict", 23456), server);
+          fixedPortResult = fixedPortStart.then(() => "started", (error: unknown) => error);
+          const fixedForwardedBeforeClose = await Promise.race([
+            replacementConnection.waitForForwardAttempt(2).then(() => true),
+            new Promise<boolean>((resolve) => setImmediate(() => resolve(false)))
+          ]);
+          expect(fixedForwardedBeforeClose).toBe(false);
+          expect(replacementConnection.forwardAttempts).toBe(1);
+
+          terminalLease.dispose();
+          terminalLease = undefined;
+          await replacementConnection.waitForForwardAttempt(2);
+          await expect(fixedPortStart).resolves.toMatchObject({ remotePort: 23456 });
+          expect(retiredConnection.transportClosed).toBe(true);
+          expect(replacementConnection.forwardRequests[1]).toEqual({ bindAddr: "127.0.0.1", bindPort: 23456 });
+        } else {
+          const stillWaiting = await Promise.race([
+            replacementConnection.waitForForwardAttempt(1).then(() => true),
+            new Promise<boolean>((resolve) => setImmediate(() => resolve(false)))
+          ]);
+          expect(stillWaiting).toBe(false);
+          terminalLease.dispose();
+          terminalLease = undefined;
+          await replacementConnection.waitForForwardAttempt(1);
+          await expect(replacementStart).resolves.toMatchObject({ remotePort: 23457 });
+          expect(retiredConnection.transportClosed).toBe(true);
+        }
+      } finally {
+        terminalLease?.dispose();
+        retiredConnection.rejectForward(1, new Error("Cleanup"));
+        await manager.stopAll();
+        pool.dispose();
+        await Promise.allSettled(
+          [retiredResult, replacementResult, fixedPortResult].filter((result): result is Promise<unknown> => Boolean(result))
+        );
+        manager = undefined;
+        vi.useRealTimers();
+      }
+    }
+  );
+
+  it.each(["fixed-port transport", "port-zero transport"] as const)(
+    "keeps a late port-zero grant's fixed-port barrier until both the existing and %s close",
+    async (firstClose) => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const fixedPortConnection = new ControlledForwardConnection();
+      fixedPortConnection.holdForward(1);
+      const portZeroConnection = new ControlledForwardConnection();
+      portZeroConnection.holdForward(1);
+      const replacementConnection = new ControlledForwardConnection();
+      replacementConnection.zeroPortAllocation = 23457;
+      const factory = new OrderedConnectionFactory([
+        fixedPortConnection,
+        portZeroConnection,
+        replacementConnection
+      ]);
+      const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
+      const server = { ...testServer };
+      manager = new TunnelManager(pool, pool);
+      const profile = (id: string, remotePort: number): TunnelProfile => ({
+        id,
+        name: id,
+        localPort: 12345,
+        remoteIP: "127.0.0.1",
+        remotePort,
+        autoStart: false,
+        tunnelType: "reverse",
+        remoteBindAddress: "127.0.0.1",
+        localTargetIP: "127.0.0.1"
+      });
+      let fixedPortLease: SshConnection | undefined;
+      let portZeroLease: SshConnection | undefined;
+      let fixedPortRetirement: Promise<unknown> | undefined;
+      let portZeroRetirement: Promise<unknown> | undefined;
+      let portZeroReplacementResult: Promise<unknown> | undefined;
+      let fixedPortWaiterResult: Promise<unknown> | undefined;
+
+      try {
+        fixedPortLease = await pool.connect(server);
+        const fixedPortStart = manager.start(profile("reverse-retired-fixed", 23456), server);
+        fixedPortRetirement = fixedPortStart.then(() => "started", (error: unknown) => error);
+        await fixedPortConnection.waitForForwardAttempt(1);
+        const fixedPortId = manager.getActiveTunnelId("reverse-retired-fixed");
+        expect(fixedPortId).toBeDefined();
+        await manager.stop(fixedPortId!);
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(await fixedPortRetirement).toBeInstanceOf(Error);
+
+        portZeroLease = await pool.connect(server);
+        const portZeroStart = manager.start(profile("reverse-retired-zero-for-port", 0), server);
+        portZeroRetirement = portZeroStart.then(() => "started", (error: unknown) => error);
+        await portZeroConnection.waitForForwardAttempt(1);
+        const portZeroId = manager.getActiveTunnelId("reverse-retired-zero-for-port");
+        expect(portZeroId).toBeDefined();
+        await manager.stop(portZeroId!);
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(await portZeroRetirement).toBeInstanceOf(Error);
+
+        portZeroConnection.releaseForward(1, 23456);
+        const replacementStart = manager.start(profile("reverse-replacement-zero", 0), server);
+        portZeroReplacementResult = replacementStart.then(() => "started", (error: unknown) => error);
+        await replacementConnection.waitForForwardAttempt(1);
+        await expect(replacementStart).resolves.toMatchObject({ remotePort: 23457 });
+
+        const fixedPortWaiter = manager.start(profile("reverse-waiting-fixed", 23456), server);
+        fixedPortWaiterResult = fixedPortWaiter.then(() => "started", (error: unknown) => error);
+        const forwardedBeforeEitherClose = await Promise.race([
+          replacementConnection.waitForForwardAttempt(2).then(() => true),
+          new Promise<boolean>((resolve) => setImmediate(() => resolve(false)))
+        ]);
+        expect(forwardedBeforeEitherClose).toBe(false);
+        expect(replacementConnection.forwardRequests).toHaveLength(1);
+
+        if (firstClose === "fixed-port transport") {
+          fixedPortLease.dispose();
+          fixedPortLease = undefined;
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          expect(fixedPortConnection.transportClosed).toBe(true);
+        } else {
+          portZeroLease.dispose();
+          portZeroLease = undefined;
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          expect(portZeroConnection.transportClosed).toBe(true);
+        }
+        const forwardedAfterFirstClose = await Promise.race([
+          replacementConnection.waitForForwardAttempt(2).then(() => true),
+          new Promise<boolean>((resolve) => setImmediate(() => resolve(false)))
+        ]);
+        expect(forwardedAfterFirstClose).toBe(false);
+
+        if (firstClose === "fixed-port transport") {
+          portZeroLease.dispose();
+          portZeroLease = undefined;
+        } else {
+          fixedPortLease.dispose();
+          fixedPortLease = undefined;
+        }
+        await replacementConnection.waitForForwardAttempt(2);
+        await expect(fixedPortWaiter).resolves.toMatchObject({ remotePort: 23456 });
+        expect(replacementConnection.forwardRequests[1]).toEqual({ bindAddr: "127.0.0.1", bindPort: 23456 });
+      } finally {
+        fixedPortLease?.dispose();
+        portZeroLease?.dispose();
+        fixedPortConnection.rejectForward(1, new Error("Cleanup"));
+        portZeroConnection.rejectForward(1, new Error("Cleanup"));
+        await manager.stopAll();
+        pool.dispose();
+        await Promise.allSettled(
+          [fixedPortRetirement, portZeroRetirement, portZeroReplacementResult, fixedPortWaiterResult]
+            .filter((result): result is Promise<unknown> => Boolean(result))
+        );
+        manager = undefined;
+        vi.useRealTimers();
+      }
+    }
+  );
+
+  it("does not let a late grant on a closed port-zero transport clear a newer zero-port barrier", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const oldConnection = new ControlledForwardConnection();
+    oldConnection.holdForward(1);
+    const newConnection = new ControlledForwardConnection();
+    newConnection.holdForward(1);
+    const replacementConnection = new ControlledForwardConnection();
+    replacementConnection.zeroPortAllocation = 23458;
+    const factory = new OrderedConnectionFactory([oldConnection, newConnection, replacementConnection]);
+    const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
+    const server = { ...testServer };
+    manager = new TunnelManager(pool, pool);
+    const profile = (id: string, remotePort: number): TunnelProfile => ({
+      id,
+      name: id,
+      localPort: 12345,
+      remoteIP: "127.0.0.1",
+      remotePort,
+      autoStart: false,
+      tunnelType: "reverse",
+      remoteBindAddress: "127.0.0.1",
+      localTargetIP: "127.0.0.1"
+    });
+    let oldTerminalLease: SshConnection | undefined;
+    let newTerminalLease: SshConnection | undefined;
+    let oldResult: Promise<unknown> | undefined;
+    let newResult: Promise<unknown> | undefined;
+    let fixedPortResult: Promise<unknown> | undefined;
+    let replacementResult: Promise<unknown> | undefined;
+
+    try {
+      oldTerminalLease = await pool.connect(server);
+      const oldStart = manager.start(profile("reverse-old-zero", 0), server);
+      oldResult = oldStart.then(() => "started", (error: unknown) => error);
+      await oldConnection.waitForForwardAttempt(1);
+      const oldTunnelId = manager.getActiveTunnelId("reverse-old-zero");
+      expect(oldTunnelId).toBeDefined();
+      await manager.stop(oldTunnelId!);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(await oldResult).toBeInstanceOf(Error);
+
+      oldTerminalLease.dispose();
+      oldTerminalLease = undefined;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(oldConnection.transportClosed).toBe(true);
+
+      newTerminalLease = await pool.connect(server);
+      const newStart = manager.start(profile("reverse-new-zero", 0), server);
+      newResult = newStart.then(() => "started", (error: unknown) => error);
+      await newConnection.waitForForwardAttempt(1);
+      const newTunnelId = manager.getActiveTunnelId("reverse-new-zero");
+      expect(newTunnelId).toBeDefined();
+      await manager.stop(newTunnelId!);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(await newResult).toBeInstanceOf(Error);
+
+      oldConnection.releaseForward(1, 23456);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const fixedPortStart = manager.start(profile("reverse-fixed-after-old-close", 23456), server);
+      fixedPortResult = fixedPortStart.then(() => "started", (error: unknown) => error);
+      await replacementConnection.waitForForwardAttempt(1);
+      await expect(fixedPortStart).resolves.toMatchObject({ remotePort: 23456 });
+
+      const replacementStart = manager.start(profile("reverse-replacement-zero", 0), server);
+      replacementResult = replacementStart.then(() => "started", (error: unknown) => error);
+      const zeroForwardedBeforeNewClose = await Promise.race([
+        replacementConnection.waitForForwardAttempt(2).then(() => true),
+        new Promise<boolean>((resolve) => setImmediate(() => resolve(false)))
+      ]);
+      expect(zeroForwardedBeforeNewClose).toBe(false);
+
+      newTerminalLease.dispose();
+      newTerminalLease = undefined;
+      await replacementConnection.waitForForwardAttempt(2);
+      await expect(replacementStart).resolves.toMatchObject({ remotePort: 23458 });
+      expect(newConnection.transportClosed).toBe(true);
+      expect(replacementConnection.forwardRequests[0]).toEqual({ bindAddr: "127.0.0.1", bindPort: 23456 });
+      expect(replacementConnection.forwardRequests[1]).toEqual({ bindAddr: "127.0.0.1", bindPort: 0 });
+    } finally {
+      oldTerminalLease?.dispose();
+      newTerminalLease?.dispose();
+      oldConnection.rejectForward(1, new Error("Cleanup"));
+      newConnection.rejectForward(1, new Error("Cleanup"));
+      await manager.stopAll();
+      pool.dispose();
+      await Promise.allSettled(
+        [oldResult, newResult, fixedPortResult, replacementResult]
+          .filter((result): result is Promise<unknown> => Boolean(result))
+      );
+      manager = undefined;
+      vi.useRealTimers();
+    }
+  });
+
+  it("rechecks the allocated-port barrier after a fixed-port replacement finishes logging in", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const retiredConnection = new ControlledForwardConnection();
+    retiredConnection.holdForward(1);
+    const candidateConnection = new ControlledForwardConnection();
+    const replacementLoginStarted = deferred<void>();
+    const finishReplacementLogin = deferred<void>();
+    let connectCount = 0;
+    const factory: SshFactory = {
+      connect: async () => {
+        connectCount += 1;
+        if (connectCount === 1) {
+          return retiredConnection;
+        }
+        if (connectCount === 2) {
+          replacementLoginStarted.resolve(undefined);
+          await finishReplacementLogin.promise;
+          return candidateConnection;
+        }
+        throw new Error(`Unexpected SSH connection request ${connectCount}`);
+      }
+    };
+    const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
+    const server = { ...testServer };
+    manager = new TunnelManager(pool, pool);
+    const profile = (id: string, remotePort: number): TunnelProfile => ({
+      id,
+      name: id,
+      localPort: 12345,
+      remoteIP: "127.0.0.1",
+      remotePort,
+      autoStart: false,
+      tunnelType: "reverse",
+      remoteBindAddress: "127.0.0.1",
+      localTargetIP: "127.0.0.1"
+    });
+    let terminalLease: SshConnection | undefined;
+    let retiredResult: Promise<unknown> | undefined;
+    let replacementResult: Promise<unknown> | undefined;
+
+    try {
+      terminalLease = await pool.connect(server);
+      const retiredStart = manager.start(profile("reverse-retired-zero-login", 0), server);
+      retiredResult = retiredStart.then(() => "started", (error: unknown) => error);
+      await retiredConnection.waitForForwardAttempt(1);
+      const retiredTunnelId = manager.getActiveTunnelId("reverse-retired-zero-login");
+      expect(retiredTunnelId).toBeDefined();
+      await manager.stop(retiredTunnelId!);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(await retiredResult).toBeInstanceOf(Error);
+
+      const replacementStart = manager.start(profile("reverse-fixed-login", 23456), server);
+      replacementResult = replacementStart.then(() => "started", (error: unknown) => error);
+      await replacementLoginStarted.promise;
+
+      retiredConnection.releaseForward(1, 23456);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      finishReplacementLogin.resolve(undefined);
+      const replacementStartedBeforeOldClose = await Promise.race([
+        replacementResult.then(() => true),
+        new Promise<boolean>((resolve) => setImmediate(() => resolve(false)))
+      ]);
+      expect(replacementStartedBeforeOldClose).toBe(false);
+      expect(candidateConnection.forwardAttempts).toBe(0);
+
+      terminalLease.dispose();
+      terminalLease = undefined;
+      await candidateConnection.waitForForwardAttempt(1);
+      await expect(replacementStart).resolves.toMatchObject({ remotePort: 23456 });
+      expect(retiredConnection.cancelAttempts).toBe(0);
+      expect(candidateConnection.forwardRequests[0]).toEqual({ bindAddr: "127.0.0.1", bindPort: 23456 });
+    } finally {
+      finishReplacementLogin.resolve(undefined);
+      terminalLease?.dispose();
+      retiredConnection.rejectForward(1, new Error("Cleanup"));
+      await manager.stopAll();
+      pool.dispose();
+      await Promise.allSettled([retiredResult, replacementResult].filter((result): result is Promise<unknown> => Boolean(result)));
       manager = undefined;
       vi.useRealTimers();
     }

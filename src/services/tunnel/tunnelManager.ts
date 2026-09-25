@@ -588,8 +588,13 @@ export class TunnelManager {
           // Stopped, and the server has not answered: no telling whether it
           // will still grant the forward. Retire it from reuse and hold a
           // replacement until refusal proves no bind was acquired, or the
-          // transport closes. A late grant is still held until transport close.
-          this.retireForwardTransport(requestKey, sshConnection, outcome.lateRefusal);
+          // transport closes. A late port-zero grant moves the uncertain bind
+          // barrier to its allocated port so another automatic allocation can proceed.
+          if (bindPort === 0) {
+            this.retireUnknownPortForwardTransport(bindKey, sshConnection, outcome.lateOutcome);
+          } else {
+            this.retireForwardTransport(requestKey, sshConnection, outcome.lateRefusal);
+          }
           sshConnection.dispose();
           throw new TunnelStoppedError(profile.name);
         }
@@ -662,7 +667,11 @@ export class TunnelManager {
     connection: SshConnection,
     bindAddr: string,
     bindPort: number
-  ): Promise<{ port: number } | { error: unknown } | { abandoned: true; lateRefusal: Promise<void> }> {
+  ): Promise<
+    | { port: number }
+    | { error: unknown }
+    | { abandoned: true; lateRefusal: Promise<void>; lateOutcome: Promise<{ port: number } | { error: unknown }> }
+  > {
     const request = Promise.resolve()
       .then(() => connection.requestForwardIn(bindAddr, bindPort))
       .then(
@@ -696,7 +705,8 @@ export class TunnelManager {
       });
       return {
         abandoned: true,
-        lateRefusal
+        lateRefusal,
+        lateOutcome: request
       };
     } finally {
       runtime.onStop = undefined;
@@ -716,15 +726,55 @@ export class TunnelManager {
     const barrier = new Promise<void>((resolve) => {
       releaseBarrier = resolve;
     });
-    this.retiredForwardTransports.set(bindKey, barrier);
-    const release = (): void => {
-      if (this.retiredForwardTransports.get(bindKey) === barrier) {
-        this.retiredForwardTransports.delete(bindKey);
-      }
-      releaseBarrier();
-    };
+    this.holdRetiredForwardTransport(bindKey, barrier);
+    const release = (): void => releaseBarrier();
     void closed.then(release, () => {});
     void lateRelease?.then(release, () => {});
+  }
+
+  private retireUnknownPortForwardTransport(
+    bindKey: (port: number) => string,
+    connection: SshConnection,
+    lateOutcome: Promise<{ port: number } | { error: unknown }>
+  ): void {
+    const closed = this.sharedFactory.retire?.(connection) ?? waitForConnectionClose(connection);
+    let releaseUnknownPort!: () => void;
+    const unknownPortBarrier = new Promise<void>((resolve) => {
+      releaseUnknownPort = resolve;
+    });
+    this.holdRetiredForwardTransport(bindKey(0), unknownPortBarrier);
+    const release = (): void => releaseUnknownPort();
+    void closed.then(release, () => {});
+    void lateOutcome.then((outcome) => {
+      if ("error" in outcome) {
+        release();
+        return;
+      }
+      if (outcome.port === 0) {
+        return;
+      }
+
+      let releaseAllocatedPort!: () => void;
+      const allocatedPortBarrier = new Promise<void>((resolve) => {
+        releaseAllocatedPort = resolve;
+      });
+      this.holdRetiredForwardTransport(bindKey(outcome.port), allocatedPortBarrier);
+      void closed.then(releaseAllocatedPort, () => {});
+      release();
+    }, () => {});
+  }
+
+  private holdRetiredForwardTransport(bindKey: string, barrier: Promise<void>): void {
+    const earlierBarrier = this.retiredForwardTransports.get(bindKey);
+    const publishedBarrier = earlierBarrier
+      ? Promise.all([earlierBarrier, barrier]).then(() => undefined)
+      : barrier;
+    this.retiredForwardTransports.set(bindKey, publishedBarrier);
+    void publishedBarrier.then(() => {
+      if (this.retiredForwardTransports.get(bindKey) === publishedBarrier) {
+        this.retiredForwardTransports.delete(bindKey);
+      }
+    });
   }
 
   private async waitForForwardWait(runtime: ActiveTunnelRuntime, pending: Promise<void>): Promise<void> {
