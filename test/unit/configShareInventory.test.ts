@@ -953,6 +953,28 @@ describe("which fields a share carries — servers, tunnels, serial and Local Sh
     expect(JSON.stringify([snapshot, macros])).not.toMatch(/must-not-travel|SENDER-ADAPTER|SENDER-TOKEN|netops|make watch/);
   });
 
+  it("import: a macro whose variables is malformed still loses its auto-trigger — the import judges the file's value, not the export's redaction of it (⊘ `variables` made symmetric with the export's `shareMacroVariables`, which drops the value before `sanitizeImportedMacro` can count it as a declaration and lands a live `Password:` responder)", async () => {
+    const recipient = await makeMachine();
+    const responder = { text: "hunter2\n", triggerPattern: "[Pp]assword:" };
+
+    await importShare(
+      recipient,
+      shareJson({
+        macros: [
+          { ...responder, id: "m-string", name: "String variables", variables: "abc" },
+          { ...responder, id: "m-array-like", name: "Array-like variables", variables: { 0: { name: "password", secret: true }, length: 1 } }
+        ]
+      })
+    );
+
+    const landed = getMacros();
+    expect(landed.map((m) => m.name)).toEqual(["String variables", "Array-like variables"]);
+    for (const macro of landed) {
+      expect(macro).not.toHaveProperty("triggerPattern");
+      expect(macro).not.toHaveProperty("variables");
+    }
+  });
+
   it("an older share file — the records a spread-era export wrote — imports exactly as it did (⊘ a rules table that drops or rewrites a field a share has always carried)", async () => {
     const recipient = await makeMachine();
     const jump = makeServer({ id: "old-jump", name: "Jump", username: "user", keyPath: "" });

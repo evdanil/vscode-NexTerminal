@@ -1955,6 +1955,7 @@ const SHARED_MACRO_RULES = {
   triggerInterval: "keep",
   triggerInitiallyDisabled: "keep",
   triggerScope: "keep",
+  // The sender's server or serial profile id, carried unremapped (#198).
   triggerProfileId: "keep",
   variables: "link",
   group: "keep",
