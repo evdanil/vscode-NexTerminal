@@ -1014,7 +1014,6 @@ describe("deleteServerSecrets", () => {
     warn.mockRestore();
   });
 });
-
 // Issue #177 — with nothing saved, concurrent logins that need the same
 // password (or key passphrase) each opened their own prompt. VS Code shows one
 // input box at a time, so the later prompt dismissed the earlier one, which

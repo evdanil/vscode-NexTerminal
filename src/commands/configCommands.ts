@@ -1405,11 +1405,14 @@ async function restoreSecrets(
   }
 }
 
-/** Every vault secret filed under a server's id. */
-async function deleteServerSecrets(vault: SecretVault, serverId: string): Promise<void> {
-  await vault.delete(passwordSecretKey(serverId));
-  await vault.delete(passphraseSecretKey(serverId));
-  await vault.delete(proxyPasswordSecretKey(serverId));
+/** Whether any secret is saved under a server's own id (see `deleteServerSecrets`). */
+async function hasServerSecrets(vault: SecretVault, serverId: string): Promise<boolean> {
+  for (const key of [passwordSecretKey(serverId), passphraseSecretKey(serverId), proxyPasswordSecretKey(serverId)]) {
+    if ((await vault.get(key)) !== undefined) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -3815,15 +3818,37 @@ export function registerConfigCommands(
     // file does not re-create loses them after the loop: left behind, they
     // wait for the next record that brings its id. Secrets a backup carries
     // are restored after all this (`restoreSecrets` below), so they still win.
+    //
+    // An id leaves the map only once its secrets are gone, so if anything in
+    // the loop throws — a vault delete, a record write — every id still in it
+    // loses its secrets before the error propagates, re-created unchanged or
+    // not: the fail-safe direction, which costs a re-prompt and never sends a
+    // password anywhere. Best effort there, so one failed key does not strand
+    // the rest or mask the error that stopped the import.
     const removedServersWithSecrets = new Map<string, ServerConfig>(mode === "replace" ? snapshot.servers.map((s) => [s.id, s]) : []);
-    const serverTally = await importPreservingIds(data.servers, existingIds, validateServerConfig, async (e) => {
-      const removed = removedServersWithSecrets.get(e.id);
-      if (removed !== undefined && !sameServerEndpoint(removed, e)) {
-        removedServersWithSecrets.delete(e.id);
-        await deleteServerSecrets(vault, e.id);
+    // Re-created servers whose secrets saved HERE were cleared for a changed
+    // endpoint — for the completion message, which tells the user why they
+    // will be asked for them again.
+    const serversClearedForNewEndpoint = new Set<string>();
+    let serverTally: ImportTally;
+    try {
+      serverTally = await importPreservingIds(data.servers, existingIds, validateServerConfig, async (e) => {
+        const removed = removedServersWithSecrets.get(e.id);
+        if (removed !== undefined && !sameServerEndpoint(removed, e)) {
+          if (await hasServerSecrets(vault, e.id)) {
+            serversClearedForNewEndpoint.add(e.id);
+          }
+          await deleteServerSecrets(vault, e.id);
+          removedServersWithSecrets.delete(e.id);
+        }
+        await addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s));
+      });
+    } catch (error) {
+      for (const id of removedServersWithSecrets.keys()) {
+        await deleteServerSecrets(vault, id, { bestEffort: true });
       }
-      await addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s));
-    });
+      throw error;
+    }
     const recreatedServerIds = new Set(serverTally.importedIds);
     for (const id of removedServersWithSecrets.keys()) {
       if (!recreatedServerIds.has(id)) {
@@ -4647,8 +4672,19 @@ export function registerConfigCommands(
     const hostKeyNote = hostKeyConflicts > 0
       ? ` Kept the locally trusted SSH host key for ${plural(hostKeyConflicts, "host")} where the backup holds a different key.`
       : "";
+    // ISSUE #175 — say why the next connect asks for a password this machine
+    // had saved. A server whose backup carried secrets of its own got those
+    // instead (`restoreSecrets` above), so it is not counted.
+    const carriedByBackup = (id: string): boolean =>
+      [decryptedSecrets?.passwords, decryptedSecrets?.passphrases, decryptedSecrets?.proxyPasswords].some(
+        (bucket) => typeof bucket === "object" && bucket !== null && Object.prototype.hasOwnProperty.call(bucket, id)
+      );
+    const clearedCount = [...serversClearedForNewEndpoint].filter((id) => !carriedByBackup(id)).length;
+    const clearedNote = clearedCount > 0
+      ? ` ${plural(clearedCount, "server")} came back at a different address or route; the passwords saved for ${clearedCount === 1 ? "it" : "them"} here were cleared and will be asked for on the next connect.`
+      : "";
     void vscode.window.showInformationMessage(
-      `Imported ${plural(imported, "profile")}${mode === "replace" ? " (replaced existing)" : ""}${skipNote}${restoredFileNote}.${hostKeyNote}`
+      `Imported ${plural(imported, "profile")}${mode === "replace" ? " (replaced existing)" : ""}${skipNote}${restoredFileNote}.${hostKeyNote}${clearedNote}`
     );
   }
 

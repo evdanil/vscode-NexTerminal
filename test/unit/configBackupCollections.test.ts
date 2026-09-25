@@ -947,6 +947,9 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
 
     expect(dest.core.getServer("srv-1")?.host).toBe("attacker.example");
     expect(await savedSecrets(dest)).toEqual(GONE);
+    expect(lastInfoMessage()).toContain(
+      "1 server came back at a different address or route; the passwords saved for it here were cleared and will be asked for on the next connect."
+    );
   });
 
   it("an unchanged endpoint keeps them, whatever else about the server changed", async () => {
@@ -965,6 +968,7 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
 
     expect(dest.core.getServer("srv-1")?.name).toBe("Renamed");
     expect(await savedSecrets(dest)).toEqual(KEPT);
+    expect(lastInfoMessage()).not.toContain("different address");
   });
 
   it.each<[string, Partial<ServerConfig>, Partial<ServerConfig>]>([
@@ -978,7 +982,9 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
     ["the proxy type", {}, { proxy: { type: "http", host: "proxy.lab", port: 1080, username: "pxuser" } }],
     ["the proxy, removed", {}, { proxy: undefined }],
     ["the jump host", { proxy: { type: "ssh", jumpHostId: "jump-1" } }, { proxy: { type: "ssh", jumpHostId: "jump-2" } }],
-    ["a proxy, added", { proxy: undefined }, { proxy: { type: "socks5", host: "proxy.lab", port: 1080, username: "pxuser" } }]
+    ["a proxy, added", { proxy: undefined }, { proxy: { type: "socks5", host: "proxy.lab", port: 1080, username: "pxuser" } }],
+    ["the proxy kind, an SSH jump host turned SOCKS5", { proxy: { type: "ssh", jumpHostId: "jump-1" } }, { proxy: { type: "socks5", host: "jump-1", port: 1080 } }],
+    ["the proxy kind, HTTP turned an SSH jump host", { proxy: { type: "http", host: "proxy.lab", port: 3128 } }, { proxy: { type: "ssh", jumpHostId: "proxy.lab" } }]
   ])("a changed endpoint — %s — deletes all three", async (_what, local, incoming) => {
     const dest = await destWithSavedSecrets(local);
     const recreated = makeServer({ ...LOCAL_ENDPOINT, ...local, ...incoming });
@@ -1048,6 +1054,8 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
 
     expect(dest.core.getServer("srv-1")?.host).toBe("10.9.9.9");
     expect(await savedSecrets(dest)).toEqual(["file-pw", undefined, undefined]);
+    // It got the backup's password, so nothing will ask for one: not counted.
+    expect(lastInfoMessage()).not.toContain("different address");
   });
 
   it("a sealed backup of the same endpoint keeps what this machine saved and overwrites only what the backup carries", async () => {
@@ -1060,6 +1068,68 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
     await runImport(dest, json, "replace");
 
     expect(await savedSecrets(dest)).toEqual(["file-pw", "router-pp", "proxy-pw"]);
+  });
+
+  it("the completion message counts the re-created servers whose saved secrets were cleared — not an unchanged one, and not one that had none", async () => {
+    const dest = await destWithSavedSecrets();
+    for (const id of ["srv-2", "srv-3"]) {
+      await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, id, name: id }));
+      await dest.vault.store(`password-${id}`, `${id}-pw`);
+    }
+    await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, id: "srv-4", name: "No saved password" }));
+
+    await runImport(dest, unsealedJson([
+      makeServer({ ...LOCAL_ENDPOINT, host: "attacker.example" }),
+      makeServer({ ...LOCAL_ENDPOINT, id: "srv-2", name: "srv-2", port: 2222 }),
+      makeServer({ ...LOCAL_ENDPOINT, id: "srv-3", name: "srv-3" }),
+      makeServer({ ...LOCAL_ENDPOINT, id: "srv-4", name: "No saved password", host: "elsewhere.example" })
+    ]), "replace");
+
+    expect(lastInfoMessage()).toBe(
+      "Imported 4 profiles (replaced existing). 2 servers came back at a different address or route; the passwords saved for them here were cleared and will be asked for on the next connect."
+    );
+    expect(await dest.vault.get("password-srv-3")).toBe("srv-3-pw");
+  });
+
+  it("if the import fails partway, every removed server still holding secrets loses them before the error surfaces — re-created unchanged or not", async () => {
+    const dest = await destWithSavedSecrets();
+    const write = dest.core.addOrUpdateServer.bind(dest.core);
+    vi.spyOn(dest.core, "addOrUpdateServer").mockImplementation(async (server) => {
+      if (server.id === "boom") throw new Error("disk full");
+      await write(server);
+    });
+
+    // srv-1 comes back unchanged, then the next record's write fails.
+    register(dest);
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }).mockResolvedValueOnce({ label: "Replace", value: "replace" });
+    mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/nexus-backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValueOnce(Buffer.from(unsealedJson([makeServer({ ...LOCAL_ENDPOINT }), makeServer({ id: "boom", name: "Boom" })]), "utf8"));
+    await expect(registeredCommands.get("nexus.config.import")!()).rejects.toThrow("disk full");
+
+    expect(await savedSecrets(dest)).toEqual(GONE);
+  });
+
+  it("if clearing a changed endpoint's secrets fails, they are cleared again before the error surfaces, and the record is never published", async () => {
+    let failOnce = true;
+    class FlakyVault extends MockVault {
+      async delete(key: string) {
+        if (key === "password-srv-1" && failOnce) {
+          failOnce = false;
+          throw new Error("keychain locked");
+        }
+        await super.delete(key);
+      }
+    }
+    const dest = await destWithSavedSecrets({}, new FlakyVault());
+
+    register(dest);
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }).mockResolvedValueOnce({ label: "Replace", value: "replace" });
+    mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/nexus-backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValueOnce(Buffer.from(unsealedJson([makeServer({ ...LOCAL_ENDPOINT, host: "attacker.example" })]), "utf8"));
+    await expect(registeredCommands.get("nexus.config.import")!()).rejects.toThrow("keychain locked");
+
+    expect(dest.core.getServer("srv-1")).toBeUndefined();
+    expect(await savedSecrets(dest)).toEqual(GONE);
   });
 
   it("Merge is unchanged: the local server and its secrets stay, whatever endpoint the file gives its id", async () => {
