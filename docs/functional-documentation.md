@@ -625,6 +625,8 @@ Point an inventory source at a GNS3 server and its projects become folders, its 
 
 ## 5. Settings Reference
 
+Export for Sharing uses an explicit settings policy: only individually allowlisted portable preferences are included. Security and privacy choices, global macro/script automation controls, all directory paths, bind addresses and interfaces, every Network Servers setting, and Local Servers restart defaults remain machine-local. Share import filters with the same policy, so older or hand-edited files cannot replace the recipient's local values; encrypted backup/restore is unchanged.
+
 ### 5.1 SSH
 
 | Setting | Type | Default | Range | Description |

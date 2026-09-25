@@ -154,7 +154,7 @@ vi.mock("node:crypto", async (importOriginal) =>
   (await import("../helpers/fastBackupKdf")).withFastPbkdf2(await importOriginal<typeof import("node:crypto")>())
 );
 
-import { registerConfigCommands, isValidExport, SETTINGS_KEYS, sanitizeForSharing } from "../../src/commands/configCommands";
+import { registerConfigCommands, isValidExport, SETTINGS_KEYS, SHARE_SETTINGS_POLICY, sanitizeForSharing } from "../../src/commands/configCommands";
 import { IMPORTED_CAPABILITY_RESET_NOTICE } from "../../src/models/terminalMacro";
 import { SETTINGS_META } from "../../src/ui/settingsMetadata";
 import { NexusCore } from "../../src/core/nexusCore";
@@ -424,6 +424,13 @@ describe("SETTINGS_KEYS", () => {
       .filter((fullKey) => !keys.has(fullKey));
     expect(missing).toEqual([]);
   });
+
+  it("requires a share/local policy decision for every contributed and compatibility setting", () => {
+    const policyKeys = Object.keys(SHARE_SETTINGS_POLICY).sort();
+    const knownKeys = SETTINGS_KEYS.map(({ section, key }) => `${section}.${key}`).sort();
+    expect(policyKeys).toEqual(knownKeys);
+    expect(SHARE_SETTINGS_POLICY["nexus.settings.futurePreference"]).toBeUndefined();
+  });
 });
 
 describe("config import command (legacy)", () => {
@@ -676,6 +683,63 @@ describe("config import command (legacy)", () => {
     expect(configStore.get("nexus.tunnel.defaultBindAddress")).toBe("0.0.0.0");
     expect(configStore.has("nexus.logging.unexpectedKey")).toBe(false);
     expect(configStore.has("badkey")).toBe(false);
+  });
+
+  it("share imports preserve recipient-local settings from a hand-edited payload", async () => {
+    const recipientSettings = {
+      "nexus.ssh.trustNewHosts": false,
+      "nexus.logging.sessionLogDirectory": "/recipient/logs",
+      "nexus.tunnel.defaultBindAddress": "127.0.0.1",
+      "nexus.sftp.sudo.enabled": false,
+      "nexus.settingsGuard.enabled": false,
+      "nexus.terminal.macros.autoTrigger": false,
+      "nexus.scripts.macroPolicy": "suspend-all",
+      "nexus.scripts.path": "/recipient/scripts",
+      "nexus.networkServers.tftp.root": "/recipient/tftp",
+      "nexus.networkServers.tftp.interface": "192.0.2.10",
+      "nexus.networkServers.tftp.port": 6969,
+      "nexus.networkServers.tftp.allowWrite": false,
+      "nexus.networkServers.dhcp.rangeStart": "192.0.2.100",
+      "nexus.networkServers.dhcp.static": [{ mac: "00:11:22:33:44:55", ip: "192.0.2.20" }],
+      "nexus.localServers.defaultMaxAutoRestarts": 2,
+      "nexus.sftp.cacheTtlSeconds": 10
+    };
+    for (const [key, value] of Object.entries(recipientSettings)) {
+      configStore.set(key, value);
+    }
+
+    await runImport(makeExportData({
+      version: 1,
+      exportType: "share",
+      settings: {
+        "nexus.ssh.trustNewHosts": true,
+        "nexus.logging.sessionLogDirectory": "/sender/logs",
+        "nexus.tunnel.defaultBindAddress": "0.0.0.0",
+        "nexus.sftp.sudo.enabled": true,
+        "nexus.settingsGuard.enabled": true,
+        "nexus.terminal.macros.autoTrigger": true,
+        "nexus.scripts.macroPolicy": "keep-enabled",
+        "nexus.scripts.path": "/sender/scripts",
+        "nexus.networkServers.tftp.root": "/sender/tftp",
+        "nexus.networkServers.tftp.interface": "0.0.0.0",
+        "nexus.networkServers.tftp.port": 69,
+        "nexus.networkServers.tftp.allowWrite": true,
+        "nexus.networkServers.dhcp.rangeStart": "10.0.0.100",
+        "nexus.networkServers.dhcp.static": [{ mac: "AA:BB:CC:DD:EE:FF", ip: "10.0.0.20" }],
+        "nexus.localServers.defaultMaxAutoRestarts": 5,
+        "nexus.ssh.connectionTimeout": 120,
+        "nexus.sftp.cacheTtlSeconds": 45,
+        "nexus.settings.futurePreference": "unknown"
+      }
+    }));
+
+    for (const [key, value] of Object.entries(recipientSettings)) {
+      if (key === "nexus.sftp.cacheTtlSeconds") continue;
+      expect(configStore.get(key), key).toEqual(value);
+    }
+    expect(configStore.get("nexus.ssh.connectionTimeout")).toBe(120);
+    expect(configStore.get("nexus.sftp.cacheTtlSeconds")).toBe(45);
+    expect(configStore.has("nexus.settings.futurePreference")).toBe(false);
   });
 
   it("imports backed-up Ctrl+Q terminal passthrough selection", async () => {
@@ -1855,8 +1919,8 @@ describe("share export command", () => {
     // Old settings key must not appear
     expect(writtenData.settings?.["nexus.terminal.macros"]).toBeUndefined();
 
-    // Session log dir stripped
-    expect(writtenData.settings["nexus.logging.sessionLogDirectory"]).toBe("");
+    // Local directory settings are omitted, not reset to the sender's default.
+    expect(writtenData.settings["nexus.logging.sessionLogDirectory"]).toBeUndefined();
   });
 
   it("does nothing when save dialog is cancelled", async () => {
@@ -6568,6 +6632,43 @@ Server=#109#0%host.test%22%user%%-1%
 });
 
 describe("sanitizeForSharing", () => {
+  it("exports only explicitly share-safe settings and omits local, security and unknown values", () => {
+    const result = sanitizeForSharing([], [], [], [], {
+      "nexus.logging.maxFileSizeMb": 128,
+      "nexus.ssh.connectionTimeout": 45,
+      "nexus.ui.showTreeDescriptions": false,
+      "nexus.sftp.cacheTtlSeconds": 30,
+      "nexus.scripts.defaultTimeoutSeconds": 90,
+      "nexus.terminal.highlighting.rules": [{ id: "rule-1", pattern: "warning" }],
+      "nexus.logging.sessionTranscripts": true,
+      "nexus.logging.sessionLogDirectory": "/sender/logs",
+      "nexus.logging.terminalOutputTrace": true,
+      "nexus.ssh.trustNewHosts": true,
+      "nexus.tunnel.defaultBindAddress": "0.0.0.0",
+      "nexus.sftp.sudo.enabled": true,
+      "nexus.settingsGuard.enabled": false,
+      "nexus.terminal.macros.autoTrigger": false,
+      "nexus.scripts.macroPolicy": "keep-enabled",
+      "nexus.scripts.path": "/sender/scripts",
+      "nexus.networkServers.tftp.root": "/sender/tftp",
+      "nexus.networkServers.tftp.interface": "0.0.0.0",
+      "nexus.networkServers.tftp.allowWrite": true,
+      "nexus.networkServers.dhcp.rangeStart": "10.0.0.100",
+      "nexus.networkServers.dhcp.static": [{ mac: "AA:BB:CC:DD:EE:FF", ip: "10.0.0.20" }],
+      "nexus.localServers.defaultMaxAutoRestarts": 0,
+      "nexus.settings.futurePreference": "unknown"
+    });
+
+    expect(result.settings).toEqual({
+      "nexus.logging.maxFileSizeMb": 128,
+      "nexus.ssh.connectionTimeout": 45,
+      "nexus.ui.showTreeDescriptions": false,
+      "nexus.sftp.cacheTtlSeconds": 30,
+      "nexus.scripts.defaultTimeoutSeconds": 90,
+      "nexus.terminal.highlighting.rules": [{ id: "rule-1", pattern: "warning" }]
+    });
+  });
+
   it("generates fresh IDs and sanitizes user fields", () => {
     const servers = [makeServer({ username: "alice", keyPath: "/home/alice/.ssh/id_rsa" })];
     const tunnels = [makeTunnel({ defaultServerId: "s1" })];
@@ -6602,7 +6703,7 @@ describe("sanitizeForSharing", () => {
     // The old settings key no longer carries macros
     expect(result.settings["nexus.terminal.macros"]).toBeUndefined();
 
-    expect(result.settings["nexus.logging.sessionLogDirectory"]).toBe("");
+    expect(result.settings["nexus.logging.sessionLogDirectory"]).toBeUndefined();
   });
 
   /**

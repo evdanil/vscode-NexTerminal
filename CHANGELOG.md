@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.264] — 2026-09-25
+
+### Fixed
+
+- **Export for Sharing no longer moves machine-local settings to another host.** Share files now include only explicitly allowlisted portable preferences. Security and privacy choices, automation controls, directory paths, bind addresses and interfaces, all Network Servers settings, and Local Servers restart defaults are omitted. Share import applies the same policy again, so an older or hand-edited file cannot overwrite the recipient's values. Encrypted backup and restore are unchanged.
+
 ## [2.8.263] — 2026-09-25
 
 ### Fixed
