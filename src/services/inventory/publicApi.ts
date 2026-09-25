@@ -103,11 +103,14 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  *
  * The practical consequence for a provider author: DO NOT CHANGE `label` or
  * `configFields` casually on an id that already has sources configured against
- * it. A `configFields` change takes effect only through a new registration
- * (dispose, then register again). Every such change is a new shape, and every existing STAMPED source
- * stops reporting live status until its user has confirmed the change once —
- * so the blast radius is every source saved by a current build, which in
- * practice is all of them. ADDING A REQUIRED SECRET FIELD is worse than the
+ * it. A `configFields` change takes effect only through a new registration:
+ * dispose the old registration, then register a fresh provider object with the
+ * same id. The registry rejects the same provider object again, even after
+ * disposal, because a form or prompt may still be holding it. Every such
+ * change is a new shape. Each existing STAMPED source stops reporting live
+ * status until its user has confirmed the change once — so the blast radius is
+ * every source saved by a current build, which in practice is all of them.
+ * ADDING A REQUIRED SECRET FIELD is worse than the
  * rest: the sync that would otherwise settle the question aborts at its
  * missing-credential check before it can restamp, so those users have to go
  * through Edit Source to enter the credential and confirm in one step. The
