@@ -611,9 +611,12 @@ describe("package contributions", () => {
     }
 
     const runNoteRationale = readDoc("src/commands/serverMacroCommands.ts");
+    const normalizedRunNoteRationale = runNoteRationale
+      .replace(/^\s*\/\/\s?/gm, "")
+      .replace(/\s+/g, " ");
     expect(runNoteRationale).not.toContain("then prompting, as `-a` does (#189)");
-    expect(runNoteRationale).not.toContain("gateway-routed macro never prompts for a password");
-    expect(runNoteRationale).not.toContain("ipmitool prompts on the bastion");
+    expect(normalizedRunNoteRationale).not.toMatch(/gateway-routed macro never prompts for a password/);
+    expect(normalizedRunNoteRationale).not.toMatch(/ipmitool prompts on the bastion/);
     expect(runNoteRationale).toMatch(/authentication is\s+enabled/i);
     // This sentence describes the built-in jump-host template's actual `-a`
     // command, not a guarantee about all possible authentication modes.
@@ -622,7 +625,10 @@ describe("package contributions", () => {
 
   it("does not claim the checkbox is always inert when a macro selects the gateway route", () => {
     const macroGuide = userDoc("docs/macros.md");
-    expect(macroGuide).not.toContain("On a macro whose **Run on** is *The server's IPMI gateway*, the checkbox does nothing");
+    const normalizedMacroGuide = macroGuide.replace(/\s+/g, " ");
+    expect(normalizedMacroGuide).not.toMatch(
+      /On a macro whose \*\*Run on\*\* is \*The server's IPMI gateway\*, the checkbox does nothing/
+    );
   });
 
   it("orders Macros welcome links by guided setup path", () => {
