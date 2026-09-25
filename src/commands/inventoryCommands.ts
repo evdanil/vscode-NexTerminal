@@ -542,6 +542,48 @@ function isSourceConfigMismatchError(error: unknown): boolean {
   return error instanceof Error && error.message.includes("configuration changed since the sync was computed");
 }
 
+/**
+ * Deletes every secret saved under the id of each server a sync is about to
+ * ADD, before the add is published (#200). Runs inside the lock, right before
+ * `applyInventorySyncPlan`.
+ *
+ * WHY. A synced server's id is `deterministicServerId(sourceId, externalId)`,
+ * so a device that is delete-pruned and later comes back gets the id its
+ * deleted server had — Proxmox hands a freed VMID to the next new guest. The
+ * prune deletes that server's secrets only after its record is gone, and only
+ * best-effort, so a delete the keyring refuses, or a window closed before the
+ * cleanup loop runs, leaves them under the id. Connect reads a server's own
+ * secrets by id and sends a saved password without prompting. A server the sync
+ * is adding has, by definition, no secret the user saved for it, so whatever is
+ * found under its id is a leftover.
+ *
+ * FAIL CLOSED, NO RESTORE. A delete that rejects throws, and the caller aborts
+ * the apply: the add is never published while the leftover is still there.
+ * The rethrown message is the one the sync's error notification shows, so it
+ * says what failed and that nothing was applied; the vault's own error rides
+ * along as `cause`. Nothing is captured to put back — a leftover belongs to no
+ * record, so an aborted apply has nothing to restore it for, and the next add
+ * of the id would only delete it again.
+ *
+ * SCOPE: the add's OWN keys (`deleteServerSecrets`). An auth profile's
+ * credential is keyed by the profile and shared by every server linked to it,
+ * so it is never touched here. Updates are never passed in — an adopted or
+ * updated record keeps what the user saved for it; the proxy password an
+ * update's proxy change makes stale is `clearStaleProxyPasswordSecretsBeforeApply`'s.
+ */
+async function clearLeftoverSecretsOfAdds(vault: SecretVault, adds: ReadonlyArray<ServerConfig>): Promise<void> {
+  for (const add of adds) {
+    try {
+      await deleteServerSecrets(vault, add.id);
+    } catch (error) {
+      throw new Error(
+        "Could not clear old saved credentials for a server this sync adds from the system keychain — nothing was applied, try again.",
+        { cause: error }
+      );
+    }
+  }
+}
+
 /** Auto-picks when exactly one source exists; warns and returns undefined when there are none. */
 async function pickInventorySource(core: NexusCore, registry: InventoryProviderRegistry): Promise<InventorySourceConfig | undefined> {
   const sources = core.getSnapshot().inventorySources;
@@ -3543,6 +3585,9 @@ export function registerInventoryCommands(
           // accepted here; closing it would require generation-specific
           // secret keys, which touches the whole password subsystem and is
           // out of scope.
+          // #200 — a key this loop fails to delete is reachable by a sync add
+          // only if this source id comes back (a restored backup), and syncNow
+          // deletes it before publishing that add (`clearLeftoverSecretsOfAdds`).
           for (const id of removedServerIds) {
             if (core.getServer(id) !== undefined) {
               recreatedIds.add(id);
@@ -4055,12 +4100,14 @@ export function registerInventoryCommands(
           // failure throws out of the helper (fail closed) → the shared catch below
           // restores + aborts; an apply failure likewise restores `cleared` so the
           // still-live old proxy keeps its password. This fast-path only fires on a
-          // nothing-to-do plan (no updates), so `cleared` is empty here — routed for
-          // uniform coverage. `cleared` stays `[]` if the helper itself throws (it
-          // restores internally), so the catch's restore is then a harmless no-op.
+          // nothing-to-do plan (no adds, no updates), so both clears are no-ops
+          // here — routed for uniform coverage. `cleared` stays `[]` if a helper
+          // throws (the proxy helper restores internally, the leftover clear has
+          // nothing to restore), so the catch's restore is then a harmless no-op.
           let cleared: Array<{ key: string; value: string }> = [];
           try {
-            cleared = await clearStaleProxyPasswordSecretsBeforeApply(vault, recomputed.updates, recomputed.adds);
+            await clearLeftoverSecretsOfAdds(vault, recomputed.adds);
+            cleared = await clearStaleProxyPasswordSecretsBeforeApply(vault, recomputed.updates);
             const applyResult = await core.applyInventorySyncPlan(planToApplication(recomputed, freshSource));
             // F5 — `freshSource` (the exact incarnation this apply just ran
             // against), not the outer `source` captured before this sync
@@ -4852,6 +4899,10 @@ export function registerInventoryCommands(
           // is the only thing that can still catch that — surface its rejection
           // the same way as the fast-fail check above rather than letting it
           // propagate as an unhandled command rejection.
+          // #200 (SECURITY) — delete every secret left under an ADD's id BEFORE
+          // the apply publishes the add: ids are reused, and the prune's cleanup
+          // below is best-effort. A failed delete throws (fail closed) → the catch
+          // below aborts with the add unpublished. See the helper's doc.
           // FIX B (round 10, SECURITY) — capture+delete any stale proxy-password
           // secret BEFORE the apply publishes the new proxy. connect doesn't take
           // configMutationLock, so clearing after the apply (round 9) left a leak
@@ -4863,14 +4914,16 @@ export function registerInventoryCommands(
           let applyResult: { skippedCount: number; removedServerIds: string[]; removedEmptyFolderCount: number };
           let cleared: Array<{ key: string; value: string }> = [];
           try {
-            cleared = await clearStaleProxyPasswordSecretsBeforeApply(vault, finalPlan.updates, finalPlan.adds);
+            await clearLeftoverSecretsOfAdds(vault, finalPlan.adds);
+            cleared = await clearStaleProxyPasswordSecretsBeforeApply(vault, finalPlan.updates);
             applyResult = await core.applyInventorySyncPlan(finalApplication);
           } catch (error) {
-            // The apply did NOT commit (or a stale-secret delete failed) — the old
+            // The apply did NOT commit (or a secret delete failed) — the old
             // proxy config is still live and needs its password. `cleared` stays
-            // `[]` when the helper itself throws (it restores internally), so this
-            // restore is a no-op in that case and puts the captured values back
-            // when the apply is what threw.
+            // `[]` when a helper throws (the proxy helper restores internally, the
+            // leftover clear has nothing to restore), so this restore is a no-op
+            // in that case and puts the captured values back when the apply is
+            // what threw.
             await restoreProxyPasswordSecrets(vault, cleared);
             // m4 — same friendly rewording as the fast-path apply above.
             void vscode.window.showErrorMessage(
@@ -4957,6 +5010,14 @@ export function registerInventoryCommands(
           // accepted here; closing it would require generation-specific
           // secret keys, which touches the whole password subsystem and is
           // out of scope.
+          // #200 — best-effort AFTER the removal, so a key can outlive its
+          // record: a rejected delete, or the window closing before this loop
+          // runs. The device comes back under this id as a sync add, and
+          // `clearLeftoverSecretsOfAdds` deletes the key before that add is
+          // published. Deleting before the removal instead would turn a keyring
+          // outage into a failed prune and need a capture-and-restore for an
+          // apply that then fails; the add-time clear covers both ways a key
+          // survives without either.
           for (const id of prunedServerIdsForSecretCleanup(finalPlan)) {
             if (core.getServer(id) !== undefined) {
               recreatedIds.add(id);

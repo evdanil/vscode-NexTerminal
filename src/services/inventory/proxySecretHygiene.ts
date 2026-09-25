@@ -78,12 +78,13 @@ import { proxyPasswordSecretKey } from "../ssh/silentAuth";
  * an update that newly matches but has no stored secret captures nothing and deletes
  * nothing — broadening the trigger costs nothing where there is no orphan.
  *
- * ROUND 12 — ALSO covers the plan's ADDS, not just its updates. A delete-pruned
- * device whose best-effort `proxy-password-{id}` delete FAILED can reappear as an
- * ADD under the same reused deterministic id; treating an add's `before` as "no
- * proxy" (undefined) makes the EITHER-side rule fire exactly when the add's proxy
- * is a password-bearing socks5/http endpoint, clearing the orphan before the add
- * is published. See the inline note on the helper for the reuse mechanism.
+ * ADDS ARE NOT SCANNED HERE (#200). Round 12 scanned the sync plan's adds too,
+ * for a `proxy-password-{id}` orphaned under a reused deterministic id, but only
+ * when the add's proxy was socks5/http — and the same orphaning strands the
+ * server's `password-` and `passphrase-{id}`. The sync now deletes EVERY secret
+ * under an add's id before publishing it (`clearLeftoverSecretsOfAdds`,
+ * inventoryCommands.ts), which covers the proxy password whatever the add's
+ * proxy is, so this helper is for updates only.
  *
  * Centralized so EVERY proxy-config writer shares one rule — invoked before the
  * fast-path recompute apply, the in-lock confirmed sync apply, AND the manual
@@ -133,35 +134,19 @@ export function isSameAuthenticatedEndpoint(before: ProxyConfig | undefined, aft
 
 export async function clearStaleProxyPasswordSecretsBeforeApply(
   vault: SecretVault,
-  updates: ReadonlyArray<{ before: ServerConfig; after: ServerConfig }>,
-  adds: ReadonlyArray<ServerConfig> = []
+  updates: ReadonlyArray<{ before: ServerConfig; after: ServerConfig }>
 ): Promise<CapturedProxyPasswordSecret[]> {
-  // ROUND 12 — ADDS are scanned too, not just updates. Deterministic server ids
-  // are REUSED, and the delete-prune path clears `proxy-password-{id}` only
-  // best-effort — so a device delete-pruned with a FAILED secret delete can
-  // reappear as an ADD under the same id with the orphaned password still in the
-  // vault. A template can add it with a NEW authenticated socks5/http endpoint,
-  // and the first connect would send the orphan there. An add has no prior
-  // proxy, so its `before` is "no proxy" (undefined): the round-11 EITHER-side
-  // rule then fires exactly when the add's proxy is password-bearing. A fresh
-  // sync-added server never legitimately stores a proxy password (templates
-  // prompt per-connect, §5.3), so any secret under its id is an orphan — clearing
-  // it is correct.
-  const entries: Array<{ id: string; beforeProxy: ProxyConfig | undefined; afterProxy: ProxyConfig | undefined }> = [];
+  const captured: CapturedProxyPasswordSecret[] = [];
   for (const { before, after } of updates) {
     // before.id === after.id (same record through an update); use after.id.
-    entries.push({ id: after.id, beforeProxy: before.proxy, afterProxy: after.proxy });
-  }
-  for (const add of adds) {
-    entries.push({ id: add.id, beforeProxy: undefined, afterProxy: add.proxy });
-  }
-  const captured: CapturedProxyPasswordSecret[] = [];
-  for (const { id, beforeProxy: bp, afterProxy: ap } of entries) {
+    const id = after.id;
+    const bp = before.proxy;
+    const ap = after.proxy;
     // ROUND 11 — trigger on EITHER side being a password-bearing endpoint. A
     // non-password-bearing `before.proxy` does NOT prove no secret exists (an
-    // orphaned legacy-backup entry can sit under an undefined/ssh proxy, and an
-    // add's `before` is always undefined), so an `after`-side authenticated
-    // endpoint must trigger the clear too — see the function doc for why.
+    // orphaned legacy-backup entry can sit under an undefined/ssh proxy), so an
+    // `after`-side authenticated endpoint must trigger the clear too — see the
+    // function doc for why.
     if (!isPasswordBearingProxy(bp) && !isPasswordBearingProxy(ap)) {
       continue; // neither side carries a proxy password — nothing to leak (ssh proxies never send one)
     }

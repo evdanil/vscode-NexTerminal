@@ -29,7 +29,14 @@ import { startInventoryStatusPoll } from "../../src/services/inventory/inventory
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 import { ORPHAN_FOLDER_NAME, type InventorySyncPlan } from "../../src/services/inventory/syncEngine";
 import { configMutationLock } from "../../src/services/configMutationLock";
-import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
+import type { SshConnection, SshConnector } from "../../src/services/ssh/contracts";
+import {
+  authProfilePasswordSecretKey,
+  passphraseSecretKey,
+  passwordSecretKey,
+  proxyPasswordSecretKey,
+  SilentAuthSshFactory
+} from "../../src/services/ssh/silentAuth";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { MAX_FOLDER_DEPTH } from "../../src/utils/folderPaths";
 import type { FormDefinition, FormValues } from "../../src/ui/formTypes";
@@ -3247,9 +3254,9 @@ describe("inventoryCommands", () => {
     // REUSED; a device delete-pruned with a FAILED best-effort proxy-password delete
     // can reappear as an ADD under the SAME id with the orphaned password still in
     // the vault. A template can add it with a NEW authenticated socks5/http endpoint,
-    // and the first connect would send the orphan there. An add has no prior proxy,
-    // so its `before` is treated as undefined → the round-11 EITHER-side rule fires
-    // exactly when the add's proxy is password-bearing. --------
+    // and the first connect would send the orphan there. Round 12 cleared it only
+    // when the add's proxy was password-bearing; since #200 every secret under an
+    // add's id is cleared whatever its proxy (the #200 block below has the rest). --------
 
     // The id the ADD path mints for device:1 under src-1 — the same deterministic id
     // a prior delete-prune would have used, so an orphaned secret can sit under it.
@@ -3306,7 +3313,7 @@ describe("inventoryCommands", () => {
       expect(await vault.get(proxyKey)).toBeUndefined();
     });
 
-    it("(round 12, SECURITY — orphan on ADD, delete fails CLOSED) a vault.delete throw for the add's orphaned proxy key ABORTS the sync (applyInventorySyncPlan never called, the add never published) and RESTORES the orphan", async () => {
+    it("(round 12, SECURITY — orphan on ADD, delete fails CLOSED) a vault.delete throw for the add's orphaned proxy key ABORTS the sync (applyInventorySyncPlan never called, the add never published), and nothing is written back — a leftover under an add's id belongs to no record, so there is nothing to restore it for (#200)", async () => {
       const repo = new InMemoryConfigRepository([]);
       const core = new NexusCore(repo);
       await core.initialize();
@@ -3344,8 +3351,11 @@ describe("inventoryCommands", () => {
       // Fail closed: the add was never published — no server exists under the id.
       expect(applySpy).not.toHaveBeenCalled();
       expect(core.getServer(addId())).toBeUndefined();
-      // The captured orphan is restored (best-effort) so the pass is atomic.
-      expect(vault.store).toHaveBeenCalledWith(proxyKey, "orphan-pw");
+      // #200 — the orphan is still there only because its delete failed. Round 12
+      // captured it first and wrote it back, which kept the pass "atomic" for a
+      // secret no record owns; the next add of this id would only have had to
+      // delete it again.
+      expect(vault.store).not.toHaveBeenCalled();
       expect(await vault.get(proxyKey)).toBe("orphan-pw");
       expect(mockShowErrorMessage).toHaveBeenCalled();
     });
@@ -3377,7 +3387,7 @@ describe("inventoryCommands", () => {
       expect(vault.store).not.toHaveBeenCalledWith(proxyKey, expect.anything());
     });
 
-    it("(round 12, SECURITY — over-clear guard) an ADD with an SSH jump-host proxy leaves an orphaned proxy-password-{addId} ALONE — neither side is password-bearing, so an ssh proxy never sends it (a later template→socks change is the update path's job)", async () => {
+    it("(#200, reverses round 12's over-clear guard) an ADD with an SSH jump-host proxy clears an orphaned proxy-password-{addId} too — the ssh proxy never sends it, but the user's first hand-typed socks5/http proxy with the password left blank keeps the stored one, and that path is not the sync's update path (kills gating the add-time clear on the add's proxy kind)", async () => {
       const bastion = makeServer({ id: "bastion-1", name: "bastion", host: "10.0.0.9", port: 22 }); // hand-added survivor
       const repo = new InMemoryConfigRepository([bastion]);
       const core = new NexusCore(repo);
@@ -3403,8 +3413,200 @@ describe("inventoryCommands", () => {
       await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
 
       expect(core.getServer(addId())?.proxy).toEqual({ type: "ssh", jumpHostId: "bastion-1" }); // the add landed
-      expect(vault.delete).not.toHaveBeenCalledWith(proxyKey); // orphan KEPT — ssh never sends it
-      expect(await vault.get(proxyKey)).toBe("orphan-pw");
+      // Cleared although nothing sends it today: `syncProxyPasswordSecret` keeps
+      // the stored secret when a hand-set socks5/http proxy names a username and
+      // leaves the password blank, so the orphan would be sent to that proxy.
+      expect(vault.delete).toHaveBeenCalledWith(proxyKey);
+      expect(await vault.get(proxyKey)).toBeUndefined();
+    });
+
+    // -------- #200 (SECURITY) — a server the sync ADDS never inherits a secret
+    // left under its id. Deterministic ids are REUSED: a device that is
+    // delete-pruned and later comes back — Proxmox hands a freed VMID to the next
+    // new guest — is re-added under the id its deleted server had. The prune
+    // removes the record first and deletes its secrets only best-effort
+    // afterwards, so a keyring that refuses the delete, or a window closed before
+    // the cleanup loop runs, leaves `password-`, `passphrase-` and
+    // `proxy-password-{id}` behind for the next server under that id. --------
+    describe("#200 — secrets left under a reused id", () => {
+      const reusedId = deterministicServerId("src-1", "device:1");
+      const leftoverKeys = [passwordSecretKey(reusedId), passphraseSecretKey(reusedId), proxyPasswordSecretKey(reusedId)];
+
+      function deviceAt(host: string): InventoryTree {
+        return { contractVersion: 1, devices: [{ externalId: "device:1", name: "vm-101", endpoints: [{ kind: "ssh", host, port: 22 }] }] };
+      }
+
+      /**
+       * A vault whose deletes of `leftoverKeys` reject while `locked` is set — the
+       * keyring error that strands the prune's best-effort cleanup.
+       */
+      function lockableVault(initial: Record<string, string>) {
+        const store = new Map(Object.entries(initial));
+        const state = { locked: false };
+        const vault = {
+          get: vi.fn(async (key: string) => store.get(key)),
+          store: vi.fn(async (key: string, value: string) => {
+            store.set(key, value);
+          }),
+          delete: vi.fn(async (key: string) => {
+            if (state.locked && leftoverKeys.includes(key)) throw new Error("keyring locked");
+            store.delete(key);
+          })
+        };
+        return { vault, state };
+      }
+
+      /**
+       * Sync 1 delete-prunes device:1's password-auth server while the keyring
+       * refuses to delete its secrets; sync 2 brings device:1 back at `reAddHost`.
+       * `lockedOnReAdd` keeps the keyring refusing through sync 2.
+       */
+      async function pruneWithFailedDeleteThenReAdd(reAddHost: string, lockedOnReAdd = false) {
+        const pruned = makeServer({
+          id: reusedId,
+          name: "vm-101",
+          host: "10.0.0.1",
+          authType: "password",
+          origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+        });
+        const core = new NexusCore(new InMemoryConfigRepository([pruned]));
+        await core.initialize();
+        let tree: InventoryTree = { contractVersion: 1, devices: [] }; // device gone → delete-prune
+        const registry = new InventoryProviderRegistry();
+        registry.register(makeProvider({ fetchInventory: vi.fn(async () => tree) }));
+        const { vault, state } = lockableVault({
+          [passwordSecretKey(reusedId)]: "old-pw",
+          [passphraseSecretKey(reusedId)]: "old-pp",
+          [proxyPasswordSecretKey(reusedId)]: "old-proxy-pw",
+          [inventorySecretKey("src-1", "apiToken")]: "tok"
+        });
+        registerInventoryCommands(core, registry, vault, makeTeardown());
+        await core.addOrUpdateInventorySource(makeSource({ prunePolicy: "delete" }));
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+        state.locked = true;
+        mockShowInformationMessage.mockResolvedValueOnce("Apply");
+        await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+        // The precondition this issue is about: the record is gone, its secrets are not.
+        expect(core.getServer(reusedId)).toBeUndefined();
+        for (const key of leftoverKeys) {
+          expect(await vault.get(key)).toBeDefined();
+        }
+
+        state.locked = lockedOnReAdd;
+        tree = deviceAt(reAddHost);
+        mockShowInformationMessage.mockResolvedValueOnce("Apply");
+        const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+        await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+        warn.mockRestore();
+        return { core, vault, applySpy };
+      }
+
+      const connection = { dispose: vi.fn() } as unknown as SshConnection;
+
+      it("a device re-added at a NEW host under the id of a server whose secrets the prune failed to delete gets none of them: connecting with password auth prompts instead of sending the old password, and key auth does not unlock the key with the old passphrase (kills leaving adds unscanned, and kills clearing only an add's proxy password, or only its password)", async () => {
+        const { core, vault } = await pruneWithFailedDeleteThenReAdd("10.0.0.99");
+
+        const added = core.getServer(reusedId)!;
+        expect(added.host).toBe("10.0.0.99");
+        for (const key of leftoverKeys) {
+          expect(await vault.get(key)).toBeUndefined();
+        }
+
+        // What the leftovers would have done. A sync adds an agent-auth record;
+        // the user switches it to password or key auth by hand, and connect reads
+        // the server's own keys by id. `ProxySshFactory` reads
+        // `proxy-password-{id}` the same way (pinned in proxySshFactory.test.ts),
+        // so the vault assertion above is that half of the check.
+        const connector = { connect: vi.fn<SshConnector["connect"]>(async () => connection) };
+        const prompt = { prompt: vi.fn(async () => ({ password: "typed-pw", save: false })) };
+        const auth = new SilentAuthSshFactory(connector, vault, prompt);
+
+        await auth.connect({ ...added, authType: "password" });
+        expect(prompt.prompt).toHaveBeenCalledTimes(1);
+        expect(connector.connect).toHaveBeenCalledTimes(1);
+        expect(connector.connect.mock.calls[0][1]).toMatchObject({ password: "typed-pw" });
+
+        await auth.connect({ ...added, authType: "key", keyPath: "/keys/id_ed25519" });
+        expect(connector.connect).toHaveBeenCalledTimes(2);
+        expect(connector.connect.mock.calls[1][1]).not.toHaveProperty("passphrase");
+      });
+
+      it("a device re-added at the SAME host is cleared too — fail closed: an id and an address prove nothing about which machine the password was typed for, since a reused VMID can come back on the same DHCP lease (kills keeping a leftover when the endpoint is unchanged, the rule #175 applies to Replace import)", async () => {
+        const { core, vault } = await pruneWithFailedDeleteThenReAdd("10.0.0.1");
+
+        expect(core.getServer(reusedId)?.host).toBe("10.0.0.1");
+        for (const key of leftoverKeys) {
+          expect(await vault.get(key)).toBeUndefined();
+        }
+      });
+
+      it("a leftover that cannot be deleted blocks the add — the sync aborts before applying and says why, rather than publishing a server that would pick the secret up (kills a best-effort add-time clear)", async () => {
+        const { core, vault, applySpy } = await pruneWithFailedDeleteThenReAdd("10.0.0.99", true);
+
+        expect(applySpy).not.toHaveBeenCalled();
+        expect(core.getServer(reusedId)).toBeUndefined();
+        expect(await vault.get(passwordSecretKey(reusedId))).toBe("old-pw");
+        expect(mockShowErrorMessage).toHaveBeenCalledWith(
+          "Inventory sync failed: Could not clear old saved credentials for a server this sync adds from the system keychain — nothing was applied, try again."
+        );
+      });
+
+      it("a first add with nothing under its id is published as before, and neither a password auth profile it links nor another server loses a saved secret (kills clearing the credential key connect resolves for the add instead of the add's own keys — for a linked password profile that key is the profile's, shared by every server linked to it)", async () => {
+        const other = makeServer({ id: "hand-1", name: "bastion", host: "10.0.0.9", authType: "password" });
+        const core = new NexusCore(new InMemoryConfigRepository([other]));
+        await core.initialize();
+        await core.addOrUpdateAuthProfile({ id: "p1", name: "Fleet", username: "ops", authType: "password" });
+        const registry = new InventoryProviderRegistry();
+        registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceAt("10.0.0.99")) }));
+        const vault = makeVault({
+          [authProfilePasswordSecretKey("p1")]: "fleet-pw",
+          [passwordSecretKey("hand-1")]: "bastion-pw",
+          [inventorySecretKey("src-1", "apiToken")]: "tok"
+        });
+        registerInventoryCommands(core, registry, vault, makeTeardown());
+        await core.addOrUpdateInventorySource(makeSource({ authProfileId: "p1" }));
+
+        mockShowInformationMessage.mockResolvedValueOnce("Apply");
+        await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+        expect(core.getServer(reusedId)?.authProfileId).toBe("p1");
+        expect(mockShowErrorMessage).not.toHaveBeenCalled();
+        expect(await vault.get(authProfilePasswordSecretKey("p1"))).toBe("fleet-pw");
+        expect(await vault.get(passwordSecretKey("hand-1"))).toBe("bastion-pw");
+        expect(vault.delete).not.toHaveBeenCalledWith(authProfilePasswordSecretKey("p1"));
+        expect(vault.store).not.toHaveBeenCalled();
+      });
+
+      it("an UPDATE keeps the record's own secrets — a device that moved to a new address is still the server the user saved them for (kills clearing on every server the plan writes, and kills clearing whenever the host changes)", async () => {
+        const owned = makeServer({
+          id: reusedId,
+          name: "vm-101",
+          host: "10.0.0.1",
+          authType: "password",
+          origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1 }
+        });
+        const core = new NexusCore(new InMemoryConfigRepository([owned]));
+        await core.initialize();
+        const registry = new InventoryProviderRegistry();
+        registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceAt("10.0.0.99")) }));
+        const vault = makeVault({
+          [passwordSecretKey(reusedId)]: "pw",
+          [passphraseSecretKey(reusedId)]: "pp",
+          [proxyPasswordSecretKey(reusedId)]: "proxy-pw",
+          [inventorySecretKey("src-1", "apiToken")]: "tok"
+        });
+        registerInventoryCommands(core, registry, vault, makeTeardown());
+        await core.addOrUpdateInventorySource(makeSource());
+
+        mockShowInformationMessage.mockResolvedValueOnce("Apply");
+        await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+        expect(core.getServer(reusedId)?.host).toBe("10.0.0.99");
+        expect(await vault.get(passwordSecretKey(reusedId))).toBe("pw");
+        expect(await vault.get(passphraseSecretKey(reusedId))).toBe("pp");
+        expect(await vault.get(proxyPasswordSecretKey(reusedId))).toBe("proxy-pw");
+      });
     });
 
     it("(ITEM B) a rack rename that empties its old folder appends the empty-folder count to the completion toast", async () => {
@@ -6570,8 +6772,10 @@ describe("inventoryCommands", () => {
          * its edit inside that window on every run rather than usually racing it.
          */
         onSecretRead?: () => void | Promise<void>;
+        /** #200 — secrets saved before the sync, beside each source's API token. */
+        secrets?: Record<string, string>;
       } = {}
-    ): Promise<{ core: NexusCore }> {
+    ): Promise<{ core: NexusCore; vault: ReturnType<typeof makeVault> }> {
       const core = new NexusCore(new InMemoryConfigRepository(options.servers ?? [keptServer()]));
       await core.initialize();
       for (const profile of options.profiles ?? []) {
@@ -6585,7 +6789,10 @@ describe("inventoryCommands", () => {
         })
       );
       const sources = options.sources ?? [{}];
-      const vault = makeVault(Object.fromEntries(sources.map((s) => [inventorySecretKey(s.id ?? "src-1", "apiToken"), "tok"])));
+      const vault = makeVault({
+        ...Object.fromEntries(sources.map((s) => [inventorySecretKey(s.id ?? "src-1", "apiToken"), "tok"])),
+        ...options.secrets
+      });
       if (options.onSecretRead) {
         const hook = options.onSecretRead;
         const inner = vault.get;
@@ -6598,7 +6805,7 @@ describe("inventoryCommands", () => {
       for (const overrides of sources) {
         await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["apiToken"], ...overrides }));
       }
-      return { core };
+      return { core, vault };
     }
 
     // Several tests below deliberately queue an answer the GUARDED run never
@@ -7310,6 +7517,25 @@ describe("inventoryCommands", () => {
       expect(servers[0].username).toBe("handpicked");
       expect(servers[0].formerlySynced).toBeUndefined();
       expect(applySpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("#200 — an adoption is not an add: a kept server that holds the add path's own id (the restored ID-preserving backup) keeps its saved password, passphrase and proxy password when it is adopted (kills clearing the secrets of every server a sync newly links to its source, and kills clearing by the add path's id rather than by the plan's adds)", async () => {
+      const { core, vault } = await harness({
+        servers: [keptServer({ id: ADD_PATH_ID })],
+        secrets: {
+          [passwordSecretKey(ADD_PATH_ID)]: "pw",
+          [passphraseSecretKey(ADD_PATH_ID)]: "pp",
+          [proxyPasswordSecretKey(ADD_PATH_ID)]: "proxy-pw"
+        }
+      });
+
+      mockShowInformationMessage.mockResolvedValueOnce("Adopt Existing").mockResolvedValueOnce("Apply");
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(core.getServer(ADD_PATH_ID)?.origin?.sourceId).toBe("src-1");
+      expect(await vault.get(passwordSecretKey(ADD_PATH_ID))).toBe("pw");
+      expect(await vault.get(passphraseSecretKey(ADD_PATH_ID))).toBe("pp");
+      expect(await vault.get(proxyPasswordSecretKey(ADD_PATH_ID))).toBe("proxy-pw");
     });
 
     // REVIEW FINDING (P2, "avoid promising a separate add when the ID is
