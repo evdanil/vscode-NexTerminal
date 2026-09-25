@@ -1515,7 +1515,10 @@ async function fetchInventoryImpl(
   // that it cannot grow: it is that a clear is always SAFE to apply and
   // cheap to carry — a bare id, asserting only that a row the sync observed
   // has no state — so dropping one past a cap would cost a stale decoration
-  // while keeping it costs a string. A missing STATUS entry is the opposite:
+  // while keeping it costs a string. Its ceiling is `rows.length` — the
+  // listing `fetchResources` already holds whole at ~10x the bytes per row —
+  // so a cap here could not move the sync's peak by more than a few percent
+  // (#128). A missing STATUS entry is the opposite:
   // it makes the report partial, which is exactly what the cap is for. (The
   // poll counts its clears against the same budget as its statuses; the sync
   // does not. See the doc note in §4.12.8.)

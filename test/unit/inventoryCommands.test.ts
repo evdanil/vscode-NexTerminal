@@ -11121,6 +11121,55 @@ describe("nexus.inventory.syncNow — the sync applies the fetched lab status", 
     expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped"); // retained, not cleared
   });
 
+  /**
+   * #128 — NO STAGE BETWEEN THE PROVIDER AND THE TREE BUDGETS THE CLEARS. The
+   * provider's clear list is bounded by its listing, not by a cap (pinned in
+   * proxmoxProvider.test.ts); a budget added one layer later — the validator,
+   * this command's hand-over, or `applyInventoryStatus`'s clear pass — would be
+   * the same net-negative trade: each dropped clear leaves a converted
+   * template's stale 'running', and the Start/Stop menu it lights, standing on
+   * a MERGING report with nothing on screen saying so. 10,001 is one past every
+   * built-in provider's default cap, the constant a downstream budget would
+   * reach for, and the report is handed over by a real sync, so all three
+   * stages sit between the fetch and the assertion.
+   */
+  it("#128: a TRUNCATED sync report clearing 10,001 servers — one past every provider's default cap — clears EVERY one through validation, hand-over and apply, while a merely-absent server keeps its state (⊘ a budget at any stage after the provider — a validator that slices or rejects the list, a hand-over that trims it, or a clear pass that stops early — leaves the servers past it with a stale 'running' and its Start/Stop menu on every merging sync)", async () => {
+    const count = 10_001;
+    const vmids = Array.from({ length: count }, (_, i) => String(1000 + i));
+    // Converted to templates since the last sync: a truncated sync (so nothing
+    // is pruned and the report MERGES) that reports no state and clears every vmid.
+    const { core, sync } = await makeWorld({
+      contractVersion: 1,
+      truncated: true,
+      devices: [],
+      status: { contractVersion: 1, truncated: true, statuses: {}, clearedExternalIds: vmids }
+    });
+    // Seeded directly rather than by a first sync of 10,002 devices, which
+    // would cost the suite seconds and exercise nothing this test is about:
+    // servers this source owns, every one decorated running.
+    const owned = (externalId: string, i: number) =>
+      makeServer({
+        id: deterministicServerId("src-1", externalId),
+        name: `vm-${externalId}`,
+        host: `10.1.${i >> 8}.${i & 255}`,
+        origin: { sourceId: "src-1", externalId, syncedAt: 1 }
+      });
+    await core.addServersBatch([...vmids, "dev#keep"].map(owned));
+    core.applyInventoryStatus("src-1", {
+      contractVersion: 1,
+      statuses: Object.fromEntries([...vmids, "dev#keep"].map((id) => [id, { state: "running" as const }]))
+    });
+    expect(core.getSnapshot().serverStatus.size).toBe(count + 1);
+
+    await sync("src-1");
+
+    const snap = core.getSnapshot();
+    expect(snap.servers).toHaveLength(count + 1); // the truncated plan pruned nothing
+    expect(snap.serverStatus.has(deterministicServerId("src-1", vmids[count - 1]))).toBe(false); // the last clear landed
+    expect(snap.serverStatus.get(deterministicServerId("src-1", "dev#keep"))).toBe("running"); // absent ⇒ retained
+    expect(snap.serverStatus.size).toBe(1); // ...and it is the only entry left
+  });
+
   it("a COMPLETE report CLEARS first: a node the source stopped reporting drops out of the status map instead of lingering (⊘ merging unconditionally leaves a vanished node's state painted on a server the sync deliberately kept)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();
