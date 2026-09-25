@@ -7,12 +7,16 @@ import type { NexusCore } from "../../core/nexusCore";
  * finish on their already-open transport.
  */
 export function watchSshPoolServerRemovals(
-  core: Pick<NexusCore, "getSnapshot" | "onDidChange">,
+  core: Pick<NexusCore, "getSnapshot" | "onDidChange" | "onDidRemoveServer">,
   pool: { invalidate(serverId: string): void }
 ): () => void {
   let previousIds = new Set(core.getSnapshot().servers.map((server) => server.id));
 
-  return core.onDidChange((snapshot) => {
+  const unsubscribeRemoval = core.onDidRemoveServer((serverId) => {
+    previousIds.delete(serverId);
+    pool.invalidate(serverId);
+  });
+  const unsubscribeChange = core.onDidChange((snapshot) => {
     const currentIds = new Set(snapshot.servers.map((server) => server.id));
     for (const serverId of previousIds) {
       if (!currentIds.has(serverId)) {
@@ -21,4 +25,9 @@ export function watchSshPoolServerRemovals(
     }
     previousIds = currentIds;
   });
+
+  return () => {
+    unsubscribeRemoval();
+    unsubscribeChange();
+  };
 }

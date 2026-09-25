@@ -55,6 +55,7 @@ import type { ConfigRepository, SessionSnapshot } from "./contracts";
 import { normalizeFolderPath, isDescendantOrSelf, parentPath, folderDisplayName, getAncestorPaths } from "../utils/folderPaths";
 
 type NexusListener = (snapshot: SessionSnapshot) => void;
+type ServerRemovalListener = (serverId: string) => void;
 
 /**
  * Result of a sync engine run (see services/inventory/syncEngine.ts), reduced
@@ -143,6 +144,7 @@ export class FolderCascadeSaveError extends Error {
 
 export class NexusCore {
   private readonly listeners = new Set<NexusListener>();
+  private readonly serverRemovalListeners = new Set<ServerRemovalListener>();
   private readonly servers = new Map<string, ServerConfig>();
   private readonly tunnels = new Map<string, TunnelProfile>();
   private readonly serialProfiles = new Map<string, SerialProfile>();
@@ -318,6 +320,16 @@ export class NexusCore {
   public onDidChange(listener: NexusListener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  /**
+   * Observes a server row leaving live in-memory state. `removeServer` and
+   * folder deletion fire this synchronously before their fallible persistence;
+   * those mutations are not rolled back when a repository write rejects.
+   */
+  public onDidRemoveServer(listener: ServerRemovalListener): () => void {
+    this.serverRemovalListeners.add(listener);
+    return () => this.serverRemovalListeners.delete(listener);
   }
 
   public getServer(id: string): ServerConfig | undefined {
@@ -2314,7 +2326,9 @@ export class NexusCore {
   }
 
   public async removeServer(serverId: string): Promise<void> {
-    this.servers.delete(serverId);
+    if (this.servers.delete(serverId)) {
+      this.emitServerRemoved(serverId);
+    }
     // LIVE STATUS (Phase 2) — drop any runtime status keyed to the deleted server.
     this.dropServerStatusEntry(serverId);
     // DEPENDENT-LINK SWEEP (issue #48 PR-C, PR #65 Codex round 9, extracted to
@@ -2976,6 +2990,7 @@ export class NexusCore {
       for (const [id, server] of this.servers.entries()) {
         if (server.group && isDescendantOrSelf(server.group, path)) {
           this.servers.delete(id);
+          this.emitServerRemoved(id);
           // LIVE STATUS — dropped as removeServer drops it; otherwise a server
           // re-created under this id (a re-synced node) shows the old state.
           this.dropServerStatusEntry(id);
@@ -3178,6 +3193,16 @@ export class NexusCore {
         listener(snapshot);
       } catch (error) {
         console.error("[Nexus] NexusCore onDidChange listener threw; the change was persisted and other listeners still run:", error);
+      }
+    }
+  }
+
+  private emitServerRemoved(serverId: string): void {
+    for (const listener of this.serverRemovalListeners) {
+      try {
+        listener(serverId);
+      } catch (error) {
+        console.error("[Nexus] NexusCore onDidRemoveServer listener threw; server removal continues and other listeners still run:", error);
       }
     }
   }

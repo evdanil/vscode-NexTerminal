@@ -1258,6 +1258,273 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
     }
   });
 
+  it("does not read or send a restored target password through a pre-Replace jump handshake", async () => {
+    const dest = await makeMachine();
+    const oldJump = makeServer({
+      id: "jump-1",
+      name: "Bastion",
+      host: "bastion.example",
+      authType: "key",
+      keyPath: "/keys/bastion"
+    });
+    const oldTarget = makeServer({
+      id: "srv-1",
+      name: "Router",
+      host: "10.0.0.1",
+      username: "target-user",
+      authType: "password",
+      proxy: { type: "ssh", jumpHostId: oldJump.id }
+    });
+    await dest.core.addOrUpdateServer(oldJump);
+    await dest.core.addOrUpdateServer(oldTarget);
+    await dest.vault.store("password-srv-1", "old-route-secret");
+
+    const replacement = await makeMachine();
+    const newJump = { ...oldJump };
+    const newTarget = { ...oldTarget };
+    await replacement.core.addOrUpdateServer(newJump);
+    await replacement.core.addOrUpdateServer(newTarget);
+    await replacement.vault.store("password-srv-1", "backup-new-route-secret");
+    const backup = await exportBackup(replacement);
+
+    let releaseOldBastionHandshake!: () => void;
+    const oldBastionHandshakeGate = new Promise<void>((resolve) => {
+      releaseOldBastionHandshake = resolve;
+    });
+    let signalOldBastionHandshakeStarted!: () => void;
+    const oldBastionHandshakeStarted = new Promise<void>((resolve) => {
+      signalOldBastionHandshakeStarted = resolve;
+    });
+    let nextConnectionId = 0;
+    const tunnelOwners = new WeakMap<object, number>();
+    const connections: Array<SshConnection & { id: number; serverId: string; host: string; disposed: boolean }> = [];
+    const connectorCalls: Array<{
+      serverId: string;
+      host: string;
+      password: string | undefined;
+      tunnelOwner: number | undefined;
+    }> = [];
+    const connector: SshConnector = {
+      connect: async (server, auth) => {
+        connectorCalls.push({
+          serverId: server.id,
+          host: server.host,
+          password: auth.password,
+          tunnelOwner: auth.sock ? tunnelOwners.get(auth.sock) : undefined
+        });
+        if (server.id === oldJump.id && server.host === oldJump.host && connections.length === 0) {
+          signalOldBastionHandshakeStarted();
+          await oldBastionHandshakeGate;
+        }
+        let connection!: SshConnection & { id: number; serverId: string; host: string; disposed: boolean };
+        connection = {
+          id: ++nextConnectionId,
+          serverId: server.id,
+          host: server.host,
+          disposed: false,
+          openDirectTcp: async () => {
+            const socket = new PassThrough();
+            tunnelOwners.set(socket, connection.id);
+            return socket;
+          },
+          onClose: () => () => undefined,
+          dispose: () => { connection.disposed = true; },
+          getBanner: () => undefined
+        } as unknown as SshConnection & { id: number; serverId: string; host: string; disposed: boolean };
+        connections.push(connection);
+        return connection;
+      }
+    };
+    const targetPasswordReads: string[] = [];
+    const authVault: SecretVault = {
+      get: async (key) => {
+        if (key === "password-srv-1") targetPasswordReads.push(key);
+        return dest.vault.get(key);
+      },
+      store: async (key, value) => dest.vault.store(key, value),
+      delete: async (key) => dest.vault.delete(key)
+    };
+    const authFactory = new SilentAuthSshFactory(
+      connector,
+      authVault,
+      { prompt: async () => undefined },
+      undefined,
+      undefined,
+      (id) => dest.core.getServer(id)
+    );
+    const proxyFactory = new ProxySshFactory(authFactory, (id) => dest.core.getServer(id), authVault);
+    const pool = new SshConnectionPool(proxyFactory, { enabled: true, idleTimeoutMs: 0 });
+    proxyFactory.setJumpHostConnectionFactory(pool);
+    const unsubscribeRemovedServerPoolEntries = watchSshPoolServerRemovals(dest.core, pool);
+
+    let staleTargetAttempt: Promise<SshConnection> | undefined;
+    let freshTargetConnection: SshConnection | undefined;
+    try {
+      staleTargetAttempt = proxyFactory.connectWithContext(oldTarget);
+      await oldBastionHandshakeStarted;
+
+      await runImport(dest, backup, "replace");
+      expect(dest.core.getServer(oldTarget.id)).toEqual(oldTarget);
+      expect(await dest.vault.get("password-srv-1")).toBe("backup-new-route-secret");
+
+      releaseOldBastionHandshake();
+      const staleAttemptResult = await staleTargetAttempt.then(() => "resolved", () => "rejected");
+      expect({
+        targetPasswordReads,
+        staleTargetCalls: connectorCalls.filter((call) => call.serverId === oldTarget.id),
+        staleAttemptResult
+      }).toEqual({ targetPasswordReads: [], staleTargetCalls: [], staleAttemptResult: "rejected" });
+
+      freshTargetConnection = await proxyFactory.connectWithContext(dest.core.getServer(oldTarget.id)!);
+      const targetCall = connectorCalls.find((call) => call.serverId === oldTarget.id);
+      const freshJumpConnection = connections.find((connection) => connection.id === targetCall?.tunnelOwner);
+      expect(targetCall?.password).toBe("backup-new-route-secret");
+      expect(freshJumpConnection?.host).toBe("bastion.example");
+      expect(freshJumpConnection?.id).not.toBe(connections.find((connection) => connection.serverId === oldJump.id)?.id);
+    } finally {
+      releaseOldBastionHandshake();
+      if (staleTargetAttempt) await staleTargetAttempt.catch(() => undefined);
+      unsubscribeRemovedServerPoolEntries();
+      freshTargetConnection?.dispose();
+      pool.dispose();
+    }
+  });
+
+  it("rechecks target identity after an async vault read before sending a saved password", async () => {
+    const dest = await makeMachine();
+    const oldTarget = makeServer({ id: "srv-1", host: "10.0.0.1", authType: "password" });
+    await dest.core.addOrUpdateServer(oldTarget);
+    await dest.vault.store("password-srv-1", "old-target-secret");
+
+    const replacement = await makeMachine();
+    const newTarget = { ...oldTarget };
+    await replacement.core.addOrUpdateServer(newTarget);
+    await replacement.vault.store("password-srv-1", "backup-new-target-secret");
+    const backup = await exportBackup(replacement);
+
+    let releasePasswordRead!: () => void;
+    const passwordReadGate = new Promise<void>((resolve) => {
+      releasePasswordRead = resolve;
+    });
+    let signalPasswordRead!: () => void;
+    const passwordReadStarted = new Promise<void>((resolve) => {
+      signalPasswordRead = resolve;
+    });
+    const targetPasswordReads: string[] = [];
+    const authVault: SecretVault = {
+      get: async (key) => {
+        if (key === "password-srv-1") {
+          targetPasswordReads.push(key);
+          signalPasswordRead();
+          await passwordReadGate;
+        }
+        return dest.vault.get(key);
+      },
+      store: async (key, value) => dest.vault.store(key, value),
+      delete: async (key) => dest.vault.delete(key)
+    };
+    const connectorCalls: Array<{ serverId: string; password: string | undefined }> = [];
+    const connector: SshConnector = {
+      connect: async (server, auth) => {
+        connectorCalls.push({ serverId: server.id, password: auth.password });
+        return {
+          dispose: () => undefined,
+          onClose: () => () => undefined,
+          getBanner: () => undefined
+        } as unknown as SshConnection;
+      }
+    };
+    const authFactory = new SilentAuthSshFactory(
+      connector,
+      authVault,
+      { prompt: async () => undefined },
+      undefined,
+      undefined,
+      (id) => dest.core.getServer(id)
+    );
+    const proxyFactory = new ProxySshFactory(authFactory, (id) => dest.core.getServer(id), authVault);
+
+    let staleAttempt: Promise<SshConnection> | undefined;
+    try {
+      staleAttempt = proxyFactory.connectWithContext(oldTarget);
+      await passwordReadStarted;
+      await runImport(dest, backup, "replace");
+      expect(dest.core.getServer(oldTarget.id)).toEqual(oldTarget);
+      expect(await dest.vault.get("password-srv-1")).toBe("backup-new-target-secret");
+
+      releasePasswordRead();
+      const staleAttemptResult = await staleAttempt.then(() => "resolved", () => "rejected");
+      expect({
+        connectorCalls,
+        staleAttemptResult
+      }).toEqual({ connectorCalls: [], staleAttemptResult: "rejected" });
+    } finally {
+      releasePasswordRead();
+      if (staleAttempt) await staleAttempt.catch(() => undefined);
+    }
+  });
+
+  it("rechecks target identity after an async password prompt before sending its answer", async () => {
+    const dest = await makeMachine();
+    const oldTarget = makeServer({ id: "srv-1", host: "10.0.0.1", authType: "password" });
+    await dest.core.addOrUpdateServer(oldTarget);
+
+    const replacement = await makeMachine();
+    const newTarget = { ...oldTarget };
+    await replacement.core.addOrUpdateServer(newTarget);
+    const backup = await exportBackup(replacement);
+
+    let releasePrompt!: () => void;
+    const promptGate = new Promise<void>((resolve) => {
+      releasePrompt = resolve;
+    });
+    let signalPrompt!: () => void;
+    const promptStarted = new Promise<void>((resolve) => {
+      signalPrompt = resolve;
+    });
+    const connectorCalls: Array<{ serverId: string; password: string | undefined }> = [];
+    const connector: SshConnector = {
+      connect: async (server, auth) => {
+        connectorCalls.push({ serverId: server.id, password: auth.password });
+        return {
+          dispose: () => undefined,
+          onClose: () => () => undefined,
+          getBanner: () => undefined
+        } as unknown as SshConnection;
+      }
+    };
+    const authFactory = new SilentAuthSshFactory(
+      connector,
+      dest.vault,
+      {
+        prompt: async () => {
+          signalPrompt();
+          await promptGate;
+          return { password: "stale-prompt-answer", save: false };
+        }
+      },
+      undefined,
+      undefined,
+      (id) => dest.core.getServer(id)
+    );
+    const proxyFactory = new ProxySshFactory(authFactory, (id) => dest.core.getServer(id), dest.vault);
+
+    let staleAttempt: Promise<SshConnection> | undefined;
+    try {
+      staleAttempt = proxyFactory.connectWithContext(oldTarget);
+      await promptStarted;
+      await runImport(dest, backup, "replace");
+      expect(dest.core.getServer(oldTarget.id)).toEqual(oldTarget);
+
+      releasePrompt();
+      const staleAttemptResult = await staleAttempt.then(() => "resolved", () => "rejected");
+      expect({ connectorCalls, staleAttemptResult }).toEqual({ connectorCalls: [], staleAttemptResult: "rejected" });
+    } finally {
+      releasePrompt();
+      if (staleAttempt) await staleAttempt.catch(() => undefined);
+    }
+  });
+
   it("a removed server retires its idle pooled connection before the same id is added again", async () => {
     const machine = await makeMachine();
     const server = makeServer({ id: "jump-1", name: "Bastion" });
@@ -1292,6 +1559,50 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
       expect(connections).toHaveLength(2);
       expect(connections[1]?.disposed).toBe(false);
       freshLease.dispose();
+    } finally {
+      unsubscribeRemovedServerPoolEntries();
+      pool.dispose();
+    }
+  });
+
+  it("retires a pooled server when removeServer deletes it but persistence rejects", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+    const server = makeServer({ id: "jump-1", name: "Bastion" });
+    await core.addOrUpdateServer(server);
+
+    const connections: Array<{ disposed: boolean }> = [];
+    const factory = {
+      connect: async () => {
+        const connection = {
+          disposed: false,
+          onClose: () => () => undefined,
+          dispose: () => { connection.disposed = true; },
+          getBanner: () => undefined
+        } as unknown as SshConnection & { disposed: boolean };
+        connections.push(connection);
+        return connection;
+      }
+    };
+    const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
+    const unsubscribeRemovedServerPoolEntries = watchSshPoolServerRemovals(core, pool);
+
+    try {
+      const firstLease = await pool.connect(server);
+      firstLease.dispose();
+      expect(connections[0]?.disposed).toBe(false);
+
+      vi.spyOn(repository, "saveServers").mockRejectedValueOnce(new Error("server write failed"));
+      await expect(core.removeServer(server.id)).rejects.toThrow("server write failed");
+      expect(core.getServer(server.id)).toBeUndefined();
+      expect(connections[0]?.disposed).toBe(true);
+
+      await core.addOrUpdateServer(server);
+      const replacementLease = await pool.connect(server);
+      expect(connections).toHaveLength(2);
+      expect(connections[1]?.disposed).toBe(false);
+      replacementLease.dispose();
     } finally {
       unsubscribeRemovedServerPoolEntries();
       pool.dispose();

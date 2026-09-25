@@ -144,9 +144,10 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     context?: SshConnectContext
   ): Promise<SshConnection> {
     // `server` may be a host-only alternate-address clone. Capture identity
-    // from the live record at the start, while deriving the endpoint signature
-    // from the original source config so a successful fallback may save its
-    // credential without weakening stale-record protection.
+    // from the live source record at the start and derive its endpoint
+    // signature from the original config. SilentAuth checks both before using
+    // credentials and before persisting them, so a replacement during any
+    // jump-host or alternate-address await cannot inherit this attempt's auth.
     const credentialSource = context?.credentialSource ?? server;
     const credentialRecord = this.serverLookup(credentialSource.id) ?? null;
     const credentialEndpointSignature = this.authFactory.getCredentialEndpointSignature?.(credentialSource, this.serverLookup);
