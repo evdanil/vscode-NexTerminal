@@ -2237,7 +2237,8 @@ describe("SSH File Explorer auto-open on manual connect", () => {
     expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexusFileExplorer.focus");
     expect(ctx.scriptRuntimeManager.runScript).toHaveBeenCalledWith(
       expect.objectContaining({ fsPath: "/workspace/.nexus/scripts/task.js" }),
-      "script-session-1"
+      "script-session-1",
+      expect.objectContaining({ subscription: expect.anything() })
     );
   });
 
@@ -4669,6 +4670,53 @@ describe("telnet connect path", () => {
         terminalName: "Nexus Telnet: Server 1"
       })
     );
+  });
+
+  // #166 — runScript reads the script file before it could watch the output
+  // itself, and a Telnet device prints its login prompt the moment the
+  // connection is up. Connect and Run Script… keeps the output from the
+  // registration on, and hands it to the run.
+  it("Connect and Run Script… hands the run what the device printed as the session registered (#166)", async () => {
+    // ⊘ runScript(uri, id) alone: the "Username:" below lands before the run
+    // watches, and the Wait for prompt then send template stops with "No
+    // login prompt arrived" under the very launch it names as the remedy.
+    // ⊘ keeping it from after an await: the prompt is printed in the same
+    // tick as the registration.
+    const server = makeServer({ protocol: "telnet", username: "", port: 2001 });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    ctx.scriptRuntimeManager = { runScript: vi.fn(async () => undefined) } as any;
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.runWithScript")!("srv-1");
+
+    const callbacks = vi.mocked(TelnetPty).mock.calls[0][1] as unknown as {
+      onSessionOpened(sessionId: string): void;
+    };
+    const attachedBefore = mockAddOutputObserver.mock.calls.length;
+    callbacks.onSessionOpened("telnet-session-1");
+    for (const [observer] of mockAddOutputObserver.mock.calls.slice(attachedBefore)) {
+      (observer as { onOutput(text: string): void }).onOutput("\r\n\r\nUser Access Verification\r\n\r\nUsername: ");
+    }
+
+    const [, sessionId, capture] = vi.mocked(ctx.scriptRuntimeManager!.runScript).mock.calls[0] as unknown as [
+      unknown,
+      string,
+      { buffer: { scan(p: RegExp): { text: string } | null } } | undefined
+    ];
+    expect(sessionId).toBe("telnet-session-1");
+    expect(capture?.buffer.scan(/(?:login|username|password):\s*$/i)?.text).toBe("Username: ");
+  });
+
+  it("a plain Connect keeps no output for a script (#166)", async () => {
+    // ⊘ capturing at every session's registration: each session would carry
+    // a 64 KiB buffer, and a later Quick Run could open on stale output —
+    // only Connect and Run Script… starts a run at the session's start.
+    const { run } = connectTelnet();
+    await run();
+    const callbacks = vi.mocked(TelnetPty).mock.calls[0][1] as unknown as {
+      onSessionOpened(sessionId: string): void;
+    };
+    callbacks.onSessionOpened("telnet-session-1");
+    expect(mockAddOutputObserver).not.toHaveBeenCalled();
   });
 
   it("passes the server's host and port through to the pty", async () => {

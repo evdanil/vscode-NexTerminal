@@ -123,6 +123,25 @@ const outputChannel = {
   name: "Nexus Scripts"
 } as unknown as import("vscode").OutputChannel;
 
+/** The pattern a template's opening `waitFor` waits on, read from its declaration. */
+function firstWaitPattern(body: string): RegExp {
+  const code = body.slice(body.indexOf("*/") + 2);
+  const name = code.match(/\bawait waitFor\((\w+), /)?.[1];
+  expect(name, "the opening waitFor names its pattern").toBeDefined();
+  const decl = body.match(new RegExp(String.raw`^const ${name} = \/([^/\n]+)\/([a-z]*);$`, "m"));
+  expect(decl, `${name} is declared once as a regex literal`).not.toBeNull();
+  return new RegExp(decl![1], decl![2]);
+}
+
+/**
+ * A template whose first prompt can be a password prompt (#166). An Enter
+ * there is not a harmless request for a fresh prompt: it submits an empty
+ * password, a failed login attempt.
+ */
+function opensAtLoginPrompt(template: (typeof SCRIPT_TEMPLATES)[number]): boolean {
+  return firstWaitPattern(template.body).test("Password: ");
+}
+
 describe("scriptCommands", () => {
   beforeEach(() => {
     state.registeredCommands.clear();
@@ -195,9 +214,13 @@ describe("scriptCommands", () => {
       expect(body).toBeDefined();
       expect(body!).toMatch(/@nexus-script/);
       expect(body!).toMatch(/@name wait-send/);
-      expect(body!).toMatch(/const LOGIN = \/login:/);
+      // #166 — a login prompt is real on Telnet; an SSH session never shows one.
+      expect(body!).toMatch(/@target-type telnet/);
+      expect(body!).not.toMatch(/@target-type ssh/);
+      expect(body!).toContain("const LOGIN = /(?:login|username|password):\\s*$/i;");
       expect(body!).toMatch(/await waitFor\(LOGIN\b/);
       expect(body!).toMatch(/await sendLine\("admin"\)/);
+      expect(body!).toMatch(/await prompt\("Password", \{ password: true \}\)/);
     });
 
     it("writes capture-output and backup-running-config templates as valid Nexus scripts", async () => {
@@ -986,14 +1009,15 @@ describe("scriptCommands", () => {
       expect(template.body).not.toMatch(declared);
     });
 
-    it.each(SCRIPT_TEMPLATES.map((t) => [t.label, t] as const))("%s: waits briefly for its first prompt and presses Enter only if none came", (_label, template) => {
+    it.each(SCRIPT_TEMPLATES.filter((t) => !opensAtLoginPrompt(t)).map((t) => [t.label, t] as const))("%s: waits briefly for its first prompt and presses Enter only if none came", (_label, template) => {
       // ⊘ opening with a plain wait: on an idle, already-open terminal the
       // prompt was printed before the run started and never comes again, so
       // the wait times out. ⊘ opening with an unconditional sendLine(""): when
       // the first prompt is still on its way (Connect and Run Script… on SSH)
       // the Enter leaves a spare prompt for a later wait to match too early.
       // ⊘ telling the user to delete the Enter for one launch path: whether the
-      // prompt beats the run there is a race, not a property of the path.
+      // first prompt comes within the short wait depends on the host, not
+      // only on the path.
       // Plain string checks and single-quantifier patterns only: no nested or
       // overlapping repetition (CodeQL js/redos).
       const code = codeAfterHeader(template.body);
@@ -1020,10 +1044,26 @@ describe("scriptCommands", () => {
       expect(PROMPT.test("\r\nRouter#")).toBe(true);
       expect(PROMPT.test("\r\nRouter>")).toBe(true);
       expect(PROMPT.test("\r\nswitch# ")).toBe(true);
-      // Every shell-prompt wait goes through PROMPT; the only other wait is a login prompt.
+      // Every device-prompt wait goes through PROMPT; the only other waits are
+      // a Telnet login's own prompts.
       const waitArgs = [...template.body.matchAll(/\b(?:expect|waitFor)\(([^,)]+)/g)].map((m) => m[1].trim());
       expect(waitArgs.length).toBeGreaterThan(0);
-      for (const arg of waitArgs) expect(arg === "PROMPT" || /login/i.test(arg)).toBe(true);
+      for (const arg of waitArgs) expect(["PROMPT", "LOGIN", "PASSWORD"]).toContain(arg);
+    });
+
+    it("the templates that open at a login prompt are the ones expected", () => {
+      // Guards the Enter-opening sweep above from silently skipping a template.
+      expect(SCRIPT_TEMPLATES.filter(opensAtLoginPrompt).map((t) => t.id)).toEqual(["wait-send"]);
+    });
+
+    it.each(SCRIPT_TEMPLATES.filter(opensAtLoginPrompt).map((t) => [t.label, t] as const))("%s: never presses Enter for a login prompt it has not seen (#166)", (_label, template) => {
+      // ⊘ the Enter opening of the other templates: at a "Password:" prompt
+      // already on screen, an empty line is a failed login attempt.
+      const code = codeAfterHeader(template.body);
+      expect(code).not.toContain('sendLine("")');
+      expect(code).not.toContain("sendLine('')");
+      const firstWaitOrSend = code.search(/\bawait (?:expect|waitFor|waitAny|poll|sendLine|send|sendKey)\(/);
+      expect(firstWaitOrSend).toBe(code.indexOf("await waitFor("));
     });
 
     it("the Cisco sweep covers the templates it should", () => {
@@ -1051,6 +1091,280 @@ describe("scriptCommands", () => {
       const basic = SCRIPT_TEMPLATES.find((t) => t.id === "basic-command")!;
       const headerBlock = basic.body.slice(0, basic.body.indexOf("*/"));
       expect(headerBlock).toContain("@allow-macros");
+    });
+  });
+
+  // #166 — a template's waits must be for output its declared @target-type
+  // actually shows. "Wait for prompt then send" declared ssh and waited for
+  // "login:", which an SSH session — already authenticated when the script
+  // binds to it — never prints, so every run timed out.
+  describe("starter templates run against realistic output for their target type (#166)", () => {
+    // A device model: `first` is what arrives once the session is open (for
+    // SSH, after Nexus has authenticated, so a prompt; for Telnet, the
+    // device's own login prompt); `reply` is what it prints after a line is
+    // sent — the echo, any output, then its next prompt.
+    type Device = { first: string; reply: (line: string) => string };
+    type Family = "shell" | "ios";
+
+    function execReply(promptText: string): (line: string) => string {
+      return (line) => (line === "" ? `\r\n${promptText}` : `${line}\r\noutput of ${line}\r\n${promptText}`);
+    }
+
+    function loggedIn(first: string, promptText: string): () => Device {
+      return () => ({ first: first + promptText, reply: execReply(promptText) });
+    }
+
+    // What the simulated user types into the Password box, and the only
+    // password the password-only line model accepts.
+    const USER_PASSWORD = "s3cret";
+
+    // An IOS vty line with "login" and a line password: no username, only
+    // "Password:". A wrong or empty password is a failed attempt, and IOS
+    // asks again.
+    function linePasswordLogin(banner: string, execPrompt: string): () => Device {
+      return () => {
+        let state: "password" | "exec" = "password";
+        const exec = execReply(execPrompt);
+        return {
+          first: `${banner}Password: `,
+          reply(line) {
+            if (state === "password") {
+              if (line !== USER_PASSWORD) return "\r\nPassword: ";
+              state = "exec";
+              return `\r\n\r\n${execPrompt}`;
+            }
+            return exec(line);
+          }
+        };
+      };
+    }
+
+    function telnetLogin(banner: string, userPrompt: string, execPrompt: string): () => Device {
+      return () => {
+        let state: "user" | "password" | "exec" = "user";
+        const exec = execReply(execPrompt);
+        return {
+          first: banner + userPrompt,
+          reply(line) {
+            if (state === "user") {
+              if (line === "") return `\r\n${userPrompt}`;
+              state = "password";
+              return `${line}\r\nPassword: `;
+            }
+            if (state === "password") {
+              // A password is not echoed; an empty one is a failed login.
+              state = line === "" ? "user" : "exec";
+              return line === "" ? `\r\n% Login invalid\r\n\r\n${userPrompt}` : `\r\n\r\n${execPrompt}`;
+            }
+            return exec(line);
+          }
+        };
+      };
+    }
+
+    // Keyed by @target-type, then by the device family the template's commands
+    // are written for — Cisco-style when it sends "terminal length 0".
+    const DEVICES: Record<string, Partial<Record<Family, Array<[string, () => Device]>>>> = {
+      ssh: {
+        shell: [
+          ["Ubuntu", loggedIn("Welcome to Ubuntu 24.04.1 LTS\r\n\r\nLast login: Thu Sep 25 09:12:44 2026 from 192.0.2.10\r\n", "admin@server:~$ ")],
+          ["RHEL as root", loggedIn("Last login: Thu Sep 25 09:12:44 2026\r\n", "[root@server ~]# ")]
+        ],
+        ios: [
+          ["Cisco IOS XE, privileged", loggedIn("\r\n", "Router#")],
+          ["Cisco IOS XE, user EXEC", loggedIn("\r\n", "Router>")],
+          ["Cisco NX-OS", loggedIn("Cisco Nexus Operating System (NX-OS) Software\r\n", "switch# ")]
+        ]
+      },
+      telnet: {
+        ios: [
+          ["Cisco IOS", telnetLogin("\r\n\r\nUser Access Verification\r\n\r\n", "Username: ", "Router>")],
+          ["Cisco IOS, line password only", linePasswordLogin("\r\n\r\nUser Access Verification\r\n\r\n", "Router>")],
+          ["Arista EOS", telnetLogin("\r\n", "switch login: ", "switch>")]
+        ]
+      }
+    };
+
+    function targetTypeOf(template: (typeof SCRIPT_TEMPLATES)[number]): string {
+      return parseScriptHeader(template.body.replaceAll("{{NAME}}", "probe")).targetType ?? "";
+    }
+
+    function devicesFor(template: (typeof SCRIPT_TEMPLATES)[number]): Array<[string, () => Device]> {
+      const family: Family = template.body.includes("terminal length 0") ? "ios" : "shell";
+      const devices = DEVICES[targetTypeOf(template)]?.[family] ?? [];
+      // A template for a target type or family with no model here fails
+      // until one is added — rather than passing by testing nothing.
+      expect(devices.length, `a realistic ${targetTypeOf(template)} ${family} device model`).toBeGreaterThan(0);
+      return devices;
+    }
+
+    type Launch = "connect" | "idle";
+
+    /**
+     * Runs a template's body against a device model with the script API's
+     * matching rules: a wait scans the output received since the previous
+     * match and consumes through its match; `$` is the end of what has
+     * arrived. Nothing arrives unprompted, so a wait that does not match now
+     * never will — `waitFor` returns null and `expect` throws a Timeout.
+     * "connect" is Connect and Run Script… on a server, whose run holds the
+     * device's output from the moment the session opened, first output
+     * included; "idle" is an already-open terminal, whose prompt was printed
+     * before the run and is never seen. Each reply arrives
+     * whole, so a `$`-anchored PROMPT matching early at a TCP chunk boundary
+     * (a partial line that happens to end in ">" or "#") is not modelled.
+     */
+    async function runTemplate(
+      body: string,
+      device: Device,
+      launch: Launch,
+      password = USER_PASSWORD
+    ): Promise<{ sent: string[]; leftover: string }> {
+      let pending = launch === "connect" ? device.first : "";
+      const sent: string[] = [];
+      const scan = (pattern: RegExp) => {
+        const m = pending.match(pattern);
+        if (!m || m.index === undefined) return null;
+        const match = { text: m[0], groups: m.slice(1).map((g) => g ?? ""), before: pending.slice(0, m.index) };
+        pending = pending.slice(m.index + m[0].length);
+        return match;
+      };
+      const api: Record<string, unknown> = {
+        waitFor: async (pattern: RegExp) => scan(pattern),
+        expect: async (pattern: RegExp) => {
+          const m = scan(pattern);
+          if (!m) throw Object.assign(new Error(`Timeout waiting for ${pattern} in ${JSON.stringify(pending)}`), { code: "Timeout" });
+          return m;
+        },
+        sendLine: async (line: string) => {
+          sent.push(line);
+          pending += device.reply(line);
+        },
+        prompt: async () => password,
+        log: { info: () => {}, warn: () => {}, error: () => {} }
+      };
+      const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor as new (...args: string[]) => (...a: unknown[]) => Promise<void>;
+      await new AsyncFunction(...Object.keys(api), body.replaceAll("{{NAME}}", "probe"))(...Object.values(api));
+      return { sent, leftover: pending };
+    }
+
+    it.each(SCRIPT_TEMPLATES.map((t) => [t.label, t] as const))("%s: its first wait matches what its target type shows first", (_label, template) => {
+      // ⊘ waiting for "login:" on SSH: the session is authenticated before the
+      // script binds, so a login prompt never comes. ⊘ retargeting to Telnet
+      // but keeping /login:/: Cisco IOS asks "Username:".
+      const pattern = firstWaitPattern(template.body);
+      for (const [name, make] of devicesFor(template)) {
+        const device = make();
+        expect(pattern.test(device.first), `${name}: first output`).toBe(true);
+        // On an idle, already-open terminal the opening presses Enter; the
+        // strict wait after it must match what that brings. A login template
+        // never presses it (see "…never presses Enter…").
+        if (!opensAtLoginPrompt(template)) {
+          expect(pattern.test(device.reply("")), `${name}: after Enter`).toBe(true);
+        }
+      }
+    });
+
+    it.each(
+      SCRIPT_TEMPLATES.flatMap((t) =>
+        (opensAtLoginPrompt(t) ? (["connect"] as const) : (["connect", "idle"] as const)).map(
+          (launch) => [t.label, launch, t] as const
+        )
+      )
+    )("%s (%s): runs to completion with no spare prompt left", async (_label, launch, template) => {
+      // ⊘ any wait for output the target type never prints — the run times
+      // out. ⊘ a Telnet login that sends the username and then waits for the
+      // device prompt: the device asks for a password first.
+      for (const [name, make] of devicesFor(template)) {
+        const { sent, leftover } = await runTemplate(template.body, make(), launch).catch((err: Error) => {
+          throw new Error(`${name}: ${err.message}`);
+        });
+        // The opening presses Enter only when no prompt came.
+        expect(sent[0] === "", `${name}: opening Enter`).toBe(launch === "idle");
+        expect(leftover, `${name}: output no wait consumed`).toBe("");
+      }
+    });
+
+    it("Wait for prompt then send: sends a username only to a device that asks for one", async () => {
+      // ⊘ always sending the username: an IOS line with only a line password
+      // asks "Password:" first, and the username goes in as a wrong password
+      // — a failed login attempt. The run itself would still finish, since
+      // IOS asks again, so the lines sent are what show it.
+      const template = SCRIPT_TEMPLATES.find((t) => t.id === "wait-send")!;
+      const models = devicesFor(template);
+      expect(models.some(([, make]) => /password: $/i.test(make().first)), "a password-only model").toBe(true);
+      for (const [name, make] of models) {
+        const device = make();
+        const asksUsername = !/password: $/i.test(device.first);
+        const { sent } = await runTemplate(template.body, device, "connect");
+        expect(sent.slice(0, 2), name).toEqual(asksUsername ? ["admin", USER_PASSWORD] : [USER_PASSWORD, "terminal length 0"]);
+      }
+    });
+
+    it.each(["connect", "idle"] as const)("Wait for prompt then send (%s): never sends an empty line when the password prompt is cancelled", async (launch) => {
+      // ⊘ sendLine(await prompt(…)) unchecked: prompt() resolves "" on cancel,
+      // and an empty password is a failed login attempt on the device.
+      // ⊘ (idle) the Enter opening: on an open terminal at "Password:", the
+      // Enter is itself an empty password, sent before the user is even asked.
+      const template = SCRIPT_TEMPLATES.find((t) => t.id === "wait-send")!;
+      for (const [name, make] of devicesFor(template)) {
+        const device = make();
+        const sentLines: string[] = [];
+        const recording: Device = {
+          first: device.first,
+          reply: (line) => {
+            sentLines.push(line);
+            return device.reply(line);
+          }
+        };
+        await runTemplate(template.body, recording, launch, "").then(
+          () => {
+            throw new Error(`${name}: the run finished without a password`);
+          },
+          (err: { code?: string }) => {
+            // From connect, the cancelled prompt ends the run; from idle, it
+            // ends before any prompt (see the next test).
+            if (launch === "connect") expect(err.code, name).toBe("Cancelled");
+          }
+        );
+        expect(sentLines, name).not.toContain("");
+        if (launch === "connect") {
+          expect(sentLines, name).toEqual(/password: $/i.test(device.first) ? [] : ["admin"]);
+        }
+      }
+    });
+
+    it("Wait for prompt then send (idle): sends nothing to a device it has not heard, and says how to start it", async () => {
+      // ⊘ the Enter opening: on an already-open terminal the visible prompt
+      // predates the run, and at "Password:" (an IOS line with a line
+      // password) the Enter is a failed login attempt — three lock the line.
+      // ⊘ a stop that names no remedy, or one that cannot work: pressing
+      // Enter in the terminal prints a prompt the script, not yet running,
+      // never sees, and is the same failed attempt at "Password:".
+      const template = SCRIPT_TEMPLATES.find((t) => t.id === "wait-send")!;
+      const models = devicesFor(template);
+      expect(models.some(([, make]) => /password: $/i.test(make().first)), "a password-only model").toBe(true);
+      for (const [name, make] of models) {
+        const device = make();
+        const sentLines: string[] = [];
+        const recording: Device = {
+          first: device.first,
+          reply: (line) => {
+            sentLines.push(line);
+            return device.reply(line);
+          }
+        };
+        const err = await runTemplate(template.body, recording, "idle").then(
+          () => undefined,
+          (e: Error & { code?: string }) => e
+        );
+        expect(err, `${name}: the run stops`).toBeInstanceOf(Error);
+        expect(sentLines, name).toEqual([]);
+        expect(err!.message).toContain("Connect and Run Script…");
+        expect(err!.message).not.toMatch(/press Enter/i);
+        // Not an expected code: the failure toast is how the user learns
+        // why nothing happened.
+        expect(err!.code).toBeUndefined();
+      }
     });
   });
 });

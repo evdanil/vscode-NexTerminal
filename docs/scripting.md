@@ -5,6 +5,7 @@ Nexus Scripts let you automate multi-step terminal procedures in plain JavaScrip
 - [When to use a script (vs. a macro)](#when-to-use-a-script-vs-a-macro)
 - [Quickstart](#quickstart)
 - [Script examples](#script-examples)
+- [Starter templates](#starter-templates)
 - [Anatomy of a script](#anatomy-of-a-script)
 - [Header fields](#header-fields)
 - [Script API reference](#script-api-reference)
@@ -59,9 +60,11 @@ A script is a regular `.js` file — kept either in your workspace (under versio
     * @target-type ssh
     */
 
-   // The script only sees output that arrives after it starts. On a terminal
-   // that is already open the prompt is on screen and won't come again, so
-   // wait briefly for one and press Enter only if none arrives.
+   // Started on a terminal that is already open, the script sees only output
+   // that arrives after it starts, so the prompt on screen won't come again;
+   // under Connect and Run Script… on a server it gets everything since the
+   // session opened, first prompt included. So wait briefly for a prompt and
+   // press Enter only if none arrives.
    if (!(await waitFor(/[$#] $/, { timeout: 2_000 }))) {
      await sendLine("");
      await expect(/[$#] $/, { timeout: 10_000 });
@@ -79,7 +82,7 @@ A script is a regular `.js` file — kept either in your workspace (under versio
    - `Cmd/Ctrl+Shift+P` → **Nexus: Run Nexus Script** (always shows the session picker).
    - In the **Nexus** sidebar, expand **Scripts** and click the inline **▶** button. This "quick-run" binds to the active terminal (the one you last focused) when it is a Nexus SSH, Telnet, Serial, or Local Shell terminal; with no terminal, a plain (non-Nexus) one, or a Local Server terminal (which scripts can't drive), it falls back to the picker. If that session doesn't match the script's `@target-type` / `@target-profile`, quick-run refuses with an error instead — use **Run** to pick another session.
    - Open `hello.js` in the editor and click the **▶ Run in Nexus** CodeLens above the header — always shows the picker.
-   - Right-click a server, serial, or Local Shell profile → **Connect/Open and Run Script…** — picks a script, opens the profile, and runs it against the new session. On an SSH or Telnet server the host's first prompt usually arrives just *after* the run starts, so the opening `waitFor` catches it and no Enter is sent — an Enter there would leave a spare prompt that the second `expect` matches before `uname` has answered. See [Match window semantics](#match-window-semantics).
+   - Right-click a server, serial, or Local Shell profile → **Connect/Open and Run Script…** — picks a script, opens the profile, and runs it against the new session. On an SSH or Telnet server the run keeps the session's output from the moment it opens, so the opening `waitFor` catches the host's first prompt and no Enter is sent — an Enter there would leave a spare prompt that the second `expect` matches before `uname` has answered. See [Match window semantics](#match-window-semantics).
 
    The session picker always renders — even when only one session is eligible — so you can see which terminal the script will drive before it starts. Auto-pick only happens when the script's `@target-profile` uniquely matches an active session.
 
@@ -103,6 +106,27 @@ The first time you run a script in this workspace (from any entry point — even
 ## Script examples
 
 Browse [`examples/scripts/`](../examples/scripts/) for seven runnable scripts that demonstrate branching and loops (`if` / `while` / `for`), retries, polling, user interaction, and complete multi-step procedures. In VS Code, use **Nexus: Open Script Examples** or the examples icon in the **Scripts** view title bar.
+
+---
+
+## Starter templates
+
+**Nexus: New Nexus Script** (also the **New Script** button in the **Scripts** view title bar) asks you to pick a template, then a name:
+
+| Template | Runs on | What it does |
+|---|---|---|
+| **Basic command** | SSH | Waits for a shell prompt (ending in `$ ` or `# `), runs `uname -a`, and logs the output. |
+| **Wait for prompt then send** | Telnet | Logs in at the device's own login prompt, then turns off paging (`terminal length 0`). |
+| **Capture command output** | SSH | On a Cisco-style device: turns off paging, runs `show version`, and logs the output. |
+| **Backup running config** | SSH | On a Cisco-style device: turns off paging and logs `show running-config`. |
+
+Each declares the prompt it waits for once, as `PROMPT`, near the top — adapt it and the commands to your device. The three SSH templates open like the [Quickstart](#quickstart): they wait briefly for a prompt and press Enter only if none arrived, so they work on a terminal that is already open and under **Connect and Run Script…** alike.
+
+**Wait for prompt then send** runs on Telnet because Nexus has already logged an SSH session in before a script can run on it, so a login prompt never appears there. On Telnet the device asks for the login itself:
+
+- It answers `Username:` (Cisco IOS) or `login:` with the username written in the script — `admin` until you change it — then waits for `Password:`. A device that asks only for a password (a Cisco line with a line password and no usernames) gets no username.
+- It asks you for the password in a masked input box on every run; the password is never written to the Output Channel. Cancel the box and the run stops without sending an empty password, which the device would count as a failed login.
+- **Start it with Connect and Run Script… on the Telnet server.** The run then keeps everything the device sends from the moment the session opens, its login prompt included (see [Match window semantics](#match-window-semantics)). A script started on a terminal that is already open sees only output that arrives after it starts, and — unlike the other templates — this one does not press Enter to get a fresh prompt: at a `Password:` prompt an empty line is a failed login attempt. So on a Telnet terminal that is already open — or on a device that never asks for a login — it waits up to 30 seconds, sends nothing, and stops; the failure notification's **Show Output** says why.
 
 ---
 
@@ -228,7 +252,7 @@ switch (r.index) {
 | Option | Type | Default | Notes |
 |---|---|---|---|
 | `timeout` | `number` (ms) | `@default-timeout` header or `nexus.scripts.defaultTimeoutSeconds` setting | Upper bound on the wait. |
-| `lookback` | `number` | `0` | Characters of already-scanned output before the cursor to scan again — e.g. `4096` to re-match a prompt an earlier wait already consumed. Until something has matched, a wait already scans everything received since the run started, and no `lookback` reaches output from before that. See [match window semantics](#match-window-semantics). |
+| `lookback` | `number` | `0` | Characters of already-scanned output before the cursor to scan again — e.g. `4096` to re-match a prompt an earlier wait already consumed. Until something has matched, a wait already scans everything received since the run started (under **Connect and Run Script…** on a server, since the session opened), and no `lookback` reaches output from before that. See [match window semantics](#match-window-semantics). |
 
 ### Sending input
 
@@ -609,18 +633,18 @@ If you want to shut a script down from the host side (e.g. a deploy pipeline's w
 
 Understanding how `expect` / `waitFor` scan output matters when you're debugging "why didn't my pattern match?"
 
-- Each running script owns a rolling buffer of the session's recent output (the last 65,536 characters; ANSI escapes stripped at write time so patterns match on the same characters the user sees). **The buffer starts empty when the run starts**: anything the session printed before that — including a prompt already sitting on screen — is never in it.
-- The buffer has a **forward-only cursor**. A wait scans from the cursor to the end of the buffer, then keeps scanning as new output arrives. Until something has matched, that window is everything received since the run started; after that, only output following the previous match.
+- Each running script owns a rolling buffer of the session's recent output (the last 65,536 characters; ANSI escapes stripped at write time so patterns match on the same characters the user sees). **The buffer starts when the run starts**: anything the session printed before that — including a prompt already sitting on screen — is never in it. Under **Connect and Run Script…** on an SSH or Telnet server the run starts with the session itself: the buffer holds the session's output from the moment it opens, so nothing the host sends first is lost while Nexus reads the script file.
+- The buffer has a **forward-only cursor**. A wait scans from the cursor to the end of the buffer, then keeps scanning as new output arrives. Until something has matched, that window is everything received since the run started — under **Connect and Run Script…** on a server, since the session opened, so the first match's `before` can hold the host's banner; after that, only output following the previous match.
 - Once a wait matches, the cursor advances past the match. The same prompt can't accidentally satisfy two consecutive waits. A wait that times out leaves the cursor where it was.
 - If a wait's pattern doesn't match immediately, the runtime re-scans on every new output chunk until it matches or the timeout fires.
-- Per-call `lookback: n` widens the window to include `n` characters before the cursor — use it (e.g. `lookback: 4096`) to re-match a banner or prompt an earlier wait already consumed. It never reaches output from before the run started.
+- Per-call `lookback: n` widens the window to include `n` characters before the cursor — use it (e.g. `lookback: 4096`) to re-match a banner or prompt an earlier wait already consumed. It never reaches output from before the run started (under **Connect and Run Script…** on a server, before the session opened).
 
 Common pitfalls:
 
 - **Pattern matches too aggressively**, catching a promptish substring inside normal output. Use a more specific regex: include the device's own prefix, anchored to a line — `/^Router#\s*$/m`.
 - **Pattern doesn't match despite visible output**, because ANSI color escapes split the pattern. Remember the buffer holds stripped text — write patterns against the printable characters.
 - **First prompt never appears**, because it was already on screen when the run started — so it isn't in the script's buffer, and no `lookback` can reach it. Wait briefly for it and ask for a fresh one only if it doesn't come — `if (!(await waitFor(PROMPT, { timeout: 2_000 }))) { await sendLine(""); await expect(PROMPT); }`, with `PROMPT` your prompt pattern, as in the [Quickstart](#quickstart) — or, for a console that may be slow to answer, `await poll({ send: "\r", until: PROMPT, every: 1_000, timeout: 10_000 })`.
-- **A wait matches a spare prompt**, because the script pressed Enter while the host's first prompt was still on its way. That happens under **Connect and Run Script…** on an SSH or Telnet server: the run starts the moment the session registers — when the SSH shell channel opens, or the Telnet TCP connection is up — so the first prompt usually arrives *after* the run starts, and an opening `sendLine("")` makes a second one that the wait after your first command matches before the command has answered. Usually is not always: the run reads the script file before it starts watching the output, and a fast host's prompt can land in that moment and be missed. So don't decide by launch path — wait briefly for a prompt and press Enter only if none came, as the Quickstart does. On the other paths the wait simply times out and the Enter follows: a serial port prints nothing when it opens, and **Open and Run Script…** on a Local Shell profile starts the run once the shell has been running for about five seconds, with its first prompt already on screen, as in any open terminal.
+- **A wait matches a spare prompt**, because the script pressed Enter although the host's first prompt was already in its buffer or on its way. That happens under **Connect and Run Script…** on an SSH or Telnet server: the run keeps the session's output from the moment it registers — when the SSH shell channel opens, or the Telnet TCP connection is up — so the host's first prompt is in the buffer or on its way, and an opening `sendLine("")` makes a second one that the wait after your first command matches before the command has answered. So wait briefly for a prompt and press Enter only if none came, as the Quickstart does: there the wait finds the first prompt, and on an already-open terminal it times out and the Enter follows. **Connect and Run Script…** on a serial profile starts the run when the port opens but watches the output only once it has read the script file — a port usually prints nothing when it opens, so the Enter follows — and **Open and Run Script…** on a Local Shell profile starts the run once the shell has been running for about five seconds, with its first prompt already on screen, as in any open terminal.
 
 ---
 
@@ -847,13 +871,13 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 | `Nexus: Run Nexus Script` | `Ctrl+Alt+R` (macOS `⌘⌥R`) when an editor is focused on a `.js` file | Run the script in the active editor when it's a JavaScript file carrying `@nexus-script`; otherwise pick one from a file dialog opened at the scripts folder. (From a CodeLens or the Scripts view, it runs that script.) Always shows the session picker. |
 | `Nexus: Quick Run in Active Terminal` | — | Bind the script to the active terminal when it's a Nexus SSH, Telnet, Serial, or Local Shell terminal — no picker. Falls back to the session picker when there's no active terminal, or it's a plain (non-Nexus) one or a Local Server terminal. If the active session doesn't match the script's `@target-type` / `@target-profile`, it refuses with an error instead of offering the picker. Wired to the sidebar's inline ▶ button. |
 | `Nexus: Stop Nexus Script` | `Ctrl+Alt+S` (macOS `⌘⌥S`) when a script is running | Stop a running script. Prompts if more than one is running. |
-| `Nexus: New Nexus Script` | — | Create a new script from a starter template in your configured scripts directory. Accepts a `/`-separated path (`cisco/backup`) to create it inside a folder, creating missing intermediate folders. |
+| `Nexus: New Nexus Script` | — | Create a new script from a [starter template](#starter-templates) in your configured scripts directory. Accepts a `/`-separated path (`cisco/backup`) to create it inside a folder, creating missing intermediate folders. |
 | `Nexus: New Script Folder` (Scripts view title bar, or a folder's right-click menu) | — | Create a real directory under the scripts folder. Shows up immediately, even while empty. |
 | `Nexus: Refresh Scripts` | — | Manually rescan the scripts directory, bypassing the ~300ms watcher debounce. |
 | `Nexus: Edit Script` | — | Right-click a script → Edit. Opens the file in the editor. (Clicking the row no longer auto-opens the editor — it would be noisy.) |
 | `Nexus: Delete Script` | — | Right-click a script in the sidebar. Asks for confirmation, then moves the file to the Trash. In a remote window (Remote-SSH, WSL, Dev Containers) or on a file system another extension provides there is no Trash to move it to, so it asks once whether to delete the file permanently instead. If moving it to the Trash fails, it says why and offers **Delete Permanently**, which asks you again. If the file was already deleted outside VS Code, it says so and refreshes the view. |
 | `Nexus: Open Scripts Folder` | — | Open the configured scripts directory in the OS file manager. |
-| `Connect/Open and Run Script…` (server, serial, or Local Shell right-click) | — | Pick a Nexus script, open the profile, and run the script against the new session the moment it registers — for SSH when the shell channel opens, for Telnet when the TCP connection is up, for Serial when the port opens: usually before the device's first prompt, though a fast host's can arrive first (see [Match window semantics](#match-window-semantics)). Scripts are filtered to those whose `@target-type` is compatible with the profile. SSH, Telnet and Serial use a 90-second watchdog; Local Shell starts the run once the shell has been running for about five seconds. |
+| `Connect/Open and Run Script…` (server, serial, or Local Shell right-click) | — | Pick a Nexus script, open the profile, and run the script against the new session the moment it registers — for SSH when the shell channel opens, for Telnet when the TCP connection is up, for Serial when the port opens. On a server the run keeps the session's output from that moment, so the host's first prompt is never missed; on Serial it watches once it has read the script file (see [Match window semantics](#match-window-semantics)). Scripts are filtered to those whose `@target-type` is compatible with the profile. SSH, Telnet and Serial use a 90-second watchdog; Local Shell starts the run once the shell has been running for about five seconds. |
 | `Nexus: Show Nexus Scripts Output` | — | Open the **Nexus Scripts** Output Channel. |
 | `Nexus: Open Scripting Guide` | — | Open this document in your browser. |
 | `Nexus: Open Script Examples` | — | Open the example scripts on GitHub in your browser. |
@@ -879,8 +903,8 @@ Registered under the `nexus.script.*` namespace and available in the Command Pal
 | "▶ Run in Nexus" CodeLens doesn't appear above my file | The `@nexus-script` marker is missing, or something other than a `#!` line comes before the `/**` header | Add the marker; move the header to the very top of the file |
 | Autocomplete is missing in my script | First-time scaffolding hasn't run yet, or the scripts folder's `jsconfig.json` doesn't load the Nexus types | Run any script once (cancelling the session picker is enough); reopen the file. If you edited `<scriptsDir>/types/nexus-scripts.d.ts` by hand, delete it — Nexus will rewrite it from the bundled version on the next run. Nexus never overwrites a `jsconfig.json` you've changed, so if the one in your scripts folder is your own, make sure its `compilerOptions.types` lists `./types/nexus-scripts` — or delete it to get the bundled copy on the next run. |
 | `expect` always times out | Pattern doesn't match the actual output (ANSI, anchors, banner noise) | Log `await tail()` in the `catch` to see what the session actually sent; tighten the pattern accordingly |
-| First wait misses a prompt that's already on screen | The script's buffer holds only output received after the run started, so a prompt printed before that is invisible to it — no `lookback` reaches back further | Wait briefly for the prompt and press Enter only if none arrives — the opening in the [Quickstart](#quickstart). See [Match window semantics](#match-window-semantics) |
-| Under **Connect and Run Script…** on an SSH or Telnet server, a command's captured output is empty — the wait after it matched at once | The script pressed Enter before the host's first prompt had arrived, so a spare prompt followed and this wait matched it | Send the opening `sendLine("")` only when a short `waitFor` for the prompt returns `null` — the opening in the [Quickstart](#quickstart). See [Match window semantics](#match-window-semantics) |
+| First wait misses a prompt that's already on screen | The script's buffer holds only output received after the run started (under **Connect and Run Script…** on a server, after the session opened), so a prompt printed before that is invisible to it — no `lookback` reaches back further | Wait briefly for the prompt and press Enter only if none arrives — the opening in the [Quickstart](#quickstart). See [Match window semantics](#match-window-semantics) |
+| Under **Connect and Run Script…** on an SSH or Telnet server, a command's captured output is empty — the wait after it matched at once | The script pressed Enter although the host's first prompt was already in its output or on its way — the run holds the session's output from the moment it opened — so a spare prompt followed and this wait matched it | Send the opening `sendLine("")` only when a short `waitFor` for the prompt returns `null` — the opening in the [Quickstart](#quickstart). See [Match window semantics](#match-window-semantics) |
 | A macro fires on top of my script and double-sends something | Default macro policy is `suspend-all`, but maybe `keep-enabled` was set | Check `nexus.scripts.macroPolicy` and any `@allow-macros` header |
 | After a stop, the Output Channel logs `warning: worker did not terminate within grace` | The script was inside a blocking synchronous Node call (from an unsupported `node:` import — `execSync`, `readFileSync` on a dead mount), and a Worker can only be stopped when control returns to JavaScript. The run is marked `stopped` after 100 ms regardless; the worker ends when that call returns | Avoid synchronous Node calls in scripts. If the call never returns, reload the window |
 | In VS Code for the Web, script commands only say "Nexus runtime features are unavailable in the web extension host. Use desktop VS Code." | Expected — scripts are desktop-only | Use VS Code Desktop |

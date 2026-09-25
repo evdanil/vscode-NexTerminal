@@ -9,8 +9,11 @@
 // Each iteration sends a command and waits for the prompt that follows it — so
 // we can slice the output using the `before` field on the Match.
 
-// Start from a fresh prompt — the one already on screen was printed before the
-// script started, so the script can't see it (see 01-hello.js).
+// Start from a fresh prompt: on a terminal that is already open, the one on
+// screen was printed before the script started, so the script can't see it.
+// (Under Connect and Run Script… on a server the script already has the first
+// prompt, and this Enter adds a spare one — 01-hello.js opens in a way that
+// suits both.)
 await sendLine("");
 await expect(/[$#] $/);
 

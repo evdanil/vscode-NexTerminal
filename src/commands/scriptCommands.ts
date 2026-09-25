@@ -98,12 +98,13 @@ type ScriptTemplate = {
   body: string;
 };
 
-const FIRST_PROMPT_COMMENT = `  // The script only sees output that arrives after it starts. On a terminal
-  // that is already open, the prompt is on screen and will not come again;
-  // under Connect and Run Script… it usually arrives just after the start.
-  // So wait briefly, and press Enter for a fresh prompt only if none came —
-  // an Enter while the first prompt is on its way leaves a spare one for a
-  // later wait to match too early.`;
+const FIRST_PROMPT_COMMENT = `  // Started on a terminal that is already open, the script sees only output
+  // that arrives after it starts, so the prompt on screen will not come
+  // again; under Connect and Run Script… on a server it gets everything since
+  // the session opened, first prompt included. So wait briefly, and press
+  // Enter for a fresh prompt only if none came — an Enter while the first
+  // prompt is on its way leaves a spare one for a later wait to match too
+  // early.`;
 
 const IOS_PROMPT_DECLARATION = `// IOS and IOS XE prompts end in ">" or "#" with no trailing space ("Router#");
 // the optional space also matches NX-OS-style "switch# ". Adapt it to your device.
@@ -116,15 +117,27 @@ const API_REFERENCE_COMMENT = "// Full API reference: types/nexus-scripts.d.ts a
  * follow the scripting guide (docs/scripting.md):
  *
  * - Each opens by waiting briefly for its first prompt and pressing Enter only
- *   if none came. A script sees only output that arrives after it starts, so
- *   on an idle, already-open terminal a plain first wait times out; but an
- *   unconditional Enter leaves a spare prompt when the first one is still on
- *   its way (Connect and Run Script… on SSH / Telnet). Which of the two a run
- *   meets is a race — runScript awaits file reads before it starts watching
- *   the output — so the opening must not depend on the launch path.
+ *   if none came. A script started on an idle, already-open terminal sees only
+ *   output that arrives after it starts, so a plain first wait times out; but
+ *   under Connect and Run Script… on SSH / Telnet the run holds the session's
+ *   output from the moment it opened, so the first prompt is there or on its
+ *   way, and an unconditional Enter leaves a spare one for a later wait to
+ *   match too early. The short wait serves both, so the opening does not
+ *   depend on the launch path.
  * - The prompt pattern is declared once, as `PROMPT`, and fits the commands the
  *   template sends: a shell prompt ends in "$ " or "# ", an IOS / IOS XE prompt
  *   in ">" or "#" with no trailing space ("Router#").
+ * - Every wait is for output the declared `@target-type` actually shows. An
+ *   SSH session is authenticated before a script can bind to it, so a login
+ *   prompt never comes there; the login template targets Telnet, which opens
+ *   at the device's own "Username:" / "login:" / "Password:".
+ * - The login template is the exception to the opening above: at a
+ *   "Password:" prompt an Enter is a failed login attempt, and no script API
+ *   reads output from before the run, so on an already-open terminal it
+ *   cannot tell whether that is what is on screen. It waits for the device's
+ *   first prompt — which Connect and Run Script… keeps from the moment the
+ *   session opens (`captureSessionOutput`) — and, if none comes, stops and
+ *   says so without sending anything.
  * - No local shadows a script API global (a `const prompt` would make
  *   `prompt()` a Match for the rest of the script).
  * - Header tags are read only from the leading JSDoc block, so `@allow-macros`
@@ -175,26 +188,56 @@ ${FIRST_PROMPT_COMMENT}
   {
     id: "wait-send",
     label: "Wait for prompt then send",
-    description: "Wait for login-style prompts and send responses.",
+    description: "Answer a Telnet device's login and password prompts, then disable paging.",
     body: `/**
  * @nexus-script
  * @name {{NAME}}
- * @description Wait for terminal prompts and send responses.
- * @target-type ssh
+ * @description Log in at a Telnet device's prompts, then disable paging.
+ * @target-type telnet
  */
 
 ${API_REFERENCE_COMMENT}
 
 ${IOS_PROMPT_DECLARATION}
-const LOGIN = /login:\\s*$/i;
+
+// Telnet opens at the device's own login prompt: "Username:" on Cisco IOS,
+// "login:" on many others, or just "Password:" on an IOS line that has a
+// line password and no usernames. An SSH session is logged in before a
+// script can run on it and never shows one, which is why this template
+// targets Telnet.
+const LOGIN = /(?:login|username|password):\\s*$/i;
+const PASSWORD = /password:\\s*$/i;
 
 try {
-${FIRST_PROMPT_COMMENT}
-  if (!(await waitFor(LOGIN, { timeout: 2_000 }))) {
-    await sendLine("");
-    await expect(LOGIN, { timeout: 30_000 });
+  // Start this script with Connect and Run Script… on the Telnet server: the
+  // run then holds everything the device sends from the moment the session
+  // opens, its login prompt included. Started on a terminal that is already
+  // open, a script sees only output that arrives after it starts, and the
+  // prompt on screen will not come again. The other templates press Enter
+  // for a fresh one; this one must not, because at a "Password:" prompt an
+  // empty line is a failed login attempt.
+  const loginPrompt = await waitFor(LOGIN, { timeout: 30_000 });
+  if (!loginPrompt) {
+    throw new Error(
+      "No login prompt arrived. Start this script with Connect and Run Script… on the Telnet server: " +
+        "it then sees what the device sends from the moment the session opens, while a prompt already " +
+        "on screen when a script starts is not seen. A device that does not ask for a login needs no login script."
+    );
   }
-  await sendLine("admin");
+  if (!PASSWORD.test(loginPrompt.text)) {
+    // Replace with your username.
+    await sendLine("admin");
+    await expect(PASSWORD, { timeout: 10_000 });
+  }
+
+  // Asked for on each run, masked, and never written to the Output Channel.
+  // prompt() returns "" when cancelled: stop rather than send an empty
+  // password, which the device counts as a failed login.
+  const password = await prompt("Password", { password: true });
+  if (!password) {
+    throw Object.assign(new Error("password prompt cancelled"), { code: "Cancelled" });
+  }
+  await sendLine(password);
 
   await expect(PROMPT, { timeout: 30_000 });
   await sendLine("terminal length 0");

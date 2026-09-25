@@ -106,6 +106,7 @@ import {
   type WorkerLike
 } from "../../../src/services/scripts/scriptRuntimeManager";
 import type { FailureReason, StopReason } from "../../../src/services/scripts/scriptTypes";
+import { captureSessionOutput } from "../../../src/services/scripts/sessionOutputCapture";
 import type { NexusCore } from "../../../src/core/nexusCore";
 import type { ActiveLocalShellSession, ActiveSession, SessionPtyHandle } from "../../../src/models/config";
 import type { PtyOutputObserver } from "../../../src/services/macroAutoTrigger";
@@ -1706,5 +1707,141 @@ describe("ScriptRuntimeManager — a finished run cannot act on its terminal (#1
     h.worker.emit({ kind: "rpc", id: 12, method: "sendLine", args: ["show version"] });
     await waitFor(() => resultFor(h, 12) !== undefined);
     expect(h.pty.writes).toEqual(["show version\r"]);
+  });
+});
+
+// #166 — Connect and Run Script… hands runScript the new session's output,
+// kept since it opened (`captureSessionOutput`); every other run starts empty.
+describe("ScriptRuntimeManager — the output a run starts with (#166)", () => {
+  const MARKED = `/**\n * @nexus-script\n */\n`;
+
+  interface CountingPty extends TestPty {
+    /** Observers attached and not yet disposed. */
+    live(): number;
+  }
+
+  function countingPty(): CountingPty {
+    const pty = makeTestPty();
+    const attach = pty.addOutputObserver.bind(pty);
+    let live = 0;
+    pty.addOutputObserver = (o) => {
+      live++;
+      const inner = attach(o);
+      let disposed = false;
+      return {
+        dispose: () => {
+          if (!disposed) {
+            disposed = true;
+            live--;
+          }
+          inner.dispose();
+        }
+      } as never;
+    };
+    return Object.assign(pty, { live: () => live });
+  }
+
+  async function harness(source = MARKED) {
+    const pty = countingPty();
+    const session: ActiveSession = { id: "test-session", serverId: "srv1", terminalName: "t", startedAt: Date.now(), pty };
+    const workers: FakeWorker[] = [];
+    const manager = new ScriptRuntimeManager({
+      core: makeMockCore(session),
+      macroAutoTrigger: { pushFilter: () => ({ dispose: () => {} }), bindObserverToSession: () => {} } as never,
+      outputChannel: { appendLine: () => {}, append: vi.fn(), show: vi.fn(), dispose: vi.fn() } as never,
+      workerPath: "/fake/worker.js",
+      createWorker: () => {
+        const w = makeFakeWorker();
+        workers.push(w);
+        return w;
+      }
+    });
+    const fs = await import("node:fs/promises");
+    const os = await import("node:os");
+    const fixture = path.join(os.tmpdir(), `nexus-capture-unit-${Date.now()}-${Math.random()}.js`);
+    await fs.writeFile(fixture, source, "utf8");
+    const scriptUri = { fsPath: fixture, scheme: "file", authority: "", path: fixture, toString: () => fixture };
+    return { manager, pty, workers, scriptUri };
+  }
+
+  async function tailOf(worker: FakeWorker, id: number): Promise<string> {
+    worker.emit({ kind: "rpc", id, method: "tail", args: [4096] });
+    const isResult = (m: WorkerInbound) => m.kind === "rpc-result" && (m as { id: number }).id === id;
+    await waitFor(() => worker.posted.some(isResult));
+    return (worker.posted.find(isResult) as { value: string }).value;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("keeps output from before, during and after the script read — each chunk exactly once", async () => {
+    // ⊘ the capture ignored (runScript's own observer, attached after the
+    // read, is all there is): only "C". ⊘ a handover with a gap — the capture
+    // released when the run begins, the run's observer attached after the
+    // read: "B" is lost. ⊘ a handover with an overlap — the run attaches its
+    // own observer to the captured buffer and the capture's stays attached:
+    // "C" twice, and two observers for the rest of the run.
+    const h = await harness();
+    const vscode = await import("vscode");
+    let releaseRead: (() => void) | undefined;
+    vi.mocked(vscode.workspace.fs.readFile).mockImplementationOnce(async (uri: { fsPath: string }) => {
+      await new Promise<void>((resolve) => {
+        releaseRead = resolve;
+      });
+      const fs = await import("node:fs/promises");
+      return new Uint8Array(await fs.readFile(uri.fsPath));
+    });
+
+    const capture = captureSessionOutput(h.pty);
+    h.pty.emitOutput("A"); // as the session registers, before runScript is called
+    const started = h.manager.runScript(h.scriptUri as never, "test-session", capture);
+    h.pty.emitOutput("B"); // while the script file is being read
+    await waitFor(() => releaseRead !== undefined);
+    releaseRead!();
+    await started;
+    h.pty.emitOutput("C"); // once the run is going
+
+    expect(await tailOf(h.workers[0], 1)).toBe("ABC");
+    expect(h.pty.live()).toBe(1);
+  });
+
+  it("starts a run with no capture empty, whatever the session printed before it", async () => {
+    // ⊘ seeding every run with what the session already printed (a capture
+    // each session keeps from registration, or the terminal's scrollback):
+    // an already-open terminal's stale output would satisfy waits it must
+    // not, contradicting `lookback`'s documented "starts empty".
+    const h = await harness();
+    h.pty.emitOutput("Router#");
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    expect(await tailOf(h.workers[0], 1)).toBe("");
+    h.pty.emitOutput("X");
+    expect(await tailOf(h.workers[0], 2)).toBe("X");
+  });
+
+  it("gives the capture to that one run: a later run on the same session starts empty", async () => {
+    // ⊘ keeping the capture on the session for whatever runs next: a Quick
+    // Run later would open on the login banner of a connect long past.
+    // ⊘ the capture's observer outliving the run that took it over.
+    const h = await harness();
+    const capture = captureSessionOutput(h.pty);
+    h.pty.emitOutput("Username: ");
+    await h.manager.runScript(h.scriptUri as never, "test-session", capture);
+    h.workers[0].emit({ kind: "complete" });
+    expect(h.pty.live()).toBe(0);
+
+    h.pty.emitOutput("Router#");
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    expect(await tailOf(h.workers[1], 1)).toBe("");
+  });
+
+  it("releases a capture whose run does not start", async () => {
+    // ⊘ a refusal (here: no @nexus-script marker) that returns with the
+    // capture still attached — it would fill for the life of the session.
+    const h = await harness(`// not a Nexus script\n`);
+    const capture = captureSessionOutput(h.pty);
+    const runId = await h.manager.runScript(h.scriptUri as never, "test-session", capture);
+    expect(runId).toBeUndefined();
+    expect(h.pty.live()).toBe(0);
   });
 });

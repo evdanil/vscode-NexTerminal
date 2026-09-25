@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.8.258] — 2026-09-25
+
+### Fixed
+
+- **Connect and Run Script… on an SSH or Telnet server no longer misses what the host sends first.** Nexus read the script file before it started watching the new session, so a host that answered at once — a Telnet device's login prompt, a fast shell's first prompt — could arrive in that moment, and the script never saw it. The script now sees the session's output from the moment it opens. Other ways of running a script are unchanged: they see only output that arrives after the run starts.
+
+- **The *Wait for prompt then send* script template now logs in over Telnet, where the login prompt it waits for actually appears.** It was set up for SSH sessions but waited for `login:`, which an SSH session never shows — Nexus has already logged in before a script can run — so every run timed out. It now runs on Telnet sessions and answers a `Username:` (Cisco IOS) or `login:` prompt with your username — or, on a device that asks only for a password (a Cisco line password), goes straight to the password. It asks you for the password in a masked input box, stops rather than send an empty one if you cancel, then turns off paging. Start it with **Connect and Run Script…** on the Telnet server, which now hands it everything the device sends from the moment the session opens. Started on a Telnet terminal that is already open, a script sees only what arrives after it starts, and this template does not press Enter for a fresh prompt the way the others do, because at a `Password:` prompt an empty line is a failed login attempt — so there it sends nothing and stops, and says why. The new **Starter templates** section of the scripting guide describes all four templates. Scripts already created from the old template are not changed.
+
 ## [2.8.257] — 2026-09-25
 
 ### Fixed
