@@ -147,6 +147,13 @@ vi.mock("../../src/utils/securecrtParser", async () => {
   };
 });
 
+// Backups here are encrypted and decrypted for real, with only the 210,000-
+// iteration key derivation swapped for a fast one (see the helper for what it
+// keeps); `configCrypto.test.ts` covers the real derivation.
+vi.mock("node:crypto", async (importOriginal) =>
+  (await import("../helpers/fastBackupKdf")).withFastPbkdf2(await importOriginal<typeof import("node:crypto")>())
+);
+
 import { registerConfigCommands, isValidExport, SETTINGS_KEYS, sanitizeForSharing } from "../../src/commands/configCommands";
 import { IMPORTED_CAPABILITY_RESET_NOTICE } from "../../src/models/terminalMacro";
 import { SETTINGS_META } from "../../src/ui/settingsMetadata";
@@ -2169,7 +2176,7 @@ describe("backup export command", () => {
     const { decrypt } = await import("../../src/utils/configCrypto");
     const decrypted = JSON.parse(decrypt(writtenData.encryptedSecrets, "testpass123"));
 
-    const fileBackups = decrypted.fileBackups as Array<{ id: string; files: Array<{ relativePath: string; contentsBase64: string }> }>;
+    const fileBackups = decrypted.fileBackups as Array<{ id: string; configuredPath?: string; files: Array<{ relativePath: string; contentsBase64: string }> }>;
     expect(fileBackups.map((b) => b.id)).toEqual(["ssh", "scripts"]);
     expect(fileBackups.find((b) => b.id === "ssh")?.files.map((f) => f.relativePath).sort()).toEqual([
       "config",

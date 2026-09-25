@@ -543,11 +543,16 @@ describe("SettingsGuardController", () => {
         key === "nexus.terminal.passthroughKeys" || key === "nexus.terminal.highlighting.rules",
     });
 
-    await flush(10);
-
-    const shadows = store.get("nexus.settingsGuard.lastKnownGoodValues") as Record<string, unknown[]> | undefined;
-    expect(shadows?.["nexus.terminal.passthroughKeys"]).toEqual(["b"]);
-    expect(shadows?.["nexus.terminal.highlighting.rules"]).toEqual([{ pattern: "x", color: "red" }]);
+    // The fake globalState above lands each update on its own setTimeout(0)
+    // hop, and a fixed sleep can end before those hops run on a loaded host.
+    // So wait for the stored result instead. Both keys are checked in the
+    // same poll: a stale read-modify-write passes through {passthroughKeys}
+    // and ends at {highlighting.rules}, and neither state holds both keys.
+    await vi.waitFor(() => {
+      const shadows = store.get("nexus.settingsGuard.lastKnownGoodValues") as Record<string, unknown[]> | undefined;
+      expect(shadows?.["nexus.terminal.passthroughKeys"]).toEqual(["b"]);
+      expect(shadows?.["nexus.terminal.highlighting.rules"]).toEqual([{ pattern: "x", color: "red" }]);
+    }, { timeout: 4_000 });
   });
 
   it("no double logging: live corruption of passthroughKeys produces exactly one external-strip event", async () => {

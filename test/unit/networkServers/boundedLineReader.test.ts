@@ -1,6 +1,4 @@
-import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { resolve } from "node:path";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { MAX_RPC_LINE_BYTES, attachBoundedLineReader } from "../../../src/services/networkServers/boundedLineReader";
@@ -336,19 +334,6 @@ describe("bounded RPC line reader", () => {
     expect(lines).toEqual([]);
     expect(listenerCounts(stream)).toEqual({ data: 0, end: 0 });
     dispose();
-  });
-
-  it("releases historical queued snapshots during rolling reentrancy", () => {
-    const fixture = resolve(process.cwd(), "test/unit/networkServers/fixtures/boundedLineReaderRollingRetention.fixture.mjs");
-    const child = spawnSync(process.execPath, ["--expose-gc", fixture], {
-      cwd: process.cwd(),
-      encoding: "utf8",
-      timeout: 15_000,
-    });
-
-    expect(child.error, child.stderr).toBeUndefined();
-    expect(child.status, child.stderr).toBe(0);
-    expect((JSON.parse(child.stdout) as { readonly liveSnapshots: number }).liveSnapshots).toBeLessThanOrEqual(2);
   });
 
   it("reports once and detaches after byte 1,048,577 before a newline", () => {

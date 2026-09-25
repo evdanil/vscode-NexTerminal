@@ -12,7 +12,7 @@
  * REAL engine against the same devices. Zero adds, zero prunes.
  *
  * The share path runs no cipher, so unlike the backup suites nothing here needs
- * `configCrypto` mocked.
+ * the backup key derivation faked (`test/helpers/fastBackupKdf.ts`).
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 

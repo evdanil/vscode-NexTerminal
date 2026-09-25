@@ -1407,8 +1407,12 @@ describe("session transcript failure paths", () => {
 
     // Non-vacuous: the descriptor is making real progress — this is the
     // healthy-but-hopelessly-slow case, not a wedge anyone could detect.
+    // The first byte lands only after a 4 ms timer hop and a real fs.write,
+    // and on a loaded host those can still be outstanding when the sleep above
+    // ends, so poll for it. The arrivals above are mid-trickle either way: the
+    // drain took its batch as soon as the earlier 250 ms flush timer fired.
     const file = transcriptPath(dir, "trickle_");
-    expect(statSync(file).size).toBeGreaterThan(0);
+    await vi.waitFor(() => expect(statSync(file).size).toBeGreaterThan(0), { timeout: 4_000 });
     expect(statSync(file).size).toBeLessThan(1024);
 
     // The bound, with the drain mid-trickle and a backlog it can never catch.

@@ -1,7 +1,7 @@
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSessionTranscript, type SessionTranscript } from "../../src/logging/sessionTranscriptLogger";
 
 const tempDirs: string[] = [];
@@ -154,9 +154,13 @@ describe("createSessionTranscript", () => {
       });
 
       transcript.write("timed line\n");
-      await new Promise((resolve) => setTimeout(resolve, 400));
 
-      expect(transcriptFiles(dir, "timer_").base).toContain("timed line");
+      // The line reaches the file only after the 250 ms flush timer has fired
+      // and the async fs.write it starts has come back. A fixed sleep can end
+      // before both have happened on a loaded host, so poll the file instead.
+      // Nothing here flushes or closes the writer, so a writer without its own
+      // timer never writes the line and this still fails.
+      await vi.waitFor(() => expect(transcriptFiles(dir, "timer_").base).toContain("timed line"), { timeout: 4_000 });
       transcript.close();
     });
 
