@@ -1,6 +1,7 @@
 import type { Duplex } from "node:stream";
 import type { AuthProfile, ServerConfig } from "../../models/config";
 import { authProfileOwnedCredentials } from "../../models/config";
+import { configMutationLock } from "../configMutationLock";
 import type {
   KeyboardInteractiveHandler,
   PasswordPrompt,
@@ -122,8 +123,76 @@ export class SilentAuthSshFactory implements SshFactory {
     private readonly vault: SecretVault,
     private readonly prompt: PasswordPrompt,
     private readonly inputPromptFn?: InputPromptFn,
-    private readonly authProfileLookup?: (id: string) => AuthProfile | undefined
+    private readonly authProfileLookup?: (id: string) => AuthProfile | undefined,
+    private readonly liveServerLookup?: (id: string) => ServerConfig | undefined
   ) {}
+
+  /**
+   * Captures the config identity a prompted SSH credential was authenticated
+   * against, including profile-owned auth fields and every hop in its route.
+   * ProxySshFactory calls this before opening a proxy/jump connection, so a
+   * config replacement during that work cannot make a later target handshake
+   * look as though it started on the new route.
+   */
+  public getCredentialEndpointSignature(
+    server: ServerConfig,
+    serverLookup: ((id: string) => ServerConfig | undefined) | undefined = this.liveServerLookup,
+    visited: ReadonlySet<string> = new Set<string>()
+  ): string {
+    if (visited.has(server.id)) {
+      return JSON.stringify(["cycle", server.id]);
+    }
+    const nextVisited = new Set(visited);
+    nextVisited.add(server.id);
+
+    const { resolved, passwordKey, passphraseKey, legacyServerPassphraseKey, profileScoped } = this.resolveServer(server);
+    let route: unknown = null;
+    if (server.proxy?.type === "ssh") {
+      const jump = serverLookup?.(server.proxy.jumpHostId);
+      route = jump
+        ? ["ssh", server.proxy.jumpHostId, this.getCredentialEndpointSignature(jump, serverLookup, nextVisited)]
+        : ["ssh", server.proxy.jumpHostId, "missing"];
+    } else if (server.proxy) {
+      route = [server.proxy.type, server.proxy.host, server.proxy.port, server.proxy.username ?? null];
+    }
+
+    return JSON.stringify([
+      server.id,
+      server.protocol ?? "ssh",
+      resolved.host,
+      resolved.altHost ?? null,
+      resolved.port,
+      resolved.username,
+      resolved.authType,
+      resolved.keyPath ?? null,
+      server.authProfileId ?? null,
+      passwordKey,
+      passphraseKey,
+      legacyServerPassphraseKey ?? null,
+      profileScoped,
+      route
+    ]);
+  }
+
+  private async mutateCredentialIfEndpointUnchanged(
+    serverId: string,
+    expectedEndpoint: string,
+    mutate: () => Promise<void>
+  ): Promise<void> {
+    if (!this.liveServerLookup) {
+      return;
+    }
+
+    // Replace/reset and this deferred credential mutation share one lock. The
+    // live route check and vault operation stay together so a clear+publish
+    // cannot slip between them and leave an old credential under a reused id.
+    await configMutationLock.runExclusive(async () => {
+      const live = this.liveServerLookup?.(serverId);
+      if (live && this.getCredentialEndpointSignature(live) === expectedEndpoint) {
+        await mutate();
+      }
+    });
+  }
 
   private resolveServer(
     server: ServerConfig
@@ -249,8 +318,11 @@ export class SilentAuthSshFactory implements SshFactory {
        * fallback of its own.
        */
       route?: () => string;
+      credentialEndpointSignature?: string;
     }
   ): Promise<SshConnection> {
+    const credentialEndpointSignature =
+      options?.credentialEndpointSignature ?? this.getCredentialEndpointSignature(server);
     const { resolved, passwordKey, passphraseKey, legacyServerPassphraseKey, profileScoped } = this.resolveServer(server);
 
     if (resolved.authType === "key") {
@@ -323,17 +395,21 @@ export class SilentAuthSshFactory implements SshFactory {
         // it is not security-relevant.
         try {
           if (promptResult.save) {
-            await this.vault.store(passphraseKey, promptResult.password);
-            if (legacyServerPassphraseKey && legacyServerPassphraseKey !== passphraseKey) {
-              await this.vault.delete(legacyServerPassphraseKey);
-            }
+            await this.mutateCredentialIfEndpointUnchanged(server.id, credentialEndpointSignature, async () => {
+              await this.vault.store(passphraseKey, promptResult.password);
+              if (legacyServerPassphraseKey && legacyServerPassphraseKey !== passphraseKey) {
+                await this.vault.delete(legacyServerPassphraseKey);
+              }
+            });
           } else if (!profileScoped) {
             // Declining to save replaces the stored credential for a server —
             // but a profile-scoped passphrase belongs to the whole fleet, and
             // "don't save this one" must not erase what other servers still
             // authenticate with. Clearing a profile passphrase is done through
             // the profile editor, not here.
-            await this.vault.delete(passphraseKey);
+            await this.mutateCredentialIfEndpointUnchanged(server.id, credentialEndpointSignature, () =>
+              this.vault.delete(passphraseKey)
+            );
           }
         } catch (vaultErr) {
           console.error(
@@ -443,14 +519,18 @@ export class SilentAuthSshFactory implements SshFactory {
       // authenticated; the natural fallback is being re-prompted next time.
       try {
         if (promptResult.save) {
-          await this.vault.store(passwordKey, promptResult.password);
+          await this.mutateCredentialIfEndpointUnchanged(server.id, credentialEndpointSignature, () =>
+            this.vault.store(passwordKey, promptResult.password)
+          );
         } else if (!profileScoped) {
           // Declining to save replaces the stored credential for a server —
           // but a profile-scoped password belongs to the whole fleet, and
           // "don't save this one" must not erase what other servers still
           // authenticate with. Clearing a profile password is done through the
           // profile editor, not here.
-          await this.vault.delete(passwordKey);
+          await this.mutateCredentialIfEndpointUnchanged(server.id, credentialEndpointSignature, () =>
+            this.vault.delete(passwordKey)
+          );
         }
       } catch (vaultErr) {
         console.error(

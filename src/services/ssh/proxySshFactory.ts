@@ -143,27 +143,39 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     server: ServerConfig,
     context?: SshConnectContext
   ): Promise<SshConnection> {
+    const credentialEndpointSignature = this.authFactory.getCredentialEndpointSignature?.(server, this.serverLookup);
     if (!server.proxy) {
-      return context?.onAuthMessage
-        ? this.authFactory.connect(server, { onAuthMessage: context.onAuthMessage })
-        : this.authFactory.connect(server);
+      if (!context?.onAuthMessage && credentialEndpointSignature === undefined) {
+        return this.authFactory.connect(server);
+      }
+      return this.authFactory.connect(server, {
+        ...(context?.onAuthMessage && { onAuthMessage: context.onAuthMessage }),
+        ...(credentialEndpointSignature !== undefined && { credentialEndpointSignature })
+      });
     }
-    return this.connectViaProxy(server, server.proxy, context?.proxyVisited ?? new Set<string>(), context?.onAuthMessage);
+    return this.connectViaProxy(
+      server,
+      server.proxy,
+      context?.proxyVisited ?? new Set<string>(),
+      context?.onAuthMessage,
+      credentialEndpointSignature
+    );
   }
 
   private async connectViaProxy(
     server: ServerConfig,
     proxy: ProxyConfig,
     visited: ReadonlySet<string>,
-    onAuthMessage?: (text: string) => void
+    onAuthMessage?: (text: string) => void,
+    credentialEndpointSignature?: string
   ): Promise<SshConnection> {
     switch (proxy.type) {
       case "ssh":
-        return this.connectViaSshJump(server, proxy.jumpHostId, visited, onAuthMessage);
+        return this.connectViaSshJump(server, proxy.jumpHostId, visited, onAuthMessage, credentialEndpointSignature);
       case "socks5":
-        return this.connectViaSocks5(server, proxy, onAuthMessage);
+        return this.connectViaSocks5(server, proxy, onAuthMessage, credentialEndpointSignature);
       case "http":
-        return this.connectViaHttpConnect(server, proxy, onAuthMessage);
+        return this.connectViaHttpConnect(server, proxy, onAuthMessage, credentialEndpointSignature);
     }
   }
 
@@ -171,7 +183,8 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     target: ServerConfig,
     jumpHostId: string,
     visited: ReadonlySet<string>,
-    onAuthMessage?: (text: string) => void
+    onAuthMessage?: (text: string) => void,
+    credentialEndpointSignature?: string
   ): Promise<SshConnection> {
     const nextVisited = this.addToVisited(visited, target);
     const jumpServer = this.serverLookup(jumpHostId);
@@ -236,7 +249,8 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       targetConnection = await this.authFactory.connect(target, {
         sockFactory,
         route: () => jumpConnectionRoute(jumpConnection),
-        ...(onAuthMessage && { onAuthMessage })
+        ...(onAuthMessage && { onAuthMessage }),
+        ...(credentialEndpointSignature !== undefined && { credentialEndpointSignature })
       });
     } catch (error) {
       jumpConnection.dispose();
@@ -253,7 +267,8 @@ export class ProxySshFactory implements ContextAwareSshFactory {
   private async connectViaSocks5(
     target: ServerConfig,
     proxy: Socks5Proxy,
-    onAuthMessage?: (text: string) => void
+    onAuthMessage?: (text: string) => void,
+    credentialEndpointSignature?: string
   ): Promise<SshConnection> {
     const resolved = await this.resolveProxyPassword(target, proxy);
     const proxyPassword = resolved.password;
@@ -311,7 +326,14 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       return socket;
     };
 
-    const connection = await this.authenticateThroughProxy(target, proxy, resolved, sockFactory, onAuthMessage);
+    const connection = await this.authenticateThroughProxy(
+      target,
+      proxy,
+      resolved,
+      sockFactory,
+      onAuthMessage,
+      credentialEndpointSignature
+    );
     // lastSock is guaranteed to be defined here: a successful authFactory.connect
     // means sockFactory was called and resolved at least once.
     return new ProxiedSshConnection(connection, socketCleanup(lastSock!), socketCloseRelay(lastSock!));
@@ -320,7 +342,8 @@ export class ProxySshFactory implements ContextAwareSshFactory {
   private async connectViaHttpConnect(
     target: ServerConfig,
     proxy: HttpConnectProxy,
-    onAuthMessage?: (text: string) => void
+    onAuthMessage?: (text: string) => void,
+    credentialEndpointSignature?: string
   ): Promise<SshConnection> {
     const resolved = await this.resolveProxyPassword(target, proxy);
     const proxyPassword = resolved.password;
@@ -357,7 +380,14 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       return socket;
     };
 
-    const connection = await this.authenticateThroughProxy(target, proxy, resolved, sockFactory, onAuthMessage);
+    const connection = await this.authenticateThroughProxy(
+      target,
+      proxy,
+      resolved,
+      sockFactory,
+      onAuthMessage,
+      credentialEndpointSignature
+    );
     // lastSock is guaranteed to be defined here: a successful authFactory.connect
     // means sockFactory was called and resolved at least once.
     return new ProxiedSshConnection(connection, socketCleanup(lastSock!), socketCloseRelay(lastSock!));
@@ -368,14 +398,16 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     proxy: Socks5Proxy | HttpConnectProxy,
     resolved: ResolvedProxyPassword,
     sockFactory: () => Promise<Duplex>,
-    onAuthMessage?: (text: string) => void
+    onAuthMessage?: (text: string) => void,
+    credentialEndpointSignature?: string
   ): Promise<SshConnection> {
     let connection: SshConnection;
     try {
       connection = await this.authFactory.connect(target, {
         sockFactory,
         route: () => proxyEndpointRoute(proxy),
-        ...(onAuthMessage && { onAuthMessage })
+        ...(onAuthMessage && { onAuthMessage }),
+        ...(credentialEndpointSignature !== undefined && { credentialEndpointSignature })
       });
     } catch (error) {
       // The shared answer may be what failed: the next connect asks afresh.

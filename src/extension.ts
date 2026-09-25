@@ -488,7 +488,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
           ignoreFocusOut: true
         })
       ),
-    (id) => core.getAuthProfile(id)
+    (id) => core.getAuthProfile(id),
+    (id) => core.getServer(id)
   );
   const multiplexingConfig = vscode.workspace.getConfiguration("nexus.ssh.multiplexing");
   const { proxiedFactory, pool, tunnelManager } = createSshTransportStack(sshFactory, {
