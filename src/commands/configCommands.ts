@@ -1610,15 +1610,12 @@ function remapProxy(proxy: ProxyConfig | undefined, linkServer: (id: string) => 
 const SHARED_USERNAME = "user";
 
 /**
- * SETTINGS — the one part of a share not rebuilt by a rules table below. Its
- * key set is data (`SETTINGS_KEYS`, most of it generated from the settings
- * panel's metadata), not a model type the compiler could hold a table to, and
- * it is already an allowlist on both sides: the export reads only those keys
- * (`readSettings`) and the import writes only those keys
- * (`partitionImportedSettings`), so an undeclared key travels in neither
- * direction. What is left is the one value a share rewrites — a session log
- * directory is a path on the sender's machine, so it becomes "" (the default)
- * — applied in BOTH directions, because a share file is untrusted.
+ * SETTINGS — the one part of a share not rebuilt by a model-typed rules table
+ * below. `SHARE_SETTINGS_POLICY` is a separate, explicit per-key allowlist:
+ * only keys marked "share" travel on export or import. Unknown and local-only
+ * keys never overwrite the recipient's settings, including machine-specific
+ * paths and security-relevant controls. Apply it in BOTH directions because a
+ * share file is untrusted.
  */
 function scrubSharedSettings(settings: Record<string, unknown>): Record<string, unknown> {
   const scrubbed: Record<string, unknown> = {};
