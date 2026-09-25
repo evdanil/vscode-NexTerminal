@@ -1316,6 +1316,22 @@ describe("ipmiCredentialsOffNote — fires only where something reads the passwo
     ).toContain('tick "Provide IPMI credentials"');
   });
 
+  it.each([
+    ["stdin dup of fd 0", "sh <<'EOF' 0<&0\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n"],
+    ["stdin dup of fd 3", "sh 3<<'EOF' 0<&3\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n"],
+    ["cat pipeline into sh", "cat <<'EOF' | sh\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n"]
+  ])("keeps the credential hint when here-document stdin reaches a shell through %s", (_route, text) => {
+    expect(hint(text as string) ?? "", text).toContain('tick "Provide IPMI credentials"');
+  });
+
+  it("keeps later pipeline routing aligned after parsing an earlier executable here-document", () => {
+    expect(
+      hint(
+        "sh <<'FIRST'\necho first\nFIRST\ncat <<'SECOND' | sh\nipmitool -H ${profile.ipmiHost} -E sol activate\nSECOND\n"
+      ) ?? ""
+    ).toContain('tick "Provide IPMI credentials"');
+  });
+
   it("keeps executable here-documents with their shell command across pipelines and separators", () => {
     for (const text of [
       "sh <<'EOF' | cat\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n",

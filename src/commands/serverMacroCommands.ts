@@ -296,7 +296,7 @@ const IPMI_PASSWORD_VAR_RE = new RegExp(`\\b(?:${IPMI_PASSWORD_ENV_VARS.join("|"
  * text-derived HINT only (§3.3), never an authorization input.
  */
 function macroMayReadIpmiPasswordEnv(text: string): boolean {
-  return shellSegments(text).some((words) => {
+  return shellSegments(text).segments.some((words) => {
     const segment = words.map((word) => word.raw).join(" ");
     const args = ipmitoolArguments(words);
     return (
@@ -414,6 +414,7 @@ interface ShellWord {
 
 interface ShellRedirection {
   readonly fileDescriptor: number;
+  readonly operator: string;
   readonly hereDocumentStripTabs?: boolean;
 }
 
@@ -464,11 +465,17 @@ function readHereDocumentBody(text: string, start: number, hereDocument: HereDoc
  * `-U "ops;admin" -E` stays one command, `"ipmitool"`, `ip"mi"tool`, `-"E"` and
  * `\-E` read as the shell reads them, and `'\-E'` and `"\-E"` reach the command
  * as `\-E`, not `-E`. Here-document bodies are skipped through their matching
- * delimiter, with `<<-` matching after leading tabs are stripped; bodies read by
- * a shell interpreter as its stdin script are parsed as executable code.
+ * delimiter, with `<<-` matching after leading tabs are stripped; executable
+ * shell-script bodies are parsed, and only routes known to be inert are skipped.
  */
-function shellSegments(text: string): ShellWord[][] {
+interface ShellSegmentParseResult {
+  readonly segments: ShellWord[][];
+  readonly separators: string[];
+}
+
+function shellSegments(text: string): ShellSegmentParseResult {
   const segments: ShellWord[][] = [];
+  const segmentSeparators: string[] = [];
   let words: ShellWord[] = [];
   let raw = "";
   let value = "";
@@ -525,6 +532,7 @@ function shellSegments(text: string): ShellWord[][] {
     } else if (/[;&|\n]/.test(c)) {
       endWord();
       segments.push(words);
+      segmentSeparators.push(c);
       words = [];
       if (c === "\n" && hereDocuments.length > 0) {
         let bodyStart = i + 1;
@@ -538,7 +546,7 @@ function shellSegments(text: string): ShellWord[][] {
             break;
           }
           bodyStart = body.afterDelimiter;
-          if (hereDocumentFeedsShellScript(hereDocument)) {
+          if (hereDocumentDisposition(hereDocument, segments, segmentSeparators) !== "inert") {
             scriptBodies.push(body.text);
           }
         }
@@ -548,7 +556,9 @@ function shellSegments(text: string): ShellWord[][] {
         hereDocuments.length = 0;
         if (complete) {
           for (const scriptBody of scriptBodies) {
-            segments.push(...shellSegments(scriptBody));
+            const parsedBody = shellSegments(scriptBody);
+            segments.push(...parsedBody.segments);
+            segmentSeparators.push(...parsedBody.separators);
           }
         }
       }
@@ -582,6 +592,7 @@ function shellSegments(text: string): ShellWord[][] {
       redirectionTarget = true;
       pendingRedirection = {
         fileDescriptor,
+        operator,
         ...((operator === "<<" || operator === "<<-") ? { hereDocumentStripTabs: operator === "<<-" } : {})
       };
     } else if (/[\s)]/.test(c)) {
@@ -593,7 +604,8 @@ function shellSegments(text: string): ShellWord[][] {
   }
   endWord();
   segments.push(words);
-  return segments;
+  segmentSeparators.push("");
+  return { segments, separators: segmentSeparators };
 }
 
 /**
@@ -663,7 +675,7 @@ function shellInvocation(segment: readonly ShellWord[]): ShellInvocation | undef
     }
     // The basename is cut from the word AS WRITTEN, so a Windows-style path
     // keeps its separators, and only then read as a word.
-    const basename = shellSegments(raw.split(/[\\/]/).pop() ?? "")[0][0]?.value;
+    const basename = shellSegments(raw.split(/[\\/]/).pop() ?? "").segments[0][0]?.value;
     return basename ? { command: basename, args: words.slice(i + 1) } : undefined;
   }
   return undefined;
@@ -725,15 +737,73 @@ function shellReadsStdinScript(segment: readonly ShellWord[]): boolean {
   return true;
 }
 
-/** Whether this specific queued body is the shell command's effective stdin script. */
-function hereDocumentFeedsShellScript(hereDocument: HereDocument): boolean {
-  if (hereDocument.target.redirection?.fileDescriptor !== 0) {
-    return false;
+type HereDocumentDisposition = "executable" | "inert" | "unknown";
+
+/** Whether this body executes, is known data, or has routing this small parser cannot prove. */
+function hereDocumentDisposition(
+  hereDocument: HereDocument,
+  segments: readonly ShellWord[][],
+  separators: readonly string[]
+): HereDocumentDisposition {
+  const ownerIndex = segments.indexOf(hereDocument.ownerWords);
+  if (ownerIndex < 0) {
+    return "unknown";
   }
-  const effectiveStdinRedirection = hereDocument.ownerWords
-    .filter((word) => word.redirection?.fileDescriptor === 0)
-    .at(-1);
-  return effectiveStdinRedirection === hereDocument.target && shellReadsStdinScript(hereDocument.ownerWords);
+
+  const owner = hereDocument.ownerWords;
+  const invocation = shellInvocation(owner);
+  if (invocation && SHELL_INTERPRETERS.has(invocation.command)) {
+    const effectiveStdinRedirection = owner
+      .filter(
+        (word) => word.redirection?.fileDescriptor === 0 && word.redirection.operator.startsWith("<")
+      )
+      .at(-1);
+    if (effectiveStdinRedirection?.redirection?.operator === "<&") {
+      // A descriptor duplicate may keep this body connected to stdin. Since
+      // the source descriptor is not part of the command grammar, do not treat
+      // an unfamiliar duplicate as proof that the body cannot execute.
+      return "unknown";
+    }
+    if (hereDocument.target.redirection?.fileDescriptor === 0) {
+      if (effectiveStdinRedirection === hereDocument.target) {
+        return shellReadsStdinScript(owner) ? "executable" : "unknown";
+      }
+      // A later non-duplicating stdin source replaces this queued body.
+      if (effectiveStdinRedirection) {
+        return "inert";
+      }
+    }
+    return "unknown";
+  }
+
+  // A non-shell command in a pipeline can pass this body to a later shell.
+  // Recognize the direct case, but leave other pipeline transformations
+  // unknown rather than assuming their stdin is harmless data.
+  let pipelineIndex = ownerIndex;
+  while (separators[pipelineIndex] === "|") {
+    pipelineIndex++;
+    const pipedSegment = segments[pipelineIndex];
+    if (!pipedSegment) {
+      return "unknown";
+    }
+    const pipedInvocation = shellInvocation(pipedSegment);
+    if (pipedInvocation && SHELL_INTERPRETERS.has(pipedInvocation.command)) {
+      const stdinRedirection = pipedSegment
+        .filter(
+          (word) => word.redirection?.fileDescriptor === 0 && word.redirection.operator.startsWith("<")
+        )
+        .at(-1);
+      if (stdinRedirection) {
+        return stdinRedirection.redirection?.operator === "<&" ? "unknown" : "inert";
+      }
+      return shellReadsStdinScript(pipedSegment) ? "executable" : "unknown";
+    }
+  }
+
+  if (invocation?.command === "cat" && separators[ownerIndex] !== "|") {
+    return "inert";
+  }
+  return "unknown";
 }
 
 /** An `ipmitool …` invocation in a macro's text — at line start or after whitespace. */
@@ -958,7 +1028,7 @@ function passesEnvFlag(args: readonly ShellWord[]): boolean {
  * command is neither blocked nor rewritten on its account.
  */
 export function commandReadsIpmiEnv(text: string): boolean {
-  return shellSegments(text).some((words) => {
+  return shellSegments(text).segments.some((words) => {
     const args = ipmitoolArguments(words);
     return args !== undefined && passesEnvFlag(args);
   });
