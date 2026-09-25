@@ -1300,6 +1300,18 @@ describe("ipmiCredentialsOffNote — fires only where something reads the passwo
     expect(hint(" ipmitool -H ${profile.ipmiHost} -a sel list | grep -E Critical\n")).toBeUndefined();
   });
 
+  it("does not treat a quoted here-document body as an executable command", () => {
+    expect(
+      hint(" ipmitool -H ${profile.ipmiHost} -a sol activate\ncat <<'EOF'\nipmitool -E\nEOF\n")
+    ).toBeUndefined();
+  });
+
+  it("matches tab-stripped `<<-` terminators before parsing following commands", () => {
+    expect(
+      hint(" ipmitool -H ${profile.ipmiHost} -a sol activate\ncat <<-EOF\n\tipmitool -a sol activate\n\tEOF\nipmitool -E sol activate\n")
+    ).toContain("Provide IPMI credentials");
+  });
+
   /**
    * "Is this segment an ipmitool invocation?" is decided by the COMMAND POSITION
    * — the first word after `NAME=value` assignments and the known prefixes

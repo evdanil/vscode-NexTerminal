@@ -410,6 +410,30 @@ interface ShellWord {
   readonly redirectionTarget?: boolean;
 }
 
+interface HereDocument {
+  readonly delimiter: string;
+  readonly stripTabs: boolean;
+}
+
+/** Skip a here-document body and return the start of the line after its delimiter. */
+function skipHereDocumentBody(text: string, start: number, hereDocument: HereDocument): number | undefined {
+  let lineStart = start;
+  while (lineStart <= text.length) {
+    const newline = text.indexOf("\n", lineStart);
+    const lineEnd = newline < 0 ? text.length : newline;
+    const line = text.slice(lineStart, lineEnd);
+    const candidate = hereDocument.stripTabs ? line.replace(/^\t+/, "") : line;
+    if (candidate === hereDocument.delimiter) {
+      return newline < 0 ? text.length : newline + 1;
+    }
+    if (newline < 0) {
+      return undefined;
+    }
+    lineStart = newline + 1;
+  }
+  return undefined;
+}
+
 /**
  * A macro's command segments, each a list of words, read with POSIX quoting and
  * nothing more — no expansion, no general parse (Codex on #191). A `;`, `&`, `|`
@@ -422,7 +446,8 @@ interface ShellWord {
  * a backslash-newline joins the lines except inside single quotes. So
  * `-U "ops;admin" -E` stays one command, `"ipmitool"`, `ip"mi"tool`, `-"E"` and
  * `\-E` read as the shell reads them, and `'\-E'` and `"\-E"` reach the command
- * as `\-E`, not `-E`.
+ * as `\-E`, not `-E`. Here-document bodies are skipped through their matching
+ * delimiter, with `<<-` matching after leading tabs are stripped.
  */
 function shellSegments(text: string): ShellWord[][] {
   const segments: ShellWord[][] = [];
@@ -431,9 +456,15 @@ function shellSegments(text: string): ShellWord[][] {
   let value = "";
   let quote = "";
   let redirectionTarget = false;
+  let hereDocumentStripTabs: boolean | undefined;
+  const hereDocuments: HereDocument[] = [];
   const endWord = (): void => {
     if (raw) {
       words.push({ raw, value, redirectionTarget });
+      if (redirectionTarget && hereDocumentStripTabs !== undefined) {
+        hereDocuments.push({ delimiter: value, stripTabs: hereDocumentStripTabs });
+        hereDocumentStripTabs = undefined;
+      }
       redirectionTarget = false;
     }
     raw = value = "";
@@ -466,11 +497,32 @@ function shellSegments(text: string): ShellWord[][] {
       endWord();
       segments.push(words);
       words = [];
+      if (c === "\n" && hereDocuments.length > 0) {
+        let bodyStart = i + 1;
+        for (const hereDocument of hereDocuments) {
+          const afterDelimiter = skipHereDocumentBody(text, bodyStart, hereDocument);
+          if (afterDelimiter === undefined) {
+            i = text.length;
+            break;
+          }
+          bodyStart = afterDelimiter;
+        }
+        if (bodyStart > i + 1) {
+          i = bodyStart - 1;
+        }
+        hereDocuments.length = 0;
+      }
     } else if (c === "<" || c === ">") {
       endWord();
+      let hereDocumentOperator = false;
+      let stripTabs = false;
       if (next === c) {
         i++;
-        if (c === "<" && text[i + 1] === "-") i++;
+        if (c === "<" && text[i + 1] === "-") {
+          i++;
+          stripTabs = true;
+        }
+        hereDocumentOperator = c === "<" && text[i + 1] !== "<";
       } else if (
         (c === "<" && (next === ">" || next === "&")) ||
         (c === ">" && (next === "&" || next === "|"))
@@ -478,6 +530,9 @@ function shellSegments(text: string): ShellWord[][] {
         i++;
       }
       redirectionTarget = true;
+      if (hereDocumentOperator) {
+        hereDocumentStripTabs = stripTabs;
+      }
     } else if (/[\s)]/.test(c)) {
       endWord();
     } else {
