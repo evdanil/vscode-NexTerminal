@@ -4551,6 +4551,69 @@ describe("nexus.server.edit — addressless placeholder is editable (P2-a)", () 
     ]);
   });
 
+  // #170 (Codex P2 on #202, second) — the notice names the protocol whose address
+  // the sync will report, so the protocol stamp has to go with the address stamps.
+  // A hand-edited backup can leave a telnet placeholder with
+  // `syncedProtocol: "telnet"`; kept through the edit, it reads as sync-owned, a
+  // device that offers SSH moves the next sync onto its SSH endpoint, and the
+  // warning names an SSH address for a server that stays on telnet — while the
+  // notice promised a different TELNET address would be named.
+  it("#170 — typing a telnet address onto a telnet placeholder that carried a telnet protocol stamp drops it too, so a sync on a dual-stack device names the telnet address the notice promised (⊘ dropping only the host and port stamps names the device's SSH address instead)", async () => {
+    const stamped = makeServer({
+      ...placeholder(),
+      protocol: "telnet",
+      origin: {
+        sourceId: "s",
+        externalId: "e",
+        syncedAt: 1,
+        syncedInstanceKey: "https://lab.example.test",
+        syncedUsername: "admin",
+        syncedProtocol: "telnet",
+        syncedHost: "10.0.0.1",
+        syncedPort: 2300
+      }
+    });
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [stamped], authProfiles: [] });
+
+    const panel = await openEdit(ctx);
+    await panel.onSubmit(addresslessSubmit({ host: "10.0.0.5", port: 23, protocol: "telnet" }));
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.protocol).toBe("telnet");
+    expect(saved.origin).not.toHaveProperty("syncedProtocol");
+    // Only the stamps that pick or describe the endpoint go. The username stamp
+    // records who wrote the username — it picks no endpoint, and the auth
+    // retro-apply rule reads it — and identity stays with it.
+    expect(saved.origin).toEqual({ sourceId: "s", externalId: "e", syncedAt: 1, syncedInstanceKey: "https://lab.example.test", syncedUsername: "admin" });
+
+    const source = { id: "s", providerId: "eve-ng", name: "Lab", targetFolder: "Lab", prunePolicy: "orphan" as const, config: {}, secretFieldIds: [] };
+    const dualStack = computeSyncPlan({
+      source,
+      tree: {
+        contractVersion: 1,
+        devices: [{ externalId: "e", name: "stopped-node", endpoints: [{ kind: "ssh", host: "10.0.0.9", port: 22 }, { kind: "telnet", host: "10.0.0.7", port: 2323 }] }]
+      },
+      currentServers: [saved],
+      now: 2000
+    });
+    expect(dualStack.warnings.filter((w) => w.includes("kept your"))).toEqual([
+      '"stopped-node": kept your host 10.0.0.5 and port 23; the source now reports host 10.0.0.7 and port 2323 — set the host and port to those to let the source manage them.'
+    ]);
+    for (const u of dualStack.updates) {
+      expect(u.after.protocol).toBe("telnet");
+    }
+
+    // A device that offers SSH only has no telnet address to report, so nothing
+    // is named — never an SSH address for a server that stays on telnet.
+    const sshOnly = computeSyncPlan({
+      source,
+      tree: { contractVersion: 1, devices: [{ externalId: "e", name: "stopped-node", endpoints: [{ kind: "ssh", host: "10.0.0.9", port: 22 }] }] },
+      currentServers: [saved],
+      now: 2000
+    });
+    expect(sshOnly.warnings.filter((w) => w.includes("kept your"))).toEqual([]);
+  });
+
   it("P2-3 control — editing an addressless placeholder WITHOUT giving it a host shows no hand-typed-address notice (⊘ a notice on every placeholder edit is noise)", async () => {
     const { ctx } = setupHarness({
       profiles: [],

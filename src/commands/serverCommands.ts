@@ -1903,22 +1903,32 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             // `candidate.authProfileId` and the hidden select produced no
             // candidate. Synchronous, so the "nothing may await between the
             // liveRecord capture and the write" rule above still holds.
-            // #170 — an address typed onto a placeholder is the user's, and it
-            // is recorded as such by carrying NO syncedHost/syncedPort stamp. A
-            // real placeholder has none (the addressless add and the downgrade
-            // both drop them), so this loses nothing there; a hand-edited
-            // backup can still carry them, and kept stamps would make the sync's
-            // kept-address warning treat the stamped value as already seen —
-            // a device reporting it would go unmentioned, breaking the notice's
-            // promise below. Keyed on the form-open placeholder, as the notice
-            // is: if a sync gave the live record an address while the form sat
-            // open, the typed value overrides it and the same holds. A copy, so
-            // the live record is never mutated.
+            // #170 — an address typed onto a placeholder is the user's console
+            // endpoint, recorded as such by carrying no stamp that describes an
+            // endpoint: syncedHost/syncedPort (whose address the sync wrote) and
+            // syncedProtocol (which transport it wrote, and so which endpoint
+            // the next sync reads). A real placeholder carries none of the three
+            // (the addressless add writes none, and the downgrade drops them),
+            // so this loses nothing there; a hand-edited backup can still carry
+            // them. A kept host/port stamp
+            // would make the kept-address warning treat the stamped value as
+            // already seen, and a kept protocol stamp equal to the record's
+            // protocol would let a device's other transport move the next sync
+            // onto that endpoint — either way the warning the notice below
+            // promises would not come, or would name another transport's
+            // address. syncedUsername stays: it records who wrote the username,
+            // which picks no endpoint and which the auth retro-apply rule reads.
+            // Identity (source, device, deployment) stays too. Keyed on the
+            // form-open placeholder, as the notice is: if a sync gave the live
+            // record an address while the form sat open, the typed value
+            // overrides it and the same holds. A copy, so the live record is
+            // never mutated.
             let liveOrigin = liveRecord?.origin;
             if (liveOrigin !== undefined && gainsHandAddress) {
               liveOrigin = { ...liveOrigin };
               delete liveOrigin.syncedHost;
               delete liveOrigin.syncedPort;
+              delete liveOrigin.syncedProtocol;
             }
             const updated: ServerConfig = {
               ...preserveDormantSshConfig(liveRecord ?? existing, linked),
