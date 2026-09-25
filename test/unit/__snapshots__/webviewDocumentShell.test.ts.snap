@@ -7112,7 +7112,7 @@ echo hi</textarea>
          triggers it (route = gateway AND this box ticked), not in the run-on group
          where ticking the box surfaced a hint in a different, possibly off-screen
          group. Same id / same live-update (updateGatewayInertHint), same constant. -->
-    <div class="hint" id="gateway-inert-credentials-hint" style="display:none;">Nexus doesn&#39;t send IPMI credentials to a gateway session — there, ipmitool with \`-a\`, or with \`-E\` and no IPMITOOL_PASSWORD/IPMI_PASSWORD set on the gateway, asks for the password in the gateway terminal</div>
+    <div class="hint" id="gateway-inert-credentials-hint" style="display:none;">Nexus doesn&#39;t send IPMI credentials to a gateway session — ipmitool there uses only what the command or the gateway supplies (\`-P\`, \`-f\`, or IPMITOOL_PASSWORD/IPMI_PASSWORD set on the gateway); with none of those, \`-a\` or \`-E\` makes it ask in the gateway terminal</div>
   </div>
 
   <div class="form-group">

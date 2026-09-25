@@ -286,9 +286,10 @@ describe("renderMacroEditorHtml", () => {
       0
     );
     expect(both).toContain('id="gateway-inert-credentials-hint"');
-    expect(both).toContain("asks for the password in the gateway terminal");
-    // #189 — says what happens for `-a` and `-E` alike; no `-a`-only promise.
+    expect(both).toContain("with none of those, `-a` or `-E` makes it ask in the gateway terminal");
+    // #189 — no `-a`-only promise; Codex on #191 — no unconditional prompt either.
     expect(both).not.toContain("via its `-a` form");
+    expect(both).not.toContain("asks for the password in the gateway terminal");
     // Rendered visible (no display:none) when both are on.
     expect(both).not.toContain('id="gateway-inert-credentials-hint" style="display:none;"');
     // Gateway route but credentials OFF → hint hidden.

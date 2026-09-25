@@ -181,15 +181,18 @@ export function resolveMacroRoute(macro: Pick<TerminalMacro, "route">): MacroRou
  * editor's live hint and the per-run delivery note read from ONE string and
  * cannot drift.
  *
- * STATES WHAT HAPPENS, NOT WHICH FORM THIS COMMAND USES (#174, #189). ipmitool
- * on the gateway uses what the gateway has: with `-a` it prompts, and with `-E`
- * and neither variable set there it logs "Unable to read password from
- * environment" and then prompts too (upstream `lib/ipmi_main.c`) — it does not
- * fail. Earlier copy promised a prompt "via its `-a` form" and a run-time warning
- * said `-E` "will fail"; both were guesses from parsing the command.
+ * STATES ONLY WHAT IS GUARANTEED (#174, #189). The note never names the form this
+ * command uses, and its prompt is conditional. Upstream `lib/ipmi_main.c`: `-a`
+ * prompts while the options are read; `-E` takes a password variable if one is
+ * set, and otherwise logs "Unable to read password from environment" and leaves
+ * the prompt to the end, which is skipped when `-P` or `-f` supplied one — so
+ * `-E -P …` never asks, and `-E` never fails for want of the variable. Earlier
+ * copy promised a prompt "via its `-a` form", a run-time warning said `-E` "will
+ * fail", and a later draft promised a prompt outright; each was a guess about
+ * the command.
  */
 export const IPMI_GATEWAY_INERT_CREDENTIALS_HINT =
-  "Nexus doesn't send IPMI credentials to a gateway session — there, ipmitool with `-a`, or with `-E` and no IPMITOOL_PASSWORD/IPMI_PASSWORD set on the gateway, asks for the password in the gateway terminal";
+  "Nexus doesn't send IPMI credentials to a gateway session — ipmitool there uses only what the command or the gateway supplies (`-P`, `-f`, or IPMITOOL_PASSWORD/IPMI_PASSWORD set on the gateway); with none of those, `-a` or `-E` makes it ask in the gateway terminal";
 
 /** Human-readable label for a run target, shared by the editor and the pickers. */
 export function macroRunTargetLabel(target: MacroRunTarget): string {

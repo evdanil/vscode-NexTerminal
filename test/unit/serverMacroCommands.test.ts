@@ -1366,6 +1366,35 @@ describe("ipmiCredentialsOffNote — fires only where something reads the passwo
     );
   });
 
+  /**
+   * Codex on #191 — quotes and backslashes are read the way a POSIX shell reads
+   * them (`shellSegments`): inside single quotes a backslash is literal, inside
+   * double quotes it escapes only `$`, `` ` ``, `"`, `\` and newline, and a `;`,
+   * `&` or `|` splits commands only outside quotes.
+   */
+  it("reads a backslash inside quotes as literal, so `'\\-E'` is not ipmitool's `-E` — ⊘ treating every backslash as an escape", () => {
+    expect(hint(" ipmitool -H ${profile.ipmiHost} '\\-E' sol activate\n")).toBeUndefined();
+  });
+
+  it("reads `\"\\-E\"` as a literal backslash too — ⊘ escaping any character inside double quotes", () => {
+    expect(hint(' ipmitool -H ${profile.ipmiHost} "\\-E" sol activate\n')).toBeUndefined();
+  });
+
+  it("reads an unquoted `\\-E` as `-E` — ⊘ never treating a backslash as an escape", () => {
+    expect(hint(" ipmitool -H ${profile.ipmiHost} \\-E sol activate\n")).toContain("Provide IPMI credentials");
+  });
+
+  it("keeps `-U \"ops;admin\" -E` one command — ⊘ splitting segments at a quoted separator", () => {
+    expect(hint(' ipmitool -H ${profile.ipmiHost} -U "ops;admin" -E sol activate\n')).toContain("Provide IPMI credentials");
+  });
+
+  it("still splits at the `;` after a closed quote — ⊘ a quote state that never closes", () => {
+    expect(hint(" echo 'a;b'; ipmitool -H ${profile.ipmiHost} -E sol activate\n")).toContain("Provide IPMI credentials");
+    // With `-a` the ipmitool segment needs no hint; an unclosed quote would merge it
+    // into the echo segment and bring the token-consumer hint back.
+    expect(hint(" echo 'a;b'; ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
+  });
+
   it("still hints when an ipmitool command takes the password from the variable by name — ⊘ 'no -E ⇒ never reads the env'", () => {
     // The shell expands it into argv: the checkbox is exactly what makes this work.
     expect(hint(' ipmitool -H ${profile.ipmiHost} -P "$IPMI_PASSWORD" sol activate\n')).toContain(
@@ -1966,11 +1995,13 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
    * Every command below was misread by one version of that parse.
    */
   describe("one gateway note, from the route and the flag alone (#174, #189)", () => {
-    const NOTE_TAIL = "asks for the password in the gateway terminal";
+    const NOTE_TAIL = "makes it ask in the gateway terminal";
     const COMMANDS = [
       " ipmitool -H ${profile.ipmiHost} -E sol activate\n",
       " ipmitool -H ${profile.ipmiHost} -a sol activate\n",
       " ipmitool -I lanplus -H ${profile.ipmiHost} -U admin sol activate\n",
+      // Already has its password: `-E` does not make it ask (Codex on #191).
+      " ipmitool -H ${profile.ipmiHost} -E -f /etc/bmc.pass sol activate\n",
       // The shapes review found the parse misreading on #191:
       ' ipmitool -H ${profile.ipmiHost} -U "ops;admin" -E sol activate\n', // a quoted separator
       ' n=ipmi; "$n"tool -H ${profile.ipmiHost} -E sol activate\n', // a dynamic command word
@@ -2025,15 +2056,20 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
           expect(status, text).not.toContain("reads the IPMI password from the environment");
           expect(status, text).not.toContain("via its `-a` form");
           expect(status, text).not.toContain("use ipmitool's -a form");
+          // No unconditional prompt: `-E -P …` / `-E -f …` already has its password.
+          expect(status, text).not.toContain("asks for the password in the gateway terminal");
         }
       }
     });
 
-    it("says what ipmitool does on the gateway for `-a` AND for `-E` with no variable there — ⊘ the old `-a`-only promise", () => {
-      // The one string the run note and the editor hint share (#189: `-E` prompts too).
-      expect(IPMI_GATEWAY_INERT_CREDENTIALS_HINT).toContain(NOTE_TAIL);
-      expect(IPMI_GATEWAY_INERT_CREDENTIALS_HINT).toContain("with `-a`");
-      expect(IPMI_GATEWAY_INERT_CREDENTIALS_HINT).toContain("`-E` and no IPMITOOL_PASSWORD/IPMI_PASSWORD set on the gateway");
+    it("states only what is guaranteed, with the prompt conditional — ⊘ the old `-a`-only promise, ⊘ an unconditional prompt", () => {
+      // The one string the run note and the editor hint share. What ipmitool uses on
+      // the gateway comes first; the prompt applies only when none of it is there
+      // (#189: `-E` with no variable prompts too; Codex on #191: `-E -P …` does not).
+      expect(IPMI_GATEWAY_INERT_CREDENTIALS_HINT).toContain("uses only what the command or the gateway supplies");
+      expect(IPMI_GATEWAY_INERT_CREDENTIALS_HINT).toContain("`-P`, `-f`, or IPMITOOL_PASSWORD/IPMI_PASSWORD set on the gateway");
+      expect(IPMI_GATEWAY_INERT_CREDENTIALS_HINT).toContain("with none of those, `-a` or `-E` " + NOTE_TAIL);
+      expect(IPMI_GATEWAY_INERT_CREDENTIALS_HINT).not.toContain("asks for the password in the gateway terminal");
       expect(IPMI_GATEWAY_INERT_CREDENTIALS_HINT).not.toMatch(/fail/i);
     });
   });
@@ -2163,6 +2199,18 @@ describe("commandReadsIpmiEnv — ipmitool `-E` env-password flag detection", ()
     expect(commandReadsIpmiEnv("C:\\tools\\ipmitool -H x -E sol activate")).toBe(true);
     // …and an assignment is recognised as written: a quoted one is the command name.
     expect(commandReadsIpmiEnv('"LANG=C" ipmitool -E sol activate')).toBe(false);
+  });
+
+  it("follows POSIX quoting for backslashes and separators (Codex on #191)", () => {
+    // A backslash is literal inside single quotes and escapes only $ ` " \ and
+    // newline inside double quotes, so ipmitool receives `\-E`, not `-E`…
+    expect(commandReadsIpmiEnv("ipmitool -H x '\\-E' sol activate")).toBe(false);
+    expect(commandReadsIpmiEnv('ipmitool -H x "\\-E" sol activate')).toBe(false);
+    // …and a `;`, `&` or `|` inside quotes or escaped does not end the command.
+    expect(commandReadsIpmiEnv('ipmitool -H x -U "ops;admin" -E sol activate')).toBe(true);
+    expect(commandReadsIpmiEnv("ipmitool -H x -U 'a|b&c' -E sol activate")).toBe(true);
+    expect(commandReadsIpmiEnv("ipmitool -H x -U ops\\;admin -E sol activate")).toBe(true);
+    expect(commandReadsIpmiEnv("echo 'a;b'; ipmitool -H x -E sol activate")).toBe(true);
   });
 
   it("does NOT match `-E` embedded in another word", () => {

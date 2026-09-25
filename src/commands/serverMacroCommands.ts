@@ -279,7 +279,7 @@ const IPMI_PASSWORD_VAR_RE = new RegExp(`\\b(?:${IPMI_PASSWORD_ENV_VARS.join("|"
 
 /**
  * Could ticking "Provide IPMI credentials" change this macro's run? Decided per
- * command segment (`commandSegments`), and true if ANY segment may read the
+ * command segment (`shellSegments`), and true if ANY segment may read the
  * password environment:
  *
  *  - it names a password variable (`ipmitool -P "$IPMI_PASSWORD"` reads it
@@ -295,11 +295,13 @@ const IPMI_PASSWORD_VAR_RE = new RegExp(`\\b(?:${IPMI_PASSWORD_ENV_VARS.join("|"
  * text-derived HINT only (§3.3), never an authorization input.
  */
 function macroMayReadIpmiPasswordEnv(text: string): boolean {
-  return commandSegments(text).some(
-    (segment) =>
+  return shellSegments(text).some((words) => {
+    const segment = words.map((word) => word.raw).join(" ");
+    return (
       IPMI_PASSWORD_VAR_RE.test(segment) ||
-      (ipmitoolArguments(segment) === undefined ? usesIpmiTokens(segment) : commandReadsIpmiEnv(segment))
-  );
+      (ipmitoolArguments(words) === undefined ? usesIpmiTokens(segment) : commandReadsIpmiEnv(segment))
+    );
+  });
 }
 
 /**
@@ -400,36 +402,83 @@ function prefixOptionOperandWords(options: PrefixOptions, word: string): 0 | 1 |
   return 0;
 }
 
-/**
- * A subshell's opening `(` (or `( (`), which is not a word of the command it
- * runs — but not `((`, which opens arithmetic, not a command.
- */
-const SUBSHELL_OPENERS_RE = /^(?:\((?!\()\s*)+/;
+/** A shell word as written (`raw`) and as the command receives it (`value`). */
+interface ShellWord {
+  readonly raw: string;
+  readonly value: string;
+}
 
 /**
- * A word as the shell hands it on: quote characters removed and each backslash
- * escape reduced to the character it escapes, so `"ipmitool"`, `'ipmitool'`,
- * `ipmitool''` and `ip"mi"tool` are `ipmitool`, `"sudo"` is `sudo` and `-"E"` or
- * `\-E` is `-E`. Every name and option comparison in `ipmitoolArguments` and
- * `passesEnvFlag` goes through it. Words only: quotes that hide whitespace
- * (`"/opt/my tools/ipmitool"`) were split apart before this sees them, which
- * leaves the segment "not ipmitool" — and that keeps the hint.
+ * A macro's command segments, each a list of words, read with POSIX quoting and
+ * nothing more — no expansion, no general parse (Codex on #191). A `;`, `&`, `|`
+ * or newline ends a segment only outside quotes and unescaped; whitespace, `<`,
+ * `>` and `)` end a word there, so `-E>/tmp/log` and `(ipmitool -E)` give a bare
+ * `-E`. Inside single quotes everything is literal; inside double quotes a
+ * backslash escapes only `$`, `` ` ``, `"`, `\` and newline; outside quotes it
+ * escapes the next character; a backslash-newline joins the lines except inside
+ * single quotes. So `-U "ops;admin" -E` stays one command, `"ipmitool"`,
+ * `ip"mi"tool`, `-"E"` and `\-E` read as the shell reads them, and `'\-E'` and
+ * `"\-E"` reach the command as `\-E`, not `-E`.
  */
-function unquoteShellWord(word: string): string {
-  return word.replace(/\\(.)|['"]/g, "$1");
+function shellSegments(text: string): ShellWord[][] {
+  const segments: ShellWord[][] = [];
+  let words: ShellWord[] = [];
+  let raw = "";
+  let value = "";
+  let quote = "";
+  const endWord = (): void => {
+    if (raw) {
+      words.push({ raw, value });
+    }
+    raw = value = "";
+  };
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    const next = text[i + 1] ?? "";
+    if (quote === "'") {
+      quote = c === "'" ? "" : quote;
+      value += c === "'" ? "" : c;
+      raw += c;
+    } else if (c === "\\" && /^\r?\n/.test(text.slice(i + 1, i + 3))) {
+      i += next === "\r" ? 2 : 1;
+    } else if (c === "\\" && next && (!quote || '$`"\\'.includes(next))) {
+      raw += c + next;
+      value += next;
+      i++;
+    } else if (quote === '"') {
+      quote = c === '"' ? "" : quote;
+      value += c === '"' ? "" : c;
+      raw += c;
+    } else if (c === "'" || c === '"') {
+      quote = c;
+      raw += c;
+    } else if (/[;&|\n]/.test(c)) {
+      endWord();
+      segments.push(words);
+      words = [];
+    } else if (/[\s<>)]/.test(c)) {
+      endWord();
+    } else {
+      raw += c;
+      value += c;
+    }
+  }
+  endWord();
+  segments.push(words);
+  return segments;
 }
 
 /**
  * The ARGUMENT WORDS of a segment whose COMMAND is ipmitool — the words after
- * the command word, as written — or `undefined` when its command is not
- * ipmitool. The command word is the first after a subshell's opening `(`,
- * `NAME=value` assignments and `COMMAND_PREFIXES` (their options AND those
- * options' operands consumed, getopt-style, then any positional operand such as
- * timeout's DURATION), with a basename of exactly `ipmitool` once dequoted —
- * `/usr/bin/ipmitool`, `"ipmitool"`, `sudo -E ipmitool`, `sudo -u root ipmitool`,
- * `LANG=C ipmitool`, `timeout 30 ipmitool`, `(ipmitool …)`. Returning the
- * arguments, not a yes/no, is what keeps a flag scan off the prefix: in
- * `sudo -u ipmitool -E ipmitool -a` the `-E` is sudo's.
+ * the command word — or `undefined` when its command is not ipmitool. The
+ * command word is the first after a subshell's opening `(`, `NAME=value`
+ * assignments and `COMMAND_PREFIXES` (their options AND those options' operands
+ * consumed, getopt-style, then any positional operand such as timeout's
+ * DURATION), with a basename of exactly `ipmitool` — `/usr/bin/ipmitool`,
+ * `"ipmitool"`, `sudo -E ipmitool`, `sudo -u root ipmitool`, `LANG=C ipmitool`,
+ * `timeout 30 ipmitool`, `(ipmitool …)`. Returning the arguments, not a yes/no,
+ * is what keeps a flag scan off the prefix: in `sudo -u ipmitool -E ipmitool -a`
+ * the `-E` is sudo's.
  *
  * COMMAND POSITION, NOT "THE WORD APPEARS". `\bipmitool\b` also matches inside
  * `my-ipmitool-wrapper`, `ipmitool.sh` and a quoted `echo "use ipmitool -E"`,
@@ -439,29 +488,39 @@ function unquoteShellWord(word: string): string {
  * Any word this cannot place — an unknown option, env's `-S`, a nested
  * `bash -c "ipmitool …"` — answers "not ipmitool", which can only keep the hint.
  */
-function ipmitoolArguments(segment: string): string[] | undefined {
-  const words = segment.trim().replace(SUBSHELL_OPENERS_RE, "").split(/\s+/);
+function ipmitoolArguments(segment: readonly ShellWord[]): ShellWord[] | undefined {
+  const words = [...segment];
+  // A subshell's opening "(" (repeatable: "( (") is not a word of the command;
+  // "((" opens arithmetic, which runs no command.
+  while (words.length > 0 && /^\((?!\()/.test(words[0].raw)) {
+    const rest = words[0].raw.slice(1);
+    if (rest) {
+      words[0] = { raw: rest, value: words[0].value.slice(1) };
+    } else {
+      words.shift();
+    }
+  }
   let options: PrefixOptions | undefined;
   let positionals = 0;
   for (let i = 0; i < words.length; i++) {
+    const { raw, value } = words[i];
     // An assignment is recognised as written — a quoted `"NAME=value"` is a
     // command name to the shell, not an assignment.
-    if (/^[A-Za-z_]\w*=/.test(words[i])) {
+    if (/^[A-Za-z_]\w*=/.test(raw)) {
       continue;
     }
-    const word = unquoteShellWord(words[i]);
-    const prefix = COMMAND_PREFIXES.get(word);
+    const prefix = COMMAND_PREFIXES.get(value);
     if (prefix) {
       options = prefix;
       positionals = prefix.positionals ?? 0;
       continue;
     }
-    if (word.startsWith("-")) {
-      if (word === "--" && options) {
+    if (value.startsWith("-")) {
+      if (value === "--" && options) {
         options = undefined;
         continue;
       }
-      const consumed = options ? prefixOptionOperandWords(options, word) : undefined;
+      const consumed = options ? prefixOptionOperandWords(options, value) : undefined;
       if (consumed === undefined) {
         return undefined;
       }
@@ -472,9 +531,10 @@ function ipmitoolArguments(segment: string): string[] | undefined {
       positionals--;
       continue;
     }
-    // Basename BEFORE dequoting, so a Windows-style `C:\tools\ipmitool` keeps
-    // its separators and `\ipmitool` still ends in `ipmitool`.
-    return unquoteShellWord(words[i].split(/[\\/]/).pop() ?? "") === "ipmitool" ? words.slice(i + 1) : undefined;
+    // The basename is cut from the word AS WRITTEN, so a Windows-style
+    // `C:\tools\ipmitool` keeps its separators, and only then read as a word.
+    const basename = shellSegments(raw.split(/[\\/]/).pop() ?? "")[0][0]?.value;
+    return basename === "ipmitool" ? words.slice(i + 1) : undefined;
   }
   return undefined;
 }
@@ -677,10 +737,9 @@ export function gatewayInertCredentialsNote(macro: TerminalMacro): string | unde
 /**
  * Whether an ipmitool invocation's ARGUMENTS (`ipmitoolArguments`) pass `-E` —
  * its "read the password from the environment" flag (`IPMITOOL_PASSWORD` /
- * `IPMI_PASSWORD`). A word counts when, cut at a redirection or paren glued to
- * it and dequoted (`unquoteShellWord`), it is exactly `-E`: `-E`, `'-E'`, `-"E"`,
- * `\-E`, `-E>/tmp/log` (round 8), `-E)`; but not `-Example`, `-Env`, `-E=foo`
- * or `-E/path`, which are other tokens.
+ * `IPMI_PASSWORD`): a word the shell hands over as exactly `-E` (`shellSegments`
+ * — `-E`, `'-E'`, `-"E"`, `\-E`, `-E>/tmp/log`, `-E)`), never `-Example`, `-Env`,
+ * `-E=foo`, `-E/path`, `'\-E'` or `"\-E"`.
  *
  * WHERE it looks is the other half: only the words after a command word placed
  * as ipmitool can be ipmitool's flags. A `-E` anywhere in the text would count
@@ -688,28 +747,8 @@ export function gatewayInertCredentialsNote(macro: TerminalMacro): string | unde
  * command's (`ipmitool -a … | grep -E …`) or a prefix's after an operand named
  * ipmitool (`sudo -u ipmitool -E ipmitool -a`).
  */
-function passesEnvFlag(args: readonly string[]): boolean {
-  return args.some((word) => unquoteShellWord(word.split(/[<>()]/)[0]) === "-E");
-}
-
-/**
- * Shell line continuation: a backslash immediately before a newline joins the
- * two lines into ONE command, so a flag on a continued line is still an
- * argument of the command above it. Collapsed to a space (a safe token
- * separator) so a segment scan sees one line; an UNESCAPED newline stays a real
- * command boundary.
- */
-function joinLineContinuations(text: string): string {
-  return text.replace(/\\\r?\n/g, " ");
-}
-
-/**
- * A macro's command segments — split at `;`, `&`, `|` and each unescaped
- * newline once continuations are joined — the unit the local credentials hint
- * classifies.
- */
-function commandSegments(text: string): string[] {
-  return joinLineContinuations(text).split(/[;&|\n]/);
+function passesEnvFlag(args: readonly ShellWord[]): boolean {
+  return args.some((word) => word.value === "-E");
 }
 
 /**
@@ -721,8 +760,8 @@ function commandSegments(text: string): string[] {
  * command is neither blocked nor rewritten on its account.
  */
 export function commandReadsIpmiEnv(text: string): boolean {
-  return commandSegments(text).some((segment) => {
-    const args = ipmitoolArguments(segment);
+  return shellSegments(text).some((words) => {
+    const args = ipmitoolArguments(words);
     return args !== undefined && passesEnvFlag(args);
   });
 }
