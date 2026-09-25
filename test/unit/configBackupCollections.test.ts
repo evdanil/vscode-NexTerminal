@@ -11,6 +11,7 @@
  * seam so each test can see WHEN it ran relative to the profile removal.
  */
 import { createHash } from "node:crypto";
+import { PassThrough } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
@@ -112,10 +113,12 @@ import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigReposi
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { setActiveMacroStore } from "../../src/macroSettings";
 import { decrypt, encrypt } from "../../src/utils/configCrypto";
-import type { SecretVault } from "../../src/services/ssh/contracts";
+import type { SecretVault, SshConnection, SshConnector } from "../../src/services/ssh/contracts";
 import type { LocalServerConfig } from "../../src/models/localServer";
 import type { DhcpConfigProfile, TftpConfigProfile } from "../../src/models/networkServerProfile";
-import type { LocalShellProfile, ServerConfig } from "../../src/models/config";
+import type { AuthProfile, LocalShellProfile, ServerConfig } from "../../src/models/config";
+import { ProxySshFactory } from "../../src/services/ssh/proxySshFactory";
+import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 
 const KNOWN_HOSTS_KEY = "nexus.ssh.knownHostFingerprints.v1";
 const PASSWORD = "backup-pass-1";
@@ -1048,6 +1051,89 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
 
     expect(hostAtDelete).toEqual([undefined]);
     expect(await savedSecrets(dest)).toEqual(GONE);
+  });
+
+  it("restores linked auth profiles before publishing servers that keep their saved credentials", async () => {
+    const dest = await makeMachine();
+    const jumpAuth: AuthProfile = {
+      id: "jump-auth",
+      name: "Jump auth",
+      username: "safe-user",
+      authType: "key",
+      keyPath: "/keys/jump"
+    };
+    const jump = makeServer({
+      id: "jump-1",
+      name: "Bastion",
+      host: "bastion.example",
+      username: "raw-other-user",
+      authType: "key",
+      keyPath: "/keys/jump",
+      authProfileId: jumpAuth.id
+    });
+    const target = makeServer({
+      id: "srv-1",
+      name: "Router",
+      host: "10.0.0.1",
+      username: "target-user",
+      authType: "password",
+      proxy: { type: "ssh", jumpHostId: jump.id }
+    });
+    await dest.core.addOrUpdateAuthProfile(jumpAuth);
+    await dest.core.addOrUpdateServer(jump);
+    await dest.core.addOrUpdateServer(target);
+    await dest.vault.store("password-srv-1", "target-secret");
+
+    const connectorCalls: Array<{
+      server: ServerConfig;
+      auth: Parameters<SshConnector["connect"]>[1];
+    }> = [];
+    const connector: SshConnector = {
+      connect: async (server, auth) => {
+        connectorCalls.push({ server, auth });
+        return {
+          openDirectTcp: async () => new PassThrough(),
+          onClose: () => () => undefined,
+          dispose: () => undefined,
+          getBanner: () => undefined
+        } as unknown as SshConnection;
+      }
+    };
+    const authFactory = new SilentAuthSshFactory(
+      connector,
+      dest.vault,
+      { prompt: async () => undefined },
+      undefined,
+      (id) => dest.core.getAuthProfile(id),
+      (id) => dest.core.getServer(id)
+    );
+    const proxyFactory = new ProxySshFactory(authFactory, (id) => dest.core.getServer(id), dest.vault);
+    let profileAtTargetPublication: AuthProfile | undefined;
+    let connectPromise: Promise<SshConnection> | undefined;
+    const unsubscribe = dest.core.onDidChange((snapshot) => {
+      const hasJump = snapshot.servers.some((server) => server.id === jump.id);
+      const hasTarget = snapshot.servers.some((server) => server.id === target.id);
+      if (!connectPromise && hasJump && hasTarget) {
+        profileAtTargetPublication = dest.core.getAuthProfile(jumpAuth.id);
+        // `addOrUpdateServer` publishes synchronously, while an unrelated connect
+        // can start without waiting for the import command's mutation lock.
+        connectPromise = proxyFactory.connectWithContext(dest.core.getServer(target.id)!);
+      }
+    });
+
+    try {
+      await runImport(dest, unsealedJson([jump, target], [jumpAuth]), "replace");
+      if (!connectPromise) throw new Error("Replace did not publish the complete jump route");
+      await connectPromise;
+    } finally {
+      unsubscribe();
+    }
+
+    expect(profileAtTargetPublication).toEqual(jumpAuth);
+    expect(connectorCalls.map(({ server }) => server.id)).toEqual([jump.id, target.id]);
+    expect(connectorCalls[0]?.server.username).toBe("safe-user");
+    expect(connectorCalls[1]?.auth.password).toBe("target-secret");
+    expect(await dest.vault.get("password-srv-1")).toBe("target-secret");
   });
 
   it("a sealed backup still restores the secrets it carries onto its own record, and a secret it lacks is not kept from this machine", async () => {

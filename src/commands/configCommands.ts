@@ -3964,6 +3964,13 @@ export function registerConfigCommands(
     const keepSecrets = mode === "replace"
       ? serversKeepingSecrets(snapshot.servers, data.servers, snapshot.authProfiles, data.authProfiles)
       : new Set<string>();
+    // AUTH PROFILES — publish linked credential config before its servers. A
+    // server add emits synchronously, and connects do not wait for
+    // `configMutationLock`; a listener or concurrent command can therefore
+    // start an SSH jump through a just-published server while its referenced
+    // profile is still missing, resolving the raw username and sending a
+    // retained target credential over the wrong route.
+    const authProfileTally = await importPreservingIds(data.authProfiles, existingIds, validateAuthProfile, (e) => core.addOrUpdateAuthProfile(e));
     // Re-created servers whose secrets saved HERE were cleared, with which ones
     // — for the completion message, which tells the user why they will be
     // asked again.
@@ -4007,7 +4014,6 @@ export function registerConfigCommands(
     // Environment restored from the encrypted section first; see `restoreEnvFromSecrets`.
     restoreEnvFromSecrets(data.localShellProfiles, decryptedSecrets?.localShellEnv);
     const localShellTally = await importPreservingIds(data.localShellProfiles, existingIds, validateLocalShellProfile, (e) => core.addOrUpdateLocalShellProfile(e));
-    const authProfileTally = await importPreservingIds(data.authProfiles, existingIds, validateAuthProfile, (e) => core.addOrUpdateAuthProfile(e));
     // DEVICE TEMPLATES (PR-T1) — imported id-preserving like every other bucket.
     const deviceTemplateTally = await importPreservingIds(data.deviceTemplates, existingIds, validateDeviceTemplate, (e) =>
       core.addOrUpdateDeviceTemplate(e)
