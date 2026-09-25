@@ -754,10 +754,13 @@ Cooldown and interval solve different problems.
 After the macro fires, the same macro cannot fire again on that terminal until
 the cooldown has elapsed.
 If another match appears during cooldown, Nexus ignores that match and does not
-schedule a delayed retry. The Macro Editor's **Trigger Cooldown** field starts
-at 3 seconds. Left at 3 (or empty), the macro follows
-`nexus.terminal.macros.defaultCooldown`, which is also 3 unless you change it;
-any other value is the macro's own.
+schedule a delayed retry. The Macro Editor's **Trigger Cooldown** field is
+empty for a macro without its own cooldown, with the current
+`nexus.terminal.macros.defaultCooldown` value as its placeholder (`Default: 3`
+unless you change the setting); such a macro follows that setting, including
+later changes to it. A number you type, from 0 to 300, is the macro's own and is
+kept even when it equals the default. Clear the field to go back to following
+the setting.
 
 Example: a password macro has `triggerCooldown: 5`. It fires at `12:00:00`.
 Another `Password:` prompt arrives at `12:00:02`; it is ignored. A later prompt

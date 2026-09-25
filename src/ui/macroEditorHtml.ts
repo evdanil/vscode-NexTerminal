@@ -11,6 +11,11 @@ import { buildMacroProfileSelectOptions, type MacroProfileOptionInput } from "./
 import { MAX_MACRO_VARIABLES, getValidMacroVariables, macroVariablesWebviewJs } from "../services/macroVariables";
 import { PROFILE_TOKEN_TRIGGER_CONFLICT_MESSAGE, profileTokensWebviewJs } from "../services/profileTokens";
 import { macroFolderField } from "../services/macroFolders";
+import {
+  TRIGGER_COOLDOWN_MAX_SECONDS,
+  TRIGGER_COOLDOWN_MIN_SECONDS,
+  compiledTriggerCooldownSeconds
+} from "../storage/macroStore";
 
 /**
  * Emitted immediately after `<textarea>`, before the macro's own text.
@@ -33,6 +38,54 @@ import { macroFolderField } from "../services/macroFolders";
  * the editor was written and, replacing "\n" with itself, did nothing at all.
  */
 const TEXTAREA_LEADING_NEWLINE = "\n";
+
+/**
+ * The Trigger Cooldown field's error, shared by the webview's own check and the panel's
+ * host-side one so the two cannot word the same refusal differently.
+ */
+export const TRIGGER_COOLDOWN_RANGE_MESSAGE =
+  `Enter a number of seconds from ${TRIGGER_COOLDOWN_MIN_SECONDS} to ${TRIGGER_COOLDOWN_MAX_SECONDS}, or leave the field empty to use the default.`;
+
+/** What the empty cooldown field shows; the webview rebuilds it from the same prefix on a setting change. */
+const COOLDOWN_PLACEHOLDER_PREFIX = "Default: ";
+
+/**
+ * The Trigger Cooldown field's webview helpers, embedded in the editor script and exported so a
+ * test can execute exactly what ships (the `macroVariablesWebviewJs()` precedent).
+ *
+ * `readCooldownField` is the whole of the field's save-side meaning (#150). EMPTY is "no
+ * override" — `null`, so the macro follows `nexus.terminal.macros.defaultCooldown` — and any
+ * number in range is the macro's own, including one that equals the shipped 3 or the current
+ * setting. The old payload (`isNaN(v) ? 3 : v`, with the host then deleting a 3) could not tell
+ * those apart, so a 3 typed with the setting at 10 ran at 10.
+ *
+ * A number input reports `value === ""` for unparseable text as well as for an empty box;
+ * `validity.badInput` is the only thing that separates them, and without it a typo would quietly
+ * become "follow the setting". `Number()` rather than `parseInt()`: the input accepts `1e2` and
+ * `2.5`, which `parseInt()` reads as 1 and 2 — the second rewrote a stored fractional cooldown
+ * on a save that never touched the field.
+ *
+ * No leading newline: the call site is indented (see `macroVariablesWebviewJs()`).
+ */
+export function macroCooldownWebviewJs(): string {
+  return `var COOLDOWN_PLACEHOLDER_PREFIX = ${serializeForInlineScript(COOLDOWN_PLACEHOLDER_PREFIX)};
+      var COOLDOWN_RANGE_MESSAGE = ${serializeForInlineScript(TRIGGER_COOLDOWN_RANGE_MESSAGE)};
+      function readCooldownField(input) {
+        var raw = String(input.value).trim();
+        if (raw === "") {
+          var badInput = !!(input.validity && input.validity.badInput);
+          return { value: null, error: badInput ? COOLDOWN_RANGE_MESSAGE : "" };
+        }
+        var seconds = Number(raw);
+        if (!isFinite(seconds) || seconds < ${TRIGGER_COOLDOWN_MIN_SECONDS} || seconds > ${TRIGGER_COOLDOWN_MAX_SECONDS}) {
+          return { value: null, error: COOLDOWN_RANGE_MESSAGE };
+        }
+        return { value: seconds, error: "" };
+      }
+      function cooldownPlaceholder(seconds) {
+        return COOLDOWN_PLACEHOLDER_PREFIX + seconds;
+      }`;
+}
 
 /**
  * One repeatable variable row (docs/plans/2026-07-29-macro-variables.md §9.1):
@@ -94,6 +147,12 @@ function renderVariableRow(variable: MacroVariable, index: number): string {
  * issues: a render-only caller (the byte-identity snapshot, a test) produces a
  * page whose save would be refused as coming from no render at all, rather than
  * one that claims something about an id.
+ *
+ * @param defaultCooldownSeconds The cooldown a macro without its own will run at — the
+ * `defaultCooldown` setting as the runtime compiles it — shown as the empty cooldown field's
+ * placeholder. REQUIRED, with no default, on purpose: a default here would be a hard-coded 3
+ * again for any caller that forgot to pass the setting, which is issue #150. It is last, so
+ * `seedGroup` and `justSavedName` before it are `string | undefined` rather than optional.
  */
 export function renderMacroEditorHtml(
   macros: TerminalMacro[],
@@ -101,9 +160,10 @@ export function renderMacroEditorHtml(
   nonce: string,
   profiles: MacroProfileOptionInput[] = [],
   folders: string[] = [],
-  seedGroup?: string,
+  seedGroup: string | undefined,
   renderGeneration = 0,
-  justSavedName?: string
+  justSavedName: string | undefined,
+  defaultCooldownSeconds: number
 ): string {
   const macro = selectedIndex !== null ? macros[selectedIndex] : undefined;
 
@@ -122,7 +182,13 @@ export function renderMacroEditorHtml(
 
   const bindingValue = macro ? (getAssignedBinding(macro) ?? "") : "";
   const triggerValue = macro?.triggerPattern ?? "";
-  const cooldownValue = macro?.triggerCooldown ?? 3;
+  // #150 — the field shows the cooldown that will RUN, through the same definition the compiler
+  // uses, and is EMPTY when the macro pins none: the placeholder then names the setting's value.
+  // It used to render `triggerCooldown ?? 3`, which misreported every macro without an override
+  // once the setting was changed, and made "no override" and "exactly 3" look identical.
+  const cooldownSeconds = macro ? compiledTriggerCooldownSeconds(macro.triggerCooldown) : undefined;
+  const cooldownValue = cooldownSeconds === undefined ? "" : String(cooldownSeconds);
+  const cooldownPlaceholder = `${COOLDOWN_PLACEHOLDER_PREFIX}${defaultCooldownSeconds}`;
   const intervalValue = macro?.triggerInterval ?? "";
   const triggerInitiallyDisabled = macro?.triggerInitiallyDisabled ?? false;
   const triggerScope = macro?.triggerScope ?? "all-terminals";
@@ -444,8 +510,9 @@ export function renderMacroEditorHtml(
 
   <div class="form-group">
     <label for="macro-cooldown">Trigger Cooldown (seconds)</label>
-    <input type="number" id="macro-cooldown" value="${escapeHtml(String(cooldownValue))}" min="0" max="300" step="1" />
-    <div class="hint">Seconds between auto-triggers on the same terminal. Prevents echo-loops where server re-prompts after each response.</div>
+    <input type="number" id="macro-cooldown" value="${escapeHtml(cooldownValue)}" min="${TRIGGER_COOLDOWN_MIN_SECONDS}" max="${TRIGGER_COOLDOWN_MAX_SECONDS}" step="1" placeholder="${escapeHtml(cooldownPlaceholder)}" />
+    <div class="field-error" id="error-cooldown"></div>
+    <div class="hint">Seconds between auto-triggers on the same terminal. Prevents echo-loops where server re-prompts after each response. Leave empty to use the Default Trigger Cooldown setting (nexus.terminal.macros.defaultCooldown), shown in the empty field; a number entered here applies to this macro only, even when it equals that default.</div>
   </div>
 
   <div class="form-group">
@@ -531,6 +598,7 @@ ${folderOptionsHtml}
       // whitelist are interpolated from services/profileTokens.ts so the live
       // hints below say exactly what a run will do.
       ${profileTokensWebviewJs()}
+      ${macroCooldownWebviewJs()}
 
       function isValidBinding(value) {
         return VALID_PATTERN.test(value.trim().toLowerCase());
@@ -1055,7 +1123,10 @@ ${folderOptionsHtml}
           document.getElementById("error-trigger-profile").textContent = "";
         }
       });
-      document.getElementById("macro-cooldown").addEventListener("input", markDirty);
+      document.getElementById("macro-cooldown").addEventListener("input", function() {
+        markDirty();
+        document.getElementById("error-cooldown").textContent = "";
+      });
       document.getElementById("macro-interval").addEventListener("input", markDirty);
       document.getElementById("macro-trigger-disabled").addEventListener("change", markDirty);
       document.getElementById("macro-binding").addEventListener("input", function() {
@@ -1101,7 +1172,7 @@ ${folderOptionsHtml}
         var secret = document.getElementById("macro-secret").checked;
         var bindingVal = document.getElementById("macro-binding").value.trim().toLowerCase();
         var triggerVal = document.getElementById("macro-trigger").value.trim();
-        var cooldownVal = parseInt(document.getElementById("macro-cooldown").value, 10);
+        var cooldownField = readCooldownField(document.getElementById("macro-cooldown"));
         var intervalVal = parseInt(document.getElementById("macro-interval").value, 10);
         var triggerInitiallyDisabled = document.getElementById("macro-trigger-disabled").checked;
         var triggerScope = document.getElementById("macro-trigger-scope").value;
@@ -1150,6 +1221,13 @@ ${folderOptionsHtml}
           valid = false;
         } else {
           document.getElementById("error-trigger-profile").textContent = "";
+        }
+
+        // #150 — every macro stores its cooldown whether or not it has a pattern, so this is
+        // checked unconditionally; an empty field is legal (it means "use the default").
+        document.getElementById("error-cooldown").textContent = cooldownField.error;
+        if (cooldownField.error) {
+          valid = false;
         }
 
         if (triggerVal && runInVal !== "session") {
@@ -1204,7 +1282,7 @@ ${folderOptionsHtml}
           secret: secret,
           keybinding: bindingVal || null,
           triggerPattern: triggerVal || null,
-          triggerCooldown: isNaN(cooldownVal) ? 3 : cooldownVal,
+          triggerCooldown: cooldownField.value,
           triggerInterval: isNaN(intervalVal) || intervalVal < 1 ? null : intervalVal,
           triggerInitiallyDisabled: triggerInitiallyDisabled,
           triggerScope: triggerScope,
@@ -1249,6 +1327,10 @@ ${folderOptionsHtml}
               errEl.scrollIntoView({ block: "center" });
             }
           }
+        } else if (msg.type === "defaultCooldown" && typeof msg.seconds === "number") {
+          // The setting changed while this form is open. Posted rather than re-rendered by the
+          // panel, because a render rebuilds the form from the store and discards unsaved edits.
+          document.getElementById("macro-cooldown").placeholder = cooldownPlaceholder(msg.seconds);
         }
       });
       updateTriggerProfileState();

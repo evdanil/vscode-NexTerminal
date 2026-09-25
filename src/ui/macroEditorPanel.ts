@@ -13,7 +13,6 @@ import {
 } from "../macroSettings";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { resolveMacroRoute, resolveMacroRunTarget, validateMacroRunTarget } from "../models/terminalMacro";
-import { DEFAULT_TRIGGER_COOLDOWN } from "../services/macroAutoTrigger";
 import { getValidMacroVariables, MAX_MACRO_VARIABLES, validateMacroVariables } from "../services/macroVariables";
 import { collectMacroFolders, macroFolderField } from "../services/macroFolders";
 import { hasProfileTokens, PROFILE_TOKEN_TRIGGER_CONFLICT_MESSAGE } from "../services/profileTokens";
@@ -25,9 +24,14 @@ import {
   type MacroRef,
   type MacroTarget
 } from "../services/macroMutation";
+import {
+  compiledDefaultCooldownSeconds,
+  TRIGGER_COOLDOWN_MAX_SECONDS,
+  TRIGGER_COOLDOWN_MIN_SECONDS
+} from "../storage/macroStore";
 import { normalizeOptionalFolderPath, INVALID_FOLDER_PATH_MESSAGE } from "../utils/folderPaths";
 import { validateRegexSafety } from "../utils/regexSafety";
-import { renderMacroEditorHtml } from "./macroEditorHtml";
+import { renderMacroEditorHtml, TRIGGER_COOLDOWN_RANGE_MESSAGE } from "./macroEditorHtml";
 import type { MacroProfileOptionInput } from "./macroProfileOptions";
 import { createWebviewNonce } from "./shared/webviewNonce";
 
@@ -50,6 +54,17 @@ const MAX_RETAINED_RENDERS = 8;
  * `MacroEditorPanel.resolveEditorTarget`), which is the stale-form case and
  * reads as one.
  */
+/**
+ * The cooldown a macro without its own will run at, as the editor shows it. Read through the
+ * compiler's own function so the placeholder cannot name a value `MacroAutoTrigger` does not use
+ * (#150 — it used to be a hard-coded 3).
+ */
+function readDefaultCooldownSeconds(): number {
+  return compiledDefaultCooldownSeconds(
+    vscode.workspace.getConfiguration("nexus.terminal.macros").get<unknown>("defaultCooldown")
+  );
+}
+
 function unresolvedTargetMessage(target: MacroTarget | undefined, verb: "saved" | "deleted"): string {
   return target?.kind === "ambiguous"
     ? AMBIGUOUS_MACRO_TARGET_MESSAGE
@@ -102,6 +117,7 @@ export class MacroEditorPanel {
   /** Set only by `openNew(seed)`; consumed while composing that one new macro (§4.7). */
   private pendingSeedGroup: string | undefined;
   private unsubscribe: () => void = () => {};
+  private configSubscription: vscode.Disposable | undefined;
   /**
    * Set while this panel is persisting its own save/delete. The macro store's
    * change event fires for our own writes too; without this guard a self-save
@@ -162,7 +178,15 @@ export class MacroEditorPanel {
     this.panel.onDidDispose(() => {
       this.disposed = true;
       this.unsubscribe();
+      this.configSubscription?.dispose();
       MacroEditorPanel.instance = undefined;
+    });
+    // #150 — the empty cooldown field names the `defaultCooldown` setting, so a change to it has
+    // to reach a form that is already open. Posted rather than re-rendered: `render()` rebuilds
+    // the form from the store, which would throw away whatever the user has typed but not saved.
+    this.configSubscription = vscode.workspace.onDidChangeConfiguration((event) => {
+      if (!event.affectsConfiguration("nexus.terminal.macros.defaultCooldown")) return;
+      void this.panel.webview.postMessage({ type: "defaultCooldown", seconds: readDefaultCooldownSeconds() });
     });
     // Re-render when the macro store changes underneath us so index/id
     // resolution stays current. "Underneath us" means THIS window: the store's
@@ -231,7 +255,17 @@ export class MacroEditorPanel {
     // ONLY by the save handler — the reload from `render()` would otherwise outrun a
     // post-render `postMessage`, which is why the old `{type:"saved"}` signal was
     // invisible. External re-renders (store change, macro switch, delete) pass nothing.
-    this.panel.webview.html = renderMacroEditorHtml(macros, this.selectedIndex, nonce, MacroEditorPanel.profileProvider(), folders, seedGroup, generation, justSavedName);
+    this.panel.webview.html = renderMacroEditorHtml(
+      macros,
+      this.selectedIndex,
+      nonce,
+      MacroEditorPanel.profileProvider(),
+      folders,
+      seedGroup,
+      generation,
+      justSavedName,
+      readDefaultCooldownSeconds()
+    );
   }
 
   /**
@@ -451,6 +485,28 @@ export class MacroEditorPanel {
           }
         }
 
+        // #150 — `null` (the webview's empty field) means "no override, follow the
+        // `defaultCooldown` setting"; any number is the macro's own. Checked here as well as in
+        // the webview because this is the side that writes, and the page's own check is only as
+        // current as the page. The range is the one `MacroAutoTrigger` clamps to, so an
+        // out-of-range value would be stored as something other than what then runs.
+        const triggerCooldown: unknown = msg.triggerCooldown;
+        const cooldownOverride =
+          typeof triggerCooldown === "number" &&
+          Number.isFinite(triggerCooldown) &&
+          triggerCooldown >= TRIGGER_COOLDOWN_MIN_SECONDS &&
+          triggerCooldown <= TRIGGER_COOLDOWN_MAX_SECONDS
+            ? triggerCooldown
+            : undefined;
+        if (triggerCooldown !== null && triggerCooldown !== undefined && cooldownOverride === undefined) {
+          void this.panel.webview.postMessage({
+            type: "saveError",
+            field: "cooldown",
+            message: TRIGGER_COOLDOWN_RANGE_MESSAGE
+          });
+          return;
+        }
+
         // §4.11 — Folder field validation, same helper every profile form uses.
         // "" canonicalizes to `undefined` (§4.1); anything else structurally
         // invalid (`..`, `.`, `\`, over-depth) is rejected rather than silently
@@ -647,7 +703,6 @@ export class MacroEditorPanel {
         }
         if (secret) macro.secret = true;
         else delete macro.secret;
-        const triggerCooldown = msg.triggerCooldown as number | undefined;
         if (triggerPattern) {
           macro.triggerPattern = triggerPattern;
           if (triggerInitiallyDisabled) {
@@ -657,7 +712,10 @@ export class MacroEditorPanel {
             macro.triggerInterval = triggerInterval;
           }
         }
-        if (triggerCooldown !== undefined && triggerCooldown !== DEFAULT_TRIGGER_COOLDOWN) macro.triggerCooldown = triggerCooldown;
+        // Stored as typed, even when it equals the shipped 3 or the current setting: comparing
+        // against a default is what made a per-macro 3 impossible (#150), because an absent
+        // cooldown follows a setting the user can change.
+        if (cooldownOverride !== undefined) macro.triggerCooldown = cooldownOverride;
         else delete macro.triggerCooldown;
         if (triggerPattern && safeScope) {
           macro.triggerScope = safeScope;

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { renderWebviewDocument } from "../../src/ui/shared/webviewDocument";
 import { renderHighlightRuleEditorHtml } from "../../src/ui/highlightRuleEditorHtml";
 import { renderMacroEditorHtml } from "../../src/ui/macroEditorHtml";
+import { DEFAULT_TRIGGER_COOLDOWN } from "../../src/storage/macroStore";
 import { renderTerminalAppearanceHtml } from "../../src/ui/terminalAppearanceHtml";
 import { renderAuthProfileEditorHtml } from "../../src/ui/authProfileEditorHtml";
 import { renderManagementListHtml } from "../../src/ui/managementListHtml";
@@ -60,7 +61,12 @@ describe("webview document shell (byte-identity guard)", () => {
         [{ name: "Hello", text: "echo hi", secret: true, triggerPattern: "x", triggerInterval: 5 }],
         0,
         NONCE,
-        [{ id: "abc12345-0000-0000-0000-000000000000", name: "Router", kind: "server" }]
+        [{ id: "abc12345-0000-0000-0000-000000000000", name: "Router", kind: "server" }],
+        [],
+        undefined,
+        0,
+        undefined,
+        DEFAULT_TRIGGER_COOLDOWN
       )
     ).toMatchSnapshot();
   });

@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { renderMacroEditorHtml } from "../../src/ui/macroEditorHtml";
+import { TRIGGER_COOLDOWN_RANGE_MESSAGE, macroCooldownWebviewJs, renderMacroEditorHtml } from "../../src/ui/macroEditorHtml";
 import type { MacroVariable, TerminalMacro } from "../../src/models/terminalMacro";
+import { DEFAULT_TRIGGER_COOLDOWN } from "../../src/storage/macroStore";
 
 const nonce = "test-nonce-456";
 
+// `defaultCooldownSeconds` has no default (see its @param), so every call here names the one it
+// renders with: the setting's shipped value, unless a case is about the cooldown field.
 function render(macros: TerminalMacro[], selectedIndex: number | null): string {
-  return renderMacroEditorHtml(macros, selectedIndex, nonce);
+  return renderMacroEditorHtml(macros, selectedIndex, nonce, [], [], undefined, 0, undefined, DEFAULT_TRIGGER_COOLDOWN);
 }
 
 describe("renderMacroEditorHtml", () => {
@@ -395,12 +398,12 @@ describe("renderMacroEditorHtml", () => {
   it("shows the '✓ Saved' indicator ONLY when a just-saved name is passed", () => {
     const macros: TerminalMacro[] = [{ name: "Deploy", text: "npm run deploy" }];
     // No justSavedName → indicator present in markup but NOT visible.
-    const idle = renderMacroEditorHtml(macros, 0, nonce, [], [], undefined, 1);
+    const idle = renderMacroEditorHtml(macros, 0, nonce, [], [], undefined, 1, undefined, DEFAULT_TRIGGER_COOLDOWN);
     expect(idle).toContain('id="save-flag"');
     expect(idle).not.toMatch(/class="save-indicator visible"/);
     // justSavedName set → indicator rendered visible (baked in, not a post-render
     // message that would race the webview reload), plus the auto-hide timer.
-    const saved = renderMacroEditorHtml(macros, 0, nonce, [], [], undefined, 1, "Deploy");
+    const saved = renderMacroEditorHtml(macros, 0, nonce, [], [], undefined, 1, "Deploy", DEFAULT_TRIGGER_COOLDOWN);
     expect(saved).toMatch(/class="save-indicator visible"[^>]*id="save-flag"/);
     expect(saved).toContain("setTimeout(hideSaveFlag");
   });
@@ -937,7 +940,7 @@ describe("renderMacroEditorHtml", () => {
       { id: "52a3b610-f871-462c-9541-20d13c0f7e56", name: "Core Router", kind: "server" },
       { id: "61a3b610-f871-462c-9541-20d13c0f7e57", name: "Core Router", kind: "serial" },
       { id: "console-1", name: "Lab Console", kind: "serial" }
-    ]);
+    ], [], undefined, 0, undefined, DEFAULT_TRIGGER_COOLDOWN);
 
     expect(html).toContain("Core Router (Server, 52a3b610)");
     expect(html).toContain("Core Router (Serial, 61a3b610)");
@@ -973,22 +976,22 @@ describe("renderMacroEditorHtml", () => {
 describe("renderMacroEditorHtml — Folder field (§4.11)", () => {
   it("renders the macro's existing group as the field value, with no notice", () => {
     const macros: TerminalMacro[] = [{ name: "M", text: "t", group: "Cisco/Routers" }];
-    const html = renderMacroEditorHtml(macros, 0, nonce);
+    const html = render(macros, 0);
     expect(html).toContain('<input type="text" id="macro-folder" value="Cisco/Routers"');
     expect(html).not.toContain("shows at the root");
   });
 
   it("renders an empty value for a macro with no group", () => {
     const macros: TerminalMacro[] = [{ name: "M", text: "t" }];
-    const html = renderMacroEditorHtml(macros, 0, nonce);
+    const html = render(macros, 0);
     expect(html).toContain('<input type="text" id="macro-folder" value=""');
     expect(html).not.toContain("shows at the root");
   });
 
   it("never crashes and renders blank for a malformed (§4.2) group", () => {
     const macros: TerminalMacro[] = [{ name: "M", text: "t", group: { bad: true } as unknown as string }];
-    expect(() => renderMacroEditorHtml(macros, 0, nonce)).not.toThrow();
-    const html = renderMacroEditorHtml(macros, 0, nonce);
+    expect(() => render(macros, 0)).not.toThrow();
+    const html = render(macros, 0);
     expect(html).toContain('<input type="text" id="macro-folder" value=""');
   });
 
@@ -998,7 +1001,7 @@ describe("renderMacroEditorHtml — Folder field (§4.11)", () => {
     // surface where correcting it happens — display nothing to correct, and fed
     // the save handler an empty value that then destroyed the stored path.
     const macros: TerminalMacro[] = [{ name: "M", text: "t", group: "Cisco\\Routers" }];
-    const html = renderMacroEditorHtml(macros, 0, nonce);
+    const html = render(macros, 0);
     expect(html).toContain('<input type="text" id="macro-folder" value="Cisco\\Routers"');
     expect(html).toContain("This folder path isn&#39;t usable, so this macro shows at the root.");
   });
@@ -1007,7 +1010,7 @@ describe("renderMacroEditorHtml — Folder field (§4.11)", () => {
     const macros: TerminalMacro[] = [
       { name: "M", text: "t", group: '"><img src=x onerror=alert(1)>' }
     ];
-    const html = renderMacroEditorHtml(macros, 0, nonce);
+    const html = render(macros, 0);
     expect(html).not.toContain("<img src=x");
     expect(html).toContain("&quot;&gt;&lt;img src=x onerror=alert(1)&gt;");
   });
@@ -1016,26 +1019,26 @@ describe("renderMacroEditorHtml — Folder field (§4.11)", () => {
     // The bound exists so an 8 MB `group` (hand-written into settings.json and
     // absorbed verbatim) cannot be shipped into the webview on every render.
     const macros: TerminalMacro[] = [{ name: "M", text: "t", group: "X".repeat(8_000_000) }];
-    const html = renderMacroEditorHtml(macros, 0, nonce);
+    const html = render(macros, 0);
     expect(html).toContain('<input type="text" id="macro-folder" value=""');
     expect(html).toContain("too long to show here");
     expect(html.length).toBeLessThan(1_000_000);
   });
 
   it("lists the supplied folders as combobox suggestions", () => {
-    const html = renderMacroEditorHtml([], null, nonce, [], ["Cisco", "Juniper/Routers"]);
+    const html = renderMacroEditorHtml([], null, nonce, [], ["Cisco", "Juniper/Routers"], undefined, 0, undefined, DEFAULT_TRIGGER_COOLDOWN);
     expect(html).toContain('data-value="Cisco"');
     expect(html).toContain('data-value="Juniper/Routers"');
   });
 
   it("seeds the Folder field for a new (not-yet-saved) macro via the seedGroup param (§4.7 addToFolder)", () => {
-    const html = renderMacroEditorHtml([], null, nonce, [], ["Cisco"], "Cisco");
+    const html = renderMacroEditorHtml([], null, nonce, [], ["Cisco"], "Cisco", 0, undefined, DEFAULT_TRIGGER_COOLDOWN);
     expect(html).toContain('<input type="text" id="macro-folder" value="Cisco"');
   });
 
   it("the seed is ignored once an existing macro is selected", () => {
     const macros: TerminalMacro[] = [{ name: "M", text: "t", group: "Juniper" }];
-    const html = renderMacroEditorHtml(macros, 0, nonce, [], ["Cisco", "Juniper"], "Cisco");
+    const html = renderMacroEditorHtml(macros, 0, nonce, [], ["Cisco", "Juniper"], "Cisco", 0, undefined, DEFAULT_TRIGGER_COOLDOWN);
     expect(html).toContain('<input type="text" id="macro-folder" value="Juniper"');
   });
 
@@ -1055,5 +1058,121 @@ describe("renderMacroEditorHtml — Folder field (§4.11)", () => {
   it("calls initCustomComboboxes() so the Folder field's suggestion dropdown is wired up", () => {
     const html = render([], null);
     expect(html).toContain("initCustomComboboxes();");
+  });
+});
+
+/**
+ * Issue #150 — the Trigger Cooldown field. It used to render `triggerCooldown ?? 3` and post
+ * `isNaN(v) ? 3 : v`, so "no override" and "exactly 3" were the same value on both ends.
+ */
+describe("renderMacroEditorHtml — Trigger Cooldown field (#150)", () => {
+  function cooldownAttr(html: string, name: "value" | "placeholder" | "min" | "max"): string | undefined {
+    const tag = /<input type="number" id="macro-cooldown"[^>]*>/.exec(html)?.[0] ?? "";
+    return new RegExp(`\\b${name}="([^"]*)"`).exec(tag)?.[1];
+  }
+
+  function renderWithDefault(macros: TerminalMacro[], selectedIndex: number | null, defaultCooldown: number): string {
+    return renderMacroEditorHtml(macros, selectedIndex, nonce, [], [], undefined, 0, undefined, defaultCooldown);
+  }
+
+  it("leaves the field empty for a macro with no override, with the supplied default as its placeholder", () => {
+    const html = renderWithDefault([{ name: "pw", text: "x", triggerPattern: "Password:" }], 0, 10);
+    expect(cooldownAttr(html, "value")).toBe("");
+    expect(cooldownAttr(html, "placeholder")).toBe("Default: 10");
+  });
+
+  it("starts a new macro empty too, never at a hard-coded 3", () => {
+    const html = renderWithDefault([], null, 10);
+    expect(cooldownAttr(html, "value")).toBe("");
+    expect(cooldownAttr(html, "placeholder")).toBe("Default: 10");
+  });
+
+  it("shows an explicit override as the field value, 3 and 0 included", () => {
+    expect(cooldownAttr(renderWithDefault([{ name: "a", text: "x", triggerCooldown: 3 }], 0, 10), "value")).toBe("3");
+    expect(cooldownAttr(renderWithDefault([{ name: "a", text: "x", triggerCooldown: 0 }], 0, 10), "value")).toBe("0");
+  });
+
+  it("shows the cooldown the runtime compiles for a stored value, not the raw one", () => {
+    // Through compiledTriggerCooldownSeconds(), the definition MacroAutoTrigger.reload() uses:
+    // 500 runs as 300, a quoted "5" runs as the shipped 3, a fraction runs as itself.
+    expect(cooldownAttr(renderWithDefault([{ name: "a", text: "x", triggerCooldown: 500 }], 0, 10), "value")).toBe("300");
+    const quoted = { name: "a", text: "x", triggerCooldown: "5" as unknown as number };
+    expect(cooldownAttr(renderWithDefault([quoted], 0, 10), "value")).toBe("3");
+    expect(cooldownAttr(renderWithDefault([{ name: "a", text: "x", triggerCooldown: 2.5 }], 0, 10), "value")).toBe("2.5");
+  });
+
+  it("bounds the input to the range the runtime clamps to", () => {
+    const html = render([], null);
+    expect(cooldownAttr(html, "min")).toBe("0");
+    expect(cooldownAttr(html, "max")).toBe("300");
+  });
+
+  it("posts the parsed field, not a substituted 3, and blocks the save on a field error", () => {
+    const html = render([], null);
+    expect(html).toContain('var cooldownField = readCooldownField(document.getElementById("macro-cooldown"));');
+    expect(html).toContain("triggerCooldown: cooldownField.value,");
+    expect(html).toContain('document.getElementById("error-cooldown").textContent = cooldownField.error;');
+    expect(html).toContain('<div class="field-error" id="error-cooldown"></div>');
+    // The pre-#150 payload, which turned an empty field into an explicit 3.
+    expect(html).not.toContain("isNaN(cooldownVal) ? 3");
+  });
+
+  it("re-labels the placeholder when the host posts a changed default", () => {
+    const html = render([], null);
+    expect(html).toContain('msg.type === "defaultCooldown"');
+    expect(html).toContain('document.getElementById("macro-cooldown").placeholder = cooldownPlaceholder(msg.seconds);');
+  });
+
+  it("says in the hint that an empty field follows the setting", () => {
+    const html = render([], null);
+    expect(html).toContain("Leave empty to use the Default Trigger Cooldown setting");
+  });
+});
+
+describe("macroCooldownWebviewJs", () => {
+  // Executed, not string-matched: the helpers ARE the field's meaning on the webview side.
+  const compiled = new Function(
+    `${macroCooldownWebviewJs()}\nreturn { readCooldownField: readCooldownField, cooldownPlaceholder: cooldownPlaceholder };`
+  )() as {
+    readCooldownField(input: { value: string; validity?: { badInput: boolean } }): { value: number | null; error: string };
+    cooldownPlaceholder(seconds: number): string;
+  };
+  const field = (value: string, badInput = false) => ({ value, validity: { badInput } });
+
+  it("reads an empty field as no override — not as 3", () => {
+    expect(compiled.readCooldownField(field(""))).toEqual({ value: null, error: "" });
+    expect(compiled.readCooldownField(field("  "))).toEqual({ value: null, error: "" });
+  });
+
+  it("reads any in-range number as the macro's own, 3 and both bounds included", () => {
+    expect(compiled.readCooldownField(field("3"))).toEqual({ value: 3, error: "" });
+    expect(compiled.readCooldownField(field("0"))).toEqual({ value: 0, error: "" });
+    expect(compiled.readCooldownField(field("300"))).toEqual({ value: 300, error: "" });
+    // parseInt() would read these as 2 and 1: the first silently rewrites a stored fractional
+    // cooldown on a save that never touched it, the second is how a number input spells 100.
+    expect(compiled.readCooldownField(field("2.5"))).toEqual({ value: 2.5, error: "" });
+    expect(compiled.readCooldownField(field("1e2"))).toEqual({ value: 100, error: "" });
+  });
+
+  it("rejects out-of-range input, and unparseable input a number input reports as empty", () => {
+    expect(compiled.readCooldownField(field("301"))).toEqual({ value: null, error: TRIGGER_COOLDOWN_RANGE_MESSAGE });
+    expect(compiled.readCooldownField(field("-1"))).toEqual({ value: null, error: TRIGGER_COOLDOWN_RANGE_MESSAGE });
+    // `value === ""` with `validity.badInput` is a typo, not an empty field; reading it as
+    // "no override" would quietly hand the macro to the setting.
+    expect(compiled.readCooldownField(field("", true))).toEqual({ value: null, error: TRIGGER_COOLDOWN_RANGE_MESSAGE });
+  });
+
+  it("formats the placeholder exactly as the host renders it", () => {
+    for (const seconds of [0, 3, 10, 2.5, 300]) {
+      const html = renderMacroEditorHtml([], null, nonce, [], [], undefined, 0, undefined, seconds);
+      const placeholder = /<input type="number" id="macro-cooldown"[^>]*\bplaceholder="([^"]*)"/.exec(html)?.[1];
+      expect(placeholder).toBe(compiled.cooldownPlaceholder(seconds));
+    }
+  });
+
+  it("contains no leading newline or whitespace-only line (it is embedded, indented, in the rendered HTML)", () => {
+    const js = macroCooldownWebviewJs();
+    expect(js.startsWith("\n")).toBe(false);
+    expect(js.split("\n").filter((line) => line.length > 0 && /^\s+$/.test(line))).toEqual([]);
   });
 });
