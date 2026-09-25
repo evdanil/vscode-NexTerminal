@@ -25,7 +25,7 @@ import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { toParityCode } from "../utils/helpers";
 import { naturalCompare } from "../utils/naturalCompare";
 import { normalizeOptionalFolderPath, INVALID_FOLDER_PATH_MESSAGE } from "../utils/folderPaths";
-import { collectGroups } from "./serverCommands";
+import { collectGroups, runScriptOnOpenedSession } from "./serverCommands";
 import type { CommandContext, SerialTerminalEntry } from "./types";
 import { pickScriptFromWorkspace } from "../services/scripts/scriptPicker";
 
@@ -825,7 +825,8 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
 
     // Connect to a serial profile and auto-run a picked Nexus script once the
     // session is registered. Same pattern as nexus.server.runWithScript but for
-    // the serial active-session list.
+    // the serial active-session list — the run keeps the session's output from
+    // that registration on, the way the server command's does.
     vscode.commands.registerCommand("nexus.serial.runWithScript", async (arg?: unknown) => {
       const profile = toSerialProfileFromArg(ctx.core, arg) ?? (await pickSerialProfile(ctx.core));
       if (!profile) return;
@@ -853,10 +854,7 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
         resolved = true;
         clearTimeout(timer);
         unsubscribe();
-        void ctx.scriptRuntimeManager!.runScript(scriptUri, newSession.id).catch((err) => {
-          const message = err instanceof Error ? err.message : String(err);
-          void vscode.window.showErrorMessage(`Failed to start script after connect: ${message}`);
-        });
+        runScriptOnOpenedSession(ctx.scriptRuntimeManager!, scriptUri, newSession);
       });
       const timer = setTimeout(() => {
         if (resolved) return;
