@@ -491,6 +491,12 @@ is used at all. Token usage is a hint, never an authorization: a macro's text is
 something anyone can write, so it can never be what decides that a stored
 password is handed over.
 
+On a macro whose **Run on** is *The server's IPMI gateway*, the checkbox does
+nothing: Nexus doesn't send IPMI credentials to a gateway session. ipmitool
+there asks for the password in the gateway terminal — with `-a`, or with `-E`
+when neither `IPMITOOL_PASSWORD` nor `IPMI_PASSWORD` is set on the gateway. The
+macro editor says so beside the ticked box, and so does the send confirmation.
+
 ### Upgrading an older IPMI macro
 
 **Run in** did not always exist, so a macro created before it defaults to *Session

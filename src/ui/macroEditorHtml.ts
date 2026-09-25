@@ -684,8 +684,8 @@ ${folderOptionsHtml}
 
       // Issue #48 PR-C item 4 — the inert-combination hint: route = the server's
       // IPMI gateway AND "Provide IPMI credentials" ticked. Non-blocking (never
-      // disables Save); env injection can't cross to a gateway session, so
-      // ipmitool prompts on the gateway instead.
+      // disables Save); env injection can't cross to a gateway session, and the
+      // hint says what ipmitool does there instead, whatever the command's form.
       function updateGatewayInertHint() {
         var isLocal = document.getElementById("macro-run-in").value === "localTerminal";
         var isGateway = document.getElementById("macro-run-on").value === "ipmiGateway";

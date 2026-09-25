@@ -279,13 +279,12 @@ const IPMI_PASSWORD_VAR_RE = new RegExp(`\\b(?:${IPMI_PASSWORD_ENV_VARS.join("|"
 
 /**
  * Could ticking "Provide IPMI credentials" change this macro's run? Decided per
- * command segment (split where `commandReadsIpmiEnv` scopes its scan: `;`, `&`,
- * `|`, an unescaped newline), and true if ANY segment may read the password
- * environment:
+ * command segment (`commandSegments`), and true if ANY segment may read the
+ * password environment:
  *
  *  - it names a password variable (`ipmitool -P "$IPMI_PASSWORD"` reads it
  *    through the shell, whatever ipmitool's own flags say);
- *  - its command is ipmitool (`segmentRunsIpmitool`) and it uses `-E` —
+ *  - its command is ipmitool and its arguments use `-E` (`commandReadsIpmiEnv`) —
  *    ipmitool's ONLY environment read (upstream ipmi_main.c keeps `getenv` of
  *    both names inside its `-E` branch);
  *  - its command is anything else and it uses an IPMI token — a script may read
@@ -296,31 +295,31 @@ const IPMI_PASSWORD_VAR_RE = new RegExp(`\\b(?:${IPMI_PASSWORD_ENV_VARS.join("|"
  * text-derived HINT only (§3.3), never an authorization input.
  */
 function macroMayReadIpmiPasswordEnv(text: string): boolean {
-  return joinLineContinuations(text)
-    .split(/[;&|\n]/)
-    .some((segment) => {
-      if (IPMI_PASSWORD_VAR_RE.test(segment)) {
-        return true;
-      }
-      return segmentRunsIpmitool(segment) ? commandReadsIpmiEnv(segment) : usesIpmiTokens(segment);
-    });
+  return commandSegments(text).some(
+    (segment) =>
+      IPMI_PASSWORD_VAR_RE.test(segment) ||
+      (ipmitoolArguments(segment) === undefined ? usesIpmiTokens(segment) : commandReadsIpmiEnv(segment))
+  );
 }
 
 /**
  * The options of a word that runs the word after them as the command, as far as
  * this parser needs to know them: single-letter flags, single-letter options
  * taking an operand (getopt: the rest of the word, else the next word), and the
- * long forms of each (`--name=value` or `--name value`).
+ * long forms of each (`--name=value` or `--name value`), plus how many
+ * positional operands come between those options and the command (timeout's
+ * DURATION).
  */
 interface PrefixOptions {
   readonly flags: string;
   readonly operands: string;
   readonly longFlags: readonly string[];
   readonly longOperands: readonly string[];
+  readonly positionals?: number;
 }
 
 /**
- * The prefixes `segmentRunsIpmitool` looks through. Deliberately partial: an
+ * The prefixes `ipmitoolArguments` looks through. Deliberately partial: an
  * option not listed makes the parse AMBIGUOUS, and ambiguity keeps the hint.
  * Left out on purpose: sudo's `-e`/`-l`/`-v`/`-V`/`-K` (the next word is then a
  * file or nothing, not a command run) and env's `-S`/`--split-string` (it
@@ -367,7 +366,11 @@ const COMMAND_PREFIXES: ReadonlyMap<string, PrefixOptions> = new Map([
   ["env", { flags: "i0v", operands: "Cu", longFlags: ["ignore-environment", "null", "debug"], longOperands: ["chdir", "unset"] }],
   ["exec", { flags: "cl", operands: "a", longFlags: [], longOperands: [] }],
   ["nice", { flags: "0123456789", operands: "n", longFlags: [], longOperands: ["adjustment"] }],
-  ["time", { flags: "apqv", operands: "fo", longFlags: ["append", "portability", "quiet", "verbose"], longOperands: ["format", "output"] }]
+  ["time", { flags: "apqv", operands: "fo", longFlags: ["append", "portability", "quiet", "verbose"], longOperands: ["format", "output"] }],
+  [
+    "timeout",
+    { flags: "fpv", operands: "ks", longFlags: ["foreground", "preserve-status", "verbose"], longOperands: ["kill-after", "signal"], positionals: 1 }
+  ]
 ]);
 
 /**
@@ -398,31 +401,59 @@ function prefixOptionOperandWords(options: PrefixOptions, word: string): 0 | 1 |
 }
 
 /**
- * Whether a segment's COMMAND is ipmitool: the first word after `NAME=value`
- * assignments and `COMMAND_PREFIXES` (their options AND those options'
- * operands consumed, getopt-style), with a basename of exactly `ipmitool` —
- * `/usr/bin/ipmitool`, `sudo -E ipmitool`, `sudo -u root ipmitool`,
- * `LANG=C ipmitool`.
+ * A subshell's opening `(` (or `( (`), which is not a word of the command it
+ * runs — but not `((`, which opens arithmetic, not a command.
+ */
+const SUBSHELL_OPENERS_RE = /^(?:\((?!\()\s*)+/;
+
+/**
+ * A word as the shell hands it on: quote characters removed and each backslash
+ * escape reduced to the character it escapes, so `"ipmitool"`, `'ipmitool'`,
+ * `ipmitool''` and `ip"mi"tool` are `ipmitool`, `"sudo"` is `sudo` and `-"E"` or
+ * `\-E` is `-E`. Every name and option comparison in `ipmitoolArguments` and
+ * `passesEnvFlag` goes through it. Words only: quotes that hide whitespace
+ * (`"/opt/my tools/ipmitool"`) were split apart before this sees them, which
+ * leaves the segment "not ipmitool" — and that keeps the hint.
+ */
+function unquoteShellWord(word: string): string {
+  return word.replace(/\\(.)|['"]/g, "$1");
+}
+
+/**
+ * The ARGUMENT WORDS of a segment whose COMMAND is ipmitool — the words after
+ * the command word, as written — or `undefined` when its command is not
+ * ipmitool. The command word is the first after a subshell's opening `(`,
+ * `NAME=value` assignments and `COMMAND_PREFIXES` (their options AND those
+ * options' operands consumed, getopt-style, then any positional operand such as
+ * timeout's DURATION), with a basename of exactly `ipmitool` once dequoted —
+ * `/usr/bin/ipmitool`, `"ipmitool"`, `sudo -E ipmitool`, `sudo -u root ipmitool`,
+ * `LANG=C ipmitool`, `timeout 30 ipmitool`, `(ipmitool …)`. Returning the
+ * arguments, not a yes/no, is what keeps a flag scan off the prefix: in
+ * `sudo -u ipmitool -E ipmitool -a` the `-E` is sudo's.
  *
  * COMMAND POSITION, NOT "THE WORD APPEARS". `\bipmitool\b` also matches inside
  * `my-ipmitool-wrapper`, `ipmitool.sh` and a quoted `echo "use ipmitool -E"`,
  * and skipping only option-SHAPED words took the operand of `sudo -u ipmitool
  * bmc-login` or `exec -a ipmitool bmc-login` for the command. Either mistake
- * classed a token consumer as ipmitool and dropped a hint it may need. So any
- * word this cannot place — an unknown option, env's `-S`, a nested
+ * classed a token consumer as ipmitool and dropped a hint it may need (#151).
+ * Any word this cannot place — an unknown option, env's `-S`, a nested
  * `bash -c "ipmitool …"` — answers "not ipmitool", which can only keep the hint.
  */
-function segmentRunsIpmitool(segment: string): boolean {
-  const words = segment.trim().split(/\s+/);
+function ipmitoolArguments(segment: string): string[] | undefined {
+  const words = segment.trim().replace(SUBSHELL_OPENERS_RE, "").split(/\s+/);
   let options: PrefixOptions | undefined;
+  let positionals = 0;
   for (let i = 0; i < words.length; i++) {
-    const word = words[i];
-    if (/^[A-Za-z_]\w*=/.test(word)) {
+    // An assignment is recognised as written — a quoted `"NAME=value"` is a
+    // command name to the shell, not an assignment.
+    if (/^[A-Za-z_]\w*=/.test(words[i])) {
       continue;
     }
+    const word = unquoteShellWord(words[i]);
     const prefix = COMMAND_PREFIXES.get(word);
     if (prefix) {
       options = prefix;
+      positionals = prefix.positionals ?? 0;
       continue;
     }
     if (word.startsWith("-")) {
@@ -432,14 +463,20 @@ function segmentRunsIpmitool(segment: string): boolean {
       }
       const consumed = options ? prefixOptionOperandWords(options, word) : undefined;
       if (consumed === undefined) {
-        return false;
+        return undefined;
       }
       i += consumed;
       continue;
     }
-    return word.split(/[\\/]/).pop() === "ipmitool";
+    if (positionals > 0) {
+      positionals--;
+      continue;
+    }
+    // Basename BEFORE dequoting, so a Windows-style `C:\tools\ipmitool` keeps
+    // its separators and `\ipmitool` still ends in `ipmitool`.
+    return unquoteShellWord(words[i].split(/[\\/]/).pop() ?? "") === "ipmitool" ? words.slice(i + 1) : undefined;
   }
-  return false;
+  return undefined;
 }
 
 /** An `ipmitool …` invocation in a macro's text — at line start or after whitespace. */
@@ -616,45 +653,44 @@ export function routeReconsentNote(
 }
 
 /**
- * The inert-credentials per-run note (§4.2 Path B item 4): a gateway-routed macro
- * that also has `provideIpmiCredentials` on. Env injection cannot cross to the
- * gateway shell, so the flag is inert and ipmitool's own `-a` prompt supplies the
- * password there instead. Reads the SAME string the editor hint does
- * (`IPMI_GATEWAY_INERT_CREDENTIALS_HINT`) so the two cannot drift.
+ * The one IPMI note for a run routed to the gateway (§4.2 Path B item 4; #174,
+ * #189): the macro has `provideIpmiCredentials` on, and env injection cannot
+ * cross to the gateway shell, so the flag is inert there. Reads the SAME string
+ * the editor hint does (`IPMI_GATEWAY_INERT_CREDENTIALS_HINT`) so the two cannot
+ * drift.
+ *
+ * DECIDED BY THE ROUTE AND THE FLAG, NEVER BY THE COMMAND. This used to choose
+ * between a "`-E` will fail on the gateway" warning and a "prompts via its `-a`
+ * form" assurance by parsing the command, and every round of review found a
+ * shell form that parse got wrong (a quoted separator, `"$n"tool`,
+ * `bash -c 'ipmitool -"E"'`). The distinction was also mostly false: upstream
+ * ipmitool (`lib/ipmi_main.c`) answers an `-E` that finds no password variable
+ * by logging "Unable to read password from environment" and then prompting, as
+ * `-a` does (#189). So the note states only what Nexus knows, and with the box
+ * unticked there is nothing to explain — the prompt appears in the gateway
+ * terminal the run reveals.
  */
 export function gatewayInertCredentialsNote(macro: TerminalMacro): string | undefined {
   return (macro.provideIpmiCredentials as unknown) === true ? IPMI_GATEWAY_INERT_CREDENTIALS_HINT : undefined;
 }
 
 /**
- * ipmitool's `-E` flag as a STANDALONE token, SCOPED to an actual ipmitool
- * invocation — its "read the password from the environment" flag
- * (`IPMITOOL_PASSWORD` / `IPMI_PASSWORD`). `\bipmitool\b` matches the command
- * (word-boundary, so a path prefix `/usr/bin/ipmitool` counts and `ipmitoolx`
- * does not) then, WITHIN THE SAME command segment (`[^;&|\n]*` stops at a `;`,
- * `&`, `|` or newline), a whitespace-delimited standalone `-E` (before whitespace
- * or end of string, so `-Example`/`-Env` do not match).
+ * Whether an ipmitool invocation's ARGUMENTS (`ipmitoolArguments`) pass `-E` —
+ * its "read the password from the environment" flag (`IPMITOOL_PASSWORD` /
+ * `IPMI_PASSWORD`). A word counts when, cut at a redirection or paren glued to
+ * it and dequoted (`unquoteShellWord`), it is exactly `-E`: `-E`, `'-E'`, `-"E"`,
+ * `\-E`, `-E>/tmp/log` (round 8), `-E)`; but not `-Example`, `-Env`, `-E=foo`
+ * or `-E/path`, which are other tokens.
  *
- * The scoping is what round 4 lacked: a bare `/(?:^|\s)-E(?=\s|$)/` matched any
- * `-E` anywhere in the text, false-positiving on a `-E` owned by a WRAPPER
- * (`sudo -E ipmitool … -a`, where the `-E` is sudo's preserve-environment and
- * ipmitool itself uses `-a` and prompts) or by a PIPED non-ipmitool command
- * (`ipmitool -a … | grep -E …`). Requiring the `-E` to follow `ipmitool` inside
- * the same segment ties it to the invocation that actually reads the env.
+ * WHERE it looks is the other half: only the words after a command word placed
+ * as ipmitool can be ipmitool's flags. A `-E` anywhere in the text would count
+ * a WRAPPER's (`sudo -E ipmitool … -a`, sudo's preserve-environment), a PIPED
+ * command's (`ipmitool -a … | grep -E …`) or a prefix's after an operand named
+ * ipmitool (`sudo -u ipmitool -E ipmitool -a`).
  */
-// \bipmitool\b, then within the same segment ([^;&|\n]* — cannot cross ; & | or
-// an unescaped newline), a -E preceded by HORIZONTAL whitespace OR a quote
-// ((?:[^\S\n]|['"]), so a shell-stripped `'-E'`/`"-E"` counts but a bare newline
-// does NOT put a next-line -E on this command) and NOT followed by a
-// word-continuation character. `-E(?![^\s'"<>;|&()])` closes the WHOLE
-// shell-token-terminator class rather than whitelisting a few chars: a -E is a
-// complete ipmitool token when what follows it is a token terminator —
-// whitespace (incl. the newline that ends the command), a quote, a redirection
-// `<`/`>` (so the compact `ipmitool -E>/tmp/log` counts, round 8), a separator
-// `;`/`|`/`&`, a subshell paren `(`/`)`, or end of string — but NOT a
-// word-continuation char, so `-Example`/`'-Example'`/`-Env`/`-E=foo`/`-E/path`
-// still do not match (the char after -E is `x`/`n`/`=`/`/`).
-const IPMITOOL_ENV_PASSWORD_FLAG_RE = /\bipmitool\b[^;&|\n]*(?:[^\S\n]|['"])-E(?![^\s'"<>;|&()])/;
+function passesEnvFlag(args: readonly string[]): boolean {
+  return args.some((word) => unquoteShellWord(word.split(/[<>()]/)[0]) === "-E");
+}
 
 /**
  * Shell line continuation: a backslash immediately before a newline joins the
@@ -668,34 +704,27 @@ function joinLineContinuations(text: string): string {
 }
 
 /**
- * Whether a command reads the IPMI password from the environment via ipmitool's
- * `-E` flag. This is the real predicate for "this will FAIL on a gateway": the
- * gateway session gets no injected env (the secret never crosses to the remote
- * hop), so a `-E` command exits "password not available" there instead of
- * prompting. A text-derived HINT only (§3.3) — never used for authorization, and
- * the command is neither blocked nor rewritten on its account.
+ * A macro's command segments — split at `;`, `&`, `|` and each unescaped
+ * newline once continuations are joined — the unit the local credentials hint
+ * classifies.
  */
-export function commandReadsIpmiEnv(text: string): boolean {
-  return IPMITOOL_ENV_PASSWORD_FLAG_RE.test(joinLineContinuations(text));
+function commandSegments(text: string): string[] {
+  return joinLineContinuations(text).split(/[;&|\n]/);
 }
 
 /**
- * The `-E`-on-gateway per-run WARNING (PR-C round 4, P2). A gateway-routed command
- * that reads the password from the environment (`-E`) can't get that env on the
- * gateway session, so it FAILS on the bastion rather than prompting — the exact
- * case the inert-credentials note's old "will prompt" copy over-promised. Keyed on
- * the COMMAND, not the credentials flag: `-E` fails whether or not
- * `provideIpmiCredentials` is set, so this fires regardless of the flag and
- * REPLACES the flag-gated inert note when it applies (the two never double-fire).
- *
- * Names the gateway and points at ipmitool's `-a` form (which prompts on the
- * bastion tty) as the fix. Lowercase-leaning, no trailing period: appended as a
- * clause like the sibling notes; the status line adds its own punctuation.
+ * Whether a command reads the IPMI password from the environment via ipmitool's
+ * `-E` flag: some segment's COMMAND is ipmitool (`ipmitoolArguments`) and its
+ * arguments pass `-E` (`passesEnvFlag`). The local credentials hint asks this of
+ * each ipmitool segment (`macroMayReadIpmiPasswordEnv`); exported for its unit
+ * tests. A text-derived HINT only (§3.3) — never used for authorization, and the
+ * command is neither blocked nor rewritten on its account.
  */
-export function gatewayEnvPasswordNote(command: string, gateway: ServerConfig): string | undefined {
-  return commandReadsIpmiEnv(command)
-    ? `this command reads the IPMI password from the environment (-E), which a gateway session can't provide — it will fail on ${gateway.name}; use ipmitool's -a form so it prompts there instead`
-    : undefined;
+export function commandReadsIpmiEnv(text: string): boolean {
+  return commandSegments(text).some((segment) => {
+    const args = ipmitoolArguments(segment);
+    return args !== undefined && passesEnvFlag(args);
+  });
 }
 
 /**
@@ -1048,17 +1077,10 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
     // to a LOCAL run it fell back to).
     noGatewayFallbackNote(server, route, gatewayServer),
     // On the gateway path the "tick Provide IPMI credentials" hint would be wrong
-    // (the flag is inert there), so it is replaced by a gateway-specific note; the
-    // local and fall-back paths keep the original hint. When the command reads its
-    // password from the environment (`-E`), the gateway session can't provide it,
-    // so it FAILS there rather than prompting — that case gets an active warning
-    // (keyed on the command, not the flag) that REPLACES the inert note, which
-    // would otherwise over-promise a prompt that never comes.
-    routedToGateway
-      ? commandReadsIpmiEnv(resolution.text)
-        ? gatewayEnvPasswordNote(resolution.text, gatewayServer!)
-        : gatewayInertCredentialsNote(macro)
-      : ipmiCredentialsOffNote(macro),
+    // (the flag is inert there), so it is replaced by the gateway note, which
+    // depends only on the route and the flag (#174, #189); the local and fall-back
+    // paths keep the original hint.
+    routedToGateway ? gatewayInertCredentialsNote(macro) : ipmiCredentialsOffNote(macro),
     sessionIpmiHintNote(macro),
     // Only a resolved, addressed gateway earns the reconsent note (it names the
     // gateway); a `none`/`unavailable` disposition has no name to point at, and on

@@ -176,20 +176,20 @@ export function resolveMacroRoute(macro: Pick<TerminalMacro, "route">): MacroRou
 /**
  * The non-blocking note shown when `route: "ipmiGateway"` and
  * `provideIpmiCredentials` are BOTH on: env injection cannot cross to a remote
- * shell, so the credentials flag is inert and ipmitool's own `-a` prompt supplies
- * the password on the bastion tty instead. Deliberately not an error — a user may
- * flip `route` back and forth on one macro. Defined here so the macro editor's
- * live hint and the per-run delivery note read from ONE string and cannot drift.
+ * shell, so the credentials flag is inert there. Deliberately not an error — a
+ * user may flip `route` back and forth on one macro. Defined here so the macro
+ * editor's live hint and the per-run delivery note read from ONE string and
+ * cannot drift.
  *
- * POINTS AT `-a`, DOES NOT PROMISE A BARE PROMPT (PR-C round 4, P2). ipmitool only
- * prompts on the gateway when the command uses its `-a` form; a command that reads
- * the password from the environment (`-E`) gets no env on the gateway and simply
- * FAILS there. So this shared copy names the `-a` form rather than promising an
- * unconditional prompt — the run-time `-E`-on-gateway warning
- * (`gatewayEnvPasswordNote`) covers the failing case that this editor hint can't.
+ * STATES WHAT HAPPENS, NOT WHICH FORM THIS COMMAND USES (#174, #189). ipmitool
+ * on the gateway uses what the gateway has: with `-a` it prompts, and with `-E`
+ * and neither variable set there it logs "Unable to read password from
+ * environment" and then prompts too (upstream `lib/ipmi_main.c`) — it does not
+ * fail. Earlier copy promised a prompt "via its `-a` form" and a run-time warning
+ * said `-E` "will fail"; both were guesses from parsing the command.
  */
 export const IPMI_GATEWAY_INERT_CREDENTIALS_HINT =
-  "IPMI credentials can't be sent to a gateway session — ipmitool prompts on the gateway via its `-a` form instead";
+  "Nexus doesn't send IPMI credentials to a gateway session — there, ipmitool with `-a`, or with `-E` and no IPMITOOL_PASSWORD/IPMI_PASSWORD set on the gateway, asks for the password in the gateway terminal";
 
 /** Human-readable label for a run target, shared by the editor and the pickers. */
 export function macroRunTargetLabel(target: MacroRunTarget): string {

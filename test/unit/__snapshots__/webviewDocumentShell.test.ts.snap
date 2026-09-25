@@ -7112,7 +7112,7 @@ echo hi</textarea>
          triggers it (route = gateway AND this box ticked), not in the run-on group
          where ticking the box surfaced a hint in a different, possibly off-screen
          group. Same id / same live-update (updateGatewayInertHint), same constant. -->
-    <div class="hint" id="gateway-inert-credentials-hint" style="display:none;">IPMI credentials can&#39;t be sent to a gateway session — ipmitool prompts on the gateway via its \`-a\` form instead</div>
+    <div class="hint" id="gateway-inert-credentials-hint" style="display:none;">Nexus doesn&#39;t send IPMI credentials to a gateway session — there, ipmitool with \`-a\`, or with \`-E\` and no IPMITOOL_PASSWORD/IPMI_PASSWORD set on the gateway, asks for the password in the gateway terminal</div>
   </div>
 
   <div class="form-group">
@@ -7705,8 +7705,8 @@ echo hi</textarea>
 
       // Issue #48 PR-C item 4 — the inert-combination hint: route = the server's
       // IPMI gateway AND "Provide IPMI credentials" ticked. Non-blocking (never
-      // disables Save); env injection can't cross to a gateway session, so
-      // ipmitool prompts on the gateway instead.
+      // disables Save); env injection can't cross to a gateway session, and the
+      // hint says what ipmitool does there instead, whatever the command's form.
       function updateGatewayInertHint() {
         var isLocal = document.getElementById("macro-run-in").value === "localTerminal";
         var isGateway = document.getElementById("macro-run-on").value === "ipmiGateway";
