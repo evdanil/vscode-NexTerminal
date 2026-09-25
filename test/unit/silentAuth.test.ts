@@ -1616,6 +1616,124 @@ describe("SilentAuthSshFactory — concurrent logins share one prompt (issue #17
       expect(sentPasswords(connector)).toEqual(["pw-for-a.example.com", "pw-for-b.example.com"]);
     });
 
+    it("does not share a profile password when only the alternate host differs", async () => {
+      const profile: AuthProfile = { id: "prof-alt-host", name: "Fleet", username: "ops", authType: "password" };
+      const lookup = (id: string) => id === profile.id ? profile : undefined;
+      const deviceA: ServerConfig = {
+        ...baseServer,
+        id: "srv-alt-a",
+        host: "primary.example.com",
+        altHost: "alt-a.example.com",
+        authProfileId: profile.id
+      };
+      const deviceB: ServerConfig = {
+        ...baseServer,
+        id: "srv-alt-b",
+        host: "primary.example.com",
+        altHost: "alt-b.example.com",
+        authProfileId: profile.id
+      };
+      const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+      const vault = createVault();
+      const answers = [deferred<Answer>(), deferred<Answer>()];
+      let promptIndex = 0;
+      const prompt: PasswordPrompt = { prompt: vi.fn(() => answers[promptIndex++].promise) };
+      const liveServers = new Map([[deviceA.id, deviceA], [deviceB.id, deviceB]]);
+      const factory = new SilentAuthSshFactory(
+        connector,
+        vault,
+        prompt,
+        undefined,
+        lookup,
+        (id) => liveServers.get(id)
+      );
+
+      const first = factory.connect(deviceA);
+      await settle();
+      const second = factory.connect(deviceB);
+      await settle();
+      const promptCount = prompt.prompt.mock.calls.length;
+      answers[0].resolve({ password: "password-for-alt-a", save: false });
+      answers[1].resolve({ password: "password-for-alt-b", save: false });
+      await Promise.all([first, second]);
+
+      expect(promptCount).toBe(2);
+      expect(sentPasswords(connector)).toEqual(["password-for-alt-a", "password-for-alt-b"]);
+    });
+
+    it("still shares a password between profile-linked records with the same full endpoint", async () => {
+      const profile: AuthProfile = { id: "prof-same-endpoint", name: "Fleet", username: "ops", authType: "password" };
+      const lookup = (id: string) => id === profile.id ? profile : undefined;
+      const deviceA: ServerConfig = {
+        ...baseServer,
+        id: "srv-same-a",
+        host: "primary.example.com",
+        altHost: "alt.example.com",
+        authProfileId: profile.id
+      };
+      const deviceB: ServerConfig = { ...deviceA, id: "srv-same-b" };
+      const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+      const vault = createVault();
+      const { prompt, answer } = openPrompt();
+      const liveServers = new Map([[deviceA.id, deviceA], [deviceB.id, deviceB]]);
+      const factory = new SilentAuthSshFactory(
+        connector,
+        vault,
+        prompt,
+        undefined,
+        lookup,
+        (id) => liveServers.get(id)
+      );
+
+      const first = factory.connect(deviceA);
+      await settle();
+      const second = factory.connect(deviceB);
+      await settle();
+      answer({ password: "shared-profile-password", save: false });
+      await Promise.all([first, second]);
+
+      expect(prompt.prompt).toHaveBeenCalledOnce();
+      expect(sentPasswords(connector)).toEqual(["shared-profile-password", "shared-profile-password"]);
+    });
+
+    it.each([
+      { description: "changed alternate host", replacementAltHost: "alt-b.example.com" },
+      { description: "identical values", replacementAltHost: "alt-a.example.com" }
+    ])("does not let a same-ID record with $description inherit or persist the pending answer", async ({ replacementAltHost }) => {
+      const original: ServerConfig = { ...baseServer, altHost: "alt-a.example.com" };
+      const liveServers = new Map<string, ServerConfig>([[original.id, original]]);
+      const passwordKey = passwordSecretKey(original.id);
+      const answers = [deferred<Answer>(), deferred<Answer>()];
+      let promptIndex = 0;
+      const prompt: PasswordPrompt = { prompt: vi.fn(() => answers[promptIndex++].promise) };
+      const vault = createVault();
+      const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+      const factory = new SilentAuthSshFactory(
+        connector,
+        vault,
+        prompt,
+        undefined,
+        undefined,
+        (id) => liveServers.get(id)
+      );
+
+      const removedRecordLogin = factory.connect(original);
+      await settle();
+      const replacement: ServerConfig = { ...original, altHost: replacementAltHost };
+      liveServers.set(replacement.id, replacement);
+      const replacementLogin = factory.connect(replacement);
+      await settle();
+      const promptCount = prompt.prompt.mock.calls.length;
+      answers[0].resolve({ password: "password-from-removed-record", save: true });
+      answers[1].resolve({ password: "password-from-replacement", save: true });
+      await Promise.all([removedRecordLogin, replacementLogin]);
+
+      expect(vault.store).not.toHaveBeenCalledWith(passwordKey, "password-from-removed-record");
+      expect(promptCount).toBe(2);
+      expect(sentPasswords(connector)).toEqual(["password-from-removed-record", "password-from-replacement"]);
+      expect(vault.store).toHaveBeenCalledWith(passwordKey, "password-from-replacement");
+    });
+
     it("does not share between two servers that name the same address through different jump hosts", async () => {
       // Lab devices commonly reuse management addresses: the same user@host:port
       // reached through another jump host is another machine.
