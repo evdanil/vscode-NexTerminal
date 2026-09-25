@@ -1494,7 +1494,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     localShellTerminals: ctx.localShellTerminals,
     localServerTerminals: ctx.localServerTerminals
   });
-  const profileDisposables = registerProfileCommands(ctx);
+  // localServerCtx, not ctx: a folder's Delete contents stops the Local Servers
+  // it deletes, exactly as Remove Local Server does.
+  const profileDisposables = registerProfileCommands(localServerCtx);
   const settingsDisposables = registerSettingsCommands(() => ctx.sessionLogDir);
   const authProfileDisposables = registerAuthProfileCommands(ctx);
   const deviceTemplateDisposables = registerDeviceTemplateCommands(ctx, inventoryProviderRegistry);

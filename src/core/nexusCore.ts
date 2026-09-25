@@ -127,6 +127,20 @@ export class InventorySourceRemovalMismatchError extends Error {
   }
 }
 
+/**
+ * Thrown by removeFolderCascade when a save rejects after the in-memory change
+ * is made (the message is the first rejection's). `serversSaved` says whether
+ * the server list reached storage — whether a deleted server is gone for good
+ * or comes back after a restart — which decides whether its caller may delete
+ * that server's saved credentials.
+ */
+export class FolderCascadeSaveError extends Error {
+  public constructor(public readonly serversSaved: boolean, cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "FolderCascadeSaveError";
+  }
+}
+
 export class NexusCore {
   private readonly listeners = new Set<NexusListener>();
   private readonly servers = new Map<string, ServerConfig>();
@@ -1379,10 +1393,11 @@ export class NexusCore {
     // revalidation (deviceTemplateCommands.ts `applyPlanWrites`), same class, same
     // graceful-degradation symptom. `computeSyncPlan` validated each upserted
     // server's `ipmiGatewayServerId` against a `liveServerIds` SNAPSHOT taken at
-    // PLAN time (syncEngine.ts). A folder delete (`nexus.group.remove`) does NOT
-    // take `configMutationLock` and does not revise the source/template, so it can
-    // prune the selected gateway AFTER that snapshot — e.g. from another window
-    // while this apply's confirmation modal is open — and the pre-apply guards
+    // PLAN time (syncEngine.ts), before the apply acquires `configMutationLock`. A
+    // folder delete (`nexus.group.remove`, which holds the lock itself) can
+    // complete in that window — e.g. while this apply's confirmation modal is open
+    // — and it does not revise the source/template, so it prunes the selected
+    // gateway AFTER that snapshot and the pre-apply guards
     // (`sourceConfigUnchanged` / the "absent" structural checks) still pass. The
     // upsert then lands in `this.servers` above carrying a gateway id that no
     // longer names any server. The `gatewayDeletedIds` sweep just above only
@@ -1854,11 +1869,13 @@ export class NexusCore {
       // the same way an unconditional restore would for addedExplicitGroups.
       //
       // PARENT-CHAIN FIX — presence-of-the-exact-path alone isn't enough.
-      // Lock-free tree commands (`_renameFolderPath` / `removeFolderCascade`)
-      // are NOT serialized against this batch's pending persist (same window
-      // FINDING 3/REVIEW FINDING 2 above already contend with for servers),
-      // so the surrounding tree can be renamed or deleted out from under a
-      // removed candidate while this save is in flight — e.g. the whole
+      // The folder commands behind `_renameFolderPath` / `removeFolderCascade`
+      // take configMutationLock, as this batch's callers do, so today they do
+      // not run during this persist; but the lock is a convention, not an
+      // invariant, and a writer that skipped it (the same window FINDING
+      // 3/REVIEW FINDING 2 above contend with for servers) could rename or
+      // delete the surrounding tree out from under a removed candidate
+      // while this save is in flight — e.g. the whole
       // "NetBox" branch renamed to "Lab" while this batch is mid-persist
       // after GC'ing the now-empty "NetBox/RackA". "NetBox/RackA" is still
       // ABSENT from `explicitGroups` at rollback time (it was never
@@ -2959,6 +2976,9 @@ export class NexusCore {
       for (const [id, server] of this.servers.entries()) {
         if (server.group && isDescendantOrSelf(server.group, path)) {
           this.servers.delete(id);
+          // LIVE STATUS — dropped as removeServer drops it; otherwise a server
+          // re-created under this id (a re-synced node) shows the old state.
+          this.dropServerStatusEntry(id);
           this.removeServerSessions(id);
           cascadeDeletedServerIds.add(id);
         }
@@ -3026,13 +3046,17 @@ export class NexusCore {
     // Sweep dangling gateway refs left by the cascade's server deletions (see the
     // note at the top of this method), folded into the persist just below.
     this.clearGatewayReferencesTo(cascadeDeletedServerIds);
-    await Promise.all([
+    const [servers, ...others] = await Promise.allSettled([
       this.repository.saveServers([...this.servers.values()]),
       this.repository.saveSerialProfiles([...this.serialProfiles.values()]),
       this.repository.saveLocalShellProfiles([...this.localShellProfiles.values()]),
       this.repository.saveLocalServers([...this.localServers.values()]),
       this.repository.saveGroups([...this.explicitGroups])
     ]);
+    const firstRejection = [servers, ...others].find((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (firstRejection) {
+      throw new FolderCascadeSaveError(servers.status === "fulfilled", firstRejection.reason);
+    }
     this.emitChanged();
   }
 

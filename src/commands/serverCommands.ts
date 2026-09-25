@@ -21,7 +21,7 @@ import { SshPty } from "../services/ssh/sshPty";
 import { TelnetPty } from "../services/telnet/telnetPty";
 import type { PtyOutputObserver } from "../services/macroAutoTrigger";
 import { Osc7Parser } from "../services/terminal/osc7Parser";
-import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
+import { deleteServerSecrets, passwordSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { serverFormDefinition, toSshInfrastructureServerList } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, ServerTreeItem, SessionTreeItem } from "../ui/nexusTreeProvider";
@@ -1823,10 +1823,12 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             // secret-capture await MUST run BEFORE the baseline snapshot
             // (liveRecord) below, and nothing may await between that
             // baseline capture and the addOrUpdateServer(updated) write
-            // further down. nexus.server.rename and nexus.server.remove
-            // don't take configMutationLock (see the FINDING 1 comment in
-            // the catch block below), so either can commit against this
-            // same server id while THIS await is pending. Previously
+            // further down. nexus.server.rename and nexus.server.remove take
+            // configMutationLock too, so neither commits against this server
+            // id while THIS await is pending today; the ordering stays as
+            // defence in depth against a writer that skips the lock (it is a
+            // convention, not an invariant — see the FINDING 1 comment in
+            // the catch block below). Previously
             // liveRecord was captured BEFORE this await: a rename landing
             // during it produced a stale liveRecord, and a subsequently
             // failed secret write rolled back onto that stale snapshot,
@@ -1959,13 +1961,15 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
               // generation.
               //
               // FINDING 1 (P2, edit-rollback-race review) — nexus.server.rename
-              // and nexus.server.remove don't take configMutationLock, so
-              // either can commit against this SAME server id while this
-              // catch is only reached after awaiting syncProxyPasswordSecret
-              // above — i.e. after the lock body has already resumed from an
-              // await, no longer exclusive in practice against unlocked
-              // callers. An unconditional restore here would then erase a
-              // concurrent rename, or resurrect a concurrent delete. Guard
+              // and nexus.server.remove take configMutationLock as this edit
+              // does, so today neither can commit against this SAME server id
+              // before this catch runs. The lock is a command-layer convention,
+              // not an invariant, though, and this catch is only reached after
+              // awaiting syncProxyPasswordSecret above — i.e. after the lock
+              // body has already resumed from an await, never exclusive
+              // against a caller that skips the lock. For such a caller an
+              // unconditional restore here would erase a concurrent rename,
+              // or resurrect a concurrent delete. Guard
               // it: only restore/remove when the CURRENT live record is
               // still structurally exactly what THIS submission's
               // addOrUpdateServer(updated) call wrote (serverConfigsEqual
@@ -2278,9 +2282,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         }
         await teardownServerRuntime(ctx, server.id);
         if (ctx.secretVault) {
-          await ctx.secretVault.delete(passwordSecretKey(server.id));
-          await ctx.secretVault.delete(passphraseSecretKey(server.id));
-          await ctx.secretVault.delete(proxyPasswordSecretKey(server.id));
+          await deleteServerSecrets(ctx.secretVault, server.id);
         }
         await ctx.core.removeServer(server.id);
       });

@@ -552,12 +552,14 @@ function planFor(ctx: CommandContext, template: DeviceTemplateProfile, servers: 
  * 6). The three cross-record references — `ipmiGatewayServerId` (a `ServerConfig.id`)
  * and the two auth links (`authProfileId` / `ipmiAuthProfileId`, `AuthProfile.id`s) —
  * are validated at PLAN time, but this loop yields at every `addOrUpdateServer`, so
- * a concurrent deletion can land between writes. The flagged path: `nexus.group.remove`
- * (folder delete) prunes servers WITHOUT taking `configMutationLock`, so it can delete
- * the selected IPMI gateway from another folder mid-apply even though this apply runs
- * under the lock. Its deletion sweep (`clearGatewayReferencesTo`) only reaches servers
- * ALREADY written; a server written AFTER it would re-introduce the dangling link, which
- * then silently routes IPMI locally. So each reference is RE-RESOLVED against live core
+ * a deletion could land between writes. The flagged path was `nexus.group.remove`
+ * (folder delete) deleting the selected IPMI gateway from another folder mid-apply.
+ * It takes `configMutationLock` as this apply does, and the plan is re-derived under
+ * that lock, so today it cannot land mid-apply; the guard stays as defence in depth,
+ * because the lock is a command-layer convention rather than an enforced invariant. A
+ * deletion's sweep (`clearGatewayReferencesTo`) only reaches servers ALREADY written; a
+ * server written AFTER it would re-introduce the dangling link, which then silently
+ * routes IPMI locally. So each reference is RE-RESOLVED against live core
  * immediately before the write and, if it no longer resolves, SKIPPED and dropped from
  * the stamp-clear set (neither written nor recorded as hand-owned). Robust without a
  * second lock: every deletion path mutates `this.servers` / the auth store in memory

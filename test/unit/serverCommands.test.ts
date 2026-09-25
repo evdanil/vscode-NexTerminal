@@ -5168,7 +5168,13 @@ describe("folder-op serialization (#84 P1)", () => {
       [telnetServer("t1", "Trash", 22), telnetServer("s1", "Keep", 32769)],
       ["Trash", "Keep"]
     );
-    registerProfileCommands(realCtx(core));
+    // Delete contents tears the deleted server's runtime down (#158), so the
+    // owners teardownServerRuntime reaches have to exist; t1 has nothing open.
+    registerProfileCommands(realCtx(core, {
+      terminalsByServer: new Map(),
+      tunnelManager: { stop: vi.fn() } as unknown as CmdCtx["tunnelManager"],
+      sshPool: { disconnect: vi.fn() } as unknown as CmdCtx["sshPool"]
+    }) as never);
 
     mockShowWarningMessage.mockResolvedValue("Delete contents");
 

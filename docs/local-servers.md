@@ -16,6 +16,8 @@ Distinct from [**Embedded Network Servers**](network-servers.md), which serves T
 
 To file a profile in a folder, drag it onto the folder in the Connectivity Hub, or use **Move to Folder…** on its right-click menu, which offers your existing folders, a new one, or the top level.
 
+Deleting a profile stops its server first if it is running, closes its terminal, and calls off any automatic restart it was waiting to make — whether you delete the profile itself or the folder it is in (**Remove Folder** → **Delete contents**).
+
 Environment variables often hold tokens, so an [Encrypted Backup](import-export.md#encrypted-backup-and-share-export) keeps them in its password-protected part, and **Export for Sharing** leaves Local Server profiles out altogether.
 
 ## Output

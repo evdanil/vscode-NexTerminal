@@ -17,6 +17,7 @@ import { isValidVariableName, MAX_MACRO_VARIABLES, withRedactedVariables } from 
 import { sanitizeMacroFolderList, sanitizeMacroGroup } from "../services/macroFolders";
 import type { SecretVault } from "../services/ssh/contracts";
 import {
+  deleteServerSecrets,
   passwordSecretKey,
   passphraseSecretKey,
   proxyPasswordSecretKey,
@@ -4496,9 +4497,7 @@ export function registerConfigCommands(
 
       // Delete all passwords/passphrases first (before removing servers)
       for (const server of snapshot.servers) {
-        await vault.delete(passwordSecretKey(server.id));
-        await vault.delete(passphraseSecretKey(server.id));
-        await vault.delete(proxyPasswordSecretKey(server.id));
+        await deleteServerSecrets(vault, server.id);
       }
 
       // Remove all servers

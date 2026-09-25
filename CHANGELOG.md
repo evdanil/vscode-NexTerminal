@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.257] — 2026-09-25
+
+### Fixed
+
+- **Removing a folder with Delete contents no longer leaves its Local Servers running.** The profiles were deleted, but a running Local Server kept running with no row left to stop it from. Each is now stopped before its profile is deleted, exactly as deleting the profile on its own does. The same goes for the folder's other profiles: an SSH or telnet session (with its tunnels), a serial session or a Local Shell no longer stays open on a profile that is gone, and the passwords and passphrases Nexus saved for the deleted servers are deleted with them instead of being left behind. The confirmation now says that Delete contents closes open sessions and, when the folder holds a Local Server, that it stops the running ones; if a server cannot be disconnected cleanly, a warning says so and offers **Reload Window**.
+
 ## [2.8.256] — 2026-09-25
 
 ### Fixed

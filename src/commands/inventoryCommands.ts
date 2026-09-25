@@ -37,7 +37,7 @@ import {
   type InventorySyncPlan
 } from "../services/inventory/syncEngine";
 import type { SecretVault } from "../services/ssh/contracts";
-import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
+import { deleteServerSecrets } from "../services/ssh/silentAuth";
 import { configMutationLock } from "../services/configMutationLock";
 import {
   clearStaleProxyPasswordSecretsBeforeApply,
@@ -199,21 +199,6 @@ function cloneForProvider(
   secrets: InventorySourceSecrets
 ): { config: InventorySourceValues; secrets: InventorySourceSecrets } {
   return { config: structuredClone(config), secrets: { ...secrets } };
-}
-
-/**
- * ITEM 9 — best-effort secret delete for post-apply/post-removal cleanup
- * steps that must not abort a primary operation that has already succeeded
- * (servers removed / plan applied) just because clearing one now-orphaned
- * vault key failed. Logs and continues so the remaining keys in the batch
- * still get their own delete attempt.
- */
-async function deleteSecretBestEffort(vault: SecretVault, key: string): Promise<void> {
-  try {
-    await vault.delete(key);
-  } catch (error) {
-    console.warn(`[Nexus] Failed to delete secret key "${key}":`, error);
-  }
 }
 
 /**
@@ -3484,14 +3469,15 @@ export function registerInventoryCommands(
           // even though the servers are already gone for good. Contain each
           // teardown per id, count failures, and keep going regardless; the
           // count is folded into the closing report below.
-          // FINDING (round 22, mirrors syncNow) — nexus.server.edit /
-          // nexus.server.rename deliberately don't take configMutationLock,
-          // so a re-add (upsert) of one of these ids can land in the awaited
-          // window between applyInventorySyncPlan committing above and this
-          // loop's iteration for it running. Re-check the server is actually
-          // still absent immediately before tearing it down — otherwise a
-          // recreated, live server's terminals/tunnels/pool connection would
-          // be killed out from under it. Ids skipped this way are folded into
+          // FINDING (round 22, mirrors syncNow) — re-check the server is
+          // actually still absent immediately before tearing it down. Every
+          // command that re-adds a server (nexus.server.edit and
+          // nexus.server.rename included) takes configMutationLock, so none
+          // can land in the awaited window between applyInventorySyncPlan
+          // committing above and this loop's iteration today; but the lock is
+          // a command-layer convention, not an invariant, and a re-add by a
+          // writer that skipped it would have its live terminals/tunnels/pool
+          // connection killed out from under it. Ids skipped this way are folded into
           // the same `recreatedIds` set the credential-cleanup loop below
           // uses, so the final "N re-created server(s)" report counts each id
           // once even though both loops can independently notice the same
@@ -3520,16 +3506,16 @@ export function registerInventoryCommands(
           // wrongly wiped out from under its surviving, live record.
           // ITEM 9 — per-key best-effort: one rejected delete must not strand
           // the remaining removed servers' secrets uncleaned.
-          // FINDING 2 (review) — nexus.server.edit / nexus.server.rename
-          // deliberately don't take configMutationLock, so while
-          // applyInventorySyncPlan above was awaiting its saves such a flow
-          // could have re-added one of these ids (upsert semantics) before
-          // this loop's iteration for it runs. Re-check the server is still
-          // absent immediately before deleting its keys — otherwise a
-          // recreated, live server's credentials would be wiped out from
-          // under it. The narrower residual window — a re-add landing during
+          // FINDING 2 (review) — re-check the server is still absent
+          // immediately before deleting its keys. The commands that re-add a
+          // server (nexus.server.edit / nexus.server.rename included) take
+          // configMutationLock, so none can re-add one of these ids while
+          // applyInventorySyncPlan above awaits its saves; the check is
+          // defence in depth, since the lock is a convention rather than an
+          // invariant and a recreated, live server's credentials would
+          // otherwise be wiped out from under it. The narrower residual window — a re-add landing during
           // the awaited vault.delete call itself, inside
-          // deleteSecretBestEffort — is intrinsic to the async vault API and
+          // deleteServerSecrets — is intrinsic to the async vault API and
           // accepted here; closing it would require generation-specific
           // secret keys, which touches the whole password subsystem and is
           // out of scope.
@@ -3538,9 +3524,7 @@ export function registerInventoryCommands(
               recreatedIds.add(id);
               continue;
             }
-            await deleteSecretBestEffort(vault, passwordSecretKey(id));
-            await deleteSecretBestEffort(vault, passphraseSecretKey(id));
-            await deleteSecretBestEffort(vault, proxyPasswordSecretKey(id));
+            await deleteServerSecrets(vault, id, { bestEffort: true });
           }
         } else if (choice === "Keep Servers") {
           // ADOPT 1 — strip AND STAMP. The strip is unchanged and stays
@@ -4891,15 +4875,15 @@ export function registerInventoryCommands(
           // (services/terminal/orphanDetect.ts, run at next activation) is the
           // backstop that surfaces any terminal stranded this way.
           //
-          // FINDING 1 (P2, second-sweep-abort review) — nexus.server.edit /
-          // nexus.server.rename deliberately don't take configMutationLock,
-          // so a re-add (upsert) of one of these ids can land in the awaited
-          // window between applyInventorySyncPlan committing above and this
-          // loop's iteration for it running. Re-check the server is actually
-          // still absent immediately before tearing it down — mirrors the
-          // credential-cleanup loop right below — otherwise a recreated,
-          // live server's terminals/tunnels/pool connection would be killed
-          // out from under it. Ids skipped this way are folded into the same
+          // FINDING 1 (P2, second-sweep-abort review) — re-check the server
+          // is actually still absent immediately before tearing it down —
+          // mirrors the credential-cleanup loop right below. The commands that
+          // re-add a server (nexus.server.edit / nexus.server.rename included)
+          // take configMutationLock, so none lands in the awaited window
+          // between applyInventorySyncPlan committing above and this loop
+          // today; the lock is a convention rather than an invariant, and a
+          // re-add by a writer that skipped it would have its live
+          // terminals/tunnels/pool connection killed out from under it. Ids skipped this way are folded into the same
           // `recreatedIds` set the credential-cleanup loop uses, so the final
           // "N re-created server(s)" report counts each id once even though
           // both loops can independently notice the same recreation.
@@ -4932,16 +4916,16 @@ export function registerInventoryCommands(
 
           // ITEM 9 — per-key best-effort: one rejected delete must not strand
           // the remaining pruned servers' secrets uncleaned.
-          // FINDING 2 (review) — nexus.server.edit / nexus.server.rename
-          // deliberately don't take configMutationLock, so while
-          // applyInventorySyncPlan above was awaiting its saves such a flow
-          // could have re-added one of these pruned ids (upsert semantics)
-          // before this loop's iteration for it runs. Re-check the server is
-          // still absent immediately before deleting its keys — otherwise a
-          // recreated, live server's credentials would be wiped out from
-          // under it. The narrower residual window — a re-add landing during
+          // FINDING 2 (review) — re-check the server is still absent
+          // immediately before deleting its keys. The commands that re-add a
+          // server (nexus.server.edit / nexus.server.rename included) take
+          // configMutationLock, so none can re-add one of these pruned ids
+          // while applyInventorySyncPlan above awaits its saves; the check is
+          // defence in depth, since the lock is a convention rather than an
+          // invariant and a recreated, live server's credentials would
+          // otherwise be wiped out from under it. The narrower residual window — a re-add landing during
           // the awaited vault.delete call itself, inside
-          // deleteSecretBestEffort — is intrinsic to the async vault API and
+          // deleteServerSecrets — is intrinsic to the async vault API and
           // accepted here; closing it would require generation-specific
           // secret keys, which touches the whole password subsystem and is
           // out of scope.
@@ -4950,9 +4934,7 @@ export function registerInventoryCommands(
               recreatedIds.add(id);
               continue;
             }
-            await deleteSecretBestEffort(vault, passwordSecretKey(id));
-            await deleteSecretBestEffort(vault, passphraseSecretKey(id));
-            await deleteSecretBestEffort(vault, proxyPasswordSecretKey(id));
+            await deleteServerSecrets(vault, id, { bestEffort: true });
           }
 
           return {
