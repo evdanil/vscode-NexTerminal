@@ -14,6 +14,7 @@ import {
   proxyPasswordSecretKey
 } from "../../src/services/ssh/silentAuth";
 import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
+import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 import { PassThrough } from "node:stream";
 
 const baseServer: ServerConfig = {
@@ -1383,6 +1384,52 @@ describe("SilentAuthSshFactory — concurrent logins share one prompt (issue #17
     (connector.connect as ReturnType<typeof vi.fn>).mock.calls.map((call) => (call[1] as { password?: string }).password);
 
   describe("server password", () => {
+    it("does not save a prompt answer after sync removes and recreates its deterministic server id", async () => {
+      const serverId = deterministicServerId("source-id", "external-device-id");
+      const oldServer: ServerConfig = { ...baseServer, id: serverId };
+      const live = { current: oldServer as ServerConfig | undefined };
+      const handshakeStarted = gate();
+      const handshake = gate();
+      const connector: SshConnector = {
+        connect: vi.fn(async () => {
+          handshakeStarted.open();
+          await handshake.promise;
+          return fakeConnection;
+        })
+      };
+      const vault = createVault();
+      const prompt: PasswordPrompt = { prompt: vi.fn(async () => ({ password: "old-record-password", save: true })) };
+      // The live lookup is the record-provenance hook added by the overlapping
+      // #201 fix. Keep this regression runnable on #214's pre-merge constructor;
+      // once #201 lands, this passes through the real constructor argument.
+      const FactoryWithLiveLookup = SilentAuthSshFactory as unknown as new (
+        connector: SshConnector,
+        vault: SecretVault,
+        prompt: PasswordPrompt,
+        inputPromptFn: undefined,
+        authProfileLookup: undefined,
+        liveServerLookup: (id: string) => ServerConfig | undefined
+      ) => SilentAuthSshFactory;
+      const factory = new FactoryWithLiveLookup(connector, vault, prompt, undefined, undefined, (id) =>
+        id === serverId ? live.current : undefined
+      );
+
+      const connecting = factory.connect(oldServer);
+      await handshakeStarted.promise;
+
+      // Inventory sync retires the old row and its secret, then adds a fresh
+      // object under the same deterministic id. Its config is intentionally
+      // identical: only record provenance distinguishes the two incarnations.
+      live.current = undefined;
+      await deleteServerSecrets(vault, serverId);
+      live.current = { ...oldServer };
+      handshake.open();
+
+      await expect(connecting).resolves.toBe(fakeConnection);
+      expect(vault.store).not.toHaveBeenCalledWith(passwordSecretKey(serverId), "old-record-password");
+      await expect(vault.get(passwordSecretKey(serverId))).resolves.toBeUndefined();
+    });
+
     it("asks once when a second login arrives while the prompt is open, and both log in with the answer", async () => {
       const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
       const vault = createVault();

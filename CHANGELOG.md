@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.267] — 2026-09-25
+
+### Fixed
+
+- **A server an inventory sync adds no longer picks up a password saved for a deleted server.** A synced server's identity comes from its device, so a device whose server was deleted gets the same identity when it comes back — and on Proxmox a different guest can come back that way, because Proxmox gives a deleted guest's ID to the next new one. A sync set to delete removed servers deletes their saved password, passphrase and proxy password after removing them, and if that failed — the system keychain refused, or the window closed mid-sync — the next server under that identity inherited them: switched to password authentication, it sent the old password to its host without asking. A sync now deletes any credential saved under a server's identity before adding the server, whatever its address, so a returning device starts without saved credentials, like any new server; if they cannot be deleted, the sync stops with nothing applied and says so. Servers that are updated or adopted keep their credentials, and auth profiles are not affected.
+
 ## [2.8.266] — 2026-09-25
 
 ### Fixed

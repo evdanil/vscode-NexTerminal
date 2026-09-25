@@ -28,6 +28,12 @@ function bytesToUuid(bytes: Buffer): string {
  * change once released — server ids derived from this function key saved
  * passwords, tunnel defaults, and jump-host references.
  *
+ * The same stability means an id is REUSED: a device whose server was deleted
+ * gets the same id when it returns — and a provider may reuse an externalId for
+ * a different machine (Proxmox VMIDs). A new server under such an id must not
+ * inherit secrets still stored for the old one; syncNow deletes them before it
+ * publishes an add (`clearLeftoverSecretsOfAdds`, commands/inventoryCommands.ts).
+ *
  * Name is `${sourceId.length}:${sourceId}:${externalId}` rather than a bare
  * `sourceId:externalId` concatenation — sourceId is a user-editable inventory
  * source id (not guaranteed `:`-free like a randomUUID), so without a length
