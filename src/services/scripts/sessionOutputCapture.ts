@@ -18,8 +18,9 @@ export function outputBufferObserver(buffer: ScriptOutputBuffer): PtyOutputObser
  *
  * `runScript` reads the script file (and seeds the editor types) before it has
  * a run to attach an observer for, so a device that answers the moment the
- * session opens — a Telnet login prompt — would print into that gap and be
- * lost for good. The caller takes this in the same change event that
+ * session opens — a Telnet login prompt, a serial console mid-boot — would
+ * print into that gap and be lost for good. `runScriptOnOpenedSession` (the
+ * server and serial commands) takes this in the same change event that
  * registered the session, before any await, and hands it to `runScript`, which
  * takes the buffer and the subscription over as the run's own. One observer
  * throughout: nothing is copied at the handover, so nothing can be missed or

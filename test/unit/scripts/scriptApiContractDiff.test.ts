@@ -69,4 +69,19 @@ describe("script-api.d.ts contract sync", () => {
       expect(example).not.toMatch(/\breturn\b/);
     }
   });
+
+  it("the shipped types say Connect and Run Script… keeps the session's output on a serial profile too (#207)", () => {
+    // ⊘ the v11 wording, "starts on a server", left in `Match.before` or
+    // `lookback` (or updated in only one of them): a serial script's author
+    // would read that a device's first output is never in the buffer, and
+    // press Enter for a prompt the run already holds.
+    const bundled = readFileSync(
+      path.join(REPO_ROOT, "src", "services", "scripts", "assets", "nexus-scripts.d.ts"),
+      "utf8"
+    );
+    const prose = bundled.replace(/\r?\n\s*\*\s?/g, " ");
+    const scopes = [...prose.matchAll(/Connect and Run Script… starts on a (.+?), (?:since|from)/g)].map((m) => m[1]);
+    expect(scopes).toEqual(["server or a serial profile", "server or a serial profile"]);
+    expect(prose).not.toMatch(/Connect and Run Script… starts on a server, /);
+  });
 });

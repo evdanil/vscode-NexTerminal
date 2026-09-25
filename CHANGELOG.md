@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.263] — 2026-09-25
+
+### Fixed
+
+- **Connect and Run Script… on a serial profile no longer misses what the device prints as the port opens.** Nexus read the script file before it started watching the new serial session, so output that arrived in that moment — boot messages from a device still starting up, say — never reached the script, and a script waiting for it timed out. The script now sees the session's output from the moment it opens, as it has on SSH and Telnet servers since 2.8.258. While the port-open response is pending, Nexus retains at most 64 KiB or 256 data chunks; if that bound is exceeded it drops the oldest chunks, and a single chunk larger than 64 KiB is discarded. A port usually prints nothing as it opens, so scripts that press Enter for a first prompt behave as before.
+
 ## [2.8.262] — 2026-09-25
 
 ### Fixed

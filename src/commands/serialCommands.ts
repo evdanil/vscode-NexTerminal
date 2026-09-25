@@ -25,7 +25,7 @@ import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { toParityCode } from "../utils/helpers";
 import { naturalCompare } from "../utils/naturalCompare";
 import { normalizeOptionalFolderPath, INVALID_FOLDER_PATH_MESSAGE } from "../utils/folderPaths";
-import { collectGroups } from "./serverCommands";
+import { collectGroups, runScriptOnOpenedSession } from "./serverCommands";
 import type { CommandContext, SerialTerminalEntry } from "./types";
 import { pickScriptFromWorkspace } from "../services/scripts/scriptPicker";
 
@@ -385,9 +385,9 @@ export function formValuesToSerial(values: FormValues, existing?: Partial<Serial
   };
 }
 
-async function connectStandardSerialProfile(ctx: CommandContext, profile: SerialProfile): Promise<void> {
+async function connectStandardSerialProfile(ctx: CommandContext, profile: SerialProfile): Promise<boolean> {
   if (!enforceSerialConnectPreconditions(ctx, profile)) {
-    return;
+    return false;
   }
   const terminalName = serialTerminalName(profile);
   let terminalRef: vscode.Terminal | undefined;
@@ -466,11 +466,12 @@ async function connectStandardSerialProfile(ctx: CommandContext, profile: Serial
   ctx.terminalRegistry?.register(terminal, pty);
   ctx.focusedTerminal = terminal;
   terminal.show();
+  return true;
 }
 
-async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialProfile): Promise<void> {
+async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialProfile): Promise<boolean> {
   if (!enforceSerialConnectPreconditions(ctx, profile)) {
-    return;
+    return false;
   }
 
   const logicalSessionId = randomUUID();
@@ -579,6 +580,7 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
   ctx.macroAutoTrigger.bindObserverToSession(triggerObserver, logicalSessionId);
   ctx.focusedTerminal = terminal;
   terminal.show();
+  return true;
 }
 
 async function testSerialConnection(ctx: CommandContext, arg?: unknown): Promise<void> {
@@ -825,7 +827,8 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
 
     // Connect to a serial profile and auto-run a picked Nexus script once the
     // session is registered. Same pattern as nexus.server.runWithScript but for
-    // the serial active-session list.
+    // the serial active-session list — the run keeps the session's output from
+    // that registration on, the way the server command's does.
     vscode.commands.registerCommand("nexus.serial.runWithScript", async (arg?: unknown) => {
       const profile = toSerialProfileFromArg(ctx.core, arg) ?? (await pickSerialProfile(ctx.core));
       if (!profile) return;
@@ -853,10 +856,7 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
         resolved = true;
         clearTimeout(timer);
         unsubscribe();
-        void ctx.scriptRuntimeManager!.runScript(scriptUri, newSession.id).catch((err) => {
-          const message = err instanceof Error ? err.message : String(err);
-          void vscode.window.showErrorMessage(`Failed to start script after connect: ${message}`);
-        });
+        runScriptOnOpenedSession(ctx.scriptRuntimeManager!, scriptUri, newSession);
       });
       const timer = setTimeout(() => {
         if (resolved) return;
@@ -868,10 +868,14 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
       }, timeoutMs);
 
       try {
-        if (resolveSerialProfileMode(profile) === "smartFollow") {
-          await connectSmartSerialProfile(ctx, profile);
-        } else {
-          await connectStandardSerialProfile(ctx, profile);
+        const started =
+          resolveSerialProfileMode(profile) === "smartFollow"
+            ? await connectSmartSerialProfile(ctx, profile)
+            : await connectStandardSerialProfile(ctx, profile);
+        if (!started && !resolved) {
+          resolved = true;
+          clearTimeout(timer);
+          unsubscribe();
         }
       } catch (err) {
         resolved = true;

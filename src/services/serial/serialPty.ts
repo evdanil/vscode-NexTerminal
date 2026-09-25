@@ -7,9 +7,10 @@ import { CLEAR_VISIBLE_SCREEN } from "../terminal/terminalEscapes";
 import { PtyObserverHub } from "../terminal/ptyObserverHub";
 import { toParityCode } from "../../utils/helpers";
 import type { OpenPortParams } from "./protocol";
+import { SerialOpeningDataBuffer } from "./serialOpeningDataBuffer";
 
 export interface SerialTransport {
-  openPort(options: OpenPortParams): Promise<string>;
+  openPort(options: OpenPortParams, sessionId?: string): Promise<string>;
   writePort(sessionId: string, data: Buffer): Promise<void>;
   closePort(sessionId: string): Promise<void>;
   onDidReceiveData(listener: (sessionId: string, data: Buffer) => void): () => void;
@@ -30,6 +31,9 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
   private readonly closeEmitter = new vscode.EventEmitter<void>();
   private readonly nameEmitter = new vscode.EventEmitter<string>();
   private sidecarSessionId?: string;
+  private openingSessionId?: string;
+  private openingPort = false;
+  private readonly openingData = new SerialOpeningDataBuffer();
   private dataSubscription?: () => void;
   private errorSubscription?: () => void;
   private disconnectSubscription?: () => void;
@@ -179,6 +183,9 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
   private releaseSubscriptions(): string | undefined {
     const sessionId = this.sidecarSessionId;
     this.sidecarSessionId = undefined;
+    this.openingSessionId = undefined;
+    this.openingPort = false;
+    this.openingData.clear();
     this.dataSubscription?.();
     this.errorSubscription?.();
     this.disconnectSubscription?.();
@@ -213,8 +220,25 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
 
   private async start(): Promise<void> {
     try {
-      const sessionId = await this.transport.openPort(this.options);
+      // The sidecar may emit portData before its openPort response reaches this PTY.
+      // Pass a session ID up front so this buffer cannot collect another PTY's traffic.
+      const openingSessionId = globalThis.crypto.randomUUID();
+      this.openingSessionId = openingSessionId;
+      this.openingPort = true;
+      this.dataSubscription = this.transport.onDidReceiveData((eventSessionId, data) => {
+        if (eventSessionId !== this.sidecarSessionId) {
+          if (this.openingPort && eventSessionId === this.openingSessionId) {
+            this.openingData.capture(eventSessionId, data);
+          }
+          return;
+        }
+        this.handleData(eventSessionId, data);
+      });
+
+      const sessionId = await this.transport.openPort(this.options, openingSessionId);
       if (this.disposed) {
+        this.openingPort = false;
+        this.openingData.clear();
         await this.transport.closePort(sessionId);
         return;
       }
@@ -227,18 +251,11 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
         `\r\n[Nexus Serial] Connected ${this.options.path} @ ${this.options.baudRate} (${this.options.dataBits ?? 8}${toParityCode(this.options.parity)}${this.options.stopBits ?? 1})\r\n`
       );
 
-      this.dataSubscription = this.transport.onDidReceiveData((eventSessionId, data) => {
-        if (eventSessionId !== this.sidecarSessionId) {
-          return;
-        }
-        const output = data.toString("utf8");
-        this.logger.logOutput?.(`serial stdout ${JSON.stringify(output)}`);
-        this.transcript?.write(output);
-        this.observerHub.notifyOutput(output, this.highlighterStream, this.highlighter, (rendered) =>
-          this.writeEmitter.fire(rendered)
-        );
-        this.callbacks.onDataReceived?.(eventSessionId);
-      });
+      this.openingPort = false;
+      this.openingSessionId = undefined;
+      for (const data of this.openingData.takeFor(sessionId)) {
+        this.handleData(sessionId, data);
+      }
       this.errorSubscription = this.transport.onDidReceiveError((eventSessionId, errorMessage) => {
         if (eventSessionId !== this.sidecarSessionId) {
           return;
@@ -254,11 +271,22 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
         this.handleDisconnect(reason);
       });
     } catch (error) {
+      this.releaseSubscriptions();
       const message = error instanceof Error ? error.message : "unknown serial connection error";
       this.logger.log(`serial connect failed ${message}`);
       this.writeEmitter.fire(`\r\n[Nexus Serial] Connection failed: ${message}\r\n\r\nPress any key to close.\r\n`);
       this.failed = true;
     }
+  }
+
+  private handleData(eventSessionId: string, data: Buffer): void {
+    const output = data.toString("utf8");
+    this.logger.logOutput?.(`serial stdout ${JSON.stringify(output)}`);
+    this.transcript?.write(output);
+    this.observerHub.notifyOutput(output, this.highlighterStream, this.highlighter, (rendered) =>
+      this.writeEmitter.fire(rendered)
+    );
+    this.callbacks.onDataReceived?.(eventSessionId);
   }
 
 }

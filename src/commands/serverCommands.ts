@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import type { AuthProfile, AuthType, ProxyConfig, ServerConfig } from "../models/config";
+import type { AuthProfile, AuthType, ProxyConfig, ServerConfig, SessionPtyHandle } from "../models/config";
 import {
   authProfileOwnedCredentials,
   authProfileOwnershipSignature,
@@ -43,6 +43,7 @@ import { naturalCompare, naturalComparePath } from "../utils/naturalCompare";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 import { pickScriptFromWorkspace } from "../services/scripts/scriptPicker";
 import { captureSessionOutput } from "../services/scripts/sessionOutputCapture";
+import type { ScriptRuntimeManager } from "../services/scripts/scriptRuntimeManager";
 import { configMutationLock } from "../services/configMutationLock";
 import { addresslessUnavailableMessage, telnetUnsupportedMessage } from "../utils/protocolGuards";
 
@@ -1461,6 +1462,28 @@ async function testServerConnection(ctx: CommandContext, arg?: unknown): Promise
 }
 
 /**
+ * Start the script Connect and Run Script… picked on the session it has just
+ * opened — shared by the server and serial commands so both do it the same
+ * way. Call it from the change event that registered the session, before any
+ * await: nothing has been received yet, and the capture taken here keeps the
+ * session's output from that moment. runScript reads the script file before
+ * it could watch the output itself, and a device that answers at once (a
+ * Telnet login prompt, a serial console mid-boot) would print into that gap.
+ */
+export function runScriptOnOpenedSession(
+  runtime: ScriptRuntimeManager,
+  scriptUri: vscode.Uri,
+  session: { readonly id: string; readonly pty?: SessionPtyHandle }
+): void {
+  const capture = session.pty ? captureSessionOutput(session.pty) : undefined;
+  // runScript itself logs to the Scripts output channel; only a throw needs a toast.
+  void runtime.runScript(scriptUri, session.id, capture).catch((err) => {
+    const message = err instanceof Error ? err.message : String(err);
+    void vscode.window.showErrorMessage(`Failed to start script after connect: ${message}`);
+  });
+}
+
+/**
  * Connect to a server (opening a fresh session) and auto-run a picked Nexus
  * script against it the moment the session registers. Invoked from the server
  * tree-item context menu entry "Run with script…".
@@ -1502,16 +1525,7 @@ async function connectAndRunScript(ctx: CommandContext, arg?: unknown): Promise<
     resolved = true;
     clearTimeout(timer);
     unsubscribe();
-    // Keep the session's output from now — this change event is its
-    // registration, and nothing has been received yet. runScript reads the
-    // script file before it could watch the output itself, and a device that
-    // answers at once (a Telnet login prompt) would print into that gap.
-    const capture = newSession.pty ? captureSessionOutput(newSession.pty) : undefined;
-    // Fire the script — runScript itself logs to the Scripts output channel.
-    void ctx.scriptRuntimeManager!.runScript(scriptUri, newSession.id, capture).catch((err) => {
-      const message = err instanceof Error ? err.message : String(err);
-      void vscode.window.showErrorMessage(`Failed to start script after connect: ${message}`);
-    });
+    runScriptOnOpenedSession(ctx.scriptRuntimeManager!, scriptUri, newSession);
   });
 
   const timer = setTimeout(() => {

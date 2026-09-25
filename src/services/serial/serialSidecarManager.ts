@@ -69,22 +69,28 @@ export class SerialSidecarManager {
 
   public async openPort(path: string, baudRate: number): Promise<string>;
 
-  public async openPort(options: OpenPortParams): Promise<string>;
+  public async openPort(options: OpenPortParams, sessionId?: string): Promise<string>;
+  public async openPort(path: string, baudRate?: number): Promise<string>;
 
-  public async openPort(pathOrOptions: string | OpenPortParams, baudRate?: number): Promise<string> {
+  public async openPort(pathOrOptions: string | OpenPortParams, sessionIdOrBaudRate?: number | string): Promise<string> {
     const params: OpenPortParams =
       typeof pathOrOptions === "string"
         ? {
             path: pathOrOptions,
-            baudRate: baudRate ?? 115200
+            baudRate: typeof sessionIdOrBaudRate === "number" ? sessionIdOrBaudRate : 115200
           }
         : pathOrOptions;
-    const result = await this.request("openPort", params);
-    const sessionId = (result as { sessionId?: string }).sessionId;
-    if (!sessionId) {
+    const requestedSessionId =
+      typeof pathOrOptions !== "string" && typeof sessionIdOrBaudRate === "string" ? sessionIdOrBaudRate : undefined;
+    const result = await this.request(
+      "openPort",
+      requestedSessionId !== undefined ? { ...params, sessionId: requestedSessionId } : params
+    );
+    const openedSessionId = (result as { sessionId?: string }).sessionId;
+    if (!openedSessionId) {
       throw new Error("Serial sidecar returned invalid openPort response");
     }
-    return sessionId;
+    return openedSessionId;
   }
 
   public async writePort(sessionId: string, data: Buffer): Promise<void> {

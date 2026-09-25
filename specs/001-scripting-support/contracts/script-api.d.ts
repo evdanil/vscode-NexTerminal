@@ -1,4 +1,4 @@
-// Nexus Scripts API types — v11
+// Nexus Scripts API types — v12
 /**
  * Nexus Terminal — Scripts API
  *
@@ -41,7 +41,10 @@ declare global {
      * Output from the start of the scan window up to the match: everything since
      * the previous match (for the run's first match, everything received since
      * the run started — or, for a run Connect and Run Script… starts on a
-     * server, since its new session opened), plus any `lookback` characters.
+     * server or a serial profile, since its new session opened), plus any
+     * `lookback` characters. Serial output received before its open response
+     * is bounded to 64 KiB or 256 chunks; overflow drops oldest chunks and an
+     * individual chunk larger than 64 KiB is discarded.
      * Characters, with ANSI escape sequences already removed.
      */
     before: string;
@@ -62,10 +65,13 @@ declare global {
      * Default 0.
      *
      * The script's buffer holds output from the moment the run starts — or,
-     * for a run Connect and Run Script… starts on a server, from the moment
-     * its new session opened, so the host's first output is in it. Output
-     * printed before that is never in it, and no `lookback` can reach it
-     * (re-elicit a prompt with `sendLine("")` or `poll` instead). Until the
+     * for a run Connect and Run Script… starts on a server or a serial
+     * profile, from the moment its new session opened, so the host's or
+     * device's first output is in it unless the serial pre-response queue
+     * exceeds its 64 KiB / 256-chunk bound (oldest chunks are dropped, and an
+     * individual chunk above 64 KiB is discarded). Output printed before that is never in
+     * it, and no `lookback` can reach it (re-elicit a prompt with
+     * `sendLine("")` or `poll` instead). Until the
      * first match the cursor is at the start, so the window is already the
      * whole buffer; `lookback` matters on later waits, e.g. `lookback: 4096`
      * to match a prompt an earlier wait already consumed. Only a match moves the cursor —
