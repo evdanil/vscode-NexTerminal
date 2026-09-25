@@ -26,11 +26,32 @@ interface PoolEntry {
   connection: SshConnection;
   refCount: number;
   healthy: boolean;
+  closePromise: Promise<void>;
+  markClosed: () => void;
   idleTimer?: ReturnType<typeof setTimeout>;
   closeUnsubscribe: () => void;
 }
 
 const MAX_IDLE_TIMEOUT_MS = 3_600_000;
+
+function waitForConnectionClose(connection: SshConnection): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let unsubscribe: (() => void) | undefined;
+    let closed = false;
+    const finish = (): void => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      unsubscribe?.();
+      resolve();
+    };
+    unsubscribe = connection.onClose(finish);
+    if (closed) {
+      unsubscribe?.();
+    }
+  });
+}
 
 class PooledSshConnection implements SshConnection {
   private disposed = false;
@@ -43,12 +64,15 @@ class PooledSshConnection implements SshConnection {
     private onRelease: () => void,
     private readonly createFallback?: () => Promise<SshConnection>,
     private readonly isReused = false,
-    private readonly retireEntry: () => void = () => {}
+    private readonly retireEntry: () => Promise<void> = () => Promise.resolve()
   ) {}
 
   /** See `SshConnectionPool.retire`. */
-  public retireTransport(): void {
-    this.retireEntry();
+  public retireTransport(): Promise<void> {
+    if (this.fallbackUsed && this.fallbackConnection) {
+      return waitForConnectionClose(this.fallbackConnection);
+    }
+    return this.retireEntry();
   }
 
   private get active(): SshConnection {
@@ -283,7 +307,6 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
           this.startIdleTimer(server.id, entry);
         } else {
           // Orphaned: entry was soft-removed from pool, dispose now
-          entry.closeUnsubscribe();
           entry.connection.dispose();
         }
       }
@@ -291,13 +314,16 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
       if (this.entries.get(server.id) === entry) {
         this.softRemoveEntry(server.id, entry);
       }
+      return entry.closePromise;
     });
   }
 
   /**
    * Stops handing the transport `lease` rides to new consumers, without
    * closing it under the leases already on it: it closes when the last of them
-   * is released. For a transport left in a state no new consumer should
+   * is released. The returned promise settles when the transport actually
+   * closes, so a caller can keep a conflicting resource from being rebound in
+   * the meantime. For a transport left in a state no new consumer should
    * inherit — a remote forward it may still hold, say. Only that transport: if
    * the server's pooled entry has been replaced since the lease was taken — or
    * the lease fell back to a connection of its own, which takes its entry out
@@ -305,10 +331,11 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
    * its own, and the replacement is left alone. A no-op for a lease this pool
    * did not hand out.
    */
-  public retire(lease: SshConnection): void {
+  public retire(lease: SshConnection): Promise<void> | undefined {
     if (lease instanceof PooledSshConnection) {
-      lease.retireTransport();
+      return lease.retireTransport();
     }
+    return undefined;
   }
 
   public disconnect(serverId: string): void {
@@ -347,7 +374,7 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
     this.disposed = true;
     for (const [serverId, entry] of this.entries) {
       this.cancelIdleTimer(entry);
-      entry.closeUnsubscribe();
+      this.entries.delete(serverId);
       entry.connection.dispose();
       this.emit({ type: "disconnected", serverId });
     }
@@ -368,7 +395,6 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
     if (existing && !existing.healthy) {
       this.entries.delete(server.id);
       this.cancelIdleTimer(existing);
-      existing.closeUnsubscribe();
     }
 
     const pendingPromise = this.pending.get(server.id);
@@ -400,12 +426,29 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
       throw new Error("Connection pool is disposed");
     }
 
+    let markClosed!: () => void;
+    const closePromise = new Promise<void>((resolve) => {
+      markClosed = resolve;
+    });
     const entry: PoolEntry = {
       connection,
       refCount: 0,
       healthy: true,
+      closePromise,
+      markClosed,
       closeUnsubscribe: () => {}
     };
+
+    entry.closeUnsubscribe = connection.onClose(() => {
+      entry.markClosed();
+      entry.healthy = false;
+      this.cancelIdleTimer(entry);
+      if (this.entries.get(server.id) === entry) {
+        this.entries.delete(server.id);
+        this.emit({ type: "disconnected", serverId: server.id });
+      }
+      entry.closeUnsubscribe();
+    });
 
     if (this.invalidationEpoch(server.id) !== epochAtStart) {
       // invalidate() fired while this handshake was in flight, so the
@@ -420,15 +463,6 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
       return entry;
     }
 
-    entry.closeUnsubscribe = connection.onClose(() => {
-      entry.healthy = false;
-      this.cancelIdleTimer(entry);
-      if (this.entries.get(server.id) === entry) {
-        this.entries.delete(server.id);
-        this.emit({ type: "disconnected", serverId: server.id });
-      }
-    });
-
     this.entries.set(server.id, entry);
     this.emit({ type: "connected", serverId: server.id });
     return entry;
@@ -436,7 +470,6 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
 
   private evictEntry(serverId: string, entry: PoolEntry): void {
     this.cancelIdleTimer(entry);
-    entry.closeUnsubscribe();
     this.entries.delete(serverId);
     entry.connection.dispose();
     this.emit({ type: "disconnected", serverId });
@@ -448,7 +481,6 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
     this.entries.delete(serverId);
     this.emit({ type: "disconnected", serverId });
     if (entry.refCount === 0) {
-      entry.closeUnsubscribe();
       entry.connection.dispose();
     }
   }

@@ -64,6 +64,16 @@ function fakeConnection(
   cancelForwardIn: (bindAddr: string, bindPort: number) => Promise<void> = async () => {}
 ) {
   const closeListeners = new Set<() => void>();
+  let closed = false;
+  const emitClose = (): void => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    for (const listener of [...closeListeners]) {
+      listener();
+    }
+  };
   const connection: SshConnection & { drop(): void } = {
     openShell: vi.fn(async () => new PassThrough()),
     openDirectTcp: vi.fn(openDirectTcp),
@@ -79,13 +89,12 @@ function fakeConnection(
       return () => closeListeners.delete(listener);
     },
     getBanner: () => undefined,
-    dispose: vi.fn(onDispose),
+    dispose: vi.fn(() => {
+      onDispose();
+      emitClose();
+    }),
     /** The transport drops under the connection, as when the server goes away. */
-    drop: () => {
-      for (const listener of [...closeListeners]) {
-        listener();
-      }
-    }
+    drop: emitClose
   };
   return connection;
 }
@@ -142,6 +151,10 @@ function createAuthFactory(
   const forwardedStreams: string[] = [];
   const channels: Duplex[] = [];
   const disposedIds: string[] = [];
+  // Remote TCP forwards bind on the server, not inside one SSH connection.
+  // Keeping the fake state at server scope catches collisions across transports.
+  const boundForwardsByServer = new Map<string, Set<string>>();
+  let nextAllocated = 40_000;
   const connect = vi.fn(async (server: ServerConfig, options?: { sockFactory?: () => Promise<Duplex> }) => {
     calls.push({ serverId: server.id, route: options?.sockFactory ? "via-proxy" : "direct" });
     const sock = await options?.sockFactory?.();
@@ -158,12 +171,20 @@ function createAuthFactory(
       );
     }
     let disposed = false;
-    const boundForwards = new Set<string>();
-    let nextAllocated = 40_000;
+    const serverKey = `${server.host}:${server.port}`;
+    let boundForwards = boundForwardsByServer.get(serverKey);
+    if (!boundForwards) {
+      boundForwards = new Set<string>();
+      boundForwardsByServer.set(serverKey, boundForwards);
+    }
+    const ownedForwards = new Set<string>();
     const target = fakeConnection(
       () => {
         disposed = true;
-        boundForwards.clear();
+        for (const binding of ownedForwards) {
+          boundForwards!.delete(binding);
+        }
+        ownedForwards.clear();
         disposedIds.push(server.id);
         sock?.destroy();
       },
@@ -180,6 +201,9 @@ function createAuthFactory(
       },
       async (bindAddr, bindPort) => {
         await gates.forwardIn;
+        if (disposed) {
+          throw new Error("Not connected");
+        }
         if (gates.forwardInRefusal) {
           throw gates.forwardInRefusal;
         }
@@ -187,7 +211,9 @@ function createAuthFactory(
         if (boundForwards.has(`${bindAddr}:${port}`)) {
           throw new Error(`Unable to bind to ${bindAddr}:${port}`);
         }
-        boundForwards.add(`${bindAddr}:${port}`);
+        const binding = `${bindAddr}:${port}`;
+        boundForwards.add(binding);
+        ownedForwards.add(binding);
         return port;
       },
       async (bindAddr, bindPort) => {
@@ -195,7 +221,9 @@ function createAuthFactory(
         if (gates.forwardCancelRefusal) {
           throw gates.forwardCancelRefusal;
         }
-        boundForwards.delete(`${bindAddr}:${bindPort}`);
+        const binding = `${bindAddr}:${bindPort}`;
+        boundForwards.delete(binding);
+        ownedForwards.delete(binding);
       }
     );
     targets.push(target);
@@ -209,6 +237,8 @@ function createAuthFactory(
     forwardedStreams,
     channels,
     disposedIds,
+    isForwardBound: (server: ServerConfig, bindAddr: string, bindPort: number) =>
+      boundForwardsByServer.get(`${server.host}:${server.port}`)?.has(`${bindAddr}:${bindPort}`) ?? false,
     callsFor: (serverId: string) => calls.filter((call) => call.serverId === serverId).map((call) => call.route)
   };
 }
@@ -808,11 +838,9 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
   it.each([
     { outcome: "refuses", gates: { forwardCancelRefusal: new Error("request failed") } },
     { outcome: "never answers", gates: { forwardCancel: new Promise<void>(() => {}) } }
-  ])("retires a pooled transport whose late-granted forward the server $outcome to withdraw, without closing it under a terminal", async ({ outcome, gates }) => {
-    // The bind may still be on that transport. A later start must not reuse
-    // it — it would be refused as already bound for as long as the terminal
-    // keeps it open — but the terminal keeps its session; the transport, and
-    // the bind with it, close once its last lease is returned.
+  ])("holds a replacement until the retired transport's late-granted forward the server $outcome to withdraw is gone", async ({ outcome, gates }) => {
+    // The bind is server-wide. Keep the terminal lease usable, but do not let a
+    // replacement bind until that lease is released and the old transport closes.
     const forwardIn = deferred();
     const liveGates: Parameters<typeof createAuthFactory>[0] = { forwardIn: forwardIn.promise, ...gates };
     const auth = createAuthFactory(liveGates);
@@ -843,14 +871,26 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
     liveGates.forwardCancel = undefined;
     liveGates.forwardCancelRefusal = undefined;
 
-    const restarted = await stack.tunnelManager.start(profile, direct, { connectionMode: "shared" });
-    cleanups.push(() => stack.tunnelManager.stop(restarted.id));
-    expect(auth.targets).toHaveLength(2);
+    const restarted = stack.tunnelManager.start(profile, direct, { connectionMode: "shared" }).then(
+      (active) => ({ active }),
+      (error: unknown) => ({ error })
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(auth.targets).toHaveLength(1);
     expect(auth.targets[0].dispose).not.toHaveBeenCalled();
     await expect(terminalLease.exec("uptime")).resolves.toBeDefined();
 
     terminalLease.dispose();
     await vi.waitFor(() => expect(auth.targets[0].dispose).toHaveBeenCalledTimes(1), SETTLE);
+    const result = await restarted;
+    expect("active" in result).toBe(true);
+    if (!("active" in result)) {
+      throw result.error;
+    }
+    const active = result.active;
+    cleanups.push(() => stack.tunnelManager.stop(active.id));
+    expect(auth.targets).toHaveLength(2);
+    expect(auth.targets[1].requestForwardIn).toHaveBeenCalledWith("127.0.0.1", 8022);
   });
 
   it("takes a replacement start's lease only after the stopped start's request is over, so a transport it retires is not reused", async () => {
@@ -997,11 +1037,12 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
     });
   });
 
-  it("abandons a forward request the server never answers once the start is stopped, and retires its transport", async () => {
-    // ssh2's request has no timeout. Waited on for ever, the stopped start kept
-    // its lease — out of stop()'s reach — and never settled; a replacement then
-    // asked again over the same wedged transport.
-    const liveGates: Parameters<typeof createAuthFactory>[0] = { forwardIn: new Promise<void>(() => {}) };
+  it("abandons a request that does not answer, then waits for its possible late bind to disappear", async () => {
+    // ssh2's request has no timeout. A stopped start must release its lease,
+    // but the server may still grant the request later while another lease
+    // keeps the transport alive; a replacement cannot race that bind.
+    const forwardIn = deferred();
+    const liveGates: Parameters<typeof createAuthFactory>[0] = { forwardIn: forwardIn.promise };
     const auth = createAuthFactory(liveGates);
     const stack = buildStack(auth, [direct], 20);
     const terminalLease = await stack.pool.connect(direct);
@@ -1021,14 +1062,25 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
     }
     const pending = new Promise<string>((resolve) => setImmediate(() => resolve("still pending")));
     expect(await Promise.race([stale, pending])).toBeInstanceOf(TunnelStoppedError);
-    liveGates.forwardIn = undefined;
+    forwardIn.resolve();
+    await vi.waitFor(() => expect(auth.isForwardBound(direct, "127.0.0.1", 8022)).toBe(true), SETTLE);
 
-    const restarted = await stack.tunnelManager.start(profile, direct, { connectionMode: "shared" });
-    cleanups.push(() => stack.tunnelManager.stop(restarted.id));
-    expect(auth.targets).toHaveLength(2);
+    const restarted = stack.tunnelManager.start(profile, direct, { connectionMode: "shared" }).then(
+      (active) => ({ active }),
+      (error: unknown) => ({ error })
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(auth.targets).toHaveLength(1);
     await expect(terminalLease.exec("uptime")).resolves.toBeDefined();
     terminalLease.dispose();
     await vi.waitFor(() => expect(auth.targets[0].dispose).toHaveBeenCalledTimes(1), SETTLE);
+    const result = await restarted;
+    expect("active" in result).toBe(true);
+    if (!("active" in result)) {
+      throw result.error;
+    }
+    cleanups.push(() => stack.tunnelManager.stop(result.active.id));
+    expect(auth.targets).toHaveLength(2);
   });
 
   it("does not hold a start of the profile on one server behind its stopped request on another", async () => {
