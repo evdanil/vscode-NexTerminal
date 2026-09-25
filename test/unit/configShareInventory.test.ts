@@ -1399,7 +1399,7 @@ describe("share import — synced servers", () => {
       authProfiles: [makeProfile({ id: "ap-old", username: "user" })],
       groups: ["Lab"],
       macroFolders: [],
-      settings: { "nexus.logging.sessionLogDirectory": "" }
+      settings: {}
     });
 
     await importShare(recipient, oldShare);

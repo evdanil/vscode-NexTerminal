@@ -296,6 +296,119 @@ export const SETTINGS_KEYS: Array<{ section: string; key: string }> = [
 ];
 
 const SETTINGS_KEY_SET = new Set(SETTINGS_KEYS.map(({ section, key }) => `${section}.${key}`));
+
+/**
+ * Per-setting policy for the clear-text share format. Backups intentionally do
+ * not use this table: they preserve settings under the existing encrypted
+ * backup contract. Anything not explicitly marked `share` stays on the sender;
+ * a future or hand-added key therefore defaults to local-only.
+ *
+ * Keep one decision for every SETTINGS_KEYS entry. The equality test beside
+ * the SETTINGS_KEYS coverage tests makes a newly added setting wait for review
+ * here instead of silently broadening the share format.
+ */
+export const SHARE_SETTINGS_POLICY: Readonly<Record<string, "share" | "local">> = Object.freeze({
+  // Capture, retention caps, and the destination are local privacy/disk policy.
+  "nexus.logging.sessionTranscripts": "local",
+  "nexus.logging.sessionLogDirectory": "local",
+  "nexus.logging.maxFileSizeMb": "local",
+  "nexus.logging.maxRotatedFiles": "local",
+  "nexus.logging.terminalOutputTrace": "local",
+
+  // Connection pooling changes which sessions share a transport, so that
+  // isolation choice stays local; timeouts and terminal preferences travel.
+  "nexus.ssh.multiplexing.enabled": "local",
+  "nexus.ssh.multiplexing.idleTimeout": "local",
+  "nexus.ssh.trustNewHosts": "local",
+  "nexus.ssh.connectionTimeout": "share",
+  "nexus.ssh.keepaliveInterval": "share",
+  "nexus.ssh.keepaliveCountMax": "share",
+  "nexus.ssh.terminalType": "share",
+  "nexus.ssh.proxyTimeout": "share",
+
+  // Tunnel connection reuse/isolation and listener address belong to this host.
+  "nexus.tunnel.defaultConnectionMode": "local",
+  "nexus.tunnel.defaultBindAddress": "local",
+  "nexus.tunnel.socks5HandshakeTimeout": "share",
+
+  // UI and terminal interaction preferences.
+  "nexus.terminal.openLocation": "share",
+  "nexus.ui.showTreeDescriptions": "share",
+  "nexus.terminal.keyboardPassthrough": "share",
+  "nexus.terminal.passthroughKeys": "share",
+
+  // Cache freshness and one-shot operation timeouts travel. Memory budgets,
+  // background polling/watch mode, recursive-delete ceilings, and sudo policy
+  // are local because they control this host's workload or safety boundaries.
+  "nexus.sftp.cacheTtlSeconds": "share",
+  "nexus.sftp.maxCacheEntries": "local",
+  "nexus.sftp.autoRefreshInterval": "local",
+  "nexus.sftp.remoteWatchMode": "local",
+  "nexus.sftp.maxOpenFileSizeMB": "local",
+  "nexus.sftp.operationTimeout": "share",
+  "nexus.sftp.commandTimeout": "share",
+  "nexus.sftp.deleteDepthLimit": "local",
+  "nexus.sftp.deleteOperationLimit": "local",
+  "nexus.sftp.sudo.enabled": "local",
+  "nexus.sftp.sudo.rememberPasswordForSession": "local",
+
+  // Highlighting rules are portable user preferences. Macro activation,
+  // cooldown, and prompt context are local automation safeguards.
+  "nexus.terminal.highlighting.enabled": "share",
+  "nexus.terminal.macros.autoTrigger": "local",
+  "nexus.terminal.macros.defaultCooldown": "local",
+  "nexus.terminal.macros.bufferLength": "local",
+
+  // Wait-time preference travels. Script watchdog/read budgets, paths, and
+  // automation policy stay with the recipient's machine.
+  "nexus.serial.rpcTimeout": "share",
+  "nexus.scripts.path": "local",
+  "nexus.scripts.defaultTimeoutSeconds": "share",
+  "nexus.scripts.maxRuntimeSeconds": "local",
+  "nexus.scripts.maxReadSizeMb": "local",
+  "nexus.scripts.macroPolicy": "local",
+  "nexus.settingsGuard.enabled": "local",
+
+  // Network-server settings are all bound to this machine's live interfaces,
+  // local files, exposure policy, or address plan; keep the whole group local.
+  "nexus.networkServers.verboseMode": "local",
+  "nexus.networkServers.engine": "local",
+  "nexus.networkServers.tftp.root": "local",
+  "nexus.networkServers.tftp.interface": "local",
+  "nexus.networkServers.tftp.port": "local",
+  "nexus.networkServers.tftp.allowWrite": "local",
+  "nexus.networkServers.dhcp.interface": "local",
+  "nexus.networkServers.dhcp.rangeStart": "local",
+  "nexus.networkServers.dhcp.rangeEnd": "local",
+  "nexus.networkServers.dhcp.subnet": "local",
+  "nexus.networkServers.dhcp.gateway": "local",
+  "nexus.networkServers.dhcp.leaseTimeSec": "local",
+  "nexus.networkServers.dhcp.serverId": "local",
+  "nexus.networkServers.dhcp.broadcast": "local",
+  "nexus.networkServers.dhcp.bootFileName": "local",
+  "nexus.networkServers.dhcp.nextServer": "local",
+  "nexus.networkServers.dhcp.autoLinkTftp": "local",
+  "nexus.networkServers.dhcp.allowRelayAgents": "local",
+  "nexus.networkServers.dhcp.vendorClassId": "local",
+  "nexus.networkServers.dhcp.dns": "local",
+  "nexus.networkServers.dhcp.tftpServerAddresses": "local",
+  "nexus.networkServers.dhcp.vendorSpecificOptions": "local",
+  "nexus.networkServers.dhcp.static": "local",
+
+  // Restart thresholds describe local processes and stay with their host.
+  "nexus.localServers.defaultMaxAutoRestarts": "local",
+  "nexus.localServers.stableRuntimeMs": "local",
+  "nexus.localServers.initialBackoffMs": "local",
+  "nexus.localServers.maxBackoffMs": "local",
+
+  // Import compatibility keys are policy-reviewed too. The retired poll key
+  // is consumed only by backup migration and is deliberately never shared.
+  "nexus.terminal.highlighting.rules": "share",
+  "nexus.scripts.defaultTimeout": "share",
+  "nexus.scripts.maxRuntimeMs": "local",
+  "nexus.inventory.statusPollSeconds": "local"
+});
+
 const SCRIPT_DEFAULT_TIMEOUT_SECONDS_KEY = "nexus.scripts.defaultTimeoutSeconds";
 const LEGACY_SCRIPT_DEFAULT_TIMEOUT_MS_KEY = "nexus.scripts.defaultTimeout";
 const RETIRED_STATUS_POLL_FULL_KEY = `${RETIRED_STATUS_POLL_SECTION}.${RETIRED_STATUS_POLL_KEY}`;
@@ -1382,11 +1495,17 @@ function scrubSharedLocalShellProfile(profile: LocalShellProfile): LocalShellPro
   return kept;
 }
 
-/** Settings: a session log directory is a path on the sender's machine; it becomes "" (the default). */
+/**
+ * Share only explicitly approved portable preferences. The share importer calls
+ * this again on input so old and hand-edited files cannot overwrite local
+ * security choices, paths, network plans, or future unknown settings.
+ */
 function scrubSharedSettings(settings: Record<string, unknown>): Record<string, unknown> {
-  const scrubbed = { ...settings };
-  if (scrubbed["nexus.logging.sessionLogDirectory"]) {
-    scrubbed["nexus.logging.sessionLogDirectory"] = "";
+  const scrubbed: Record<string, unknown> = {};
+  for (const [fullKey, value] of Object.entries(settings)) {
+    if (SHARE_SETTINGS_POLICY[fullKey] === "share") {
+      scrubbed[fullKey] = value;
+    }
   }
   return scrubbed;
 }

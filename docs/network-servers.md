@@ -32,6 +32,8 @@ Save refuses a bind only when the interface's network genuinely does not match t
 
 ## Quick Settings and Profiles
 
+TFTP and DHCP settings belong to the machine and network they serve, so none of the Network Servers settings travel in Export for Sharing or apply from a shared file. This includes the TFTP root, port, write-access choice, bind interface and the DHCP address plan. Encrypted backups keep their existing settings and saved-profile restore behavior.
+
 **Quick Settings** also offers to fill in the gateway and broadcast that follow from a new pool, with DNS pointed at the gateway, and named profiles capture a whole bench setup for next week, relay-agent support included. Saved profiles travel in an [Encrypted Backup](import-export.md#encrypted-backup-and-share-export) but never in Export for Sharing, and Delete All Data removes them.
 
 ## Isolation and Trust
