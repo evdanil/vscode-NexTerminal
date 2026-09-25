@@ -493,13 +493,13 @@ export class TunnelManager {
           if (runtime.isStopping) {
             throw new TunnelStoppedError(profile.name);
           }
-          const retiredTransport = this.retiredForwardTransports.get(requestKey);
-          if (retiredTransport) {
+          const retiredAfterLogin = this.retiredForwardTransports.get(requestKey);
+          if (retiredAfterLogin) {
             // The old SSH lease is gone, but a terminal may still keep its
             // transport open. Do not request the same server-wide bind over a
             // fresh connection until that transport's close removes the bind.
-            await this.waitForRetiredForward(runtime, retiredTransport);
-            if (this.retiredForwardTransports.get(requestKey) === retiredTransport) {
+            await this.waitForRetiredForward(runtime, retiredAfterLogin);
+            if (this.retiredForwardTransports.get(requestKey) === retiredAfterLogin) {
               this.retiredForwardTransports.delete(requestKey);
             }
             continue;
@@ -523,6 +523,22 @@ export class TunnelManager {
             // getOrCreateSharedConnection registered the candidate before its
             // caller resumed, so stop() already released it in this case.
             throw new TunnelStoppedError(profile.name);
+          }
+          const retiredTransport = this.retiredForwardTransports.get(requestKey);
+          if (retiredTransport) {
+            // Retirement can begin while this start is authenticating. Drop
+            // the candidate lease before waiting so it cannot keep the old
+            // transport alive and preserve the bind conflict.
+            runtime.sshConnections.delete(candidate);
+            if (runtime.sharedConnection === candidate) {
+              runtime.sharedConnection = undefined;
+            }
+            candidate.dispose();
+            await this.waitForRetiredForward(runtime, retiredTransport);
+            if (this.retiredForwardTransports.get(requestKey) === retiredTransport) {
+              this.retiredForwardTransports.delete(requestKey);
+            }
+            continue;
           }
           const competingRequest = this.forwardRequests.get(requestKey);
           if (competingRequest) {

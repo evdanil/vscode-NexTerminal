@@ -3,7 +3,16 @@ import { PassThrough, type Duplex } from "node:stream";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { ServerConfig, TunnelProfile } from "../../src/models/config";
 import type { SshConnection, SshFactory, TcpConnectionInfo } from "../../src/services/ssh/contracts";
+import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
 import { TunnelManager, type TunnelEvent } from "../../src/services/tunnel/tunnelManager";
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 
 async function getFreePort(): Promise<number> {
   const server = net.createServer();
@@ -163,6 +172,79 @@ class ScriptedSshFactory implements SshFactory {
     const conn = new ScriptedSshConnection();
     this.connections.push(conn);
     return conn;
+  }
+}
+
+class HeldForwardConnection extends DirectTcpSshConnection {
+  public readonly forwardRequested = deferred<void>();
+  private readonly forwardResult = deferred<number>();
+
+  public override requestForwardIn(_bindAddr: string, _bindPort: number): Promise<number> {
+    this.forwardRequested.resolve(undefined);
+    return this.forwardResult.promise;
+  }
+
+  public releaseForward(port: number): void {
+    this.forwardResult.resolve(port);
+  }
+}
+
+class ObservedForwardConnection extends DirectTcpSshConnection {
+  public readonly forwardRequested = deferred<void>();
+  public forwardAttempts = 0;
+
+  public override requestForwardIn(bindAddr: string, bindPort: number): Promise<number> {
+    this.forwardAttempts += 1;
+    this.forwardRequested.resolve(undefined);
+    return super.requestForwardIn(bindAddr, bindPort);
+  }
+}
+
+class DelayedReplacementFactory implements SshFactory {
+  public readonly replacementLoginStarted = deferred<void>();
+  public readonly finishReplacementLogin = deferred<void>();
+
+  public constructor(
+    private readonly retiredServerId: string,
+    private readonly replacementServerId: string,
+    public readonly retiredConnection: HeldForwardConnection,
+    public readonly replacementConnection: ObservedForwardConnection
+  ) {}
+
+  public async connect(server: ServerConfig): Promise<SshConnection> {
+    if (server.id === this.retiredServerId) {
+      return this.retiredConnection;
+    }
+    if (server.id === this.replacementServerId) {
+      this.replacementLoginStarted.resolve(undefined);
+      await this.finishReplacementLogin.promise;
+      return this.replacementConnection;
+    }
+    throw new Error(`Unexpected server ${server.id}`);
+  }
+}
+
+class TrackingConnectionPool extends SshConnectionPool {
+  public readonly replacementLeaseDisposed = deferred<void>();
+
+  public constructor(
+    factory: SshFactory,
+    options: { enabled: boolean; idleTimeoutMs: number },
+    private readonly replacementServerId: string
+  ) {
+    super(factory, options);
+  }
+
+  public override async connect(server: ServerConfig): Promise<SshConnection> {
+    const lease = await super.connect(server);
+    if (server.id === this.replacementServerId) {
+      const dispose = lease.dispose.bind(lease);
+      lease.dispose = () => {
+        dispose();
+        this.replacementLeaseDisposed.resolve(undefined);
+      };
+    }
+    return lease;
   }
 }
 
@@ -397,6 +479,82 @@ describe("TunnelManager integration", () => {
 
     await manager.stop(activeTunnel.id);
     expect(events.some((e) => e.type === "stopped")).toBe(true);
+  });
+
+  it("waits for a retired bind when a same-route reverse start finishes logging in", async () => {
+    const retiredServer = { ...testServer, id: "server-retired" };
+    const replacementServer = { ...testServer, id: "server-replacement" };
+    const retiredConnection = new HeldForwardConnection();
+    const replacementConnection = new ObservedForwardConnection();
+    const factory = new DelayedReplacementFactory(
+      retiredServer.id,
+      replacementServer.id,
+      retiredConnection,
+      replacementConnection
+    );
+    const pool = new TrackingConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 }, replacementServer.id);
+    manager = new TunnelManager(pool, pool);
+    const terminalLease = await pool.connect(retiredServer);
+
+    const profile = (id: string): TunnelProfile => ({
+      id,
+      name: id,
+      localPort: 12345,
+      remoteIP: "127.0.0.1",
+      remotePort: 23456,
+      autoStart: false,
+      tunnelType: "reverse",
+      remoteBindAddress: "127.0.0.1",
+      localTargetIP: "127.0.0.1"
+    });
+    const retiredProfile = profile("reverse-retired");
+    const replacementProfile = profile("reverse-replacement");
+    const retiredStart = manager.start(retiredProfile, retiredServer);
+    const retiredResult = retiredStart.then(
+      () => "started",
+      (error: unknown) => error
+    );
+    const replacementStart = manager.start(replacementProfile, replacementServer);
+    const replacementResult = replacementStart.then(
+      () => "started",
+      (error: unknown) => error
+    );
+
+    try {
+      // The second route is authenticating before the first route is stopped.
+      await Promise.all([factory.replacementLoginStarted.promise, retiredConnection.forwardRequested.promise]);
+      const retiredTunnelId = manager.getActiveTunnelId(retiredProfile.id);
+      expect(retiredTunnelId).toBeDefined();
+      await manager.stop(retiredTunnelId!);
+      const retiredOutcome = await retiredResult;
+      expect(retiredOutcome).toBeInstanceOf(Error);
+      expect((retiredOutcome as Error).name).toBe("TunnelStoppedError");
+
+      factory.finishReplacementLogin.resolve(undefined);
+      const beforeRetiredTransportCloses = await Promise.race([
+        pool.replacementLeaseDisposed.promise.then(() => "candidate-disposed"),
+        replacementConnection.forwardRequested.promise.then(() => "forward-requested")
+      ]);
+      expect(beforeRetiredTransportCloses).toBe("candidate-disposed");
+      expect(replacementConnection.forwardAttempts).toBe(0);
+
+      // The pooled connection remains open for the terminal lease, so the
+      // replacement must wait until that lease releases the retired bind.
+      terminalLease.dispose();
+      await replacementConnection.forwardRequested.promise;
+      await expect(replacementResult).resolves.toBe("started");
+
+      const replacementTunnelId = manager.getActiveTunnelId(replacementProfile.id);
+      expect(replacementTunnelId).toBeDefined();
+      await manager.stop(replacementTunnelId!);
+    } finally {
+      factory.finishReplacementLogin.resolve(undefined);
+      retiredConnection.releaseForward(23456);
+      terminalLease.dispose();
+      await manager.stopAll();
+      await Promise.all([retiredResult, replacementResult]);
+      pool.dispose();
+    }
   });
 
   it("starts a dynamic SOCKS5 tunnel and accepts SOCKS5 handshake", async () => {
