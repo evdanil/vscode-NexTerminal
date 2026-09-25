@@ -17,6 +17,34 @@ export function proxyPasswordSecretKey(serverId: string): string {
   return `proxy-password-${serverId}`;
 }
 
+/**
+ * Deletes every secret saved under a server's own id — its password, key
+ * passphrase and proxy password. Every path that deletes a server calls this,
+ * so a key added here is deleted by all of them.
+ *
+ * By default the first failed delete rejects, for a caller that has not removed
+ * the record yet and can stop. `bestEffort` is for cleanup after the record is
+ * already gone: a failed key is logged and the rest are still attempted, so one
+ * rejection does not strand the others.
+ */
+export async function deleteServerSecrets(
+  vault: SecretVault,
+  serverId: string,
+  options: { bestEffort?: boolean } = {}
+): Promise<void> {
+  for (const key of [passwordSecretKey(serverId), passphraseSecretKey(serverId), proxyPasswordSecretKey(serverId)]) {
+    if (!options.bestEffort) {
+      await vault.delete(key);
+      continue;
+    }
+    try {
+      await vault.delete(key);
+    } catch (error) {
+      console.warn(`[Nexus] Failed to delete secret key "${key}":`, error);
+    }
+  }
+}
+
 export function authProfilePasswordSecretKey(profileId: string): string {
   return `auth-profile-password-${profileId}`;
 }

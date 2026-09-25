@@ -209,7 +209,8 @@ Telnet is a per-server **protocol** choice, not a separate profile type: one ser
 ### 4.8 Group Management
 - Servers and serial profiles can be organized into named groups.
 - Drag and drop items between groups in the Connectivity Hub.
-- Right-click a group to rename or remove it.
+- Right-click a group to rename or remove it. Removing a folder that holds profiles asks whether to move them to the parent folder or delete them; the confirmation says that deleting closes their open sessions and, when the folder holds a Local Server, stops the running ones.
+- **Delete contents** deletes every profile in the folder and its subfolders the way deleting each one does. Each running Local Server is stopped, and any automatic restart it was waiting to make called off, before its profile is removed; serial and Local Shell terminals are closed; and each deleted server's terminals are closed, its tunnels stopped, its SSH connection dropped and its saved password, passphrase and proxy password deleted. Every server is cleaned up at once, so one that cannot be disconnected — a tunnel whose remote end never answers — does not hold up the others, and its credentials are deleted regardless. If the server list itself cannot be saved, the servers are still disconnected but their credentials are kept, because the servers come back after a restart. One warning counts the servers not cleanly disconnected, shown once all have finished or after ten seconds for any still waiting, and offers **Reload Window**, which closes whatever they left open.
 - Groups can be created from **New Folder** in the Hub title bar's `...` overflow menu or inline while editing a profile.
 
 #### 4.8.1 Connectivity Hub Filter

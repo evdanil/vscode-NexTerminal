@@ -5024,6 +5024,22 @@ describe("NexusCore inventory status", () => {
     expect(core.getSnapshot().serverStatus.has(s1.id)).toBe(false);
   });
 
+  it("#158: a folder's Delete contents drops the status of the servers it deletes and keeps a survivor's (⊘ the cascade strands a running highlight keyed to a deleted server)", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const inLab = { ...makeSyncedServer("a", "source-1", "dev#1"), group: "Lab/Sub" };
+    const kept = { ...makeSyncedServer("b", "source-1", "dev#2"), group: "Keep" };
+    await core.addServersBatch([inLab, kept]);
+    core.applyInventoryStatus("source-1", {
+      contractVersion: 1,
+      statuses: { "dev#1": { state: "running" }, "dev#2": { state: "running" } }
+    });
+
+    await core.removeFolderCascade("Lab", true);
+    expect(core.getSnapshot().serverStatus.has(inLab.id)).toBe(false);
+    expect(core.getSnapshot().serverStatus.get(kept.id)).toBe("running");
+  });
+
   it("P3-4: applyInventorySyncPlan drops a pruned server's runtime status entry (⊘ a sync prune leaves a ghost running highlight behind)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();

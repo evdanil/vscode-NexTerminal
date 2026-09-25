@@ -361,10 +361,11 @@ function errorMessageFor(error: unknown, prefix: string): string {
  * deleted: stop its process, call off an auto-restart a crash has already
  * scheduled, and close the terminal tabs the config still owns.
  *
- * Shared by every path that deletes profiles — Remove Local Server here, and
- * Delete All Data and a Replace-mode backup restore in configCommands.ts (wired
- * through `ConfigRuntimeHooks` in extension.ts). Without it a deleted profile's
- * process keeps running with no row to stop it from.
+ * Shared by every path that deletes profiles — Remove Local Server here, a
+ * folder's Delete contents in profileCommands.ts, and Delete All Data and a
+ * Replace-mode backup restore in configCommands.ts (wired through
+ * `ConfigRuntimeHooks` in extension.ts). Without it a deleted profile's process
+ * keeps running with no row to stop it from.
  *
  * The pending-restart cancel matters beyond tidiness. `retryStart` refuses a
  * config that no longer exists, which is enough while a deletion STAYS a

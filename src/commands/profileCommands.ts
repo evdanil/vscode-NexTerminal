@@ -4,13 +4,26 @@ import { unifiedProfileFormDefinition, unifiedProfileFormId , toSshInfrastructur
 import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, LocalShellProfileTreeItem, LocalServerConfigTreeItem, SerialProfileTreeItem, ServerTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
-import { authProfileCredentialMirror, formValuesToServer, browseForKey, collectGroups, syncProxyPasswordSecret } from "./serverCommands";
+import {
+  authProfileCredentialMirror,
+  formValuesToServer,
+  browseForKey,
+  collectGroups,
+  syncProxyPasswordSecret,
+  teardownServerRuntime
+} from "./serverCommands";
+import { FolderCascadeSaveError } from "../core/nexusCore";
 import { serverConfigsEqual, type ServerConfig } from "../models/config";
 import { configMutationLock } from "../services/configMutationLock";
-import { proxyPasswordSecretKey } from "../services/ssh/silentAuth";
-import { formValuesToSerial, scanForPort } from "./serialCommands";
-import { formValuesToLocalShell, getConfiguredVscodeTerminalProfileNames } from "./localShellCommands";
-import { formValuesToLocalServer } from "./localServerCommands";
+import type { LocalServerManager } from "../services/local/localServerManager";
+import { deleteServerSecrets, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
+import { closeSerialProfileTerminals, formValuesToSerial, scanForPort } from "./serialCommands";
+import {
+  closeLocalShellProfileTerminals,
+  formValuesToLocalShell,
+  getConfiguredVscodeTerminalProfileNames
+} from "./localShellCommands";
+import { formValuesToLocalServer, stopLocalServerForRemoval } from "./localServerCommands";
 import type { CommandContext } from "./types";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 import {
@@ -343,7 +356,165 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
   inlineAuthProfile.attachPanel(panel);
 }
 
-export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[] {
+/**
+ * The Local Server manager rides along only for a folder's Delete contents,
+ * which has to stop the Local Servers it deletes (`stopLocalServerForRemoval`).
+ */
+export type ProfileCommandContext = CommandContext & {
+  localServerManager: Pick<LocalServerManager, "cancelPendingRestart" | "stopConfig">;
+};
+
+/**
+ * The confirmation's second line: what "Delete contents" does besides deleting.
+ * Local Servers are named only when the folder holds one — generic about which
+ * are running, as Remove Local Server's own disclosure is, because one can start
+ * or stop while the modal is open and the delete stops it either way.
+ */
+function folderDeleteContentsDetail(hasLocalServers: boolean): string {
+  return hasLocalServers
+    ? "Delete contents also closes their open sessions and stops their running local servers."
+    : "Delete contents also closes their open sessions.";
+}
+
+/**
+ * Delete contents for one folder (#158): every profile the cascade deletes gets
+ * the teardown its own Remove performs, so nothing keeps running — or stays
+ * connected, or keeps a saved password — with no row left to reach it from.
+ *
+ * This is the half that runs under `configMutationLock`, and it holds only work
+ * that cannot wait on anything outside this process: each Local Server is
+ * stopped and its pending auto-restart called off while its profile still
+ * exists (`stopLocalServerForRemoval` — the stop signals the process and does
+ * not wait for it to exit), serial and Local Shell terminals are closed, and
+ * the cascade runs. Servers are torn down by `teardownDeletedServers` once the
+ * lock is released, because that can wait on the SSH peer.
+ *
+ * Resolves to the ids of the servers the cascade deleted even when one of its
+ * saves rejects — the records are already out of memory by then, so skipping
+ * their teardown would leave a session with no row to close it from. The save
+ * failure rides along for the caller to rethrow after the teardown.
+ *
+ * Their credentials go only once the deletion is on disk. If the server list
+ * itself did not save, those servers come back after a restart, at the same
+ * address, and deleting their credentials would lose them; kept, they are
+ * orphaned at worst — if a later save of the list lands the deletion — and
+ * reach no other host. An error that is not the cascade's own says nothing
+ * about the list, so it keeps them too.
+ */
+async function deleteFolderContents(
+  ctx: ProfileCommandContext,
+  folderPath: string
+): Promise<{ deletedServerIds: string[]; deleteCredentials: boolean; saveFailure?: { error: unknown } }> {
+  const doomed = ctx.core.getItemsInFolder(folderPath, true);
+  for (const config of doomed.localServers) {
+    await stopLocalServerForRemoval(ctx, config.id);
+  }
+  for (const profile of doomed.serialProfiles) {
+    closeSerialProfileTerminals(ctx, profile.id);
+  }
+  for (const profile of doomed.localShellProfiles) {
+    closeLocalShellProfileTerminals(ctx, profile.id);
+  }
+  // Read in the same synchronous step as the cascade's own walk — nothing
+  // yields between the two, and both select a server by the same folder test —
+  // so this is exactly the set it deletes, and it is known before any save.
+  const deletedServerIds = ctx.core.getItemsInFolder(folderPath, true).servers.map((server) => server.id);
+  try {
+    await ctx.core.removeFolderCascade(folderPath, true);
+  } catch (error) {
+    const deleteCredentials = error instanceof FolderCascadeSaveError && error.serversSaved;
+    return { deletedServerIds, deleteCredentials, saveFailure: { error } };
+  }
+  return { deletedServerIds, deleteCredentials: true };
+}
+
+/**
+ * How long Delete contents waits for its servers to disconnect before it
+ * reports. A reverse tunnel's stop waits on the SSH peer, which may never
+ * answer; a server still disconnecting by then is counted with the ones that
+ * failed, and its teardown carries on in the background.
+ */
+export const FOLDER_TEARDOWN_REPORT_MS = 10_000;
+
+/**
+ * The half of Delete contents that runs after `configMutationLock` is released:
+ * each deleted server's saved credentials (when `deleteCredentials` — see
+ * `deleteFolderContents` for when they must stay) and its runtime
+ * (`teardownServerRuntime` — terminals, tunnels, pooled connection). A reverse
+ * tunnel's stop waits on the SSH peer, and nothing may wait on the network
+ * under the lock, or a slow peer would queue every edit, sync, import and
+ * removal behind it.
+ *
+ * Every server's two steps start at once, independent of each other and of
+ * every other server's, because a stop can hang: done one after another, a
+ * single stuck peer would keep every later server connected and every
+ * credential — its own included — saved indefinitely. The credentials are
+ * deleted without waiting on the runtime, the fail-safe way round.
+ *
+ * Other writers can run meanwhile, so each destructive step re-checks that the
+ * id is still absent: a server back under the same id before cleanup starts
+ * keeps everything, and one back mid-teardown keeps its pooled connection
+ * (`shouldAbort`). A credential write racing the delete call itself is not
+ * covered — the same residual window inventory source removal accepts.
+ *
+ * Resolves once everything has settled or `FOLDER_TEARDOWN_REPORT_MS` has
+ * passed, with the number of servers not cleanly disconnected by then — failed
+ * or still waiting — for one warning.
+ */
+async function teardownDeletedServers(
+  ctx: ProfileCommandContext,
+  serverIds: readonly string[],
+  deleteCredentials: boolean
+): Promise<number> {
+  const isBack = (id: string): boolean => ctx.core.getServer(id) !== undefined;
+  const vault = deleteCredentials ? ctx.secretVault : undefined;
+  const secretDeletions = serverIds.map(async (id) => {
+    if (vault && !isBack(id)) {
+      await deleteServerSecrets(vault, id, { bestEffort: true });
+    }
+  });
+  let disconnected = 0;
+  const teardowns = serverIds.map(async (id) => {
+    if (!isBack(id)) {
+      await teardownServerRuntime(ctx, id, () => isBack(id));
+    }
+    disconnected++;
+  });
+  let bound: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    Promise.allSettled([...secretDeletions, ...teardowns]),
+    new Promise<void>((resolve) => {
+      bound = setTimeout(resolve, FOLDER_TEARDOWN_REPORT_MS);
+    })
+  ]);
+  clearTimeout(bound);
+  return serverIds.length - disconnected;
+}
+
+/**
+ * A teardown that failed can leave a tunnel or the pooled SSH connection open,
+ * with no row left to stop it from. Reloading the window restarts the extension
+ * host, which is the one thing certain to close it — so that is the remedy the
+ * warning offers, saying what else it closes.
+ */
+function reportFolderTeardownFailures(count: number): void {
+  if (count === 0) {
+    return;
+  }
+  void vscode.window
+    .showWarningMessage(
+      `The folder was deleted, but ${count} of its servers did not disconnect cleanly, so a tunnel or SSH connection may still be open. ` +
+        "Reloading the window closes it, along with every other open session.",
+      "Reload Window"
+    )
+    .then((picked) => {
+      if (picked === "Reload Window") {
+        void vscode.commands.executeCommand("workbench.action.reloadWindow");
+      }
+    });
+}
+
+export function registerProfileCommands(ctx: ProfileCommandContext): vscode.Disposable[] {
   const showProfileActions = async (arg?: unknown): Promise<void> => {
     if (arg instanceof ServerTreeItem) {
       // NODE CONTROL (Phase 4, task #28 — M5) — node power is the headline EVE-row
@@ -533,14 +704,20 @@ export function registerProfileCommands(ctx: CommandContext): vscode.Disposable[
 
       const choice = await vscode.window.showWarningMessage(
         `Remove folder "${folderDisplayName(folderPath)}"? It contains ${itemCount} item(s).`,
-        { modal: true },
+        { modal: true, detail: folderDeleteContentsDetail((items.localServers?.length ?? 0) > 0) },
         "Move to parent",
         "Delete contents"
       );
       if (choice === "Move to parent") {
         await configMutationLock.runExclusive(() => ctx.core.removeFolderCascade(folderPath, false));
       } else if (choice === "Delete contents") {
-        await configMutationLock.runExclusive(() => ctx.core.removeFolderCascade(folderPath, true));
+        const { deletedServerIds, deleteCredentials, saveFailure } = await configMutationLock.runExclusive(() =>
+          deleteFolderContents(ctx, folderPath)
+        );
+        reportFolderTeardownFailures(await teardownDeletedServers(ctx, deletedServerIds, deleteCredentials));
+        if (saveFailure) {
+          throw saveFailure.error;
+        }
       }
     })
   ];

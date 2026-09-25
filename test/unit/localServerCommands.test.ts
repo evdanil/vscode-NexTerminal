@@ -1370,7 +1370,8 @@ describe("nexus.localServer.duplicate re-resolves under the lock (issue #108 fol
 
 /**
  * The teardown every path that deletes a Local Server profile runs first —
- * Remove Local Server, Delete All Data, and a Replace-mode backup restore.
+ * Remove Local Server, a folder's Delete contents (folderDeleteContents.test.ts),
+ * Delete All Data, and a Replace-mode backup restore.
  */
 describe("stopLocalServerForRemoval", () => {
   function fixture(options: { stopFails?: boolean } = {}) {

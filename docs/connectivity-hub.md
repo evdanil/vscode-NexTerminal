@@ -30,7 +30,7 @@ The right-click menu has the less frequent ones too — Disconnect, Rename, Depl
 
 Right-click a folder that holds servers for **Connect Folder Servers** and **Disconnect Folder Servers** (also icons on the folder row). They act on the servers directly in that folder — not those in its subfolders, and not its serial, Local Shell or Local Server profiles. A server its inventory source has no address for yet is skipped, and one notice counts them.
 
-The same menu renames the folder, adds a subfolder or a profile inside it, applies an auth profile or device template to every server in it and its subfolders, and removes it — asking whether to move its contents to the parent folder or delete them. A folder an inventory source syncs into also has **Sync Inventory Now**.
+The same menu renames the folder, adds a subfolder or a profile inside it, applies an auth profile or device template to every server in it and its subfolders, and removes it — asking whether to move its contents to the parent folder or delete them. **Delete contents** deletes every profile in the folder and its subfolders just as deleting each one would: their open sessions are closed, each running Local Server is stopped first (and any restart it was waiting to make is called off), and the passwords and passphrases Nexus saved for the deleted servers are deleted with them. If a server cannot be disconnected cleanly, a warning says so and offers **Reload Window**, which closes whatever it left open. A folder an inventory source syncs into also has **Sync Inventory Now**.
 
 ## Filter
 

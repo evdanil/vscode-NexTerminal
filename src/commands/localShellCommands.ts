@@ -491,6 +491,20 @@ function localShellRemovalDisclosure(profileName: string): string {
   return `Remove local shell profile "${profileName}" and close all sessions?`;
 }
 
+/**
+ * Closes every open terminal of one Local Shell profile — the runtime teardown
+ * that happens before the profile is deleted. Shared by Remove here and a
+ * folder's Delete contents (profileCommands.ts), so the two cannot drift apart.
+ */
+export function closeLocalShellProfileTerminals(ctx: Pick<CommandContext, "localShellTerminals">, profileId: string): void {
+  for (const [sessionId, entry] of ctx.localShellTerminals.entries()) {
+    if (entry.profileId === profileId) {
+      entry.terminal.dispose();
+      ctx.localShellTerminals.delete(sessionId);
+    }
+  }
+}
+
 function toLocalShellProfileFromArg(
   core: import("../core/nexusCore").NexusCore,
   arg: unknown
@@ -778,12 +792,7 @@ export function registerLocalShellCommands(ctx: CommandContext): vscode.Disposab
             "nothing was removed. Remove it again to review the current details.";
           return;
         }
-        for (const [sessionId, entry] of ctx.localShellTerminals.entries()) {
-          if (entry.profileId === profileId) {
-            entry.terminal.dispose();
-            ctx.localShellTerminals.delete(sessionId);
-          }
-        }
+        closeLocalShellProfileTerminals(ctx, profileId);
         await ctx.core.removeLocalShellProfile(profileId);
       });
       if (alreadyRemoved !== undefined) {

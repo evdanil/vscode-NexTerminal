@@ -3,10 +3,12 @@ import type { AuthProfile, ServerConfig } from "../../src/models/config";
 import type { KeyboardInteractiveHandler, PasswordPrompt, SecretVault, SshConnection, SshConnector } from "../../src/services/ssh/contracts";
 import {
   SilentAuthSshFactory,
+  deleteServerSecrets,
   passwordSecretKey,
   authProfilePasswordSecretKey,
   authProfilePassphraseSecretKey,
-  passphraseSecretKey
+  passphraseSecretKey,
+  proxyPasswordSecretKey
 } from "../../src/services/ssh/silentAuth";
 
 const baseServer: ServerConfig = {
@@ -968,5 +970,44 @@ describe("SilentAuthSshFactory vault-failure isolation (Stage B)", () => {
     } finally {
       consoleSpy.mockRestore();
     }
+  });
+});
+
+describe("deleteServerSecrets", () => {
+  function vaultFailingOn(failingKey: string) {
+    const attempted: string[] = [];
+    const vault: SecretVault = {
+      get: vi.fn(async () => undefined),
+      store: vi.fn(async () => undefined),
+      delete: vi.fn(async (key: string) => {
+        attempted.push(key);
+        if (key === failingKey) throw new Error("keychain locked");
+      })
+    };
+    return { vault, attempted };
+  }
+
+  it("deletes the server's password, passphrase and proxy password — every key saved under its id", async () => {
+    const { vault, attempted } = vaultFailingOn("none");
+    await deleteServerSecrets(vault, "srv-1");
+    // ⊘ a list missing a key strands that secret on every delete path.
+    expect(attempted).toEqual([passwordSecretKey("srv-1"), passphraseSecretKey("srv-1"), proxyPasswordSecretKey("srv-1")]);
+  });
+
+  it("rejects on the first failure by default, so a caller that still holds the record can stop", async () => {
+    const { vault, attempted } = vaultFailingOn(passphraseSecretKey("srv-1"));
+    // ⊘ swallowing by default: nexus.server.remove would delete the record anyway.
+    await expect(deleteServerSecrets(vault, "srv-1")).rejects.toThrow("keychain locked");
+    expect(attempted).toEqual([passwordSecretKey("srv-1"), passphraseSecretKey("srv-1")]);
+  });
+
+  it("with bestEffort, still attempts the remaining keys after one fails, and resolves", async () => {
+    const { vault, attempted } = vaultFailingOn(passphraseSecretKey("srv-1"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    // ⊘ stopping at the failure strands the proxy password behind it.
+    await expect(deleteServerSecrets(vault, "srv-1", { bestEffort: true })).resolves.toBeUndefined();
+    expect(attempted).toEqual([passwordSecretKey("srv-1"), passphraseSecretKey("srv-1"), proxyPasswordSecretKey("srv-1")]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
   });
 });
