@@ -242,7 +242,7 @@ class ControlledForwardConnection extends DirectTcpSshConnection {
   private readonly cancelSignals = new Map<number, ReturnType<typeof deferred<void>>>();
   private readonly heldForwardAttempts = new Set<number>();
   private readonly heldCancelAttempts = new Set<number>();
-  private readonly heldForwards = new Map<number, (port: number) => void>();
+  private readonly heldForwards = new Map<number, { resolve: (port: number) => void; reject: (error: Error) => void }>();
   private readonly heldCancels = new Map<number, { resolve: () => void; reject: (error: Error) => void }>();
 
   public holdForward(attempt: number): void {
@@ -268,7 +268,11 @@ class ControlledForwardConnection extends DirectTcpSshConnection {
   }
 
   public releaseForward(attempt: number, port: number): void {
-    this.heldForwards.get(attempt)?.(port);
+    this.heldForwards.get(attempt)?.resolve(port);
+  }
+
+  public rejectForward(attempt: number, error: Error): void {
+    this.heldForwards.get(attempt)?.reject(error);
   }
 
   public resolveCancel(attempt: number): void {
@@ -285,10 +289,16 @@ class ControlledForwardConnection extends DirectTcpSshConnection {
     if (!this.heldForwardAttempts.has(attempt)) {
       return Promise.resolve(bindPort);
     }
-    return new Promise<number>((resolve) => {
-      this.heldForwards.set(attempt, (port) => {
-        this.heldForwards.delete(attempt);
-        resolve(port);
+    return new Promise<number>((resolve, reject) => {
+      this.heldForwards.set(attempt, {
+        resolve: (port) => {
+          this.heldForwards.delete(attempt);
+          resolve(port);
+        },
+        reject: (error) => {
+          this.heldForwards.delete(attempt);
+          reject(error);
+        }
       });
     });
   }
@@ -1204,6 +1214,82 @@ describe("TunnelManager integration", () => {
       }
     }
   );
+
+  it("releases an abandoned reverse bind when its request is later refused", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const retiredConnection = new ControlledForwardConnection();
+    retiredConnection.holdForward(1);
+    const replacementConnection = new ControlledForwardConnection();
+    const factory = new OrderedConnectionFactory([retiredConnection, replacementConnection]);
+    const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
+    const server = { ...testServer };
+    manager = new TunnelManager(pool, pool);
+    const profile = (id: string): TunnelProfile => ({
+      id,
+      name: id,
+      localPort: 12345,
+      remoteIP: "127.0.0.1",
+      remotePort: 23456,
+      autoStart: false,
+      tunnelType: "reverse",
+      remoteBindAddress: "127.0.0.1",
+      localTargetIP: "127.0.0.1"
+    });
+    let terminalLease: SshConnection | undefined;
+    let retiredResult: Promise<unknown> | undefined;
+    let replacementResult: Promise<unknown> | undefined;
+
+    try {
+      terminalLease = await pool.connect(server);
+      const retiredProfile = profile("reverse-abandoned-refusal");
+      const retiredStart = manager.start(retiredProfile, server);
+      retiredResult = retiredStart.then(() => "started", (error: unknown) => error);
+      await retiredConnection.waitForForwardAttempt(1);
+
+      const retiredTunnelId = manager.getActiveTunnelId(retiredProfile.id);
+      expect(retiredTunnelId).toBeDefined();
+      await manager.stop(retiredTunnelId!);
+      await vi.advanceTimersByTimeAsync(5_000);
+      const retiredOutcome = await retiredResult;
+      expect(retiredOutcome).toBeInstanceOf(Error);
+      expect((retiredOutcome as Error).name).toBe("TunnelStoppedError");
+
+      const replacementProfile = profile("reverse-after-late-refusal");
+      const replacementStart = manager.start(replacementProfile, server);
+      replacementResult = replacementStart.then(() => "started", (error: unknown) => error);
+      const initiallyWaiting = await Promise.race([
+        replacementConnection.waitForForwardAttempt(1).then(() => false),
+        new Promise<boolean>((resolve) => setImmediate(() => resolve(true)))
+      ]);
+      expect(initiallyWaiting).toBe(true);
+      expect(replacementConnection.forwardAttempts).toBe(0);
+      expect(factory.connectCount).toBe(1);
+
+      retiredConnection.rejectForward(1, new Error("Remote forwarding refused"));
+      const proceededAfterRefusal = await Promise.race([
+        replacementConnection.waitForForwardAttempt(1).then(() => true),
+        new Promise<boolean>((resolve) => setImmediate(() => resolve(false)))
+      ]);
+      expect(proceededAfterRefusal).toBe(true);
+      expect(retiredConnection.transportClosed).toBe(false);
+      expect(factory.connectCount).toBe(2);
+      await expect(replacementResult).resolves.toBe("started");
+
+      const replacementTunnelId = manager.getActiveTunnelId(replacementProfile.id);
+      expect(replacementTunnelId).toBeDefined();
+      await manager.stop(replacementTunnelId!);
+    } finally {
+      await manager.stopAll();
+      retiredConnection.rejectForward(1, new Error("Cleanup"));
+      terminalLease?.dispose();
+      pool.dispose();
+      await Promise.allSettled(
+        [retiredResult, replacementResult].filter((result): result is Promise<unknown> => Boolean(result))
+      );
+      manager = undefined;
+      vi.useRealTimers();
+    }
+  });
 
   it("does not let an old close clear a newer same-bind retirement", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });

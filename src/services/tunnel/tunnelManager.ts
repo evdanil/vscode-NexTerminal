@@ -582,11 +582,12 @@ export class TunnelManager {
         // closed. So the forward's outcome decides what happens to it here.
         runtime.sshConnections.delete(sshConnection);
         const outcome = await this.requestForward(runtime, sshConnection, bindAddr, bindPort);
-        if (outcome === "abandoned") {
+        if ("abandoned" in outcome) {
           // Stopped, and the server has not answered: no telling whether it
           // will still grant the forward. Retire it from reuse and hold a
-          // replacement for this bind until its transport closes.
-          this.retireForwardTransport(requestKey, sshConnection);
+          // replacement until refusal proves no bind was acquired, or the
+          // transport closes. A late grant is still held until transport close.
+          this.retireForwardTransport(requestKey, sshConnection, outcome.lateRefusal);
           sshConnection.dispose();
           throw new TunnelStoppedError(profile.name);
         }
@@ -659,7 +660,7 @@ export class TunnelManager {
     connection: SshConnection,
     bindAddr: string,
     bindPort: number
-  ): Promise<{ port: number } | { error: unknown } | "abandoned"> {
+  ): Promise<{ port: number } | { error: unknown } | { abandoned: true; lateRefusal: Promise<void> }> {
     const request = Promise.resolve()
       .then(() => connection.requestForwardIn(bindAddr, bindPort))
       .then(
@@ -678,7 +679,23 @@ export class TunnelManager {
       }
     });
     try {
-      return await Promise.race([request, abandoned]);
+      const outcome = await Promise.race([request, abandoned]);
+      if (outcome !== "abandoned") {
+        return outcome;
+      }
+      const lateRefusal = new Promise<void>((resolve) => {
+        // Refusal proves no remote bind exists. A late grant or no answer
+        // leaves this signal pending so the close barrier remains in force.
+        void request.then((lateOutcome) => {
+          if ("error" in lateOutcome) {
+            resolve();
+          }
+        });
+      });
+      return {
+        abandoned: true,
+        lateRefusal
+      };
     } finally {
       runtime.onStop = undefined;
       clearTimeout(timer);
@@ -691,8 +708,8 @@ export class TunnelManager {
     lateRelease?: Promise<unknown>
   ): void {
     const closed = this.sharedFactory.retire?.(connection) ?? waitForConnectionClose(connection);
-    // Keep the transport retired, but let a successful late withdrawal release
-    // this bind while existing leases keep the old connection alive.
+    // Keep the transport retired, but let proof that this bind is gone release
+    // it while existing leases keep the old connection alive.
     let releaseBarrier!: () => void;
     const barrier = new Promise<void>((resolve) => {
       releaseBarrier = resolve;
