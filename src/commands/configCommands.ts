@@ -3734,7 +3734,7 @@ export function registerConfigCommands(
 
   /**
    * ISSUE #175 — FAIL-SAFE SWEEP. A server Replace removes joins
-   * `awaitingVerdict` the moment it is removed, and leaves it only once its
+   * `awaitingVerdict` just before it is removed, and leaves it only once its
    * saved secrets are either deleted or known to be kept (see
    * `serversKeepingSecrets`). Whatever throws in between — a later wipe step's
    * vault delete, a record write, a secret delete — the secrets of every server
@@ -3786,8 +3786,11 @@ export function registerConfigCommands(
 
     if (mode === "replace") {
       for (const server of snapshot.servers) {
-        await core.removeServer(server.id);
+        // Tracked BEFORE the await: `removeServer` drops the record from memory
+        // before it persists, so a rejected persist still leaves the server gone
+        // for this session — and a retry could bring its id back anywhere.
         awaitingVerdict.add(server.id);
+        await core.removeServer(server.id);
       }
       for (const tunnel of snapshot.tunnels) {
         await core.removeTunnel(tunnel.id);

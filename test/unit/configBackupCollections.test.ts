@@ -1264,6 +1264,28 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
     expect(await dest.vault.get("proxy-password-srv-2")).toBeUndefined();
   });
 
+  it("a server whose removal fails to persist still has its secrets swept — it is already gone from this session", async () => {
+    const dest = await destWithSavedSecrets();
+    await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, id: "srv-2", name: "srv-2" }));
+    await dest.vault.store("password-srv-2", "srv-2-pw");
+    const remove = dest.core.removeServer.bind(dest.core);
+    vi.spyOn(dest.core, "removeServer").mockImplementation(async (id) => {
+      // As NexusCore does: the record leaves memory, then the persist rejects.
+      await remove(id);
+      if (id === "srv-2") throw new Error("disk full");
+    });
+
+    register(dest);
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }).mockResolvedValueOnce({ label: "Replace", value: "replace" });
+    mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/nexus-backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValueOnce(Buffer.from(unsealedJson([makeServer({ ...LOCAL_ENDPOINT })]), "utf8"));
+    await expect(registeredCommands.get("nexus.config.import")!()).rejects.toThrow("disk full");
+
+    expect(dest.core.getServer("srv-2")).toBeUndefined();
+    expect(await dest.vault.get("password-srv-2")).toBeUndefined();
+    expect(await savedSecrets(dest)).toEqual(GONE);
+  });
+
   it("a failed delete for one server the file leaves out does not stop the others' being cleared", async () => {
     let failOnce = true;
     class FlakyVault extends MockVault {
