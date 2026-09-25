@@ -517,21 +517,88 @@ function scriptExamplesUrl(): string {
   return repositoryTreeUrl("examples/scripts");
 }
 
-async function deleteScript(uri: vscode.Uri): Promise<void> {
+/**
+ * Whether a delete of `uri` can go to the Trash. VS Code refuses a `useTrash`
+ * delete on a file system without one ("… via trash because provider does not
+ * support it") instead of deleting permanently, and gives an extension no way
+ * to ask a file system whether it has one — so this decides from where the
+ * file lives. Only the desktop's local disk has a Trash: a `file:` URI in a
+ * window with no remote. With a remote (Remote-SSH, WSL, Dev Containers) this
+ * extension runs in the remote extension host — it declares no
+ * `extensionKind` — where `file:` URIs are the remote's and go through VS
+ * Code's remote file system, which has no Trash; any other scheme is that
+ * remote file system or one an extension registered, which cannot declare a
+ * Trash. Where this is wrong (`remote.extensionKind` forcing Nexus local in a
+ * remote window, deleting a `file:` script from global storage) it asks for a
+ * permanent delete the user can still decline — it never promises a Trash
+ * that is not there.
+ */
+function canMoveToTrash(uri: vscode.Uri): boolean {
+  return uri.scheme === "file" && vscode.env.remoteName === undefined;
+}
+
+/**
+ * A delete of a file that is not there: the extension host throws a
+ * `FileSystemError` whose `code` is "FileNotFound". Read by `code` rather
+ * than `instanceof`, like `scriptFs.ts`'s not-found check.
+ */
+function isFileNotFound(err: unknown): boolean {
+  return (err as { code?: unknown } | undefined)?.code === "FileNotFound";
+}
+
+async function deleteScript(uri: vscode.Uri, refreshScriptTree?: () => void): Promise<void> {
   if (!uri?.fsPath) return;
   const base = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
-  // The file goes to the Trash, so the warning must not say the delete is
-  // final. It never is: where a file system has no Trash, VS Code refuses a
-  // `useTrash` delete (the error below) rather than deleting for good.
-  const picked = await vscode.window.showWarningMessage(
-    `Delete ${base}? It will be moved to the Trash.`,
-    { modal: true },
-    "Delete"
-  );
-  if (picked !== "Delete") return;
+  const DELETE_PERMANENTLY = "Delete Permanently";
+  // The row the user clicked is stale — deleted outside VS Code, or before
+  // the watcher's rescan. What they asked for is already true, and a
+  // permanent delete could not succeed either, so say so and rescan.
+  const alreadyGone = () => {
+    void vscode.window.showInformationMessage(`${base} is already gone.`);
+    refreshScriptTree?.();
+  };
+  if (canMoveToTrash(uri)) {
+    const picked = await vscode.window.showWarningMessage(
+      `Delete ${base}? It will be moved to the Trash.`,
+      { modal: true },
+      "Delete"
+    );
+    if (picked !== "Delete") return;
+    try {
+      await vscode.workspace.fs.delete(uri, { useTrash: true });
+      return;
+    } catch (err) {
+      if (isFileNotFound(err)) {
+        alreadyGone();
+        return;
+      }
+      // The OS Trash can still fail (a mount with no Trash directory), and
+      // VS Code then throws rather than deleting permanently. Offer what its
+      // own explorer does — a permanent delete behind a second confirmation,
+      // since the first one promised the Trash.
+      const reason = err instanceof Error ? err.message : String(err);
+      const again = await vscode.window.showWarningMessage(
+        `${base} could not be moved to the Trash. Delete it permanently instead?`,
+        { modal: true, detail: `${reason}\n\nThis cannot be undone.` },
+        DELETE_PERMANENTLY
+      );
+      if (again !== DELETE_PERMANENTLY) return;
+    }
+  } else {
+    const picked = await vscode.window.showWarningMessage(
+      `Delete ${base} permanently? This cannot be undone.`,
+      { modal: true },
+      DELETE_PERMANENTLY
+    );
+    if (picked !== DELETE_PERMANENTLY) return;
+  }
   try {
-    await vscode.workspace.fs.delete(uri, { useTrash: true });
+    await vscode.workspace.fs.delete(uri, { useTrash: false });
   } catch (err) {
+    if (isFileNotFound(err)) {
+      alreadyGone();
+      return;
+    }
     const message = err instanceof Error ? err.message : String(err);
     void vscode.window.showErrorMessage(`Failed to delete script: ${message}`);
   }
@@ -665,7 +732,7 @@ export function registerScriptCommands(
     vscode.commands.registerCommand("nexus.script.delete", async (arg?: unknown) => {
       const uri = toScriptUri(arg);
       if (!uri) return;
-      await deleteScript(uri);
+      await deleteScript(uri, refreshScriptTree);
     }),
 
     // Namespaced wrapper around the built-in `revealInExplorer`. Registering

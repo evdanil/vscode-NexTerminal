@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.254] — 2026-09-25
+
+### Fixed
+
+- **Delete Script works in remote windows, and says what will happen to the file.** Under Remote-SSH, WSL and Dev Containers there is no Trash for a script to go to, so every delete failed with an error that offered no way forward — while the confirmation, since 2.8.247, said the script would be moved to the Trash. There the confirmation now asks once whether to delete the script permanently, and does not mention the Trash; the same goes for a script on a file system another extension provides. On your own machine the script still goes to the Trash, and if the Trash cannot take it, Nexus says why and offers **Delete Permanently** behind a second confirmation, as VS Code's explorer does. Deleting a script that was already deleted outside VS Code now says it is already gone and refreshes the Scripts view, instead of reporting a failure.
+
 ## [2.8.253] — 2026-09-25
 
 ### Added

@@ -9,6 +9,9 @@ const state = {
   quickPickOptions: undefined as unknown,
   quickPickReturn: undefined as unknown,
   warningReturn: undefined as string | undefined,
+  // Answers for successive warning dialogs, taken in order; once empty,
+  // every dialog answers `warningReturn`.
+  warningAnswers: [] as Array<string | undefined>,
   mockShowWarningMessage: vi.fn(),
   mockShowInformationMessage: vi.fn(),
   mockShowErrorMessage: vi.fn(),
@@ -35,7 +38,7 @@ vi.mock("vscode", () => ({
     },
     showWarningMessage: (...args: unknown[]) => {
       state.mockShowWarningMessage(...args);
-      return Promise.resolve(state.warningReturn);
+      return Promise.resolve(state.warningAnswers.length > 0 ? state.warningAnswers.shift() : state.warningReturn);
     },
     showInformationMessage: (...args: unknown[]) => {
       state.mockShowInformationMessage(...args);
@@ -76,6 +79,7 @@ vi.mock("vscode", () => ({
     }
   },
   env: {
+    remoteName: undefined as string | undefined,
     openExternal: (...args: unknown[]) => state.mockOpenExternal(...args)
   },
   Uri: {
@@ -129,13 +133,18 @@ describe("scriptCommands", () => {
     state.quickPickOptions = undefined;
     state.quickPickReturn = undefined;
     state.warningReturn = undefined;
+    state.warningAnswers = [];
+    (vscode.env as { remoteName: string | undefined }).remoteName = undefined;
     state.mockShowWarningMessage.mockClear();
     state.mockShowInformationMessage.mockClear();
     state.mockShowErrorMessage.mockClear();
     state.mockOpenExternal.mockClear();
     vi.mocked(vscode.commands.executeCommand).mockClear();
     vi.mocked(vscode.workspace.fs.createDirectory).mockClear();
-    state.mockFsDelete.mockClear();
+    // Reset, not clear: a test's unconsumed mockRejectedValueOnce must not
+    // leak into the next one.
+    state.mockFsDelete.mockReset();
+    state.mockFsDelete.mockImplementation(async () => {});
     state.mockFsStatThrows = true;
   });
 
@@ -780,21 +789,175 @@ describe("scriptCommands", () => {
 
     it("says the script goes to the Trash, not that deleting it cannot be undone (#155)", async () => {
       // ⊘ "This cannot be undone." over a delete that moves the file to the
-      // Trash. The second half pins why the new wording is true: the delete
-      // asks for the Trash, and where there is none VS Code refuses the
-      // delete rather than falling back to a permanent one.
+      // Trash. The second half pins why the wording is true: on the local
+      // disk the delete asks for the Trash, and nothing else is deleted.
       state.warningReturn = "Delete";
       registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
       const handler = state.registeredCommands.get("nexus.script.delete")!;
       const uri = { fsPath: "/ws/.nexus/scripts/foo.js", scheme: "file", toString: () => "/ws/.nexus/scripts/foo.js" };
       await handler(uri);
 
-      const [message, options] = state.mockShowWarningMessage.mock.calls[0] as [string, unknown];
+      const [message, options, ...items] = state.mockShowWarningMessage.mock.calls[0] as [string, unknown, ...unknown[]];
       expect(message).toContain("foo.js");
       expect(message).toContain("Trash");
       expect(message).not.toContain("cannot be undone");
       expect(options).toEqual({ modal: true });
+      // ⊘ offering Delete Permanently up front where the Trash is there to use.
+      expect(items).toEqual(["Delete"]);
       expect(state.mockFsDelete).toHaveBeenCalledWith(uri, { useTrash: true });
+      // ⊘ a permanent delete, or a second dialog, after a Trash delete that worked.
+      expect(state.mockFsDelete).toHaveBeenCalledTimes(1);
+      expect(state.mockShowWarningMessage).toHaveBeenCalledTimes(1);
+      expect(state.mockShowErrorMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  // #165 — VS Code refuses a `useTrash` delete on a file system with no Trash
+  // (the remote provider under Remote-SSH / WSL / Dev Containers, or any
+  // provider an extension registers) instead of deleting permanently, and the
+  // OS Trash itself can fail. Delete Script must neither promise a Trash it
+  // cannot use nor dead-end in a toast with no way forward.
+  describe("Delete Script where the Trash is unavailable (#165)", () => {
+    const TRASH_UNSUPPORTED = "Unable to delete file '/ws/.nexus/scripts/foo.js' via trash because provider does not support it.";
+    // What the extension host throws for a delete of a file that is not there:
+    // a FileSystemError whose code is "FileNotFound".
+    function fileNotFound(): Error {
+      return Object.assign(new Error("Unable to delete nonexistent file '/ws/.nexus/scripts/foo.js'"), {
+        name: "FileNotFound (FileSystemError)",
+        code: "FileNotFound"
+      });
+    }
+
+    function scriptUri(scheme = "file") {
+      return { fsPath: "/ws/.nexus/scripts/foo.js", scheme, toString: () => "/ws/.nexus/scripts/foo.js" };
+    }
+
+    async function runDelete(uri: ReturnType<typeof scriptUri>, refreshScriptTree?: () => void): Promise<void> {
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs", undefined, refreshScriptTree);
+      await state.registeredCommands.get("nexus.script.delete")!(uri);
+    }
+
+    function warnings(): Array<{ message: string; options: unknown; items: unknown[] }> {
+      return state.mockShowWarningMessage.mock.calls.map((call) => {
+        const [message, options, ...items] = call as [string, unknown, ...unknown[]];
+        return { message, options, items };
+      });
+    }
+
+    it("offers Delete Permanently behind a second modal confirmation when the Trash delete fails", async () => {
+      // ⊘ today's behaviour: an error toast naming no remedy. ⊘ a silent
+      // fallback to a permanent delete the user never agreed to — the first
+      // confirmation promised the Trash.
+      state.mockFsDelete.mockRejectedValueOnce(new Error(TRASH_UNSUPPORTED));
+      state.warningAnswers = ["Delete", "Delete Permanently"];
+      const uri = scriptUri();
+      await runDelete(uri);
+
+      const shown = warnings();
+      expect(shown).toHaveLength(2);
+      expect(shown[1].items).toEqual(["Delete Permanently"]);
+      expect(shown[1].message).toContain("foo.js");
+      expect(shown[1].message).toContain("permanently");
+      const { modal, detail } = shown[1].options as { modal?: boolean; detail?: string };
+      expect(modal).toBe(true);
+      // Why the Trash failed, and what agreeing costs.
+      expect(detail).toContain(TRASH_UNSUPPORTED);
+      expect(detail).toContain("cannot be undone");
+      expect(state.mockFsDelete.mock.calls).toEqual([
+        [uri, { useTrash: true }],
+        [uri, { useTrash: false }]
+      ]);
+      expect(state.mockShowErrorMessage).not.toHaveBeenCalled();
+    });
+
+    it("keeps the file when the second confirmation is cancelled", async () => {
+      // ⊘ a fallback that deletes permanently whatever the answer, or treats
+      // a dismissed dialog as consent.
+      state.mockFsDelete.mockRejectedValueOnce(new Error(TRASH_UNSUPPORTED));
+      state.warningAnswers = ["Delete", undefined];
+      const uri = scriptUri();
+      await runDelete(uri);
+
+      expect(warnings()).toHaveLength(2);
+      expect(state.mockFsDelete.mock.calls).toEqual([[uri, { useTrash: true }]]);
+      expect(state.mockShowErrorMessage).not.toHaveBeenCalled();
+    });
+
+    it("says the script is already gone, and refreshes, when the Trash delete finds no file", async () => {
+      // ⊘ offering Delete Permanently for a file that is not there: that
+      // delete cannot succeed, so the dialog would lead only to an error.
+      state.mockFsDelete.mockRejectedValueOnce(fileNotFound());
+      state.warningAnswers = ["Delete"];
+      const refresh = vi.fn();
+      const uri = scriptUri();
+      await runDelete(uri, refresh);
+
+      expect(warnings()).toHaveLength(1);
+      expect(state.mockFsDelete.mock.calls).toEqual([[uri, { useTrash: true }]]);
+      expect(state.mockShowInformationMessage).toHaveBeenCalledWith("foo.js is already gone.");
+      expect(state.mockShowErrorMessage).not.toHaveBeenCalled();
+      // ⊘ leaving the stale row in the Scripts view.
+      expect(refresh).toHaveBeenCalledTimes(1);
+    });
+
+    it("says the script is already gone, and refreshes, when a permanent delete finds no file", async () => {
+      // ⊘ "Failed to delete script: Unable to delete nonexistent file" — the
+      // user asked for the file to be gone, and it is.
+      (vscode.env as { remoteName: string | undefined }).remoteName = "ssh-remote";
+      state.mockFsDelete.mockRejectedValueOnce(fileNotFound());
+      state.warningAnswers = ["Delete Permanently"];
+      const refresh = vi.fn();
+      await runDelete(scriptUri(), refresh);
+
+      expect(state.mockShowInformationMessage).toHaveBeenCalledWith("foo.js is already gone.");
+      expect(state.mockShowErrorMessage).not.toHaveBeenCalled();
+      expect(refresh).toHaveBeenCalledTimes(1);
+    });
+
+    it("reports a permanent delete that fails too", async () => {
+      // ⊘ swallowing the second failure: the user agreed to a delete and
+      // must learn it did not happen.
+      state.mockFsDelete
+        .mockRejectedValueOnce(new Error(TRASH_UNSUPPORTED))
+        .mockRejectedValueOnce(new Error("EACCES: permission denied"));
+      state.warningAnswers = ["Delete", "Delete Permanently"];
+      await runDelete(scriptUri());
+
+      expect(state.mockShowErrorMessage).toHaveBeenCalledTimes(1);
+      expect(state.mockShowErrorMessage.mock.calls[0][0]).toContain("EACCES: permission denied");
+    });
+
+    it.each([
+      ["a remote window (the extension host is remote; its file: URIs are the remote's)", "ssh-remote", "file"],
+      ["WSL", "wsl", "file"],
+      ["a file system another extension provides, in a local window", undefined, "vscode-vfs"]
+    ] as const)("in %s, asks once for a permanent delete and never mentions the Trash", async (_label, remoteName, scheme) => {
+      // ⊘ promising the Trash where VS Code will refuse to use it. ⊘ deciding
+      // from the scheme alone (a remote extension host sees file: URIs) or
+      // from remoteName alone (a local window can hold a Trash-less scheme).
+      // ⊘ trying the Trash anyway: every delete there would take two dialogs.
+      (vscode.env as { remoteName: string | undefined }).remoteName = remoteName;
+      state.warningAnswers = ["Delete Permanently"];
+      const uri = scriptUri(scheme);
+      await runDelete(uri);
+
+      const shown = warnings();
+      expect(shown).toHaveLength(1);
+      expect(shown[0].options).toEqual({ modal: true });
+      expect(shown[0].items).toEqual(["Delete Permanently"]);
+      expect(shown[0].message).toContain("foo.js");
+      expect(shown[0].message).toContain("permanently");
+      expect(shown[0].message).toContain("cannot be undone");
+      expect(shown[0].message).not.toContain("Trash");
+      expect(state.mockFsDelete.mock.calls).toEqual([[uri, { useTrash: false }]]);
+    });
+
+    it("deletes nothing when the permanent-delete confirmation is cancelled", async () => {
+      (vscode.env as { remoteName: string | undefined }).remoteName = "ssh-remote";
+      state.warningAnswers = [undefined];
+      await runDelete(scriptUri());
+
+      expect(state.mockFsDelete).not.toHaveBeenCalled();
     });
   });
 
