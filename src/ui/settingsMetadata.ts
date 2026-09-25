@@ -569,13 +569,13 @@ export const SETTINGS_META: SettingMeta[] = [
       {
         label: "Node",
         value: "node",
-        description: "Bundled JavaScript daemon — available on every platform",
-        recommended: true
+        description: "Bundled JavaScript daemon — available on every platform"
       },
       {
         label: "Rust",
         value: "rust",
-        description: "Native binary — used when a packaged or development binary is available"
+        description: "Native binary — used when a packaged or development binary is available",
+        recommended: true
       }
     ]
   },
