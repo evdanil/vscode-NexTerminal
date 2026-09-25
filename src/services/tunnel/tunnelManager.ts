@@ -102,7 +102,11 @@ function networkRouteIdentity(
       jumpHost ? networkRouteIdentity(jumpHost, serverLookup, nextVisited) : ["unresolved", proxy.jumpHostId]
     ];
   }
-  return [proxy.type, proxy.host.toLowerCase(), proxy.port, proxy.username ?? "", endpoint];
+  // Proxy credentials may select separate egress routes, so this can
+  // serialize independent backends. The key protects the SSH server's
+  // server-wide bind namespace; omitting username avoids racing two credentials
+  // that reach the same proxy and SSH endpoint.
+  return [proxy.type, proxy.host.toLowerCase(), proxy.port, endpoint];
 }
 
 /**

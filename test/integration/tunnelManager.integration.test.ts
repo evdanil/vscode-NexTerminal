@@ -200,6 +200,56 @@ class ObservedForwardConnection extends DirectTcpSshConnection {
   }
 }
 
+class BindNamespaceConnection extends DirectTcpSshConnection {
+  public readonly forwardRequested = deferred<void>();
+  public forwardAttempts = 0;
+  private finishHeldRequest?: (result: { port: number } | { error: Error }) => void;
+
+  public constructor(
+    private readonly remoteBinds: Map<string, BindNamespaceConnection>,
+    private readonly holdRequest = false
+  ) {
+    super();
+  }
+
+  public override requestForwardIn(bindAddr: string, bindPort: number): Promise<number> {
+    this.forwardAttempts += 1;
+    this.forwardRequested.resolve(undefined);
+    const key = `${bindAddr}:${bindPort}`;
+    if (this.remoteBinds.has(key)) {
+      return Promise.reject(new Error("Remote bind is already in use"));
+    }
+    this.remoteBinds.set(key, this);
+    if (!this.holdRequest) {
+      return Promise.resolve(bindPort);
+    }
+    return new Promise<number>((resolve, reject) => {
+      this.finishHeldRequest = (result) => {
+        this.finishHeldRequest = undefined;
+        if ("error" in result) {
+          if (this.remoteBinds.get(key) === this) {
+            this.remoteBinds.delete(key);
+          }
+          reject(result.error);
+          return;
+        }
+        resolve(result.port);
+      };
+    });
+  }
+
+  public refuseHeldRequest(error: Error): void {
+    this.finishHeldRequest?.({ error });
+  }
+
+  public override async cancelForwardIn(bindAddr: string, bindPort: number): Promise<void> {
+    const key = `${bindAddr}:${bindPort}`;
+    if (this.remoteBinds.get(key) === this) {
+      this.remoteBinds.delete(key);
+    }
+  }
+}
+
 class RefusedForwardConnection extends DirectTcpSshConnection {
   public override async requestForwardIn(_bindAddr: string, _bindPort: number): Promise<number> {
     throw new Error("Remote forwarding refused");
@@ -679,9 +729,93 @@ describe("TunnelManager integration", () => {
     expect(events.some((e) => e.type === "stopped")).toBe(true);
   });
 
-  it("waits for a retired bind when a same-route reverse start finishes logging in", async () => {
-    const retiredServer = { ...testServer, id: "server-retired" };
-    const replacementServer = { ...testServer, id: "server-replacement", multiplexing: false };
+  it.each([
+    ["SOCKS5", "socks5", 1080],
+    ["HTTP CONNECT", "http", 3128]
+  ] as const)("serializes reverse binds across proxy usernames for the same %s endpoint", async (_label, proxyType, proxyPort) => {
+    const server = (id: string, username: string): ServerConfig => ({
+      ...testServer,
+      id,
+      multiplexing: false,
+      proxy: proxyType === "socks5"
+        ? { type: "socks5", host: "proxy.example", port: proxyPort, username }
+        : { type: "http", host: "proxy.example", port: proxyPort, username }
+    });
+    const aliceServer = server("server-alice", "alice");
+    const bobServer = server("server-bob", "bob");
+    const remoteBinds = new Map<string, BindNamespaceConnection>();
+    const aliceConnection = new BindNamespaceConnection(remoteBinds, true);
+    const bobConnection = new BindNamespaceConnection(remoteBinds);
+    const sshFactory: SshFactory = {
+      connect: async (config) => {
+        if (config.id === aliceServer.id) {
+          return aliceConnection;
+        }
+        if (config.id === bobServer.id) {
+          return bobConnection;
+        }
+        throw new Error(`Unexpected server ${config.id}`);
+      }
+    };
+    const pool = new SshConnectionPool(sshFactory, { enabled: true, idleTimeoutMs: 60_000 });
+    manager = new TunnelManager(pool, pool);
+    const profile = (id: string): TunnelProfile => ({
+      id,
+      name: id,
+      localPort: 12345,
+      remoteIP: "127.0.0.1",
+      remotePort: 23456,
+      autoStart: false,
+      tunnelType: "reverse",
+      remoteBindAddress: "127.0.0.1",
+      localTargetIP: "127.0.0.1"
+    });
+    const aliceProfile = profile("reverse-alice");
+    const bobProfile = profile("reverse-bob");
+    const aliceStart = manager.start(aliceProfile, aliceServer);
+    const bobStart = manager.start(bobProfile, bobServer);
+    const aliceSettled = aliceStart.then(() => undefined, () => undefined);
+    const bobSettled = bobStart.then(() => undefined, () => undefined);
+    const refusal = new Error("Predecessor reverse request refused");
+    const bindKey = "127.0.0.1:23456";
+
+    try {
+      await aliceConnection.forwardRequested.promise;
+      expect(remoteBinds.get(bindKey)).toBe(aliceConnection);
+
+      const bobAttemptedBeforeAliceSettled = await Promise.race([
+        bobConnection.forwardRequested.promise.then(() => true),
+        new Promise<boolean>((resolve) => setImmediate(() => resolve(false)))
+      ]);
+      expect(bobAttemptedBeforeAliceSettled).toBe(false);
+      expect(bobConnection.forwardAttempts).toBe(0);
+
+      aliceConnection.refuseHeldRequest(refusal);
+      await expect(aliceStart).rejects.toBe(refusal);
+      const bobTunnel = await bobStart;
+      expect(bobTunnel.profileId).toBe(bobProfile.id);
+      expect(bobConnection.forwardAttempts).toBe(1);
+      expect(remoteBinds.get(bindKey)).toBe(bobConnection);
+
+      await manager.stop(bobTunnel.id);
+      expect(remoteBinds.has(bindKey)).toBe(false);
+    } finally {
+      aliceConnection.refuseHeldRequest(refusal);
+      await Promise.all([aliceSettled, bobSettled]);
+      await manager.stopAll();
+      pool.dispose();
+    }
+  });
+
+  it("waits for a retired bind across proxy usernames when a reverse start finishes logging in", async () => {
+    const proxy = (username: string) => ({ type: "socks5" as const, host: "proxy.example", port: 1080, username });
+    const retiredServer = { ...testServer, id: "server-retired", proxy: proxy("alice") };
+    const replacementServer = {
+      ...testServer,
+      id: "server-replacement",
+      multiplexing: false,
+      proxy: proxy("bob")
+    };
     const retiredConnection = new HeldForwardConnection();
     const replacementConnection = new ObservedForwardConnection();
     const factory = new DelayedReplacementFactory(
