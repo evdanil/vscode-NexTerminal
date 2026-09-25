@@ -1112,6 +1112,20 @@ describe("formValuesToServer — BMC fields (issue #48 PR-B)", () => {
   });
 });
 
+describe("formValuesToServer — primary host", () => {
+  it("trims surrounding whitespace from Host on save", () => {
+    const saved = formValuesToServer({
+      name: "Test",
+      host: "  10.0.0.9  ",
+      port: 22,
+      username: "root",
+      authType: "password"
+    });
+
+    expect(saved?.host).toBe("10.0.0.9");
+  });
+});
+
 describe("formValuesToServer — altHost (issue #48)", () => {
   const base = { name: "Test", host: "example.com", port: 22, username: "root", authType: "password" };
 

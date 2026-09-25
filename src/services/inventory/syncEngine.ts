@@ -656,20 +656,54 @@ function keptHandAddressWarning(
   takes: { host: boolean; port: boolean }
 ): string | undefined {
   const kept: Array<{ field: "host" | "port"; yours: string; theirs: string }> = [];
+  const actionable: Array<{ field: "host" | "port"; yours: string; theirs: string }> = [];
+  let nonRoundTrippableHost = false;
+  // The plan's final warning pass flattens provider text. A host recommendation
+  // is only actionable when the displayed value, after the edit form's Host trim,
+  // is exactly what row 5a compares on the next sync. Still report the changed
+  // host in sanitized form so the address change is visible, but do not include
+  // it in the settable fields when that round trip would change it.
   if (!takes.host && reported.host !== record.origin?.syncedHost) {
-    kept.push({ field: "host", yours: record.host, theirs: reported.host });
+    const displayHost = flattenProviderText(reported.host);
+    // `formValuesToServer` trims Host on save. The value a user can hand back by
+    // setting the displayed text must therefore match the original report after
+    // both warning flattening and form normalization.
+    const savedDisplayHost = displayHost.trim();
+    const hostCanBeHandedBack = savedDisplayHost === reported.host;
+    const host = {
+      field: "host" as const,
+      yours: record.host,
+      theirs: hostCanBeHandedBack ? reported.host : `${displayHost || "(no visible text)"} (sanitized for display)`
+    };
+    kept.push(host);
+    if (hostCanBeHandedBack) {
+      actionable.push(host);
+    } else {
+      nonRoundTrippableHost = true;
+    }
   }
   if (!takes.port && reported.port !== record.origin?.syncedPort) {
-    kept.push({ field: "port", yours: String(record.port), theirs: String(reported.port) });
+    const port = { field: "port" as const, yours: String(record.port), theirs: String(reported.port) };
+    kept.push(port);
+    actionable.push(port);
   }
   if (kept.length === 0) {
     return undefined;
   }
   const yours = kept.map((k) => `${k.field} ${k.yours}`).join(" and ");
   const theirs = kept.map((k) => `${k.field} ${k.theirs}`).join(" and ");
-  const fields = kept.map((k) => k.field).join(" and ");
-  const [those, them] = kept.length === 1 ? ["that", "it"] : ["those", "them"];
-  return `"${serverName}": kept your ${yours}; the source now reports ${theirs} — set the ${fields} to ${those} to let the source manage ${them}.`;
+  let warning = `"${serverName}": kept your ${yours}; the source now reports ${theirs}`;
+  if (actionable.length > 0) {
+    const fields = actionable.map((k) => k.field).join(" and ");
+    const [those, them] = actionable.length === 1 ? ["that", "it"] : ["those", "them"];
+    warning += ` — set the ${fields} to ${those} to let the source manage ${them}`;
+  }
+  if (nonRoundTrippableHost) {
+    warning += ". The displayed host was sanitized; setting it as shown will not hand the field back.";
+  } else {
+    warning += ".";
+  }
+  return warning;
 }
 
 /**

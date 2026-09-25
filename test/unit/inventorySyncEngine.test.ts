@@ -6294,6 +6294,31 @@ describe("computeSyncPlan — a kept hand-typed address the source reports diffe
     expect(after.origin?.syncedHost).toBeUndefined();
   });
 
+  it.each([
+    ["a bidi override", "10.0.0.9\u202e"],
+    ["trailing whitespace", "10.0.0.9 "]
+  ])("reports but does not prescribe a flattened host when the source value contains %s", (_description, reportedHost) => {
+    const before = handTypedPlaceholder();
+    const tree = makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: reportedHost, port: 22 }] })]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 2000 });
+
+    expect(plan.warnings).toContain(
+      '"core-sw-1": kept your host 10.0.0.5; the source now reports host 10.0.0.9 (sanitized for display). The displayed host was sanitized; setting it as shown will not hand the field back.'
+    );
+    expect(plan.warnings.join("\n")).not.toContain("set the host to that");
+  });
+
+  it("keeps a safe port remedy when the reported host must be flattened, but does not offer the host (kills treating one unsafe component as making both actionable)", () => {
+    const before = handTypedPlaceholder();
+    const tree = makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.9 ", port: 2222 }] })]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 2000 });
+
+    expect(plan.warnings).toContain(
+      '"core-sw-1": kept your host 10.0.0.5 and port 22; the source now reports host 10.0.0.9 (sanitized for display) and port 2222 — set the port to that to let the source manage it. The displayed host was sanitized; setting it as shown will not hand the field back.'
+    );
+    expect(plan.warnings.join("\n")).not.toContain("set the host");
+  });
+
   it("names only the port when the host matches the device's and the typed port is kept (kills a helper that reports the host half alone and drops a kept port)", () => {
     const before = handTypedPlaceholder({ port: 2222 });
     const tree = makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.5", port: 22 }] })]);
