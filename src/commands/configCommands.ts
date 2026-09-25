@@ -1610,50 +1610,15 @@ function remapProxy(proxy: ProxyConfig | undefined, linkServer: (id: string) => 
 const SHARED_USERNAME = "user";
 
 /**
- * SHARE SCRUBS — what a share clears from the records it still carries whole
- * (servers, serial and Local Shell profiles, settings; rebuilding them from
- * rules tables like the inventory records is #179). Applied in BOTH
- * directions: `sanitizeForSharing` on the way out, and `importShareData` again
- * before validation, because a share file is untrusted and a hand-edited or
- * older one could carry anything the export clears. One function per record,
- * so the two sides cannot drift apart.
- *
- * Tunnels need none, and macros are already symmetric: a secret macro is left
- * out in both directions, and a masked variable's default is removed by
- * `withRedactedVariables` on the way out and by `sanitizeImportedMacro`, which
- * removes more, on the way in.
- */
-
-/**
- * A server: every `username` becomes SHARED_USERNAME and `keyPath` is blanked —
- * the sender's login and where their key file is — and `formerlySynced`, the
- * adoption key, never travels (see the ADOPT 1 note in `importShareData`).
- */
-function scrubSharedServer(server: ServerConfig): ServerConfig {
-  const { formerlySynced: _adoptionKey, ...kept } = server;
-  return { ...kept, username: SHARED_USERNAME, keyPath: "" };
-}
-
-/** A serial profile: `deviceHint`, the identity of the sender's USB adapter that Smart Follow learned. */
-function scrubSharedSerialProfile(profile: SerialProfile): SerialProfile {
-  const { deviceHint: _learned, ...kept } = profile;
-  return kept;
-}
-
-/**
- * A Local Shell profile: the working directory, the startup command — which
- * runs the moment the profile opens — and the environment variables, which
- * routinely carry tokens (issue #159).
- */
-function scrubSharedLocalShellProfile(profile: LocalShellProfile): LocalShellProfile {
-  const { cwd: _cwd, startupCommand: _startupCommand, env: _env, ...kept } = profile;
-  return kept;
-}
-
-/**
- * Share only explicitly approved portable preferences. The share importer calls
- * this again on input so old and hand-edited files cannot overwrite local
- * security choices, paths, network plans, or future unknown settings.
+ * SETTINGS — the one part of a share not rebuilt by a rules table below. Its
+ * key set is data (`SETTINGS_KEYS`, most of it generated from the settings
+ * panel's metadata), not a model type the compiler could hold a table to, and
+ * it is already an allowlist on both sides: the export reads only those keys
+ * (`readSettings`) and the import writes only those keys
+ * (`partitionImportedSettings`), so an undeclared key travels in neither
+ * direction. What is left is the one value a share rewrites — a session log
+ * directory is a path on the sender's machine, so it becomes "" (the default)
+ * — applied in BOTH directions, because a share file is untrusted.
  */
 function scrubSharedSettings(settings: Record<string, unknown>): Record<string, unknown> {
   const scrubbed: Record<string, unknown> = {};
@@ -1666,10 +1631,10 @@ function scrubSharedSettings(settings: Record<string, unknown>): Record<string, 
 }
 
 /**
- * What a share does with each field of the inventory records it carries, in
- * BOTH directions — the export applies it, and the import applies it again,
- * because a share file is untrusted and a hand-edited one could put back
- * anything the export removed.
+ * What a share does with each field of every record it carries (settings
+ * aside — see `scrubSharedSettings`), in BOTH directions: the export applies
+ * it, and the import applies it again, because a share file is untrusted and
+ * a hand-edited one could put back anything the export removed.
  *
  *  - `"keep"` — copied as it is;
  *  - `"drop"` — never travels;
@@ -1683,9 +1648,10 @@ function scrubSharedSettings(settings: Record<string, unknown>): Record<string, 
  * the build here until someone decides what a share does with it. A spread
  * would ship it by default — and the fields most likely to be added are
  * exactly the kind that must not travel: another trust stamp, another consent
- * record, more sync bookkeeping. A key the model does not declare is not copied
- * in either direction, and neither is one inside the nested records rebuilt
- * here (template rules, template field wrappers, proxies).
+ * record, more sync bookkeeping, another path on the sender's machine. A key
+ * the model does not declare is not copied in either direction, and neither is
+ * one inside the nested records rebuilt here (template rules, template field
+ * wrappers, proxies, a server's `origin`, a macro's variable entries).
  */
 type ShareRule<T, K extends keyof T> = "keep" | "drop" | "link" | ((value: T[K], record: T) => T[K] | undefined);
 type ShareRules<T> = { readonly [K in keyof T]-?: ShareRule<T, K> };
@@ -1875,6 +1841,151 @@ const SHARED_SAVED_FILTER_RULES = {
   name: "keep",
   filter: "keep"
 } satisfies ShareRules<SavedFilterDefinition>;
+
+/**
+ * A server as a share carries it, in both directions. What the record gives
+ * away of the sender is their login and where their key file is, so
+ * `username` becomes SHARED_USERNAME, like every username a share carries,
+ * and `keyPath` is blanked. `formerlySynced`, the adoption key, never travels
+ * (see the ADOPT 1 note in `importShareData`). Every reference is re-pointed
+ * by `shareServer`.
+ */
+const SHARED_SERVER_RULES = {
+  id: "link",
+  name: "keep",
+  group: "keep",
+  host: "keep",
+  port: "keep",
+  addressless: "keep",
+  protocol: "keep",
+  altHost: "keep",
+  username: () => SHARED_USERNAME,
+  authType: "keep",
+  keyPath: () => "",
+  isHidden: "keep",
+  logSession: "keep",
+  multiplexing: "keep",
+  legacyAlgorithms: "keep",
+  ipmiHost: "keep",
+  ipmiAuthProfileId: "link",
+  bmcWebProtocol: "keep",
+  ipmiGatewayServerId: "link",
+  openFileExplorerOnFirstConnect: "keep",
+  proxy: "link",
+  authProfileId: "link",
+  origin: "link",
+  formerlySynced: "drop"
+} satisfies ShareRules<ServerConfig>;
+
+const SHARED_TUNNEL_RULES = {
+  id: "link",
+  name: "keep",
+  localPort: "keep",
+  remoteIP: "keep",
+  remotePort: "keep",
+  defaultServerId: "link",
+  autoStart: "keep",
+  autoStop: "keep",
+  connectionMode: "keep",
+  tunnelType: "keep",
+  remoteBindAddress: "keep",
+  localTargetIP: "keep",
+  localBindAddress: "keep",
+  notes: "keep",
+  browserUrl: "keep"
+} satisfies ShareRules<TunnelProfile>;
+
+/** A serial profile: `deviceHint`, the identity of the sender's USB adapter that Smart Follow learned, never travels. */
+const SHARED_SERIAL_PROFILE_RULES = {
+  id: "link",
+  name: "keep",
+  group: "keep",
+  path: "keep",
+  baudRate: "keep",
+  dataBits: "keep",
+  stopBits: "keep",
+  parity: "keep",
+  rtscts: "keep",
+  logSession: "keep",
+  mode: "keep",
+  deviceHint: "drop"
+} satisfies ShareRules<SerialProfile>;
+
+/**
+ * A Local Shell profile: the working directory, the startup command — which
+ * runs the moment the profile opens — and the environment variables, which
+ * routinely carry tokens (issue #159), never travel.
+ */
+const SHARED_LOCAL_SHELL_PROFILE_RULES = {
+  id: "link",
+  name: "keep",
+  group: "keep",
+  launchMode: "keep",
+  vscodeProfileName: "keep",
+  shellPath: "keep",
+  shellArgs: "keep",
+  cwd: "drop",
+  env: "drop",
+  startupCommand: "drop"
+} satisfies ShareRules<LocalShellProfile>;
+
+/**
+ * A macro: a secret one is left out of a share altogether, in both directions.
+ * The capability flags are carried as they are only so the import can say it
+ * reset them: every import strips them (`sanitizeImportedMacro`,
+ * `IMPORTED_CAPABILITY_FIELDS`), whatever the file says.
+ *
+ * `variables` is linked because the two sides judge a malformed value
+ * differently. The export redacts it and rebuilds each entry
+ * (`shareMacroVariables`), dropping a value that is not an array. The import
+ * hands the file's value to `sanitizeImportedMacro` as it is: a malformed
+ * declaration still counts as one there, and strips the auto-trigger beside it
+ * (variables and a trigger are exclusive), and every entry is rebuilt there
+ * from its declared members.
+ */
+const SHARED_MACRO_RULES = {
+  id: "link",
+  name: "keep",
+  text: "keep",
+  keybinding: "keep",
+  slot: "keep",
+  secret: "keep",
+  triggerPattern: "keep",
+  triggerCooldown: "keep",
+  triggerInterval: "keep",
+  triggerInitiallyDisabled: "keep",
+  triggerScope: "keep",
+  triggerProfileId: "keep",
+  variables: "link",
+  group: "keep",
+  runIn: "keep",
+  provideIpmiCredentials: "keep",
+  route: "keep"
+} satisfies ShareRules<TerminalMacro>;
+
+const SHARED_MACRO_VARIABLE_RULES = {
+  name: "keep",
+  label: "keep",
+  default: "keep",
+  secret: "keep",
+  remember: "keep"
+} satisfies ShareRules<MacroVariable>;
+
+/**
+ * A macro's variable declarations on the way OUT: redacted by
+ * `withRedactedVariables` — a masked variable loses its default, and a
+ * `variables` that is not an array is dropped — then each entry rebuilt from
+ * its declared members. An entry that is not an object is left for the
+ * recipient's `sanitizeImportedMacro` to drop.
+ */
+function shareMacroVariables(variables: MacroVariable[] | undefined): MacroVariable[] | undefined {
+  const redacted = withRedactedVariables({ variables }).variables;
+  return Array.isArray(redacted)
+    ? redacted.map((entry) =>
+        typeof entry === "object" && entry !== null ? (shareRecord(entry, SHARED_MACRO_VARIABLE_RULES, {}) as MacroVariable) : entry
+      )
+    : redacted;
+}
 
 /**
  * The built-in inventory providers — the only ones whose config field ids
@@ -2089,6 +2200,36 @@ function shareOrigin(origin: ServerOrigin, sourceId: string, lenses: ShareLenses
   }) as ServerOrigin;
 }
 
+/**
+ * A server as a share carries it — `SHARED_SERVER_RULES`, with every reference
+ * re-pointed through `lenses` — the one call both sides make. The proxy goes
+ * through `remapProxy`, which drops a SOCKS5/HTTP login and a jump host that
+ * is not in the bundle; both profile links through `linkProfile`; the IPMI
+ * gateway, a SERVER-LIST reference like `proxy.jumpHostId`, through
+ * `linkServer`. What differs between the sides is decided by each and passed
+ * in: the record's `id`, its `origin` (already rebuilt by `shareOrigin`, or
+ * `undefined` where it does not travel), and `dropAuthLink`, the sync's own
+ * link to a profile that arrives with no key file
+ * (`syncAuthLinkArrivesNeedingServerKey`), left out with its stamp.
+ */
+function shareServer(
+  server: ServerConfig,
+  id: string,
+  lenses: ShareLenses,
+  origin: ServerOrigin | undefined,
+  dropAuthLink: boolean
+): ServerConfig {
+  const linkProfile = (profileId: string | undefined): string | undefined => (profileId ? lenses.linkProfile(profileId) : undefined);
+  return shareRecord(server, SHARED_SERVER_RULES, {
+    id: () => id,
+    proxy: (proxy) => remapProxy(proxy, lenses.linkServer),
+    authProfileId: (profileId) => (dropAuthLink ? undefined : linkProfile(profileId)),
+    ipmiAuthProfileId: linkProfile,
+    ipmiGatewayServerId: (serverId) => (serverId ? lenses.linkServer(serverId) : undefined),
+    origin: () => origin
+  }) as ServerConfig;
+}
+
 export function sanitizeForSharing(
   servers: ServerConfig[],
   tunnels: TunnelProfile[],
@@ -2228,42 +2369,32 @@ export function sanitizeForSharing(
   );
 
   const newServers = servers.map((s) => {
-    const newId = idMap.get(s.id)!;
     // A row whose origin travels loses the sync's own link to a key profile
     // together with its stamp (`syncAuthLinkArrivesNeedingServerKey`). A row
     // whose origin does not arrives as a server no source owns, which the sync
     // never unlinks, so it keeps its link as any hand-made server does.
     const dropAuthLink = originShips(s) && syncAuthLinkArrivesNeedingServerKey(s, lenses);
-    const newAuthProfileId = dropAuthLink ? undefined : linkToShippedProfile(s.authProfileId);
-    const newIpmiAuthProfileId = linkToShippedProfile(s.ipmiAuthProfileId);
-    // JUMP-HOST IPMI ROUTING (issue #48 PR-C) — an id reference INTO THE SERVER
-    // LIST, so it remaps through the SAME idMap as `proxy.jumpHostId` (every
-    // server's new id is already assigned in the second pass above), and takes
-    // `remapProxy`'s out-of-export disposition: when the gateway server is not in
-    // the bundle the field is dropped to `undefined`, never carried stale. An
-    // unset gateway means "the BMC is reachable locally" — a safe working default
-    // on the recipient — whereas a stale id can only fail confusingly at run time.
-    const newIpmiGatewayServerId = s.ipmiGatewayServerId ? idMap.get(s.ipmiGatewayServerId) : undefined;
     // `origin` travels when its source does (`shareOrigin`); a dangling one is
     // dropped (see `originShips`).
     //
-    // ADOPT 1 — `formerlySynced` never travels, and the two are deliberately not
-    // treated alike. A shipped origin names a source that travels in the SAME
-    // file and lands with a fresh id, so on the recipient it owns exactly the rows
-    // it owned here, and nothing else. The marker is the adoption key: it names a
-    // source removed on THIS machine, and on the recipient's it would let their
-    // OWN pre-existing source of the same provider silently claim a server it
-    // never synced — and take its whole lifecycle, prune policy included. Backups
-    // keep the marker (full fidelity, same machine); a share never does.
-    return {
-      ...scrubSharedServer(s),
-      id: newId,
-      proxy: remapProxy(s.proxy, lenses.linkServer),
-      authProfileId: newAuthProfileId,
-      ipmiAuthProfileId: newIpmiAuthProfileId,
-      ipmiGatewayServerId: newIpmiGatewayServerId,
-      origin: originShips(s) ? shareOrigin(s.origin!, sourceIdMap.get(s.origin!.sourceId)!, lenses, dropAuthLink) : undefined
-    };
+    // ADOPT 1 — `formerlySynced` never travels (`SHARED_SERVER_RULES`), and the
+    // two are deliberately not treated alike. A shipped origin names a source
+    // that travels in the SAME file and lands with a fresh id, so on the
+    // recipient it owns exactly the rows it owned here, and nothing else. The
+    // marker is the adoption key: it names a source removed on THIS machine, and
+    // on the recipient's it would let their OWN pre-existing source of the same
+    // provider silently claim a server it never synced — and take its whole
+    // lifecycle, prune policy included. Backups keep the marker (full fidelity,
+    // same machine); a share never does.
+    //
+    // JUMP-HOST IPMI ROUTING (issue #48 PR-C) — every server's new id is already
+    // in `idMap` (the second pass above), so the gateway link resolves to a
+    // gateway anywhere in the bundle and is dropped when the gateway is not in
+    // it: an unset gateway means "the BMC is reachable locally", a safe working
+    // default on the recipient, whereas a stale id can only fail confusingly at
+    // run time.
+    const origin = originShips(s) ? shareOrigin(s.origin!, sourceIdMap.get(s.origin!.sourceId)!, lenses, dropAuthLink) : undefined;
+    return shareServer(s, idMap.get(s.id)!, lenses, origin, dropAuthLink);
   });
 
   // SAVED FILTERS — a name and a query string, both the same class of data as a
@@ -2272,33 +2403,27 @@ export function sanitizeForSharing(
     (filter) => shareRecord(filter, SHARED_SAVED_FILTER_RULES, { id: () => randomUUID() }) as SavedFilterDefinition
   );
 
-  const newTunnels = tunnels.map((t) => {
-    const newId = randomUUID();
-    idMap.set(t.id, newId);
-    const remapped = { ...t, id: newId };
-    if (remapped.defaultServerId) {
-      remapped.defaultServerId = idMap.get(remapped.defaultServerId) ?? undefined;
-    }
-    return remapped;
-  });
+  // A tunnel's default server is re-pointed at that server's id in the bundle,
+  // and dropped when the server is not in it.
+  const newTunnels = tunnels.map(
+    (t) =>
+      shareRecord(t, SHARED_TUNNEL_RULES, {
+        id: () => randomUUID(),
+        defaultServerId: (serverId) => (serverId ? lenses.linkServer(serverId) : undefined)
+      }) as TunnelProfile
+  );
 
-  const newSerialProfiles = serialProfiles.map((p) => {
-    const newId = randomUUID();
-    idMap.set(p.id, newId);
-    return { ...scrubSharedSerialProfile(p), id: newId };
-  });
+  const newSerialProfiles = serialProfiles.map(
+    (p) => shareRecord(p, SHARED_SERIAL_PROFILE_RULES, { id: () => randomUUID() }) as SerialProfile
+  );
 
-  const newLocalShellProfiles = localShellProfiles.map((p) => {
-    const newId = randomUUID();
-    idMap.set(p.id, newId);
-    return { ...scrubSharedLocalShellProfile(p), id: newId };
-  });
+  const newLocalShellProfiles = localShellProfiles.map(
+    (p) => shareRecord(p, SHARED_LOCAL_SHELL_PROFILE_RULES, { id: () => randomUUID() }) as LocalShellProfile
+  );
 
   const sanitizedMacros = macros
     .filter((m) => !m.secret)
-    // fresh ids for share exports; variable declarations normalized so a masked
-    // variable's plaintext `default` never leaves this machine in a share file.
-    .map((m) => withRedactedVariables({ ...m, id: randomUUID() }));
+    .map((m) => shareRecord(m, SHARED_MACRO_RULES, { id: () => randomUUID(), variables: shareMacroVariables }) as TerminalMacro);
 
   // Sanitize paths from the settings snapshot.
   const sanitizedSettings = scrubSharedSettings(settings);
@@ -3490,8 +3615,8 @@ export function registerConfigCommands(
         continue;
       }
       /**
-       * ADOPT 1 — `formerlySynced`, which `scrubSharedServer` drops rather than
-       * remaps, deliberately NOT symmetric with `origin` below.
+       * ADOPT 1 — `formerlySynced`, which `SHARED_SERVER_RULES` drops rather
+       * than remaps, deliberately NOT symmetric with `origin` below.
        *
        * An `origin` that survives `linkToImportedSource` names a source that
        * travelled in this same file and has just landed with a fresh id, so it
@@ -3511,9 +3636,9 @@ export function registerConfigCommands(
        * accept a file from someone else, which makes the record theirs by hand
        * — and the governing rule is that a server the user made by hand is
        * never adopted. A share file is untrusted third-party content by
-       * construction (the same scrub replaces every server's `username` and
-       * `keyPath` for that reason), so the marker is exactly the kind of assertion a trust
-       * boundary exists to refuse.
+       * construction (the same rules replace every server's `username` and
+       * `keyPath` for that reason), so the marker is exactly the kind of
+       * assertion a trust boundary exists to refuse.
        *
        * `sanitizeForSharing` already strips it on the way out, so a file this
        * extension produced carries none and this costs it nothing. What is left
@@ -3531,25 +3656,14 @@ export function registerConfigCommands(
        * history, where the marker is true, and stripping it there would make
        * every restored kept server permanently unadoptable.
        */
-      const remappedServer: ServerConfig = {
-        // The export's own scrub, again: every username becomes SHARED_USERNAME —
-        // a cached row's moving with the `syncedUsername` stamp `shareOrigin` has
-        // just rewritten — the key path is blanked, and `formerlySynced` dropped.
-        ...scrubSharedServer(server),
-        id: idMap.get(server.id)!,
-        proxy: remapProxy(server.proxy, lenses.linkServer),
-        authProfileId: origin !== undefined && syncAuthLinkUnusable ? undefined : linkToImportedProfile(server.authProfileId),
-        // The BMC credential link goes through the same lens: it is a profile
-        // reference like any other, and a share bundle's ids are the sender's.
-        ipmiAuthProfileId: linkToImportedProfile(server.ipmiAuthProfileId),
-        // The IPMI gateway link is a SERVER-LIST reference, not a profile one, so
-        // it remaps through the same `idMap` as `proxy.jumpHostId` (server half) —
-        // NOT `linkToImportedProfile`. Raw-remapped here; FINALIZED below once the
-        // full surviving-server set is known (`linkToImportedServer`), because a
-        // raw remap alone keeps a fresh id even for a gateway that failed import.
-        ipmiGatewayServerId: server.ipmiGatewayServerId ? (idMap.get(server.ipmiGatewayServerId) ?? undefined) : undefined,
-        origin
-      };
+      // The export's own rules, again (`shareServer`): only the declared fields
+      // land, every username becomes SHARED_USERNAME — a cached row's moving with
+      // the `syncedUsername` stamp `shareOrigin` has just rewritten — the key path
+      // is blanked, and `formerlySynced` dropped. The IPMI gateway link is
+      // raw-remapped through `idMap` here and FINALIZED below, once the full
+      // surviving-server set is known (`linkToImportedServer`), because a raw
+      // remap alone keeps a fresh id even for a gateway that failed import.
+      const remappedServer = shareServer(server, idMap.get(server.id)!, lenses, origin, origin !== undefined && syncAuthLinkUnusable);
       remappedServers.push(remappedServer);
       if (validateServerConfig(remappedServer)) {
         importedServerIds.add(remappedServer.id);
@@ -3598,34 +3712,37 @@ export function registerConfigCommands(
       };
       tally(await addIfValid(finalizedServer, validateServerConfig, (e) => addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s))));
     }
+    // Tunnels, serial and Local Shell profiles: rebuilt by the export's own
+    // rules, each with a fresh id, before validation — so what the export
+    // leaves out (a serial profile's learned `deviceHint`, a Local Shell's
+    // working directory, startup command and environment), and any member the
+    // model does not declare, cannot land from a hand-edited file. A tunnel's
+    // server link is remapped through `idMap`, as it always has been.
     for (const tunnel of tunnels) {
-      ensureId(tunnel as unknown as Record<string, unknown>);
-      const remappedTunnel: TunnelProfile = {
-        ...tunnel,
-        id: randomUUID(),
-        defaultServerId: tunnel.defaultServerId ? idMap.get(tunnel.defaultServerId) ?? undefined : undefined
-      };
+      const remappedTunnel = shareRecord(tunnel, SHARED_TUNNEL_RULES, {
+        id: () => randomUUID(),
+        defaultServerId: (serverId) => (serverId ? idMap.get(serverId) : undefined)
+      }) as TunnelProfile;
       tally(await addIfValid(remappedTunnel, validateTunnelProfile, (e) => core.addOrUpdateTunnel(e)));
     }
     for (const profile of serialProfiles) {
-      ensureId(profile as unknown as Record<string, unknown>);
-      const remappedProfile: SerialProfile = { ...scrubSharedSerialProfile(profile), id: randomUUID() };
+      const remappedProfile = shareRecord(profile, SHARED_SERIAL_PROFILE_RULES, { id: () => randomUUID() }) as SerialProfile;
       tally(await addIfValid(remappedProfile, validateSerialProfile, (e) => core.addOrUpdateSerialProfile(e)));
     }
     for (const profile of localShellProfiles) {
-      ensureId(profile as unknown as Record<string, unknown>);
-      const remappedProfile: LocalShellProfile = { ...scrubSharedLocalShellProfile(profile), id: randomUUID() };
+      const remappedProfile = shareRecord(profile, SHARED_LOCAL_SHELL_PROFILE_RULES, { id: () => randomUUID() }) as LocalShellProfile;
       tally(await addIfValid(remappedProfile, validateLocalShellProfile, (e) => core.addOrUpdateLocalShellProfile(e)));
     }
-    // SAVED FILTERS — a name and a query string; only the id is new. Built field
-    // by field so nothing else a hand-edited file puts beside them lands.
+    // SAVED FILTERS — a name and a query string; only the id is new. Rebuilt by
+    // the export's own rules, so nothing else a hand-edited file puts beside
+    // them lands.
     let importedFilterCount = 0;
     for (const filter of savedFilters) {
       if (typeof filter !== "object" || filter === null) {
         skipped++;
         continue;
       }
-      const remappedFilter: SavedFilterDefinition = { id: randomUUID(), name: filter.name, filter: filter.filter };
+      const remappedFilter = shareRecord(filter, SHARED_SAVED_FILTER_RULES, { id: () => randomUUID() }) as SavedFilterDefinition;
       if (await addIfValid(remappedFilter, validateSavedFilter, (e) => core.addOrUpdateSavedFilter(e))) {
         importedFilterCount++;
       } else {
@@ -3689,7 +3806,11 @@ export function registerConfigCommands(
         // plaintext `default` (which then reaches globalState and `Copy All as JSON`),
         // an over-cap or malformed `variables` array, or a variables+trigger macro
         // whose auto-trigger can never compile.
-        const remapped: TerminalMacro = sanitizeImportedMacro({ ...m, id: randomUUID() });
+        // Rebuilt by the export's own rules first (`SHARED_MACRO_RULES`), so a
+        // member the model does not declare never reaches the store.
+        const remapped: TerminalMacro = sanitizeImportedMacro(
+          shareRecord(m, SHARED_MACRO_RULES, { id: () => randomUUID(), variables: (variables) => variables }) as TerminalMacro
+        );
         const key = keyOf(remapped);
         if (!existingByKey.has(key)) {
           // Record the key as we go: two entries in one share file can differ before
