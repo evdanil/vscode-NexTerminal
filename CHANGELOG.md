@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.270] — 2026-09-25
+
+### Fixed
+
+- **Malformed JSON import rows no longer abort Nexus config imports halfway through.** Share imports skip and count non-record auth profiles, servers, tunnels, serial and Local Shell profiles, and macros; backup imports do the same for inventory sources and macro-list rows. Remaining valid rows import and the completion message reports the skipped entries. Secret macros intentionally omitted from a share are not counted as malformed.
+
 ## [2.8.269] — 2026-09-25
 
 ### Fixed

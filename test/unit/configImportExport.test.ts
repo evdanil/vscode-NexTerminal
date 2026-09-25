@@ -2360,6 +2360,49 @@ describe("backup import", () => {
     await registeredCommands.get("nexus.config.import")!();
   }
 
+  it.each(["merge", "replace"] as const)("skips malformed backup inventory sources in %s mode and restores later rows", async (mode) => {
+    await core.addOrUpdateInventorySource(makeInventorySource({ id: "local-source", name: "Local Source" }));
+    const importData = makeExportData({
+      version: 2,
+      exportType: "backup",
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      authProfiles: [],
+      inventorySources: [null, [], makeInventorySource({ id: "restored-source", name: "Restored Source" })]
+    });
+
+    await runBackupImport(importData, mode);
+
+    const expectedSources = mode === "merge" ? ["Local Source", "Restored Source"] : ["Restored Source"];
+    expect(core.getSnapshot().inventorySources.map((source) => source.name)).toEqual(expectedSources);
+    expect(mockShowInformationMessage).toHaveBeenCalledWith(expect.stringContaining("(2 skipped)"));
+  });
+
+  it.each([
+    { format: "v2", mode: "merge", macros: [null, [], { id: "public", name: "Public", text: "echo hi" }, { id: "secret", name: "Secret", text: "", secret: true }] },
+    { format: "v2", mode: "replace", macros: [null, [], { id: "public", name: "Public", text: "echo hi" }, { id: "secret", name: "Secret", text: "", secret: true }] },
+    { format: "legacy", mode: "merge", macros: [null, [], { id: "public", name: "Public", text: "echo hi" }, { id: "secret", name: "Secret", text: "cleartext", secret: true }] },
+    { format: "legacy", mode: "replace", macros: [null, [], { id: "public", name: "Public", text: "echo hi" }, { id: "secret", name: "Secret", text: "cleartext", secret: true }] }
+  ] as const)("counts malformed $format backup macros in $mode mode without treating valid secret macros as invalid", async ({ format, mode, macros }) => {
+    const importData = makeExportData({
+      version: format === "v2" ? 2 : 1,
+      exportType: "backup",
+      servers: [],
+      tunnels: [],
+      serialProfiles: [],
+      ...(format === "v2" ? { macros } : { settings: { "nexus.terminal.macros": macros } })
+    });
+
+    await runBackupImport(importData, mode);
+
+    expect(getMacros().map((macro) => macro.name)).toEqual(["Public", "Secret"]);
+    expect(mockShowInformationMessage).toHaveBeenCalledWith(expect.stringContaining("(2 skipped)"));
+    if (format === "v2") {
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("1 secret macro could not be decrypted"));
+    }
+  });
+
   // TELNET (Phase 0) — the round trip a telnet server has to survive. The
   // fixture is discriminating on BOTH halves of the model change: a rebuild that
   // enumerated fields and forgot `protocol` restores an SSH server (which would
