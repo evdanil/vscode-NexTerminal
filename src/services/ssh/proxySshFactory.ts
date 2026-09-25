@@ -143,27 +143,50 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     server: ServerConfig,
     context?: SshConnectContext
   ): Promise<SshConnection> {
+    // `server` may be a host-only alternate-address clone. Capture identity
+    // from the live source record at the start and derive its endpoint
+    // signature from the original config. SilentAuth checks both before using
+    // credentials and before persisting them, so a replacement during any
+    // jump-host or alternate-address await cannot inherit this attempt's auth.
+    const credentialSource = context?.credentialSource ?? server;
+    const credentialRecord = this.serverLookup(credentialSource.id) ?? null;
+    const credentialEndpointSignature = this.authFactory.getCredentialEndpointSignature?.(credentialSource, this.serverLookup);
+    const hasCredentialGuard = typeof this.authFactory.getCredentialEndpointSignature === "function";
     if (!server.proxy) {
-      return context?.onAuthMessage
-        ? this.authFactory.connect(server, { onAuthMessage: context.onAuthMessage })
-        : this.authFactory.connect(server);
+      if (!context?.onAuthMessage && !hasCredentialGuard) {
+        return this.authFactory.connect(server);
+      }
+      return this.authFactory.connect(server, {
+        ...(context?.onAuthMessage && { onAuthMessage: context.onAuthMessage }),
+        ...(credentialEndpointSignature !== undefined && { credentialEndpointSignature }),
+        ...(hasCredentialGuard && { credentialRecord })
+      });
     }
-    return this.connectViaProxy(server, server.proxy, context?.proxyVisited ?? new Set<string>(), context?.onAuthMessage);
+    return this.connectViaProxy(
+      server,
+      server.proxy,
+      context?.proxyVisited ?? new Set<string>(),
+      context?.onAuthMessage,
+      credentialEndpointSignature,
+      credentialRecord
+    );
   }
 
   private async connectViaProxy(
     server: ServerConfig,
     proxy: ProxyConfig,
     visited: ReadonlySet<string>,
-    onAuthMessage?: (text: string) => void
+    onAuthMessage?: (text: string) => void,
+    credentialEndpointSignature?: string,
+    credentialRecord?: ServerConfig | null
   ): Promise<SshConnection> {
     switch (proxy.type) {
       case "ssh":
-        return this.connectViaSshJump(server, proxy.jumpHostId, visited, onAuthMessage);
+        return this.connectViaSshJump(server, proxy.jumpHostId, visited, onAuthMessage, credentialEndpointSignature, credentialRecord);
       case "socks5":
-        return this.connectViaSocks5(server, proxy, onAuthMessage);
+        return this.connectViaSocks5(server, proxy, onAuthMessage, credentialEndpointSignature, credentialRecord);
       case "http":
-        return this.connectViaHttpConnect(server, proxy, onAuthMessage);
+        return this.connectViaHttpConnect(server, proxy, onAuthMessage, credentialEndpointSignature, credentialRecord);
     }
   }
 
@@ -171,7 +194,9 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     target: ServerConfig,
     jumpHostId: string,
     visited: ReadonlySet<string>,
-    onAuthMessage?: (text: string) => void
+    onAuthMessage?: (text: string) => void,
+    credentialEndpointSignature?: string,
+    credentialRecord?: ServerConfig | null
   ): Promise<SshConnection> {
     const nextVisited = this.addToVisited(visited, target);
     const jumpServer = this.serverLookup(jumpHostId);
@@ -236,7 +261,9 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       targetConnection = await this.authFactory.connect(target, {
         sockFactory,
         route: () => jumpConnectionRoute(jumpConnection),
-        ...(onAuthMessage && { onAuthMessage })
+        ...(onAuthMessage && { onAuthMessage }),
+        ...(credentialEndpointSignature !== undefined && { credentialEndpointSignature }),
+        ...(typeof this.authFactory.getCredentialEndpointSignature === "function" && { credentialRecord })
       });
     } catch (error) {
       jumpConnection.dispose();
@@ -253,7 +280,9 @@ export class ProxySshFactory implements ContextAwareSshFactory {
   private async connectViaSocks5(
     target: ServerConfig,
     proxy: Socks5Proxy,
-    onAuthMessage?: (text: string) => void
+    onAuthMessage?: (text: string) => void,
+    credentialEndpointSignature?: string,
+    credentialRecord?: ServerConfig | null
   ): Promise<SshConnection> {
     const resolved = await this.resolveProxyPassword(target, proxy);
     const proxyPassword = resolved.password;
@@ -311,7 +340,15 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       return socket;
     };
 
-    const connection = await this.authenticateThroughProxy(target, proxy, resolved, sockFactory, onAuthMessage);
+    const connection = await this.authenticateThroughProxy(
+      target,
+      proxy,
+      resolved,
+      sockFactory,
+      onAuthMessage,
+      credentialEndpointSignature,
+      credentialRecord
+    );
     // lastSock is guaranteed to be defined here: a successful authFactory.connect
     // means sockFactory was called and resolved at least once.
     return new ProxiedSshConnection(connection, socketCleanup(lastSock!), socketCloseRelay(lastSock!));
@@ -320,7 +357,9 @@ export class ProxySshFactory implements ContextAwareSshFactory {
   private async connectViaHttpConnect(
     target: ServerConfig,
     proxy: HttpConnectProxy,
-    onAuthMessage?: (text: string) => void
+    onAuthMessage?: (text: string) => void,
+    credentialEndpointSignature?: string,
+    credentialRecord?: ServerConfig | null
   ): Promise<SshConnection> {
     const resolved = await this.resolveProxyPassword(target, proxy);
     const proxyPassword = resolved.password;
@@ -357,7 +396,15 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       return socket;
     };
 
-    const connection = await this.authenticateThroughProxy(target, proxy, resolved, sockFactory, onAuthMessage);
+    const connection = await this.authenticateThroughProxy(
+      target,
+      proxy,
+      resolved,
+      sockFactory,
+      onAuthMessage,
+      credentialEndpointSignature,
+      credentialRecord
+    );
     // lastSock is guaranteed to be defined here: a successful authFactory.connect
     // means sockFactory was called and resolved at least once.
     return new ProxiedSshConnection(connection, socketCleanup(lastSock!), socketCloseRelay(lastSock!));
@@ -368,14 +415,18 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     proxy: Socks5Proxy | HttpConnectProxy,
     resolved: ResolvedProxyPassword,
     sockFactory: () => Promise<Duplex>,
-    onAuthMessage?: (text: string) => void
+    onAuthMessage?: (text: string) => void,
+    credentialEndpointSignature?: string,
+    credentialRecord?: ServerConfig | null
   ): Promise<SshConnection> {
     let connection: SshConnection;
     try {
       connection = await this.authFactory.connect(target, {
         sockFactory,
         route: () => proxyEndpointRoute(proxy),
-        ...(onAuthMessage && { onAuthMessage })
+        ...(onAuthMessage && { onAuthMessage }),
+        ...(credentialEndpointSignature !== undefined && { credentialEndpointSignature }),
+        ...(typeof this.authFactory.getCredentialEndpointSignature === "function" && { credentialRecord })
       });
     } catch (error) {
       // The shared answer may be what failed: the next connect asks afresh.
@@ -388,7 +439,7 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     // sensitive sockFactory (setImmediate/resume banner-loss path). Best-effort: a
     // keychain-store failure must not abort an already-established connection.
     if (resolved.storeOnSuccess) {
-      await this.persistProxyPasswordIfEndpointUnchanged(target, proxy, resolved.storeOnSuccess);
+      await this.persistProxyPasswordIfEndpointUnchanged(target, proxy, credentialRecord ?? undefined, resolved.storeOnSuccess);
     }
     // Settled only after the store, so a connect arriving in between still finds
     // the answer. From here the vault is the source of truth: a password removed
@@ -451,6 +502,7 @@ export class ProxySshFactory implements ContextAwareSshFactory {
   private async persistProxyPasswordIfEndpointUnchanged(
     target: ServerConfig,
     connectionProxy: Socks5Proxy | HttpConnectProxy,
+    expectedRecord: ServerConfig | undefined,
     storeOnSuccess: { key: string; value: string }
   ): Promise<void> {
     try {
@@ -459,7 +511,7 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       // interleave between the check passing and the store completing.
       await configMutationLock.runExclusive(async () => {
         const live = this.serverLookup(target.id);
-        if (live && isSameAuthenticatedEndpoint(live.proxy, connectionProxy)) {
+        if (live && live === expectedRecord && isSameAuthenticatedEndpoint(live.proxy, connectionProxy)) {
           await this.vault.store(storeOnSuccess.key, storeOnSuccess.value);
         }
       });

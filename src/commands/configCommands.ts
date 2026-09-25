@@ -4,7 +4,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, LocalShellProfile, ProxyConfig, ServerConfig, ServerOrigin, TunnelProfile, SerialProfile } from "../models/config";
-import { authProfileNeedsServerKeyPath, cloneTemplatedStamps, templatedHasAnyStamp } from "../models/config";
+import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials, cloneTemplatedStamps, templatedHasAnyStamp } from "../models/config";
 import type { InventorySourceConfig, InventorySourceValues, TemplateRule } from "../models/inventory";
 import { inventorySecretKey } from "../models/inventory";
 import type { DeviceTemplateProfile, TemplateField } from "../models/deviceTemplate";
@@ -102,6 +102,7 @@ import {
   EVE_NG_STATUS_POLL_MIN_SECONDS
 } from "../services/inventory/providers/eveNgProvider";
 import { ORPHAN_FOLDER_NAME } from "../services/inventory/syncEngine";
+import { isSameAuthenticatedEndpoint } from "../services/inventory/proxySecretHygiene";
 import { GNS3_PROVIDER_ID, GNS3_STATUS_POLL_FIELD_ID } from "../services/inventory/providers/gns3Provider";
 import { NETBOX_PROVIDER_ID } from "../services/inventory/providers/netboxProvider";
 import { PROXMOX_PROVIDER_ID, PROXMOX_STATUS_POLL_FIELD_ID } from "../services/inventory/providers/proxmoxProvider";
@@ -1402,6 +1403,160 @@ async function restoreSecrets(
     if (!importedIds.has(id)) continue;
     await vault.store(keyFn(id), secret);
   }
+}
+
+/**
+ * The secrets saved under a server's own id (see `deleteServerSecrets`), each
+ * with the bucket of a backup's encrypted section that restores it. One table,
+ * so a backup restore and the Replace completion message (which says whose
+ * cleared secrets the backup did NOT put back) cannot disagree about which is
+ * which.
+ */
+const SERVER_SECRETS = [
+  { key: passwordSecretKey, bucket: "passwords" },
+  { key: passphraseSecretKey, bucket: "passphrases" },
+  { key: proxyPasswordSecretKey, bucket: "proxyPasswords" }
+] as const;
+type ServerSecretBucket = (typeof SERVER_SECRETS)[number]["bucket"];
+
+/** The buckets of the secrets actually saved under a server's own id. */
+async function savedServerSecretBuckets(vault: SecretVault, serverId: string): Promise<ServerSecretBucket[]> {
+  const saved: ServerSecretBucket[] = [];
+  for (const { key, bucket } of SERVER_SECRETS) {
+    if ((await vault.get(key(serverId))) !== undefined) {
+      saved.push(bucket);
+    }
+  }
+  return saved;
+}
+
+/**
+ * ISSUE #175 — whether two server records name the same ENDPOINT, the one its
+ * saved secrets were entered for. The vault files them by server id alone, and
+ * Replace removes every local server and re-imports the file's with their ids,
+ * so a file carrying no seal (an older backup, a hand-written export, a backup
+ * with its encrypted part removed) can re-create id X anywhere; the secrets are
+ * kept only when this returns true — for the server and every jump host on its
+ * route (`serversKeepingSecrets`). The endpoint is everything in the record
+ * itself that decides where those secrets go:
+ *  - `host`, and `altHost` — the SSH connect retries the same credentials
+ *    against the alternate address (`SshPty.start`), which is why the
+ *    connection pool compares it too (`pooledConnectionParamsChanged`);
+ *  - `port` and `username`;
+ *  - the proxy, because a hostname resolves wherever the proxy puts it and a
+ *    proxy password goes to the proxy itself: none on either side (absent and
+ *    `null` alike — `validateServerConfig` admits both), or the same kind with
+ *    the same members — `jumpHostId` for an SSH jump host; `host`, `port` and
+ *    `username` for SOCKS5/HTTP, the identity the proxy-password hygiene
+ *    already keeps a secret by (`isSameAuthenticatedEndpoint`).
+ * Nothing else counts: a renamed, moved or re-flagged server at the same
+ * endpoint keeps its secrets. SSH jump hosts additionally compare their
+ * auth-profile identity and effective connection fields: replacing a profile
+ * can change the bastion user even when its raw server record is unchanged.
+ * Compared exactly — a difference in case or spacing costs a re-prompt, never
+ * a password sent somewhere new.
+ */
+function sameServerEndpoint(a: ServerConfig, b: ServerConfig): boolean {
+  return a.host === b.host && a.altHost === b.altHost && a.port === b.port && a.username === b.username && sameProxy(a.proxy, b.proxy);
+}
+
+function sameProxy(a: ProxyConfig | null | undefined, b: ProxyConfig | null | undefined): boolean {
+  if (!a || !b) {
+    return !a && !b;
+  }
+  if (a.type === "ssh" || b.type === "ssh") {
+    return a.type === "ssh" && b.type === "ssh" && a.jumpHostId === b.jumpHostId;
+  }
+  return isSameAuthenticatedEndpoint(a, b);
+}
+
+function effectiveSshAuthIdentity(server: ServerConfig, profiles: ReadonlyMap<string, AuthProfile>): string {
+  const profile = server.authProfileId ? profiles.get(server.authProfileId) : undefined;
+  const owned = authProfileOwnedCredentials(profile);
+  const authType = owned.authType ?? server.authType;
+  return JSON.stringify([
+    profile ? server.authProfileId : null,
+    owned.username ?? server.username,
+    authType,
+    authType === "key" ? (owned.keyPath ?? server.keyPath ?? null) : null
+  ]);
+}
+
+function sameEffectiveSshAuthIdentity(
+  before: ServerConfig,
+  after: ServerConfig,
+  beforeProfiles: ReadonlyMap<string, AuthProfile>,
+  afterProfiles: ReadonlyMap<string, AuthProfile>
+): boolean {
+  return effectiveSshAuthIdentity(before, beforeProfiles) === effectiveSshAuthIdentity(after, afterProfiles);
+}
+
+/**
+ * ISSUE #175 — the servers a Replace removed whose saved secrets it may keep:
+ * every valid record the file writes under the id has the same endpoint
+ * (`sameServerEndpoint`), and so does every SSH jump host on its route,
+ * including the jump host's auth-profile identity and effective connection
+ * fields. A jump host is resolved by id when connecting (`ProxySshFactory`), so a jump host
+ * the file moves — or does not bring back — moves the route of every server
+ * behind it, however deep the chain; the closure runs to a fixpoint, which
+ * settles cycles too. Judged over the whole file before anything is written,
+ * so the order of its records does not matter: a jump host listed after the
+ * servers behind it still decides them. A record that fails validation is
+ * never written and so decides nothing.
+ */
+function serversKeepingSecrets(
+  removed: readonly ServerConfig[],
+  incoming: readonly unknown[] | undefined,
+  removedAuthProfiles: readonly unknown[],
+  incomingAuthProfiles: readonly unknown[] | undefined
+): Set<string> {
+  const removedById = new Map(removed.map((server) => [server.id, server]));
+  const profilesById = (profiles: readonly unknown[]): Map<string, AuthProfile> => {
+    const result = new Map<string, AuthProfile>();
+    for (const profile of Array.isArray(profiles) ? profiles : []) {
+      if (validateAuthProfile(profile)) {
+        result.set(profile.id, profile);
+      }
+    }
+    return result;
+  };
+  const beforeProfiles = profilesById(removedAuthProfiles);
+  const afterProfiles = profilesById(incomingAuthProfiles ?? []);
+  const validIncoming: ServerConfig[] = [];
+  for (const record of incoming ?? []) {
+    if (validateServerConfig(record)) validIncoming.push(record);
+  }
+  const jumpHostIds = new Set<string>();
+  for (const server of [...removed, ...validIncoming]) {
+    if (server.proxy?.type === "ssh") jumpHostIds.add(server.proxy.jumpHostId);
+  }
+  const kept = new Set<string>();
+  const changed = new Set<string>();
+  for (const record of validIncoming) {
+    const before = removedById.get(record.id);
+    if (before !== undefined) {
+      const sameEndpoint = sameServerEndpoint(before, record);
+      const sameJumpAuth =
+        !jumpHostIds.has(record.id) ||
+        sameEffectiveSshAuthIdentity(before, record, beforeProfiles, afterProfiles);
+      (sameEndpoint && sameJumpAuth ? kept : changed).add(record.id);
+    }
+  }
+  for (const id of changed) {
+    kept.delete(id);
+  }
+  let shrank = true;
+  while (shrank) {
+    shrank = false;
+    for (const id of kept) {
+      const proxy = removedById.get(id)!.proxy;
+      if (proxy?.type === "ssh" && !kept.has(proxy.jumpHostId)) {
+        kept.delete(id);
+        shrank = true;
+      }
+    }
+  }
+  return kept;
 }
 
 interface SanitizedSnapshot {
@@ -3627,10 +3782,38 @@ export function registerConfigCommands(
     await configMutationLock.runExclusive(() => importMergeReplaceLocked(data, mode, decryptedSecrets));
   }
 
+  /**
+   * ISSUE #175 — FAIL-SAFE SWEEP. A server Replace removes joins
+   * `awaitingVerdict` just before it is removed, and leaves it only once its
+   * saved secrets are either deleted or known to be kept (see
+   * `serversKeepingSecrets`). Whatever throws in between — a later wipe step's
+   * vault delete, a record write, a secret delete — the secrets of every server
+   * still waiting are deleted before the error propagates: best effort, so one
+   * failed key neither strands the rest nor replaces the ORIGINAL error, which
+   * is rethrown. The direction costs a re-prompt, never a password left for the
+   * next record that brings the id.
+   */
   async function importMergeReplaceLocked(
     data: NexusConfigExport,
     mode: "merge" | "replace",
     decryptedSecrets?: Record<string, unknown>
+  ): Promise<void> {
+    const awaitingVerdict = new Set<string>();
+    try {
+      await applyMergeReplace(data, mode, decryptedSecrets, awaitingVerdict);
+    } catch (error) {
+      for (const id of awaitingVerdict) {
+        await deleteServerSecrets(vault, id, { bestEffort: true });
+      }
+      throw error;
+    }
+  }
+
+  async function applyMergeReplace(
+    data: NexusConfigExport,
+    mode: "merge" | "replace",
+    decryptedSecrets: Record<string, unknown> | undefined,
+    awaitingVerdict: Set<string>
   ): Promise<void> {
     const snapshot = core.getSnapshot();
 
@@ -3653,6 +3836,10 @@ export function registerConfigCommands(
 
     if (mode === "replace") {
       for (const server of snapshot.servers) {
+        // Tracked BEFORE the await: `removeServer` drops the record from memory
+        // before it persists, so a rejected persist still leaves the server gone
+        // for this session — and a retry could bring its id back anywhere.
+        awaitingVerdict.add(server.id);
         await core.removeServer(server.id);
       }
       for (const tunnel of snapshot.tunnels) {
@@ -3759,7 +3946,57 @@ export function registerConfigCommands(
     let skipped = 0;
     // id-PRESERVING import (distinct from the share path's fresh-id remap): each entity keeps
     // its id and is skipped when that id already exists. Same shape across every bucket.
-    const serverTally = await importPreservingIds(data.servers, existingIds, validateServerConfig, (e) => addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s)));
+    // ISSUE #175 — the servers Replace removed above still have their saved
+    // secrets in the vault, filed under ids the file may re-create at another
+    // endpoint or behind a moved jump host (see `serversKeepingSecrets`). A
+    // server not kept loses them BEFORE its record is published:
+    // `nexus.server.connect` does not take `configMutationLock`, so a connect
+    // landing after the publish would otherwise pair the new route with the
+    // old password (the ordering proxySecretHygiene.ts gives for proxy
+    // passwords). A removed server the file does not re-create loses them after
+    // the loop: left behind, they wait for the next record that brings its id.
+    // Secrets a backup carries are restored after all this (`restoreSecrets`
+    // below), so they still win. `awaitingVerdict` and its sweep are described
+    // on `importMergeReplaceLocked`.
+    //
+    // Deciding up front, over the whole file, is what lets a jump host listed
+    // AFTER the servers behind it decide them before they are published.
+    const keepSecrets = mode === "replace"
+      ? serversKeepingSecrets(snapshot.servers, data.servers, snapshot.authProfiles, data.authProfiles)
+      : new Set<string>();
+    // AUTH PROFILES — publish linked credential config before its servers. A
+    // server add emits synchronously, and connects do not wait for
+    // `configMutationLock`; a listener or concurrent command can therefore
+    // start an SSH jump through a just-published server while its referenced
+    // profile is still missing, resolving the raw username and sending a
+    // retained target credential over the wrong route.
+    const authProfileTally = await importPreservingIds(data.authProfiles, existingIds, validateAuthProfile, (e) => core.addOrUpdateAuthProfile(e));
+    // Re-created servers whose secrets saved HERE were cleared, with which ones
+    // — for the completion message, which tells the user why they will be
+    // asked again.
+    const clearedSecretBuckets = new Map<string, ServerSecretBucket[]>();
+    const serverTally = await importPreservingIds(data.servers, existingIds, validateServerConfig, async (e) => {
+      if (awaitingVerdict.has(e.id) && !keepSecrets.has(e.id)) {
+        const saved = await savedServerSecretBuckets(vault, e.id);
+        if (saved.length > 0) {
+          clearedSecretBuckets.set(e.id, saved);
+        }
+        await deleteServerSecrets(vault, e.id);
+        awaitingVerdict.delete(e.id);
+      }
+      await addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s));
+    });
+    // Every id still waiting was either re-created and kept — its verdict is
+    // final — or not re-created at all. A failed delete for one of the latter
+    // throws with it still waiting, so the sweep in `importMergeReplaceLocked`
+    // goes on to clear it and every other one before the error propagates.
+    for (const id of serverTally.importedIds) {
+      awaitingVerdict.delete(id);
+    }
+    for (const id of [...awaitingVerdict]) {
+      await deleteServerSecrets(vault, id);
+      awaitingVerdict.delete(id);
+    }
     const tunnelTally = await importPreservingIds(data.tunnels, existingIds, validateTunnelProfile, (e) => core.addOrUpdateTunnel(e));
     const serialTally = await importPreservingIds(data.serialProfiles, existingIds, validateSerialProfile, (e) => core.addOrUpdateSerialProfile(e));
     // Kept in its own variable (not folded into the array below) because the inventory-secret
@@ -3777,7 +4014,6 @@ export function registerConfigCommands(
     // Environment restored from the encrypted section first; see `restoreEnvFromSecrets`.
     restoreEnvFromSecrets(data.localShellProfiles, decryptedSecrets?.localShellEnv);
     const localShellTally = await importPreservingIds(data.localShellProfiles, existingIds, validateLocalShellProfile, (e) => core.addOrUpdateLocalShellProfile(e));
-    const authProfileTally = await importPreservingIds(data.authProfiles, existingIds, validateAuthProfile, (e) => core.addOrUpdateAuthProfile(e));
     // DEVICE TEMPLATES (PR-T1) — imported id-preserving like every other bucket.
     const deviceTemplateTally = await importPreservingIds(data.deviceTemplates, existingIds, validateDeviceTemplate, (e) =>
       core.addOrUpdateDeviceTemplate(e)
@@ -4243,9 +4479,9 @@ export function registerConfigCommands(
       // this applies in both merge and replace mode.
       const importedServerIds = new Set(serverTally.importedIds);
       const importedAuthProfileIds = new Set(authProfileTally.importedIds);
-      await restoreSecrets(decryptedSecrets.passwords as Record<string, string> | undefined, passwordSecretKey, vault, importedServerIds);
-      await restoreSecrets(decryptedSecrets.passphrases as Record<string, string> | undefined, passphraseSecretKey, vault, importedServerIds);
-      await restoreSecrets(decryptedSecrets.proxyPasswords as Record<string, string> | undefined, proxyPasswordSecretKey, vault, importedServerIds);
+      for (const { key, bucket } of SERVER_SECRETS) {
+        await restoreSecrets(decryptedSecrets[bucket] as Record<string, string> | undefined, key, vault, importedServerIds);
+      }
       await restoreSecrets(decryptedSecrets.authProfilePasswords as Record<string, string> | undefined, authProfilePasswordSecretKey, vault, importedAuthProfileIds);
       await restoreSecrets(decryptedSecrets.authProfilePassphrases as Record<string, string> | undefined, authProfilePassphraseSecretKey, vault, importedAuthProfileIds);
       // Nested (sourceId -> fieldId -> secret) shape, unlike the flat id->secret buckets
@@ -4577,8 +4813,24 @@ export function registerConfigCommands(
     const hostKeyNote = hostKeyConflicts > 0
       ? ` Kept the locally trusted SSH host key for ${plural(hostKeyConflicts, "host")} where the backup holds a different key.`
       : "";
+    // ISSUE #175 — say that credentials this machine had saved were cleared. A
+    // server counts when ANY secret cleared for it was not put back by the
+    // backup (`restoreSecrets` above): a restored password does not stand in
+    // for a cleared proxy password. A secret the backup carries for an id is
+    // restored, so carrying it is the test. The message states only that fact
+    // and promises no prompt: whether the imported record still needs what was
+    // cleared (its auth type, whether it still has an authenticated proxy) is
+    // not something this count knows.
+    const restoredByBackup = (id: string, bucket: ServerSecretBucket): boolean => {
+      const restored = decryptedSecrets?.[bucket];
+      return typeof restored === "object" && restored !== null && Object.prototype.hasOwnProperty.call(restored, id);
+    };
+    const clearedCount = [...clearedSecretBuckets].filter(([id, buckets]) => buckets.some((bucket) => !restoredByBackup(id, bucket))).length;
+    const clearedNote = clearedCount > 0
+      ? ` ${plural(clearedCount, "server")} came back at a different address or route; the credentials saved here for ${clearedCount === 1 ? "it" : "them"} were cleared.`
+      : "";
     void vscode.window.showInformationMessage(
-      `Imported ${plural(imported, "profile")}${mode === "replace" ? " (replaced existing)" : ""}${skipNote}${restoredFileNote}.${hostKeyNote}`
+      `Imported ${plural(imported, "profile")}${mode === "replace" ? " (replaced existing)" : ""}${skipNote}${restoredFileNote}.${hostKeyNote}${clearedNote}`
     );
   }
 

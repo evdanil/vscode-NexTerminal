@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AuthProfile, HttpConnectProxy, ServerConfig, Socks5Proxy } from "../../src/models/config";
 import type { KeyboardInteractiveHandler, PasswordPrompt, SecretVault, SshConnection, SshConnector } from "../../src/services/ssh/contracts";
+import type { ContextAwareSshFactory } from "../../src/services/ssh/contracts";
+import { configMutationLock } from "../../src/services/configMutationLock";
+import { ProxySshFactory, proxyEndpointRoute } from "../../src/services/ssh/proxySshFactory";
 import {
   SilentAuthSshFactory,
   deleteServerSecrets,
@@ -10,7 +13,6 @@ import {
   passphraseSecretKey,
   proxyPasswordSecretKey
 } from "../../src/services/ssh/silentAuth";
-import { ProxySshFactory, proxyEndpointRoute } from "../../src/services/ssh/proxySshFactory";
 import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
 import { PassThrough } from "node:stream";
 
@@ -50,6 +52,14 @@ function createVault(seed?: Record<string, string>): SecretVault {
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 describe("SilentAuthSshFactory", () => {
   it("uses stored password without prompting", async () => {
     const connector: SshConnector = {
@@ -68,6 +78,51 @@ describe("SilentAuthSshFactory", () => {
     expect(prompt.prompt).not.toHaveBeenCalled();
   });
 
+  it("does not read saved credentials when the server is already absent from live state", async () => {
+    const connector: SshConnector = {
+      connect: vi.fn(async () => fakeConnection)
+    };
+    const vault = createVault({ [passwordSecretKey(baseServer.id)]: "saved-secret" });
+    const prompt: PasswordPrompt = { prompt: vi.fn() };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, undefined, () => undefined);
+
+    await expect(factory.connect(baseServer)).rejects.toThrow("configuration changed while connecting");
+
+    expect(vault.get).not.toHaveBeenCalled();
+    expect(connector.connect).not.toHaveBeenCalled();
+  });
+
+  it("does not release an interactive answer after the live server record is replaced", async () => {
+    const liveServer: { current: ServerConfig | undefined } = { current: { ...baseServer, authType: "key", keyPath: "/keys/id_ed25519" } };
+    const inputPromptStarted = deferred<void>();
+    const inputPromptAnswer = deferred<string | undefined>();
+    const connector: SshConnector = {
+      connect: vi.fn(async (_server, auth) => {
+        await auth.onKeyboardInteractive?.("Verification", "", [{ prompt: "Code: ", echo: false }]);
+        return fakeConnection;
+      })
+    };
+    const factory = new SilentAuthSshFactory(
+      connector,
+      createVault(),
+      { prompt: vi.fn() },
+      async () => {
+        inputPromptStarted.resolve();
+        return inputPromptAnswer.promise;
+      },
+      undefined,
+      (id) => (id === baseServer.id ? liveServer.current : undefined)
+    );
+
+    const connecting = factory.connect(liveServer.current);
+    await inputPromptStarted.promise;
+    liveServer.current = { ...liveServer.current! };
+    inputPromptAnswer.resolve("stale-interactive-answer");
+
+    await expect(connecting).rejects.toThrow("configuration changed while connecting");
+    expect(connector.connect).toHaveBeenCalledOnce();
+  });
+
   it("retries with prompted password after auth error and stores when requested", async () => {
     const connector: SshConnector = {
       connect: vi
@@ -79,7 +134,14 @@ describe("SilentAuthSshFactory", () => {
     const prompt: PasswordPrompt = {
       prompt: vi.fn(async () => ({ password: "fresh-secret", save: true }))
     };
-    const factory = new SilentAuthSshFactory(connector, vault, prompt);
+    const factory = new SilentAuthSshFactory(
+      connector,
+      vault,
+      prompt,
+      undefined,
+      undefined,
+      (id) => id === baseServer.id ? baseServer : undefined
+    );
 
     const connection = await factory.connect(baseServer);
 
@@ -225,7 +287,14 @@ describe("SilentAuthSshFactory", () => {
     };
     const lookup = (id: string) => id === "prof-key" ? profile : undefined;
     const vault = createVault({ [passphraseSecretKey(server.id)]: "old-duplicate" });
-    const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, lookup);
+    const factory = new SilentAuthSshFactory(
+      connector,
+      vault,
+      prompt,
+      undefined,
+      lookup,
+      (id) => id === server.id ? server : undefined
+    );
 
     const connection = await factory.connect(server);
 
@@ -488,6 +557,7 @@ describe("SilentAuthSshFactory profile-scoped credential preservation", () => {
 
   it("updates the profile password when a linked server authenticates with save accepted", async () => {
     const serverB = profileServer("srv-b3", "Rotated");
+    const serverA = profileServer("srv-a3", "Fleet Member");
     const profileKey = authProfilePasswordSecretKey("prof-fleet");
     const connector: SshConnector = {
       connect: vi.fn()
@@ -498,7 +568,14 @@ describe("SilentAuthSshFactory profile-scoped credential preservation", () => {
     const prompt: PasswordPrompt = {
       prompt: vi.fn(async () => ({ password: "rotated-pass", save: true }))
     };
-    const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, lookup);
+    const factory = new SilentAuthSshFactory(
+      connector,
+      vault,
+      prompt,
+      undefined,
+      lookup,
+      (id) => id === serverB.id ? serverB : id === serverA.id ? serverA : undefined
+    );
 
     await factory.connect(serverB);
 
@@ -506,7 +583,6 @@ describe("SilentAuthSshFactory profile-scoped credential preservation", () => {
     await expect(vault.get(profileKey)).resolves.toBe("rotated-pass");
 
     // The rest of the fleet picks up the updated credential.
-    const serverA = profileServer("srv-a3", "Fleet Member");
     await factory.connect(serverA);
     expect(connector.connect).toHaveBeenLastCalledWith(
       expect.objectContaining({ id: "srv-a3" }),
@@ -782,7 +858,14 @@ describe("SilentAuthSshFactory vault-failure isolation (Stage B)", () => {
     const prompt: PasswordPrompt = {
       prompt: vi.fn(async () => ({ password: "prompted-pw", save: true }))
     };
-    const factory = new SilentAuthSshFactory(connector, vault, prompt);
+    const factory = new SilentAuthSshFactory(
+      connector,
+      vault,
+      prompt,
+      undefined,
+      undefined,
+      (id) => id === baseServer.id ? baseServer : undefined
+    );
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     try {
@@ -820,7 +903,14 @@ describe("SilentAuthSshFactory vault-failure isolation (Stage B)", () => {
     const prompt: PasswordPrompt = {
       prompt: vi.fn(async () => ({ password: "prompted-pw", save: false }))
     };
-    const factory = new SilentAuthSshFactory(connector, vault, prompt);
+    const factory = new SilentAuthSshFactory(
+      connector,
+      vault,
+      prompt,
+      undefined,
+      undefined,
+      (id) => id === baseServer.id ? baseServer : undefined
+    );
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     try {
@@ -857,7 +947,14 @@ describe("SilentAuthSshFactory vault-failure isolation (Stage B)", () => {
     const prompt: PasswordPrompt = {
       prompt: vi.fn(async () => ({ password: "correct-passphrase", save: true }))
     };
-    const factory = new SilentAuthSshFactory(connector, vault, prompt);
+    const factory = new SilentAuthSshFactory(
+      connector,
+      vault,
+      prompt,
+      undefined,
+      undefined,
+      (id) => id === keyServer.id ? keyServer : undefined
+    );
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     try {
@@ -914,7 +1011,14 @@ describe("SilentAuthSshFactory vault-failure isolation (Stage B)", () => {
       prompt: vi.fn(async () => ({ password: "new-passphrase", save: true }))
     };
     const lookup = (id: string) => id === "prof-key-2" ? profile : undefined;
-    const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, lookup);
+    const factory = new SilentAuthSshFactory(
+      connector,
+      vault,
+      prompt,
+      undefined,
+      lookup,
+      (id) => id === serverWithProfile.id ? serverWithProfile : undefined
+    );
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     try {
@@ -958,7 +1062,14 @@ describe("SilentAuthSshFactory vault-failure isolation (Stage B)", () => {
     const prompt: PasswordPrompt = {
       prompt: vi.fn(async () => ({ password: "correct-passphrase", save: false }))
     };
-    const factory = new SilentAuthSshFactory(connector, vault, prompt);
+    const factory = new SilentAuthSshFactory(
+      connector,
+      vault,
+      prompt,
+      undefined,
+      undefined,
+      (id) => id === keyServer.id ? keyServer : undefined
+    );
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     try {
@@ -973,6 +1084,226 @@ describe("SilentAuthSshFactory vault-failure isolation (Stage B)", () => {
     } finally {
       consoleSpy.mockRestore();
     }
+  });
+});
+
+describe("SilentAuthSshFactory secret writes racing with Replace", () => {
+  it("does not save a password after the same server id is re-added with identical values", async () => {
+    const target: ServerConfig = { ...baseServer };
+    const liveServers = new Map<string, ServerConfig>([[target.id, target]]);
+    const handshake = deferred<SshConnection>();
+    const handshakeStarted = deferred<void>();
+    const passwordKey = passwordSecretKey(target.id);
+    const vault = createVault();
+    const connector: SshConnector = {
+      connect: vi.fn(() => {
+        handshakeStarted.resolve();
+        return handshake.promise;
+      })
+    };
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async () => ({ password: "password-from-removed-record", save: true }))
+    };
+    const factory = new SilentAuthSshFactory(
+      connector,
+      vault,
+      prompt,
+      undefined,
+      undefined,
+      (id) => liveServers.get(id)
+    );
+
+    const connecting = factory.connect(target);
+    await handshakeStarted.promise;
+    await configMutationLock.runExclusive(async () => {
+      await vault.delete(passwordKey);
+      liveServers.set(target.id, { ...target });
+    });
+    handshake.resolve(fakeConnection);
+    await expect(connecting).resolves.toBe(fakeConnection);
+
+    expect(await vault.get(passwordKey)).toBeUndefined();
+    expect(vault.store).not.toHaveBeenCalledWith(passwordKey, "password-from-removed-record");
+  });
+
+  it("saves a direct prompted password for a copied config while its live record is unchanged", async () => {
+    const liveTarget: ServerConfig = { ...baseServer };
+    const callerCopy: ServerConfig = { ...liveTarget };
+    const liveServers = new Map<string, ServerConfig>([[liveTarget.id, liveTarget]]);
+    const passwordKey = passwordSecretKey(liveTarget.id);
+    const vault = createVault();
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async () => ({ password: "current-record-password", save: true }))
+    };
+    const connector: SshConnector = {
+      connect: vi.fn(async () => fakeConnection)
+    };
+    const factory = new SilentAuthSshFactory(
+      connector,
+      vault,
+      prompt,
+      undefined,
+      undefined,
+      (id) => liveServers.get(id)
+    );
+
+    await factory.connect(callerCopy);
+
+    expect(vault.store).toHaveBeenCalledWith(passwordKey, "current-record-password");
+  });
+
+  it("keeps the primary credential record when an alternate-host clone authenticates", async () => {
+    const target: ServerConfig = {
+      ...baseServer,
+      host: "primary.example.com",
+      altHost: "10.0.0.2"
+    };
+    const liveServers = new Map<string, ServerConfig>([[target.id, target]]);
+    const vault = createVault();
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async () => ({ password: "alternate-host-password", save: true }))
+    };
+    const connector: SshConnector = {
+      connect: vi.fn(async () => fakeConnection)
+    };
+    const authFactory = new SilentAuthSshFactory(
+      connector,
+      vault,
+      prompt,
+      undefined,
+      undefined,
+      (id) => liveServers.get(id)
+    );
+    const proxyFactory = new ProxySshFactory(authFactory, (id) => liveServers.get(id), vault);
+
+    await proxyFactory.connectWithContext(
+      { ...target, host: target.altHost! },
+      { credentialSource: target }
+    );
+
+    expect(connector.connect).toHaveBeenCalledWith(
+      expect.objectContaining({ host: "10.0.0.2" }),
+      expect.objectContaining({ password: "alternate-host-password" })
+    );
+    expect(vault.store).toHaveBeenCalledWith(passwordSecretKey(target.id), "alternate-host-password");
+  });
+
+  it("does not save a profile password after Replace moves its SSH jump route", async () => {
+    const profile: AuthProfile = {
+      id: "profile-pw",
+      name: "Shared password",
+      username: "root",
+      authType: "password"
+    };
+    const target: ServerConfig = {
+      ...baseServer,
+      authProfileId: profile.id,
+      proxy: { type: "ssh", jumpHostId: "jump-1" }
+    };
+    const jump: ServerConfig = {
+      ...baseServer,
+      id: "jump-1",
+      name: "Old jump",
+      host: "old-jump.internal"
+    };
+    const liveServers = new Map<string, ServerConfig>([[target.id, target], [jump.id, jump]]);
+    const passwordKey = authProfilePasswordSecretKey(profile.id);
+    const jumpConnectionPending = deferred<SshConnection>();
+    const jumpConnectStarted = deferred<void>();
+    const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+    const vault = createVault();
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async () => ({ password: "old-route-password", save: true }))
+    };
+    const factory = new SilentAuthSshFactory(
+      connector,
+      vault,
+      prompt,
+      undefined,
+      (id) => id === profile.id ? profile : undefined,
+      (id) => liveServers.get(id)
+    );
+    const proxyFactory = new ProxySshFactory(factory, (id) => liveServers.get(id), vault);
+    const jumpFactory = {
+      connectWithContext: vi.fn(() => {
+        jumpConnectStarted.resolve();
+        return jumpConnectionPending.promise;
+      })
+    } as unknown as ContextAwareSshFactory;
+    proxyFactory.setJumpHostConnectionFactory(jumpFactory);
+
+    const connecting = proxyFactory.connect(target);
+    await jumpConnectStarted.promise;
+
+    await configMutationLock.runExclusive(async () => {
+      await vault.delete(passwordKey);
+      liveServers.set(target.id, { ...target });
+      liveServers.set(jump.id, { ...jump, host: "new-jump.internal" });
+    });
+
+    const routedSocket = { pause: vi.fn(), destroy: vi.fn() };
+    const openDirectTcp = vi.fn(async () => routedSocket as any);
+    jumpConnectionPending.resolve({
+      ...fakeConnection,
+      openDirectTcp
+    });
+    await expect(connecting).rejects.toThrow("configuration changed while connecting");
+
+    expect(await vault.get(passwordKey)).toBeUndefined();
+    expect(openDirectTcp).not.toHaveBeenCalled();
+    expect(connector.connect).not.toHaveBeenCalled();
+    expect(vault.store).not.toHaveBeenCalledWith(passwordKey, "old-route-password");
+  });
+
+  it("does not save a profile passphrase after Replace changes the key file", async () => {
+    const profile: AuthProfile = {
+      id: "profile-key",
+      name: "Rotated key",
+      username: "root",
+      authType: "key",
+      keyPath: "/keys/old-id_ed25519"
+    };
+    const target: ServerConfig = { ...baseServer, authProfileId: profile.id };
+    let liveProfile = profile;
+    const passphraseKey = authProfilePassphraseSecretKey(profile.id);
+    const handshake = deferred<SshConnection>();
+    const handshakeStarted = deferred<void>();
+    let attempts = 0;
+    const connector: SshConnector = {
+      connect: vi.fn(async () => {
+        attempts += 1;
+        if (attempts === 1) {
+          throw new Error("Encrypted private key requires passphrase");
+        }
+        handshakeStarted.resolve();
+        return handshake.promise;
+      })
+    };
+    const vault = createVault();
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async () => ({ password: "old-key-passphrase", save: true }))
+    };
+    const factory = new SilentAuthSshFactory(
+      connector,
+      vault,
+      prompt,
+      undefined,
+      (id) => id === profile.id ? liveProfile : undefined,
+      (id) => id === target.id ? target : undefined
+    );
+
+    const connecting = factory.connect(target);
+    await handshakeStarted.promise;
+
+    await configMutationLock.runExclusive(async () => {
+      await vault.delete(passphraseKey);
+      liveProfile = { ...profile, keyPath: "/keys/new-id_ed25519" };
+    });
+    handshake.resolve(fakeConnection);
+    await expect(connecting).resolves.toBe(fakeConnection);
+
+    expect(await vault.get(passphraseKey)).toBeUndefined();
+    expect(vault.store).not.toHaveBeenCalledWith(passphraseKey, "old-key-passphrase");
   });
 });
 
@@ -1014,7 +1345,6 @@ describe("deleteServerSecrets", () => {
     warn.mockRestore();
   });
 });
-
 // Issue #177 — with nothing saved, concurrent logins that need the same
 // password (or key passphrase) each opened their own prompt. VS Code shows one
 // input box at a time, so the later prompt dismissed the earlier one, which
@@ -1079,7 +1409,14 @@ describe("SilentAuthSshFactory — concurrent logins share one prompt (issue #17
       };
       const vault = createVault();
       const prompt: PasswordPrompt = { prompt: vi.fn(async () => ({ password: "pw", save: true })) };
-      const factory = new SilentAuthSshFactory(connector, vault, prompt);
+      const factory = new SilentAuthSshFactory(
+        connector,
+        vault,
+        prompt,
+        undefined,
+        undefined,
+        (id) => id === baseServer.id ? baseServer : undefined
+      );
 
       const first = factory.connect(baseServer);
       await vi.waitFor(() => expect(connector.connect).toHaveBeenCalledTimes(1));
@@ -1105,7 +1442,14 @@ describe("SilentAuthSshFactory — concurrent logins share one prompt (issue #17
         await store(key, value);
       });
       const prompt: PasswordPrompt = { prompt: vi.fn(async () => ({ password: "pw", save: true })) };
-      const factory = new SilentAuthSshFactory(connector, vault, prompt);
+      const factory = new SilentAuthSshFactory(
+        connector,
+        vault,
+        prompt,
+        undefined,
+        undefined,
+        (id) => id === baseServer.id ? baseServer : undefined
+      );
 
       const first = factory.connect(baseServer);
       await vi.waitFor(() => expect(vault.store).toHaveBeenCalledTimes(1));
@@ -1311,6 +1655,126 @@ describe("SilentAuthSshFactory — concurrent logins share one prompt (issue #17
       expect(sentPasswords(connector)).toEqual(["pw-for-a.example.com", "pw-for-b.example.com"]);
     });
 
+    it("does not share a profile password when only the alternate host differs", async () => {
+      const profile: AuthProfile = { id: "prof-alt-host", name: "Fleet", username: "ops", authType: "password" };
+      const lookup = (id: string) => id === profile.id ? profile : undefined;
+      const deviceA: ServerConfig = {
+        ...baseServer,
+        id: "srv-alt-a",
+        host: "primary.example.com",
+        altHost: "alt-a.example.com",
+        authProfileId: profile.id
+      };
+      const deviceB: ServerConfig = {
+        ...baseServer,
+        id: "srv-alt-b",
+        host: "primary.example.com",
+        altHost: "alt-b.example.com",
+        authProfileId: profile.id
+      };
+      const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+      const vault = createVault();
+      const answers = [deferred<Answer>(), deferred<Answer>()];
+      let promptIndex = 0;
+      const prompt: PasswordPrompt = { prompt: vi.fn(() => answers[promptIndex++].promise) };
+      const liveServers = new Map([[deviceA.id, deviceA], [deviceB.id, deviceB]]);
+      const factory = new SilentAuthSshFactory(
+        connector,
+        vault,
+        prompt,
+        undefined,
+        lookup,
+        (id) => liveServers.get(id)
+      );
+
+      const first = factory.connect(deviceA);
+      await settle();
+      const second = factory.connect(deviceB);
+      await settle();
+      const promptCount = prompt.prompt.mock.calls.length;
+      answers[0].resolve({ password: "password-for-alt-a", save: false });
+      answers[1].resolve({ password: "password-for-alt-b", save: false });
+      await Promise.all([first, second]);
+
+      expect(promptCount).toBe(2);
+      expect(sentPasswords(connector)).toEqual(["password-for-alt-a", "password-for-alt-b"]);
+    });
+
+    it("still shares a password between profile-linked records with the same full endpoint", async () => {
+      const profile: AuthProfile = { id: "prof-same-endpoint", name: "Fleet", username: "ops", authType: "password" };
+      const lookup = (id: string) => id === profile.id ? profile : undefined;
+      const deviceA: ServerConfig = {
+        ...baseServer,
+        id: "srv-same-a",
+        host: "primary.example.com",
+        altHost: "alt.example.com",
+        authProfileId: profile.id
+      };
+      const deviceB: ServerConfig = { ...deviceA, id: "srv-same-b" };
+      const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+      const vault = createVault();
+      const { prompt, answer } = openPrompt();
+      const liveServers = new Map([[deviceA.id, deviceA], [deviceB.id, deviceB]]);
+      const factory = new SilentAuthSshFactory(
+        connector,
+        vault,
+        prompt,
+        undefined,
+        lookup,
+        (id) => liveServers.get(id)
+      );
+
+      const first = factory.connect(deviceA);
+      await settle();
+      const second = factory.connect(deviceB);
+      await settle();
+      answer({ password: "shared-profile-password", save: false });
+      await Promise.all([first, second]);
+
+      expect(prompt.prompt).toHaveBeenCalledOnce();
+      expect(sentPasswords(connector)).toEqual(["shared-profile-password", "shared-profile-password"]);
+    });
+
+    it.each([
+      { description: "changed alternate host", replacementAltHost: "alt-b.example.com" },
+      { description: "identical values", replacementAltHost: "alt-a.example.com" }
+    ])("does not let a same-ID record with $description inherit or persist the pending answer", async ({ replacementAltHost }) => {
+      const original: ServerConfig = { ...baseServer, altHost: "alt-a.example.com" };
+      const liveServers = new Map<string, ServerConfig>([[original.id, original]]);
+      const passwordKey = passwordSecretKey(original.id);
+      const answers = [deferred<Answer>(), deferred<Answer>()];
+      let promptIndex = 0;
+      const prompt: PasswordPrompt = { prompt: vi.fn(() => answers[promptIndex++].promise) };
+      const vault = createVault();
+      const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+      const factory = new SilentAuthSshFactory(
+        connector,
+        vault,
+        prompt,
+        undefined,
+        undefined,
+        (id) => liveServers.get(id)
+      );
+
+      const removedRecordLogin = factory.connect(original);
+      await settle();
+      const replacement: ServerConfig = { ...original, altHost: replacementAltHost };
+      liveServers.set(replacement.id, replacement);
+      const replacementLogin = factory.connect(replacement);
+      await settle();
+      const promptCount = prompt.prompt.mock.calls.length;
+      answers[0].resolve({ password: "password-from-removed-record", save: true });
+      answers[1].resolve({ password: "password-from-replacement", save: true });
+      const removedAttemptResult = await removedRecordLogin.then(() => "resolved", () => "rejected");
+      await replacementLogin;
+
+      expect(removedAttemptResult).toBe("rejected");
+      expect(vault.store).not.toHaveBeenCalledWith(passwordKey, "password-from-removed-record");
+      expect(promptCount).toBe(2);
+      expect(sentPasswords(connector)).toEqual(["password-from-replacement"]);
+      expect(vault.store).toHaveBeenCalledWith(passwordKey, "password-from-replacement");
+    });
+
     it("does not share between two servers that name the same address through different jump hosts", async () => {
       // Lab devices commonly reuse management addresses: the same user@host:port
       // reached through another jump host is another machine.
@@ -1406,7 +1870,15 @@ describe("SilentAuthSshFactory — concurrent logins share one prompt (issue #17
       const connector = encryptedKeyConnector();
       const vault = createVault();
       const { prompt, answer } = openPrompt();
-      const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, lookup);
+      const liveServers = new Map<string, ServerConfig>([[deviceA.id, deviceA], [deviceB.id, deviceB]]);
+      const factory = new SilentAuthSshFactory(
+        connector,
+        vault,
+        prompt,
+        undefined,
+        lookup,
+        (id) => liveServers.get(id)
+      );
 
       const first = factory.connect(deviceA);
       const second = factory.connect(deviceB);
@@ -1417,6 +1889,61 @@ describe("SilentAuthSshFactory — concurrent logins share one prompt (issue #17
       expect(prompt.prompt).toHaveBeenCalledTimes(1);
       expect(sentPassphrases(connector)).toEqual(["fleet-phrase", "fleet-phrase"]);
       expect(vault.store).toHaveBeenCalledWith(authProfilePassphraseSecretKey(profile.id), "fleet-phrase");
+    });
+
+    it("does not let a profile-shared answer delete a replacement server passphrase", async () => {
+      type Answer = { password: string; save: boolean } | undefined;
+      const profile: AuthProfile = { id: "prof-key", name: "Fleet key", username: "ops", authType: "key", keyPath: "/keys/fleet" };
+      const deviceA: ServerConfig = { ...baseServer, id: "srv-a", name: "A", host: "a.example.com", authProfileId: profile.id };
+      const deviceB: ServerConfig = { ...baseServer, id: "srv-b", name: "B", host: "b.example.com", authProfileId: profile.id };
+      const standaloneB: ServerConfig = {
+        ...deviceB,
+        authProfileId: undefined,
+        authType: "key",
+        keyPath: "/keys/replacement"
+      };
+      const liveServers = new Map<string, ServerConfig>([[deviceA.id, deviceA], [deviceB.id, deviceB]]);
+      const connector = encryptedKeyConnector();
+      const vault = createVault();
+      const profileAnswer = deferred<Answer>();
+      const replacementAnswer = deferred<Answer>();
+      const prompt: PasswordPrompt = {
+        prompt: vi.fn((server: ServerConfig) =>
+          server.keyPath === profile.keyPath ? profileAnswer.promise : replacementAnswer.promise
+        )
+      };
+      const factory = new SilentAuthSshFactory(
+        connector,
+        vault,
+        prompt,
+        undefined,
+        (id) => id === profile.id ? profile : undefined,
+        (id) => liveServers.get(id)
+      );
+
+      const owner = factory.connect(deviceA);
+      const joined = factory.connect(deviceB);
+      await settle();
+      expect(prompt.prompt).toHaveBeenCalledOnce();
+
+      // B is edited while the profile prompt is still open, then connects with
+      // its replacement key and saves the new server-scoped passphrase.
+      liveServers.set(deviceB.id, standaloneB);
+      const replacementLogin = factory.connect(standaloneB);
+      await settle();
+      expect(prompt.prompt).toHaveBeenCalledTimes(2);
+      replacementAnswer.resolve({ password: "new-B-passphrase", save: true });
+      await expect(replacementLogin).resolves.toBe(fakeConnection);
+
+      // A remains the live owner of the shared profile answer, and may still
+      // use and save it. B's old record was replaced, so its joiner must stop
+      // before sending that answer and must not erase B's replacement key.
+      profileAnswer.resolve({ password: "fleet-passphrase", save: true });
+      await expect(owner).resolves.toBe(fakeConnection);
+      await expect(joined).rejects.toThrow("configuration changed while connecting");
+
+      expect(vault.store).toHaveBeenCalledWith(authProfilePassphraseSecretKey(profile.id), "fleet-passphrase");
+      await expect(vault.get(passphraseSecretKey(deviceB.id))).resolves.toBe("new-B-passphrase");
     });
 
     it("asks once for the passphrase of one key file whatever route each login takes", async () => {

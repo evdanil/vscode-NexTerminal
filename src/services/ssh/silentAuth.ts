@@ -1,6 +1,7 @@
 import type { Duplex } from "node:stream";
 import type { AuthProfile, ServerConfig } from "../../models/config";
 import { authProfileOwnedCredentials } from "../../models/config";
+import { configMutationLock } from "../configMutationLock";
 import type {
   KeyboardInteractiveHandler,
   PasswordPrompt,
@@ -81,10 +82,20 @@ function isPassphraseError(error: unknown): boolean {
   return message.includes("encrypted") || message.includes("passphrase") || message.includes("bad decrypt");
 }
 
+interface PromptAnswerProvenance {
+  serverId: string;
+  record: ServerConfig | null;
+  endpointSignature: string;
+  /** Whether `record` is authoritative enough to detect same-ID Replace. */
+  recordIdentityAvailable: boolean;
+}
+
 /** A prompted password or passphrase being asked for, or answered and not yet settled. */
 interface SharedPromptAnswer {
-  /** What it was typed for: a password's `user@host:port` and route, a passphrase's key file. */
+  /** What it was typed for: a password's complete endpoint and route, a passphrase's key file. */
   typedFor: string;
+  /** Keep the prompt owner's record as the authority for any later vault write. */
+  provenance?: PromptAnswerProvenance;
   answer: Promise<PasswordPromptResult | undefined>;
 }
 
@@ -122,8 +133,93 @@ export class SilentAuthSshFactory implements SshFactory {
     private readonly vault: SecretVault,
     private readonly prompt: PasswordPrompt,
     private readonly inputPromptFn?: InputPromptFn,
-    private readonly authProfileLookup?: (id: string) => AuthProfile | undefined
+    private readonly authProfileLookup?: (id: string) => AuthProfile | undefined,
+    private readonly liveServerLookup?: (id: string) => ServerConfig | undefined
   ) {}
+
+  /**
+   * Captures the config identity a prompted SSH credential was authenticated
+   * against, including profile-owned auth fields and every hop in its route.
+   * ProxySshFactory calls this before opening a proxy/jump connection, so a
+   * config replacement during that work cannot make a later target handshake
+   * look as though it started on the new route.
+   */
+  public getCredentialEndpointSignature(
+    server: ServerConfig,
+    serverLookup: ((id: string) => ServerConfig | undefined) | undefined = this.liveServerLookup,
+    visited: ReadonlySet<string> = new Set<string>()
+  ): string {
+    if (visited.has(server.id)) {
+      return JSON.stringify(["cycle", server.id]);
+    }
+    const nextVisited = new Set(visited);
+    nextVisited.add(server.id);
+
+    const { resolved, passwordKey, passphraseKey, legacyServerPassphraseKey, profileScoped } = this.resolveServer(server);
+    let route: unknown = null;
+    if (server.proxy?.type === "ssh") {
+      const jump = serverLookup?.(server.proxy.jumpHostId);
+      route = jump
+        ? ["ssh", server.proxy.jumpHostId, this.getCredentialEndpointSignature(jump, serverLookup, nextVisited)]
+        : ["ssh", server.proxy.jumpHostId, "missing"];
+    } else if (server.proxy) {
+      route = [server.proxy.type, server.proxy.host, server.proxy.port, server.proxy.username ?? null];
+    }
+
+    return JSON.stringify([
+      server.id,
+      server.protocol ?? "ssh",
+      resolved.host,
+      resolved.altHost ?? null,
+      resolved.port,
+      resolved.username,
+      resolved.authType,
+      resolved.keyPath ?? null,
+      server.authProfileId ?? null,
+      passwordKey,
+      passphraseKey,
+      legacyServerPassphraseKey ?? null,
+      profileScoped,
+      route
+    ]);
+  }
+
+  private async mutateCredentialIfEndpointUnchanged(
+    serverId: string,
+    expectedRecord: ServerConfig | null | undefined,
+    expectedEndpoint: string,
+    mutate: () => Promise<void>
+  ): Promise<void> {
+    if (!this.liveServerLookup) {
+      return;
+    }
+
+    // Replace/reset and this deferred credential mutation share one lock. The
+    // record identity catches same-value delete/re-adds that an endpoint
+    // signature alone cannot distinguish; the signature still catches edits
+    // to the captured record. Both checks and the vault operation stay atomic.
+    await configMutationLock.runExclusive(async () => {
+      const live = this.liveServerLookup?.(serverId);
+      if (live && live === expectedRecord && this.getCredentialEndpointSignature(live) === expectedEndpoint) {
+        await mutate();
+      }
+    });
+  }
+
+  private assertCredentialRecordCurrent(provenance: PromptAnswerProvenance | undefined): void {
+    if (!provenance || !provenance.recordIdentityAvailable || !this.liveServerLookup) {
+      return;
+    }
+
+    const live = this.liveServerLookup(provenance.serverId) ?? null;
+    if (
+      live === null ||
+      live !== provenance.record ||
+      this.getCredentialEndpointSignature(live) !== provenance.endpointSignature
+    ) {
+      throw new Error("The server configuration changed while connecting; the credential was not sent. Connect again.");
+    }
+  }
 
   private resolveServer(
     server: ServerConfig
@@ -176,13 +272,15 @@ export class SilentAuthSshFactory implements SshFactory {
 
   private buildKeyboardInteractiveHandler(
     password?: string,
-    onAuthMessage?: (text: string) => void
+    onAuthMessage?: (text: string) => void,
+    provenance?: PromptAnswerProvenance
   ): KeyboardInteractiveHandler | undefined {
     if (!this.inputPromptFn) {
       return undefined;
     }
     const promptFn = this.inputPromptFn;
     return async (name, instructions, prompts) => {
+      this.assertCredentialRecordCurrent(provenance);
       // OpenSSH delivers MFA context (e.g. Duo's option menu) via these two
       // fields ahead of the prompts. Surface them before prompting so the
       // user isn't shown a bare input box with no context. Display is
@@ -213,9 +311,11 @@ export class SilentAuthSshFactory implements SshFactory {
           if (answer === undefined) {
             throw new Error("Keyboard-interactive authentication canceled");
           }
+          this.assertCredentialRecordCurrent(provenance);
           responses.push(answer);
         }
       }
+      this.assertCredentialRecordCurrent(provenance);
       return responses;
     };
   }
@@ -249,17 +349,37 @@ export class SilentAuthSshFactory implements SshFactory {
        * fallback of its own.
        */
       route?: () => string;
+      credentialEndpointSignature?: string;
+      /** Exact live record captured before async connection work; null means absent at start. */
+      credentialRecord?: ServerConfig | null;
     }
   ): Promise<SshConnection> {
+    const credentialEndpointSignature =
+      options?.credentialEndpointSignature ?? this.getCredentialEndpointSignature(server);
+    const hasCapturedCredentialRecord = options !== undefined && "credentialRecord" in options;
+    const credentialRecord = hasCapturedCredentialRecord
+      ? options.credentialRecord ?? null
+      : this.liveServerLookup
+        ? this.liveServerLookup(server.id) ?? null
+        : server;
+    const promptProvenance: PromptAnswerProvenance = {
+      serverId: server.id,
+      record: credentialRecord,
+      endpointSignature: credentialEndpointSignature,
+      recordIdentityAvailable: this.liveServerLookup !== undefined || hasCapturedCredentialRecord
+    };
+    this.assertCredentialRecordCurrent(promptProvenance);
     const { resolved, passwordKey, passphraseKey, legacyServerPassphraseKey, profileScoped } = this.resolveServer(server);
 
     if (resolved.authType === "key") {
-      const handler = this.buildKeyboardInteractiveHandler(undefined, options?.onAuthMessage);
+      const handler = this.buildKeyboardInteractiveHandler(undefined, options?.onAuthMessage, promptProvenance);
       const savedPassphrase = await this.vault.get(passphraseKey);
+      this.assertCredentialRecordCurrent(promptProvenance);
 
       // Try saved passphrase (or no passphrase on first attempt).
       const firstSock = await options?.sockFactory?.();
       try {
+        this.assertCredentialRecordCurrent(promptProvenance);
         return await this.connector.connect(resolved, {
           ...(savedPassphrase && { passphrase: savedPassphrase }),
           ...(handler && { onKeyboardInteractive: handler }),
@@ -277,23 +397,35 @@ export class SilentAuthSshFactory implements SshFactory {
         // on this server retries it once and prompts, while the rest of the
         // fleet keeps authenticating silently.
         if (savedPassphrase && !profileScoped) {
-          await this.vault.delete(passphraseKey);
+          await this.mutateCredentialIfEndpointUnchanged(
+            promptProvenance.serverId,
+            promptProvenance.record,
+            promptProvenance.endpointSignature,
+            () => this.vault.delete(passphraseKey)
+          );
         }
       }
 
+      this.assertCredentialRecordCurrent(promptProvenance);
+
       // Prompt user for passphrase — or join the prompt already open for it.
-      const prompted = await this.promptShared(passphraseKey, resolved.keyPath ?? "", () =>
-        this.prompt.prompt({
-          ...resolved,
-          name: `${server.name} (key passphrase)`
-        })
+      const prompted = await this.promptShared(
+        passphraseKey,
+        resolved.keyPath ?? "",
+        () =>
+          this.prompt.prompt({
+            ...resolved,
+            name: `${server.name} (key passphrase)`
+          }),
+        promptProvenance
       );
       if (!prompted) {
         throw new Error(`Passphrase entry canceled for ${server.name}`);
       }
-      const { result: promptResult, settle } = prompted;
+      const { result: promptResult, settle, provenance = promptProvenance } = prompted;
 
       try {
+        this.assertCredentialRecordCurrent(promptProvenance);
         const secondSock = await options?.sockFactory?.();
 
         // Stage A — establish connection. Narrow try scope so vault ops cannot
@@ -303,6 +435,7 @@ export class SilentAuthSshFactory implements SshFactory {
         // prompted retry) — intentional, mirrors re-running ssh by hand.
         let connection: SshConnection;
         try {
+          this.assertCredentialRecordCurrent(promptProvenance);
           connection = await this.connector.connect(resolved, {
             passphrase: promptResult.password,
             ...(handler && { onKeyboardInteractive: handler }),
@@ -323,9 +456,21 @@ export class SilentAuthSshFactory implements SshFactory {
         // it is not security-relevant.
         try {
           if (promptResult.save) {
-            await this.vault.store(passphraseKey, promptResult.password);
+            await this.mutateCredentialIfEndpointUnchanged(provenance.serverId, provenance.record, provenance.endpointSignature, async () => {
+              await this.vault.store(passphraseKey, promptResult.password);
+            });
+            // The profile-scoped value belongs to the shared prompt owner, but
+            // this server-scoped legacy duplicate belongs only to this login.
+            // Re-check its own captured record in a separate lock span: the
+            // config lock is non-reentrant, and a same-id edit while the prompt
+            // was open must not let the owner authorize deleting a new secret.
             if (legacyServerPassphraseKey && legacyServerPassphraseKey !== passphraseKey) {
-              await this.vault.delete(legacyServerPassphraseKey);
+              await this.mutateCredentialIfEndpointUnchanged(
+                promptProvenance.serverId,
+                promptProvenance.record,
+                promptProvenance.endpointSignature,
+                () => this.vault.delete(legacyServerPassphraseKey)
+              );
             }
           } else if (!profileScoped) {
             // Declining to save replaces the stored credential for a server —
@@ -333,7 +478,9 @@ export class SilentAuthSshFactory implements SshFactory {
             // "don't save this one" must not erase what other servers still
             // authenticate with. Clearing a profile passphrase is done through
             // the profile editor, not here.
-            await this.vault.delete(passphraseKey);
+            await this.mutateCredentialIfEndpointUnchanged(provenance.serverId, provenance.record, provenance.endpointSignature, () =>
+              this.vault.delete(passphraseKey)
+            );
           }
         } catch (vaultErr) {
           console.error(
@@ -350,9 +497,10 @@ export class SilentAuthSshFactory implements SshFactory {
     }
 
     if (resolved.authType !== "password") {
-      const handler = this.buildKeyboardInteractiveHandler(undefined, options?.onAuthMessage);
+      const handler = this.buildKeyboardInteractiveHandler(undefined, options?.onAuthMessage, promptProvenance);
       const sock = await options?.sockFactory?.();
       try {
+        this.assertCredentialRecordCurrent(promptProvenance);
         return await this.connector.connect(resolved, {
           ...(handler && { onKeyboardInteractive: handler }),
           ...(sock && { sock }),
@@ -365,10 +513,12 @@ export class SilentAuthSshFactory implements SshFactory {
     }
 
     const savedPassword = await this.vault.get(passwordKey);
+    this.assertCredentialRecordCurrent(promptProvenance);
     if (savedPassword) {
-      const handler = this.buildKeyboardInteractiveHandler(savedPassword, options?.onAuthMessage);
+      const handler = this.buildKeyboardInteractiveHandler(savedPassword, options?.onAuthMessage, promptProvenance);
       const firstSock = await options?.sockFactory?.();
       try {
+        this.assertCredentialRecordCurrent(promptProvenance);
         return await this.connector.connect(resolved, {
           password: savedPassword,
           ...(handler && { onKeyboardInteractive: handler }),
@@ -387,25 +537,45 @@ export class SilentAuthSshFactory implements SshFactory {
         // stays: this server retries it once and prompts, while the rest of
         // the fleet keeps authenticating silently.
         if (!profileScoped) {
-          await this.vault.delete(passwordKey);
+          await this.mutateCredentialIfEndpointUnchanged(
+            promptProvenance.serverId,
+            promptProvenance.record,
+            promptProvenance.endpointSignature,
+            () => this.vault.delete(passwordKey)
+          );
         }
       }
     }
 
+    this.assertCredentialRecordCurrent(promptProvenance);
+
     // Prompt user for the password — or join the prompt already open for it.
     const route = options?.route?.() ?? (resolved.proxy ? undefined : "direct");
+    const typedFor =
+      route === undefined
+        ? undefined
+        : JSON.stringify([
+            resolved.protocol ?? "ssh",
+            resolved.username,
+            resolved.host,
+            resolved.altHost ?? null,
+            resolved.port,
+            route
+          ]);
     const prompted = await this.promptShared(
       passwordKey,
-      route === undefined ? undefined : `${resolved.username}@${resolved.host}:${resolved.port} via ${route}`,
-      () => this.prompt.prompt({ ...resolved, name: server.name })
+      typedFor,
+      () => this.prompt.prompt({ ...resolved, name: server.name }),
+      promptProvenance
     );
     if (!prompted) {
       throw new Error(`Password entry canceled for ${server.name}`);
     }
-    const { result: promptResult, settle, joined } = prompted;
+    const { result: promptResult, settle, joined, provenance = promptProvenance } = prompted;
 
     try {
-      const handler = this.buildKeyboardInteractiveHandler(promptResult.password, options?.onAuthMessage);
+      this.assertCredentialRecordCurrent(promptProvenance);
+      const handler = this.buildKeyboardInteractiveHandler(promptResult.password, options?.onAuthMessage, promptProvenance);
       const secondSock = await options?.sockFactory?.();
       if (joined && options?.route && options.route() !== route) {
         // Opening the socket moved this login onto another route — a pooled
@@ -427,6 +597,7 @@ export class SilentAuthSshFactory implements SshFactory {
       // prompted retry) — intentional, mirrors re-running ssh by hand.
       let connection: SshConnection;
       try {
+        this.assertCredentialRecordCurrent(promptProvenance);
         connection = await this.connector.connect(resolved, {
           password: promptResult.password,
           ...(handler && { onKeyboardInteractive: handler }),
@@ -443,14 +614,18 @@ export class SilentAuthSshFactory implements SshFactory {
       // authenticated; the natural fallback is being re-prompted next time.
       try {
         if (promptResult.save) {
-          await this.vault.store(passwordKey, promptResult.password);
+          await this.mutateCredentialIfEndpointUnchanged(provenance.serverId, provenance.record, provenance.endpointSignature, () =>
+            this.vault.store(passwordKey, promptResult.password)
+          );
         } else if (!profileScoped) {
           // Declining to save replaces the stored credential for a server —
           // but a profile-scoped password belongs to the whole fleet, and
           // "don't save this one" must not erase what other servers still
           // authenticate with. Clearing a profile password is done through the
           // profile editor, not here.
-          await this.vault.delete(passwordKey);
+          await this.mutateCredentialIfEndpointUnchanged(provenance.serverId, provenance.record, provenance.endpointSignature, () =>
+            this.vault.delete(passwordKey)
+          );
         }
       } catch (vaultErr) {
         console.error(
@@ -470,27 +645,40 @@ export class SilentAuthSshFactory implements SshFactory {
    * Asks for the credential saved under `vaultKey`, or joins the prompt already
    * open — or answered, with its login still in flight — for the same key and
    * the same `typedFor` (see `sharedAnswers`); an undefined `typedFor` is
-   * never shared. A cancel is every waiting
-   * login's cancel, and the next login asks again. An answer is shared until
-   * `settle()`, which each login that used it calls once it has succeeded (and
-   * saved it, if asked to) or failed: settled only after the save, so a login
-   * arriving in between still finds the answer; from then on the vault is the
-   * source of truth, and a failed answer — which may be what failed — or one
-   * the user chose not to save is asked for afresh.
+   * never shared. Calls for the same server id also need the same captured live
+   * record, so a same-value Replace cannot join an older record's prompt. The
+   * entry retains the prompt owner's provenance for vault writes; a joiner's
+   * newer record cannot vouch for an older answer. Different servers linked to
+   * one profile can still share the same endpoint's answer. A cancel is every
+   * waiting login's cancel, and the next login asks again. An answer is shared
+   * until `settle()`, which each login that used it calls once it has succeeded
+   * (and saved it, if asked to) or failed: settled only after the save, so a
+   * login arriving in between still finds the answer; from then on the vault is
+   * the source of truth, and a failed answer — which may be what failed — or
+   * one the user chose not to save is asked for afresh.
    */
   private async promptShared(
     vaultKey: string,
     typedFor: string | undefined,
-    ask: () => Promise<PasswordPromptResult | undefined>
-  ): Promise<{ result: PasswordPromptResult; settle: () => void; joined: boolean } | undefined> {
+    ask: () => Promise<PasswordPromptResult | undefined>,
+    provenance?: PromptAnswerProvenance
+  ): Promise<{ result: PasswordPromptResult; settle: () => void; joined: boolean; provenance?: PromptAnswerProvenance } | undefined> {
     if (typedFor === undefined) {
       const result = await ask();
-      return result ? { result, settle: () => {}, joined: false } : undefined;
+      return result ? { result, settle: () => {}, joined: false, provenance } : undefined;
     }
     let shared = this.sharedAnswers.get(vaultKey);
-    const joined = shared !== undefined && shared.typedFor === typedFor;
+    const sameSourceRecord =
+      shared?.provenance === undefined ||
+      provenance === undefined ||
+      shared.provenance.serverId !== provenance.serverId ||
+      (!shared.provenance.recordIdentityAvailable && !provenance.recordIdentityAvailable) ||
+      (shared.provenance.recordIdentityAvailable &&
+        provenance.recordIdentityAvailable &&
+        shared.provenance.record === provenance.record);
+    const joined = shared !== undefined && shared.typedFor === typedFor && sameSourceRecord;
     if (!shared || !joined) {
-      shared = { typedFor, answer: ask() };
+      shared = { typedFor, answer: ask(), provenance };
       this.sharedAnswers.set(vaultKey, shared);
     }
     const own = shared;
@@ -509,6 +697,6 @@ export class SilentAuthSshFactory implements SshFactory {
         settle();
       }
     }
-    return result ? { result, settle, joined } : undefined;
+    return result ? { result, settle, joined, provenance: own.provenance } : undefined;
   }
 }

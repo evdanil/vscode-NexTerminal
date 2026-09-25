@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.266] — 2026-09-25
+
+### Fixed
+
+- **Replace import no longer hands a saved password to a server that comes back at a different address.** Replace removes your servers and re-creates the file's under the same ids, and the passwords this machine had saved for a server stayed behind under its id. A file the backup seal cannot check — a backup from before 2.8.243, a hand-written file, a backup with its encrypted part removed — could therefore bring a server back pointing at another host, and your saved password went there on the next connect. A server's saved password, key passphrase and proxy password are now kept only when the file brings it back with the same host, alternate host, port, username and proxy — and, for a server reached through an SSH jump host, with every jump host on the way unchanged too. Otherwise they are deleted, and the import's summary says how many servers that affected. An import that stops partway with an error clears the saved passwords of the servers it had already removed. A renamed or moved server at the same address keeps them, passwords a backup carries are still restored, and Merge is unchanged.
+
 ## [2.8.264] — 2026-09-25
 
 ### Fixed

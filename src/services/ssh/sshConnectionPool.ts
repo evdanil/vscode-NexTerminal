@@ -215,8 +215,9 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
   // Per-server invalidation counter. A connect captures the value at handshake
   // start and re-checks it once the handshake settles; a bump in between means
   // the credentials/settings it authenticated with have since been replaced, so
-  // the resulting connection must never be pooled. Bounded by the number of
-  // configured servers.
+  // the resulting connection must never be pooled. Removed IDs remain here to
+  // fence detached in-flight handshakes, so this is bounded by distinct IDs
+  // invalidated during this pool's lifetime and cleared when the pool is disposed.
   private readonly invalidationEpochs = new Map<string, number>();
   private disposed = false;
 

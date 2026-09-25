@@ -11,6 +11,7 @@
  * seam so each test can see WHEN it ran relative to the profile removal.
  */
 import { createHash } from "node:crypto";
+import { PassThrough } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
@@ -112,10 +113,14 @@ import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigReposi
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { setActiveMacroStore } from "../../src/macroSettings";
 import { decrypt, encrypt } from "../../src/utils/configCrypto";
-import type { SecretVault } from "../../src/services/ssh/contracts";
+import type { SecretVault, SshConnection, SshConnector } from "../../src/services/ssh/contracts";
 import type { LocalServerConfig } from "../../src/models/localServer";
 import type { DhcpConfigProfile, TftpConfigProfile } from "../../src/models/networkServerProfile";
-import type { LocalShellProfile, ServerConfig } from "../../src/models/config";
+import type { AuthProfile, LocalShellProfile, ServerConfig } from "../../src/models/config";
+import { ProxySshFactory } from "../../src/services/ssh/proxySshFactory";
+import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
+import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
+import { watchSshPoolServerRemovals } from "../../src/services/ssh/sshPoolServerRemovalObserver";
 
 const KNOWN_HOSTS_KEY = "nexus.ssh.knownHostFingerprints.v1";
 const PASSWORD = "backup-pass-1";
@@ -901,6 +906,1037 @@ describe("Encrypted Backup — the readable half is sealed by the encrypted half
 
     expect(error).toContain("newer version");
     expect(dest.core.getSnapshot().servers).toEqual([]);
+  });
+});
+
+/**
+ * Issue #175 — Replace removes every local server and then imports the file's,
+ * ids preserved. A server's saved secrets are filed under its id, so a file with
+ * no seal to check — a backup from before 2.8.243, a hand-written export, a
+ * backup with its encrypted part removed — could re-create id X at another host
+ * and the password this machine already held for X went there on the next
+ * connect. They are now kept only when the re-created server has the same
+ * endpoint: host, alternate host, port, username and proxy.
+ */
+describe("Replace keeps a removed server's saved secrets only when its endpoint is unchanged (#175)", () => {
+  const SECRET_KEYS = ["password-srv-1", "passphrase-srv-1", "proxy-password-srv-1"];
+  const KEPT = ["router-pw", "router-pp", "proxy-pw"];
+  const GONE = [undefined, undefined, undefined];
+  const LOCAL_ENDPOINT: Partial<ServerConfig> = {
+    altHost: "10.0.1.1",
+    proxy: { type: "socks5", host: "proxy.lab", port: 1080, username: "pxuser" }
+  };
+
+  async function destWithSavedSecrets(overrides: Partial<ServerConfig> = {}, vault: MockVault = new MockVault()): Promise<Machine> {
+    const dest = { ...(await makeMachine()), vault };
+    await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, ...overrides }));
+    await vault.store("password-srv-1", "router-pw");
+    await vault.store("passphrase-srv-1", "router-pp");
+    await vault.store("proxy-password-srv-1", "proxy-pw");
+    return dest;
+  }
+
+  function savedSecrets(machine: Machine): Promise<Array<string | undefined>> {
+    return Promise.all(SECRET_KEYS.map((key) => machine.vault.get(key)));
+  }
+
+  /** A file that carries no seal and no secrets: the only secrets in play are the ones already on this machine. */
+  function unsealedJson(servers: unknown[], authProfiles?: unknown[]): string {
+    return JSON.stringify({
+      version: 2,
+      exportType: "backup",
+      exportedAt: new Date().toISOString(),
+      servers,
+      ...(authProfiles !== undefined && { authProfiles })
+    });
+  }
+
+  it("a file that re-creates the server's id at another host takes none of the secrets this machine saved for it", async () => {
+    const dest = await destWithSavedSecrets();
+
+    await runImport(dest, unsealedJson([makeServer({ ...LOCAL_ENDPOINT, host: "attacker.example" })]), "replace");
+
+    expect(dest.core.getServer("srv-1")?.host).toBe("attacker.example");
+    expect(await savedSecrets(dest)).toEqual(GONE);
+    expect(lastInfoMessage()).toContain(
+      "1 server came back at a different address or route; the credentials saved here for it were cleared."
+    );
+    expect(lastInfoMessage()).not.toContain("next connect");
+  });
+
+  it("an unchanged endpoint keeps them, whatever else about the server changed", async () => {
+    const dest = await destWithSavedSecrets();
+    const sameEndpoint = makeServer({
+      name: "Renamed",
+      group: "Moved",
+      isHidden: true,
+      multiplexing: false,
+      altHost: "10.0.1.1",
+      // Same members, other key order: identity is by value, not by serialization.
+      proxy: { username: "pxuser", port: 1080, host: "proxy.lab", type: "socks5" }
+    });
+
+    await runImport(dest, unsealedJson([sameEndpoint]), "replace");
+
+    expect(dest.core.getServer("srv-1")?.name).toBe("Renamed");
+    expect(await savedSecrets(dest)).toEqual(KEPT);
+    expect(lastInfoMessage()).not.toContain("different address");
+  });
+
+  it.each<[string, Partial<ServerConfig>, Partial<ServerConfig>]>([
+    ["the port", {}, { port: 2222 }],
+    ["the username", {}, { username: "root" }],
+    ["the alternate host", {}, { altHost: "attacker.example" }],
+    ["the alternate host, removed", {}, { altHost: undefined }],
+    ["the proxy host", {}, { proxy: { type: "socks5", host: "attacker.example", port: 1080, username: "pxuser" } }],
+    ["the proxy port", {}, { proxy: { type: "socks5", host: "proxy.lab", port: 1081, username: "pxuser" } }],
+    ["the proxy username", {}, { proxy: { type: "socks5", host: "proxy.lab", port: 1080, username: "other" } }],
+    ["the proxy type", {}, { proxy: { type: "http", host: "proxy.lab", port: 1080, username: "pxuser" } }],
+    ["the proxy, removed", {}, { proxy: undefined }],
+    ["the jump host", { proxy: { type: "ssh", jumpHostId: "jump-1" } }, { proxy: { type: "ssh", jumpHostId: "jump-2" } }],
+    ["a proxy, added", { proxy: undefined }, { proxy: { type: "socks5", host: "proxy.lab", port: 1080, username: "pxuser" } }],
+    ["the proxy kind, an SSH jump host turned SOCKS5", { proxy: { type: "ssh", jumpHostId: "jump-1" } }, { proxy: { type: "socks5", host: "jump-1", port: 1080 } }],
+    ["the proxy kind, HTTP turned an SSH jump host", { proxy: { type: "http", host: "proxy.lab", port: 3128 } }, { proxy: { type: "ssh", jumpHostId: "proxy.lab" } }]
+  ])("a changed endpoint — %s — deletes all three", async (_what, local, incoming) => {
+    const dest = await destWithSavedSecrets(local);
+    const recreated = makeServer({ ...LOCAL_ENDPOINT, ...local, ...incoming });
+
+    await runImport(dest, unsealedJson([recreated]), "replace");
+
+    expect(dest.core.getServer("srv-1")).toBeDefined();
+    expect(await savedSecrets(dest)).toEqual(GONE);
+  });
+
+  it("a removed server the file does not re-create leaves no saved secrets behind for a later record with its id", async () => {
+    const dest = await destWithSavedSecrets();
+
+    await runImport(dest, unsealedJson([makeServer({ id: "other", name: "Other" })]), "replace");
+
+    expect(dest.core.getServer("srv-1")).toBeUndefined();
+    expect(await savedSecrets(dest)).toEqual(GONE);
+  });
+
+  it("a same-endpoint record that cannot be imported does not keep them either", async () => {
+    const dest = await destWithSavedSecrets();
+
+    // Same endpoint, but no name: validation skips it, so nothing re-creates srv-1.
+    await runImport(dest, unsealedJson([makeServer({ ...LOCAL_ENDPOINT, name: "" })]), "replace");
+
+    expect(dest.core.getServer("srv-1")).toBeUndefined();
+    expect(await savedSecrets(dest)).toEqual(GONE);
+  });
+
+  it("a second record with the same id at another host is judged too — the last one written is the one that connects", async () => {
+    const dest = await destWithSavedSecrets();
+
+    await runImport(dest, unsealedJson([
+      makeServer({ ...LOCAL_ENDPOINT }),
+      makeServer({ ...LOCAL_ENDPOINT, host: "attacker.example" })
+    ]), "replace");
+
+    expect(dest.core.getServer("srv-1")?.host).toBe("attacker.example");
+    expect(await savedSecrets(dest)).toEqual(GONE);
+  });
+
+  it("the secrets are deleted before the re-created server is published, so no connect can pair them", async () => {
+    const hostAtDelete: Array<string | undefined> = [];
+    let dest: Machine | undefined;
+    class WatchingVault extends MockVault {
+      async delete(key: string) {
+        if (key === "password-srv-1") hostAtDelete.push(dest?.core.getServer("srv-1")?.host);
+        await super.delete(key);
+      }
+    }
+    dest = await destWithSavedSecrets({}, new WatchingVault());
+
+    await runImport(dest, unsealedJson([makeServer({ ...LOCAL_ENDPOINT, host: "attacker.example" })]), "replace");
+
+    expect(hostAtDelete).toEqual([undefined]);
+    expect(await savedSecrets(dest)).toEqual(GONE);
+  });
+
+  it("restores linked auth profiles before publishing servers that keep their saved credentials", async () => {
+    const dest = await makeMachine();
+    const jumpAuth: AuthProfile = {
+      id: "jump-auth",
+      name: "Jump auth",
+      username: "safe-user",
+      authType: "key",
+      keyPath: "/keys/jump"
+    };
+    const jump = makeServer({
+      id: "jump-1",
+      name: "Bastion",
+      host: "bastion.example",
+      username: "raw-other-user",
+      authType: "key",
+      keyPath: "/keys/jump",
+      authProfileId: jumpAuth.id
+    });
+    const target = makeServer({
+      id: "srv-1",
+      name: "Router",
+      host: "10.0.0.1",
+      username: "target-user",
+      authType: "password",
+      proxy: { type: "ssh", jumpHostId: jump.id }
+    });
+    await dest.core.addOrUpdateAuthProfile(jumpAuth);
+    await dest.core.addOrUpdateServer(jump);
+    await dest.core.addOrUpdateServer(target);
+    await dest.vault.store("password-srv-1", "target-secret");
+
+    const connectorCalls: Array<{
+      server: ServerConfig;
+      auth: Parameters<SshConnector["connect"]>[1];
+    }> = [];
+    const connector: SshConnector = {
+      connect: async (server, auth) => {
+        connectorCalls.push({ server, auth });
+        return {
+          openDirectTcp: async () => new PassThrough(),
+          onClose: () => () => undefined,
+          dispose: () => undefined,
+          getBanner: () => undefined
+        } as unknown as SshConnection;
+      }
+    };
+    const authFactory = new SilentAuthSshFactory(
+      connector,
+      dest.vault,
+      { prompt: async () => undefined },
+      undefined,
+      (id) => dest.core.getAuthProfile(id),
+      (id) => dest.core.getServer(id)
+    );
+    const proxyFactory = new ProxySshFactory(authFactory, (id) => dest.core.getServer(id), dest.vault);
+    let profileAtTargetPublication: AuthProfile | undefined;
+    let connectPromise: Promise<SshConnection> | undefined;
+    const unsubscribe = dest.core.onDidChange((snapshot) => {
+      const hasJump = snapshot.servers.some((server) => server.id === jump.id);
+      const hasTarget = snapshot.servers.some((server) => server.id === target.id);
+      if (!connectPromise && hasJump && hasTarget) {
+        profileAtTargetPublication = dest.core.getAuthProfile(jumpAuth.id);
+        // `addOrUpdateServer` publishes synchronously, while an unrelated connect
+        // can start without waiting for the import command's mutation lock.
+        connectPromise = proxyFactory.connectWithContext(dest.core.getServer(target.id)!);
+      }
+    });
+
+    try {
+      await runImport(dest, unsealedJson([jump, target], [jumpAuth]), "replace");
+      if (!connectPromise) throw new Error("Replace did not publish the complete jump route");
+      await connectPromise;
+    } finally {
+      unsubscribe();
+    }
+
+    expect(profileAtTargetPublication).toEqual(jumpAuth);
+    expect(connectorCalls.map(({ server }) => server.id)).toEqual([jump.id, target.id]);
+    expect(connectorCalls[0]?.server.username).toBe("safe-user");
+    expect(connectorCalls[1]?.auth.password).toBe("target-secret");
+    expect(await dest.vault.get("password-srv-1")).toBe("target-secret");
+  });
+
+  it("Replace retires a removed jump pool entry before restored target credentials can use it", async () => {
+    const dest = await makeMachine();
+    const oldProfile: AuthProfile = {
+      id: "jump-auth",
+      name: "Jump auth",
+      username: "old-jump-user",
+      authType: "key",
+      keyPath: "/keys/old-jump"
+    };
+    const oldJump = makeServer({
+      id: "jump-1",
+      name: "Bastion",
+      host: "bastion.example",
+      username: "raw-user",
+      authType: "key",
+      keyPath: "/keys/old-jump",
+      authProfileId: oldProfile.id
+    });
+    const oldTarget = makeServer({
+      id: "srv-1",
+      name: "Router",
+      host: "10.0.0.1",
+      username: "target-user",
+      authType: "password",
+      proxy: { type: "ssh", jumpHostId: oldJump.id }
+    });
+    await dest.core.addOrUpdateAuthProfile(oldProfile);
+    await dest.core.addOrUpdateServer(oldJump);
+    await dest.core.addOrUpdateServer(oldTarget);
+    await dest.vault.store("password-srv-1", "old-target-password");
+
+    const replacement = await makeMachine();
+    const newProfile: AuthProfile = { ...oldProfile, username: "new-jump-user", keyPath: "/keys/new-jump" };
+    const newJump = { ...oldJump, keyPath: "/keys/new-jump" };
+    const newTarget = { ...oldTarget };
+    await replacement.core.addOrUpdateAuthProfile(newProfile);
+    await replacement.core.addOrUpdateServer(newJump);
+    await replacement.core.addOrUpdateServer(newTarget);
+    await replacement.vault.store("password-srv-1", "backup-target-password");
+    const backup = await exportBackup(replacement);
+
+    let nextConnectionId = 0;
+    const tunnelOwners = new WeakMap<object, number>();
+    const connections: Array<SshConnection & { id: number; serverId: string; disposed: boolean }> = [];
+    const connectorCalls: Array<{
+      serverId: string;
+      username: string;
+      password: string | undefined;
+      tunnelOwner: number | undefined;
+    }> = [];
+    const connector: SshConnector = {
+      connect: async (server, auth) => {
+        connectorCalls.push({
+          serverId: server.id,
+          username: server.username,
+          password: auth.password,
+          tunnelOwner: auth.sock ? tunnelOwners.get(auth.sock) : undefined
+        });
+        let connection!: SshConnection & { id: number; serverId: string; disposed: boolean };
+        connection = {
+          id: ++nextConnectionId,
+          serverId: server.id,
+          disposed: false,
+          openDirectTcp: async () => {
+            const socket = new PassThrough();
+            tunnelOwners.set(socket, connection.id);
+            return socket;
+          },
+          onClose: () => () => undefined,
+          dispose: () => { connection.disposed = true; },
+          getBanner: () => undefined
+        } as unknown as SshConnection & { id: number; serverId: string; disposed: boolean };
+        connections.push(connection);
+        return connection;
+      }
+    };
+    const authFactory = new SilentAuthSshFactory(
+      connector,
+      dest.vault,
+      { prompt: async () => undefined },
+      undefined,
+      (id) => dest.core.getAuthProfile(id),
+      (id) => dest.core.getServer(id)
+    );
+    const proxyFactory = new ProxySshFactory(authFactory, (id) => dest.core.getServer(id), dest.vault);
+    const pool = new SshConnectionPool(proxyFactory, { enabled: true, idleTimeoutMs: 0 });
+    proxyFactory.setJumpHostConnectionFactory(pool);
+    const unsubscribeRemovedServerPoolEntries = watchSshPoolServerRemovals(dest.core, pool);
+
+    let oldTargetConnection: SshConnection | undefined;
+    let newTargetConnection: SshConnection | undefined;
+    try {
+      oldTargetConnection = await proxyFactory.connectWithContext(oldTarget);
+      const oldJumpConnection = connections.find((connection) => connection.serverId === oldJump.id);
+      expect(oldJumpConnection).toBeDefined();
+      expect(connectorCalls.find((call) => call.serverId === oldTarget.id)?.tunnelOwner).toBe(oldJumpConnection?.id);
+
+      await runImport(dest, backup, "replace");
+      expect(await dest.vault.get("password-srv-1")).toBe("backup-target-password");
+
+      newTargetConnection = await proxyFactory.connectWithContext(dest.core.getServer(oldTarget.id)!);
+
+      const jumpCalls = connectorCalls.filter((call) => call.serverId === oldJump.id);
+      const targetCalls = connectorCalls.filter((call) => call.serverId === oldTarget.id);
+      expect(jumpCalls.map((call) => call.username)).toEqual(["old-jump-user", "new-jump-user"]);
+      expect(targetCalls.at(-1)?.password).toBe("backup-target-password");
+      expect(targetCalls.at(-1)?.tunnelOwner).toBe(connections.filter((connection) => connection.serverId === oldJump.id).at(-1)?.id);
+      expect(connections.find((connection) => connection.id === oldJumpConnection?.id)?.disposed).toBe(false);
+
+      oldTargetConnection.dispose();
+      oldTargetConnection = undefined;
+      expect(connections.find((connection) => connection.id === oldJumpConnection?.id)?.disposed).toBe(true);
+    } finally {
+      unsubscribeRemovedServerPoolEntries();
+      oldTargetConnection?.dispose();
+      newTargetConnection?.dispose();
+      pool.dispose();
+    }
+  });
+
+  it("does not read or send a restored target password through a pre-Replace jump handshake", async () => {
+    const dest = await makeMachine();
+    const oldJump = makeServer({
+      id: "jump-1",
+      name: "Bastion",
+      host: "bastion.example",
+      authType: "key",
+      keyPath: "/keys/bastion"
+    });
+    const oldTarget = makeServer({
+      id: "srv-1",
+      name: "Router",
+      host: "10.0.0.1",
+      username: "target-user",
+      authType: "password",
+      proxy: { type: "ssh", jumpHostId: oldJump.id }
+    });
+    await dest.core.addOrUpdateServer(oldJump);
+    await dest.core.addOrUpdateServer(oldTarget);
+    await dest.vault.store("password-srv-1", "old-route-secret");
+
+    const replacement = await makeMachine();
+    const newJump = { ...oldJump };
+    const newTarget = { ...oldTarget };
+    await replacement.core.addOrUpdateServer(newJump);
+    await replacement.core.addOrUpdateServer(newTarget);
+    await replacement.vault.store("password-srv-1", "backup-new-route-secret");
+    const backup = await exportBackup(replacement);
+
+    let releaseOldBastionHandshake!: () => void;
+    const oldBastionHandshakeGate = new Promise<void>((resolve) => {
+      releaseOldBastionHandshake = resolve;
+    });
+    let signalOldBastionHandshakeStarted!: () => void;
+    const oldBastionHandshakeStarted = new Promise<void>((resolve) => {
+      signalOldBastionHandshakeStarted = resolve;
+    });
+    let nextConnectionId = 0;
+    const tunnelOwners = new WeakMap<object, number>();
+    const connections: Array<SshConnection & { id: number; serverId: string; host: string; disposed: boolean }> = [];
+    const connectorCalls: Array<{
+      serverId: string;
+      host: string;
+      password: string | undefined;
+      tunnelOwner: number | undefined;
+    }> = [];
+    const connector: SshConnector = {
+      connect: async (server, auth) => {
+        connectorCalls.push({
+          serverId: server.id,
+          host: server.host,
+          password: auth.password,
+          tunnelOwner: auth.sock ? tunnelOwners.get(auth.sock) : undefined
+        });
+        if (server.id === oldJump.id && server.host === oldJump.host && connections.length === 0) {
+          signalOldBastionHandshakeStarted();
+          await oldBastionHandshakeGate;
+        }
+        let connection!: SshConnection & { id: number; serverId: string; host: string; disposed: boolean };
+        connection = {
+          id: ++nextConnectionId,
+          serverId: server.id,
+          host: server.host,
+          disposed: false,
+          openDirectTcp: async () => {
+            const socket = new PassThrough();
+            tunnelOwners.set(socket, connection.id);
+            return socket;
+          },
+          onClose: () => () => undefined,
+          dispose: () => { connection.disposed = true; },
+          getBanner: () => undefined
+        } as unknown as SshConnection & { id: number; serverId: string; host: string; disposed: boolean };
+        connections.push(connection);
+        return connection;
+      }
+    };
+    const targetPasswordReads: string[] = [];
+    const authVault: SecretVault = {
+      get: async (key) => {
+        if (key === "password-srv-1") targetPasswordReads.push(key);
+        return dest.vault.get(key);
+      },
+      store: async (key, value) => dest.vault.store(key, value),
+      delete: async (key) => dest.vault.delete(key)
+    };
+    const authFactory = new SilentAuthSshFactory(
+      connector,
+      authVault,
+      { prompt: async () => undefined },
+      undefined,
+      undefined,
+      (id) => dest.core.getServer(id)
+    );
+    const proxyFactory = new ProxySshFactory(authFactory, (id) => dest.core.getServer(id), authVault);
+    const pool = new SshConnectionPool(proxyFactory, { enabled: true, idleTimeoutMs: 0 });
+    proxyFactory.setJumpHostConnectionFactory(pool);
+    const unsubscribeRemovedServerPoolEntries = watchSshPoolServerRemovals(dest.core, pool);
+
+    let staleTargetAttempt: Promise<SshConnection> | undefined;
+    let freshTargetConnection: SshConnection | undefined;
+    try {
+      staleTargetAttempt = proxyFactory.connectWithContext(oldTarget);
+      await oldBastionHandshakeStarted;
+
+      await runImport(dest, backup, "replace");
+      expect(dest.core.getServer(oldTarget.id)).toEqual(oldTarget);
+      expect(await dest.vault.get("password-srv-1")).toBe("backup-new-route-secret");
+
+      releaseOldBastionHandshake();
+      const staleAttemptResult = await staleTargetAttempt.then(() => "resolved", () => "rejected");
+      expect({
+        targetPasswordReads,
+        staleTargetCalls: connectorCalls.filter((call) => call.serverId === oldTarget.id),
+        staleAttemptResult
+      }).toEqual({ targetPasswordReads: [], staleTargetCalls: [], staleAttemptResult: "rejected" });
+
+      freshTargetConnection = await proxyFactory.connectWithContext(dest.core.getServer(oldTarget.id)!);
+      const targetCall = connectorCalls.find((call) => call.serverId === oldTarget.id);
+      const freshJumpConnection = connections.find((connection) => connection.id === targetCall?.tunnelOwner);
+      expect(targetCall?.password).toBe("backup-new-route-secret");
+      expect(freshJumpConnection?.host).toBe("bastion.example");
+      expect(freshJumpConnection?.id).not.toBe(connections.find((connection) => connection.serverId === oldJump.id)?.id);
+    } finally {
+      releaseOldBastionHandshake();
+      if (staleTargetAttempt) await staleTargetAttempt.catch(() => undefined);
+      unsubscribeRemovedServerPoolEntries();
+      freshTargetConnection?.dispose();
+      pool.dispose();
+    }
+  });
+
+  it("rechecks target identity after an async vault read before sending a saved password", async () => {
+    const dest = await makeMachine();
+    const oldTarget = makeServer({ id: "srv-1", host: "10.0.0.1", authType: "password" });
+    await dest.core.addOrUpdateServer(oldTarget);
+    await dest.vault.store("password-srv-1", "old-target-secret");
+
+    const replacement = await makeMachine();
+    const newTarget = { ...oldTarget };
+    await replacement.core.addOrUpdateServer(newTarget);
+    await replacement.vault.store("password-srv-1", "backup-new-target-secret");
+    const backup = await exportBackup(replacement);
+
+    let releasePasswordRead!: () => void;
+    const passwordReadGate = new Promise<void>((resolve) => {
+      releasePasswordRead = resolve;
+    });
+    let signalPasswordRead!: () => void;
+    const passwordReadStarted = new Promise<void>((resolve) => {
+      signalPasswordRead = resolve;
+    });
+    const targetPasswordReads: string[] = [];
+    const authVault: SecretVault = {
+      get: async (key) => {
+        if (key === "password-srv-1") {
+          targetPasswordReads.push(key);
+          signalPasswordRead();
+          await passwordReadGate;
+        }
+        return dest.vault.get(key);
+      },
+      store: async (key, value) => dest.vault.store(key, value),
+      delete: async (key) => dest.vault.delete(key)
+    };
+    const connectorCalls: Array<{ serverId: string; password: string | undefined }> = [];
+    const connector: SshConnector = {
+      connect: async (server, auth) => {
+        connectorCalls.push({ serverId: server.id, password: auth.password });
+        return {
+          dispose: () => undefined,
+          onClose: () => () => undefined,
+          getBanner: () => undefined
+        } as unknown as SshConnection;
+      }
+    };
+    const authFactory = new SilentAuthSshFactory(
+      connector,
+      authVault,
+      { prompt: async () => undefined },
+      undefined,
+      undefined,
+      (id) => dest.core.getServer(id)
+    );
+    const proxyFactory = new ProxySshFactory(authFactory, (id) => dest.core.getServer(id), authVault);
+
+    let staleAttempt: Promise<SshConnection> | undefined;
+    try {
+      staleAttempt = proxyFactory.connectWithContext(oldTarget);
+      await passwordReadStarted;
+      await runImport(dest, backup, "replace");
+      expect(dest.core.getServer(oldTarget.id)).toEqual(oldTarget);
+      expect(await dest.vault.get("password-srv-1")).toBe("backup-new-target-secret");
+
+      releasePasswordRead();
+      const staleAttemptResult = await staleAttempt.then(() => "resolved", () => "rejected");
+      expect({
+        connectorCalls,
+        staleAttemptResult
+      }).toEqual({ connectorCalls: [], staleAttemptResult: "rejected" });
+    } finally {
+      releasePasswordRead();
+      if (staleAttempt) await staleAttempt.catch(() => undefined);
+    }
+  });
+
+  it("rechecks target identity after an async password prompt before sending its answer", async () => {
+    const dest = await makeMachine();
+    const oldTarget = makeServer({ id: "srv-1", host: "10.0.0.1", authType: "password" });
+    await dest.core.addOrUpdateServer(oldTarget);
+
+    const replacement = await makeMachine();
+    const newTarget = { ...oldTarget };
+    await replacement.core.addOrUpdateServer(newTarget);
+    const backup = await exportBackup(replacement);
+
+    let releasePrompt!: () => void;
+    const promptGate = new Promise<void>((resolve) => {
+      releasePrompt = resolve;
+    });
+    let signalPrompt!: () => void;
+    const promptStarted = new Promise<void>((resolve) => {
+      signalPrompt = resolve;
+    });
+    const connectorCalls: Array<{ serverId: string; password: string | undefined }> = [];
+    const connector: SshConnector = {
+      connect: async (server, auth) => {
+        connectorCalls.push({ serverId: server.id, password: auth.password });
+        return {
+          dispose: () => undefined,
+          onClose: () => () => undefined,
+          getBanner: () => undefined
+        } as unknown as SshConnection;
+      }
+    };
+    const authFactory = new SilentAuthSshFactory(
+      connector,
+      dest.vault,
+      {
+        prompt: async () => {
+          signalPrompt();
+          await promptGate;
+          return { password: "stale-prompt-answer", save: false };
+        }
+      },
+      undefined,
+      undefined,
+      (id) => dest.core.getServer(id)
+    );
+    const proxyFactory = new ProxySshFactory(authFactory, (id) => dest.core.getServer(id), dest.vault);
+
+    let staleAttempt: Promise<SshConnection> | undefined;
+    try {
+      staleAttempt = proxyFactory.connectWithContext(oldTarget);
+      await promptStarted;
+      await runImport(dest, backup, "replace");
+      expect(dest.core.getServer(oldTarget.id)).toEqual(oldTarget);
+
+      releasePrompt();
+      const staleAttemptResult = await staleAttempt.then(() => "resolved", () => "rejected");
+      expect({ connectorCalls, staleAttemptResult }).toEqual({ connectorCalls: [], staleAttemptResult: "rejected" });
+    } finally {
+      releasePrompt();
+      if (staleAttempt) await staleAttempt.catch(() => undefined);
+    }
+  });
+
+  it("a removed server retires its idle pooled connection before the same id is added again", async () => {
+    const machine = await makeMachine();
+    const server = makeServer({ id: "jump-1", name: "Bastion" });
+    await machine.core.addOrUpdateServer(server);
+
+    const connections: Array<{ disposed: boolean }> = [];
+    const factory = {
+      connect: async () => {
+        const connection = {
+          disposed: false,
+          onClose: () => () => undefined,
+          dispose: () => { connection.disposed = true; },
+          getBanner: () => undefined
+        } as unknown as SshConnection & { disposed: boolean };
+        connections.push(connection);
+        return connection;
+      }
+    };
+    const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
+    const unsubscribeRemovedServerPoolEntries = watchSshPoolServerRemovals(machine.core, pool);
+
+    try {
+      const idleLease = await pool.connect(server);
+      idleLease.dispose();
+      expect(connections[0]?.disposed).toBe(false);
+
+      await machine.core.removeServer(server.id);
+      expect(connections[0]?.disposed).toBe(true);
+
+      await machine.core.addOrUpdateServer(server);
+      const freshLease = await pool.connect(server);
+      expect(connections).toHaveLength(2);
+      expect(connections[1]?.disposed).toBe(false);
+      freshLease.dispose();
+    } finally {
+      unsubscribeRemovedServerPoolEntries();
+      pool.dispose();
+    }
+  });
+
+  it("retires a pooled server when removeServer deletes it but persistence rejects", async () => {
+    const repository = new InMemoryConfigRepository();
+    const core = new NexusCore(repository);
+    await core.initialize();
+    const server = makeServer({ id: "jump-1", name: "Bastion" });
+    await core.addOrUpdateServer(server);
+
+    const connections: Array<{ disposed: boolean }> = [];
+    const factory = {
+      connect: async () => {
+        const connection = {
+          disposed: false,
+          onClose: () => () => undefined,
+          dispose: () => { connection.disposed = true; },
+          getBanner: () => undefined
+        } as unknown as SshConnection & { disposed: boolean };
+        connections.push(connection);
+        return connection;
+      }
+    };
+    const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
+    const unsubscribeRemovedServerPoolEntries = watchSshPoolServerRemovals(core, pool);
+
+    try {
+      const firstLease = await pool.connect(server);
+      firstLease.dispose();
+      expect(connections[0]?.disposed).toBe(false);
+
+      vi.spyOn(repository, "saveServers").mockRejectedValueOnce(new Error("server write failed"));
+      await expect(core.removeServer(server.id)).rejects.toThrow("server write failed");
+      expect(core.getServer(server.id)).toBeUndefined();
+      expect(connections[0]?.disposed).toBe(true);
+
+      await core.addOrUpdateServer(server);
+      const replacementLease = await pool.connect(server);
+      expect(connections).toHaveLength(2);
+      expect(connections[1]?.disposed).toBe(false);
+      replacementLease.dispose();
+    } finally {
+      unsubscribeRemovedServerPoolEntries();
+      pool.dispose();
+    }
+  });
+
+  it("a sealed backup still restores the secrets it carries onto its own record, and a secret it lacks is not kept from this machine", async () => {
+    const source = await makeMachine();
+    await source.core.addOrUpdateServer(makeServer({ host: "10.9.9.9" }));
+    await source.vault.store("password-srv-1", "file-pw");
+    const json = await exportBackup(source);
+    const dest = await destWithSavedSecrets();
+
+    await runImport(dest, json, "replace");
+
+    expect(dest.core.getServer("srv-1")?.host).toBe("10.9.9.9");
+    expect(await savedSecrets(dest)).toEqual(["file-pw", undefined, undefined]);
+  });
+
+  it("the message counts a server whose backup put back its password but not its proxy password, and not one whose backup put back everything cleared", async () => {
+    const source = await makeMachine();
+    await source.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, host: "10.9.9.9" }));
+    await source.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, id: "srv-2", name: "srv-2", host: "10.9.9.10" }));
+    await source.vault.store("password-srv-1", "file-pw");
+    await source.vault.store("password-srv-2", "file-pw-2");
+    const json = await exportBackup(source);
+    const dest = await makeMachine();
+    await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT }));
+    await dest.vault.store("password-srv-1", "router-pw");
+    await dest.vault.store("proxy-password-srv-1", "proxy-pw");
+    await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, id: "srv-2", name: "srv-2" }));
+    await dest.vault.store("password-srv-2", "router-pw-2");
+
+    await runImport(dest, json, "replace");
+
+    // srv-1 will still ask for its proxy password; srv-2 got everything it lost back.
+    expect(await dest.vault.get("proxy-password-srv-1")).toBeUndefined();
+    expect(await dest.vault.get("password-srv-2")).toBe("file-pw-2");
+    expect(lastInfoMessage()).toContain(
+      "1 server came back at a different address or route; the credentials saved here for it were cleared."
+    );
+    expect(lastInfoMessage()).not.toContain("next connect");
+  });
+
+  it("a sealed backup of the same endpoint keeps what this machine saved and overwrites only what the backup carries", async () => {
+    const source = await makeMachine();
+    await source.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT }));
+    await source.vault.store("password-srv-1", "file-pw");
+    const json = await exportBackup(source);
+    const dest = await destWithSavedSecrets();
+
+    await runImport(dest, json, "replace");
+
+    expect(await savedSecrets(dest)).toEqual(["file-pw", "router-pp", "proxy-pw"]);
+  });
+
+  it("a server a sealed backup brings back with no proxy and its SSH password restored is still counted, and the message promises no prompt", async () => {
+    const source = await makeMachine();
+    await source.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, proxy: undefined }));
+    await source.vault.store("password-srv-1", "file-pw");
+    const json = await exportBackup(source);
+    const dest = await makeMachine();
+    await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT }));
+    await dest.vault.store("password-srv-1", "router-pw");
+    await dest.vault.store("proxy-password-srv-1", "proxy-pw");
+
+    await runImport(dest, json, "replace");
+
+    // Nothing will ask for the cleared proxy password — the server has no proxy
+    // now — so the message states what happened and nothing more.
+    expect(dest.core.getServer("srv-1")?.proxy).toBeUndefined();
+    expect(await savedSecrets(dest)).toEqual(["file-pw", undefined, undefined]);
+    expect(lastInfoMessage()).toContain("1 server came back at a different address or route; the credentials saved here for it were cleared.");
+    expect(lastInfoMessage()).not.toContain("next connect");
+  });
+
+  it("the completion message counts the re-created servers whose saved secrets were cleared — not an unchanged one, and not one that had none", async () => {
+    const dest = await destWithSavedSecrets();
+    for (const id of ["srv-2", "srv-3"]) {
+      await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, id, name: id }));
+      await dest.vault.store(`password-${id}`, `${id}-pw`);
+    }
+    await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, id: "srv-4", name: "No saved password" }));
+
+    await runImport(dest, unsealedJson([
+      makeServer({ ...LOCAL_ENDPOINT, host: "attacker.example" }),
+      makeServer({ ...LOCAL_ENDPOINT, id: "srv-2", name: "srv-2", port: 2222 }),
+      makeServer({ ...LOCAL_ENDPOINT, id: "srv-3", name: "srv-3" }),
+      makeServer({ ...LOCAL_ENDPOINT, id: "srv-4", name: "No saved password", host: "elsewhere.example" })
+    ]), "replace");
+
+    expect(lastInfoMessage()).toBe(
+      "Imported 4 profiles (replaced existing). 2 servers came back at a different address or route; the credentials saved here for them were cleared."
+    );
+    expect(await dest.vault.get("password-srv-3")).toBe("srv-3-pw");
+  });
+
+  it("if the import fails partway, every removed server still holding secrets loses them before the error surfaces — re-created unchanged or not", async () => {
+    const dest = await destWithSavedSecrets();
+    const write = dest.core.addOrUpdateServer.bind(dest.core);
+    vi.spyOn(dest.core, "addOrUpdateServer").mockImplementation(async (server) => {
+      if (server.id === "boom") throw new Error("disk full");
+      await write(server);
+    });
+
+    // srv-1 comes back unchanged, then the next record's write fails.
+    register(dest);
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }).mockResolvedValueOnce({ label: "Replace", value: "replace" });
+    mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/nexus-backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValueOnce(Buffer.from(unsealedJson([makeServer({ ...LOCAL_ENDPOINT }), makeServer({ id: "boom", name: "Boom" })]), "utf8"));
+    await expect(registeredCommands.get("nexus.config.import")!()).rejects.toThrow("disk full");
+
+    expect(await savedSecrets(dest)).toEqual(GONE);
+  });
+
+  it("if clearing a changed endpoint's secrets fails, they are cleared again before the error surfaces, and the record is never published", async () => {
+    let failOnce = true;
+    class FlakyVault extends MockVault {
+      async delete(key: string) {
+        if (key === "password-srv-1" && failOnce) {
+          failOnce = false;
+          throw new Error("keychain locked");
+        }
+        await super.delete(key);
+      }
+    }
+    const dest = await destWithSavedSecrets({}, new FlakyVault());
+
+    register(dest);
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }).mockResolvedValueOnce({ label: "Replace", value: "replace" });
+    mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/nexus-backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValueOnce(Buffer.from(unsealedJson([makeServer({ ...LOCAL_ENDPOINT, host: "attacker.example" })]), "utf8"));
+    await expect(registeredCommands.get("nexus.config.import")!()).rejects.toThrow("keychain locked");
+
+    expect(dest.core.getServer("srv-1")).toBeUndefined();
+    expect(await savedSecrets(dest)).toEqual(GONE);
+  });
+
+  describe("a server behind an SSH jump host — the jump host is part of its route", () => {
+    const via = (jumpHostId: string): Partial<ServerConfig> => ({ proxy: { type: "ssh", jumpHostId } });
+
+    async function destWithChain(): Promise<Machine> {
+      const dest = await destWithSavedSecrets(via("jump-1"));
+      await dest.core.addOrUpdateServer(makeServer({ id: "jump-1", name: "Jump 1", host: "10.1.0.1", ...via("jump-2") }));
+      await dest.core.addOrUpdateServer(makeServer({ id: "jump-2", name: "Jump 2", host: "10.2.0.1" }));
+      for (const id of ["jump-1", "jump-2"]) await dest.vault.store(`password-${id}`, `${id}-pw`);
+      return dest;
+    }
+    const target = () => makeServer({ ...LOCAL_ENDPOINT, ...via("jump-1") });
+    const jump1 = (overrides: Partial<ServerConfig> = {}) => makeServer({ id: "jump-1", name: "Jump 1", host: "10.1.0.1", ...via("jump-2"), ...overrides });
+    const jump2 = (overrides: Partial<ServerConfig> = {}) => makeServer({ id: "jump-2", name: "Jump 2", host: "10.2.0.1", ...overrides });
+
+    it("a target that comes back unchanged loses its secrets when its jump host comes back somewhere else", async () => {
+      const dest = await destWithChain();
+
+      await runImport(dest, unsealedJson([jump1({ host: "attacker.example" }), target(), jump2()]), "replace");
+
+      expect(dest.core.getServer("srv-1")?.host).toBe("10.0.0.1");
+      expect(await savedSecrets(dest)).toEqual(GONE);
+      expect(await dest.vault.get("password-jump-2")).toBe("jump-2-pw");
+    });
+
+    it.each([
+      ["recreates a profile with changed connection fields", "jump-auth", "ops-new"],
+      ["relinks the jump host to another profile", "jump-auth-replacement", "ops-old"]
+    ])("clears target secrets when Replace %s", async (_change, profileId, username) => {
+      const dest = await destWithChain();
+      const oldProfile = { id: "jump-auth", name: "Jump auth", username: "ops-old", authType: "password" as const };
+      await dest.core.addOrUpdateAuthProfile(oldProfile);
+      await dest.core.addOrUpdateServer(jump1({ authProfileId: oldProfile.id }));
+      await dest.vault.store("password-jump-1", "jump-1-pw");
+
+      // The server record and its raw username are unchanged. The effective
+      // bastion auth changes either through profile fields or its linked id.
+      const replacementProfile = { ...oldProfile, id: profileId, username };
+      await runImport(
+        dest,
+        unsealedJson([target(), jump1({ authProfileId: replacementProfile.id }), jump2()], [replacementProfile]),
+        "replace"
+      );
+
+      expect(dest.core.getAuthProfile(replacementProfile.id)?.username).toBe(username);
+      expect(await savedSecrets(dest)).toEqual(GONE);
+      expect(await dest.vault.get("password-jump-1")).toBeUndefined();
+    });
+
+    it("a two-hop chain whose far hop moved clears every server behind it", async () => {
+      const dest = await destWithChain();
+
+      await runImport(dest, unsealedJson([target(), jump1(), jump2({ host: "attacker.example" })]), "replace");
+
+      expect(await savedSecrets(dest)).toEqual(GONE);
+      expect(await dest.vault.get("password-jump-1")).toBeUndefined();
+      expect(await dest.vault.get("password-jump-2")).toBeUndefined();
+    });
+
+    it("a jump host listed after its target still decides the target, before the target is published", async () => {
+      const hostAtDelete: Array<string | undefined> = [];
+      let dest: Machine | undefined;
+      class WatchingVault extends MockVault {
+        async delete(key: string) {
+          if (key === "password-srv-1") hostAtDelete.push(dest?.core.getServer("srv-1")?.host);
+          await super.delete(key);
+        }
+      }
+      dest = await destWithSavedSecrets(via("jump-1"), new WatchingVault());
+      await dest.core.addOrUpdateServer(jump1({ proxy: undefined }));
+
+      await runImport(dest, unsealedJson([target(), jump1({ proxy: undefined, host: "attacker.example" })]), "replace");
+
+      expect(hostAtDelete).toEqual([undefined]);
+      expect(await savedSecrets(dest)).toEqual(GONE);
+    });
+
+    it("a jump host the file does not bring back clears the servers behind it", async () => {
+      const dest = await destWithChain();
+
+      await runImport(dest, unsealedJson([target(), jump2()]), "replace");
+
+      expect(dest.core.getServer("jump-1")).toBeUndefined();
+      expect(await savedSecrets(dest)).toEqual(GONE);
+    });
+
+    it("an unchanged chain, or an unchanged cycle, keeps every hop's secrets", async () => {
+      const dest = await destWithChain();
+      await dest.core.addOrUpdateServer(makeServer({ id: "cyc-a", name: "Cycle A", host: "10.3.0.1", ...via("cyc-b") }));
+      await dest.core.addOrUpdateServer(makeServer({ id: "cyc-b", name: "Cycle B", host: "10.3.0.2", ...via("cyc-a") }));
+      for (const id of ["cyc-a", "cyc-b"]) await dest.vault.store(`password-${id}`, `${id}-pw`);
+
+      await runImport(dest, unsealedJson([
+        target(),
+        jump1(),
+        jump2(),
+        makeServer({ id: "cyc-a", name: "Cycle A", host: "10.3.0.1", ...via("cyc-b") }),
+        makeServer({ id: "cyc-b", name: "Cycle B", host: "10.3.0.2", ...via("cyc-a") })
+      ]), "replace");
+
+      expect(await savedSecrets(dest)).toEqual(KEPT);
+      for (const id of ["jump-1", "jump-2", "cyc-a", "cyc-b"]) {
+        expect(await dest.vault.get(`password-${id}`)).toBe(`${id}-pw`);
+      }
+      expect(lastInfoMessage()).not.toContain("different address");
+    });
+  });
+
+  it("a wipe step that fails after the servers are removed still sweeps their secrets, and the original error is the one reported", async () => {
+    class FailingVault extends MockVault {
+      async delete(key: string) {
+        if (key === "auth-profile-password-ap-1" || key === "passphrase-srv-1") throw new Error(`cannot delete ${key}`);
+        await super.delete(key);
+      }
+    }
+    const dest = await destWithSavedSecrets({}, new FailingVault());
+    await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, id: "srv-2", name: "srv-2" }));
+    await dest.vault.store("password-srv-2", "srv-2-pw");
+    await dest.vault.store("proxy-password-srv-2", "srv-2-proxy");
+    await dest.core.addOrUpdateAuthProfile({ id: "ap-1", name: "Ops", username: "ops", authType: "password" });
+
+    register(dest);
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }).mockResolvedValueOnce({ label: "Replace", value: "replace" });
+    mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/nexus-backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValueOnce(Buffer.from(unsealedJson([makeServer({ ...LOCAL_ENDPOINT })]), "utf8"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await expect(registeredCommands.get("nexus.config.import")!()).rejects.toThrow("cannot delete auth-profile-password-ap-1");
+    warn.mockRestore();
+
+    // Every key that can be deleted is: the one that cannot does not stop the rest.
+    expect(await savedSecrets(dest)).toEqual([undefined, "router-pp", undefined]);
+    expect(await dest.vault.get("password-srv-2")).toBeUndefined();
+    expect(await dest.vault.get("proxy-password-srv-2")).toBeUndefined();
+  });
+
+  it("a server whose removal fails to persist still has its secrets swept — it is already gone from this session", async () => {
+    const dest = await destWithSavedSecrets();
+    await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, id: "srv-2", name: "srv-2" }));
+    await dest.vault.store("password-srv-2", "srv-2-pw");
+    const remove = dest.core.removeServer.bind(dest.core);
+    vi.spyOn(dest.core, "removeServer").mockImplementation(async (id) => {
+      // As NexusCore does: the record leaves memory, then the persist rejects.
+      await remove(id);
+      if (id === "srv-2") throw new Error("disk full");
+    });
+
+    register(dest);
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }).mockResolvedValueOnce({ label: "Replace", value: "replace" });
+    mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/nexus-backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValueOnce(Buffer.from(unsealedJson([makeServer({ ...LOCAL_ENDPOINT })]), "utf8"));
+    await expect(registeredCommands.get("nexus.config.import")!()).rejects.toThrow("disk full");
+
+    expect(dest.core.getServer("srv-2")).toBeUndefined();
+    expect(await dest.vault.get("password-srv-2")).toBeUndefined();
+    expect(await savedSecrets(dest)).toEqual(GONE);
+  });
+
+  it("a failed delete for one server the file leaves out does not stop the others' being cleared", async () => {
+    let failOnce = true;
+    class FlakyVault extends MockVault {
+      async delete(key: string) {
+        if (key === "password-srv-1" && failOnce) {
+          failOnce = false;
+          throw new Error("keychain locked");
+        }
+        await super.delete(key);
+      }
+    }
+    const dest = await destWithSavedSecrets({}, new FlakyVault());
+    for (const id of ["srv-2", "srv-3"]) {
+      await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, id, name: id }));
+      await dest.vault.store(`password-${id}`, `${id}-pw`);
+    }
+
+    register(dest);
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }).mockResolvedValueOnce({ label: "Replace", value: "replace" });
+    mockShowOpenDialog.mockResolvedValueOnce([{ fsPath: "/fake/nexus-backup.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValueOnce(Buffer.from(unsealedJson([makeServer({ id: "other", name: "Other" })]), "utf8"));
+    await expect(registeredCommands.get("nexus.config.import")!()).rejects.toThrow("keychain locked");
+
+    expect(await dest.vault.get("password-srv-2")).toBeUndefined();
+    expect(await dest.vault.get("password-srv-3")).toBeUndefined();
+    // The one that failed stays waiting, and the sweep clears it.
+    expect(await savedSecrets(dest)).toEqual(GONE);
+  });
+
+  it("Merge is unchanged: the local server and its secrets stay, whatever endpoint the file gives its id", async () => {
+    const dest = await destWithSavedSecrets();
+
+    await runImport(dest, unsealedJson([
+      makeServer({ ...LOCAL_ENDPOINT, host: "attacker.example" }),
+      makeServer({ id: "srv-2", name: "New" })
+    ]), "merge");
+
+    expect(dest.core.getServer("srv-1")?.host).toBe("10.0.0.1");
+    expect(dest.core.getServer("srv-2")).toBeDefined();
+    expect(await savedSecrets(dest)).toEqual(KEPT);
   });
 });
 
