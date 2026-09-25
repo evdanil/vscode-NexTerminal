@@ -9,6 +9,7 @@ export class ProxiedSshConnection implements SshConnection {
   private readonly closeListeners = new Set<() => void>();
   private readonly innerCloseUnsubscribe: () => void;
   private readonly proxyCloseUnsubscribe?: () => void;
+  private disposed = false;
   private closed = false;
 
   public constructor(
@@ -64,11 +65,12 @@ export class ProxiedSshConnection implements SshConnection {
   }
 
   public dispose(): void {
-    this.innerCloseUnsubscribe();
-    this.proxyCloseUnsubscribe?.();
+    if (this.disposed) {
+      return;
+    }
+    this.disposed = true;
     this.inner.dispose();
     this.proxyCleanup();
-    this.emitClose();
   }
 
   private emitClose(): void {
@@ -76,6 +78,8 @@ export class ProxiedSshConnection implements SshConnection {
       return;
     }
     this.closed = true;
+    this.innerCloseUnsubscribe();
+    this.proxyCloseUnsubscribe?.();
     for (const listener of this.closeListeners) {
       listener();
     }
