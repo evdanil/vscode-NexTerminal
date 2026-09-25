@@ -2,8 +2,10 @@ import * as net from "node:net";
 import { PassThrough, type Duplex } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ServerConfig, TunnelProfile } from "../../src/models/config";
-import type { SshConnection, SshFactory, TcpConnectionInfo } from "../../src/services/ssh/contracts";
+import type { SecretVault, SshConnection, SshFactory, TcpConnectionInfo } from "../../src/services/ssh/contracts";
+import { ProxySshFactory } from "../../src/services/ssh/proxySshFactory";
 import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
+import type { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 import { TunnelManager, type TunnelEvent } from "../../src/services/tunnel/tunnelManager";
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
@@ -179,6 +181,42 @@ class ScriptedSshFactory implements SshFactory {
     const conn = new ScriptedSshConnection();
     this.connections.push(conn);
     return conn;
+  }
+}
+
+class CloseReplaySshConnection extends DirectTcpSshConnection {
+  public disposeCount = 0;
+  private closed = false;
+  private disposed = false;
+
+  public remoteClose(): void {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    super.dispose();
+  }
+
+  public override async openDirectTcp(): Promise<net.Socket> {
+    return new net.Socket();
+  }
+
+  public override onClose(listener: () => void): () => void {
+    if (this.closed) {
+      listener();
+      return () => {};
+    }
+    return super.onClose(listener);
+  }
+
+  public override dispose(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.disposed = true;
+    this.disposeCount += 1;
+    this.closed = true;
+    super.dispose();
   }
 }
 
@@ -1343,6 +1381,80 @@ describe("TunnelManager integration", () => {
       await manager.stopAll();
       await Promise.all([waitingResult, ...(predecessorResult ? [predecessorResult] : [])]);
       pool.dispose();
+    }
+  });
+
+  it("releases the bastion lease when a non-multiplexed reverse target receives a replayed close", async () => {
+    const bastionConnection = new CloseReplaySshConnection();
+    const targetConnection = new CloseReplaySshConnection();
+    const jumpServer: ServerConfig = { ...testServer, id: "server-close-replay-bastion", multiplexing: true };
+    const targetServer: ServerConfig = {
+      ...testServer,
+      id: "server-close-replay-target",
+      multiplexing: false,
+      proxy: { type: "ssh", jumpHostId: jumpServer.id }
+    };
+    const authFactory = {
+      connect: async (server: ServerConfig, options?: { sockFactory?: () => Promise<Duplex> }) => {
+        if (server.id === jumpServer.id) {
+          return bastionConnection;
+        }
+        const hop = await options?.sockFactory?.();
+        hop?.destroy();
+        bastionConnection.remoteClose();
+        return targetConnection;
+      }
+    } as unknown as SilentAuthSshFactory;
+    const vault: SecretVault = {
+      get: async () => undefined,
+      store: async () => {},
+      delete: async () => {}
+    };
+    const proxyFactory = new ProxySshFactory(authFactory, (id) => id === jumpServer.id ? jumpServer : undefined, vault);
+    const pool = new SshConnectionPool(proxyFactory, { enabled: true, idleTimeoutMs: 0 });
+    proxyFactory.setJumpHostConnectionFactory(pool);
+    manager = new TunnelManager(pool, pool);
+    const profile: TunnelProfile = {
+      id: "reverse-close-replay-target",
+      name: "Replay-closed jump target",
+      localPort: 12345,
+      remoteIP: "127.0.0.1",
+      remotePort: 23456,
+      autoStart: false,
+      tunnelType: "reverse",
+      remoteBindAddress: "127.0.0.1",
+      localTargetIP: "127.0.0.1"
+    };
+    const events: TunnelEvent[] = [];
+    manager.onDidChange((event) => events.push(event));
+    let bastionLease: SshConnection | undefined;
+
+    try {
+      // Keep another real pool lease alive so the target's leaked lease is
+      // visible when this one is released after the remote close.
+      bastionLease = await pool.connect(jumpServer);
+      await expect(manager.start(profile, targetServer)).rejects.toThrow(
+        "Shared SSH connection closed while starting tunnel Replay-closed jump target"
+      );
+      expect(events.filter((event) => event.type === "started")).toHaveLength(0);
+      expect(events.filter((event) => event.type === "error")).toHaveLength(0);
+
+      bastionLease.dispose();
+      bastionLease = undefined;
+      expect(bastionConnection.disposeCount).toBe(1);
+      expect(targetConnection.disposeCount).toBe(1);
+      expect(manager.getActiveTunnelId(profile.id)).toBeUndefined();
+    } finally {
+      await manager.stopAll();
+      bastionLease?.dispose();
+      pool.dispose();
+      if (targetConnection.disposeCount === 0) {
+        targetConnection.dispose();
+      }
+      if (bastionConnection.disposeCount === 0) {
+        bastionConnection.dispose();
+      }
+      manager = undefined;
     }
   });
 

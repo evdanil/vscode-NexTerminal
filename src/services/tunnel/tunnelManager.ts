@@ -960,6 +960,8 @@ export class TunnelManager {
     });
     subscribing = false;
     if (closedDuringSubscription) {
+      // The close callback removed it from runtime ownership, so no failed-start cleanup can release wrapped resources.
+      sharedConnection.dispose();
       throw new Error(`Shared SSH connection closed while starting tunnel ${runtime.profile.name}`);
     }
     return sharedConnection;
