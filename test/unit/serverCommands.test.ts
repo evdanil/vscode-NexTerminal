@@ -4487,10 +4487,10 @@ describe("nexus.server.edit — addressless placeholder is editable (P2-a)", () 
   });
 
   // #170 — the notice points at where the source's address will appear, and
-  // names the protocol that decides it: the sync names only an address of the
-  // transport this server will use, so for a protocol set by hand that the device
-  // does not offer it names nothing, and an unqualified promise would be false.
-  it("#170 — the notice says a sync reporting a different address of this server's protocol names it in its warnings, telnet or SSH (⊘ no pointer leaves the remedy undiscoverable; ⊘ a protocol-blind promise is false when the device lacks that transport)", async () => {
+  // limits the promise to the endpoint the sync reads. If that endpoint belongs
+  // to another transport, setting the retained transport's address would not
+  // hand it back to the sync.
+  it("#170 — the notice only promises a warning when the sync reads this server's protocol, telnet or SSH (⊘ no pointer leaves the remedy undiscoverable; ⊘ an unconditional promise is false when the sync reads another transport)", async () => {
     const noticeFor = async (submit: Record<string, unknown>): Promise<string> => {
       vi.mocked(vscode.window.showInformationMessage).mockClear();
       const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [placeholder()], authProfiles: [] });
@@ -4505,10 +4505,12 @@ describe("nexus.server.edit — addressless placeholder is editable (P2-a)", () 
     };
 
     const ssh = await noticeFor({ host: "10.0.0.5", port: 22 });
-    expect(ssh).toContain("If an inventory sync finds it reporting a different SSH address, the sync's warnings name it.");
+    expect(ssh).toContain("The sync's warnings name a different address only when it reads an endpoint for this server's protocol (SSH); a different address from the other transport is not named because setting it would not hand the field back.");
+    expect(ssh).not.toContain("If an inventory sync finds it reporting a different SSH address, the sync's warnings name it.");
     registeredCommands.clear();
     const telnet = await noticeFor({ host: "10.0.0.5", port: 23, protocol: "telnet" });
-    expect(telnet).toContain("If an inventory sync finds it reporting a different telnet address, the sync's warnings name it.");
+    expect(telnet).toContain("The sync's warnings name a different address only when it reads an endpoint for this server's protocol (telnet); a different address from the other transport is not named because setting it would not hand the field back.");
+    expect(telnet).not.toContain("If an inventory sync finds it reporting a different telnet address, the sync's warnings name it.");
     expect(telnet).not.toContain("SSH");
   });
 

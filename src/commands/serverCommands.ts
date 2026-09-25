@@ -2205,7 +2205,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           if (gainsHandAddress) {
             const protocolName = candidate.protocol === "telnet" ? "telnet" : "SSH";
             void vscode.window.showInformationMessage(
-              `You gave "${existing.name}" a console address by hand, and syncs and status refreshes leave it as you set it. Its inventory source takes over the host or the port only once an inventory sync finds it reporting that exact value. If an inventory sync finds it reporting a different ${protocolName} address, the sync's warnings name it.`
+              `You gave "${existing.name}" a console address by hand, and syncs and status refreshes leave it as you set it. Its inventory source takes over the host or the port only once an inventory sync finds it reporting that exact value. The sync's warnings name a different address only when it reads an endpoint for this server's protocol (${protocolName}); a different address from the other transport is not named because setting it would not hand the field back.`
             );
           }
         },
