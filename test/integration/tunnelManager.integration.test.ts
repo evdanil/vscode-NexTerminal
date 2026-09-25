@@ -128,6 +128,13 @@ class DirectTcpSshConnection implements SshConnection {
   }
 }
 
+class AlreadyClosedSshConnection extends DirectTcpSshConnection {
+  public override onClose(listener: () => void): () => void {
+    listener();
+    return () => {};
+  }
+}
+
 class DirectTcpSshFactory implements SshFactory {
   public connectCount = 0;
   public lastConnection?: DirectTcpSshConnection;
@@ -607,6 +614,45 @@ describe("TunnelManager integration", () => {
 
     await manager.stop(activeTunnel.id);
   });
+
+  it.each(["local", "dynamic"] as const)(
+    "rejects a shared %s tunnel when its SSH connection is already closed",
+    async (tunnelType) => {
+      const profile: TunnelProfile = {
+        id: `tunnel-shared-closed-${tunnelType}`,
+        name: `Closed ${tunnelType} tunnel`,
+        localPort: await getFreePort(),
+        remoteIP: "127.0.0.1",
+        remotePort: 22,
+        autoStart: false,
+        connectionMode: "shared",
+        tunnelType
+      };
+      const closedConnection = new AlreadyClosedSshConnection();
+      let connectCount = 0;
+      const innerFactory: SshFactory = {
+        connect: async () => {
+          connectCount += 1;
+          return closedConnection;
+        }
+      };
+      const pool = new SshConnectionPool(innerFactory, { enabled: true, idleTimeoutMs: 60_000 });
+      const server = { ...testServer, multiplexing: false };
+      manager = new TunnelManager(pool, pool);
+      const events: TunnelEvent[] = [];
+      manager.onDidChange((event) => events.push(event));
+
+      try {
+        await expect(manager.start(profile, server, { connectionMode: "shared" })).rejects.toThrow();
+        expect(connectCount).toBe(1);
+        expect(events.some((event) => event.type === "started")).toBe(false);
+      } finally {
+        await manager.stopAll();
+        pool.dispose();
+        manager = undefined;
+      }
+    }
+  );
 
   it("reports an unexpected close of the active shared SSH connection", async () => {
     const profile: TunnelProfile = {

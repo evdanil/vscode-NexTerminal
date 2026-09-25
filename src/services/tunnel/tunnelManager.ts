@@ -920,7 +920,10 @@ export class TunnelManager {
     }
     runtime.sharedConnection = sharedConnection;
     runtime.sshConnections.add(sharedConnection);
+    // onClose replays synchronously when authentication returned an already-closed transport.
+    let closedDuringSubscription = false;
     sharedConnection.onClose(() => {
+      closedDuringSubscription = true;
       runtime.sshConnections.delete(sharedConnection);
       if (runtime.sharedConnection === sharedConnection) {
         runtime.sharedConnection = undefined;
@@ -940,6 +943,9 @@ export class TunnelManager {
         });
       }
     });
+    if (closedDuringSubscription) {
+      throw new Error(`Shared SSH connection closed while starting tunnel ${runtime.profile.name}`);
+    }
     return sharedConnection;
   }
 
