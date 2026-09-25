@@ -41,7 +41,7 @@ esbuild emits `dist/extension.js`, `dist/webExtension.js`, `dist/services/serial
   - After a release, confirm that each publish job (Marketplace and Open VSX) succeeded and that both listing pages show the new version — the workflow's top-level green is not enough.
 - Don't bump `package.json` version on outside-contributor PRs (maintainer bumps on merge). Maintainer-authored change PRs do bump the patch version — **CI enforces it**: the `Version bump` check fails any PR whose version has not moved past `main`'s, because a later release onto an existing tag fails with an opaque "tag already exists". A docs-only or chore PR still needs the bump; it does not need a CHANGELOG entry if nothing a user can observe changed.
 - Don't commit: `.claude/`, `.specify/`, `docs/plans/`, `docs/superpowers/`, `specs/` except `specs/001-scripting-support/contracts/script-api.d.ts`, `dist/`, `coverage/`, `*.vsix`, secrets or real hostnames.
-- No model identifiers in commit messages, PR text, or comments.
+- No model identifiers in commit messages, PR text, or comments — no model names, versions or ids. The plain trailer `Co-Authored-By: Claude <noreply@anthropic.com>` is the permitted attribution: it names the tool, not a model.
 - Never use `NODE_TLS_REJECT_UNAUTHORIZED` — it is process-global and the extension host is shared with every other installed extension; TLS opt-outs are per source.
 - Never dismiss CodeQL alerts on the maintainer's behalf.
 - Don't edit published CHANGELOG entries (they ship inside installed VSIXs); corrections go in a new entry that names the claims it replaces.
