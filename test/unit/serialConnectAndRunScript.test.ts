@@ -398,6 +398,31 @@ describe("Connect and Run Script… on a serial profile keeps the session's outp
     }
   });
 
+  it.each<Mode>(["standard", "smartFollow"])(
+    "%s: a declined connect clears the script-start watchdog",
+    async (mode) => {
+      const h = await harness(mode);
+      try {
+        // Open the profile once so the run-with-script command declines its
+        // second connect through the normal same-profile precondition.
+        await h.command("nexus.serial.connect");
+        h.openPort();
+
+        vi.useFakeTimers();
+        await h.command("nexus.serial.runWithScript");
+        await vi.advanceTimersByTimeAsync(90_000);
+
+        expect(vscode.window.showWarningMessage).not.toHaveBeenCalledWith(
+          expect.stringContaining("the script did not start within 90s")
+        );
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+        await h.cleanup();
+      }
+    }
+  );
+
   it.each<Mode>(["standard", "smartFollow"])("%s: a plain Connect keeps no output for a script", async (mode) => {
     // ⊘ capturing at every serial session's registration: each session would
     // carry a 64 KiB buffer, and a later Quick Run could open on stale output

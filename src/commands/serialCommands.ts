@@ -385,9 +385,9 @@ export function formValuesToSerial(values: FormValues, existing?: Partial<Serial
   };
 }
 
-async function connectStandardSerialProfile(ctx: CommandContext, profile: SerialProfile): Promise<void> {
+async function connectStandardSerialProfile(ctx: CommandContext, profile: SerialProfile): Promise<boolean> {
   if (!enforceSerialConnectPreconditions(ctx, profile)) {
-    return;
+    return false;
   }
   const terminalName = serialTerminalName(profile);
   let terminalRef: vscode.Terminal | undefined;
@@ -466,11 +466,12 @@ async function connectStandardSerialProfile(ctx: CommandContext, profile: Serial
   ctx.terminalRegistry?.register(terminal, pty);
   ctx.focusedTerminal = terminal;
   terminal.show();
+  return true;
 }
 
-async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialProfile): Promise<void> {
+async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialProfile): Promise<boolean> {
   if (!enforceSerialConnectPreconditions(ctx, profile)) {
-    return;
+    return false;
   }
 
   const logicalSessionId = randomUUID();
@@ -579,6 +580,7 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
   ctx.macroAutoTrigger.bindObserverToSession(triggerObserver, logicalSessionId);
   ctx.focusedTerminal = terminal;
   terminal.show();
+  return true;
 }
 
 async function testSerialConnection(ctx: CommandContext, arg?: unknown): Promise<void> {
@@ -866,10 +868,14 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
       }, timeoutMs);
 
       try {
-        if (resolveSerialProfileMode(profile) === "smartFollow") {
-          await connectSmartSerialProfile(ctx, profile);
-        } else {
-          await connectStandardSerialProfile(ctx, profile);
+        const started =
+          resolveSerialProfileMode(profile) === "smartFollow"
+            ? await connectSmartSerialProfile(ctx, profile)
+            : await connectStandardSerialProfile(ctx, profile);
+        if (!started && !resolved) {
+          resolved = true;
+          clearTimeout(timer);
+          unsubscribe();
         }
       } catch (err) {
         resolved = true;
