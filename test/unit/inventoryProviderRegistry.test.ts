@@ -385,6 +385,19 @@ describe("InventoryProviderRegistry configFieldsOf", () => {
     expect(registry.configFieldsOf(replacement)).toEqual([token()]);
   });
 
+  it("rejects registering the same provider object again after its id and fields change, preserving its first copy", () => {
+    const registry = new InventoryProviderRegistry();
+    const provider = makeProvider({ id: "first", configFields: [host()] });
+    registry.register(provider);
+
+    Object.assign(provider, { id: "second", configFields: [token()] });
+
+    expect(() => registry.register(provider)).toThrow(/provider object.*already registered/i);
+    expect(registry.get("first")).toBe(provider);
+    expect(registry.get("second")).toBeUndefined();
+    expect(registry.configFieldsOf(provider)).toEqual([host()]);
+  });
+
   it("throws for a provider this registry never accepted, including one refused as a duplicate (⊘ `?? []`, which would render a form with no provider fields and fingerprint an empty shape)", () => {
     const registry = new InventoryProviderRegistry();
     registry.register(makeProvider());

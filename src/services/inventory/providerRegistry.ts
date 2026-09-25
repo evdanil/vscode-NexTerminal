@@ -390,6 +390,11 @@ export class InventoryProviderRegistry {
     if (this.providers.has(provider.id)) {
       throw new Error(`An inventory provider with id "${provider.id}" is already registered.`);
     }
+    if (this.configFieldsByProvider.has(provider)) {
+      // A flow can keep this provider object after its id is disposed. Reusing
+      // it would replace the copy that flow rendered or fingerprinted.
+      throw new Error(`Inventory provider object "${provider.id}" was already registered with this registry.`);
+    }
     this.providers.set(provider.id, registration);
     this.configFieldsByProvider.set(provider, configFields);
     // AFTER the map write, so a listener that repaints from the registry sees
@@ -455,7 +460,8 @@ export class InventoryProviderRegistry {
    * and iterator it controls, and whose contents it can change after the check.
    * That includes `computeProviderFingerprint`'s input: the fingerprint hashes
    * this copy, so it describes the fields that were checked, and a provider
-   * cannot change the fields a user confirmed without registering again.
+   * cannot change the fields a user confirmed without registering a new
+   * provider object.
    *
    * KEYED BY THE PROVIDER OBJECT, NOT BY ITS ID, unlike `attributeKeysOf`,
    * because of how the consumers hold a provider. Add Source picks one and then
@@ -465,8 +471,10 @@ export class InventoryProviderRegistry {
    * the replacement's fields, so a form would be parsed against a schema other
    * than the one it rendered, and a fingerprint would combine one registrant's
    * label with another's fields. Looked up by the object, the answer is always
-   * the copy taken when that provider object last registered. It lasts as long as something
-   * still holds the provider, including after the registration is disposed.
+   * the copy taken when that provider object registered. This registry refuses
+   * to register the same object again, even after disposal, because a form or
+   * prompt may still hold it. The copy lasts as long as something still holds
+   * the provider.
    *
    * Throws for a provider this registry never accepted. The command layer only
    * ever holds providers that `get` or `list` returned, so this is a bug in the
