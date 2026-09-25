@@ -2191,16 +2191,17 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           // which kind of placeholder it was — so an instruction to "set it to the
           // address the source reports" would be one some users can never carry
           // out (PR #171 review). The prescription lives in the sync plan instead
-          // (`keptHandAddressWarning`, #170), which names the address only once the
-          // source reports one — the one moment it can be carried out — and the
-          // notice's last sentence says where to look. It names the protocol
-          // because the sync does: it reports only an address of the transport
-          // this server keeps, so for a protocol set here that the device does
-          // not offer it reports nothing, and an unqualified promise would be
-          // false. (The stamp drop above is what makes the promise hold for
-          // either protocol.) An information message, because nothing is lost: this is a
-          // hand-off, not a hazard. (It used to be a warning promising a revert to
-          // a placeholder — true before the stamps, #153.)
+          // (`keptHandAddressWarning`, #170), which names an address of this
+          // server's transport only once the source reports one — the one
+          // moment it can be carried out — and the notice's last sentence says
+          // where to look. It names the protocol because the sync does: it
+          // reports only an address of the transport this server keeps, so for
+          // a protocol set here that the device does not offer it reports
+          // nothing, and an unqualified promise would be false. (The stamp drop
+          // above is what makes the promise hold for either protocol.) An
+          // information message, because nothing is lost: this is a hand-off,
+          // not a hazard. (It used to be a warning promising a revert to a
+          // placeholder — true before the stamps, #153.)
           if (gainsHandAddress) {
             const protocolName = candidate.protocol === "telnet" ? "telnet" : "SSH";
             void vscode.window.showInformationMessage(
