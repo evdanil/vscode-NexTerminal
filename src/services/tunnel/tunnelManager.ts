@@ -452,9 +452,16 @@ export class TunnelManager {
     try {
       const bindAddr = profile.remoteBindAddress ?? "127.0.0.1";
       const bindPort = profile.remotePort;
+      const proxy = serverConfig.proxy;
+      const proxyRoute = proxy
+        ? proxy.type === "ssh"
+          ? ["ssh", proxy.jumpHostId]
+          : [proxy.type, proxy.host.toLowerCase(), proxy.port, proxy.username ?? ""]
+        : ["direct"];
       const bindKey = (port: number): string => JSON.stringify([
         serverConfig.host.toLowerCase(),
         serverConfig.port,
+        proxyRoute,
         bindAddr,
         port
       ]);

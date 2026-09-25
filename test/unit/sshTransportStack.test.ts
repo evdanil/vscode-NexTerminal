@@ -767,6 +767,64 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
     expect(stack.tunnelManager.getActiveTunnelId(profile.id)).toBe(active.id);
   });
 
+  it("allows a reverse forward on a distinct proxy route while the first route's request is pending", async () => {
+    const forwardIn = deferred();
+    const auth = createAuthFactory({
+      forwardIn: forwardIn.promise,
+      forwardInRefusal: new Error("forward request refused")
+    });
+    const routeARequests: string[] = [];
+    const routeBRequests: string[] = [];
+    const routeAPort = await startSocks5Proxy(routeARequests);
+    const routeBPort = await startSocks5Proxy(routeBRequests);
+    const routeA: ServerConfig = {
+      ...direct,
+      id: "srv-direct-route-a",
+      multiplexing: false,
+      proxy: { type: "socks5", host: "127.0.0.1", port: routeAPort }
+    };
+    const routeB: ServerConfig = {
+      ...direct,
+      id: "srv-direct-route-b",
+      multiplexing: false,
+      proxy: { type: "socks5", host: "127.0.0.1", port: routeBPort }
+    };
+    const stack = buildStack(auth, [routeA, routeB], 20);
+    const profileA: TunnelProfile = {
+      ...isolatedProfile(12345),
+      id: "tun-route-a",
+      connectionMode: "shared",
+      tunnelType: "reverse",
+      remotePort: 8022
+    };
+    const profileB: TunnelProfile = { ...profileA, id: "tun-route-b" };
+
+    const stale = stack.tunnelManager.start(profileA, routeA, { connectionMode: "shared" }).then(
+      () => undefined,
+      (error: unknown) => error
+    );
+    await vi.waitFor(() => expect(auth.targets[0]?.requestForwardIn).toHaveBeenCalled(), SETTLE);
+    await stack.tunnelManager.stopAll();
+
+    const replacement = stack.tunnelManager.start(profileB, routeB, { connectionMode: "shared" }).then(
+      () => undefined,
+      (error: unknown) => error
+    );
+    try {
+      await vi.waitFor(() => expect(auth.targets).toHaveLength(2), SETTLE);
+      await vi.waitFor(
+        () => expect(auth.targets[1].requestForwardIn).toHaveBeenCalledWith("127.0.0.1", 8022),
+        SETTLE
+      );
+      expect(routeARequests).toEqual([`${TARGET_HOST}:${TARGET_PORT}`]);
+      expect(routeBRequests).toEqual([`${TARGET_HOST}:${TARGET_PORT}`]);
+    } finally {
+      await stack.tunnelManager.stopAll();
+      forwardIn.resolve();
+      await Promise.all([stale, replacement]);
+    }
+  });
+
   it("does not wait for a non-pooled predecessor's login before connecting a replacement", async () => {
     const login = deferred();
     const auth = createAuthFactory({ targetLogin: login.promise });
