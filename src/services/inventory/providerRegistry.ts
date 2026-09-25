@@ -185,6 +185,36 @@ export function validateProviderShape(provider: unknown): asserts provider is In
   if (obj.canWebConsole !== undefined && typeof obj.canWebConsole !== "function") {
     throw new Error("Inventory provider canWebConsole must be a function when present.");
   }
+  // TEMPLATE-RULE FILTER KEYS (issue #163) — the twin of the clauses above, for
+  // the one optional member that is data rather than a function. `attributeKeys`
+  // is OPTIONAL (a provider that declares no list has its filters checked
+  // against none), but a present value that is not an array of strings IS an
+  // error, named here: `unknownFilterKeys` and `knownKeysList`
+  // (templateApply.ts) iterate it and call string methods on every entry, so a
+  // `"role,site"` or a `[1]` that survived registration would throw TypeError out
+  // of Edit Template Rules before the Rule Filter box could open, far from the
+  // registration that caused it.
+  //
+  // An index loop rather than `.every`: `.every` skips the holes of a sparse
+  // array, but `knownKeysList` spreads the list when it appends `name`, which
+  // turns a hole into `undefined` and throws all the same.
+  //
+  // DELIBERATELY ACCEPTED: a blank or whitespace-only entry, and a duplicate.
+  // Neither throws anywhere — a blank key matches nothing and `knownKeysList`
+  // leaves it out of every list it builds, and a duplicate is one entry in the
+  // matcher's Set (and at worst a repeated word in that list) — so refusing the
+  // provider's whole registration, sync and all, would cost far more than the entry.
+  const attributeKeys: unknown = obj.attributeKeys;
+  if (attributeKeys !== undefined) {
+    if (!Array.isArray(attributeKeys)) {
+      throw new Error("Inventory provider attributeKeys must be an array of strings when present.");
+    }
+    for (let i = 0; i < attributeKeys.length; i++) {
+      if (typeof attributeKeys[i] !== "string") {
+        throw new Error(`Inventory provider attributeKeys entry ${i} must be a string.`);
+      }
+    }
+  }
 }
 
 /**

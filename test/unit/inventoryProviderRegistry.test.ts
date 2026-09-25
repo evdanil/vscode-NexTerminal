@@ -3,6 +3,7 @@ import { InventoryProviderRegistry, validateProviderShape } from "../../src/serv
 import { MAX_INVENTORY_INSTANCE_KEY_LENGTH, resolveProviderInstanceKey } from "../../src/models/inventory";
 import type { InventoryProvider } from "../../src/models/inventory";
 import { createNetboxProvider } from "../../src/services/inventory/providers/netboxProvider";
+import { knownKeysList, parseTemplateFilter, unknownFilterKeys } from "../../src/services/inventory/templateApply";
 
 function makeProvider(overrides: Partial<InventoryProvider> = {}): InventoryProvider {
   return {
@@ -329,6 +330,60 @@ describe("validateProviderShape", () => {
   it("rejects a non-function canWebConsole loudly (kills a silent survive-at-registration for a typo'd `canWebConsole` that is not callable — the marker gate invokes it during tree render, where a string value would throw TypeError on every repaint of a row)", () => {
     expect(() => validateProviderShape(makeProvider({ canWebConsole: "nope" as never }))).toThrow(/canWebConsole/);
     expect(() => validateProviderShape(makeProvider({ canWebConsole: 42 as never }))).toThrow(/canWebConsole/);
+  });
+
+  // attributeKeys (issue #163 item 2) — the one optional member that is DATA, and
+  // the one the registry used to let through unchecked. Every consumer
+  // (`unknownFilterKeys`, `knownKeysList`) iterates it and calls string methods on
+  // each entry, so a malformed list surfaced as a TypeError out of Edit Template
+  // Rules, before the Rule Filter box could open, instead of here.
+  it("accepts a provider with NO attributeKeys — it is optional (⊘ making it required, which would refuse every provider that declares no key list)", () => {
+    const provider = makeProvider();
+    expect(provider.attributeKeys).toBeUndefined();
+    expect(() => validateProviderShape(provider)).not.toThrow();
+  });
+
+  it.each([
+    ["a comma-joined string", "role,site"],
+    ["null", null],
+    ["an array-like object", { 0: "role", length: 1 }],
+    ["a Set", new Set(["role"])]
+  ])("rejects attributeKeys that is %s, naming the member (⊘ no clause, which hands the list to `knownKeysList` / `unknownFilterKeys`, both of which throw TypeError on it)", (_label, bad) => {
+    expect(() => validateProviderShape(makeProvider({ attributeKeys: bad as never }))).toThrow(
+      "Inventory provider attributeKeys must be an array of strings when present."
+    );
+  });
+
+  // A hole in a sparse array reads as `undefined` once `knownKeysList` spreads the
+  // list to append `name`, and throws there exactly as a stored `undefined` would — but
+  // `Array.prototype.every` SKIPS holes, so a check written with it lets one through.
+  const sparse: unknown[] = ["role"];
+  sparse[2] = "site";
+  it.each([
+    ["a number", ["role", 42], 1],
+    ["null", ["role", "site", null], 2],
+    ["undefined", [undefined, "role"], 0],
+    ["a nested array", ["role", ["site"]], 1],
+    ["a hole (sparse array)", sparse, 1]
+  ])("rejects an attributeKeys entry that is %s, naming the entry's index (⊘ checking only `Array.isArray`; ⊘ `.every(isString)`, which skips holes)", (_label, bad, index) => {
+    expect(() => validateProviderShape(makeProvider({ attributeKeys: bad as never }))).toThrow(
+      `Inventory provider attributeKeys entry ${index} must be a string.`
+    );
+  });
+
+  it.each([
+    ["an empty list (a provider that matches on `name` alone)", []],
+    ["a list of keys", ["role", "site", "name"]],
+    // Neither throws anywhere: a blank key matches nothing and `knownKeysList`
+    // leaves it out, and a duplicate is one entry to the matcher's Set. Refusing
+    // the provider's whole registration over one would cost far more than the entry.
+    ["blank, whitespace-only and duplicate keys", ["", "   ", "role", "role", "Role"]]
+  ])("accepts attributeKeys that is %s (⊘ an over-strict clause that refuses a whole provider over an entry every consumer already copes with)", (_label, keys) => {
+    expect(() => validateProviderShape(makeProvider({ attributeKeys: keys }))).not.toThrow();
+    // ...and the premise of accepting it: both consumers take the list as it is,
+    // with no blank slot in the list a user is shown.
+    expect(() => unknownFilterKeys(parseTemplateFilter("role=x"), keys)).not.toThrow();
+    expect(knownKeysList(keys).split(", ")).not.toContain("");
   });
 
   // MINOR-14 (EVE-NG review) — `InventoryConfigField.defaultValue` is part of
