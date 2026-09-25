@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.248] — 2026-09-25
+
+### Fixed
+
+- **A restored jump-host IPMI macro is no longer told to tick the wrong checkbox.** Restoring a backup or importing macros turns **Run on** back to *This machine*, so a restored **IPMI SOL console (via jump host)** runs its `ipmitool … -a` command locally. Its send confirmation used to open with "tick Provide IPMI credentials" — which can never help, because `-a` makes ipmitool ask for the password itself and never reads the credentials that checkbox supplies. On a server with an **IPMI Gateway** set, the confirmation now points only at **Run on → The server's IPMI gateway**, the setting that actually puts it back. The same wrong hint no longer appears when the shipped jump-host macro runs on this machine because its server has no IPMI Gateway set. More generally, the hint now appears only when something in the macro would read the password from the environment: ipmitool with `-E`, a command that uses `IPMI_PASSWORD` or `IPMITOOL_PASSWORD` itself, or another command that uses the IPMI tokens. An ipmitool command using `-P`, `-f`, `-a` or no password option is no longer told to tick the checkbox, which would change nothing for it. The macro editor's hint for an ipmitool command left on *Session terminal* no longer tells every such command to tick the checkbox either: it now says the checkbox is for `-E`, and that with `-a` ipmitool asks for the password in the terminal.
+
 ## [2.8.247] — 2026-09-25
 
 ### Fixed

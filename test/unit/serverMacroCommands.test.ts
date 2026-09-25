@@ -75,9 +75,11 @@ import { setActiveMacroStore } from "../../src/macroSettings";
 import {
   buildServerMacroPicks,
   commandReadsIpmiEnv,
+  ipmiCredentialsOffNote,
   runMacroOnServer,
   sessionIpmiHintNote
 } from "../../src/commands/serverMacroCommands";
+import { MACRO_TEMPLATES } from "../../src/commands/macroCommands";
 import { resolveMacroBrowserUrl } from "../../src/utils/browserUrl";
 
 const store = new InMemoryMacroStore();
@@ -1267,6 +1269,127 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
 });
 
 /**
+ * Issue #151 — the credentials hint names a remedy ("tick Provide IPMI
+ * credentials"), so it may only fire where that remedy can change the run: where
+ * something in the macro reads the password from the environment the checkbox
+ * fills. ipmitool reads it ONLY under `-E` (upstream ipmi_main.c: the one
+ * `getenv("IPMITOOL_PASSWORD"/"IPMI_PASSWORD")` is in the `-E` branch); `-P`,
+ * `-f` and `-a` supply it themselves, and with none of them ipmitool prompts. A
+ * command that names the variable reads it too, and a non-ipmitool command using
+ * the IPMI tokens may (a script can read it internally), so both keep the hint.
+ */
+describe("ipmiCredentialsOffNote — fires only where something reads the password environment (#151)", () => {
+  const local = (text: string): TerminalMacro => ({ id: "a", name: "SOL", text, runIn: "localTerminal" });
+  const hint = (text: string): string | undefined => ipmiCredentialsOffNote(local(text));
+
+  it("still hints for an unflagged local `-E` command — the one ipmitool form the checkbox repairs", () => {
+    expect(hint(" ipmitool -H ${profile.ipmiHost} -E sol activate\n")).toContain('tick "Provide IPMI credentials"');
+  });
+
+  it("returns nothing for every ipmitool form that gets its password another way — ⊘ special-casing only `-a`", () => {
+    expect(hint(" ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
+    expect(hint(" ipmitool -H ${profile.ipmiHost} -P hunter2 sol activate\n")).toBeUndefined();
+    expect(hint(" ipmitool -H ${profile.ipmiHost} -f ~/.bmcpass sol activate\n")).toBeUndefined();
+    // No password option at all: ipmitool prompts ("Password: ") when -H is given.
+    expect(hint(" ipmitool -I lanplus -H ${profile.ipmiHost} -U ${profile.ipmiUsername} sol activate\n")).toBeUndefined();
+  });
+
+  it("returns nothing when the only `-E` belongs to a wrapper or a piped command — ⊘ an unscoped `-E` check", () => {
+    // sudo's preserve-environment flag and grep's extended-regex flag, not ipmitool's.
+    expect(hint(" sudo -E ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
+    expect(hint(" ipmitool -H ${profile.ipmiHost} -a sel list | grep -E Critical\n")).toBeUndefined();
+  });
+
+  /**
+   * "Is this segment an ipmitool invocation?" is decided by the COMMAND POSITION
+   * — the first word after `NAME=value` assignments and the known prefixes
+   * (`sudo`, `env`, `exec`, `time`, `nice`, with their options), basename exactly
+   * `ipmitool` — never by the word appearing somewhere in the segment.
+   */
+  it("treats a WRAPPER whose name merely contains 'ipmitool' as a token consumer that keeps the hint — ⊘ a `\\bipmitool\\b` word match", () => {
+    // `-`, `.` and `/` are word boundaries, so `\bipmitool\b` finds "ipmitool" in
+    // each name — and classing a wrapper as ipmitool suppressed the hint for a
+    // script that may read the env itself.
+    expect(hint(" /opt/bin/my-ipmitool-wrapper ${profile.ipmiHost} sol\n")).toContain("Provide IPMI credentials");
+    expect(hint(" ipmitool.sh ${profile.ipmiHost} ${profile.ipmiUsername}\n")).toContain("Provide IPMI credentials");
+  });
+
+  it("does not treat a QUOTED mention of `ipmitool -E` as an ipmitool invocation that reads the env", () => {
+    // The echo reads nothing; the only real invocation is `-a`. ⊘ the word match,
+    // which saw "ipmitool -E" inside the quotes and restored the dead-end hint.
+    expect(hint(' ipmitool -H ${profile.ipmiHost} -a sol activate; echo "next time use ipmitool -E"\n')).toBeUndefined();
+  });
+
+  it("finds ipmitool in command position behind assignments, prefixes and a path — ⊘ first-word-only / no-basename parsing", () => {
+    expect(hint(" sudo -E ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
+    expect(hint(" LANG=C ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
+    expect(hint(" /usr/bin/ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
+    // …and still reads ipmitool's own `-E` once it is found there.
+    expect(hint(" sudo -E /usr/bin/ipmitool -H ${profile.ipmiHost} -E sol activate\n")).toContain(
+      "Provide IPMI credentials"
+    );
+  });
+
+  it("consumes a prefix option's OPERAND, so a user or argv[0] named 'ipmitool' is not the command — ⊘ skipping only option-shaped words", () => {
+    // sudo runs bmc-login AS the user "ipmitool"; exec runs bmc-login with argv[0] "ipmitool".
+    expect(hint(" sudo -u ipmitool /opt/bin/bmc-login ${profile.ipmiHost}\n")).toContain("Provide IPMI credentials");
+    expect(hint(" exec -a ipmitool bmc-login ${profile.ipmiHost}\n")).toContain("Provide IPMI credentials");
+    // …and the command AFTER the operand is still found.
+    expect(hint(" sudo -u root ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
+    expect(hint(" nice -n 10 ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
+  });
+
+  it("reads option clusters and inline operands the way getopt does — ⊘ first-letter-only / always-next-word", () => {
+    // `-Eu root`: E is a flag, u takes the NEXT word. `-uroot`: u's operand is inline.
+    expect(hint(" sudo -Eu root ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
+    expect(hint(" sudo -uroot ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
+    expect(hint(" sudo --user=root ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toBeUndefined();
+  });
+
+  it("keeps the hint when a prefix option rewrites the command line (`env -S`) — ⊘ treating it as an ordinary operand or flag", () => {
+    // `env -S bmc-wrap ipmitool …` runs `bmc-wrap ipmitool …`: the command is
+    // bmc-wrap, which may read the env. Ambiguous prefix parsing must keep the hint.
+    expect(hint(" env -S bmc-wrap ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toContain(
+      "Provide IPMI credentials"
+    );
+    expect(hint(" env --split-string=bmc-wrap ipmitool -H ${profile.ipmiHost} -a sol activate\n")).toContain(
+      "Provide IPMI credentials"
+    );
+  });
+
+  it("still hints when an ipmitool command takes the password from the variable by name — ⊘ 'no -E ⇒ never reads the env'", () => {
+    // The shell expands it into argv: the checkbox is exactly what makes this work.
+    expect(hint(' ipmitool -H ${profile.ipmiHost} -P "$IPMI_PASSWORD" sol activate\n')).toContain(
+      "Provide IPMI credentials"
+    );
+  });
+
+  it("still hints when another ipmitool line in the same macro reads the env (`-E`) — ⊘ 'any -a silences it'", () => {
+    const text = " ipmitool -H ${profile.ipmiHost} -a chassis power status\n ipmitool -H ${profile.ipmiHost} -E sol activate\n";
+    expect(hint(text)).toContain("Provide IPMI credentials");
+  });
+
+  it("still hints when a NON-ipmitool command beside an `-a` line uses the IPMI tokens — it may read the env itself", () => {
+    // ⊘ a macro-wide stand-down keyed on the ipmitool line alone.
+    const text = " ipmitool -H ${profile.ipmiHost} -a sol activate\n bmc-login.sh ${profile.ipmiHost} ${profile.ipmiUsername}\n";
+    expect(hint(text)).toContain("Provide IPMI credentials");
+  });
+
+  it("still hints when a command beside an `-a` line names the variable in any shell's syntax — ⊘ token-only detection", () => {
+    // No IPMI token in the second command, so only the variable's NAME says it reads the env.
+    for (const reader of [
+      "curl -u admin:${IPMI_PASSWORD} https://bmc.example/redfish/v1/",
+      "curl -u admin:$env:IPMITOOL_PASSWORD https://bmc.example/redfish/v1/",
+      "curl -u admin:%IPMI_PASSWORD% https://bmc.example/redfish/v1/"
+    ]) {
+      expect(hint(` ipmitool -H \${profile.ipmiHost} -a sol activate\n ${reader}\n`), reader).toContain(
+        "Provide IPMI credentials"
+      );
+    }
+  });
+});
+
+/**
  * Issue #48 PR-C — jump-host IPMI routing (Path B). Every fixture here is built
  * to fail against a specific wrong implementation: the withdrawn "gateway set ⇒
  * route everything" design, tokens resolved on the wrong server, a routing that
@@ -1290,6 +1413,7 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
     servers: ServerConfig[];
     sessions?: Array<{ id: string; serverId: string }>;
     terminals?: Map<string, unknown>;
+    authProfiles?: AuthProfile[];
   }): CommandContext {
     const listeners = new Set<() => void>();
     const activeSessions = [...(opts.sessions ?? [])];
@@ -1302,7 +1426,7 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
     return context({
       core: {
         getSnapshot: () => ({ activeSessions: [...activeSessions], servers: opts.servers }),
-        getAuthProfile: () => undefined,
+        getAuthProfile: (id: string) => opts.authProfiles?.find((profile) => profile.id === id),
         onDidChange: (listener: () => void) => {
           listeners.add(listener);
           return () => listeners.delete(listener);
@@ -1508,6 +1632,89 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
     const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
     expect(status).toContain("set 'Run on: the server's IPMI gateway'");
     expect(status).toContain("Bastion");
+  });
+
+  /**
+   * Issue #151 — a RESTORED "IPMI SOL console (via jump host)". Import strips
+   * `route` (and it never had `provideIpmiCredentials`), so it runs its `-a`
+   * command on this machine. The one remedy that works is "Run on → the server's
+   * IPMI gateway"; ticking "Provide IPMI credentials" changes nothing for `-a`
+   * (ipmitool prompts, it never reads the environment), so that hint must not be
+   * shown at all — not merely shown second.
+   *
+   *  ⊘ today's ordering (credentials hint whenever the flag is off) — the status
+   *    carries "tick Provide IPMI credentials" → fails
+   *  ⊘ silence the credentials hint AND the reconsent note together — the status
+   *    loses "Run on" → fails
+   */
+  it("#151 — a restored jump-host macro is pointed at 'Run on', never at the credentials checkbox", async () => {
+    const template = MACRO_TEMPLATES.find((entry) => entry.id === "ipmi-sol-gateway")!.macro;
+    const incoming = collectIncomingMacros({
+      version: 2 as const,
+      exportedAt: "",
+      macros: [{ id: "m", ...template } as TerminalMacro]
+    });
+    const restored = incoming!.macros[0];
+    // The premise: the restore really did strip the route, and the text still says -a.
+    expect("route" in restored).toBe(false);
+    expect(restored.text).toContain(" -a ");
+
+    // The shipped text uses ${profile.ipmiUsername}, so the target links an IPMI
+    // auth profile — without one the run is refused before any note is built.
+    const target = server({
+      id: "srv-1",
+      name: "Target",
+      ipmiHost: "10.0.0.9",
+      ipmiAuthProfileId: "ap-1",
+      ipmiGatewayServerId: "gw-1"
+    });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    await setMacros([restored]);
+    await pickFirst();
+
+    await runMacroOnServer(routingContext({ servers: [target, gateway], authProfiles: [authProfile()] }), {
+      server: target
+    });
+
+    expect(createdTerminals).toHaveLength(1);
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).toContain("set 'Run on: the server's IPMI gateway'");
+    expect(status).toContain("Bastion");
+    expect(status).not.toContain("Provide IPMI credentials");
+    expect(status).not.toContain("IPMI credentials were not provided");
+  });
+
+  it("#151 — a local `-E` macro with the flag off on the SAME gateway server still gets the credentials hint", async () => {
+    // The sibling the fix must not over-reach into: for `-E` the checkbox IS the
+    // remedy (ipmitool reads the env it fills), and a gateway being configured
+    // does not change that. ⊘ "suppress the credentials hint whenever the
+    // reconsent note fires" (keyed on the route, not the command) → fails here.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gw-1" });
+    const gateway = server({ id: "gw-1", name: "Bastion" });
+    await setMacros([
+      { id: "a", name: "SOL", text: " ipmitool -H ${profile.ipmiHost} -E sol activate\n", runIn: "localTerminal" }
+    ]);
+    await pickFirst();
+
+    await runMacroOnServer(routingContext({ servers: [target, gateway] }), { server: target });
+
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).toContain('tick "Provide IPMI credentials"');
+    expect(status).toContain("set 'Run on: the server's IPMI gateway'");
+  });
+
+  it("#151 — the shipped jump-host macro falling back to local (no gateway set) is not told to tick the credentials checkbox either", async () => {
+    // The same wrong remedy on the fall-back path: the `-a` command prompts on
+    // this machine, so the fall-back note is the whole story.
+    const target = server({ id: "srv-1", name: "Target", ipmiHost: "10.0.0.9" });
+    await setMacros([{ id: "a", name: "SOL", text: GW_SOL, runIn: "localTerminal", route: "ipmiGateway" }]);
+    await pickFirst();
+
+    await runMacroOnServer(routingContext({ servers: [target] }), { server: target });
+
+    const status = setStatusBarMessage.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(status).toContain("No IPMI gateway is configured for Target — running locally");
+    expect(status).not.toContain("Provide IPMI credentials");
   });
 
   it("does NOT emit the re-consent note for a local macro with NO IPMI token on the same gateway server", async () => {

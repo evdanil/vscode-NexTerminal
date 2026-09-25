@@ -191,6 +191,16 @@ describe("renderMacroEditorHtml", () => {
     expect(html).toContain("Leave this off unless the macro is an ipmitool command.");
   });
 
+  it("#151 — the Session-terminal ipmitool hint ties the checkbox to `-E`, never to every ipmitool command", () => {
+    // The checkbox only helps a command that reads the environment (`-E`); with
+    // `-a` ipmitool asks for the password itself. The old wording told every
+    // ipmitool macro to tick it — pinned absent so it cannot come back.
+    const html = render([], null);
+    expect(html).toContain('use <code>-E</code> and tick "Provide IPMI credentials"');
+    expect(html).toContain("with <code>-a</code>, ipmitool asks for it in the terminal");
+    expect(html).not.toContain('then tick "Provide IPMI credentials"');
+  });
+
   it("carries the flag in the save payload and re-hides/unchecks it when Run in leaves Local terminal", () => {
     const html = render([], null);
     expect(html).toContain("provideIpmiCredentials: provideIpmiVal");
