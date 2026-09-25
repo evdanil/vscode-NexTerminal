@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.267] — 2026-09-25
+
+### Fixed
+
+- **A server an inventory sync adds no longer picks up a password saved for a deleted server.** A synced server's identity comes from its device, so a device whose server was deleted gets the same identity when it comes back — and on Proxmox a different guest can come back that way, because Proxmox gives a deleted guest's ID to the next new one. A sync set to delete removed servers deletes their saved password, passphrase and proxy password after removing them, and if that failed — the system keychain refused, or the window closed mid-sync — the next server under that identity inherited them: switched to password authentication, it sent the old password to its host without asking. A sync now deletes any credential saved under a server's identity before adding the server, whatever its address, so a returning device starts without saved credentials, like any new server; if they cannot be deleted, the sync stops with nothing applied and says so. Servers that are updated or adopted keep their credentials, and auth profiles are not affected.
+
 ## [2.8.266] — 2026-09-25
 
 ### Fixed
@@ -16,7 +22,6 @@
 
 ### Fixed
 
-- **A server an inventory sync adds no longer picks up a password saved for a deleted server.** A synced server's identity comes from its device, so a device whose server was deleted gets the same identity when it comes back — and on Proxmox a different guest can come back that way, because Proxmox gives a deleted guest's ID to the next new one. A sync set to delete removed servers deletes their saved password, passphrase and proxy password after removing them, and if that failed — the system keychain refused, or the window closed mid-sync — the next server under that identity inherited them: switched to password authentication, it sent the old password to its host without asking. A sync now deletes any credential saved under a server's identity before adding the server, whatever its address, so a returning device starts without saved credentials, like any new server; if they cannot be deleted, the sync stops with nothing applied and says so. Servers that are updated or adopted keep their credentials, and auth profiles are not affected.
 - **Connect and Run Script… on a serial profile no longer misses what the device prints as the port opens.** Nexus read the script file before it started watching the new serial session, so output that arrived in that moment — boot messages from a device still starting up, say — never reached the script, and a script waiting for it timed out. The script now sees the session's output from the moment it opens, as it has on SSH and Telnet servers since 2.8.258. While the port-open response is pending, Nexus retains at most 64 KiB or 256 data chunks; if that bound is exceeded it drops the oldest chunks, and a single chunk larger than 64 KiB is discarded. A port usually prints nothing as it opens, so scripts that press Enter for a first prompt behave as before.
 
 ## [2.8.262] — 2026-09-25
