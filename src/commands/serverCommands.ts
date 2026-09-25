@@ -2158,12 +2158,20 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           // an EVE-NG HTML5/VNC-only node never will, and the record does not say
           // which kind of placeholder it was — so an instruction to "set it to the
           // address the source reports" would be one some users can never carry
-          // out (PR #171 review). An information message, because nothing is
-          // lost: this is a hand-off, not a hazard. (It used to be a warning
-          // promising a revert to a placeholder — true before the stamps, #153.)
+          // out (PR #171 review). The prescription lives in the sync plan instead
+          // (`keptHandAddressWarning`, #170), which names the address only once the
+          // source reports one — the one moment it can be carried out — and the
+          // notice's last sentence says where to look. It names the protocol
+          // because the sync does: it reports only an address of the transport
+          // this server will use, so for a protocol set here that the device does
+          // not offer it reports nothing, and an unqualified promise would be
+          // false. An information message, because nothing is lost: this is a
+          // hand-off, not a hazard. (It used to be a warning promising a revert to
+          // a placeholder — true before the stamps, #153.)
           if (existing.addressless === true && candidate.addressless !== true) {
+            const protocolName = candidate.protocol === "telnet" ? "telnet" : "SSH";
             void vscode.window.showInformationMessage(
-              `You gave "${existing.name}" a console address by hand, and syncs and status refreshes leave it as you set it. Its inventory source takes over the host or the port only once an inventory sync finds it reporting that exact value.`
+              `You gave "${existing.name}" a console address by hand, and syncs and status refreshes leave it as you set it. Its inventory source takes over the host or the port only once an inventory sync finds it reporting that exact value. If an inventory sync finds it reporting a different ${protocolName} address, the sync's warnings name it.`
             );
           }
         },

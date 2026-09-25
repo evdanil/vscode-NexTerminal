@@ -6238,3 +6238,156 @@ describe("provider text in plan warnings — the Show Warnings document", () => 
     expect(plan.warnings[1]).toContain("Duplicate device ID");
   });
 });
+
+// #170 — a console address the sync keeps because the user set it by hand is
+// kept SILENTLY no longer when the device reports a different one: the plan
+// names both, so the one remedy (set the field to exactly what the source
+// reports, matrix row 5a) is discoverable. Counted, never acted on.
+describe("computeSyncPlan — a kept hand-typed address the source reports differently (#170)", () => {
+  // A placeholder the user gave an address by hand: addressed, but its origin
+  // carries NO host/port stamp (the downgrade dropped them and the form never
+  // mints one). Built without `makeOwnedServer`, which would seed the stamps and
+  // turn it into a sync-owned record.
+  function handTypedPlaceholder(overrides: Partial<ServerConfig> = {}): ServerConfig {
+    return {
+      id: deterministicServerId("source-1", "device:1"),
+      name: "core-sw-1",
+      host: "10.0.0.5",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      group: "NetBox",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000 },
+      ...overrides
+    };
+  }
+
+  const keptLines = (plan: InventorySyncPlan): string[] => plan.warnings.filter((w) => w.includes("kept your"));
+
+  it("names the typed host and port and the ones the device now reports, and leaves the server exactly as it was (kills the silent keep, and kills a fix that takes the device's address instead of reporting it)", () => {
+    const before = handTypedPlaceholder();
+    const tree = makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.9", port: 2222 }] })]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 2000 });
+
+    expect(keptLines(plan)).toEqual([
+      '"core-sw-1": kept your host 10.0.0.5 and port 22; the source now reports host 10.0.0.9 and port 2222 — set the host and port to those to let the source manage them.'
+    ]);
+    // Counted, not acted on: no update, the record is one of the unchanged.
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.unchangedCount).toBe(1);
+  });
+
+  it("names only the half that differs — a host kept while the port matches the device's (kills a fix that always names both halves, telling the user to retype a port the sync has just taken back)", () => {
+    const before = handTypedPlaceholder();
+    const tree = makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.9", port: 22 }] })]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 2000 });
+
+    expect(keptLines(plan)).toEqual([
+      '"core-sw-1": kept your host 10.0.0.5; the source now reports host 10.0.0.9 — set the host to that to let the source manage it.'
+    ]);
+    // The matching port is handed back (row 5a) — a stamp, not a value change —
+    // and the typed host stays.
+    const after = plan.updates[0].after;
+    expect(after.host).toBe("10.0.0.5");
+    expect(after.origin?.syncedPort).toBe(22);
+    expect(after.origin?.syncedHost).toBeUndefined();
+  });
+
+  it("names only the port when the host matches the device's and the typed port is kept (kills a helper that reports the host half alone and drops a kept port)", () => {
+    const before = handTypedPlaceholder({ port: 2222 });
+    const tree = makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.5", port: 22 }] })]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 2000 });
+
+    expect(keptLines(plan)).toEqual([
+      '"core-sw-1": kept your port 2222; the source now reports port 22 — set the port to that to let the source manage it.'
+    ]);
+    // The matching host is handed back (a stamp only) and the typed port stays.
+    const after = plan.updates[0].after;
+    expect(after.port).toBe(2222);
+    expect(after.origin?.syncedHost).toBe("10.0.0.5");
+    expect(after.origin?.syncedPort).toBeUndefined();
+  });
+
+  it("says nothing when the typed address equals the device's — the sync hands ownership back instead (kills a warning keyed on the missing stamp rather than on a real difference)", () => {
+    const before = handTypedPlaceholder({ host: "10.0.0.9", port: 2222 });
+    const tree = makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.9", port: 2222 }] })]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 2000 });
+
+    expect(keptLines(plan)).toEqual([]);
+    const after = plan.updates[0].after;
+    expect(after.origin?.syncedHost).toBe("10.0.0.9");
+    expect(after.origin?.syncedPort).toBe(2222);
+  });
+
+  it("says nothing about an address the user overrode while the device still reports the one the sync wrote — that is no news, and repeating it every sync is noise (kills warning on every retained address)", () => {
+    // The sync wrote 10.0.0.1; the user replaced it with 10.0.0.99 knowing that.
+    // The device still reports 10.0.0.1. Renamed so an update exists regardless.
+    const before = makeOwnedServer({
+      host: "10.0.0.99",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedHost: "10.0.0.1", syncedPort: 22 }
+    });
+    const tree = makeTree([makeDevice({ name: "renamed", endpoints: [{ kind: "ssh", host: "10.0.0.1" }] })]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 2000 });
+
+    expect(plan.updates[0].after.host).toBe("10.0.0.99");
+    expect(keptLines(plan)).toEqual([]);
+  });
+
+  it("names the new address when the device moves away from the one the sync last wrote under a hand override (kills limiting the warning to never-stamped placeholders, which leaves a re-addressed device silent)", () => {
+    const before = makeOwnedServer({
+      host: "10.0.0.99",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedHost: "10.0.0.1", syncedPort: 22 }
+    });
+    const tree = makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.7" }] })]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 2000 });
+
+    expect(keptLines(plan)).toEqual([
+      '"core-sw-1": kept your host 10.0.0.99; the source now reports host 10.0.0.7 — set the host to that to let the source manage it.'
+    ]);
+    expect(plan.updates).toHaveLength(0);
+  });
+
+  it("says nothing when the device offers no endpoint of the record's own transport — typing the other transport's address would hand nothing back (kills comparing against the device's primary endpoint instead of the one the record would use)", () => {
+    // A hand-set telnet server whose device offers only SSH: no address of the
+    // record's transport exists, so there is nothing the user could set to match.
+    const before = handTypedPlaceholder({ protocol: "telnet", port: 23 });
+    const tree = makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.9" }] })]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 2000 });
+
+    expect(keptLines(plan)).toEqual([]);
+  });
+
+  it("keeps a device name and a reported host that carry a line break or a bidi override inside the one sentence (kills adding the line past the plan's sanitizing choke point)", () => {
+    const before = handTypedPlaceholder({ name: "core\u202esw\nfake line" });
+    const tree = makeTree([
+      makeDevice({ name: "core\u202esw\nfake line", endpoints: [{ kind: "ssh", host: "10.0.0.9\u202e\nforged line", port: 2222 }] })
+    ]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 2000 });
+
+    const lines = keptLines(plan);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain("\n");
+    expect(lines[0]).not.toMatch(/[\u202a-\u202e\u2066-\u2069]/);
+    expect(lines[0]).toContain("fake line");
+    // The host is still named — made inert, not dropped.
+    expect(lines[0]).toContain("10.0.0.9");
+    expect(lines[0]).toContain("forged line");
+  });
+
+  it("says nothing for an addressless record that carries address stamps — it has no address of its own to keep, and naming its blank host and sentinel port would print nonsense (kills calling the helper without the addressless guard)", () => {
+    // Not a shape any sync writes (the downgrade and the addressless add both drop
+    // the stamps), but validation admits it, so a hand-edited backup can carry it.
+    const before = handTypedPlaceholder({
+      host: "",
+      port: 0,
+      addressless: true,
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedHost: "10.0.0.1", syncedPort: 22 }
+    });
+    const tree = makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.9", port: 2222 }] })]);
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 2000 });
+
+    expect(keptLines(plan)).toEqual([]);
+    expect(plan.warnings.some((w) => w.includes("port 0"))).toBe(false);
+  });
+});

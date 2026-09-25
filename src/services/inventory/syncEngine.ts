@@ -619,6 +619,54 @@ export function syncOwnsPort(current: number, stamp: number | undefined, dev: nu
 }
 
 /**
+ * #170 — the plan warning for a console address the sync KEEPS because the user
+ * set it by hand (matrix rows 4/5 of `syncOwnsHost`/`syncOwnsPort`) while the
+ * device reports a different one. Without it the keep is silent, and the only way
+ * to hand a field back — set it to exactly what the source reports, so row 5a
+ * re-stamps it — needs a value the user has no way to see short of opening the
+ * source. The warning names that value; it changes nothing.
+ *
+ * Per component, because ownership is: each half is named only when it was kept
+ * AND the device reports something other than what the sync last wrote into it.
+ * The second test is what keeps a deliberate override quiet — a user who replaced
+ * the address the sync wrote, while the device still reports that address, has
+ * seen it already, and a line repeated on every sync for every such server would
+ * bury the warnings that are news. The quiet is only as good as the stamp, though:
+ * a record with none — a placeholder the user typed onto, or a server synced
+ * before the stamps existed — has nothing to compare against, so its line is
+ * repeated on every sync until the field and the device agree.
+ *
+ * The caller passes the endpoint of the record's OWN transport and calls this only
+ * when there is one: an address of the other transport would not hand the field
+ * back if typed in, so naming it would be a remedy that cannot work. It also skips
+ * an addressless record, which has no address of its own to keep — one carrying
+ * stamps (a hand-edited backup can) would otherwise be told about its blank host
+ * and sentinel port.
+ */
+function keptHandAddressWarning(
+  serverName: string,
+  record: ServerConfig,
+  reported: { host: string; port: number },
+  takes: { host: boolean; port: boolean }
+): string | undefined {
+  const kept: Array<{ field: "host" | "port"; yours: string; theirs: string }> = [];
+  if (!takes.host && reported.host !== record.origin?.syncedHost) {
+    kept.push({ field: "host", yours: record.host, theirs: reported.host });
+  }
+  if (!takes.port && reported.port !== record.origin?.syncedPort) {
+    kept.push({ field: "port", yours: String(record.port), theirs: String(reported.port) });
+  }
+  if (kept.length === 0) {
+    return undefined;
+  }
+  const yours = kept.map((k) => `${k.field} ${k.yours}`).join(" and ");
+  const theirs = kept.map((k) => `${k.field} ${k.theirs}`).join(" and ");
+  const fields = kept.map((k) => k.field).join(" and ");
+  const [those, them] = kept.length === 1 ? ["that", "it"] : ["those", "them"];
+  return `"${serverName}": kept your ${yours}; the source now reports ${theirs} — set the ${fields} to ${those} to let the source manage ${them}.`;
+}
+
+/**
  * AUTH 2b (REVIEW FINDING, P1) — "can this server supply the key file the
  * profile does not?". The server-side half of `authProfileNeedsServerKeyPath`
  * (models/config.ts), which asks the same question of the profile.
@@ -1942,6 +1990,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // per-component ownership (`takesHost`/`takesPort`); this gates the fields
       // that ride the endpoint without an ownership signal of their own.
       const takesEndpoint = takesHost && takesPort;
+      // #170 — a kept hand address is reported, not acted on: pushed whether or
+      // not anything else makes this an update, so an unchanged server says so too.
+      if (ownedEndpoint !== undefined && ownedServer.addressless !== true) {
+        const kept = keptHandAddressWarning(device.name, ownedServer, { host: ownedHost, port: ownedPort }, { host: takesHost, port: takesPort });
+        if (kept !== undefined) {
+          warnings.push(kept);
+        }
+      }
       // The username rides the SAME endpoint the address came from, and is
       // `undefined` when no endpoint of the record's transport was found — a
       // username belongs to an endpoint, so taking one from an endpoint whose

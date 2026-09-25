@@ -4485,6 +4485,32 @@ describe("nexus.server.edit — addressless placeholder is editable (P2-a)", () 
     expect(notice).not.toContain("placeholder unless");
   });
 
+  // #170 — the notice points at where the source's address will appear, and
+  // names the protocol that decides it: the sync names only an address of the
+  // transport this server will use, so for a protocol set by hand that the device
+  // does not offer it names nothing, and an unqualified promise would be false.
+  it("#170 — the notice says a sync reporting a different address of this server's protocol names it in its warnings, telnet or SSH (⊘ no pointer leaves the remedy undiscoverable; ⊘ a protocol-blind promise is false when the device lacks that transport)", async () => {
+    const noticeFor = async (submit: Record<string, unknown>): Promise<string> => {
+      vi.mocked(vscode.window.showInformationMessage).mockClear();
+      const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [placeholder()], authProfiles: [] });
+      const panel = await openEdit(ctx);
+      await panel.onSubmit(addresslessSubmit(submit));
+      const notices = vi
+        .mocked(vscode.window.showInformationMessage)
+        .mock.calls.map((call) => String(call[0]))
+        .filter((text) => text.includes("console address by hand"));
+      expect(notices).toHaveLength(1);
+      return notices[0];
+    };
+
+    const ssh = await noticeFor({ host: "10.0.0.5", port: 22 });
+    expect(ssh).toContain("If an inventory sync finds it reporting a different SSH address, the sync's warnings name it.");
+    registeredCommands.clear();
+    const telnet = await noticeFor({ host: "10.0.0.5", port: 23, protocol: "telnet" });
+    expect(telnet).toContain("If an inventory sync finds it reporting a different telnet address, the sync's warnings name it.");
+    expect(telnet).not.toContain("SSH");
+  });
+
   it("P2-3 control — editing an addressless placeholder WITHOUT giving it a host shows no hand-typed-address notice (⊘ a notice on every placeholder edit is noise)", async () => {
     const { ctx } = setupHarness({
       profiles: [],
