@@ -117,6 +117,8 @@ interface RunningScriptRecord {
   includeState: ScriptIncludeState;
   worker: WorkerLike;
   pendingRpcs: Map<number, PendingRpc>;
+  /** Closers for this run's open `prompt` input boxes — cleanupRun cancels them (see doUserInteraction). */
+  openInputBoxes: Set<vscode.CancellationTokenSource>;
   observerSubscription?: vscode.Disposable;
   macroFilter?: ScriptMacroFilter;
   macroFilterInitial?: { defaultAllow: boolean; allowList: string[]; denyList: string[] };
@@ -126,7 +128,6 @@ interface RunningScriptRecord {
   /** Direct PTY handle captured at run-start so cleanup can release the lock even
    *  after the session is deregistered from NexusCore (e.g. on ConnectionLost). */
   pty: SessionPtyHandle;
-  writeBack: (data: string) => void;
   connectionLostSignaled: boolean;
   /** Idempotency guard — cleanupRun flips this at the very top so a racing
    *  "exit" event + ConnectionLost grace-timer can't double-dispose. */
@@ -205,7 +206,19 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     const target = sessionId
       ? this.resolveSession(sessionId)
       : await this.pickTargetForScript(displayName, header);
-    if (!target) return undefined;
+    if (!target) {
+      // A cancelled picker is the user's own choice and stays quiet. An
+      // explicit session that cannot be found is not: returning silently here
+      // is how Quick Run on a focused Local Server terminal used to do
+      // nothing and say nothing, and how Connect/Open and Run Script… would
+      // if the session closed between registering and this point.
+      if (sessionId) {
+        void vscode.window.showErrorMessage(
+          `"${displayName}" did not run: its session could not be found — it may have closed before the script started.`
+        );
+      }
+      return undefined;
+    }
     if (sessionId && !this.validateExplicitTarget(displayName, header, target)) {
       return undefined;
     }
@@ -257,11 +270,11 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       includeState: undefined as unknown as ScriptIncludeState,
       worker: this.createWorker(),
       pendingRpcs: new Map(),
+      openInputBoxes: new Set(),
       inputLockHeld: false,
       pty,
       connectionLostSignaled: false,
-      cleanedUp: false,
-      writeBack: (data: string) => pty.writeProgrammatic(data)
+      cleanedUp: false
     };
 
     // Seeded here (not lazily on the first include) so `#root`'s resolved path,
@@ -372,7 +385,6 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     for (const run of Array.from(this.runs.values())) {
       run.stopReason = "extension-deactivating";
       this.rejectAllPending(run, makeScriptError("Stopped", "Extension deactivating"));
-      void run.worker.terminate();
       this.cleanupRun(run, "stopped");
     }
     this.runs.clear();
@@ -464,8 +476,9 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       // that gets granted its semaphore permit during that window would see
       // `cleanedUp === false` and proceed with I/O for a run that's already
       // been asked to stop. `stopReason` is set synchronously at the top of
-      // `stopScript`, before the race — checking it here closes that window.
-      isAborted: () => record.cleanedUp || record.stopReason !== undefined
+      // `stopScript`, before the race — checking it too (runIsOver) closes
+      // that window.
+      isAborted: () => runIsOver(record)
     };
   }
 
@@ -515,6 +528,12 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     return resolveSessionProtocol(session, server) === "telnet" ? "telnet" : "ssh";
   }
 
+  /**
+   * An explicit session arrives from Quick Run (the focused terminal) and from
+   * Connect/Open and Run Script… (the session that command just opened, with
+   * nothing focused) — this method cannot tell which, so a refusal names the
+   * session itself rather than claiming a focused terminal.
+   */
   private validateExplicitTarget(
     displayName: string,
     header: ScriptHeader,
@@ -522,13 +541,13 @@ export class ScriptRuntimeManager implements vscode.Disposable {
   ): boolean {
     if (header.targetType && header.targetType !== target.type) {
       void vscode.window.showErrorMessage(
-        `"${displayName}" targets ${friendlyTargetType(header.targetType)} sessions, but the focused terminal is ${friendlyTargetType(target.type)}.`
+        `"${displayName}" targets ${friendlyTargetType(header.targetType)} sessions and cannot run on ${target.session.terminalName} (${friendlyTargetType(target.type)}).`
       );
       return false;
     }
     if (header.targetProfile && !this.explicitTargetProfileMatches(header.targetProfile, target)) {
       void vscode.window.showErrorMessage(
-        `"${displayName}" targets profile "${header.targetProfile}", but the focused terminal is ${target.session.terminalName}.`
+        `"${displayName}" targets profile "${header.targetProfile}" and cannot run on ${target.session.terminalName}.`
       );
       return false;
     }
@@ -621,6 +640,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
   ): Promise<void> {
     try {
       const value = await this.invokeMethod(record, method, args);
+      if (value === NO_REPLY) return;
       record.worker.postMessage({ kind: "rpc-result", id, ok: true, value });
     } catch (err) {
       const e = err as { code?: string; message?: string };
@@ -642,6 +662,13 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     method: string,
     args: unknown[]
   ): Promise<unknown> {
+    // Ending the worker with its run (cleanupRun) is not enough on its own:
+    // a message the worker posted before it ended is still delivered after
+    // terminate(). And stopScript waits up to 100 ms for the worker before
+    // it cleans up, so a requested stop counts as over too (runIsOver).
+    if (ACTS_ON_TERMINAL_OR_USER.has(method) && runIsOver(record)) {
+      throw makeScriptError("Stopped", `Script run has ended — ${method} refused`);
+    }
     switch (method) {
       case "waitFor":
         return this.doWait(record, args[0] as string | RegExp, args[1] as WaitOpts | undefined, /*throwOnTimeout*/ false);
@@ -650,16 +677,16 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       case "waitAny":
         return this.doWaitAny(record, args[0] as Array<string | RegExp>, args[1] as WaitOpts | undefined);
       case "send":
-        record.writeBack(String(args[0] ?? ""));
+        this.writeToSession(record, String(args[0] ?? ""));
         return undefined;
       case "sendLine":
-        record.writeBack(String(args[0] ?? "") + "\r");
+        this.writeToSession(record, String(args[0] ?? "") + "\r");
         return undefined;
       case "sendKey": {
         const key = String(args[0] ?? "").toLowerCase();
         const bytes = CONTROL_KEY_BYTES[key];
         if (!bytes) throw makeScriptError("InvalidKey", `Unknown control key: ${key}`);
-        record.writeBack(bytes);
+        this.writeToSession(record, bytes);
         return undefined;
       }
       case "sleep":
@@ -786,7 +813,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       // There is no function form: a function `send` never arrives here,
       // because the worker's `rpc()` rejects the whole call when postMessage
       // cannot clone it. A missing or other non-string `send` sends nothing.
-      if (typeof s === "string") record.writeBack(s);
+      if (typeof s === "string") this.writeToSession(record, s);
     };
     while (Date.now() < deadline) {
       await sendOnTick();
@@ -806,6 +833,37 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     });
   }
 
+  /**
+   * `prompt` / `confirm` / `alert`. A dialog must not outlive the run that
+   * asked: the run can end under it — stopped, its session dropped, or the
+   * script finished or threw without awaiting it.
+   *
+   * - The input box behind `prompt` takes a CancellationToken, so cleanupRun
+   *   closes it however the run ends.
+   * - A modal `confirm` / `alert` takes none — VS Code gives an extension no
+   *   way to close one — so it stays until the user answers.
+   *
+   * Nothing that comes back after the run ended is posted to the worker
+   * (NO_REPLY): the answer belongs to a run that is over. Its worker is ended
+   * with the run (cleanupRun), but while stopScript is still waiting for
+   * that, a posted answer would resume the script's code. An answer the user
+   * actually gave is reported as ignored, so a click on OK is not mistaken
+   * for "the script carried on". A dialog asked for after the run ended is
+   * refused before it is shown (ACTS_ON_TERMINAL_OR_USER in invokeMethod).
+   */
+  /**
+   * The one way a run writes to its session. Checked at every write, not only
+   * when an RPC is dispatched: a `poll` already in its loop when the run ends
+   * (the script completed without awaiting it, or a stop is waiting up to
+   * 100 ms for the worker) would otherwise keep ticking into a terminal whose
+   * input lock and macro filter were released — or that a new run now owns.
+   * Throwing ends that loop, with the same Stopped a late RPC gets.
+   */
+  private writeToSession(record: RunningScriptRecord, data: string): void {
+    if (runIsOver(record)) throw makeScriptError("Stopped", "Script run has ended — nothing more is sent");
+    record.pty.writeProgrammatic(data);
+  }
+
   private async doUserInteraction(
     record: RunningScriptRecord,
     method: string,
@@ -813,35 +871,57 @@ export class ScriptRuntimeManager implements vscode.Disposable {
   ): Promise<unknown> {
     const message = String(args[0] ?? "");
     this.beginOp(record, "prompt", `${method}: ${message}`);
+    let answer: { value: unknown; givenByUser: boolean };
     try {
-      if (method === "prompt") {
-        const opts = (args[1] ?? {}) as { default?: string; password?: boolean };
-        const value = await vscode.window.showInputBox({
-          prompt: message,
-          value: opts.default,
-          password: !!opts.password
-        });
-        this.endOp(record, "user-input");
-        return value ?? "";
-      }
-      if (method === "confirm") {
-        const picked = await vscode.window.showInformationMessage(
-          message,
-          { modal: true },
-          "OK",
-          "Cancel"
-        );
-        this.endOp(record, "user-input");
-        return picked === "OK";
-      }
-      // alert
-      await vscode.window.showInformationMessage(message, { modal: true }, "OK");
-      this.endOp(record, "user-input");
-      return undefined;
+      answer = await this.showScriptDialog(record, method, message, args[1]);
     } catch (err) {
       this.endOp(record, "timeout");
       throw err;
     }
+    if (runIsOver(record)) {
+      if (answer.givenByUser) {
+        this.logEvent(record, `← ${method} answered after the run ended — ignored`);
+        void vscode.window.showWarningMessage(
+          `"${record.scriptName}" had already ended when you answered "${message}", so your answer was ignored.`
+        );
+      } else {
+        this.logEvent(record, `← ${method} closed — the run ended`);
+      }
+      return NO_REPLY;
+    }
+    this.endOp(record, "user-input");
+    return answer.value;
+  }
+
+  private async showScriptDialog(
+    record: RunningScriptRecord,
+    method: string,
+    message: string,
+    rawOpts: unknown
+  ): Promise<{ value: unknown; givenByUser: boolean }> {
+    if (method === "prompt") {
+      const opts = (rawOpts ?? {}) as { default?: string; password?: boolean };
+      const closer = new vscode.CancellationTokenSource();
+      record.openInputBoxes.add(closer);
+      try {
+        const typed = await vscode.window.showInputBox(
+          { prompt: message, value: opts.default, password: !!opts.password },
+          closer.token
+        );
+        // `undefined` is Escape — or cleanupRun closing the box, which is no answer at all.
+        return { value: typed ?? "", givenByUser: typed !== undefined };
+      } finally {
+        record.openInputBoxes.delete(closer);
+        closer.dispose();
+      }
+    }
+    if (method === "confirm") {
+      const picked = await vscode.window.showInformationMessage(message, { modal: true }, "OK", "Cancel");
+      return { value: picked === "OK", givenByUser: true };
+    }
+    // alert
+    await vscode.window.showInformationMessage(message, { modal: true }, "OK");
+    return { value: undefined, givenByUser: true };
   }
 
   /**
@@ -938,8 +1018,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     const graceMs = 150;
     setTimeout(() => {
       if (!this.runs.has(record.sessionId)) return; // already cleaned up by worker "complete" / "failed"
-      void record.worker.terminate();
-      this.cleanupRun(record, "connection-lost");
+      this.cleanupRun(record, "connection-lost"); // terminates the worker
     }, graceMs);
   }
 
@@ -953,9 +1032,20 @@ export class ScriptRuntimeManager implements vscode.Disposable {
   private cleanupRun(record: RunningScriptRecord, finalState: FinalState): void {
     if (record.cleanedUp) return;
     record.cleanedUp = true;
+    // The run is over however it ended, so its worker is too. A script that
+    // completes or fails does not end its thread: the parentPort listener
+    // keeps it alive, so a timer the script left behind could still send to
+    // the terminal after the input lock and macro filter below are released
+    // — and every such run leaked a Worker. A second terminate() (after
+    // stopScript's own) is a no-op, and the "exit" handler acts only while a
+    // run is starting or running.
+    void record.worker.terminate();
     record.coreChangeSubscription?.dispose();
     record.observerSubscription?.dispose();
     record.macroFilterHandle?.dispose();
+    // Every ending, not only Stop: a dropped session or a script that ended
+    // without awaiting its prompt() leaves the box just as open (see doUserInteraction).
+    for (const closer of record.openInputBoxes) closer.cancel();
     if (record.inputLockHeld) {
       // Release directly via the captured PTY handle — works even after the
       // session has been deregistered from NexusCore (ConnectionLost path).
@@ -1023,6 +1113,27 @@ interface PollOpts {
 }
 
 let pendingIdCounter = 0;
+
+/** What an RPC handler returns when its caller must get no rpc-result at all (see doUserInteraction). */
+const NO_REPLY = Symbol("no-reply");
+
+/**
+ * True once a run has ended (`cleanedUp`, flipped first thing in cleanupRun)
+ * or a stop was asked for (`stopReason`, set before stopScript's up-to-100 ms
+ * wait for the worker, which is the window `cleanedUp` alone would miss).
+ */
+function runIsOver(record: RunningScriptRecord): boolean {
+  return record.cleanedUp || record.stopReason !== undefined;
+}
+
+/**
+ * RPCs that write to the session or put something in front of the user —
+ * refused before they start once the run has ended or a stop was asked for
+ * (see invokeMethod); writeToSession catches the ones already under way.
+ * Waits, reads and macro calls act on neither; nexus.fs and nexus.include
+ * refuse through their own `isAborted` check.
+ */
+const ACTS_ON_TERMINAL_OR_USER = new Set(["send", "sendLine", "sendKey", "poll", "prompt", "confirm", "alert"]);
 
 function patternToLabel(p: string | RegExp): string {
   return typeof p === "string" ? JSON.stringify(p) : p.toString();

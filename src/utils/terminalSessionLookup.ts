@@ -19,11 +19,18 @@ export function resolveSessionForTerminal(
 }
 
 /**
- * Script targeting resolves a terminal exactly like everything else does.
- *
- * It did not always: the script variant deliberately omitted `localShellTerminals`
- * back when scripts could not target a local shell. Local-shell scripting support
- * added that map, leaving the two functions character-identical. The separate name
- * is kept because it documents intent at the call site.
+ * Script targeting resolves only the terminals a script can drive: SSH / Telnet,
+ * serial and Local Shell. A Local Server terminal (`Nexus Local Server: <name>`)
+ * is deliberately not among them — the runtime never binds to a Local Server
+ * session, so resolving one handed Quick Run an id it could not map and the run
+ * ended there, silently. Left out, a focused Local Server terminal is treated
+ * like any plain terminal: Quick Run offers the session picker.
  */
-export const resolveScriptSessionForTerminal = resolveSessionForTerminal;
+export function resolveScriptSessionForTerminal(
+  terminal: vscode.Terminal | undefined,
+  sessionTerminals: SessionTerminalMap,
+  serialTerminals: SerialTerminalMap,
+  localShellTerminals: LocalShellTerminalMap
+): string | undefined {
+  return resolveSessionForTerminal(terminal, sessionTerminals, serialTerminals, localShellTerminals);
+}

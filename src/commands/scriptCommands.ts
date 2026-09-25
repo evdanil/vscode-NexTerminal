@@ -98,6 +98,38 @@ type ScriptTemplate = {
   body: string;
 };
 
+const FIRST_PROMPT_COMMENT = `  // The script only sees output that arrives after it starts. On a terminal
+  // that is already open, the prompt is on screen and will not come again;
+  // under Connect and Run Script… it usually arrives just after the start.
+  // So wait briefly, and press Enter for a fresh prompt only if none came —
+  // an Enter while the first prompt is on its way leaves a spare one for a
+  // later wait to match too early.`;
+
+const IOS_PROMPT_DECLARATION = `// IOS and IOS XE prompts end in ">" or "#" with no trailing space ("Router#");
+// the optional space also matches NX-OS-style "switch# ". Adapt it to your device.
+const PROMPT = /[>#] ?$/;`;
+
+const API_REFERENCE_COMMENT = "// Full API reference: types/nexus-scripts.d.ts at the top of your scripts folder.";
+
+/**
+ * Starter templates for New Script. They are most users' first script, so they
+ * follow the scripting guide (docs/scripting.md):
+ *
+ * - Each opens by waiting briefly for its first prompt and pressing Enter only
+ *   if none came. A script sees only output that arrives after it starts, so
+ *   on an idle, already-open terminal a plain first wait times out; but an
+ *   unconditional Enter leaves a spare prompt when the first one is still on
+ *   its way (Connect and Run Script… on SSH / Telnet). Which of the two a run
+ *   meets is a race — runScript awaits file reads before it starts watching
+ *   the output — so the opening must not depend on the launch path.
+ * - The prompt pattern is declared once, as `PROMPT`, and fits the commands the
+ *   template sends: a shell prompt ends in "$ " or "# ", an IOS / IOS XE prompt
+ *   in ">" or "#" with no trailing space ("Router#").
+ * - No local shadows a script API global (a `const prompt` would make
+ *   `prompt()` a Match for the rest of the script).
+ * - Header tags are read only from the leading JSDoc block, so `@allow-macros`
+ *   is explained there, never offered as a line to uncomment in the body.
+ */
 export const SCRIPT_TEMPLATES: ScriptTemplate[] = [
   {
     id: "basic-command",
@@ -108,18 +140,26 @@ export const SCRIPT_TEMPLATES: ScriptTemplate[] = [
  * @name {{NAME}}
  * @description A new Nexus automation script.
  * @target-type ssh
+ *
+ * To let a macro keep firing while this script runs, add a header line
+ * "@allow-macros <macro name>" to this block (tags anywhere else are ignored).
  */
 
-// Full API reference: ./types/nexus-scripts.d.ts
-// Uncomment to let a specific macro fire during this run:
-// @allow-macros password
+${API_REFERENCE_COMMENT}
+
+// A shell prompt ends in "$ " or "# ". Adapt it to your host.
+const PROMPT = /[$#] $/;
 
 try {
-  const prompt = await expect(/[$#] $/, { timeout: 10_000 });
-  log.info("shell ready:", prompt.text);
+${FIRST_PROMPT_COMMENT}
+  if (!(await waitFor(PROMPT, { timeout: 2_000 }))) {
+    await sendLine("");
+    await expect(PROMPT, { timeout: 10_000 });
+  }
+  log.info("shell ready");
 
   await sendLine("uname -a");
-  const out = await expect(/[$#] $/, { timeout: 5_000 });
+  const out = await expect(PROMPT, { timeout: 5_000 });
   log.info("uname:", out.before.trim());
 } catch (err) {
   // Prefer the "instanceof Error" narrowing so the editor gives you full
@@ -143,17 +183,24 @@ try {
  * @target-type ssh
  */
 
-// Full API reference: ./types/nexus-scripts.d.ts
+${API_REFERENCE_COMMENT}
+
+${IOS_PROMPT_DECLARATION}
+const LOGIN = /login:\\s*$/i;
 
 try {
-  await expect(/login:\\s*$/i, { timeout: 30_000 });
+${FIRST_PROMPT_COMMENT}
+  if (!(await waitFor(LOGIN, { timeout: 2_000 }))) {
+    await sendLine("");
+    await expect(LOGIN, { timeout: 30_000 });
+  }
   await sendLine("admin");
 
-  await expect(/[$#] $/, { timeout: 30_000 });
+  await expect(PROMPT, { timeout: 30_000 });
   await sendLine("terminal length 0");
 
-  const prompt = await expect(/[$#] $/, { timeout: 10_000 });
-  log.info("ready:", prompt.text);
+  const ready = await expect(PROMPT, { timeout: 10_000 });
+  log.info("ready:", ready.text);
 } catch (err) {
   const message = err instanceof Error ? err.message : String(err);
   log.error("script failed:", message);
@@ -172,13 +219,23 @@ try {
  * @target-type ssh
  */
 
-// Full API reference: ./types/nexus-scripts.d.ts
+${API_REFERENCE_COMMENT}
+
+${IOS_PROMPT_DECLARATION}
 
 try {
-  await expect(/[$#] $/, { timeout: 10_000 });
-  await sendLine("show version");
+${FIRST_PROMPT_COMMENT}
+  if (!(await waitFor(PROMPT, { timeout: 2_000 }))) {
+    await sendLine("");
+    await expect(PROMPT, { timeout: 10_000 });
+  }
+  // Without this, output longer than a screen stops at --More-- and the
+  // wait below times out.
+  await sendLine("terminal length 0");
+  await expect(PROMPT, { timeout: 10_000 });
 
-  const result = await expect(/[$#] $/, { timeout: 10_000 });
+  await sendLine("show version");
+  const result = await expect(PROMPT, { timeout: 10_000 });
   const output = result.before.trim();
   log.info("command output:", output);
 } catch (err) {
@@ -199,15 +256,21 @@ try {
  * @target-type ssh
  */
 
-// Full API reference: ./types/nexus-scripts.d.ts
+${API_REFERENCE_COMMENT}
+
+${IOS_PROMPT_DECLARATION}
 
 try {
-  await expect(/[$#] $/, { timeout: 10_000 });
+${FIRST_PROMPT_COMMENT}
+  if (!(await waitFor(PROMPT, { timeout: 2_000 }))) {
+    await sendLine("");
+    await expect(PROMPT, { timeout: 10_000 });
+  }
   await sendLine("terminal length 0");
-  await expect(/[$#] $/, { timeout: 10_000 });
+  await expect(PROMPT, { timeout: 10_000 });
 
   await sendLine("show running-config");
-  const result = await expect(/[$#] $/, { timeout: 30_000 });
+  const result = await expect(PROMPT, { timeout: 30_000 });
   const runningConfig = result.before.trim();
   log.info("running config backup:", runningConfig);
 } catch (err) {
@@ -457,8 +520,11 @@ function scriptExamplesUrl(): string {
 async function deleteScript(uri: vscode.Uri): Promise<void> {
   if (!uri?.fsPath) return;
   const base = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
+  // The file goes to the Trash, so the warning must not say the delete is
+  // final. It never is: where a file system has no Trash, VS Code refuses a
+  // `useTrash` delete (the error below) rather than deleting for good.
   const picked = await vscode.window.showWarningMessage(
-    `Delete ${base}? This cannot be undone.`,
+    `Delete ${base}? It will be moved to the Trash.`,
     { modal: true },
     "Delete"
   );
@@ -473,11 +539,10 @@ async function deleteScript(uri: vscode.Uri): Promise<void> {
 
 /**
  * Resolve the Nexus session id for a given VS Code `Terminal`, or undefined
- * if the terminal isn't a Nexus-managed session (could be a plain shell, the
- * serial sidecar host's stdio, etc.). Used by `nexus.script.runQuick` to
- * auto-pick the currently focused terminal when the user hits the tree view's
- * inline ▶ play button. Passed in from extension.ts where the two terminal
- * maps live.
+ * if the terminal isn't a session a script can run on (a plain shell, a Local
+ * Server terminal, etc.). Used by `nexus.script.runQuick` to auto-pick the
+ * currently focused terminal when the user hits the tree view's inline ▶ play
+ * button. Passed in from extension.ts where the terminal maps live.
  */
 export type TerminalToSessionResolver = (
   terminal: vscode.Terminal | undefined
@@ -504,8 +569,8 @@ export function registerScriptCommands(
 
     // Quick-run: if the user has a Nexus terminal focused, bind the script to that
     // session without the picker. Falls back to the normal picker flow when no
-    // terminal is focused, or when the focused terminal isn't a Nexus session
-    // (plain shell, etc.). This is wired to the Scripts tree view's inline
+    // terminal is focused, or when the focused terminal isn't one a script can
+    // run on (plain shell, Local Server, etc.). This is wired to the Scripts tree view's inline
     // ▶ play button; the CodeLens / Palette / right-click menu keep the
     // explicit picker behaviour because those contexts aren't a user telling us
     // "the terminal I'm looking at is where I want this to run".

@@ -1,5 +1,23 @@
 # Changelog
 
+## [2.8.247] — 2026-09-25
+
+### Fixed
+
+- **Quick Run on a focused Local Server terminal now shows the session picker.** Scripts can't drive a Local Server terminal, but the inline **▶** in the Scripts view took it as the script's target anyway, then did nothing and showed no message. It is now treated like a plain terminal. And if a run is ever handed a session that closed before the script could start — a server whose shell exits the moment **Connect and Run Script…** opens it, say — an error now says the script did not run, instead of nothing happening.
+
+- **A finished script can no longer act on the terminal, and its dialogs no longer outlive it.** A script that completed or failed kept running in the background, so a `setTimeout` it left behind, a `poll` it hadn't waited for, or code it had left waiting on a dialog could still send text to the terminal after the run had ended and released its input lock and macros — even into the next script's run on the same terminal. Everything a script leaves running now ends with its run. When a run ends — you stop it, its session drops, or the script finishes without waiting for its `prompt` — an open `prompt` box now closes. VS Code gives extensions no way to close a `confirm` or `alert` dialog, so one of those can still be on screen after its script has ended; answering it now does nothing, and a notification says your answer was ignored.
+
+- **Delete Script no longer warns "This cannot be undone."** The script is moved to the Trash, and the confirmation now says so.
+
+- **Your changes to `jsconfig.json` in the scripts folder now stick.** Nexus rewrote that file on every script run whenever it differed from its own copy, silently undoing your edits — or replacing a `jsconfig.json` that was in the folder before Nexus was. It is now written only when there is none; delete it to get the bundled copy back. An unedited copy written by Nexus 2.8.0–2.8.2 is still replaced with the current one, which fixes the "'await' expressions are only allowed…" error those copies raise in script files. `types/nexus-scripts.d.ts` is still Nexus's own file and is still replaced when a new version ships.
+
+- **The New Script templates now work on an already-open terminal and on Cisco devices.** A script only sees output that arrives after it starts, so the templates' first wait — for the prompt already on screen — timed out. Each template now waits briefly for its first prompt and presses Enter only if none came, which works both on a terminal that is already open and under **Connect and Run Script…**, where the first prompt usually arrives just after the script starts. The three templates that send Cisco commands now wait for a prompt with no trailing space (`Router#`), which they could never match before, and **Capture command output** turns off paging first so its output doesn't stop at `--More--`. No template names a variable `prompt` any more, which hid the `prompt()` dialog for the rest of the script, and **Basic command** explains `@allow-macros` inside its header — the only place Nexus reads it — instead of suggesting you uncomment a line in the script body, where it did nothing.
+
+- **The `waitFor` example in the script types no longer ends with a top-level `return`**, which the editor marks as an error in a script file. The corrected types replace the copy in your scripts folder the next time you run a script.
+
+- **When a script refuses the session it was started on, the error names that session.** It said "the focused terminal is …" even when **Connect/Open and Run Script…** had started the run on the session it had just opened.
+
 ## [2.8.246] — 2026-09-25
 
 ### Fixed

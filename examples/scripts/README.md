@@ -19,7 +19,7 @@ Seven short, focused scripts that each demonstrate one facet of the scripting AP
 3. `Cmd/Ctrl+Shift+P` → **Nexus: Run Nexus Script** → pick the script (with the example open in the editor, it runs that one), then the session.
 4. Watch progress in the **Nexus Scripts** Output Channel.
 
-Every example assumes a session that is already open and sitting at a prompt — what **Run**, the Scripts view's ▶ quick-run and the CodeLens bind to — so most of them begin by pressing Enter (`sendLine("")`, or a `poll` that sends `\r` in 07). **Connect and Run Script…** on an SSH server starts the run before the host has printed its first prompt, so an opening `sendLine("")` there leaves a spare prompt that a later wait matches too early: remove it for that path. See [Match window semantics](../../docs/scripting.md#match-window-semantics).
+Every example assumes a session that is already open and sitting at a prompt — what **Run**, the Scripts view's ▶ quick-run and the CodeLens bind to — so most of them begin by pressing Enter (`sendLine("")`, or a `poll` that sends `\r` in 07). **Connect and Run Script…** on an SSH server usually starts the run just before the host's first prompt arrives, and an Enter then leaves a spare prompt that a later wait matches too early. For that path, open the way `01-hello.js` does: wait briefly for a prompt and press Enter only if none came, which works on an open terminal too. See [Match window semantics](../../docs/scripting.md#match-window-semantics).
 
 The first time you run a script, Nexus writes `types/nexus-scripts.d.ts` + `jsconfig.json` alongside your scripts so the editor gives autocomplete and JSDoc hovers for `expect`, `sendLine`, `poll`, etc.
 
