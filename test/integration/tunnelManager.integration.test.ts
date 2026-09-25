@@ -646,6 +646,7 @@ describe("TunnelManager integration", () => {
         await expect(manager.start(profile, server, { connectionMode: "shared" })).rejects.toThrow();
         expect(connectCount).toBe(1);
         expect(events.some((event) => event.type === "started")).toBe(false);
+        expect(events.some((event) => event.type === "error")).toBe(false);
       } finally {
         await manager.stopAll();
         pool.dispose();

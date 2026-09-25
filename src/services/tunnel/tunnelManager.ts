@@ -922,6 +922,8 @@ export class TunnelManager {
     runtime.sshConnections.add(sharedConnection);
     // onClose replays synchronously when authentication returned an already-closed transport.
     let closedDuringSubscription = false;
+    // The start rejection reports this replay; avoid a duplicate manager error event.
+    let subscribing = true;
     sharedConnection.onClose(() => {
       closedDuringSubscription = true;
       runtime.sshConnections.delete(sharedConnection);
@@ -932,7 +934,8 @@ export class TunnelManager {
       // still be using this transport. Only candidates deliberately discarded
       // before use are quiet; real transport loss remains visible.
       if (
-        !this.intentionallyDiscardedSharedConnections.has(sharedConnection)
+        !subscribing
+        && !this.intentionallyDiscardedSharedConnections.has(sharedConnection)
         && !runtime.isStopping
         && this.activeTunnels.has(activeTunnelId)
       ) {
@@ -943,6 +946,7 @@ export class TunnelManager {
         });
       }
     });
+    subscribing = false;
     if (closedDuringSubscription) {
       throw new Error(`Shared SSH connection closed while starting tunnel ${runtime.profile.name}`);
     }
