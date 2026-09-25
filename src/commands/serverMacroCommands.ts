@@ -409,11 +409,19 @@ interface ShellWord {
   readonly raw: string;
   readonly value: string;
   readonly redirectionTarget?: boolean;
+  readonly redirection?: ShellRedirection;
+}
+
+interface ShellRedirection {
+  readonly fileDescriptor: number;
+  readonly hereDocumentStripTabs?: boolean;
 }
 
 interface HereDocument {
   readonly delimiter: string;
   readonly stripTabs: boolean;
+  readonly ownerWords: ShellWord[];
+  readonly target: ShellWord;
 }
 
 interface HereDocumentBody {
@@ -466,16 +474,27 @@ function shellSegments(text: string): ShellWord[][] {
   let value = "";
   let quote = "";
   let redirectionTarget = false;
-  let hereDocumentStripTabs: boolean | undefined;
+  let pendingRedirection: ShellRedirection | undefined;
   const hereDocuments: HereDocument[] = [];
   const endWord = (): void => {
     if (raw) {
-      words.push({ raw, value, redirectionTarget });
-      if (redirectionTarget && hereDocumentStripTabs !== undefined) {
-        hereDocuments.push({ delimiter: value, stripTabs: hereDocumentStripTabs });
-        hereDocumentStripTabs = undefined;
+      const word: ShellWord = {
+        raw,
+        value,
+        redirectionTarget,
+        ...(pendingRedirection ? { redirection: pendingRedirection } : {})
+      };
+      words.push(word);
+      if (redirectionTarget && pendingRedirection?.hereDocumentStripTabs !== undefined) {
+        hereDocuments.push({
+          delimiter: value,
+          stripTabs: pendingRedirection.hereDocumentStripTabs,
+          ownerWords: words,
+          target: word
+        });
       }
       redirectionTarget = false;
+      pendingRedirection = undefined;
     }
     raw = value = "";
   };
@@ -505,12 +524,11 @@ function shellSegments(text: string): ShellWord[][] {
       raw += c;
     } else if (/[;&|\n]/.test(c)) {
       endWord();
-      const shellReadsHereDocument = c === "\n" && hereDocuments.length > 0 && shellReadsStdinScript(words);
       segments.push(words);
       words = [];
       if (c === "\n" && hereDocuments.length > 0) {
         let bodyStart = i + 1;
-        let scriptBody: string | undefined;
+        const scriptBodies: string[] = [];
         let complete = true;
         for (const hereDocument of hereDocuments) {
           const body = readHereDocumentBody(text, bodyStart, hereDocument);
@@ -520,39 +538,52 @@ function shellSegments(text: string): ShellWord[][] {
             break;
           }
           bodyStart = body.afterDelimiter;
-          if (shellReadsHereDocument) {
-            scriptBody = body.text;
+          if (hereDocumentFeedsShellScript(hereDocument)) {
+            scriptBodies.push(body.text);
           }
         }
         if (bodyStart > i + 1) {
           i = bodyStart - 1;
         }
         hereDocuments.length = 0;
-        if (complete && scriptBody !== undefined) {
-          segments.push(...shellSegments(scriptBody));
+        if (complete) {
+          for (const scriptBody of scriptBodies) {
+            segments.push(...shellSegments(scriptBody));
+          }
         }
       }
     } else if (c === "<" || c === ">") {
-      endWord();
-      let hereDocumentOperator = false;
-      let stripTabs = false;
+      let fileDescriptor = c === "<" ? 0 : 1;
+      if (/^\d+$/.test(raw)) {
+        fileDescriptor = Number(raw);
+        raw = value = "";
+      } else {
+        endWord();
+      }
+      let operator = c;
       if (next === c) {
         i++;
         if (c === "<" && text[i + 1] === "-") {
           i++;
-          stripTabs = true;
+          operator = "<<-";
+        } else if (c === "<" && text[i + 1] === "<") {
+          i++;
+          operator = "<<<";
+        } else {
+          operator += c;
         }
-        hereDocumentOperator = c === "<" && text[i + 1] !== "<";
       } else if (
         (c === "<" && (next === ">" || next === "&")) ||
         (c === ">" && (next === "&" || next === "|"))
       ) {
         i++;
+        operator += next;
       }
       redirectionTarget = true;
-      if (hereDocumentOperator) {
-        hereDocumentStripTabs = stripTabs;
-      }
+      pendingRedirection = {
+        fileDescriptor,
+        ...((operator === "<<" || operator === "<<-") ? { hereDocumentStripTabs: operator === "<<-" } : {})
+      };
     } else if (/[\s)]/.test(c)) {
       endWord();
     } else {
@@ -655,15 +686,17 @@ function shellReadsStdinScript(segment: readonly ShellWord[]): boolean {
 
   const args = invocation.args;
   let scriptFromStdin = false;
+  let optionsEnded = false;
   for (let i = 0; i < args.length; i++) {
     const value = args[i].value;
-    if (value === "--") {
-      return i === args.length - 1 || (i === args.length - 2 && args[i + 1].value === "-");
+    if (!optionsEnded && value === "--") {
+      optionsEnded = true;
+      continue;
     }
-    if (value === "-") {
+    if (!optionsEnded && value === "-") {
       return true;
     }
-    if (value.startsWith("--")) {
+    if (!optionsEnded && value.startsWith("--")) {
       if (value === "--command" || value.startsWith("--command=")) {
         return false;
       }
@@ -672,7 +705,7 @@ function shellReadsStdinScript(segment: readonly ShellWord[]): boolean {
       }
       continue;
     }
-    if (value.startsWith("-")) {
+    if (!optionsEnded && value.startsWith("-")) {
       const options = value.slice(1);
       if (options.includes("c")) {
         return false;
@@ -685,9 +718,22 @@ function shellReadsStdinScript(segment: readonly ShellWord[]): boolean {
       }
       continue;
     }
-    return scriptFromStdin;
+    if (!scriptFromStdin) {
+      return value === "-";
+    }
   }
   return true;
+}
+
+/** Whether this specific queued body is the shell command's effective stdin script. */
+function hereDocumentFeedsShellScript(hereDocument: HereDocument): boolean {
+  if (hereDocument.target.redirection?.fileDescriptor !== 0) {
+    return false;
+  }
+  const effectiveStdinRedirection = hereDocument.ownerWords
+    .filter((word) => word.redirection?.fileDescriptor === 0)
+    .at(-1);
+  return effectiveStdinRedirection === hereDocument.target && shellReadsStdinScript(hereDocument.ownerWords);
 }
 
 /** An `ipmitool …` invocation in a macro's text — at line start or after whitespace. */

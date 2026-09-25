@@ -1316,6 +1316,43 @@ describe("ipmiCredentialsOffNote — fires only where something reads the passwo
     ).toContain('tick "Provide IPMI credentials"');
   });
 
+  it("keeps executable here-documents with their shell command across pipelines and separators", () => {
+    for (const text of [
+      "sh <<'EOF' | cat\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n",
+      "sh <<'EOF'; echo done\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n"
+    ]) {
+      expect(hint(text) ?? "", text).toContain('tick "Provide IPMI credentials"');
+    }
+  });
+
+  it("does not scan a cat here-document just because a later shell command is present", () => {
+    expect(
+      hint("cat <<'EOF'; sh </dev/null\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n")
+    ).toBeUndefined();
+  });
+
+  it("does not count an I/O descriptor as a shell script argument", () => {
+    for (const text of [
+      "sh <<'EOF' 2>/dev/null\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n",
+      "sh 0<<'EOF'\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n"
+    ]) {
+      expect(hint(text) ?? "", text).toContain('tick "Provide IPMI credentials"');
+    }
+  });
+
+  it("does not scan a shell here-document when a later stdin redirection replaces it", () => {
+    expect(
+      hint("sh <<'EOF' </dev/null\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n")
+    ).toBeUndefined();
+  });
+
+  it("recognizes `-s -- arguments` as a shell script read from stdin", () => {
+    expect(
+      hint("sh -s -- argument <<'EOF'\nipmitool -H ${profile.ipmiHost} -E sol activate\nEOF\n")
+      ?? ""
+    ).toContain('tick "Provide IPMI credentials"');
+  });
+
   it("matches tab-stripped `<<-` terminators before parsing following commands", () => {
     expect(
       hint(" ipmitool -H ${profile.ipmiHost} -a sol activate\ncat <<-EOF\n\tipmitool -a sol activate\n\tEOF\nipmitool -E sol activate\n")
@@ -2023,7 +2060,7 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
    * Every command below was misread by one version of that parse.
    */
   describe("one gateway note, from the route and the flag alone (#174, #189)", () => {
-    const NOTE_TAIL = "makes it ask in the gateway terminal";
+    const NOTE_TAIL = "may prompt in the gateway terminal";
     const COMMANDS = [
       " ipmitool -H ${profile.ipmiHost} -E sol activate\n",
       " ipmitool -H ${profile.ipmiHost} -a sol activate\n",
@@ -2096,9 +2133,16 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
       // (#189: `-E` with no variable prompts too; Codex on #191: `-E -P …` does not).
       expect(IPMI_GATEWAY_INERT_CREDENTIALS_HINT).toContain("uses only what the command or the gateway supplies");
       expect(IPMI_GATEWAY_INERT_CREDENTIALS_HINT).toContain("`-P`, `-f`, or IPMITOOL_PASSWORD/IPMI_PASSWORD set on the gateway");
-      expect(IPMI_GATEWAY_INERT_CREDENTIALS_HINT).toContain("with none of those, `-a` or `-E` " + NOTE_TAIL);
+      expect(IPMI_GATEWAY_INERT_CREDENTIALS_HINT).toContain(
+        "when authentication is enabled and no password is supplied, `-a` or `-E` " + NOTE_TAIL
+      );
       expect(IPMI_GATEWAY_INERT_CREDENTIALS_HINT).not.toContain("asks for the password in the gateway terminal");
       expect(IPMI_GATEWAY_INERT_CREDENTIALS_HINT).not.toMatch(/fail/i);
+    });
+
+    it("does not promise a password prompt when authentication is disabled with `-A NONE`", () => {
+      expect(IPMI_GATEWAY_INERT_CREDENTIALS_HINT).not.toContain("makes it ask in the gateway terminal");
+      expect(IPMI_GATEWAY_INERT_CREDENTIALS_HINT).toContain("when authentication is enabled");
     });
   });
 });

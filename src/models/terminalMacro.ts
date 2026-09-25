@@ -186,13 +186,15 @@ export function resolveMacroRoute(macro: Pick<TerminalMacro, "route">): MacroRou
  * prompts while the options are read; `-E` takes a password variable if one is
  * set, and otherwise logs "Unable to read password from environment" and leaves
  * the prompt to the end, which is skipped when `-P` or `-f` supplied one — so
- * `-E -P …` never asks, and `-E` never fails for want of the variable. Earlier
+ * `-E -P …` never asks, and `-E` never fails for want of the variable. `-A NONE`
+ * also disables authentication, so a general note must not promise a prompt
+ * unless authentication is enabled. Earlier
  * copy promised a prompt "via its `-a` form", a run-time warning said `-E` "will
  * fail", and a later draft promised a prompt outright; each was a guess about
  * the command.
  */
 export const IPMI_GATEWAY_INERT_CREDENTIALS_HINT =
-  "Nexus doesn't send IPMI credentials to a gateway session — ipmitool there uses only what the command or the gateway supplies (`-P`, `-f`, or IPMITOOL_PASSWORD/IPMI_PASSWORD set on the gateway); with none of those, `-a` or `-E` makes it ask in the gateway terminal";
+  "Nexus doesn't send IPMI credentials to a gateway session — ipmitool there uses only what the command or the gateway supplies (`-P`, `-f`, or IPMITOOL_PASSWORD/IPMI_PASSWORD set on the gateway); when authentication is enabled and no password is supplied, `-a` or `-E` may prompt in the gateway terminal";
 
 /** Human-readable label for a run target, shared by the editor and the pickers. */
 export function macroRunTargetLabel(target: MacroRunTarget): string {
