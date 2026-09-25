@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.271] — 2026-09-25
+
+### Fixed
+
+- **Profile-scoped macro triggers now follow their server, serial, or Local Shell profile through Share Export and import.** If the target profile is not included or does not import, all of the macro's trigger settings are removed instead of remaining tied to the sender's ID.
+
 ## [2.8.270] — 2026-09-25
 
 ### Fixed

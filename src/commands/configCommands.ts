@@ -1965,8 +1965,7 @@ const SHARED_MACRO_RULES = {
   triggerInterval: "keep",
   triggerInitiallyDisabled: "keep",
   triggerScope: "keep",
-  // The sender's server or serial profile id, carried unremapped (#198).
-  triggerProfileId: "keep",
+  triggerProfileId: "link",
   variables: "link",
   group: "keep",
   runIn: "keep",
@@ -2424,17 +2423,33 @@ export function sanitizeForSharing(
       }) as TunnelProfile
   );
 
-  const newSerialProfiles = serialProfiles.map(
-    (p) => shareRecord(p, SHARED_SERIAL_PROFILE_RULES, { id: () => randomUUID() }) as SerialProfile
-  );
+  // A macro's profile scope can target a server, serial, or Local Shell profile.
+  // Only IDs for profiles in this bundle travel; sender IDs cannot match on import.
+  const macroProfileIdMap = new Map<string, string>();
+  for (const server of servers) {
+    const id = idMap.get(server.id);
+    if (id) macroProfileIdMap.set(server.id, id);
+  }
 
-  const newLocalShellProfiles = localShellProfiles.map(
-    (p) => shareRecord(p, SHARED_LOCAL_SHELL_PROFILE_RULES, { id: () => randomUUID() }) as LocalShellProfile
-  );
+  const newSerialProfiles = serialProfiles.map((profile) => {
+    const id = randomUUID();
+    macroProfileIdMap.set(profile.id, id);
+    return shareRecord(profile, SHARED_SERIAL_PROFILE_RULES, { id: () => id }) as SerialProfile;
+  });
+
+  const newLocalShellProfiles = localShellProfiles.map((profile) => {
+    const id = randomUUID();
+    macroProfileIdMap.set(profile.id, id);
+    return shareRecord(profile, SHARED_LOCAL_SHELL_PROFILE_RULES, { id: () => id }) as LocalShellProfile;
+  });
 
   const sanitizedMacros = macros
     .filter((m) => !m.secret)
-    .map((m) => shareRecord(m, SHARED_MACRO_RULES, { id: () => randomUUID(), variables: shareMacroVariables }) as TerminalMacro);
+    .map((m) => shareRecord(m, SHARED_MACRO_RULES, {
+      id: () => randomUUID(),
+      variables: shareMacroVariables,
+      triggerProfileId: (profileId) => (profileId ? macroProfileIdMap.get(profileId) : undefined)
+    }) as TerminalMacro);
 
   // Sanitize paths from the settings snapshot.
   const sanitizedSettings = scrubSharedSettings(settings);
@@ -3759,13 +3774,23 @@ export function registerConfigCommands(
       }) as TunnelProfile;
       tally(await addIfValid(remappedTunnel, validateTunnelProfile, (e) => core.addOrUpdateTunnel(e)));
     }
+    // Keep profile-scoped macro links only after each target survives validation,
+    // so a rejected profile cannot leave a live-looking rule.
+    const importedSerialProfileIds = new Map<string, string>();
     for (const profile of serialProfiles) {
-      const remappedProfile = shareRecord(profile, SHARED_SERIAL_PROFILE_RULES, { id: () => randomUUID() }) as SerialProfile;
-      tally(await addIfValid(remappedProfile, validateSerialProfile, (e) => core.addOrUpdateSerialProfile(e)));
+      const id = randomUUID();
+      const remappedProfile = shareRecord(profile, SHARED_SERIAL_PROFILE_RULES, { id: () => id }) as SerialProfile;
+      const added = await addIfValid(remappedProfile, validateSerialProfile, (e) => core.addOrUpdateSerialProfile(e));
+      if (added) importedSerialProfileIds.set(profile.id, id);
+      tally(added);
     }
+    const importedLocalShellProfileIds = new Map<string, string>();
     for (const profile of localShellProfiles) {
-      const remappedProfile = shareRecord(profile, SHARED_LOCAL_SHELL_PROFILE_RULES, { id: () => randomUUID() }) as LocalShellProfile;
-      tally(await addIfValid(remappedProfile, validateLocalShellProfile, (e) => core.addOrUpdateLocalShellProfile(e)));
+      const id = randomUUID();
+      const remappedProfile = shareRecord(profile, SHARED_LOCAL_SHELL_PROFILE_RULES, { id: () => id }) as LocalShellProfile;
+      const added = await addIfValid(remappedProfile, validateLocalShellProfile, (e) => core.addOrUpdateLocalShellProfile(e));
+      if (added) importedLocalShellProfileIds.set(profile.id, id);
+      tally(added);
     }
     // SAVED FILTERS — a name and a query string; only the id is new. Rebuilt by
     // the export's own rules, so nothing else a hand-edited file puts beside
@@ -3840,7 +3865,15 @@ export function registerConfigCommands(
         // Rebuilt by the export's own rules first (`SHARED_MACRO_RULES`), so a
         // member the model does not declare never reaches the store.
         const remapped: TerminalMacro = sanitizeImportedMacro(
-          shareRecord(m, SHARED_MACRO_RULES, { id: () => randomUUID(), variables: (variables) => variables }) as TerminalMacro
+          shareRecord(m, SHARED_MACRO_RULES, {
+            id: () => randomUUID(),
+            variables: (variables) => variables,
+            triggerProfileId: (profileId) => {
+              if (!profileId) return undefined;
+              const serverId = linkToImportedServer(idMap.get(profileId));
+              return serverId ?? importedSerialProfileIds.get(profileId) ?? importedLocalShellProfileIds.get(profileId);
+            }
+          }) as TerminalMacro
         );
         const key = keyOf(remapped);
         if (!existingByKey.has(key)) {
