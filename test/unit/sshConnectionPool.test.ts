@@ -160,6 +160,31 @@ describe("SshConnectionPool", () => {
     expect(listener2).toHaveBeenCalled();
   });
 
+  it("rejects a connection whose close is replayed during pool registration", async () => {
+    const conn = createMockConnection();
+    conn.onClose = vi.fn((listener: () => void) => {
+      listener();
+      return () => {};
+    });
+    const f = createMockFactory([conn]);
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 5000 });
+    const events: PoolEvent[] = [];
+    p.onDidChange((event) => events.push(event));
+
+    const result = await p.connect(testServer).then(
+      (lease) => {
+        lease.dispose();
+        return "connected" as const;
+      },
+      () => "closed" as const
+    );
+    p.dispose();
+
+    expect(result).toBe("closed");
+    expect(events).not.toContainEqual({ type: "connected", serverId: testServer.id });
+    expect(conn.dispose).toHaveBeenCalled();
+  });
+
   it("concurrent connects serialize (factory called once, both callers get leases)", async () => {
     let resolveConnect: ((conn: SshConnection) => void) | undefined;
     const delayedFactory: SshFactory = {

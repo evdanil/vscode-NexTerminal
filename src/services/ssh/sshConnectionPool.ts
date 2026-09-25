@@ -450,6 +450,14 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
       entry.closeUnsubscribe();
     });
 
+    if (!entry.healthy) {
+      // A tunnel may replay its close event from onClose() registration. That
+      // means the connection is already unusable, so do not publish or return it.
+      entry.closeUnsubscribe();
+      connection.dispose();
+      throw new Error("SSH connection closed before it could be pooled");
+    }
+
     if (this.invalidationEpoch(server.id) !== epochAtStart) {
       // invalidate() fired while this handshake was in flight, so the
       // connection carries pre-invalidation credentials/settings. Callers
