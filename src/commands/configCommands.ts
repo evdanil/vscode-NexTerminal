@@ -4755,18 +4755,21 @@ export function registerConfigCommands(
     const hostKeyNote = hostKeyConflicts > 0
       ? ` Kept the locally trusted SSH host key for ${plural(hostKeyConflicts, "host")} where the backup holds a different key.`
       : "";
-    // ISSUE #175 — say why the next connect asks for a password this machine
-    // had saved. A server counts when ANY secret cleared for it was not put
-    // back by the backup (`restoreSecrets` above): a restored password does not
-    // stop the prompt for a cleared proxy password. A secret the backup carries
-    // for an id is restored, so carrying it is the test.
+    // ISSUE #175 — say that credentials this machine had saved were cleared. A
+    // server counts when ANY secret cleared for it was not put back by the
+    // backup (`restoreSecrets` above): a restored password does not stand in
+    // for a cleared proxy password. A secret the backup carries for an id is
+    // restored, so carrying it is the test. The message states only that fact
+    // and promises no prompt: whether the imported record still needs what was
+    // cleared (its auth type, whether it still has an authenticated proxy) is
+    // not something this count knows.
     const restoredByBackup = (id: string, bucket: ServerSecretBucket): boolean => {
       const restored = decryptedSecrets?.[bucket];
       return typeof restored === "object" && restored !== null && Object.prototype.hasOwnProperty.call(restored, id);
     };
     const clearedCount = [...clearedSecretBuckets].filter(([id, buckets]) => buckets.some((bucket) => !restoredByBackup(id, bucket))).length;
     const clearedNote = clearedCount > 0
-      ? ` ${plural(clearedCount, "server")} came back at a different address or route; the passwords saved for ${clearedCount === 1 ? "it" : "them"} here were cleared and will be asked for on the next connect.`
+      ? ` ${plural(clearedCount, "server")} came back at a different address or route; the credentials saved here for ${clearedCount === 1 ? "it" : "them"} were cleared.`
       : "";
     void vscode.window.showInformationMessage(
       `Imported ${plural(imported, "profile")}${mode === "replace" ? " (replaced existing)" : ""}${skipNote}${restoredFileNote}.${hostKeyNote}${clearedNote}`

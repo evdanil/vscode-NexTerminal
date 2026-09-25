@@ -948,8 +948,9 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
     expect(dest.core.getServer("srv-1")?.host).toBe("attacker.example");
     expect(await savedSecrets(dest)).toEqual(GONE);
     expect(lastInfoMessage()).toContain(
-      "1 server came back at a different address or route; the passwords saved for it here were cleared and will be asked for on the next connect."
+      "1 server came back at a different address or route; the credentials saved here for it were cleared."
     );
+    expect(lastInfoMessage()).not.toContain("next connect");
   });
 
   it("an unchanged endpoint keeps them, whatever else about the server changed", async () => {
@@ -1076,8 +1077,9 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
     expect(await dest.vault.get("proxy-password-srv-1")).toBeUndefined();
     expect(await dest.vault.get("password-srv-2")).toBe("file-pw-2");
     expect(lastInfoMessage()).toContain(
-      "1 server came back at a different address or route; the passwords saved for it here were cleared and will be asked for on the next connect."
+      "1 server came back at a different address or route; the credentials saved here for it were cleared."
     );
+    expect(lastInfoMessage()).not.toContain("next connect");
   });
 
   it("a sealed backup of the same endpoint keeps what this machine saved and overwrites only what the backup carries", async () => {
@@ -1090,6 +1092,26 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
     await runImport(dest, json, "replace");
 
     expect(await savedSecrets(dest)).toEqual(["file-pw", "router-pp", "proxy-pw"]);
+  });
+
+  it("a server a sealed backup brings back with no proxy and its SSH password restored is still counted, and the message promises no prompt", async () => {
+    const source = await makeMachine();
+    await source.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, proxy: undefined }));
+    await source.vault.store("password-srv-1", "file-pw");
+    const json = await exportBackup(source);
+    const dest = await makeMachine();
+    await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT }));
+    await dest.vault.store("password-srv-1", "router-pw");
+    await dest.vault.store("proxy-password-srv-1", "proxy-pw");
+
+    await runImport(dest, json, "replace");
+
+    // Nothing will ask for the cleared proxy password — the server has no proxy
+    // now — so the message states what happened and nothing more.
+    expect(dest.core.getServer("srv-1")?.proxy).toBeUndefined();
+    expect(await savedSecrets(dest)).toEqual(["file-pw", undefined, undefined]);
+    expect(lastInfoMessage()).toContain("1 server came back at a different address or route; the credentials saved here for it were cleared.");
+    expect(lastInfoMessage()).not.toContain("next connect");
   });
 
   it("the completion message counts the re-created servers whose saved secrets were cleared — not an unchanged one, and not one that had none", async () => {
@@ -1108,7 +1130,7 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
     ]), "replace");
 
     expect(lastInfoMessage()).toBe(
-      "Imported 4 profiles (replaced existing). 2 servers came back at a different address or route; the passwords saved for them here were cleared and will be asked for on the next connect."
+      "Imported 4 profiles (replaced existing). 2 servers came back at a different address or route; the credentials saved here for them were cleared."
     );
     expect(await dest.vault.get("password-srv-3")).toBe("srv-3-pw");
   });
