@@ -38,6 +38,7 @@ function createTransport(): {
   emitDisconnect: (sessionId: string, reason: string) => void;
   writePort: ReturnType<typeof vi.fn>;
   closePort: ReturnType<typeof vi.fn>;
+  dataListenerCount: () => number;
 } {
   const dataListeners = new Set<DataListener>();
   const errorListeners = new Set<ErrorListener>();
@@ -81,7 +82,8 @@ function createTransport(): {
       }
     },
     writePort,
-    closePort
+    closePort,
+    dataListenerCount: () => dataListeners.size
   };
 }
 
@@ -153,6 +155,158 @@ describe("SerialPty", () => {
     expect(onDataReceived).toHaveBeenCalledTimes(2);
 
     pty.dispose();
+  });
+
+  it("captures data notifications delivered before the openPort response", async () => {
+    const { transport, emitData } = createTransport();
+    let resolveOpen: ((sessionId: string) => void) | undefined;
+    let openingSessionId = "";
+    transport.openPort = vi.fn(
+      (...args: Parameters<SerialTransport["openPort"]>) => {
+        openingSessionId = args[1] ?? "";
+        return new Promise<string>((resolve) => {
+          resolveOpen = resolve;
+        });
+      }
+    );
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const writes: string[] = [];
+    const pty = new SerialPty(transport, { path: "COM9", baudRate: 115200 }, callbacks, logger as any);
+    pty.onDidWrite((chunk) => writes.push(chunk));
+
+    pty.open();
+    emitData(openingSessionId, "early output");
+    resolveOpen!(openingSessionId);
+    await flushAsync();
+
+    expect(writes.join("")).toContain("early output");
+    pty.dispose();
+  });
+
+  it("bounds data buffered while openPort is pending", async () => {
+    const { transport, emitData } = createTransport();
+    let resolveOpen: ((sessionId: string) => void) | undefined;
+    let openingSessionId = "";
+    transport.openPort = vi.fn(
+      (...args: Parameters<SerialTransport["openPort"]>) => {
+        openingSessionId = args[1] ?? "";
+        return new Promise<string>((resolve) => {
+          resolveOpen = resolve;
+        });
+      }
+    );
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const writes: string[] = [];
+    const pty = new SerialPty(transport, { path: "COM9", baudRate: 115200 }, callbacks, logger as any);
+    pty.onDidWrite((chunk) => writes.push(chunk));
+
+    pty.open();
+    for (let index = 0; index < 80; index += 1) {
+      emitData(openingSessionId, `chunk-${index}:` + "x".repeat(1024));
+    }
+    resolveOpen!(openingSessionId);
+    await flushAsync();
+
+    const earlyOutput = writes.filter((chunk) => chunk.startsWith("chunk-")).join("");
+    expect(earlyOutput).toContain("chunk-79:");
+    expect(earlyOutput).not.toContain("chunk-0:");
+    expect(Buffer.byteLength(earlyOutput, "utf8")).toBeLessThanOrEqual(64 * 1024);
+    pty.dispose();
+  });
+
+  it("does not let another session's output evict startup data while opening", async () => {
+    const { transport, emitData } = createTransport();
+    let resolveOpen: ((sessionId: string) => void) | undefined;
+    let openingSessionId = "";
+    transport.openPort = vi.fn(
+      (...args: Parameters<SerialTransport["openPort"]>) => {
+        openingSessionId = args[1] ?? "";
+        return new Promise<string>((resolve) => {
+          resolveOpen = resolve;
+        });
+      }
+    );
+    const pty = new SerialPty(
+      transport,
+      { path: "COM9", baudRate: 115200 },
+      { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() },
+      { log: vi.fn(), close: vi.fn() } as any
+    );
+    const writes: string[] = [];
+    pty.onDidWrite((chunk) => writes.push(chunk));
+
+    pty.open();
+    emitData(openingSessionId, "opening output");
+    for (let index = 0; index < 80; index += 1) {
+      emitData("other-session", `foreign-${index}:` + "x".repeat(1024));
+    }
+    resolveOpen!(openingSessionId);
+    await flushAsync();
+
+    expect(writes.join("")).toContain("opening output");
+    pty.dispose();
+  });
+
+  it("releases its opening data listener when openPort fails", async () => {
+    const { transport, dataListenerCount } = createTransport();
+    let rejectOpen: ((error: Error) => void) | undefined;
+    transport.openPort = vi.fn(
+      () =>
+        new Promise<string>((_resolve, reject) => {
+          rejectOpen = reject;
+        })
+    );
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() };
+    const pty = new SerialPty(
+      transport,
+      { path: "COM9", baudRate: 115200 },
+      callbacks,
+      { log: vi.fn(), close: vi.fn() } as any
+    );
+
+    pty.open();
+    expect(dataListenerCount()).toBe(1);
+    rejectOpen!(new Error("port open failed"));
+    await flushAsync();
+
+    expect(dataListenerCount()).toBe(0);
+    pty.dispose();
+  });
+
+  it("releases buffered opening data when disposed before openPort responds", async () => {
+    const { transport, emitData, closePort, dataListenerCount } = createTransport();
+    let resolveOpen: ((sessionId: string) => void) | undefined;
+    let openingSessionId = "";
+    transport.openPort = vi.fn(
+      (...args: Parameters<SerialTransport["openPort"]>) => {
+        openingSessionId = args[1] ?? "";
+        return new Promise<string>((resolve) => {
+          resolveOpen = resolve;
+        });
+      }
+    );
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() };
+    const pty = new SerialPty(
+      transport,
+      { path: "COM9", baudRate: 115200 },
+      callbacks,
+      { log: vi.fn(), close: vi.fn() } as any
+    );
+    const writes: string[] = [];
+    pty.onDidWrite((chunk) => writes.push(chunk));
+
+    pty.open();
+    expect(dataListenerCount()).toBe(1);
+    emitData(openingSessionId, "must be discarded");
+    pty.dispose();
+    expect(dataListenerCount()).toBe(0);
+    resolveOpen!(openingSessionId);
+    await flushAsync();
+
+    expect(closePort).toHaveBeenCalledWith(openingSessionId);
+    expect(writes.join("")).not.toContain("must be discarded");
   });
 
   it("pauses interval macros when the serial session disconnects", async () => {

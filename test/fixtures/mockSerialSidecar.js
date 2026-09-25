@@ -1,4 +1,5 @@
 const readline = require("node:readline");
+const sessions = new Set();
 
 function respond(id, result, error) {
   const payload = error ? { id, error: { message: error } } : { id, result };
@@ -21,13 +22,22 @@ rl.on("line", (line) => {
     return;
   }
   if (request.method === "openPort") {
-    const { path } = request.params || {};
+    const { path, sessionId = "session-1" } = request.params || {};
+    if (typeof sessionId !== "string" || !sessionId.trim()) {
+      respond(request.id, undefined, "invalid serial session ID");
+      return;
+    }
+    if (sessions.has(sessionId)) {
+      respond(request.id, undefined, "serial session ID is already in use");
+      return;
+    }
     if (path === "ERR") {
       respond(request.id, undefined, "failed to open mock serial port");
       return;
     }
-    respond(request.id, { sessionId: "session-1" });
-    notify("portData", { sessionId: "session-1", data: Buffer.from("ready").toString("base64") });
+    sessions.add(sessionId);
+    notify("portData", { sessionId, data: Buffer.from("ready").toString("base64") });
+    respond(request.id, { sessionId });
     return;
   }
   if (request.method === "writePort") {
@@ -41,6 +51,7 @@ rl.on("line", (line) => {
     return;
   }
   if (request.method === "closePort") {
+    sessions.delete(request.params.sessionId);
     respond(request.id, { ok: true });
     notify("portDisconnected", { sessionId: request.params.sessionId, reason: "Port closed" });
     return;

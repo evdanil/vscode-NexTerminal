@@ -56,22 +56,26 @@ function makeProfile(overrides: Partial<SerialProfile> = {}): SerialProfile {
 
 function createTransport(options: {
   listPorts: () => Promise<SerialPortInfo[]>;
-  openPort: (params: OpenPortParams) => Promise<string>;
+  openPort: (params: OpenPortParams, sessionId?: string) => Promise<string>;
 }): {
   transport: SmartSerialTransport;
   openPort: ReturnType<typeof vi.fn>;
+  closePort: ReturnType<typeof vi.fn>;
+  emitData: (sessionId: string, payload: string) => void;
   emitDisconnect: (sessionId: string, reason: string) => void;
+  dataListenerCount: () => number;
 } {
   const dataListeners = new Set<DataListener>();
   const errorListeners = new Set<ErrorListener>();
   const disconnectListeners = new Set<DisconnectListener>();
   const openPort = vi.fn(options.openPort);
+  const closePort = vi.fn(async () => {});
 
   const transport: SmartSerialTransport = {
     listPorts: vi.fn(options.listPorts),
     openPort,
     writePort: vi.fn(async () => {}),
-    closePort: vi.fn(async () => {}),
+    closePort,
     onDidReceiveData(listener) {
       dataListeners.add(listener);
       return () => dataListeners.delete(listener);
@@ -89,11 +93,18 @@ function createTransport(options: {
   return {
     transport,
     openPort,
+    closePort,
+    emitData: (sessionId, payload) => {
+      for (const listener of dataListeners) {
+        listener(sessionId, Buffer.from(payload, "utf8"));
+      }
+    },
     emitDisconnect: (sessionId, reason) => {
       for (const listener of disconnectListeners) {
         listener(sessionId, reason);
       }
-    }
+    },
+    dataListenerCount: () => dataListeners.size
   };
 }
 
@@ -194,12 +205,136 @@ describe("SmartSerialPty", () => {
     await flushAsync();
 
     expect(openPort).toHaveBeenCalledTimes(1);
-    expect(openPort).toHaveBeenCalledWith(expect.objectContaining({ path: "COM5" }));
+    expect(openPort).toHaveBeenCalledWith(expect.objectContaining({ path: "COM5" }), expect.any(String));
     expect(harness.spies.promptPortChoice).not.toHaveBeenCalled();
     expect(harness.spies.onActivePortChanged).toHaveBeenLastCalledWith("COM5");
     expect(harness.spies.onStateChanged).toHaveBeenCalledWith("connected");
 
     pty.dispose();
+  });
+
+  it("captures data notifications delivered before the openPort response", async () => {
+    let resolveOpen: ((sessionId: string) => void) | undefined;
+    let openingSessionId = "";
+    const { transport, openPort, emitData } = createTransport({
+      listPorts: async () => [{ path: "COM5" }],
+      openPort: (_params, sessionId) => {
+        openingSessionId = sessionId ?? "";
+        return new Promise<string>((resolve) => {
+          resolveOpen = resolve;
+        });
+      }
+    });
+    const harness = makeCallbacks();
+    const writes: string[] = [];
+    const pty = new SmartSerialPty(transport, makeProfile(), harness.callbacks, noopLogger());
+    pty.onDidWrite((chunk) => writes.push(chunk));
+
+    pty.open();
+    await flushAsync();
+    expect(openPort).toHaveBeenCalledTimes(1);
+
+    emitData(openingSessionId, "early output");
+    resolveOpen!(openingSessionId);
+    await flushAsync();
+
+    expect(writes.join("")).toContain("early output");
+    pty.dispose();
+  });
+
+  it("bounds data buffered while openPort is pending", async () => {
+    let resolveOpen: ((sessionId: string) => void) | undefined;
+    let openingSessionId = "";
+    const { transport, openPort, emitData } = createTransport({
+      listPorts: async () => [{ path: "COM5" }],
+      openPort: (_params, sessionId) => {
+        openingSessionId = sessionId ?? "";
+        return new Promise<string>((resolve) => {
+          resolveOpen = resolve;
+        });
+      }
+    });
+    const harness = makeCallbacks();
+    const writes: string[] = [];
+    const pty = new SmartSerialPty(transport, makeProfile(), harness.callbacks, noopLogger());
+    pty.onDidWrite((chunk) => writes.push(chunk));
+
+    pty.open();
+    await flushAsync();
+    expect(openPort).toHaveBeenCalledTimes(1);
+    for (let index = 0; index < 80; index += 1) {
+      emitData(openingSessionId, `chunk-${index}:` + "x".repeat(1024));
+    }
+    resolveOpen!(openingSessionId);
+    await flushAsync();
+
+    const earlyOutput = writes.filter((chunk) => chunk.startsWith("chunk-")).join("");
+    expect(earlyOutput).toContain("chunk-79:");
+    expect(earlyOutput).not.toContain("chunk-0:");
+    expect(Buffer.byteLength(earlyOutput, "utf8")).toBeLessThanOrEqual(64 * 1024);
+    pty.dispose();
+  });
+
+  it("does not let another session's output evict startup data while opening", async () => {
+    let resolveOpen: ((sessionId: string) => void) | undefined;
+    let openingSessionId = "";
+    const { transport, openPort, emitData } = createTransport({
+      listPorts: async () => [{ path: "COM5" }],
+      openPort: (_params, sessionId) => {
+        openingSessionId = sessionId ?? "";
+        return new Promise<string>((resolve) => {
+          resolveOpen = resolve;
+        });
+      }
+    });
+    const harness = makeCallbacks();
+    const writes: string[] = [];
+    const pty = new SmartSerialPty(transport, makeProfile(), harness.callbacks, noopLogger());
+    pty.onDidWrite((chunk) => writes.push(chunk));
+
+    pty.open();
+    await flushAsync();
+    expect(openPort).toHaveBeenCalledTimes(1);
+    emitData(openingSessionId, "opening output");
+    for (let index = 0; index < 80; index += 1) {
+      emitData("other-session", `foreign-${index}:` + "x".repeat(1024));
+    }
+    resolveOpen!(openingSessionId);
+    await flushAsync();
+
+    expect(writes.join("")).toContain("opening output");
+    pty.dispose();
+  });
+
+  it("releases its opening data subscription when disposed before openPort responds", async () => {
+    let resolveOpen: ((sessionId: string) => void) | undefined;
+    let openingSessionId = "";
+    const { transport, closePort, emitData, openPort, dataListenerCount } = createTransport({
+      listPorts: async () => [{ path: "COM5" }],
+      openPort: (_params, sessionId) => {
+        openingSessionId = sessionId ?? "";
+        return new Promise<string>((resolve) => {
+          resolveOpen = resolve;
+        });
+      }
+    });
+    const harness = makeCallbacks();
+    const writes: string[] = [];
+    const pty = new SmartSerialPty(transport, makeProfile(), harness.callbacks, noopLogger());
+    pty.onDidWrite((chunk) => writes.push(chunk));
+
+    pty.open();
+    await flushAsync();
+    expect(openPort).toHaveBeenCalledTimes(1);
+    expect(dataListenerCount()).toBe(1);
+    emitData(openingSessionId, "must be discarded");
+    pty.dispose();
+    expect(dataListenerCount()).toBe(0);
+    resolveOpen!(openingSessionId);
+    await flushAsync();
+
+    expect(closePort).toHaveBeenCalledWith(openingSessionId);
+    expect(writes.join("")).not.toContain("must be discarded");
   });
 
   it("prompts a picker when a single non-hint port is available and connects on user selection", async () => {
@@ -231,7 +366,7 @@ describe("SmartSerialPty", () => {
       otherCandidates: [com9],
       reason: "initial"
     });
-    expect(openPort).toHaveBeenCalledWith(expect.objectContaining({ path: "COM9" }));
+    expect(openPort).toHaveBeenCalledWith(expect.objectContaining({ path: "COM9" }), expect.any(String));
     expect(harness.spies.onActivePortChanged).toHaveBeenLastCalledWith("COM9");
     expect(harness.spies.onResolvedPort).toHaveBeenCalledWith("COM9", expect.objectContaining({ serialNumber: "ABC123" }));
     expect(writes.join("")).toContain("Preferred port updated from COM5 to COM9");
@@ -272,7 +407,7 @@ describe("SmartSerialPty", () => {
     await vi.advanceTimersByTimeAsync(2000);
     await flushAsync();
 
-    expect(openPort).toHaveBeenNthCalledWith(2, expect.objectContaining({ path: "COM9" }));
+    expect(openPort).toHaveBeenNthCalledWith(2, expect.objectContaining({ path: "COM9" }), expect.any(String));
     expect(harness.spies.promptPortChoice).not.toHaveBeenCalled();
     expect(harness.spies.onTransportSessionChanged).toHaveBeenLastCalledWith("session-2");
     expect(writes.join("")).toContain("Preferred port updated from COM5 to COM9");
@@ -466,7 +601,7 @@ describe("SmartSerialPty", () => {
     await flushAsync();
 
     expect(harness.spies.promptPortChoice).not.toHaveBeenCalled();
-    expect(openPort).toHaveBeenCalledWith(expect.objectContaining({ path: "COM9" }));
+    expect(openPort).toHaveBeenCalledWith(expect.objectContaining({ path: "COM9" }), expect.any(String));
     expect(harness.spies.onActivePortChanged).toHaveBeenLastCalledWith("COM9");
 
     pty.dispose();
@@ -490,7 +625,7 @@ describe("SmartSerialPty", () => {
     await flushAsync();
 
     expect(openPort).toHaveBeenCalledTimes(1);
-    expect(openPort).toHaveBeenCalledWith(expect.objectContaining({ path: "COM9" }));
+    expect(openPort).toHaveBeenCalledWith(expect.objectContaining({ path: "COM9" }), expect.any(String));
     expect(harness.spies.promptPortChoice).not.toHaveBeenCalled();
     expect(harness.spies.onStateChanged).toHaveBeenCalledWith("waiting");
     expect(writes.join("")).toContain("Hint-matched port COM9 could not be opened");

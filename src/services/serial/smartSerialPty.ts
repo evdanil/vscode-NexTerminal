@@ -10,6 +10,7 @@ import { toParityCode } from "../../utils/helpers";
 import type { SerialTransport } from "./serialPty";
 import { isSerialRuntimeMissingError } from "./errorMatchers";
 import type { OpenPortParams, SerialPortInfo } from "./protocol";
+import { SerialOpeningDataBuffer } from "./serialOpeningDataBuffer";
 
 const SMART_FOLLOW_POLL_MS = 2000;
 const STOPPED_INPUT_HINT_INTERVAL_MS = 1000;
@@ -83,6 +84,9 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
   private readonly closeEmitter = new vscode.EventEmitter<void>();
   private readonly nameEmitter = new vscode.EventEmitter<string>();
   private transportSessionId?: string;
+  private openingSessionId?: string;
+  private openingPort = false;
+  private readonly openingData = new SerialOpeningDataBuffer();
   private currentPath?: string;
   private preferredPath: string;
   private deviceHint?: SerialDeviceHint;
@@ -126,15 +130,12 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
         : undefined;
     this.unsubscribeData = this.transport.onDidReceiveData((sessionId, data) => {
       if (sessionId !== this.transportSessionId) {
+        if (this.openingPort && sessionId === this.openingSessionId) {
+          this.openingData.capture(sessionId, data);
+        }
         return;
       }
-      const output = data.toString("utf8");
-      this.logger.logOutput?.(`smart serial stdout ${JSON.stringify(output)}`);
-      this.transcript?.write(output);
-      this.observerHub.notifyOutput(output, this.highlighterStream, this.highlighter, (rendered) =>
-        this.writeEmitter.fire(rendered)
-      );
-      this.callbacks.onDataReceived?.();
+      this.handleData(data);
     });
     this.unsubscribeError = this.transport.onDidReceiveError((sessionId, message) => {
       if (sessionId !== this.transportSessionId) {
@@ -272,6 +273,9 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
       return;
     }
     this.disposed = true;
+    this.openingSessionId = undefined;
+    this.openingPort = false;
+    this.openingData.clear();
     this.stopPolling();
     this.highlighterStream?.dispose();
     this.observerHub.disposeAll();
@@ -524,23 +528,48 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     | { type: "connected"; path: string; port?: SerialPortInfo }
     | { type: "failed"; message: string }
   > {
+    const openingSessionId = globalThis.crypto.randomUUID();
+    this.openingSessionId = openingSessionId;
+    this.openingPort = true;
+    this.openingData.clear();
     try {
       const sessionId = await this.transport.openPort({
         ...this.openPortOptions,
         path
-      });
+      }, openingSessionId);
       if (this.disposed) {
+        this.openingSessionId = undefined;
+        this.openingPort = false;
+        this.openingData.clear();
         await this.transport.closePort(sessionId);
         return { type: "failed", message: "terminal disposed" };
       }
       this.transportSessionId = sessionId;
+      this.openingSessionId = undefined;
+      this.openingPort = false;
       this.callbacks.onTransportSessionChanged?.(sessionId);
+      for (const data of this.openingData.takeFor(sessionId)) {
+        this.handleData(data);
+      }
       return { type: "connected", path, port: knownPort };
     } catch (error: unknown) {
+      this.openingSessionId = undefined;
+      this.openingPort = false;
+      this.openingData.clear();
       const message = error instanceof Error ? error.message : "unknown serial connection error";
       this.logger.log(`smart serial open failed path=${path} ${message}`);
       return { type: "failed", message };
     }
+  }
+
+  private handleData(data: Buffer): void {
+    const output = data.toString("utf8");
+    this.logger.logOutput?.(`smart serial stdout ${JSON.stringify(output)}`);
+    this.transcript?.write(output);
+    this.observerHub.notifyOutput(output, this.highlighterStream, this.highlighter, (rendered) =>
+      this.writeEmitter.fire(rendered)
+    );
+    this.callbacks.onDataReceived?.();
   }
 
   private async handleConnected(

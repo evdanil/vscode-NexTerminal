@@ -15,6 +15,7 @@ type PortRecord = {
   write(data: Buffer, callback: (error?: Error | null) => void): void;
   close(callback: (error?: Error | null) => void): void;
   set(options: Record<string, boolean>, callback: (error?: Error | null) => void): void;
+  removeAllListeners(): void;
   on(event: "data", listener: (data: Buffer) => void): void;
   on(event: "error", listener: (error: Error) => void): void;
   on(event: "close", listener: () => void): void;
@@ -86,12 +87,18 @@ async function handleRequest(request: RpcRequest): Promise<RpcResponse> {
       return response(request.id, undefined, serialLoadError);
     }
 
-    const params = request.params as OpenPortParams | undefined;
+    const params = request.params as (OpenPortParams & { sessionId?: unknown }) | undefined;
     if (!params || !params.path || !params.baudRate) {
       return response(request.id, undefined, "invalid openPort parameters");
     }
 
-    const sessionId = randomUUID();
+    if (params.sessionId !== undefined && (typeof params.sessionId !== "string" || !params.sessionId.trim())) {
+      return response(request.id, undefined, "invalid serial session ID");
+    }
+    const sessionId = typeof params.sessionId === "string" ? params.sessionId : randomUUID();
+    if (ports.has(sessionId)) {
+      return response(request.id, undefined, "serial session ID is already in use");
+    }
     const port = new module.SerialPort({
       path: params.path,
       baudRate: params.baudRate,
@@ -101,9 +108,10 @@ async function handleRequest(request: RpcRequest): Promise<RpcResponse> {
       rtscts: params.rtscts,
       autoOpen: false
     });
-    await new Promise<void>((resolve, reject) => {
-      port.open((error) => (error ? reject(friendlyOpenError(params.path, error)) : resolve()));
-    });
+    // SerialPort can emit startup bytes before its open callback. Attach its
+    // listeners before opening so the first data notification is preserved.
+    let opening = true;
+    let closedWhileOpening = false;
     port.on("data", (data: Buffer) => {
       writeLine({
         method: PORT_DATA_NOTIFICATION,
@@ -123,8 +131,12 @@ async function handleRequest(request: RpcRequest): Promise<RpcResponse> {
       });
     });
     port.on("close", () => {
-      if (ports.has(sessionId)) {
+      if (ports.get(sessionId) === port) {
         ports.delete(sessionId);
+        if (opening) {
+          closedWhileOpening = true;
+          return;
+        }
         writeLine({
           method: PORT_DISCONNECTED_NOTIFICATION,
           params: { sessionId, reason: "Port closed" }
@@ -132,6 +144,22 @@ async function handleRequest(request: RpcRequest): Promise<RpcResponse> {
       }
     });
     ports.set(sessionId, port);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        port.open((error) => (error ? reject(friendlyOpenError(params.path, error)) : resolve()));
+      });
+    } catch (error) {
+      if (ports.get(sessionId) === port) {
+        ports.delete(sessionId);
+      }
+      port.removeAllListeners();
+      throw error;
+    }
+    if (closedWhileOpening) {
+      port.removeAllListeners();
+      return response(request.id, undefined, "Serial port closed while opening");
+    }
+    opening = false;
     return response(request.id, { sessionId });
   }
 
