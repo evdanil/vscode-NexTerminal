@@ -102,6 +102,7 @@ import {
   EVE_NG_STATUS_POLL_MIN_SECONDS
 } from "../services/inventory/providers/eveNgProvider";
 import { ORPHAN_FOLDER_NAME } from "../services/inventory/syncEngine";
+import { isSameAuthenticatedEndpoint } from "../services/inventory/proxySecretHygiene";
 import { GNS3_PROVIDER_ID, GNS3_STATUS_POLL_FIELD_ID } from "../services/inventory/providers/gns3Provider";
 import { NETBOX_PROVIDER_ID } from "../services/inventory/providers/netboxProvider";
 import { PROXMOX_PROVIDER_ID, PROXMOX_STATUS_POLL_FIELD_ID } from "../services/inventory/providers/proxmoxProvider";
@@ -1402,6 +1403,49 @@ async function restoreSecrets(
     if (!importedIds.has(id)) continue;
     await vault.store(keyFn(id), secret);
   }
+}
+
+/** Every vault secret filed under a server's id. */
+async function deleteServerSecrets(vault: SecretVault, serverId: string): Promise<void> {
+  await vault.delete(passwordSecretKey(serverId));
+  await vault.delete(passphraseSecretKey(serverId));
+  await vault.delete(proxyPasswordSecretKey(serverId));
+}
+
+/**
+ * ISSUE #175 — whether two server records name the same ENDPOINT, the one its
+ * saved secrets were entered for. The vault files them by server id alone, and
+ * Replace removes every local server and re-imports the file's with their ids,
+ * so a file carrying no seal (an older backup, a hand-written export, a backup
+ * with its encrypted part removed) can re-create id X anywhere; the secrets are
+ * kept only when this returns true. The endpoint is everything that decides
+ * where those secrets go:
+ *  - `host`, and `altHost` — the SSH connect retries the same credentials
+ *    against the alternate address (`SshPty.start`), which is why the
+ *    connection pool compares it too (`pooledConnectionParamsChanged`);
+ *  - `port` and `username`;
+ *  - the proxy, because a hostname resolves wherever the proxy puts it and a
+ *    proxy password goes to the proxy itself: none on either side (absent and
+ *    `null` alike — `validateServerConfig` admits both), or the same kind with
+ *    the same members — `jumpHostId` for an SSH jump host; `host`, `port` and
+ *    `username` for SOCKS5/HTTP, the identity the proxy-password hygiene
+ *    already keeps a secret by (`isSameAuthenticatedEndpoint`).
+ * Nothing else counts: a renamed, moved or re-flagged server at the same
+ * endpoint keeps its secrets. Compared exactly — a difference in case or
+ * spacing costs a re-prompt, never a password sent somewhere new.
+ */
+function sameServerEndpoint(a: ServerConfig, b: ServerConfig): boolean {
+  return a.host === b.host && a.altHost === b.altHost && a.port === b.port && a.username === b.username && sameProxy(a.proxy, b.proxy);
+}
+
+function sameProxy(a: ProxyConfig | null | undefined, b: ProxyConfig | null | undefined): boolean {
+  if (!a || !b) {
+    return !a && !b;
+  }
+  if (a.type === "ssh" || b.type === "ssh") {
+    return a.type === "ssh" && b.type === "ssh" && a.jumpHostId === b.jumpHostId;
+  }
+  return isSameAuthenticatedEndpoint(a, b);
 }
 
 interface SanitizedSnapshot {
@@ -3759,7 +3803,33 @@ export function registerConfigCommands(
     let skipped = 0;
     // id-PRESERVING import (distinct from the share path's fresh-id remap): each entity keeps
     // its id and is skipped when that id already exists. Same shape across every bucket.
-    const serverTally = await importPreservingIds(data.servers, existingIds, validateServerConfig, (e) => addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s)));
+    // ISSUE #175 — the servers Replace removed above still have their saved
+    // secrets in the vault, filed under ids the file may re-create at another
+    // endpoint (see `sameServerEndpoint`). Each re-created record is judged as
+    // it is written, so every one counts — a file can carry the same id twice,
+    // and the last write is the record that connects. A changed endpoint loses
+    // the secrets BEFORE the record is published: `nexus.server.connect` does
+    // not take `configMutationLock`, so a connect landing after the publish
+    // would otherwise pair the new host with the old password (the ordering
+    // proxySecretHygiene.ts gives for proxy passwords). A removed server the
+    // file does not re-create loses them after the loop: left behind, they
+    // wait for the next record that brings its id. Secrets a backup carries
+    // are restored after all this (`restoreSecrets` below), so they still win.
+    const removedServersWithSecrets = new Map<string, ServerConfig>(mode === "replace" ? snapshot.servers.map((s) => [s.id, s]) : []);
+    const serverTally = await importPreservingIds(data.servers, existingIds, validateServerConfig, async (e) => {
+      const removed = removedServersWithSecrets.get(e.id);
+      if (removed !== undefined && !sameServerEndpoint(removed, e)) {
+        removedServersWithSecrets.delete(e.id);
+        await deleteServerSecrets(vault, e.id);
+      }
+      await addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s));
+    });
+    const recreatedServerIds = new Set(serverTally.importedIds);
+    for (const id of removedServersWithSecrets.keys()) {
+      if (!recreatedServerIds.has(id)) {
+        await deleteServerSecrets(vault, id);
+      }
+    }
     const tunnelTally = await importPreservingIds(data.tunnels, existingIds, validateTunnelProfile, (e) => core.addOrUpdateTunnel(e));
     const serialTally = await importPreservingIds(data.serialProfiles, existingIds, validateSerialProfile, (e) => core.addOrUpdateSerialProfile(e));
     // Kept in its own variable (not folded into the array below) because the inventory-secret

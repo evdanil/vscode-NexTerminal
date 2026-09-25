@@ -905,6 +905,178 @@ describe("Encrypted Backup — the readable half is sealed by the encrypted half
 });
 
 /**
+ * Issue #175 — Replace removes every local server and then imports the file's,
+ * ids preserved. A server's saved secrets are filed under its id, so a file with
+ * no seal to check — a backup from before 2.8.243, a hand-written export, a
+ * backup with its encrypted part removed — could re-create id X at another host
+ * and the password this machine already held for X went there on the next
+ * connect. They are now kept only when the re-created server has the same
+ * endpoint: host, alternate host, port, username and proxy.
+ */
+describe("Replace keeps a removed server's saved secrets only when its endpoint is unchanged (#175)", () => {
+  const SECRET_KEYS = ["password-srv-1", "passphrase-srv-1", "proxy-password-srv-1"];
+  const KEPT = ["router-pw", "router-pp", "proxy-pw"];
+  const GONE = [undefined, undefined, undefined];
+  const LOCAL_ENDPOINT: Partial<ServerConfig> = {
+    altHost: "10.0.1.1",
+    proxy: { type: "socks5", host: "proxy.lab", port: 1080, username: "pxuser" }
+  };
+
+  async function destWithSavedSecrets(overrides: Partial<ServerConfig> = {}, vault: MockVault = new MockVault()): Promise<Machine> {
+    const dest = { ...(await makeMachine()), vault };
+    await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, ...overrides }));
+    await vault.store("password-srv-1", "router-pw");
+    await vault.store("passphrase-srv-1", "router-pp");
+    await vault.store("proxy-password-srv-1", "proxy-pw");
+    return dest;
+  }
+
+  function savedSecrets(machine: Machine): Promise<Array<string | undefined>> {
+    return Promise.all(SECRET_KEYS.map((key) => machine.vault.get(key)));
+  }
+
+  /** A file that carries no seal and no secrets: the only secrets in play are the ones already on this machine. */
+  function unsealedJson(servers: unknown[]): string {
+    return JSON.stringify({ version: 2, exportType: "backup", exportedAt: new Date().toISOString(), servers });
+  }
+
+  it("a file that re-creates the server's id at another host takes none of the secrets this machine saved for it", async () => {
+    const dest = await destWithSavedSecrets();
+
+    await runImport(dest, unsealedJson([makeServer({ ...LOCAL_ENDPOINT, host: "attacker.example" })]), "replace");
+
+    expect(dest.core.getServer("srv-1")?.host).toBe("attacker.example");
+    expect(await savedSecrets(dest)).toEqual(GONE);
+  });
+
+  it("an unchanged endpoint keeps them, whatever else about the server changed", async () => {
+    const dest = await destWithSavedSecrets();
+    const sameEndpoint = makeServer({
+      name: "Renamed",
+      group: "Moved",
+      isHidden: true,
+      multiplexing: false,
+      altHost: "10.0.1.1",
+      // Same members, other key order: identity is by value, not by serialization.
+      proxy: { username: "pxuser", port: 1080, host: "proxy.lab", type: "socks5" }
+    });
+
+    await runImport(dest, unsealedJson([sameEndpoint]), "replace");
+
+    expect(dest.core.getServer("srv-1")?.name).toBe("Renamed");
+    expect(await savedSecrets(dest)).toEqual(KEPT);
+  });
+
+  it.each<[string, Partial<ServerConfig>, Partial<ServerConfig>]>([
+    ["the port", {}, { port: 2222 }],
+    ["the username", {}, { username: "root" }],
+    ["the alternate host", {}, { altHost: "attacker.example" }],
+    ["the alternate host, removed", {}, { altHost: undefined }],
+    ["the proxy host", {}, { proxy: { type: "socks5", host: "attacker.example", port: 1080, username: "pxuser" } }],
+    ["the proxy port", {}, { proxy: { type: "socks5", host: "proxy.lab", port: 1081, username: "pxuser" } }],
+    ["the proxy username", {}, { proxy: { type: "socks5", host: "proxy.lab", port: 1080, username: "other" } }],
+    ["the proxy type", {}, { proxy: { type: "http", host: "proxy.lab", port: 1080, username: "pxuser" } }],
+    ["the proxy, removed", {}, { proxy: undefined }],
+    ["the jump host", { proxy: { type: "ssh", jumpHostId: "jump-1" } }, { proxy: { type: "ssh", jumpHostId: "jump-2" } }],
+    ["a proxy, added", { proxy: undefined }, { proxy: { type: "socks5", host: "proxy.lab", port: 1080, username: "pxuser" } }]
+  ])("a changed endpoint — %s — deletes all three", async (_what, local, incoming) => {
+    const dest = await destWithSavedSecrets(local);
+    const recreated = makeServer({ ...LOCAL_ENDPOINT, ...local, ...incoming });
+
+    await runImport(dest, unsealedJson([recreated]), "replace");
+
+    expect(dest.core.getServer("srv-1")).toBeDefined();
+    expect(await savedSecrets(dest)).toEqual(GONE);
+  });
+
+  it("a removed server the file does not re-create leaves no saved secrets behind for a later record with its id", async () => {
+    const dest = await destWithSavedSecrets();
+
+    await runImport(dest, unsealedJson([makeServer({ id: "other", name: "Other" })]), "replace");
+
+    expect(dest.core.getServer("srv-1")).toBeUndefined();
+    expect(await savedSecrets(dest)).toEqual(GONE);
+  });
+
+  it("a same-endpoint record that cannot be imported does not keep them either", async () => {
+    const dest = await destWithSavedSecrets();
+
+    // Same endpoint, but no name: validation skips it, so nothing re-creates srv-1.
+    await runImport(dest, unsealedJson([makeServer({ ...LOCAL_ENDPOINT, name: "" })]), "replace");
+
+    expect(dest.core.getServer("srv-1")).toBeUndefined();
+    expect(await savedSecrets(dest)).toEqual(GONE);
+  });
+
+  it("a second record with the same id at another host is judged too — the last one written is the one that connects", async () => {
+    const dest = await destWithSavedSecrets();
+
+    await runImport(dest, unsealedJson([
+      makeServer({ ...LOCAL_ENDPOINT }),
+      makeServer({ ...LOCAL_ENDPOINT, host: "attacker.example" })
+    ]), "replace");
+
+    expect(dest.core.getServer("srv-1")?.host).toBe("attacker.example");
+    expect(await savedSecrets(dest)).toEqual(GONE);
+  });
+
+  it("the secrets are deleted before the re-created server is published, so no connect can pair them", async () => {
+    const hostAtDelete: Array<string | undefined> = [];
+    let dest: Machine | undefined;
+    class WatchingVault extends MockVault {
+      async delete(key: string) {
+        if (key === "password-srv-1") hostAtDelete.push(dest?.core.getServer("srv-1")?.host);
+        await super.delete(key);
+      }
+    }
+    dest = await destWithSavedSecrets({}, new WatchingVault());
+
+    await runImport(dest, unsealedJson([makeServer({ ...LOCAL_ENDPOINT, host: "attacker.example" })]), "replace");
+
+    expect(hostAtDelete).toEqual([undefined]);
+    expect(await savedSecrets(dest)).toEqual(GONE);
+  });
+
+  it("a sealed backup still restores the secrets it carries onto its own record, and a secret it lacks is not kept from this machine", async () => {
+    const source = await makeMachine();
+    await source.core.addOrUpdateServer(makeServer({ host: "10.9.9.9" }));
+    await source.vault.store("password-srv-1", "file-pw");
+    const json = await exportBackup(source);
+    const dest = await destWithSavedSecrets();
+
+    await runImport(dest, json, "replace");
+
+    expect(dest.core.getServer("srv-1")?.host).toBe("10.9.9.9");
+    expect(await savedSecrets(dest)).toEqual(["file-pw", undefined, undefined]);
+  });
+
+  it("a sealed backup of the same endpoint keeps what this machine saved and overwrites only what the backup carries", async () => {
+    const source = await makeMachine();
+    await source.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT }));
+    await source.vault.store("password-srv-1", "file-pw");
+    const json = await exportBackup(source);
+    const dest = await destWithSavedSecrets();
+
+    await runImport(dest, json, "replace");
+
+    expect(await savedSecrets(dest)).toEqual(["file-pw", "router-pp", "proxy-pw"]);
+  });
+
+  it("Merge is unchanged: the local server and its secrets stay, whatever endpoint the file gives its id", async () => {
+    const dest = await destWithSavedSecrets();
+
+    await runImport(dest, unsealedJson([
+      makeServer({ ...LOCAL_ENDPOINT, host: "attacker.example" }),
+      makeServer({ id: "srv-2", name: "New" })
+    ]), "merge");
+
+    expect(dest.core.getServer("srv-1")?.host).toBe("10.0.0.1");
+    expect(dest.core.getServer("srv-2")).toBeDefined();
+    expect(await savedSecrets(dest)).toEqual(KEPT);
+  });
+});
+
+/**
  * Codex P1 on PR #168 — Replace clears these collections only when the file
  * carries them, but a carried list whose every entry is unusable used to clear
  * them all the same and then import nothing.
