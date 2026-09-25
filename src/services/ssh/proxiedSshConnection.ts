@@ -7,7 +7,7 @@ type CloseRelay = (listener: () => void) => () => void;
 
 export class ProxiedSshConnection implements SshConnection {
   private readonly closeListeners = new Set<() => void>();
-  private readonly innerCloseUnsubscribe: () => void;
+  private innerCloseUnsubscribe?: () => void;
   private readonly proxyCloseUnsubscribe?: () => void;
   private disposed = false;
   private closed = false;
@@ -23,6 +23,10 @@ export class ProxiedSshConnection implements SshConnection {
     this.proxyCloseUnsubscribe = proxyOnClose?.(() => {
       this.emitClose();
     });
+    if (this.closed) {
+      this.innerCloseUnsubscribe?.();
+      this.proxyCloseUnsubscribe?.();
+    }
   }
 
   public openShell(ptyOptions?: PtyOptions): Promise<Duplex> {
@@ -56,6 +60,10 @@ export class ProxiedSshConnection implements SshConnection {
   }
 
   public onClose(listener: () => void): () => void {
+    if (this.closed) {
+      listener();
+      return () => {};
+    }
     this.closeListeners.add(listener);
     return () => this.closeListeners.delete(listener);
   }
@@ -78,7 +86,7 @@ export class ProxiedSshConnection implements SshConnection {
       return;
     }
     this.closed = true;
-    this.innerCloseUnsubscribe();
+    this.innerCloseUnsubscribe?.();
     this.proxyCloseUnsubscribe?.();
     for (const listener of this.closeListeners) {
       listener();

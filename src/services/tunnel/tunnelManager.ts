@@ -78,6 +78,33 @@ function waitForConnectionClose(connection: SshConnection): Promise<void> {
   });
 }
 
+function networkRouteIdentity(
+  server: ServerConfig,
+  serverLookup: ((id: string) => ServerConfig | undefined) | undefined,
+  visited = new Set<string>()
+): readonly unknown[] {
+  const endpoint = [server.host.toLowerCase(), server.port];
+  if (visited.has(server.id)) {
+    return ["cycle", server.id, endpoint];
+  }
+  const nextVisited = new Set(visited);
+  nextVisited.add(server.id);
+
+  const proxy = server.proxy;
+  if (!proxy) {
+    return ["direct", endpoint];
+  }
+  if (proxy.type === "ssh") {
+    const jumpHost = serverLookup?.(proxy.jumpHostId);
+    return [
+      "ssh",
+      endpoint,
+      jumpHost ? networkRouteIdentity(jumpHost, serverLookup, nextVisited) : ["unresolved", proxy.jumpHostId]
+    ];
+  }
+  return [proxy.type, proxy.host.toLowerCase(), proxy.port, proxy.username ?? "", endpoint];
+}
+
 /**
  * How long a start stopped mid-request waits for the server to answer that
  * request, and then to withdraw a forward it granted too late. Bounded
@@ -185,7 +212,8 @@ export class TunnelManager {
     // of reuse without closing it under the leases already on it.
     private readonly sharedFactory: SshFactory & { retire?(lease: SshConnection): Promise<void> | undefined },
     private readonly isolatedFactory: SshFactory,
-    socks5HandshakeTimeoutMs: number = 10_000
+    socks5HandshakeTimeoutMs: number = 10_000,
+    private readonly serverLookup?: (id: string) => ServerConfig | undefined
   ) {
     this.socks5HandshakeTimeoutMs = normalizeSocks5HandshakeTimeoutMs(socks5HandshakeTimeoutMs);
   }
@@ -452,19 +480,9 @@ export class TunnelManager {
     try {
       const bindAddr = profile.remoteBindAddress ?? "127.0.0.1";
       const bindPort = profile.remotePort;
-      const proxy = serverConfig.proxy;
-      const proxyRoute = proxy
-        ? proxy.type === "ssh"
-          ? ["ssh", proxy.jumpHostId]
-          : [proxy.type, proxy.host.toLowerCase(), proxy.port, proxy.username ?? ""]
-        : ["direct"];
-      const bindKey = (port: number): string => JSON.stringify([
-        serverConfig.host.toLowerCase(),
-        serverConfig.port,
-        proxyRoute,
-        bindAddr,
-        port
-      ]);
+      // Private addresses can identify different SSH servers on different jump routes.
+      const routeIdentity = networkRouteIdentity(serverConfig, this.serverLookup);
+      const bindKey = (port: number): string => JSON.stringify([routeIdentity, bindAddr, port]);
       const requestKey = bindKey(bindPort);
       let requestOver: (() => void) | undefined;
       let thisRequest: Promise<void> | undefined;

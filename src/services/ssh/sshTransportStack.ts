@@ -52,6 +52,6 @@ export function createSshTransportStack(
   // Isolated mode gets `proxiedFactory`, not the pool: each client needs its
   // own connection to the target — a pool lease would ride the terminal's —
   // but it must still take the server's proxy, including the pooled bastion hop.
-  const tunnelManager = new TunnelManager(pool, proxiedFactory, options.socks5HandshakeTimeoutMs);
+  const tunnelManager = new TunnelManager(pool, proxiedFactory, options.socks5HandshakeTimeoutMs, options.serverLookup);
   return { proxiedFactory, pool, tunnelManager };
 }

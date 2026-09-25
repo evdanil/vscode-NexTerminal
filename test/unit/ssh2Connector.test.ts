@@ -164,6 +164,25 @@ describe("Ssh2Connector.connect banner handling", () => {
     expect(connection.getBanner()).toBe("Authorized use only");
   });
 
+  it("notifies a close listener registered after the SSH connection has closed", async () => {
+    const connector = new Ssh2Connector();
+
+    const connectPromise = connector.connect(makeServer(), { password: "pw" });
+    await flushMicrotasks();
+    const client = mockClients.at(-1);
+    expect(client).toBeDefined();
+    client.emit("ready");
+    const connection = await connectPromise;
+
+    client.emit("close");
+    const onClose = vi.fn();
+    connection.onClose(onClose);
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    client.emit("end");
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
   it("supports multiple onAuthMessage calls (e.g. banner then keyboard-interactive context) without buffering any of them", async () => {
     const connector = new Ssh2Connector();
     const onAuthMessage = vi.fn();
