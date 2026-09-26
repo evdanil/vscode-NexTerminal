@@ -8,7 +8,7 @@ export function textRunsIpmitool(text: string): boolean {
     const executableWords: string[] = [];
     const executableAssignmentAllowed: boolean[] = [];
     for (let wordIndex = 0; wordIndex < words.length; wordIndex++) {
-      const redirection = redirectionAllowed[wordIndex] && /^(?:\d*)(?:&>>|&>|>>|<>|<&|>&|>|<)(.*)$/.exec(words[wordIndex]);
+      const redirection = redirectionAllowed[wordIndex] && /^(?:\d*)(?:&>>|&>|>>|<>|<&|>&|>\||>|<)(.*)$/.exec(words[wordIndex]);
       if (redirection) {
         if (!redirection[1]) {
           if (++wordIndex >= words.length) return false;
@@ -35,7 +35,7 @@ export function textRunsIpmitool(text: string): boolean {
         argvAssignmentsAllowed = true;
         while (index < words.length && words[index].startsWith("-")) {
           const option = words[index++];
-          const shortValueOption = /^-[EABbnSHkis]*[ugpCDTR](.*)$/.exec(option);
+          const shortValueOption = /^-[EABbnSHkisP]*[ugpCDTR](.*)$/.exec(option);
           if (["-u", "--user", "-g", "--group", "-p", "--prompt", "-C", "--close-from", "-D", "--chdir", "-T", "--command-timeout", "-R", "--chroot"].includes(option)) {
             if (index >= words.length) return false;
             index++;
@@ -46,8 +46,8 @@ export function textRunsIpmitool(text: string): boolean {
             }
           } else if (
             !/^(?:--(?:user|group|prompt|close-from|chdir|preserve-env|command-timeout|chroot)=.+|-[ugpCDTR].+)$/.test(option) &&
-            !["--login", "--shell", "--non-interactive", "--askpass", "--background", "--bell", "--set-home", "--stdin", "--reset-timestamp", "--preserve-env"].includes(option) &&
-            option !== "--" && !/^-[EABbnSHkis]+$/.test(option)
+            !["--login", "--shell", "--non-interactive", "--askpass", "--background", "--bell", "--set-home", "--stdin", "--reset-timestamp", "--preserve-env", "--preserve-groups"].includes(option) &&
+            option !== "--" && !/^-[EABbnSHkisP]+$/.test(option)
           ) {
             return false;
           }
@@ -58,16 +58,27 @@ export function textRunsIpmitool(text: string): boolean {
       if (name === "env") {
         index++;
         allowAssignments = false;
+        // GNU env stops interpreting options at its first NAME=VALUE. A later
+        // -u is the attempted command, not a wrapper option to skip.
+        let optionsAllowed = true;
         while (index < words.length) {
           const option = words[index];
-          if (assignment.test(option) || option === "-i" || option === "--ignore-environment") { index++; continue; }
+          if (assignment.test(option)) { optionsAllowed = false; index++; continue; }
+          if (!optionsAllowed) break;
+          if (option === "--") { optionsAllowed = false; index++; continue; }
+          if (option === "-i" || option === "--ignore-environment" || option === "-v" || option === "--debug") { index++; continue; }
+          if (option === "-C" || option === "--chdir") {
+            if (index + 1 >= words.length) return false;
+            index += 2;
+            continue;
+          }
+          if (/^(?:-C.+|--chdir=.+)$/.test(option)) { index++; continue; }
           if (option === "-u" || option === "--unset") {
             if (index + 1 >= words.length) return false;
             index += 2;
             continue;
           }
           if (/^(?:-u.+|--unset=.+)$/.test(option)) { index++; continue; }
-          if (option === "--") index++;
           break;
         }
         continue;
@@ -105,7 +116,12 @@ export function textRunsIpmitool(text: string): boolean {
       if (name === "nice") {
         index++;
         allowAssignments = false;
-        if (words[index] === "-n") index += 2;
+        if (words[index] === "-n" || words[index] === "--adjustment") {
+          if (!/^[+-]?\d+$/.test(words[index + 1] ?? "")) return false;
+          index += 2;
+        } else if (/^(?:-n[+-]?\d+|--adjustment=[+-]?\d+)$/.test(words[index] ?? "")) {
+          index++;
+        }
         continue;
       }
       return !word.includes("$") && !word.includes("\\") && name === "ipmitool";
@@ -189,6 +205,19 @@ export function textRunsIpmitool(text: string): boolean {
         ((char === "<" || char === ">") && text[i + 1] === "(") ||
         (char === "<" && text[i + 1] === "<")) return false;
     if (char === "&" && (text[i - 1] === ">" || text[i - 1] === "<" || text[i + 1] === ">")) {
+      if (text[i + 1] === ">" && inWord && !/^(?:\d*)$/.test(word)) finishWord();
+      word += char;
+      inWord = true;
+      continue;
+    }
+    // A redirection may touch the executable without whitespace. Keep the
+    // executable and operator separate while retaining a leading fd number.
+    if ((char === ">" || char === "<") && inWord &&
+        !/^(?:\d*|&|(?:\d*)(?:&>>|&>|>>|<>|<&|>&|>\||>|<))$/.test(word)) {
+      finishWord();
+    }
+    // Bash >| clobbers a file; its target never begins a pipeline command.
+    if (char === "|" && wordAllowsRedirection && /^(?:\d*)>$/.test(word)) {
       word += char;
       inWord = true;
       continue;
