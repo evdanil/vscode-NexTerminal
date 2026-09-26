@@ -36,7 +36,7 @@ A tunnel reaches its server the way a terminal does — through the server's [ju
 
 Each isolated client logs in to the server on its own, but a password is not asked for per client. The server's password or key passphrase, or a SOCKS5 or HTTP proxy's password, is asked for once, and clients that arrive while you answer it — or before the first login using it has finished — use the same answer. A server password or passphrase you chose not to save is asked for again by the next client after that. The exception is a server behind a jump host with [multiplexing](ssh-and-telnet.md#connection-multiplexing) turned off: each client then reaches the server over a jump connection of its own and is asked for the server password separately, and prompts that open together dismiss each other — save the password, or keep multiplexing on for the jump host.
 
-If several isolated clients were waiting on one credential prompt and you cancel it, Nexus shows one tunnel error notification for that group. A later connection attempt can prompt and report its own cancellation again.
+If several isolated clients were waiting on one credential prompt and you cancel it, Nexus shows one tunnel error notification for that group, even when the clients use different tunnel profiles or the prompt was for a jump host. A later connection attempt can prompt and report its own cancellation again.
 
 A tunnel that opens its own connection always dials the server's primary Host — the [Alternate host](ssh-and-telnet.md#alternate-host) fallback is the terminal's own. A shared-mode tunnel that rides a terminal's existing multiplexed connection uses whichever address that connection reached. Port forwarding isn't available on a [telnet](ssh-and-telnet.md#telnet) server.
 

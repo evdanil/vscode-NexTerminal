@@ -962,24 +962,35 @@ describe("TunnelManager integration", () => {
     await manager.stop(active.id);
   });
 
-  it("reports one canceled password prompt for concurrent isolated clients", async () => {
+  it.each([false, true])("reports one canceled password prompt for concurrent isolated clients across profiles (jump wrapper: %s)", async (wrapped) => {
     let rejectLogin!: (error: Error) => void;
     const login = new Promise<SshConnection>((_resolve, reject) => { rejectLogin = reject; });
     let attempts = 0;
     const factory: SshFactory = { connect: async () => {
       attempts++;
-      return attempts <= 3 ? login : Promise.reject(new Error("Password entry canceled for Server"));
+      return attempts <= 3
+        ? login.catch((error: Error) => {
+          throw wrapped ? new Error(`Jump host connection failed: ${error.message}`, { cause: error }) : error;
+        })
+        : Promise.reject(new Error("Password entry canceled for Server"));
     } };
     manager = new TunnelManager(factory, factory);
     const profile: TunnelProfile = {
       id: "isolated-canceled-prompt", name: "Canceled prompt", localPort: await getFreePort(),
       remoteIP: "127.0.0.1", remotePort: 22, autoStart: false, connectionMode: "isolated"
     };
+    const otherProfile: TunnelProfile = {
+      ...profile, id: "other-isolated-canceled-prompt", name: "Other canceled prompt",
+      localPort: await getFreePort()
+    };
     const events: TunnelEvent[] = [];
     manager.onDidChange((event) => events.push(event));
     const active = await manager.start(profile, testServer, { connectionMode: "isolated" });
-    const clients = Array.from({ length: 3 }, () => {
-      const client = net.createConnection({ host: "127.0.0.1", port: profile.localPort });
+    const otherActive = await manager.start(otherProfile, testServer, { connectionMode: "isolated" });
+    const clients = Array.from({ length: 3 }, (_unused, index) => {
+      const client = net.createConnection({
+        host: "127.0.0.1", port: index === 2 ? otherProfile.localPort : profile.localPort
+      });
       client.on("error", () => {});
       return client;
     });
@@ -996,6 +1007,7 @@ describe("TunnelManager integration", () => {
     } finally {
       for (const client of clients) client.destroy();
       await manager.stop(active.id);
+      await manager.stop(otherActive.id);
     }
   });
 

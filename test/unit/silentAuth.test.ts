@@ -1519,8 +1519,11 @@ describe("SilentAuthSshFactory — concurrent logins share one prompt (issue #17
       const second = factory.connect(baseServer);
       await settle();
       answer(undefined);
-      await expect(first).rejects.toThrow("Password entry canceled");
-      await expect(second).rejects.toThrow("Password entry canceled");
+      const firstFailure = await first.catch((error: unknown) => error);
+      const secondFailure = await second.catch((error: unknown) => error);
+      expect(firstFailure).toBeInstanceOf(Error);
+      expect((firstFailure as Error).message).toContain("Password entry canceled");
+      expect(secondFailure).toBe(firstFailure);
       expect(prompt.prompt).toHaveBeenCalledTimes(1);
 
       const third = factory.connect(baseServer);

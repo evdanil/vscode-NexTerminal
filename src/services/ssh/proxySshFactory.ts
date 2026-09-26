@@ -268,7 +268,7 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       jumpConnection = await this.connectToJumpHost(jumpServer, nextVisited, onAuthMessage);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      throw new Error(`Jump host connection failed (${jumpServer.name}): ${detail}`);
+      throw new Error(`Jump host connection failed (${jumpServer.name}): ${detail}`, { cause: error });
     }
 
     // Each auth attempt gets its own TCP tunnel through the jump host.

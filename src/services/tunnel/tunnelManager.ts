@@ -37,8 +37,6 @@ interface ActiveTunnelRuntime {
   sshConnections: Set<SshConnection>;
   sharedConnection?: SshConnection;
   pendingSharedConnection?: Promise<SshConnection>;
-  pendingIsolatedConnections?: number;
-  canceledPromptReported?: boolean;
   reverseUnsubscribe?: () => void;
   reverseBindAddr?: string;
   reverseBindPort?: number;
@@ -185,6 +183,7 @@ export class TunnelManager {
   private readonly activeTunnels = new Map<string, ActiveTunnelRuntime>();
   private readonly activeByProfile = new Map<string, string>();
   private readonly pendingStarts = new Map<string, { tunnelId: string; promise: Promise<ActiveTunnel> }>();
+  private readonly reportedPromptCancellations = new WeakSet<Error>();
   /**
    * Per remote bind: tracks only the remote-forward phase, after login. A
    * stopped start may still be authenticating, but a replacement for the same
@@ -411,7 +410,6 @@ export class TunnelManager {
       if (useSharedConnection) {
         sshConnection = await this.getOrCreateSharedConnection(runtime, activeTunnelId);
       } else {
-        runtime.pendingIsolatedConnections = (runtime.pendingIsolatedConnections ?? 0) + 1;
         sshConnection = await this.isolatedFactory.connect(runtime.serverConfig);
         if (!client.own(sshConnection)) {
           return;
@@ -455,7 +453,7 @@ export class TunnelManager {
       }
       // A client that already left, or a tunnel being stopped, has no one
       // waiting on this connection — and its own release may be what failed it.
-      if (!client.gone() && this.shouldReportClientError(runtime, error)) {
+      if (!client.gone() && this.shouldReportClientError(error)) {
         this.emit({
           type: "error",
           tunnelId: activeTunnelId,
@@ -465,11 +463,6 @@ export class TunnelManager {
       }
       socket.destroy();
       client.release();
-    } finally {
-      if (!useSharedConnection && runtime.pendingIsolatedConnections) {
-        runtime.pendingIsolatedConnections--;
-        if (runtime.pendingIsolatedConnections === 0) runtime.canceledPromptReported = false;
-      }
     }
   }
 
@@ -947,7 +940,6 @@ export class TunnelManager {
       if (useSharedConnection) {
         sshConnection = await this.getOrCreateSharedConnection(runtime, activeTunnelId);
       } else {
-        runtime.pendingIsolatedConnections = (runtime.pendingIsolatedConnections ?? 0) + 1;
         sshConnection = await this.isolatedFactory.connect(runtime.serverConfig);
         if (!client.own(sshConnection)) {
           return;
@@ -998,7 +990,7 @@ export class TunnelManager {
         sshConnection.dispose();
       }
       // As on the local-forward path: a client that left has no one to tell.
-      if (!client.gone() && this.shouldReportClientError(runtime, error)) {
+      if (!client.gone() && this.shouldReportClientError(error)) {
         this.emit({
           type: "error",
           tunnelId: activeTunnelId,
@@ -1009,11 +1001,6 @@ export class TunnelManager {
       }
       socket.destroy();
       client.release();
-    } finally {
-      if (!useSharedConnection && runtime.pendingIsolatedConnections) {
-        runtime.pendingIsolatedConnections--;
-        if (runtime.pendingIsolatedConnections === 0) runtime.canceledPromptReported = false;
-      }
     }
   }
 
@@ -1088,12 +1075,18 @@ export class TunnelManager {
     return sharedConnection;
   }
 
-  private shouldReportClientError(runtime: ActiveTunnelRuntime, error: unknown): boolean {
-    const canceled = error instanceof Error &&
-      /(?:Password entry|Passphrase entry|Keyboard-interactive authentication) canceled/i.test(error.message);
-    if (!canceled) return true;
-    if (runtime.canceledPromptReported) return false;
-    runtime.canceledPromptReported = true;
+  private shouldReportClientError(error: unknown): boolean {
+    let cancellation: Error | undefined;
+    const seen = new Set<Error>();
+    for (let candidate = error; candidate instanceof Error && !seen.has(candidate); candidate = candidate.cause) {
+      seen.add(candidate);
+      if (/(?:Password entry|Passphrase entry|Keyboard-interactive authentication) canceled/i.test(candidate.message)) {
+        cancellation = candidate;
+      }
+    }
+    if (!cancellation) return true;
+    if (this.reportedPromptCancellations.has(cancellation)) return false;
+    this.reportedPromptCancellations.add(cancellation);
     return true;
   }
 
