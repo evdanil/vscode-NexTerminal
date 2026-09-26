@@ -4881,6 +4881,47 @@ describe("inventoryCommands", () => {
       expect(server.addressless === true).toBe(addressless);
       expect(server.origin?.syncedHost).toBe(addressless ? undefined : storedHost);
     });
+
+    it("offers a settable normalized alternate host in Show Warnings and re-stamps it after hand-back", async () => {
+      const before = makeServer({
+        name: "Device",
+        altHost: "10.0.2.5",
+        origin: { sourceId: "src-1", externalId: "d1", syncedAt: 1, syncedAltHost: "10.0.2.1" }
+      });
+      const core = new NexusCore(new InMemoryConfigRepository([before]));
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({
+        fetchInventory: vi.fn(async () => ({
+          contractVersion: 1 as const,
+          devices: [{ externalId: "d1", name: "Device", endpoints: [
+            { kind: "ssh" as const, host: "10.0.0.1", port: 22 },
+            { kind: "ssh" as const, host: " 10.0.2.9 ", port: 22 }
+          ] }]
+        }))
+      }));
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+
+      mockShowInformationMessage.mockResolvedValueOnce("Show Warnings").mockResolvedValueOnce("Apply");
+      mockShowWarningMessage.mockResolvedValue(undefined);
+      const syncNow = registeredCommands.get("nexus.inventory.syncNow")!;
+      await syncNow("src-1");
+
+      const [openArgs] = mockOpenTextDocument.mock.calls as Array<[{ content: string }]>;
+      expect(openArgs[0].content).toContain(
+        '"Device": kept your alternate host 10.0.2.5; the source now reports 10.0.2.9 — set the alternate host to that to let the source manage it.'
+      );
+      expect(openArgs[0].content).not.toContain("setting it as shown will not hand the field back");
+      expect(core.getServer(before.id)?.origin?.syncedAltHost).toBe("10.0.2.1");
+
+      await core.addOrUpdateServer({ ...core.getServer(before.id)!, altHost: "10.0.2.9" });
+      await syncNow("src-1");
+
+      expect(core.getServer(before.id)?.altHost).toBe("10.0.2.9");
+      expect(core.getServer(before.id)?.origin?.syncedAltHost).toBe("10.0.2.9");
+    });
   });
 
   describe("inventory source auth profile", () => {
