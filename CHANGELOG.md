@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.291] — 2026-09-26
+
+### Fixed
+
+- **Cancelling a shared proxy password prompt stops its waiting logins.** Each login receives the same cancellation error without sending an empty password to the proxy. A later connection asks again.
+
 ## [2.8.290] — 2026-09-26
 
 ### Fixed

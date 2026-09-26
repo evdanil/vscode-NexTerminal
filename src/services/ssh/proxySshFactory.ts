@@ -583,9 +583,10 @@ export class ProxySshFactory implements ContextAwareSshFactory {
    * returned as a `storeOnSuccess` descriptor and persisted by the caller ONLY
    * after `authFactory.connect` resolves (deferred, post-connect, best-effort),
    * so a mistyped first-time password is never persisted before the handshake
-   * (which would lock the proxy out of every later connect). A cancelled prompt,
-   * an absent prompt dependency, or a proxy without a username all fall back to
-   * the prior behavior (`undefined` → `?? ""` downstream) with no behavior change.
+   * (which would lock the proxy out of every later connect). A cancelled prompt
+   * aborts every connect sharing it before the proxy handshake. Only an absent
+   * prompt dependency or a proxy without a username keeps the old empty-password
+   * fallback (`undefined` → `?? ""` downstream).
    */
   private async resolveProxyPassword(
     target: ServerConfig,

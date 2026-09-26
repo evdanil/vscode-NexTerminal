@@ -1399,7 +1399,7 @@ describe("ProxySshFactory", () => {
     expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
   });
 
-  it("Fix A — a cancelled prompt (undefined) falls back to the empty password and stores nothing", async () => {
+  it("a cancelled proxy password prompt aborts before a handshake or save", async () => {
     const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
     const socket = makeSimpleSocks5Socket();
     const socksMod = await import("socks");
@@ -1407,14 +1407,10 @@ describe("ProxySshFactory", () => {
 
     const prompt = vi.fn(async () => undefined);
     const factory = await createFactoryWithPrompt(prompt);
-    await factory.connect(server);
+    await expect(factory.connect(server)).rejects.toThrow(/proxy password entry canceled/i);
 
     expect(prompt).toHaveBeenCalledTimes(1);
-    expect(socksMod.SocksClient.createConnection).toHaveBeenCalledWith(
-      expect.objectContaining({
-        proxy: expect.objectContaining({ userId: "puser", password: "" })
-      })
-    );
+    expect(socksMod.SocksClient.createConnection).not.toHaveBeenCalled();
     expect(vault.store).not.toHaveBeenCalled();
   });
 
