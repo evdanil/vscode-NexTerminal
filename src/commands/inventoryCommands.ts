@@ -30,6 +30,7 @@ import type { InventoryProviderRegistry } from "../services/inventory/providerRe
 import { sourceDescription } from "../services/inventory/sourceDescription";
 import {
   computeSyncPlan,
+  normalizeInventoryTreeHosts,
   planToApplication,
   prunedServerIdsForSecretCleanup,
   validateInventoryTree,
@@ -3880,7 +3881,7 @@ export function registerInventoryCommands(
           const reason = validationError instanceof Error ? validationError.message : String(validationError);
           throw new InventoryProviderError("protocol", `Provider returned an invalid inventory tree: ${reason}`);
         }
-        tree = fetched;
+        tree = normalizeInventoryTreeHosts(fetched);
       } catch (error) {
         void vscode.window.showErrorMessage(`Inventory sync failed: ${describeInventoryError(error)}`);
         return;

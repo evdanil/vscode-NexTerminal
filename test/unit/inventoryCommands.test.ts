@@ -4854,6 +4854,33 @@ describe("inventoryCommands", () => {
       expect(core.getInventorySource("src-1")?.lastSyncAt).toBeUndefined();
       expect(mockShowInformationMessage).not.toHaveBeenCalled();
     });
+
+    it.each([
+      { host: " 10.0.0.9 ", storedHost: "10.0.0.9", addressless: false },
+      { host: "10.0.0.9\u200b", storedHost: "", addressless: true }
+    ])("normalizes provider endpoint host $host before syncing", async ({ host, storedHost, addressless }) => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      registry.register(makeProvider({
+        fetchInventory: vi.fn(async () => ({
+          contractVersion: 1 as const,
+          devices: [{ externalId: "d1", name: "Device", endpoints: [{ kind: "ssh", host, port: 22 }] }]
+        }))
+      }));
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+      mockShowInformationMessage.mockResolvedValueOnce("Apply");
+      mockShowWarningMessage.mockResolvedValue(undefined);
+
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      const [server] = core.getSnapshot().servers;
+      expect(server.host).toBe(storedHost);
+      expect(server.addressless === true).toBe(addressless);
+      expect(server.origin?.syncedHost).toBe(addressless ? undefined : storedHost);
+    });
   });
 
   describe("inventory source auth profile", () => {
