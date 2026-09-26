@@ -23,14 +23,21 @@ function isValidPort(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
 }
 
-/** An addressless row owns no console address, even if an imported origin claims one. */
+/** An addressless row owns no console address, even if imported data claims one. */
 export function stripAddresslessOriginAddressStamps(server: ServerConfig): ServerConfig {
-  if (server.addressless !== true || server.origin === undefined ||
-      (server.origin.syncedHost === undefined && server.origin.syncedPort === undefined)) {
+  if (server.addressless !== true) {
     return server;
   }
+  // Storage admits finite legacy placeholder ports. Normalize them before the
+  // next sync: ownership treats only 0 as blank, so another value can block
+  // the first real endpoint or leave an invalid addressed record behind.
+  const port = 0;
+  if (server.origin === undefined ||
+      (server.origin.syncedHost === undefined && server.origin.syncedPort === undefined)) {
+    return server.port === port ? server : { ...server, port };
+  }
   const { syncedHost: _syncedHost, syncedPort: _syncedPort, ...origin } = server.origin;
-  return { ...server, origin };
+  return { ...server, port, origin };
 }
 
 function isOptionalNonEmptyString(value: unknown): boolean {

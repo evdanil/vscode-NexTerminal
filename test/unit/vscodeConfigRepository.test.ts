@@ -215,6 +215,33 @@ describe("VscodeConfigRepository corrupt globalState shapes", () => {
     expect(validateServerConfig(plan.updates[0].after)).toBe(true);
   });
 
+  it.each([
+    { port: 22, stamped: true },
+    { port: -1, stamped: true },
+    { port: 22, stamped: false }
+  ])("normalizes addressless port $port before the first addressed sync (stamped: $stamped)", async ({ port, stamped }) => {
+    const placeholder: ServerConfig = {
+      ...validServer, host: "", port, addressless: true,
+      origin: {
+        sourceId: "src", externalId: "ext", syncedAt: 1,
+        ...(stamped && { syncedHost: "10.0.0.1", syncedPort: 22 })
+      }
+    };
+    const repo = new VscodeConfigRepository(makeContext({ "nexus.servers": [placeholder] }));
+    const [loaded] = await repo.getServers();
+    expect(loaded.port).toBe(0);
+    expect(placeholder.port).toBe(port);
+
+    const plan = computeSyncPlan({
+      source: { id: "src", providerId: "netbox", name: "Inventory", targetFolder: "Inventory", defaultUsername: "root", prunePolicy: "orphan", config: {}, secretFieldIds: [] },
+      tree: { contractVersion: 1, devices: [{ externalId: "ext", name: "Prod", endpoints: [{ kind: "ssh", host: "10.0.0.9", port: 2222 }] }] },
+      currentServers: [loaded], now: 2
+    });
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after).toMatchObject({ host: "10.0.0.9", port: 2222 });
+    expect(validateServerConfig(plan.updates[0].after)).toBe(true);
+  });
+
   it("getServers keeps an origin carrying syncedUsername, and keeps one that omits it (kills a shape check that rejects the new member, or that requires it and strips every pre-existing server's origin)", async () => {
     const stamped = { sourceId: "src", externalId: "ext", syncedAt: 1000, syncedUsername: "admin" };
     // The three-member shape every build before this release wrote. Stripping
