@@ -664,6 +664,8 @@ Export for Sharing uses an explicit settings policy: only individually allowlist
 | `nexus.sftp.deleteOperationLimit` | number | `10000` | 100–100000 | Safety limit: max items removed by one recursive delete |
 ### 5.3 Tunnels
 
+Shared local and dynamic tunnels use one in-flight SSH login for their listener and arriving clients. A repeated start waits for the first start to announce the tunnel; stopping it while login is pending prevents an announcement. An unexpected shared-connection close releases the tunnel's lease and its jump-host resources. Concurrent isolated clients whose shared credential prompt is canceled produce one tunnel error notification across tunnel profiles, including when a jump-host prompt is canceled; a later attempt can report a new cancellation.
+
 | Setting | Type | Default | Range | Description |
 |---------|------|---------|-------|-------------|
 | `nexus.tunnel.defaultConnectionMode` | enum | `shared` | `shared`, `isolated` | SSH connection mode for tunnels |

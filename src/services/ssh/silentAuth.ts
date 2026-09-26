@@ -97,6 +97,7 @@ interface SharedPromptAnswer {
   /** Keep the prompt owner's record as the authority for any later vault write. */
   provenance?: PromptAnswerProvenance;
   answer: Promise<PasswordPromptResult | undefined>;
+  cancellationError?: Error;
 }
 
 export class SilentAuthSshFactory implements SshFactory {
@@ -417,11 +418,9 @@ export class SilentAuthSshFactory implements SshFactory {
             ...resolved,
             name: `${server.name} (key passphrase)`
           }),
+        `Passphrase entry canceled for ${server.name}`,
         promptProvenance
       );
-      if (!prompted) {
-        throw new Error(`Passphrase entry canceled for ${server.name}`);
-      }
       const { result: promptResult, settle, provenance = promptProvenance } = prompted;
 
       try {
@@ -566,11 +565,9 @@ export class SilentAuthSshFactory implements SshFactory {
       passwordKey,
       typedFor,
       () => this.prompt.prompt({ ...resolved, name: server.name }),
+      `Password entry canceled for ${server.name}`,
       promptProvenance
     );
-    if (!prompted) {
-      throw new Error(`Password entry canceled for ${server.name}`);
-    }
     const { result: promptResult, settle, joined, provenance = promptProvenance } = prompted;
 
     try {
@@ -661,11 +658,13 @@ export class SilentAuthSshFactory implements SshFactory {
     vaultKey: string,
     typedFor: string | undefined,
     ask: () => Promise<PasswordPromptResult | undefined>,
+    cancellationMessage: string,
     provenance?: PromptAnswerProvenance
-  ): Promise<{ result: PasswordPromptResult; settle: () => void; joined: boolean; provenance?: PromptAnswerProvenance } | undefined> {
+  ): Promise<{ result: PasswordPromptResult; settle: () => void; joined: boolean; provenance?: PromptAnswerProvenance }> {
     if (typedFor === undefined) {
       const result = await ask();
-      return result ? { result, settle: () => {}, joined: false, provenance } : undefined;
+      if (!result) throw new Error(cancellationMessage);
+      return { result, settle: () => {}, joined: false, provenance };
     }
     let shared = this.sharedAnswers.get(vaultKey);
     const sameSourceRecord =
@@ -697,6 +696,11 @@ export class SilentAuthSshFactory implements SshFactory {
         settle();
       }
     }
-    return result ? { result, settle, joined, provenance: own.provenance } : undefined;
+    if (!result) {
+      // Every login waiting on this one input box reports the same cancellation.
+      own.cancellationError ??= new Error(cancellationMessage);
+      throw own.cancellationError;
+    }
+    return { result, settle, joined, provenance: own.provenance };
   }
 }

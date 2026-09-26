@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.277] — 2026-09-26
+
+### Fixed
+
+- **Tunnel startup and disconnect cleanup.** A shared tunnel uses one SSH login when a client arrives during startup, and another start request waits until the tunnel is announced. A closed shared connection releases its jump-host lease. Canceling one credential prompt for several isolated clients now shows one tunnel error notification for that group.
+
 ## [2.8.276] — 2026-09-26
 
 ### Fixed

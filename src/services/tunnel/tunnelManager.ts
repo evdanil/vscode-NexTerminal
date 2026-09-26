@@ -36,6 +36,7 @@ interface ActiveTunnelRuntime {
   sockets: Set<net.Socket>;
   sshConnections: Set<SshConnection>;
   sharedConnection?: SshConnection;
+  pendingSharedConnection?: Promise<SshConnection>;
   reverseUnsubscribe?: () => void;
   reverseBindAddr?: string;
   reverseBindPort?: number;
@@ -181,6 +182,8 @@ export class TunnelManager {
   private readonly listeners = new Set<TunnelListener>();
   private readonly activeTunnels = new Map<string, ActiveTunnelRuntime>();
   private readonly activeByProfile = new Map<string, string>();
+  private readonly pendingStarts = new Map<string, { tunnelId: string; promise: Promise<ActiveTunnel> }>();
+  private readonly reportedPromptCancellations = new WeakSet<Error>();
   /**
    * Per remote bind: tracks only the remote-forward phase, after login. A
    * stopped start may still be authenticating, but a replacement for the same
@@ -236,6 +239,10 @@ export class TunnelManager {
     serverConfig: ServerConfig,
     options?: { connectionMode?: ResolvedTunnelConnectionMode }
   ): Promise<ActiveTunnel> {
+    const pending = this.pendingStarts.get(profile.id);
+    if (pending) {
+      return pending.promise;
+    }
     const existingActiveId = this.activeByProfile.get(profile.id);
     if (existingActiveId) {
       const runtime = this.activeTunnels.get(existingActiveId);
@@ -263,13 +270,26 @@ export class TunnelManager {
       localBindAddress: profile.localBindAddress
     };
 
+    let startPromise: Promise<ActiveTunnel>;
     switch (tunnelType) {
       case "local":
-        return this.startLocal(profile, serverConfig, activeTunnel);
+        startPromise = this.startLocal(profile, serverConfig, activeTunnel);
+        break;
       case "reverse":
-        return this.startReverse(profile, serverConfig, activeTunnel);
+        startPromise = this.startReverse(profile, serverConfig, activeTunnel);
+        break;
       case "dynamic":
-        return this.startDynamic(profile, serverConfig, activeTunnel);
+        startPromise = this.startDynamic(profile, serverConfig, activeTunnel);
+        break;
+    }
+    const entry = { tunnelId: activeTunnel.id, promise: startPromise };
+    this.pendingStarts.set(profile.id, entry);
+    try {
+      return await startPromise;
+    } finally {
+      if (this.pendingStarts.get(profile.id) === entry) {
+        this.pendingStarts.delete(profile.id);
+      }
     }
   }
 
@@ -280,6 +300,9 @@ export class TunnelManager {
     }
     runtime.isStopping = true;
     runtime.onStop?.();
+    if (this.pendingStarts.get(runtime.profile.id)?.tunnelId === activeTunnelId) {
+      this.pendingStarts.delete(runtime.profile.id);
+    }
     this.activeByProfile.delete(runtime.profile.id);
     this.activeTunnels.delete(activeTunnelId);
 
@@ -430,7 +453,7 @@ export class TunnelManager {
       }
       // A client that already left, or a tunnel being stopped, has no one
       // waiting on this connection — and its own release may be what failed it.
-      if (!client.gone()) {
+      if (!client.gone() && this.shouldReportClientError(error)) {
         this.emit({
           type: "error",
           tunnelId: activeTunnelId,
@@ -967,7 +990,7 @@ export class TunnelManager {
         sshConnection.dispose();
       }
       // As on the local-forward path: a client that left has no one to tell.
-      if (!client.gone()) {
+      if (!client.gone() && this.shouldReportClientError(error)) {
         this.emit({
           type: "error",
           tunnelId: activeTunnelId,
@@ -990,6 +1013,19 @@ export class TunnelManager {
     if (runtime.sharedConnection) {
       return runtime.sharedConnection;
     }
+    if (runtime.pendingSharedConnection) {
+      return runtime.pendingSharedConnection;
+    }
+    const pending = this.connectShared(runtime, activeTunnelId);
+    runtime.pendingSharedConnection = pending;
+    try {
+      return await pending;
+    } finally {
+      if (runtime.pendingSharedConnection === pending) runtime.pendingSharedConnection = undefined;
+    }
+  }
+
+  private async connectShared(runtime: ActiveTunnelRuntime, activeTunnelId: string): Promise<SshConnection> {
     const sharedConnection = await this.sharedFactory.connect(runtime.serverConfig);
     if (runtime.isStopping) {
       // stop() swept the tunnel while this connect was in flight, so its sweep
@@ -1003,14 +1039,19 @@ export class TunnelManager {
     runtime.sshConnections.add(sharedConnection);
     // onClose replays synchronously when authentication returned an already-closed transport.
     let closedDuringSubscription = false;
+    let closeHandled = false;
     // The start rejection reports this replay; avoid a duplicate manager error event.
     let subscribing = true;
     sharedConnection.onClose(() => {
+      if (closeHandled) return;
+      closeHandled = true;
       closedDuringSubscription = true;
-      runtime.sshConnections.delete(sharedConnection);
+      const owned = runtime.sshConnections.delete(sharedConnection);
       if (runtime.sharedConnection === sharedConnection) {
         runtime.sharedConnection = undefined;
       }
+      // A pooled target can close while its lease still owns a jump-host lease.
+      if (owned) sharedConnection.dispose();
       // Supersession alone does not make a close expected: another client may
       // still be using this transport. Only candidates deliberately discarded
       // before use are quiet; real transport loss remains visible.
@@ -1029,11 +1070,24 @@ export class TunnelManager {
     });
     subscribing = false;
     if (closedDuringSubscription) {
-      // The close callback removed it from runtime ownership, so no failed-start cleanup can release wrapped resources.
-      sharedConnection.dispose();
       throw new Error(`Shared SSH connection closed while starting tunnel ${runtime.profile.name}`);
     }
     return sharedConnection;
+  }
+
+  private shouldReportClientError(error: unknown): boolean {
+    let cancellation: Error | undefined;
+    const seen = new Set<Error>();
+    for (let candidate = error; candidate instanceof Error && !seen.has(candidate); candidate = candidate.cause) {
+      seen.add(candidate);
+      if (/(?:Password entry|Passphrase entry|Keyboard-interactive authentication) canceled/i.test(candidate.message)) {
+        cancellation = candidate;
+      }
+    }
+    if (!cancellation) return true;
+    if (this.reportedPromptCancellations.has(cancellation)) return false;
+    this.reportedPromptCancellations.add(cancellation);
+    return true;
   }
 
   private discardSharedConnection(connection: SshConnection): void {

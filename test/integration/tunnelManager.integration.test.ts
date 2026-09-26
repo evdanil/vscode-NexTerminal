@@ -845,6 +845,172 @@ describe("TunnelManager integration", () => {
     await manager.stop(activeTunnel.id);
   });
 
+  it("releases the jump-host lease when an active shared target closes", async () => {
+    const bastionConnection = new CloseReplaySshConnection();
+    const targetConnection = new CloseReplaySshConnection();
+    const bastion: ServerConfig = { ...testServer, id: "active-close-bastion", multiplexing: true };
+    const target: ServerConfig = {
+      ...testServer,
+      id: "active-close-target",
+      multiplexing: false,
+      proxy: { type: "ssh", jumpHostId: bastion.id }
+    };
+    const authFactory = {
+      connect: async (server: ServerConfig, options?: { sockFactory?: () => Promise<Duplex> }) => {
+        if (server.id === bastion.id) return bastionConnection;
+        const hop = await options?.sockFactory?.();
+        hop?.destroy();
+        return targetConnection;
+      }
+    } as unknown as SilentAuthSshFactory;
+    const vault: SecretVault = {
+      get: async () => undefined,
+      store: async () => {},
+      delete: async () => {}
+    };
+    const proxyFactory = new ProxySshFactory(authFactory, (id) => id === bastion.id ? bastion : undefined, vault);
+    const pool = new SshConnectionPool(proxyFactory, { enabled: true, idleTimeoutMs: 20 });
+    proxyFactory.setJumpHostConnectionFactory(pool);
+    manager = new TunnelManager(pool, pool);
+    const profile: TunnelProfile = {
+      id: "active-close-target-tunnel", name: "Active jump target", localPort: 12345,
+      remoteIP: "127.0.0.1", remotePort: 23456, autoStart: false,
+      tunnelType: "reverse", remoteBindAddress: "127.0.0.1", localTargetIP: "127.0.0.1"
+    };
+    let separateBastionLease: SshConnection | undefined;
+    try {
+      separateBastionLease = await pool.connect(bastion);
+      const active = await manager.start(profile, target);
+      targetConnection.remoteClose();
+      separateBastionLease.dispose();
+      separateBastionLease = undefined;
+      await vi.waitFor(() => expect(bastionConnection.disposeCount).toBe(1));
+      await manager.stop(active.id);
+    } finally {
+      separateBastionLease?.dispose();
+      await manager.stopAll();
+      pool.dispose();
+    }
+  });
+
+  it("shares the eager login with a local client arriving before startup completes", async () => {
+    const login = deferred<SshConnection>();
+    const loginStarted = deferred<void>();
+    let connects = 0;
+    const factory: SshFactory = {
+      connect: async () => {
+        connects++;
+        loginStarted.resolve(undefined);
+        return connects === 1 ? login.promise : new DirectTcpSshConnection();
+      }
+    };
+    manager = new TunnelManager(factory, factory);
+    const profile: TunnelProfile = {
+      id: "eager-login-client", name: "Eager login", localPort: await getFreePort(),
+      remoteIP: "127.0.0.1", remotePort: 22, autoStart: false, connectionMode: "shared"
+    };
+    const start = manager.start(profile, testServer, { connectionMode: "shared" });
+    await loginStarted.promise;
+    const client = net.createConnection({ host: "127.0.0.1", port: profile.localPort });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        client.once("connect", resolve);
+        client.once("error", reject);
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(connects).toBe(1);
+      login.resolve(new DirectTcpSshConnection());
+      const active = await start;
+      await manager.stop(active.id);
+    } finally {
+      client.destroy();
+      login.resolve(new DirectTcpSshConnection());
+      await start.catch(() => undefined);
+    }
+  });
+
+  it("waits for a pending start before returning the active tunnel to another caller", async () => {
+    const login = deferred<SshConnection>();
+    const loginStarted = deferred<void>();
+    const factory: SshFactory = { connect: async () => {
+      loginStarted.resolve(undefined);
+      return login.promise;
+    } };
+    manager = new TunnelManager(factory, factory);
+    const profile: TunnelProfile = {
+      id: "pending-start-result", name: "Pending start", localPort: await getFreePort(),
+      remoteIP: "127.0.0.1", remotePort: 22, autoStart: false, connectionMode: "shared"
+    };
+    const events: TunnelEvent[] = [];
+    manager.onDidChange((event) => events.push(event));
+    const first = manager.start(profile, testServer, { connectionMode: "shared" });
+    await loginStarted.promise;
+    let returnedEarly = false;
+    const second = manager.start(profile, testServer, { connectionMode: "shared" }).then((active) => {
+      returnedEarly = true;
+      return active;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    try {
+      expect(returnedEarly).toBe(false);
+    } finally {
+      login.resolve(new DirectTcpSshConnection());
+    }
+    const active = await first;
+    expect(await second).toBe(active);
+    expect(events.filter((event) => event.type === "started")).toHaveLength(1);
+    await manager.stop(active.id);
+  });
+
+  it.each([false, true])("reports one canceled password prompt for concurrent isolated clients across profiles (jump wrapper: %s)", async (wrapped) => {
+    let rejectLogin!: (error: Error) => void;
+    const login = new Promise<SshConnection>((_resolve, reject) => { rejectLogin = reject; });
+    let attempts = 0;
+    const factory: SshFactory = { connect: async () => {
+      attempts++;
+      return attempts <= 3
+        ? login.catch((error: Error) => {
+          throw wrapped ? new Error(`Jump host connection failed: ${error.message}`, { cause: error }) : error;
+        })
+        : Promise.reject(new Error("Password entry canceled for Server"));
+    } };
+    manager = new TunnelManager(factory, factory);
+    const profile: TunnelProfile = {
+      id: "isolated-canceled-prompt", name: "Canceled prompt", localPort: await getFreePort(),
+      remoteIP: "127.0.0.1", remotePort: 22, autoStart: false, connectionMode: "isolated"
+    };
+    const otherProfile: TunnelProfile = {
+      ...profile, id: "other-isolated-canceled-prompt", name: "Other canceled prompt",
+      localPort: await getFreePort()
+    };
+    const events: TunnelEvent[] = [];
+    manager.onDidChange((event) => events.push(event));
+    const active = await manager.start(profile, testServer, { connectionMode: "isolated" });
+    const otherActive = await manager.start(otherProfile, testServer, { connectionMode: "isolated" });
+    const clients = Array.from({ length: 3 }, (_unused, index) => {
+      const client = net.createConnection({
+        host: "127.0.0.1", port: index === 2 ? otherProfile.localPort : profile.localPort
+      });
+      client.on("error", () => {});
+      return client;
+    });
+    try {
+      await vi.waitFor(() => expect(attempts).toBe(3));
+      rejectLogin(new Error("Password entry canceled for Server"));
+      await Promise.all(clients.map((client) => new Promise<void>((resolve) => client.once("close", resolve))));
+      expect(events.filter((event) => event.type === "error")).toHaveLength(1);
+
+      const laterClient = net.createConnection({ host: "127.0.0.1", port: profile.localPort });
+      laterClient.on("error", () => {});
+      await new Promise<void>((resolve) => laterClient.once("close", resolve));
+      expect(events.filter((event) => event.type === "error")).toHaveLength(2);
+    } finally {
+      for (const client of clients) client.destroy();
+      await manager.stop(active.id);
+      await manager.stop(otherActive.id);
+    }
+  });
+
   it("reports a superseded shared transport closing while another client still uses it", async () => {
     const profile: TunnelProfile = {
       id: "tunnel-shared-reconnect",
