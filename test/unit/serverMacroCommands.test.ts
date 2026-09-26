@@ -1277,6 +1277,7 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     ['a redirection target after echo', 'echo &> ipmitool\n'],
     ['a clobber-redirection target', 'echo hello >| ipmitool\n'],
     ['an attached clobber-redirection target', 'echo hello >|ipmitool\n'],
+    ['a clobber-redirection target after an empty quoted word', 'echo "">|ipmitool\n'],
     ['an env option after an assignment', 'env FOO=1 -u BAR ipmitool -E\n'],
     ['an env debug option after an assignment', 'env FOO=1 --debug ipmitool -E\n'],
     ['a quoted leading redirection', '">/tmp/log" ipmitool -E\n']
@@ -1313,6 +1314,7 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     ["a leading separated redirection", "> /tmp/ipmi.log ipmitool -E\n"],
     ["a redirection attached to ipmitool", "ipmitool>/tmp/ipmi.log -E\n"],
     ["a clobber redirection attached to ipmitool", "ipmitool>|/tmp/ipmi.log -E\n"],
+    ["a pipeline after an escaped greater-than sign", "echo \\>|ipmitool -E\n"],
     ["a command wrapper with -p", "command -p ipmitool -E\n"],
     ["an exec wrapper with -c", "exec -c ipmitool -E\n"],
     ["a time wrapper with -p", "time -p ipmitool -E\n"],

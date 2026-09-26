@@ -212,8 +212,10 @@ export function textRunsIpmitool(text: string): boolean {
     }
     // A redirection may touch the executable without whitespace. Keep the
     // executable and operator separate while retaining a leading fd number.
+    // An empty quoted word has no fd digits and must be finished first.
     if ((char === ">" || char === "<") && inWord &&
-        !/^(?:\d*|&|(?:\d*)(?:&>>|&>|>>|<>|<&|>&|>\||>|<))$/.test(word)) {
+        ((word === "" && !wordAllowsRedirection) ||
+          !/^(?:\d*|&|(?:\d*)(?:&>>|&>|>>|<>|<&|>&|>\||>|<))$/.test(word))) {
       finishWord();
     }
     // Bash >| clobbers a file; its target never begins a pipeline command.
