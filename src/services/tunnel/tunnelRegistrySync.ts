@@ -155,6 +155,7 @@ export class TunnelRegistrySync {
     await this.mutateEntries(async () => {
       const entries = await this.store.getEntries();
       const entry: TunnelRegistryEntry = {
+        activeTunnelId: tunnel.id,
         profileId: tunnel.profileId,
         serverId: tunnel.serverId,
         localPort: tunnel.localPort,
@@ -187,6 +188,7 @@ export class TunnelRegistrySync {
         this.unsettledReverseBindFenceIds.add(fence.fenceId);
         const tunnel = options.tunnel;
         const fenceEntry: TunnelRegistryEntry = {
+          activeTunnelId: tunnel.id,
           profileId: tunnel.profileId,
           serverId: tunnel.serverId,
           localPort: tunnel.localPort,
@@ -242,8 +244,22 @@ export class TunnelRegistrySync {
         });
       }
       void fence.settled.then(() => this.mutateEntries(async () => {
-        this.unsettledReverseBindFenceIds.delete(fence.fenceId);
+        const entries = await this.store.getEntries();
+        const filtered = entries.filter((entry) =>
+          entry.retiredReverseBind !== undefined ||
+          entry.ownerSessionId !== this.sessionId ||
+          entry.profileId !== profileId ||
+          (entry.activeTunnelId !== undefined
+            ? entry.activeTunnelId !== options?.tunnel.id
+            : entry.startedAt !== options?.tunnel.startedAt)
+        );
+        if (filtered.length !== entries.length) {
+          // A stale window can restore the old active row while this fence is
+          // held. Remove that row before another window can see settlement.
+          await this.store.saveEntries(filtered);
+        }
         await this.store.removeFence(fence.fenceId);
+        this.unsettledReverseBindFenceIds.delete(fence.fenceId);
       }));
     }
   }
@@ -363,6 +379,7 @@ export class TunnelRegistrySync {
       if (missingOwn.length > 0) {
         for (const tunnel of missingOwn) {
           entries.push({
+            activeTunnelId: tunnel.id,
             profileId: tunnel.profileId,
             serverId: tunnel.serverId,
             localPort: tunnel.localPort,

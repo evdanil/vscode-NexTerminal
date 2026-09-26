@@ -280,6 +280,65 @@ describe("TunnelRegistrySync", () => {
     expect(await ownerStore.getEntries()).toEqual([]);
   });
 
+  it("clears an active row restored by another window before settling its fence", async () => {
+    const [ownerStore, otherStore, refreshOther, refreshOwner] = sharedWindowStores();
+    const owner = new TunnelRegistrySync(ownerStore, core, "owner", probePort);
+    const other = new TunnelRegistrySync(otherStore, core, "other", probePort);
+    const tunnel = makeTunnel({ id: "retired-1", tunnelType: "reverse", remotePort: 9000 });
+    let releaseFence!: () => void;
+    const settled = new Promise<void>((resolve) => { releaseFence = resolve; });
+    await owner.registerTunnel(tunnel);
+    refreshOther();
+    const staleActive = await otherStore.getEntries();
+
+    await owner.unregisterTunnel(tunnel.profileId, {
+      tunnel,
+      retiredReverseBind: {
+        fenceId: tunnel.id,
+        routeIdentity: { kind: "direct", endpoint: { hosts: ["bastion"], port: 22 } },
+        remotePort: tunnel.remotePort,
+        settled
+      }
+    });
+    await otherStore.saveEntries(staleActive);
+    refreshOwner();
+    expect(await ownerStore.getEntries()).toHaveLength(2);
+
+    releaseFence();
+    await vi.waitFor(async () => {
+      expect((await ownerStore.getEntries()).some((entry) => entry.retiredReverseBind)).toBe(false);
+    });
+    refreshOther();
+    expect(await other.checkRemoteOwnership(tunnel.profileId, tunnel.localPort)).toBeUndefined();
+  });
+
+  it("keeps a newer start of the same profile when an older fence settles", async () => {
+    const oldTunnel = makeTunnel({ id: "old", tunnelType: "reverse", remotePort: 9000 });
+    const replacement = makeTunnel({
+      id: "replacement", serverId: "new-route", tunnelType: "reverse", remotePort: 9001,
+      startedAt: oldTunnel.startedAt + 1
+    });
+    let settle!: () => void;
+    const settled = new Promise<void>((resolve) => { settle = resolve; });
+    await sync.registerTunnel(oldTunnel);
+    await sync.unregisterTunnel(oldTunnel.profileId, {
+      tunnel: oldTunnel,
+      retiredReverseBind: {
+        fenceId: oldTunnel.id,
+        routeIdentity: { kind: "direct", endpoint: { hosts: ["old-route"], port: 22 } },
+        remotePort: oldTunnel.remotePort,
+        settled
+      }
+    });
+    await sync.registerTunnel(replacement);
+
+    settle();
+    await vi.waitFor(async () => {
+      expect((await store.getEntries()).some((entry) => entry.retiredReverseBind)).toBe(false);
+    });
+    expect(await store.getEntries()).toEqual([expect.objectContaining({ activeTunnelId: replacement.id })]);
+  });
+
   it("moves a stopped port-zero fence to its late allocated port across windows", async () => {
     const [ownerStore, otherStore] = sharedWindowStores();
     const owner = new TunnelRegistrySync(ownerStore, core, "owner", probePort);
