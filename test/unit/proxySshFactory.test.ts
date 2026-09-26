@@ -1505,7 +1505,7 @@ describe("ProxySshFactory", () => {
     });
 
     it("propagates one cancellation error to every connect sharing a proxy prompt", async () => {
-      const server = makeServer({ proxy: authenticated });
+      const server = makeServer({ name: "switch\n\u001b[31mspoof\u001b[0m\u202e", proxy: authenticated });
       servers.set(server.id, server);
       const sentPasswords = await mockSocks();
       let cancel!: (value: undefined) => void;
@@ -1531,7 +1531,9 @@ describe("ProxySshFactory", () => {
 
       expect(firstError).toBeInstanceOf(Error);
       expect(firstError).toBe(secondError);
-      expect((firstError as Error).message).toMatch(/proxy password entry canceled/i);
+      expect((firstError as Error).message).toBe("Proxy password entry canceled");
+      expect((firstError as Error).message).not.toContain(server.name);
+      expect((firstError as Error).message).not.toMatch(/[\n\u001b\u202e]/);
       expect(sentPasswords()).toEqual([]);
     });
 

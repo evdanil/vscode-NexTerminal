@@ -618,7 +618,9 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       }
     }
     if (!result) {
-      shared.cancellationError ??= new Error(`Proxy password entry canceled for ${target.name}`);
+      // Server names from inventory can contain control text, and SSH PTYs print
+      // this error directly. The terminal already identifies the connection.
+      shared.cancellationError ??= new Error("Proxy password entry canceled");
       throw shared.cancellationError;
     }
     if (isActive?.() === false) {
