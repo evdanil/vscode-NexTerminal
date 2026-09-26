@@ -506,8 +506,41 @@ describe("pending standard serial starts", () => {
     else original.path = "COM4";
 
     expect(callbacks?.isProfileCurrent?.()).toBe(false);
+    if (change !== "removed") mockShowWarningMessage.mockResolvedValueOnce("Retry");
+    (callbacks as { onStartRejected?: () => void } | undefined)?.onStartRejected?.();
+    await Promise.resolve();
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining(change === "removed" ? "removed" : "changed"),
+      ...(change === "removed" ? [] : ["Retry"])
+    );
+    if (change !== "removed") {
+      expect(vscode.commands.executeCommand).toHaveBeenCalledWith("nexus.serial.connect", "sp1");
+    } else {
+      expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexus.serial.connect", "sp1");
+    }
     expect(ctx.serialTerminals.size).toBe(0);
     expect(ctx.core.registerSerialSession).not.toHaveBeenCalled();
+  });
+
+  it("keeps a pending open when refresh replaces the cached profile with equal contents", async () => {
+    const original = makeSerialProfile();
+    let current = original;
+    const ctx = {
+      core: { getSerialProfile: vi.fn(() => current), registerSerialSession: vi.fn() },
+      serialSidecar: {},
+      loggerFactory: { create: vi.fn() },
+      macroAutoTrigger: { createObserver: vi.fn(() => ({})), bindObserverToSession: vi.fn() },
+      sessionLogDir: "",
+      serialTerminals: new Map(),
+      activityIndicators: new Map(),
+      highlighter: {}
+    } as unknown as CommandContext;
+    registerSerialCommands(ctx);
+    await registeredCommands.get("nexus.serial.connect")!("sp1");
+    current = { ...original };
+
+    const callbacks = vi.mocked(SerialPty).mock.calls.at(-1)?.[2] as { isProfileCurrent?: () => boolean };
+    expect(callbacks.isProfileCurrent?.()).toBe(true);
   });
 });
 

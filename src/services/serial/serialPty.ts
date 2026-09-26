@@ -23,6 +23,7 @@ export type SerialPtyOptions = OpenPortParams;
 export interface SerialPtyCallbacks {
   /** A late open must not register a session for a profile removed during openPort. */
   isProfileCurrent?(): boolean;
+  onStartRejected?(): void;
   onSessionOpened(sessionId: string): void;
   onSessionClosed(sessionId: string): void;
   onDataReceived?(sessionId: string): void;
@@ -248,7 +249,11 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
         // Bulk profile removal cannot see a port until onSessionOpened registers
         // it. Close the port here, before that callback can revive the session.
         this.dispose();
-        await this.transport.closePort(sessionId);
+        try {
+          await this.transport.closePort(sessionId);
+        } finally {
+          this.callbacks.onStartRejected?.();
+        }
         return;
       }
       this.sidecarSessionId = sessionId;

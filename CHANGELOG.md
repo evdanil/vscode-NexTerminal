@@ -11,6 +11,11 @@
 ### Fixed
 
 - **Session IPMI hints recognize more shell command forms.** The send confirmation and Macro Editor now recognize `ipmitool` after supported `sudo`, `env`, and `nice` options, including `nice --`, and when a redirection touches the executable. They no longer mistake a `>|` redirection target or an option-looking word after an `env` assignment for a command. These hints still only describe where the command will run; they do not change how macros execute.
+## [2.8.289] — 2026-09-26
+
+### Fixed
+
+- **Pending serial and Local Shell starts respect profile changes.** A serial port that opens after its profile is removed or edited is closed before becoming a session. A Local Shell waiting at an auto-trigger confirmation is cancelled when its profile changes. Both paths explain the cancellation and offer a retry when the profile still exists.
 
 ## [2.8.286] — 2026-09-26
 

@@ -104,6 +104,7 @@ describe("SerialPty", () => {
     let profileCurrent = true;
     const callbacks = {
       isProfileCurrent: () => profileCurrent,
+      onStartRejected: vi.fn(),
       onSessionOpened: vi.fn(),
       onSessionClosed: vi.fn()
     };
@@ -121,6 +122,7 @@ describe("SerialPty", () => {
     expect(closePort).toHaveBeenCalledExactlyOnceWith("late-session");
     expect(callbacks.onSessionOpened).not.toHaveBeenCalled();
     expect(callbacks.onSessionClosed).not.toHaveBeenCalled();
+    expect(callbacks.onStartRejected).toHaveBeenCalledTimes(1);
     expect(onDidClose).toHaveBeenCalledTimes(1);
     expect(dataListenerCount()).toBe(0);
   });

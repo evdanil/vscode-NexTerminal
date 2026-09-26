@@ -21,7 +21,7 @@ Smart Follow profiles coexist with other serial sessions on different ports, pri
 
 Connect on a profile that is already connected just focuses its terminal. A connect is refused only when the target port is already held by another Nexus serial session — the warning names that session.
 
-If a Standard serial profile is removed or changed while its port is still opening, Nexus closes the late port and terminal instead of restoring the old session.
+If a Standard serial profile is removed or changed while its port is still opening, Nexus closes the late port and terminal instead of restoring the old session. A notice explains the cancellation and offers **Retry** when the profile still exists.
 
 ## Crash Isolation
 

@@ -390,6 +390,7 @@ async function connectStandardSerialProfile(ctx: CommandContext, profile: Serial
     return false;
   }
   const profileAtStart = JSON.stringify(profile);
+  const profileNameAtStart = profile.name;
   const terminalName = serialTerminalName(profile);
   let terminalRef: vscode.Terminal | undefined;
   let ptyRef: SerialPty | undefined;
@@ -410,8 +411,25 @@ async function connectStandardSerialProfile(ctx: CommandContext, profile: Serial
       rtscts: profile.rtscts
     },
     {
-      isProfileCurrent: () =>
-        ctx.core.getSerialProfile(profile.id) === profile && JSON.stringify(profile) === profileAtStart,
+      isProfileCurrent: () => {
+        const current = ctx.core.getSerialProfile(profile.id);
+        return current !== undefined && JSON.stringify(current) === profileAtStart;
+      },
+      onStartRejected: () => {
+        const current = ctx.core.getSerialProfile(profile.id);
+        if (!current) {
+          void vscode.window.showWarningMessage(
+            `Serial profile "${profileNameAtStart}" was removed while its port opened. The connection was cancelled.`
+          );
+          return;
+        }
+        void Promise.resolve(vscode.window.showWarningMessage(
+          `Serial profile "${profileNameAtStart}" changed while its port opened. The connection was cancelled. Retry with the current settings.`,
+          "Retry"
+        )).then((choice) => {
+          if (choice === "Retry") void vscode.commands.executeCommand("nexus.serial.connect", profile.id);
+        });
+      },
       onSessionOpened: (sessionId) => {
         if (terminalRef) {
           ctx.serialTerminals.set(sessionId, {

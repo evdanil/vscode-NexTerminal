@@ -499,13 +499,70 @@ describe("registerLocalShellCommands", () => {
     if (change === "removed") current = undefined;
     else if (change === "replaced") current = { ...original, name: "Replacement" };
     else original.name = "Renamed";
+    if (change !== "removed") mockShowWarningMessage.mockResolvedValueOnce("Retry");
 
     warning.resolve("Continue");
     await connect;
+    await settle();
 
     expect(mockCreateTerminal).not.toHaveBeenCalled();
     expect(ctx.core.registerLocalShellSession).not.toHaveBeenCalled();
     expect(ctx.localShellTerminals.size).toBe(0);
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining(change === "removed" ? "removed" : "changed"),
+      ...(change === "removed" ? [] : ["Retry"])
+    );
+    if (change !== "removed") {
+      expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.localShell.connect", "local-1");
+    } else {
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.localShell.connect", "local-1");
+    }
+  });
+
+  it("keeps a pending launch when refresh replaces the cached profile with equal contents", async () => {
+    mockMacros.push({ name: "Prompt", text: "answer", triggerPattern: "Prompt:" });
+    const warning = deferred<string>();
+    mockShowWarningMessage.mockReturnValueOnce(warning.promise);
+    const ctx = makeCtx();
+    let current = ctx.core.getLocalShellProfile("local-1");
+    ctx.core.getLocalShellProfile.mockImplementation(() => current);
+    registerLocalShellCommands(ctx);
+
+    const connect = Promise.resolve(registeredCommands.get("nexus.localShell.connect")!("local-1"));
+    await settle();
+    current = { ...current };
+    warning.resolve("Continue");
+    await connect;
+
+    expect(mockCreateTerminal).toHaveBeenCalledTimes(1);
+    expect(ctx.core.registerLocalShellSession).toHaveBeenCalledTimes(1);
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries the script launch command after the profile changes during confirmation", async () => {
+    mockMacros.push({ name: "Prompt", text: "answer", triggerPattern: "Prompt:" });
+    const warning = deferred<string>();
+    mockShowWarningMessage.mockReturnValueOnce(warning.promise);
+    mockPickScriptFromWorkspace.mockResolvedValueOnce({ fsPath: "/ws/.nexus/scripts/local.js" });
+    const ctx = {
+      ...makeCtx(),
+      scriptRuntimeManager: { runScript: vi.fn() }
+    };
+    let current = ctx.core.getLocalShellProfile("local-1");
+    ctx.core.getLocalShellProfile.mockImplementation(() => current);
+    registerLocalShellCommands(ctx as any);
+
+    const run = Promise.resolve(registeredCommands.get("nexus.localShell.runWithScript")!("local-1"));
+    await settle();
+    current = { ...current, shellPath: "/bin/zsh" };
+    mockShowWarningMessage.mockResolvedValueOnce("Retry");
+    warning.resolve("Continue");
+    await run;
+    await settle();
+
+    expect(mockCreateTerminal).not.toHaveBeenCalled();
+    expect(ctx.scriptRuntimeManager.runScript).not.toHaveBeenCalled();
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.localShell.runWithScript", "local-1");
   });
 
   it("passes the command context highlighter into the local shell PTY", async () => {

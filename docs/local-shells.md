@@ -13,7 +13,7 @@ Use a launchable VS Code terminal profile from the profile dropdown, including c
 5. Optionally set a working directory and startup command, then save the profile
 6. Right-click the profile and select **Open Local Shell**. You can open multiple sessions from the same saved Local Shell profile.
 
-If the profile is removed or changed while a confirmation prompt is open, Nexus cancels that pending launch.
+If the profile is removed or changed while a confirmation prompt is open, Nexus cancels that pending launch. A notice explains why and offers **Retry** when the profile still exists.
 
 ## Macros and Scripts in Local Shells
 
