@@ -7624,21 +7624,28 @@ echo hi</textarea>
       }
       var textRunsIpmitool = function textRunsIpmitool(text) {
 	const runsIpmitool = (words, assignmentAllowed, redirectionAllowed) => {
+		const executableWords = [];
+		const executableAssignmentAllowed = [];
+		for (let wordIndex = 0; wordIndex < words.length; wordIndex++) {
+			const redirection = redirectionAllowed[wordIndex] && /^(?:\\d*)(?:&>>|&>|>>|<>|<&|>&|>|<)(.*)$/.exec(words[wordIndex]);
+			if (redirection) {
+				if (!redirection[1]) {
+					if (++wordIndex >= words.length) return false;
+				};
+				continue;
+			};
+			executableWords.push(words[wordIndex]);
+			executableAssignmentAllowed.push(assignmentAllowed[wordIndex]);
+		};
+		words = executableWords;
+		assignmentAllowed = executableAssignmentAllowed;
 		let index = 0;
 		let allowAssignments = true;
 		let argvAssignmentsAllowed = false;
-		const assignment = /^[A-Za-z_][A-Za-z0-9_]*=/;
+		const assignment = /^[A-Za-z_][A-Za-z0-9_]*\\+?=/;
 		const basename = (word) => word.slice(word.lastIndexOf("/") + 1);
 		while (index < words.length) {
 			const word = words[index];
-			if (redirectionAllowed[index]) {
-				const redirection = /^(?:\\d*)(?:&>>|&>|>>|<>|<&|>&|>|<)(.*)$/.exec(word);
-				if (redirection) {
-					index += redirection[1] ? 1 : 2;
-					if (index > words.length) return false;
-					continue;
-				}
-			};
 			if (allowAssignments && (assignmentAllowed[index] || argvAssignmentsAllowed) && assignment.test(word)) {
 				index++;
 				continue;
@@ -7650,7 +7657,7 @@ echo hi</textarea>
 				argvAssignmentsAllowed = true;
 				while (index < words.length && words[index].startsWith("-")) {
 					const option = words[index++];
-					const shortValueOption = /^-[EABbnSHkis]*[ugpCDT](.*)$/.exec(option);
+					const shortValueOption = /^-[EABbnSHkis]*[ugpCDTR](.*)$/.exec(option);
 					if ([
 						"-u",
 						"--user",
@@ -7663,7 +7670,9 @@ echo hi</textarea>
 						"-D",
 						"--chdir",
 						"-T",
-						"--command-timeout"
+						"--command-timeout",
+						"-R",
+						"--chroot"
 					].includes(option)) {
 						if (index >= words.length) return false;
 						index++;
@@ -7672,7 +7681,7 @@ echo hi</textarea>
 							if (index >= words.length) return false;
 							index++;
 						}
-					} else if (!/^(?:--(?:user|group|prompt|close-from|chdir|preserve-env|command-timeout)=.+|-[ugpCDT].+)$/.test(option) && ![
+					} else if (!/^(?:--(?:user|group|prompt|close-from|chdir|preserve-env|command-timeout|chroot)=.+|-[ugpCDTR].+)$/.test(option) && ![
 						"--login",
 						"--shell",
 						"--non-interactive",

@@ -5,21 +5,28 @@
  */
 export function textRunsIpmitool(text: string): boolean {
   const runsIpmitool = (words: string[], assignmentAllowed: boolean[], redirectionAllowed: boolean[]): boolean => {
+    const executableWords: string[] = [];
+    const executableAssignmentAllowed: boolean[] = [];
+    for (let wordIndex = 0; wordIndex < words.length; wordIndex++) {
+      const redirection = redirectionAllowed[wordIndex] && /^(?:\d*)(?:&>>|&>|>>|<>|<&|>&|>|<)(.*)$/.exec(words[wordIndex]);
+      if (redirection) {
+        if (!redirection[1]) {
+          if (++wordIndex >= words.length) return false;
+        }
+        continue;
+      }
+      executableWords.push(words[wordIndex]);
+      executableAssignmentAllowed.push(assignmentAllowed[wordIndex]);
+    }
+    words = executableWords;
+    assignmentAllowed = executableAssignmentAllowed;
     let index = 0;
     let allowAssignments = true;
     let argvAssignmentsAllowed = false;
-    const assignment = /^[A-Za-z_][A-Za-z0-9_]*=/;
+    const assignment = /^[A-Za-z_][A-Za-z0-9_]*\+?=/;
     const basename = (word: string) => word.slice(word.lastIndexOf("/") + 1);
     while (index < words.length) {
       const word = words[index];
-      if (redirectionAllowed[index]) {
-        const redirection = /^(?:\d*)(?:&>>|&>|>>|<>|<&|>&|>|<)(.*)$/.exec(word);
-        if (redirection) {
-          index += redirection[1] ? 1 : 2;
-          if (index > words.length) return false;
-          continue;
-        }
-      }
       if (allowAssignments && (assignmentAllowed[index] || argvAssignmentsAllowed) && assignment.test(word)) { index++; continue; }
       const name = basename(word);
       if (name === "sudo") {
@@ -28,8 +35,8 @@ export function textRunsIpmitool(text: string): boolean {
         argvAssignmentsAllowed = true;
         while (index < words.length && words[index].startsWith("-")) {
           const option = words[index++];
-          const shortValueOption = /^-[EABbnSHkis]*[ugpCDT](.*)$/.exec(option);
-          if (["-u", "--user", "-g", "--group", "-p", "--prompt", "-C", "--close-from", "-D", "--chdir", "-T", "--command-timeout"].includes(option)) {
+          const shortValueOption = /^-[EABbnSHkis]*[ugpCDTR](.*)$/.exec(option);
+          if (["-u", "--user", "-g", "--group", "-p", "--prompt", "-C", "--close-from", "-D", "--chdir", "-T", "--command-timeout", "-R", "--chroot"].includes(option)) {
             if (index >= words.length) return false;
             index++;
           } else if (shortValueOption) {
@@ -38,7 +45,7 @@ export function textRunsIpmitool(text: string): boolean {
               index++;
             }
           } else if (
-            !/^(?:--(?:user|group|prompt|close-from|chdir|preserve-env|command-timeout)=.+|-[ugpCDT].+)$/.test(option) &&
+            !/^(?:--(?:user|group|prompt|close-from|chdir|preserve-env|command-timeout|chroot)=.+|-[ugpCDTR].+)$/.test(option) &&
             !["--login", "--shell", "--non-interactive", "--askpass", "--background", "--bell", "--set-home", "--stdin", "--reset-timestamp", "--preserve-env"].includes(option) &&
             option !== "--" && !/^-[EABbnSHkis]+$/.test(option)
           ) {
