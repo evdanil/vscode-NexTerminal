@@ -4,6 +4,7 @@ import type { ActiveTunnel, TunnelRegistryEntry } from "../../src/models/config"
 import { stopTunnelsForShutdown, TunnelRegistrySync } from "../../src/services/tunnel/tunnelRegistrySync";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { InMemoryTunnelRegistryStore } from "../../src/storage/inMemoryTunnelRegistryStore";
+import { VscodeTunnelRegistryStore } from "../../src/storage/vscodeTunnelRegistryStore";
 
 function makeTunnel(overrides: Partial<ActiveTunnel> = {}): ActiveTunnel {
   return {
@@ -35,6 +36,24 @@ function makeEntry(overrides: Partial<TunnelRegistryEntry> = {}): TunnelRegistry
     ownerSessionId: "other-session",
     ...overrides
   };
+}
+
+function sharedWindowStores(): [VscodeTunnelRegistryStore, VscodeTunnelRegistryStore] {
+  const values = new Map<string, unknown>();
+  const globalState = {
+    keys: () => [...values.keys()],
+    get: <T>(key: string, defaultValue?: T): T | undefined =>
+      values.has(key) ? values.get(key) as T : defaultValue,
+    update: async (key: string, value: unknown): Promise<void> => {
+      if (value === undefined) {
+        values.delete(key);
+      } else {
+        values.set(key, value);
+      }
+    }
+  };
+  const context = { globalState } as unknown as ConstructorParameters<typeof VscodeTunnelRegistryStore>[0];
+  return [new VscodeTunnelRegistryStore(context), new VscodeTunnelRegistryStore(context)];
 }
 
 describe("TunnelRegistrySync", () => {
@@ -145,6 +164,94 @@ describe("TunnelRegistrySync", () => {
     const entries = await store.getEntries();
     expect(entries).toHaveLength(2);
     expect(entries.map((entry) => entry.retiredReverseBind?.fenceId).sort()).toEqual([first.id, second.id]);
+  });
+
+  it("keeps a published fence when another window saves an earlier array snapshot", async () => {
+    const [ownerStore, otherStore] = sharedWindowStores();
+    const owner = new TunnelRegistrySync(ownerStore, core, "owner", probePort);
+    const tunnel = makeTunnel({ id: "retired-1", tunnelType: "reverse", remotePort: 9000 });
+    await owner.registerTunnel(tunnel);
+    const staleSnapshot = await otherStore.getEntries();
+    const neverSettles = new Promise<void>(() => {});
+
+    await owner.unregisterTunnel(tunnel.profileId, {
+      tunnel,
+      retiredReverseBind: {
+        fenceId: tunnel.id,
+        routeIdentity: { kind: "direct", endpoint: { hosts: ["bastion"], port: 22 } },
+        remotePort: tunnel.remotePort,
+        settled: neverSettles
+      }
+    });
+    await otherStore.saveEntries(staleSnapshot);
+
+    expect((await ownerStore.getEntries()).map((entry) => entry.retiredReverseBind?.fenceId))
+      .toContain(tunnel.id);
+  });
+
+  it("does not restore a settled fence when another window saves its old array snapshot", async () => {
+    const [ownerStore, otherStore] = sharedWindowStores();
+    const owner = new TunnelRegistrySync(ownerStore, core, "owner", probePort);
+    const tunnel = makeTunnel({ id: "retired-1", tunnelType: "reverse", remotePort: 9000 });
+    let releaseFence!: () => void;
+    const settled = new Promise<void>((resolve) => { releaseFence = resolve; });
+    await owner.registerTunnel(tunnel);
+    await owner.unregisterTunnel(tunnel.profileId, {
+      tunnel,
+      retiredReverseBind: {
+        fenceId: tunnel.id,
+        routeIdentity: { kind: "direct", endpoint: { hosts: ["bastion"], port: 22 } },
+        remotePort: tunnel.remotePort,
+        settled
+      }
+    });
+    const staleSnapshot = await otherStore.getEntries();
+    releaseFence();
+    await vi.waitFor(async () => expect(await ownerStore.getEntries()).toEqual([]));
+
+    await otherStore.saveEntries(staleSnapshot);
+    expect(await ownerStore.getEntries()).toEqual([]);
+  });
+
+  it("moves a stopped port-zero fence to its late allocated port across windows", async () => {
+    const [ownerStore, otherStore] = sharedWindowStores();
+    const owner = new TunnelRegistrySync(ownerStore, core, "owner", probePort);
+    const other = new TunnelRegistrySync(otherStore, core, "other", probePort);
+    const tunnel = makeTunnel({ id: "port-zero", tunnelType: "reverse", remotePort: 0 });
+    const route = { kind: "direct", endpoint: { hosts: ["bastion"], port: 22 } } as const;
+    let allocate!: (port: number | undefined) => void;
+    let settle!: () => void;
+    const allocatedPort = new Promise<number | undefined>((resolve) => { allocate = resolve; });
+    const settled = new Promise<void>((resolve) => { settle = resolve; });
+    await owner.registerTunnel(tunnel);
+    await owner.unregisterTunnel(tunnel.profileId, {
+      tunnel,
+      retiredReverseBind: {
+        fenceId: tunnel.id,
+        routeIdentity: route,
+        remotePort: 0,
+        settled,
+        allocatedPort
+      }
+    });
+
+    await expect(other.checkRemoteOwnership("different-profile", 12345, {
+      routeIdentity: route, remotePort: 34567
+    })).resolves.toMatchObject({ retiredReverseBind: { fenceId: tunnel.id, remotePort: 0 } });
+
+    allocate(34567);
+    await vi.waitFor(async () => {
+      expect((await ownerStore.getEntries())[0].retiredReverseBind?.remotePort).toBe(34567);
+    });
+    await expect(other.checkRemoteOwnership("different-profile", 12345, {
+      routeIdentity: route, remotePort: 23456
+    })).resolves.toBeUndefined();
+    await expect(other.checkRemoteOwnership("different-profile", 12345, {
+      routeIdentity: route, remotePort: 34567
+    })).resolves.toMatchObject({ retiredReverseBind: { fenceId: tunnel.id, remotePort: 34567 } });
+
+    settle();
+    await vi.waitFor(async () => expect(await ownerStore.getEntries()).toEqual([]));
   });
 
   it("does not restore a settled reverse-bind fence from a stale heartbeat snapshot", async () => {
@@ -320,10 +427,8 @@ describe("TunnelRegistrySync", () => {
         remotePort: 9000
       }
     });
-    await store.saveEntries([
-      fence("expired", "crashed-window", Date.now() - 40_000),
-      fence("fresh", "live-window", Date.now())
-    ]);
+    await store.publishFence(fence("expired", "crashed-window", Date.now() - 40_000));
+    await store.publishFence(fence("fresh", "live-window", Date.now()));
 
     await expect(sync.checkRemoteOwnership("different-profile", 12345, {
       routeIdentity: route,

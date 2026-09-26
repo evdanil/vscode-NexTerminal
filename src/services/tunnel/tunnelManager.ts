@@ -20,6 +20,7 @@ export type TunnelEvent =
         routeIdentity: NetworkRouteIdentity;
         remotePort: number;
         settled: Promise<void>;
+        allocatedPort?: Promise<number | undefined>;
       };
     }
   | { type: "error"; tunnelId?: string; message: string; error?: unknown };
@@ -62,6 +63,8 @@ interface ActiveTunnelRuntime {
     bindPort: number;
     released: Promise<void>;
     release: () => void;
+    allocatedPort?: Promise<number | undefined>;
+    allocate?: (port: number | undefined) => void;
   };
   isStopping: boolean;
   /** Called by stop(): a start still waiting on the server bounds that wait from then on. */
@@ -340,12 +343,13 @@ export class TunnelManager {
       runtime.reverseUnsubscribe();
     }
     const pendingBind = runtime.pendingReverseBind;
-    if (pendingBind && pendingBind.bindPort !== 0) {
+    if (pendingBind) {
       retiredReverseBind = {
         fenceId: activeTunnelId,
         routeIdentity: pendingBind.routeIdentity,
         remotePort: pendingBind.bindPort,
-        settled: pendingBind.released
+        settled: pendingBind.released,
+        ...(pendingBind.allocatedPort ? { allocatedPort: pendingBind.allocatedPort } : {})
       };
     }
     if (runtime.reverseBindAddr !== undefined && runtime.reverseBindPort !== undefined && runtime.sharedConnection) {
@@ -666,11 +670,17 @@ export class TunnelManager {
         runtime.sshConnections.delete(sshConnection);
         let releasePendingBind!: () => void;
         const released = new Promise<void>((resolve) => { releasePendingBind = resolve; });
+        let allocatePendingBind!: (port: number | undefined) => void;
+        const allocatedPortResult = bindPort === 0
+          ? new Promise<number | undefined>((resolve) => { allocatePendingBind = resolve; })
+          : undefined;
         const pendingBind = {
           routeIdentity,
           bindPort,
           released,
-          release: releasePendingBind
+          release: releasePendingBind,
+          allocatedPort: allocatedPortResult,
+          allocate: bindPort === 0 ? allocatePendingBind : undefined
         };
         runtime.pendingReverseBind = pendingBind;
         const outcome = await this.requestForward(runtime, sshConnection, bindAddr, bindPort);
@@ -681,7 +691,11 @@ export class TunnelManager {
           // transport closes. A late port-zero grant moves the uncertain bind
           // barrier to its allocated port so another automatic allocation can proceed.
           if (bindPort === 0) {
-            this.retireUnknownPortForwardTransport(routeIdentity, sshConnection, outcome.lateOutcome);
+            const settled = this.retireUnknownPortForwardTransport(routeIdentity, sshConnection, outcome.lateOutcome);
+            void settled.then(pendingBind.release);
+            void outcome.lateOutcome.then((late) => {
+              pendingBind.allocate?.("port" in late ? late.port : undefined);
+            });
           } else {
             const settled = this.retireForwardTransport(routeIdentity, bindPort, sshConnection, outcome.lateRefusal);
             void settled.then(pendingBind.release);
@@ -691,6 +705,7 @@ export class TunnelManager {
           throw new TunnelStoppedError(profile.name);
         }
         if ("error" in outcome) {
+          pendingBind.allocate?.(undefined);
           pendingBind.release();
           // Refused, or stopped meanwhile: discard this start and do not let
           // its expected close be reported as an unexpected shared-transport loss.
@@ -702,6 +717,7 @@ export class TunnelManager {
         }
         allocatedPort = outcome.port;
         if (runtime.isStopping) {
+          pendingBind.allocate?.(allocatedPort);
           // Granted after stop(): withdraw it, then let the connection go, and
           // do not announce a tunnel that is gone. A withdrawal refused or not
           // answered may leave the bind on a transport other leases keep open.
@@ -837,8 +853,11 @@ export class TunnelManager {
     routeIdentity: NetworkRouteIdentity,
     connection: SshConnection,
     lateOutcome: Promise<{ port: number } | { error: unknown }>
-  ): void {
+  ): Promise<void> {
     const closed = this.sharedFactory.retire?.(connection) ?? waitForConnectionClose(connection);
+    let settle!: () => void;
+    const settled = new Promise<void>((resolve) => { settle = resolve; });
+    void closed.then(settle, () => {});
     let releaseUnknownPort!: () => void;
     const unknownPortBarrier = new Promise<void>((resolve) => {
       releaseUnknownPort = resolve;
@@ -849,6 +868,7 @@ export class TunnelManager {
     void lateOutcome.then((outcome) => {
       if ("error" in outcome) {
         release();
+        settle();
         return;
       }
       if (outcome.port === 0) {
@@ -859,10 +879,12 @@ export class TunnelManager {
       const allocatedPortBarrier = new Promise<void>((resolve) => {
         releaseAllocatedPort = resolve;
       });
-      this.holdRetiredForwardTransport(routeIdentity, outcome.port, allocatedPortBarrier);
+      const allocatedSettled = this.holdRetiredForwardTransport(routeIdentity, outcome.port, allocatedPortBarrier);
+      void allocatedSettled.then(settle);
       void closed.then(releaseAllocatedPort, () => {});
       release();
     }, () => {});
+    return settled;
   }
 
   private holdRetiredForwardTransport(

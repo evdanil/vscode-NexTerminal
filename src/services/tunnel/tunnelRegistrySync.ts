@@ -18,6 +18,7 @@ export interface RetiredReverseBindFence {
   routeIdentity: NetworkRouteIdentity;
   remotePort: number;
   settled: Promise<void>;
+  allocatedPort?: Promise<number | undefined>;
 }
 
 export async function stopTunnelsForShutdown(
@@ -100,7 +101,7 @@ function retiredRouteOverlaps(
   remotePort: number
 ): boolean {
   const retired = entry.retiredReverseBind;
-  if (!retired || retired.remotePort !== remotePort) {
+  if (!retired || (retired.remotePort !== 0 && retired.remotePort !== remotePort)) {
     return false;
   }
   const retiredRoute = parseNetworkRouteIdentity(retired.routeIdentity);
@@ -168,7 +169,7 @@ export class TunnelRegistrySync {
         lastSeen: Date.now()
       };
       entries.push(entry);
-      await this.saveEntries(entries);
+      await this.store.saveEntries(entries);
     });
   }
 
@@ -185,7 +186,7 @@ export class TunnelRegistrySync {
       if (fence && options?.tunnel) {
         this.unsettledReverseBindFenceIds.add(fence.fenceId);
         const tunnel = options.tunnel;
-        filtered.push({
+        const fenceEntry: TunnelRegistryEntry = {
           profileId: tunnel.profileId,
           serverId: tunnel.serverId,
           localPort: tunnel.localPort,
@@ -203,22 +204,46 @@ export class TunnelRegistrySync {
             routeIdentity: JSON.stringify(fence.routeIdentity),
             remotePort: fence.remotePort
           }
-        });
+        };
+        try {
+          // Publish first: a stale active-array save from any window cannot
+          // remove this separate key, and removal of our active row follows it.
+          await this.store.publishFence(fenceEntry);
+        } catch (error) {
+          this.unsettledReverseBindFenceIds.delete(fence.fenceId);
+          throw error;
+        }
       }
-      await this.saveEntries(filtered);
+      await this.store.saveEntries(filtered);
     });
 
     if (fence) {
+      if (fence.allocatedPort) {
+        void Promise.race([fence.allocatedPort, fence.settled.then(() => undefined)]).then((port) => {
+          if (port === undefined || port === 0) {
+            return;
+          }
+          return this.mutateEntries(async () => {
+            if (!this.unsettledReverseBindFenceIds.has(fence.fenceId)) {
+              return;
+            }
+            const current = await this.store.getEntries();
+            const entry = current.find((item) =>
+              item.ownerSessionId === this.sessionId && item.retiredReverseBind?.fenceId === fence.fenceId
+            );
+            if (entry?.retiredReverseBind) {
+              await this.store.publishFence({
+                ...entry,
+                remotePort: port,
+                retiredReverseBind: { ...entry.retiredReverseBind, remotePort: port }
+              });
+            }
+          });
+        });
+      }
       void fence.settled.then(() => this.mutateEntries(async () => {
         this.unsettledReverseBindFenceIds.delete(fence.fenceId);
-        const current = await this.store.getEntries();
-        const withoutFence = current.filter(
-          (entry) =>
-            !(entry.ownerSessionId === this.sessionId && entry.retiredReverseBind?.fenceId === fence.fenceId)
-        );
-        if (withoutFence.length !== current.length) {
-          await this.saveEntries(withoutFence);
-        }
+        await this.store.removeFence(fence.fenceId);
       }));
     }
   }
@@ -288,7 +313,7 @@ export class TunnelRegistrySync {
         (entry.retiredReverseBind !== undefined &&
           this.unsettledReverseBindFenceIds.has(entry.retiredReverseBind.fenceId))
       );
-      await this.saveEntries(filtered);
+      await this.store.saveEntries(filtered);
     });
   }
 
@@ -321,7 +346,11 @@ export class TunnelRegistrySync {
 
       // Update lastSeen on existing own entries
       for (const entry of ownEntries) {
-        if (entry.retiredReverseBind || activeTunnels.some((t) => t.profileId === entry.profileId)) {
+        if (entry.retiredReverseBind) {
+          if (this.unsettledReverseBindFenceIds.has(entry.retiredReverseBind.fenceId)) {
+            await this.store.publishFence({ ...entry, lastSeen: now });
+          }
+        } else if (activeTunnels.some((t) => t.profileId === entry.profileId)) {
           entry.lastSeen = now;
           changed = true;
         }
@@ -352,7 +381,7 @@ export class TunnelRegistrySync {
       }
 
       if (changed) {
-        await this.saveEntries(entries);
+        await this.store.saveEntries(entries);
       }
     });
   }
@@ -361,7 +390,7 @@ export class TunnelRegistrySync {
     await this.mutateEntries(async () => {
       const entries = await this.store.getEntries();
       const remote = entries.filter((e) => e.ownerSessionId !== this.sessionId && !e.retiredReverseBind);
-      const remoteForProbe = entries.filter((e) => e.ownerSessionId !== this.sessionId);
+      const remoteForProbe = entries.filter((e) => e.ownerSessionId !== this.sessionId && !e.retiredReverseBind);
       const now = Date.now();
 
       // Probe all remote entries concurrently.
@@ -384,7 +413,7 @@ export class TunnelRegistrySync {
         const cleaned = entries.filter(
           (e) => !staleProfileIds.has(`${e.ownerSessionId}:${e.profileId}`)
         );
-        await this.saveEntries(cleaned);
+        await this.store.saveEntries(cleaned);
         const cleanedRemote = cleaned.filter((e) => e.ownerSessionId !== this.sessionId && !e.retiredReverseBind);
         this.lastRemoteJson = JSON.stringify(cleanedRemote);
         this.core.setRemoteTunnels(cleanedRemote);
@@ -406,13 +435,4 @@ export class TunnelRegistrySync {
     return result;
   }
 
-  private async saveEntries(entries: TunnelRegistryEntry[]): Promise<void> {
-    // A read may return an old whole-array snapshot after settlement removed a
-    // fence. Keep the in-memory settlement state authoritative on every write.
-    await this.store.saveEntries(entries.filter((entry) =>
-      entry.ownerSessionId !== this.sessionId ||
-      !entry.retiredReverseBind ||
-      this.unsettledReverseBindFenceIds.has(entry.retiredReverseBind.fenceId)
-    ));
-  }
 }

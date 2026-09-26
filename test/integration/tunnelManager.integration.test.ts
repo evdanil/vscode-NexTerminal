@@ -1204,6 +1204,50 @@ describe("TunnelManager integration", () => {
     }
   });
 
+  it("announces the late allocated port of a stopped port-zero reverse request", async () => {
+    const connection = new ControlledForwardConnection();
+    connection.holdForward(1);
+    const factory = new OrderedConnectionFactory([connection]);
+    const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
+    manager = new TunnelManager(pool, pool);
+    const profile: TunnelProfile = {
+      id: "reverse-port-zero-stopped", name: "Port zero stopped", localPort: 12345,
+      remoteIP: "127.0.0.1", remotePort: 0, autoStart: false,
+      tunnelType: "reverse", remoteBindAddress: "127.0.0.1", localTargetIP: "127.0.0.1"
+    };
+    const events: TunnelEvent[] = [];
+    manager.onDidChange((event) => events.push(event));
+    const terminalLease = await pool.connect(testServer);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const starting = manager.start(profile, testServer).catch((error: unknown) => error);
+      await connection.waitForForwardAttempt(1);
+      const tunnelId = manager.getActiveTunnelId(profile.id);
+      expect(tunnelId).toBeDefined();
+      await manager.stop(tunnelId!);
+      const stopped = events.find((event) => event.type === "stopped");
+      expect(stopped).toMatchObject({ retiredReverseBind: { fenceId: tunnelId, remotePort: 0 } });
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(await starting).toBeInstanceOf(TunnelStoppedError);
+      connection.releaseForward(1, 34567);
+      if (stopped?.type === "stopped" && stopped.retiredReverseBind) {
+        await expect(stopped.retiredReverseBind.allocatedPort).resolves.toBe(34567);
+        let settled = false;
+        void stopped.retiredReverseBind.settled.then(() => { settled = true; });
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(settled).toBe(false);
+        terminalLease.dispose();
+        await expect(stopped.retiredReverseBind.settled).resolves.toBeUndefined();
+      }
+    } finally {
+      connection.rejectForward(1, new Error("Cleanup"));
+      terminalLease.dispose();
+      pool.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it("checks the captured transport route before requesting a reverse bind", async () => {
     const connection = new ControlledForwardConnection();
     const oldRoute = { kind: "direct", endpoint: { hosts: ["old-jump"], port: 22 } } as const;

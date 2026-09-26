@@ -88,5 +88,9 @@ export interface SessionSnapshot {
 
 export interface TunnelRegistryStore {
   getEntries(): Promise<TunnelRegistryEntry[]>;
+  /** Saves active entries; retired reverse binds are stored under separate keys. */
   saveEntries(entries: TunnelRegistryEntry[]): Promise<void>;
+  /** Independent keys keep a fence safe from another window's stale array save. */
+  publishFence(entry: TunnelRegistryEntry): Promise<void>;
+  removeFence(fenceId: string): Promise<void>;
 }
