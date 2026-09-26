@@ -91,7 +91,7 @@ All auth types support **keyboard-interactive 2FA**: `tryKeyboard` is enabled gl
 6. Output/input logs are written under extension global storage logs.
 7. Client errors raised after the connection is ready (keepalive timeout, protocol error) and every connection close are written to the **Nexus SSH** output channel, tagged with the server name, host, and ssh2's own `err.level`. Pre-ready errors are not logged there — they are returned to the connect flow, which handles auth retries and host-key prompts. The channel takes no configuration and stays inert until it is opened.
 
-On disconnect, pending highlighted output is flushed and terminal mouse-tracking modes are disabled through the local terminal output before the disconnect banner. The visible screen and scrollback remain intact; late data from the disconnected stream is ignored during and after reconnect.
+On disconnect, pending highlighted output is flushed, terminal mouse-tracking is disabled, and the active screen's Kitty keyboard-mode stack and flags are reset through local terminal output before the disconnect banner. The visible screen and scrollback remain intact; late data from the disconnected stream is ignored during and after reconnect.
 
 #### 4.4.1 SFTP File Explorer Operations
 - **Browse Files** (`nexus.files.browse`) selects an active connected SSH profile as the SFTP target.

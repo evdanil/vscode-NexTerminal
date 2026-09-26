@@ -4,7 +4,8 @@ import type { ServerConfig } from "../../src/models/config";
 import { SshPty } from "../../src/services/ssh/sshPty";
 import { CLEAR_VISIBLE_SCREEN } from "../../src/services/terminal/terminalEscapes";
 
-const RESET_MOUSE_TRACKING = "\x1b[?9;1000;1002;1003;1006;1016l";
+const RESET_TERMINAL_MODES = "\x1b[?9;1000;1002;1003;1006;1016l\x1b[<9999u\x1b[=0;1u";
+const KITTY_KEYBOARD_MODE_ENABLE = "\x1b[>1u";
 
 const { mockShowErrorMessage } = vi.hoisted(() => ({
   mockShowErrorMessage: vi.fn()
@@ -541,7 +542,7 @@ describe("SshPty", () => {
     pty.dispose();
   });
 
-  it("flushes buffered highlighted output before disconnect messaging", async () => {
+  it("flushes buffered Kitty keyboard-mode changes before disconnect cleanup", async () => {
     const stream = new PassThrough();
     const { connection, emitClose } = createConnection(stream);
     const sshFactory = { connect: vi.fn(async () => connection) };
@@ -579,8 +580,8 @@ describe("SshPty", () => {
     pty.open();
     await flushAsync();
 
-    stream.push("ERR");
-    expect(highlighterStream.push).toHaveBeenCalledWith("ERR");
+    stream.push(KITTY_KEYBOARD_MODE_ENABLE);
+    expect(highlighterStream.push).toHaveBeenCalledWith(KITTY_KEYBOARD_MODE_ENABLE);
     expect(writes).toEqual([]);
 
     emitClose();
@@ -588,8 +589,8 @@ describe("SshPty", () => {
 
     expect(highlighter.createStream).toHaveBeenCalledTimes(1);
     expect(highlighterStream.flush).toHaveBeenCalledTimes(1);
-    expect(writes[0]).toBe("[hl]ERR");
-    expect(writes[1]).toBe(RESET_MOUSE_TRACKING);
+    expect(writes[0]).toBe(`[hl]${KITTY_KEYBOARD_MODE_ENABLE}`);
+    expect(writes[1]).toBe(RESET_TERMINAL_MODES);
     expect(writes.slice(2).join("")).toContain("Connection lost");
 
     pty.dispose();
@@ -752,7 +753,7 @@ describe("SshPty", () => {
     first.emitClose();
     await flushAsync();
     expect(callbacks.onDisconnected).toHaveBeenCalledTimes(1);
-    expect(writes.filter((text) => text === RESET_MOUSE_TRACKING)).toHaveLength(1);
+    expect(writes.filter((text) => text === RESET_TERMINAL_MODES)).toHaveLength(1);
 
     pty.handleInput("R");
     await Promise.resolve();
@@ -772,13 +773,13 @@ describe("SshPty", () => {
     // that session down or emit another terminal-mode cleanup sequence.
     first.emitClose();
     expect(callbacks.onDisconnected).toHaveBeenCalledTimes(1);
-    expect(writes.filter((text) => text === RESET_MOUSE_TRACKING)).toHaveLength(1);
+    expect(writes.filter((text) => text === RESET_TERMINAL_MODES)).toHaveLength(1);
 
     pty.dispose();
   });
 
   it.each(["connection close", "stream end", "stream close", "stream error"])(
-    "resets mouse tracking after %s without clearing the screen or writing to the transport",
+    "resets terminal modes after %s without clearing the screen or writing to the transport",
     async (cause) => {
       const stream = new PassThrough();
       const { connection, emitClose } = createConnection(stream);
@@ -795,7 +796,7 @@ describe("SshPty", () => {
 
       pty.open();
       await flushAsync();
-      expect(writes.join("")).not.toContain(RESET_MOUSE_TRACKING);
+      expect(writes.join("")).not.toContain(RESET_TERMINAL_MODES);
       const transportWrite = vi.spyOn(stream, "write");
 
       switch (cause) {
@@ -815,13 +816,13 @@ describe("SshPty", () => {
       await flushAsync();
 
       const output = writes.join("");
-      expect(writes.filter((text) => text === RESET_MOUSE_TRACKING)).toHaveLength(1);
+      expect(writes.filter((text) => text === RESET_TERMINAL_MODES)).toHaveLength(1);
       expect(output).not.toContain("\x1bc");
       expect(output).not.toContain("\x1b[!p");
       expect(output).not.toContain("\x1b[2J");
       expect(output).not.toContain("\x1b[3J");
       expect(transportWrite).not.toHaveBeenCalled();
-      const resetIndex = writes.indexOf(RESET_MOUSE_TRACKING);
+      const resetIndex = writes.indexOf(RESET_TERMINAL_MODES);
       const bannerIndex = writes.findIndex((text) =>
         text.includes("Remote host closed the session") || text.includes("Connection lost")
       );
@@ -931,9 +932,10 @@ describe("SshPty", () => {
     pty.dispose();
   });
 
-  it("markShuttingDown() writes a farewell banner, tears down transport, and keeps the tab open", async () => {
+  it("markShuttingDown() resets terminal modes once if dispose closes synchronously", async () => {
     const stream = new PassThrough();
-    const { connection } = createConnection(stream);
+    const { connection, emitClose } = createConnection(stream);
+    connection.dispose.mockImplementation(emitClose);
     const sshFactory = { connect: vi.fn(async () => connection) };
     const callbacks = {
       onSessionOpened: vi.fn(),
@@ -978,12 +980,16 @@ describe("SshPty", () => {
 
     pty.markShuttingDown("Nexus extension is shutting down. This session has been closed.");
 
+    expect(writes.filter((text) => text.includes("\x1b[?9;1000;1002;1003;1006;1016l"))).toHaveLength(1);
+    expect(writes.filter((text) => text === RESET_TERMINAL_MODES)).toHaveLength(1);
     expect(highlighterStream.flush).toHaveBeenCalledTimes(1);
     expect(writes[0]).toBe("[hl]pending output");
-    expect(writes[1]).toBe(RESET_MOUSE_TRACKING);
+    expect(writes[1]).toBe(RESET_TERMINAL_MODES);
     expect(writes.join("")).toContain("Nexus extension is shutting down");
     expect(writes.join("")).toContain("Close this terminal and start a new session to reconnect.");
-    expect(writes.filter((text) => text === RESET_MOUSE_TRACKING)).toHaveLength(1);
+    expect(callbacks.onDisconnected).not.toHaveBeenCalled();
+    expect(writes.join("")).not.toContain("Connection lost");
+    expect(writes.join("")).not.toContain("Press R to reconnect");
     expect(writes.join("")).not.toContain(CLEAR_VISIBLE_SCREEN);
     expect(writes.join("")).not.toContain("\x1b[2J");
     expect(writes.join("")).not.toContain("\x1b[3J");

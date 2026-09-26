@@ -21,7 +21,9 @@ import { createAnsiRegex } from "../../utils/ansi";
 // malicious banner can't manipulate terminal state or spoof the prompt.
 const AUTH_MESSAGE_ANSI_RE = createAnsiRegex();
 const AUTH_MESSAGE_CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
-const RESET_MOUSE_TRACKING = "\x1b[?9;1000;1002;1003;1006;1016l";
+// Kitty keeps a bounded keyboard-mode stack per screen. Drain the active
+// stack before zeroing its flags so a later pop cannot restore stale key modes.
+const RESET_TERMINAL_MODES = "\x1b[?9;1000;1002;1003;1006;1016l\x1b[<9999u\x1b[=0;1u";
 
 export interface SshPtyCallbacks {
   onSessionOpened(sessionId: string): void;
@@ -164,6 +166,9 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       return;
     }
     this.shuttingDown = true;
+    // Fence synchronous close callbacks during teardown from entering the
+    // reconnectable-disconnect path.
+    this.disconnected = true;
     this.observerHub.pauseIntervalMacros();
     this.highlighterStream?.flush();
     // Extension deactivate reaches the PTYs here. The transcript writer is
@@ -173,8 +178,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.connection?.dispose();
     this.stream = undefined;
     this.connection = undefined;
-    this.disconnected = true;
-    this.writeEmitter.fire(RESET_MOUSE_TRACKING);
+    this.writeEmitter.fire(RESET_TERMINAL_MODES);
     this.activityIndicator = false;
     this.nameEmitter.fire(`${this.baseName} [Disconnected]`);
     this.writeEmitter.fire(`\r\n\r\n[Nexus SSH] ${reason}\r\n`);
@@ -219,7 +223,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.connection?.dispose();
     this.stream = undefined;
     this.connection = undefined;
-    this.writeEmitter.fire(RESET_MOUSE_TRACKING);
+    this.writeEmitter.fire(RESET_TERMINAL_MODES);
     this.logger.log(
       reason === "remote-closed"
         ? "remote host closed the session - entering disconnected state"

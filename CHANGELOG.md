@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.275] — 2026-09-26
+
+### Fixed
+
+- **SSH reconnects reset Kitty keyboard modes.** A disconnect now drains the active screen's Kitty keyboard-mode stack and clears its flags alongside mouse tracking, before reconnect guidance appears. The visible screen and scrollback remain intact, and late output from the old SSH connection is still ignored.
+
 ## [2.8.274] — 2026-09-26
 
 ### Fixed
