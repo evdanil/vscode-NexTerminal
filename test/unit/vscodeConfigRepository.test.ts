@@ -4,6 +4,8 @@ vi.mock("vscode", () => ({}));
 
 import { VscodeConfigRepository } from "../../src/storage/vscodeConfigRepository";
 import type { ServerConfig } from "../../src/models/config";
+import { computeSyncPlan } from "../../src/services/inventory/syncEngine";
+import { validateServerConfig } from "../../src/utils/validation";
 
 /**
  * A fake ExtensionContext whose globalState mirrors VS Code semantics: the
@@ -189,6 +191,27 @@ describe("VscodeConfigRepository corrupt globalState shapes", () => {
     const servers = await repo.getServers();
 
     expect(servers[0].origin).toEqual(origin);
+  });
+
+  it("removes stale address stamps from an addressless row so its first addressed sync keeps a valid server", async () => {
+    const placeholder: ServerConfig = {
+      ...validServer, host: "", port: 0, addressless: true,
+      origin: { sourceId: "src", externalId: "ext", syncedAt: 1, syncedHost: "10.0.0.1", syncedPort: 22, syncedUsername: "root" }
+    };
+    const repo = new VscodeConfigRepository(makeContext({ "nexus.servers": [placeholder] }));
+    const [loaded] = await repo.getServers();
+    expect(loaded.origin).toEqual({ sourceId: "src", externalId: "ext", syncedAt: 1, syncedUsername: "root" });
+    expect(placeholder.origin?.syncedHost).toBe("10.0.0.1");
+
+    const plan = computeSyncPlan({
+      source: { id: "src", providerId: "netbox", name: "Inventory", targetFolder: "Inventory", prunePolicy: "orphan", config: {}, secretFieldIds: [] },
+      tree: { contractVersion: 1, devices: [{ externalId: "ext", name: "Prod", endpoints: [{ kind: "ssh", host: "10.0.0.9", port: 22 }] }] },
+      currentServers: [loaded], now: 2
+    });
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after).toMatchObject({ host: "10.0.0.9", port: 22 });
+    expect(plan.updates[0].after.addressless).toBeUndefined();
+    expect(validateServerConfig(plan.updates[0].after)).toBe(true);
   });
 
   it("getServers keeps an origin carrying syncedUsername, and keeps one that omits it (kills a shape check that rejects the new member, or that requires it and strips every pre-existing server's origin)", async () => {

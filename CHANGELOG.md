@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.283] — 2026-09-26
+
+### Fixed
+
+- **Addressless imported servers retain their settings on their first addressed sync.** Storage load and backup/share import now remove contradictory console address stamps from a placeholder while preserving its origin and other fields, so a newly reported address fills the existing server instead of producing an invalid record that disappears after reload.
+
 ## [2.8.282] — 2026-09-26
 
 ### Fixed

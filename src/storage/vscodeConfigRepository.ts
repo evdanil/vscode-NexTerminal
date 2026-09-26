@@ -19,7 +19,8 @@ import {
   validateDeviceTemplate,
   validateSavedFilter,
   isValidServerOrigin,
-  isValidDetachedServerOrigin
+  isValidDetachedServerOrigin,
+  stripAddresslessOriginAddressStamps
 } from "../utils/validation";
 import { asArray } from "../utils/helpers";
 
@@ -334,7 +335,7 @@ export class VscodeConfigRepository implements ConfigRepository {
           sanitized = rest as ServerConfig;
         }
       }
-      result.push(sanitized);
+      result.push(stripAddresslessOriginAddressStamps(sanitized));
     }
     return result;
   }
