@@ -67,6 +67,7 @@ interface SharedProxyPasswordAnswer {
   credentialEndpointSignature?: string;
   owners: Array<(() => boolean) | undefined>;
   answer: Promise<{ password: string; save: boolean } | undefined>;
+  cancellationError?: Error;
 }
 
 /**
@@ -616,7 +617,8 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       }
     }
     if (!result) {
-      return { password: undefined };
+      shared.cancellationError ??= new Error(`Proxy password entry canceled for ${target.name}`);
+      throw shared.cancellationError;
     }
     if (isActive?.() === false) {
       if (shared.owners.every((owner) => owner?.() === false)) {

@@ -1508,6 +1508,31 @@ describe("ProxySshFactory", () => {
       expect(sentPasswords()).toEqual(["pw", "pw"]);
     });
 
+    it("propagates one cancellation error to every connect sharing a proxy prompt", async () => {
+      const server = makeServer({ proxy: authenticated });
+      servers.set(server.id, server);
+      const sentPasswords = await mockSocks();
+      let cancel!: (value: undefined) => void;
+      const prompt = vi.fn(() => new Promise<{ password: string; save: boolean } | undefined>((resolve) => {
+        cancel = resolve;
+      }));
+      const factory = await createFactoryWithPrompt(prompt);
+
+      const first = factory.connect(server);
+      const second = factory.connect(server);
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(1));
+      cancel(undefined);
+      const [firstError, secondError] = await Promise.all([
+        first.catch((error: unknown) => error),
+        second.catch((error: unknown) => error)
+      ]);
+
+      expect(firstError).toBeInstanceOf(Error);
+      expect(firstError).toBe(secondError);
+      expect((firstError as Error).message).toMatch(/proxy password entry canceled/i);
+      expect(sentPasswords()).toEqual([]);
+    });
+
     it("reuses an answer that a still-connecting connect has not stored yet", async () => {
       const server = makeServer({ proxy: authenticated });
       servers.set(server.id, server);
@@ -1543,11 +1568,11 @@ describe("ProxySshFactory", () => {
         .mockResolvedValueOnce({ password: "pw", save: true });
       const factory = await createFactoryWithPrompt(prompt);
 
-      await factory.connect(server);
+      await expect(factory.connect(server)).rejects.toThrow(/proxy password entry canceled/i);
       await factory.connect(server);
 
       expect(prompt).toHaveBeenCalledTimes(2);
-      expect(sentPasswords()).toEqual(["", "pw"]);
+      expect(sentPasswords()).toEqual(["pw"]);
     });
 
     it("asks again after a connection that used the answer fails", async () => {
