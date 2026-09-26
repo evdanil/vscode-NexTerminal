@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.274] — 2026-09-26
+
+### Fixed
+
+- **SSH disconnects release terminal mouse capture.** Disconnecting disables mouse-tracking modes in the terminal while preserving the screen and scrollback. Late output from the old SSH stream is ignored, including during reconnect.
+
 ## [2.8.273] — 2026-09-25
 
 ### Fixed

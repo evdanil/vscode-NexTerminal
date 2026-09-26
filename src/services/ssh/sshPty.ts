@@ -21,6 +21,7 @@ import { createAnsiRegex } from "../../utils/ansi";
 // malicious banner can't manipulate terminal state or spoof the prompt.
 const AUTH_MESSAGE_ANSI_RE = createAnsiRegex();
 const AUTH_MESSAGE_CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
+const RESET_MOUSE_TRACKING = "\x1b[?9;1000;1002;1003;1006;1016l";
 
 export interface SshPtyCallbacks {
   onSessionOpened(sessionId: string): void;
@@ -173,6 +174,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.stream = undefined;
     this.connection = undefined;
     this.disconnected = true;
+    this.writeEmitter.fire(RESET_MOUSE_TRACKING);
     this.activityIndicator = false;
     this.nameEmitter.fire(`${this.baseName} [Disconnected]`);
     this.writeEmitter.fire(`\r\n\r\n[Nexus SSH] ${reason}\r\n`);
@@ -217,6 +219,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.connection?.dispose();
     this.stream = undefined;
     this.connection = undefined;
+    this.writeEmitter.fire(RESET_MOUSE_TRACKING);
     this.logger.log(
       reason === "remote-closed"
         ? "remote host closed the session - entering disconnected state"
@@ -407,6 +410,9 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
 
       connection.onClose(() => this.handleDisconnect(generation));
       stream.on("data", (data: Buffer | string) => {
+        if (this.disposed || this.disconnected || generation !== this.connectionGeneration) {
+          return;
+        }
         const rawText = typeof data === "string" ? data : data.toString("utf8");
         const text = this.oscFilter.filter(rawText);
         this.logger.logOutput?.(`stdout ${JSON.stringify(text)}`);
