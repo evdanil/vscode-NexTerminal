@@ -329,7 +329,9 @@ export type InventorySourceValues = Record<string, string | number | boolean>; /
 export type InventorySourceSecrets = Record<string, string>; // from SecretStorage
 
 export interface InventoryProvider {
-  id: string; // e.g. "netbox"; unique in registry
+  /** Unique registry key, read once at registration; later edits do not move this registration or its sources. */
+  id: string; // e.g. "netbox"
+  /** Display name, read once at registration for forms, lists and the trust fingerprint. */
   label: string;
   /**
    * The fields the Add/Edit Source form shows for this provider, in order.

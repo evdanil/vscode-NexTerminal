@@ -50,6 +50,8 @@ import {
   DataManagementGroupItem,
   DataManagementActionItem
 } from "../../src/ui/settingsTreeProvider";
+import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
+import type { InventoryProvider } from "../../src/models/inventory";
 
 function createProvider(): SettingsTreeProvider {
   return new SettingsTreeProvider();
@@ -88,7 +90,7 @@ function makeRegistry(labels: Record<string, string>) {
   const listeners: Array<() => void> = [];
   return {
     registry: {
-      get: (id: string) => (labels[id] === undefined ? undefined : { label: labels[id] }),
+      labelOf: (id: string) => labels[id],
       onDidChange: (listener: () => void) => {
         listeners.push(listener);
         return () => {
@@ -555,6 +557,28 @@ describe("SettingsTreeProvider", () => {
 
       expect(listener).toHaveBeenCalledWith(undefined);
       expect((groupChildren(provider)[0] as InventorySourceItem).description).toBe("Acme CMDB \u2014 never synced");
+    });
+
+    it("repaints a late registration from its checked label after the provider mutates", () => {
+      const { core } = makeCore([{ id: "s1", providerId: "acme-cmdb", name: "Legacy" }]);
+      const registry = new InventoryProviderRegistry();
+      const tree = new SettingsTreeProvider(core as never, registry);
+      const listener = vi.fn();
+      tree.onDidChangeTreeData(listener);
+      const inventoryProvider: InventoryProvider = {
+        id: "acme-cmdb", label: "Acme CMDB", configFields: [],
+        testConnection: async () => {},
+        fetchInventory: async () => ({ contractVersion: 1, devices: [] })
+      };
+
+      registry.register(inventoryProvider);
+      Object.defineProperties(inventoryProvider, {
+        id: { get: () => { throw new Error("live id read"); } },
+        label: { get: () => { throw new Error("live label read"); } }
+      });
+
+      expect(listener).toHaveBeenCalledWith(undefined);
+      expect((groupChildren(tree)[0] as InventorySourceItem).description).toBe("Acme CMDB \u2014 never synced");
     });
 
     it("unsubscribes from the registry on dispose (⊘ an un-disposed listener fires into a dead emitter for the rest of the session)", () => {

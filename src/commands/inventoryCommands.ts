@@ -25,7 +25,7 @@ import {
   type InventorySourceValues,
   type InventoryTree
 } from "../models/inventory";
-import type { InventoryProviderRegistry } from "../services/inventory/providerRegistry";
+import type { InventoryProviderRegistry, ProviderRegistrationSnapshot } from "../services/inventory/providerRegistry";
 // Shared with ui/settingsTreeProvider.ts so both surfaces describe a source identically.
 import { sourceDescription } from "../services/inventory/sourceDescription";
 import {
@@ -311,11 +311,10 @@ async function restampProviderFingerprintBestEffort(core: NexusCore, syncSnapsho
  */
 async function checkProviderFingerprint(
   source: InventorySourceConfig,
-  provider: InventoryProvider,
-  configFields: readonly InventoryConfigField[],
+  providerSnapshot: ProviderRegistrationSnapshot,
   confirmedProviderShapes: Map<string, ProviderShapeConfirmation>
 ): Promise<{ outcome: "ok"; fingerprintToStamp: string | undefined } | { outcome: "cancelled" }> {
-  const currentProviderFingerprint = computeProviderFingerprint({ label: provider.label, configFields });
+  const currentProviderFingerprint = computeProviderFingerprint(providerSnapshot);
   if (sourceTrustsProviderShape(source, currentProviderFingerprint)) {
     // Unstamped => there is nothing to compare against, and the stamp is the
     // caller's to write on its own success path. Matching => already stamped
@@ -431,11 +430,10 @@ type ProviderShapeConfirmation = { fingerprint: string; revision: string | undef
  */
 function providerShapeIsTrusted(
   source: InventorySourceConfig,
-  provider: InventoryProvider,
-  configFields: readonly InventoryConfigField[],
+  providerSnapshot: ProviderRegistrationSnapshot,
   confirmedProviderShapes: ReadonlyMap<string, ProviderShapeConfirmation>
 ): boolean {
-  const currentProviderFingerprint = computeProviderFingerprint({ label: provider.label, configFields });
+  const currentProviderFingerprint = computeProviderFingerprint(providerSnapshot);
   if (sourceTrustsProviderShape(source, currentProviderFingerprint)) {
     return true;
   }
@@ -480,12 +478,11 @@ function providerShapeIsTrusted(
  */
 async function providerStillTrustedSilently(
   source: InventorySourceConfig,
-  provider: InventoryProvider,
-  configFields: readonly InventoryConfigField[],
+  providerSnapshot: ProviderRegistrationSnapshot,
   vault: SecretVault,
   confirmedProviderShapes: ReadonlyMap<string, ProviderShapeConfirmation>
 ): Promise<SilentProviderTrust> {
-  if (!providerShapeIsTrusted(source, provider, configFields, confirmedProviderShapes)) {
+  if (!providerShapeIsTrusted(source, providerSnapshot, confirmedProviderShapes)) {
     return { trusted: false };
   }
   const secrets: InventorySourceSecrets = {};
@@ -621,7 +618,7 @@ async function promptProviderPick(registry: InventoryProviderRegistry): Promise<
     return { provider: providers[0] };
   }
   const pick = await vscode.window.showQuickPick(
-    providers.map((provider) => ({ label: provider.label, provider })),
+    providers.map((provider) => ({ label: registry.snapshotOf(provider).label, provider })),
     { title: "Select Inventory Provider" }
   );
   return pick ? { provider: pick.provider } : undefined;
@@ -1245,9 +1242,8 @@ export interface NewInventorySourceInput {
   renderedAuthProfile: RenderedSourceAuthProfile | undefined;
   defaultUsername: string;
   prunePolicy: InventoryPrunePolicy;
-  provider: InventoryProvider;
-  /** `provider`'s fields as the registry keeps them (`configFieldsOf`) — the list the form was built from. */
-  configFields: readonly InventoryConfigField[];
+  /** The checked registration data the form was built from. */
+  providerSnapshot: ProviderRegistrationSnapshot;
   config: InventorySourceValues;
   secrets: InventorySourceSecrets;
   /** DEVICE TEMPLATES (PR-T1b) — the catch-all rule (or `[]`) the Device
@@ -1273,7 +1269,8 @@ async function persistNewInventorySource(
   vault: SecretVault,
   input: NewInventorySourceInput
 ): Promise<InventorySourceConfig> {
-  const { name, targetFolder, authProfileId, renderedAuthProfile, defaultUsername, prunePolicy, provider, configFields, config, secrets, templateRules } = input;
+  const { name, targetFolder, authProfileId, renderedAuthProfile, defaultUsername, prunePolicy, providerSnapshot, config, secrets, templateRules } = input;
+  const { configFields } = providerSnapshot;
   const id = randomUUID();
   const passwordFieldIds = configFields.filter((f) => f.type === "password").map((f) => f.id);
 
@@ -1367,10 +1364,9 @@ async function persistNewInventorySource(
       throw new Error(templateRuleRejection);
     }
 
-    // ITEM A — stamp the provider's fingerprint at creation time: the user
-    // is knowingly configuring against WHICHEVER registrant currently holds
-    // `provider.id` right now, so that registrant's observable shape is the
-    // baseline every later sync compares against.
+    // ITEM A — stamp the exact registration the form showed. If another
+    // provider takes its id while the form is open, the next credential-spending
+    // path compares that replacement against this stamp and asks first.
     //
     // Built HERE, below the re-resolve rather than above it, because
     // `defaultUsername` is derived from the profile that resolve produced.
@@ -1379,7 +1375,7 @@ async function persistNewInventorySource(
     // untouched.
     const source: InventorySourceConfig = {
       id,
-      providerId: provider.id,
+      providerId: providerSnapshot.id,
       name,
       targetFolder,
       prunePolicy,
@@ -1390,7 +1386,7 @@ async function persistNewInventorySource(
       defaultUsername: fallbackUsernameForSource(linkedProfile, defaultUsername),
       config,
       secretFieldIds,
-      providerFingerprint: computeProviderFingerprint({ label: provider.label, configFields }),
+      providerFingerprint: computeProviderFingerprint(providerSnapshot),
       // DEVICE TEMPLATES (PR-T1b) — a representable select resolved to `[]` or one
       // catch-all rule; `undefined` (fallback shown / never touched) stores none.
       ...(templateRules !== undefined ? { templateRules } : {})
@@ -1427,9 +1423,8 @@ export interface UpdatedInventorySourceInput {
   renderedAuthProfile: RenderedSourceAuthProfile | undefined;
   defaultUsername: string;
   prunePolicy: InventoryPrunePolicy;
-  provider: InventoryProvider;
   /** As `NewInventorySourceInput`. */
-  configFields: readonly InventoryConfigField[];
+  providerSnapshot: ProviderRegistrationSnapshot;
   config: InventorySourceValues;
   /** Only fields the user actually re-typed this run — a blank/kept field is omitted. */
   reenteredSecrets: InventorySourceSecrets;
@@ -1457,7 +1452,8 @@ async function persistUpdatedInventorySource(
   source: InventorySourceConfig,
   input: UpdatedInventorySourceInput
 ): Promise<InventorySourceConfig> {
-  const { name, targetFolder, authProfileId, renderedAuthProfile, defaultUsername, prunePolicy, provider, configFields, config, reenteredSecrets, templateRules } = input;
+  const { name, targetFolder, authProfileId, renderedAuthProfile, defaultUsername, prunePolicy, providerSnapshot, config, reenteredSecrets, templateRules } = input;
+  const { configFields } = providerSnapshot;
   const existingSecretFieldIds = new Set(source.secretFieldIds);
 
   return configMutationLock.runExclusive(async (): Promise<InventorySourceConfig> => {
@@ -1585,7 +1581,7 @@ async function persistUpdatedInventorySource(
       defaultUsername: fallbackUsernameForSource(linkedProfile, defaultUsername),
       config,
       secretFieldIds: newSecretFieldIds,
-      providerFingerprint: computeProviderFingerprint({ label: provider.label, configFields }),
+      providerFingerprint: computeProviderFingerprint(providerSnapshot),
       // DEVICE TEMPLATES (PR-T1b) — a representable select supplies the new rule
       // list; `undefined` (fallback shown / non-representable) keeps the source's
       // existing rules, which `...source` above already carried forward. Assigned
@@ -2889,7 +2885,8 @@ export function registerInventoryCommands(
     // Issue #195 — the copy registration checked, read once for the whole flow:
     // the form is built from it, Test and Save parse against it, and Save stamps
     // its fingerprint. The provider's own array is never read.
-    const configFields = registry.configFieldsOf(provider);
+    const providerSnapshot = registry.snapshotOf(provider);
+    const configFields = providerSnapshot.configFields;
 
     // VERIFIED (post-#52 review) — addSource has no editSource-style
     // dispose-vs-in-flight-submit race to guard against: there is no id to
@@ -2909,7 +2906,7 @@ export function registerInventoryCommands(
     // no part in that sequencing. No closure-local tracking is needed here.
     const snapshot = core.getSnapshot();
     const definition = inventorySourceFormDefinition(
-      { label: provider.label, configFields },
+      providerSnapshot,
       undefined,
       mostCommonUsername(snapshot.servers),
       snapshot.authProfiles,
@@ -2936,7 +2933,7 @@ export function registerInventoryCommands(
     // `addSelectOption` after an inline create, both post one — and that is
     // what "rendered" means on this path.
     let renderedAuthProfile: RenderedSourceAuthProfile | undefined = undefined;
-    const panel = WebviewFormPanel.open(`inventory-source-add-${provider.id}`, definition, {
+    const panel = WebviewFormPanel.open(`inventory-source-add-${providerSnapshot.id}`, definition, {
       onSubmit: async (values) => {
         const parsed = await parseSourceFormValues(values, configFields);
         const created = await persistNewInventorySource(core, vault, {
@@ -2946,8 +2943,7 @@ export function registerInventoryCommands(
           renderedAuthProfile,
           defaultUsername: parsed.defaultUsername,
           prunePolicy: parsed.prunePolicy,
-          provider,
-          configFields,
+          providerSnapshot,
           config: parsed.config,
           secrets: parsed.secrets,
           // No existing rules on an Add — a representable submit either stores
@@ -2970,7 +2966,7 @@ export function registerInventoryCommands(
           }
         })();
       },
-      onTest: (values) => handleFormTest(values, provider, configFields, provider.label),
+      onTest: (values) => handleFormTest(values, provider, configFields, providerSnapshot.label),
       onCreateInline: (key, values) => {
         inlineAuthProfile.handleCreateInline(key);
         inlineDeviceTemplate.handleCreateInline(key);
@@ -3098,7 +3094,8 @@ export function registerInventoryCommands(
     }
     // Issue #195 — read once, beside `provider`, and used for the gate, the
     // form, Test and Save alike (see addSource's).
-    const configFields = registry.configFieldsOf(provider);
+    const providerSnapshot = registry.snapshotOf(provider);
+    const configFields = providerSnapshot.configFields;
 
     // F3 — gated BEFORE the form ever opens: the Edit form's Test button
     // hydrates kept (blank) secret fields straight from the vault (see
@@ -3110,7 +3107,7 @@ export function registerInventoryCommands(
     // gate only needs to decide whether editing may proceed at all, never a
     // fingerprintToStamp to carry forward.) The marker was already claimed
     // above, so a Cancel here must release it before returning.
-    const fingerprintCheck = await checkProviderFingerprint(source, provider, configFields, confirmedProviderShapes);
+    const fingerprintCheck = await checkProviderFingerprint(source, providerSnapshot, confirmedProviderShapes);
     if (fingerprintCheck.outcome === "cancelled") {
       releaseInFlight();
       return;
@@ -3125,7 +3122,7 @@ export function registerInventoryCommands(
     const deviceTemplates = core.getSnapshot().deviceTemplates;
     const savedFilters = core.getSnapshot().savedFilters;
     const definition = inventorySourceFormDefinition(
-      { label: provider.label, configFields },
+      providerSnapshot,
       source,
       undefined,
       authProfiles,
@@ -3183,8 +3180,7 @@ export function registerInventoryCommands(
               renderedAuthProfile,
               defaultUsername: parsed.defaultUsername,
               prunePolicy: parsed.prunePolicy,
-              provider,
-              configFields,
+              providerSnapshot,
               config: parsed.config,
               reenteredSecrets: parsed.secrets,
               // Representable submit → new rule list; fallback shown → undefined
@@ -3824,7 +3820,7 @@ export function registerInventoryCommands(
       // checkProviderFingerprint is the same helper editSource's own
       // pre-open gate uses, so the two flows can't drift on wording or on
       // when this confirmation fires.
-      const fingerprintCheck = await checkProviderFingerprint(source, provider, configFields, confirmedProviderShapes);
+      const fingerprintCheck = await checkProviderFingerprint(source, registry.snapshotOf(provider), confirmedProviderShapes);
       if (fingerprintCheck.outcome === "cancelled") {
         // Cancel (or dismiss) aborts before ANY vault.get for this source —
         // the required-secret loop and every other vault read below never run.
@@ -5475,7 +5471,7 @@ export function registerInventoryCommands(
           return [];
         }
         const configFields = registry.configFieldsOf(provider);
-        if (providerShapeIsTrusted(liveSource, provider, configFields, confirmedProviderShapes)) {
+        if (providerShapeIsTrusted(liveSource, registry.snapshotOf(provider), confirmedProviderShapes)) {
           return [];
         }
         // WHICH REMEDY THIS SOURCE CAN ACTUALLY FINISH. Sync Inventory Now is
@@ -5661,7 +5657,7 @@ export function registerInventoryCommands(
       // `providerStillTrustedSilently`.
       let trust: SilentProviderTrust;
       try {
-        trust = await providerStillTrustedSilently(source, provider, registry.configFieldsOf(provider), vault, confirmedProviderShapes);
+        trust = await providerStillTrustedSilently(source, registry.snapshotOf(provider), vault, confirmedProviderShapes);
       } catch {
         // A REJECTING VAULT READ — the only failure this call can produce, and
         // non-fatal per source exactly like the catch around the rest of the
@@ -6063,7 +6059,7 @@ export function registerInventoryCommands(
       // seconds after the user authorised it, and — on the manual form — warn
       // them to confirm a change they had only just confirmed, breaking the
       // promise the success toast makes.
-      const fingerprintCheck = await checkProviderFingerprint(source, provider, registry.configFieldsOf(provider), confirmedProviderShapes);
+      const fingerprintCheck = await checkProviderFingerprint(source, registry.snapshotOf(provider), confirmedProviderShapes);
       if (fingerprintCheck.outcome === "cancelled") {
         // Cancel (or dismiss) aborts before ANY vault read for this source and
         // before anything is dispatched at the node. Silent, like its siblings:
@@ -6242,7 +6238,7 @@ export function registerInventoryCommands(
     // so the latch here is simply what the shared gate does, not something this
     // path needs. Worth knowing before anyone reads it as a second blessing:
     // nothing persists, and no later interactive flow stops asking.
-    const fingerprintCheck = await checkProviderFingerprint(source, provider, registry.configFieldsOf(provider), confirmedProviderShapes);
+    const fingerprintCheck = await checkProviderFingerprint(source, registry.snapshotOf(provider), confirmedProviderShapes);
     if (fingerprintCheck.outcome === "cancelled") {
       // Cancel (or dismiss) aborts before ANY vault read for this source — the
       // capture below never runs. Silent, like its siblings: the modal the user

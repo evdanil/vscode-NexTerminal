@@ -5,6 +5,8 @@ import {
   sourceDescription,
   sourceDescriptionAbsolute
 } from "../../src/services/inventory/sourceDescription";
+import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
+import type { InventoryProvider } from "../../src/models/inventory";
 
 /**
  * P2-1 — two renderings of the same record's last-sync time. The Manage panel
@@ -41,7 +43,7 @@ describe("formatLastSyncAbsolute (Settings tree)", () => {
 });
 
 describe("sourceDescriptionAbsolute", () => {
-  const registry = { get: (id: string) => (id === "eve-ng" ? { label: "EVE-NG" } : undefined) };
+  const registry = { labelOf: (id: string) => (id === "eve-ng" ? "EVE-NG" : undefined) };
   it("pairs the provider label with the absolute stamp", () => {
     expect(sourceDescriptionAbsolute({ providerId: "eve-ng", lastSyncAt: new Date("2026-08-17T04:30:00Z").getTime() }, registry as never)).toMatch(
       /^EVE-NG — synced \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/
@@ -54,5 +56,20 @@ describe("sourceDescriptionAbsolute", () => {
     const at = Date.now() - 3 * 60 * 60_000;
     expect(sourceDescription({ providerId: "eve-ng", lastSyncAt: at }, registry as never)).toContain("ago");
     expect(sourceDescriptionAbsolute({ providerId: "eve-ng", lastSyncAt: at }, registry as never)).not.toContain("ago");
+  });
+
+  it("keeps the registered label on later repaints even if a provider changes its getter", () => {
+    const registry = new InventoryProviderRegistry();
+    const provider: InventoryProvider = {
+      id: "unstable", label: "Stable Label", configFields: [],
+      testConnection: async () => {},
+      fetchInventory: async () => ({ contractVersion: 1, devices: [] })
+    };
+    registry.register(provider);
+    Object.defineProperty(provider, "label", { get: () => { throw new Error("live label read"); } });
+
+    const source = { providerId: "unstable", lastSyncAt: undefined };
+    expect(sourceDescription(source, registry)).toBe("Stable Label — never synced");
+    expect(sourceDescriptionAbsolute(source, registry)).toBe("Stable Label — never synced");
   });
 });

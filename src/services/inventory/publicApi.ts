@@ -32,14 +32,14 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  * OBSERVABLE shape, taken at the moment the source was created, last edited,
  * or last synced successfully (see `computeProviderFingerprint()` in
  * `models/inventory.ts`, which also explains each exclusion). WHAT IT HASHES:
- * the provider's `label`, and its `configFields` — each field's `id`, `label`,
+ * the provider's registered `label`, and its `configFields` — each field's `id`, `label`,
  * `type` and `required` flag, plus a select field's `options` — in the
  * provider's own declared ORDER, so reordering the list is a new shape just as
- * renaming a field is. The `configFields` hashed are the ones the provider
- * REGISTERED with: the registry checks the list and keeps a copy of it when
- * `registerInventoryProvider` is called, and the form, the sync and this hash
- * all read that copy. An edit the provider makes to its array afterwards
- * reaches none of them. What it does NOT hash is everything that describes how a
+ * renaming a field is. The registry checks `id` and `label` once and keeps
+ * them with a frozen copy of `configFields` when `registerInventoryProvider`
+ * is called. Forms, lists, source records and this hash use those registered
+ * values; later edits to the provider object's id, label or field array reach
+ * none of them. What it does NOT hash is everything that describes how a
  * value is entered rather than what the source is configured with (`advanced`,
  * `defaultValue`, `min`/`max`, `integer`, `placeholder`, `description`) and the
  * `id` itself: hashing the id would make every mismatch invisible, since a
@@ -103,7 +103,7 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  *
  * The practical consequence for a provider author: DO NOT CHANGE `label` or
  * `configFields` casually on an id that already has sources configured against
- * it. A `configFields` change takes effect only through a new registration:
+ * it. Neither change takes effect on a registered object; use a new registration:
  * dispose the old registration, then register a fresh provider object with the
  * same id. The registry rejects the same provider object again, even after
  * disposal, because a form or prompt may still be holding it. Every such

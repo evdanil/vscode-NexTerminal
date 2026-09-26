@@ -19,6 +19,31 @@ function makeProvider(overrides: Partial<InventoryProvider> = {}): InventoryProv
 }
 
 describe("InventoryProviderRegistry", () => {
+  it("stores exactly the id and label checked once at registration, including through dispose", () => {
+    const registry = new InventoryProviderRegistry();
+    const provider = makeProvider();
+    let idReads = 0;
+    let labelReads = 0;
+    Object.defineProperties(provider, {
+      id: { configurable: true, get: () => (++idReads === 1 ? "netbox" : "changed") },
+      label: { configurable: true, get: () => (++labelReads === 1 ? "NetBox" : 42) }
+    });
+
+    const registration = registry.register(provider);
+    expect(idReads).toBe(1);
+    expect(labelReads).toBe(1);
+    expect(registry.get("netbox")).toBe(provider);
+    expect(registry.snapshotOf(provider)).toMatchObject({ id: "netbox", label: "NetBox" });
+    expect(Object.isFrozen(registry.snapshotOf(provider))).toBe(true);
+    expect(registry.labelOf("netbox")).toBe("NetBox");
+
+    registration.dispose();
+    expect(registry.get("netbox")).toBeUndefined();
+    expect(registry.labelOf("netbox")).toBeUndefined();
+    expect(idReads).toBe(1);
+    expect(labelReads).toBe(1);
+  });
+
   it("throws on duplicate id, and the first registration is still resolvable (kills last-write-wins)", () => {
     const registry = new InventoryProviderRegistry();
     const first = makeProvider({ label: "First" });
@@ -404,8 +429,10 @@ describe("InventoryProviderRegistry configFieldsOf", () => {
     const duplicate = makeProvider({ configFields: [token()] });
     expect(() => registry.register(duplicate)).toThrow(/already registered/i);
 
-    expect(() => registry.configFieldsOf(duplicate)).toThrow('Inventory provider "netbox" was never registered with this registry.');
-    expect(() => registry.configFieldsOf(makeProvider())).toThrow('Inventory provider "netbox" was never registered with this registry.');
+    expect(() => registry.configFieldsOf(duplicate)).toThrow("Inventory provider was never registered with this registry.");
+    const unknown = makeProvider();
+    Object.defineProperty(unknown, "id", { get: () => { throw new Error("live id read"); } });
+    expect(() => registry.configFieldsOf(unknown)).toThrow("Inventory provider was never registered with this registry.");
   });
 });
 

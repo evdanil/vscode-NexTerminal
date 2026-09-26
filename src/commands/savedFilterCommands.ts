@@ -36,7 +36,7 @@ function emptyStateMessage(registry: InventoryProviderRegistry): string {
   const withPicker = registry
     .list()
     .filter((provider) => savedFilterTarget(registry.configFieldsOf(provider)) !== undefined)
-    .map((provider) => flattenProviderText(provider.label))
+    .map((provider) => flattenProviderText(registry.snapshotOf(provider).label))
     .filter((label) => label !== "");
   if (withPicker.length === 0) {
     return "No saved filters yet. Create one here.";
