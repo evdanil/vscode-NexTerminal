@@ -99,7 +99,7 @@ interface SharedPromptAnswer {
   answer: Promise<PasswordPromptResult | undefined>;
   /** A current joiner can own the prompt if the original request goes stale. */
   requests: Array<{
-    ask: () => Promise<PasswordPromptResult | undefined>;
+    ask: (signal?: AbortSignal) => Promise<PasswordPromptResult | undefined>;
     provenance?: PromptAnswerProvenance;
     isActive?: () => boolean;
   }>;
@@ -460,11 +460,11 @@ export class SilentAuthSshFactory implements SshFactory {
       const prompted = await this.promptShared(
         passphraseKey,
         resolved.keyPath ?? "",
-        () =>
+        (signal) =>
           this.prompt.prompt({
             ...resolved,
             name: `${server.name} (key passphrase)`
-          }),
+          }, signal),
         `Passphrase entry canceled for ${server.name}`,
         promptProvenance,
         options?.isActive
@@ -617,7 +617,7 @@ export class SilentAuthSshFactory implements SshFactory {
     const prompted = await this.promptShared(
       passwordKey,
       typedFor,
-      () => this.prompt.prompt({ ...resolved, name: server.name }),
+      (signal) => this.prompt.prompt({ ...resolved, name: server.name }, signal),
       `Password entry canceled for ${server.name}`,
       promptProvenance,
       options?.isActive
@@ -712,31 +712,31 @@ export class SilentAuthSshFactory implements SshFactory {
   private async promptShared(
     vaultKey: string,
     typedFor: string | undefined,
-    ask: () => Promise<PasswordPromptResult | undefined>,
+    ask: (signal?: AbortSignal) => Promise<PasswordPromptResult | undefined>,
     cancellationMessage: string,
     provenance?: PromptAnswerProvenance,
     isActive?: () => boolean
   ): Promise<{ result: PasswordPromptResult; settle: () => void; joined: boolean; provenance?: PromptAnswerProvenance }> {
     if (typedFor === undefined) {
-      const result = await this.promptExclusively(() => {
+      const result = await this.promptExclusively(() => this.promptUntilOwnersInactive((signal) => {
         if (isActive?.() === false) {
           throw new Error("SSH connection attempt ended before its prompt opened");
         }
         this.assertCredentialRecordCurrent(provenance);
-        return ask();
-      });
+        return ask(signal);
+      }, () => [isActive]));
       this.assertAttemptActive(isActive);
       if (!result) throw new Error(cancellationMessage);
       return { result, settle: () => {}, joined: false, provenance };
     }
     const request = { ask, provenance, isActive };
-    const promptCurrentRequest = (shared: SharedPromptAnswer): Promise<PasswordPromptResult | undefined> => {
+    const promptCurrentRequest = (shared: SharedPromptAnswer, signal?: AbortSignal): Promise<PasswordPromptResult | undefined> => {
       const current = shared.requests.find(
         (waiting) => waiting.isActive?.() !== false && this.isCredentialRecordCurrent(waiting.provenance)
       );
       if (current) {
         shared.provenance = current.provenance;
-        return current.ask();
+        return current.ask(signal);
       }
       if (shared.requests.every((waiting) => waiting.isActive?.() === false)) {
         throw new Error("SSH connection attempt ended before its prompt opened");
@@ -761,7 +761,10 @@ export class SilentAuthSshFactory implements SshFactory {
         requests,
         answer: Promise.resolve(undefined)
       };
-      own.answer = this.promptExclusively(() => promptCurrentRequest(own));
+      own.answer = this.promptExclusively(() => this.promptUntilOwnersInactive(
+        (signal) => promptCurrentRequest(own, signal),
+        () => own.requests.map((waiting) => waiting.isActive)
+      ));
       shared = own;
       this.sharedAnswers.set(vaultKey, shared);
     } else {
@@ -795,6 +798,32 @@ export class SilentAuthSshFactory implements SshFactory {
       throw new Error("SSH connection attempt ended before authentication completed");
     }
     return { result, settle, joined, provenance: own.provenance };
+  }
+
+  private async promptUntilOwnersInactive(
+    ask: (signal: AbortSignal) => Promise<PasswordPromptResult | undefined>,
+    owners: () => Array<(() => boolean) | undefined>
+  ): Promise<PasswordPromptResult | undefined> {
+    const controller = new AbortController();
+    let rejectAbandoned!: (error: Error) => void;
+    const abandoned = new Promise<never>((_resolve, reject) => { rejectAbandoned = reject; });
+    const checkOwners = (): void => {
+      const current = owners();
+      if (current.length > 0 && current.every((owner) => owner?.() === false)) {
+        rejectAbandoned(new Error("SSH connection attempt ended during its prompt"));
+        controller.abort();
+      }
+    };
+    // The connection owners expose a liveness function, not an event. Poll only
+    // while a dialog is open so an abandoned input can release the prompt queue.
+    const checkTimer = setInterval(checkOwners, 50);
+    try {
+      checkOwners();
+      if (controller.signal.aborted) return await abandoned;
+      return await Promise.race([ask(controller.signal), abandoned]);
+    } finally {
+      clearInterval(checkTimer);
+    }
   }
 
   private assertAttemptActive(isActive?: () => boolean): void {
