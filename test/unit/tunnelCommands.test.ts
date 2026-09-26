@@ -607,6 +607,52 @@ describe("startTunnel — retired reverse-bind reservations", () => {
     );
     expect(start).toHaveBeenCalledOnce();
   });
+
+  it("ends a cross-window reservation wait when the pending reverse start is stopped", async () => {
+    const profile = makeTunnel({ tunnelType: "reverse", remotePort: 9000 });
+    const ctx = await setupContext([profile]);
+    const server: ServerConfig = {
+      id: "srv-1", name: "Target", host: "target", port: 22,
+      username: "ops", authType: "password", isHidden: false
+    };
+    await ctx.core.addOrUpdateServer(server);
+    const route = { kind: "direct", endpoint: { hosts: ["target"], port: 22 } } as const;
+    const registrySync = {
+      syncNow: vi.fn(async () => {}),
+      checkRemoteOwnership: vi.fn(async () => ({
+        ...makeRegistryEntry(profile.id),
+        retiredReverseBind: {
+          fenceId: "remote-pending",
+          routeIdentity: JSON.stringify(route),
+          remotePort: 9000
+        }
+      })),
+      waitForRemoteReverseBindClear: vi.fn(async (_bind: unknown, isCancelled: () => boolean) => {
+        expect(isCancelled()).toBe(true);
+        return false;
+      })
+    };
+    const start = vi.fn(async (_profile: TunnelProfile, _server: ServerConfig, options: {
+      beforeReverseForward?: (route: NetworkRouteIdentity, isStopping: () => boolean) => Promise<void>;
+    }) => {
+      await options.beforeReverseForward?.(route, () => true);
+      return makeActiveTunnel(profile.id);
+    });
+    mockWithProgress.mockImplementation(async (...args: unknown[]) => {
+      const task = args[1];
+      return typeof task === "function"
+        ? (task as (progress: unknown, token: { isCancellationRequested: boolean }) => Promise<unknown>)(
+            undefined, { isCancellationRequested: false }
+          )
+        : undefined;
+    });
+
+    await startTunnel(
+      ctx.core, { start } as never, { connect: vi.fn(async () => ({ dispose: vi.fn() })) } as never,
+      ctx.core.getTunnel(profile.id)!, ctx.core.getServer(server.id)!, "shared", registrySync as never
+    );
+    expect(registrySync.waitForRemoteReverseBindClear).toHaveBeenCalledOnce();
+  });
 });
 
 describe("startTunnel — a tunnel stopped before it finished starting", () => {

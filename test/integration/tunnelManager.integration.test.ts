@@ -1239,6 +1239,33 @@ describe("TunnelManager integration", () => {
     }
   });
 
+  it("passes stop state into a pending reverse reservation check", async () => {
+    const connection = new ControlledForwardConnection();
+    const factory = new OrderedConnectionFactory([connection]);
+    manager = new TunnelManager(factory, factory);
+    const profile: TunnelProfile = {
+      id: "reverse-wait-stopped", name: "Stopped wait", localPort: 12345,
+      remoteIP: "127.0.0.1", remotePort: 23456, autoStart: false,
+      tunnelType: "reverse", remoteBindAddress: "127.0.0.1", localTargetIP: "127.0.0.1"
+    };
+    const checkEntered = deferred<void>();
+    const starting = manager.start(profile, testServer, {
+      beforeReverseForward: async (_route, isStopping) => {
+        checkEntered.resolve(undefined);
+        while (!isStopping()) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 10));
+        }
+      }
+    }).catch((error: unknown) => error);
+
+    await checkEntered.promise;
+    const tunnelId = manager.getActiveTunnelId(profile.id);
+    expect(tunnelId).toBeDefined();
+    await manager.stop(tunnelId!);
+    expect(await starting).toBeInstanceOf(TunnelStoppedError);
+    expect(connection.forwardAttempts).toBe(0);
+  });
+
   it("holds a replacement reverse bind off a pooled transport whose cancel timed out", async () => {
     const oldTransport = new ControlledForwardConnection();
     oldTransport.holdCancel(1);

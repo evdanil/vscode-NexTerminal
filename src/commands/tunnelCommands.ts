@@ -158,7 +158,7 @@ export async function startTunnel(
   const checkRemoteOwner = async (reverseBind?: {
     routeIdentity: NetworkRouteIdentity;
     remotePort: number;
-  }): Promise<boolean> => {
+  }, isStopping: () => boolean = () => false): Promise<boolean> => {
     if (!registrySync) {
       return true;
     }
@@ -172,7 +172,7 @@ export async function startTunnel(
           cancellable: true
         },
         (_progress, token) =>
-          registrySync.waitForRemoteReverseBindClear(reverseBind, () => token.isCancellationRequested)
+          registrySync.waitForRemoteReverseBindClear(reverseBind, () => token.isCancellationRequested || isStopping())
       );
       if (!released) {
         return false;
@@ -236,8 +236,8 @@ export async function startTunnel(
 
   try {
     const beforeReverseForward = registrySync && resolveTunnelType(profile) === "reverse"
-      ? async (routeIdentity: NetworkRouteIdentity): Promise<void> => {
-          if (!await checkRemoteOwner({ routeIdentity, remotePort: profile.remotePort })) {
+      ? async (routeIdentity: NetworkRouteIdentity, isStopping: () => boolean): Promise<void> => {
+          if (!await checkRemoteOwner({ routeIdentity, remotePort: profile.remotePort }, isStopping)) {
             throw new TunnelStartCancelledError(profile.name);
           }
         }

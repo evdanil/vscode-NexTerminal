@@ -308,6 +308,29 @@ describe("TunnelRegistrySync", () => {
     expect(result).toBeDefined();
   });
 
+  it("finds a fresh reverse-bind fence after an expired matching fence", async () => {
+    const route = { kind: "direct", endpoint: { hosts: ["bastion"], port: 22 } } as const;
+    const fence = (fenceId: string, ownerSessionId: string, lastSeen: number) => makeEntry({
+      ownerSessionId,
+      tunnelType: "reverse",
+      lastSeen,
+      retiredReverseBind: {
+        fenceId,
+        routeIdentity: JSON.stringify(route),
+        remotePort: 9000
+      }
+    });
+    await store.saveEntries([
+      fence("expired", "crashed-window", Date.now() - 40_000),
+      fence("fresh", "live-window", Date.now())
+    ]);
+
+    await expect(sync.checkRemoteOwnership("different-profile", 12345, {
+      routeIdentity: route,
+      remotePort: 9000
+    })).resolves.toMatchObject({ retiredReverseBind: { fenceId: "fresh" } });
+  });
+
   it("syncWithProbe cleans stale remote entries", async () => {
     await store.saveEntries([makeEntry()]);
     probePort.mockResolvedValue(false);

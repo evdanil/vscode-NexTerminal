@@ -229,28 +229,27 @@ export class TunnelRegistrySync {
     reverseBind?: { routeIdentity: NetworkRouteIdentity; remotePort: number }
   ): Promise<TunnelRegistryEntry | undefined> {
     const entries = await this.store.getEntries();
-    const remote = entries.find(
-      (entry) => {
-        if (entry.ownerSessionId === this.sessionId) {
-          return false;
-        }
-        if (entry.retiredReverseBind) {
-          return reverseBind !== undefined &&
-            retiredRouteOverlaps(entry, reverseBind.routeIdentity, reverseBind.remotePort);
-        }
-        return entry.profileId === profileId || entry.localPort === localPort;
+    for (const entry of entries) {
+      if (entry.ownerSessionId === this.sessionId) {
+        continue;
       }
-    );
-    if (!remote) {
-      return undefined;
+      const matches = entry.retiredReverseBind
+        ? reverseBind !== undefined && retiredRouteOverlaps(entry, reverseBind.routeIdentity, reverseBind.remotePort)
+        : entry.profileId === profileId || entry.localPort === localPort;
+      if (!matches) {
+        continue;
+      }
+      // Reverse tunnels have no local listener to probe — use heartbeat staleness check.
+      if (entry.tunnelType === "reverse") {
+        const lastSeen = entry.lastSeen ?? entry.startedAt;
+        if (Date.now() - lastSeen < STALE_THRESHOLD_MS) {
+          return entry;
+        }
+      } else if (await this.probePort(entry.localPort)) {
+        return entry;
+      }
     }
-    // Reverse tunnels have no local listener to probe — use heartbeat staleness check
-    if (remote.tunnelType === "reverse") {
-      const lastSeen = remote.lastSeen ?? remote.startedAt;
-      return Date.now() - lastSeen < STALE_THRESHOLD_MS ? remote : undefined;
-    }
-    const alive = await this.probePort(remote.localPort);
-    return alive ? remote : undefined;
+    return undefined;
   }
 
   public async waitForRemoteReverseBindClear(
