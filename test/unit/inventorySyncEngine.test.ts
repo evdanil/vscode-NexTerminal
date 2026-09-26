@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { flattenProviderText } from "../../src/models/inventory";
 import {
   computeSyncPlan,
   planToApplication,
@@ -4802,7 +4803,16 @@ describe("normalizeInventoryTreeHosts", () => {
     expect(plan.updates[0].after.origin?.syncedHost).toBe("10.0.0.9");
   });
 
-  it.each(["10.0.0.9\u200b", "10.0.0.\u202e9", "10.0.0.9\x1b", "  "])(
+  it.each([
+    "10.0.0.9\u200b",
+    "10.0.0.\u202e9",
+    "10.0.0.9\u200c",
+    "10.0.0.9\u200d",
+    "10.0.0.9\ufe0f",
+    "10.0.0.9\u{e0067}",
+    "10.0.0.9\x1b",
+    "  "
+  ])(
     "drops an unusable endpoint instead of storing its host (%s)", (host) => {
       const tree: InventoryTree = { contractVersion: 1, devices: [{ externalId: "d1", name: "Device", endpoints: [{ kind: "ssh", host }] }] };
       const normalized = normalizeInventoryTreeHosts(tree);
@@ -4815,6 +4825,24 @@ describe("normalizeInventoryTreeHosts", () => {
       expect(plan.adds[0].host).toBe("");
     }
   );
+
+  it("preserves combining marks in a provider host", () => {
+    const host = "cafe\u0301.example";
+    const tree: InventoryTree = {
+      contractVersion: 1,
+      devices: [{ externalId: "d1", name: "Device", endpoints: [{ kind: "ssh", host }] }]
+    };
+
+    const normalized = normalizeInventoryTreeHosts(tree);
+
+    expect(normalized.devices[0].endpoints[0].host).toBe(host);
+    expect(normalized.warnings).toEqual([]);
+  });
+
+  it("keeps grapheme joiners, combining marks, and tag characters in provider prose", () => {
+    const prose = "👩\u200d💻 cafe\u0301 🏴\u{e0067}\u{e0062}\u{e0065}\u{e006e}\u{e0067}\u{e007f}";
+    expect(flattenProviderText(prose)).toBe(prose);
+  });
 });
 
 describe("planToApplication (F19 — no targetFolder parameter)", () => {

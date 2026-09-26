@@ -4799,13 +4799,12 @@ export function prunedServerIdsForSecretCleanup(plan: InventorySyncPlan): string
   return plan.prunes.filter((p) => p.policy === "delete").map((p) => p.server.id);
 }
 
-/**
- * F8: runtime shape check for a fetched InventoryTree — providers are
- * external code (built-in or third-party via the public API) and their
- * output must not be trusted at the contract boundary. Throws a plain Error
- * describing exactly which field is wrong; syncNow (Chunk B) wraps the
- * message as an InventoryProviderError("protocol", ...).
- */
+// Hosts have a stricter text contract than provider prose: default-ignorable
+// code points can make distinct endpoints render or resolve as the same name.
+// Keep this host-only so flattenProviderText can preserve grapheme sequences
+// when it sanitizes human-readable provider text.
+const INVISIBLE_HOST_CHAR_RE = /\p{Default_Ignorable_Code_Point}/u;
+
 /** Copy provider endpoints into the host spelling that sync and its remedies can use. */
 export function normalizeInventoryTreeHosts(tree: InventoryTree): InventoryTree {
   const warnings: string[] = [];
@@ -4817,7 +4816,12 @@ export function normalizeInventoryTreeHosts(tree: InventoryTree): InventoryTree 
         const host = endpoint.host.trim();
         // A host containing display-only characters could never match the
         // value shown in a plan warning or typed back into the server form.
-        if (host === "" || /\s/u.test(host) || flattenProviderText(host) !== host) {
+        if (
+          host === "" ||
+          /\s/u.test(host) ||
+          INVISIBLE_HOST_CHAR_RE.test(host) ||
+          flattenProviderText(host) !== host
+        ) {
           warnings.push(`Ignored an endpoint for ${flattenProviderText(device.name) || "(unnamed device)"} because its host is empty or contains unsupported characters.`);
           return [];
         }
@@ -4828,6 +4832,13 @@ export function normalizeInventoryTreeHosts(tree: InventoryTree): InventoryTree 
   };
 }
 
+/**
+ * F8: runtime shape check for a fetched InventoryTree — providers are
+ * external code (built-in or third-party via the public API) and their
+ * output must not be trusted at the contract boundary. Throws a plain Error
+ * describing exactly which field is wrong; syncNow (Chunk B) wraps the
+ * message as an InventoryProviderError("protocol", ...).
+ */
 export function validateInventoryTree(tree: unknown): asserts tree is InventoryTree {
   if (typeof tree !== "object" || tree === null) {
     throw new Error("tree is not an object");
