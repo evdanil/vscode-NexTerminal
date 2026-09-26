@@ -7650,7 +7650,7 @@ echo hi</textarea>
 					].includes(option)) {
 						if (index >= words.length) return false;
 						index++;
-					} else if (option !== "--" && !/^-[EnHSbkv]+$/.test(option)) {
+					} else if (option !== "--" && !/^-[EABbnSHkis]+$/.test(option)) {
 						return false;
 					};
 					if (option === "--") break;

@@ -1263,7 +1263,8 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     ['a comment', '# ipmitool -E\n'],
     ['a redirection target', 'echo hello >& ipmitool\n'],
     ['a literal backslash in double quotes', '"ipmi\\tool" -E\n'],
-    ['a fully quoted assignment-shaped command', '"FOO=bar" ipmitool -E\n']
+    ['a fully quoted assignment-shaped command', '"FOO=bar" ipmitool -E\n'],
+    ['a sudo validate request', 'sudo -v ipmitool -E\n']
   ])("does not treat %s as an ipmitool command", (_case, text) => {
     expect(sessionIpmiHintNote({ id: "a", name: "X", text, runIn: "session" })).toBeUndefined();
   });
@@ -1271,6 +1272,9 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
   it.each([
     ["an executable path", "/usr/bin/ipmitool -E\n"],
     ["a sudo command after its user option", "sudo -u root /usr/bin/ipmitool -E\n"],
+    ["a sudo login shell command", "sudo -i ipmitool -E\n"],
+    ["a sudo shell command", "sudo -s ipmitool -E\n"],
+    ["a sudo noninteractive command", "sudo -n ipmitool -E\n"],
     ["an env prefix", "env BMC=1 ipmitool -E\n"],
     ["a later command", "echo ready; ipmitool -E\n"],
     ["a command after a bare carriage return", "echo ready\ripmitool -E\r"],

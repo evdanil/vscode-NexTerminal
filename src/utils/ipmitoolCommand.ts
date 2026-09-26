@@ -19,7 +19,7 @@ export function textRunsIpmitool(text: string): boolean {
           if (["-u", "--user", "-g", "--group", "-p", "--prompt", "-C", "--close-from"].includes(option)) {
             if (index >= words.length) return false;
             index++;
-          } else if (option !== "--" && !/^-[EnHSbkv]+$/.test(option)) {
+          } else if (option !== "--" && !/^-[EABbnSHkis]+$/.test(option)) {
             return false;
           }
           if (option === "--") break;
