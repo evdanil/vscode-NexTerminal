@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.284] — 2026-09-26
+
+### Fixed
+
+- **Inventory sync keeps console addresses on one transport.** When a hand-entered host or port keeps a server on telnet while the source begins preferring SSH, the sync-owned address half now follows the telnet endpoint. A fully sync-owned server still moves its host, port and protocol to SSH together.
+
 ## [2.8.283] — 2026-09-26
 
 ### Fixed
