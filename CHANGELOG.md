@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- **Closing the last terminal releases an active credential prompt.** A password prompt tied to an abandoned pooled SSH connection is canceled so other queued credentials can proceed.
+- **Closing the last terminal releases an active credential prompt.** A server-password, proxy-password or key-passphrase prompt tied to an abandoned SSH connection is canceled so other queued credentials can proceed. A shared prompt stays open while another connection still needs it.
 
 ## [2.8.287] — 2026-09-26
 

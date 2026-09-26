@@ -509,24 +509,33 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     // prompt §5.3 assumed for a template's authenticated socks5/http proxy, which
     // carries no secret. Fired by ProxySshFactory only for a username-bearing proxy
     // with no stored `proxy-password-{id}`. Masked, never logged (matching the
-    // VscodePasswordPrompt discipline); on entry it stores the secret per-server so
-    // it is one-time (the per-server vault entry IS the §5.3 model), and returns
-    // undefined on cancel (ProxySshFactory then falls back to the prior behavior).
-    promptProxyPassword: async (server, proxy) => {
+    // VscodePasswordPrompt discipline); a chosen save waits for successful proxy
+    // and SSH authentication. Owner cancellation closes the input box and frees
+    // the shared prompt queue when no connection is waiting for its answer.
+    promptProxyPassword: async (server, proxy, signal) => {
       const label = proxy.type === "socks5" ? "SOCKS5" : "HTTP";
       const endpoint = proxy.username
         ? `${proxy.username}@${proxy.host}:${proxy.port}`
         : `${proxy.host}:${proxy.port}`;
-      const password = await vscode.window.showInputBox({
-        title: `Nexus ${label} Proxy Password`,
-        prompt: `Enter password for ${label} proxy ${endpoint}`,
-        password: true,
-        ignoreFocusOut: true
-      });
-      if (password === undefined) {
-        return undefined;
+      const cancellation = new vscode.CancellationTokenSource();
+      const abort = (): void => cancellation.cancel();
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+      try {
+        const password = await vscode.window.showInputBox({
+          title: `Nexus ${label} Proxy Password`,
+          prompt: `Enter password for ${label} proxy ${endpoint}`,
+          password: true,
+          ignoreFocusOut: true
+        }, cancellation.token);
+        if (password === undefined) {
+          return undefined;
+        }
+        return { password, save: true };
+      } finally {
+        signal.removeEventListener("abort", abort);
+        cancellation.dispose();
       }
-      return { password, save: true };
     },
     pool: {
       enabled: multiplexingConfig.get<boolean>("enabled", true),
