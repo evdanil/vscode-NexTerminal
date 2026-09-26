@@ -7,6 +7,7 @@ import { getAssignedBinding } from "../macroBindingHelpers";
 import type { MacroVariable, TerminalMacro } from "../models/terminalMacro";
 import { IPMI_GATEWAY_INERT_CREDENTIALS_HINT, MACRO_RUN_TARGETS, MACRO_RUN_TARGET_TRIGGER_CONFLICT_MESSAGE, macroProvidesIpmiCredentials, resolveMacroRoute, resolveMacroRunTarget } from "../models/terminalMacro";
 import { regexSafetyWebviewJs } from "../utils/regexSafety";
+import { ipmitoolCommandWebviewJs } from "../utils/ipmitoolCommand";
 import { buildMacroProfileSelectOptions, type MacroProfileOptionInput } from "./macroProfileOptions";
 import { MAX_MACRO_VARIABLES, getValidMacroVariables, macroVariablesWebviewJs } from "../services/macroVariables";
 import { PROFILE_TOKEN_TRIGGER_CONFLICT_MESSAGE, profileTokensWebviewJs } from "../services/profileTokens";
@@ -601,6 +602,7 @@ ${folderOptionsHtml}
       // hints below say exactly what a run will do.
       ${profileTokensWebviewJs()}
       ${macroCooldownWebviewJs()}
+      ${ipmitoolCommandWebviewJs()}
 
       function isValidBinding(value) {
         return VALID_PATTERN.test(value.trim().toLowerCase());
@@ -739,7 +741,7 @@ ${folderOptionsHtml}
         var text = document.getElementById("macro-text").value;
         var used = scanProfileTokens(text).used;
         var usesIpmiToken = used.indexOf("ipmiHost") !== -1 || used.indexOf("ipmiUsername") !== -1;
-        var looksIpmitool = /(^|\\s)ipmitool\\b/.test(text) || usesIpmiToken;
+        var looksIpmitool = textRunsIpmitool(text) || usesIpmiToken;
         var show = runInVal === "session" && looksIpmitool;
         document.getElementById("session-ipmitool-hint").style.display = show ? "" : "none";
       }

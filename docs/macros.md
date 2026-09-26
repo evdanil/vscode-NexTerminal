@@ -485,6 +485,11 @@ bare `ipmitool` invocation with `-E` and a whole IPMI profile token argument.
 Wrappers, scripts, shell operators, quoting, multiple commands, attached or
 clustered option words, the `--` option terminator, and other ambiguous forms
 are deliberately left alone.
+The exception is a simple quoted username after `-U`, such as `"ops;admin"`:
+the semicolon stays inside that argument, so the missing-password suggestion
+still applies. An unticked box does not prevent the command from running;
+when authentication needs a password, local `ipmitool -E` may ask for it in
+that terminal.
 The detector also stays silent when `-E` immediately follows another
 single-letter option; it does not guess whether `-E` is that option's operand.
 It also stays silent when the command supplies another password source (`-a`,
@@ -513,6 +518,10 @@ intend. To upgrade one: open the macro, set **Run in** → *Local terminal*, rep
 `-P $password` (or a typed-in password) with `-E`, and tick **Provide IPMI
 credentials**. The macro editor shows a hint the moment it sees an ipmitool
 command still set to *Session terminal*, and the send confirmation says the same.
+That hint looks for `ipmitool` in command position, including an executable path
+such as `/usr/bin/ipmitool`. A quoted mention, a comment, or a `sudo -u`
+username does not count; nested shell commands that cannot be placed reliably
+get no hint.
 The alternative is to delete the macro and re-insert the shipped template, which
 already has all of this set.
 

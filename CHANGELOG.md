@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.278] — 2026-09-26
+
+### Fixed
+
+- **Session IPMI hints recognize commands instead of mentions.** The send confirmation and Macro Editor now share a command-position check: a quoted mention, comment, or `sudo -u ipmitool` username no longer looks like a command, while `/usr/bin/ipmitool` does. Nested shell forms the check cannot place get no hint. The local credential suggestion now handles a simple quoted `-U` username containing a semicolon. This corrects the 2.8.273 entry's blanket claim that quoting never receives that suggestion; other complex quoting remains excluded. Without the checkbox, local `ipmitool -E` may prompt for a password when authentication needs one.
+
 ## [2.8.277] — 2026-09-26
 
 ### Fixed

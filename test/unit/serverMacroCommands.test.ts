@@ -1257,6 +1257,29 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     expect(sessionIpmiHintNote({ id: "a", name: "X", text: "myipmitoolwrapper --run\n", runIn: "session" })).toBeUndefined();
   });
 
+  it.each([
+    ['a quoted mention', 'echo "use ipmitool -E"\n'],
+    ['a sudo user', 'sudo -u ipmitool bmc-login\n'],
+    ['a comment', '# ipmitool -E\n']
+  ])("does not treat %s as an ipmitool command", (_case, text) => {
+    expect(sessionIpmiHintNote({ id: "a", name: "X", text, runIn: "session" })).toBeUndefined();
+  });
+
+  it.each([
+    ["an executable path", "/usr/bin/ipmitool -E\n"],
+    ["a sudo command after its user option", "sudo -u root /usr/bin/ipmitool -E\n"],
+    ["an env prefix", "env BMC=1 ipmitool -E\n"],
+    ["a later command", "echo ready; ipmitool -E\n"]
+  ])("recognizes ipmitool in command position with %s", (_case, text) => {
+    expect(sessionIpmiHintNote({ id: "a", name: "X", text, runIn: "session" })).toBeDefined();
+  });
+
+  it("keeps quoted separators inside arguments and avoids guessing at nested shell commands", () => {
+    expect(sessionIpmiHintNote({ id: "a", name: "X", text: 'ipmitool -U "ops;admin" -E\n', runIn: "session" })).toBeDefined();
+    expect(sessionIpmiHintNote({ id: "a", name: "X", text: 'echo "then; ipmitool -E"\n', runIn: "session" })).toBeUndefined();
+    expect(sessionIpmiHintNote({ id: "a", name: "X", text: "bash -c 'ipmitool -E'\n", runIn: "session" })).toBeUndefined();
+  });
+
   it("returns nothing for a localTerminal ipmitool macro — that path is ipmiCredentialsOffNote's, not this one", () => {
     expect(
       sessionIpmiHintNote({ id: "a", name: "SOL", text: "ipmitool -H 10.0.0.9 sol activate\n", runIn: "localTerminal" })
@@ -1285,6 +1308,11 @@ describe("ipmiCredentialsOffNote — narrow local ipmitool credential hint (#151
     expect(hint(text)).toContain('tick "Provide IPMI credentials"');
   });
 
+  it("keeps a quoted semicolon in the username and still suggests the missing local credentials", () => {
+    expect(hint('ipmitool -H ${profile.ipmiHost} -U "ops;admin" -E sol activate\n'))
+      .toContain('tick "Provide IPMI credentials"');
+  });
+
   it.each([
     ["no IPMI profile token", "ipmitool -H 10.0.0.9 -E sol activate\n"],
     ["no -E flag", "ipmitool -H ${profile.ipmiHost} -a sol activate\n"],
@@ -1310,6 +1338,7 @@ describe("ipmiCredentialsOffNote — narrow local ipmitool credential hint (#151
     ["a wrapper", "sudo ipmitool -H ${profile.ipmiHost} -E sol activate\n"],
     ["a shell script", "sh -c 'ipmitool -H ${profile.ipmiHost} -E sol activate'\n"],
     ["a quoted token", 'ipmitool -H "${profile.ipmiHost}" -E sol activate\n'],
+    ["shell expansion inside a quoted username", 'ipmitool -H ${profile.ipmiHost} -U "ops;$(id)" -E sol activate\n'],
     ["a token embedded in an argument", "ipmitool -H host${profile.ipmiHost} -E sol activate\n"],
     ["a pipeline", "ipmitool -H ${profile.ipmiHost} -E sol activate | tee log\n"],
     ["a redirection", "ipmitool -H ${profile.ipmiHost} -E sol activate >log\n"],
