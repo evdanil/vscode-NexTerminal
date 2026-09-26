@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.290] — 2026-09-26
+
+### Fixed
+
+- **Reverse tunnel binds stay reserved across VS Code windows while cancellation is uncertain.** A hidden registry reservation blocks another window from requesting the same SSH route and remote port until cancellation succeeds or the retired transport closes.
+
 ## [2.8.289] — 2026-09-26
 
 ### Fixed

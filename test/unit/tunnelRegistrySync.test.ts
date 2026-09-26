@@ -71,6 +71,42 @@ describe("TunnelRegistrySync", () => {
     expect(await store.getEntries()).toHaveLength(0);
   });
 
+  it("publishes a reverse-bind tombstone across windows until remote cancellation or close is confirmed", async () => {
+    let releaseFence!: () => void;
+    const settled = new Promise<void>((resolve) => { releaseFence = resolve; });
+    const tunnel = makeTunnel({ id: "retired-1", tunnelType: "reverse", remotePort: 9000 });
+    await sync.registerTunnel(tunnel);
+
+    const unregistering = sync.unregisterTunnel("t1", {
+      tunnel,
+      retiredReverseBind: {
+        fenceId: tunnel.id,
+        routeIdentity: "shared-ssh-route",
+        remotePort: 9000,
+        settled
+      }
+    });
+    await vi.waitFor(async () => {
+      expect(await store.getEntries()).toHaveLength(1);
+      expect((await store.getEntries())[0].retiredReverseBind?.fenceId).toBe(tunnel.id);
+    });
+
+    const secondCore = new NexusCore(new InMemoryConfigRepository());
+    await secondCore.initialize();
+    const secondWindow = new TunnelRegistrySync(store, secondCore, "second-window", probePort);
+    await secondWindow.initialize();
+    expect(secondCore.getSnapshot().remoteTunnels).toEqual([]);
+    await expect(secondWindow.checkRemoteOwnership("different-profile", 9090, {
+      routeIdentity: "shared-ssh-route",
+      remotePort: 9000
+    })).resolves.toMatchObject({ retiredReverseBind: { fenceId: tunnel.id } });
+    secondWindow.dispose();
+
+    releaseFence();
+    await unregistering;
+    await vi.waitFor(async () => expect(await store.getEntries()).toEqual([]));
+  });
+
   it("cleanupOwnEntries removes only own entries", async () => {
     await store.saveEntries([
       makeEntry({ ownerSessionId: "my-session", profileId: "t1" }),

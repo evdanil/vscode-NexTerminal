@@ -21,6 +21,7 @@ import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { naturalCompare } from "../utils/naturalCompare";
 import { isTunnelRouteChanged, resolveBrowserUrl } from "../utils/tunnelProfile";
 import { addresslessUnavailableMessage, telnetUnsupportedMessage } from "../utils/protocolGuards";
+import { networkRouteIdentity } from "../services/ssh/sshNetworkRoute";
 import { browseForKey, collectGroups, formValuesToServer } from "./serverCommands";
 import type { CommandContext } from "./types";
 
@@ -156,7 +157,13 @@ export async function startTunnel(
 
   if (registrySync) {
     await registrySync.syncNow();
-    const remoteOwner = await registrySync.checkRemoteOwnership(profile.id, profile.localPort);
+    const reverseBind = resolveTunnelType(profile) === "reverse"
+      ? {
+          routeIdentity: JSON.stringify(networkRouteIdentity(server, (serverId) => core.getServer(serverId))),
+          remotePort: profile.remotePort
+        }
+      : undefined;
+    const remoteOwner = await registrySync.checkRemoteOwnership(profile.id, profile.localPort, reverseBind);
     if (remoteOwner) {
       const action = await vscode.window.showWarningMessage(
         `Tunnel "${profile.name}" is already active in another VS Code window (localhost:${profile.localPort}). The forwarded port is accessible from this window too.`,

@@ -11,6 +11,13 @@ const STALE_THRESHOLD_MS = 30_000;
 
 export type ProbePortFn = (port: number) => Promise<boolean>;
 
+export interface RetiredReverseBindFence {
+  fenceId: string;
+  routeIdentity: string;
+  remotePort: number;
+  settled: Promise<void>;
+}
+
 function defaultProbePort(port: number): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = new net.Socket();
@@ -72,23 +79,67 @@ export class TunnelRegistrySync {
     await this.store.saveEntries(entries);
   }
 
-  public async unregisterTunnel(profileId: string): Promise<void> {
+  public async unregisterTunnel(
+    profileId: string,
+    options?: { tunnel: ActiveTunnel; retiredReverseBind?: RetiredReverseBindFence }
+  ): Promise<void> {
     const entries = await this.store.getEntries();
     const filtered = entries.filter(
       (e) => !(e.ownerSessionId === this.sessionId && e.profileId === profileId)
     );
+    const fence = options?.retiredReverseBind;
+    if (fence && options?.tunnel) {
+      const tunnel = options.tunnel;
+      filtered.push({
+        profileId: tunnel.profileId,
+        serverId: tunnel.serverId,
+        localPort: tunnel.localPort,
+        remoteIP: tunnel.remoteIP,
+        remotePort: tunnel.remotePort,
+        connectionMode: tunnel.connectionMode,
+        tunnelType: tunnel.tunnelType,
+        remoteBindAddress: tunnel.remoteBindAddress,
+        localTargetIP: tunnel.localTargetIP,
+        startedAt: tunnel.startedAt,
+        ownerSessionId: this.sessionId,
+        lastSeen: Date.now(),
+        retiredReverseBind: {
+          fenceId: fence.fenceId,
+          routeIdentity: fence.routeIdentity,
+          remotePort: fence.remotePort
+        }
+      });
+    }
     await this.store.saveEntries(filtered);
+
+    if (fence) {
+      void fence.settled.then(async () => {
+        const current = await this.store.getEntries();
+        const withoutFence = current.filter(
+          (entry) =>
+            !(entry.ownerSessionId === this.sessionId && entry.retiredReverseBind?.fenceId === fence.fenceId)
+        );
+        if (withoutFence.length !== current.length) {
+          await this.store.saveEntries(withoutFence);
+        }
+      });
+    }
   }
 
   public async checkRemoteOwnership(
     profileId: string,
-    localPort: number
+    localPort: number,
+    reverseBind?: { routeIdentity: string; remotePort: number }
   ): Promise<TunnelRegistryEntry | undefined> {
     const entries = await this.store.getEntries();
     const remote = entries.find(
       (e) =>
         e.ownerSessionId !== this.sessionId &&
-        (e.profileId === profileId || e.localPort === localPort)
+        (e.profileId === profileId ||
+          e.localPort === localPort ||
+          (reverseBind !== undefined &&
+            e.retiredReverseBind?.routeIdentity === reverseBind.routeIdentity &&
+            e.retiredReverseBind.remotePort === reverseBind.remotePort))
     );
     if (!remote) {
       return undefined;
@@ -125,7 +176,7 @@ export class TunnelRegistrySync {
 
   private async syncFast(): Promise<void> {
     const entries = await this.store.getEntries();
-    const remote = entries.filter((e) => e.ownerSessionId !== this.sessionId);
+    const remote = entries.filter((e) => e.ownerSessionId !== this.sessionId && !e.retiredReverseBind);
     const remoteJson = JSON.stringify(remote);
     if (remoteJson !== this.lastRemoteJson) {
       this.lastRemoteJson = remoteJson;
@@ -140,7 +191,7 @@ export class TunnelRegistrySync {
 
     // Update lastSeen on existing own entries
     for (const entry of ownEntries) {
-      if (activeTunnels.some((t) => t.profileId === entry.profileId)) {
+      if (entry.retiredReverseBind || activeTunnels.some((t) => t.profileId === entry.profileId)) {
         entry.lastSeen = now;
         changed = true;
       }
@@ -177,14 +228,15 @@ export class TunnelRegistrySync {
 
   private async syncWithProbe(): Promise<void> {
     const entries = await this.store.getEntries();
-    const remote = entries.filter((e) => e.ownerSessionId !== this.sessionId);
+    const remote = entries.filter((e) => e.ownerSessionId !== this.sessionId && !e.retiredReverseBind);
+    const remoteForProbe = entries.filter((e) => e.ownerSessionId !== this.sessionId);
     const now = Date.now();
 
     // Probe all remote entries concurrently.
     // Reverse tunnels have no local listener to probe — use lastSeen heartbeat instead.
     // Entries without lastSeen (pre-heartbeat) are given a grace period from startedAt.
     const probeResults = await Promise.all(
-      remote.map(async (e) => {
+      remoteForProbe.map(async (e) => {
         if (e.tunnelType === "reverse") {
           const lastSeen = e.lastSeen ?? e.startedAt;
           return { entry: e, alive: now - lastSeen < STALE_THRESHOLD_MS };
@@ -201,7 +253,7 @@ export class TunnelRegistrySync {
         (e) => !staleProfileIds.has(`${e.ownerSessionId}:${e.profileId}`)
       );
       await this.store.saveEntries(cleaned);
-      const cleanedRemote = cleaned.filter((e) => e.ownerSessionId !== this.sessionId);
+      const cleanedRemote = cleaned.filter((e) => e.ownerSessionId !== this.sessionId && !e.retiredReverseBind);
       this.lastRemoteJson = JSON.stringify(cleanedRemote);
       this.core.setRemoteTunnels(cleanedRemote);
     } else {

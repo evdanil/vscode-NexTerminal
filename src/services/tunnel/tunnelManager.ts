@@ -11,10 +11,19 @@ import { handleSocks5Handshake, sendSocks5Failure, sendSocks5Success, Socks5Hand
 export type TunnelEvent =
   | { type: "started"; tunnel: ActiveTunnel }
   | { type: "traffic"; tunnelId: string; bytesIn: number; bytesOut: number }
-  | { type: "stopped"; tunnelId: string }
+  | {
+      type: "stopped";
+      tunnelId: string;
+      retiredReverseBind?: {
+        fenceId: string;
+        routeIdentity: string;
+        remotePort: number;
+        settled: Promise<void>;
+      };
+    }
   | { type: "error"; tunnelId?: string; message: string; error?: unknown };
 
-type TunnelListener = (event: TunnelEvent) => void;
+type TunnelListener = (event: TunnelEvent) => unknown;
 
 /**
  * stop() swept the tunnel while it was still connecting. start() rejects with
@@ -308,6 +317,7 @@ export class TunnelManager {
     this.activeByProfile.delete(runtime.profile.id);
     this.activeTunnels.delete(activeTunnelId);
 
+    let retiredReverseBind: Extract<TunnelEvent, { type: "stopped" }>["retiredReverseBind"];
     // Cancel reverse forwarding on the remote side
     if (runtime.reverseUnsubscribe) {
       runtime.reverseUnsubscribe();
@@ -334,7 +344,13 @@ export class TunnelManager {
         if (!canceled) {
           // A pooled lease can be disposed while other users keep the transport
           // alive. Retire it so a replacement cannot reuse an unresolved bind.
-          this.retireForwardTransport(route, runtime.reverseBindPort, connection, cancellation);
+          const settled = this.retireForwardTransport(route, runtime.reverseBindPort, connection, cancellation);
+          retiredReverseBind = {
+            fenceId: activeTunnelId,
+            routeIdentity: JSON.stringify(route),
+            remotePort: runtime.reverseBindPort,
+            settled
+          };
         }
       } finally {
         releasePendingCancel();
@@ -362,7 +378,7 @@ export class TunnelManager {
         bytesOut: runtime.active.bytesOut
       });
     }
-    this.emit({ type: "stopped", tunnelId: activeTunnelId });
+    await this.emitAndWait({ type: "stopped", tunnelId: activeTunnelId, retiredReverseBind });
   }
 
   public async stopAll(): Promise<void> {
@@ -742,7 +758,7 @@ export class TunnelManager {
     bindPort: number,
     connection: SshConnection,
     lateRelease?: Promise<unknown>
-  ): void {
+  ): Promise<void> {
     const closed = this.sharedFactory.retire?.(connection) ?? waitForConnectionClose(connection);
     // Keep the transport retired, but let proof that this bind is gone release
     // it while existing leases keep the old connection alive.
@@ -750,10 +766,11 @@ export class TunnelManager {
     const barrier = new Promise<void>((resolve) => {
       releaseBarrier = resolve;
     });
-    this.holdRetiredForwardTransport(routeIdentity, bindPort, barrier);
+    const settled = this.holdRetiredForwardTransport(routeIdentity, bindPort, barrier);
     const release = (): void => releaseBarrier();
     void closed.then(release, () => {});
     void lateRelease?.then(release, () => {});
+    return settled;
   }
 
   private retireUnknownPortForwardTransport(
@@ -792,7 +809,7 @@ export class TunnelManager {
     routeIdentity: NetworkRouteIdentity,
     bindPort: number,
     barrier: Promise<void>
-  ): void {
+  ): Promise<void> {
     const bindKey = JSON.stringify([routeIdentity, bindPort]);
     const earlierBarrier = this.retiredForwardTransports.get(bindKey);
     const publishedBarrier: ForwardWaitEntry = earlierBarrier
@@ -808,6 +825,7 @@ export class TunnelManager {
         this.retiredForwardTransports.delete(bindKey);
       }
     });
+    return publishedBarrier.promise;
   }
 
   private findOverlappingForwardWait(
@@ -1137,6 +1155,12 @@ export class TunnelManager {
   private emit(event: TunnelEvent): void {
     for (const listener of this.listeners) {
       listener(event);
+    }
+  }
+
+  private async emitAndWait(event: TunnelEvent): Promise<void> {
+    for (const listener of [...this.listeners]) {
+      await listener(event);
     }
   }
 }

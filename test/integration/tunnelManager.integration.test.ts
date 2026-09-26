@@ -1133,6 +1133,18 @@ describe("TunnelManager integration", () => {
       expect(finished).toBe(true);
       expect(connection.transportClosed).toBe(true);
       expect(events.filter((event) => event.type === "stopped")).toHaveLength(1);
+      const stoppedEvent = events.find((event) => event.type === "stopped");
+      expect(stoppedEvent).toMatchObject({
+        tunnelId: active.id,
+        retiredReverseBind: {
+          fenceId: active.id,
+          routeIdentity: expect.any(String),
+          remotePort: 23456
+        }
+      });
+      if (stoppedEvent?.type === "stopped" && stoppedEvent.retiredReverseBind) {
+        await expect(stoppedEvent.retiredReverseBind.settled).resolves.toBeUndefined();
+      }
     } finally {
       connection.resolveCancel(1);
       await stopping;
