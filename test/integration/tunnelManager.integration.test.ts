@@ -1,7 +1,7 @@
 import * as net from "node:net";
 import { PassThrough, type Duplex } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ServerConfig, TunnelProfile } from "../../src/models/config";
+import type { ActiveTunnel, ServerConfig, TunnelProfile } from "../../src/models/config";
 import type { SecretVault, SshConnection, SshFactory, TcpConnectionInfo } from "../../src/services/ssh/contracts";
 import { ProxySshFactory } from "../../src/services/ssh/proxySshFactory";
 import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
@@ -1106,6 +1106,132 @@ describe("TunnelManager integration", () => {
 
     await manager.stop(activeTunnel.id);
     expect(events.some((e) => e.type === "stopped")).toBe(true);
+  });
+
+  it("finishes stopping a reverse tunnel when the remote cancel never answers", async () => {
+    const connection = new ControlledForwardConnection();
+    connection.holdCancel(1);
+    const factory = new OrderedConnectionFactory([connection]);
+    manager = new TunnelManager(factory, factory);
+    const profile: TunnelProfile = {
+      id: "reverse-unanswered-cancel", name: "Unanswered cancel", localPort: 12345,
+      remoteIP: "127.0.0.1", remotePort: 23456, autoStart: false,
+      tunnelType: "reverse", remoteBindAddress: "127.0.0.1", localTargetIP: "127.0.0.1"
+    };
+    const events: TunnelEvent[] = [];
+    manager.onDidChange((event) => events.push(event));
+    const active = await manager.start(profile, testServer);
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const stopping = manager.stop(active.id);
+    let finished = false;
+    void stopping.then(() => { finished = true; });
+    try {
+      await connection.waitForCancelAttempt(1);
+      expect(connection.cancelRequests).toEqual([{ bindAddr: "127.0.0.1", bindPort: 23456 }]);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(finished).toBe(true);
+      expect(connection.transportClosed).toBe(true);
+      expect(events.filter((event) => event.type === "stopped")).toHaveLength(1);
+    } finally {
+      connection.resolveCancel(1);
+      await stopping;
+      vi.useRealTimers();
+    }
+  });
+
+  it("holds a replacement reverse bind off a pooled transport whose cancel timed out", async () => {
+    const oldTransport = new ControlledForwardConnection();
+    oldTransport.holdCancel(1);
+    const replacementTransport = new ControlledForwardConnection();
+    const factory = new OrderedConnectionFactory([oldTransport, replacementTransport]);
+    const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
+    manager = new TunnelManager(pool, pool);
+    const profile: TunnelProfile = {
+      id: "reverse-pooled-cancel", name: "Pooled cancel", localPort: 12345,
+      remoteIP: "127.0.0.1", remotePort: 23456, autoStart: false,
+      tunnelType: "reverse", remoteBindAddress: "127.0.0.1", localTargetIP: "127.0.0.1"
+    };
+    const terminalLease = await pool.connect(testServer);
+    const active = await manager.start(profile, testServer);
+    let replacement: Promise<ActiveTunnel> | undefined;
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const stopping = manager.stop(active.id);
+      await oldTransport.waitForCancelAttempt(1);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await stopping;
+      expect(oldTransport.transportClosed).toBe(false);
+
+      let replacementSettled = false;
+      replacement = manager.start(profile, testServer).then((tunnel) => {
+        replacementSettled = true;
+        return tunnel;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(replacementSettled).toBe(false);
+      expect(oldTransport.forwardAttempts).toBe(1);
+
+      oldTransport.resolveCancel(1);
+      const restarted = await replacement;
+      expect(replacementTransport.forwardAttempts).toBe(1);
+      await manager.stop(restarted.id);
+    } finally {
+      oldTransport.resolveCancel(1);
+      const restarted = await replacement?.catch(() => undefined);
+      if (restarted) await manager.stop(restarted.id);
+      terminalLease.dispose();
+      pool.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("holds a replacement reverse bind while remote cancellation is pending", async () => {
+    const oldTransport = new ControlledForwardConnection();
+    oldTransport.holdCancel(1);
+    const replacementTransport = new ControlledForwardConnection();
+    const factory = new OrderedConnectionFactory([oldTransport, replacementTransport]);
+    const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
+    manager = new TunnelManager(pool, pool);
+    const profile: TunnelProfile = {
+      id: "reverse-pending-cancel", name: "Pending cancel", localPort: 12345,
+      remoteIP: "127.0.0.1", remotePort: 23456, autoStart: false,
+      tunnelType: "reverse", remoteBindAddress: "127.0.0.1", localTargetIP: "127.0.0.1"
+    };
+    const terminalLease = await pool.connect(testServer);
+    const active = await manager.start(profile, testServer);
+    let replacement: Promise<ActiveTunnel> | undefined;
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const stopping = manager.stop(active.id);
+    try {
+      await oldTransport.waitForCancelAttempt(1);
+      let replacementSettled = false;
+      replacement = manager.start(profile, testServer).then((tunnel) => {
+        replacementSettled = true;
+        return tunnel;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(replacementSettled).toBe(false);
+      expect(oldTransport.forwardAttempts).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      await stopping;
+      oldTransport.resolveCancel(1);
+      const restarted = await replacement;
+      expect(replacementTransport.forwardAttempts).toBe(1);
+      await manager.stop(restarted.id);
+    } finally {
+      await vi.advanceTimersByTimeAsync(2_000);
+      await stopping;
+      oldTransport.resolveCancel(1);
+      const restarted = await replacement?.catch(() => undefined);
+      if (restarted) await manager.stop(restarted.id);
+      terminalLease.dispose();
+      pool.dispose();
+      vi.useRealTimers();
+    }
   });
 
   it.each([
