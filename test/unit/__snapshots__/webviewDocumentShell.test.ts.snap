@@ -7626,6 +7626,7 @@ echo hi</textarea>
 	const runsIpmitool = (words, assignmentAllowed, redirectionAllowed) => {
 		let index = 0;
 		let allowAssignments = true;
+		let argvAssignmentsAllowed = false;
 		const assignment = /^[A-Za-z_][A-Za-z0-9_]*=/;
 		const basename = (word) => word.slice(word.lastIndexOf("/") + 1);
 		while (index < words.length) {
@@ -7638,7 +7639,7 @@ echo hi</textarea>
 					continue;
 				}
 			};
-			if (allowAssignments && assignmentAllowed[index] && assignment.test(word)) {
+			if (allowAssignments && (assignmentAllowed[index] || argvAssignmentsAllowed) && assignment.test(word)) {
 				index++;
 				continue;
 			};
@@ -7646,9 +7647,10 @@ echo hi</textarea>
 			if (name === "sudo") {
 				index++;
 				allowAssignments = true;
+				argvAssignmentsAllowed = true;
 				while (index < words.length && words[index].startsWith("-")) {
 					const option = words[index++];
-					const shortValueOption = /^-[EABbnSHkis]*[ugpCD](.*)$/.exec(option);
+					const shortValueOption = /^-[EABbnSHkis]*[ugpCDT](.*)$/.exec(option);
 					if ([
 						"-u",
 						"--user",
@@ -7659,7 +7661,9 @@ echo hi</textarea>
 						"-C",
 						"--close-from",
 						"-D",
-						"--chdir"
+						"--chdir",
+						"-T",
+						"--command-timeout"
 					].includes(option)) {
 						if (index >= words.length) return false;
 						index++;
@@ -7668,7 +7672,7 @@ echo hi</textarea>
 							if (index >= words.length) return false;
 							index++;
 						}
-					} else if (!/^(?:--(?:user|group|prompt|close-from|chdir|preserve-env)=.+|-[ugpCD].+)$/.test(option) && ![
+					} else if (!/^(?:--(?:user|group|prompt|close-from|chdir|preserve-env|command-timeout)=.+|-[ugpCDT].+)$/.test(option) && ![
 						"--login",
 						"--shell",
 						"--non-interactive",
@@ -7818,7 +7822,7 @@ echo hi</textarea>
 		};
 		// Dynamic substitutions and heredocs need a real shell parser. Ignore
 		// these markers in comments and single quotes, where they are inert.
-		if (char === "\`" || char === "$" && text[i + 1] === "(" || char === "<" && text[i + 1] === "<") return false;
+		if (char === "\`" || char === "$" && text[i + 1] === "(" || (char === "<" || char === ">") && text[i + 1] === "(" || char === "<" && text[i + 1] === "<") return false;
 		if (char === "&" && (text[i - 1] === ">" || text[i - 1] === "<" || text[i + 1] === ">")) {
 			word += char;
 			inWord = true;

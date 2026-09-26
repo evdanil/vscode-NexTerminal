@@ -1270,6 +1270,8 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     ['a command inspection', 'command -v ipmitool -E\n'],
     ['a leading redirection target', '>& ipmitool\n'],
     ['a clustered sudo username', 'sudo -nu ipmitool\n'],
+    ['process substitution before a command', '<(true) ipmitool -E\n'],
+    ['output process substitution before a command', '>(cat) ipmitool -E\n'],
     ['a redirection target after echo', 'echo &> ipmitool\n'],
     ['a quoted leading redirection', '">/tmp/log" ipmitool -E\n']
   ])("does not treat %s as an ipmitool command", (_case, text) => {
@@ -1285,6 +1287,9 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     ["an attached sudo user", "sudo --user=root ipmitool -E\n"],
     ["an attached sudo group", "sudo --group=wheel ipmitool -E\n"],
     ["a sudo environment assignment", "sudo BMC=1 ipmitool -E\n"],
+    ["a quoted sudo environment assignment", "sudo 'BMC=1' ipmitool -E\n"],
+    ["a sudo timeout option", "sudo -T 10 ipmitool -E\n"],
+    ["an attached sudo timeout option", "sudo --command-timeout=10 ipmitool -E\n"],
     ["a clustered sudo user option", "sudo -nu root ipmitool -E\n"],
     ["an attached clustered sudo user", "sudo -nuroot ipmitool -E\n"],
     ["an attached env unset option", "env --unset=FOO ipmitool -E\n"],

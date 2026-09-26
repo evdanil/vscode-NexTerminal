@@ -7,6 +7,7 @@ export function textRunsIpmitool(text: string): boolean {
   const runsIpmitool = (words: string[], assignmentAllowed: boolean[], redirectionAllowed: boolean[]): boolean => {
     let index = 0;
     let allowAssignments = true;
+    let argvAssignmentsAllowed = false;
     const assignment = /^[A-Za-z_][A-Za-z0-9_]*=/;
     const basename = (word: string) => word.slice(word.lastIndexOf("/") + 1);
     while (index < words.length) {
@@ -19,15 +20,16 @@ export function textRunsIpmitool(text: string): boolean {
           continue;
         }
       }
-      if (allowAssignments && assignmentAllowed[index] && assignment.test(word)) { index++; continue; }
+      if (allowAssignments && (assignmentAllowed[index] || argvAssignmentsAllowed) && assignment.test(word)) { index++; continue; }
       const name = basename(word);
       if (name === "sudo") {
         index++;
         allowAssignments = true;
+        argvAssignmentsAllowed = true;
         while (index < words.length && words[index].startsWith("-")) {
           const option = words[index++];
-          const shortValueOption = /^-[EABbnSHkis]*[ugpCD](.*)$/.exec(option);
-          if (["-u", "--user", "-g", "--group", "-p", "--prompt", "-C", "--close-from", "-D", "--chdir"].includes(option)) {
+          const shortValueOption = /^-[EABbnSHkis]*[ugpCDT](.*)$/.exec(option);
+          if (["-u", "--user", "-g", "--group", "-p", "--prompt", "-C", "--close-from", "-D", "--chdir", "-T", "--command-timeout"].includes(option)) {
             if (index >= words.length) return false;
             index++;
           } else if (shortValueOption) {
@@ -36,7 +38,7 @@ export function textRunsIpmitool(text: string): boolean {
               index++;
             }
           } else if (
-            !/^(?:--(?:user|group|prompt|close-from|chdir|preserve-env)=.+|-[ugpCD].+)$/.test(option) &&
+            !/^(?:--(?:user|group|prompt|close-from|chdir|preserve-env|command-timeout)=.+|-[ugpCDT].+)$/.test(option) &&
             !["--login", "--shell", "--non-interactive", "--askpass", "--background", "--bell", "--set-home", "--stdin", "--reset-timestamp", "--preserve-env"].includes(option) &&
             option !== "--" && !/^-[EABbnSHkis]+$/.test(option)
           ) {
@@ -176,7 +178,9 @@ export function textRunsIpmitool(text: string): boolean {
     }
     // Dynamic substitutions and heredocs need a real shell parser. Ignore
     // these markers in comments and single quotes, where they are inert.
-    if (char === "`" || (char === "$" && text[i + 1] === "(") || (char === "<" && text[i + 1] === "<")) return false;
+    if (char === "`" || (char === "$" && text[i + 1] === "(") ||
+        ((char === "<" || char === ">") && text[i + 1] === "(") ||
+        (char === "<" && text[i + 1] === "<")) return false;
     if (char === "&" && (text[i - 1] === ">" || text[i - 1] === "<" || text[i + 1] === ">")) {
       word += char;
       inWord = true;
