@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.288] — 2026-09-26
+
+### Fixed
+
+- **Closing the last terminal releases an active credential prompt.** A password prompt tied to an abandoned pooled SSH connection is canceled so other queued credentials can proceed.
+
 ## [2.8.287] — 2026-09-26
 
 ### Fixed
