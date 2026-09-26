@@ -19,7 +19,7 @@ const showWarningMessage = vi.fn();
 const setStatusBarMessage = vi.fn();
 const showInputBox = vi.fn();
 const executeCommand = vi.fn();
-const openExternal = vi.fn(async () => true);
+const openExternal = vi.fn(async (_uri: unknown) => true);
 const createdTerminals: Array<{ name: string; sent: string[]; env?: Record<string, string>; options: Record<string, unknown> }> = [];
 // The open-terminal set backing `vscode.window.terminals`, so a pinned session
 // target's isStillValid() re-check (P5) can be exercised — a terminal absent here
@@ -57,7 +57,7 @@ vi.mock("vscode", () => ({
     activeTerminal: undefined as unknown
   },
   env: {
-    openExternal: (...args: unknown[]) => openExternal(...args)
+    openExternal: (uri: unknown) => openExternal(uri)
   },
   Uri: {
     parse: (value: string) => ({ toString: () => value, value })

@@ -9,8 +9,8 @@ const showWarningMessage = vi.fn();
 const showErrorMessage = vi.fn();
 const showInformationMessage = vi.fn();
 const setStatusBarMessage = vi.fn();
-const executeCommand = vi.fn();
-const openExternal = vi.fn(async () => true);
+const executeCommand = vi.fn((..._args: unknown[]) => undefined);
+const openExternal = vi.fn(async (_uri: { value: string }) => true);
 const showInputBox = vi.fn();
 const createdTerminals: Array<{ name: string; sent: string[]; env?: Record<string, string>; options: Record<string, unknown> }> = [];
 let openTerminals: Array<{ name: string; sendText: (text: string, addNewLine?: boolean) => void; exitStatus?: unknown }> = [];
@@ -49,7 +49,7 @@ vi.mock("vscode", () => ({
     activeTerminal: undefined as unknown
   },
   env: {
-    openExternal: (...args: unknown[]) => openExternal(...args)
+    openExternal: (uri: { value: string }) => openExternal(uri)
   },
   Uri: {
     parse: (value: string) => ({ toString: () => value, value })
@@ -60,10 +60,10 @@ vi.mock("vscode", () => ({
 // The server-resolution helpers are exercised by serverCommands.test.ts; mocking
 // them here keeps this file about macro dispatch and off the SSH/keygen imports.
 const pickServer = vi.fn();
-const connectServer = vi.fn(async () => {});
+const connectServer = vi.fn(async (_ctx: unknown, _id: unknown, _options?: { onConnectFailed?: (message: string) => void }) => {});
 vi.mock("../../src/commands/serverCommands", () => ({
   pickServer: (...args: unknown[]) => pickServer(...args),
-  connectServer: (...args: unknown[]) => connectServer(...args),
+  connectServer: (ctx: unknown, id: unknown, options?: { onConnectFailed?: (message: string) => void }) => connectServer(ctx, id, options),
   toServerFromArg: (_core: unknown, arg: unknown) =>
     arg && typeof arg === "object" && "server" in arg ? (arg as { server: ServerConfig }).server : undefined
 }));

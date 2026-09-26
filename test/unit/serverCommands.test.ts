@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import * as vscode from "vscode";
 import type { CommandContext } from "../../src/commands/types";
 import {
@@ -205,12 +205,12 @@ interface Harness {
   ctx: CommandContext;
   stopTunnel: ReturnType<typeof vi.fn>;
   disconnectPool: ReturnType<typeof vi.fn>;
-  removeServer: ReturnType<typeof vi.fn>;
-  addOrUpdateServer: ReturnType<typeof vi.fn>;
-  addOrUpdateAuthProfile: ReturnType<typeof vi.fn>;
+  removeServer: Mock<(serverId: string) => Promise<void>>;
+  addOrUpdateServer: Mock<(server: ServerConfig) => Promise<void>>;
+  addOrUpdateAuthProfile: Mock<(profile: AuthProfile) => Promise<void>>;
   terminalDispose: ReturnType<typeof vi.fn>;
-  secretDelete: ReturnType<typeof vi.fn>;
-  secretStore: ReturnType<typeof vi.fn>;
+  secretDelete: Mock<(key: string) => Promise<void>>;
+  secretStore: Mock<(key: string, value: string) => Promise<void>>;
 }
 
 function setupHarness(options: {
@@ -345,6 +345,7 @@ function setupHarness(options: {
     sessionTerminals: new Map(),
     serialTerminals: new Map(),
     localShellTerminals: new Map(),
+    localServerTerminals: new Map(),
     highlighter: {} as any,
     macroAutoTrigger: {
       createObserver: vi.fn(() => ({})),
@@ -779,7 +780,8 @@ describe("server disconnect with tunnel autoStop", () => {
     // nexus.group.rename mutating server.group ON THAT OBJECT while the
     // confirmation modal is pending, by hooking the mock modal's resolution.
     mockShowWarningMessage.mockImplementationOnce(async () => {
-      const live = (ctx.core.getServer as ReturnType<typeof vi.fn>)("srv-1");
+      const live = ctx.core.getServer("srv-1");
+      if (!live) throw new Error("Expected live server");
       live.group = "renamed-folder";
       return "Remove";
     });
@@ -2283,7 +2285,7 @@ describe("SSH File Explorer auto-open on manual connect", () => {
 
     expect(ctx.sftpService.connect).not.toHaveBeenCalled();
     expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexusFileExplorer.focus");
-    expect(ctx.scriptRuntimeManager.runScript).toHaveBeenCalledWith(
+    expect(ctx.scriptRuntimeManager!.runScript).toHaveBeenCalledWith(
       expect.objectContaining({ fsPath: "/workspace/.nexus/scripts/task.js" }),
       "script-session-1",
       expect.objectContaining({ subscription: expect.anything() })
@@ -3190,7 +3192,7 @@ describe("nexus.server.edit → connect — a profile owns only what it supplies
       onTcpConnection: vi.fn().mockReturnValue(() => {}), onClose: vi.fn().mockReturnValue(() => {}),
       getBanner: vi.fn().mockReturnValue(undefined), dispose: vi.fn()
     };
-    const connector = { connect: vi.fn(async () => connection) };
+    const connector = { connect: vi.fn(async (_server: ServerConfig) => connection) };
     const vault = { get: vi.fn(async () => undefined), store: vi.fn(async () => {}), delete: vi.fn(async () => {}) };
     const prompt = { prompt: vi.fn(async () => ({ password: "typed", save: false })) };
     const factory = new SilentAuthSshFactory(
@@ -3201,7 +3203,7 @@ describe("nexus.server.edit → connect — a profile owns only what it supplies
       (id: string) => profiles.find((p) => p.id === id)
     );
     await factory.connect(server);
-    return connector.connect.mock.calls[0][0] as ServerConfig;
+    return connector.connect.mock.calls[0][0];
   }
 
   it("saves AND then connects with the username you typed under a profile whose own username is blank (kills the save reverting it, and kills the connect overwriting it with the profile's whitespace)", async () => {
@@ -4590,7 +4592,7 @@ describe("nexus.server.edit — addressless placeholder is editable (P2-a)", () 
 
     // The next sync: the device reports exactly the address the stale stamps held.
     const plan = computeSyncPlan({
-      source: { id: "s", providerId: "netbox", name: "NetBox", targetFolder: "NetBox", prunePolicy: "orphan", config: {}, secretFieldIds: [] },
+      source: { id: "s", providerId: "netbox", name: "NetBox", targetFolder: "NetBox", prunePolicy: "orphan", config: {}, secretFieldIds: [], defaultUsername: "" },
       tree: { contractVersion: 1, devices: [{ externalId: "e", name: "stopped-node", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 2200 }] }] },
       currentServers: [saved],
       now: 2000
@@ -4635,7 +4637,7 @@ describe("nexus.server.edit — addressless placeholder is editable (P2-a)", () 
     // retro-apply rule reads it — and identity stays with it.
     expect(saved.origin).toEqual({ sourceId: "s", externalId: "e", syncedAt: 1, syncedInstanceKey: "https://lab.example.test", syncedUsername: "admin" });
 
-    const source = { id: "s", providerId: "eve-ng", name: "Lab", targetFolder: "Lab", prunePolicy: "orphan" as const, config: {}, secretFieldIds: [] };
+    const source = { id: "s", providerId: "eve-ng", name: "Lab", targetFolder: "Lab", prunePolicy: "orphan" as const, config: {}, secretFieldIds: [], defaultUsername: "" };
     const dualStack = computeSyncPlan({
       source,
       tree: {
@@ -4755,7 +4757,7 @@ describe("addressless connect guard", () => {
       await vi.advanceTimersByTimeAsync(90_000);
 
       expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("did not start within"));
-      expect(ctx.scriptRuntimeManager.runScript).not.toHaveBeenCalled();
+      expect(ctx.scriptRuntimeManager!.runScript).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
@@ -5441,13 +5443,13 @@ describe("folder-op serialization (#84 P1)", () => {
     vi.mocked(findLocalKeyPairs).mockResolvedValue([
       { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
     ]);
-    vi.mocked(readFile).mockResolvedValue("ssh-ed25519 AAAAKEY user@host" as unknown as Buffer);
+    vi.mocked(readFile).mockResolvedValue(Buffer.from("ssh-ed25519 AAAAKEY user@host"));
     // pickKeyForDeployment's quick pick → choose the existing key.
     vi.mocked(vscode.window.showQuickPick).mockResolvedValue({
       keyPair: { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
     } as unknown as vscode.QuickPickItem);
     // withProgress runs its callback (connect + deploy) directly.
-    vi.mocked(vscode.window.withProgress).mockImplementation(async (_opts: unknown, task: (...a: unknown[]) => unknown) => task());
+    vi.mocked(vscode.window.withProgress).mockImplementation(async (_opts, task) => task({ report: vi.fn() }, {} as vscode.CancellationToken));
     // pickDeployConversionMode → "Use standalone key".
     vi.mocked(vscode.window.showInformationMessage).mockResolvedValue("Use standalone key" as unknown as vscode.MessageItem);
 
@@ -5476,8 +5478,8 @@ describe("folder-op serialization (#84 P1)", () => {
     vi.mocked(findLocalKeyPairs).mockResolvedValue([
       { name: "id_ed25519", publicKeyPath: "/home/user/.ssh/id_ed25519.pub", privateKeyPath: "/home/user/.ssh/id_ed25519" }
     ]);
-    vi.mocked(readFile).mockResolvedValue("ssh-ed25519 AAAAKEY user@host" as unknown as Buffer);
-    vi.mocked(vscode.window.withProgress).mockImplementation(async (_o: unknown, task: (...a: unknown[]) => unknown) => task());
+    vi.mocked(readFile).mockResolvedValue(Buffer.from("ssh-ed25519 AAAAKEY user@host"));
+    vi.mocked(vscode.window.withProgress).mockImplementation(async (_opts, task) => task({ report: vi.fn() }, {} as vscode.CancellationToken));
   }
   const sshDeploy = () => ({ connect: vi.fn(async () => ({ dispose: vi.fn() })) });
 

@@ -4,7 +4,7 @@ const mockMacros = vi.hoisted(() => [] as any[]);
 const mockExistingPaths = vi.hoisted(() => new Set<string>());
 const mockExecFileSync = vi.hoisted(() => vi.fn());
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
-const mockCreateTerminal = vi.fn(() => ({ show: vi.fn(), sendText: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" }));
+const mockCreateTerminal = vi.fn((_options: { pty: unknown }) => ({ show: vi.fn(), sendText: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" }));
 const mockExecuteCommand = vi.fn();
 const mockPickScriptFromWorkspace = vi.fn();
 const mockShowErrorMessage = vi.fn();
@@ -89,7 +89,7 @@ vi.mock("vscode", () => ({
     get terminals() {
       return mockTerminals;
     },
-    createTerminal: (...args: unknown[]) => mockCreateTerminal(...args),
+    createTerminal: (options: { pty: unknown }) => mockCreateTerminal(options),
     showErrorMessage: (...args: unknown[]) => mockShowErrorMessage(...args),
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
     showInformationMessage: vi.fn(),
@@ -450,7 +450,7 @@ describe("registerLocalShellCommands", () => {
   });
 
   it("opens a custom local shell with an extension-owned PTY", async () => {
-    const terminal = { show: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" };
+    const terminal = { show: vi.fn(), sendText: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" };
     mockCreateTerminal.mockReturnValueOnce(terminal);
     const ctx = makeCtx();
 
@@ -481,14 +481,14 @@ describe("registerLocalShellCommands", () => {
   });
 
   it("passes the command context highlighter into the local shell PTY", async () => {
-    const terminal = { show: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" };
+    const terminal = { show: vi.fn(), sendText: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" };
     mockCreateTerminal.mockReturnValueOnce(terminal);
     const ctx = makeCtx();
 
     registerLocalShellCommands(ctx);
     await registeredCommands.get("nexus.localShell.connect")!("local-1");
 
-    const pty = (mockCreateTerminal.mock.calls[0][0] as { pty: unknown }).pty;
+    const pty = mockCreateTerminal.mock.calls[0][0].pty;
     expect((pty as any).options.highlighter).toBe(ctx.highlighter);
   });
 
@@ -537,7 +537,7 @@ describe("registerLocalShellCommands", () => {
       triggerPattern: "[Pp]assword:",
       variables: [{ name: "host" }]
     });
-    const terminal = { show: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" };
+    const terminal = { show: vi.fn(), sendText: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" };
     mockCreateTerminal.mockReturnValueOnce(terminal);
     const ctx = makeCtx();
 
@@ -610,7 +610,7 @@ describe("registerLocalShellCommands", () => {
     registerLocalShellCommands(ctx);
     await registeredCommands.get("nexus.localShell.connect")!("local-1");
     const sessionId = [...ctx.localShellTerminals.keys()][0];
-    const pty = (mockCreateTerminal.mock.calls[0][0] as { pty: unknown }).pty;
+    const pty = mockCreateTerminal.mock.calls[0][0].pty;
 
     (pty as any).earlyTerminateEmitter.fire({ code: 2 });
 
@@ -620,7 +620,7 @@ describe("registerLocalShellCommands", () => {
   });
 
   it("opens a local shell profile and runs a picked compatible script against the new session", async () => {
-    const terminal = { show: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" };
+    const terminal = { show: vi.fn(), sendText: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" };
     const scriptUri = { fsPath: "/ws/.nexus/scripts/local.js" };
     mockCreateTerminal.mockImplementationOnce((options: { pty: unknown }) => {
       setImmediate(() => (options.pty as any).startupCompleteEmitter.fire());
@@ -643,7 +643,7 @@ describe("registerLocalShellCommands", () => {
   });
 
   it("does not run a picked script when the new local shell terminates during startup", async () => {
-    const terminal = { show: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" };
+    const terminal = { show: vi.fn(), sendText: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" };
     const scriptUri = { fsPath: "/ws/.nexus/scripts/local.js" };
     mockCreateTerminal.mockImplementationOnce((options: { pty: unknown }) => {
       setImmediate(() => (options.pty as any).earlyTerminateEmitter.fire({ code: 2 }));

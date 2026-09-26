@@ -126,7 +126,7 @@ vi.mock("vscode", () => {
     Pseudoterminal: class {},
     commands: { executeCommand: vi.fn() },
     window: {
-      createTerminal: (..._args: unknown[]) => createTerminalMock(..._args),
+      createTerminal: () => createTerminalMock(),
       onDidCloseTerminal: (l: (t: unknown) => void) => {
         listeners.push(l);
         return { dispose: vi.fn() };

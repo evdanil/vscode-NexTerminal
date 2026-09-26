@@ -96,7 +96,9 @@ describe("local server session row → focusSessionTerminal", () => {
       restartAttempts: 0
     });
 
-    const [sessionId, type] = (item.command as { arguments: [string, never] }).arguments;
+    const args = item.command?.arguments;
+    if (!args) throw new Error("expected a terminal command");
+    const [sessionId, type] = args;
     expect(sessionId).toBe("ls-session-1");
     expect(type).toBe("localServer");
 

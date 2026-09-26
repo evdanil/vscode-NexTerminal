@@ -394,8 +394,8 @@ describe("server form — telnet servers are not selectable as SSH infrastructur
   // into.
   it("toSshInfrastructureServerList carries `addressless` through (⊘ an adapter that drops it leaves the picker filter blind, and placeholders appear as infrastructure)", () => {
     const entries = toSshInfrastructureServerList([
-      { id: "a", name: "addressed", host: "10.0.0.1", port: 22, username: "u", authType: "agent", isHidden: false },
-      { id: "b", name: "stopped", host: "", port: 0, username: "", authType: "agent", isHidden: false, addressless: true }
+      { id: "a", name: "addressed" },
+      { id: "b", name: "stopped", addressless: true }
     ]);
     expect(entries.find((e) => e.id === "b")?.addressless).toBe(true);
     expect(entries.find((e) => e.id === "a")?.addressless).toBeUndefined();

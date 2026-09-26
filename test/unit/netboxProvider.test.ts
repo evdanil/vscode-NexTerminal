@@ -14,7 +14,7 @@ import { createInsecureHttpsFetch } from "../../src/services/inventory/insecureF
 import { redirectNotFollowedMessage } from "../../src/services/inventory/certificateHints";
 import { validateProviderShape } from "../../src/services/inventory/providerRegistry";
 import { deviceMatchesFilter, parseTemplateFilter } from "../../src/services/inventory/templateApply";
-import { InventoryProviderError, type InventoryConfigField } from "../../src/models/inventory";
+import { InventoryProviderError, type InventoryConfigField, type InventorySourceValues } from "../../src/models/inventory";
 import { ADVANCED_SECTION_LABEL } from "../../src/ui/formTypes";
 
 function makeResponse(status: number, body: unknown): { status: number; text: () => Promise<string> } {
@@ -227,7 +227,7 @@ describe("createNetboxProvider", () => {
     });
 
     it("F2 — throws a protocol error when a page is empty but the reported count says more remain (kills silent truncation / an infinite loop)", async () => {
-      const fetchImpl = vi.fn(async () => makeResponse(200, { count: 50, results: [] }));
+      const fetchImpl = vi.fn(async (_url: string) => makeResponse(200, { count: 50, results: [] }));
       const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
 
       await expect(provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" })).rejects.toMatchObject({ kind: "protocol" });
@@ -239,14 +239,14 @@ describe("createNetboxProvider", () => {
       // runs a single iteration — a malformed/negative count must fail loudly here rather
       // than silently pass through as "there is nothing to sync", which would prune every
       // server this endpoint owns.
-      const fetchImpl = vi.fn(async () => makeResponse(200, { count: -1, results: [] }));
+      const fetchImpl = vi.fn(async (_url: string) => makeResponse(200, { count: -1, results: [] }));
       const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
 
       await expect(provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" })).rejects.toMatchObject({ kind: "protocol" });
     });
 
     it("a genuinely empty inventory (`{ count: 0, results: [] }`) still resolves without error (sanity companion — kills over-strict rejection of a legitimate empty result)", async () => {
-      const fetchImpl = vi.fn(async () => makeResponse(200, { count: 0, results: [] }));
+      const fetchImpl = vi.fn(async (_url: string) => makeResponse(200, { count: 0, results: [] }));
       const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
 
       const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
@@ -269,7 +269,7 @@ describe("createNetboxProvider", () => {
       const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
 
       expect(tree.devices.length).toBeLessThanOrEqual(10_000);
-      expect(tree.warnings.some((w) => w.includes("10000") && w.toLowerCase().includes("truncat"))).toBe(true);
+      expect((tree.warnings ?? []).some((w) => w.includes("10000") && w.toLowerCase().includes("truncat"))).toBe(true);
       expect(tree.truncated).toBe(true);
     });
 
@@ -292,7 +292,7 @@ describe("createNetboxProvider", () => {
 
       expect(tree.devices).toHaveLength(total);
       expect(tree.truncated).toBeUndefined();
-      expect(tree.warnings.some((w) => w.toLowerCase().includes("truncat"))).toBe(false);
+      expect((tree.warnings ?? []).some((w) => w.toLowerCase().includes("truncat"))).toBe(false);
     });
 
     it("FINDING (P2) — count exactly equal to the hard cap (10,000) but pages carrying 10,001 rows is rejected as a protocol error, not silently clipped as a legitimate cap hit (kills capAllowance > count instead of >=)", async () => {
@@ -638,7 +638,7 @@ describe("createNetboxProvider", () => {
         oob_ip4: { address: "10.4.4.4/24" }
       };
       const fetchOne = (row: unknown) =>
-        vi.fn(async () => makeResponse(200, { count: 1, results: [row] }));
+        vi.fn(async (_url: string) => makeResponse(200, { count: 1, results: [row] }));
 
       it("auto (default) takes primary_ip unchanged — byte-identical to pre-PR-E (kills a family read that reroutes the default)", async () => {
         const provider = createNetboxProvider(fetchOne(bothFamilies) as unknown as typeof fetch);
@@ -744,7 +744,7 @@ describe("createNetboxProvider", () => {
         primary_ip4: { address: "10.0.0.5/24" },
         primary_ip6: { address: "2001:db8::5/64" }
       };
-      const fetchOne = (row: unknown) => vi.fn(async () => makeResponse(200, { count: 1, results: [row] }));
+      const fetchOne = (row: unknown) => vi.fn(async (_url: string) => makeResponse(200, { count: 1, results: [row] }));
       const sshEndpoints = (tree: { devices: { endpoints: { kind: string }[] }[] }) =>
         tree.devices[0].endpoints.filter((e) => e.kind === "ssh");
 
@@ -841,7 +841,7 @@ describe("createNetboxProvider", () => {
     });
 
     it("FINDING 1 — throws a protocol error (not a silent drop) when a page contains a null row (kills silently dropping the row while pagination still believes the count was fully collected)", async () => {
-      const fetchImpl = vi.fn(async () => makeResponse(200, { count: 1, results: [null] }));
+      const fetchImpl = vi.fn(async (_url: string) => makeResponse(200, { count: 1, results: [null] }));
       const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
 
       await expect(provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" })).rejects.toMatchObject({
@@ -850,7 +850,7 @@ describe("createNetboxProvider", () => {
     });
 
     it("FINDING 1 — throws a protocol error naming the endpoint and row index when a row has no id (kills silently dropping an id-less row)", async () => {
-      const fetchImpl = vi.fn(async () => makeResponse(200, { count: 1, results: [{ name: "x" }] }));
+      const fetchImpl = vi.fn(async (_url: string) => makeResponse(200, { count: 1, results: [{ name: "x" }] }));
       const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
 
       await expect(provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" })).rejects.toMatchObject({
@@ -875,7 +875,7 @@ describe("createNetboxProvider", () => {
     });
 
     it("never requests the virtual-machines endpoint when includeVms is omitted/false (kills unconditional VM fetch)", async () => {
-      const fetchImpl = vi.fn(async () => makeResponse(200, { count: 0, results: [] }));
+      const fetchImpl = vi.fn(async (_url: string) => makeResponse(200, { count: 0, results: [] }));
       const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
 
       await provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" });
@@ -905,7 +905,7 @@ describe("createNetboxProvider", () => {
 
   describe("filter handling (F11)", () => {
     it("appends the user filter to the devices request and normalizes a trailing /api/ base URL (no /api/api/)", async () => {
-      const fetchImpl = vi.fn(async () => makeResponse(200, { count: 0, results: [] }));
+      const fetchImpl = vi.fn(async (_url: string) => makeResponse(200, { count: 0, results: [] }));
       const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
 
       await provider.fetchInventory({ baseUrl: "https://netbox.local/api/", filter: "status=active&site=syd" }, { apiToken: "tok" });
@@ -918,7 +918,7 @@ describe("createNetboxProvider", () => {
     });
 
     it("strips reserved filter keys (limit/offset/brief), keeps Nexus's own pagination values, and warns (kills a naive param merge)", async () => {
-      const fetchImpl = vi.fn(async () => makeResponse(200, { count: 0, results: [] }));
+      const fetchImpl = vi.fn(async (_url: string) => makeResponse(200, { count: 0, results: [] }));
       const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
 
       const tree = await provider.fetchInventory({ baseUrl: "https://netbox.local", filter: "limit=1&status=active" }, { apiToken: "tok" });
@@ -926,11 +926,11 @@ describe("createNetboxProvider", () => {
       const url = new URL(String(fetchImpl.mock.calls[0][0]));
       expect(url.searchParams.get("limit")).toBe("250");
       expect(url.searchParams.get("status")).toBe("active");
-      expect(tree.warnings.some((w) => w.toLowerCase().includes("reserved"))).toBe(true);
+      expect((tree.warnings ?? []).some((w) => w.toLowerCase().includes("reserved"))).toBe(true);
     });
 
     it("never applies the device filter to the VM request (F11 — filter is devices-only, documented in the field description)", async () => {
-      const fetchImpl = vi.fn(async () => makeResponse(200, { count: 0, results: [] }));
+      const fetchImpl = vi.fn(async (_url: string) => makeResponse(200, { count: 0, results: [] }));
       const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
 
       await provider.fetchInventory({ baseUrl: "https://netbox.local", filter: "status=active", includeVms: true }, { apiToken: "tok" });
@@ -943,7 +943,7 @@ describe("createNetboxProvider", () => {
 
   describe("error mapping", () => {
     it("maps HTTP 401 to an auth error", async () => {
-      const fetchImpl = vi.fn(async () => makeResponse(401, "unauthorized"));
+      const fetchImpl = vi.fn(async (_url: string) => makeResponse(401, "unauthorized"));
       const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
 
       await expect(provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "bad" })).rejects.toMatchObject({ kind: "auth" });
@@ -961,7 +961,7 @@ describe("createNetboxProvider", () => {
     });
 
     it("maps a 200 response with a non-JSON (HTML) body to a protocol error (kills a catch-all classification)", async () => {
-      const fetchImpl = vi.fn(async () => makeResponse(200, "<html>not json</html>"));
+      const fetchImpl = vi.fn(async (_url: string) => makeResponse(200, "<html>not json</html>"));
       const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
 
       await expect(provider.fetchInventory({ baseUrl: "https://netbox.local" }, { apiToken: "tok" })).rejects.toMatchObject({ kind: "protocol" });
@@ -997,7 +997,7 @@ describe("createNetboxProvider", () => {
     });
 
     it("does NOT fall back on 401 — bubbles as an auth error with a single request (kills fallback-on-every-error masking auth)", async () => {
-      const fetchImpl = vi.fn(async () => makeResponse(401, "unauthorized"));
+      const fetchImpl = vi.fn(async (_url: string) => makeResponse(401, "unauthorized"));
       const provider = createNetboxProvider(fetchImpl as unknown as typeof fetch);
 
       await expect(provider.testConnection({ baseUrl: "https://netbox.local" }, { apiToken: "bad" })).rejects.toMatchObject({ kind: "auth" });
@@ -1171,7 +1171,8 @@ describe("createNetboxProvider — insecure TLS transport selection", () => {
   });
 
   it("NEVER uses it for a source that did not opt in, however the certificate would have failed (⊘ selecting on the URL scheme alone turns verification off for every https source)", async () => {
-    for (const config of [{ baseUrl: "https://10.0.0.5", allowInsecureTls: false }, { baseUrl: "https://10.0.0.5" }]) {
+    const configs: InventorySourceValues[] = [{ baseUrl: "https://10.0.0.5", allowInsecureTls: false }, { baseUrl: "https://10.0.0.5" }];
+    for (const config of configs) {
       const { standard, insecure, provider } = probes();
       await provider.fetchInventory(config, SECRETS);
       expect(standard.calls.length).toBeGreaterThan(0);
@@ -1318,13 +1319,14 @@ describe("createNetboxProvider — a sync run with verification off discloses it
   });
 
   it("says NOTHING for a source that is actually verifying its certificate (⊘ an unconditional warning trains the user to ignore the one that means something)", async () => {
-    for (const config of [
+    const configs: InventorySourceValues[] = [
       { baseUrl: "https://10.0.0.5", allowInsecureTls: false },
       { baseUrl: "https://10.0.0.5" },
       // Ticked but http: the selector keeps the standard transport, so nothing
       // was relaxed and there is nothing to disclose.
       { baseUrl: "http://netbox.example.com", allowInsecureTls: true }
-    ]) {
+    ];
+    for (const config of configs) {
       const tree = await provider().fetchInventory(config, SECRETS);
       // Asserted against the CONSTANT, not a substring like "certificate": the
       // warning capitalises the word in both places it uses it, so a
@@ -1457,7 +1459,7 @@ describe("createNetboxProvider — a 3xx on the transport that cannot follow it"
    * that varies between these cases is which one the config selects — the
    * wording difference cannot come from the responses differing.
    */
-  async function messageFor(impl: typeof fetch, config: Record<string, unknown> = OPTED_IN): Promise<string> {
+  async function messageFor(impl: typeof fetch, config: InventorySourceValues = OPTED_IN): Promise<string> {
     const err = await createNetboxProvider(impl, impl)
       .testConnection(config, SECRETS)
       .catch((e: unknown) => e);

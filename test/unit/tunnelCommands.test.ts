@@ -94,6 +94,7 @@ async function setupContext(tunnels: TunnelProfile[]): Promise<CommandContext> {
     sessionTerminals: new Map() as any,
     serialTerminals: new Map() as any,
     localShellTerminals: new Map() as any,
+    localServerTerminals: new Map() as any,
     highlighter: {} as any,
     macroAutoTrigger: {} as any,
     sftpService: {} as any,

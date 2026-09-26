@@ -13,7 +13,7 @@ vi.mock("vscode", () => ({
       openHandler = cb;
       return { dispose: vi.fn() };
     }),
-    getConfiguration: (...args: unknown[]) => mockGetConfiguration(...args)
+    getConfiguration: () => mockGetConfiguration()
   },
   window: {
     showInformationMessage: (...args: unknown[]) => mockShowInformationMessage(...args)

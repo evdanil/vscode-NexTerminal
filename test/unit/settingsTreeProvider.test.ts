@@ -2,7 +2,7 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 
 const { mockGetConfiguration, mockOnDidChangeConfiguration } = vi.hoisted(() => ({
   mockGetConfiguration: vi.fn(),
-  mockOnDidChangeConfiguration: vi.fn(() => ({ dispose: vi.fn() }))
+  mockOnDidChangeConfiguration: vi.fn((_listener: (event: { affectsConfiguration: (key: string) => boolean }) => void) => ({ dispose: vi.fn() }))
 }));
 
 vi.mock("vscode", () => {
@@ -261,7 +261,7 @@ describe("SettingsTreeProvider", () => {
       const provider = createProvider();
       const category = new SettingsCategoryItem("logging");
       const children = provider.getChildren(category) as SettingsValueItem[];
-      expect(children.some((child) => child.label?.includes("Terminal Output Trace"))).toBe(true);
+      expect(children.some((child) => (typeof child.label === "string" ? child.label : child.label?.label)?.includes("Terminal Output Trace"))).toBe(true);
     });
 
     it("returns 7 children for ssh category after host trust moves to Security & Data", () => {
@@ -320,7 +320,7 @@ describe("SettingsTreeProvider", () => {
       const provider = createProvider();
       const category = new SettingsCategoryItem("sftp");
       const children = provider.getChildren(category) as SettingsValueItem[];
-      expect(children.some((child) => child.label?.includes("Operation Timeout: 30 seconds"))).toBe(true);
+      expect(children.some((child) => (typeof child.label === "string" ? child.label : child.label?.label)?.includes("Operation Timeout: 30 seconds"))).toBe(true);
     });
 
     it("shows formatted values in labels", () => {
@@ -410,7 +410,7 @@ describe("SettingsTreeProvider", () => {
     const listener = vi.fn();
     provider.onDidChangeTreeData(listener);
 
-    const configListener = mockOnDidChangeConfiguration.mock.calls[0][0] as (event: { affectsConfiguration: (key: string) => boolean }) => void;
+    const configListener = mockOnDidChangeConfiguration.mock.calls[0][0];
     configListener({
       affectsConfiguration: (key: string) => key === "nexus.terminal.highlighting.rules"
     });

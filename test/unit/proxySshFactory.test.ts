@@ -1131,10 +1131,10 @@ describe("ProxySshFactory", () => {
     const opened: string[] = [];
     let answerDirect!: (value: { password: string; save: boolean }) => void;
     const directPrompt: PasswordPrompt = {
-      prompt: vi.fn((server) => {
+      prompt: vi.fn((server: ServerConfig) => {
         if (server.id !== direct.id) return Promise.resolve({ password: "target-pw", save: false });
         opened.push("server");
-        return new Promise((resolve) => { answerDirect = resolve; });
+        return new Promise<{ password: string; save: boolean }>((resolve) => { answerDirect = resolve; });
       })
     };
     const connector: SshConnector = { connect: vi.fn(async () => makeFakeConnection()) };
@@ -1167,10 +1167,10 @@ describe("ProxySshFactory", () => {
     const opened: string[] = [];
     let answerDirect!: (value: { password: string; save: boolean }) => void;
     const directPrompt: PasswordPrompt = {
-      prompt: vi.fn((server) => {
+      prompt: vi.fn((server: ServerConfig) => {
         opened.push("server");
         return server.id === direct.id
-          ? new Promise((resolve) => { answerDirect = resolve; })
+          ? new Promise<{ password: string; save: boolean }>((resolve) => { answerDirect = resolve; })
           : Promise.resolve({ password: "target-pw", save: false });
       })
     };
@@ -1206,10 +1206,10 @@ describe("ProxySshFactory", () => {
     const opened: string[] = [];
     let answerDirect!: (value: { password: string; save: boolean }) => void;
     const directPrompt: PasswordPrompt = {
-      prompt: vi.fn((server) => {
+      prompt: vi.fn((server: ServerConfig) => {
         if (server.id === direct.id) opened.push("server");
         return server.id === direct.id
-          ? new Promise((resolve) => { answerDirect = resolve; })
+          ? new Promise<{ password: string; save: boolean }>((resolve) => { answerDirect = resolve; })
           : Promise.resolve({ password: "target-pw", save: false });
       })
     };
@@ -1247,10 +1247,10 @@ describe("ProxySshFactory", () => {
     const opened: string[] = [];
     let answerDirect!: (value: { password: string; save: boolean }) => void;
     const directPrompt: PasswordPrompt = {
-      prompt: vi.fn((server) => {
+      prompt: vi.fn((server: ServerConfig) => {
         if (server.id === direct.id) opened.push("server");
         return server.id === direct.id
-          ? new Promise((resolve) => { answerDirect = resolve; })
+          ? new Promise<{ password: string; save: boolean }>((resolve) => { answerDirect = resolve; })
           : Promise.resolve({ password: "target-pw", save: false });
       })
     };

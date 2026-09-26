@@ -20,7 +20,8 @@ esbuild bundler, Vitest. Targets VS Code ^1.105 (Node 22 extension host,
 
 ## Commands
 
-- `npm run compile` — type-check only. This is the only static check; **no linter/formatter is configured**.
+- `npm run compile` — type-check extension source only, with no emit.
+- `npm run typecheck:test` — strict type-check of source and test files, with no emit. **No linter/formatter is configured**.
 - `npm run build` — clean + type-check + all esbuild bundles + native artifact prep.
 - `npm test` (coverage), `npm run test:unit`, `npm run test:integration`.
 - Single test: `npx vitest run test/unit/nexusCore.test.ts`; by name: `npx vitest run -t "pattern"`.

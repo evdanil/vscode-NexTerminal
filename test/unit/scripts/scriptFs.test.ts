@@ -2864,6 +2864,8 @@ describe("buildScriptFsScope — scheme guard (decision 5, remote compat)", () =
       scriptUri: remoteScriptUri,
       scriptDirUri: remoteScriptDirUri,
       scriptsRootUri: localRootUri,
+      maxBytes: 1024,
+      isAborted: () => false,
       log: vi.fn()
     });
 
@@ -2884,6 +2886,8 @@ describe("buildScriptFsScope — scheme guard (decision 5, remote compat)", () =
       scriptUri: remoteScriptUri,
       scriptDirUri: remoteScriptDirUri,
       scriptsRootUri: remoteRootUri,
+      maxBytes: 1024,
+      isAborted: () => false,
       log: vi.fn()
     });
 
@@ -2987,6 +2991,8 @@ describe("remote (non-file) scheme — reads route by .path, never by the (bogus
         scriptUri: remoteUri("wsl+ubuntu", "/home/u/scripts/cisco/probe.js"),
         scriptDirUri: remoteUri("wsl+ubuntu", "/home/u/scripts/cisco"),
         scriptsRootUri: undefined,
+        maxBytes: 1024,
+        isAborted: () => false,
         log: vi.fn()
       });
       expect("code" in remoteScope).toBe(false);

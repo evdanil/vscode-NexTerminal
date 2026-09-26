@@ -102,6 +102,8 @@ function makeTestPty(): TestPty {
       return { dispose: () => observers.delete(o) };
     },
     setInputBlocked: vi.fn(),
+    resetTerminal: vi.fn(),
+    markShuttingDown: vi.fn(),
     writeProgrammatic(data) {
       writes.push(data);
     },
@@ -109,7 +111,7 @@ function makeTestPty(): TestPty {
       observers.forEach((o) => o.onOutput(text));
     },
     writes
-  } as TestPty;
+  };
 }
 
 function makeMockCore(session: ActiveSession): NexusCore {

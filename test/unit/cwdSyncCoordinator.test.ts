@@ -106,7 +106,7 @@ function makeFakeSftp() {
   return {
     // Identity by default: realpath just echoes what it's given.
     realpath: vi.fn(async (_serverId: string, remotePath: string) => remotePath),
-    tryStat: vi.fn(async (_serverId: string, _remotePath: string) => ({ isDirectory: true }))
+    tryStat: vi.fn(async (_serverId: string, _remotePath: string): Promise<{ isDirectory: boolean } | undefined> => ({ isDirectory: true }))
   };
 }
 

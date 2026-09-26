@@ -2122,7 +2122,7 @@ describe("bulk removal closes runtime owned by deleted profiles", () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
       let settled = false;
-      void registeredCommands.get("nexus.config.completeReset")!().then(() => { settled = true; });
+      void Promise.resolve(registeredCommands.get("nexus.config.completeReset")!()).then(() => { settled = true; });
       await stopStarted;
       await vi.advanceTimersByTimeAsync(10_000);
 

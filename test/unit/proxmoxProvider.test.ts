@@ -723,7 +723,8 @@ describe("createProxmoxProvider", () => {
     });
 
     it("NEVER uses it for a source that did not opt in, however the certificate would have failed (⊘ selecting on the URL scheme alone turns verification off for every https source)", async () => {
-      for (const config of [{ baseUrl: "https://pve.example.com:8006", allowInsecureTls: false }, { baseUrl: "https://pve.example.com:8006" }]) {
+      const configs: InventorySourceValues[] = [{ baseUrl: "https://pve.example.com:8006", allowInsecureTls: false }, { baseUrl: "https://pve.example.com:8006" }];
+      for (const config of configs) {
         const { standard, insecure, provider } = probes();
         await provider.testConnection(config, SECRETS);
         expect(standard.calls.length).toBeGreaterThan(0);
@@ -787,7 +788,7 @@ describe("createProxmoxProvider", () => {
      * request to land somewhere observable.
      */
     async function syncRows(rows: unknown[], config: InventorySourceValues = { baseUrl: BASE }) {
-      const fetchImpl = vi.fn(async () => makeResponse(200, { data: rows }));
+      const fetchImpl = vi.fn(async (_url: string) => makeResponse(200, { data: rows }));
       const provider = createProxmoxProvider(fetchImpl as unknown as typeof fetch, fetchImpl as unknown as typeof fetch);
       const tree = await provider.fetchInventory(config, SECRETS);
       return { tree, fetchImpl };

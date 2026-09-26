@@ -7,6 +7,10 @@ let quickPickOptions: { placeHolder?: string } | undefined;
 let quickPickReturn: unknown = undefined;
 const shownInfo: string[] = [];
 
+function pickedLabels(): string[] {
+  return (quickPickItems ?? []).map((item) => (item as { label: string }).label);
+}
+
 vi.mock("vscode", () => ({
   FileType: { File: 1, Directory: 2 },
   Uri: {
@@ -131,12 +135,12 @@ describe("scriptPicker / pickScriptFromWorkspace", () => {
 
     quickPickItems = undefined;
     await pickScriptFromWorkspace(GLOBAL_STORAGE, "serial");
-    const serialLabels = (quickPickItems as Array<{ label: string }>)?.map((i) => i.label) ?? [];
+    const serialLabels = pickedLabels();
     expect(serialLabels).toEqual(["Any"]);
 
     quickPickItems = undefined;
     await pickScriptFromWorkspace(GLOBAL_STORAGE, "local");
-    const localLabels = (quickPickItems as Array<{ label: string }>)?.map((i) => i.label) ?? [];
+    const localLabels = pickedLabels();
     expect(localLabels).toEqual(["Any"]);
   });
 

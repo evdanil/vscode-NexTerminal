@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { PassThrough, Writable } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CLEAR_VISIBLE_SCREEN } from "../../src/services/terminal/terminalEscapes";
 
@@ -40,15 +41,15 @@ function decodeFrame(line: string): any {
 }
 
 class FakeSidecar extends EventEmitter implements LocalPtySidecarProcess {
-  public readonly stdout = new EventEmitter();
-  public readonly stderr = new EventEmitter();
-  public readonly stdin = {
-    write: vi.fn((chunk: string) => {
-      this.stdinWrites.push(chunk);
-      return true;
-    })
-  };
-  public readonly kill = vi.fn();
+  public readonly stdout = new PassThrough();
+  public readonly stderr = new PassThrough();
+  public readonly stdin = new Writable({
+    write: (chunk: Buffer, _encoding, done) => {
+      this.stdinWrites.push(chunk.toString("utf8"));
+      done();
+    }
+  });
+  public readonly kill = vi.fn(() => true);
   public readonly stdinWrites: string[] = [];
 
   public emitStdout(frame: unknown): void {
@@ -58,11 +59,15 @@ class FakeSidecar extends EventEmitter implements LocalPtySidecarProcess {
 
 describe("LocalShellPty", () => {
   let sidecar: FakeSidecar;
-  let spawnSidecar: ReturnType<typeof vi.fn>;
+  let spawnSidecar: ReturnType<typeof createSpawnSidecar>;
+
+  function createSpawnSidecar(child: FakeSidecar) {
+    return vi.fn((_path: string): LocalPtySidecarProcess => child);
+  }
 
   beforeEach(() => {
     sidecar = new FakeSidecar();
-    spawnSidecar = vi.fn(() => sidecar);
+    spawnSidecar = createSpawnSidecar(sidecar);
   });
 
   it("spawns the sidecar, queues startup input until ready, and forwards PTY output to observers", () => {
@@ -450,8 +455,8 @@ describe("LocalShellPty", () => {
     });
     pty.open({ rows: 24, columns: 80 });
     sidecar.emitStdout({ type: "ready" });
-    const before = sidecar.stdin.write.mock.calls.length;
+    const before = sidecar.stdinWrites.length;
     pty.resetTerminal();
-    expect(sidecar.stdin.write.mock.calls.length).toBe(before);
+    expect(sidecar.stdinWrites.length).toBe(before);
   });
 });

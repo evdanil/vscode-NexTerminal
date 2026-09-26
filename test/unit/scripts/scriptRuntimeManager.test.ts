@@ -178,6 +178,8 @@ function makeTestPty(): TestPty {
     writeProgrammatic(data: string) {
       writes.push(data);
     },
+    resetTerminal: vi.fn(),
+    markShuttingDown: vi.fn((_reason: string) => {}),
     emitOutput(text: string) {
       observers.forEach((o) => o.onOutput(text));
     },
@@ -262,6 +264,7 @@ async function createHarness(scriptSource: string, sessionOverrides: Partial<Act
     } as never,
     outputChannel: outputChannel as never,
     workerPath: "/fake/worker.js",
+    globalStoragePath: "/fake/global-storage",
     createWorker: () => worker
   });
 
@@ -304,6 +307,7 @@ async function createLocalHarness(scriptSource: string): Promise<Harness> {
     } as never,
     outputChannel: outputChannel as never,
     workerPath: "/fake/worker.js",
+    globalStoragePath: "/fake/global-storage",
     createWorker: () => worker
   });
 
@@ -1173,6 +1177,7 @@ describe("ScriptRuntimeManager — Workspace Trust gate", () => {
       } as never,
       outputChannel: { appendLine: vi.fn(), append: vi.fn(), show: vi.fn(), dispose: vi.fn() } as never,
       workerPath: "/fake/worker.js",
+      globalStoragePath: "/fake/global-storage",
       createWorker: createWorkerSpy
     });
     const fs = await import("node:fs/promises");
@@ -1750,6 +1755,7 @@ describe("ScriptRuntimeManager — the output a run starts with (#166)", () => {
       macroAutoTrigger: { pushFilter: () => ({ dispose: () => {} }), bindObserverToSession: () => {} } as never,
       outputChannel: { appendLine: () => {}, append: vi.fn(), show: vi.fn(), dispose: vi.fn() } as never,
       workerPath: "/fake/worker.js",
+      globalStoragePath: "/fake/global-storage",
       createWorker: () => {
         const w = makeFakeWorker();
         workers.push(w);

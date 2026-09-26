@@ -220,7 +220,7 @@ describe("collectIncomingMacros — variable sanitization (§10)", () => {
     const payload = {
       version: 2 as const,
       exportedAt: "",
-      macros: [macro] as TerminalMacro[]
+      macros: [macro] as unknown as TerminalMacro[]
     };
     return collectIncomingMacros(payload)!.macros[0];
   }
@@ -355,7 +355,7 @@ describe("collectIncomingMacros — `group` is untrusted at every ingest site (�
     const payload = {
       version: 2 as const,
       exportedAt: "",
-      macros: [macro] as TerminalMacro[]
+      macros: [macro] as unknown as TerminalMacro[]
     };
     return collectIncomingMacros(payload)!.macros[0];
   }

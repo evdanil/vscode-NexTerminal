@@ -211,9 +211,10 @@ describe("shared short-label map (§7.3/§7.4)", () => {
       port: 22,
       username: "u",
       authType: "agent",
+      isHidden: false,
       proxy: P,
       multiplexing: true,
-      origin: { sourceId: "src", externalId: "d", templated: { proxy: P, multiplexing: true } }
+      origin: { sourceId: "src", externalId: "d", syncedAt: 1, templated: { proxy: P, multiplexing: true } }
     };
     const applied = templateAppliedFields(server);
     expect(applied).toEqual(["proxy", "multiplexing"]);
@@ -228,8 +229,9 @@ describe("shared short-label map (§7.3/§7.4)", () => {
       port: 22,
       username: "u",
       authType: "agent",
+      isHidden: false,
       proxy: { type: "socks5", host: "changed", port: 1 }, // hand-edited away from the stamp
-      origin: { sourceId: "src", externalId: "d", templated: { proxy: P } }
+      origin: { sourceId: "src", externalId: "d", syncedAt: 1, templated: { proxy: P } }
     };
     expect(templateAppliedFields(server)).toEqual([]);
   });

@@ -59,7 +59,7 @@ class DirectTcpSshConnection implements SshConnection {
     return new PassThrough();
   }
 
-  public async openDirectTcp(remoteIP: string, remotePort: number): Promise<net.Socket> {
+  public async openDirectTcp(remoteIP: string, remotePort: number): Promise<Duplex> {
     const socket = net.createConnection({ host: remoteIP, port: remotePort });
     this.openSockets.add(socket);
     socket.on("close", () => this.openSockets.delete(socket));
@@ -159,7 +159,7 @@ class ScriptedSshConnection extends DirectTcpSshConnection {
   public disposeCount = 0;
   public readonly pendingFailures: unknown[] = [];
 
-  public override async openDirectTcp(remoteIP: string, remotePort: number): Promise<net.Socket> {
+  public override async openDirectTcp(remoteIP: string, remotePort: number): Promise<Duplex> {
     if (this.pendingFailures.length > 0) {
       throw this.pendingFailures.shift();
     }
@@ -2107,9 +2107,11 @@ describe("TunnelManager integration", () => {
         expect(forwardedAfterFirstClose).toBe(false);
 
         if (firstClose === "fixed-port transport") {
+          if (!portZeroLease) throw new Error("Expected port-zero lease");
           portZeroLease.dispose();
           portZeroLease = undefined;
         } else {
+          if (!fixedPortLease) throw new Error("Expected fixed-port lease");
           fixedPortLease.dispose();
           fixedPortLease = undefined;
         }
@@ -2474,7 +2476,7 @@ describe("TunnelManager integration", () => {
       await predecessorConnection.forwardRequested.promise;
 
       factory.finishReplacementLogin.resolve(undefined);
-      await pool.replacementLeaseDisposed.promise;
+      await pool.replacementLeaseDisposed[0].promise;
 
       const waitingId = manager.getActiveTunnelId(waitingProfile.id);
       expect(waitingId).toBeDefined();

@@ -91,6 +91,11 @@ interface FakeTerminal {
   sendText: ReturnType<typeof vi.fn>;
 }
 
+const mockWindow = vscode.window as unknown as {
+  activeTerminal: FakeTerminal | undefined;
+  terminals: FakeTerminal[];
+};
+
 function makeTerminal(name: string): FakeTerminal {
   return { name, exitStatus: undefined, sendText: vi.fn() };
 }
@@ -121,8 +126,8 @@ function makeMacro(overrides: Partial<TerminalMacro> = {}): TerminalMacro {
 beforeEach(() => {
   vi.clearAllMocks();
   lastInputBox = undefined;
-  (vscode.window as { activeTerminal: unknown }).activeTerminal = undefined;
-  (vscode.window as { terminals: unknown[] }).terminals = [];
+  mockWindow.activeTerminal = undefined;
+  mockWindow.terminals = [];
 });
 
 describe("resolveMacroText — prompt sequencing", () => {
@@ -471,8 +476,8 @@ describe("runMacro — target pinning (§8.1)", () => {
   it("sends the resolved text to the terminal active at invocation time, even if activeTerminal changes mid-prompt", async () => {
     const terminalA = makeTerminal("a");
     const terminalB = makeTerminal("b");
-    vscode.window.terminals = [terminalA, terminalB] as unknown as vscode.Terminal[];
-    vscode.window.activeTerminal = terminalA as unknown as vscode.Terminal;
+    mockWindow.terminals = [terminalA, terminalB];
+    mockWindow.activeTerminal = terminalA;
 
     const macro = makeMacro({ variables: [{ name: "host" }], text: "$host" });
     const box = queueInputBox();
@@ -480,7 +485,7 @@ describe("runMacro — target pinning (§8.1)", () => {
     await tick();
 
     // User clicks a different terminal while the prompt is open.
-    vscode.window.activeTerminal = terminalB as unknown as vscode.Terminal;
+    mockWindow.activeTerminal = terminalB;
 
     box.value = "10.0.0.1";
     box.fireAccept();
@@ -491,7 +496,7 @@ describe("runMacro — target pinning (§8.1)", () => {
   });
 
   it("aborts with no send and no prompt when there is no active terminal", async () => {
-    vscode.window.activeTerminal = undefined;
+    mockWindow.activeTerminal = undefined;
     const macro = makeMacro();
 
     await runMacro(macro);
@@ -502,8 +507,8 @@ describe("runMacro — target pinning (§8.1)", () => {
 
   it("aborts with no send when the captured target terminal closes mid-prompt", async () => {
     const terminalA = makeTerminal("a");
-    vscode.window.terminals = [terminalA] as unknown as vscode.Terminal[];
-    vscode.window.activeTerminal = terminalA as unknown as vscode.Terminal;
+    mockWindow.terminals = [terminalA];
+    mockWindow.activeTerminal = terminalA;
 
     const macro = makeMacro({ variables: [{ name: "host" }], text: "$host" });
     const box = queueInputBox();
@@ -511,7 +516,7 @@ describe("runMacro — target pinning (§8.1)", () => {
     await tick();
 
     // Terminal closes while the prompt is open.
-    vscode.window.terminals = [] as unknown as vscode.Terminal[];
+    mockWindow.terminals = [];
 
     box.value = "10.0.0.1";
     box.fireAccept();
@@ -523,8 +528,8 @@ describe("runMacro — target pinning (§8.1)", () => {
 
   it("aborts with no send when the captured target terminal's exitStatus becomes set mid-prompt", async () => {
     const terminalA = makeTerminal("a");
-    vscode.window.terminals = [terminalA] as unknown as vscode.Terminal[];
-    vscode.window.activeTerminal = terminalA as unknown as vscode.Terminal;
+    mockWindow.terminals = [terminalA];
+    mockWindow.activeTerminal = terminalA;
 
     const macro = makeMacro({ variables: [{ name: "host" }], text: "$host" });
     const box = queueInputBox();
@@ -545,8 +550,8 @@ describe("runMacro — target pinning (§8.1)", () => {
 describe("runMacro — success reporting (§8.3 fix: successful sends were silent)", () => {
   it("reports success via the status bar after a successful send, without leaking the resolved value", async () => {
     const terminalA = makeTerminal("Router1");
-    vscode.window.terminals = [terminalA] as unknown as vscode.Terminal[];
-    vscode.window.activeTerminal = terminalA as unknown as vscode.Terminal;
+    mockWindow.terminals = [terminalA];
+    mockWindow.activeTerminal = terminalA;
 
     const macro = makeMacro({ name: "IPMI SOL", variables: [{ name: "host" }], text: "$host" });
     const box = queueInputBox();
@@ -566,8 +571,8 @@ describe("runMacro — success reporting (§8.3 fix: successful sends were silen
 describe("runMacro — cancel reporting (§8.3)", () => {
   it("cancelling reports through the status bar and sends nothing", async () => {
     const terminalA = makeTerminal("a");
-    vscode.window.terminals = [terminalA] as unknown as vscode.Terminal[];
-    vscode.window.activeTerminal = terminalA as unknown as vscode.Terminal;
+    mockWindow.terminals = [terminalA];
+    mockWindow.activeTerminal = terminalA;
 
     const macro = makeMacro({ name: "IPMI SOL" });
     const box = queueInputBox();
@@ -585,8 +590,8 @@ describe("runMacro — cancel reporting (§8.3)", () => {
 describe("runMacro — re-entrancy (§8.4)", () => {
   it("rejects a concurrent run of a DIFFERENT macro while one is in flight, with no second InputBox", async () => {
     const terminalA = makeTerminal("a");
-    vscode.window.terminals = [terminalA] as unknown as vscode.Terminal[];
-    vscode.window.activeTerminal = terminalA as unknown as vscode.Terminal;
+    mockWindow.terminals = [terminalA];
+    mockWindow.activeTerminal = terminalA;
 
     const macroA = makeMacro({ name: "First", id: "a" });
     const macroB = makeMacro({ name: "Second", id: "b" });
@@ -614,8 +619,8 @@ describe("runMacro — re-entrancy (§8.4)", () => {
 
   it("a repeat invocation of the SAME in-flight macro drops silently (no status message, no second box)", async () => {
     const terminalA = makeTerminal("a");
-    vscode.window.terminals = [terminalA] as unknown as vscode.Terminal[];
-    vscode.window.activeTerminal = terminalA as unknown as vscode.Terminal;
+    mockWindow.terminals = [terminalA];
+    mockWindow.activeTerminal = terminalA;
 
     const macro = makeMacro({ id: "same-id" });
     const box = queueInputBox();
@@ -639,8 +644,8 @@ describe("runMacro — re-entrancy (§8.4)", () => {
 
   it("releases the guard even when the resolver throws, so a later run is not permanently locked out", async () => {
     const terminalA = makeTerminal("a");
-    vscode.window.terminals = [terminalA] as unknown as vscode.Terminal[];
-    vscode.window.activeTerminal = terminalA as unknown as vscode.Terminal;
+    mockWindow.terminals = [terminalA];
+    mockWindow.activeTerminal = terminalA;
 
     const failingMacro = makeMacro({ name: "Failing", id: "fail", variables: [{ name: "host" }], text: "$host" });
     queueInputBox((b) => {
@@ -677,8 +682,8 @@ describe("runMacro — re-entrancy (§8.4)", () => {
 describe("runMacro — variable-free macros never reach the InputBox machinery", () => {
   it("a macro with no variables resolves to its own text with no prompt", async () => {
     const terminalA = makeTerminal("a");
-    vscode.window.terminals = [terminalA] as unknown as vscode.Terminal[];
-    vscode.window.activeTerminal = terminalA as unknown as vscode.Terminal;
+    mockWindow.terminals = [terminalA];
+    mockWindow.activeTerminal = terminalA;
 
     const macro: TerminalMacro = { name: "Plain", text: "show version\n" };
     await runMacro(macro);

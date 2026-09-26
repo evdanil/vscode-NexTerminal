@@ -7,7 +7,7 @@ import {
   unescapeProfileTokens,
   PROFILE_TOKEN_WHITELIST
 } from "../../src/services/profileTokens";
-import type { ProfileTokenContext } from "../../src/services/profileTokens";
+import type { ProfileTokenContext, ProfileTokenFacts } from "../../src/services/profileTokens";
 import { scanPlaceholders, substituteMacroVariables } from "../../src/services/macroVariables";
 import type { ServerConfig } from "../../src/models/config";
 
@@ -25,7 +25,7 @@ function server(overrides: Partial<ServerConfig> = {}): ServerConfig {
 }
 
 /** Every outcome the tests assert on is a success — narrows without `as`. */
-function resolved(text: string, cfg: ServerConfig, context?: ProfileTokenContext): string {
+function resolved(text: string, cfg: ProfileTokenFacts, context?: ProfileTokenContext): string {
   const outcome = resolveProfileTokens(text, cfg, context);
   if (!outcome.ok) {
     throw new Error(`expected a resolution, got ${outcome.error.kind} for ${outcome.error.token}`);

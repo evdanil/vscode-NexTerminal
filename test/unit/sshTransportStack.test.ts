@@ -701,8 +701,8 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
     expect(auth.targets[0].onTcpConnection).not.toHaveBeenCalled();
     expect(auth.targets[0].cancelForwardIn).toHaveBeenCalledWith("127.0.0.1", 40_000);
     expect(auth.targets[0].dispose).toHaveBeenCalledTimes(1);
-    expect(auth.targets[0].cancelForwardIn.mock.invocationCallOrder[0]).toBeLessThan(
-      auth.targets[0].dispose.mock.invocationCallOrder[0]
+    expect(vi.mocked(auth.targets[0].cancelForwardIn).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(auth.targets[0].dispose).mock.invocationCallOrder[0]
     );
     expect(result).toBeInstanceOf(TunnelStoppedError);
   });

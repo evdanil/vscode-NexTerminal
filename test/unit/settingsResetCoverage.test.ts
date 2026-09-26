@@ -83,7 +83,7 @@ async function sendPanelMessage(msg: Record<string, unknown>): Promise<void> {
   state.panelDispose = undefined;
   state.messageListener = undefined;
   SettingsPanel.open();
-  await state.messageListener?.(msg);
+  await (state.messageListener as ((message: Record<string, unknown>) => void) | undefined)?.(msg);
   // handleMessage is async and fired without await from the listener wrapper.
   await new Promise((resolve) => setImmediate(resolve));
 }

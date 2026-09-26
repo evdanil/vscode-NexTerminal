@@ -58,13 +58,19 @@ function createFakeSocket(): FakeSocketHandle {
   const destroy = vi.fn();
   const connectArgs: Array<{ host: string; port: number }> = [];
 
+  function on(event: "connect", listener: () => void): TelnetSocket;
+  function on(event: "data", listener: (chunk: Buffer) => void): TelnetSocket;
+  function on(event: "error", listener: (error: Error) => void): TelnetSocket;
+  function on(event: "close", listener: () => void): TelnetSocket;
+  function on(event: string, listener: (...args: never[]) => void): TelnetSocket {
+    const bucket = listeners.get(event) ?? [];
+    bucket.push(listener as (arg?: unknown) => void);
+    listeners.set(event, bucket);
+    return socket;
+  }
+
   const socket: TelnetSocket = {
-    on(event: string, listener: (arg?: never) => void) {
-      const bucket = listeners.get(event) ?? [];
-      bucket.push(listener as (arg?: unknown) => void);
-      listeners.set(event, bucket);
-      return socket;
-    },
+    on,
     write(data: Buffer) {
       writes.push(Buffer.from(data));
       return true;

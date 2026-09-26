@@ -49,6 +49,10 @@ interface Recorder {
   respondWith(index: number, stream: Readable, res?: { status?: number; headers?: Record<string, string | string[]> }): void;
 }
 
+function headerValue(headers: RequestOptions["headers"], name: string): unknown {
+  return Object.entries(headers ?? {}).find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
+}
+
 function recorder(): Recorder {
   const calls: { options: RequestOptions; req: FakeRequest }[] = [];
   const callbacks: ((res: IncomingMessage) => void)[] = [];
@@ -168,7 +172,7 @@ describe("createInsecureHttpsFetch — request construction", () => {
     const { options, req } = rec.calls[0];
     expect(options.method).toBe("POST");
     expect(options.headers).toMatchObject({ "Content-Type": "application/json", Accept: "application/json" });
-    expect(options.headers?.["Content-Length"]).toBe(String(Buffer.byteLength(body)));
+    expect(headerValue(options.headers, "Content-Length")).toBe(String(Buffer.byteLength(body)));
     expect(req.written).toBe(body);
     rec.respond(0, { body: "{}" });
     await promise;
@@ -177,13 +181,13 @@ describe("createInsecureHttpsFetch — request construction", () => {
   it("accepts headers as a Headers instance or as an array of pairs, not only a plain object", async () => {
     const a = issue("https://eve.example.com/api/status", { headers: new Headers({ Cookie: "unetlab_session=s1" }) });
     await tick();
-    expect(String(a.rec.calls[0].options.headers?.["cookie"] ?? a.rec.calls[0].options.headers?.["Cookie"])).toBe("unetlab_session=s1");
+    expect(String(headerValue(a.rec.calls[0].options.headers, "Cookie"))).toBe("unetlab_session=s1");
     a.rec.respond(0, { body: "{}" });
     await a.promise;
 
     const b = issue("https://eve.example.com/api/status", { headers: [["Accept", "application/json"]] });
     await tick();
-    expect(b.rec.calls[0].options.headers?.["Accept"]).toBe("application/json");
+    expect(headerValue(b.rec.calls[0].options.headers, "Accept")).toBe("application/json");
     b.rec.respond(0, { body: "{}" });
     await b.promise;
   });
@@ -191,7 +195,7 @@ describe("createInsecureHttpsFetch — request construction", () => {
   it("asks for an UNcompressed body, because node:https does not decompress one (⊘ letting the server gzip yields bytes the JSend parser reads as 'not EVE-NG JSON')", async () => {
     const { rec, promise } = issue("https://eve.example.com/api/status");
     await tick();
-    expect(rec.calls[0].options.headers?.["Accept-Encoding"]).toBe("identity");
+    expect(headerValue(rec.calls[0].options.headers, "Accept-Encoding")).toBe("identity");
     rec.respond(0, { body: "{}" });
     await promise;
   });

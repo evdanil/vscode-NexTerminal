@@ -115,7 +115,9 @@ describe("SilentAuthSshFactory", () => {
       (id) => (id === baseServer.id ? liveServer.current : undefined)
     );
 
-    const connecting = factory.connect(liveServer.current);
+    const initialServer = liveServer.current;
+    if (!initialServer) throw new Error("expected a live server");
+    const connecting = factory.connect(initialServer);
     await inputPromptStarted.promise;
     liveServer.current = { ...liveServer.current! };
     inputPromptAnswer.resolve("stale-interactive-answer");

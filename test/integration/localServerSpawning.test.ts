@@ -131,7 +131,7 @@ vi.mock("vscode", () => ({
   Pseudoterminal: class {},
   commands: { executeCommand: vi.fn() },
   window: {
-    createTerminal: (...a: unknown[]) => createTerminalMock(...a),
+    createTerminal: (options?: { pty?: { close?: () => void } }) => createTerminalMock(options),
     onDidCloseTerminal: (l: (t: unknown) => void) => {
       closeTerminalListeners.push(l);
       return { dispose: vi.fn(() => { const i = closeTerminalListeners.indexOf(l); if (i >= 0) closeTerminalListeners.splice(i, 1); }) };
@@ -187,7 +187,7 @@ function makeManager(core: any, overrides: Partial<ConstructorParameters<typeof 
     extensionPath: "/tmp/nexus-ext-integration",
     terminals: new Map(),
     terminalRegistry: undefined as any,
-    outputChannel: { appendLine: vi.fn(), show: vi.fn() },
+    outputChannel: { appendLine: vi.fn() },
     highlighter: undefined as any,
     diagnostics: vi.fn(),
     ...overrides
@@ -486,7 +486,7 @@ describe("LocalServerManager integration (lifecycle + core hub + trust gating)",
     spawnedPtys[0].fire("startup");
     spawnedPtys[0].fire("close", 0);
 
-    const secondId = await manager.restart(cfg.id);
+    const secondId = await manager.restart(cfg);
     expect(typeof secondId).toBe("string");
     expect(spawnedPtys).toHaveLength(2);
     // Fire startup + advance past LOCAL_SERVER_STABLE_RUN_MS on the restarted PTY

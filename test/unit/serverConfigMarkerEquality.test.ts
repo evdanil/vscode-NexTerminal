@@ -151,7 +151,7 @@ describe("serverConfigsEqual — formerlySynced (ADOPT 1)", () => {
     expect(serverConfigsEqual(server(), server())).toBe(true);
     // Including the optional members, so the clause added for them cannot be a
     // permanent "not equal".
-    const full = { ...MARKER, instanceKey: "https://netbox.example.com", syncedAuthProfileId: "p1", syncedIpmiHost: "10.9.9.9", templated: { proxy: { type: "socks5", host: "10.9.9.1", port: 1080 }, multiplexing: false } };
+    const full: DetachedServerOrigin = { ...MARKER, instanceKey: "https://netbox.example.com", syncedAuthProfileId: "p1", syncedIpmiHost: "10.9.9.9", templated: { proxy: { type: "socks5", host: "10.9.9.1", port: 1080 }, multiplexing: false } };
     expect(serverConfigsEqual(server({ formerlySynced: full }), server({ formerlySynced: { ...full } }))).toBe(true);
   });
 });

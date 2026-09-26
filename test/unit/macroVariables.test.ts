@@ -404,7 +404,7 @@ describe("withRedactedVariables (security fix — redact masked fields only; nev
   });
 
   it("returns the input unchanged when `variables` is absent", () => {
-    const macro = { name: "m", text: "echo hi" };
+    const macro: TerminalMacro = { name: "m", text: "echo hi" };
     const result = withRedactedVariables(macro);
     expect(result).toBe(macro);
   });
