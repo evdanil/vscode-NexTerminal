@@ -116,7 +116,7 @@ import { decrypt, encrypt } from "../../src/utils/configCrypto";
 import type { SecretVault, SshConnection, SshConnector } from "../../src/services/ssh/contracts";
 import type { LocalServerConfig } from "../../src/models/localServer";
 import type { DhcpConfigProfile, TftpConfigProfile } from "../../src/models/networkServerProfile";
-import type { AuthProfile, LocalShellProfile, ServerConfig } from "../../src/models/config";
+import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile } from "../../src/models/config";
 import { ProxySshFactory } from "../../src/services/ssh/proxySshFactory";
 import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
@@ -192,6 +192,20 @@ function makeLocalShell(overrides: Partial<LocalShellProfile> = {}): LocalShellP
     cwd: "/work",
     env: { GITHUB_TOKEN: "ghp-shell-secret-value", PAGER: "less" },
     ...overrides
+  };
+}
+
+function makeSerial(overrides: Partial<SerialProfile> = {}): SerialProfile {
+  return {
+    id: "serial-1", name: "Console", path: "COM4", baudRate: 115200,
+    dataBits: 8, stopBits: 1, parity: "none", rtscts: false, ...overrides
+  };
+}
+
+function makeTunnel(overrides: Partial<TunnelProfile> = {}): TunnelProfile {
+  return {
+    id: "tunnel-1", name: "Web", localPort: 8080, remoteIP: "127.0.0.1",
+    remotePort: 80, autoStart: false, ...overrides
   };
 }
 
@@ -353,8 +367,31 @@ function recordingRuntime(core: NexusCore): ConfigRuntimeHooks & {
         dhcpProfiles: snapshot.dhcpProfiles.length,
         localServers: snapshot.localServers.length
       });
-    }
+    },
+    teardownServerRuntime: async () => undefined,
+    stopTunnel: async () => undefined,
+    closeSerialProfileTerminals: () => undefined,
+    closeLocalShellProfileTerminals: () => undefined
   };
+}
+
+function liveProfileRuntime(core: NexusCore) {
+  const live = {
+    servers: new Set<string>(),
+    tunnels: new Set<string>(),
+    serial: new Set<string>(),
+    shells: new Set<string>()
+  };
+  const runtime = {
+    ...recordingRuntime(core),
+    teardownServerRuntime: async (id: string, shouldAbort?: () => boolean) => {
+      if (!shouldAbort?.()) live.servers.delete(id);
+    },
+    stopTunnel: async (id: string) => { live.tunnels.delete(id); },
+    closeSerialProfileTerminals: (id: string) => { live.serial.delete(id); },
+    closeLocalShellProfileTerminals: (id: string) => { live.shells.delete(id); }
+  };
+  return { live, runtime };
 }
 
 const START_COMMANDS = [
@@ -2005,6 +2042,147 @@ describe("Encrypted Backup — environment maps hold any profile id", () => {
   });
 });
 
+describe("bulk removal closes runtime owned by deleted profiles", () => {
+  async function populatedMachine() {
+    const machine = await makeMachine();
+    await machine.core.addOrUpdateServer(makeServer());
+    await machine.core.addOrUpdateTunnel(makeTunnel());
+    machine.core.registerTunnel({
+      id: "active-tunnel-1", profileId: "tunnel-1", serverId: "srv-1",
+      localPort: 8080, remoteIP: "127.0.0.1", remotePort: 80,
+      connectionMode: "shared", tunnelType: "local", startedAt: 0, bytesIn: 0, bytesOut: 0
+    });
+    await machine.core.addOrUpdateSerialProfile(makeSerial());
+    await machine.core.addOrUpdateLocalShellProfile(makeLocalShell());
+    const { live, runtime } = liveProfileRuntime(machine.core);
+    live.servers.add("srv-1");
+    live.tunnels.add("active-tunnel-1");
+    live.serial.add("serial-1");
+    live.shells.add("sh-1");
+    return { machine, live, runtime };
+  }
+
+  it("Delete All Data closes a deleted server, serial terminal, and local shell", async () => {
+    const { machine, live, runtime } = await populatedMachine();
+    register(machine, runtime);
+    mockShowWarningMessage.mockResolvedValueOnce("Delete Everything");
+    mockShowInputBox.mockResolvedValueOnce("DELETE");
+
+    await registeredCommands.get("nexus.config.completeReset")!();
+
+    expect(live.servers.size).toBe(0);
+    expect(live.tunnels.size).toBe(0);
+    expect(live.serial.size).toBe(0);
+    expect(live.shells.size).toBe(0);
+  });
+
+  it("Delete All Data disconnects profiles already removed when a later write fails", async () => {
+    const { machine, live, runtime } = await populatedMachine();
+    vi.spyOn(machine.core, "removeSerialProfile").mockRejectedValueOnce(new Error("persist failed"));
+    register(machine, runtime);
+    mockShowWarningMessage.mockResolvedValueOnce("Delete Everything");
+    mockShowInputBox.mockResolvedValueOnce("DELETE");
+
+    await expect(registeredCommands.get("nexus.config.completeReset")!()).rejects.toThrow("persist failed");
+
+    expect(live.servers.size).toBe(0);
+    expect(live.tunnels.size).toBe(0);
+    expect(live.serial).toEqual(new Set(["serial-1"]));
+    expect(live.shells).toEqual(new Set(["sh-1"]));
+  });
+
+  it("Delete All Data offers reload without a success toast when a connection cannot stop", async () => {
+    const { machine, runtime } = await populatedMachine();
+    runtime.stopTunnel = async () => { throw new Error("stop failed"); };
+    register(machine, runtime);
+    mockShowWarningMessage.mockResolvedValueOnce("Delete Everything").mockResolvedValueOnce(undefined);
+    mockShowInputBox.mockResolvedValueOnce("DELETE");
+
+    await registeredCommands.get("nexus.config.completeReset")!();
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining("connection could not be stopped"),
+      "Reload Window"
+    );
+    expect(mockShowInformationMessage).not.toHaveBeenCalledWith("All Nexus data has been deleted.");
+  });
+
+  it("Delete All Data reports a tunnel stop that never settles", async () => {
+    const { machine, runtime } = await populatedMachine();
+    let signalStop!: () => void;
+    const stopStarted = new Promise<void>((resolve) => { signalStop = resolve; });
+    runtime.stopTunnel = async () => {
+      signalStop();
+      await new Promise<void>(() => undefined);
+    };
+    register(machine, runtime);
+    mockShowWarningMessage.mockResolvedValueOnce("Delete Everything").mockResolvedValueOnce(undefined);
+    mockShowInputBox.mockResolvedValueOnce("DELETE");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let settled = false;
+      void registeredCommands.get("nexus.config.completeReset")!().then(() => { settled = true; });
+      await stopStarted;
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(settled).toBe(true);
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        expect.stringContaining("connection could not be stopped"),
+        "Reload Window"
+      );
+      expect(mockShowInformationMessage).not.toHaveBeenCalledWith("All Nexus data has been deleted.");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("Replace closes runtime for profiles absent from the imported backup", async () => {
+    const { machine, live, runtime } = await populatedMachine();
+
+    await runImport(machine, backupJson({}, {}), "replace", runtime);
+
+    expect(live.servers.size).toBe(0);
+    expect(live.tunnels.size).toBe(0);
+    expect(live.serial.size).toBe(0);
+    expect(live.shells.size).toBe(0);
+  });
+
+  it("Replace keeps runtime for profiles restored under their original ids", async () => {
+    const { machine, live, runtime } = await populatedMachine();
+    const backup = backupJson({
+      servers: [makeServer()],
+      tunnels: [makeTunnel()],
+      serialProfiles: [makeSerial()],
+      localShellProfiles: [makeLocalShell()]
+    }, {});
+
+    await runImport(machine, backup, "replace", runtime);
+
+    expect(live.servers).toEqual(new Set(["srv-1"]));
+    expect(live.tunnels).toEqual(new Set(["active-tunnel-1"]));
+    expect(live.serial).toEqual(new Set(["serial-1"]));
+    expect(live.shells).toEqual(new Set(["sh-1"]));
+  });
+
+  it("Replace stops a removed tunnel even when its server survives", async () => {
+    const { machine, live, runtime } = await populatedMachine();
+
+    await runImport(machine, backupJson({ servers: [makeServer()] }, {}), "replace", runtime);
+
+    expect(live.servers).toEqual(new Set(["srv-1"]));
+    expect(live.tunnels.size).toBe(0);
+  });
+
+  it("Replace discloses that removing profiles closes their open sessions", async () => {
+    const machine = await makeMachine();
+    await runImport(machine, backupJson({}, {}), "replace");
+
+    const choices = mockShowQuickPick.mock.calls[1]?.[0] as Array<{ label: string; detail: string }>;
+    const replace = choices.find((choice) => choice.label === "Replace");
+    expect(replace?.detail).toContain("Open sessions for removed profiles will close");
+  });
+});
+
 describe("Delete All Data (nexus.config.completeReset) covers Local Servers and TFTP/DHCP profiles", () => {
   const OLD_CONFIRMATION =
     "This will permanently delete ALL servers, tunnels, serial profiles, local shell profiles, inventory sources, macros, groups, and saved passwords. This cannot be undone.";
@@ -2074,6 +2252,7 @@ describe("Delete All Data (nexus.config.completeReset) covers Local Servers and 
     expect(confirmation).toContain("Local Server profiles");
     expect(confirmation).toContain("saved TFTP/DHCP profiles");
     expect(confirmation).toContain("Running Local Servers and TFTP/DHCP services are stopped before their configuration is removed.");
+    expect(confirmation).toContain("Open sessions and tunnels will be closed");
     expect(confirmation).not.toBe(OLD_CONFIRMATION);
     expect(confirmation).not.toContain("local shell profiles, inventory sources, macros");
   });

@@ -493,8 +493,8 @@ function localShellRemovalDisclosure(profileName: string): string {
 
 /**
  * Closes every open terminal of one Local Shell profile — the runtime teardown
- * that happens before the profile is deleted. Shared by Remove here and a
- * folder's Delete contents (profileCommands.ts), so the two cannot drift apart.
+ * that happens before a single-profile delete and after a bulk delete has
+ * released its config lock. Shared with folder and config-wide removal flows.
  */
 export function closeLocalShellProfileTerminals(ctx: Pick<CommandContext, "localShellTerminals">, profileId: string): void {
   for (const [sessionId, entry] of ctx.localShellTerminals.entries()) {

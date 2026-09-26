@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.276] — 2026-09-26
+
+### Fixed
+
+- **Bulk profile deletion closes its live connections.** Delete All Data and Replace import now close sessions and stop tunnels for removed servers, serial profiles, Local Shell profiles and tunnel profiles. Replace keeps runtime for profiles restored with the same id; cleanup happens outside the config mutation lock so a slow tunnel cannot block unrelated edits. Confirmations disclose the closures.
+
 ## [2.8.275] — 2026-09-26
 
 ### Fixed
