@@ -174,6 +174,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.stream = undefined;
     this.connection = undefined;
     this.disconnected = true;
+    this.writeEmitter.fire(RESET_MOUSE_TRACKING);
     this.activityIndicator = false;
     this.nameEmitter.fire(`${this.baseName} [Disconnected]`);
     this.writeEmitter.fire(`\r\n\r\n[Nexus SSH] ${reason}\r\n`);

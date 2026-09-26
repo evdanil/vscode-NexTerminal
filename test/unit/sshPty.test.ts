@@ -941,8 +941,28 @@ describe("SshPty", () => {
       onDisconnected: vi.fn()
     };
     const logger = { log: vi.fn(), close: vi.fn() };
-    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
     const writes: string[] = [];
+    let buffered = "";
+    let emitHighlighted: (text: string) => void = () => {};
+    const highlighterStream = {
+      push: vi.fn((text: string) => {
+        buffered += text;
+      }),
+      flush: vi.fn(() => {
+        if (buffered) {
+          emitHighlighted(`[hl]${buffered}`);
+          buffered = "";
+        }
+      }),
+      dispose: vi.fn()
+    };
+    const highlighter = {
+      createStream: vi.fn((emit: (text: string) => void) => {
+        emitHighlighted = emit;
+        return highlighterStream;
+      })
+    };
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any, undefined, highlighter as any);
     pty.onDidWrite((s) => writes.push(s));
     const closes: void[] = [];
     pty.onDidClose(() => closes.push());
@@ -953,11 +973,21 @@ describe("SshPty", () => {
     pty.open();
     await flushAsync();
     writes.length = 0;
+    stream.push("pending output");
+    const transportWrite = vi.spyOn(stream, "write");
 
     pty.markShuttingDown("Nexus extension is shutting down. This session has been closed.");
 
+    expect(highlighterStream.flush).toHaveBeenCalledTimes(1);
+    expect(writes[0]).toBe("[hl]pending output");
+    expect(writes[1]).toBe(RESET_MOUSE_TRACKING);
     expect(writes.join("")).toContain("Nexus extension is shutting down");
     expect(writes.join("")).toContain("Close this terminal and start a new session to reconnect.");
+    expect(writes.filter((text) => text === RESET_MOUSE_TRACKING)).toHaveLength(1);
+    expect(writes.join("")).not.toContain(CLEAR_VISIBLE_SCREEN);
+    expect(writes.join("")).not.toContain("\x1b[2J");
+    expect(writes.join("")).not.toContain("\x1b[3J");
+    expect(transportWrite).not.toHaveBeenCalled();
     expect(nameChanges.at(-1)).toBe("Nexus SSH: Server 1 [Disconnected]");
     expect(streamDestroySpy).toHaveBeenCalled();
     expect(connection.dispose).toHaveBeenCalled();
@@ -965,10 +995,9 @@ describe("SshPty", () => {
     expect(callbacks.onSessionClosed).not.toHaveBeenCalled();
 
     // Input after shutdown must not re-dispose the pty (would close the tab).
-    const writeSpyAfter = vi.spyOn(stream, "write");
     pty.handleInput("R");
     pty.handleInput("\r");
-    expect(writeSpyAfter).not.toHaveBeenCalled();
+    expect(transportWrite).not.toHaveBeenCalled();
     expect(closes).toHaveLength(0);
   });
 
@@ -1044,6 +1073,10 @@ describe("SshPty", () => {
     pty.handleInput("R");
     await flushAsync();
 
+    // Data already queued on the old stream can arrive after start() reset the
+    // filter. It must be rejected before it can seed a partial OSC 3008 carry.
+    stream1.emit("data", Buffer.from("\x1b]3008;start=late-old;pid=2"));
+
     // Session B's first chunk: visible banner, then B's own BEL-terminated
     // OSC 3008 (its first prompt context line), then the prompt. If stale-A
     // carry survived, findTerminator fuses "<stale A partial>BANNER-B...<B's BEL>"
@@ -1058,6 +1091,7 @@ describe("SshPty", () => {
     expect(sessionBOutput).not.toContain("\x1b]3008;");
     // The stale-A partial must never resurface either.
     expect(sessionBOutput).not.toContain("start=A");
+    expect(sessionBOutput).not.toContain("start=late-old");
 
     pty.dispose();
   });
