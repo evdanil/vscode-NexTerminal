@@ -1321,6 +1321,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   });
   const unsubscribeTunnel = tunnelManager.onDidChange((event) => {
     if (event.type === "started") {
+      // A start already in progress can emit after bulk removal. Keep that
+      // orphan out of both the core snapshot and the cross-window registry;
+      // startTunnel stops it as soon as the manager returns.
+      if (!core.getTunnel(event.tunnel.profileId) || !core.getServer(event.tunnel.serverId)) {
+        return;
+      }
       core.registerTunnel(event.tunnel);
       void registrySync.registerTunnel(event.tunnel);
       const logger = loggerFactory.create("tunnel", event.tunnel.id);
@@ -1568,6 +1574,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     stopNetworkServices: () => stopRunningNetworkServices(core, networkServerManager),
     teardownServerRuntime: (serverId, shouldAbort) => teardownServerRuntime(ctx, serverId, shouldAbort),
     stopTunnel: (activeTunnelId) => ctx.tunnelManager.stop(activeTunnelId),
+    activeTunnelIdForProfile: (profileId) => ctx.tunnelManager.getActiveTunnelId(profileId),
     closeSerialProfileTerminals: (profileId) => closeSerialProfileTerminals(ctx, profileId),
     closeLocalShellProfileTerminals: (profileId) => closeLocalShellProfileTerminals(ctx, profileId)
   });

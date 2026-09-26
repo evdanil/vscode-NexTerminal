@@ -228,19 +228,22 @@ export interface ConfigRuntimeHooks {
   teardownServerRuntime(serverId: string, shouldAbort: () => boolean): Promise<void>;
   /** Stop a running tunnel whose profile or server was removed. */
   stopTunnel(activeTunnelId: string): Promise<void>;
+  /** Includes starts that own a listener but have not emitted to NexusCore yet. */
+  activeTunnelIdForProfile(profileId: string): string | undefined;
   closeSerialProfileTerminals(profileId: string): void;
   closeLocalShellProfileTerminals(profileId: string): void;
 }
 
 interface RemovedProfileIds {
   servers: string[];
+  tunnelProfiles: string[];
   activeTunnels: Array<{ id: string; profileId: string; serverId: string }>;
   serial: string[];
   localShell: string[];
 }
 
 function emptyRemovedProfileIds(): RemovedProfileIds {
-  return { servers: [], activeTunnels: [], serial: [], localShell: [] };
+  return { servers: [], tunnelProfiles: [], activeTunnels: [], serial: [], localShell: [] };
 }
 
 const BULK_TEARDOWN_REPORT_MS = 10_000;
@@ -255,9 +258,15 @@ async function teardownRemovedProfiles(
 
   const isBack = (id: string): boolean => core.getServer(id) !== undefined;
   const serverIds = ids.servers.filter((id) => !isBack(id));
-  const tunnelStops = ids.activeTunnels
+  const tunnelIds = new Set(ids.activeTunnels
     .filter((tunnel) => !core.getTunnel(tunnel.profileId) || !core.getServer(tunnel.serverId))
-    .map((tunnel) => runtime.stopTunnel(tunnel.id));
+    .map((tunnel) => tunnel.id));
+  for (const profileId of ids.tunnelProfiles) {
+    if (core.getTunnel(profileId)) continue;
+    const activeId = runtime.activeTunnelIdForProfile(profileId);
+    if (activeId) tunnelIds.add(activeId);
+  }
+  const tunnelStops = [...tunnelIds].map((id) => runtime.stopTunnel(id));
   const teardowns = serverIds.map((id) => runtime.teardownServerRuntime(id, () => isBack(id)));
   for (const id of ids.serial) {
     if (!core.getSerialProfile(id)) runtime.closeSerialProfileTerminals(id);
@@ -4088,6 +4097,7 @@ export function registerConfigCommands(
     }
 
     if (mode === "replace") {
+      removed.tunnelProfiles.push(...snapshot.tunnels.map(({ id }) => id));
       removed.activeTunnels.push(...snapshot.activeTunnels.map(({ id, profileId, serverId }) => ({ id, profileId, serverId })));
       for (const server of snapshot.servers) {
         // Tracked BEFORE the await: `removeServer` drops the record from memory
@@ -5127,6 +5137,7 @@ export function registerConfigCommands(
     const removed = emptyRemovedProfileIds();
     const resetMutation = async (): Promise<void> => {
       const snapshot = core.getSnapshot();
+      removed.tunnelProfiles.push(...snapshot.tunnels.map(({ id }) => id));
       removed.activeTunnels.push(...snapshot.activeTunnels.map(({ id, profileId, serverId }) => ({ id, profileId, serverId })));
 
       // Delete all passwords/passphrases first (before removing servers)

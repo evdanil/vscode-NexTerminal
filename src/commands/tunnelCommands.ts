@@ -133,6 +133,7 @@ export async function startTunnel(
   connectionMode: ResolvedTunnelConnectionMode,
   registrySync?: TunnelRegistrySync
 ): Promise<void> {
+  const stillCurrent = () => core.getTunnel(profile.id) === profile && core.getServer(server.id) === server;
   // TELNET (Phase 0) — port forwarding is an SSH channel feature and telnet has
   // no equivalent. THE one guard for every route into starting a tunnel: the
   // command, the tree's drag-and-drop of a tunnel profile onto a server, the
@@ -199,8 +200,18 @@ export async function startTunnel(
     }
   }
 
+  // Registry and authentication work can outlive Replace or Delete All Data.
+  // Checking object identity also rejects a different profile restored with
+  // the same ID before this start resumes.
+  if (!stillCurrent()) {
+    return;
+  }
+
   try {
-    await tunnelManager.start(profile, server, { connectionMode });
+    const active = await tunnelManager.start(profile, server, { connectionMode });
+    if (!stillCurrent()) {
+      await tunnelManager.stop(active.id);
+    }
   } catch (error) {
     // Stopped before it finished connecting: the stop was asked for, so there
     // is no failure to report — the tunnel simply is not running.

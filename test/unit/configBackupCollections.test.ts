@@ -370,6 +370,7 @@ function recordingRuntime(core: NexusCore): ConfigRuntimeHooks & {
     },
     teardownServerRuntime: async () => undefined,
     stopTunnel: async () => undefined,
+    activeTunnelIdForProfile: () => undefined,
     closeSerialProfileTerminals: () => undefined,
     closeLocalShellProfileTerminals: () => undefined
   };
@@ -2168,6 +2169,20 @@ describe("bulk removal closes runtime owned by deleted profiles", () => {
     const { machine, live, runtime } = await populatedMachine();
 
     await runImport(machine, backupJson({ servers: [makeServer()] }, {}), "replace", runtime);
+
+    expect(live.servers).toEqual(new Set(["srv-1"]));
+    expect(live.tunnels.size).toBe(0);
+  });
+
+  it("Replace stops a tunnel that is starting but has not reached the core snapshot", async () => {
+    const { machine, live, runtime } = await populatedMachine();
+    live.tunnels.add("pending-tunnel");
+    const runtimeWithPending = {
+      ...runtime,
+      activeTunnelIdForProfile: (profileId: string) => profileId === "tunnel-1" ? "pending-tunnel" : undefined
+    };
+
+    await runImport(machine, backupJson({ servers: [makeServer()] }, {}), "replace", runtimeWithPending);
 
     expect(live.servers).toEqual(new Set(["srv-1"]));
     expect(live.tunnels.size).toBe(0);

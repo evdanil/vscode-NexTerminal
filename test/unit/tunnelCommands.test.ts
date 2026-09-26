@@ -470,14 +470,15 @@ describe("startTunnel — telnet servers", () => {
 
   it("does not refuse an ordinary SSH server", async () => {
     const ctx = await setupContext([makeTunnel()]);
-    const start = vi.fn(async () => {});
+    await ctx.core.addOrUpdateServer(telnetServer({ protocol: undefined, port: 22 }));
+    const start = vi.fn(async () => makeActiveTunnel("t1"));
 
     await startTunnel(
       ctx.core,
       { start } as never,
       { connect: vi.fn() } as never,
-      makeTunnel(),
-      telnetServer({ protocol: undefined, port: 22 }),
+      ctx.core.getTunnel("t1")!,
+      ctx.core.getServer("srv-telnet")!,
       "isolated"
     );
 
@@ -507,12 +508,14 @@ describe("startTunnel — a tunnel stopped before it finished starting", () => {
   // a tunnel funnels through here, and none of them may report it as a failure.
   it("resolves quietly, as a cancel", async () => {
     const ctx = await setupContext([makeTunnel()]);
+    await ctx.core.addOrUpdateServer(sshServer);
     const start = vi.fn(async () => {
       throw new TunnelStoppedError("Tunnel 1");
     });
 
     await expect(
-      startTunnel(ctx.core, { start } as never, { connect: vi.fn() } as never, makeTunnel(), sshServer, "isolated")
+      startTunnel(ctx.core, { start } as never, { connect: vi.fn() } as never,
+        ctx.core.getTunnel("t1")!, ctx.core.getServer("srv-ssh")!, "isolated")
     ).resolves.toBeUndefined();
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
     expect(mockShowInformationMessage).not.toHaveBeenCalled();
@@ -520,12 +523,89 @@ describe("startTunnel — a tunnel stopped before it finished starting", () => {
 
   it("still fails on any other start error", async () => {
     const ctx = await setupContext([makeTunnel()]);
+    await ctx.core.addOrUpdateServer(sshServer);
     const start = vi.fn(async () => {
       throw new Error("listen EADDRINUSE: address already in use 127.0.0.1:8080");
     });
 
     await expect(
-      startTunnel(ctx.core, { start } as never, { connect: vi.fn() } as never, makeTunnel(), sshServer, "isolated")
+      startTunnel(ctx.core, { start } as never, { connect: vi.fn() } as never,
+        ctx.core.getTunnel("t1")!, ctx.core.getServer("srv-ssh")!, "isolated")
     ).rejects.toThrow("EADDRINUSE");
+  });
+});
+
+describe("startTunnel — profile removed while start is pending", () => {
+  const server: ServerConfig = {
+    id: "srv-1", name: "Router", host: "10.0.0.1", port: 22,
+    username: "ops", authType: "password", isHidden: false
+  };
+
+  async function fixture() {
+    const ctx = await setupContext([makeTunnel()]);
+    await ctx.core.addOrUpdateServer(server);
+    return { core: ctx.core, profile: ctx.core.getTunnel("t1")!, server: ctx.core.getServer("srv-1")! };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+  });
+
+  it("does not start an old route after Replace recreates its profile under the same id", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const sync = deferred<void>();
+    const start = vi.fn(async () => makeActiveTunnel("t1"));
+    const run = startTunnel(
+      core,
+      { start } as never,
+      { connect: vi.fn() } as never,
+      profile,
+      capturedServer,
+      "isolated",
+      { syncNow: () => sync.promise, checkRemoteOwnership: async () => undefined } as never
+    );
+
+    await core.removeTunnel("t1");
+    await core.addOrUpdateTunnel({ ...profile, remotePort: 443 });
+    sync.resolve();
+    await run;
+
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it("does not start against a server replaced under the same id", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const sync = deferred<void>();
+    const start = vi.fn(async () => makeActiveTunnel("t1"));
+    const run = startTunnel(
+      core, { start } as never, { connect: vi.fn() } as never,
+      profile, capturedServer, "isolated",
+      { syncNow: () => sync.promise, checkRemoteOwnership: async () => undefined } as never
+    );
+
+    await core.removeServer("srv-1");
+    await core.addOrUpdateServer({ ...capturedServer, host: "10.0.0.2" });
+    sync.resolve();
+    await run;
+
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it("stops a start that finishes after its profile was deleted", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const starting = deferred<ActiveTunnel>();
+    const start = vi.fn(() => starting.promise);
+    const stop = vi.fn(async () => {});
+    const run = startTunnel(
+      core, { start, stop } as never, { connect: vi.fn() } as never,
+      profile, capturedServer, "isolated"
+    );
+
+    await core.removeTunnel("t1");
+    starting.resolve(makeActiveTunnel("t1"));
+    await run;
+
+    expect(stop).toHaveBeenCalledWith("at-1");
   });
 });
