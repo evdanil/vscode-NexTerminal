@@ -99,6 +99,8 @@ interface ForwardWaitMatch {
  * without a timeout of its own: these two phases are what bound that wait.
  */
 const LATE_FORWARD_CANCEL_TIMEOUT_MS = 5_000;
+// ssh2 can leave an unforward request unanswered while stop() is holding a caller's config lock.
+const REVERSE_STOP_CANCEL_TIMEOUT_MS = 1_000;
 
 /** Whether `work` fulfilled within `timeoutMs`; false if it rejected or is still pending. */
 async function fulfilledWithin(work: Promise<unknown>, timeoutMs: number): Promise<boolean> {
@@ -312,9 +314,12 @@ export class TunnelManager {
     }
     if (runtime.reverseBindAddr !== undefined && runtime.reverseBindPort !== undefined && runtime.sharedConnection) {
       try {
-        await runtime.sharedConnection.cancelForwardIn(runtime.reverseBindAddr, runtime.reverseBindPort);
+        await fulfilledWithin(
+          runtime.sharedConnection.cancelForwardIn(runtime.reverseBindAddr, runtime.reverseBindPort),
+          REVERSE_STOP_CANCEL_TIMEOUT_MS
+        );
       } catch {
-        // Best effort — connection may already be closed
+        // Best effort — connection may already be closed.
       }
     }
 

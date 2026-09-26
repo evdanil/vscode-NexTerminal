@@ -1108,6 +1108,38 @@ describe("TunnelManager integration", () => {
     expect(events.some((e) => e.type === "stopped")).toBe(true);
   });
 
+  it("finishes stopping a reverse tunnel when the remote cancel never answers", async () => {
+    const connection = new ControlledForwardConnection();
+    connection.holdCancel(1);
+    const factory = new OrderedConnectionFactory([connection]);
+    manager = new TunnelManager(factory, factory);
+    const profile: TunnelProfile = {
+      id: "reverse-unanswered-cancel", name: "Unanswered cancel", localPort: 12345,
+      remoteIP: "127.0.0.1", remotePort: 23456, autoStart: false,
+      tunnelType: "reverse", remoteBindAddress: "127.0.0.1", localTargetIP: "127.0.0.1"
+    };
+    const events: TunnelEvent[] = [];
+    manager.onDidChange((event) => events.push(event));
+    const active = await manager.start(profile, testServer);
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const stopping = manager.stop(active.id);
+    let finished = false;
+    void stopping.then(() => { finished = true; });
+    try {
+      await connection.waitForCancelAttempt(1);
+      expect(connection.cancelRequests).toEqual([{ bindAddr: "127.0.0.1", bindPort: 23456 }]);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(finished).toBe(true);
+      expect(connection.transportClosed).toBe(true);
+      expect(events.filter((event) => event.type === "stopped")).toHaveLength(1);
+    } finally {
+      connection.resolveCancel(1);
+      await stopping;
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     ["different port", "port"],
     ["different route", "route"]
