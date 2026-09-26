@@ -6,20 +6,26 @@
 export function textRunsIpmitool(text: string): boolean {
   const runsIpmitool = (words: string[], assignmentAllowed: boolean[]): boolean => {
     let index = 0;
+    let allowAssignments = true;
     const assignment = /^[A-Za-z_][A-Za-z0-9_]*=/;
     const basename = (word: string) => word.slice(word.lastIndexOf("/") + 1);
     while (index < words.length) {
       const word = words[index];
-      if (assignmentAllowed[index] && assignment.test(word)) { index++; continue; }
+      if (allowAssignments && assignmentAllowed[index] && assignment.test(word)) { index++; continue; }
       const name = basename(word);
       if (name === "sudo") {
         index++;
+        allowAssignments = false;
         while (index < words.length && words[index].startsWith("-")) {
           const option = words[index++];
-          if (["-u", "--user", "-g", "--group", "-p", "--prompt", "-C", "--close-from"].includes(option)) {
+          if (["-u", "--user", "-g", "--group", "-p", "--prompt", "-C", "--close-from", "-D", "--chdir"].includes(option)) {
             if (index >= words.length) return false;
             index++;
-          } else if (option !== "--" && !/^-[EABbnSHkis]+$/.test(option)) {
+          } else if (
+            !/^(?:--(?:user|group|prompt|close-from|chdir)=.+|-[ugpCD].+)$/.test(option) &&
+            !["--login", "--shell", "--non-interactive", "--askpass", "--background", "--bell", "--set-home", "--stdin", "--reset-timestamp"].includes(option) &&
+            option !== "--" && !/^-[EABbnSHkis]+$/.test(option)
+          ) {
             return false;
           }
           if (option === "--") break;
@@ -28,6 +34,7 @@ export function textRunsIpmitool(text: string): boolean {
       }
       if (name === "env") {
         index++;
+        allowAssignments = false;
         while (index < words.length) {
           const option = words[index];
           if ((assignmentAllowed[index] && assignment.test(option)) || option === "-i" || option === "--ignore-environment") { index++; continue; }
@@ -41,12 +48,39 @@ export function textRunsIpmitool(text: string): boolean {
         }
         continue;
       }
-      if (name === "command" || name === "exec" || name === "time") {
+      if (name === "command") {
         index++;
+        allowAssignments = false;
+        if (words[index] === "-v" || words[index] === "-V") return false;
+        if (words[index] === "-p" || words[index] === "--") index++;
+        if (words[index]?.startsWith("-")) return false;
+        continue;
+      }
+      if (name === "exec") {
+        index++;
+        allowAssignments = false;
+        while (words[index]?.startsWith("-")) {
+          const option = words[index++];
+          if (option === "-a") {
+            if (index >= words.length) return false;
+            index++;
+          } else if (option !== "--" && !/^-[cl]+$/.test(option)) {
+            return false;
+          }
+          if (option === "--") break;
+        }
+        continue;
+      }
+      if (name === "time") {
+        index++;
+        allowAssignments = false;
+        if (words[index] === "-p" || words[index] === "--") index++;
+        if (words[index]?.startsWith("-")) return false;
         continue;
       }
       if (name === "nice") {
         index++;
+        allowAssignments = false;
         if (words[index] === "-n") index += 2;
         continue;
       }

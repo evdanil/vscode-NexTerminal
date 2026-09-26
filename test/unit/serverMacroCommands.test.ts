@@ -1264,7 +1264,10 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     ['a redirection target', 'echo hello >& ipmitool\n'],
     ['a literal backslash in double quotes', '"ipmi\\tool" -E\n'],
     ['a fully quoted assignment-shaped command', '"FOO=bar" ipmitool -E\n'],
-    ['a sudo validate request', 'sudo -v ipmitool -E\n']
+    ['a sudo validate request', 'sudo -v ipmitool -E\n'],
+    ['an assignment after command', 'command FOO=bar ipmitool -E\n'],
+    ['an assignment after nice', 'nice FOO=bar ipmitool -E\n'],
+    ['a command inspection', 'command -v ipmitool -E\n']
   ])("does not treat %s as an ipmitool command", (_case, text) => {
     expect(sessionIpmiHintNote({ id: "a", name: "X", text, runIn: "session" })).toBeUndefined();
   });
@@ -1275,6 +1278,11 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     ["a sudo login shell command", "sudo -i ipmitool -E\n"],
     ["a sudo shell command", "sudo -s ipmitool -E\n"],
     ["a sudo noninteractive command", "sudo -n ipmitool -E\n"],
+    ["an attached sudo user", "sudo --user=root ipmitool -E\n"],
+    ["an attached sudo group", "sudo --group=wheel ipmitool -E\n"],
+    ["a command wrapper with -p", "command -p ipmitool -E\n"],
+    ["an exec wrapper with -c", "exec -c ipmitool -E\n"],
+    ["a time wrapper with -p", "time -p ipmitool -E\n"],
     ["an env prefix", "env BMC=1 ipmitool -E\n"],
     ["a later command", "echo ready; ipmitool -E\n"],
     ["a command after a bare carriage return", "echo ready\ripmitool -E\r"],
