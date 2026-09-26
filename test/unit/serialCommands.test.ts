@@ -501,7 +501,7 @@ describe("pending standard serial starts", () => {
 
     await registeredCommands.get("nexus.serial.connect")!("sp1");
     const callbacks = vi.mocked(SerialPty).mock.calls.at(-1)?.[2] as
-      | { isProfileCurrent?: () => boolean }
+      | { isProfileCurrent?: () => boolean; onStartRejected?: () => void; onStartCleanupComplete?: (error?: unknown) => void }
       | undefined;
     expect(callbacks?.isProfileCurrent?.()).toBe(true);
     // A bulk sweep sees no registered session while openPort is still pending.
@@ -513,6 +513,8 @@ describe("pending standard serial starts", () => {
     expect(callbacks?.isProfileCurrent?.()).toBe(false);
     if (change !== "removed") mockShowWarningMessage.mockResolvedValueOnce("Retry");
     (callbacks as { onStartRejected?: () => void } | undefined)?.onStartRejected?.();
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    callbacks?.onStartCleanupComplete?.();
     await Promise.resolve();
     expect(mockShowWarningMessage).toHaveBeenCalledWith(
       expect.stringContaining(change === "removed" ? "removed" : "changed"),
@@ -548,6 +550,38 @@ describe("pending standard serial starts", () => {
     expect(callbacks.isProfileCurrent?.()).toBe(true);
   });
 
+  it("offers a reload instead of retry when the stale serial port could not be closed", async () => {
+    const original = makeSerialProfile();
+    const ctx = {
+      core: { getSerialProfile: vi.fn(() => original), registerSerialSession: vi.fn() },
+      serialSidecar: {},
+      loggerFactory: { create: vi.fn() },
+      macroAutoTrigger: { createObserver: vi.fn(() => ({})), bindObserverToSession: vi.fn() },
+      sessionLogDir: "",
+      serialTerminals: new Map(),
+      activityIndicators: new Map(),
+      highlighter: {}
+    } as unknown as CommandContext;
+    registerSerialCommands(ctx);
+    await registeredCommands.get("nexus.serial.connect")!("sp1");
+    vi.mocked(vscode.window.showErrorMessage).mockResolvedValueOnce("Reload Window" as any);
+
+    const callbacks = vi.mocked(SerialPty).mock.calls.at(-1)?.[2] as {
+      onStartRejected?: () => void;
+      onStartCleanupComplete?: (error?: unknown) => void;
+    };
+    callbacks.onStartRejected?.();
+    callbacks.onStartCleanupComplete?.(new Error("port busy"));
+    await Promise.resolve();
+
+    expect(vscode.window.showErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("could not be confirmed closed: port busy"),
+      "Reload Window"
+    );
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.any(String), "Retry");
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("workbench.action.reloadWindow");
+  });
+
   it("clears a pending Connect and Run Script watcher when a late open is rejected", async () => {
     const original = makeSerialProfile();
     let current: SerialProfile | undefined = original;
@@ -581,12 +615,15 @@ describe("pending standard serial starts", () => {
       const callbacks = vi.mocked(SerialPty).mock.calls.at(-1)?.[2] as {
         isProfileCurrent?: () => boolean;
         onStartRejected?: () => void;
+        onStartCleanupComplete?: (error?: unknown) => void;
       };
       expect(callbacks.isProfileCurrent?.()).toBe(false);
       callbacks.onStartRejected?.();
 
       expect(unsubscribe).toHaveBeenCalledTimes(1);
       expect(vi.getTimerCount()).toBe(0);
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+      callbacks.onStartCleanupComplete?.();
       await vi.advanceTimersByTimeAsync(90_000);
       expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
         expect.stringContaining("script did not start")

@@ -24,6 +24,7 @@ export interface SerialPtyCallbacks {
   /** A late open must not register a session for a profile removed during openPort. */
   isProfileCurrent?(): boolean;
   onStartRejected?(): void;
+  onStartCleanupComplete?(error?: unknown): void;
   onSessionOpened(sessionId: string): void;
   onSessionClosed(sessionId: string): void;
   onDataReceived?(sessionId: string): void;
@@ -251,7 +252,12 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
         this.dispose();
         // Cancel dependent commands before waiting for a potentially slow close.
         this.callbacks.onStartRejected?.();
-        await this.transport.closePort(sessionId);
+        try {
+          await this.transport.closePort(sessionId);
+          this.callbacks.onStartCleanupComplete?.(undefined);
+        } catch (error) {
+          this.callbacks.onStartCleanupComplete?.(error);
+        }
         return;
       }
       this.sidecarSessionId = sessionId;

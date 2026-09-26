@@ -421,6 +421,20 @@ async function connectStandardSerialProfile(
       },
       onStartRejected: () => {
         options.onStartRejected?.();
+      },
+      onStartCleanupComplete: (error) => {
+        if (error !== undefined) {
+          const message = error instanceof Error ? error.message : String(error);
+          void Promise.resolve(vscode.window.showErrorMessage(
+            `The cancelled serial port for "${profileNameAtStart}" could not be confirmed closed: ${message}. Reload the window before reconnecting.`,
+            "Reload Window"
+          )).then((choice) => {
+            if (choice === "Reload Window") {
+              void vscode.commands.executeCommand("workbench.action.reloadWindow");
+            }
+          });
+          return;
+        }
         const current = ctx.core.getSerialProfile(profile.id);
         if (!current) {
           void vscode.window.showWarningMessage(

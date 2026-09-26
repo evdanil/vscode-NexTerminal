@@ -107,6 +107,7 @@ describe("SerialPty", () => {
     const callbacks = {
       isProfileCurrent: () => profileCurrent,
       onStartRejected: vi.fn(),
+      onStartCleanupComplete: vi.fn(),
       onSessionOpened: vi.fn(),
       onSessionClosed: vi.fn()
     };
@@ -126,10 +127,37 @@ describe("SerialPty", () => {
     expect(callbacks.onSessionClosed).not.toHaveBeenCalled();
     // The script-start watchdog must be cleared even if sidecar close is slow.
     expect(callbacks.onStartRejected).toHaveBeenCalledTimes(1);
+    expect(callbacks.onStartCleanupComplete).not.toHaveBeenCalled();
     expect(onDidClose).toHaveBeenCalledTimes(1);
     expect(dataListenerCount()).toBe(0);
     resolveClose();
     await flushAsync();
+    expect(callbacks.onStartCleanupComplete).toHaveBeenCalledExactlyOnceWith(undefined);
+  });
+
+  it("reports a rejected stale-port close without registering the session", async () => {
+    const { transport } = createTransport();
+    transport.closePort = vi.fn(async () => { throw new Error("port busy"); });
+    const callbacks = {
+      isProfileCurrent: () => false,
+      onStartRejected: vi.fn(),
+      onStartCleanupComplete: vi.fn(),
+      onSessionOpened: vi.fn(),
+      onSessionClosed: vi.fn()
+    };
+    const pty = new SerialPty(
+      transport,
+      { path: "COM9", baudRate: 115200 },
+      callbacks,
+      { log: vi.fn(), close: vi.fn() } as any
+    );
+
+    pty.open();
+    await flushAsync();
+
+    expect(callbacks.onStartRejected).toHaveBeenCalledTimes(1);
+    expect(callbacks.onStartCleanupComplete).toHaveBeenCalledExactlyOnceWith(expect.any(Error));
+    expect(callbacks.onSessionOpened).not.toHaveBeenCalled();
   });
 
   it("enters disconnected state on sidecar disconnect notification", async () => {
