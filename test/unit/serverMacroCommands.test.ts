@@ -1315,6 +1315,8 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     ["a redirection attached to ipmitool", "ipmitool>/tmp/ipmi.log -E\n"],
     ["a clobber redirection attached to ipmitool", "ipmitool>|/tmp/ipmi.log -E\n"],
     ["a pipeline after an escaped greater-than sign", "echo \\>|ipmitool -E\n"],
+    ["a pipeline after an empty double-quoted redirection target", 'echo >""|ipmitool -E\n'],
+    ["a pipeline after an empty single-quoted redirection target", "echo 2>''|ipmitool -E\n"],
     ["a command wrapper with -p", "command -p ipmitool -E\n"],
     ["an exec wrapper with -c", "exec -c ipmitool -E\n"],
     ["a time wrapper with -p", "time -p ipmitool -E\n"],

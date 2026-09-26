@@ -189,6 +189,9 @@ export function textRunsIpmitool(text: string): boolean {
       continue;
     }
     if (char === "'" || char === '"') {
+      // A quoted target begins a new word after a complete redirect operator.
+      // Even an empty target must leave a following | as a pipeline separator.
+      if (wordAllowsRedirection && /^(?:\d*)(?:&>>|&>|>>|<>|<&|>&|>\||>|<)$/.test(word)) finishWord();
       if (!word.includes("=")) wordAllowsAssignment = false;
       if (!/[<>]/.test(word)) wordAllowsRedirection = false;
       quote = char;

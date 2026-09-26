@@ -223,6 +223,8 @@ describe("renderMacroEditorHtml", () => {
     ["echo hello >|ipmitool", "none"],
     ['echo "">|ipmitool', "none"],
     ["echo \\>|ipmitool", ""],
+    ['echo >""|ipmitool -E', ""],
+    ["echo 2>''|ipmitool -E", ""],
     ["env FOO=1 -u BAR ipmitool -E", "none"],
     ["env FOO=1 --debug ipmitool -E", "none"],
     ['">/tmp/log" ipmitool -E', "none"],
