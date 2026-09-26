@@ -76,6 +76,10 @@ export class DuplicateIdMacroStore implements MacroStore {
     for (const listener of this.listeners) listener();
   }
 
+  public async replaceAll(macros: TerminalMacro[]): Promise<void> {
+    await this.save(macros.map((macro) => ({ ...macro, id: undefined })));
+  }
+
   public onDidChange(listener: MacroStoreChangeListener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);

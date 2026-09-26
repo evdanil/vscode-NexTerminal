@@ -324,8 +324,8 @@ describe("configMutationLock — real call-site serialization", () => {
     const registry = new InventoryProviderRegistry();
     const provider = makeProvider({
       fetchInventory: vi.fn(async () => ({
-        contractVersion: 1,
-        devices: [{ externalId: "device:1", name: "new-sw", endpoints: [{ kind: "ssh", host: "10.0.0.5", port: 22 }] }]
+        contractVersion: 1 as const,
+        devices: [{ externalId: "device:1", name: "new-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.5", port: 22 }] }]
       }))
     });
     registry.register(provider);

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-const quickPickCalls: Array<{ items: Array<{ label: string; sessionId?: string }>; placeHolder?: string }> = [];
+const quickPickCalls: Array<{ items: Array<{ label: string; sessionId?: string; targetKind?: string }>; placeHolder?: string }> = [];
 let pickBySessionId: string | undefined;
 
 const errorMessages: string[] = [];
@@ -360,7 +360,7 @@ describe("pickTarget — telnet sessions", () => {
     pickBySessionId = "tel-1";
     await pickTarget(makeDescriptor(), makeCore(snapshot));
 
-    const items = quickPickCalls[0].items as Array<{ sessionId: string; targetKind: string }>;
+    const items = quickPickCalls[0].items;
     expect(items.find((i) => i.sessionId === "ssh-1")?.targetKind).toBe("ssh");
     expect(items.find((i) => i.sessionId === "tel-1")?.targetKind).toBe("telnet");
   });
@@ -383,7 +383,7 @@ describe("pickTarget — telnet sessions", () => {
     pickBySessionId = "tel-1";
     await pickTarget(makeDescriptor({ targetProfile: "edge" }), makeCore(shared));
 
-    const items = quickPickCalls[0].items as Array<{ sessionId: string; targetKind: string }>;
+    const items = quickPickCalls[0].items;
     expect(items.find((i) => i.sessionId === "ssh-1")?.targetKind).toBe("ssh");
     expect(items.find((i) => i.sessionId === "tel-1")?.targetKind).toBe("telnet");
   });

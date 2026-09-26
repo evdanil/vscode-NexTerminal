@@ -5,7 +5,7 @@ import { browseServerFiles, registerFileCommands } from "../../src/commands/file
 import { FileTreeItem } from "../../src/ui/fileExplorerTreeProvider";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
-const mockExecuteCommand = vi.fn();
+const mockExecuteCommand = vi.fn((..._args: unknown[]) => undefined);
 const mockShowInputBox = vi.fn();
 const mockShowOpenDialog = vi.fn();
 const mockShowErrorMessage = vi.fn();
@@ -15,7 +15,7 @@ const mockWithProgress = vi.fn(async (_opts: unknown, task: (progress: { report:
   task({ report: vi.fn() })
 );
 const mockBuildUri = vi.fn((serverId: string, remotePath: string) => ({ scheme: "nexterm", serverId, remotePath }));
-const mockGetConfiguration = vi.fn(() => ({ get: (_key: string, def: unknown) => def }));
+const mockGetConfiguration = vi.fn((_section?: string) => ({ get: (_key: string, def: unknown) => def }));
 
 function createFileTreeItem(overrides: {
   serverId?: string;
@@ -42,7 +42,7 @@ vi.mock("vscode", () => ({
   window: {
     showInputBox: (...args: unknown[]) => mockShowInputBox(...args),
     showOpenDialog: (...args: unknown[]) => mockShowOpenDialog(...args),
-    withProgress: (...args: unknown[]) => mockWithProgress(...args),
+    withProgress: (opts: unknown, task: (progress: { report: (arg: unknown) => void }) => Promise<void>) => mockWithProgress(opts, task),
     showErrorMessage: (...args: unknown[]) => mockShowErrorMessage(...args),
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
     showInformationMessage: (...args: unknown[]) => mockShowInformationMessage(...args),
@@ -57,7 +57,7 @@ vi.mock("vscode", () => ({
       createDirectory: vi.fn(),
       delete: vi.fn()
     },
-    getConfiguration: (...args: unknown[]) => mockGetConfiguration(...args)
+    getConfiguration: (section?: string) => mockGetConfiguration(section)
   },
   ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
   env: {
@@ -121,7 +121,10 @@ function createContext(overrides?: {
     terminalsByServer: new Map(),
     sessionTerminals: new Map(),
     serialTerminals: new Map(),
+    localShellTerminals: new Map(),
+    localServerTerminals: new Map(),
     highlighter: {} as any,
+    macroAutoTrigger: {} as any,
     sftpService: {
       writeFile,
       upload,
@@ -146,6 +149,10 @@ function createContext(overrides?: {
       isBusy: vi.fn(() => false),
       beginBusy: vi.fn(() => vi.fn())
     } as any,
+    activityIndicators: new Map(),
+    globalStoragePath: "/tmp/nexterminal-tests",
+    extensionPath: "/tmp/nexterminal-tests",
+    globalState: {} as any,
     cwdSyncCoordinator: {
       notifyManualNavigation: vi.fn(),
       clearPin: vi.fn(),

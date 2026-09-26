@@ -911,8 +911,10 @@ describe("NetworkServerDaemonHost — closed daemon stdout contract", () => {
     }],
     ["write callback error", (stdin: NodeJS.WritableStream) => {
       const original = stdin.write.bind(stdin);
-      (stdin as unknown as { write: typeof stdin.write }).write = ((_chunk, callback) => {
-        queueMicrotask(() => callback?.(new Error("forced write callback failure")));
+      (stdin as unknown as { write: typeof stdin.write }).write = ((_chunk: unknown, callback?: unknown) => {
+        if (typeof callback === "function") {
+          queueMicrotask(() => callback(new Error("forced write callback failure")));
+        }
         return true;
       }) as typeof stdin.write;
       return () => { (stdin as unknown as { write: typeof stdin.write }).write = original; };

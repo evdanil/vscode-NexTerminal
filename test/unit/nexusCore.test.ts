@@ -307,6 +307,7 @@ describe("NexusCore", () => {
       id: "active-1",
       profileId: "t1",
       serverId: "s1",
+      tunnelType: "local",
       localPort: 6379,
       remoteIP: "127.0.0.1",
       remotePort: 6379,
@@ -343,6 +344,7 @@ describe("NexusCore", () => {
       id: "active-1",
       profileId: "t1",
       serverId: "s1",
+      tunnelType: "local",
       localPort: 6379,
       remoteIP: "127.0.0.1",
       remotePort: 6379,
@@ -400,6 +402,7 @@ describe("NexusCore", () => {
       {
         profileId: "t1",
         serverId: "s1",
+        tunnelType: "local" as const,
         localPort: 8080,
         remoteIP: "10.0.0.5",
         remotePort: 3306,
@@ -1014,7 +1017,7 @@ describe("NexusCore", () => {
     await core.addOrUpdateServer({
       id: "s1", name: "S1", host: "h", port: 22, username: "u",
       authType: "agent", isHidden: false, ipmiAuthProfileId: "ap1",
-      formerlySynced: { sourceId: "src-1", sourceName: "NB", providerId: "netbox", externalId: "device:1", templated: { ipmiAuthProfileId: "ap1" } }
+      formerlySynced: { sourceId: "src-1", sourceName: "NB", providerId: "netbox", externalId: "device:1", detachedAt: 1, templated: { ipmiAuthProfileId: "ap1" } }
     });
 
     await core.removeAuthProfile("ap1");

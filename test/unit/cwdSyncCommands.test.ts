@@ -102,6 +102,7 @@ function makeHarness(overrides?: {
     sessionTerminals: new Map(),
     serialTerminals: new Map(),
     localShellTerminals: new Map(),
+    localServerTerminals: new Map(),
     highlighter: {} as any,
     macroAutoTrigger: {} as any,
     sftpService: {

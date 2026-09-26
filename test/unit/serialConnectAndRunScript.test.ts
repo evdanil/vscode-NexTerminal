@@ -241,6 +241,7 @@ async function harness(mode: Mode, source = MARKED) {
     core,
     macroAutoTrigger: { pushFilter: () => ({ dispose: () => {} }), bindObserverToSession: () => {} } as never,
     outputChannel: { appendLine: () => {}, append: () => {}, show: () => {}, dispose: () => {} } as never,
+    globalStoragePath: "/global-storage",
     workerPath: "/fake/worker.js",
     createWorker: () => {
       const w = makeFakeWorker();

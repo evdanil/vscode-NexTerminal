@@ -205,7 +205,8 @@ function createDeferred<T>() {
 describe("FileExplorerTreeProvider", () => {
   let sftp: ReturnType<typeof createMockSftpService>;
   let provider: FileExplorerTreeProvider;
-  let diagnostics: ReturnType<typeof vi.fn>;
+  const makeDiagnostics = () => vi.fn((_line: string) => {});
+  let diagnostics: ReturnType<typeof makeDiagnostics>;
 
   const diagnosticsText = (): string => diagnostics.mock.calls.map((args) => String(args[0])).join("\n");
   const shownMessages = (spy: unknown): string[] =>
@@ -213,7 +214,7 @@ describe("FileExplorerTreeProvider", () => {
 
   beforeEach(async () => {
     sftp = createMockSftpService();
-    diagnostics = vi.fn();
+    diagnostics = makeDiagnostics();
     provider = new FileExplorerTreeProvider(sftp, diagnostics);
     const vscode = await import("vscode");
     (vscode.window.showQuickPick as any).mockReset();
@@ -1248,7 +1249,7 @@ describe("FileExplorerTreeProvider", () => {
       // broken and the fixed implementation produce the same state. File items
       // carry their fsPath verbatim, which is what a Windows Explorer drag does.
       const fileItem = (fsPath: string) =>
-        new DataTransferItem("", { uri: { scheme: "file", authority: "", path: fsPath, fsPath } } as any);
+        Object.assign(new DataTransferItem(""), { file: { uri: { scheme: "file", authority: "", path: fsPath, fsPath } } });
       const items = [fileItem("//NAS/share/a.txt"), fileItem("//nas/share/b.txt")];
 
       const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
@@ -1273,7 +1274,7 @@ describe("FileExplorerTreeProvider", () => {
       provider.setActiveServer(testServer, "/home/dev");
 
       // The usual shape for drags originating outside VS Code.
-      const filesItem = new DataTransferItem("", { uri: undefined });
+      const filesItem = Object.assign(new DataTransferItem(""), { file: { uri: undefined } });
       const targetDir = new FileTreeItem("srv-1", "/home/dev", dirEntry);
       await provider.handleDrop(targetDir, {
         get: (mime: string) => (mime === "files" ? filesItem : undefined),

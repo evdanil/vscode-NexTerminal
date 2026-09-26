@@ -29,6 +29,13 @@ vi.mock("ssh2", () => {
 
 import { buildConnectConfig, LEGACY_ALGORITHMS, Ssh2Connector } from "../../src/services/ssh/ssh2Connector";
 
+function appendedAlgorithms(value: unknown): readonly string[] {
+  if (!value || typeof value !== "object" || !("append" in value) || !Array.isArray(value.append)) {
+    throw new Error("Expected appended SSH algorithms");
+  }
+  return value.append;
+}
+
 function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
   return {
     id: "s1",
@@ -99,14 +106,14 @@ describe("buildConnectConfig", () => {
   });
 
   it("LEGACY_ALGORITHMS contains expected algorithm families", () => {
-    expect(LEGACY_ALGORITHMS.kex.append).toContain("diffie-hellman-group1-sha1");
-    expect(LEGACY_ALGORITHMS.cipher.append).toContain("3des-cbc");
-    expect(LEGACY_ALGORITHMS.serverHostKey.append).toContain("ssh-dss");
-    expect(LEGACY_ALGORITHMS.hmac.append).toContain("hmac-md5");
+    expect(appendedAlgorithms(LEGACY_ALGORITHMS.kex)).toContain("diffie-hellman-group1-sha1");
+    expect(appendedAlgorithms(LEGACY_ALGORITHMS.cipher)).toContain("3des-cbc");
+    expect(appendedAlgorithms(LEGACY_ALGORITHMS.serverHostKey)).toContain("ssh-dss");
+    expect(appendedAlgorithms(LEGACY_ALGORITHMS.hmac)).toContain("hmac-md5");
   });
 
   it("LEGACY_ALGORITHMS excludes broken and unsupported ciphers", () => {
-    const ciphers = LEGACY_ALGORITHMS.cipher.append as string[];
+    const ciphers = appendedAlgorithms(LEGACY_ALGORITHMS.cipher);
     // RC4 - cryptographically broken
     expect(ciphers).not.toContain("arcfour");
     expect(ciphers).not.toContain("arcfour128");

@@ -66,7 +66,8 @@ const validServer: ServerConfig = {
   host: "10.0.0.1",
   port: 22,
   username: "root",
-  authType: "password"
+  authType: "password",
+  isHidden: false
 };
 
 // Each read method, paired with the globalState key it reads.

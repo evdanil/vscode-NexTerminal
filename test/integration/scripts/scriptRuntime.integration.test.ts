@@ -24,10 +24,11 @@ vi.mock("vscode", () => {
       }
     },
     Uri: {
-      file: (p: string) => ({ fsPath: p, scheme: "file", path: p, toString: () => p }),
+      file: (p: string) => ({ fsPath: p, scheme: "file", authority: "", path: p, toString: () => p }),
       joinPath: (base: { fsPath: string }, ...parts: string[]) => ({
         fsPath: path.join(base.fsPath, ...parts),
         scheme: "file",
+        authority: "",
         path: path.join(base.fsPath, ...parts),
         toString: () => path.join(base.fsPath, ...parts)
       })
@@ -85,6 +86,8 @@ function makeTestPty(): TestPty {
     writeProgrammatic(data) {
       writes.push(data);
     },
+    resetTerminal: vi.fn(),
+    markShuttingDown: vi.fn((_reason: string) => {}),
     emitOutput(text) {
       observers.forEach((o) => o.onOutput(text));
     },
@@ -123,7 +126,7 @@ function runtimeFixture(scriptFixture: string): {
   manager: ScriptRuntimeManager;
   pty: TestPty;
   core: ReturnType<typeof makeMockCore>;
-  scriptUri: { fsPath: string; scheme: string; path: string; toString: () => string };
+  scriptUri: { fsPath: string; scheme: string; authority: string; path: string; toString: () => string };
 } {
   const pty = makeTestPty();
   const session: ActiveSession = {
@@ -150,11 +153,12 @@ function runtimeFixture(scriptFixture: string): {
     core,
     macroAutoTrigger: mockMacroAutoTrigger as never,
     outputChannel: outputChannel as never,
-    workerPath
+    workerPath,
+    globalStoragePath: path.dirname(workerPath)
   });
 
   const fixturePath = path.resolve(__dirname, "..", "..", "fixtures", "scripts", scriptFixture);
-  const scriptUri = { fsPath: fixturePath, scheme: "file", path: fixturePath, toString: () => fixturePath };
+  const scriptUri = { fsPath: fixturePath, scheme: "file", authority: "", path: fixturePath, toString: () => fixturePath };
 
   return { manager, pty, core, scriptUri };
 }
@@ -234,7 +238,7 @@ describe("ScriptRuntimeManager — end-to-end integration", () => {
     await fs.writeFile(tmpFile, fixtureContent, "utf8");
 
     const { manager } = runtimeFixture("basic-expect-send.js"); // any fixture — we won't use its content
-    const scriptUri = { fsPath: tmpFile, scheme: "file", path: tmpFile, toString: () => tmpFile };
+    const scriptUri = { fsPath: tmpFile, scheme: "file", authority: "", path: tmpFile, toString: () => tmpFile };
     const events: Array<{ kind: string; finalState?: string }> = [];
     manager.onDidChangeRun((e) => events.push(e as never));
 
@@ -261,7 +265,7 @@ describe("ScriptRuntimeManager — end-to-end integration", () => {
     await fs.writeFile(tmpFile, fixtureContent, "utf8");
 
     const { manager, core } = runtimeFixture("basic-expect-send.js");
-    const scriptUri = { fsPath: tmpFile, scheme: "file", path: tmpFile, toString: () => tmpFile };
+    const scriptUri = { fsPath: tmpFile, scheme: "file", authority: "", path: tmpFile, toString: () => tmpFile };
     const logs: string[] = [];
     manager.onDidChangeRun((e) => {
       if (e.kind === "log") logs.push(e.text);
@@ -310,7 +314,8 @@ describe("ScriptRuntimeManager — end-to-end integration", () => {
       core,
       macroAutoTrigger: { pushFilter: () => ({ dispose: () => {} }), bindObserverToSession: () => {} } as never,
       outputChannel: outputChannel as never,
-      workerPath
+      workerPath,
+      globalStoragePath: path.dirname(workerPath)
     });
     const events: string[] = [];
     manager.onDidChangeRun((e) => events.push(e.kind + (e.kind === "ended" ? `:${e.finalState}` : "")));

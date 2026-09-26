@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, type Mock } from "vitest";
 import { EventEmitter } from "node:events";
 
 // Controllable node:fs promises. SftpService now does its local-side IO here —
@@ -306,7 +306,7 @@ describe("SftpService", () => {
   let connection: SshConnection;
   let factory: SshFactory;
   let service: SftpService;
-  let diagnostics: ReturnType<typeof vi.fn>;
+  let diagnostics: Mock<(line: string) => void>;
 
   const diagnosticsText = (): string => diagnostics.mock.calls.map((args) => String(args[0])).join("\n");
 
@@ -314,7 +314,7 @@ describe("SftpService", () => {
     sftp = createMockSftp();
     connection = createMockConnection(sftp);
     factory = createMockFactory(connection);
-    diagnostics = vi.fn();
+    diagnostics = vi.fn((_line: string) => {});
     service = new SftpService(factory, undefined, diagnostics);
 
     fsPromisesMock.stat.mockReset();

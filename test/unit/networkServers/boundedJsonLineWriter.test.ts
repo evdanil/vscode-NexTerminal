@@ -11,15 +11,15 @@ import {
 
 class ControlledWritable extends Writable {
   public readonly chunks: Buffer[] = [];
-  private readonly callbacks: Array<(error?: Error | null) => void> = [];
+  private readonly pendingWrites: Array<(error?: Error | null) => void> = [];
 
   public release(error?: Error): void {
-    this.callbacks.shift()?.(error);
+    this.pendingWrites.shift()?.(error);
   }
 
-  protected override _write(chunk: Buffer, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+  public override _write(chunk: Buffer, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
     this.chunks.push(Buffer.from(chunk));
-    this.callbacks.push(callback);
+    this.pendingWrites.push(callback);
   }
 }
 

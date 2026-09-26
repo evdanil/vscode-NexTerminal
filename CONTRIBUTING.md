@@ -57,6 +57,7 @@ You need Node.js and a recent VS Code — this extension targets `^1.105.0`, who
 ```bash
 npm install
 npm run compile        # type-check only, no emit
+npm run typecheck:test # strict type-check of test and source files, no emit
 npm run build          # clean + type-check + bundle to dist/
 npm test               # full suite with coverage
 npm run test:unit      # unit tests only

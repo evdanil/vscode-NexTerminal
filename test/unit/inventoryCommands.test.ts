@@ -57,7 +57,7 @@ const mockAuthProfileEditorOpenNew = vi.fn();
 // OPEN WEB CONSOLE — the browser handoff. `openExternal` resolving FALSE is a
 // real outcome (no handler, or the user dismissed the trust prompt), so the
 // default is an explicit `true` and the refusal case overrides it per test.
-const mockOpenExternal = vi.fn(async () => true);
+const mockOpenExternal = vi.fn(async (_uri: { value: string }) => true);
 
 vi.mock("vscode", () => ({
   commands: {
@@ -82,7 +82,7 @@ vi.mock("vscode", () => ({
   // The browser handoff Open Web Console performs. `Uri.parse` keeps the string
   // readable off the call so a test can assert the EXACT address handed out.
   env: {
-    openExternal: (...args: unknown[]) => mockOpenExternal(...args)
+    openExternal: (uri: { value: string }) => mockOpenExternal(uri)
   },
   Uri: {
     parse: (value: string) => ({ toString: () => value, value })
@@ -189,7 +189,7 @@ function makeProvider(overrides: Partial<InventoryProvider> = {}): InventoryProv
       { id: "apiToken", label: "API Token", type: "password", required: true }
     ],
     testConnection: vi.fn(async () => {}),
-    fetchInventory: vi.fn(async (): Promise<InventoryTree> => ({ contractVersion: 1, devices: [] })),
+    fetchInventory: vi.fn(async (): Promise<InventoryTree> => ({ contractVersion: 1 as const, devices: [] })),
     // REVIEW FINDING (P1, cross-instance adoption) — the fake provider names its
     // DEPLOYMENT the way the real NetBox one does: from its own non-secret
     // config, here the `host` field declared above. Sources built by
@@ -634,7 +634,7 @@ describe("inventoryCommands", () => {
 
       await registeredCommands.get("nexus.inventory.addSource")!();
       const { onSubmit } = latestFormCall();
-      const post = (pollSeconds: unknown) =>
+      const post = (pollSeconds: string | number) =>
         onSubmit({ name: "Lab", targetFolder: "Labs", defaultUsername: "admin", prunePolicy: "orphan", cfg_host: "eve.local", cfg_pollSeconds: pollSeconds });
 
       await expect(post(0.4)).rejects.toThrow(/Poll Seconds must be a whole number/);
@@ -1407,7 +1407,7 @@ describe("inventoryCommands", () => {
       // same bounded window (an unbounded `await` here would instead hang
       // the whole test out to the runner's timeout).
       const syncCmd = registeredCommands.get("nexus.inventory.syncNow")!;
-      const syncPromise = syncCmd("src-1");
+      const syncPromise = Promise.resolve(syncCmd("src-1"));
       let syncSettled = false;
       void syncPromise
         .finally(() => {
@@ -1513,7 +1513,7 @@ describe("inventoryCommands", () => {
       // past that same flush.
       const syncCmd = registeredCommands.get("nexus.inventory.syncNow")!;
       let syncSettled = false;
-      const syncPromise = syncCmd("src-1").finally(() => {
+      const syncPromise = Promise.resolve(syncCmd("src-1")).finally(() => {
         syncSettled = true;
       });
       await Promise.resolve();
@@ -1538,7 +1538,7 @@ describe("inventoryCommands", () => {
       await core.initialize();
       const registry = new InventoryProviderRegistry();
       const provider = makeProvider({
-        fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] }))
+        fetchInventory: vi.fn(async () => ({ contractVersion: 1 as const, devices: [] }))
       });
       registry.register(provider);
       const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
@@ -2564,7 +2564,7 @@ describe("inventoryCommands", () => {
       expect(core.getSnapshot().inventorySources).toHaveLength(1);
       expect(core.getSnapshot().servers).toHaveLength(1);
 
-      resolveFetch({ contractVersion: 1, devices: [] });
+      resolveFetch({ contractVersion: 1 as const, devices: [] });
       await syncPromise;
     });
   });
@@ -2765,8 +2765,8 @@ describe("inventoryCommands", () => {
       const registry = new InventoryProviderRegistry();
       const provider = makeProvider({
         fetchInventory: vi.fn(async () => ({
-          contractVersion: 1,
-          devices: [{ externalId: "device:2", name: "core-sw", endpoints: [{ kind: "ssh", host: "10.0.0.2", port: 22 }] }]
+          contractVersion: 1 as const,
+          devices: [{ externalId: "device:2", name: "core-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.2", port: 22 }] }]
         }))
       });
       registry.register(provider);
@@ -2913,8 +2913,8 @@ describe("inventoryCommands", () => {
       registry.register(
         makeProvider({
           fetchInventory: vi.fn(async () => ({
-            contractVersion: 1,
-            devices: [{ externalId: "device:1", name: "renamed-sw", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }] }]
+            contractVersion: 1 as const,
+            devices: [{ externalId: "device:1", name: "renamed-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] }]
           }))
         })
       );
@@ -2950,8 +2950,8 @@ describe("inventoryCommands", () => {
       registry.register(
         makeProvider({
           fetchInventory: vi.fn(async () => ({
-            contractVersion: 1,
-            devices: [{ externalId: "device:1", name: "renamed-sw", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }] }]
+            contractVersion: 1 as const,
+            devices: [{ externalId: "device:1", name: "renamed-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] }]
           }))
         })
       );
@@ -3252,8 +3252,8 @@ describe("inventoryCommands", () => {
         makeProvider({
           // Rename forces an UPDATE (before.proxy ssh, after.proxy ssh carried unchanged).
           fetchInventory: vi.fn(async () => ({
-            contractVersion: 1,
-            devices: [{ externalId: "device:1", name: "renamed-sw", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }] }]
+            contractVersion: 1 as const,
+            devices: [{ externalId: "device:1", name: "renamed-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] }]
           }))
         })
       );
@@ -3456,7 +3456,7 @@ describe("inventoryCommands", () => {
       const leftoverKeys = [passwordSecretKey(reusedId), passphraseSecretKey(reusedId), proxyPasswordSecretKey(reusedId)];
 
       function deviceAt(host: string): InventoryTree {
-        return { contractVersion: 1, devices: [{ externalId: "device:1", name: "vm-101", endpoints: [{ kind: "ssh", host, port: 22 }] }] };
+        return { contractVersion: 1 as const, devices: [{ externalId: "device:1", name: "vm-101", endpoints: [{ kind: "ssh" as const, host, port: 22 }] }] };
       }
 
       /**
@@ -3494,7 +3494,7 @@ describe("inventoryCommands", () => {
         });
         const core = new NexusCore(new InMemoryConfigRepository([pruned]));
         await core.initialize();
-        let tree: InventoryTree = { contractVersion: 1, devices: [] }; // device gone → delete-prune
+        let tree: InventoryTree = { contractVersion: 1 as const, devices: [] }; // device gone → delete-prune
         const registry = new InventoryProviderRegistry();
         registry.register(makeProvider({ fetchInventory: vi.fn(async () => tree) }));
         const { vault, state } = lockableVault({
@@ -3650,8 +3650,8 @@ describe("inventoryCommands", () => {
       const provider = makeProvider({
         // Same device, renamed rack -> "RackB" this time.
         fetchInventory: vi.fn(async () => ({
-          contractVersion: 1,
-          devices: [{ externalId: "device:1", name: "sw1", folderPath: "RackB", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }] }]
+          contractVersion: 1 as const,
+          devices: [{ externalId: "device:1", name: "sw1", folderPath: "RackB", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] }]
         }))
       });
       registry.register(provider);
@@ -3695,7 +3695,7 @@ describe("inventoryCommands", () => {
 
       const registry = new InventoryProviderRegistry();
       const provider = makeProvider({
-        fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] })) // device gone -> prune "delete"
+        fetchInventory: vi.fn(async () => ({ contractVersion: 1 as const, devices: [] })) // device gone -> prune "delete"
       });
       registry.register(provider);
       const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
@@ -3763,7 +3763,7 @@ describe("inventoryCommands", () => {
 
       const registry = new InventoryProviderRegistry();
       const provider = makeProvider({
-        fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] })) // device gone -> prune "delete"
+        fetchInventory: vi.fn(async () => ({ contractVersion: 1 as const, devices: [] })) // device gone -> prune "delete"
       });
       registry.register(provider);
       const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
@@ -3836,7 +3836,7 @@ describe("inventoryCommands", () => {
 
       const registry = new InventoryProviderRegistry();
       const provider = makeProvider({
-        fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] })) // both devices gone -> prune "delete"
+        fetchInventory: vi.fn(async () => ({ contractVersion: 1 as const, devices: [] })) // both devices gone -> prune "delete"
       });
       registry.register(provider);
       const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
@@ -3896,7 +3896,7 @@ describe("inventoryCommands", () => {
 
       const registry = new InventoryProviderRegistry();
       const provider = makeProvider({
-        fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] })) // both devices gone -> prune "delete"
+        fetchInventory: vi.fn(async () => ({ contractVersion: 1 as const, devices: [] })) // both devices gone -> prune "delete"
       });
       registry.register(provider);
       const vault = makeVault({
@@ -3975,7 +3975,7 @@ describe("inventoryCommands", () => {
 
       const registry = new InventoryProviderRegistry();
       const provider = makeProvider({
-        fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] }))
+        fetchInventory: vi.fn(async () => ({ contractVersion: 1 as const, devices: [] }))
       });
       registry.register(provider);
       const vault = makeVault({
@@ -4033,7 +4033,7 @@ describe("inventoryCommands", () => {
       expect(mockShowWarningMessage).toHaveBeenCalledWith(BUSY_SYNC_FROM_SYNC);
       expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
 
-      resolveFetch({ contractVersion: 1, devices: [] });
+      resolveFetch({ contractVersion: 1 as const, devices: [] });
       await first;
     });
 
@@ -4043,8 +4043,8 @@ describe("inventoryCommands", () => {
       const registry = new InventoryProviderRegistry();
       const provider = makeProvider({
         fetchInventory: vi.fn(async () => ({
-          contractVersion: 1,
-          devices: [{ externalId: "device:1", name: "new-sw", endpoints: [{ kind: "ssh", host: "10.0.0.5", port: 22 }] }]
+          contractVersion: 1 as const,
+          devices: [{ externalId: "device:1", name: "new-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.5", port: 22 }] }]
         }))
       });
       registry.register(provider);
@@ -4068,8 +4068,8 @@ describe("inventoryCommands", () => {
       const registry = new InventoryProviderRegistry();
       const provider = makeProvider({
         fetchInventory: vi.fn(async () => ({
-          contractVersion: 1,
-          devices: [{ externalId: "device:1", name: "old-sw", endpoints: [{ kind: "ssh", host: "10.0.0.9", port: 22 }] }]
+          contractVersion: 1 as const,
+          devices: [{ externalId: "device:1", name: "old-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.9", port: 22 }] }]
         }))
       });
       registry.register(provider);
@@ -4112,8 +4112,8 @@ describe("inventoryCommands", () => {
       const provider = makeProvider({
         // device:1 absent -> prune "delete"; device:2 present with a NEW host -> "update".
         fetchInventory: vi.fn(async () => ({
-          contractVersion: 1,
-          devices: [{ externalId: "device:2", name: "core-sw", endpoints: [{ kind: "ssh", host: "10.0.0.99", port: 22 }] }]
+          contractVersion: 1 as const,
+          devices: [{ externalId: "device:2", name: "core-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.99", port: 22 }] }]
         }))
       });
       registry.register(provider);
@@ -4154,8 +4154,8 @@ describe("inventoryCommands", () => {
       const registry = new InventoryProviderRegistry();
       const provider = makeProvider({
         fetchInventory: vi.fn(async () => ({
-          contractVersion: 1,
-          devices: [{ externalId: "device:1", name: "new-sw", endpoints: [{ kind: "ssh", host: "10.0.0.5", port: 22 }] }]
+          contractVersion: 1 as const,
+          devices: [{ externalId: "device:1", name: "new-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.5", port: 22 }] }]
         }))
       });
       registry.register(provider);
@@ -4194,8 +4194,8 @@ describe("inventoryCommands", () => {
           // FINDING 2 config-comparison check alone would let this through.
           await vault.store(inventorySecretKey("src-1", "apiToken"), "new-tok");
           return {
-            contractVersion: 1,
-            devices: [{ externalId: "device:1", name: "new-sw", endpoints: [{ kind: "ssh", host: "10.0.0.5", port: 22 }] }]
+            contractVersion: 1 as const,
+            devices: [{ externalId: "device:1", name: "new-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.5", port: 22 }] }]
           };
         })
       });
@@ -4222,7 +4222,7 @@ describe("inventoryCommands", () => {
       await core.initialize();
       const registry = new InventoryProviderRegistry();
       const provider = makeProvider({
-        fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] })) // device gone -> prune "delete"
+        fetchInventory: vi.fn(async () => ({ contractVersion: 1 as const, devices: [] })) // device gone -> prune "delete"
       });
       registry.register(provider);
       const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
@@ -4266,7 +4266,7 @@ describe("inventoryCommands", () => {
       const registry = new InventoryProviderRegistry();
       const provider = makeProvider({
         // device:1 is gone from the tree -> prune "delete". No other devices.
-        fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] }))
+        fetchInventory: vi.fn(async () => ({ contractVersion: 1 as const, devices: [] }))
       });
       registry.register(provider);
       const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
@@ -4329,8 +4329,8 @@ describe("inventoryCommands", () => {
         // brand-new device -> a planned add at 10.0.0.9:22, with no manual
         // server colliding yet at the time the first modal is shown.
         fetchInventory: vi.fn(async () => ({
-          contractVersion: 1,
-          devices: [{ externalId: "device:2", name: "web1", endpoints: [{ kind: "ssh", host: "10.0.0.9", port: 22 }] }]
+          contractVersion: 1 as const,
+          devices: [{ externalId: "device:2", name: "web1", endpoints: [{ kind: "ssh" as const, host: "10.0.0.9", port: 22 }] }]
         }))
       });
       registry.register(provider);
@@ -4398,7 +4398,7 @@ describe("inventoryCommands", () => {
       const registry = new InventoryProviderRegistry();
       const provider = makeProvider({
         // device:1 is gone from the tree -> prune "delete". No other devices.
-        fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] }))
+        fetchInventory: vi.fn(async () => ({ contractVersion: 1 as const, devices: [] }))
       });
       registry.register(provider);
       const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
@@ -4476,8 +4476,8 @@ describe("inventoryCommands", () => {
         // plan computed against the CURRENT (pre-removal) server list is
         // genuinely empty (unchanged), so syncNow takes the fast path.
         fetchInventory: vi.fn(async () => ({
-          contractVersion: 1,
-          devices: [{ externalId: "device:1", name: "old-sw", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }] }]
+          contractVersion: 1 as const,
+          devices: [{ externalId: "device:1", name: "old-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] }]
         }))
       });
       registry.register(provider);
@@ -4576,7 +4576,7 @@ describe("inventoryCommands", () => {
         const registry = new InventoryProviderRegistry();
         const provider = makeProvider({
           // device:1 absent from the fetched tree -> prune "orphan".
-          fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] }))
+          fetchInventory: vi.fn(async () => ({ contractVersion: 1 as const, devices: [] }))
         });
         registry.register(provider);
         const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
@@ -4616,7 +4616,7 @@ describe("inventoryCommands", () => {
         await core.initialize();
         const registry = new InventoryProviderRegistry();
         const provider = makeProvider({
-          fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] }))
+          fetchInventory: vi.fn(async () => ({ contractVersion: 1 as const, devices: [] }))
         });
         registry.register(provider);
         const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
@@ -4645,7 +4645,7 @@ describe("inventoryCommands", () => {
         await core.initialize();
         const registry = new InventoryProviderRegistry();
         const provider = makeProvider({
-          fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] }))
+          fetchInventory: vi.fn(async () => ({ contractVersion: 1 as const, devices: [] }))
         });
         registry.register(provider);
         const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
@@ -4698,7 +4698,7 @@ describe("inventoryCommands", () => {
           // A misbehaving third-party provider mutating the config object it
           // was handed, as if it were free to treat it as scratch space.
           (config as Record<string, unknown>).baseUrl = "mutated";
-          return { contractVersion: 1, devices: [] };
+          return { contractVersion: 1 as const, devices: [] };
         })
       });
       registry.register(provider);
@@ -4772,7 +4772,7 @@ describe("inventoryCommands", () => {
           { id: "apiToken", label: "API Token", type: "password", required: true },
           { id: "extraToken", label: "Extra Token", type: "password", required: false }
         ],
-        fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] }))
+        fetchInventory: vi.fn(async () => ({ contractVersion: 1 as const, devices: [] }))
       });
       registry.register(provider);
       // Vault only has apiToken — extraToken was never stored, yet secretFieldIds
@@ -4799,8 +4799,8 @@ describe("inventoryCommands", () => {
       const registry = new InventoryProviderRegistry();
       const provider = makeProvider({
         fetchInventory: vi.fn(async () => ({
-          contractVersion: 1,
-          devices: [{ externalId: "device:1", name: "new-sw", endpoints: [{ kind: "ssh", host: "10.0.0.5", port: 22 }] }]
+          contractVersion: 1 as const,
+          devices: [{ externalId: "device:1", name: "new-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.5", port: 22 }] }]
         }))
       });
       registry.register(provider);
@@ -4837,7 +4837,7 @@ describe("inventoryCommands", () => {
       const core = new NexusCore(repo);
       await core.initialize();
       const registry = new InventoryProviderRegistry();
-      const provider = makeProvider({ fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: [] })) });
+      const provider = makeProvider({ fetchInventory: vi.fn(async () => ({ contractVersion: 1 as const, devices: [] })) });
       registry.register(provider);
       const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
       registerInventoryCommands(core, registry, vault, makeTeardown());
@@ -5279,7 +5279,7 @@ describe("inventoryCommands", () => {
         servers: [ownedServer({ id: "owned-1", externalId: "device:1", name: "sw1", host: "10.0.0.1" })],
         provider: {
           fetchInventory: vi.fn(async () => ({
-            contractVersion: 1,
+            contractVersion: 1 as const,
             devices: [
               { externalId: "device:1", name: "sw1", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] },
               { externalId: "device:2", name: "sw2", endpoints: [{ kind: "ssh" as const, host: "10.0.0.2", port: 22 }] }
@@ -5577,9 +5577,9 @@ describe("inventoryCommands", () => {
       // The round trip is GATED, not raced: the request is posted…
       harness.choose("authProfileId", "p1");
       const requested = [...harness.posted].reverse().find((msg) => msg.type === "autofill");
-      expect(requested?.type).toBe("autofill");
-      const requestedId = requested!.type === "autofill" ? requested.value : "";
-      const requestNumber = requested!.type === "autofill" ? requested.requestId : undefined;
+      if (requested?.type !== "autofill") throw new Error("Expected autofill request");
+      const requestedId = requested.value;
+      const requestNumber = requested.requestId;
       // …the extension composes its real answer…
       const answer = await onAutofill!("authProfileId", requestedId);
       expect(answer).toEqual({ defaultUsername: "labuser" });
@@ -5953,7 +5953,7 @@ describe("inventoryCommands", () => {
         ],
         provider: {
           fetchInventory: vi.fn(async () => ({
-            contractVersion: 1,
+            contractVersion: 1 as const,
             devices: [
               { externalId: "device:1", name: "sw1", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] },
               { externalId: "device:2", name: "sw2", endpoints: [{ kind: "ssh" as const, host: "10.0.0.2", port: 22 }] },
@@ -5991,7 +5991,7 @@ describe("inventoryCommands", () => {
         // already match their device, so the retro-apply stamp is the only
         // thing turning any of them into an update.
         servers: devices.map((d, i) => ownedServer({ id: `owned-${i + 1}`, externalId: d.externalId, name: d.name, host: d.endpoints[0].host })),
-        provider: { fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices })) }
+        provider: { fetchInventory: vi.fn(async () => ({ contractVersion: 1 as const, devices })) }
       });
 
       mockShowInformationMessage.mockResolvedValueOnce("Show Warnings");
@@ -6054,7 +6054,7 @@ describe("inventoryCommands", () => {
             origin: { sourceId: "src-1", externalId: d.externalId, syncedAt: 1, syncedAuthProfileId: "pk" }
           })
         ),
-        provider: { fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices })) }
+        provider: { fetchInventory: vi.fn(async () => ({ contractVersion: 1 as const, devices })) }
       });
     }
 
@@ -6208,7 +6208,7 @@ describe("inventoryCommands", () => {
           ],
           provider: {
             fetchInventory: vi.fn(async () => ({
-              contractVersion: 1,
+              contractVersion: 1 as const,
               devices: [
                 { externalId: "device:1", name: "sw1", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] },
                 { externalId: "device:2", name: "sw2", endpoints: [{ kind: "ssh" as const, host: "10.0.0.2", port: 22 }] }
@@ -6279,7 +6279,7 @@ describe("inventoryCommands", () => {
         servers: [ownedServer({ id: "owned-1", externalId: "device:1", name: "sw1", host: "10.0.0.1" })],
         provider: {
           fetchInventory: vi.fn(async () => ({
-            contractVersion: 1,
+            contractVersion: 1 as const,
             devices: [{ externalId: "device:1", name: "sw1", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] }]
           }))
         }
@@ -6310,7 +6310,7 @@ describe("inventoryCommands", () => {
         servers: [ownedServer({ id: "owned-1", externalId: "device:1", name: "sw1", host: "10.0.0.1" })],
         provider: {
           fetchInventory: vi.fn(async () => ({
-            contractVersion: 1,
+            contractVersion: 1 as const,
             devices: [{ externalId: "device:1", name: "sw1", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] }]
           }))
         }
@@ -6351,7 +6351,7 @@ describe("inventoryCommands", () => {
         ],
         provider: {
           fetchInventory: vi.fn(async () => ({
-            contractVersion: 1,
+            contractVersion: 1 as const,
             devices: [
               { externalId: "device:1", name: "sw1", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] },
               { externalId: "device:2", name: "sw2", endpoints: [{ kind: "ssh" as const, host: "10.0.0.2", port: 22 }] }
@@ -6406,7 +6406,7 @@ describe("inventoryCommands", () => {
         source: { targetFolder: "", authProfileId: "ghost" },
         provider: {
           fetchInventory: vi.fn(async () => ({
-            contractVersion: 1,
+            contractVersion: 1 as const,
             devices: [{ externalId: "device:9", name: "new-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.9", port: 22 }] }]
           }))
         }
@@ -6426,7 +6426,7 @@ describe("inventoryCommands", () => {
         source: { targetFolder: "", authProfileId: "ghost" },
         provider: {
           fetchInventory: vi.fn(async () => ({
-            contractVersion: 1,
+            contractVersion: 1 as const,
             devices: [{ externalId: "device:9", name: "new-sw", endpoints: [{ kind: "ssh" as const, host: "10.0.0.9", port: 22 }] }]
           }))
         }
@@ -6875,7 +6875,7 @@ describe("inventoryCommands", () => {
       const registry = new InventoryProviderRegistry();
       registry.register(
         makeProvider({
-          fetchInventory: vi.fn(async () => ({ contractVersion: 1, devices: options.devices ?? [DEVICE_1] })),
+          fetchInventory: vi.fn(async () => ({ contractVersion: 1 as const, devices: options.devices ?? [DEVICE_1] })),
           ...options.provider
         })
       );
@@ -8514,7 +8514,7 @@ describe("inventoryCommands", () => {
       expect(mockWebviewOpen).not.toHaveBeenCalled();
       expect(core.getSnapshot().inventorySources).toHaveLength(1);
 
-      resolveFetch({ contractVersion: 1, devices: [] });
+      resolveFetch({ contractVersion: 1 as const, devices: [] });
       await syncPromise;
     });
 
@@ -8717,8 +8717,8 @@ describe("inventoryCommands", () => {
       // default undefined resolution, never open a form at all).
       expect(mockShowQuickPick).not.toHaveBeenCalled();
       const { definition } = latestFormCall();
-      const nameField = definition.fields.find((field) => field.key === "name") as { value?: string };
-      expect(nameField.value).toBe("Beta");
+      const nameField = definition.fields.find((field) => "key" in field && field.key === "name");
+      expect(nameField && "value" in nameField ? nameField.value : undefined).toBe("Beta");
     });
 
     it("editSource(unknownId) reports the source is gone without falling back to the picker", async () => {
@@ -9932,7 +9932,7 @@ describe("nexus.inventory.refreshStatus", () => {
       return { poll, view, setVisible: (v: boolean) => { view.visible = v; listener?.({ visible: v }); } };
     }
 
-    function pollingProvider(fetchStatus: ReturnType<typeof vi.fn>, extra: Partial<InventoryProvider> = {}): InventoryProvider {
+    function pollingProvider(fetchStatus: NonNullable<InventoryProvider["fetchStatus"]>, extra: Partial<InventoryProvider> = {}): InventoryProvider {
       return makeProvider({
         fetchStatus,
         configFields: [
@@ -10332,7 +10332,7 @@ describe("nexus.inventory.refreshStatus", () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();
     const registry = new InventoryProviderRegistry();
-    const fetchStatus = vi.fn(async () => { throw new Error("auth broken"); });
+    const fetchStatus = vi.fn(async (_config: InventorySourceValues) => { throw new Error("auth broken"); });
     registry.register(makeProvider({ fetchStatus }));
     registerInventoryCommands(core, registry, makeVault(), makeTeardown());
     await core.addOrUpdateInventorySource(makeSource());
@@ -10364,7 +10364,7 @@ describe("nexus.inventory.refreshStatus", () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();
     const registry = new InventoryProviderRegistry();
-    const fetchStatus = vi.fn(async () => { throw new Error("auth broken"); });
+    const fetchStatus = vi.fn(async (_config: InventorySourceValues) => { throw new Error("auth broken"); });
     registry.register(makeProvider({ fetchStatus }));
     registerInventoryCommands(core, registry, makeVault(), makeTeardown());
     await core.addOrUpdateInventorySource(makeSource({ id: "src-1", config: { host: "one" } }));
@@ -10975,7 +10975,7 @@ describe("nexus.inventory.refreshStatus", () => {
       // A nothing-to-change sync that still carries a COMPLETE status report —
       // the ordinary shape of a re-sync of a settled lab.
       const fetchInventory = vi.fn(
-        async (): Promise<InventoryTree> => ({ contractVersion: 1, devices: [], status: { contractVersion: 1, statuses: { "dev#1": { state: "running" } } } })
+        async (): Promise<InventoryTree> => ({ contractVersion: 1 as const, devices: [], status: { contractVersion: 1 as const, statuses: { "dev#1": { state: "running" } } } })
       );
       const provider = makeProvider({ fetchStatus, fetchInventory });
       registry.register(provider);
@@ -11050,10 +11050,10 @@ describe("nexus.inventory.refreshStatus", () => {
         });
         const fetchInventory = vi.fn(
           async (): Promise<InventoryTree> => ({
-            contractVersion: 1,
+            contractVersion: 1 as const,
             devices: [],
             truncated: shape.treeTruncated,
-            status: { contractVersion: 1, truncated: true, statuses: { "dev#1": { state: "running" } } }
+            status: { contractVersion: 1 as const, truncated: true, statuses: { "dev#1": { state: "running" } } }
           })
         );
         const provider = makeProvider({ fetchStatus, fetchInventory });
@@ -11295,9 +11295,9 @@ describe("nexus.inventory.refreshStatus", () => {
     });
     const fetchInventory = vi.fn(
       async (): Promise<InventoryTree> => ({
-        contractVersion: 1,
-        devices: [{ externalId: "dev#1", name: "R1", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }] }],
-        status: { contractVersion: 1, statuses: { "dev#1": { state: "running" } } }
+        contractVersion: 1 as const,
+        devices: [{ externalId: "dev#1", name: "R1", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] }],
+        status: { contractVersion: 1 as const, statuses: { "dev#1": { state: "running" } } }
       })
     );
     const provider = makeProvider({ fetchStatus, fetchInventory });
@@ -11400,13 +11400,13 @@ describe("nexus.inventory.syncNow — the sync applies the fetched lab status", 
 
   function eveTree(overrides: Partial<InventoryTree> = {}): InventoryTree {
     return {
-      contractVersion: 1,
+      contractVersion: 1 as const,
       devices: [
         { externalId: "/L.unl#1", name: "R1", endpoints: [{ kind: "telnet", host: "10.0.0.1", port: 32769 }] },
         { externalId: "/L.unl#2", name: "R2", endpoints: [{ kind: "telnet", host: "10.0.0.2", port: 32770 }] }
       ],
       status: {
-        contractVersion: 1,
+        contractVersion: 1 as const,
         statuses: { "/L.unl#1": { state: "running" }, "/L.unl#2": { state: "stopped" } }
       },
       ...overrides
@@ -11453,7 +11453,7 @@ describe("nexus.inventory.syncNow — the sync applies the fetched lab status", 
     // nothing-to-change plan takes the fast path and shows no confirm modal.
     const sync2 = reregister(core, {
       ...eveTree(),
-      status: { contractVersion: 1, statuses: { "/L.unl#1": { state: "stopped" }, "/L.unl#2": { state: "running" } } }
+      status: { contractVersion: 1 as const, statuses: { "/L.unl#1": { state: "stopped" }, "/L.unl#2": { state: "running" } } }
     });
     await sync2("src-1");
 
@@ -11519,11 +11519,11 @@ describe("nexus.inventory.syncNow — the sync applies the fetched lab status", 
         id: "eve2",
         fetchInventory: vi.fn(
           async (): Promise<InventoryTree> => ({
-            contractVersion: 1,
+            contractVersion: 1 as const,
             devices: [{ externalId: "/O.unl#1", name: "O1", endpoints: [{ kind: "telnet" as const, host: "10.9.0.9", port: 32769 }] }],
             // COMPLETE (no `truncated`), so the apply CLEARS before it applies —
             // the only shape that can wipe anything at all.
-            status: { contractVersion: 1, statuses: { "/O.unl#1": { state: "running" } } }
+            status: { contractVersion: 1 as const, statuses: { "/O.unl#1": { state: "running" } } }
           })
         )
       })
@@ -11556,10 +11556,10 @@ describe("nexus.inventory.syncNow — the sync applies the fetched lab status", 
     // A second, TRUNCATED crawl that only reached node 1. `truncated` on the
     // TREE too, so the plan skips pruning and node 2's server survives.
     const sync2 = reregister(core, {
-      contractVersion: 1,
+      contractVersion: 1 as const,
       truncated: true,
       devices: [{ externalId: "/L.unl#1", name: "R1", endpoints: [{ kind: "telnet", host: "10.0.0.1", port: 32769 }] }],
-      status: { contractVersion: 1, truncated: true, statuses: { "/L.unl#1": { state: "running" } } }
+      status: { contractVersion: 1 as const, truncated: true, statuses: { "/L.unl#1": { state: "running" } } }
     });
     await sync2("src-1");
 
@@ -11586,10 +11586,10 @@ describe("nexus.inventory.syncNow — the sync applies the fetched lab status", 
     // Converted to templates since the last sync: a truncated sync (so nothing
     // is pruned and the report MERGES) that reports no state and clears every vmid.
     const { core, sync } = await makeWorld({
-      contractVersion: 1,
+      contractVersion: 1 as const,
       truncated: true,
       devices: [],
-      status: { contractVersion: 1, truncated: true, statuses: {}, clearedExternalIds: vmids }
+      status: { contractVersion: 1 as const, truncated: true, statuses: {}, clearedExternalIds: vmids }
     });
     // Seeded directly rather than by a first sync of 10,002 devices, which
     // would cost the suite seconds and exercise nothing this test is about:
@@ -11603,7 +11603,7 @@ describe("nexus.inventory.syncNow — the sync applies the fetched lab status", 
       });
     await core.addServersBatch([...vmids, "dev#keep"].map(owned));
     core.applyInventoryStatus("src-1", {
-      contractVersion: 1,
+      contractVersion: 1 as const,
       statuses: Object.fromEntries([...vmids, "dev#keep"].map((id) => [id, { state: "running" as const }]))
     });
     expect(core.getSnapshot().serverStatus.size).toBe(count + 1);
@@ -11632,9 +11632,9 @@ describe("nexus.inventory.syncNow — the sync applies the fetched lab status", 
 
     // Node 2 is gone from the source, and the crawl was COMPLETE.
     const sync2 = reregister(core, {
-      contractVersion: 1,
+      contractVersion: 1 as const,
       devices: [{ externalId: "/L.unl#1", name: "R1", endpoints: [{ kind: "telnet", host: "10.0.0.1", port: 32769 }] }],
-      status: { contractVersion: 1, statuses: { "/L.unl#1": { state: "running" } } }
+      status: { contractVersion: 1 as const, statuses: { "/L.unl#1": { state: "running" } } }
     });
     mockShowInformationMessage.mockResolvedValueOnce("Apply");
     await sync2("src-1");
@@ -11669,12 +11669,12 @@ describe("nexus.inventory.syncNow — the sync applies the fetched lab status", 
     return {
       core,
       flipped: {
-        contractVersion: 1,
+        contractVersion: 1 as const,
         devices: [
           { externalId: "/L.unl#1", name: "R1-renamed", endpoints: [{ kind: "telnet", host: "10.0.0.1", port: 32769 }] },
           { externalId: "/L.unl#2", name: "R2", endpoints: [{ kind: "telnet", host: "10.0.0.2", port: 32770 }] }
         ],
-        status: { contractVersion: 1, statuses: { "/L.unl#1": { state: "stopped" }, "/L.unl#2": { state: "running" } } }
+        status: { contractVersion: 1 as const, statuses: { "/L.unl#1": { state: "stopped" }, "/L.unl#2": { state: "running" } } }
       }
     };
   }
@@ -11705,7 +11705,7 @@ describe("nexus.inventory.syncNow — the sync applies the fetched lab status", 
     expect(core.getSnapshot().serverStatus.get(STOPPED_ID)).toBe("stopped");
   });
   it("a malformed provider status degrades to NO status update rather than failing the sync — the devices were fine (⊘ validating it as part of the tree aborts an otherwise-good sync over one bad status entry, and skipping validation entirely lets a garbage report reach the core)", async () => {
-    const { core, sync } = await makeWorld(eveTree({ status: { contractVersion: 1, statuses: { "/L.unl#1": { state: "on fire" } } } as never }));
+    const { core, sync } = await makeWorld(eveTree({ status: { contractVersion: 1 as const, statuses: { "/L.unl#1": { state: "on fire" } } } as never }));
     const applySpy = vi.spyOn(core, "applyInventoryStatus");
     mockShowInformationMessage.mockResolvedValueOnce("Apply");
 
@@ -11720,14 +11720,14 @@ describe("nexus.inventory.syncNow — the sync applies the fetched lab status", 
   });
 
   it("a status-less fetch leaves that SAME source's existing status untouched — an absent report is 'no news', not 'nothing is running' (⊘ applying an empty report unconditionally wipes on the source's OWN next sync the state a Refresh Lab Status had just established)", async () => {
-    const statusless: InventoryTree = { contractVersion: 1, devices: eveTree().devices };
+    const statusless: InventoryTree = { contractVersion: 1 as const, devices: eveTree().devices };
     const { core, sync } = await makeWorld(statusless);
     mockShowInformationMessage.mockResolvedValueOnce("Apply");
     await sync("src-1"); // creates both servers; the tree carries no status
 
     // A Refresh Lab Status has since established their real state.
     core.applyInventoryStatus("src-1", {
-      contractVersion: 1,
+      contractVersion: 1 as const,
       statuses: { "/L.unl#1": { state: "running" }, "/L.unl#2": { state: "stopped" } }
     });
 
@@ -11753,7 +11753,7 @@ describe("nexus.inventory.syncNow — the sync applies the fetched lab status", 
    */
   const FLIPPED = {
     ...eveTree(),
-    status: { contractVersion: 1, statuses: { "/L.unl#1": { state: "stopped" as const }, "/L.unl#2": { state: "running" as const } } }
+    status: { contractVersion: 1 as const, statuses: { "/L.unl#1": { state: "stopped" as const }, "/L.unl#2": { state: "running" as const } } }
   };
 
   /**
@@ -12211,7 +12211,7 @@ describe("nexus.inventory.refreshStatus — provider trust fingerprint", () => {
     const core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();
     const registry = new InventoryProviderRegistry();
-    const fetchStatus = vi.fn(async () => REPORT);
+    const fetchStatus = vi.fn<NonNullable<InventoryProvider["fetchStatus"]>>(async () => REPORT);
     registry.register(makeProvider({ fetchStatus, ...providerOverrides }));
     // `vaulted: false` models the record keeping its `secretFieldIds` while the
     // SecretStorage entry behind one of them is gone — a restore whose secret

@@ -266,14 +266,17 @@ describe("NexusFileSystemProvider", () => {
   });
 
   describe("elevated (sudo) saves", () => {
-    let broker: { confirmElevation: ReturnType<typeof vi.fn>; saveElevated: ReturnType<typeof vi.fn> };
+    function makeBroker() {
+      return {
+        confirmElevation: vi.fn(async (_serverId: string, _remotePath: string) => true),
+        saveElevated: vi.fn(async (_serverId: string, _remotePath: string, _content: Buffer, _knownMode?: number) => true)
+      };
+    }
+    let broker: ReturnType<typeof makeBroker>;
     let providerWithBroker: NexusFileSystemProvider;
 
     beforeEach(() => {
-      broker = {
-        confirmElevation: vi.fn(async () => true),
-        saveElevated: vi.fn(async () => true),
-      };
+      broker = makeBroker();
       providerWithBroker = new NexusFileSystemProvider(sftp, broker);
     });
 
@@ -812,8 +815,7 @@ describe("NexusFileSystemProvider", () => {
   });
 
   it("watch returns a no-op disposable", () => {
-    const uri = buildUri("srv-1", "/home");
-    const disposable = provider.watch(uri);
+    const disposable = provider.watch();
     expect(disposable).toBeDefined();
     expect(() => disposable.dispose()).not.toThrow();
   });

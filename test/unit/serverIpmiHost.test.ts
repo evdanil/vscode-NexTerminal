@@ -78,7 +78,7 @@ describe("server form — IPMI / BMC Host field", () => {
     const field = keyedField(serverFormDefinition({ id: "s1", ipmiHost: "10.0.0.99" }), "ipmiHost");
     expect(field).toBeDefined();
     expect(field?.type).toBe("text");
-    expect(field?.label).toBe("IPMI / BMC Host");
+    expect(field && "label" in field ? field.label : undefined).toBe("IPMI / BMC Host");
     expect(field && "value" in field ? field.value : undefined).toBe("10.0.0.99");
     // Never required — a server without a BMC must still be savable.
     expect(field && "required" in field ? field.required : undefined).toBeFalsy();

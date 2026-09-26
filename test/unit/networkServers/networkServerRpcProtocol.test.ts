@@ -256,9 +256,12 @@ describe("network-server RPC protocol", () => {
         poolInfo: { ...DHCP_RUNTIME.poolInfo, activeCount: 5_000 },
       });
       expect(parsed.ok).toBe(true);
-      if (parsed.ok) {
+      if (parsed.ok && "leases" in parsed.value) {
+        expect(parsed.value.snapshot.id).toBe("dhcp");
         expect(parsed.value.leases).toHaveLength(1);
         expect(parsed.value.poolInfo.activeCount).toBe(5_000);
+      } else {
+        throw new Error("Expected a parsed DHCP runtime snapshot");
       }
     });
 

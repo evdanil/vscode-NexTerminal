@@ -55,6 +55,7 @@ import dgram from "node:dgram";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   NetworkServerDaemonHost,
   resolveNativeDaemonBinaryPath,
@@ -64,7 +65,6 @@ import {
 } from "../../../src/services/networkServers/daemonHost";
 import { encodeRRQ, encodeWRQ, encodeACK, getOpcode } from "../../../src/services/networkServers/tftp/engine/protocol";
 import { createUdpClient, mkdtemp, sleep } from "../../helpers/networkServerTestHelpers";
-import { createBuildConfigs } from "../../../scripts/buildConfigs.mjs";
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
 
@@ -99,6 +99,10 @@ let daemonScript: string;
  */
 async function buildDaemonBundle(): Promise<string> {
   const esbuild = await import("esbuild");
+  const configUrl = pathToFileURL(path.join(REPO_ROOT, "scripts", "buildConfigs.mjs")).href;
+  const { createBuildConfigs } = await import(configUrl) as {
+    createBuildConfigs(options: { production: boolean }): Array<import("esbuild").BuildOptions & { outfile: string }>;
+  };
   const outdir = fs.mkdtempSync(path.join(os.tmpdir(), "nexus-parity-build-"));
   const outfile = path.join(outdir, "networkServerDaemon.js");
   const daemonConfig = createBuildConfigs({ production: true }).find((config) =>

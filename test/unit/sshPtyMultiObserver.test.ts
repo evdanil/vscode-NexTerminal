@@ -28,10 +28,10 @@ import type { PtyOutputObserver } from "../../src/services/macroAutoTrigger";
 function buildPty(initialObserver?: PtyOutputObserver): { pty: SshPty; writes: string[] } {
   const writes: string[] = [];
   const pty = new SshPty(
-    { id: "s1", name: "test", host: "h", port: 22, username: "u" } as unknown as Parameters<typeof SshPty>[0],
-    { create: vi.fn() } as unknown as Parameters<typeof SshPty>[1],
+    { id: "s1", name: "test", host: "h", port: 22, username: "u" } as unknown as ConstructorParameters<typeof SshPty>[0],
+    { create: vi.fn() } as unknown as ConstructorParameters<typeof SshPty>[1],
     { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() },
-    { log: vi.fn(), close: vi.fn() } as unknown as Parameters<typeof SshPty>[3],
+    { log: vi.fn(), close: vi.fn() } as unknown as ConstructorParameters<typeof SshPty>[3],
     undefined,
     undefined,
     initialObserver

@@ -519,8 +519,8 @@ describe("AuthProfileEditorPanel", () => {
    */
   describe("profile saves are serialized against deletion", () => {
     /** Parks the Nth call to a vault method until released, then runs the real one. */
-    function gateVaultCall(
-      method: { getMockImplementation: () => ((key: string, value?: string) => Promise<void>) | undefined; mockImplementation: (fn: (key: string, value?: string) => Promise<void>) => unknown },
+    function gateVaultCall<Args extends [key: string] | [key: string, value: string]>(
+      method: { getMockImplementation: () => ((...args: Args) => Promise<void>) | undefined; mockImplementation: (fn: (...args: Args) => Promise<void>) => unknown },
       gateOnCall: number
     ): { release: () => void } {
       let release!: () => void;
@@ -529,11 +529,11 @@ describe("AuthProfileEditorPanel", () => {
       });
       const real = method.getMockImplementation()!;
       let calls = 0;
-      method.mockImplementation(async (key: string, value?: string) => {
+      method.mockImplementation(async (...args: Args) => {
         if (calls++ === gateOnCall) {
           await gate;
         }
-        await real(key, value);
+        await real(...args);
       });
       return { release };
     }

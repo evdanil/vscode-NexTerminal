@@ -7,6 +7,12 @@ const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockCreateTerminal = vi.fn();
 const mockWithProgress = vi.fn(async (_options: unknown, task: () => Promise<unknown>) => task());
 
+function getGlobalStateValue<T>(_key: string): T | undefined;
+function getGlobalStateValue<T>(_key: string, defaultValue: T): T;
+function getGlobalStateValue<T>(_key: string, defaultValue?: T): T | undefined {
+  return defaultValue;
+}
+
 vi.mock("../../src/logging/sessionTranscriptLogger", () => ({
   createSessionTranscript: vi.fn(() => undefined)
 }));
@@ -26,7 +32,7 @@ vi.mock("vscode", () => ({
     showInputBox: vi.fn(),
     showOpenDialog: vi.fn(),
     showErrorMessage: vi.fn(),
-    withProgress: (...args: unknown[]) => mockWithProgress(...args),
+    withProgress: (options: unknown, task: () => Promise<unknown>) => mockWithProgress(options, task),
     createTerminal: (...args: unknown[]) => mockCreateTerminal(...args)
   },
   workspace: {
@@ -175,12 +181,21 @@ describe("server terminal focus tracking", () => {
       terminalsByServer: new Map(),
       sessionTerminals: new Map(),
       serialTerminals: new Map(),
+      localShellTerminals: new Map(),
+      localServerTerminals: new Map(),
       highlighter: { apply: vi.fn((text: string) => text) } as any,
       macroAutoTrigger: { createObserver: vi.fn(() => undefined) } as any,
       sftpService: {} as any,
       fileExplorerProvider: {} as any,
       focusedTerminal: undefined,
-      activityIndicators: new Map()
+      activityIndicators: new Map(),
+      globalStoragePath: "",
+      extensionPath: "",
+      globalState: {
+        keys: () => [],
+        get: getGlobalStateValue,
+        update: async () => {}
+      }
     };
 
     registerServerCommands(ctx);

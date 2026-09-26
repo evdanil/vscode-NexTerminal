@@ -21,6 +21,7 @@ import {
   computeProviderFingerprint,
   resolveStatusTruncationRemedy,
   type InventoryConfigField,
+  type InventorySourceValues,
   type InventoryStatusReport
 } from "../../src/models/inventory";
 
@@ -2264,7 +2265,7 @@ describe("createEveNgProvider — error mapping", () => {
   });
 
   it("MINOR-5 — sends `redirect: \"manual\"` on the login POST and on GETs, so a 3xx from the lab box is never auto-followed across origins with the password (⊘ default `redirect: \"follow\"` retains the POST body on 307/308)", async () => {
-    const redirects: (RequestRedirect | undefined)[] = [];
+    const redirects: Array<RequestInit["redirect"]> = [];
     const fetchImpl = (async (input: string, init?: RequestInit) => {
       redirects.push(init?.redirect);
       if (new URL(input).pathname.endsWith("/api/auth/login")) return makeResponse(200, jsend(null), [`unetlab_session=${SESSION}`]);
@@ -3024,10 +3025,11 @@ describe("createEveNgProvider — insecure TLS transport selection", () => {
   });
 
   it("NEVER uses it for a source that did not opt in, however the certificate would have failed (⊘ selecting on the URL scheme alone turns verification off for every https source)", async () => {
-    for (const config of [
+    const configs: InventorySourceValues[] = [
       { baseUrl: "https://10.0.0.5", allowInsecureTls: false },
       { baseUrl: "https://10.0.0.5" }
-    ]) {
+    ];
+    for (const config of configs) {
       const { standard, insecure, provider } = probes();
       await provider.fetchInventory({ ...CONFIG, ...config }, SECRETS);
       expect(standard.calls.length).toBeGreaterThan(0);
@@ -3162,13 +3164,14 @@ describe("createEveNgProvider — a sync run with verification off discloses it"
   });
 
   it("says NOTHING for a source that is actually verifying its certificate (⊘ an unconditional warning trains the user to ignore the one that means something)", async () => {
-    for (const config of [
+    const configs: InventorySourceValues[] = [
       { baseUrl: "https://10.0.0.5", allowInsecureTls: false },
       { baseUrl: "https://10.0.0.5" },
       // Ticked but http: the selector keeps the standard transport, so nothing
       // was relaxed and there is nothing to disclose.
       { baseUrl: "http://eve.example.com", allowInsecureTls: true }
-    ]) {
+    ];
+    for (const config of configs) {
       const tree = await provider().fetchInventory({ ...CONFIG, ...config }, SECRETS);
       // Asserted against the CONSTANT, not a substring like "certificate": the
       // warning capitalises the word in both places it uses it, so a

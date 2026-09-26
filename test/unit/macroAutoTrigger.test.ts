@@ -107,7 +107,7 @@ function setConfig(
     "nexus.terminal.macros": { autoTrigger, ...macroSettings }
   };
   // Feed macros into the store synchronously (save is async but InMemoryMacroStore resolves immediately)
-  void activeStore.save(macros as TerminalMacro[]);
+  void activeStore.save(macros as unknown as TerminalMacro[]);
 }
 
 /**
@@ -741,14 +741,13 @@ describe("MacroAutoTrigger", () => {
     const trigger = new MacroAutoTrigger();
     const sentA: string[] = [];
     const sentB: string[] = [];
-    let activeObs: "a" | "b" = "a";
     const obsA = trigger.createObserver(
       (text) => sentA.push(text),
-      () => activeObs === "a"
+      () => true
     );
     const obsB = trigger.createObserver(
       (text) => sentB.push(text),
-      () => activeObs === "b"
+      () => false
     );
 
     // Terminal A (focused) gets output — interval starts
@@ -1778,7 +1777,7 @@ describe("MacroAutoTrigger", () => {
       void rawStore.initialize();
       setActiveMacroStore(rawStore);
       mockConfig = { "nexus.terminal.macros": { autoTrigger: true } };
-      void rawStore.save(macros as TerminalMacro[]);
+      void rawStore.save(macros as unknown as TerminalMacro[]);
       return rawStore;
     }
 

@@ -182,12 +182,17 @@ describe("serial terminal focus tracking", () => {
       terminalsByServer: new Map(),
       sessionTerminals: new Map(),
       serialTerminals: new Map(),
+      localShellTerminals: new Map(),
+      localServerTerminals: new Map(),
       highlighter: { apply: vi.fn((text: string) => text) } as any,
       macroAutoTrigger: { createObserver: vi.fn(() => undefined) } as any,
       sftpService: {} as any,
       fileExplorerProvider: {} as any,
       focusedTerminal: undefined,
-      activityIndicators: new Map()
+      activityIndicators: new Map(),
+      globalStoragePath: "/global-storage",
+      extensionPath: "/extension",
+      globalState: { get: vi.fn(), update: vi.fn(), keys: vi.fn() } as any
     };
 
     registerSerialCommands(ctx);

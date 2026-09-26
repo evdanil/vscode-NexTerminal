@@ -407,9 +407,10 @@ describe("nexus.deviceTemplate.applyToFolder (§7.4)", () => {
       port: 22,
       username: "admin",
       authType: "agent",
+      isHidden: false,
       group: "DC",
       proxy: P,
-      origin: { sourceId: "src", externalId: "d", templated: { proxy: P } }
+      origin: { sourceId: "src", externalId: "d", syncedAt: 1, templated: { proxy: P } }
     };
     await core.addOrUpdateServer(server);
     const template: DeviceTemplateProfile = { id: "t1", name: "Reproxy", fields: { proxy: { mode: "override", value: { type: "socks5", host: "10.0.0.2", port: 1080 } } } };
@@ -439,7 +440,7 @@ describe("nexus.deviceTemplate.applyToFolder (§7.4)", () => {
 
   it("B1 — ABORTS without writing when folder membership changes under the lock (re-derived plan diverges)", async () => {
     const core = makeCore();
-    const s1: ServerConfig = { id: "srv-1", name: "a", host: "h", port: 22, username: "admin", authType: "agent", group: "DC" };
+    const s1: ServerConfig = { id: "srv-1", name: "a", host: "h", port: 22, username: "admin", authType: "agent", isHidden: false, group: "DC" };
     await core.addOrUpdateServer(s1);
     const template: DeviceTemplateProfile = {
       id: "t1",
@@ -454,7 +455,7 @@ describe("nexus.deviceTemplate.applyToFolder (§7.4)", () => {
     // server joins the folder — so the set the user consented to (1 server)
     // diverges from what the lock re-derives (2 servers).
     mockShowWarningMessage.mockImplementation(async () => {
-      await core.addOrUpdateServer({ id: "srv-2", name: "b", host: "h2", port: 22, username: "admin", authType: "agent", group: "DC" });
+      await core.addOrUpdateServer({ id: "srv-2", name: "b", host: "h2", port: 22, username: "admin", authType: "agent", isHidden: false, group: "DC" });
       return "Apply";
     });
 
@@ -473,7 +474,7 @@ describe("nexus.deviceTemplate.applyToFolder (§7.4)", () => {
 
   it("B1 — a MATCHING re-derived plan still applies (the guard does not over-refuse)", async () => {
     const core = makeCore();
-    const s1: ServerConfig = { id: "srv-1", name: "a", host: "h", port: 22, username: "admin", authType: "agent", group: "DC" };
+    const s1: ServerConfig = { id: "srv-1", name: "a", host: "h", port: 22, username: "admin", authType: "agent", isHidden: false, group: "DC" };
     await core.addOrUpdateServer(s1);
     await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Mpx", fields: { multiplexing: { mode: "override", value: true } } });
     register(core);
@@ -488,7 +489,7 @@ describe("nexus.deviceTemplate.applyToFolder (§7.4)", () => {
 
   it("B1 lesser sibling — template deleted mid-modal names the deletion, does not report '0 servers'", async () => {
     const core = makeCore();
-    await core.addOrUpdateServer({ id: "srv-1", name: "a", host: "h", port: 22, username: "admin", authType: "agent", group: "DC" });
+    await core.addOrUpdateServer({ id: "srv-1", name: "a", host: "h", port: 22, username: "admin", authType: "agent", group: "DC", isHidden: false });
     await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Mpx", fields: { multiplexing: { mode: "override", value: true } } });
     register(core);
     const picked = core.getSnapshot().deviceTemplates[0];
@@ -520,9 +521,10 @@ describe("nexus.deviceTemplate.applyToFolder (§7.4)", () => {
       port: 22,
       username: "admin",
       authType: "agent",
+      isHidden: false,
       group: "DC",
       proxy: P, // { host: 10.0.0.9 } — the pre-existing, undisclosed baseline
-      origin: { sourceId: "src", externalId: "d", templated: { proxy: P } }
+      origin: { sourceId: "src", externalId: "d", syncedAt: 1, templated: { proxy: P } }
     };
     await core.addOrUpdateServer(server);
     // Template proxy OVERRIDE value A (host .2) — what the modal is rendered from.
@@ -654,9 +656,10 @@ describe("Fix A (PR #62 Codex round 2, SECURITY) — manual apply clears the sta
       port: 22,
       username: "admin",
       authType: "agent",
+      isHidden: false,
       group: "DC",
       proxy: X,
-      origin: { sourceId: "src", externalId: "d", templated: { proxy: X } }
+      origin: { sourceId: "src", externalId: "d", syncedAt: 1, templated: { proxy: X } }
     });
   }
 
@@ -746,9 +749,10 @@ describe("Fix A′ (PR #62 Codex round 3, SECURITY) — restore-on-apply-failure
         port: 22,
         username: "admin",
         authType: "agent",
+        isHidden: false,
         group: "DC",
         proxy: X,
-        origin: { sourceId: "src", externalId: id, templated: { proxy: X } }
+        origin: { sourceId: "src", externalId: id, syncedAt: 1, templated: { proxy: X } }
       });
     }
   }

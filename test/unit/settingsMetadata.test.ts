@@ -34,7 +34,7 @@ describe("Inventory settings category (retired)", () => {
   it("no longer exposes nexus.inventory.statusPollSeconds, and holds no other nexus.inventory setting (⊘ leaving it in SETTINGS_META keeps a dead key on the settings page, in Reset All and in every config export)", () => {
     expect(SETTINGS_META.find((item) => item.section === "nexus.inventory" && item.key === "statusPollSeconds")).toBeUndefined();
     expect(SETTINGS_META.filter((item) => item.section === "nexus.inventory")).toEqual([]);
-    expect(SETTINGS_META.filter((item) => item.category === "inventory")).toEqual([]);
+    expect(SETTINGS_META.map((item) => item.category)).not.toContain("inventory");
   });
 
   it("keeps every REMAINING category populated, which is the invariant the removal has to preserve (⊘ removing a setting and leaving its category is the same bug in a different place)", async () => {

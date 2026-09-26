@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { FormDefinition, FormValues } from "../../src/ui/formTypes";
 
-const mockExecuteCommand = vi.fn();
+const mockExecuteCommand = vi.fn((..._args: unknown[]) => undefined);
 const mockShowWarningMessage = vi.fn();
 const mockShowQuickPick = vi.fn();
 const mockGetConfiguration = vi.fn();
@@ -51,7 +51,7 @@ vi.mock("../../src/ui/webviewFormPanel", () => ({
 vi.mock("../../src/commands/serverCommands", () => ({
   authProfileCredentialMirror: (...args: unknown[]) => mockAuthProfileCredentialMirror(...(args as [])),
   browseForKey: (...args: unknown[]) => mockBrowseForKey(...args),
-  collectGroups: (...args: unknown[]) => mockCollectGroups(...args),
+  collectGroups: () => mockCollectGroups(),
   formValuesToServer: (...args: unknown[]) => mockFormValuesToServer(...args),
   syncProxyPasswordSecret: (...args: unknown[]) => mockSyncProxyPasswordSecret(...args)
 }));
@@ -475,7 +475,7 @@ describe("openUnifiedForm SSH submit — the auth profile link is re-resolved un
   });
 
   function ctxWithProfiles(profiles: Map<string, { id: string; name: string }>) {
-    const addOrUpdateServer = vi.fn(async () => {});
+    const addOrUpdateServer = vi.fn(async (_server: Record<string, unknown>) => {});
     return {
       addOrUpdateServer,
       ctx: {
@@ -670,7 +670,7 @@ describe("openUnifiedForm SSH submit — the IPMI gateway server link is guarded
   });
 
   function ctxWithServers(servers: Map<string, { id: string; name: string }>) {
-    const addOrUpdateServer = vi.fn(async () => {});
+    const addOrUpdateServer = vi.fn(async (_server: Record<string, unknown>) => {});
     return {
       addOrUpdateServer,
       ctx: {

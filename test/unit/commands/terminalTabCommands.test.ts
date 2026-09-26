@@ -7,7 +7,7 @@ const state = {
   showWarning: vi.fn(),
   showInfo: vi.fn(),
   showError: vi.fn(),
-  clipboardWrite: vi.fn(async () => {})
+  clipboardWrite: vi.fn(async (_text: string) => {})
 };
 
 vi.mock("vscode", () => ({
@@ -33,7 +33,7 @@ vi.mock("vscode", () => ({
       return Promise.resolve(undefined);
     },
     showErrorMessage: (...args: unknown[]) => {
-      state.showError(...args);
+      state.showError(args[0]);
       return Promise.resolve(undefined);
     }
   },

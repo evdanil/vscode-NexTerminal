@@ -78,7 +78,7 @@ describe("server form — Alternate host field", () => {
     const field = keyedField(serverFormDefinition({ id: "s1", altHost: "2001:db8::1" }), "altHost");
     expect(field).toBeDefined();
     expect(field?.type).toBe("text");
-    expect(field?.label).toBe("Alternate host");
+    expect(field && "label" in field ? field.label : undefined).toBe("Alternate host");
     expect(field && "advanced" in field ? field.advanced : undefined).toBe(true);
     expect(field && "value" in field ? field.value : undefined).toBe("2001:db8::1");
     // Never required — a server with a single address must still be savable.

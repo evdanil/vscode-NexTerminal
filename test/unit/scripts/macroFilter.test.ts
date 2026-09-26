@@ -45,7 +45,7 @@ function setConfig(macros: Array<Record<string, unknown>>): void {
   mockConfig = {
     "nexus.terminal.macros": { autoTrigger: true }
   };
-  void store.save(macros as TerminalMacro[]);
+  void store.save(macros as unknown as TerminalMacro[]);
 }
 
 describe("MacroAutoTrigger + ScriptMacroFilter", () => {

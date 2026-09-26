@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import * as os from "node:os";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 
 let mockInputResponse: string | undefined;
@@ -34,10 +35,11 @@ vi.mock("vscode", () => ({
     public dispose(): void {}
   },
   Uri: {
-    file: (p: string) => ({ fsPath: p, scheme: "file", path: p, toString: () => p }),
+    file: (p: string) => ({ fsPath: p, scheme: "file", authority: "", path: p, toString: () => p }),
     joinPath: (base: { fsPath: string }, ...parts: string[]) => ({
       fsPath: path.join(base.fsPath, ...parts),
       scheme: "file",
+      authority: "",
       path: path.join(base.fsPath, ...parts),
       toString: () => path.join(base.fsPath, ...parts)
     })
@@ -82,6 +84,8 @@ function makeTestPty(): SessionPtyHandle & { emitOutput(t: string): void; writes
       return { dispose: () => observers.delete(o) };
     },
     setInputBlocked: vi.fn(),
+    resetTerminal: vi.fn(),
+    markShuttingDown: vi.fn(),
     writeProgrammatic(data: string) {
       writes.push(data);
     },
@@ -132,7 +136,8 @@ function runtimeFixture(): {
       bindObserverToSession: () => {}
     } as never,
     outputChannel: outputChannel as never,
-    workerPath
+    workerPath,
+    globalStoragePath: path.join(os.tmpdir(), "nexus-script-interaction-integration")
   });
   const events: Array<{ kind: string; text?: string }> = [];
   manager.onDidChangeRun((e) => {

@@ -34,10 +34,11 @@ vi.mock("vscode", () => ({
     public dispose(): void {}
   },
   Uri: {
-    file: (p: string) => ({ fsPath: p, scheme: "file", path: p, toString: () => p }),
+    file: (p: string) => ({ fsPath: p, scheme: "file", authority: "", path: p, toString: () => p }),
     joinPath: (base: { fsPath: string }, ...parts: string[]) => ({
       fsPath: path.join(base.fsPath, ...parts),
       scheme: "file",
+      authority: "",
       path: path.join(base.fsPath, ...parts),
       toString: () => path.join(base.fsPath, ...parts)
     })
@@ -124,6 +125,7 @@ function waitFor(predicate: () => boolean, timeoutMs: number): Promise<void> {
 }
 
 async function telnetTemplateFixture() {
+  const os = await import("node:os");
   const pty = makeIosTelnetPty();
   const session: ActiveSession = {
     id: "telnet-session",
@@ -150,19 +152,19 @@ async function telnetTemplateFixture() {
     core,
     macroAutoTrigger: { pushFilter: () => ({ dispose: () => {} }), bindObserverToSession: () => {} } as never,
     outputChannel: { appendLine: vi.fn(), show: vi.fn(), dispose: vi.fn() } as never,
-    workerPath: path.resolve(__dirname, "..", "..", "..", "dist", "services", "scripts", "scriptWorker.js")
+    workerPath: path.resolve(__dirname, "..", "..", "..", "dist", "services", "scripts", "scriptWorker.js"),
+    globalStoragePath: path.join(os.tmpdir(), "nexus-connect-capture-integration")
   });
   const ended: string[] = [];
   manager.onDidChangeRun((e) => {
     if (e.kind === "ended") ended.push(e.finalState);
   });
 
-  const os = await import("node:os");
   const fs = await import("node:fs/promises");
   const template = SCRIPT_TEMPLATES.find((t) => t.id === "wait-send")!;
   const fixture = path.join(os.tmpdir(), `nexus-telnet-login-${Date.now()}-${Math.random()}.js`);
   await fs.writeFile(fixture, template.body.replaceAll("{{NAME}}", "telnet-login"), "utf8");
-  const scriptUri = { fsPath: fixture, scheme: "file", path: fixture, toString: () => fixture };
+  const scriptUri = { fsPath: fixture, scheme: "file", authority: "", path: fixture, toString: () => fixture };
   return { manager, pty, ended, scriptUri, cleanup: () => fs.unlink(fixture).catch(() => {}) };
 }
 

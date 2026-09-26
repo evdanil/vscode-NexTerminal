@@ -479,7 +479,7 @@ describe("ServerManager disposal ownership", () => {
       releaseFirstDrop.resolve();
       stopSpy?.mockRestore();
       await Promise.allSettled(
-        [firstDrop, restarting, finalDrop].filter((operation): operation is Promise<unknown> => operation !== undefined),
+        [firstDrop, restarting, finalDrop].filter((operation): operation is Promise<boolean> | Promise<void> => operation !== undefined),
       );
       await Promise.allSettled(adapters.map((adapter) => adapter.stop()));
     }
@@ -527,7 +527,7 @@ describe("ServerManager disposal ownership", () => {
       releaseFirstDrop.resolve();
       stopSpy?.mockRestore();
       await Promise.allSettled(
-        [firstDrop, restarting, disposingAll].filter((operation): operation is Promise<unknown> => operation !== undefined),
+        [firstDrop, restarting, disposingAll].filter((operation): operation is Promise<boolean> | Promise<void> => operation !== undefined),
       );
       await Promise.allSettled(adapters.map((adapter) => adapter.stop()));
     }

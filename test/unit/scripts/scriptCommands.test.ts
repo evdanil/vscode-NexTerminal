@@ -16,7 +16,7 @@ const state = {
   mockShowInformationMessage: vi.fn(),
   mockShowErrorMessage: vi.fn(),
   mockOpenExternal: vi.fn(),
-  mockFsDelete: vi.fn(async () => {}),
+  mockFsDelete: vi.fn(async (..._args: unknown[]) => {}),
   mockFsStatThrows: true
 };
 
@@ -98,6 +98,10 @@ import * as vscode from "vscode";
 import { SCRIPT_TEMPLATES, registerScriptCommands } from "../../../src/commands/scriptCommands";
 import { parseScriptHeader } from "../../../src/services/scripts/scriptHeader";
 import type { ScriptRuntimeManager } from "../../../src/services/scripts/scriptRuntimeManager";
+
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+const mockWorkspace = vscode.workspace as Mutable<typeof vscode.workspace>;
+const mockWindow = vscode.window as Mutable<typeof vscode.window>;
 
 function makeManager(overrides: Partial<Record<string, unknown>> = {}): ScriptRuntimeManager {
   return {
@@ -497,8 +501,8 @@ describe("scriptCommands", () => {
 
   describe("workspace gating", () => {
     it("run works without an open workspace folder (user can open a .js directly)", async () => {
-      const prevFolders = (await import("vscode")).workspace.workspaceFolders;
-      (await import("vscode")).workspace.workspaceFolders = undefined as unknown as typeof prevFolders;
+      const prevFolders = mockWorkspace.workspaceFolders;
+      mockWorkspace.workspaceFolders = undefined as unknown as typeof prevFolders;
 
       const mgr = makeManager();
       registerScriptCommands(mgr, outputChannel, "/tmp/fake-gs");
@@ -508,13 +512,13 @@ describe("scriptCommands", () => {
       expect(mgr.runScript).toHaveBeenCalledWith(uri);
       expect(state.mockShowInformationMessage).not.toHaveBeenCalled(); // no "open a folder" nag
 
-      (await import("vscode")).workspace.workspaceFolders = prevFolders;
+      mockWorkspace.workspaceFolders = prevFolders;
     });
 
     it("new works without a workspace by falling back to globalStoragePath", async () => {
-      const prevFolders = (await import("vscode")).workspace.workspaceFolders;
+      const prevFolders = mockWorkspace.workspaceFolders;
       try {
-        (await import("vscode")).workspace.workspaceFolders = undefined as unknown as typeof prevFolders;
+        mockWorkspace.workspaceFolders = undefined as unknown as typeof prevFolders;
         state.inputBoxReturn = "my-procedure";
         registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
         const handler = state.registeredCommands.get("nexus.script.new")!;
@@ -523,7 +527,7 @@ describe("scriptCommands", () => {
         expect(body).toBeDefined();
         expect(body!).toMatch(/@nexus-script/);
       } finally {
-        (await import("vscode")).workspace.workspaceFolders = prevFolders;
+        mockWorkspace.workspaceFolders = prevFolders;
       }
     });
   });
@@ -630,7 +634,7 @@ describe("scriptCommands", () => {
     it("binds to the focused Nexus terminal when one is active (no picker shown)", async () => {
       const mgr = makeManager();
       const fakeTerminal = { name: "web-1" } as unknown as import("vscode").Terminal;
-      (await import("vscode")).window.activeTerminal = fakeTerminal;
+      mockWindow.activeTerminal = fakeTerminal;
       const resolver = vi.fn((t: unknown) => (t === fakeTerminal ? "sess-a" : undefined));
 
       registerScriptCommands(mgr, outputChannel, "/tmp/fake-gs", resolver as never);
@@ -641,12 +645,12 @@ describe("scriptCommands", () => {
       expect(resolver).toHaveBeenCalledWith(fakeTerminal);
       expect(mgr.runScript).toHaveBeenCalledWith(uri, "sess-a");
 
-      (await import("vscode")).window.activeTerminal = undefined;
+      mockWindow.activeTerminal = undefined;
     });
 
     it("falls back to the picker (manager.runScript(uri)) when no terminal is focused", async () => {
       const mgr = makeManager();
-      (await import("vscode")).window.activeTerminal = undefined;
+      mockWindow.activeTerminal = undefined;
       const resolver = vi.fn(() => undefined);
 
       registerScriptCommands(mgr, outputChannel, "/tmp/fake-gs", resolver as never);
@@ -661,7 +665,7 @@ describe("scriptCommands", () => {
     it("falls back to the picker when the focused terminal isn't a Nexus session", async () => {
       const mgr = makeManager();
       const nonNexusTerminal = { name: "bash" } as unknown as import("vscode").Terminal;
-      (await import("vscode")).window.activeTerminal = nonNexusTerminal;
+      mockWindow.activeTerminal = nonNexusTerminal;
       const resolver = vi.fn(() => undefined); // not a Nexus session
 
       registerScriptCommands(mgr, outputChannel, "/tmp/fake-gs", resolver as never);
@@ -671,13 +675,13 @@ describe("scriptCommands", () => {
 
       expect(mgr.runScript).toHaveBeenCalledWith(uri, undefined);
 
-      (await import("vscode")).window.activeTerminal = undefined;
+      mockWindow.activeTerminal = undefined;
     });
 
     it("binds to the focused Local Shell terminal when one is active", async () => {
       const mgr = makeManager();
       const localShellTerminal = { name: "Nexus Local Shell: Dev" } as unknown as import("vscode").Terminal;
-      (await import("vscode")).window.activeTerminal = localShellTerminal;
+      mockWindow.activeTerminal = localShellTerminal;
       const resolver = vi.fn((terminal: unknown) => terminal === localShellTerminal ? "local-session" : undefined);
 
       registerScriptCommands(mgr, outputChannel, "/tmp/fake-gs", resolver as never);
@@ -688,13 +692,13 @@ describe("scriptCommands", () => {
       expect(resolver).toHaveBeenCalledWith(localShellTerminal);
       expect(mgr.runScript).toHaveBeenCalledWith(uri, "local-session");
 
-      (await import("vscode")).window.activeTerminal = undefined;
+      mockWindow.activeTerminal = undefined;
     });
 
     it("unwraps ScriptNode like the other handlers do", async () => {
       const mgr = makeManager();
       const fakeTerminal = { name: "web-1" } as unknown as import("vscode").Terminal;
-      (await import("vscode")).window.activeTerminal = fakeTerminal;
+      mockWindow.activeTerminal = fakeTerminal;
       const resolver = vi.fn(() => "sess-a");
 
       registerScriptCommands(mgr, outputChannel, "/tmp/fake-gs", resolver as never);
@@ -704,7 +708,7 @@ describe("scriptCommands", () => {
 
       expect(mgr.runScript).toHaveBeenCalledWith(innerUri, "sess-a");
 
-      (await import("vscode")).window.activeTerminal = undefined;
+      mockWindow.activeTerminal = undefined;
     });
   });
 
@@ -772,9 +776,9 @@ describe("scriptCommands", () => {
     });
 
     it("falls back to globalStoragePath when no workspace is open", async () => {
-      const prevFolders = (await import("vscode")).workspace.workspaceFolders;
+      const prevFolders = mockWorkspace.workspaceFolders;
       try {
-        (await import("vscode")).workspace.workspaceFolders = undefined as unknown as typeof prevFolders;
+        mockWorkspace.workspaceFolders = undefined as unknown as typeof prevFolders;
         state.mockOpenExternal.mockResolvedValue(true);
         registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
 
@@ -784,7 +788,7 @@ describe("scriptCommands", () => {
           "/tmp/fake-gs/scripts"
         );
       } finally {
-        (await import("vscode")).workspace.workspaceFolders = prevFolders;
+        mockWorkspace.workspaceFolders = prevFolders;
       }
     });
   });

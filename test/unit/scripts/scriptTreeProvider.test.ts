@@ -1025,7 +1025,7 @@ describe("ScriptTreeProvider", () => {
       }
     }
 
-    function scriptNode(fsPath: string, name = "Probe"): ScriptNode {
+    function scriptNode(fsPath: string, name = "Probe"): Extract<ScriptNode, { kind: "script" }> {
       return {
         kind: "script",
         uri: vscode.Uri.file(fsPath),

@@ -13,6 +13,7 @@ import {
   InventoryProviderError,
   resolveStatusTruncationRemedy,
   type InventoryConfigField,
+  type InventorySourceValues,
   type InventoryStatusReport,
   type InventoryTree
 } from "../../src/models/inventory";
@@ -1565,7 +1566,8 @@ describe("createGns3Provider — insecure TLS transport selection", () => {
   });
 
   it("NEVER uses it for a source that did not opt in, however the certificate would have failed (⊘ selecting on the URL scheme alone turns verification off for every https source)", async () => {
-    for (const config of [{ baseUrl: "https://10.0.0.5:3080", allowInsecureTls: false }, { baseUrl: "https://10.0.0.5:3080" }]) {
+    const configs: InventorySourceValues[] = [{ baseUrl: "https://10.0.0.5:3080", allowInsecureTls: false }, { baseUrl: "https://10.0.0.5:3080" }];
+    for (const config of configs) {
       const { standard, insecure, provider } = probes();
       await provider.fetchInventory(config, SECRETS);
       expect(standard.calls.length).toBeGreaterThan(0);

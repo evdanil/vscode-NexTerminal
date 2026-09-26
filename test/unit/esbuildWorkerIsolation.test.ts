@@ -1,12 +1,16 @@
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import * as esbuild from "esbuild";
-import { createBuildConfigs } from "../../scripts/buildConfigs.mjs";
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const FIXTURE = path.join(REPO_ROOT, "test", "fixtures", "esbuild", "importsVscode.ts");
 
-function configFor(suffix: string) {
+async function configFor(suffix: string): Promise<esbuild.BuildOptions & { outfile: string }> {
+  const configUrl = pathToFileURL(path.join(REPO_ROOT, "scripts", "buildConfigs.mjs")).href;
+  const { createBuildConfigs } = await import(configUrl) as {
+    createBuildConfigs(options: { production: boolean }): Array<esbuild.BuildOptions & { outfile: string }>;
+  };
   const config = createBuildConfigs({ production: true }).find((c) => c.outfile.endsWith(suffix));
   if (!config) {
     throw new Error(`no build config produces a file ending in ${suffix}`);
@@ -35,18 +39,18 @@ describe("out-of-host bundles are isolated from the vscode module", () => {
   ] as const;
 
   for (const [label, suffix] of OUT_OF_HOST) {
-    it(`${label} config does not declare vscode external`, () => {
-      expect(configFor(suffix).external ?? []).not.toContain("vscode");
+    it(`${label} config does not declare vscode external`, async () => {
+      expect((await configFor(suffix)).external ?? []).not.toContain("vscode");
     });
 
-    it(`${label} config installs the deny-vscode-import plugin`, () => {
-      const names = (configFor(suffix).plugins ?? []).map((p: { name: string }) => p.name);
+    it(`${label} config installs the deny-vscode-import plugin`, async () => {
+      const names = ((await configFor(suffix)).plugins ?? []).map((p) => p.name);
       expect(names).toContain("deny-vscode-import");
     });
 
     it(`${label} config rejects a build whose entry imports vscode`, async () => {
       const build = esbuild.build({
-        ...configFor(suffix),
+        ...await configFor(suffix),
         entryPoints: [FIXTURE],
         outfile: undefined,
         write: false,
@@ -60,7 +64,7 @@ describe("out-of-host bundles are isolated from the vscode module", () => {
       let serialized = "";
       try {
         await esbuild.build({
-          ...configFor(suffix),
+          ...await configFor(suffix),
           entryPoints: [FIXTURE],
           outfile: undefined,
           write: false,
@@ -80,8 +84,8 @@ describe("out-of-host bundles are isolated from the vscode module", () => {
     ["the main extension", "dist/extension.js"],
     ["the web extension", "dist/webExtension.js"]
   ] as const) {
-    it(`${label} config still declares vscode external`, () => {
-      expect(configFor(suffix).external ?? []).toContain("vscode");
+    it(`${label} config still declares vscode external`, async () => {
+      expect((await configFor(suffix)).external ?? []).toContain("vscode");
     });
   }
 });

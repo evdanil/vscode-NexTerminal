@@ -171,7 +171,7 @@ describe("installSshDhGroupCompat", () => {
     const sentinel = Symbol("native-group");
     let calls = 0;
     const target = {
-      createDiffieHellmanGroup(): unknown {
+      createDiffieHellmanGroup(_name: string): unknown {
         calls += 1;
         return sentinel;
       }
@@ -184,7 +184,7 @@ describe("installSshDhGroupCompat", () => {
   it("rethrows the original error for group names it cannot back", async () => {
     const { installSshDhGroupCompat } = await import("../../src/services/ssh/sshDhGroupCompat");
     const target = {
-      createDiffieHellmanGroup(): never {
+      createDiffieHellmanGroup(_name: string): never {
         throw new Error("Unknown DH group");
       }
     };
@@ -243,4 +243,3 @@ describe("installSshDhGroupCompat", () => {
     expect(target.createDiffieHellmanGroup).toBe(thirdParty);
   });
 });
-

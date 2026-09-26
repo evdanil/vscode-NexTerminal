@@ -140,11 +140,18 @@ async function setupContext(options?: {
     terminalsByServer: new Map() as any,
     sessionTerminals: new Map() as any,
     serialTerminals: new Map() as any,
+    localShellTerminals: new Map(),
+    localServerTerminals: new Map(),
     highlighter: {} as any,
+    macroAutoTrigger: {} as any,
     sftpService: {} as any,
     fileExplorerProvider: {} as any,
     secretVault: vault as any,
-    registrySync: undefined
+    registrySync: undefined,
+    activityIndicators: new Map(),
+    globalStoragePath: "/tmp/nexterminal-tests",
+    extensionPath: "/tmp/nexterminal-tests",
+    globalState: {} as any
   };
 
   return { ctx, core, repo, vault };
@@ -243,7 +250,7 @@ describe("authProfileCommands", () => {
 
     const cmd = registeredCommands.get("nexus.authProfile.applyToFolder");
     expect(cmd).toBeDefined();
-    await cmd!(new FolderTreeItem("Prod"));
+    await cmd!(new FolderTreeItem("Prod", "Prod"));
 
     // Should store reference, NOT copy credentials
     expect(core.getServer("s1")?.authProfileId).toBe("ap1");
@@ -266,7 +273,7 @@ describe("authProfileCommands", () => {
 
     const applyToServer = registeredCommands.get("nexus.authProfile.applyToServer");
     expect(applyToServer).toBeDefined();
-    await applyToServer!(new ServerTreeItem(server));
+    await applyToServer!(new ServerTreeItem(server, false));
 
     // Should store reference, NOT copy credentials or password
     expect(core.getServer("s1")?.authProfileId).toBe("ap1");
@@ -293,7 +300,7 @@ describe("authProfileCommands", () => {
 
     const applyToServer = registeredCommands.get("nexus.authProfile.applyToServer");
     expect(applyToServer).toBeDefined();
-    await applyToServer!(new ServerTreeItem(server));
+    await applyToServer!(new ServerTreeItem(server, false));
 
     expect(mockShowQuickPick).toHaveBeenCalledWith(
       expect.arrayContaining([
@@ -318,7 +325,7 @@ describe("authProfileCommands", () => {
 
     const applyToServer = registeredCommands.get("nexus.authProfile.applyToServer");
     expect(applyToServer).toBeDefined();
-    await applyToServer!(new ServerTreeItem(server));
+    await applyToServer!(new ServerTreeItem(server, false));
 
     const items = mockShowQuickPick.mock.calls[0][0] as Array<{ profile: AuthProfile }>;
     expect(items.map((item) => item.profile.name)).toEqual(["A1", "A2", "A10"]);
@@ -373,13 +380,13 @@ describe("Apply Auth Profile — the disclosure is re-checked and the write re-d
   function applyToFolder(folderPath: string): Promise<unknown> {
     const cmd = registeredCommands.get("nexus.authProfile.applyToFolder");
     expect(cmd).toBeDefined();
-    return Promise.resolve(cmd!(new FolderTreeItem(folderPath)));
+    return Promise.resolve(cmd!(new FolderTreeItem(folderPath, folderPath)));
   }
 
   function applyToServer(server: ServerConfig): Promise<unknown> {
     const cmd = registeredCommands.get("nexus.authProfile.applyToServer");
     expect(cmd).toBeDefined();
-    return Promise.resolve(cmd!(new ServerTreeItem(server)));
+    return Promise.resolve(cmd!(new ServerTreeItem(server, false)));
   }
 
   it("names the servers it is about to link with the right number AND agrees with itself in the next sentence, singular and plural (the disclosure the checks below are compared against)", async () => {

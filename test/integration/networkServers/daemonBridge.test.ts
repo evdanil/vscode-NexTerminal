@@ -45,8 +45,8 @@ import dgram from "node:dgram";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { createInterface, type Interface } from "node:readline";
-import { createBuildConfigs } from "../../../scripts/buildConfigs.mjs";
 import { encodeRRQ, encodeACK, getOpcode } from "../../../src/services/networkServers/tftp/engine/protocol";
 import { RUNTIME_UPDATE_THROTTLE_MS } from "../../../src/services/networkServers/runtimeUpdateThrottle";
 import { createUdpClient, mkdtemp, sleep } from "../../helpers/networkServerTestHelpers";
@@ -72,6 +72,10 @@ let daemonBundleDir: string | undefined;
  */
 async function buildDaemonBundle(): Promise<string> {
   const esbuild = await import("esbuild");
+  const configUrl = pathToFileURL(path.join(REPO_ROOT, "scripts", "buildConfigs.mjs")).href;
+  const { createBuildConfigs } = await import(configUrl) as {
+    createBuildConfigs(options: { production: boolean }): Array<import("esbuild").BuildOptions & { outfile: string }>;
+  };
   const outdir = fs.mkdtempSync(path.join(os.tmpdir(), "nexus-daemon-build-"));
   const outfile = path.join(outdir, "networkServerDaemon.js");
   const daemonConfig = createBuildConfigs({ production: true }).find((config) =>

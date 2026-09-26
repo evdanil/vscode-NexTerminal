@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { MAX_SCRIPT_RUNTIME_MS, MAX_SCRIPT_RUNTIME_SECONDS, resolveScriptMaxRuntimeMs } from "../../../src/services/scripts/maxRuntime";
+import type { ScriptRuntimeConfigLike } from "../../../src/services/scripts/configHelpers";
 
 function config(
   values: Record<string, number | undefined>,
   inspected: Record<string, Record<string, number | undefined> | undefined> = {}
-) {
+): ScriptRuntimeConfigLike {
   return {
-    get: (key: string, fallback?: number) => values[key] ?? fallback,
+    get: <T>(key: string, fallback?: T) => (values[key] as T | undefined) ?? fallback,
     inspect: (key: string) => inspected[key] ?? (values[key] === undefined ? undefined : { globalValue: values[key] })
   };
 }

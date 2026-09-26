@@ -54,7 +54,7 @@ import type { SessionPtyHandle } from "../../../../src/models/config";
 interface FakeNexusCore {
   getSnapshot(): {
     activeSessions: Array<{ id: string; pty?: SessionPtyHandle }>;
-    activeSerialSessions: Array<{ id: string; pty?: SessionPtyHandle }>;
+    activeSerialSessions: Array<{ id: string; status?: "waiting" | "connected"; pty?: SessionPtyHandle }>;
     activeLocalShellSessions: Array<{ id: string; pty?: SessionPtyHandle }>;
     activeLocalServerSessions: Array<{ id: string; status?: string; pty?: SessionPtyHandle }>;
   };
@@ -64,7 +64,7 @@ interface FakeNexusCore {
 function makePty(): SessionPtyHandle & { resetTerminal: () => void; onOutput(text: string): void; __observers: Array<(text: string) => void> } {
   const observers: Array<(text: string) => void> = [];
   return {
-    addOutputObserver(o) {
+    addOutputObserver(o: Parameters<SessionPtyHandle["addOutputObserver"]>[0]) {
       const wrapped = (text: string) => o.onOutput(text);
       observers.push(wrapped);
       return {
@@ -77,16 +77,17 @@ function makePty(): SessionPtyHandle & { resetTerminal: () => void; onOutput(tex
     setInputBlocked: () => {},
     writeProgrammatic: () => {},
     resetTerminal: () => {},
+    markShuttingDown: () => {},
     onOutput(text: string) {
       observers.forEach((cb) => cb(text));
     },
     __observers: observers
-  } as unknown as SessionPtyHandle & { resetTerminal: () => void; onOutput(text: string): void; __observers: Array<(text: string) => void> };
+  };
 }
 
 function makeCore(): FakeNexusCore & {
   sessions: Array<{ id: string; pty?: SessionPtyHandle }>;
-  serialSessions: Array<{ id: string; pty?: SessionPtyHandle }>;
+  serialSessions: Array<{ id: string; status?: "waiting" | "connected"; pty?: SessionPtyHandle }>;
   localShellSessions: Array<{ id: string; pty?: SessionPtyHandle }>;
   localServerSessions: Array<{ id: string; status?: string; pty?: SessionPtyHandle }>;
   emit: () => void;
@@ -94,7 +95,7 @@ function makeCore(): FakeNexusCore & {
   const listeners = new Set<() => void>();
   const core = {
     sessions: [] as Array<{ id: string; pty?: SessionPtyHandle }>,
-    serialSessions: [] as Array<{ id: string; pty?: SessionPtyHandle }>,
+    serialSessions: [] as Array<{ id: string; status?: "waiting" | "connected"; pty?: SessionPtyHandle }>,
     localShellSessions: [] as Array<{ id: string; pty?: SessionPtyHandle }>,
     localServerSessions: [] as Array<{ id: string; status?: string; pty?: SessionPtyHandle }>,
     getSnapshot() {

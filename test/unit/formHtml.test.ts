@@ -1088,11 +1088,8 @@ describe("renderFormHtml", () => {
   it("renders a dangling seeded auth profile id as an empty hidden value, not just an empty label", () => {
     const definition = inventorySourceFormDefinition(
       {
-        id: "fake",
         label: "Fake Provider",
-        configFields: [],
-        testConnection: async () => undefined,
-        fetchInventory: async () => ({ nodes: [] }) as never
+        configFields: []
       },
       {
         id: "src1",
@@ -1455,12 +1452,10 @@ describe("FIX B — saved-filter picker synchronous fill (no round-trip race)", 
 
   /** A form.elements that supports BOTH named (`form.elements["cfg_filter"]`) and
    *  indexed (`form.elements[0]` + `.length`) access, like the real collection. */
-  function makeForm(): { form: { elements: Record<string | number, FakeEl> & { length: number } }; cfg: FakeEl; sf: FakeEl } {
+  function makeForm() {
     const cfg: FakeEl = { name: "cfg_filter", value: "OLD-source-filter", type: "text" };
     const sf: FakeEl = { name: "savedFilter", value: "", type: "hidden" };
-    const elements = { cfg_filter: cfg, savedFilter: sf, 0: cfg, 1: sf, length: 2 } as Record<string | number, FakeEl> & {
-      length: number;
-    };
+    const elements = { cfg_filter: cfg, savedFilter: sf, 0: cfg, 1: sf, length: 2 };
     return { form: { elements }, cfg, sf };
   }
 

@@ -53,12 +53,12 @@ describe("network-server daemon operation serialization", () => {
     const timeline: string[] = [];
     const shutdown = createNetworkServerDaemonShutdown({
       stopAccepting: () => timeline.push("stop"),
-      drain: async () => timeline.push("drain"),
+      drain: async () => { timeline.push("drain"); },
       flushRuntimeUpdates: () => {
         timeline.push("flush");
         throw new Error("flush exploded");
       },
-      dispose: async () => timeline.push("dispose"),
+      dispose: async () => { timeline.push("dispose"); },
       exit: () => timeline.push("exit"),
     });
 

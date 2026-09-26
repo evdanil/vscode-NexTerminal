@@ -4515,6 +4515,7 @@
   "scripts": {
     "clean": "rimraf dist coverage",
     "compile": "tsc -p tsconfig.json --noEmit",
+    "typecheck:test": "tsc -p tsconfig.test.json --noEmit",
     "build": "npm run clean && npm run compile && node esbuild.mjs && npm run prepare:local-pty && npm run prepare:network-server-daemon",
     "build:production": "npm run clean && npm run compile && node esbuild.mjs --production && npm run smoke:bundle && npm run prepare:local-pty && npm run prepare:network-server-daemon",
     "smoke:bundle": "node scripts/smokeBundle.mjs",

@@ -28,6 +28,12 @@ function keyedField(definition: FormDefinition, key: string): Extract<FormFieldD
   return field!;
 }
 
+function requiredField(definition: FormDefinition, key: string) {
+  const field = keyedField(definition, key);
+  if (!("required" in field)) throw new Error(`Field "${key}" has no required flag`);
+  return field;
+}
+
 function maybeKeyedField(definition: FormDefinition, key: string): Extract<FormFieldDescriptor, { key: string }> | undefined {
   return definition.fields.find(
     (candidate): candidate is Extract<FormFieldDescriptor, { key: string }> =>
@@ -63,14 +69,14 @@ describe("serverFormDefinition — addressless (P2-a)", () => {
   // the save at the webview boundary before formValuesToServer is ever reached.
   it("does NOT require Host or Port when the seed is addressless", () => {
     const def = serverFormDefinition({ id: "s1", name: "stopped", host: "", port: 0, username: "admin", authType: "agent", addressless: true });
-    expect(keyedField(def, "host").required).toBe(false);
-    expect(keyedField(def, "port").required).toBe(false);
+    expect(requiredField(def, "host").required).toBe(false);
+    expect(requiredField(def, "port").required).toBe(false);
   });
 
   it("STILL requires Host and Port for an ordinary (non-addressless) server", () => {
     const def = serverFormDefinition({ id: "s1", name: "prod", host: "h", port: 22, username: "admin", authType: "agent" });
-    expect(keyedField(def, "host").required).toBe(true);
-    expect(keyedField(def, "port").required).toBe(true);
+    expect(requiredField(def, "host").required).toBe(true);
+    expect(requiredField(def, "port").required).toBe(true);
   });
 
   // P2-b (Codex) — the addressless Port field must seed the PROTOCOL-appropriate
@@ -409,7 +415,7 @@ describe("formDefinitions keyPath visibility", () => {
         { field: "launchMode", value: "vscodeProfile" }
       ]
     }));
-    expect(definition.fields.some((field) => field.type === "info")).toBe(false);
+    expect(definition.fields.some((field) => String(field.type) === "info")).toBe(false);
     expect(keyedField(definition, "shellPath")).toEqual(expect.objectContaining({
       label: "Shell Path",
       required: true,
@@ -441,7 +447,7 @@ describe("formDefinitions keyPath visibility", () => {
       hint: expect.stringMatching(/WSL.*wsl\.exe/i),
       visibleWhen: { field: "launchMode", value: "custom" }
     }));
-    expect(definition.fields.some((field) => field.type === "info")).toBe(false);
+    expect(definition.fields.some((field) => String(field.type) === "info")).toBe(false);
   });
 
   it("marks Local Shell working directory and startup command as advanced with hints", () => {
@@ -1086,8 +1092,9 @@ describe("formDefinitions — IPMI auth profile and BMC web protocol", () => {
     // BMC login is a different account on a different interface.
     const definition = serverFormDefinition({ ipmiAuthProfileId: "ap-bmc" }, [], true, [], profiles);
     const field = keyedField(definition, "ipmiAuthProfileId");
-    expect(field.autofill).toBeUndefined();
-    expect(keyedField(definition, "authProfileId").autofill).toBe(true);
+    expect("autofill" in field ? field.autofill : undefined).toBeUndefined();
+    const authProfileField = keyedField(definition, "authProfileId");
+    expect("autofill" in authProfileField && authProfileField.autofill).toBe(true);
   });
 
   it("tells the user what the link grants and what it ignores", () => {

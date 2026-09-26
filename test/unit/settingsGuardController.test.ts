@@ -10,7 +10,7 @@ const mockState = {
 const mockConfig = {
   effectiveValues: new Map<string, unknown>(),
   inspectValues: new Map<string, { globalValue?: unknown; defaultValue?: unknown }>(),
-  update: vi.fn(async () => {}),
+  update: vi.fn(async (_key: string, _value: unknown, _target?: number) => {}),
 };
 
 const mockFs = { files: new Map<string, Uint8Array>() };
@@ -140,7 +140,7 @@ describe("SettingsGuardController", () => {
     await flush();
 
     // config.update called for both keys
-    const updateCalls = mockConfig.update.mock.calls as [string, unknown, number][];
+    const updateCalls = mockConfig.update.mock.calls;
     expect(updateCalls.some(([leaf]) => leaf === "commandsToSkipShell")).toBe(true);
     expect(updateCalls.some(([leaf]) => leaf === "passthroughKeys")).toBe(true);
 
@@ -234,7 +234,7 @@ describe("SettingsGuardController", () => {
     await flush();
 
     // Both config.update calls must have happened
-    const updateCalls = mockConfig.update.mock.calls as [string, unknown, number][];
+    const updateCalls = mockConfig.update.mock.calls;
     expect(updateCalls.some(([leaf]) => leaf === "commandsToSkipShell")).toBe(true);
     expect(updateCalls.some(([leaf]) => leaf === "passthroughKeys")).toBe(true);
   });
