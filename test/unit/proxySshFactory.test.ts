@@ -1535,6 +1535,11 @@ describe("ProxySshFactory", () => {
       expect((firstError as Error).message).not.toContain(server.name);
       expect((firstError as Error).message).not.toMatch(/[\n\u001b\u202e]/);
       expect(sentPasswords()).toEqual([]);
+
+      prompt.mockImplementationOnce(async () => ({ password: "fresh", save: false }));
+      await factory.connect(server);
+      expect(prompt).toHaveBeenCalledTimes(2);
+      expect(sentPasswords()).toEqual(["fresh"]);
     });
 
     it("reuses an answer that a still-connecting connect has not stored yet", async () => {
