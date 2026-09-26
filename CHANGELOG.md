@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.287] — 2026-09-26
+
+### Fixed
+
+- **Session IPMI hints recognize more shell command forms.** The send confirmation and Macro Editor now recognize `ipmitool` after supported `sudo`, `env`, and `nice` options, including `nice --`, and when a redirection touches the executable. They no longer mistake a `>|` redirection target or an option-looking word after an `env` assignment for a command. These hints still only describe where the command will run; they do not change how macros execute.
+
 ## [2.8.286] — 2026-09-26
 
 ### Maintenance
