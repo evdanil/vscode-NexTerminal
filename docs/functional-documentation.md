@@ -50,6 +50,7 @@ Nexus Terminal provides one operational surface in VS Code for:
 - Server profile actions include **Connect**, **Test Connection**, **Browse Files** when connected, **Connect and Run Script**, **Edit**, **Duplicate**, **Copy Connection Info**, and **Delete**.
 - Serial profile actions include **Connect**, **Test Connection**, **Connect and Run Script**, **Edit**, **Duplicate**, **Copy Port Info**, and **Delete**.
 - Local Shell profile actions include **Open Local Shell**, **Open and Run Script**, **Edit**, **Duplicate**, **Copy Shell Info**, and **Delete**. Local Shell profiles do not show a Test Connection action.
+- A Local Shell launch waiting on the auto-trigger confirmation is cancelled if its profile is removed or changed before the prompt resolves; it does not create a stale terminal. A notice offers **Retry** when the profile still exists.
 - The Local Shell VS Code profile dropdown lists only terminal profiles that expose an explicit executable path to extensions. For WSL, use a custom Local Shell profile with `wsl.exe` as the shell path and any distribution arguments as shell arguments.
 - Folder actions use folder-specific labels for bulk operations: **Connect Folder Servers** and **Disconnect Folder Servers**.
 
@@ -204,6 +205,8 @@ A tunnel is announced as started and registered cross-window only after startup 
 6. Unread output marks both the sidebar session node and the terminal tab title until the terminal regains focus.
 7. Smart Follow mode tries the saved preferred port first, silently reconnects only when a free replacement matches the saved device metadata, prompts before switching to unfamiliar free replacement ports, updates the saved preferred port after a successful move, and keeps the terminal open while waiting or stopped if the device disappears or serial runtime errors occur.
 8. Smart Follow sessions coexist with standard serial sessions as long as they target different ports. Connect on a profile that already has a session focuses that session's terminal instead of opening a second one. Starting any new serial session is blocked only when the target port is already held by another Nexus serial session; the warning toast names the existing session.
+   A Standard serial port that finishes opening after its profile is removed or changed is closed before a session is registered. After close completes, a notice offers **Retry** when the profile still exists; an unconfirmed close instead offers **Reload Window** before reconnecting.
+   A cancelled **Connect and Run Script** start also clears its pending script wait; **Retry** starts that command again for the current profile.
 9. Use `Nexus: Disconnect Serial Session` from profile/session context menu or command.
 10. `Nexus: List Serial Ports` reports detected ports and manufacturers for diagnostics.
 

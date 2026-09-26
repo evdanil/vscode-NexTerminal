@@ -97,6 +97,69 @@ describe("SerialPty", () => {
     vi.clearAllMocks();
   });
 
+  it("closes a port that finishes opening after its profile was removed, without registering a session", async () => {
+    const { transport, dataListenerCount } = createTransport();
+    let resolveOpen!: (sessionId: string) => void;
+    let resolveClose!: () => void;
+    transport.openPort = vi.fn(() => new Promise<string>((resolve) => { resolveOpen = resolve; }));
+    transport.closePort = vi.fn(() => new Promise<void>((resolve) => { resolveClose = resolve; }));
+    let profileCurrent = true;
+    const callbacks = {
+      isProfileCurrent: () => profileCurrent,
+      onStartRejected: vi.fn(),
+      onStartCleanupComplete: vi.fn(),
+      onSessionOpened: vi.fn(),
+      onSessionClosed: vi.fn()
+    };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const pty = new SerialPty(transport, { path: "COM9", baudRate: 115200 }, callbacks, logger as any);
+    const onDidClose = vi.fn();
+    pty.onDidClose(onDidClose);
+
+    pty.open();
+    expect(dataListenerCount()).toBe(1);
+    profileCurrent = false;
+    resolveOpen("late-session");
+    await flushAsync();
+
+    expect(transport.closePort).toHaveBeenCalledExactlyOnceWith("late-session");
+    expect(callbacks.onSessionOpened).not.toHaveBeenCalled();
+    expect(callbacks.onSessionClosed).not.toHaveBeenCalled();
+    // The script-start watchdog must be cleared even if sidecar close is slow.
+    expect(callbacks.onStartRejected).toHaveBeenCalledTimes(1);
+    expect(callbacks.onStartCleanupComplete).not.toHaveBeenCalled();
+    expect(onDidClose).toHaveBeenCalledTimes(1);
+    expect(dataListenerCount()).toBe(0);
+    resolveClose();
+    await flushAsync();
+    expect(callbacks.onStartCleanupComplete).toHaveBeenCalledExactlyOnceWith(undefined);
+  });
+
+  it("reports a rejected stale-port close without registering the session", async () => {
+    const { transport } = createTransport();
+    transport.closePort = vi.fn(async () => { throw new Error("port busy"); });
+    const callbacks = {
+      isProfileCurrent: () => false,
+      onStartRejected: vi.fn(),
+      onStartCleanupComplete: vi.fn(),
+      onSessionOpened: vi.fn(),
+      onSessionClosed: vi.fn()
+    };
+    const pty = new SerialPty(
+      transport,
+      { path: "COM9", baudRate: 115200 },
+      callbacks,
+      { log: vi.fn(), close: vi.fn() } as any
+    );
+
+    pty.open();
+    await flushAsync();
+
+    expect(callbacks.onStartRejected).toHaveBeenCalledTimes(1);
+    expect(callbacks.onStartCleanupComplete).toHaveBeenCalledExactlyOnceWith(expect.any(Error));
+    expect(callbacks.onSessionOpened).not.toHaveBeenCalled();
+  });
+
   it("enters disconnected state on sidecar disconnect notification", async () => {
     const { transport, emitDisconnect, closePort } = createTransport();
     const callbacks = {
