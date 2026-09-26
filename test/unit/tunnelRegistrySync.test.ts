@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NexusCore } from "../../src/core/nexusCore";
 import type { ActiveTunnel, TunnelRegistryEntry } from "../../src/models/config";
-import { TunnelRegistrySync } from "../../src/services/tunnel/tunnelRegistrySync";
+import { stopTunnelsForShutdown, TunnelRegistrySync } from "../../src/services/tunnel/tunnelRegistrySync";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { InMemoryTunnelRegistryStore } from "../../src/storage/inMemoryTunnelRegistryStore";
 
@@ -154,6 +154,66 @@ describe("TunnelRegistrySync", () => {
     expect(await store.getEntries()).toEqual([]);
     await sync.syncNow();
     expect(await store.getEntries()).toEqual([]);
+  });
+
+  it("keeps an unresolved reverse-bind fence during own-entry shutdown cleanup", async () => {
+    let releaseFence!: () => void;
+    const settled = new Promise<void>((resolve) => { releaseFence = resolve; });
+    const tunnel = makeTunnel({ id: "retired-1", tunnelType: "reverse", remotePort: 9000 });
+    await sync.registerTunnel(tunnel);
+    await sync.unregisterTunnel(tunnel.profileId, {
+      tunnel,
+      retiredReverseBind: {
+        fenceId: tunnel.id,
+        routeIdentity: { kind: "direct", endpoint: { hosts: ["bastion"], port: 22 } },
+        remotePort: tunnel.remotePort,
+        settled
+      }
+    });
+
+    await sync.cleanupOwnEntries();
+    expect((await store.getEntries())[0].retiredReverseBind?.fenceId).toBe(tunnel.id);
+    releaseFence();
+    await vi.waitFor(async () => expect(await store.getEntries()).toEqual([]));
+  });
+
+  it("keeps the tunnel listener until shutdown stops publish their fences", async () => {
+    let releaseFence!: () => void;
+    const settled = new Promise<void>((resolve) => { releaseFence = resolve; });
+    const tunnel = makeTunnel({ id: "retired-1", tunnelType: "reverse", remotePort: 9000 });
+    core.registerTunnel(tunnel);
+    await sync.registerTunnel(tunnel);
+
+    let subscribed = true;
+    let releaseStop!: () => void;
+    const stopGate = new Promise<void>((resolve) => { releaseStop = resolve; });
+    const stopAll = vi.fn(async () => {
+      await stopGate;
+      if (subscribed) {
+        core.unregisterTunnel(tunnel.id);
+        await sync.unregisterTunnel(tunnel.profileId, {
+          tunnel,
+          retiredReverseBind: {
+            fenceId: tunnel.id,
+            routeIdentity: { kind: "direct", endpoint: { hosts: ["bastion"], port: 22 } },
+            remotePort: tunnel.remotePort,
+            settled
+          }
+        });
+      }
+    });
+    const unsubscribe = vi.fn(() => { subscribed = false; });
+
+    const shuttingDown = stopTunnelsForShutdown(stopAll, unsubscribe, sync);
+    const subscribedWhileStopping = subscribed;
+    releaseStop();
+    await shuttingDown;
+    expect(subscribedWhileStopping).toBe(true);
+    expect(stopAll).toHaveBeenCalledOnce();
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    expect((await store.getEntries())[0].retiredReverseBind?.fenceId).toBe(tunnel.id);
+    releaseFence();
+    await vi.waitFor(async () => expect(await store.getEntries()).toEqual([]));
   });
 
   it("cleanupOwnEntries removes only own entries", async () => {

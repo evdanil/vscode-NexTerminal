@@ -20,6 +20,20 @@ export interface RetiredReverseBindFence {
   settled: Promise<void>;
 }
 
+export async function stopTunnelsForShutdown(
+  stopAll: () => Promise<void>,
+  unsubscribeTunnel: () => void,
+  registrySync: Pick<TunnelRegistrySync, "dispose" | "cleanupOwnEntries">
+): Promise<void> {
+  try {
+    await stopAll();
+  } finally {
+    unsubscribeTunnel();
+    registrySync.dispose();
+    await registrySync.cleanupOwnEntries();
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -264,7 +278,11 @@ export class TunnelRegistrySync {
 
   public async cleanupOwnEntries(): Promise<void> {
     const entries = await this.store.getEntries();
-    const filtered = entries.filter((e) => e.ownerSessionId !== this.sessionId);
+    const filtered = entries.filter((entry) =>
+      entry.ownerSessionId !== this.sessionId ||
+      (entry.retiredReverseBind !== undefined &&
+        this.unsettledReverseBindFenceIds.has(entry.retiredReverseBind.fenceId))
+    );
     await this.saveEntries(filtered);
   }
 
