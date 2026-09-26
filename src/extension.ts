@@ -1360,7 +1360,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
       return;
     }
     if (event.type === "stopped") {
-      const stoppingTunnel = core.getSnapshot().activeTunnels.find((t) => t.id === event.tunnelId);
+      const stoppingTunnel = core.getSnapshot().activeTunnels.find((t) => t.id === event.tunnelId)
+        ?? (event.retiredReverseBind ? event.tunnel : undefined);
       core.unregisterTunnel(event.tunnelId);
       if (stoppingTunnel) {
         return registrySync.unregisterTunnel(stoppingTunnel.profileId, {

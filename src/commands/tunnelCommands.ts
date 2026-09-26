@@ -12,7 +12,7 @@ import type {
 import { resolveTunnelType } from "../models/config";
 import { configMutationLock } from "../services/configMutationLock";
 import type { SshFactory } from "../services/ssh/contracts";
-import { TunnelStoppedError, type TunnelManager } from "../services/tunnel/tunnelManager";
+import { TunnelStartCancelledError, TunnelStoppedError, type TunnelManager } from "../services/tunnel/tunnelManager";
 import type { TunnelRegistrySync } from "../services/tunnel/tunnelRegistrySync";
 import { serverFormDefinition, tunnelFormDefinition } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
@@ -21,7 +21,7 @@ import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { naturalCompare } from "../utils/naturalCompare";
 import { isTunnelRouteChanged, resolveBrowserUrl } from "../utils/tunnelProfile";
 import { addresslessUnavailableMessage, telnetUnsupportedMessage } from "../utils/protocolGuards";
-import { networkRouteIdentity } from "../services/ssh/sshNetworkRoute";
+import type { NetworkRouteIdentity } from "../services/ssh/sshNetworkRoute";
 import { browseForKey, collectGroups, formValuesToServer } from "./serverCommands";
 import type { CommandContext } from "./types";
 
@@ -155,14 +155,14 @@ export async function startTunnel(
     return;
   }
 
-  if (registrySync) {
+  const checkRemoteOwner = async (reverseBind?: {
+    routeIdentity: NetworkRouteIdentity;
+    remotePort: number;
+  }): Promise<boolean> => {
+    if (!registrySync) {
+      return true;
+    }
     await registrySync.syncNow();
-    const reverseBind = resolveTunnelType(profile) === "reverse"
-      ? {
-          routeIdentity: networkRouteIdentity(server, (serverId) => core.getServer(serverId)),
-          remotePort: profile.remotePort
-        }
-      : undefined;
     let remoteOwner = await registrySync.checkRemoteOwnership(profile.id, profile.localPort, reverseBind);
     if (remoteOwner?.retiredReverseBind && reverseBind) {
       const released = await vscode.window.withProgress(
@@ -175,7 +175,7 @@ export async function startTunnel(
           registrySync.waitForRemoteReverseBindClear(reverseBind, () => token.isCancellationRequested)
       );
       if (!released) {
-        return;
+        return false;
       }
       remoteOwner = await registrySync.checkRemoteOwnership(profile.id, profile.localPort, reverseBind);
     }
@@ -187,8 +187,13 @@ export async function startTunnel(
       if (action === "Open in Browser") {
         void vscode.env.openExternal(vscode.Uri.parse(resolveBrowserUrl(profile)));
       }
-      return;
+      return false;
     }
+    return true;
+  };
+
+  if (registrySync && resolveTunnelType(profile) !== "reverse" && !await checkRemoteOwner()) {
+    return;
   }
 
   if (connectionMode === "shared") {
@@ -230,14 +235,21 @@ export async function startTunnel(
   }
 
   try {
-    const active = await tunnelManager.start(profile, server, { connectionMode });
+    const beforeReverseForward = registrySync && resolveTunnelType(profile) === "reverse"
+      ? async (routeIdentity: NetworkRouteIdentity): Promise<void> => {
+          if (!await checkRemoteOwner({ routeIdentity, remotePort: profile.remotePort })) {
+            throw new TunnelStartCancelledError(profile.name);
+          }
+        }
+      : undefined;
+    const active = await tunnelManager.start(profile, server, { connectionMode, beforeReverseForward });
     if (!stillCurrent()) {
       await tunnelManager.stop(active.id);
     }
   } catch (error) {
     // Stopped before it finished connecting: the stop was asked for, so there
     // is no failure to report — the tunnel simply is not running.
-    if (error instanceof TunnelStoppedError) {
+    if (error instanceof TunnelStoppedError || error instanceof TunnelStartCancelledError) {
       return;
     }
     throw error;

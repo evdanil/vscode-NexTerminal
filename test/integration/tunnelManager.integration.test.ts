@@ -5,8 +5,9 @@ import type { ActiveTunnel, ServerConfig, TunnelProfile } from "../../src/models
 import type { SecretVault, SshConnection, SshFactory, TcpConnectionInfo } from "../../src/services/ssh/contracts";
 import { ProxySshFactory } from "../../src/services/ssh/proxySshFactory";
 import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
+import { rememberSshNetworkRoute } from "../../src/services/ssh/sshNetworkRoute";
 import type { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
-import { TunnelManager, type TunnelEvent } from "../../src/services/tunnel/tunnelManager";
+import { TunnelManager, TunnelStoppedError, type TunnelEvent } from "../../src/services/tunnel/tunnelManager";
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
@@ -1152,6 +1153,89 @@ describe("TunnelManager integration", () => {
       connection.resolveCancel(1);
       await stopping;
       vi.useRealTimers();
+    }
+  });
+
+  it("publishes a fence when a stopped reverse start still awaits its forward request", async () => {
+    const connection = new ControlledForwardConnection();
+    connection.holdForward(1);
+    const factory = new OrderedConnectionFactory([connection]);
+    const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
+    manager = new TunnelManager(pool, pool);
+    const profile: TunnelProfile = {
+      id: "reverse-stopped-pending", name: "Stopped pending", localPort: 12345,
+      remoteIP: "127.0.0.1", remotePort: 23456, autoStart: false,
+      tunnelType: "reverse", remoteBindAddress: "127.0.0.1", localTargetIP: "127.0.0.1"
+    };
+    const events: TunnelEvent[] = [];
+    manager.onDidChange((event) => events.push(event));
+    const terminalLease = await pool.connect(testServer);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const starting = manager.start(profile, testServer).catch((error: unknown) => error);
+      await connection.waitForForwardAttempt(1);
+      const tunnelId = manager.getActiveTunnelId(profile.id);
+      expect(tunnelId).toBeDefined();
+
+      await manager.stop(tunnelId!);
+      const stopped = events.find((event) => event.type === "stopped");
+      expect(stopped).toMatchObject({
+        tunnel: { id: tunnelId, profileId: profile.id },
+        retiredReverseBind: { fenceId: tunnelId, remotePort: profile.remotePort }
+      });
+      expect(connection.transportClosed).toBe(false);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(await starting).toBeInstanceOf(TunnelStoppedError);
+
+      if (stopped?.type === "stopped" && stopped.retiredReverseBind) {
+        let settled = false;
+        void stopped.retiredReverseBind.settled.then(() => { settled = true; });
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(settled).toBe(false);
+        connection.rejectForward(1, new Error("Remote forwarding refused"));
+        await expect(stopped.retiredReverseBind.settled).resolves.toBeUndefined();
+      }
+    } finally {
+      connection.rejectForward(1, new Error("Cleanup"));
+      await manager.stopAll();
+      terminalLease.dispose();
+      pool.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("checks the captured transport route before requesting a reverse bind", async () => {
+    const connection = new ControlledForwardConnection();
+    const oldRoute = { kind: "direct", endpoint: { hosts: ["old-jump"], port: 22 } } as const;
+    rememberSshNetworkRoute(connection, oldRoute);
+    const factory = new OrderedConnectionFactory([connection]);
+    manager = new TunnelManager(factory, factory);
+    const profile: TunnelProfile = {
+      id: "reverse-captured-route", name: "Captured route", localPort: 12345,
+      remoteIP: "127.0.0.1", remotePort: 23456, autoStart: false,
+      tunnelType: "reverse", remoteBindAddress: "127.0.0.1", localTargetIP: "127.0.0.1"
+    };
+    const routeChecked = deferred<void>();
+    const releaseCheck = deferred<void>();
+    const seenRoutes: unknown[] = [];
+    const starting = manager.start(profile, { ...testServer, host: "new-jump" }, {
+      beforeReverseForward: async (route) => {
+        seenRoutes.push(route);
+        routeChecked.resolve(undefined);
+        await releaseCheck.promise;
+      }
+    });
+    try {
+      await routeChecked.promise;
+      expect(seenRoutes).toEqual([oldRoute]);
+      expect(connection.forwardAttempts).toBe(0);
+      releaseCheck.resolve(undefined);
+      const active = await starting;
+      expect(connection.forwardAttempts).toBe(1);
+      await manager.stop(active.id);
+    } finally {
+      releaseCheck.resolve(undefined);
+      await starting.catch(() => undefined);
     }
   });
 

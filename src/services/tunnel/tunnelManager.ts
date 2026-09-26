@@ -14,6 +14,7 @@ export type TunnelEvent =
   | {
       type: "stopped";
       tunnelId: string;
+      tunnel: ActiveTunnel;
       retiredReverseBind?: {
         fenceId: string;
         routeIdentity: NetworkRouteIdentity;
@@ -37,6 +38,13 @@ export class TunnelStoppedError extends Error {
   }
 }
 
+export class TunnelStartCancelledError extends Error {
+  public constructor(profileName: string) {
+    super(`Tunnel ${profileName} start was canceled`);
+    this.name = "TunnelStartCancelledError";
+  }
+}
+
 interface ActiveTunnelRuntime {
   active: ActiveTunnel;
   profile: TunnelProfile;
@@ -49,6 +57,14 @@ interface ActiveTunnelRuntime {
   reverseUnsubscribe?: () => void;
   reverseBindAddr?: string;
   reverseBindPort?: number;
+  pendingReverseBind?: {
+    routeIdentity: NetworkRouteIdentity;
+    bindPort: number;
+    connection: SshConnection;
+    released: Promise<void>;
+    release: () => void;
+    retired?: Promise<void>;
+  };
   isStopping: boolean;
   /** Called by stop(): a start still waiting on the server bounds that wait from then on. */
   onStop?: () => void;
@@ -248,7 +264,10 @@ export class TunnelManager {
   public async start(
     profile: TunnelProfile,
     serverConfig: ServerConfig,
-    options?: { connectionMode?: ResolvedTunnelConnectionMode }
+    options?: {
+      connectionMode?: ResolvedTunnelConnectionMode;
+      beforeReverseForward?: (routeIdentity: NetworkRouteIdentity) => Promise<void>;
+    }
   ): Promise<ActiveTunnel> {
     const pending = this.pendingStarts.get(profile.id);
     if (pending) {
@@ -287,7 +306,7 @@ export class TunnelManager {
         startPromise = this.startLocal(profile, serverConfig, activeTunnel);
         break;
       case "reverse":
-        startPromise = this.startReverse(profile, serverConfig, activeTunnel);
+        startPromise = this.startReverse(profile, serverConfig, activeTunnel, options?.beforeReverseForward);
         break;
       case "dynamic":
         startPromise = this.startDynamic(profile, serverConfig, activeTunnel);
@@ -321,6 +340,18 @@ export class TunnelManager {
     // Cancel reverse forwarding on the remote side
     if (runtime.reverseUnsubscribe) {
       runtime.reverseUnsubscribe();
+    }
+    const pendingBind = runtime.pendingReverseBind;
+    if (pendingBind && pendingBind.bindPort !== 0) {
+      pendingBind.retired = this.retireForwardTransport(
+        pendingBind.routeIdentity, pendingBind.bindPort, pendingBind.connection, pendingBind.released
+      );
+      retiredReverseBind = {
+        fenceId: activeTunnelId,
+        routeIdentity: pendingBind.routeIdentity,
+        remotePort: pendingBind.bindPort,
+        settled: pendingBind.retired
+      };
     }
     if (runtime.reverseBindAddr !== undefined && runtime.reverseBindPort !== undefined && runtime.sharedConnection) {
       const connection = runtime.sharedConnection;
@@ -378,7 +409,7 @@ export class TunnelManager {
         bytesOut: runtime.active.bytesOut
       });
     }
-    await this.emitAndWait({ type: "stopped", tunnelId: activeTunnelId, retiredReverseBind });
+    await this.emitAndWait({ type: "stopped", tunnelId: activeTunnelId, tunnel: runtime.active, retiredReverseBind });
   }
 
   public async stopAll(): Promise<void> {
@@ -510,7 +541,8 @@ export class TunnelManager {
   private async startReverse(
     profile: TunnelProfile,
     serverConfig: ServerConfig,
-    activeTunnel: ActiveTunnel
+    activeTunnel: ActiveTunnel,
+    beforeReverseForward?: (routeIdentity: NetworkRouteIdentity) => Promise<void>
   ): Promise<ActiveTunnel> {
     // Reverse tunnels always use shared mode (need a persistent SSH connection)
     activeTunnel.connectionMode = "shared";
@@ -556,6 +588,21 @@ export class TunnelManager {
           // tells us which remote bind namespace this lease can affect.
           const candidateRouteIdentity =
             getSshNetworkRoute(candidate) ?? networkRouteIdentity(runtime.serverConfig, this.serverLookup);
+          if (beforeReverseForward) {
+            try {
+              await beforeReverseForward(candidateRouteIdentity);
+            } catch (error) {
+              runtime.sshConnections.delete(candidate);
+              if (runtime.sharedConnection === candidate) {
+                runtime.sharedConnection = undefined;
+              }
+              candidate.dispose();
+              throw error;
+            }
+            if (runtime.isStopping) {
+              throw new TunnelStoppedError(profile.name);
+            }
+          }
           const candidateRequestKey = bindKey(candidateRouteIdentity, bindPort);
           const retiredTransport = this.findOverlappingForwardWait(
             this.retiredForwardTransports,
@@ -622,6 +669,17 @@ export class TunnelManager {
         // tunnel's next start would fail as already bound until that connection
         // closed. So the forward's outcome decides what happens to it here.
         runtime.sshConnections.delete(sshConnection);
+        let releasePendingBind!: () => void;
+        const released = new Promise<void>((resolve) => { releasePendingBind = resolve; });
+        const pendingBind = {
+          routeIdentity,
+          bindPort,
+          connection: sshConnection,
+          released,
+          release: releasePendingBind,
+          retired: undefined as Promise<void> | undefined
+        };
+        runtime.pendingReverseBind = pendingBind;
         const outcome = await this.requestForward(runtime, sshConnection, bindAddr, bindPort);
         if ("abandoned" in outcome) {
           // Stopped, and the server has not answered: no telling whether it
@@ -631,13 +689,15 @@ export class TunnelManager {
           // barrier to its allocated port so another automatic allocation can proceed.
           if (bindPort === 0) {
             this.retireUnknownPortForwardTransport(routeIdentity, sshConnection, outcome.lateOutcome);
-          } else {
+          } else if (!pendingBind.retired) {
             this.retireForwardTransport(routeIdentity, bindPort, sshConnection, outcome.lateRefusal);
           }
+          void outcome.lateRefusal.then(pendingBind.release);
           sshConnection.dispose();
           throw new TunnelStoppedError(profile.name);
         }
         if ("error" in outcome) {
+          pendingBind.release();
           // Refused, or stopped meanwhile: discard this start and do not let
           // its expected close be reported as an unexpected shared-transport loss.
           if (runtime.sharedConnection === sshConnection) {
@@ -656,11 +716,18 @@ export class TunnelManager {
           const cancellation = Promise.resolve().then(() => sshConnection.cancelForwardIn(bindAddr, allocatedPort));
           const withdrawn = await fulfilledWithin(cancellation, LATE_FORWARD_CANCEL_TIMEOUT_MS);
           if (!withdrawn) {
-            this.retireForwardTransport(routeIdentity, allocatedPort, sshConnection, cancellation);
+            if (!pendingBind.retired) {
+              this.retireForwardTransport(routeIdentity, allocatedPort, sshConnection, cancellation);
+            }
+            void cancellation.then(pendingBind.release, () => {});
+          } else {
+            pendingBind.release();
           }
           sshConnection.dispose();
           throw new TunnelStoppedError(profile.name);
         }
+        runtime.pendingReverseBind = undefined;
+        pendingBind.release();
       } finally {
         requestOver?.();
         if (requestKey && thisRequest && this.forwardRequests.get(requestKey) === thisRequest) {
