@@ -96,10 +96,15 @@ export function textRunsIpmitool(text: string): boolean {
     }
     if (char === "'" || char === '"') { quote = char; inWord = true; continue; }
     if (char === "#" && !inWord) {
-      while (i + 1 < text.length && text[i + 1] !== "\n") i++;
+      while (i + 1 < text.length && text[i + 1] !== "\n" && text[i + 1] !== "\r") i++;
       continue;
     }
-    if (char === ";" || char === "|" || char === "&" || char === "\n") {
+    if (char === "&" && (text[i - 1] === ">" || text[i - 1] === "<")) {
+      word += char;
+      inWord = true;
+      continue;
+    }
+    if (char === ";" || char === "|" || char === "&" || char === "\n" || char === "\r") {
       if (finishSegment()) return true;
       continue;
     }

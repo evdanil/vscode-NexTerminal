@@ -205,7 +205,9 @@ describe("renderMacroEditorHtml", () => {
   it.each([
     ["echo \"use ipmitool -E\"", "none"],
     ["sudo -u ipmitool bmc-login", "none"],
-    ["/usr/bin/ipmitool -E", ""]
+    ["echo hello >& ipmitool", "none"],
+    ["/usr/bin/ipmitool -E", ""],
+    ["echo ready\ripmitool -E\r", ""]
   ])("classifies the command position in the live Session hint for %s", (text, expectedDisplay) => {
     const html = render([], null);
     const match = /function updateSessionIpmitoolHint\(\) \{[\s\S]*?\n      \}/.exec(html);
