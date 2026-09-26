@@ -128,6 +128,25 @@ describe("Ssh2Connector.connect banner handling", () => {
     mockClients.length = 0;
   });
 
+  it("aborts a keyboard-interactive request when the handshake times out", async () => {
+    const connector = new Ssh2Connector();
+    let signal: AbortSignal | undefined;
+    const handler = vi.fn(async (_name, _instructions, _prompts, requestSignal?: AbortSignal) => {
+      signal = requestSignal;
+      return new Promise<string[]>(() => {});
+    });
+    const connecting = connector.connect(makeServer(), { password: "pw", onKeyboardInteractive: handler });
+    await flushMicrotasks();
+    const client = mockClients.at(-1);
+    client.emit("keyboard-interactive", "Verification", "", "", [{ prompt: "Code:", echo: false }], vi.fn());
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(signal?.aborted).toBe(false);
+
+    client.emit("error", new Error("Timed out while waiting for handshake"));
+    await expect(connecting).rejects.toThrow("Timed out while waiting for handshake");
+    expect(signal?.aborted).toBe(true);
+  });
+
   it("routes the banner to onAuthMessage immediately and does not buffer it when a callback is provided", async () => {
     const connector = new Ssh2Connector();
     const onAuthMessage = vi.fn();
@@ -161,6 +180,21 @@ describe("Ssh2Connector.connect banner handling", () => {
 
     const connection = await connectPromise;
 
+    expect(connection.getBanner()).toBe("Authorized use only");
+  });
+
+  it("buffers a banner when a pooled message router has no terminal sink yet", async () => {
+    const connector = new Ssh2Connector();
+    const onAuthMessage = vi.fn(() => false);
+    const connectPromise = connector.connect(makeServer(), { password: "pw", onAuthMessage });
+    await flushMicrotasks();
+
+    const client = mockClients.at(-1);
+    client.emit("banner", "Authorized use only");
+    client.emit("ready");
+
+    const connection = await connectPromise;
+    expect(onAuthMessage).toHaveBeenCalledWith("Authorized use only");
     expect(connection.getBanner()).toBe("Authorized use only");
   });
 

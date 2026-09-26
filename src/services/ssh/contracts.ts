@@ -58,6 +58,8 @@ export interface SshConnectContext {
    * verify this record and its endpoint after asynchronous connection steps.
    */
   credentialSource?: ServerConfig;
+  /** False once the owner has closed or superseded this connection attempt. */
+  isActive?: () => boolean;
   /**
    * Called during authentication with human-readable server messages
    * (USERAUTH_BANNER, keyboard-interactive `name`/`instructions`). May be
@@ -68,22 +70,20 @@ export interface SshConnectContext {
    * consumers rendering it to a terminal must strip ANSI/control sequences
    * themselves (see `SshPty`'s sink).
    *
-   * Pooled/multiplexed connections (`SshConnectionPool`): only the FIRST
-   * caller to trigger a given server's connect gets its sink wired to the
-   * in-flight handshake. A second caller that joins an already-pending
-   * connect (or reuses an already-established one) has its `onAuthMessage`
-   * silently discarded — there is only one underlying handshake, so only
-   * one sink can observe it. This is acceptable because the MFA popup this
-   * is meant to contextualize is itself global to the connection, not
-   * per-lease.
+   * Pooled/multiplexed connections (`SshConnectionPool`) have one underlying
+   * handshake. Messages go to the first live pending owner with a sink; if
+   * that owner closes, a live joiner receives later messages. Existing leases
+   * do not replay messages from an already completed handshake.
    */
-  onAuthMessage?: (text: string) => void;
+  /** Return false when no live sink handled the message, so banners can be buffered. */
+  onAuthMessage?: (text: string) => boolean | void;
 }
 
 export type KeyboardInteractiveHandler = (
   name: string,
   instructions: string,
-  prompts: Array<{ prompt: string; echo: boolean }>
+  prompts: Array<{ prompt: string; echo: boolean }>,
+  signal?: AbortSignal
 ) => Promise<string[]>;
 
 export interface SshConnector {
@@ -94,7 +94,7 @@ export interface SshConnector {
       passphrase?: string;
       sock?: Duplex;
       onKeyboardInteractive?: KeyboardInteractiveHandler;
-      onAuthMessage?: (text: string) => void;
+      onAuthMessage?: (text: string) => boolean | void;
     }
   ): Promise<SshConnection>;
 }

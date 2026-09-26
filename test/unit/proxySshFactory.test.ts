@@ -2,7 +2,8 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { Duplex } from "node:stream";
 import type { SFTPWrapper } from "ssh2";
 import type { ServerConfig, Socks5Proxy } from "../../src/models/config";
-import type { SecretVault, SshConnection } from "../../src/services/ssh/contracts";
+import type { PasswordPrompt, SecretVault, SshConnection, SshConnector } from "../../src/services/ssh/contracts";
+import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 import { ProxiedSshConnection, jumpHostCleanup, socketCleanup } from "../../src/services/ssh/proxiedSshConnection";
 import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
 
@@ -320,6 +321,7 @@ describe("ProxySshFactory", () => {
     // The real SilentAuthSshFactory calls sockFactory() before each connect attempt.
     // This minimal mock does the same so proxy tests exercise the full sockFactory path.
     authFactory = {
+      promptExclusively: <T>(ask: () => Promise<T>) => ask(),
       connect: vi.fn(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
         await opts?.sockFactory?.();
         return makeFakeConnection();
@@ -513,7 +515,11 @@ describe("ProxySshFactory", () => {
     const onAuthMessage = vi.fn();
     await factory.connectWithContext(targetServer, { onAuthMessage });
 
-    expect(authFactory.connect).toHaveBeenNthCalledWith(1, jumpServer, { onAuthMessage });
+    expect(authFactory.connect).toHaveBeenNthCalledWith(1, jumpServer, {
+      isActive: expect.any(Function), onAuthMessage: expect.any(Function)
+    });
+    authFactory.connect.mock.calls[0][1].onAuthMessage("Jump host banner");
+    expect(onAuthMessage).toHaveBeenCalledWith("Jump host banner");
     expect(authFactory.connect).toHaveBeenNthCalledWith(2, targetServer, {
       sockFactory: expect.any(Function),
       route: expect.any(Function),
@@ -727,8 +733,13 @@ describe("ProxySshFactory", () => {
     const targetLease = await pool.connect(targetServer);
 
     expect(authFactory.connect).toHaveBeenCalledTimes(2);
-    expect(authFactory.connect).toHaveBeenNthCalledWith(1, jumpServer);
-    expect(authFactory.connect).toHaveBeenNthCalledWith(2, targetServer, { sockFactory: expect.any(Function), route: expect.any(Function) });
+    expect(authFactory.connect).toHaveBeenNthCalledWith(1, jumpServer, {
+      isActive: expect.any(Function), onAuthMessage: expect.any(Function)
+    });
+    expect(authFactory.connect).toHaveBeenNthCalledWith(2, targetServer, {
+      sockFactory: expect.any(Function), route: expect.any(Function),
+      isActive: expect.any(Function), onAuthMessage: expect.any(Function)
+    });
     expect(jumpConn.openDirectTcp).toHaveBeenCalledWith("target.example.com", 22);
 
     targetLease.dispose();
@@ -894,8 +905,13 @@ describe("ProxySshFactory", () => {
 
     expect(authFactory.connect).toHaveBeenCalledTimes(3);
     expect(authFactory.connect).toHaveBeenNthCalledWith(1, jumpServer);
-    expect(authFactory.connect).toHaveBeenNthCalledWith(2, jumpServer);
-    expect(authFactory.connect).toHaveBeenNthCalledWith(3, targetServer, { sockFactory: expect.any(Function), route: expect.any(Function) });
+    expect(authFactory.connect).toHaveBeenNthCalledWith(2, jumpServer, {
+      isActive: expect.any(Function), onAuthMessage: expect.any(Function)
+    });
+    expect(authFactory.connect).toHaveBeenNthCalledWith(3, targetServer, {
+      sockFactory: expect.any(Function), route: expect.any(Function),
+      isActive: expect.any(Function), onAuthMessage: expect.any(Function)
+    });
     expect(proxiedJumpConn.openDirectTcp).toHaveBeenCalledWith("target.example.com", 22);
 
     targetLease.dispose();
@@ -945,8 +961,13 @@ describe("ProxySshFactory", () => {
     const targetLease = await pool.connect(targetServer);
 
     expect(authFactory.connect).toHaveBeenCalledTimes(3);
-    expect(authFactory.connect).toHaveBeenCalledWith(jumpServer);
-    expect(authFactory.connect).toHaveBeenCalledWith(targetServer, { sockFactory: expect.any(Function), route: expect.any(Function) });
+    expect(authFactory.connect).toHaveBeenCalledWith(jumpServer, {
+      isActive: expect.any(Function), onAuthMessage: expect.any(Function)
+    });
+    expect(authFactory.connect).toHaveBeenCalledWith(targetServer, {
+      sockFactory: expect.any(Function), route: expect.any(Function),
+      isActive: expect.any(Function), onAuthMessage: expect.any(Function)
+    });
     expect(fallbackJumpConn.openDirectTcp).toHaveBeenCalledWith("target.example.com", 22);
 
     targetLease.dispose();
@@ -1101,6 +1122,165 @@ describe("ProxySshFactory", () => {
       prompt
     );
   }
+
+  it("waits for an open SSH password prompt before asking for a proxy password", async () => {
+    const direct = makeServer({ id: "direct" });
+    const proxied = makeServer({ id: "proxied", proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    servers.set(direct.id, direct);
+    servers.set(proxied.id, proxied);
+    const opened: string[] = [];
+    let answerDirect!: (value: { password: string; save: boolean }) => void;
+    const directPrompt: PasswordPrompt = {
+      prompt: vi.fn((server) => {
+        if (server.id !== direct.id) return Promise.resolve({ password: "target-pw", save: false });
+        opened.push("server");
+        return new Promise((resolve) => { answerDirect = resolve; });
+      })
+    };
+    const connector: SshConnector = { connect: vi.fn(async () => makeFakeConnection()) };
+    const realAuth = new SilentAuthSshFactory(connector, vault, directPrompt, undefined, undefined, (id) => servers.get(id));
+    const proxyPrompt = vi.fn(async () => {
+      opened.push("proxy");
+      return { password: "proxy-pw", save: false };
+    });
+    const { ProxySshFactory } = await import("../../src/services/ssh/proxySshFactory");
+    const factory = new ProxySshFactory(realAuth, (id) => servers.get(id), vault, 60_000, proxyPrompt);
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket: makeSimpleSocks5Socket() } as any);
+
+    const first = realAuth.connect(direct);
+    await vi.waitFor(() => expect(opened).toEqual(["server"]));
+    const second = factory.connect(proxied);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(opened).toEqual(["server"]);
+
+    answerDirect({ password: "server-pw", save: false });
+    await Promise.all([first, second]);
+    expect(opened).toEqual(["server", "proxy"]);
+  });
+
+  it("does not open a queued proxy password prompt after its server record is replaced", async () => {
+    const direct = makeServer({ id: "direct" });
+    const proxied = makeServer({ id: "proxied", proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    servers.set(direct.id, direct);
+    servers.set(proxied.id, proxied);
+    const opened: string[] = [];
+    let answerDirect!: (value: { password: string; save: boolean }) => void;
+    const directPrompt: PasswordPrompt = {
+      prompt: vi.fn((server) => {
+        opened.push("server");
+        return server.id === direct.id
+          ? new Promise((resolve) => { answerDirect = resolve; })
+          : Promise.resolve({ password: "target-pw", save: false });
+      })
+    };
+    const connector: SshConnector = { connect: vi.fn(async () => makeFakeConnection()) };
+    const realAuth = new SilentAuthSshFactory(connector, vault, directPrompt, undefined, undefined, (id) => servers.get(id));
+    const proxyPrompt = vi.fn(async () => {
+      opened.push("proxy");
+      return { password: "proxy-pw", save: false };
+    });
+    const { ProxySshFactory } = await import("../../src/services/ssh/proxySshFactory");
+    const factory = new ProxySshFactory(realAuth, (id) => servers.get(id), vault, 60_000, proxyPrompt);
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket: makeSimpleSocks5Socket() } as any);
+
+    const first = realAuth.connect(direct);
+    await vi.waitFor(() => expect(opened).toEqual(["server"]));
+    const second = factory.connect(proxied);
+    const secondFailure = expect(second).rejects.toThrow("configuration changed while connecting");
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    servers.set(proxied.id, { ...proxied });
+
+    answerDirect({ password: "server-pw", save: false });
+    await first;
+    await secondFailure;
+    expect(opened).toEqual(["server"]);
+  });
+
+  it("does not open a queued proxy password prompt after its connection owner closes", async () => {
+    const direct = makeServer({ id: "direct" });
+    const proxied = makeServer({ id: "proxied", proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    servers.set(direct.id, direct);
+    servers.set(proxied.id, proxied);
+    const opened: string[] = [];
+    let answerDirect!: (value: { password: string; save: boolean }) => void;
+    const directPrompt: PasswordPrompt = {
+      prompt: vi.fn((server) => {
+        if (server.id === direct.id) opened.push("server");
+        return server.id === direct.id
+          ? new Promise((resolve) => { answerDirect = resolve; })
+          : Promise.resolve({ password: "target-pw", save: false });
+      })
+    };
+    const connector: SshConnector = { connect: vi.fn(async () => makeFakeConnection()) };
+    const realAuth = new SilentAuthSshFactory(connector, vault, directPrompt, undefined, undefined, (id) => servers.get(id));
+    const proxyPrompt = vi.fn(async () => {
+      opened.push("proxy");
+      return { password: "proxy-pw", save: false };
+    });
+    const { ProxySshFactory } = await import("../../src/services/ssh/proxySshFactory");
+    const factory = new ProxySshFactory(realAuth, (id) => servers.get(id), vault, 60_000, proxyPrompt);
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket: makeSimpleSocks5Socket() } as any);
+    let ownerActive = true;
+
+    const first = realAuth.connect(direct);
+    await vi.waitFor(() => expect(opened).toEqual(["server"]));
+    const second = factory.connectWithContext(proxied, { isActive: () => ownerActive });
+    const secondFailure = expect(second).rejects.toThrow("connection attempt ended");
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    ownerActive = false;
+
+    answerDirect({ password: "server-pw", save: false });
+    await first;
+    await secondFailure;
+    expect(opened).toEqual(["server"]);
+    expect(proxyPrompt).not.toHaveBeenCalled();
+  });
+
+  it("prompts a replacement server separately from a stale queued proxy request", async () => {
+    const direct = makeServer({ id: "direct" });
+    const oldProxied = makeServer({ id: "proxied", proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    servers.set(direct.id, direct);
+    servers.set(oldProxied.id, oldProxied);
+    const opened: string[] = [];
+    let answerDirect!: (value: { password: string; save: boolean }) => void;
+    const directPrompt: PasswordPrompt = {
+      prompt: vi.fn((server) => {
+        if (server.id === direct.id) opened.push("server");
+        return server.id === direct.id
+          ? new Promise((resolve) => { answerDirect = resolve; })
+          : Promise.resolve({ password: "target-pw", save: false });
+      })
+    };
+    const connector: SshConnector = { connect: vi.fn(async () => makeFakeConnection()) };
+    const realAuth = new SilentAuthSshFactory(connector, vault, directPrompt, undefined, undefined, (id) => servers.get(id));
+    const proxyPrompt = vi.fn(async () => {
+      opened.push("proxy");
+      return { password: "proxy-pw", save: false };
+    });
+    const { ProxySshFactory } = await import("../../src/services/ssh/proxySshFactory");
+    const factory = new ProxySshFactory(realAuth, (id) => servers.get(id), vault, 60_000, proxyPrompt);
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket: makeSimpleSocks5Socket() } as any);
+
+    const first = realAuth.connect(direct);
+    await vi.waitFor(() => expect(opened).toEqual(["server"]));
+    const stale = factory.connect(oldProxied);
+    const staleFailure = expect(stale).rejects.toThrow("configuration changed while connecting");
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const replacement = { ...oldProxied };
+    servers.set(replacement.id, replacement);
+    const fresh = factory.connect(replacement);
+
+    answerDirect({ password: "server-pw", save: false });
+    await first;
+    await staleFailure;
+    await fresh;
+    expect(opened).toEqual(["server", "proxy"]);
+    expect(proxyPrompt).toHaveBeenCalledWith(replacement, replacement.proxy);
+  });
 
   it("Fix A — SOCKS5 authenticated proxy with no stored secret prompts, connects with the entered password, and stores it", async () => {
     const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });

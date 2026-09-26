@@ -480,15 +480,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     sshConnector,
     secretVault,
     new VscodePasswordPrompt(),
-    (message, isPassword) =>
-      Promise.resolve(
-        vscode.window.showInputBox({
+    async (message, isPassword, signal) => {
+      const cancellation = new vscode.CancellationTokenSource();
+      const abort = (): void => cancellation.cancel();
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort();
+      try {
+        return await vscode.window.showInputBox({
           title: "Nexus SSH",
           prompt: message.replace(/:\s*$/, ""),
           password: isPassword,
           ignoreFocusOut: true
-        })
-      ),
+        }, cancellation.token);
+      } finally {
+        signal?.removeEventListener("abort", abort);
+        cancellation.dispose();
+      }
+    },
     (id) => core.getAuthProfile(id),
     (id) => core.getServer(id)
   );

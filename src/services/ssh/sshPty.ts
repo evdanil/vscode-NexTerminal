@@ -314,7 +314,11 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       // the "press any key" notice and `onConnectFailed` fires exactly once.
       const connectOnce = (cfg: ServerConfig): Promise<SshConnection> =>
         hasContextAwareConnect(this.sshFactory)
-          ? this.sshFactory.connectWithContext(cfg, { onAuthMessage, credentialSource: this.serverConfig })
+          ? this.sshFactory.connectWithContext(cfg, {
+            onAuthMessage,
+            credentialSource: this.serverConfig,
+            isActive: () => !this.disposed && !this.shuttingDown && generation === this.connectionGeneration
+          })
           : this.sshFactory.connect(cfg);
 
       // Blank / whitespace reads as "no alternate host", matching the form's

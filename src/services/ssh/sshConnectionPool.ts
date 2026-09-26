@@ -240,7 +240,10 @@ class PooledSshConnection implements SshConnection {
 
 export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl {
   private readonly entries = new Map<string, PoolEntry>();
-  private readonly pending = new Map<string, Promise<PoolEntry>>();
+  private readonly pending = new Map<string, {
+    promise: Promise<PoolEntry>;
+    owners: Array<SshConnectContext | undefined>;
+  }>();
   private readonly listeners = new Set<(event: PoolEvent) => void>();
   // Per-server invalidation counter. A connect captures the value at handshake
   // start and re-checks it once the handshake settles; a bump in between means
@@ -272,12 +275,18 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
     if (this.disposed) {
       throw new Error("Connection pool is disposed");
     }
+    if (context?.isActive?.() === false) {
+      throw new Error("SSH connection attempt ended before authentication completed");
+    }
     const multiplexingEnabled = server.multiplexing ?? this.options.enabled;
     if (!multiplexingEnabled) {
       return this.connectInner(server, context);
     }
 
     const entry = await this.getOrCreateEntry(server, context);
+    if (context?.isActive?.() === false) {
+      throw new Error("SSH connection attempt ended before authentication completed");
+    }
     this.cancelIdleTimer(entry);
     entry.refCount++;
 
@@ -397,19 +406,31 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
       this.cancelIdleTimer(existing);
     }
 
-    const pendingPromise = this.pending.get(server.id);
-    if (pendingPromise) {
-      return pendingPromise;
+    const pending = this.pending.get(server.id);
+    if (pending) {
+      pending.owners.push(context);
+      return pending.promise;
     }
 
-    const promise: Promise<PoolEntry> = this.createEntry(server, context).finally(() => {
+    const owners: Array<SshConnectContext | undefined> = [context];
+    // The first terminal may close while another caller awaits the same
+    // handshake. Keep its queued prompt only while at least one owner is live.
+    const sharedContext: SshConnectContext = {
+      ...context,
+      isActive: () => owners.some((owner) => owner?.isActive?.() !== false),
+      onAuthMessage: (text: string) => {
+        const receiver = owners.find((owner) => owner?.isActive?.() !== false && owner?.onAuthMessage);
+        return receiver ? receiver.onAuthMessage!(text) !== false : false;
+      }
+    };
+    const promise: Promise<PoolEntry> = this.createEntry(server, sharedContext).finally(() => {
       // Only clear the slot if it is still ours: invalidate() may have dropped
       // this connect from `pending` and a newer handshake may already hold it.
-      if (this.pending.get(server.id) === promise) {
+      if (this.pending.get(server.id)?.promise === promise) {
         this.pending.delete(server.id);
       }
     });
-    this.pending.set(server.id, promise);
+    this.pending.set(server.id, { promise, owners });
     return promise;
   }
 
@@ -421,6 +442,10 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
     const epochAtStart = this.invalidationEpoch(server.id);
     const connection = await this.connectInner(server, context);
 
+    if (context?.isActive?.() === false) {
+      connection.dispose();
+      throw new Error("SSH connection attempt ended before authentication completed");
+    }
     if (this.disposed) {
       connection.dispose();
       throw new Error("Connection pool is disposed");

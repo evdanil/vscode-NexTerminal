@@ -1384,6 +1384,41 @@ describe("SilentAuthSshFactory — concurrent logins share one prompt (issue #17
     (connector.connect as ReturnType<typeof vi.fn>).mock.calls.map((call) => (call[1] as { password?: string }).password);
 
   describe("server password", () => {
+    it("keeps a freshly saved password when an older saved-password attempt fails later", async () => {
+      const key = passwordSecretKey(baseServer.id);
+      const staleAttempt = gate();
+      let savedAttempts = 0;
+      const connector: SshConnector = {
+        connect: vi.fn(async (_server, auth) => {
+          if (auth.password === "old") {
+            savedAttempts += 1;
+            if (savedAttempts === 1) await staleAttempt.promise;
+            throw new Error("All configured authentication methods failed");
+          }
+          return fakeConnection;
+        })
+      };
+      const vault = createVault({ [key]: "old" });
+      const prompt: PasswordPrompt = {
+        prompt: vi.fn()
+          .mockResolvedValueOnce({ password: "new", save: true })
+          .mockResolvedValueOnce(undefined)
+      };
+      const factory = new SilentAuthSshFactory(
+        connector, vault, prompt, undefined, undefined,
+        (id) => id === baseServer.id ? baseServer : undefined
+      );
+
+      const slow = factory.connect(baseServer);
+      await vi.waitFor(() => expect(savedAttempts).toBe(1));
+      await factory.connect(baseServer);
+      expect(await vault.get(key)).toBe("new");
+
+      staleAttempt.open();
+      await expect(slow).rejects.toThrow("Password entry canceled");
+      expect(await vault.get(key)).toBe("new");
+    });
+
     it("does not save a prompt answer after sync removes and recreates its deterministic server id", async () => {
       const serverId = deterministicServerId("source-id", "external-device-id");
       const oldServer: ServerConfig = { ...baseServer, id: serverId };
@@ -1680,6 +1715,8 @@ describe("SilentAuthSshFactory — concurrent logins share one prompt (issue #17
       const second = factory.connect(viaBastion());
       await settle();
       answer({ password: "pw", save: false });
+      await vi.waitFor(() => expect(prompt.prompt).toHaveBeenCalledTimes(2));
+      answer({ password: "pw", save: false });
       await Promise.all([first, second]);
 
       expect(prompt.prompt).toHaveBeenCalledTimes(2);
@@ -1741,12 +1778,12 @@ describe("SilentAuthSshFactory — concurrent logins share one prompt (issue #17
       await settle();
       const second = factory.connect(deviceB);
       await settle();
-      const promptCount = prompt.prompt.mock.calls.length;
+      expect(prompt.prompt).toHaveBeenCalledTimes(1);
       answers[0].resolve({ password: "password-for-alt-a", save: false });
+      await vi.waitFor(() => expect(prompt.prompt).toHaveBeenCalledTimes(2));
       answers[1].resolve({ password: "password-for-alt-b", save: false });
       await Promise.all([first, second]);
 
-      expect(promptCount).toBe(2);
       expect(sentPasswords(connector)).toEqual(["password-for-alt-a", "password-for-alt-b"]);
     });
 
@@ -1807,20 +1844,22 @@ describe("SilentAuthSshFactory — concurrent logins share one prompt (issue #17
       );
 
       const removedRecordLogin = factory.connect(original);
+      const removedAttemptResultPromise = removedRecordLogin.then(() => "resolved", () => "rejected");
       await settle();
       const replacement: ServerConfig = { ...original, altHost: replacementAltHost };
       liveServers.set(replacement.id, replacement);
       const replacementLogin = factory.connect(replacement);
       await settle();
-      const promptCount = prompt.prompt.mock.calls.length;
+      expect(prompt.prompt).toHaveBeenCalledTimes(1);
       answers[0].resolve({ password: "password-from-removed-record", save: true });
+      await vi.waitFor(() => expect(prompt.prompt).toHaveBeenCalledTimes(2));
       answers[1].resolve({ password: "password-from-replacement", save: true });
-      const removedAttemptResult = await removedRecordLogin.then(() => "resolved", () => "rejected");
+      const removedAttemptResult = await removedAttemptResultPromise;
       await replacementLogin;
 
       expect(removedAttemptResult).toBe("rejected");
       expect(vault.store).not.toHaveBeenCalledWith(passwordKey, "password-from-removed-record");
-      expect(promptCount).toBe(2);
+      expect(prompt.prompt).toHaveBeenCalledTimes(2);
       expect(sentPasswords(connector)).toEqual(["password-from-replacement"]);
       expect(vault.store).toHaveBeenCalledWith(passwordKey, "password-from-replacement");
     });
@@ -1896,6 +1935,41 @@ describe("SilentAuthSshFactory — concurrent logins share one prompt (issue #17
         .filter((passphrase) => passphrase !== undefined);
     const keyServer: ServerConfig = { ...baseServer, authType: "key", keyPath: "/keys/id_ed25519" };
 
+    it("keeps a freshly saved passphrase when an older saved-passphrase attempt fails later", async () => {
+      const key = passphraseSecretKey(keyServer.id);
+      const staleAttempt = gate();
+      let savedAttempts = 0;
+      const connector: SshConnector = {
+        connect: vi.fn(async (_server, auth) => {
+          if (auth.passphrase === "old") {
+            savedAttempts += 1;
+            if (savedAttempts === 1) await staleAttempt.promise;
+            throw new Error("Cannot parse privateKey: bad decrypt");
+          }
+          return fakeConnection;
+        })
+      };
+      const vault = createVault({ [key]: "old" });
+      const prompt: PasswordPrompt = {
+        prompt: vi.fn()
+          .mockResolvedValueOnce({ password: "new", save: true })
+          .mockResolvedValueOnce(undefined)
+      };
+      const factory = new SilentAuthSshFactory(
+        connector, vault, prompt, undefined, undefined,
+        (id) => id === keyServer.id ? keyServer : undefined
+      );
+
+      const slow = factory.connect(keyServer);
+      await vi.waitFor(() => expect(savedAttempts).toBe(1));
+      await factory.connect(keyServer);
+      expect(await vault.get(key)).toBe("new");
+
+      staleAttempt.open();
+      await expect(slow).rejects.toThrow("Passphrase entry canceled");
+      expect(await vault.get(key)).toBe("new");
+    });
+
     it("asks once when concurrent logins need the passphrase, and both log in with it", async () => {
       const connector = encryptedKeyConnector();
       const vault = createVault();
@@ -1941,6 +2015,53 @@ describe("SilentAuthSshFactory — concurrent logins share one prompt (issue #17
       expect(vault.store).toHaveBeenCalledWith(authProfilePassphraseSecretKey(profile.id), "fleet-phrase");
     });
 
+    it("uses a current joiner when a queued profile passphrase owner's record is replaced", async () => {
+      const profile: AuthProfile = { id: "prof-key", name: "Fleet key", username: "ops", authType: "key", keyPath: "/keys/fleet" };
+      const deviceA: ServerConfig = { ...baseServer, id: "srv-a", name: "A", host: "a.example.com", authProfileId: profile.id };
+      const deviceB: ServerConfig = { ...baseServer, id: "srv-b", name: "B", host: "b.example.com", authProfileId: profile.id };
+      const blocker: ServerConfig = { ...baseServer, id: "blocker", name: "Blocker" };
+      const liveServers = new Map<string, ServerConfig>([[deviceA.id, deviceA], [deviceB.id, deviceB], [blocker.id, blocker]]);
+      const blockerAnswer = deferred<{ password: string; save: boolean } | undefined>();
+      const opened: string[] = [];
+      const prompt: PasswordPrompt = {
+        prompt: vi.fn(async (server) => {
+          opened.push(server.name);
+          return server.id === blocker.id
+            ? blockerAnswer.promise
+            : { password: "fleet-phrase", save: true };
+        })
+      };
+      const connector: SshConnector = {
+        connect: vi.fn(async (server, auth) => {
+          if (server.authType === "key" && !auth.passphrase) {
+            throw new Error("Encrypted private OpenSSH key detected, but no passphrase given");
+          }
+          return fakeConnection;
+        })
+      };
+      const vault = createVault();
+      const factory = new SilentAuthSshFactory(
+        connector, vault, prompt, undefined,
+        (id) => id === profile.id ? profile : undefined,
+        (id) => liveServers.get(id)
+      );
+
+      const first = factory.connect(blocker);
+      await vi.waitFor(() => expect(opened).toEqual(["Blocker"]));
+      const stale = factory.connect(deviceA);
+      const staleFailure = expect(stale).rejects.toThrow("configuration changed while connecting");
+      const fresh = factory.connect(deviceB);
+      await settle();
+      liveServers.set(deviceA.id, { ...deviceA });
+
+      blockerAnswer.resolve({ password: "blocker-password", save: false });
+      await first;
+      await staleFailure;
+      await fresh;
+      expect(opened).toEqual(["Blocker", "B (key passphrase)"]);
+      expect(vault.store).toHaveBeenCalledWith(authProfilePassphraseSecretKey(profile.id), "fleet-phrase");
+    });
+
     it("does not let a profile-shared answer delete a replacement server passphrase", async () => {
       type Answer = { password: string; save: boolean } | undefined;
       const profile: AuthProfile = { id: "prof-key", name: "Fleet key", username: "ops", authType: "key", keyPath: "/keys/fleet" };
@@ -1973,24 +2094,26 @@ describe("SilentAuthSshFactory — concurrent logins share one prompt (issue #17
 
       const owner = factory.connect(deviceA);
       const joined = factory.connect(deviceB);
+      const joinedFailure = expect(joined).rejects.toThrow("configuration changed while connecting");
       await settle();
       expect(prompt.prompt).toHaveBeenCalledOnce();
 
-      // B is edited while the profile prompt is still open, then connects with
-      // its replacement key and saves the new server-scoped passphrase.
+      // B is edited while the profile prompt is still open. Its replacement
+      // prompt waits, then saves a new server-scoped passphrase.
       liveServers.set(deviceB.id, standaloneB);
       const replacementLogin = factory.connect(standaloneB);
       await settle();
-      expect(prompt.prompt).toHaveBeenCalledTimes(2);
-      replacementAnswer.resolve({ password: "new-B-passphrase", save: true });
-      await expect(replacementLogin).resolves.toBe(fakeConnection);
+      expect(prompt.prompt).toHaveBeenCalledOnce();
 
       // A remains the live owner of the shared profile answer, and may still
       // use and save it. B's old record was replaced, so its joiner must stop
       // before sending that answer and must not erase B's replacement key.
       profileAnswer.resolve({ password: "fleet-passphrase", save: true });
+      await vi.waitFor(() => expect(prompt.prompt).toHaveBeenCalledTimes(2));
+      replacementAnswer.resolve({ password: "new-B-passphrase", save: true });
+      await expect(replacementLogin).resolves.toBe(fakeConnection);
       await expect(owner).resolves.toBe(fakeConnection);
-      await expect(joined).rejects.toThrow("configuration changed while connecting");
+      await joinedFailure;
 
       expect(vault.store).toHaveBeenCalledWith(authProfilePassphraseSecretKey(profile.id), "fleet-passphrase");
       await expect(vault.get(passphraseSecretKey(deviceB.id))).resolves.toBe("new-B-passphrase");
@@ -2055,6 +2178,283 @@ describe("SilentAuthSshFactory — concurrent logins share one prompt (issue #17
       expect(prompt.prompt).toHaveBeenCalledTimes(2);
       expect(vault.store).not.toHaveBeenCalledWith(passphraseSecretKey(keyServer.id), "wrong");
     });
+  });
+});
+
+describe("SilentAuthSshFactory — interactive prompts do not overlap", () => {
+  it("does not open a queued password prompt after its server record is replaced", async () => {
+    const firstAnswer = deferred<{ password: string; save: boolean } | undefined>();
+    const other: ServerConfig = { ...baseServer, id: "other", name: "Other" };
+    let liveOther = other;
+    const opened: string[] = [];
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async (server) => {
+        opened.push(server.name);
+        return server.id === baseServer.id
+          ? firstAnswer.promise
+          : { password: "stale-password", save: false };
+      })
+    };
+    const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+    const factory = new SilentAuthSshFactory(
+      connector, createVault(), prompt, undefined, undefined,
+      (id) => id === baseServer.id ? baseServer : id === other.id ? liveOther : undefined
+    );
+
+    const first = factory.connect(baseServer);
+    await vi.waitFor(() => expect(opened).toEqual(["Prod"]));
+    const second = factory.connect(other);
+    const secondFailure = expect(second).rejects.toThrow("configuration changed while connecting");
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    liveOther = { ...other };
+
+    firstAnswer.resolve({ password: "first-password", save: false });
+    await first;
+    await secondFailure;
+    expect(opened).toEqual(["Prod"]);
+  });
+
+  it("does not open a queued password prompt after its connection owner closes", async () => {
+    const firstAnswer = deferred<{ password: string; save: boolean } | undefined>();
+    const other: ServerConfig = { ...baseServer, id: "other", name: "Other" };
+    const opened: string[] = [];
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async (server) => {
+        opened.push(server.name);
+        return server.id === baseServer.id
+          ? firstAnswer.promise
+          : { password: "obsolete-password", save: false };
+      })
+    };
+    const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+    const factory = new SilentAuthSshFactory(connector, createVault(), prompt);
+    let ownerActive = true;
+
+    const first = factory.connect(baseServer);
+    await vi.waitFor(() => expect(opened).toEqual(["Prod"]));
+    const second = factory.connect(other, { isActive: () => ownerActive });
+    const secondFailure = expect(second).rejects.toThrow("connection attempt ended");
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    ownerActive = false;
+
+    firstAnswer.resolve({ password: "first-password", save: false });
+    await first;
+    await secondFailure;
+    expect(opened).toEqual(["Prod"]);
+    expect(connector.connect).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a shared queued password prompt for a live login when its first owner closes", async () => {
+    const firstAnswer = deferred<{ password: string; save: boolean } | undefined>();
+    const other: ServerConfig = { ...baseServer, id: "other", name: "Other" };
+    const opened: string[] = [];
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async (server) => {
+        opened.push(server.name);
+        return server.id === baseServer.id
+          ? firstAnswer.promise
+          : { password: "shared-password", save: false };
+      })
+    };
+    const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+    const factory = new SilentAuthSshFactory(connector, createVault(), prompt);
+    let firstOwnerActive = true;
+
+    const blocker = factory.connect(baseServer);
+    await vi.waitFor(() => expect(opened).toEqual(["Prod"]));
+    const abandoned = factory.connect(other, { isActive: () => firstOwnerActive });
+    const abandonedFailure = expect(abandoned).rejects.toThrow("connection attempt ended");
+    const live = factory.connect(other, { isActive: () => true });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    firstOwnerActive = false;
+
+    firstAnswer.resolve({ password: "first-password", save: false });
+    await blocker;
+    await abandonedFailure;
+    await live;
+    expect(opened).toEqual(["Prod", "Other"]);
+    expect(connector.connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("answers a saved-password keyboard challenge while another prompt is open", async () => {
+    const password = deferred<{ password: string; save: boolean } | undefined>();
+    const savedServer: ServerConfig = { ...baseServer, id: "saved" };
+    const opened: string[] = [];
+    let savedResponse: string[] | undefined;
+    const connector: SshConnector = {
+      connect: vi.fn(async (server, auth) => {
+        if (server.id === savedServer.id) {
+          savedResponse = await auth.onKeyboardInteractive?.("", "", [{ prompt: "Password:", echo: false }]);
+        }
+        return fakeConnection;
+      })
+    };
+    const factory = new SilentAuthSshFactory(
+      connector,
+      createVault({ [passwordSecretKey(savedServer.id)]: "saved-pw" }),
+      { prompt: vi.fn(async () => { opened.push("password"); return password.promise; }) },
+      async () => { opened.push("keyboard input"); return undefined; }
+    );
+
+    const first = factory.connect(baseServer);
+    await vi.waitFor(() => expect(opened).toEqual(["password"]));
+    const second = factory.connect(savedServer);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const answeredBeforeFirstPromptClosed = savedResponse;
+
+    password.resolve({ password: "other-pw", save: false });
+    await Promise.all([first, second]);
+    expect(answeredBeforeFirstPromptClosed).toEqual(["saved-pw"]);
+    expect(opened).toEqual(["password"]);
+  });
+
+  it("drops a queued verification prompt when its SSH handshake ends", async () => {
+    const password = deferred<{ password: string; save: boolean } | undefined>();
+    const opened: string[] = [];
+    const agentServer: ServerConfig = { ...baseServer, id: "agent", authType: "agent" };
+    const connector: SshConnector = {
+      connect: vi.fn(async (server, auth) => {
+        if (server.id === agentServer.id) {
+          const controller = new AbortController();
+          const reply = auth.onKeyboardInteractive?.("Verification", "", [{ prompt: "Code:", echo: false }], controller.signal);
+          controller.abort();
+          void reply?.catch(() => {});
+          throw new Error("Timed out while waiting for handshake");
+        }
+        return fakeConnection;
+      })
+    };
+    const factory = new SilentAuthSshFactory(
+      connector, createVault(),
+      { prompt: vi.fn(async () => { opened.push("password"); return password.promise; }) },
+      async () => { opened.push("code"); return "123456"; }
+    );
+
+    const first = factory.connect(baseServer);
+    await vi.waitFor(() => expect(opened).toEqual(["password"]));
+    await expect(factory.connect(agentServer)).rejects.toThrow("Timed out while waiting for handshake");
+    expect(opened).toEqual(["password"]);
+
+    password.resolve({ password: "pw", save: false });
+    await first;
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(opened).toEqual(["password"]);
+  });
+
+  it("waits for a different server's password prompt to finish", async () => {
+    const firstAnswer = deferred<{ password: string; save: boolean } | undefined>();
+    const opened: string[] = [];
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn(async (server) => {
+        opened.push(server.name);
+        return server.id === baseServer.id
+          ? firstAnswer.promise
+          : { password: "second-password", save: false };
+      })
+    };
+    const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+    const factory = new SilentAuthSshFactory(connector, createVault(), prompt);
+    const other = { ...baseServer, id: "srv-2", name: "Other" };
+
+    const first = factory.connect(baseServer);
+    await vi.waitFor(() => expect(opened).toEqual(["Prod"]));
+    const second = factory.connect(other);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(opened).toEqual(["Prod"]);
+
+    firstAnswer.resolve({ password: "first-password", save: false });
+    await Promise.all([first, second]);
+    expect(opened).toEqual(["Prod", "Other"]);
+  });
+
+  it("waits for a keyboard-interactive code before opening a password prompt", async () => {
+    const code = deferred<string | undefined>();
+    const opened: string[] = [];
+    const agentServer: ServerConfig = { ...baseServer, id: "agent", authType: "agent" };
+    const connector: SshConnector = {
+      connect: vi.fn(async (server, auth) => {
+        if (server.id === agentServer.id) {
+          expect(await auth.onKeyboardInteractive?.("Verification", "", [{ prompt: "Code:", echo: false }])).toEqual(["123456"]);
+        }
+        return fakeConnection;
+      })
+    };
+    const factory = new SilentAuthSshFactory(
+      connector, createVault(),
+      { prompt: vi.fn(async () => { opened.push("password"); return { password: "pw", save: false }; }) },
+      async () => { opened.push("code"); return code.promise; }
+    );
+
+    const first = factory.connect(agentServer);
+    await vi.waitFor(() => expect(opened).toEqual(["code"]));
+    const second = factory.connect(baseServer);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(opened).toEqual(["code"]);
+
+    code.resolve("123456");
+    await Promise.all([first, second]);
+    expect(opened).toEqual(["code", "password"]);
+  });
+
+  it("waits for a password prompt before opening a keyboard-interactive code", async () => {
+    const password = deferred<{ password: string; save: boolean } | undefined>();
+    const opened: string[] = [];
+    const agentServer: ServerConfig = { ...baseServer, id: "agent", authType: "agent" };
+    const connector: SshConnector = {
+      connect: vi.fn(async (server, auth) => {
+        if (server.id === agentServer.id) {
+          expect(await auth.onKeyboardInteractive?.("Verification", "", [{ prompt: "Code:", echo: false }])).toEqual(["123456"]);
+        }
+        return fakeConnection;
+      })
+    };
+    const factory = new SilentAuthSshFactory(
+      connector, createVault(),
+      { prompt: vi.fn(async () => { opened.push("password"); return password.promise; }) },
+      async () => { opened.push("code"); return "123456"; }
+    );
+
+    const first = factory.connect(baseServer);
+    await vi.waitFor(() => expect(opened).toEqual(["password"]));
+    const second = factory.connect(agentServer);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(opened).toEqual(["password"]);
+
+    password.resolve({ password: "pw", save: false });
+    await Promise.all([first, second]);
+    expect(opened).toEqual(["password", "code"]);
+  });
+
+  it("drops a queued keyboard-interactive code when its terminal closes", async () => {
+    const password = deferred<{ password: string; save: boolean } | undefined>();
+    const opened: string[] = [];
+    const agentServer: ServerConfig = { ...baseServer, id: "agent", authType: "agent" };
+    const connector: SshConnector = {
+      connect: vi.fn(async (server, auth) => {
+        if (server.id === agentServer.id) {
+          await auth.onKeyboardInteractive?.("Verification", "", [{ prompt: "Code:", echo: false }]);
+        }
+        return fakeConnection;
+      })
+    };
+    const factory = new SilentAuthSshFactory(
+      connector, createVault(),
+      { prompt: vi.fn(async () => { opened.push("password"); return password.promise; }) },
+      async () => { opened.push("code"); return "123456"; }
+    );
+    let ownerActive = true;
+
+    const first = factory.connect(baseServer);
+    await vi.waitFor(() => expect(opened).toEqual(["password"]));
+    const second = factory.connect(agentServer, { isActive: () => ownerActive });
+    const secondFailure = expect(second).rejects.toThrow("connection attempt ended");
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    ownerActive = false;
+
+    password.resolve({ password: "pw", save: false });
+    await first;
+    await secondFailure;
+    expect(opened).toEqual(["password"]);
   });
 });
 
@@ -2143,6 +2543,8 @@ describe("ProxySshFactory + SilentAuthSshFactory — a password is shared only t
     run.pool.invalidate(bastion.id);
     const second = await run.login();
     run.answerEach();
+    await vi.waitFor(() => expect(run.prompt.prompt).toHaveBeenCalledTimes(2));
+    run.answerAll({ password: "pw-2", save: false });
     await Promise.all([first.done, second.done]);
 
     expect(run.bastionLogins()).toBe(2);
@@ -2191,6 +2593,8 @@ describe("ProxySshFactory + SilentAuthSshFactory — a password is shared only t
     run.pool.invalidate(bastion.id);
     const third = await run.login();
     run.answerEach();
+    await vi.waitFor(() => expect(run.prompt.prompt).toHaveBeenCalledTimes(2));
+    run.answerAll({ password: "pw-2", save: false });
     await Promise.all([first.done, second.done, third.done]);
 
     expect(run.bastionLogins()).toBe(2);
