@@ -1770,7 +1770,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
         pendingTunnelShutdown = stopTunnelsForShutdown(
           () => tunnelManager.stopAll(),
           unsubscribeTunnel,
-          registrySync
+          registrySync,
+          () => pool.dispose()
         ).catch((error: unknown) => {
           console.error("[Nexus] tunnel shutdown failed", error);
         });
@@ -1778,7 +1779,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
         // order, so UDP 69/67 are released before the host process goes away.
         networkServerManager.dispose();
         viewSync.dispose();
-        pool.dispose();
       }
     }
   );

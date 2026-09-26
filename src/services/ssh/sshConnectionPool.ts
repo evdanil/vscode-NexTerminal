@@ -240,6 +240,7 @@ class PooledSshConnection implements SshConnection {
 
 export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl {
   private readonly entries = new Map<string, PoolEntry>();
+  private readonly retiredEntries = new Set<PoolEntry>();
   private readonly pending = new Map<string, {
     promise: Promise<PoolEntry>;
     owners: Array<SshConnectContext | undefined>;
@@ -320,8 +321,13 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
         }
       }
     }, createFallback, isReused, () => {
+      this.retiredEntries.add(entry);
+      void entry.closePromise.then(() => { this.retiredEntries.delete(entry); });
       if (this.entries.get(server.id) === entry) {
         this.softRemoveEntry(server.id, entry);
+      }
+      if (this.disposed) {
+        entry.connection.dispose();
       }
       return entry.closePromise;
     });
@@ -387,7 +393,13 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
       entry.connection.dispose();
       this.emit({ type: "disconnected", serverId });
     }
+    // Retired transports are no longer in entries, but shutdown must close
+    // them even if a terminal or SFTP lease has not released its reference.
+    for (const entry of this.retiredEntries) {
+      entry.connection.dispose();
+    }
     this.entries.clear();
+    this.retiredEntries.clear();
     this.pending.clear();
     this.invalidationEpochs.clear();
     this.listeners.clear();
@@ -466,6 +478,7 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
 
     entry.closeUnsubscribe = connection.onClose(() => {
       entry.markClosed();
+      this.retiredEntries.delete(entry);
       entry.healthy = false;
       this.cancelIdleTimer(entry);
       if (this.entries.get(server.id) === entry) {

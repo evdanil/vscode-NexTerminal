@@ -465,7 +465,7 @@ describe("TunnelRegistrySync", () => {
     await vi.waitFor(async () => {
       expect((await store.getEntries())[0].retiredReverseBind?.fenceId).toBe(tunnel.id);
     });
-    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(2_000);
     await shuttingDown;
     expect(subscribedWhileStopping).toBe(true);
     expect(stopAll).toHaveBeenCalledOnce();
@@ -511,8 +511,8 @@ describe("TunnelRegistrySync", () => {
     const shutdown = stopTunnelsForShutdown(async () => {}, () => {}, sync)
       .then(() => { shutdownFinished = true; });
     await cleaned;
-    await Promise.resolve();
-    await Promise.resolve();
+    // Closure can arrive after the first second of shutdown work.
+    await vi.advanceTimersByTimeAsync(1_001);
     expect(shutdownFinished).toBe(false);
 
     closeTransport();
@@ -521,6 +521,20 @@ describe("TunnelRegistrySync", () => {
     finishDeletion();
     await shutdown;
     expect(await store.getEntries()).toEqual([]);
+  });
+
+  it("closes pooled transports after stops have published their fences", async () => {
+    let stopped = false;
+    const closeTransports = vi.fn(() => { expect(stopped).toBe(true); });
+
+    await stopTunnelsForShutdown(
+      async () => { stopped = true; },
+      () => {},
+      sync,
+      closeTransports
+    );
+
+    expect(closeTransports).toHaveBeenCalledOnce();
   });
 
   it("cleanupOwnEntries removes only own entries", async () => {

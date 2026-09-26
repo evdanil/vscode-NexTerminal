@@ -8,7 +8,7 @@ import { networkRoutesOverlap } from "../ssh/sshNetworkRoute";
 const POLL_INTERVAL_MS = 3_000;
 const PROBE_TIMEOUT_MS = 200;
 const SLOW_REPROBE_INTERVAL_MS = 60_000;
-const SHUTDOWN_FENCE_SETTLE_GRACE_MS = 1_000;
+const SHUTDOWN_FENCE_SETTLE_GRACE_MS = 2_000;
 /** Entries not refreshed within this window are considered stale. */
 const STALE_THRESHOLD_MS = 30_000;
 
@@ -25,7 +25,8 @@ export interface RetiredReverseBindFence {
 export async function stopTunnelsForShutdown(
   stopAll: () => Promise<void>,
   unsubscribeTunnel: () => void,
-  registrySync: Pick<TunnelRegistrySync, "dispose" | "cleanupOwnEntries" | "waitForFenceCleanups">
+  registrySync: Pick<TunnelRegistrySync, "dispose" | "cleanupOwnEntries" | "waitForFenceCleanups">,
+  closeTransports?: () => void
 ): Promise<void> {
   try {
     await stopAll();
@@ -33,9 +34,13 @@ export async function stopTunnelsForShutdown(
     unsubscribeTunnel();
     registrySync.dispose();
     try {
-      await registrySync.cleanupOwnEntries();
+      closeTransports?.();
     } finally {
-      await registrySync.waitForFenceCleanups();
+      try {
+        await registrySync.cleanupOwnEntries();
+      } finally {
+        await registrySync.waitForFenceCleanups();
+      }
     }
   }
 }
