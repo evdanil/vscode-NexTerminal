@@ -58,7 +58,8 @@ import {
   validateDeviceTemplate,
   validateSavedFilter,
   isValidServerOrigin,
-  isValidDetachedServerOrigin
+  isValidDetachedServerOrigin,
+  stripAddresslessOriginAddressStamps
 } from "../utils/validation";
 import { isValidBinding } from "../macroBindings";
 import {
@@ -1167,7 +1168,7 @@ async function addServerSanitizingOrigin(server: ServerConfig, add: (entity: Ser
       sanitized = rest as ServerConfig;
     }
   }
-  await add(sanitized);
+  await add(stripAddresslessOriginAddressStamps(sanitized));
 }
 
 /**

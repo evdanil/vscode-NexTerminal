@@ -23,6 +23,16 @@ function isValidPort(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
 }
 
+/** An addressless row owns no console address, even if an imported origin claims one. */
+export function stripAddresslessOriginAddressStamps(server: ServerConfig): ServerConfig {
+  if (server.addressless !== true || server.origin === undefined ||
+      (server.origin.syncedHost === undefined && server.origin.syncedPort === undefined)) {
+    return server;
+  }
+  const { syncedHost: _syncedHost, syncedPort: _syncedPort, ...origin } = server.origin;
+  return { ...server, origin };
+}
+
 function isOptionalNonEmptyString(value: unknown): boolean {
   return value === undefined || isNonEmptyString(value);
 }

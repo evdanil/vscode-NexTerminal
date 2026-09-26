@@ -1299,6 +1299,21 @@ describe("config import command (legacy)", () => {
     expect(snapshot.servers[0].origin).toBeUndefined();
   });
 
+  it("strips address stamps from an addressless backup row without dropping its origin or other settings", async () => {
+    const exportData = makeExportData({
+      servers: [{
+        ...makeServer(), host: "", port: 0, addressless: true, ipmiHost: "10.0.1.5",
+        origin: { sourceId: "src1", externalId: "device:1", syncedAt: 1, syncedHost: "10.0.0.1", syncedPort: 22, syncedUsername: "root" }
+      }],
+      tunnels: [], serialProfiles: []
+    });
+    await runImport(exportData, "merge");
+
+    const [server] = core.getSnapshot().servers;
+    expect(server).toMatchObject({ addressless: true, host: "", port: 0, ipmiHost: "10.0.1.5" });
+    expect(server.origin).toEqual({ sourceId: "src1", externalId: "device:1", syncedAt: 1, syncedUsername: "root" });
+  });
+
   it("ALTERNATE HOST (issue #48, Phase 2) — a synced server with `altHost` + `origin.syncedAltHost` survives an export→import round-trip, stamp and value intact (kills an `isValidServerOrigin` that rejects the new stamp, which would strip the WHOLE origin and lose sync ownership of the field)", () => {
     // A well-formed synced server carrying both the value and the sync's stamp.
     const synced = {
@@ -3946,6 +3961,28 @@ describe("share import", () => {
     // IDs should be fresh (not the share IDs)
     expect(snapshot.servers.find(s => s.id === "share-s1")).toBeUndefined();
     expect(snapshot.servers.find(s => s.id === "existing")).toBeDefined();
+  });
+
+  it("removes stale console address stamps from an imported addressless share row", async () => {
+    const exportData = makeExportData({
+      exportType: "share", inventorySources: [remoteSource()],
+      servers: [makeServer({
+        id: "share-placeholder", host: "", port: 0, addressless: true, ipmiHost: "10.0.1.5",
+        origin: { sourceId: "src-on-the-other-machine", externalId: "device:1", syncedAt: 1, syncedHost: "10.0.0.1", syncedPort: 22 }
+      })],
+      tunnels: [], serialProfiles: []
+    });
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/fake/addressless-share.json", scheme: "file" }]);
+    mockReadFile.mockResolvedValue(Buffer.from(JSON.stringify(exportData), "utf8"));
+    mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" });
+
+    await registeredCommands.get("nexus.config.import")!();
+
+    const [server] = core.getSnapshot().servers;
+    expect(server).toMatchObject({ addressless: true, host: "", port: 0, ipmiHost: "10.0.1.5" });
+    expect(server.origin?.sourceId).toBe(core.getSnapshot().inventorySources[0].id);
+    expect(server.origin?.syncedHost).toBeUndefined();
+    expect(server.origin?.syncedPort).toBeUndefined();
   });
 
   it("remaps tunnel defaultServerId on share import", async () => {
