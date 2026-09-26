@@ -462,6 +462,10 @@ describe("TunnelRegistrySync", () => {
     const shuttingDown = stopTunnelsForShutdown(stopAll, unsubscribe, sync);
     const subscribedWhileStopping = subscribed;
     releaseStop();
+    await vi.waitFor(async () => {
+      expect((await store.getEntries())[0].retiredReverseBind?.fenceId).toBe(tunnel.id);
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
     await shuttingDown;
     expect(subscribedWhileStopping).toBe(true);
     expect(stopAll).toHaveBeenCalledOnce();
@@ -469,6 +473,54 @@ describe("TunnelRegistrySync", () => {
     expect((await store.getEntries())[0].retiredReverseBind?.fenceId).toBe(tunnel.id);
     releaseFence();
     await vi.waitFor(async () => expect(await store.getEntries()).toEqual([]));
+  });
+
+  it("waits for fence-file deletion when the transport closes during shutdown", async () => {
+    const tunnel = makeTunnel({ id: "retired-1", tunnelType: "reverse", remotePort: 9000 });
+    let closeTransport!: () => void;
+    const settled = new Promise<void>((resolve) => { closeTransport = resolve; });
+    await sync.registerTunnel(tunnel);
+    await sync.unregisterTunnel(tunnel.profileId, {
+      tunnel,
+      retiredReverseBind: {
+        fenceId: tunnel.id,
+        routeIdentity: { kind: "direct", endpoint: { hosts: ["bastion"], port: 22 } },
+        remotePort: tunnel.remotePort,
+        settled
+      }
+    });
+    let deletionStarted!: () => void;
+    const deleting = new Promise<void>((resolve) => { deletionStarted = resolve; });
+    let finishDeletion!: () => void;
+    const deletionGate = new Promise<void>((resolve) => { finishDeletion = resolve; });
+    const originalRemoveFence = store.removeFence.bind(store);
+    vi.spyOn(store, "removeFence").mockImplementation(async (fenceId) => {
+      deletionStarted();
+      await deletionGate;
+      await originalRemoveFence(fenceId);
+    });
+    let cleanupFinished!: () => void;
+    const cleaned = new Promise<void>((resolve) => { cleanupFinished = resolve; });
+    const originalCleanup = sync.cleanupOwnEntries.bind(sync);
+    vi.spyOn(sync, "cleanupOwnEntries").mockImplementation(async () => {
+      await originalCleanup();
+      cleanupFinished();
+    });
+
+    let shutdownFinished = false;
+    const shutdown = stopTunnelsForShutdown(async () => {}, () => {}, sync)
+      .then(() => { shutdownFinished = true; });
+    await cleaned;
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(shutdownFinished).toBe(false);
+
+    closeTransport();
+    await deleting;
+    expect(shutdownFinished).toBe(false);
+    finishDeletion();
+    await shutdown;
+    expect(await store.getEntries()).toEqual([]);
   });
 
   it("cleanupOwnEntries removes only own entries", async () => {

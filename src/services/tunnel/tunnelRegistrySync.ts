@@ -8,6 +8,7 @@ import { networkRoutesOverlap } from "../ssh/sshNetworkRoute";
 const POLL_INTERVAL_MS = 3_000;
 const PROBE_TIMEOUT_MS = 200;
 const SLOW_REPROBE_INTERVAL_MS = 60_000;
+const SHUTDOWN_FENCE_SETTLE_GRACE_MS = 1_000;
 /** Entries not refreshed within this window are considered stale. */
 const STALE_THRESHOLD_MS = 30_000;
 
@@ -24,14 +25,18 @@ export interface RetiredReverseBindFence {
 export async function stopTunnelsForShutdown(
   stopAll: () => Promise<void>,
   unsubscribeTunnel: () => void,
-  registrySync: Pick<TunnelRegistrySync, "dispose" | "cleanupOwnEntries">
+  registrySync: Pick<TunnelRegistrySync, "dispose" | "cleanupOwnEntries" | "waitForFenceCleanups">
 ): Promise<void> {
   try {
     await stopAll();
   } finally {
     unsubscribeTunnel();
     registrySync.dispose();
-    await registrySync.cleanupOwnEntries();
+    try {
+      await registrySync.cleanupOwnEntries();
+    } finally {
+      await registrySync.waitForFenceCleanups();
+    }
   }
 }
 
@@ -134,6 +139,11 @@ export class TunnelRegistrySync {
   private lastRemoteJson = "";
   private readonly probePort: ProbePortFn;
   private readonly unsettledReverseBindFenceIds = new Set<string>();
+  private readonly pendingFenceCleanups = new Set<{
+    settled: Promise<void>;
+    cleanup: Promise<void>;
+    hasSettled: () => boolean;
+  }>();
   private mutationTail: Promise<void> = Promise.resolve();
 
   public constructor(
@@ -243,7 +253,9 @@ export class TunnelRegistrySync {
           });
         });
       }
-      void fence.settled.then(() => this.mutateEntries(async () => {
+      let hasSettled = false;
+      const settled = fence.settled.then(() => { hasSettled = true; });
+      const cleanup = settled.then(() => this.mutateEntries(async () => {
         const entries = await this.store.getEntries();
         const filtered = entries.filter((entry) =>
           entry.retiredReverseBind !== undefined ||
@@ -261,6 +273,15 @@ export class TunnelRegistrySync {
         await this.store.removeFence(fence.fenceId);
         this.unsettledReverseBindFenceIds.delete(fence.fenceId);
       }));
+      const pending = { settled, cleanup, hasSettled: () => hasSettled };
+      this.pendingFenceCleanups.add(pending);
+      void cleanup.then(
+        () => { this.pendingFenceCleanups.delete(pending); },
+        (error: unknown) => {
+          this.pendingFenceCleanups.delete(pending);
+          console.error("[Nexus] reverse-bind fence cleanup failed", error);
+        }
+      );
     }
   }
 
@@ -331,6 +352,28 @@ export class TunnelRegistrySync {
       );
       await this.store.saveEntries(filtered);
     });
+  }
+
+  public async waitForFenceCleanups(): Promise<void> {
+    const pending = [...this.pendingFenceCleanups];
+    if (pending.length === 0) {
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout>;
+    try {
+      // Shutdown cannot wait forever for an SSH peer that never confirms close.
+      // Once closure is confirmed within this grace, always finish its storage
+      // deletion before deactivation returns.
+      await Promise.race([
+        Promise.allSettled(pending.map((item) => item.settled)),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, SHUTDOWN_FENCE_SETTLE_GRACE_MS);
+        })
+      ]);
+    } finally {
+      clearTimeout(timer!);
+    }
+    await Promise.allSettled(pending.filter((item) => item.hasSettled()).map((item) => item.cleanup));
   }
 
   public dispose(): void {
