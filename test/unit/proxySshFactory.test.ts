@@ -1516,7 +1516,13 @@ describe("ProxySshFactory", () => {
 
       const first = factory.connect(server);
       const second = factory.connect(server);
-      await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => {
+        const pending = (factory as unknown as {
+          sharedProxyPasswords: Map<string, { owners: unknown[] }>;
+        }).sharedProxyPasswords.get(server.id);
+        expect(pending?.owners).toHaveLength(2);
+      });
+      expect(prompt).toHaveBeenCalledTimes(1);
       cancel(undefined);
       const [firstError, secondError] = await Promise.all([
         first.catch((error: unknown) => error),
