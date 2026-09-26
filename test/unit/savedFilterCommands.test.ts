@@ -3,6 +3,7 @@ import type { CommandContext } from "../../src/commands/types";
 import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import type { InventoryProvider } from "../../src/models/inventory";
+import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
 
 /**
  * SAVED FILTER DEFINITIONS (issue #48 PR-E, backlog #1) — the manage command and
@@ -79,7 +80,8 @@ const registryOf = (...providers: InventoryProvider[]) => {
   const fieldsOf = new Map(providers.map(({ configFields, ...listed }) => [listed as InventoryProvider, configFields] as const));
   return {
     list: () => [...fieldsOf.keys()],
-    configFieldsOf: (provider: InventoryProvider) => fieldsOf.get(provider)!
+    configFieldsOf: (provider: InventoryProvider) => fieldsOf.get(provider)!,
+    snapshotOf: (provider: InventoryProvider) => ({ id: provider.id, label: provider.label, configFields: fieldsOf.get(provider)! })
   } as unknown as Parameters<typeof registerSavedFilterCommands>[1];
 };
 
@@ -163,6 +165,20 @@ describe("nexus.savedFilter.manage", () => {
     const emptyState = String(mockShowInformationMessage.mock.calls[0][0]);
     expect(emptyState).toContain("NetBox-like and Lab-like source forms");
     expect(emptyState).not.toContain("Proxmox-like");
+  });
+
+  it("names the registered label after a provider changes its label getter", async () => {
+    const registry = new InventoryProviderRegistry();
+    const provider = providerWithFilterField("Device Filter", "Stable Provider");
+    registry.register(provider);
+    Object.defineProperty(provider, "label", { get: () => { throw new Error("live label read"); } });
+    registeredCommands.clear();
+    registerSavedFilterCommands(ctx, registry);
+    mockShowInformationMessage.mockResolvedValueOnce(undefined);
+
+    await registeredCommands.get("nexus.savedFilter.manage")!();
+
+    expect(String(mockShowInformationMessage.mock.calls[0][0])).toContain("Stable Provider source forms");
   });
 
   // Codex on #164 — provider labels come from the public API; the sentence is ours.

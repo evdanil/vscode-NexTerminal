@@ -43,8 +43,8 @@ export function formatLastSyncAbsolute(source: Pick<InventorySourceConfig, "last
 }
 
 /** The provider label, or the raw providerId when the registry cannot resolve it (extension missing/disabled — the source must stay visible and removable). */
-function providerLabelOf(providerId: string, registry: Pick<InventoryProviderRegistry, "get"> | undefined): string {
-  return registry?.get(providerId)?.label ?? providerId;
+function providerLabelOf(providerId: string, registry: Pick<InventoryProviderRegistry, "labelOf"> | undefined): string {
+  return registry?.labelOf(providerId) ?? providerId;
 }
 
 /**
@@ -53,7 +53,7 @@ function providerLabelOf(providerId: string, registry: Pick<InventoryProviderReg
  */
 export function sourceDescription(
   source: Pick<InventorySourceConfig, "providerId" | "lastSyncAt">,
-  registry: Pick<InventoryProviderRegistry, "get"> | undefined
+  registry: Pick<InventoryProviderRegistry, "labelOf"> | undefined
 ): string {
   return `${providerLabelOf(source.providerId, registry)} — ${formatLastSync(source)}`;
 }
@@ -64,7 +64,7 @@ export function sourceDescription(
  */
 export function sourceDescriptionAbsolute(
   source: Pick<InventorySourceConfig, "providerId" | "lastSyncAt">,
-  registry: Pick<InventoryProviderRegistry, "get"> | undefined
+  registry: Pick<InventoryProviderRegistry, "labelOf"> | undefined
 ): string {
   return `${providerLabelOf(source.providerId, registry)} — ${formatLastSyncAbsolute(source)}`;
 }

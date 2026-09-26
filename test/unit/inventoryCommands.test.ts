@@ -221,6 +221,14 @@ function sealConfigFields(provider: InventoryProvider): void {
   });
 }
 
+function sealProviderIdentity(provider: InventoryProvider): void {
+  for (const key of ["id", "label"] as const) {
+    Object.defineProperty(provider, key, {
+      get: () => { throw new Error(`read the registration snapshot, not provider.${key}`); }
+    });
+  }
+}
+
 function makeVault(initial: Record<string, string> = {}) {
   const store = new Map(Object.entries(initial));
   return {
@@ -414,7 +422,7 @@ describe("inventoryCommands", () => {
       expect(source.providerFingerprint).toBe(computeProviderFingerprint(provider));
     });
 
-    it("builds the form, runs Test and saves from the registry's copy of the provider's fields, never its own array (⊘ the form definition, either parse, the password-field list or the stamped fingerprint reading `provider.configFields`, which the provider can change after registering — issue #195)", async () => {
+    it("builds the form, runs Test and saves from the registry's fields, id and label snapshots", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
       const registry = new InventoryProviderRegistry();
@@ -422,10 +430,16 @@ describe("inventoryCommands", () => {
       registry.register(provider);
       const registeredShape = computeProviderFingerprint(provider);
       sealConfigFields(provider);
+      sealProviderIdentity(provider);
       registerInventoryCommands(core, registry, makeVault(), makeTeardown());
 
       await registeredCommands.get("nexus.inventory.addSource")!();
       const { definition, onTest, onSubmit } = latestFormCall();
+      expect(definition.title).toBe("Add Inventory Source (Fake Provider)");
+      expect(latestFormCall().formId).toBe("inventory-source-add-fake");
+      expect(definition.fields.find((field) => "key" in field && field.key === "name")).toEqual(
+        expect.objectContaining({ value: "Fake Provider" })
+      );
       expect(definition.fields.flatMap((field) => ("key" in field ? [field.key] : []))).toEqual(
         expect.arrayContaining(["cfg_host", "cfg_apiToken"])
       );
@@ -443,6 +457,7 @@ describe("inventoryCommands", () => {
 
       const [source] = core.getSnapshot().inventorySources;
       expect(source.secretFieldIds).toEqual(["apiToken"]);
+      expect(source.providerId).toBe("fake");
       expect(source.providerFingerprint).toBe(registeredShape);
     });
 
@@ -901,15 +916,21 @@ describe("inventoryCommands", () => {
       const providerB = makeProvider({ id: "fake-b", label: "Provider B" });
       registry.register(providerA);
       registry.register(providerB);
+      sealProviderIdentity(providerA);
+      sealProviderIdentity(providerB);
       const vault = makeVault();
       registerInventoryCommands(core, registry, vault, makeTeardown());
 
-      mockShowQuickPick.mockResolvedValueOnce({ label: providerA.label, provider: providerA });
+      mockShowQuickPick.mockResolvedValueOnce({ label: "Provider A", provider: providerA });
 
       const cmd = registeredCommands.get("nexus.inventory.addSource")!;
       await cmd();
 
       expect(mockShowQuickPick).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ title: "Select Inventory Provider" }));
+      expect(mockShowQuickPick.mock.calls[0][0]).toEqual([
+        expect.objectContaining({ label: "Provider A" }),
+        expect.objectContaining({ label: "Provider B" })
+      ]);
       const { definition } = latestFormCall();
       expect(definition.title).toBe("Add Inventory Source (Provider A)");
     });
@@ -1234,6 +1255,7 @@ describe("inventoryCommands", () => {
       registry.register(provider);
       const registeredShape = computeProviderFingerprint(provider);
       sealConfigFields(provider);
+      sealProviderIdentity(provider);
       const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "old-token" });
       registerInventoryCommands(core, registry, vault, makeTeardown());
       await core.addOrUpdateInventorySource(
@@ -2656,6 +2678,7 @@ describe("inventoryCommands", () => {
       registry.register(provider);
       const registeredShape = computeProviderFingerprint(provider);
       sealConfigFields(provider);
+      sealProviderIdentity(provider);
       const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
       registerInventoryCommands(core, registry, vault, makeTeardown());
       await core.addOrUpdateInventorySource(makeSource({ secretFieldIds: ["apiToken"] }));
@@ -8843,6 +8866,7 @@ describe("inventoryCommands", () => {
     it("gates on the registry's copy of the provider's fields, never its own array (⊘ the trust gate hashing `provider.configFields` — issue #195)", async () => {
       const { provider, start, controlSpy, server } = await setup({ providerFingerprint: computeProviderFingerprint(makeProvider()) });
       sealConfigFields(provider);
+      sealProviderIdentity(provider);
 
       await start({ server });
 
@@ -9477,7 +9501,8 @@ describe("nexus.inventory.openWebConsole", () => {
 
   it("gates on the registry's copy of the provider's fields, never its own array (⊘ the trust gate hashing `provider.configFields` — issue #195)", async () => {
     const { provider, open, urlSpy, server } = await setup({ providerFingerprint: computeProviderFingerprint(makeProvider()) });
-    sealConfigFields(provider);
+      sealConfigFields(provider);
+      sealProviderIdentity(provider);
 
     await open({ server });
 
@@ -12410,6 +12435,7 @@ describe("nexus.inventory.refreshStatus — provider trust fingerprint", () => {
       configFields: ADDED_REQUIRED_SECRET
     });
     sealConfigFields(registry.get("fake")!);
+    sealProviderIdentity(registry.get("fake")!);
 
     await refresh("src-1");
 
@@ -12422,6 +12448,7 @@ describe("nexus.inventory.refreshStatus — provider trust fingerprint", () => {
       { id: "src-1", name: "Alpha", providerFingerprint: computeProviderFingerprint(makeProvider()) }
     ]);
     sealConfigFields(registry.get("fake")!);
+    sealProviderIdentity(registry.get("fake")!);
 
     await expect(refresh()).resolves.toEqual({ unrefreshedSourceIds: [] });
     expect(fetchStatus).toHaveBeenCalledTimes(1);

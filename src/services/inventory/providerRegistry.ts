@@ -26,15 +26,20 @@ export function validateProviderShape(provider: unknown): asserts provider is In
   checkProviderShape(provider);
 }
 
-/** The data members the registry keeps a copy of, each exactly as it was checked. */
-interface CheckedProviderData {
+/** Stable data captured when one provider object registers. */
+export interface ProviderRegistrationSnapshot {
+  readonly id: string;
+  readonly label: string;
   readonly configFields: readonly InventoryConfigField[];
+}
+
+/** The checked public snapshot plus the optional template-filter keys. */
+interface CheckedProviderData extends ProviderRegistrationSnapshot {
   readonly attributeKeys: readonly string[] | undefined;
 }
 
 /**
- * `validateProviderShape`'s checks, returning the copies of `configFields` and
- * `attributeKeys` the registry keeps (`copyConfigFields`, `copyAttributeKeys`), so
+ * `validateProviderShape`'s checks, returning the data the registry keeps so
  * that `register()` reads each member once and stores exactly what was checked.
  */
 function checkProviderShape(provider: unknown): CheckedProviderData {
@@ -42,10 +47,12 @@ function checkProviderShape(provider: unknown): CheckedProviderData {
     throw new Error("Inventory provider must be an object.");
   }
   const obj = provider as Record<string, unknown>;
-  if (typeof obj.id !== "string" || obj.id.length === 0 || !PROVIDER_ID_RE.test(obj.id)) {
+  const id = obj.id;
+  if (typeof id !== "string" || id.length === 0 || !PROVIDER_ID_RE.test(id)) {
     throw new Error("Inventory provider id must be a non-empty string matching /^[a-z0-9][a-z0-9-]*$/i.");
   }
-  if (typeof obj.label !== "string" || obj.label.length === 0) {
+  const label = obj.label;
+  if (typeof label !== "string" || label.length === 0) {
     throw new Error("Inventory provider label must be a non-empty string.");
   }
   const configFields = copyConfigFields(obj.configFields);
@@ -132,7 +139,7 @@ function checkProviderShape(provider: unknown): CheckedProviderData {
   // leaves it out of every list it builds, and a duplicate is one entry in the
   // matcher's Set (and at worst a repeated word in that list) — so refusing the
   // provider's whole registration, sync and all, would cost far more than the entry.
-  return { configFields, attributeKeys: copyAttributeKeys(obj.attributeKeys) };
+  return { id, label, configFields, attributeKeys: copyAttributeKeys(obj.attributeKeys) };
 }
 
 /**
@@ -338,9 +345,10 @@ function copyAttributeKeys(value: unknown): readonly string[] | undefined {
   return Object.freeze(keys);
 }
 
-/** One registration: the provider, and the copy of its `attributeKeys` taken when it registered. */
+/** One registration and its checked data, independent of later provider mutations. */
 interface RegisteredProvider {
   readonly provider: InventoryProvider;
+  readonly snapshot: ProviderRegistrationSnapshot;
   readonly attributeKeys: readonly string[] | undefined;
 }
 
@@ -353,8 +361,8 @@ interface RegisteredProvider {
  */
 export class InventoryProviderRegistry {
   private readonly providers = new Map<string, RegisteredProvider>();
-  /** Keyed by the provider object, not its id — see `configFieldsOf`. */
-  private readonly configFieldsByProvider = new WeakMap<InventoryProvider, readonly InventoryConfigField[]>();
+  /** Keyed by the provider object, not its mutable id — see `snapshotOf`. */
+  private readonly snapshotsByProvider = new WeakMap<InventoryProvider, ProviderRegistrationSnapshot>();
   private readonly listeners = new Set<ProviderRegistryListener>();
 
   /**
@@ -385,18 +393,19 @@ export class InventoryProviderRegistry {
   }
 
   public register(provider: InventoryProvider): ProviderRegistration {
-    const { configFields, attributeKeys } = checkProviderShape(provider);
-    const registration: RegisteredProvider = { provider, attributeKeys };
-    if (this.providers.has(provider.id)) {
-      throw new Error(`An inventory provider with id "${provider.id}" is already registered.`);
+    const { id, label, configFields, attributeKeys } = checkProviderShape(provider);
+    const snapshot = Object.freeze({ id, label, configFields });
+    const registration: RegisteredProvider = { provider, snapshot, attributeKeys };
+    if (this.providers.has(id)) {
+      throw new Error(`An inventory provider with id "${id}" is already registered.`);
     }
-    if (this.configFieldsByProvider.has(provider)) {
+    if (this.snapshotsByProvider.has(provider)) {
       // A flow can keep this provider object after its id is disposed. Reusing
       // it would replace the copy that flow rendered or fingerprinted.
-      throw new Error(`Inventory provider object "${provider.id}" was already registered with this registry.`);
+      throw new Error(`Inventory provider object "${id}" was already registered with this registry.`);
     }
-    this.providers.set(provider.id, registration);
-    this.configFieldsByProvider.set(provider, configFields);
+    this.providers.set(id, registration);
+    this.snapshotsByProvider.set(provider, snapshot);
     // AFTER the map write, so a listener that repaints from the registry sees
     // the provider it was just told about. A rejected registration (duplicate
     // id, bad shape) throws above and never reaches here — nothing changed, so
@@ -411,8 +420,8 @@ export class InventoryProviderRegistry {
         disposed = true;
         // Only remove if this exact registration still owns the id — a
         // disposed-then-re-registered id must survive a stale dispose() call.
-        if (this.providers.get(provider.id) === registration) {
-          this.providers.delete(provider.id);
+        if (this.providers.get(id) === registration) {
+          this.providers.delete(id);
           // Inside the guard: a stale dispose evicts nothing, and an event for
           // it would announce a removal that did not happen.
           this.emitChanged();
@@ -442,6 +451,20 @@ export class InventoryProviderRegistry {
     return this.providers.get(id)?.provider;
   }
 
+  /** The checked label of the provider currently registered under `id`. */
+  public labelOf(id: string): string | undefined {
+    return this.providers.get(id)?.snapshot.label;
+  }
+
+  /** The checked id, label and fields of this exact provider object. */
+  public snapshotOf(provider: InventoryProvider): ProviderRegistrationSnapshot {
+    const snapshot = this.snapshotsByProvider.get(provider);
+    if (!snapshot) {
+      throw new Error("Inventory provider was never registered with this registry.");
+    }
+    return snapshot;
+  }
+
   /**
    * The `attributeKeys` of the provider holding `id`, as copied when it registered
    * (`copyAttributeKeys`): a frozen plain array, or `undefined` when that provider
@@ -469,9 +492,8 @@ export class InventoryProviderRegistry {
    * one and then wait on the trust modal. The id can be disposed or registered
    * again while they wait. A lookup by id would then answer with nothing, or with
    * the replacement's fields, so a form would be parsed against a schema other
-   * than the one it rendered, and a fingerprint would combine one registrant's
-   * label with another's fields. Looked up by the object, the answer is always
-   * the copy taken when that provider object registered. This registry refuses
+   * than the one it rendered. Looked up by the object, the fields and label
+   * always come from the same checked registration. This registry refuses
    * to register the same object again, even after disposal, because a form or
    * prompt may still hold it. The copy lasts as long as something still holds
    * the provider.
@@ -481,11 +503,7 @@ export class InventoryProviderRegistry {
    * caller, and `[]` would hide it behind a form with no provider fields.
    */
   public configFieldsOf(provider: InventoryProvider): readonly InventoryConfigField[] {
-    const configFields = this.configFieldsByProvider.get(provider);
-    if (configFields === undefined) {
-      throw new Error(`Inventory provider "${provider.id}" was never registered with this registry.`);
-    }
-    return configFields;
+    return this.snapshotOf(provider).configFields;
   }
 
   public list(): InventoryProvider[] {

@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.285] — 2026-09-26
+
+### Fixed
+
+- **Inventory provider registrations keep their checked identity.** A third-party provider changing its `id` or display name after registration no longer strands its registration, breaks Add Source, or changes the name and shape shown in source forms, lists and trust checks. A new registration is needed for an intentional change.
+
 ## [2.8.284] — 2026-09-26
 
 ### Fixed
