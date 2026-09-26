@@ -204,7 +204,7 @@ describe("SshConnectionPool", () => {
     expect(lease2).toBeDefined();
   });
 
-  it("a joiner of an in-flight connect gets the first caller's context — its own onAuthMessage is discarded", async () => {
+  it("routes pending handshake messages to its first owner while that owner is active", async () => {
     let resolveConnect: ((conn: SshConnection) => void) | undefined;
     const capturedContexts: Array<SshConnectContext | undefined> = [];
     const delayedFactory: ContextAwareSshFactory = {
@@ -224,6 +224,9 @@ describe("SshConnectionPool", () => {
     // Both calls race for the same server before the underlying handshake settles.
     const p1 = p.connectWithContext(testServer, { onAuthMessage: firstSink });
     const p2 = p.connectWithContext(testServer, { onAuthMessage: secondSink });
+    capturedContexts[0]?.onAuthMessage?.("Banner");
+    expect(firstSink).toHaveBeenCalledWith("Banner");
+    expect(secondSink).not.toHaveBeenCalled();
 
     const conn = createMockConnection();
     resolveConnect!(conn);
@@ -232,14 +235,69 @@ describe("SshConnectionPool", () => {
 
     // Only one underlying connect attempt is made...
     expect(delayedFactory.connectWithContext).toHaveBeenCalledTimes(1);
-    // ...and it only ever saw the first caller's context/sink. The second
-    // caller's onAuthMessage never reaches the handshake — by design (see
-    // SshConnectContext.onAuthMessage doc comment in contracts.ts).
+    // ...and the shared context sends messages to the first live owner.
     expect(capturedContexts).toHaveLength(1);
-    expect(capturedContexts[0]?.onAuthMessage).toBe(firstSink);
-    expect(capturedContexts[0]?.onAuthMessage).not.toBe(secondSink);
     expect(lease1).toBeDefined();
     expect(lease2).toBeDefined();
+  });
+
+  it("routes pending handshake messages to a terminal that joins a context-free owner", async () => {
+    let resolveConnect!: (connection: SshConnection) => void;
+    let forwardAuthMessage: ((text: string) => void) | undefined;
+    const delayedFactory: ContextAwareSshFactory = {
+      connect: vi.fn(async () => { throw new Error("unexpected direct connect"); }),
+      connectWithContext: vi.fn((_server: ServerConfig, context?: SshConnectContext) => {
+        forwardAuthMessage = context?.onAuthMessage;
+        return new Promise<SshConnection>((resolve) => { resolveConnect = resolve; });
+      })
+    };
+    const p = new SshConnectionPool(delayedFactory, { enabled: true, idleTimeoutMs: 5000 });
+    const sftpOwner = p.connect(testServer);
+    const terminalSink = vi.fn();
+    const terminal = p.connectWithContext(testServer, { isActive: () => true, onAuthMessage: terminalSink });
+
+    forwardAuthMessage?.("Duo option menu");
+    expect(terminalSink).toHaveBeenCalledWith("Duo option menu");
+    const connection = createMockConnection();
+    resolveConnect(connection);
+    const [sftpLease, terminalLease] = await Promise.all([sftpOwner, terminal]);
+    sftpLease.dispose();
+    terminalLease.dispose();
+  });
+
+  it("keeps a shared pending handshake active when its first owner closes but a joiner remains", async () => {
+    let resolveConnect!: (connection: SshConnection) => void;
+    let sharedIsActive: (() => boolean) | undefined;
+    let forwardAuthMessage: ((text: string) => void) | undefined;
+    const delayedFactory: ContextAwareSshFactory = {
+      connect: vi.fn(async () => { throw new Error("unexpected direct connect"); }),
+      connectWithContext: vi.fn((_server: ServerConfig, context?: SshConnectContext) => {
+        sharedIsActive = context?.isActive;
+        forwardAuthMessage = context?.onAuthMessage;
+        return new Promise<SshConnection>((resolve) => { resolveConnect = resolve; });
+      })
+    };
+    const p = new SshConnectionPool(delayedFactory, { enabled: true, idleTimeoutMs: 5000 });
+    let firstActive = true;
+    let secondActive = true;
+    const firstSink = vi.fn();
+    const secondSink = vi.fn();
+    const first = p.connectWithContext(testServer, { isActive: () => firstActive, onAuthMessage: firstSink });
+    const firstFailure = expect(first).rejects.toThrow("connection attempt ended");
+    const second = p.connectWithContext(testServer, { isActive: () => secondActive, onAuthMessage: secondSink });
+
+    firstActive = false;
+    expect(sharedIsActive?.()).toBe(true);
+    forwardAuthMessage?.("Duo option menu");
+    expect(firstSink).not.toHaveBeenCalled();
+    expect(secondSink).toHaveBeenCalledWith("Duo option menu");
+    const connection = createMockConnection();
+    resolveConnect(connection);
+    await firstFailure;
+    const lease = await second;
+    expect(connection.dispose).not.toHaveBeenCalled();
+    secondActive = false;
+    lease.dispose();
   });
 
   it("force disconnect closes regardless of refcount", async () => {

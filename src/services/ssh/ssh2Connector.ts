@@ -283,7 +283,7 @@ export class Ssh2Connector implements SshConnector {
       passphrase?: string;
       sock?: Duplex;
       onKeyboardInteractive?: KeyboardInteractiveHandler;
-      onAuthMessage?: (text: string) => void;
+      onAuthMessage?: (text: string) => boolean | void;
     }
   ): Promise<SshConnection> {
     const config = await buildConnectConfig(server, auth.password, auth.passphrase, auth.sock, this.connectionOptions);
@@ -299,24 +299,24 @@ export class Ssh2Connector implements SshConnector {
     const client = new Client();
     return new Promise((resolve, reject) => {
       let settled = false;
+      const authAbort = new AbortController();
       let banner: string | undefined;
       client.on("banner", (message: string) => {
-        // If the caller wants live auth messages (e.g. to render pre-auth
-        // banners in the terminal before the MFA prompt), hand it off
-        // immediately and don't buffer — getBanner() must stay undefined so
-        // sshPty.ts doesn't print it a second time after ready.
+        // A live sink handles banners immediately, so getBanner() must stay
+        // empty and sshPty.ts will not print them a second time. A pooled
+        // handshake may begin without a terminal and gain one while pending;
+        // its router returns false until a sink joins, preserving the banner.
         if (auth.onAuthMessage) {
           // Legacy getBanner() consumers still see blank banners (unchanged
           // buffering below); the live sink only wants non-blank messages.
-          if (message.trim()) {
-            try {
-              auth.onAuthMessage(message);
-            } catch {
-              // Display is best-effort — a throwing sink must not unwind
-              // ssh2's protocol handler mid-handshake or abort auth.
-            }
+          if (!message.trim()) return;
+          try {
+            if (auth.onAuthMessage(message) !== false) return;
+          } catch {
+            // Display is best-effort — a throwing sink must not unwind
+            // ssh2's protocol handler mid-handshake or abort auth.
+            return;
           }
-          return;
         }
         banner = message;
       });
@@ -326,13 +326,14 @@ export class Ssh2Connector implements SshConnector {
             prompt: p.prompt,
             echo: p.echo ?? false
           }));
-          auth.onKeyboardInteractive(name, instructions, mapped).then(
-            (responses) => finish(responses),
+          auth.onKeyboardInteractive(name, instructions, mapped, authAbort.signal).then(
+            (responses) => {
+              if (!authAbort.signal.aborted) finish(responses);
+            },
             (error) => {
+              if (authAbort.signal.aborted) return;
+              if (!settled) reject(error);
               client.end();
-              if (!settled) {
-                reject(error);
-              }
             }
           );
           return;
@@ -346,10 +347,12 @@ export class Ssh2Connector implements SshConnector {
       });
       const label = `${server.name} (${server.host})`;
       client.on("ready", () => {
+        authAbort.abort();
         settled = true;
         resolve(new Ssh2Connection(client, banner, label, this.diagnostics));
       });
       client.on("error", (error: Error) => {
+        authAbort.abort();
         if (!settled) {
           // Pre-ready errors are the caller's to handle and MUST stay a plain
           // rejection — the connect flow (auth retry, host-key prompts) reads
@@ -366,6 +369,10 @@ export class Ssh2Connector implements SshConnector {
         this.diagnostics?.(
           `[ssh] ${label}: post-ready client error: ${error.message}${level ? ` (level: ${level})` : ""}`
         );
+      });
+      client.on("close", () => {
+        authAbort.abort();
+        if (!settled) reject(new Error("SSH connection closed before authentication completed"));
       });
       client.connect(config);
     });

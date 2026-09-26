@@ -20,6 +20,8 @@ Two-factor authentication (keyboard-interactive) is fully supported — password
 
 Credentials are cached securely via VS Code SecretStorage with silent re-auth.
 
+When several SSH logins need input at once, server password, proxy password, key passphrase, and verification-code prompts appear one at a time. Logins that need the same credential can share one answer; prompts for different credentials wait their turn. A queued prompt is discarded if its server changes before it opens or its terminal closes; a prompt shared with another open terminal remains available to that terminal. A timed-out connection drops its queued verification prompt. If a saved password or passphrase fails, Nexus clears it only if the saved value is still the one that failed, so a newer saved answer is kept.
+
 ### Deploy an SSH Key
 
 Right-click any server and select "Deploy SSH Key" to automate key-based authentication setup. Discovers existing local keys or generates new ed25519 key pairs, deploys the public key to the remote `authorized_keys`, and optionally converts the server profile to key auth. Cross-platform (Windows, macOS, Linux).

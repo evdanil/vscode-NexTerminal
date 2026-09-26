@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.280] — 2026-09-26
+
+### Fixed
+
+- **Concurrent SSH authentication prompts no longer dismiss each other.** Server and proxy passwords, key passphrases, and keyboard-interactive verification prompts wait their turn, including when different servers or credentials need separate answers. A timed-out connection drops its queued verification prompt. A delayed failed login also leaves a newly saved replacement password or passphrase intact.
+
 ## [2.8.279] — 2026-09-26
 
 ### Fixed

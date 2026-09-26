@@ -152,9 +152,13 @@ describe("SshPty", () => {
   it("uses connectWithContext with an onAuthMessage sink when the factory is context-aware", async () => {
     const stream = new PassThrough();
     const { connection } = createConnection(stream);
+    let isActive: (() => boolean) | undefined;
     const sshFactory = {
       connect: vi.fn(async () => connection),
-      connectWithContext: vi.fn(async () => connection)
+      connectWithContext: vi.fn(async (_server: ServerConfig, context?: { isActive?: () => boolean }) => {
+        isActive = context?.isActive;
+        return connection;
+      })
     };
     const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() };
     const logger = { log: vi.fn(), close: vi.fn() };
@@ -168,12 +172,15 @@ describe("SshPty", () => {
       server,
       expect.objectContaining({
         onAuthMessage: expect.any(Function),
-        credentialSource: server
+        credentialSource: server,
+        isActive: expect.any(Function)
       })
     );
     expect(sshFactory.connect).not.toHaveBeenCalled();
+    expect(isActive?.()).toBe(true);
 
     pty.dispose();
+    expect(isActive?.()).toBe(false);
   });
 
   it("writes MFA auth messages (banner / keyboard-interactive name+instructions) via the onAuthMessage sink with CRLF normalization", async () => {
