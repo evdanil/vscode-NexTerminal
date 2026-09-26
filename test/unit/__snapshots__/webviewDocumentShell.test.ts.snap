@@ -7872,8 +7872,8 @@ echo hi</textarea>
 		};
 		// A redirection may touch the executable without whitespace. Keep the
 		// executable and operator separate while retaining a leading fd number.
-		// An empty quoted word has no fd digits and must be finished first.
-		if ((char === ">" || char === "<") && inWord && (word === "" && !wordAllowsRedirection || !/^(?:\\d*|&|(?:\\d*)(?:&>>|&>|>>|<>|<&|>&|>\\||>|<))$/.test(word))) {
+		// Quoted or escaped text cannot supply fd digits or an operator prefix.
+		if ((char === ">" || char === "<") && inWord && (!wordAllowsRedirection || !/^(?:\\d*|&|(?:\\d*)(?:&>>|&>|>>|<>|<&|>&|>\\||>|<))$/.test(word))) {
 			finishWord();
 		};
 		// Bash >| clobbers a file; its target never begins a pipeline command.
