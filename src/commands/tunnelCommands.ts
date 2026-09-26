@@ -159,11 +159,26 @@ export async function startTunnel(
     await registrySync.syncNow();
     const reverseBind = resolveTunnelType(profile) === "reverse"
       ? {
-          routeIdentity: JSON.stringify(networkRouteIdentity(server, (serverId) => core.getServer(serverId))),
+          routeIdentity: networkRouteIdentity(server, (serverId) => core.getServer(serverId)),
           remotePort: profile.remotePort
         }
       : undefined;
-    const remoteOwner = await registrySync.checkRemoteOwnership(profile.id, profile.localPort, reverseBind);
+    let remoteOwner = await registrySync.checkRemoteOwnership(profile.id, profile.localPort, reverseBind);
+    if (remoteOwner?.retiredReverseBind && reverseBind) {
+      const released = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `Waiting for remote port ${profile.remotePort} to be released`,
+          cancellable: true
+        },
+        (_progress, token) =>
+          registrySync.waitForRemoteReverseBindClear(reverseBind, () => token.isCancellationRequested)
+      );
+      if (!released) {
+        return;
+      }
+      remoteOwner = await registrySync.checkRemoteOwnership(profile.id, profile.localPort, reverseBind);
+    }
     if (remoteOwner) {
       const action = await vscode.window.showWarningMessage(
         `Tunnel "${profile.name}" is already active in another VS Code window (localhost:${profile.localPort}). The forwarded port is accessible from this window too.`,

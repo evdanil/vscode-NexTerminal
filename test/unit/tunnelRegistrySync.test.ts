@@ -75,13 +75,16 @@ describe("TunnelRegistrySync", () => {
     let releaseFence!: () => void;
     const settled = new Promise<void>((resolve) => { releaseFence = resolve; });
     const tunnel = makeTunnel({ id: "retired-1", tunnelType: "reverse", remotePort: 9000 });
+    const retiredRoute = { kind: "direct", endpoint: { hosts: ["old-primary", "alternate"], port: 22 } } as const;
+    const overlappingRoute = { kind: "direct", endpoint: { hosts: ["alternate", "new-primary"], port: 22 } } as const;
+    const unrelatedRoute = { kind: "direct", endpoint: { hosts: ["unrelated"], port: 22 } } as const;
     await sync.registerTunnel(tunnel);
 
     const unregistering = sync.unregisterTunnel("t1", {
       tunnel,
       retiredReverseBind: {
         fenceId: tunnel.id,
-        routeIdentity: "shared-ssh-route",
+        routeIdentity: retiredRoute,
         remotePort: 9000,
         settled
       }
@@ -96,14 +99,28 @@ describe("TunnelRegistrySync", () => {
     const secondWindow = new TunnelRegistrySync(store, secondCore, "second-window", probePort);
     await secondWindow.initialize();
     expect(secondCore.getSnapshot().remoteTunnels).toEqual([]);
+    await expect(secondWindow.checkRemoteOwnership("t1", 8080, {
+      routeIdentity: unrelatedRoute,
+      remotePort: 9000
+    })).resolves.toBeUndefined();
     await expect(secondWindow.checkRemoteOwnership("different-profile", 9090, {
-      routeIdentity: "shared-ssh-route",
+      routeIdentity: overlappingRoute,
       remotePort: 9000
     })).resolves.toMatchObject({ retiredReverseBind: { fenceId: tunnel.id } });
+
+    let waitResolved = false;
+    const waiting = secondWindow.waitForRemoteReverseBindClear(
+      { routeIdentity: overlappingRoute, remotePort: 9000 },
+      () => false
+    ).then((released) => { waitResolved = released; return released; });
+    await vi.advanceTimersByTimeAsync(250);
+    expect(waitResolved).toBe(false);
     secondWindow.dispose();
 
     releaseFence();
     await unregistering;
+    await vi.advanceTimersByTimeAsync(250);
+    await expect(waiting).resolves.toBe(true);
     await vi.waitFor(async () => expect(await store.getEntries()).toEqual([]));
   });
 

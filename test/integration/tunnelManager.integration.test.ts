@@ -1138,7 +1138,10 @@ describe("TunnelManager integration", () => {
         tunnelId: active.id,
         retiredReverseBind: {
           fenceId: active.id,
-          routeIdentity: expect.any(String),
+          routeIdentity: {
+            kind: "direct",
+            endpoint: { hosts: ["127.0.0.1"], port: 22 }
+          },
           remotePort: 23456
         }
       });

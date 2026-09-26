@@ -16,7 +16,7 @@ export type TunnelEvent =
       tunnelId: string;
       retiredReverseBind?: {
         fenceId: string;
-        routeIdentity: string;
+        routeIdentity: NetworkRouteIdentity;
         remotePort: number;
         settled: Promise<void>;
       };
@@ -347,7 +347,7 @@ export class TunnelManager {
           const settled = this.retireForwardTransport(route, runtime.reverseBindPort, connection, cancellation);
           retiredReverseBind = {
             fenceId: activeTunnelId,
-            routeIdentity: JSON.stringify(route),
+            routeIdentity: route,
             remotePort: runtime.reverseBindPort,
             settled
           };

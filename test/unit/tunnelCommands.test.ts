@@ -12,6 +12,7 @@ const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowQuickPick = vi.fn();
 const mockShowWarningMessage = vi.fn();
 const mockShowInformationMessage = vi.fn();
+const mockWithProgress = vi.fn<(...args: unknown[]) => Promise<unknown>>();
 
 vi.mock("vscode", () => ({
   commands: {
@@ -25,7 +26,7 @@ vi.mock("vscode", () => ({
     showQuickPick: (...args: unknown[]) => mockShowQuickPick(...args),
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
     showInformationMessage: (...args: unknown[]) => mockShowInformationMessage(...args),
-    withProgress: vi.fn()
+    withProgress: (...args: unknown[]) => mockWithProgress(...args)
   },
   env: {
     clipboard: { writeText: vi.fn() },
@@ -485,6 +486,63 @@ describe("startTunnel — telnet servers", () => {
 
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
     expect(start).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("startTunnel — retired reverse-bind reservations", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+  });
+
+  it("waits for a matching cross-window reservation instead of claiming the tunnel is active", async () => {
+    const profile = makeTunnel({ tunnelType: "reverse", remotePort: 9000, remoteBindAddress: "127.0.0.1" });
+    const ctx = await setupContext([profile]);
+    const server: ServerConfig = {
+      id: "srv-1", name: "Bastion", host: "10.0.0.1", port: 22,
+      username: "ops", authType: "password", isHidden: false
+    };
+    await ctx.core.addOrUpdateServer(server);
+    const start = vi.fn(async () => makeActiveTunnel(profile.id));
+    const tombstone: TunnelRegistryEntry = {
+      ...makeRegistryEntry(profile.id),
+      tunnelType: "reverse",
+      remotePort: 9000,
+      retiredReverseBind: {
+        fenceId: "retired-tunnel",
+        routeIdentity: JSON.stringify({ kind: "direct", endpoint: { hosts: ["10.0.0.1"], port: 22 } }),
+        remotePort: 9000
+      }
+    };
+    let ownershipChecks = 0;
+    const registrySync = {
+      syncNow: vi.fn(async () => {}),
+      checkRemoteOwnership: vi.fn(async () => ownershipChecks++ === 0 ? tombstone : undefined),
+      waitForRemoteReverseBindClear: vi.fn(async () => true)
+    };
+    mockWithProgress.mockImplementation(async (...args: unknown[]) => {
+      const task = args[1];
+      if (typeof task !== "function") {
+        return undefined;
+      }
+      return (task as (progress: unknown, token: { isCancellationRequested: boolean }) => Promise<unknown>)(
+        undefined,
+        { isCancellationRequested: false }
+      );
+    });
+
+    await startTunnel(
+      ctx.core, { start } as never, { connect: vi.fn() } as never,
+      ctx.core.getTunnel(profile.id)!, ctx.core.getServer(server.id)!, "isolated", registrySync as never
+    );
+
+    expect(mockWithProgress).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Waiting for remote port 9000 to be released", cancellable: true }),
+      expect.any(Function)
+    );
+    expect(registrySync.waitForRemoteReverseBindClear).toHaveBeenCalledTimes(1);
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("already active"), expect.anything());
   });
 });
 

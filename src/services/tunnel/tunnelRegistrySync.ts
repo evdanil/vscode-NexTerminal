@@ -2,6 +2,8 @@ import * as net from "node:net";
 import type { TunnelRegistryStore } from "../../core/contracts";
 import type { NexusCore } from "../../core/nexusCore";
 import type { ActiveTunnel, TunnelRegistryEntry } from "../../models/config";
+import type { NetworkRouteIdentity } from "../ssh/sshNetworkRoute";
+import { networkRoutesOverlap } from "../ssh/sshNetworkRoute";
 
 const POLL_INTERVAL_MS = 3_000;
 const PROBE_TIMEOUT_MS = 200;
@@ -13,9 +15,82 @@ export type ProbePortFn = (port: number) => Promise<boolean>;
 
 export interface RetiredReverseBindFence {
   fenceId: string;
-  routeIdentity: string;
+  routeIdentity: NetworkRouteIdentity;
   remotePort: number;
   settled: Promise<void>;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseEndpointIdentity(value: unknown): { hosts: readonly string[]; port: number } | undefined {
+  if (
+    !isRecord(value) ||
+    !Array.isArray(value.hosts) ||
+    !value.hosts.every((host) => typeof host === "string") ||
+    typeof value.port !== "number"
+  ) {
+    return undefined;
+  }
+  return { hosts: value.hosts, port: value.port };
+}
+
+function parseNetworkRouteIdentity(value: string): NetworkRouteIdentity | undefined {
+  let route: unknown;
+  try {
+    route = JSON.parse(value) as unknown;
+  } catch {
+    return undefined;
+  }
+
+  const parse = (candidate: unknown, depth: number): NetworkRouteIdentity | undefined => {
+    if (!isRecord(candidate) || depth > 32 || typeof candidate.kind !== "string") {
+      return undefined;
+    }
+    if (candidate.kind === "unresolved") {
+      return typeof candidate.serverId === "string"
+        ? { kind: "unresolved", serverId: candidate.serverId }
+        : undefined;
+    }
+    const endpoint = parseEndpointIdentity(candidate.endpoint);
+    if (!endpoint) {
+      return undefined;
+    }
+    if (candidate.kind === "direct") {
+      return { kind: "direct", endpoint };
+    }
+    if (candidate.kind === "cycle") {
+      return typeof candidate.serverId === "string"
+        ? { kind: "cycle", serverId: candidate.serverId, endpoint }
+        : undefined;
+    }
+    if (candidate.kind === "ssh") {
+      const jump = parse(candidate.jump, depth + 1);
+      return jump ? { kind: "ssh", endpoint, jump } : undefined;
+    }
+    if (candidate.kind === "socks5" || candidate.kind === "http") {
+      return typeof candidate.proxyHost === "string" && typeof candidate.proxyPort === "number"
+        ? { kind: candidate.kind, proxyHost: candidate.proxyHost, proxyPort: candidate.proxyPort, endpoint }
+        : undefined;
+    }
+    return undefined;
+  };
+
+  return parse(route, 0);
+}
+
+function retiredRouteOverlaps(
+  entry: TunnelRegistryEntry,
+  routeIdentity: NetworkRouteIdentity,
+  remotePort: number
+): boolean {
+  const retired = entry.retiredReverseBind;
+  if (!retired || retired.remotePort !== remotePort) {
+    return false;
+  }
+  const retiredRoute = parseNetworkRouteIdentity(retired.routeIdentity);
+  return retiredRoute !== undefined && networkRoutesOverlap(retiredRoute, routeIdentity);
 }
 
 function defaultProbePort(port: number): Promise<boolean> {
@@ -105,7 +180,7 @@ export class TunnelRegistrySync {
         lastSeen: Date.now(),
         retiredReverseBind: {
           fenceId: fence.fenceId,
-          routeIdentity: fence.routeIdentity,
+          routeIdentity: JSON.stringify(fence.routeIdentity),
           remotePort: fence.remotePort
         }
       });
@@ -129,17 +204,20 @@ export class TunnelRegistrySync {
   public async checkRemoteOwnership(
     profileId: string,
     localPort: number,
-    reverseBind?: { routeIdentity: string; remotePort: number }
+    reverseBind?: { routeIdentity: NetworkRouteIdentity; remotePort: number }
   ): Promise<TunnelRegistryEntry | undefined> {
     const entries = await this.store.getEntries();
     const remote = entries.find(
-      (e) =>
-        e.ownerSessionId !== this.sessionId &&
-        (e.profileId === profileId ||
-          e.localPort === localPort ||
-          (reverseBind !== undefined &&
-            e.retiredReverseBind?.routeIdentity === reverseBind.routeIdentity &&
-            e.retiredReverseBind.remotePort === reverseBind.remotePort))
+      (entry) => {
+        if (entry.ownerSessionId === this.sessionId) {
+          return false;
+        }
+        if (entry.retiredReverseBind) {
+          return reverseBind !== undefined &&
+            retiredRouteOverlaps(entry, reverseBind.routeIdentity, reverseBind.remotePort);
+        }
+        return entry.profileId === profileId || entry.localPort === localPort;
+      }
     );
     if (!remote) {
       return undefined;
@@ -151,6 +229,30 @@ export class TunnelRegistrySync {
     }
     const alive = await this.probePort(remote.localPort);
     return alive ? remote : undefined;
+  }
+
+  public async waitForRemoteReverseBindClear(
+    reverseBind: { routeIdentity: NetworkRouteIdentity; remotePort: number },
+    isCancelled: () => boolean
+  ): Promise<boolean> {
+    while (!isCancelled()) {
+      const entries = await this.store.getEntries();
+      const reserved = entries.some((entry) => {
+        if (
+          entry.ownerSessionId === this.sessionId ||
+          !retiredRouteOverlaps(entry, reverseBind.routeIdentity, reverseBind.remotePort)
+        ) {
+          return false;
+        }
+        const lastSeen = entry.lastSeen ?? entry.startedAt;
+        return Date.now() - lastSeen < STALE_THRESHOLD_MS;
+      });
+      if (!reserved) {
+        return true;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 250));
+    }
+    return false;
   }
 
   public async syncNow(): Promise<void> {
