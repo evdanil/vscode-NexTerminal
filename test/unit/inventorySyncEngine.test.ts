@@ -5990,6 +5990,44 @@ describe("computeSyncPlan — every telnet record it writes must validate", () =
  * assembled out of two individually-correct decisions.
  */
 describe("computeSyncPlan — protocol and endpoint are decided coherently", () => {
+  const telnetWithStamps = (overrides: Partial<ServerConfig>) => makeOwnedServer({
+    protocol: "telnet", host: "10.0.0.1", port: 23,
+    origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1, syncedProtocol: "telnet", syncedHost: "10.0.0.1", syncedPort: 23 },
+    ...overrides
+  });
+  const gainsSsh = () => makeTree([makeDevice({ endpoints: [
+    { kind: "ssh", host: "10.0.0.9", port: 22 },
+    { kind: "telnet", host: "10.0.0.1", port: 23 }
+  ] })]);
+
+  it("keeps a telnet port when only its host was hand-edited before SSH appeared", () => {
+    const before = telnetWithStamps({ host: "10.0.0.50" });
+    const plan = computeSyncPlan({ source: makeSource(), tree: gainsSsh(), currentServers: [before], now: 2 });
+    const after = plan.updates[0]?.after ?? before;
+    expect(after).toMatchObject({ protocol: "telnet", host: "10.0.0.50", port: 23 });
+    expect(after.origin?.syncedPort).toBe(23);
+    expect(after.origin?.syncedProtocol).toBe("telnet");
+  });
+
+  it("keeps a telnet host when only its port was hand-edited before SSH appeared", () => {
+    const before = telnetWithStamps({ port: 2001 });
+    const plan = computeSyncPlan({ source: makeSource(), tree: gainsSsh(), currentServers: [before], now: 2 });
+    const after = plan.updates[0]?.after ?? before;
+    expect(after).toMatchObject({ protocol: "telnet", host: "10.0.0.1", port: 2001 });
+    expect(after.origin?.syncedHost).toBe("10.0.0.1");
+    expect(after.origin?.syncedProtocol).toBe("telnet");
+  });
+
+  it("moves a fully sync-owned telnet endpoint and protocol to SSH together", () => {
+    const before = telnetWithStamps({});
+    const plan = computeSyncPlan({ source: makeSource(), tree: gainsSsh(), currentServers: [before], now: 2 });
+    const after = plan.updates[0].after;
+    expect(after).toMatchObject({ host: "10.0.0.9", port: 22 });
+    expect(after.protocol).toBeUndefined();
+    expect(after.origin).toMatchObject({ syncedHost: "10.0.0.9", syncedPort: 22 });
+    expect(after.origin?.syncedProtocol).toBeUndefined();
+  });
+
   const dualStack = () =>
     makeDevice({
       endpoints: [
@@ -6584,7 +6622,7 @@ describe("computeSyncPlan — a kept hand-typed address the source reports diffe
     ]);
   });
 
-  it("names nothing when a sync-owned telnet record keeps a typed host and the device now prefers SSH — not the SSH address (another transport), and not the telnet one, which would not hand the field back because the sync compares against the SSH endpoint it would move to (kills naming the endpoint the sync reads; kills naming the kept transport's endpoint regardless)", () => {
+  it("names the kept telnet endpoint when a typed host blocks a switch to preferred SSH", () => {
     const before = makeOwnedServer({
       protocol: "telnet",
       host: "10.0.0.50",
@@ -6596,10 +6634,18 @@ describe("computeSyncPlan — a kept hand-typed address the source reports diffe
     ]);
     const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 2000 });
 
-    expect(keptLines(plan)).toEqual([]);
+    expect(keptLines(plan)).toEqual([
+      '"core-sw-1": kept your host 10.0.0.50; the source now reports host 10.0.0.7 — set the host to that to let the source manage it.'
+    ]);
     const after = plan.updates[0]?.after ?? before;
     expect(after.protocol).toBe("telnet");
     expect(after.host).toBe("10.0.0.50");
+    expect(after.port).toBe(2323);
+    expect(after.origin?.syncedPort).toBe(2323);
+
+    const edited = { ...after, host: "10.0.0.7" };
+    const next = computeSyncPlan({ source: makeSource(), tree, currentServers: [edited], now: 3000 });
+    expect(next.updates[0].after.origin?.syncedHost).toBe("10.0.0.7");
   });
 
   it("keeps a device name and a reported host that carry a line break or a bidi override inside the one sentence (kills adding the line past the plan's sanitizing choke point)", () => {

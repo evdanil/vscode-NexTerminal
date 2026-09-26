@@ -2009,15 +2009,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         ownedServer.origin?.syncedProtocol,
         deviceProtocol
       );
-      // P1-C (Codex) — decide the ADDRESS against the protocol the record will
-      // ACTUALLY end up with, not against the device's preferred endpoint.
-      //
-      // When the sync owns the protocol this is the primary endpoint and nothing
-      // changes. When the USER owns it (a hand-flip the stamp protects), the
-      // record keeps its transport, so the address has to come from an endpoint
-      // of THAT transport — otherwise a hand-telnet server on a dual-stack
-      // device was rewritten to the ssh endpoint's host and port 22, i.e. a
-      // telnet profile aimed at the ssh port.
+      // P1-C / #212 — decide the ADDRESS against the protocol the record will
+      // ACTUALLY end up with. A sync-owned protocol may follow the device's
+      // preferred transport only when both address halves can follow it. A
+      // hand-owned host or port keeps the record on its current transport, so
+      // its sync-owned half must be read from that transport's endpoint too.
       //
       // NO MATCHING ENDPOINT ⇒ LEAVE THE ADDRESS ALONE. That is the conservative
       // branch and it is deliberate: the alternatives are to clobber the tuple
@@ -2025,7 +2021,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // that merely stopped advertising one of its two endpoints is not gone).
       // Staleness here is the same accepted trade the `ipmiHost` matrix's row 6
       // makes — the user's own value stands until the user changes it.
-      const effectiveProtocol = takesProtocol ? deviceProtocol : ownedServer.protocol;
+      const preferredEndpoint = selectEndpointForProtocol(device, deviceProtocol);
+      const followsPreferred = takesProtocol && preferredEndpoint !== undefined &&
+        syncOwnsHost(ownedServer.host, ownedServer.origin?.syncedHost, preferredEndpoint.endpoint.host) &&
+        syncOwnsPort(ownedServer.port, ownedServer.origin?.syncedPort, preferredEndpoint.port);
+      const effectiveProtocol = followsPreferred ? deviceProtocol : ownedServer.protocol;
       const ownedEndpoint = selectEndpointForProtocol(device, effectiveProtocol);
       const ownedHost = ownedEndpoint?.endpoint.host ?? ownedServer.host;
       const ownedPort = ownedEndpoint?.port ?? ownedServer.port;
@@ -2205,13 +2205,13 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         // record's current value into the stamp here would let the sync AFTER
         // this one overwrite the user's choice.
         //
-        // #84 P2 — ALSO composes with `takesEndpoint`: the protocol is part of the
-        // same console tuple as host/port, so it is refreshed only when the sync
-        // owns it AND the endpoint was accepted. A retained hand address (endpoint
+        // #84 P2 / #212 — the protocol is part of the same console tuple as
+        // host/port, so it is refreshed only when the sync owns it AND both
+        // halves accepted the preferred endpoint. A retained hand address (endpoint
         // handed off) keeps the record's protocol and carries this stamp forward,
         // so a device transport-flip cannot reset the protocol out from under a
         // hand-edited endpoint (leaving e.g. SSH aimed at a retained telnet box).
-        syncedProtocol: takesProtocol && takesEndpoint ? deviceProtocol : ownedServer.origin?.syncedProtocol,
+        syncedProtocol: followsPreferred ? deviceProtocol : ownedServer.origin?.syncedProtocol,
         // PRIMARY HOST/PORT (task #29) — the same "records what the sync wrote"
         // discipline one field down: refreshed exactly where this sync writes
         // `host`/`port` (the `takesHost`/`takesPort` lines below), and otherwise
@@ -2284,10 +2284,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // its stamp can never disagree about who owns the field. A conditional
       // assignment (not a member of the literal) so the `...ownedServer` spread
       // preserves a hand-flipped protocol on the rows this must not touch.
-      // #84 P2 — composed with `takesEndpoint` (the protocol is part of the same
-      // console tuple): written only when the sync owns the protocol AND the
-      // endpoint was accepted, so a retained hand address keeps its protocol.
-      if (takesProtocol && takesEndpoint) {
+      // #84 P2 / #212 — written only when the sync owns the protocol AND both
+      // halves accepted the preferred endpoint; the fallback endpoint may be
+      // accepted for its current transport without switching the protocol.
+      if (followsPreferred) {
         after.protocol = deviceProtocol;
       }
       // ADDRESSLESS (Codex P1) — the UPGRADE half: an owned server that was
