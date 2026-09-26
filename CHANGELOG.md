@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.286] — 2026-09-26
+
+### Maintenance
+
+- **CI strictly checks test types.** The separate no-emit test type-check now runs in CI. Test fixtures and mocks were corrected to satisfy their contracts; extension behavior is unchanged.
+
 ## [2.8.285] — 2026-09-26
 
 ### Fixed
