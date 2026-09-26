@@ -124,6 +124,29 @@ describe("TunnelRegistrySync", () => {
     await vi.waitFor(async () => expect(await store.getEntries()).toEqual([]));
   });
 
+  it("keeps both reverse-bind fences when concurrent stops read the same registry snapshot", async () => {
+    const first = makeTunnel({ id: "retired-1", profileId: "t1", tunnelType: "reverse", remotePort: 9000 });
+    const second = makeTunnel({ id: "retired-2", profileId: "t2", tunnelType: "reverse", remotePort: 9001 });
+    await sync.registerTunnel(first);
+    await sync.registerTunnel(second);
+
+    const neverSettles = new Promise<void>(() => {});
+    const retire = (tunnel: ActiveTunnel) => sync.unregisterTunnel(tunnel.profileId, {
+      tunnel,
+      retiredReverseBind: {
+        fenceId: tunnel.id,
+        routeIdentity: { kind: "direct", endpoint: { hosts: ["bastion"], port: 22 } },
+        remotePort: tunnel.remotePort,
+        settled: neverSettles
+      }
+    });
+
+    await Promise.all([retire(first), retire(second)]);
+    const entries = await store.getEntries();
+    expect(entries).toHaveLength(2);
+    expect(entries.map((entry) => entry.retiredReverseBind?.fenceId).sort()).toEqual([first.id, second.id]);
+  });
+
   it("does not restore a settled reverse-bind fence from a stale heartbeat snapshot", async () => {
     let releaseFence!: () => void;
     const settled = new Promise<void>((resolve) => { releaseFence = resolve; });
@@ -148,10 +171,9 @@ describe("TunnelRegistrySync", () => {
     const heartbeat = sync.syncNow();
 
     releaseFence();
-    await vi.waitFor(async () => expect(await store.getEntries()).toEqual([]));
     releaseHeartbeatRead(staleSnapshot);
     await heartbeat;
-    expect(await store.getEntries()).toEqual([]);
+    await vi.waitFor(async () => expect(await store.getEntries()).toEqual([]));
     await sync.syncNow();
     expect(await store.getEntries()).toEqual([]);
   });

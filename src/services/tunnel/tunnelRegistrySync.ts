@@ -133,6 +133,7 @@ export class TunnelRegistrySync {
   private lastRemoteJson = "";
   private readonly probePort: ProbePortFn;
   private readonly unsettledReverseBindFenceIds = new Set<string>();
+  private mutationTail: Promise<void> = Promise.resolve();
 
   public constructor(
     private readonly store: TunnelRegistryStore,
@@ -150,38 +151,9 @@ export class TunnelRegistrySync {
   }
 
   public async registerTunnel(tunnel: ActiveTunnel): Promise<void> {
-    const entries = await this.store.getEntries();
-    const entry: TunnelRegistryEntry = {
-      profileId: tunnel.profileId,
-      serverId: tunnel.serverId,
-      localPort: tunnel.localPort,
-      remoteIP: tunnel.remoteIP,
-      remotePort: tunnel.remotePort,
-      connectionMode: tunnel.connectionMode,
-      tunnelType: tunnel.tunnelType,
-      remoteBindAddress: tunnel.remoteBindAddress,
-      localTargetIP: tunnel.localTargetIP,
-      startedAt: tunnel.startedAt,
-      ownerSessionId: this.sessionId,
-      lastSeen: Date.now()
-    };
-    entries.push(entry);
-    await this.saveEntries(entries);
-  }
-
-  public async unregisterTunnel(
-    profileId: string,
-    options?: { tunnel: ActiveTunnel; retiredReverseBind?: RetiredReverseBindFence }
-  ): Promise<void> {
-    const entries = await this.store.getEntries();
-    const filtered = entries.filter(
-      (e) => !(e.ownerSessionId === this.sessionId && e.profileId === profileId)
-    );
-    const fence = options?.retiredReverseBind;
-    if (fence && options?.tunnel) {
-      this.unsettledReverseBindFenceIds.add(fence.fenceId);
-      const tunnel = options.tunnel;
-      filtered.push({
+    await this.mutateEntries(async () => {
+      const entries = await this.store.getEntries();
+      const entry: TunnelRegistryEntry = {
         profileId: tunnel.profileId,
         serverId: tunnel.serverId,
         localPort: tunnel.localPort,
@@ -193,18 +165,51 @@ export class TunnelRegistrySync {
         localTargetIP: tunnel.localTargetIP,
         startedAt: tunnel.startedAt,
         ownerSessionId: this.sessionId,
-        lastSeen: Date.now(),
-        retiredReverseBind: {
-          fenceId: fence.fenceId,
-          routeIdentity: JSON.stringify(fence.routeIdentity),
-          remotePort: fence.remotePort
-        }
-      });
-    }
-    await this.saveEntries(filtered);
+        lastSeen: Date.now()
+      };
+      entries.push(entry);
+      await this.saveEntries(entries);
+    });
+  }
+
+  public async unregisterTunnel(
+    profileId: string,
+    options?: { tunnel: ActiveTunnel; retiredReverseBind?: RetiredReverseBindFence }
+  ): Promise<void> {
+    const fence = options?.retiredReverseBind;
+    await this.mutateEntries(async () => {
+      const entries = await this.store.getEntries();
+      const filtered = entries.filter(
+        (e) => !(e.ownerSessionId === this.sessionId && e.profileId === profileId)
+      );
+      if (fence && options?.tunnel) {
+        this.unsettledReverseBindFenceIds.add(fence.fenceId);
+        const tunnel = options.tunnel;
+        filtered.push({
+          profileId: tunnel.profileId,
+          serverId: tunnel.serverId,
+          localPort: tunnel.localPort,
+          remoteIP: tunnel.remoteIP,
+          remotePort: tunnel.remotePort,
+          connectionMode: tunnel.connectionMode,
+          tunnelType: tunnel.tunnelType,
+          remoteBindAddress: tunnel.remoteBindAddress,
+          localTargetIP: tunnel.localTargetIP,
+          startedAt: tunnel.startedAt,
+          ownerSessionId: this.sessionId,
+          lastSeen: Date.now(),
+          retiredReverseBind: {
+            fenceId: fence.fenceId,
+            routeIdentity: JSON.stringify(fence.routeIdentity),
+            remotePort: fence.remotePort
+          }
+        });
+      }
+      await this.saveEntries(filtered);
+    });
 
     if (fence) {
-      void fence.settled.then(async () => {
+      void fence.settled.then(() => this.mutateEntries(async () => {
         this.unsettledReverseBindFenceIds.delete(fence.fenceId);
         const current = await this.store.getEntries();
         const withoutFence = current.filter(
@@ -214,7 +219,7 @@ export class TunnelRegistrySync {
         if (withoutFence.length !== current.length) {
           await this.saveEntries(withoutFence);
         }
-      });
+      }));
     }
   }
 
@@ -277,13 +282,15 @@ export class TunnelRegistrySync {
   }
 
   public async cleanupOwnEntries(): Promise<void> {
-    const entries = await this.store.getEntries();
-    const filtered = entries.filter((entry) =>
-      entry.ownerSessionId !== this.sessionId ||
-      (entry.retiredReverseBind !== undefined &&
-        this.unsettledReverseBindFenceIds.has(entry.retiredReverseBind.fenceId))
-    );
-    await this.saveEntries(filtered);
+    await this.mutateEntries(async () => {
+      const entries = await this.store.getEntries();
+      const filtered = entries.filter((entry) =>
+        entry.ownerSessionId !== this.sessionId ||
+        (entry.retiredReverseBind !== undefined &&
+          this.unsettledReverseBindFenceIds.has(entry.retiredReverseBind.fenceId))
+      );
+      await this.saveEntries(filtered);
+    });
   }
 
   public dispose(): void {
@@ -298,94 +305,106 @@ export class TunnelRegistrySync {
   }
 
   private async syncFast(): Promise<void> {
-    const entries = await this.store.getEntries();
-    const remote = entries.filter((e) => e.ownerSessionId !== this.sessionId && !e.retiredReverseBind);
-    const remoteJson = JSON.stringify(remote);
-    if (remoteJson !== this.lastRemoteJson) {
-      this.lastRemoteJson = remoteJson;
-      this.core.setRemoteTunnels(remote);
-    }
-
-    // Heartbeat: refresh lastSeen on own entries + self-heal missing entries
-    const now = Date.now();
-    const activeTunnels = this.core.getSnapshot().activeTunnels;
-    const ownEntries = entries.filter((e) => e.ownerSessionId === this.sessionId);
-    let changed = false;
-
-    // Update lastSeen on existing own entries
-    for (const entry of ownEntries) {
-      if (entry.retiredReverseBind || activeTunnels.some((t) => t.profileId === entry.profileId)) {
-        entry.lastSeen = now;
-        changed = true;
-      }
-    }
-
-    // Self-heal: re-register own active tunnels if missing from registry
-    const missingOwn = activeTunnels.filter(
-      (t) => !ownEntries.some((e) => e.profileId === t.profileId)
-    );
-    if (missingOwn.length > 0) {
-      for (const tunnel of missingOwn) {
-        entries.push({
-          profileId: tunnel.profileId,
-          serverId: tunnel.serverId,
-          localPort: tunnel.localPort,
-          remoteIP: tunnel.remoteIP,
-          remotePort: tunnel.remotePort,
-          connectionMode: tunnel.connectionMode,
-          tunnelType: tunnel.tunnelType,
-          remoteBindAddress: tunnel.remoteBindAddress,
-          localTargetIP: tunnel.localTargetIP,
-          startedAt: tunnel.startedAt,
-          ownerSessionId: this.sessionId,
-          lastSeen: now
-        });
-      }
-      changed = true;
-    }
-
-    if (changed) {
-      await this.saveEntries(entries);
-    }
-  }
-
-  private async syncWithProbe(): Promise<void> {
-    const entries = await this.store.getEntries();
-    const remote = entries.filter((e) => e.ownerSessionId !== this.sessionId && !e.retiredReverseBind);
-    const remoteForProbe = entries.filter((e) => e.ownerSessionId !== this.sessionId);
-    const now = Date.now();
-
-    // Probe all remote entries concurrently.
-    // Reverse tunnels have no local listener to probe — use lastSeen heartbeat instead.
-    // Entries without lastSeen (pre-heartbeat) are given a grace period from startedAt.
-    const probeResults = await Promise.all(
-      remoteForProbe.map(async (e) => {
-        if (e.tunnelType === "reverse") {
-          const lastSeen = e.lastSeen ?? e.startedAt;
-          return { entry: e, alive: now - lastSeen < STALE_THRESHOLD_MS };
-        }
-        return { entry: e, alive: await this.probePort(e.localPort) };
-      })
-    );
-    const staleProfileIds = new Set(
-      probeResults.filter((r) => !r.alive).map((r) => `${r.entry.ownerSessionId}:${r.entry.profileId}`)
-    );
-
-    if (staleProfileIds.size > 0) {
-      const cleaned = entries.filter(
-        (e) => !staleProfileIds.has(`${e.ownerSessionId}:${e.profileId}`)
-      );
-      await this.saveEntries(cleaned);
-      const cleanedRemote = cleaned.filter((e) => e.ownerSessionId !== this.sessionId && !e.retiredReverseBind);
-      this.lastRemoteJson = JSON.stringify(cleanedRemote);
-      this.core.setRemoteTunnels(cleanedRemote);
-    } else {
+    await this.mutateEntries(async () => {
+      const entries = await this.store.getEntries();
+      const remote = entries.filter((e) => e.ownerSessionId !== this.sessionId && !e.retiredReverseBind);
       const remoteJson = JSON.stringify(remote);
       if (remoteJson !== this.lastRemoteJson) {
         this.lastRemoteJson = remoteJson;
         this.core.setRemoteTunnels(remote);
       }
-    }
+
+      // Heartbeat: refresh lastSeen on own entries + self-heal missing entries
+      const now = Date.now();
+      const activeTunnels = this.core.getSnapshot().activeTunnels;
+      const ownEntries = entries.filter((e) => e.ownerSessionId === this.sessionId);
+      let changed = false;
+
+      // Update lastSeen on existing own entries
+      for (const entry of ownEntries) {
+        if (entry.retiredReverseBind || activeTunnels.some((t) => t.profileId === entry.profileId)) {
+          entry.lastSeen = now;
+          changed = true;
+        }
+      }
+
+      // Self-heal: re-register own active tunnels if missing from registry
+      const missingOwn = activeTunnels.filter(
+        (t) => !ownEntries.some((e) => e.profileId === t.profileId)
+      );
+      if (missingOwn.length > 0) {
+        for (const tunnel of missingOwn) {
+          entries.push({
+            profileId: tunnel.profileId,
+            serverId: tunnel.serverId,
+            localPort: tunnel.localPort,
+            remoteIP: tunnel.remoteIP,
+            remotePort: tunnel.remotePort,
+            connectionMode: tunnel.connectionMode,
+            tunnelType: tunnel.tunnelType,
+            remoteBindAddress: tunnel.remoteBindAddress,
+            localTargetIP: tunnel.localTargetIP,
+            startedAt: tunnel.startedAt,
+            ownerSessionId: this.sessionId,
+            lastSeen: now
+          });
+        }
+        changed = true;
+      }
+
+      if (changed) {
+        await this.saveEntries(entries);
+      }
+    });
+  }
+
+  private async syncWithProbe(): Promise<void> {
+    await this.mutateEntries(async () => {
+      const entries = await this.store.getEntries();
+      const remote = entries.filter((e) => e.ownerSessionId !== this.sessionId && !e.retiredReverseBind);
+      const remoteForProbe = entries.filter((e) => e.ownerSessionId !== this.sessionId);
+      const now = Date.now();
+
+      // Probe all remote entries concurrently.
+      // Reverse tunnels have no local listener to probe — use lastSeen heartbeat instead.
+      // Entries without lastSeen (pre-heartbeat) are given a grace period from startedAt.
+      const probeResults = await Promise.all(
+        remoteForProbe.map(async (e) => {
+          if (e.tunnelType === "reverse") {
+            const lastSeen = e.lastSeen ?? e.startedAt;
+            return { entry: e, alive: now - lastSeen < STALE_THRESHOLD_MS };
+          }
+          return { entry: e, alive: await this.probePort(e.localPort) };
+        })
+      );
+      const staleProfileIds = new Set(
+        probeResults.filter((r) => !r.alive).map((r) => `${r.entry.ownerSessionId}:${r.entry.profileId}`)
+      );
+
+      if (staleProfileIds.size > 0) {
+        const cleaned = entries.filter(
+          (e) => !staleProfileIds.has(`${e.ownerSessionId}:${e.profileId}`)
+        );
+        await this.saveEntries(cleaned);
+        const cleanedRemote = cleaned.filter((e) => e.ownerSessionId !== this.sessionId && !e.retiredReverseBind);
+        this.lastRemoteJson = JSON.stringify(cleanedRemote);
+        this.core.setRemoteTunnels(cleanedRemote);
+      } else {
+        const remoteJson = JSON.stringify(remote);
+        if (remoteJson !== this.lastRemoteJson) {
+          this.lastRemoteJson = remoteJson;
+          this.core.setRemoteTunnels(remote);
+        }
+      }
+    });
+  }
+
+  private mutateEntries<T>(mutate: () => Promise<T>): Promise<T> {
+    // globalState stores one whole array. Queue this window's read-modify-write
+    // spans so concurrent stops and heartbeat writes cannot erase each other.
+    const result = this.mutationTail.then(mutate);
+    this.mutationTail = result.then(() => undefined, () => undefined);
+    return result;
   }
 
   private async saveEntries(entries: TunnelRegistryEntry[]): Promise<void> {
