@@ -4806,6 +4806,28 @@ export function prunedServerIdsForSecretCleanup(plan: InventorySyncPlan): string
  * describing exactly which field is wrong; syncNow (Chunk B) wraps the
  * message as an InventoryProviderError("protocol", ...).
  */
+/** Copy provider endpoints into the host spelling that sync and its remedies can use. */
+export function normalizeInventoryTreeHosts(tree: InventoryTree): InventoryTree {
+  const warnings: string[] = [];
+  return {
+    ...tree,
+    devices: tree.devices.map((device) => ({
+      ...device,
+      endpoints: device.endpoints.flatMap((endpoint) => {
+        const host = endpoint.host.trim();
+        // A host containing display-only characters could never match the
+        // value shown in a plan warning or typed back into the server form.
+        if (host === "" || /\s/u.test(host) || flattenProviderText(host) !== host) {
+          warnings.push(`Ignored an endpoint for ${flattenProviderText(device.name) || "(unnamed device)"} because its host is empty or contains unsupported characters.`);
+          return [];
+        }
+        return [{ ...endpoint, host }];
+      })
+    })),
+    warnings: [...(tree.warnings ?? []), ...warnings]
+  };
+}
+
 export function validateInventoryTree(tree: unknown): asserts tree is InventoryTree {
   if (typeof tree !== "object" || tree === null) {
     throw new Error("tree is not an object");

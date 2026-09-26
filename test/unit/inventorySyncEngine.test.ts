@@ -3,6 +3,7 @@ import {
   computeSyncPlan,
   planToApplication,
   prunedServerIdsForSecretCleanup,
+  normalizeInventoryTreeHosts,
   validateInventoryTree,
   ORPHAN_FOLDER_NAME,
   type InventorySyncPlan
@@ -4770,6 +4771,50 @@ describe("validateInventoryTree", () => {
       })
     ).not.toThrow();
   });
+});
+
+describe("normalizeInventoryTreeHosts", () => {
+  it("trims a provider endpoint before an add and leaves the fetched tree untouched", () => {
+    const endpoint = Object.freeze({ kind: "ssh", host: " 10.0.0.9 ", port: 22 });
+    const tree = Object.freeze({ contractVersion: 1 as const, devices: [Object.freeze({ externalId: "d1", name: "Device", endpoints: [endpoint] })] });
+    const normalized = normalizeInventoryTreeHosts(tree);
+
+    expect(endpoint.host).toBe(" 10.0.0.9 ");
+    expect(normalized.devices[0].endpoints[0].host).toBe("10.0.0.9");
+    expect(normalized.warnings).toEqual([]);
+    const plan = computeSyncPlan({ source: makeSource(), tree: normalized, currentServers: [], now: 2 });
+    expect(plan.adds[0].host).toBe("10.0.0.9");
+    expect(plan.adds[0].origin?.syncedHost).toBe("10.0.0.9");
+  });
+
+  it("hands a trimmed provider host back to sync when it matches the typed value", () => {
+    const before = makeOwnedServer({
+      host: "10.0.0.9",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1, syncedHost: "10.0.0.1", syncedPort: 22 }
+    });
+    const tree = normalizeInventoryTreeHosts(makeTree([
+      makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.9 ", port: 22 }] })
+    ]));
+    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 2 });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.host).toBe("10.0.0.9");
+    expect(plan.updates[0].after.origin?.syncedHost).toBe("10.0.0.9");
+  });
+
+  it.each(["10.0.0.9\u200b", "10.0.0.\u202e9", "10.0.0.9\x1b", "  "])(
+    "drops an unusable endpoint instead of storing its host (%s)", (host) => {
+      const tree: InventoryTree = { contractVersion: 1, devices: [{ externalId: "d1", name: "Device", endpoints: [{ kind: "ssh", host }] }] };
+      const normalized = normalizeInventoryTreeHosts(tree);
+      expect(normalized.devices[0].endpoints).toEqual([]);
+      expect(normalized.warnings).toEqual([
+        "Ignored an endpoint for Device because its host is empty or contains unsupported characters."
+      ]);
+      const plan = computeSyncPlan({ source: makeSource(), tree: normalized, currentServers: [], now: 2 });
+      expect(plan.adds[0].addressless).toBe(true);
+      expect(plan.adds[0].host).toBe("");
+    }
+  );
 });
 
 describe("planToApplication (F19 — no targetFolder parameter)", () => {

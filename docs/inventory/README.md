@@ -56,7 +56,7 @@ A start or stop spends the source's saved credentials, so if the extension now a
 
 ## Servers with No Address Yet
 
-A sync creates a server for every device it finds, including one it has no address for — a stopped or VNC-only EVE-NG node, a Proxmox guest whose agent isn't answering, a GNS3 node whose console isn't telnet, a NetBox device with no usable IP. Rather than vanishing from the tree (which would read as *deleted at the source* and hand it to the Removed-Device Policy), it arrives as a placeholder: a real row, marked `(no address)`, with its folder, its auth profile and its BMC settings intact. Only the console endpoint is missing.
+A sync creates a server for every device it finds, including one it has no address for — a stopped or VNC-only EVE-NG node, a Proxmox guest whose agent isn't answering, a GNS3 node whose console isn't telnet, a NetBox device with no usable IP. Rather than vanishing from the tree (which would read as *deleted at the source* and hand it to the Removed-Device Policy), it arrives as a placeholder: a real row, marked `(no address)`, with its folder, its auth profile and its BMC settings intact. Only the console endpoint is missing. Provider hosts are trimmed before sync; an empty host or one containing an invisible, control, bidi, or embedded whitespace character is ignored with a warning. If that was the device's only usable endpoint, it arrives as the same addressless placeholder. A host shown in a sync warning is the value sync will compare when you type it into the server form.
 
 Everything that needs that endpoint says so by name instead of failing later:
 
