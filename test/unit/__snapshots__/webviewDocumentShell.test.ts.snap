@@ -7623,9 +7623,6 @@ echo hi</textarea>
         return COOLDOWN_PLACEHOLDER_PREFIX + seconds;
       }
       var textRunsIpmitool = function textRunsIpmitool(text) {
-	// Dynamic command substitutions and heredocs need a real shell parser. A
-	// missed advisory hint is preferable to a false claim about what will run.
-	if (text.includes("$(") || text.includes("\`") || text.includes("<<")) return false;
 	const runsIpmitool = (words) => {
 		let index = 0;
 		const assignment = /^[A-Za-z_][A-Za-z0-9_]*=/;
@@ -7716,6 +7713,7 @@ echo hi</textarea>
 		if (quote === "\\"") {
 			if (char === "\\"") quote = undefined;
 			else if (char === "\\\\" && i + 1 < text.length) word += text[++i];
+			else if (char === "\`" || char === "$" && text[i + 1] === "(") return false;
 			else word += char;
 			continue;
 		};
@@ -7734,6 +7732,9 @@ echo hi</textarea>
 			while (i + 1 < text.length && text[i + 1] !== "\\n" && text[i + 1] !== "\\r") i++;
 			continue;
 		};
+		// Dynamic substitutions and heredocs need a real shell parser. Ignore
+		// these markers in comments and single quotes, where they are inert.
+		if (char === "\`" || char === "$" && text[i + 1] === "(" || char === "<" && text[i + 1] === "<") return false;
 		if (char === "&" && (text[i - 1] === ">" || text[i - 1] === "<")) {
 			word += char;
 			inWord = true;

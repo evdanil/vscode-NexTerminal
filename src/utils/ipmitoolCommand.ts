@@ -4,10 +4,6 @@
  * hint and the host's delivery note use the same rule.
  */
 export function textRunsIpmitool(text: string): boolean {
-  // Dynamic command substitutions and heredocs need a real shell parser. A
-  // missed advisory hint is preferable to a false claim about what will run.
-  if (text.includes("$(") || text.includes("`") || text.includes("<<")) return false;
-
   const runsIpmitool = (words: string[]): boolean => {
     let index = 0;
     const assignment = /^[A-Za-z_][A-Za-z0-9_]*=/;
@@ -85,6 +81,8 @@ export function textRunsIpmitool(text: string): boolean {
     if (quote === '"') {
       if (char === '"') quote = undefined;
       else if (char === "\\" && i + 1 < text.length) word += text[++i];
+      // Substitutions are active inside double quotes, but inert inside single quotes.
+      else if (char === "`" || (char === "$" && text[i + 1] === "(")) return false;
       else word += char;
       continue;
     }
@@ -99,6 +97,9 @@ export function textRunsIpmitool(text: string): boolean {
       while (i + 1 < text.length && text[i + 1] !== "\n" && text[i + 1] !== "\r") i++;
       continue;
     }
+    // Dynamic substitutions and heredocs need a real shell parser. Ignore
+    // these markers in comments and single quotes, where they are inert.
+    if (char === "`" || (char === "$" && text[i + 1] === "(") || (char === "<" && text[i + 1] === "<")) return false;
     if (char === "&" && (text[i - 1] === ">" || text[i - 1] === "<")) {
       word += char;
       inWord = true;

@@ -1271,7 +1271,9 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     ["a sudo command after its user option", "sudo -u root /usr/bin/ipmitool -E\n"],
     ["an env prefix", "env BMC=1 ipmitool -E\n"],
     ["a later command", "echo ready; ipmitool -E\n"],
-    ["a command after a bare carriage return", "echo ready\ripmitool -E\r"]
+    ["a command after a bare carriage return", "echo ready\ripmitool -E\r"],
+    ["a command after a comment with backticks", "# log with `hostname`\nipmitool -E\n"],
+    ["a command after a single quoted substitution", "echo '$(hostname)'; ipmitool -E\n"]
   ])("recognizes ipmitool in command position with %s", (_case, text) => {
     expect(sessionIpmiHintNote({ id: "a", name: "X", text, runIn: "session" })).toBeDefined();
   });

@@ -207,7 +207,9 @@ describe("renderMacroEditorHtml", () => {
     ["sudo -u ipmitool bmc-login", "none"],
     ["echo hello >& ipmitool", "none"],
     ["/usr/bin/ipmitool -E", ""],
-    ["echo ready\ripmitool -E\r", ""]
+    ["echo ready\ripmitool -E\r", ""],
+    ["# log with `hostname`\nipmitool -E\n", ""],
+    ["echo '$(hostname)'; ipmitool -E\n", ""]
   ])("classifies the command position in the live Session hint for %s", (text, expectedDisplay) => {
     const html = render([], null);
     const match = /function updateSessionIpmitoolHint\(\) \{[\s\S]*?\n      \}/.exec(html);
