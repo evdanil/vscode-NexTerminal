@@ -176,20 +176,25 @@ export function resolveMacroRoute(macro: Pick<TerminalMacro, "route">): MacroRou
 /**
  * The non-blocking note shown when `route: "ipmiGateway"` and
  * `provideIpmiCredentials` are BOTH on: env injection cannot cross to a remote
- * shell, so the credentials flag is inert and ipmitool's own `-a` prompt supplies
- * the password on the bastion tty instead. Deliberately not an error — a user may
- * flip `route` back and forth on one macro. Defined here so the macro editor's
- * live hint and the per-run delivery note read from ONE string and cannot drift.
+ * shell, so the credentials flag is inert there. Deliberately not an error — a
+ * user may flip `route` back and forth on one macro. Defined here so the macro
+ * editor's live hint and the per-run delivery note read from ONE string and
+ * cannot drift.
  *
- * POINTS AT `-a`, DOES NOT PROMISE A BARE PROMPT (PR-C round 4, P2). ipmitool only
- * prompts on the gateway when the command uses its `-a` form; a command that reads
- * the password from the environment (`-E`) gets no env on the gateway and simply
- * FAILS there. So this shared copy names the `-a` form rather than promising an
- * unconditional prompt — the run-time `-E`-on-gateway warning
- * (`gatewayEnvPasswordNote`) covers the failing case that this editor hint can't.
+ * STATES ONLY WHAT IS GUARANTEED (#174, #189). The note never names the form this
+ * command uses, and its prompt is conditional. Upstream `lib/ipmi_main.c`: `-a`
+ * prompts while the options are read; `-E` takes a password variable if one is
+ * set, and otherwise logs "Unable to read password from environment" and leaves
+ * the prompt to the end, which is skipped when `-P` or `-f` supplied one — so
+ * `-E -P …` never asks, and `-E` never fails for want of the variable. `-A NONE`
+ * also disables authentication, so a general note must not promise a prompt
+ * unless authentication is enabled. Earlier
+ * copy promised a prompt "via its `-a` form", a run-time warning said `-E` "will
+ * fail", and a later draft promised a prompt outright; each was a guess about
+ * the command.
  */
 export const IPMI_GATEWAY_INERT_CREDENTIALS_HINT =
-  "IPMI credentials can't be sent to a gateway session — ipmitool prompts on the gateway via its `-a` form instead";
+  "Nexus doesn't send IPMI credentials to a gateway session — ipmitool there uses only what the command or the gateway supplies (`-P`, `-f`, or IPMITOOL_PASSWORD/IPMI_PASSWORD set on the gateway); when authentication is enabled and no password is supplied, `-a` or `-E` may prompt in the gateway terminal";
 
 /** Human-readable label for a run target, shared by the editor and the pickers. */
 export function macroRunTargetLabel(target: MacroRunTarget): string {

@@ -286,7 +286,13 @@ describe("renderMacroEditorHtml", () => {
       0
     );
     expect(both).toContain('id="gateway-inert-credentials-hint"');
-    expect(both).toContain("ipmitool prompts on the gateway via its `-a` form instead");
+    expect(both).toContain(
+      "when authentication is enabled and no password is supplied, `-a` or `-E` may prompt in the gateway terminal"
+    );
+    // #189 — no `-a`-only promise; Codex on #191 — no unconditional prompt either.
+    expect(both).not.toContain("via its `-a` form");
+    expect(both).not.toContain("makes it ask in the gateway terminal");
+    expect(both).not.toContain("asks for the password in the gateway terminal");
     // Rendered visible (no display:none) when both are on.
     expect(both).not.toContain('id="gateway-inert-credentials-hint" style="display:none;"');
     // Gateway route but credentials OFF → hint hidden.

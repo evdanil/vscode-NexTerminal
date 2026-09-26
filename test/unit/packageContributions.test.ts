@@ -598,6 +598,39 @@ describe("package contributions", () => {
     expect(functionalDocs).toContain("nexus.macro.openDocs");
   });
 
+  it("qualifies gateway prompt copy with auth state and keeps the template-specific `-a` explanation", () => {
+    const promptCopy = [
+      ["docs/macros.md", userDoc("docs/macros.md")],
+      ["docs/functional-documentation.md", functionalDocs],
+      ["CHANGELOG.md", readDoc("CHANGELOG.md")]
+    ] as const;
+    for (const [source, text] of promptCopy) {
+      expect(text, source).not.toMatch(/with none of\s+those,?\s+`-a` or `-E` makes it ask/i);
+      expect(text, source).not.toContain("then asks for the password, just as with `-a`");
+      expect(text, source).toMatch(/authentication is\s+enabled/i);
+    }
+
+    const runNoteRationale = readDoc("src/commands/serverMacroCommands.ts");
+    const normalizedRunNoteRationale = runNoteRationale
+      .replace(/^\s*\/\/\s?/gm, "")
+      .replace(/\s+/g, " ");
+    expect(runNoteRationale).not.toContain("then prompting, as `-a` does (#189)");
+    expect(normalizedRunNoteRationale).not.toMatch(/gateway-routed macro never prompts for a password/);
+    expect(normalizedRunNoteRationale).not.toMatch(/ipmitool prompts on the bastion/);
+    expect(runNoteRationale).toMatch(/authentication is\s+enabled/i);
+    // This sentence describes the built-in jump-host template's actual `-a`
+    // command, not a guarantee about all possible authentication modes.
+    expect(functionalDocs).toContain("ipmitool prompts for the password on the gateway");
+  });
+
+  it("does not claim the checkbox is always inert when a macro selects the gateway route", () => {
+    const macroGuide = userDoc("docs/macros.md");
+    const normalizedMacroGuide = macroGuide.replace(/\s+/g, " ");
+    expect(normalizedMacroGuide).not.toMatch(
+      /On a macro whose \*\*Run on\*\* is \*The server's IPMI gateway\*, the checkbox does nothing/
+    );
+  });
+
   it("orders Macros welcome links by guided setup path", () => {
     const entry = packageJson.contributes.viewsWelcome?.find((item) => item.view === "nexusMacros");
     expect(entry).toBeDefined();

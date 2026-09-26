@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.273] — 2026-09-25
+
+### Fixed
+
+- **IPMI macro credential guidance is conservative.** A local-terminal send confirmation suggests **Provide IPMI credentials** only for one simple bare `ipmitool` command with `-E` and a whole IPMI profile token. It does not infer behavior from wrappers, scripts, quoting, shell operators, substitutions, attached or clustered option words, `--` option termination, multiple lines, or an `-E` directly following another single-letter option, where `-E` may be that option's operand. It gives no suggestion when `-a`, `-P`, `-f`, or `-A NONE` changes the password source or disables authentication. The gateway note remains command-independent: it appears only when a gateway route reaches a configured gateway session with the checkbox on and says Nexus does not send the stored password to that session. With no IPMI Gateway configured, the route falls back to a local terminal where the checked box can supply the environment. When authentication is enabled and no password is otherwise available, `ipmitool` may prompt on the gateway.
+
 ## [2.8.272] — 2026-09-25
 
 ### Fixed
