@@ -519,10 +519,12 @@ intend. To upgrade one: open the macro, set **Run in** → *Local terminal*, rep
 credentials**. The macro editor shows a hint the moment it sees an ipmitool
 command still set to *Session terminal*, and the send confirmation says the same.
 That hint looks for `ipmitool` in command position, including an executable path
-such as `/usr/bin/ipmitool`, a redirection attached to its name, and documented
-`sudo`, `env`, and `nice` prefixes. A quoted mention, a comment, a `sudo -u`
-username, or a redirection target (including after Bash's `>|` operator) does
-not count. After an `env` assignment, later option-looking words are treated
+such as `/usr/bin/ipmitool`, a redirection attached to its name, and supported
+`sudo`, `env`, and `nice` prefixes (for example `sudo -P`, `env --chdir=/tmp`,
+`env --debug`, `nice -n5`, `nice --adjustment=5`, and `nice --`). A quoted
+mention, a comment, a `sudo -u` username, or a redirection target (including
+after Bash's `>|` operator) does not count. After an `env` assignment, later
+option-looking words are treated
 as the attempted command, not as options. Nested shell commands that cannot be
 placed reliably get no hint.
 The alternative is to delete the macro and re-insert the shipped template, which

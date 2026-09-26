@@ -1280,6 +1280,7 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     ['a clobber-redirection target after an empty quoted word', 'echo "">|ipmitool\n'],
     ['an env option after an assignment', 'env FOO=1 -u BAR ipmitool -E\n'],
     ['an env debug option after an assignment', 'env FOO=1 --debug ipmitool -E\n'],
+    ['a nice option after the terminator', 'nice -- -n5 ipmitool -E\n'],
     ['a quoted leading redirection', '">/tmp/log" ipmitool -E\n']
   ])("does not treat %s as an ipmitool command", (_case, text) => {
     expect(sessionIpmiHintNote({ id: "a", name: "X", text, runIn: "session" })).toBeUndefined();
@@ -1327,6 +1328,8 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     ["a long env debug option", "env --debug ipmitool -E\n"],
     ["an attached nice adjustment", "nice -n5 ipmitool -E\n"],
     ["a long nice adjustment", "nice --adjustment=5 ipmitool -E\n"],
+    ["a nice option terminator", "nice -- ipmitool -E\n"],
+    ["a nice adjustment before the option terminator", "nice -n5 -- ipmitool -E\n"],
     ["a later command", "echo ready; ipmitool -E\n"],
     ["a command after a bare carriage return", "echo ready\ripmitool -E\r"],
     ["a command after a comment with backticks", "# log with `hostname`\nipmitool -E\n"],

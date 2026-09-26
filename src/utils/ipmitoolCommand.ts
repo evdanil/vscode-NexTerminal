@@ -122,6 +122,7 @@ export function textRunsIpmitool(text: string): boolean {
         } else if (/^(?:-n[+-]?\d+|--adjustment=[+-]?\d+)$/.test(words[index] ?? "")) {
           index++;
         }
+        if (words[index] === "--") index++;
         continue;
       }
       return !word.includes("$") && !word.includes("\\") && name === "ipmitool";
