@@ -16,7 +16,13 @@ import {
   type TunnelProfile,
   type TunnelRegistryEntry
 } from "../models/config";
-import { inventorySourceValuesEqual, sourceConfigUnchanged, type InventorySourceConfig, type InventoryStatusReport } from "../models/inventory";
+import {
+  inventorySourceValuesEqual,
+  normalizeInventoryEndpointHost,
+  sourceConfigUnchanged,
+  type InventorySourceConfig,
+  type InventoryStatusReport
+} from "../models/inventory";
 // PRIMARY HOST/PORT (task #29) — the telnet port-heal reuses the sync engine's
 // OWN ownership predicates rather than a local copy, so the "only heal what the
 // sync owns" rule can never drift from the sync's own write rule. This is a
@@ -2586,10 +2592,11 @@ export class NexusCore {
       // Each half heals only when the reported value DIFFERS from the persisted
       // one AND the sync owns it — a hand-edited host/port fails `syncOwns*` and
       // is left exactly as the user set it.
+      const normalizedReportedHost = reportedHost === undefined ? undefined : normalizeInventoryEndpointHost(reportedHost);
       const healHost =
-        reportedHost !== undefined &&
-        reportedHost !== server.host &&
-        syncOwnsHost(server.host, server.origin.syncedHost, reportedHost);
+        normalizedReportedHost !== undefined &&
+        normalizedReportedHost !== server.host &&
+        syncOwnsHost(server.host, server.origin.syncedHost, normalizedReportedHost);
       const healPort =
         reportedPort !== undefined &&
         reportedPort !== server.port &&
@@ -2598,9 +2605,9 @@ export class NexusCore {
         continue;
       }
       const next = cloneServerConfig(server);
-      if (healHost && reportedHost !== undefined && next.origin !== undefined) {
-        next.host = reportedHost;
-        next.origin.syncedHost = reportedHost;
+      if (healHost && normalizedReportedHost !== undefined && next.origin !== undefined) {
+        next.host = normalizedReportedHost;
+        next.origin.syncedHost = normalizedReportedHost;
       }
       if (healPort && reportedPort !== undefined && next.origin !== undefined) {
         next.port = reportedPort;

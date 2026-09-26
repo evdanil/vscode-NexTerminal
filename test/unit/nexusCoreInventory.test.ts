@@ -5296,17 +5296,35 @@ describe("NexusCore.healSyncedConsolePorts (task #29 / D8)", () => {
       statuses: { "lab.unl#1": { state: "running", consolePort: 70000 } }
     });
     expect(core.getServer(s.id)?.port).toBe(32769);
-    // An empty console host would blank host — the whole entry is refused (the
-    // resulting record fails validateServerConfig), so its port is not healed either.
+    // An empty console host supplied directly is rejected before the write and
+    // cannot blank the existing host.
     await core.healSyncedConsolePorts("source-1", {
       contractVersion: 1,
-      statuses: { "lab.unl#1": { state: "running", consoleHost: "", consolePort: 40000 } }
+      statuses: { "lab.unl#1": { state: "running", consoleHost: "" } }
     });
     const after = core.getServer(s.id);
     expect(after?.host).toBe("10.0.0.9");
     expect(after?.port).toBe(32769);
     // Nothing was ever persisted, so no change fired across all three refusals.
     expect(listener).not.toHaveBeenCalled();
+  });
+
+  it("does not heal an invisible host from a direct status report but still heals its valid port half", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const s = telnetServer("source-1", "lab.unl#1", { port: 32769 });
+    await core.addServersBatch([s]);
+
+    await core.healSyncedConsolePorts("source-1", {
+      contractVersion: 1,
+      statuses: { "lab.unl#1": { state: "running", consoleHost: "10.0.0.10\u200b", consolePort: 40000 } }
+    });
+
+    const after = core.getServer(s.id);
+    expect(after?.host).toBe("10.0.0.9");
+    expect(after?.origin?.syncedHost).toBe("10.0.0.9");
+    expect(after?.port).toBe(40000);
+    expect(after?.origin?.syncedPort).toBe(40000);
   });
 
   it("does not heal when the reported port EQUALS the persisted one (⊘ an unconditional write churns a persist + emit every refresh on every unchanged node)", async () => {

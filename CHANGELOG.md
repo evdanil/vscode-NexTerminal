@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- **Inventory sync skips endpoint hosts containing invisible code points.** Host validation rejects Default_Ignorable_Code_Point characters while preserving valid emoji sequences and combining marks in other provider text.
+- **Inventory sync and status refresh skip unsafe endpoint hosts.** The same host boundary rejects invisible, control and whitespace characters in synced endpoints and live console status before healing persisted addresses, while provider prose keeps valid emoji sequences and combining marks.
 
 ## [2.8.291] — 2026-09-26
 

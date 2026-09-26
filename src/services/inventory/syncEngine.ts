@@ -1,7 +1,12 @@
 import type { AuthProfile, DetachedServerOrigin, ServerConfig, ServerOrigin, ServerProtocol } from "../../models/config";
 import { authProfileNeedsServerKeyPath, proxyConfigsEqual, serverOriginStampsEqual, templatedHasAnyStamp } from "../../models/config";
 import type { InventoryDevice, InventoryEndpoint, InventorySourceConfig, InventoryTree } from "../../models/inventory";
-import { flattenProviderText, normalizeNotSyncableReasons, sanitizeProviderNotice } from "../../models/inventory";
+import {
+  flattenProviderText,
+  normalizeInventoryEndpointHost,
+  normalizeNotSyncableReasons,
+  sanitizeProviderNotice
+} from "../../models/inventory";
 import type { DeviceTemplateProfile } from "../../models/deviceTemplate";
 import type { InventorySyncApplication } from "../../core/nexusCore";
 import { normalizeFolderPath } from "../../utils/folderPaths";
@@ -4799,12 +4804,6 @@ export function prunedServerIdsForSecretCleanup(plan: InventorySyncPlan): string
   return plan.prunes.filter((p) => p.policy === "delete").map((p) => p.server.id);
 }
 
-// Hosts have a stricter text contract than provider prose: default-ignorable
-// code points can make distinct endpoints render or resolve as the same name.
-// Keep this host-only so flattenProviderText can preserve grapheme sequences
-// when it sanitizes human-readable provider text.
-const INVISIBLE_HOST_CHAR_RE = /\p{Default_Ignorable_Code_Point}/u;
-
 /** Copy provider endpoints into the host spelling that sync and its remedies can use. */
 export function normalizeInventoryTreeHosts(tree: InventoryTree): InventoryTree {
   const warnings: string[] = [];
@@ -4813,15 +4812,8 @@ export function normalizeInventoryTreeHosts(tree: InventoryTree): InventoryTree 
     devices: tree.devices.map((device) => ({
       ...device,
       endpoints: device.endpoints.flatMap((endpoint) => {
-        const host = endpoint.host.trim();
-        // A host containing display-only characters could never match the
-        // value shown in a plan warning or typed back into the server form.
-        if (
-          host === "" ||
-          /\s/u.test(host) ||
-          INVISIBLE_HOST_CHAR_RE.test(host) ||
-          flattenProviderText(host) !== host
-        ) {
+        const host = normalizeInventoryEndpointHost(endpoint.host);
+        if (host === undefined) {
           warnings.push(`Ignored an endpoint for ${flattenProviderText(device.name) || "(unnamed device)"} because its host is empty or contains unsupported characters.`);
           return [];
         }

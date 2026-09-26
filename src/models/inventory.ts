@@ -655,6 +655,26 @@ export function resolveProviderInstanceKey(
  * update, since the tree would then show some nodes stale and some fresh with no
  * way to tell which.
  */
+const INVENTORY_HOST_INVISIBLE_CHAR_RE = /\p{Default_Ignorable_Code_Point}/u;
+
+/**
+ * Normalize an inventory endpoint host and reject values that cannot be safely
+ * matched as an address. Provider status reports and tree endpoints use this
+ * same boundary before their values can reach a persisted server.
+ */
+export function normalizeInventoryEndpointHost(raw: string): string | undefined {
+  const host = raw.trim();
+  if (
+    host === "" ||
+    /\s/u.test(host) ||
+    INVENTORY_HOST_INVISIBLE_CHAR_RE.test(host) ||
+    flattenProviderText(host) !== host
+  ) {
+    return undefined;
+  }
+  return host;
+}
+
 export function validateInventoryStatusReport(raw: unknown): InventoryStatusReport | undefined {
   if (typeof raw !== "object" || raw === null) {
     return undefined;
@@ -715,8 +735,11 @@ export function validateInventoryStatusReport(raw: unknown): InventoryStatusRepo
     // whole entry or report, which would blank an entire source's decorations
     // over one node's quirky console value. A non-empty string host and an
     // `isValidPort` port are the exact bounds `validateServerConfig` enforces.
-    if (Object.prototype.hasOwnProperty.call(v, "consoleHost") && typeof v.consoleHost === "string" && v.consoleHost.length > 0) {
-      status.consoleHost = v.consoleHost;
+    if (Object.prototype.hasOwnProperty.call(v, "consoleHost") && typeof v.consoleHost === "string") {
+      const host = normalizeInventoryEndpointHost(v.consoleHost);
+      if (host !== undefined) {
+        status.consoleHost = host;
+      }
     }
     if (
       Object.prototype.hasOwnProperty.call(v, "consolePort") &&
