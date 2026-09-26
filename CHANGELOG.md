@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.282] — 2026-09-26
+
+### Fixed
+
+- **Inventory endpoint hosts are normalized before sync.** Provider hosts are trimmed so displayed addresses match ownership checks. Empty hosts or hosts with invisible, control, bidi or embedded whitespace characters are ignored with a warning; affected devices can remain as addressless placeholders instead of storing unusable connection targets.
+
 ## [2.8.281] — 2026-09-26
 
 ### Fixed
