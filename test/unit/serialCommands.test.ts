@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowWarningMessage = vi.fn();
+const mockPickScriptFromWorkspace = vi.fn();
 
 vi.mock("vscode", () => ({
   commands: {
@@ -69,6 +70,10 @@ vi.mock("../../src/services/serial/smartSerialPty", () => ({
 
 vi.mock("../../src/logging/sessionTranscriptLogger", () => ({
   createSessionTranscript: vi.fn(() => undefined)
+}));
+
+vi.mock("../../src/services/scripts/scriptPicker", () => ({
+  pickScriptFromWorkspace: (...args: unknown[]) => mockPickScriptFromWorkspace(...args)
 }));
 
 const mockWebviewFormPanelOpen = vi.fn();
@@ -541,6 +546,57 @@ describe("pending standard serial starts", () => {
 
     const callbacks = vi.mocked(SerialPty).mock.calls.at(-1)?.[2] as { isProfileCurrent?: () => boolean };
     expect(callbacks.isProfileCurrent?.()).toBe(true);
+  });
+
+  it("clears a pending Connect and Run Script watcher when a late open is rejected", async () => {
+    const original = makeSerialProfile();
+    let current: SerialProfile | undefined = original;
+    const unsubscribe = vi.fn();
+    const ctx = {
+      core: {
+        getSerialProfile: vi.fn(() => current),
+        getSnapshot: vi.fn(() => ({ activeSerialSessions: [] })),
+        onDidChange: vi.fn(() => unsubscribe),
+        registerSerialSession: vi.fn()
+      },
+      serialSidecar: {},
+      loggerFactory: { create: vi.fn() },
+      macroAutoTrigger: { createObserver: vi.fn(() => ({})), bindObserverToSession: vi.fn() },
+      sessionLogDir: "",
+      globalStoragePath: "/gs",
+      scriptRuntimeManager: { runScript: vi.fn() },
+      serialTerminals: new Map(),
+      activityIndicators: new Map(),
+      highlighter: {}
+    } as unknown as CommandContext;
+    mockPickScriptFromWorkspace.mockResolvedValueOnce({ fsPath: "/ws/script.js" });
+    registerSerialCommands(ctx);
+
+    vi.useFakeTimers();
+    try {
+      await registeredCommands.get("nexus.serial.runWithScript")!("sp1");
+      expect(vi.getTimerCount()).toBe(1);
+      current = { ...original, path: "COM4" };
+      mockShowWarningMessage.mockResolvedValueOnce("Retry");
+      const callbacks = vi.mocked(SerialPty).mock.calls.at(-1)?.[2] as {
+        isProfileCurrent?: () => boolean;
+        onStartRejected?: () => void;
+      };
+      expect(callbacks.isProfileCurrent?.()).toBe(false);
+      callbacks.onStartRejected?.();
+
+      expect(unsubscribe).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(90_000);
+      expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
+        expect.stringContaining("script did not start")
+      );
+      expect(ctx.scriptRuntimeManager?.runScript).not.toHaveBeenCalled();
+      await Promise.resolve();
+      expect(vscode.commands.executeCommand).toHaveBeenCalledWith("nexus.serial.runWithScript", "sp1");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

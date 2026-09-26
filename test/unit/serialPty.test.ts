@@ -98,9 +98,11 @@ describe("SerialPty", () => {
   });
 
   it("closes a port that finishes opening after its profile was removed, without registering a session", async () => {
-    const { transport, closePort, dataListenerCount } = createTransport();
+    const { transport, dataListenerCount } = createTransport();
     let resolveOpen!: (sessionId: string) => void;
+    let resolveClose!: () => void;
     transport.openPort = vi.fn(() => new Promise<string>((resolve) => { resolveOpen = resolve; }));
+    transport.closePort = vi.fn(() => new Promise<void>((resolve) => { resolveClose = resolve; }));
     let profileCurrent = true;
     const callbacks = {
       isProfileCurrent: () => profileCurrent,
@@ -119,12 +121,15 @@ describe("SerialPty", () => {
     resolveOpen("late-session");
     await flushAsync();
 
-    expect(closePort).toHaveBeenCalledExactlyOnceWith("late-session");
+    expect(transport.closePort).toHaveBeenCalledExactlyOnceWith("late-session");
     expect(callbacks.onSessionOpened).not.toHaveBeenCalled();
     expect(callbacks.onSessionClosed).not.toHaveBeenCalled();
+    // The script-start watchdog must be cleared even if sidecar close is slow.
     expect(callbacks.onStartRejected).toHaveBeenCalledTimes(1);
     expect(onDidClose).toHaveBeenCalledTimes(1);
     expect(dataListenerCount()).toBe(0);
+    resolveClose();
+    await flushAsync();
   });
 
   it("enters disconnected state on sidecar disconnect notification", async () => {

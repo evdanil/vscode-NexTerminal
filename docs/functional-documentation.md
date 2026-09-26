@@ -206,6 +206,7 @@ A tunnel is announced as started and registered cross-window only after startup 
 7. Smart Follow mode tries the saved preferred port first, silently reconnects only when a free replacement matches the saved device metadata, prompts before switching to unfamiliar free replacement ports, updates the saved preferred port after a successful move, and keeps the terminal open while waiting or stopped if the device disappears or serial runtime errors occur.
 8. Smart Follow sessions coexist with standard serial sessions as long as they target different ports. Connect on a profile that already has a session focuses that session's terminal instead of opening a second one. Starting any new serial session is blocked only when the target port is already held by another Nexus serial session; the warning toast names the existing session.
    A Standard serial port that finishes opening after its profile is removed or changed is closed before a session is registered. A notice offers **Retry** when the profile still exists.
+   A cancelled **Connect and Run Script** start also clears its pending script wait; **Retry** starts that command again for the current profile.
 9. Use `Nexus: Disconnect Serial Session` from profile/session context menu or command.
 10. `Nexus: List Serial Ports` reports detected ports and manufacturers for diagnostics.
 

@@ -385,7 +385,11 @@ export function formValuesToSerial(values: FormValues, existing?: Partial<Serial
   };
 }
 
-async function connectStandardSerialProfile(ctx: CommandContext, profile: SerialProfile): Promise<boolean> {
+async function connectStandardSerialProfile(
+  ctx: CommandContext,
+  profile: SerialProfile,
+  options: { onStartRejected?: () => void; retryCommand?: string } = {}
+): Promise<boolean> {
   if (!enforceSerialConnectPreconditions(ctx, profile)) {
     return false;
   }
@@ -416,6 +420,7 @@ async function connectStandardSerialProfile(ctx: CommandContext, profile: Serial
         return current !== undefined && JSON.stringify(current) === profileAtStart;
       },
       onStartRejected: () => {
+        options.onStartRejected?.();
         const current = ctx.core.getSerialProfile(profile.id);
         if (!current) {
           void vscode.window.showWarningMessage(
@@ -427,7 +432,9 @@ async function connectStandardSerialProfile(ctx: CommandContext, profile: Serial
           `Serial profile "${profileNameAtStart}" changed while its port opened. The connection was cancelled. Retry with the current settings.`,
           "Retry"
         )).then((choice) => {
-          if (choice === "Retry") void vscode.commands.executeCommand("nexus.serial.connect", profile.id);
+          if (choice === "Retry") {
+            void vscode.commands.executeCommand(options.retryCommand ?? "nexus.serial.connect", profile.id);
+          }
         });
       },
       onSessionOpened: (sessionId) => {
@@ -887,21 +894,24 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
           `Connected to ${profile.name} but the script did not start within ${timeoutMs / 1000}s.`
         );
       }, timeoutMs);
+      const cancelPendingStart = (): void => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timer);
+        unsubscribe();
+      };
 
       try {
         const started =
           resolveSerialProfileMode(profile) === "smartFollow"
             ? await connectSmartSerialProfile(ctx, profile)
-            : await connectStandardSerialProfile(ctx, profile);
-        if (!started && !resolved) {
-          resolved = true;
-          clearTimeout(timer);
-          unsubscribe();
-        }
+            : await connectStandardSerialProfile(ctx, profile, {
+                onStartRejected: cancelPendingStart,
+                retryCommand: "nexus.serial.runWithScript"
+              });
+        if (!started) cancelPendingStart();
       } catch (err) {
-        resolved = true;
-        clearTimeout(timer);
-        unsubscribe();
+        cancelPendingStart();
         const message = err instanceof Error ? err.message : String(err);
         void vscode.window.showErrorMessage(`Failed to open serial terminal: ${message}`);
       }

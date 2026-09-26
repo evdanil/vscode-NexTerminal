@@ -249,11 +249,9 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
         // Bulk profile removal cannot see a port until onSessionOpened registers
         // it. Close the port here, before that callback can revive the session.
         this.dispose();
-        try {
-          await this.transport.closePort(sessionId);
-        } finally {
-          this.callbacks.onStartRejected?.();
-        }
+        // Cancel dependent commands before waiting for a potentially slow close.
+        this.callbacks.onStartRejected?.();
+        await this.transport.closePort(sessionId);
         return;
       }
       this.sidecarSessionId = sessionId;

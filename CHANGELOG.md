@@ -15,7 +15,7 @@
 
 ### Fixed
 
-- **Pending serial and Local Shell starts respect profile changes.** A serial port that opens after its profile is removed or edited is closed before becoming a session. A Local Shell waiting at an auto-trigger confirmation is cancelled when its profile changes. Both paths explain the cancellation and offer a retry when the profile still exists.
+- **Pending serial and Local Shell starts respect profile changes.** A serial port that opens after its profile is removed or edited is closed before becoming a session. A Local Shell waiting at an auto-trigger confirmation is cancelled when its profile changes. Both paths explain the cancellation and offer a retry when the profile still exists; a cancelled serial script launch ends its pending wait promptly.
 
 ## [2.8.286] — 2026-09-26
 
