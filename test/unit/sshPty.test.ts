@@ -4,6 +4,8 @@ import type { ServerConfig } from "../../src/models/config";
 import { SshPty } from "../../src/services/ssh/sshPty";
 import { CLEAR_VISIBLE_SCREEN } from "../../src/services/terminal/terminalEscapes";
 
+const RESET_MOUSE_TRACKING = "\x1b[?9;1000;1002;1003;1006;1016l";
+
 const { mockShowErrorMessage } = vi.hoisted(() => ({
   mockShowErrorMessage: vi.fn()
 }));
@@ -587,7 +589,8 @@ describe("SshPty", () => {
     expect(highlighter.createStream).toHaveBeenCalledTimes(1);
     expect(highlighterStream.flush).toHaveBeenCalledTimes(1);
     expect(writes[0]).toBe("[hl]ERR");
-    expect(writes.slice(1).join("")).toContain("Connection lost");
+    expect(writes[1]).toBe(RESET_MOUSE_TRACKING);
+    expect(writes.slice(2).join("")).toContain("Connection lost");
 
     pty.dispose();
   });
@@ -739,7 +742,9 @@ describe("SshPty", () => {
       log: vi.fn(),
       close: vi.fn()
     };
+    const writes: string[] = [];
     const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+    pty.onDidWrite((text) => writes.push(text));
 
     pty.open();
     await flushAsync();
@@ -747,6 +752,7 @@ describe("SshPty", () => {
     first.emitClose();
     await flushAsync();
     expect(callbacks.onDisconnected).toHaveBeenCalledTimes(1);
+    expect(writes.filter((text) => text === RESET_MOUSE_TRACKING)).toHaveLength(1);
 
     pty.handleInput("R");
     await Promise.resolve();
@@ -761,6 +767,150 @@ describe("SshPty", () => {
     pty.handleInput("echo");
     expect(writeSpy).toHaveBeenCalled();
     expect(callbacks.onDisconnected).toHaveBeenCalledTimes(1);
+
+    // A late old-generation close after the new shell has opened must not tear
+    // that session down or emit another terminal-mode cleanup sequence.
+    first.emitClose();
+    expect(callbacks.onDisconnected).toHaveBeenCalledTimes(1);
+    expect(writes.filter((text) => text === RESET_MOUSE_TRACKING)).toHaveLength(1);
+
+    pty.dispose();
+  });
+
+  it.each(["connection close", "stream end", "stream close", "stream error"])(
+    "resets mouse tracking after %s without clearing the screen or writing to the transport",
+    async (cause) => {
+      const stream = new PassThrough();
+      const { connection, emitClose } = createConnection(stream);
+      const sshFactory = { connect: vi.fn(async () => connection) };
+      const callbacks = {
+        onSessionOpened: vi.fn(),
+        onSessionClosed: vi.fn(),
+        onDisconnected: vi.fn()
+      };
+      const logger = { log: vi.fn(), close: vi.fn() };
+      const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+      const writes: string[] = [];
+      pty.onDidWrite((text) => writes.push(text));
+
+      pty.open();
+      await flushAsync();
+      expect(writes.join("")).not.toContain(RESET_MOUSE_TRACKING);
+      const transportWrite = vi.spyOn(stream, "write");
+
+      switch (cause) {
+        case "connection close":
+          emitClose();
+          break;
+        case "stream end":
+          stream.emit("end");
+          break;
+        case "stream close":
+          stream.emit("close");
+          break;
+        case "stream error":
+          stream.emit("error", new Error("connection reset"));
+          break;
+      }
+      await flushAsync();
+
+      const output = writes.join("");
+      expect(writes.filter((text) => text === RESET_MOUSE_TRACKING)).toHaveLength(1);
+      expect(output).not.toContain("\x1bc");
+      expect(output).not.toContain("\x1b[!p");
+      expect(output).not.toContain("\x1b[2J");
+      expect(output).not.toContain("\x1b[3J");
+      expect(transportWrite).not.toHaveBeenCalled();
+      const resetIndex = writes.indexOf(RESET_MOUSE_TRACKING);
+      const bannerIndex = writes.findIndex((text) =>
+        text.includes("Remote host closed the session") || text.includes("Connection lost")
+      );
+      expect(bannerIndex).toBeGreaterThan(resetIndex);
+
+      pty.dispose();
+    }
+  );
+
+  it("ignores old stream data while disconnected, reconnecting, and after reconnect", async () => {
+    const stream1 = new PassThrough();
+    const first = createConnection(stream1);
+    const stream2 = new PassThrough();
+    const pendingShell = deferred<PassThrough>();
+    const second = createConnection(stream2);
+    second.connection.openShell = vi.fn(() => pendingShell.promise);
+    const sshFactory = {
+      connect: vi
+        .fn()
+        .mockResolvedValueOnce(first.connection)
+        .mockResolvedValueOnce(second.connection)
+    };
+    const callbacks = {
+      onSessionOpened: vi.fn(),
+      onSessionClosed: vi.fn(),
+      onDisconnected: vi.fn(),
+      onDataReceived: vi.fn()
+    };
+    const logger = { log: vi.fn(), logOutput: vi.fn(), close: vi.fn() };
+    const transcript = { write: vi.fn(), flush: vi.fn(), close: vi.fn() };
+    const writes: string[] = [];
+    const observed: string[] = [];
+    let emitHighlighted: (text: string) => void = () => {};
+    const highlighterStream = {
+      push: vi.fn((text: string) => emitHighlighted(`[highlighted]${text}`)),
+      flush: vi.fn(),
+      dispose: vi.fn()
+    };
+    const highlighter = {
+      createStream: vi.fn((emit: (text: string) => void) => {
+        emitHighlighted = emit;
+        return highlighterStream;
+      })
+    };
+    const pty = new SshPty(
+      makeServer(),
+      sshFactory as any,
+      callbacks,
+      logger as any,
+      transcript as any,
+      highlighter as any
+    );
+    pty.onDidWrite((text) => writes.push(text));
+    pty.addOutputObserver({
+      onOutput: (text: string) => observed.push(text),
+      pauseIntervalMacros: vi.fn(),
+      dispose: vi.fn()
+    } as any);
+
+    pty.open();
+    await flushAsync();
+
+    first.emitClose();
+    await flushAsync();
+    writes.length = 0;
+    highlighterStream.push.mockClear();
+
+    stream1.emit("data", Buffer.from("old while disconnected"));
+    expect(transcript.write).not.toHaveBeenCalled();
+
+    pty.handleInput("R");
+    await flushAsync();
+    stream1.emit("data", Buffer.from("old while reconnecting"));
+    expect(transcript.write).not.toHaveBeenCalled();
+
+    pendingShell.resolve(stream2);
+    await flushAsync();
+    stream1.emit("data", Buffer.from("old after reconnect"));
+    stream2.emit("data", Buffer.from("new session output"));
+
+    expect(transcript.write.mock.calls.map(([text]) => text)).toEqual(["new session output"]);
+    expect(observed).toEqual(["new session output"]);
+    expect(highlighterStream.push.mock.calls.map(([text]) => text)).toEqual(["new session output"]);
+    expect(callbacks.onDataReceived).toHaveBeenCalledTimes(1);
+    expect(logger.logOutput.mock.calls.map(([text]) => text)).toEqual([
+      'stdout "new session output"'
+    ]);
+    expect(writes.join("")).toContain("[highlighted]new session output");
+    expect(writes.join("")).not.toMatch(/old while disconnected|old while reconnecting|old after reconnect/);
 
     pty.dispose();
   });
