@@ -206,7 +206,10 @@ describe("renderMacroEditorHtml", () => {
     ["echo \"use ipmitool -E\"", "none"],
     ["sudo -u ipmitool bmc-login", "none"],
     ["echo hello >& ipmitool", "none"],
+    ['"ipmi\\tool" -E', "none"],
+    ['"FOO=bar" ipmitool -E', "none"],
     ["/usr/bin/ipmitool -E", ""],
+    ['FOO="bar" ipmitool -E', ""],
     ["echo ready\ripmitool -E\r", ""],
     ["# log with `hostname`\nipmitool -E\n", ""],
     ["echo '$(hostname)'; ipmitool -E\n", ""]

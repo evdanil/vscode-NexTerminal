@@ -4,13 +4,13 @@
  * hint and the host's delivery note use the same rule.
  */
 export function textRunsIpmitool(text: string): boolean {
-  const runsIpmitool = (words: string[]): boolean => {
+  const runsIpmitool = (words: string[], assignmentAllowed: boolean[]): boolean => {
     let index = 0;
     const assignment = /^[A-Za-z_][A-Za-z0-9_]*=/;
     const basename = (word: string) => word.slice(word.lastIndexOf("/") + 1);
     while (index < words.length) {
       const word = words[index];
-      if (assignment.test(word)) { index++; continue; }
+      if (assignmentAllowed[index] && assignment.test(word)) { index++; continue; }
       const name = basename(word);
       if (name === "sudo") {
         index++;
@@ -30,7 +30,7 @@ export function textRunsIpmitool(text: string): boolean {
         index++;
         while (index < words.length) {
           const option = words[index];
-          if (assignment.test(option) || option === "-i" || option === "--ignore-environment") { index++; continue; }
+          if ((assignmentAllowed[index] && assignment.test(option)) || option === "-i" || option === "--ignore-environment") { index++; continue; }
           if (option === "-u" || option === "--unset") {
             if (index + 1 >= words.length) return false;
             index += 2;
@@ -56,18 +56,25 @@ export function textRunsIpmitool(text: string): boolean {
   };
 
   let words: string[] = [];
+  let assignmentAllowed: boolean[] = [];
   let word = "";
   let inWord = false;
+  let wordAllowsAssignment = true;
   let quote: "'" | '"' | undefined;
   const finishWord = () => {
-    if (inWord) words.push(word);
+    if (inWord) {
+      words.push(word);
+      assignmentAllowed.push(wordAllowsAssignment);
+    }
     word = "";
     inWord = false;
+    wordAllowsAssignment = true;
   };
   const finishSegment = () => {
     finishWord();
-    const result = runsIpmitool(words);
+    const result = runsIpmitool(words, assignmentAllowed);
     words = [];
+    assignmentAllowed = [];
     return result;
   };
 
@@ -80,19 +87,33 @@ export function textRunsIpmitool(text: string): boolean {
     }
     if (quote === '"') {
       if (char === '"') quote = undefined;
-      else if (char === "\\" && i + 1 < text.length) word += text[++i];
+      else if (char === "\\" && i + 1 < text.length) {
+        const next = text[i + 1];
+        if (next === "$" || next === "`" || next === '"' || next === "\\" || next === "\n") {
+          i++;
+          if (next !== "\n") word += next;
+        } else {
+          word += char;
+        }
+      }
       // Substitutions are active inside double quotes, but inert inside single quotes.
       else if (char === "`" || (char === "$" && text[i + 1] === "(")) return false;
       else word += char;
       continue;
     }
     if (char === "\\") {
+      if (!word.includes("=")) wordAllowsAssignment = false;
       if (i + 1 < text.length && text[i + 1] !== "\n") word += text[++i];
       else if (text[i + 1] === "\n") i++;
       inWord = true;
       continue;
     }
-    if (char === "'" || char === '"') { quote = char; inWord = true; continue; }
+    if (char === "'" || char === '"') {
+      if (!word.includes("=")) wordAllowsAssignment = false;
+      quote = char;
+      inWord = true;
+      continue;
+    }
     if (char === "#" && !inWord) {
       while (i + 1 < text.length && text[i + 1] !== "\n" && text[i + 1] !== "\r") i++;
       continue;

@@ -7623,13 +7623,13 @@ echo hi</textarea>
         return COOLDOWN_PLACEHOLDER_PREFIX + seconds;
       }
       var textRunsIpmitool = function textRunsIpmitool(text) {
-	const runsIpmitool = (words) => {
+	const runsIpmitool = (words, assignmentAllowed) => {
 		let index = 0;
 		const assignment = /^[A-Za-z_][A-Za-z0-9_]*=/;
 		const basename = (word) => word.slice(word.lastIndexOf("/") + 1);
 		while (index < words.length) {
 			const word = words[index];
-			if (assignment.test(word)) {
+			if (assignmentAllowed[index] && assignment.test(word)) {
 				index++;
 				continue;
 			};
@@ -7661,7 +7661,7 @@ echo hi</textarea>
 				index++;
 				while (index < words.length) {
 					const option = words[index];
-					if (assignment.test(option) || option === "-i" || option === "--ignore-environment") {
+					if (assignmentAllowed[index] && assignment.test(option) || option === "-i" || option === "--ignore-environment") {
 						index++;
 						continue;
 					};
@@ -7689,18 +7689,25 @@ echo hi</textarea>
 		return false;
 	};
 	let words = [];
+	let assignmentAllowed = [];
 	let word = "";
 	let inWord = false;
+	let wordAllowsAssignment = true;
 	let quote;
 	const finishWord = () => {
-		if (inWord) words.push(word);
+		if (inWord) {
+			words.push(word);
+			assignmentAllowed.push(wordAllowsAssignment);
+		};
 		word = "";
 		inWord = false;
+		wordAllowsAssignment = true;
 	};
 	const finishSegment = () => {
 		finishWord();
-		const result = runsIpmitool(words);
+		const result = runsIpmitool(words, assignmentAllowed);
 		words = [];
+		assignmentAllowed = [];
 		return result;
 	};
 	for (let i = 0; i < text.length; i++) {
@@ -7712,18 +7719,27 @@ echo hi</textarea>
 		};
 		if (quote === "\\"") {
 			if (char === "\\"") quote = undefined;
-			else if (char === "\\\\" && i + 1 < text.length) word += text[++i];
-			else if (char === "\`" || char === "$" && text[i + 1] === "(") return false;
+			else if (char === "\\\\" && i + 1 < text.length) {
+				const next = text[i + 1];
+				if (next === "$" || next === "\`" || next === "\\"" || next === "\\\\" || next === "\\n") {
+					i++;
+					if (next !== "\\n") word += next;
+				} else {
+					word += char;
+				}
+			} else if (char === "\`" || char === "$" && text[i + 1] === "(") return false;
 			else word += char;
 			continue;
 		};
 		if (char === "\\\\") {
+			if (!word.includes("=")) wordAllowsAssignment = false;
 			if (i + 1 < text.length && text[i + 1] !== "\\n") word += text[++i];
 			else if (text[i + 1] === "\\n") i++;
 			inWord = true;
 			continue;
 		};
 		if (char === "'" || char === "\\"") {
+			if (!word.includes("=")) wordAllowsAssignment = false;
 			quote = char;
 			inWord = true;
 			continue;

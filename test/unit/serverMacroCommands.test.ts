@@ -1261,7 +1261,9 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     ['a quoted mention', 'echo "use ipmitool -E"\n'],
     ['a sudo user', 'sudo -u ipmitool bmc-login\n'],
     ['a comment', '# ipmitool -E\n'],
-    ['a redirection target', 'echo hello >& ipmitool\n']
+    ['a redirection target', 'echo hello >& ipmitool\n'],
+    ['a literal backslash in double quotes', '"ipmi\\tool" -E\n'],
+    ['a fully quoted assignment-shaped command', '"FOO=bar" ipmitool -E\n']
   ])("does not treat %s as an ipmitool command", (_case, text) => {
     expect(sessionIpmiHintNote({ id: "a", name: "X", text, runIn: "session" })).toBeUndefined();
   });
@@ -1273,7 +1275,8 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     ["a later command", "echo ready; ipmitool -E\n"],
     ["a command after a bare carriage return", "echo ready\ripmitool -E\r"],
     ["a command after a comment with backticks", "# log with `hostname`\nipmitool -E\n"],
-    ["a command after a single quoted substitution", "echo '$(hostname)'; ipmitool -E\n"]
+    ["a command after a single quoted substitution", "echo '$(hostname)'; ipmitool -E\n"],
+    ["a command after an assignment with a quoted value", 'FOO="bar" ipmitool -E\n']
   ])("recognizes ipmitool in command position with %s", (_case, text) => {
     expect(sessionIpmiHintNote({ id: "a", name: "X", text, runIn: "session" })).toBeDefined();
   });
