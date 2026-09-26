@@ -4888,7 +4888,7 @@ describe("inventoryCommands", () => {
       registry.register(makeProvider({
         fetchInventory: vi.fn(async () => ({
           contractVersion: 1 as const,
-          devices: [{ externalId: "d1", name: "Device", endpoints: [{ kind: "ssh", host, port: 22 }] }]
+          devices: [{ externalId: "d1", name: "Device", endpoints: [{ kind: "ssh" as const, host, port: 22 }] }]
         }))
       }));
       const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });

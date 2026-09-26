@@ -205,7 +205,7 @@ describe("VscodeConfigRepository corrupt globalState shapes", () => {
     expect(placeholder.origin?.syncedHost).toBe("10.0.0.1");
 
     const plan = computeSyncPlan({
-      source: { id: "src", providerId: "netbox", name: "Inventory", targetFolder: "Inventory", prunePolicy: "orphan", config: {}, secretFieldIds: [] },
+      source: { id: "src", providerId: "netbox", name: "Inventory", targetFolder: "Inventory", defaultUsername: "root", prunePolicy: "orphan", config: {}, secretFieldIds: [] },
       tree: { contractVersion: 1, devices: [{ externalId: "ext", name: "Prod", endpoints: [{ kind: "ssh", host: "10.0.0.9", port: 22 }] }] },
       currentServers: [loaded], now: 2
     });
