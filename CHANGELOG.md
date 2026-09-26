@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.293] — 2026-09-26
+
+### Fixed
+
+- **Addressless inventory servers drop stale console-port ownership on restore.** Backup and share imports now clear contradictory host and port ownership stamps on addressless records so a later sync can fill the existing server.
+
 ## [2.8.292] — 2026-09-26
 
 ### Fixed
