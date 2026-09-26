@@ -164,7 +164,7 @@ export async function startTunnel(
     }
     await registrySync.syncNow();
     let remoteOwner = await registrySync.checkRemoteOwnership(profile.id, profile.localPort, reverseBind);
-    if (remoteOwner?.retiredReverseBind && reverseBind) {
+    while (remoteOwner?.retiredReverseBind && reverseBind) {
       const released = await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
