@@ -99,7 +99,7 @@ interface ForwardWaitMatch {
  * without a timeout of its own: these two phases are what bound that wait.
  */
 const LATE_FORWARD_CANCEL_TIMEOUT_MS = 5_000;
-// ssh2 can leave an unforward request unanswered while stop() is holding a caller's config lock.
+// Bound an unanswered ssh2 unforward request so Stop and bulk cleanup finish.
 const REVERSE_STOP_CANCEL_TIMEOUT_MS = 1_000;
 
 /** Whether `work` fulfilled within `timeoutMs`; false if it rejected or is still pending. */
@@ -192,7 +192,7 @@ export class TunnelManager {
    * bind must wait for this request to settle.
    */
   private readonly forwardRequests = new Map<string, ForwardWaitEntry>();
-  /** A retired transport may still own a server-wide bind while other leases use it. */
+  /** A pending cancellation or retired transport may still own a server-wide bind. */
   private readonly retiredForwardTransports = new Map<string, ForwardWaitEntry>();
   /** Only explicitly discarded candidates are quiet; a superseded transport may still be in use. */
   private readonly intentionallyDiscardedSharedConnections = new WeakSet<SshConnection>();
@@ -314,6 +314,14 @@ export class TunnelManager {
     }
     if (runtime.reverseBindAddr !== undefined && runtime.reverseBindPort !== undefined && runtime.sharedConnection) {
       const connection = runtime.sharedConnection;
+      const route = getSshNetworkRoute(connection) ?? networkRouteIdentity(runtime.serverConfig, this.serverLookup);
+      let releasePendingCancel!: () => void;
+      const pendingCancel = new Promise<void>((resolve) => {
+        releasePendingCancel = resolve;
+      });
+      // Publish before awaiting ssh2: a new start must not reuse this bind
+      // while its withdrawal is still queued on the pooled transport.
+      this.holdRetiredForwardTransport(route, runtime.reverseBindPort, pendingCancel);
       let cancellation: Promise<void> | undefined;
       let canceled = false;
       try {
@@ -322,11 +330,14 @@ export class TunnelManager {
       } catch {
         // Best effort — connection may already be closed.
       }
-      if (!canceled) {
-        // A pooled lease can be disposed while other users keep the transport
-        // alive. Retire it so a replacement cannot reuse an unresolved bind.
-        const route = getSshNetworkRoute(connection) ?? networkRouteIdentity(runtime.serverConfig, this.serverLookup);
-        this.retireForwardTransport(route, runtime.reverseBindPort, connection, cancellation);
+      try {
+        if (!canceled) {
+          // A pooled lease can be disposed while other users keep the transport
+          // alive. Retire it so a replacement cannot reuse an unresolved bind.
+          this.retireForwardTransport(route, runtime.reverseBindPort, connection, cancellation);
+        }
+      } finally {
+        releasePendingCancel();
       }
     }
 

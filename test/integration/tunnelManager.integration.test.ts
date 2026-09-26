@@ -1187,6 +1187,53 @@ describe("TunnelManager integration", () => {
     }
   });
 
+  it("holds a replacement reverse bind while remote cancellation is pending", async () => {
+    const oldTransport = new ControlledForwardConnection();
+    oldTransport.holdCancel(1);
+    const replacementTransport = new ControlledForwardConnection();
+    const factory = new OrderedConnectionFactory([oldTransport, replacementTransport]);
+    const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
+    manager = new TunnelManager(pool, pool);
+    const profile: TunnelProfile = {
+      id: "reverse-pending-cancel", name: "Pending cancel", localPort: 12345,
+      remoteIP: "127.0.0.1", remotePort: 23456, autoStart: false,
+      tunnelType: "reverse", remoteBindAddress: "127.0.0.1", localTargetIP: "127.0.0.1"
+    };
+    const terminalLease = await pool.connect(testServer);
+    const active = await manager.start(profile, testServer);
+    let replacement: Promise<ActiveTunnel> | undefined;
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const stopping = manager.stop(active.id);
+    try {
+      await oldTransport.waitForCancelAttempt(1);
+      let replacementSettled = false;
+      replacement = manager.start(profile, testServer).then((tunnel) => {
+        replacementSettled = true;
+        return tunnel;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(replacementSettled).toBe(false);
+      expect(oldTransport.forwardAttempts).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      await stopping;
+      oldTransport.resolveCancel(1);
+      const restarted = await replacement;
+      expect(replacementTransport.forwardAttempts).toBe(1);
+      await manager.stop(restarted.id);
+    } finally {
+      await vi.advanceTimersByTimeAsync(2_000);
+      await stopping;
+      oldTransport.resolveCancel(1);
+      const restarted = await replacement?.catch(() => undefined);
+      if (restarted) await manager.stop(restarted.id);
+      terminalLease.dispose();
+      pool.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     ["different port", "port"],
     ["different route", "route"]
