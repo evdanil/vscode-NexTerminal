@@ -1061,6 +1061,10 @@ async function connectTelnetServer(
       cancellable: false
     },
     async () => {
+      if (ctx.core.getServer(server.id) !== server) {
+        options.onConnectFailed?.(`Connection to "${server.name}" canceled because its server profile changed.`);
+        return;
+      }
       const terminalName = `Nexus Telnet: ${server.name}`;
       let terminalRef: vscode.Terminal | undefined;
       let ptyRef: TelnetPty | undefined;
@@ -1250,6 +1254,10 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
       cancellable: false
     },
     async () => {
+      if (ctx.core.getServer(server.id) !== server) {
+        options.onConnectFailed?.(`Connection to "${server.name}" canceled because its server profile changed.`);
+        return;
+      }
       const terminalName = `Nexus SSH: ${server.name}`;
       let terminalRef: vscode.Terminal | undefined;
       let ptyRef: SshPty | undefined;

@@ -146,6 +146,39 @@ function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
   };
 }
 
+describe("connectServer — server removed while progress is pending", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it.each(["ssh", "telnet"] as const)("does not open a stale %s terminal after a same-id Replace", async (protocol) => {
+    const server = makeServer({ protocol });
+    const { ctx, removeServer, addOrUpdateServer } = setupHarness({
+      profiles: [], activeTunnels: [], servers: [server]
+    });
+    const onConnectFailed = vi.fn();
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(
+      async (_options: unknown, task: () => Promise<unknown>) => {
+        await pending;
+        return task();
+      }
+    );
+
+    const run = connectServer(ctx, server.id, { onConnectFailed });
+    await removeServer(server.id);
+    await addOrUpdateServer({ ...server, host: "replacement.example" });
+    release();
+    await run;
+
+    expect(SshPty).not.toHaveBeenCalled();
+    expect(TelnetPty).not.toHaveBeenCalled();
+    expect(vscode.window.createTerminal).not.toHaveBeenCalled();
+    expect(onConnectFailed).toHaveBeenCalledTimes(1);
+  });
+});
+
 function makeTunnel(overrides: Partial<TunnelProfile> = {}): TunnelProfile {
   return {
     id: "t1",

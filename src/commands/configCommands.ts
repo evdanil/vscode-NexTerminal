@@ -212,7 +212,8 @@ interface NexusConfigExport {
  * Runtime teardown the config-wide commands need but must not own: this module
  * writes configuration and never holds a process or a daemon. Wired in
  * extension.ts; optional so the commands still register without it (tests,
- * and any host that runs neither manager). Both must resolve, never reject.
+ * and any host that runs neither manager). The Local Server and network-service
+ * hooks must resolve; failed connection teardown is reported to the user.
  */
 export interface ConfigRuntimeHooks {
   /**
@@ -223,6 +224,75 @@ export interface ConfigRuntimeHooks {
   stopLocalServer(configId: string): Promise<void>;
   /** Stop every running embedded TFTP/DHCP service (`stopRunningNetworkServices`). */
   stopNetworkServices(): Promise<void>;
+  /** Close terminals, tunnels, and the pooled connection for a removed server. */
+  teardownServerRuntime(serverId: string, shouldAbort: () => boolean): Promise<void>;
+  /** Stop a running tunnel whose profile or server was removed. */
+  stopTunnel(activeTunnelId: string): Promise<void>;
+  /** Includes starts that own a listener but have not emitted to NexusCore yet. */
+  activeTunnelIdForProfile(profileId: string): string | undefined;
+  closeSerialProfileTerminals(profileId: string): void;
+  closeLocalShellProfileTerminals(profileId: string): void;
+}
+
+interface RemovedProfileIds {
+  servers: string[];
+  tunnelProfiles: string[];
+  activeTunnels: Array<{ id: string; profileId: string; serverId: string }>;
+  serial: string[];
+  localShell: string[];
+}
+
+function emptyRemovedProfileIds(): RemovedProfileIds {
+  return { servers: [], tunnelProfiles: [], activeTunnels: [], serial: [], localShell: [] };
+}
+
+const BULK_TEARDOWN_REPORT_MS = 10_000;
+
+/** Run after the config lock: a reverse tunnel stop may wait on the network. */
+async function teardownRemovedProfiles(
+  core: NexusCore,
+  runtime: ConfigRuntimeHooks | undefined,
+  ids: RemovedProfileIds
+): Promise<number> {
+  if (!runtime) return 0;
+
+  const isBack = (id: string): boolean => core.getServer(id) !== undefined;
+  const serverIds = ids.servers.filter((id) => !isBack(id));
+  const tunnelIds = new Set(ids.activeTunnels
+    .filter((tunnel) => !core.getTunnel(tunnel.profileId) || !core.getServer(tunnel.serverId))
+    .map((tunnel) => tunnel.id));
+  for (const profileId of ids.tunnelProfiles) {
+    if (core.getTunnel(profileId)) continue;
+    const activeId = runtime.activeTunnelIdForProfile(profileId);
+    if (activeId) tunnelIds.add(activeId);
+  }
+  const tunnelStops = [...tunnelIds].map((id) => runtime.stopTunnel(id));
+  const teardowns = serverIds.map((id) => runtime.teardownServerRuntime(id, () => isBack(id)));
+  for (const id of ids.serial) {
+    if (!core.getSerialProfile(id)) runtime.closeSerialProfileTerminals(id);
+  }
+  for (const id of ids.localShell) {
+    if (!core.getLocalShellProfile(id)) runtime.closeLocalShellProfileTerminals(id);
+  }
+  const work = [...tunnelStops, ...teardowns];
+  let completed = 0;
+  const settled = Promise.allSettled(work.map((operation) => operation.then(() => { completed++; })));
+  let bound: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    settled,
+    new Promise<void>((resolve) => { bound = setTimeout(resolve, BULK_TEARDOWN_REPORT_MS); })
+  ]);
+  clearTimeout(bound);
+  const failed = work.length - completed;
+  if (failed > 0) {
+    void vscode.window.showWarningMessage(
+      `${failed} ${failed === 1 ? "connection could" : "connections could"} not be stopped after removing profiles. Reload the window to close anything left running.`,
+      "Reload Window"
+    ).then((choice) => {
+      if (choice === "Reload Window") void vscode.commands.executeCommand("workbench.action.reloadWindow");
+    });
+  }
+  return failed;
 }
 
 interface BackupFileEntry {
@@ -3248,7 +3318,7 @@ export function registerConfigCommands(
         {
           label: "Replace",
           description: "Replace profiles; overwrite backed-up .ssh and script files",
-          detail: "Extra local files are not deleted.",
+          detail: "Open sessions for removed profiles will close. Extra local files are not deleted.",
           value: "replace" as const
         }
       ],
@@ -3964,7 +4034,12 @@ export function registerConfigCommands(
     mode: "merge" | "replace",
     decryptedSecrets?: Record<string, unknown>
   ): Promise<void> {
-    await configMutationLock.runExclusive(() => importMergeReplaceLocked(data, mode, decryptedSecrets));
+    const removed = emptyRemovedProfileIds();
+    try {
+      await configMutationLock.runExclusive(() => importMergeReplaceLocked(data, mode, decryptedSecrets, removed));
+    } finally {
+      await teardownRemovedProfiles(core, runtime, removed);
+    }
   }
 
   /**
@@ -3981,11 +4056,12 @@ export function registerConfigCommands(
   async function importMergeReplaceLocked(
     data: NexusConfigExport,
     mode: "merge" | "replace",
-    decryptedSecrets?: Record<string, unknown>
+    decryptedSecrets: Record<string, unknown> | undefined,
+    removed: RemovedProfileIds
   ): Promise<void> {
     const awaitingVerdict = new Set<string>();
     try {
-      await applyMergeReplace(data, mode, decryptedSecrets, awaitingVerdict);
+      await applyMergeReplace(data, mode, decryptedSecrets, awaitingVerdict, removed);
     } catch (error) {
       for (const id of awaitingVerdict) {
         await deleteServerSecrets(vault, id, { bestEffort: true });
@@ -3998,7 +4074,8 @@ export function registerConfigCommands(
     data: NexusConfigExport,
     mode: "merge" | "replace",
     decryptedSecrets: Record<string, unknown> | undefined,
-    awaitingVerdict: Set<string>
+    awaitingVerdict: Set<string>,
+    removed: RemovedProfileIds
   ): Promise<void> {
     const snapshot = core.getSnapshot();
 
@@ -4020,20 +4097,25 @@ export function registerConfigCommands(
     }
 
     if (mode === "replace") {
+      removed.tunnelProfiles.push(...snapshot.tunnels.map(({ id }) => id));
+      removed.activeTunnels.push(...snapshot.activeTunnels.map(({ id, profileId, serverId }) => ({ id, profileId, serverId })));
       for (const server of snapshot.servers) {
         // Tracked BEFORE the await: `removeServer` drops the record from memory
         // before it persists, so a rejected persist still leaves the server gone
         // for this session — and a retry could bring its id back anywhere.
         awaitingVerdict.add(server.id);
+        removed.servers.push(server.id);
         await core.removeServer(server.id);
       }
       for (const tunnel of snapshot.tunnels) {
         await core.removeTunnel(tunnel.id);
       }
       for (const profile of snapshot.serialProfiles) {
+        removed.serial.push(profile.id);
         await core.removeSerialProfile(profile.id);
       }
       for (const profile of snapshot.localShellProfiles) {
+        removed.localShell.push(profile.id);
         await core.removeLocalShellProfile(profile.id);
       }
       for (const profile of snapshot.authProfiles) {
@@ -5027,6 +5109,7 @@ export function registerConfigCommands(
       "This will permanently delete ALL servers, tunnels, serial profiles, local shell profiles, Local Server profiles, " +
         "saved TFTP/DHCP profiles, inventory sources, device templates, saved filters, macros, groups, and saved passwords, " +
         "and reset every Nexus setting. Running Local Servers and TFTP/DHCP services are stopped before their configuration is removed. " +
+        "Open sessions and tunnels will be closed. " +
         "This cannot be undone.",
       { modal: true },
       "Delete Everything"
@@ -5051,8 +5134,11 @@ export function registerConfigCommands(
     // interactive UI, so it's safe to hold the lock across all of it. See
     // importMergeReplace's doc comment for the race class this closes against
     // inventoryCommands' critical sections.
-    await configMutationLock.runExclusive(async () => {
+    const removed = emptyRemovedProfileIds();
+    const resetMutation = async (): Promise<void> => {
       const snapshot = core.getSnapshot();
+      removed.tunnelProfiles.push(...snapshot.tunnels.map(({ id }) => id));
+      removed.activeTunnels.push(...snapshot.activeTunnels.map(({ id, profileId, serverId }) => ({ id, profileId, serverId })));
 
       // Delete all passwords/passphrases first (before removing servers)
       for (const server of snapshot.servers) {
@@ -5061,6 +5147,7 @@ export function registerConfigCommands(
 
       // Remove all servers
       for (const server of snapshot.servers) {
+        removed.servers.push(server.id);
         await core.removeServer(server.id);
       }
 
@@ -5071,11 +5158,13 @@ export function registerConfigCommands(
 
       // Remove all serial profiles
       for (const profile of snapshot.serialProfiles) {
+        removed.serial.push(profile.id);
         await core.removeSerialProfile(profile.id);
       }
 
       // Remove all local shell profiles
       for (const profile of snapshot.localShellProfiles) {
+        removed.localShell.push(profile.id);
         await core.removeLocalShellProfile(profile.id);
       }
 
@@ -5143,9 +5232,17 @@ export function registerConfigCommands(
       // genuinely empty hub instead of the first-run onboarding. Via the
       // command so the title-bar icon (nexus.filterActive) swaps back as well.
       await vscode.commands.executeCommand("nexus.filter.clear");
-    });
+    };
+    let failedTeardowns = 0;
+    try {
+      await configMutationLock.runExclusive(resetMutation);
+    } finally {
+      failedTeardowns = await teardownRemovedProfiles(core, runtime, removed);
+    }
 
-    void vscode.window.showInformationMessage("All Nexus data has been deleted.");
+    if (failedTeardowns === 0) {
+      void vscode.window.showInformationMessage("All Nexus data has been deleted.");
+    }
   }
 
   // Shared tail for the MobaXterm / SecureCRT importers: no-sessions warning, confirm

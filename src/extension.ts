@@ -3,8 +3,8 @@ import * as vscode from "vscode";
 import { registerFileCommands } from "./commands/fileCommands";
 import { registerCwdSyncCommands, FOLLOW_TERMINAL_STATE_KEY } from "./commands/cwdSyncCommands";
 import { registerScriptCommands } from "./commands/scriptCommands";
-import { registerSerialCommands } from "./commands/serialCommands";
-import { registerLocalShellCommands } from "./commands/localShellCommands";
+import { closeSerialProfileTerminals, registerSerialCommands } from "./commands/serialCommands";
+import { closeLocalShellProfileTerminals, registerLocalShellCommands } from "./commands/localShellCommands";
 import { registerNetworkServerCommands, stopRunningNetworkServices } from "./commands/networkServerCommands";
 import { registerNetworkServerProfileCommands } from "./commands/networkServerProfileCommands";
 import { registerNetworkServerTransferCommands } from "./commands/networkServerTransferCommands";
@@ -1321,6 +1321,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   });
   const unsubscribeTunnel = tunnelManager.onDidChange((event) => {
     if (event.type === "started") {
+      // A start already in progress can emit after bulk removal. Keep that
+      // orphan out of both the core snapshot and the cross-window registry;
+      // startTunnel stops it as soon as the manager returns.
+      if (!core.getTunnel(event.tunnel.profileId) || !core.getServer(event.tunnel.serverId)) {
+        return;
+      }
       core.registerTunnel(event.tunnel);
       void registrySync.registerTunnel(event.tunnel);
       const logger = loggerFactory.create("tunnel", event.tunnel.id);
@@ -1560,13 +1566,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
       })
   });
   context.subscriptions.push(inventoryStatusPoll);
-  // Delete All Data and a Replace-mode backup restore remove Local Server
-  // profiles, and Delete All Data resets the settings the TFTP/DHCP services
-  // were launched from — so both need the same runtime teardown the dedicated
-  // commands perform, which configCommands itself has no business owning.
+  // Bulk config changes remove profiles without going through their individual
+  // Remove commands. Supply the same teardown operations here; configCommands
+  // releases its mutation lock before waiting on SSH tunnels.
   const configDisposables = registerConfigCommands(core, secretVault, context, {
     stopLocalServer: (configId) => stopLocalServerForRemoval(localServerCtx, configId),
-    stopNetworkServices: () => stopRunningNetworkServices(core, networkServerManager)
+    stopNetworkServices: () => stopRunningNetworkServices(core, networkServerManager),
+    teardownServerRuntime: (serverId, shouldAbort) => teardownServerRuntime(ctx, serverId, shouldAbort),
+    stopTunnel: (activeTunnelId) => ctx.tunnelManager.stop(activeTunnelId),
+    activeTunnelIdForProfile: (profileId) => ctx.tunnelManager.getActiveTunnelId(profileId),
+    closeSerialProfileTerminals: (profileId) => closeSerialProfileTerminals(ctx, profileId),
+    closeLocalShellProfileTerminals: (profileId) => closeLocalShellProfileTerminals(ctx, profileId)
   });
 
   // One-time offer to import ~/.ssh/config, shown at most once ever. Strictly
