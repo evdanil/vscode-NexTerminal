@@ -6,6 +6,52 @@ import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigReposi
 import { InMemoryTunnelRegistryStore } from "../../src/storage/inMemoryTunnelRegistryStore";
 import { VscodeTunnelRegistryStore } from "../../src/storage/vscodeTunnelRegistryStore";
 
+const fakeFenceFiles = vi.hoisted(() => new Map<string, Uint8Array>());
+vi.mock("vscode", () => {
+  class FakeFileSystemError extends Error {
+    public constructor(public readonly code: string) {
+      super(code);
+    }
+  }
+  return {
+    FileType: { File: 1, Directory: 2 },
+    FileSystemError: FakeFileSystemError,
+    Uri: {
+      joinPath: (base: { path: string }, ...segments: string[]) => ({
+        path: [base.path, ...segments].join("/").replace(/\/+/g, "/")
+      })
+    },
+    workspace: {
+      fs: {
+        createDirectory: async () => {},
+        readDirectory: async (uri: { path: string }) => {
+          const prefix = `${uri.path}/`;
+          return [...fakeFenceFiles.keys()]
+            .filter((path) => path.startsWith(prefix) && !path.slice(prefix.length).includes("/"))
+            .map((path) => [path.slice(prefix.length), 1] as const);
+        },
+        readFile: async (uri: { path: string }) => {
+          const value = fakeFenceFiles.get(uri.path);
+          if (!value) throw new FakeFileSystemError("FileNotFound");
+          return value;
+        },
+        writeFile: async (uri: { path: string }, value: Uint8Array) => {
+          fakeFenceFiles.set(uri.path, new Uint8Array(value));
+        },
+        rename: async (source: { path: string }, target: { path: string }) => {
+          const value = fakeFenceFiles.get(source.path);
+          if (!value) throw new FakeFileSystemError("FileNotFound");
+          fakeFenceFiles.set(target.path, value);
+          fakeFenceFiles.delete(source.path);
+        },
+        delete: async (uri: { path: string }) => {
+          if (!fakeFenceFiles.delete(uri.path)) throw new FakeFileSystemError("FileNotFound");
+        }
+      }
+    }
+  };
+});
+
 function makeTunnel(overrides: Partial<ActiveTunnel> = {}): ActiveTunnel {
   return {
     id: "active-1",
@@ -38,22 +84,39 @@ function makeEntry(overrides: Partial<TunnelRegistryEntry> = {}): TunnelRegistry
   };
 }
 
-function sharedWindowStores(): [VscodeTunnelRegistryStore, VscodeTunnelRegistryStore] {
-  const values = new Map<string, unknown>();
-  const globalState = {
-    keys: () => [...values.keys()],
-    get: <T>(key: string, defaultValue?: T): T | undefined =>
-      values.has(key) ? values.get(key) as T : defaultValue,
-    update: async (key: string, value: unknown): Promise<void> => {
-      if (value === undefined) {
-        values.delete(key);
-      } else {
-        values.set(key, value);
+function sharedWindowStores(): [VscodeTunnelRegistryStore, VscodeTunnelRegistryStore, () => void, () => void] {
+  const persisted = new Map<string, unknown>();
+  const makeState = () => {
+    const snapshot = new Map(persisted);
+    return {
+      keys: () => [...snapshot.keys()],
+      get: <T>(key: string, defaultValue?: T): T | undefined =>
+        snapshot.has(key) ? snapshot.get(key) as T : defaultValue,
+      update: async (key: string, value: unknown): Promise<void> => {
+        if (value === undefined) snapshot.delete(key);
+        else snapshot.set(key, value);
+        // VS Code persists the extension's entire Memento object at once.
+        persisted.clear();
+        for (const [storedKey, storedValue] of snapshot) persisted.set(storedKey, storedValue);
+      },
+      refresh: () => {
+        snapshot.clear();
+        for (const [storedKey, storedValue] of persisted) snapshot.set(storedKey, storedValue);
       }
-    }
+    };
   };
-  const context = { globalState } as unknown as ConstructorParameters<typeof VscodeTunnelRegistryStore>[0];
-  return [new VscodeTunnelRegistryStore(context), new VscodeTunnelRegistryStore(context)];
+  const ownerState = makeState();
+  const otherState = makeState();
+  const context = (globalState: ReturnType<typeof makeState>) => ({
+    globalState,
+    globalStorageUri: { path: "/shared" }
+  }) as unknown as ConstructorParameters<typeof VscodeTunnelRegistryStore>[0];
+  return [
+    new VscodeTunnelRegistryStore(context(ownerState)),
+    new VscodeTunnelRegistryStore(context(otherState)),
+    otherState.refresh,
+    ownerState.refresh
+  ];
 }
 
 describe("TunnelRegistrySync", () => {
@@ -64,6 +127,7 @@ describe("TunnelRegistrySync", () => {
 
   beforeEach(async () => {
     vi.useFakeTimers();
+    fakeFenceFiles.clear();
     store = new InMemoryTunnelRegistryStore();
     core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();
@@ -167,7 +231,7 @@ describe("TunnelRegistrySync", () => {
   });
 
   it("keeps a published fence when another window saves an earlier array snapshot", async () => {
-    const [ownerStore, otherStore] = sharedWindowStores();
+    const [ownerStore, otherStore, , refreshOwner] = sharedWindowStores();
     const owner = new TunnelRegistrySync(ownerStore, core, "owner", probePort);
     const tunnel = makeTunnel({ id: "retired-1", tunnelType: "reverse", remotePort: 9000 });
     await owner.registerTunnel(tunnel);
@@ -184,13 +248,14 @@ describe("TunnelRegistrySync", () => {
       }
     });
     await otherStore.saveEntries(staleSnapshot);
+    refreshOwner();
 
     expect((await ownerStore.getEntries()).map((entry) => entry.retiredReverseBind?.fenceId))
       .toContain(tunnel.id);
   });
 
   it("does not restore a settled fence when another window saves its old array snapshot", async () => {
-    const [ownerStore, otherStore] = sharedWindowStores();
+    const [ownerStore, otherStore, refreshOther, refreshOwner] = sharedWindowStores();
     const owner = new TunnelRegistrySync(ownerStore, core, "owner", probePort);
     const tunnel = makeTunnel({ id: "retired-1", tunnelType: "reverse", remotePort: 9000 });
     let releaseFence!: () => void;
@@ -205,11 +270,13 @@ describe("TunnelRegistrySync", () => {
         settled
       }
     });
+    refreshOther();
     const staleSnapshot = await otherStore.getEntries();
     releaseFence();
     await vi.waitFor(async () => expect(await ownerStore.getEntries()).toEqual([]));
 
     await otherStore.saveEntries(staleSnapshot);
+    refreshOwner();
     expect(await ownerStore.getEntries()).toEqual([]);
   });
 

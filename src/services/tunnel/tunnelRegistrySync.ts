@@ -206,8 +206,8 @@ export class TunnelRegistrySync {
           }
         };
         try {
-          // Publish first: a stale active-array save from any window cannot
-          // remove this separate key, and removal of our active row follows it.
+          // Publish first: a stale Memento write from another window cannot
+          // remove this file, and removal of our active row follows it.
           await this.store.publishFence(fenceEntry);
         } catch (error) {
           this.unsettledReverseBindFenceIds.delete(fence.fenceId);
