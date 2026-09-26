@@ -389,6 +389,7 @@ async function connectStandardSerialProfile(ctx: CommandContext, profile: Serial
   if (!enforceSerialConnectPreconditions(ctx, profile)) {
     return false;
   }
+  const profileAtStart = JSON.stringify(profile);
   const terminalName = serialTerminalName(profile);
   let terminalRef: vscode.Terminal | undefined;
   let ptyRef: SerialPty | undefined;
@@ -409,6 +410,8 @@ async function connectStandardSerialProfile(ctx: CommandContext, profile: Serial
       rtscts: profile.rtscts
     },
     {
+      isProfileCurrent: () =>
+        ctx.core.getSerialProfile(profile.id) === profile && JSON.stringify(profile) === profileAtStart,
       onSessionOpened: (sessionId) => {
         if (terminalRef) {
           ctx.serialTerminals.set(sessionId, {

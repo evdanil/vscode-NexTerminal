@@ -546,9 +546,15 @@ async function openLocalShell(
   profile: LocalShellProfile,
   options: OpenLocalShellOptions = {}
 ): Promise<string | undefined> {
+  const profileAtStart = JSON.stringify(profile);
   const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
   const launchOptions = resolveLocalShellLaunchOptions(profile);
   if (!(await confirmLocalShellAutoTriggers(ctx))) {
+    return undefined;
+  }
+  // The warning can outlive a bulk delete. It has no registered session for
+  // that delete to close, so reject its saved launch options before spawning.
+  if (ctx.core.getLocalShellProfile(profile.id) !== profile || JSON.stringify(profile) !== profileAtStart) {
     return undefined;
   }
   const terminalName = `Nexus Local Shell: ${profile.name}`;

@@ -142,6 +142,7 @@ vi.mock("vscode", () => ({
 
 import * as vscode from "vscode";
 import {
+  closeLocalShellProfileTerminals,
   formValuesToLocalShell,
   getConfiguredVscodeTerminalProfileNames,
   registerLocalShellCommands,
@@ -478,6 +479,33 @@ describe("registerLocalShellCommands", () => {
       terminal,
       expect.objectContaining({ handleInput: expect.any(Function) })
     );
+  });
+
+  it.each(["removed", "replaced", "edited in place"])("does not start a Local Shell after its profile is %s during the auto-trigger warning", async (change) => {
+    mockMacros.push({ name: "Prompt", text: "answer", triggerPattern: "Prompt:" });
+    const warning = deferred<string>();
+    mockShowWarningMessage.mockReturnValueOnce(warning.promise);
+    const ctx = makeCtx();
+    const original = ctx.core.getLocalShellProfile("local-1");
+    let current: LocalShellProfile | undefined = original;
+    ctx.core.getLocalShellProfile.mockImplementation(() => current);
+    registerLocalShellCommands(ctx);
+
+    const connect = Promise.resolve(registeredCommands.get("nexus.localShell.connect")!("local-1"));
+    await settle();
+    expect(mockShowWarningMessage).toHaveBeenCalled();
+    // A bulk removal closes only registered sessions. This start has not reached that map yet.
+    closeLocalShellProfileTerminals(ctx, original.id);
+    if (change === "removed") current = undefined;
+    else if (change === "replaced") current = { ...original, name: "Replacement" };
+    else original.name = "Renamed";
+
+    warning.resolve("Continue");
+    await connect;
+
+    expect(mockCreateTerminal).not.toHaveBeenCalled();
+    expect(ctx.core.registerLocalShellSession).not.toHaveBeenCalled();
+    expect(ctx.localShellTerminals.size).toBe(0);
   });
 
   it("passes the command context highlighter into the local shell PTY", async () => {

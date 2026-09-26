@@ -80,11 +80,12 @@ vi.mock("../../src/ui/webviewFormPanel", () => ({
 }));
 
 import * as vscode from "vscode";
-import { formValuesToSerial, registerSerialCommands } from "../../src/commands/serialCommands";
+import { closeSerialProfileTerminals, formValuesToSerial, registerSerialCommands } from "../../src/commands/serialCommands";
 import type { CommandContext } from "../../src/commands/types";
 import { NexusCore } from "../../src/core/nexusCore";
 import type { SerialProfile } from "../../src/models/config";
 import { configMutationLock } from "../../src/services/configMutationLock";
+import { SerialPty } from "../../src/services/serial/serialPty";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import type { FormValues } from "../../src/ui/formTypes";
 
@@ -465,6 +466,48 @@ describe("serial terminal tab visual differentiation", () => {
         color: expect.objectContaining({ id: "terminal.ansiCyan" })
       })
     );
+  });
+});
+
+describe("pending standard serial starts", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+  });
+
+  it.each(["removed", "replaced", "edited in place"])("rejects a late port open after the profile is %s", async (change) => {
+    const original = makeSerialProfile();
+    let current: SerialProfile | undefined = original;
+    const ctx = {
+      core: {
+        getSerialProfile: vi.fn(() => current),
+        registerSerialSession: vi.fn()
+      },
+      serialSidecar: {},
+      loggerFactory: { create: vi.fn() },
+      macroAutoTrigger: { createObserver: vi.fn(() => ({})), bindObserverToSession: vi.fn() },
+      sessionLogDir: "",
+      serialTerminals: new Map(),
+      activityIndicators: new Map(),
+      highlighter: {},
+      focusedTerminal: undefined
+    } as unknown as CommandContext;
+    registerSerialCommands(ctx);
+
+    await registeredCommands.get("nexus.serial.connect")!("sp1");
+    const callbacks = vi.mocked(SerialPty).mock.calls.at(-1)?.[2] as
+      | { isProfileCurrent?: () => boolean }
+      | undefined;
+    expect(callbacks?.isProfileCurrent?.()).toBe(true);
+    // A bulk sweep sees no registered session while openPort is still pending.
+    closeSerialProfileTerminals(ctx, original.id);
+    if (change === "removed") current = undefined;
+    else if (change === "replaced") current = { ...original, path: "COM4" };
+    else original.path = "COM4";
+
+    expect(callbacks?.isProfileCurrent?.()).toBe(false);
+    expect(ctx.serialTerminals.size).toBe(0);
+    expect(ctx.core.registerSerialSession).not.toHaveBeenCalled();
   });
 });
 

@@ -97,6 +97,34 @@ describe("SerialPty", () => {
     vi.clearAllMocks();
   });
 
+  it("closes a port that finishes opening after its profile was removed, without registering a session", async () => {
+    const { transport, closePort, dataListenerCount } = createTransport();
+    let resolveOpen!: (sessionId: string) => void;
+    transport.openPort = vi.fn(() => new Promise<string>((resolve) => { resolveOpen = resolve; }));
+    let profileCurrent = true;
+    const callbacks = {
+      isProfileCurrent: () => profileCurrent,
+      onSessionOpened: vi.fn(),
+      onSessionClosed: vi.fn()
+    };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const pty = new SerialPty(transport, { path: "COM9", baudRate: 115200 }, callbacks, logger as any);
+    const onDidClose = vi.fn();
+    pty.onDidClose(onDidClose);
+
+    pty.open();
+    expect(dataListenerCount()).toBe(1);
+    profileCurrent = false;
+    resolveOpen("late-session");
+    await flushAsync();
+
+    expect(closePort).toHaveBeenCalledExactlyOnceWith("late-session");
+    expect(callbacks.onSessionOpened).not.toHaveBeenCalled();
+    expect(callbacks.onSessionClosed).not.toHaveBeenCalled();
+    expect(onDidClose).toHaveBeenCalledTimes(1);
+    expect(dataListenerCount()).toBe(0);
+  });
+
   it("enters disconnected state on sidecar disconnect notification", async () => {
     const { transport, emitDisconnect, closePort } = createTransport();
     const callbacks = {
