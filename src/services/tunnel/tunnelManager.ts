@@ -313,13 +313,20 @@ export class TunnelManager {
       runtime.reverseUnsubscribe();
     }
     if (runtime.reverseBindAddr !== undefined && runtime.reverseBindPort !== undefined && runtime.sharedConnection) {
+      const connection = runtime.sharedConnection;
+      let cancellation: Promise<void> | undefined;
+      let canceled = false;
       try {
-        await fulfilledWithin(
-          runtime.sharedConnection.cancelForwardIn(runtime.reverseBindAddr, runtime.reverseBindPort),
-          REVERSE_STOP_CANCEL_TIMEOUT_MS
-        );
+        cancellation = connection.cancelForwardIn(runtime.reverseBindAddr, runtime.reverseBindPort);
+        canceled = await fulfilledWithin(cancellation, REVERSE_STOP_CANCEL_TIMEOUT_MS);
       } catch {
         // Best effort — connection may already be closed.
+      }
+      if (!canceled) {
+        // A pooled lease can be disposed while other users keep the transport
+        // alive. Retire it so a replacement cannot reuse an unresolved bind.
+        const route = getSshNetworkRoute(connection) ?? networkRouteIdentity(runtime.serverConfig, this.serverLookup);
+        this.retireForwardTransport(route, runtime.reverseBindPort, connection, cancellation);
       }
     }
 

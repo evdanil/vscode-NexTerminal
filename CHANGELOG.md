@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- **Reverse-tunnel Stop no longer waits indefinitely for an unresponsive SSH server.** Nexus waits about one second for remote-listener cancellation, then completes local cleanup so server, inventory, and folder removal can continue. If the server does not answer, remote listener removal remains unconfirmed until the SSH transport closes.
+- **Reverse-tunnel Stop no longer waits indefinitely for an unresponsive SSH server.** Nexus waits about one second for remote-listener cancellation, then completes local cleanup so server, inventory, and folder removal can continue. When cancellation is unconfirmed, it retires the shared SSH transport and holds replacement starts on that route and port until cancellation succeeds or the transport closes.
 
 ## [2.8.278] — 2026-09-26
 

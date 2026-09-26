@@ -1,7 +1,7 @@
 import * as net from "node:net";
 import { PassThrough, type Duplex } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ServerConfig, TunnelProfile } from "../../src/models/config";
+import type { ActiveTunnel, ServerConfig, TunnelProfile } from "../../src/models/config";
 import type { SecretVault, SshConnection, SshFactory, TcpConnectionInfo } from "../../src/services/ssh/contracts";
 import { ProxySshFactory } from "../../src/services/ssh/proxySshFactory";
 import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
@@ -1136,6 +1136,53 @@ describe("TunnelManager integration", () => {
     } finally {
       connection.resolveCancel(1);
       await stopping;
+      vi.useRealTimers();
+    }
+  });
+
+  it("holds a replacement reverse bind off a pooled transport whose cancel timed out", async () => {
+    const oldTransport = new ControlledForwardConnection();
+    oldTransport.holdCancel(1);
+    const replacementTransport = new ControlledForwardConnection();
+    const factory = new OrderedConnectionFactory([oldTransport, replacementTransport]);
+    const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
+    manager = new TunnelManager(pool, pool);
+    const profile: TunnelProfile = {
+      id: "reverse-pooled-cancel", name: "Pooled cancel", localPort: 12345,
+      remoteIP: "127.0.0.1", remotePort: 23456, autoStart: false,
+      tunnelType: "reverse", remoteBindAddress: "127.0.0.1", localTargetIP: "127.0.0.1"
+    };
+    const terminalLease = await pool.connect(testServer);
+    const active = await manager.start(profile, testServer);
+    let replacement: Promise<ActiveTunnel> | undefined;
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const stopping = manager.stop(active.id);
+      await oldTransport.waitForCancelAttempt(1);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await stopping;
+      expect(oldTransport.transportClosed).toBe(false);
+
+      let replacementSettled = false;
+      replacement = manager.start(profile, testServer).then((tunnel) => {
+        replacementSettled = true;
+        return tunnel;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(replacementSettled).toBe(false);
+      expect(oldTransport.forwardAttempts).toBe(1);
+
+      oldTransport.resolveCancel(1);
+      const restarted = await replacement;
+      expect(replacementTransport.forwardAttempts).toBe(1);
+      await manager.stop(restarted.id);
+    } finally {
+      oldTransport.resolveCancel(1);
+      const restarted = await replacement?.catch(() => undefined);
+      if (restarted) await manager.stop(restarted.id);
+      terminalLease.dispose();
+      pool.dispose();
       vi.useRealTimers();
     }
   });
