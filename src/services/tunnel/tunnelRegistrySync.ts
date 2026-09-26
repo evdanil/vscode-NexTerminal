@@ -118,6 +118,7 @@ export class TunnelRegistrySync {
   private reprobeTimer: ReturnType<typeof setInterval> | undefined;
   private lastRemoteJson = "";
   private readonly probePort: ProbePortFn;
+  private readonly unsettledReverseBindFenceIds = new Set<string>();
 
   public constructor(
     private readonly store: TunnelRegistryStore,
@@ -151,7 +152,7 @@ export class TunnelRegistrySync {
       lastSeen: Date.now()
     };
     entries.push(entry);
-    await this.store.saveEntries(entries);
+    await this.saveEntries(entries);
   }
 
   public async unregisterTunnel(
@@ -164,6 +165,7 @@ export class TunnelRegistrySync {
     );
     const fence = options?.retiredReverseBind;
     if (fence && options?.tunnel) {
+      this.unsettledReverseBindFenceIds.add(fence.fenceId);
       const tunnel = options.tunnel;
       filtered.push({
         profileId: tunnel.profileId,
@@ -185,17 +187,18 @@ export class TunnelRegistrySync {
         }
       });
     }
-    await this.store.saveEntries(filtered);
+    await this.saveEntries(filtered);
 
     if (fence) {
       void fence.settled.then(async () => {
+        this.unsettledReverseBindFenceIds.delete(fence.fenceId);
         const current = await this.store.getEntries();
         const withoutFence = current.filter(
           (entry) =>
             !(entry.ownerSessionId === this.sessionId && entry.retiredReverseBind?.fenceId === fence.fenceId)
         );
         if (withoutFence.length !== current.length) {
-          await this.store.saveEntries(withoutFence);
+          await this.saveEntries(withoutFence);
         }
       });
     }
@@ -262,7 +265,7 @@ export class TunnelRegistrySync {
   public async cleanupOwnEntries(): Promise<void> {
     const entries = await this.store.getEntries();
     const filtered = entries.filter((e) => e.ownerSessionId !== this.sessionId);
-    await this.store.saveEntries(filtered);
+    await this.saveEntries(filtered);
   }
 
   public dispose(): void {
@@ -324,7 +327,7 @@ export class TunnelRegistrySync {
     }
 
     if (changed) {
-      await this.store.saveEntries(entries);
+      await this.saveEntries(entries);
     }
   }
 
@@ -354,7 +357,7 @@ export class TunnelRegistrySync {
       const cleaned = entries.filter(
         (e) => !staleProfileIds.has(`${e.ownerSessionId}:${e.profileId}`)
       );
-      await this.store.saveEntries(cleaned);
+      await this.saveEntries(cleaned);
       const cleanedRemote = cleaned.filter((e) => e.ownerSessionId !== this.sessionId && !e.retiredReverseBind);
       this.lastRemoteJson = JSON.stringify(cleanedRemote);
       this.core.setRemoteTunnels(cleanedRemote);
@@ -365,5 +368,15 @@ export class TunnelRegistrySync {
         this.core.setRemoteTunnels(remote);
       }
     }
+  }
+
+  private async saveEntries(entries: TunnelRegistryEntry[]): Promise<void> {
+    // A read may return an old whole-array snapshot after settlement removed a
+    // fence. Keep the in-memory settlement state authoritative on every write.
+    await this.store.saveEntries(entries.filter((entry) =>
+      entry.ownerSessionId !== this.sessionId ||
+      !entry.retiredReverseBind ||
+      this.unsettledReverseBindFenceIds.has(entry.retiredReverseBind.fenceId)
+    ));
   }
 }

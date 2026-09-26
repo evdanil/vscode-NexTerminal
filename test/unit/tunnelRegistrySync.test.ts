@@ -124,6 +124,38 @@ describe("TunnelRegistrySync", () => {
     await vi.waitFor(async () => expect(await store.getEntries()).toEqual([]));
   });
 
+  it("does not restore a settled reverse-bind fence from a stale heartbeat snapshot", async () => {
+    let releaseFence!: () => void;
+    const settled = new Promise<void>((resolve) => { releaseFence = resolve; });
+    const tunnel = makeTunnel({ id: "retired-1", tunnelType: "reverse", remotePort: 9000 });
+    await sync.initialize();
+    await sync.registerTunnel(tunnel);
+    await sync.unregisterTunnel(tunnel.profileId, {
+      tunnel,
+      retiredReverseBind: {
+        fenceId: tunnel.id,
+        routeIdentity: { kind: "direct", endpoint: { hosts: ["bastion"], port: 22 } },
+        remotePort: tunnel.remotePort,
+        settled
+      }
+    });
+
+    const staleSnapshot = await store.getEntries();
+    expect(staleSnapshot[0].retiredReverseBind?.fenceId).toBe(tunnel.id);
+    let releaseHeartbeatRead!: (entries: TunnelRegistryEntry[]) => void;
+    const heartbeatRead = new Promise<TunnelRegistryEntry[]>((resolve) => { releaseHeartbeatRead = resolve; });
+    vi.spyOn(store, "getEntries").mockImplementationOnce(() => heartbeatRead);
+    const heartbeat = sync.syncNow();
+
+    releaseFence();
+    await vi.waitFor(async () => expect(await store.getEntries()).toEqual([]));
+    releaseHeartbeatRead(staleSnapshot);
+    await heartbeat;
+    expect(await store.getEntries()).toEqual([]);
+    await sync.syncNow();
+    expect(await store.getEntries()).toEqual([]);
+  });
+
   it("cleanupOwnEntries removes only own entries", async () => {
     await store.saveEntries([
       makeEntry({ ownerSessionId: "my-session", profileId: "t1" }),
