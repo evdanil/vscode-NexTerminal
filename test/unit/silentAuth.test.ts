@@ -2278,6 +2278,64 @@ describe("SilentAuthSshFactory — interactive prompts do not overlap", () => {
     expect(connector.connect).toHaveBeenCalledTimes(2);
   });
 
+  it("dismisses an open password prompt when its last owner closes so another login can ask", async () => {
+    const other: ServerConfig = { ...baseServer, id: "other", name: "Other" };
+    const opened: string[] = [];
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn((server, signal) => {
+        opened.push(server.name);
+        if (server.id === other.id) {
+          return Promise.resolve({ password: "other-password", save: false });
+        }
+        return new Promise<{ password: string; save: boolean } | undefined>((resolve) =>
+          signal?.addEventListener("abort", () => resolve(undefined), { once: true })
+        );
+      })
+    };
+    const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+    const factory = new SilentAuthSshFactory(connector, createVault(), prompt);
+    let active = true;
+
+    const abandoned = factory.connect(baseServer, { isActive: () => active });
+    const abandonedFailure = expect(abandoned).rejects.toThrow("connection attempt ended");
+    await vi.waitFor(() => expect(opened).toEqual(["Prod"]));
+    active = false;
+
+    const next = factory.connect(other);
+    await vi.waitFor(() => expect(opened).toEqual(["Prod", "Other"]));
+    await expect(next).resolves.toBe(fakeConnection);
+    await abandonedFailure;
+    expect(connector.connect).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an open shared password prompt while another owner is live", async () => {
+    const answer = deferred<{ password: string; save: boolean } | undefined>();
+    let promptSignal: AbortSignal | undefined;
+    const prompt: PasswordPrompt = {
+      prompt: vi.fn((_server, signal) => {
+        promptSignal = signal;
+        return answer.promise;
+      })
+    };
+    const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+    const factory = new SilentAuthSshFactory(connector, createVault(), prompt);
+    let firstActive = true;
+
+    const first = factory.connect(baseServer, { isActive: () => firstActive });
+    const firstFailure = first.catch((error: unknown) => error);
+    await vi.waitFor(() => expect(prompt.prompt).toHaveBeenCalledTimes(1));
+    const second = factory.connect(baseServer, { isActive: () => true });
+    await vi.waitFor(() => expect(promptSignal).toBeDefined());
+    firstActive = false;
+    await new Promise<void>((resolve) => setTimeout(resolve, 120));
+    expect(promptSignal?.aborted).toBe(false);
+
+    answer.resolve({ password: "shared-password", save: false });
+    expect((await firstFailure as Error).message).toContain("connection attempt ended");
+    await expect(second).resolves.toBe(fakeConnection);
+    expect(prompt.prompt).toHaveBeenCalledTimes(1);
+  });
+
   it("answers a saved-password keyboard challenge while another prompt is open", async () => {
     const password = deferred<{ password: string; save: boolean } | undefined>();
     const savedServer: ServerConfig = { ...baseServer, id: "saved" };

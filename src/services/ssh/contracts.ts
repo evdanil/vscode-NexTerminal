@@ -8,7 +8,7 @@ export interface PasswordPromptResult {
 }
 
 export interface PasswordPrompt {
-  prompt(server: ServerConfig): Promise<PasswordPromptResult | undefined>;
+  prompt(server: ServerConfig, signal?: AbortSignal): Promise<PasswordPromptResult | undefined>;
 }
 
 export interface HostKeyVerifier {

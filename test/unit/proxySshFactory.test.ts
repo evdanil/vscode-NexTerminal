@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { Duplex } from "node:stream";
 import type { SFTPWrapper } from "ssh2";
-import type { ServerConfig, Socks5Proxy } from "../../src/models/config";
+import type { HttpConnectProxy, ServerConfig, Socks5Proxy } from "../../src/models/config";
 import type { PasswordPrompt, SecretVault, SshConnection, SshConnector } from "../../src/services/ssh/contracts";
 import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 import { ProxiedSshConnection, jumpHostCleanup, socketCleanup } from "../../src/services/ssh/proxiedSshConnection";
@@ -1123,6 +1123,77 @@ describe("ProxySshFactory", () => {
     );
   }
 
+  it("closes an active proxy-password prompt and releases the shared queue when its last owner ends", async () => {
+    const proxied = makeServer({ id: "proxied", authType: "agent", proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    const next = makeServer({ id: "next" });
+    servers.set(proxied.id, proxied);
+    servers.set(next.id, next);
+    const opened: string[] = [];
+    const passwordPrompt: PasswordPrompt = { prompt: vi.fn(async () => {
+      opened.push("next");
+      return { password: "target-pw", save: false };
+    }) };
+    const connector: SshConnector = { connect: vi.fn(async () => makeFakeConnection()) };
+    const realAuth = new SilentAuthSshFactory(connector, vault, passwordPrompt, undefined, undefined, (id) => servers.get(id));
+    let proxySignal: AbortSignal | undefined;
+    const proxyPrompt = vi.fn((_server: ServerConfig, _proxy: Socks5Proxy | HttpConnectProxy, signal?: AbortSignal) => {
+      opened.push("proxy");
+      proxySignal = signal;
+      return new Promise<{ password: string; save: boolean } | undefined>((resolve) => {
+        signal?.addEventListener("abort", () => resolve(undefined), { once: true });
+      });
+    });
+    const { ProxySshFactory } = await import("../../src/services/ssh/proxySshFactory");
+    const factory = new ProxySshFactory(realAuth, (id) => servers.get(id), vault, 60_000, proxyPrompt);
+    let active = true;
+
+    const abandoned = factory.connectWithContext(proxied, { isActive: () => active });
+    const abandonedFailure = abandoned.catch((error: unknown) => error);
+    await vi.waitFor(() => expect(opened).toEqual(["proxy"]));
+    const later = realAuth.connect(next);
+    active = false;
+
+    await vi.waitFor(() => expect(opened).toEqual(["proxy", "next"]));
+    expect(proxySignal?.aborted).toBe(true);
+    expect((await abandonedFailure as Error).message).toContain("connection attempt ended");
+    await expect(later).resolves.toBeDefined();
+  });
+
+  it("keeps a shared proxy-password prompt open while another owner remains live", async () => {
+    const proxied = makeServer({ authType: "agent", proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
+    servers.set(proxied.id, proxied);
+    const connector: SshConnector = { connect: vi.fn(async () => makeFakeConnection()) };
+    const realAuth = new SilentAuthSshFactory(connector, vault, { prompt: vi.fn() }, undefined, undefined, (id) => servers.get(id));
+    let proxySignal: AbortSignal | undefined;
+    let answer!: (value: { password: string; save: boolean }) => void;
+    const proxyPrompt = vi.fn((_server: ServerConfig, _proxy: Socks5Proxy | HttpConnectProxy, signal?: AbortSignal) => {
+      proxySignal = signal;
+      return new Promise<{ password: string; save: boolean }>((resolve) => { answer = resolve; });
+    });
+    const { ProxySshFactory } = await import("../../src/services/ssh/proxySshFactory");
+    const factory = new ProxySshFactory(realAuth, (id) => servers.get(id), vault, 60_000, proxyPrompt);
+    const socksMod = await import("socks");
+    (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket: makeSimpleSocks5Socket() } as any);
+    let firstActive = true;
+
+    const first = factory.connectWithContext(proxied, { isActive: () => firstActive });
+    const firstFailure = first.catch((error: unknown) => error);
+    await vi.waitFor(() => expect(proxyPrompt).toHaveBeenCalledTimes(1));
+    const second = factory.connectWithContext(proxied, { isActive: () => true });
+    await vi.waitFor(() => {
+      const shared = (factory as unknown as { sharedProxyPasswords: Map<string, { owners: unknown[] }> }).sharedProxyPasswords.get(proxied.id);
+      expect(shared?.owners).toHaveLength(2);
+    });
+    firstActive = false;
+    await new Promise<void>((resolve) => setTimeout(resolve, 120));
+    expect(proxySignal?.aborted).toBe(false);
+
+    answer({ password: "proxy-pw", save: false });
+    expect((await firstFailure as Error).message).toContain("connection attempt ended");
+    await expect(second).resolves.toBeDefined();
+    expect(proxyPrompt).toHaveBeenCalledTimes(1);
+  });
+
   it("waits for an open SSH password prompt before asking for a proxy password", async () => {
     const direct = makeServer({ id: "direct" });
     const proxied = makeServer({ id: "proxied", proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
@@ -1279,7 +1350,7 @@ describe("ProxySshFactory", () => {
     await staleFailure;
     await fresh;
     expect(opened).toEqual(["server", "proxy"]);
-    expect(proxyPrompt).toHaveBeenCalledWith(replacement, replacement.proxy);
+    expect(proxyPrompt).toHaveBeenCalledWith(replacement, replacement.proxy, expect.any(AbortSignal));
   });
 
   it("Fix A — SOCKS5 authenticated proxy with no stored secret prompts, connects with the entered password, and stores it", async () => {

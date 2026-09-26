@@ -13,7 +13,7 @@ import { ProxiedSshConnection, jumpHostCleanup, socketCleanup, socketCloseRelay 
 import { underlyingConnection } from "./sshConnectionPool";
 import { getSshNetworkRoute, networkEndpointIdentity, networkRouteIdentity, rememberSshNetworkRoute } from "./sshNetworkRoute";
 import type { SilentAuthSshFactory } from "./silentAuth";
-import { proxyPasswordSecretKey } from "./silentAuth";
+import { promptUntilOwnersInactive, proxyPasswordSecretKey } from "./silentAuth";
 import { isSameAuthenticatedEndpoint } from "../inventory/proxySecretHygiene";
 import { configMutationLock } from "../configMutationLock";
 import { addresslessUnavailableMessage, telnetUnsupportedMessage } from "../../utils/protocolGuards";
@@ -35,11 +35,13 @@ const MAX_HTTP_RESPONSE_SIZE = 65536; // 64KB — more than enough for CONNECT h
  * which share the answer (`sharedProxyPasswords`). Absent ⇒ exactly the prior behavior (backward-compatible). On a
  * saved success the password is stored under `proxyPasswordSecretKey(id)` so it
  * is one-time; a later template endpoint change re-clears it via the existing
- * hygiene → re-prompt next connect, exactly §5.3.
+ * hygiene → re-prompt next connect, exactly §5.3. The signal aborts an open
+ * dialog when every connection sharing it has ended.
  */
 export type ProxyPasswordPrompt = (
   server: ServerConfig,
-  proxy: Socks5Proxy | HttpConnectProxy
+  proxy: Socks5Proxy | HttpConnectProxy,
+  signal: AbortSignal
 ) => Promise<{ password: string; save: boolean } | undefined>;
 
 /**
@@ -657,7 +659,7 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       credentialRecord,
       credentialEndpointSignature,
       owners,
-      answer: this.authFactory.promptExclusively(() => {
+      answer: this.authFactory.promptExclusively(() => promptUntilOwnersInactive((signal) => {
         if (owners.every((owner) => owner?.() === false)) {
           throw new Error("SSH connection attempt ended before its prompt opened");
         }
@@ -671,8 +673,8 @@ export class ProxySshFactory implements ContextAwareSshFactory {
             throw new Error("The server configuration changed while connecting; the credential was not sent. Connect again.");
           }
         }
-        return prompt(target, proxy);
-      })
+        return prompt(target, proxy, signal);
+      }, () => owners))
     };
     this.sharedProxyPasswords.set(target.id, shared);
     return shared;
