@@ -1257,6 +1257,73 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     expect(sessionIpmiHintNote({ id: "a", name: "X", text: "myipmitoolwrapper --run\n", runIn: "session" })).toBeUndefined();
   });
 
+  it.each([
+    ['a quoted mention', 'echo "use ipmitool -E"\n'],
+    ['a sudo user', 'sudo -u ipmitool bmc-login\n'],
+    ['a comment', '# ipmitool -E\n'],
+    ['a redirection target', 'echo hello >& ipmitool\n'],
+    ['a literal backslash in double quotes', '"ipmi\\tool" -E\n'],
+    ['a fully quoted assignment-shaped command', '"FOO=bar" ipmitool -E\n'],
+    ['a sudo validate request', 'sudo -v ipmitool -E\n'],
+    ['an assignment after command', 'command FOO=bar ipmitool -E\n'],
+    ['an assignment after nice', 'nice FOO=bar ipmitool -E\n'],
+    ['a command inspection', 'command -v ipmitool -E\n'],
+    ['a leading redirection target', '>& ipmitool\n'],
+    ['a clustered sudo username', 'sudo -nu ipmitool\n'],
+    ['a sudo chroot operand', 'sudo -R ipmitool\n'],
+    ['an env redirection target', 'env > ipmitool\n'],
+    ['process substitution before a command', '<(true) ipmitool -E\n'],
+    ['output process substitution before a command', '>(cat) ipmitool -E\n'],
+    ['a redirection target after echo', 'echo &> ipmitool\n'],
+    ['a quoted leading redirection', '">/tmp/log" ipmitool -E\n']
+  ])("does not treat %s as an ipmitool command", (_case, text) => {
+    expect(sessionIpmiHintNote({ id: "a", name: "X", text, runIn: "session" })).toBeUndefined();
+  });
+
+  it.each([
+    ["an executable path", "/usr/bin/ipmitool -E\n"],
+    ["a sudo command after its user option", "sudo -u root /usr/bin/ipmitool -E\n"],
+    ["a sudo login shell command", "sudo -i ipmitool -E\n"],
+    ["a sudo shell command", "sudo -s ipmitool -E\n"],
+    ["a sudo noninteractive command", "sudo -n ipmitool -E\n"],
+    ["an attached sudo user", "sudo --user=root ipmitool -E\n"],
+    ["an attached sudo group", "sudo --group=wheel ipmitool -E\n"],
+    ["a sudo environment assignment", "sudo BMC=1 ipmitool -E\n"],
+    ["a quoted sudo environment assignment", "sudo 'BMC=1' ipmitool -E\n"],
+    ["a shell append assignment", "BMC+=1 ipmitool -E\n"],
+    ["an env assignment after redirection", "env >/tmp/log BMC=1 ipmitool -E\n"],
+    ["a sudo chroot option", "sudo -R / ipmitool -E\n"],
+    ["an attached sudo chroot option", "sudo --chroot=/ ipmitool -E\n"],
+    ["a sudo timeout option", "sudo -T 10 ipmitool -E\n"],
+    ["an attached sudo timeout option", "sudo --command-timeout=10 ipmitool -E\n"],
+    ["a clustered sudo user option", "sudo -nu root ipmitool -E\n"],
+    ["an attached clustered sudo user", "sudo -nuroot ipmitool -E\n"],
+    ["an attached env unset option", "env --unset=FOO ipmitool -E\n"],
+    ["a quoted env assignment", "env 'BMC=hello world' ipmitool -E\n"],
+    ["an attached short env unset option", "env -uFOO ipmitool -E\n"],
+    ["the long sudo preserve-environment option", "sudo --preserve-env ipmitool -E\n"],
+    ["a named sudo preserve-environment list", "sudo --preserve-env=PATH ipmitool -E\n"],
+    ["a leading attached redirection", ">/tmp/ipmi.log ipmitool -E\n"],
+    ["a leading separated redirection", "> /tmp/ipmi.log ipmitool -E\n"],
+    ["a command wrapper with -p", "command -p ipmitool -E\n"],
+    ["an exec wrapper with -c", "exec -c ipmitool -E\n"],
+    ["a time wrapper with -p", "time -p ipmitool -E\n"],
+    ["an env prefix", "env BMC=1 ipmitool -E\n"],
+    ["a later command", "echo ready; ipmitool -E\n"],
+    ["a command after a bare carriage return", "echo ready\ripmitool -E\r"],
+    ["a command after a comment with backticks", "# log with `hostname`\nipmitool -E\n"],
+    ["a command after a single quoted substitution", "echo '$(hostname)'; ipmitool -E\n"],
+    ["a command after an assignment with a quoted value", 'FOO="bar" ipmitool -E\n']
+  ])("recognizes ipmitool in command position with %s", (_case, text) => {
+    expect(sessionIpmiHintNote({ id: "a", name: "X", text, runIn: "session" })).toBeDefined();
+  });
+
+  it("keeps quoted separators inside arguments and avoids guessing at nested shell commands", () => {
+    expect(sessionIpmiHintNote({ id: "a", name: "X", text: 'ipmitool -U "ops;admin" -E\n', runIn: "session" })).toBeDefined();
+    expect(sessionIpmiHintNote({ id: "a", name: "X", text: 'echo "then; ipmitool -E"\n', runIn: "session" })).toBeUndefined();
+    expect(sessionIpmiHintNote({ id: "a", name: "X", text: "bash -c 'ipmitool -E'\n", runIn: "session" })).toBeUndefined();
+  });
+
   it("returns nothing for a localTerminal ipmitool macro — that path is ipmiCredentialsOffNote's, not this one", () => {
     expect(
       sessionIpmiHintNote({ id: "a", name: "SOL", text: "ipmitool -H 10.0.0.9 sol activate\n", runIn: "localTerminal" })
@@ -1285,6 +1352,11 @@ describe("ipmiCredentialsOffNote — narrow local ipmitool credential hint (#151
     expect(hint(text)).toContain('tick "Provide IPMI credentials"');
   });
 
+  it("keeps a quoted semicolon in the username and still suggests the missing local credentials", () => {
+    expect(hint('ipmitool -H ${profile.ipmiHost} -U "ops;admin" -E sol activate\n'))
+      .toContain('tick "Provide IPMI credentials"');
+  });
+
   it.each([
     ["no IPMI profile token", "ipmitool -H 10.0.0.9 -E sol activate\n"],
     ["no -E flag", "ipmitool -H ${profile.ipmiHost} -a sol activate\n"],
@@ -1310,6 +1382,7 @@ describe("ipmiCredentialsOffNote — narrow local ipmitool credential hint (#151
     ["a wrapper", "sudo ipmitool -H ${profile.ipmiHost} -E sol activate\n"],
     ["a shell script", "sh -c 'ipmitool -H ${profile.ipmiHost} -E sol activate'\n"],
     ["a quoted token", 'ipmitool -H "${profile.ipmiHost}" -E sol activate\n'],
+    ["shell expansion inside a quoted username", 'ipmitool -H ${profile.ipmiHost} -U "ops;$(id)" -E sol activate\n'],
     ["a token embedded in an argument", "ipmitool -H host${profile.ipmiHost} -E sol activate\n"],
     ["a pipeline", "ipmitool -H ${profile.ipmiHost} -E sol activate | tee log\n"],
     ["a redirection", "ipmitool -H ${profile.ipmiHost} -E sol activate >log\n"],

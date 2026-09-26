@@ -18,6 +18,7 @@ import type { ProfileTokenError, ProfileTokenErrorCommandSubject, ProfileTokenFo
 import { profileTokenServer, resolveIpmiTerminalEnv, type ProfileTokenServer } from "./ipmiCredentials";
 import { VARIABLE_MARKER } from "../ui/macroVariableMarker";
 import { resolveMacroBrowserUrl } from "../utils/browserUrl";
+import { textRunsIpmitool } from "../utils/ipmitoolCommand";
 import { macroWillPrompt } from "./macroCommands";
 import { connectServer, pickServer, toServerFromArg } from "./serverCommands";
 import { runMacroWithTarget, terminalSendTarget, type MacroSendTarget } from "./macroVariablePrompt";
@@ -281,14 +282,19 @@ function simpleIpmitoolNeedsProfilePassword(text: string): boolean {
     args.some((word) => IPMI_PROFILE_TOKEN_WORD_RE.test(word)) &&
     !hasAlternativeIpmiPasswordOption(args) &&
     !hasAmbiguousIpmiOptionToken(args) &&
-    args.every((word) => SIMPLE_IPMITOOL_ARGUMENT_RE.test(word) || IPMI_PROFILE_TOKEN_WORD_RE.test(word))
+    args.every((word, index) =>
+      SIMPLE_IPMITOOL_ARGUMENT_RE.test(word) ||
+      IPMI_PROFILE_TOKEN_WORD_RE.test(word) ||
+      // A quoted username may contain a separator; it remains one argument.
+      (args[index - 1] === "-U" && /^"[A-Za-z0-9._;:/=-]+"$/.test(word))
+    )
   );
 }
 
 /**
  * A concise suggestion for the one command shape where the checkbox is an
- * obvious remedy: one local, unquoted `ipmitool` command with an IPMI profile
- * token and `-E`. Complex shell text is left to the terminal, which can explain
+ * obvious remedy: one simple local `ipmitool` command with an unquoted IPMI
+ * profile token and `-E`. Complex shell text is left to the terminal, which can explain
  * its own behavior more accurately than a text scan can.
  */
 export function ipmiCredentialsOffNote(macro: TerminalMacro): string | undefined {
@@ -300,8 +306,6 @@ export function ipmiCredentialsOffNote(macro: TerminalMacro): string | undefined
     ? 'IPMI credentials were not provided — tick "Provide IPMI credentials" in the macro editor'
     : undefined;
 }
-
-const IPMITOOL_COMMAND_RE = /(^|\s)ipmitool\b/;
 
 /**
  * The caveat for a SESSION-target macro whose text reaches for a BMC — it uses an
@@ -320,7 +324,7 @@ export function sessionIpmiHintNote(macro: TerminalMacro): string | undefined {
   if (resolveMacroRunTarget(macro) !== "session") {
     return undefined;
   }
-  return usesIpmiTokens(macro.text) || IPMITOOL_COMMAND_RE.test(macro.text)
+  return usesIpmiTokens(macro.text) || textRunsIpmitool(macro.text)
     ? 'ran in the SSH session on the remote host — set "Run in" to Local terminal to run ipmitool from this machine'
     : undefined;
 }

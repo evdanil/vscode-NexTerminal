@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { TRIGGER_COOLDOWN_RANGE_MESSAGE, macroCooldownWebviewJs, renderMacroEditorHtml } from "../../src/ui/macroEditorHtml";
 import type { MacroVariable, TerminalMacro } from "../../src/models/terminalMacro";
 import { DEFAULT_TRIGGER_COOLDOWN } from "../../src/storage/macroStore";
+import { ipmitoolCommandWebviewJs } from "../../src/utils/ipmitoolCommand";
 
 const nonce = "test-nonce-456";
 
@@ -199,6 +200,74 @@ describe("renderMacroEditorHtml", () => {
     expect(html).toContain('use <code>-E</code> and tick "Provide IPMI credentials"');
     expect(html).toContain("with <code>-a</code>, ipmitool asks for it in the terminal");
     expect(html).not.toContain('then tick "Provide IPMI credentials"');
+  });
+
+  it.each([
+    ["echo \"use ipmitool -E\"", "none"],
+    ["sudo -u ipmitool bmc-login", "none"],
+    ["echo hello >& ipmitool", "none"],
+    ['"ipmi\\tool" -E', "none"],
+    ['"FOO=bar" ipmitool -E', "none"],
+    ["sudo -v ipmitool -E", "none"],
+    ["command FOO=bar ipmitool -E", "none"],
+    ["nice FOO=bar ipmitool -E", "none"],
+    ["command -v ipmitool -E", "none"],
+    [">& ipmitool", "none"],
+    ["sudo -nu ipmitool", "none"],
+    ["sudo -R ipmitool", "none"],
+    ["env > ipmitool", "none"],
+    ["<(true) ipmitool -E", "none"],
+    [">(cat) ipmitool -E", "none"],
+    ["echo &> ipmitool", "none"],
+    ['">/tmp/log" ipmitool -E', "none"],
+    ["/usr/bin/ipmitool -E", ""],
+    ["sudo -i ipmitool -E", ""],
+    ["sudo -s ipmitool -E", ""],
+    ["sudo -n ipmitool -E", ""],
+    ["sudo --user=root ipmitool -E", ""],
+    ["sudo --group=wheel ipmitool -E", ""],
+    ["sudo BMC=1 ipmitool -E", ""],
+    ["sudo 'BMC=1' ipmitool -E", ""],
+    ["BMC+=1 ipmitool -E", ""],
+    ["env >/tmp/log BMC=1 ipmitool -E", ""],
+    ["sudo -R / ipmitool -E", ""],
+    ["sudo --chroot=/ ipmitool -E", ""],
+    ["sudo -T 10 ipmitool -E", ""],
+    ["sudo --command-timeout=10 ipmitool -E", ""],
+    ["sudo -nu root ipmitool -E", ""],
+    ["sudo -nuroot ipmitool -E", ""],
+    ["env --unset=FOO ipmitool -E", ""],
+    ["env 'BMC=hello world' ipmitool -E", ""],
+    ["env -uFOO ipmitool -E", ""],
+    ["sudo --preserve-env ipmitool -E", ""],
+    ["sudo --preserve-env=PATH ipmitool -E", ""],
+    [">/tmp/ipmi.log ipmitool -E", ""],
+    ["> /tmp/ipmi.log ipmitool -E", ""],
+    ["command -p ipmitool -E", ""],
+    ["exec -c ipmitool -E", ""],
+    ["time -p ipmitool -E", ""],
+    ['FOO="bar" ipmitool -E', ""],
+    ["echo ready\ripmitool -E\r", ""],
+    ["# log with `hostname`\nipmitool -E\n", ""],
+    ["echo '$(hostname)'; ipmitool -E\n", ""]
+  ])("classifies the command position in the live Session hint for %s", (text, expectedDisplay) => {
+    const html = render([], null);
+    const match = /function updateSessionIpmitoolHint\(\) \{[\s\S]*?\n      \}/.exec(html);
+    if (!match) throw new Error("Session hint updater missing from webview script");
+    const elements = {
+      "macro-run-in": { value: "session" },
+      "macro-text": { value: text },
+      "session-ipmitool-hint": { style: { display: "none" } }
+    };
+    const document = { getElementById: (id: string) => elements[id as keyof typeof elements] };
+    const update = new Function(
+      "document", "scanProfileTokens",
+      `${ipmitoolCommandWebviewJs()}\n${match[0]}\nreturn updateSessionIpmitoolHint;`
+    )(document, () => ({ used: [] })) as () => void;
+
+    expect(html).toContain(ipmitoolCommandWebviewJs());
+    update();
+    expect(elements["session-ipmitool-hint"].style.display).toBe(expectedDisplay);
   });
 
   it("carries the flag in the save payload and re-hides/unchecks it when Run in leaves Local terminal", () => {
