@@ -1269,6 +1269,7 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     ['an assignment after nice', 'nice FOO=bar ipmitool -E\n'],
     ['a command inspection', 'command -v ipmitool -E\n'],
     ['a leading redirection target', '>& ipmitool\n'],
+    ['a clustered sudo username', 'sudo -nu ipmitool\n'],
     ['a redirection target after echo', 'echo &> ipmitool\n'],
     ['a quoted leading redirection', '">/tmp/log" ipmitool -E\n']
   ])("does not treat %s as an ipmitool command", (_case, text) => {
@@ -1284,7 +1285,10 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     ["an attached sudo user", "sudo --user=root ipmitool -E\n"],
     ["an attached sudo group", "sudo --group=wheel ipmitool -E\n"],
     ["a sudo environment assignment", "sudo BMC=1 ipmitool -E\n"],
+    ["a clustered sudo user option", "sudo -nu root ipmitool -E\n"],
+    ["an attached clustered sudo user", "sudo -nuroot ipmitool -E\n"],
     ["an attached env unset option", "env --unset=FOO ipmitool -E\n"],
+    ["a quoted env assignment", "env 'BMC=hello world' ipmitool -E\n"],
     ["an attached short env unset option", "env -uFOO ipmitool -E\n"],
     ["the long sudo preserve-environment option", "sudo --preserve-env ipmitool -E\n"],
     ["a named sudo preserve-environment list", "sudo --preserve-env=PATH ipmitool -E\n"],

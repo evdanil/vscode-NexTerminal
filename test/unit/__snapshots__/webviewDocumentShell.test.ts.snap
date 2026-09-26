@@ -7648,6 +7648,7 @@ echo hi</textarea>
 				allowAssignments = true;
 				while (index < words.length && words[index].startsWith("-")) {
 					const option = words[index++];
+					const shortValueOption = /^-[EABbnSHkis]*[ugpCD](.*)$/.exec(option);
 					if ([
 						"-u",
 						"--user",
@@ -7662,6 +7663,11 @@ echo hi</textarea>
 					].includes(option)) {
 						if (index >= words.length) return false;
 						index++;
+					} else if (shortValueOption) {
+						if (shortValueOption[1] === "") {
+							if (index >= words.length) return false;
+							index++;
+						}
 					} else if (!/^(?:--(?:user|group|prompt|close-from|chdir|preserve-env)=.+|-[ugpCD].+)$/.test(option) && ![
 						"--login",
 						"--shell",
@@ -7685,7 +7691,7 @@ echo hi</textarea>
 				allowAssignments = false;
 				while (index < words.length) {
 					const option = words[index];
-					if (assignmentAllowed[index] && assignment.test(option) || option === "-i" || option === "--ignore-environment") {
+					if (assignment.test(option) || option === "-i" || option === "--ignore-environment") {
 						index++;
 						continue;
 					};

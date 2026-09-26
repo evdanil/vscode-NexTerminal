@@ -26,9 +26,15 @@ export function textRunsIpmitool(text: string): boolean {
         allowAssignments = true;
         while (index < words.length && words[index].startsWith("-")) {
           const option = words[index++];
+          const shortValueOption = /^-[EABbnSHkis]*[ugpCD](.*)$/.exec(option);
           if (["-u", "--user", "-g", "--group", "-p", "--prompt", "-C", "--close-from", "-D", "--chdir"].includes(option)) {
             if (index >= words.length) return false;
             index++;
+          } else if (shortValueOption) {
+            if (shortValueOption[1] === "") {
+              if (index >= words.length) return false;
+              index++;
+            }
           } else if (
             !/^(?:--(?:user|group|prompt|close-from|chdir|preserve-env)=.+|-[ugpCD].+)$/.test(option) &&
             !["--login", "--shell", "--non-interactive", "--askpass", "--background", "--bell", "--set-home", "--stdin", "--reset-timestamp", "--preserve-env"].includes(option) &&
@@ -45,7 +51,7 @@ export function textRunsIpmitool(text: string): boolean {
         allowAssignments = false;
         while (index < words.length) {
           const option = words[index];
-          if ((assignmentAllowed[index] && assignment.test(option)) || option === "-i" || option === "--ignore-environment") { index++; continue; }
+          if (assignment.test(option) || option === "-i" || option === "--ignore-environment") { index++; continue; }
           if (option === "-u" || option === "--unset") {
             if (index + 1 >= words.length) return false;
             index += 2;
