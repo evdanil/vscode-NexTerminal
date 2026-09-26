@@ -4321,6 +4321,30 @@ describe("computeSyncPlan — adopt-on-add", () => {
       return keptDevice({ endpoints: [{ kind: "ssh", host: "lab-sw-01" }, { kind: "ssh", host: alt }], ...overrides });
     }
 
+    it.each([
+      { field: "ipmiHost" as const, stamp: "syncedIpmiHost" as const, label: "IPMI / BMC host", old: "10.0.1.1", yours: "10.0.1.5", reported: "10.0.1.9", device: keptDeviceWithOob },
+      { field: "altHost" as const, stamp: "syncedAltHost" as const, label: "alternate host", old: "10.0.2.1", yours: "10.0.2.5", reported: "10.0.2.9", device: keptDeviceWithAlt }
+    ])("warns when adoption keeps a hand-entered $label after its source moves, but not for an unchanged stamp or cleared field", (entry) => {
+      const marker = keptMarker({ [entry.stamp]: entry.old });
+      const before = makeKeptServer({ [entry.field]: entry.yours, formerlySynced: marker });
+      const planForHost = (server: ServerConfig, reported: string) => planFor({
+        source: makeSource(), tree: makeTree([entry.device(reported)]), currentServers: [server],
+        now: 5000, adoptionChoice: "adopt"
+      });
+
+      const moved = planForHost(before, entry.reported);
+      expect(moved.warnings).toContain(
+        `"core-sw-1": kept your ${entry.label} ${entry.yours}; the source now reports ${entry.reported} — set the ${entry.label} to that to let the source manage it.`
+      );
+      expect(moved.updates).toHaveLength(1);
+      expect(moved.updates[0].after.id).toBe("kept-1");
+      expect(moved.updates[0].after[entry.field]).toBe(entry.yours);
+
+      expect(planForHost(before, entry.old).warnings.filter((w) => w.includes(`kept your ${entry.label}`))).toEqual([]);
+      const cleared = makeKeptServer({ [entry.field]: undefined, formerlySynced: marker });
+      expect(planForHost(cleared, entry.reported).warnings.filter((w) => w.includes(`kept your ${entry.label}`))).toEqual([]);
+    });
+
     it("ALTERNATE HOST (Phase 2) — an adoption RESTORES `syncedAltHost` from the marker, and a marker carrying none restores none (kills a receipt-less adoption, under which Remove Source → Keep Servers → re-add → Adopt leaves a SYNC-WRITTEN alternate host looking hand-typed forever)", () => {
       const source = makeSource();
 
@@ -6236,6 +6260,107 @@ describe("provider text in plan warnings — the Show Warnings document", () => 
 
     expect(plan.warnings[0]).toBe("provider notice");
     expect(plan.warnings[1]).toContain("Duplicate device ID");
+  });
+});
+
+describe("computeSyncPlan — warn about retained hand-entered secondary hosts (#204)", () => {
+  const cases = [
+    {
+      field: "ipmiHost" as const,
+      stamp: "syncedIpmiHost" as const,
+      label: "IPMI / BMC host",
+      endpointKind: "redfish" as const,
+      old: "10.0.1.1",
+      yours: "10.0.1.5",
+      reported: "10.0.1.9"
+    },
+    {
+      field: "altHost" as const,
+      stamp: "syncedAltHost" as const,
+      label: "alternate host",
+      endpointKind: "ssh" as const,
+      old: "10.0.2.1",
+      yours: "10.0.2.5",
+      reported: "10.0.2.9"
+    }
+  ] as const;
+
+  const treeFor = (entry: typeof cases[number], host: string) => makeTree([
+    makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.1" }, { kind: entry.endpointKind, host }] })
+  ]);
+
+  it.each(cases)("warns when an addressed server keeps a hand-entered $label after the source moves", (entry) => {
+    const before = makeOwnedServer({
+      [entry.field]: entry.yours,
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, [entry.stamp]: entry.old }
+    });
+    const plan = computeSyncPlan({
+      source: makeSource(),
+      tree: treeFor(entry, entry.reported),
+      currentServers: [before],
+      now: 2000
+    });
+
+    expect(plan.warnings).toContain(
+      `"core-sw-1": kept your ${entry.label} ${entry.yours}; the source now reports ${entry.reported} — set the ${entry.label} to that to let the source manage it.`
+    );
+    expect(plan.updates).toHaveLength(0);
+    expect(plan.unchangedCount).toBe(1);
+  });
+
+  it.each(cases)("keeps a $label override quiet until the source moves, and honors a cleared field", (entry) => {
+    const origin = { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, [entry.stamp]: entry.old };
+    const overridden = makeOwnedServer({ [entry.field]: entry.yours, origin });
+    const unchangedSource = computeSyncPlan({
+      source: makeSource(), tree: treeFor(entry, entry.old), currentServers: [overridden], now: 2000
+    });
+    expect(unchangedSource.warnings.filter((w) => w.includes("kept your"))).toEqual([]);
+    expect(unchangedSource.updates).toHaveLength(0);
+
+    const cleared = makeOwnedServer({ [entry.field]: undefined, origin });
+    const movedSource = computeSyncPlan({
+      source: makeSource(), tree: treeFor(entry, entry.reported), currentServers: [cleared], now: 2000
+    });
+    expect(movedSource.warnings.filter((w) => w.includes("kept your"))).toEqual([]);
+    expect(movedSource.updates).toHaveLength(0);
+  });
+
+  it("warns about a moved BMC address on a console-addressless server but keeps a still-current stamp and a cleared value quiet", () => {
+    const origin = { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedIpmiHost: "10.0.1.1" };
+    const treeForOob = (host: string) => makeTree([makeDevice({ endpoints: [{ kind: "redfish", host }] })]);
+    const before = makeOwnedServer({ host: "", port: 0, addressless: true, ipmiHost: "10.0.1.5", origin });
+    const moved = computeSyncPlan({
+      source: makeSource(), tree: treeForOob("10.0.1.9"), currentServers: [before], now: 2000
+    });
+    expect(moved.warnings).toContain(
+      '"core-sw-1": kept your IPMI / BMC host 10.0.1.5; the source now reports 10.0.1.9 — set the IPMI / BMC host to that to let the source manage it.'
+    );
+    expect(moved.updates).toHaveLength(0);
+
+    const stillCurrent = computeSyncPlan({
+      source: makeSource(), tree: treeForOob("10.0.1.1"), currentServers: [before], now: 2000
+    });
+    expect(stillCurrent.warnings.filter((w) => w.includes("kept your IPMI / BMC host"))).toEqual([]);
+
+    const cleared = makeOwnedServer({ host: "", port: 0, addressless: true, origin });
+    const clearedPlan = computeSyncPlan({
+      source: makeSource(), tree: treeForOob("10.0.1.9"), currentServers: [cleared], now: 2000
+    });
+    expect(clearedPlan.warnings.filter((w) => w.includes("kept your IPMI / BMC host"))).toEqual([]);
+  });
+
+  it("reports a source alternate host that the form cannot round-trip without prescribing it as a remedy", () => {
+    const before = makeOwnedServer({
+      altHost: "10.0.2.5",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedAltHost: "10.0.2.1" }
+    });
+    const plan = computeSyncPlan({
+      source: makeSource(), tree: treeFor(cases[1], "10.0.2.9 "), currentServers: [before], now: 2000
+    });
+    const warning = plan.warnings.find((w) => w.includes("kept your alternate host"));
+    expect(warning).toContain("10.0.2.9 (sanitized for display)");
+    expect(warning).toContain("setting it as shown will not hand the field back");
+    expect(warning).not.toContain("set the alternate host to that");
   });
 });
 

@@ -706,6 +706,26 @@ function keptHandAddressWarning(
   return warning;
 }
 
+/** A retained secondary address needs a warning when this report differs from its last sync stamp. */
+function keptHandSecondaryHostWarning(
+  serverName: string,
+  label: "IPMI / BMC host" | "alternate host",
+  current: string | undefined,
+  stamp: string | undefined,
+  reported: string | undefined,
+  takes: boolean
+): string | undefined {
+  // An empty field with a stamp is a deliberate clear (matrix row 2).
+  if (reported === undefined || takes || current === undefined || current.trim() === "" || reported === stamp) {
+    return undefined;
+  }
+  const displayHost = flattenProviderText(reported);
+  if (displayHost.trim() !== reported) {
+    return `"${serverName}": kept your ${label} ${current}; the source now reports ${displayHost || "(no visible text)"} (sanitized for display). The displayed ${label} was sanitized; setting it as shown will not hand the field back.`;
+  }
+  return `"${serverName}": kept your ${label} ${current}; the source now reports ${reported} — set the ${label} to that to let the source manage it.`;
+}
+
 /**
  * AUTH 2b (REVIEW FINDING, P1) — "can this server supply the key file the
  * profile does not?". The server-side half of `authProfileNeedsServerKeyPath`
@@ -1509,6 +1529,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         const takesIpmiHost =
           mgmtHost !== undefined &&
           syncOwnsIpmiHost(ownedForAddressless.ipmiHost, ownedForAddressless.origin?.syncedIpmiHost, mgmtHost);
+        const keptIpmiHost = keptHandSecondaryHostWarning(
+          device.name, "IPMI / BMC host", ownedForAddressless.ipmiHost,
+          ownedForAddressless.origin?.syncedIpmiHost, mgmtHost, takesIpmiHost
+        );
+        if (keptIpmiHost !== undefined) warnings.push(keptIpmiHost);
         // PRIMARY HOST/PORT (task #29, the deferred #82 P2-3) — the console
         // address is only BLANKED to the addressless placeholder shape when the
         // sync still OWNS it. The device offers no console this fetch, so `dev`
@@ -1967,6 +1992,12 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // rebuild. See `syncOwnsAltHost` for the write rule and the whole matrix.
       const takesAltHost =
         altHost !== undefined && syncOwnsAltHost(ownedServer.altHost, ownedServer.origin?.syncedAltHost, altHost);
+      for (const kept of [
+        keptHandSecondaryHostWarning(device.name, "IPMI / BMC host", ownedServer.ipmiHost, ownedServer.origin?.syncedIpmiHost, mgmtHost, takesIpmiHost),
+        keptHandSecondaryHostWarning(device.name, "alternate host", ownedServer.altHost, ownedServer.origin?.syncedAltHost, altHost, takesAltHost)
+      ]) {
+        if (kept !== undefined) warnings.push(kept);
+      }
       // TELNET (Phase 0) — the twin decision for `protocol`, decided HERE for
       // the same reason the two above it are: its stamp goes INTO the origin
       // literal below, which the retro-apply / rollback branches rebuild. No
@@ -2896,6 +2927,12 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         const takesAltHost =
           altHost !== undefined &&
           syncOwnsAltHost(adoptee.altHost, adoptee.formerlySynced?.syncedAltHost, altHost);
+        for (const kept of [
+          keptHandSecondaryHostWarning(device.name, "IPMI / BMC host", adoptee.ipmiHost, adoptee.formerlySynced?.syncedIpmiHost, mgmtHost, takesIpmiHost),
+          keptHandSecondaryHostWarning(device.name, "alternate host", adoptee.altHost, adoptee.formerlySynced?.syncedAltHost, altHost, takesAltHost)
+        ]) {
+          if (kept !== undefined) warnings.push(kept);
+        }
         // TELNET (Phase 0) — the twin decision on an adoptee, with the same
         // substitution: `DetachedServerOrigin.syncedProtocol` stands in for the
         // origin stamp on a record this sync did not create. No `!== undefined`

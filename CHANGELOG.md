@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.281] — 2026-09-26
+
+### Fixed
+
+- **Retained BMC and alternate hosts are explained during inventory sync.** Show Warnings now names a hand-entered IPMI/BMC or alternate host when the source reports a changed address, including adoption and addressless BMC servers. It offers a set-field remedy only when the reported value can be entered unchanged.
+
 ## [2.8.280] — 2026-09-26
 
 ### Fixed
