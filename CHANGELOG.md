@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.292] — 2026-09-26
+
+### Fixed
+
+- **Inventory sync skips endpoint hosts containing invisible code points.** Host validation rejects Default_Ignorable_Code_Point characters while preserving valid emoji sequences and combining marks in other provider text.
+
 ## [2.8.291] — 2026-09-26
 
 ### Fixed
