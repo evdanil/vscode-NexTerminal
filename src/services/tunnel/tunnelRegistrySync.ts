@@ -118,6 +118,13 @@ function retiredRouteOverlaps(
   return retiredRoute !== undefined && networkRoutesOverlap(retiredRoute, routeIdentity);
 }
 
+function matchesActiveTunnel(entry: TunnelRegistryEntry, tunnel: ActiveTunnel): boolean {
+  return !entry.retiredReverseBind && entry.profileId === tunnel.profileId &&
+    (entry.activeTunnelId !== undefined
+      ? entry.activeTunnelId === tunnel.id
+      : entry.startedAt === tunnel.startedAt);
+}
+
 function defaultProbePort(port: number): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = new net.Socket();
@@ -230,45 +237,50 @@ export class TunnelRegistrySync {
           this.unsettledReverseBindFenceIds.delete(fence.fenceId);
           throw error;
         }
+        // A later active-array save can fail. The already-published fence must
+        // still be removed when the transport confirms closure.
+        this.trackFenceSettlement(profileId, tunnel, fence);
       }
       await this.store.saveEntries(filtered);
     });
+  }
 
-    if (fence) {
-      if (fence.allocatedPort) {
-        void Promise.race([fence.allocatedPort, fence.settled.then(() => undefined)]).then((port) => {
-          if (port === undefined || port === 0) {
+  private trackFenceSettlement(profileId: string, tunnel: ActiveTunnel, fence: RetiredReverseBindFence): void {
+    if (fence.allocatedPort) {
+      void Promise.race([fence.allocatedPort, fence.settled.then(() => undefined)]).then((port) => {
+        if (port === undefined || port === 0) {
+          return;
+        }
+        return this.mutateEntries(async () => {
+          if (!this.unsettledReverseBindFenceIds.has(fence.fenceId)) {
             return;
           }
-          return this.mutateEntries(async () => {
-            if (!this.unsettledReverseBindFenceIds.has(fence.fenceId)) {
-              return;
-            }
-            const current = await this.store.getEntries();
-            const entry = current.find((item) =>
-              item.ownerSessionId === this.sessionId && item.retiredReverseBind?.fenceId === fence.fenceId
-            );
-            if (entry?.retiredReverseBind) {
-              await this.store.publishFence({
-                ...entry,
-                remotePort: port,
-                retiredReverseBind: { ...entry.retiredReverseBind, remotePort: port }
-              });
-            }
-          });
+          const current = await this.store.getEntries();
+          const entry = current.find((item) =>
+            item.ownerSessionId === this.sessionId && item.retiredReverseBind?.fenceId === fence.fenceId
+          );
+          if (entry?.retiredReverseBind) {
+            await this.store.publishFence({
+              ...entry,
+              remotePort: port,
+              retiredReverseBind: { ...entry.retiredReverseBind, remotePort: port }
+            });
+          }
         });
-      }
-      let hasSettled = false;
-      const settled = fence.settled.then(() => { hasSettled = true; });
-      const cleanup = settled.then(() => this.mutateEntries(async () => {
+      });
+    }
+    let hasSettled = false;
+    const settled = fence.settled.then(() => { hasSettled = true; });
+    const cleanup = settled.then(() => this.mutateEntries(async () => {
+      try {
         const entries = await this.store.getEntries();
         const filtered = entries.filter((entry) =>
           entry.retiredReverseBind !== undefined ||
           entry.ownerSessionId !== this.sessionId ||
           entry.profileId !== profileId ||
           (entry.activeTunnelId !== undefined
-            ? entry.activeTunnelId !== options?.tunnel.id
-            : entry.startedAt !== options?.tunnel.startedAt)
+            ? entry.activeTunnelId !== tunnel.id
+            : entry.startedAt !== tunnel.startedAt)
         );
         if (filtered.length !== entries.length) {
           // A stale window can restore the old active row while this fence is
@@ -276,18 +288,21 @@ export class TunnelRegistrySync {
           await this.store.saveEntries(filtered);
         }
         await this.store.removeFence(fence.fenceId);
+      } finally {
+        // Settlement is final even when storage fails. The next slow sweep can
+        // remove an unrefreshed file; heartbeat must not keep it live forever.
         this.unsettledReverseBindFenceIds.delete(fence.fenceId);
-      }));
-      const pending = { settled, cleanup, hasSettled: () => hasSettled };
-      this.pendingFenceCleanups.add(pending);
-      void cleanup.then(
-        () => { this.pendingFenceCleanups.delete(pending); },
-        (error: unknown) => {
-          this.pendingFenceCleanups.delete(pending);
-          console.error("[Nexus] reverse-bind fence cleanup failed", error);
-        }
-      );
-    }
+      }
+    }));
+    const pending = { settled, cleanup, hasSettled: () => hasSettled };
+    this.pendingFenceCleanups.add(pending);
+    void cleanup.then(
+      () => { this.pendingFenceCleanups.delete(pending); },
+      (error: unknown) => {
+        this.pendingFenceCleanups.delete(pending);
+        console.error("[Nexus] reverse-bind fence cleanup failed", error);
+      }
+    );
   }
 
   public async checkRemoteOwnership(
@@ -414,7 +429,7 @@ export class TunnelRegistrySync {
           if (this.unsettledReverseBindFenceIds.has(entry.retiredReverseBind.fenceId)) {
             await this.store.publishFence({ ...entry, lastSeen: now });
           }
-        } else if (activeTunnels.some((t) => t.profileId === entry.profileId)) {
+        } else if (activeTunnels.some((t) => matchesActiveTunnel(entry, t))) {
           entry.lastSeen = now;
           changed = true;
         }
@@ -422,7 +437,7 @@ export class TunnelRegistrySync {
 
       // Self-heal: re-register own active tunnels if missing from registry
       const missingOwn = activeTunnels.filter(
-        (t) => !ownEntries.some((e) => e.profileId === t.profileId)
+        (t) => !ownEntries.some((e) => matchesActiveTunnel(e, t))
       );
       if (missingOwn.length > 0) {
         for (const tunnel of missingOwn) {
@@ -457,6 +472,22 @@ export class TunnelRegistrySync {
       const remote = entries.filter((e) => e.ownerSessionId !== this.sessionId && !e.retiredReverseBind);
       const remoteForProbe = entries.filter((e) => e.ownerSessionId !== this.sessionId && !e.retiredReverseBind);
       const now = Date.now();
+
+      // A terminated owner cannot delete its fence file. The same staleness
+      // rule that releases cross-window waits also bounds storage growth.
+      for (const entry of entries) {
+        if (
+          entry.ownerSessionId !== this.sessionId &&
+          entry.retiredReverseBind &&
+          now - (entry.lastSeen ?? entry.startedAt) >= STALE_THRESHOLD_MS
+        ) {
+          try {
+            await this.store.removeFence(entry.retiredReverseBind.fenceId);
+          } catch (error) {
+            console.error("[Nexus] expired reverse-bind fence cleanup failed", error);
+          }
+        }
+      }
 
       // Probe all remote entries concurrently.
       // Reverse tunnels have no local listener to probe — use lastSeen heartbeat instead.

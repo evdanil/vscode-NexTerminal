@@ -339,6 +339,106 @@ describe("TunnelRegistrySync", () => {
     expect(await store.getEntries()).toEqual([expect.objectContaining({ activeTunnelId: replacement.id })]);
   });
 
+  it("self-heals a missing replacement row while an older same-profile fence remains", async () => {
+    const oldTunnel = makeTunnel({ id: "old", tunnelType: "reverse", remotePort: 9000 });
+    const replacement = makeTunnel({ id: "replacement", tunnelType: "reverse", remotePort: 9001 });
+    await sync.registerTunnel(oldTunnel);
+    await sync.unregisterTunnel(oldTunnel.profileId, {
+      tunnel: oldTunnel,
+      retiredReverseBind: {
+        fenceId: oldTunnel.id,
+        routeIdentity: { kind: "direct", endpoint: { hosts: ["old-route"], port: 22 } },
+        remotePort: oldTunnel.remotePort,
+        settled: new Promise<void>(() => {})
+      }
+    });
+    core.registerTunnel(replacement);
+    await sync.registerTunnel(replacement);
+    await store.saveEntries([]); // another window overwrites the active array
+
+    await sync.syncNow();
+
+    expect((await store.getEntries()).filter((entry) => !entry.retiredReverseBind))
+      .toEqual([expect.objectContaining({ activeTunnelId: replacement.id })]);
+  });
+
+  it("removes a published fence after settlement even when the active-array save fails", async () => {
+    const tunnel = makeTunnel({ id: "retired-1", tunnelType: "reverse", remotePort: 9000 });
+    let settle!: () => void;
+    const settled = new Promise<void>((resolve) => { settle = resolve; });
+    await sync.registerTunnel(tunnel);
+    vi.spyOn(store, "saveEntries").mockRejectedValueOnce(new Error("registry write failed"));
+
+    await expect(sync.unregisterTunnel(tunnel.profileId, {
+      tunnel,
+      retiredReverseBind: {
+        fenceId: tunnel.id,
+        routeIdentity: { kind: "direct", endpoint: { hosts: ["bastion"], port: 22 } },
+        remotePort: tunnel.remotePort,
+        settled
+      }
+    })).rejects.toThrow("registry write failed");
+    expect((await store.getEntries()).some((entry) => entry.retiredReverseBind?.fenceId === tunnel.id)).toBe(true);
+
+    settle();
+    await vi.waitFor(async () => expect(await store.getEntries()).toEqual([]));
+  });
+
+  it("stops heartbeating a settled fence when its file deletion fails", async () => {
+    const tunnel = makeTunnel({ id: "retired-1", tunnelType: "reverse", remotePort: 9000 });
+    let settle!: () => void;
+    const settled = new Promise<void>((resolve) => { settle = resolve; });
+    await sync.registerTunnel(tunnel);
+    await sync.unregisterTunnel(tunnel.profileId, {
+      tunnel,
+      retiredReverseBind: {
+        fenceId: tunnel.id,
+        routeIdentity: { kind: "direct", endpoint: { hosts: ["bastion"], port: 22 } },
+        remotePort: tunnel.remotePort,
+        settled
+      }
+    });
+    const originalSeen = (await store.getEntries())[0].lastSeen;
+    const remove = vi.spyOn(store, "removeFence").mockRejectedValueOnce(new Error("disk unavailable"));
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    settle();
+    await vi.waitFor(() => expect(remove).toHaveBeenCalledOnce());
+    await vi.advanceTimersByTimeAsync(1_000);
+    await sync.syncNow();
+
+    expect((await store.getEntries())[0].lastSeen).toBe(originalSeen);
+    log.mockRestore();
+  });
+
+  it("removes expired fence files during the slow cross-window sweep", async () => {
+    const [ownerStore, otherStore] = sharedWindowStores();
+    const stale = makeEntry({
+      ownerSessionId: "old-window",
+      tunnelType: "reverse",
+      lastSeen: Date.now() - 31_000,
+      retiredReverseBind: {
+        fenceId: "orphan",
+        routeIdentity: JSON.stringify({ kind: "direct", endpoint: { hosts: ["bastion"], port: 22 } }),
+        remotePort: 9000
+      }
+    });
+    await ownerStore.publishFence(stale);
+    await ownerStore.publishFence({
+      ...stale,
+      lastSeen: Date.now(),
+      retiredReverseBind: { ...stale.retiredReverseBind!, fenceId: "live" }
+    });
+    expect(fakeFenceFiles.size).toBe(2);
+    const other = new TunnelRegistrySync(otherStore, core, "new-window", probePort);
+
+    await other.initialize();
+    other.dispose();
+
+    expect(fakeFenceFiles.size).toBe(1);
+    expect((await otherStore.getEntries()).map((entry) => entry.retiredReverseBind?.fenceId)).toEqual(["live"]);
+  });
+
   it("moves a stopped port-zero fence to its late allocated port across windows", async () => {
     const [ownerStore, otherStore] = sharedWindowStores();
     const owner = new TunnelRegistrySync(ownerStore, core, "owner", probePort);
