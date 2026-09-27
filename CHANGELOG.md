@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.292] — 2026-09-26
+
+### Fixed
+
+- **Inventory sync and status refresh skip unsafe endpoint hosts.** The same host boundary rejects invisible (including U+2800 Braille Pattern Blank), control and whitespace characters in synced endpoints and live console status before healing persisted addresses, while provider prose keeps valid emoji sequences and combining marks.
+
 ## [2.8.291] — 2026-09-26
 
 ### Fixed

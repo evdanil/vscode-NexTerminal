@@ -1,7 +1,12 @@
 import type { AuthProfile, DetachedServerOrigin, ServerConfig, ServerOrigin, ServerProtocol } from "../../models/config";
 import { authProfileNeedsServerKeyPath, proxyConfigsEqual, serverOriginStampsEqual, templatedHasAnyStamp } from "../../models/config";
 import type { InventoryDevice, InventoryEndpoint, InventorySourceConfig, InventoryTree } from "../../models/inventory";
-import { flattenProviderText, normalizeNotSyncableReasons, sanitizeProviderNotice } from "../../models/inventory";
+import {
+  flattenProviderText,
+  normalizeInventoryEndpointHost,
+  normalizeNotSyncableReasons,
+  sanitizeProviderNotice
+} from "../../models/inventory";
 import type { DeviceTemplateProfile } from "../../models/deviceTemplate";
 import type { InventorySyncApplication } from "../../core/nexusCore";
 import { normalizeFolderPath } from "../../utils/folderPaths";
@@ -4799,13 +4804,6 @@ export function prunedServerIdsForSecretCleanup(plan: InventorySyncPlan): string
   return plan.prunes.filter((p) => p.policy === "delete").map((p) => p.server.id);
 }
 
-/**
- * F8: runtime shape check for a fetched InventoryTree — providers are
- * external code (built-in or third-party via the public API) and their
- * output must not be trusted at the contract boundary. Throws a plain Error
- * describing exactly which field is wrong; syncNow (Chunk B) wraps the
- * message as an InventoryProviderError("protocol", ...).
- */
 /** Copy provider endpoints into the host spelling that sync and its remedies can use. */
 export function normalizeInventoryTreeHosts(tree: InventoryTree): InventoryTree {
   const warnings: string[] = [];
@@ -4814,10 +4812,8 @@ export function normalizeInventoryTreeHosts(tree: InventoryTree): InventoryTree 
     devices: tree.devices.map((device) => ({
       ...device,
       endpoints: device.endpoints.flatMap((endpoint) => {
-        const host = endpoint.host.trim();
-        // A host containing display-only characters could never match the
-        // value shown in a plan warning or typed back into the server form.
-        if (host === "" || /\s/u.test(host) || flattenProviderText(host) !== host) {
+        const host = normalizeInventoryEndpointHost(endpoint.host);
+        if (host === undefined) {
           warnings.push(`Ignored an endpoint for ${flattenProviderText(device.name) || "(unnamed device)"} because its host is empty or contains unsupported characters.`);
           return [];
         }
@@ -4828,6 +4824,13 @@ export function normalizeInventoryTreeHosts(tree: InventoryTree): InventoryTree 
   };
 }
 
+/**
+ * F8: runtime shape check for a fetched InventoryTree — providers are
+ * external code (built-in or third-party via the public API) and their
+ * output must not be trusted at the contract boundary. Throws a plain Error
+ * describing exactly which field is wrong; syncNow (Chunk B) wraps the
+ * message as an InventoryProviderError("protocol", ...).
+ */
 export function validateInventoryTree(tree: unknown): asserts tree is InventoryTree {
   if (typeof tree !== "object" || tree === null) {
     throw new Error("tree is not an object");
