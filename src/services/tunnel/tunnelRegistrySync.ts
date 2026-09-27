@@ -473,12 +473,13 @@ export class TunnelRegistrySync {
       const remoteForProbe = entries.filter((e) => e.ownerSessionId !== this.sessionId && !e.retiredReverseBind);
       const now = Date.now();
 
-      // A terminated owner cannot delete its fence file. The same staleness
-      // rule that releases cross-window waits also bounds storage growth.
+      // A terminated owner or a failed settlement deletion can leave a fence
+      // file behind. Keep our own unsettled fences until closure is confirmed.
       for (const entry of entries) {
         if (
-          entry.ownerSessionId !== this.sessionId &&
           entry.retiredReverseBind &&
+          (entry.ownerSessionId !== this.sessionId ||
+            !this.unsettledReverseBindFenceIds.has(entry.retiredReverseBind.fenceId)) &&
           now - (entry.lastSeen ?? entry.startedAt) >= STALE_THRESHOLD_MS
         ) {
           try {

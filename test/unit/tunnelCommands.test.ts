@@ -496,6 +496,37 @@ describe("startTunnel — retired reverse-bind reservations", () => {
     registeredCommands.clear();
   });
 
+  it("warns about an active reverse tunnel in another window before authenticating", async () => {
+    const profile = makeTunnel({ tunnelType: "reverse", remotePort: 9000 });
+    const ctx = await setupContext([profile]);
+    const server: ServerConfig = {
+      id: "srv-1", name: "Bastion", host: "10.0.0.1", port: 22,
+      username: "ops", authType: "password", isHidden: false
+    };
+    await ctx.core.addOrUpdateServer(server);
+    const registrySync = {
+      syncNow: vi.fn(async () => {}),
+      checkRemoteOwnership: vi.fn(async () => ({
+        ...makeRegistryEntry(profile.id), tunnelType: "reverse" as const
+      }))
+    };
+    const connect = vi.fn();
+    const start = vi.fn();
+
+    await startTunnel(
+      ctx.core, { start } as never, { connect } as never,
+      ctx.core.getTunnel(profile.id)!, ctx.core.getServer(server.id)!, "shared", registrySync as never
+    );
+
+    expect(registrySync.checkRemoteOwnership).toHaveBeenCalledWith(profile.id, profile.localPort, undefined);
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining("already active in another VS Code window"), "Open in Browser"
+    );
+    expect(mockWithProgress).not.toHaveBeenCalled();
+    expect(connect).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+  });
+
   it("waits for a matching cross-window reservation instead of claiming the tunnel is active", async () => {
     const profile = makeTunnel({ tunnelType: "reverse", remotePort: 9000, remoteBindAddress: "127.0.0.1" });
     const ctx = await setupContext([profile]);
@@ -524,7 +555,8 @@ describe("startTunnel — retired reverse-bind reservations", () => {
     let ownershipChecks = 0;
     const registrySync = {
       syncNow: vi.fn(async () => {}),
-      checkRemoteOwnership: vi.fn(async () => ownershipChecks++ === 0 ? tombstone : undefined),
+      checkRemoteOwnership: vi.fn(async (_id: string, _port: number, bind?: unknown) =>
+        bind && ownershipChecks++ === 0 ? tombstone : undefined),
       waitForRemoteReverseBindClear: vi.fn(async () => true)
     };
     mockWithProgress.mockImplementation(async (...args: unknown[]) => {
@@ -573,7 +605,8 @@ describe("startTunnel — retired reverse-bind reservations", () => {
     const owners = [fence("first"), fence("second"), undefined];
     const registrySync = {
       syncNow: vi.fn(async () => {}),
-      checkRemoteOwnership: vi.fn(async () => owners.shift()),
+      checkRemoteOwnership: vi.fn(async (_id: string, _port: number, bind?: unknown) =>
+        bind ? owners.shift() : undefined),
       waitForRemoteReverseBindClear: vi.fn(async () => true)
     };
     mockWithProgress.mockImplementation(async (...args: unknown[]) => {
@@ -597,7 +630,7 @@ describe("startTunnel — retired reverse-bind reservations", () => {
     );
 
     expect(registrySync.waitForRemoteReverseBindClear).toHaveBeenCalledTimes(2);
-    expect(registrySync.checkRemoteOwnership).toHaveBeenCalledTimes(3);
+    expect(registrySync.checkRemoteOwnership).toHaveBeenCalledTimes(4);
     expect(start).toHaveBeenCalledOnce();
     expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
       expect.stringContaining("already active"), "Open in Browser"
@@ -671,14 +704,14 @@ describe("startTunnel — retired reverse-bind reservations", () => {
     const route = { kind: "direct", endpoint: { hosts: ["target"], port: 22 } } as const;
     const registrySync = {
       syncNow: vi.fn(async () => {}),
-      checkRemoteOwnership: vi.fn(async () => ({
+      checkRemoteOwnership: vi.fn(async (_id: string, _port: number, bind?: unknown) => bind ? ({
         ...makeRegistryEntry(profile.id),
         retiredReverseBind: {
           fenceId: "remote-pending",
           routeIdentity: JSON.stringify(route),
           remotePort: 9000
         }
-      })),
+      }) : undefined),
       waitForRemoteReverseBindClear: vi.fn(async (_bind: unknown, isCancelled: () => boolean) => {
         expect(isCancelled()).toBe(true);
         return false;

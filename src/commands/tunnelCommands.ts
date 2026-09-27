@@ -192,7 +192,9 @@ export async function startTunnel(
     return true;
   };
 
-  if (registrySync && resolveTunnelType(profile) !== "reverse" && !await checkRemoteOwner()) {
+  // Active owners are route-independent and must block before authentication.
+  // A retired reverse bind still needs the candidate's captured SSH route.
+  if (registrySync && !await checkRemoteOwner()) {
     return;
   }
 

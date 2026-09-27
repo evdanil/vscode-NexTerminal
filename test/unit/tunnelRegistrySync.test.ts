@@ -408,6 +408,9 @@ describe("TunnelRegistrySync", () => {
     await sync.syncNow();
 
     expect((await store.getEntries())[0].lastSeen).toBe(originalSeen);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await sync.initialize();
+    expect(await store.getEntries()).toEqual([]);
     log.mockRestore();
   });
 
