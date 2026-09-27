@@ -23,10 +23,11 @@ export type InventoryEndpointKind = "ssh" | "telnet" | "redfish" | "url" | "ipmi
  *
  * PROTOCOL AND ADDRESS ARE ONE DECISION (P1-C). The endpoint a server takes is
  * the one matching the protocol that server will ACTUALLY have — not simply the
- * device's preferred endpoint. It matters only for a record whose protocol the
- * USER owns (a hand-flip the `syncedProtocol` stamp protects): such a server
- * follows an endpoint of ITS OWN transport, and when the device offers none of
- * that kind its address is LEFT UNCHANGED rather than rewritten to the other
+ * device's preferred endpoint. This matters when the protocol is hand-owned, or
+ * when either hand-edited address field prevents the server from accepting the
+ * device's endpoint as a whole: the server keeps its current transport and sync
+ * selects an endpoint of THAT transport. When the device offers none of that
+ * kind, its address is LEFT UNCHANGED rather than rewritten to the other
  * transport's host and port. Deciding the two separately produced a telnet
  * profile pointed at port 22 — a record that cannot connect, assembled out of
  * two individually-correct answers.

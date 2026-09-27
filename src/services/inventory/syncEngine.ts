@@ -643,16 +643,15 @@ export function syncOwnsPort(current: number, stamp: number | undefined, dev: nu
  *
  * It speaks for the transport the record KEEPS. A kept address means the endpoint
  * was not accepted, so the record keeps its own protocol as well (`takesEndpoint`
- * gates the protocol write) and an address of the other transport cannot be typed
- * into it. The caller therefore calls this only when the sync read the endpoint of
- * the record's own protocol — never when it owns the protocol and the device now
- * prefers the other transport. In that case even the kept transport's address, if
- * the device offers one, is not a remedy: the row-5a match is checked against the
- * endpoint the sync reads, the other transport's, so typing it in would hand
- * nothing back. No endpoint of the record's transport means no warning either. It
- * also skips an addressless record, which has no address of its own to keep — one
- * carrying stamps (a hand-edited backup can) would otherwise be told about its
- * blank host and sentinel port.
+ * gates the protocol write). This can be a hand-owned protocol or a hand-edited
+ * address half that keeps the record from accepting a newly preferred transport.
+ * The caller reads the endpoint matching the protocol the record keeps and passes
+ * that same endpoint here; setting a retained host or port to the reported value
+ * can therefore hand that field back through row 5a on the next sync. No endpoint
+ * of the record's transport means no warning either. It also skips an addressless
+ * record, which has no address of its own to keep — one carrying stamps (a
+ * hand-edited backup can) would otherwise be told about its blank host and
+ * sentinel port.
  */
 function keptHandAddressWarning(
   serverName: string,
