@@ -1608,7 +1608,9 @@ function serversKeepingSecrets(
   const afterProfiles = profilesById(incomingAuthProfiles ?? []);
   const validIncoming: ServerConfig[] = [];
   for (const record of incoming ?? []) {
-    if (validateServerConfig(record)) validIncoming.push(record);
+    // Compare the endpoint the import will publish, not a legacy placeholder
+    // port that addServerSanitizingOrigin will immediately reset to 0.
+    if (validateServerConfig(record)) validIncoming.push(stripAddresslessOriginAddressStamps(record));
   }
   const jumpHostIds = new Set<string>();
   for (const server of [...removed, ...validIncoming]) {

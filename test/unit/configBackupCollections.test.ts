@@ -1021,6 +1021,35 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
     expect(lastInfoMessage()).not.toContain("different address");
   });
 
+  it("keeps saved secrets when an addressless import port normalizes to the existing endpoint", async () => {
+    const origin = { sourceId: "src", externalId: "device", syncedAt: 1 };
+    const dest = await destWithSavedSecrets({
+      host: "", port: 0, addressless: true, altHost: undefined, proxy: undefined, origin
+    });
+    const imported = makeServer({
+      host: "", port: 22, addressless: true, origin
+    });
+
+    await runImport(dest, unsealedJson([imported]), "replace");
+
+    expect(dest.core.getServer("srv-1")).toMatchObject({ host: "", port: 0, addressless: true });
+    expect(await savedSecrets(dest)).toEqual(KEPT);
+    expect(lastInfoMessage()).not.toContain("different address");
+  });
+
+  it("replaces an addressless row with a null origin without aborting normalization", async () => {
+    const dest = await destWithSavedSecrets({
+      host: "", port: 0, addressless: true, altHost: undefined, proxy: undefined
+    });
+    const imported = { ...makeServer({ host: "", port: 22, addressless: true }), origin: null };
+
+    await runImport(dest, unsealedJson([imported]), "replace");
+
+    expect(dest.core.getServer("srv-1")).toMatchObject({ host: "", port: 0, addressless: true });
+    expect(dest.core.getServer("srv-1")?.origin).toBeUndefined();
+    expect(await savedSecrets(dest)).toEqual(KEPT);
+  });
+
   it.each<[string, Partial<ServerConfig>, Partial<ServerConfig>]>([
     ["the port", {}, { port: 2222 }],
     ["the username", {}, { username: "root" }],
