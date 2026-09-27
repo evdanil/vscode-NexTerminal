@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- **Addressless inventory servers drop stale console-port ownership on restore.** Backup and share imports now clear contradictory host and port ownership stamps on addressless records so a later sync can fill the existing server.
+- **Addressless inventory servers drop stale console-port ownership on restore.** Backup and share imports now clear contradictory host and port ownership stamps on addressless records so a later sync can fill the existing server. Replace keeps locally saved credentials when an imported placeholder's port normalizes to the same endpoint.
 
 ## [2.8.292] — 2026-09-26
 
