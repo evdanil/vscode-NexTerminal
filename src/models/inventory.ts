@@ -655,7 +655,9 @@ export function resolveProviderInstanceKey(
  * update, since the tree would then show some nodes stale and some fresh with no
  * way to tell which.
  */
-const INVENTORY_HOST_INVISIBLE_CHAR_RE = /\p{Default_Ignorable_Code_Point}/u;
+// U+2800 renders as a blank in many fonts but is a symbol, not whitespace or
+// Default_Ignorable_Code_Point; it needs an explicit host-only exclusion.
+const INVENTORY_HOST_INVISIBLE_CHAR_RE = /[\p{Default_Ignorable_Code_Point}\u2800]/u;
 
 /**
  * Normalize an inventory endpoint host and reject values that cannot be safely

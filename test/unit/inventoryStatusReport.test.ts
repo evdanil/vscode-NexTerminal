@@ -68,6 +68,10 @@ describe("validateInventoryStatusReport", () => {
     expect(bad({ consoleHost: 10 })).toEqual({ contractVersion: 1, statuses: { a: { state: "running" } } });
     expect(bad({ consoleHost: "" })).toEqual({ contractVersion: 1, statuses: { a: { state: "running" } } });
     expect(bad({ consoleHost: "10.0.0.1\u200b" })).toEqual({ contractVersion: 1, statuses: { a: { state: "running" } } });
+    expect(bad({ consoleHost: "10.0.0.1\u2800", consolePort: 32769 })).toEqual({
+      contractVersion: 1,
+      statuses: { a: { state: "running", consolePort: 32769 } }
+    });
     expect(bad({ consolePort: Number.NaN })).toEqual({ contractVersion: 1, statuses: { a: { state: "running" } } });
     expect(bad({ consolePort: Number.POSITIVE_INFINITY })).toEqual({ contractVersion: 1, statuses: { a: { state: "running" } } });
     expect(bad({ consolePort: "32769" })).toEqual({ contractVersion: 1, statuses: { a: { state: "running" } } });
