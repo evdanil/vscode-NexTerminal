@@ -24,4 +24,11 @@ export class InMemoryTunnelRegistryStore implements TunnelRegistryStore {
   public async removeFence(fenceId: string): Promise<void> {
     this.fences.delete(fenceId);
   }
+
+  public async removeObservedFence(entry: TunnelRegistryEntry): Promise<void> {
+    const fenceId = entry.retiredReverseBind?.fenceId;
+    if (fenceId && this.fences.get(fenceId) === entry) {
+      this.fences.delete(fenceId);
+    }
+  }
 }

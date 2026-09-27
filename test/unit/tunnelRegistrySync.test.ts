@@ -7,6 +7,7 @@ import { InMemoryTunnelRegistryStore } from "../../src/storage/inMemoryTunnelReg
 import { VscodeTunnelRegistryStore } from "../../src/storage/vscodeTunnelRegistryStore";
 
 const fakeFenceFiles = vi.hoisted(() => new Map<string, Uint8Array>());
+const fakeFenceRead = vi.hoisted(() => ({ beforeRead: undefined as (() => Promise<void>) | undefined }));
 vi.mock("vscode", () => {
   class FakeFileSystemError extends Error {
     public constructor(public readonly code: string) {
@@ -31,6 +32,9 @@ vi.mock("vscode", () => {
             .map((path) => [path.slice(prefix.length), 1] as const);
         },
         readFile: async (uri: { path: string }) => {
+          const beforeRead = fakeFenceRead.beforeRead;
+          fakeFenceRead.beforeRead = undefined;
+          await beforeRead?.();
           const value = fakeFenceFiles.get(uri.path);
           if (!value) throw new FakeFileSystemError("FileNotFound");
           return value;
@@ -128,6 +132,7 @@ describe("TunnelRegistrySync", () => {
   beforeEach(async () => {
     vi.useFakeTimers();
     fakeFenceFiles.clear();
+    fakeFenceRead.beforeRead = undefined;
     store = new InMemoryTunnelRegistryStore();
     core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();
@@ -440,6 +445,61 @@ describe("TunnelRegistrySync", () => {
 
     expect(fakeFenceFiles.size).toBe(1);
     expect((await otherStore.getEntries()).map((entry) => entry.retiredReverseBind?.fenceId)).toEqual(["live"]);
+  });
+
+  it("does not delete a fence refreshed after the stale sweep reads it", async () => {
+    const [ownerStore, otherStore] = sharedWindowStores();
+    const stale = makeEntry({
+      ownerSessionId: "owner",
+      tunnelType: "reverse",
+      lastSeen: Date.now() - 31_000,
+      retiredReverseBind: {
+        fenceId: "racing-fence",
+        routeIdentity: JSON.stringify({ kind: "direct", endpoint: { hosts: ["bastion"], port: 22 } }),
+        remotePort: 9000
+      }
+    });
+    await ownerStore.publishFence(stale);
+    const [oldPath, oldContents] = [...fakeFenceFiles.entries()][0];
+    const readEntries = otherStore.getEntries.bind(otherStore);
+    vi.spyOn(otherStore, "getEntries").mockImplementationOnce(async () => {
+      const observed = await readEntries();
+      await ownerStore.publishFence({ ...stale, lastSeen: Date.now() });
+      // Model a transient owner-side prune failure: the old immutable version
+      // remains while the new publication is already visible to other windows.
+      fakeFenceFiles.set(oldPath, oldContents);
+      return observed;
+    });
+    const other = new TunnelRegistrySync(otherStore, core, "other", probePort);
+
+    await other.initialize();
+    other.dispose();
+
+    expect((await otherStore.getEntries()).map((entry) => entry.retiredReverseBind?.fenceId)).toEqual(["racing-fence"]);
+    expect(fakeFenceFiles.size).toBe(1);
+  });
+
+  it("re-reads fence files when a listed generation is replaced before read", async () => {
+    const [ownerStore, otherStore] = sharedWindowStores();
+    const first = makeEntry({
+      ownerSessionId: "owner", tunnelType: "reverse", remotePort: 9000,
+      retiredReverseBind: {
+        fenceId: "rotating-fence",
+        routeIdentity: JSON.stringify({ kind: "direct", endpoint: { hosts: ["bastion"], port: 22 } }),
+        remotePort: 9000
+      }
+    });
+    await ownerStore.publishFence(first);
+    fakeFenceRead.beforeRead = async () => {
+      await ownerStore.publishFence({
+        ...first, lastSeen: Date.now() + 1, remotePort: 9001,
+        retiredReverseBind: { ...first.retiredReverseBind!, remotePort: 9001 }
+      });
+    };
+
+    expect(await otherStore.getEntries()).toMatchObject([{
+      retiredReverseBind: { fenceId: "rotating-fence", remotePort: 9001 }
+    }]);
   });
 
   it("moves a stopped port-zero fence to its late allocated port across windows", async () => {

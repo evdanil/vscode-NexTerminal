@@ -8,6 +8,7 @@ import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
 import { rememberSshNetworkRoute } from "../../src/services/ssh/sshNetworkRoute";
 import type { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 import { TunnelManager, TunnelStoppedError, type TunnelEvent } from "../../src/services/tunnel/tunnelManager";
+import { stopTunnelsForShutdown } from "../../src/services/tunnel/tunnelRegistrySync";
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
@@ -716,6 +717,42 @@ describe("TunnelManager integration", () => {
     if (echoServer) {
       await new Promise<void>((resolve) => echoServer?.close(() => resolve()));
     }
+  });
+
+  it("waits for every stop listener before shutdown unsubscribes after a failure", async () => {
+    const sshFactory = new DirectTcpSshFactory();
+    manager = new TunnelManager(sshFactory, sshFactory);
+    const profile = (id: string, localPort: number): TunnelProfile => ({
+      id, name: id, localPort, remoteIP: "127.0.0.1", remotePort: 9000, autoStart: false
+    });
+    const first = await manager.start(profile("first", await getFreePort()), testServer);
+    const second = await manager.start(profile("second", await getFreePort()), testServer);
+    const secondStopped = deferred<void>();
+    const finishSecond = deferred<void>();
+    const unsubscribe = manager.onDidChange(async (event) => {
+      if (event.type !== "stopped") return;
+      if (event.tunnelId === first.id) {
+        await secondStopped.promise;
+        throw new Error("registry write failed");
+      }
+      if (event.tunnelId === second.id) {
+        secondStopped.resolve(undefined);
+        await finishSecond.promise;
+      }
+    });
+    let unsubscribed = false;
+    const shutdown = stopTunnelsForShutdown(
+      () => manager!.stopAll(),
+      () => { unsubscribed = true; unsubscribe(); },
+      { dispose: vi.fn(), cleanupOwnEntries: vi.fn(async () => {}), waitForFenceCleanups: vi.fn(async () => {}) }
+    ).then(() => undefined, (error: unknown) => error);
+
+    await secondStopped.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(unsubscribed).toBe(false);
+    finishSecond.resolve(undefined);
+    expect(await shutdown).toEqual(new Error("registry write failed"));
+    expect(unsubscribed).toBe(true);
   });
 
   it("forwards bytes and emits traffic updates (local)", async () => {

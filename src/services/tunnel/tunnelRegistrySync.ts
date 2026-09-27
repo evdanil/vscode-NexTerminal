@@ -483,7 +483,7 @@ export class TunnelRegistrySync {
           now - (entry.lastSeen ?? entry.startedAt) >= STALE_THRESHOLD_MS
         ) {
           try {
-            await this.store.removeFence(entry.retiredReverseBind.fenceId);
+            await this.store.removeObservedFence(entry);
           } catch (error) {
             console.error("[Nexus] expired reverse-bind fence cleanup failed", error);
           }

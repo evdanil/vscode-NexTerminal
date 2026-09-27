@@ -412,7 +412,13 @@ export class TunnelManager {
   }
 
   public async stopAll(): Promise<void> {
-    await Promise.all([...this.activeTunnels.keys()].map((activeId) => this.stop(activeId)));
+    // A failed stopped listener must not let shutdown unsubscribe while a
+    // sibling stop is still waiting to publish its reverse-bind fence.
+    const results = await Promise.allSettled([...this.activeTunnels.keys()].map((activeId) => this.stop(activeId)));
+    const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failure) {
+      throw failure.reason;
+    }
   }
 
   // ---------- Local forwarding (-L) ----------
