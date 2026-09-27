@@ -32,7 +32,10 @@ export function stripAddresslessOriginAddressStamps(server: ServerConfig): Serve
   // next sync: ownership treats only 0 as blank, so another value can block
   // the first real endpoint or leave an invalid addressed record behind.
   const port = 0;
-  if (server.origin === undefined ||
+  // Backup imports can reach this comparison before malformed origin markers
+  // are stripped. Leave those markers for the import sanitizer while still
+  // normalizing the placeholder port.
+  if (!isValidServerOrigin(server.origin) ||
       (server.origin.syncedHost === undefined && server.origin.syncedPort === undefined)) {
     return server.port === port ? server : { ...server, port };
   }
