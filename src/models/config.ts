@@ -1350,7 +1350,15 @@ export interface ActiveTunnel extends TunnelRouteInfo {
 
 export interface TunnelRegistryEntry extends TunnelRouteInfo {
   ownerSessionId: string;
+  /** Identifies the exact start when a late fence settlement clears a restored active row. */
+  activeTunnelId?: string;
   lastSeen?: number;
+  /** A stopped reverse tunnel whose remote listener is not yet confirmed gone. */
+  retiredReverseBind?: {
+    fenceId: string;
+    routeIdentity: string;
+    remotePort: number;
+  };
 }
 
 export interface AuthProfile {

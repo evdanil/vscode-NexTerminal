@@ -508,6 +508,21 @@ describe("SshConnectionPool", () => {
     expect(settled).toBe(true);
   });
 
+  it("closes a retired transport with outstanding leases when the pool shuts down", async () => {
+    const inner = createMockConnection();
+    const p = new SshConnectionPool(createMockFactory([inner]), { enabled: true, idleTimeoutMs: 5000 });
+    const tunnelLease = await p.connect(testServer);
+    const terminalLease = await p.connect(testServer);
+    const closed = p.retire(tunnelLease);
+    tunnelLease.dispose();
+    expect(inner.dispose).not.toHaveBeenCalled();
+
+    p.dispose();
+    expect(inner.dispose).toHaveBeenCalledOnce();
+    await expect(closed).resolves.toBeUndefined();
+    terminalLease.dispose();
+  });
+
   it("retired fallback proxied transport closes its bind barrier when its lease is disposed", async () => {
     const pooledInner = createMockConnection();
     let shellCalls = 0;

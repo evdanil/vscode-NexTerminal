@@ -7,11 +7,13 @@ import { registerTunnelCommands, startTunnel } from "../../src/commands/tunnelCo
 import type { ServerConfig } from "../../src/models/config";
 import { configMutationLock } from "../../src/services/configMutationLock";
 import { TunnelStoppedError } from "../../src/services/tunnel/tunnelManager";
+import type { NetworkRouteIdentity } from "../../src/services/ssh/sshNetworkRoute";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowQuickPick = vi.fn();
 const mockShowWarningMessage = vi.fn();
 const mockShowInformationMessage = vi.fn();
+const mockWithProgress = vi.fn<(...args: unknown[]) => Promise<unknown>>();
 
 vi.mock("vscode", () => ({
   commands: {
@@ -25,7 +27,7 @@ vi.mock("vscode", () => ({
     showQuickPick: (...args: unknown[]) => mockShowQuickPick(...args),
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
     showInformationMessage: (...args: unknown[]) => mockShowInformationMessage(...args),
-    withProgress: vi.fn()
+    withProgress: (...args: unknown[]) => mockWithProgress(...args)
   },
   env: {
     clipboard: { writeText: vi.fn() },
@@ -485,6 +487,256 @@ describe("startTunnel — telnet servers", () => {
 
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
     expect(start).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("startTunnel — retired reverse-bind reservations", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+  });
+
+  it("warns about an active reverse tunnel in another window before authenticating", async () => {
+    const profile = makeTunnel({ tunnelType: "reverse", remotePort: 9000 });
+    const ctx = await setupContext([profile]);
+    const server: ServerConfig = {
+      id: "srv-1", name: "Bastion", host: "10.0.0.1", port: 22,
+      username: "ops", authType: "password", isHidden: false
+    };
+    await ctx.core.addOrUpdateServer(server);
+    const registrySync = {
+      syncNow: vi.fn(async () => {}),
+      checkRemoteOwnership: vi.fn(async () => ({
+        ...makeRegistryEntry(profile.id), tunnelType: "reverse" as const
+      }))
+    };
+    const connect = vi.fn();
+    const start = vi.fn();
+
+    await startTunnel(
+      ctx.core, { start } as never, { connect } as never,
+      ctx.core.getTunnel(profile.id)!, ctx.core.getServer(server.id)!, "shared", registrySync as never
+    );
+
+    expect(registrySync.checkRemoteOwnership).toHaveBeenCalledWith(profile.id, profile.localPort, undefined);
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining("already active in another VS Code window"), "Open in Browser"
+    );
+    expect(mockWithProgress).not.toHaveBeenCalled();
+    expect(connect).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it("waits for a matching cross-window reservation instead of claiming the tunnel is active", async () => {
+    const profile = makeTunnel({ tunnelType: "reverse", remotePort: 9000, remoteBindAddress: "127.0.0.1" });
+    const ctx = await setupContext([profile]);
+    const server: ServerConfig = {
+      id: "srv-1", name: "Bastion", host: "10.0.0.1", port: 22,
+      username: "ops", authType: "password", isHidden: false
+    };
+    await ctx.core.addOrUpdateServer(server);
+    const route = { kind: "direct", endpoint: { hosts: ["10.0.0.1"], port: 22 } } as const;
+    const start = vi.fn(async (_profile: TunnelProfile, _server: ServerConfig, options: {
+      beforeReverseForward?: (route: NetworkRouteIdentity) => Promise<void>;
+    }) => {
+      await options.beforeReverseForward?.(route);
+      return makeActiveTunnel(profile.id);
+    });
+    const tombstone: TunnelRegistryEntry = {
+      ...makeRegistryEntry(profile.id),
+      tunnelType: "reverse",
+      remotePort: 9000,
+      retiredReverseBind: {
+        fenceId: "retired-tunnel",
+        routeIdentity: JSON.stringify({ kind: "direct", endpoint: { hosts: ["10.0.0.1"], port: 22 } }),
+        remotePort: 9000
+      }
+    };
+    let ownershipChecks = 0;
+    const registrySync = {
+      syncNow: vi.fn(async () => {}),
+      checkRemoteOwnership: vi.fn(async (_id: string, _port: number, bind?: unknown) =>
+        bind && ownershipChecks++ === 0 ? tombstone : undefined),
+      waitForRemoteReverseBindClear: vi.fn(async () => true)
+    };
+    mockWithProgress.mockImplementation(async (...args: unknown[]) => {
+      const task = args[1];
+      if (typeof task !== "function") {
+        return undefined;
+      }
+      return (task as (progress: unknown, token: { isCancellationRequested: boolean }) => Promise<unknown>)(
+        undefined,
+        { isCancellationRequested: false }
+      );
+    });
+
+    await startTunnel(
+      ctx.core, { start } as never, { connect: vi.fn(async () => ({ dispose: vi.fn() })) } as never,
+      ctx.core.getTunnel(profile.id)!, ctx.core.getServer(server.id)!, "shared", registrySync as never
+    );
+
+    expect(mockWithProgress).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Waiting for remote port 9000 to be released", cancellable: true }),
+      expect.any(Function)
+    );
+    expect(registrySync.waitForRemoteReverseBindClear).toHaveBeenCalledTimes(1);
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("already active"), expect.anything());
+  });
+
+  it("waits again when a different reverse-bind fence appears at the ownership recheck", async () => {
+    const profile = makeTunnel({ tunnelType: "reverse", remotePort: 9000 });
+    const ctx = await setupContext([profile]);
+    const server: ServerConfig = {
+      id: "srv-1", name: "Bastion", host: "10.0.0.1", port: 22,
+      username: "ops", authType: "password", isHidden: false
+    };
+    await ctx.core.addOrUpdateServer(server);
+    const route = { kind: "direct", endpoint: { hosts: ["10.0.0.1"], port: 22 } } as const;
+    const fence = (fenceId: string): TunnelRegistryEntry => ({
+      ...makeRegistryEntry(profile.id),
+      tunnelType: "reverse",
+      retiredReverseBind: {
+        fenceId,
+        routeIdentity: JSON.stringify(route),
+        remotePort: 9000
+      }
+    });
+    const owners = [fence("first"), fence("second"), undefined];
+    const registrySync = {
+      syncNow: vi.fn(async () => {}),
+      checkRemoteOwnership: vi.fn(async (_id: string, _port: number, bind?: unknown) =>
+        bind ? owners.shift() : undefined),
+      waitForRemoteReverseBindClear: vi.fn(async () => true)
+    };
+    mockWithProgress.mockImplementation(async (...args: unknown[]) => {
+      const task = args[1];
+      return typeof task === "function"
+        ? (task as (progress: unknown, token: { isCancellationRequested: boolean }) => Promise<unknown>)(
+            undefined, { isCancellationRequested: false }
+          )
+        : undefined;
+    });
+    const start = vi.fn(async (_profile: TunnelProfile, _server: ServerConfig, options: {
+      beforeReverseForward?: (route: NetworkRouteIdentity) => Promise<void>;
+    }) => {
+      await options.beforeReverseForward?.(route);
+      return makeActiveTunnel(profile.id);
+    });
+
+    await startTunnel(
+      ctx.core, { start } as never, { connect: vi.fn(async () => ({ dispose: vi.fn() })) } as never,
+      ctx.core.getTunnel(profile.id)!, ctx.core.getServer(server.id)!, "shared", registrySync as never
+    );
+
+    expect(registrySync.waitForRemoteReverseBindClear).toHaveBeenCalledTimes(2);
+    expect(registrySync.checkRemoteOwnership).toHaveBeenCalledTimes(4);
+    expect(start).toHaveBeenCalledOnce();
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
+      expect.stringContaining("already active"), "Open in Browser"
+    );
+  });
+
+  it("checks the route captured by the actual reverse-forward candidate after a jump-host edit", async () => {
+    const profile = makeTunnel({ tunnelType: "reverse", remotePort: 9000 });
+    const ctx = await setupContext([profile]);
+    const server: ServerConfig = {
+      id: "srv-1", name: "Target", host: "new-route", port: 22,
+      username: "ops", authType: "password", isHidden: false
+    };
+    await ctx.core.addOrUpdateServer(server);
+    const oldRoute = { kind: "direct", endpoint: { hosts: ["old-route"], port: 22 } } as const;
+    const tombstone = {
+      ...makeRegistryEntry(profile.id),
+      tunnelType: "reverse" as const,
+      retiredReverseBind: {
+        fenceId: "old-bind",
+        routeIdentity: JSON.stringify(oldRoute),
+        remotePort: 9000
+      }
+    };
+    let checks = 0;
+    const registrySync = {
+      syncNow: vi.fn(async () => {}),
+      checkRemoteOwnership: vi.fn(async (_id: string, _port: number, bind: { routeIdentity: unknown }) => {
+        if (JSON.stringify(bind?.routeIdentity) !== JSON.stringify(oldRoute)) {
+          return undefined;
+        }
+        return checks++ === 0 ? tombstone : undefined;
+      }),
+      waitForRemoteReverseBindClear: vi.fn(async () => true)
+    };
+    const start = vi.fn(async (_profile: TunnelProfile, _server: ServerConfig, options: {
+      beforeReverseForward?: (route: NetworkRouteIdentity) => Promise<void>;
+    }) => {
+      await options.beforeReverseForward?.(oldRoute);
+      return makeActiveTunnel(profile.id);
+    });
+    mockWithProgress.mockImplementation(async (...args: unknown[]) => {
+      const task = args[1];
+      return typeof task === "function"
+        ? (task as (progress: unknown, token: { isCancellationRequested: boolean }) => Promise<unknown>)(
+            undefined, { isCancellationRequested: false }
+          )
+        : undefined;
+    });
+
+    await startTunnel(
+      ctx.core, { start } as never, { connect: vi.fn(async () => ({ dispose: vi.fn() })) } as never,
+      ctx.core.getTunnel(profile.id)!, ctx.core.getServer(server.id)!, "shared", registrySync as never
+    );
+
+    expect(registrySync.waitForRemoteReverseBindClear).toHaveBeenCalledOnce();
+    expect(registrySync.checkRemoteOwnership).toHaveBeenCalledWith(
+      profile.id, profile.localPort, { routeIdentity: oldRoute, remotePort: 9000 }
+    );
+    expect(start).toHaveBeenCalledOnce();
+  });
+
+  it("ends a cross-window reservation wait when the pending reverse start is stopped", async () => {
+    const profile = makeTunnel({ tunnelType: "reverse", remotePort: 9000 });
+    const ctx = await setupContext([profile]);
+    const server: ServerConfig = {
+      id: "srv-1", name: "Target", host: "target", port: 22,
+      username: "ops", authType: "password", isHidden: false
+    };
+    await ctx.core.addOrUpdateServer(server);
+    const route = { kind: "direct", endpoint: { hosts: ["target"], port: 22 } } as const;
+    const registrySync = {
+      syncNow: vi.fn(async () => {}),
+      checkRemoteOwnership: vi.fn(async (_id: string, _port: number, bind?: unknown) => bind ? ({
+        ...makeRegistryEntry(profile.id),
+        retiredReverseBind: {
+          fenceId: "remote-pending",
+          routeIdentity: JSON.stringify(route),
+          remotePort: 9000
+        }
+      }) : undefined),
+      waitForRemoteReverseBindClear: vi.fn(async (_bind: unknown, isCancelled: () => boolean) => {
+        expect(isCancelled()).toBe(true);
+        return false;
+      })
+    };
+    const start = vi.fn(async (_profile: TunnelProfile, _server: ServerConfig, options: {
+      beforeReverseForward?: (route: NetworkRouteIdentity, isStopping: () => boolean) => Promise<void>;
+    }) => {
+      await options.beforeReverseForward?.(route, () => true);
+      return makeActiveTunnel(profile.id);
+    });
+    mockWithProgress.mockImplementation(async (...args: unknown[]) => {
+      const task = args[1];
+      return typeof task === "function"
+        ? (task as (progress: unknown, token: { isCancellationRequested: boolean }) => Promise<unknown>)(
+            undefined, { isCancellationRequested: false }
+          )
+        : undefined;
+    });
+
+    await startTunnel(
+      ctx.core, { start } as never, { connect: vi.fn(async () => ({ dispose: vi.fn() })) } as never,
+      ctx.core.getTunnel(profile.id)!, ctx.core.getServer(server.id)!, "shared", registrySync as never
+    );
+    expect(registrySync.waitForRemoteReverseBindClear).toHaveBeenCalledOnce();
   });
 });
 

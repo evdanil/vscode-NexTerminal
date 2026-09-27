@@ -53,7 +53,7 @@ import { VscodeMacroStore } from "./storage/vscodeMacroStore";
 import { setActiveMacroStore } from "./macroSettings";
 import { VscodeConfigRepository } from "./storage/vscodeConfigRepository";
 import { VscodeTunnelRegistryStore } from "./storage/vscodeTunnelRegistryStore";
-import { TunnelRegistrySync } from "./services/tunnel/tunnelRegistrySync";
+import { stopTunnelsForShutdown, TunnelRegistrySync } from "./services/tunnel/tunnelRegistrySync";
 import { FileExplorerTreeProvider } from "./ui/fileExplorerTreeProvider";
 import { createCollapsedFolderStatePersistence } from "./ui/collapsedFolderStatePersistence";
 import { FolderTreeItem, NexusTreeProvider } from "./ui/nexusTreeProvider";
@@ -108,6 +108,7 @@ import { createNexusUriHandler } from "./uri/nexusUriHandler";
 const MACRO_SKIP_SHELL_COMMANDS = ["nexus.macro.run", "nexus.macro.runBinding"];
 /** Set during activate(); lets repairMacroKeybindings mark its writes as Nexus-own. */
 let activeSettingsGuard: SettingsGuardController | undefined;
+let pendingTunnelShutdown: Promise<void> | undefined;
 const COLLAPSED_FOLDERS_KEY = "nexus.ui.collapsedFolders";
 // §4.10 — a SEPARATE key from the Hub's, so macro-folder collapse state never
 // collides with the Connectivity Hub's folder-of-the-same-name collapse state.
@@ -318,6 +319,7 @@ function readSftpServiceConfig(): SftpServiceConfig {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<NexusExtensionApi> {
+  pendingTunnelShutdown = undefined;
   // Detect tabs left behind by a previous extension host (window reload, update,
   // disable-then-enable). The old host's PTY link to each tab is already dead;
   // `writeEmitter` events from deactivate lose the IPC flush race
@@ -1358,10 +1360,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
       return;
     }
     if (event.type === "stopped") {
-      const stoppingTunnel = core.getSnapshot().activeTunnels.find((t) => t.id === event.tunnelId);
+      const stoppingTunnel = core.getSnapshot().activeTunnels.find((t) => t.id === event.tunnelId)
+        ?? (event.retiredReverseBind ? event.tunnel : undefined);
       core.unregisterTunnel(event.tunnelId);
       if (stoppingTunnel) {
-        void registrySync.unregisterTunnel(stoppingTunnel.profileId);
+        return registrySync.unregisterTunnel(stoppingTunnel.profileId, {
+          tunnel: stoppingTunnel,
+          ...(event.retiredReverseBind ? { retiredReverseBind: event.retiredReverseBind } : {})
+        });
       }
       return;
     }
@@ -1731,7 +1737,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
       dispose: () => {
         unsubscribeRemovedSshServerPoolEntries();
         unsubscribeCore();
-        unsubscribeTunnel();
         unsubscribeProviderRegistry();
         const shutdownReason = "Nexus extension is shutting down. This session has been closed.";
         const snapshot = core.getSnapshot();
@@ -1762,14 +1767,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
         serialSidecar.dispose();
         fileExplorerProvider.dispose();
         sftpService.dispose();
-        void tunnelManager.stopAll();
+        pendingTunnelShutdown = stopTunnelsForShutdown(
+          () => tunnelManager.stopAll(),
+          unsubscribeTunnel,
+          registrySync,
+          () => pool.dispose()
+        ).catch((error: unknown) => {
+          console.error("[Nexus] tunnel shutdown failed", error);
+        });
         // Kills the daemon child explicitly rather than relying on subscription
         // order, so UDP 69/67 are released before the host process goes away.
         networkServerManager.dispose();
-        registrySync.dispose();
-        void registrySync.cleanupOwnEntries();
         viewSync.dispose();
-        pool.dispose();
       }
     }
   );
@@ -1790,5 +1799,7 @@ export async function deactivate(): Promise<void> {
   // The wait is bounded inside flushSessionTranscripts — a hung filesystem
   // must not hold extension-host shutdown open.
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
-  await flushSessionTranscripts();
+  // The subscription disposer also starts tunnel shutdown. Keep this host
+  // alive until stopped events publish any reverse-bind reservations.
+  await Promise.all([flushSessionTranscripts(), pendingTunnelShutdown]);
 }
