@@ -4,7 +4,7 @@ import type { ServerConfig } from "../../src/models/config";
 import { SshPty } from "../../src/services/ssh/sshPty";
 import { CLEAR_VISIBLE_SCREEN } from "../../src/services/terminal/terminalEscapes";
 
-const RESET_TERMINAL_MODES = "\x1b[?9;1000;1002;1003;1006;1016l\x1b[<9999u\x1b[=0;1u";
+const RESET_TERMINAL_MODES = "\x1b[?9;1000;1002;1003;1004;1006;1016;2031l\x1b[<9999u\x1b[=0;1u";
 const KITTY_KEYBOARD_MODE_ENABLE = "\x1b[>1u";
 
 const { mockShowErrorMessage } = vi.hoisted(() => ({
@@ -549,7 +549,7 @@ describe("SshPty", () => {
     pty.dispose();
   });
 
-  it("flushes buffered Kitty keyboard-mode changes before disconnect cleanup", async () => {
+  it("flushes buffered mode changes before resetting interactive terminal modes on disconnect", async () => {
     const stream = new PassThrough();
     const { connection, emitClose } = createConnection(stream);
     const sshFactory = { connect: vi.fn(async () => connection) };
@@ -987,7 +987,7 @@ describe("SshPty", () => {
 
     pty.markShuttingDown("Nexus extension is shutting down. This session has been closed.");
 
-    expect(writes.filter((text) => text.includes("\x1b[?9;1000;1002;1003;1006;1016l"))).toHaveLength(1);
+    expect(writes.filter((text) => text.includes("\x1b[?9;1000;1002;1003;1004;1006;1016;2031l"))).toHaveLength(1);
     expect(writes.filter((text) => text === RESET_TERMINAL_MODES)).toHaveLength(1);
     expect(highlighterStream.flush).toHaveBeenCalledTimes(1);
     expect(writes[0]).toBe("[hl]pending output");

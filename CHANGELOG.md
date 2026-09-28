@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.295] — 2026-09-28
+
+### Fixed
+
+- **Interactive terminal mode reports no longer leak after an SSH disconnect.** Disconnect cleanup now clears color-scheme and focus reporting as well as mouse and Kitty keyboard modes, so a reconnected terminal does not print terminal protocol replies when switching tabs.
+
 ## [2.8.293] — 2026-09-26
 
 ### Fixed
