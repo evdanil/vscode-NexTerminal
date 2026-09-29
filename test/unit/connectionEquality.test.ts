@@ -77,6 +77,16 @@ describe("tunnelConnectionEqual — explicit default vs absent", () => {
     expect(tunnelConnectionEqual(tunnel, { ...tunnel, ...patch })).toBe(false);
   });
 
+  it("counts a whitespace-only or empty address as different from absent, as TunnelManager passes it through", () => {
+    expect(tunnelConnectionEqual(tunnel, { ...tunnel, localBindAddress: "  " })).toBe(false);
+    expect(tunnelConnectionEqual(tunnel, { ...tunnel, localBindAddress: "" })).toBe(false);
+    const reverse: TunnelProfile = { ...tunnel, tunnelType: "reverse" };
+    expect(tunnelConnectionEqual(reverse, { ...reverse, remoteBindAddress: " " })).toBe(false);
+    expect(tunnelConnectionEqual(reverse, { ...reverse, localTargetIP: " " })).toBe(false);
+    const dynamic: TunnelProfile = { ...tunnel, tunnelType: "dynamic" };
+    expect(tunnelConnectionEqual(dynamic, { ...dynamic, localBindAddress: "\t" })).toBe(false);
+  });
+
   it("ignores notes, name, browserUrl and autoStart", () => {
     expect(tunnelConnectionEqual(tunnel, { ...tunnel, notes: "n", name: "x", browserUrl: "u", autoStart: true })).toBe(true);
   });

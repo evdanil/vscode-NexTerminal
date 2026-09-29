@@ -895,33 +895,48 @@ export function serverConnectionEqual(
 }
 
 /** The tunnel fields that decide what is listened on and where it forwards; notes, name and browser URL are excluded. */
+const TUNNEL_DEFAULT_ADDRESS = "127.0.0.1";
+
+/**
+ * The address fields exactly as TunnelManager applies them: `??`, no trimming,
+ * so an empty or whitespace-only value is passed through, not defaulted. Shared
+ * by the manager and `tunnelConnectionEqual` so the start fence cannot judge
+ * two values equal that the manager would treat differently.
+ */
+export function resolveTunnelLocalBindAddress(profile: Pick<TunnelProfile, "localBindAddress">): string {
+  return profile.localBindAddress ?? TUNNEL_DEFAULT_ADDRESS;
+}
+export function resolveTunnelRemoteBindAddress(profile: Pick<TunnelProfile, "remoteBindAddress">): string {
+  return profile.remoteBindAddress ?? TUNNEL_DEFAULT_ADDRESS;
+}
+export function resolveTunnelLocalTargetIP(profile: Pick<TunnelProfile, "localTargetIP">): string {
+  return profile.localTargetIP ?? TUNNEL_DEFAULT_ADDRESS;
+}
+
 export function tunnelConnectionEqual(a: TunnelProfile, b: TunnelProfile): boolean {
   const type = resolveTunnelType(a);
   if (type !== resolveTunnelType(b) || a.id !== b.id || a.localPort !== b.localPort) {
     return false;
   }
-  // 127.0.0.1 is the editor's default for the address fields and is stored as
-  // absent (local bind) or explicit (reverse) depending on the type.
-  const addr = (value: string | undefined): string => value?.trim() || "127.0.0.1";
   // Only the fields TunnelManager reads for the resolved type are compared; the
   // editor canonicalizes the rest (dynamic: remoteIP "0.0.0.0" / remotePort 0;
   // reverse: remoteIP mirrors remoteBindAddress), so an unchanged Save must not
   // register them as changes.
   switch (type) {
     case "dynamic":
-      return addr(a.localBindAddress) === addr(b.localBindAddress) && (a.connectionMode === b.connectionMode);
+      return resolveTunnelLocalBindAddress(a) === resolveTunnelLocalBindAddress(b) && (a.connectionMode === b.connectionMode);
     case "reverse":
       // Reverse tunnels are always shared, so the stored mode is irrelevant.
       return (
         a.remotePort === b.remotePort &&
-        addr(a.remoteBindAddress) === addr(b.remoteBindAddress) &&
-        addr(a.localTargetIP) === addr(b.localTargetIP)
+        resolveTunnelRemoteBindAddress(a) === resolveTunnelRemoteBindAddress(b) &&
+        resolveTunnelLocalTargetIP(a) === resolveTunnelLocalTargetIP(b)
       );
     default:
       return (
         a.remoteIP === b.remoteIP &&
         a.remotePort === b.remotePort &&
-        addr(a.localBindAddress) === addr(b.localBindAddress) &&
+        resolveTunnelLocalBindAddress(a) === resolveTunnelLocalBindAddress(b) &&
         a.connectionMode === b.connectionMode
       );
   }

@@ -1,7 +1,12 @@
 import * as net from "node:net";
 import { randomUUID } from "node:crypto";
 import type { ActiveTunnel, ResolvedTunnelConnectionMode, ServerConfig, TunnelProfile, TunnelType } from "../../models/config";
-import { resolveTunnelType } from "../../models/config";
+import {
+  resolveTunnelLocalBindAddress,
+  resolveTunnelLocalTargetIP,
+  resolveTunnelRemoteBindAddress,
+  resolveTunnelType
+} from "../../models/config";
 import { normalizeBoundedNumber } from "../../utils/helpers";
 import { isFatalToSshConnection } from "../ssh/channelErrors";
 import type { SshConnection, SshFactory } from "../ssh/contracts";
@@ -440,7 +445,7 @@ export class TunnelManager {
       });
     });
 
-    await listen(listenerServer, profile.localPort, profile.localBindAddress ?? "127.0.0.1");
+    await listen(listenerServer, profile.localPort, resolveTunnelLocalBindAddress(profile));
     const runtime: ActiveTunnelRuntime = {
       active: activeTunnel,
       profile,
@@ -564,7 +569,7 @@ export class TunnelManager {
     this.activeByProfile.set(profile.id, activeTunnel.id);
 
     try {
-      const bindAddr = profile.remoteBindAddress ?? "127.0.0.1";
+      const bindAddr = resolveTunnelRemoteBindAddress(profile);
       const bindPort = profile.remotePort;
       // OpenSSH may widen a requested address (GatewayPorts), and wildcard
       // addresses overlap specific listeners. Keep uncertain barriers scoped
@@ -961,7 +966,7 @@ export class TunnelManager {
       return;
     }
 
-    const localTargetIP = runtime.profile.localTargetIP ?? "127.0.0.1";
+    const localTargetIP = resolveTunnelLocalTargetIP(runtime.profile);
     const localTargetPort = runtime.profile.localPort;
 
     let remoteStream: import("node:stream").Duplex;
@@ -1023,7 +1028,7 @@ export class TunnelManager {
       });
     });
 
-    await listen(listenerServer, profile.localPort, profile.localBindAddress ?? "127.0.0.1");
+    await listen(listenerServer, profile.localPort, resolveTunnelLocalBindAddress(profile));
     const runtime: ActiveTunnelRuntime = {
       active: activeTunnel,
       profile,
