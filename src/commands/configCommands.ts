@@ -1563,8 +1563,9 @@ async function savedServerSecretBuckets(
  *    proxy password goes to the proxy itself: none on either side (absent and
  *    `null` alike — `validateServerConfig` admits both), or the same kind with
  *    the same members — `jumpHostId` for an SSH jump host; `host`, `port` and
- *    `username` for SOCKS5/HTTP, the identity the proxy-password hygiene
- *    already keeps a secret by (`isSameAuthenticatedEndpoint`).
+ *    `username` for SOCKS5/HTTP, the identity a saved proxy password is keyed by
+ *    (`proxyPasswordSecretKey`, proxyPasswordKeys.ts; see also
+ *    `isSameAuthenticatedEndpoint`).
  * Nothing else counts: a renamed, moved or re-flagged server at the same
  * endpoint keeps its secrets. SSH jump hosts additionally compare their
  * auth-profile identity and effective connection fields: replacing a profile

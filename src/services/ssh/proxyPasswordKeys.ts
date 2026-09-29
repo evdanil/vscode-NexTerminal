@@ -10,10 +10,10 @@ import type { SecretVault } from "./contracts";
  * edit a race between the edit, the deletion of the old password and any connect
  * or prompt in between. Keyed per endpoint, a password entered for proxy B can
  * never be read while the server points at proxy A, and rolling an edit back
- * simply finds A's own key untouched, so no tombstone, ordering or generation
- * logic is needed. Removing the keys of endpoints a server no longer uses is
- * housekeeping after persistence, not a safety requirement: a stale key is
- * never read for another endpoint.
+ * simply finds A's own key untouched, with nothing to undo. Removing the keys of
+ * endpoints a server no longer uses (poolConfigInvalidation.ts) is housekeeping
+ * after persistence, not a safety requirement: a stale key is never read for
+ * another endpoint.
  *
  * Cross-window writes to one secret key are last-writer-wins, like `globalState`
  * (SecretStorage has no compare-and-swap); this window orders only its own operations

@@ -4134,7 +4134,8 @@ export function registerInventoryCommands(
             return { kind: "not-empty", plan: recomputed, authProfile: freshAuthProfile, instanceKey: freshInstanceKey };
           }
           // FIX B (round 10, SECURITY) — capture+delete any stale proxy-password
-          // secret BEFORE the apply publishes the new proxy (see the helper's doc:
+          // secret BEFORE the apply publishes the new proxy (legacy per-server key
+          // only since endpoint-keyed passwords; see the helper's doc:
           // connect doesn't take the lock, so an after-apply clear leaks). A delete
           // failure throws out of the helper (fail closed) → the shared catch below
           // restores + aborts; an apply failure likewise restores `cleared` so the
@@ -4946,7 +4947,9 @@ export function registerInventoryCommands(
           // below is best-effort. A failed delete throws (fail closed) → the catch
           // below aborts with the add unpublished. See the helper's doc.
           // FIX B (round 10, SECURITY) — capture+delete any stale proxy-password
-          // secret BEFORE the apply publishes the new proxy. connect doesn't take
+          // secret BEFORE the apply publishes the new proxy (since endpoint-keyed
+          // passwords this only clears the LEGACY per-server key; see the helper's
+          // banner). connect doesn't take
           // configMutationLock, so clearing after the apply (round 9) left a leak
           // window where a connect reads the new proxy config while the old
           // proxy-password-{id} is still in the vault; see the helper's doc. A

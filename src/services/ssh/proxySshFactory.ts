@@ -27,17 +27,18 @@ const MAX_HTTP_RESPONSE_SIZE = 65536; // 64KB — more than enough for CONNECT h
  * password prompt behavior" — but that prompt was assumed-but-never-built:
  * `connectViaSocks5` / `connectViaHttpConnect` only did `vault.get` and sent
  * `proxyPassword ?? ""`, so after a template applied an authenticated proxy
- * (templates carry no secret, and the round-2 hygiene sweeps any stale
- * `proxy-password-{id}`) the connection sent an empty password and failed. This
+ * (templates carry no secret, and a proxy change leaves that endpoint's saved
+ * password behind) the connection sent an empty password and failed. This
  * OPTIONAL dependency realizes that prompt: when present it is fired only for a
  * username-bearing proxy whose vault lookup returned nothing, at the SAME await
  * point the `vault.get` already happens (preserving the socket/banner IPC
  * ordering) — and once for concurrent connects to the same server and endpoint,
  * which share the answer (`sharedProxyPasswords`). Absent ⇒ exactly the prior behavior (backward-compatible). On a
- * saved success the password is stored under `proxyPasswordSecretKey(id)` so it
- * is one-time; a later template endpoint change re-clears it via the existing
- * hygiene → re-prompt next connect, exactly §5.3. The signal aborts an open
- * dialog when every connection sharing it has ended.
+ * saved success the password is stored under `proxyPasswordSecretKey(id, proxy)`,
+ * the key of the endpoint it was entered for (proxyPasswordKeys.ts), so it is
+ * one-time; a server that later points at a different proxy simply finds no
+ * saved password for it → re-prompt next connect, exactly §5.3. The signal
+ * aborts an open dialog when every connection sharing it has ended.
  */
 export type ProxyPasswordPrompt = (
   server: ServerConfig,
@@ -504,55 +505,33 @@ export class ProxySshFactory implements ContextAwareSshFactory {
   }
 
   /**
-   * Store-side twin of `clearStaleProxyPasswordSecretsBeforeApply`
-   * (proxySecretHygiene.ts). The invariant BOTH enforce: never leave a
-   * `proxy-password-{id}` that doesn't match the server's CURRENT authenticated
-   * endpoint — the clear side enforces it on delete, this enforces it on the
-   * deferred store.
+   * Stores a first-time proxy password after the connection it authenticated has
+   * succeeded, but only if the server STILL names the same authenticated endpoint
+   * this connection actually used.
    *
-   * SECURITY (issue #48 PR-T1b / PR #62 Codex round 8) — the deferred store key is
-   * server-id-only, so a concurrent connect that read the OLD server config and
-   * prompted for the OLD proxy's password can reach this post-connect store AFTER a
-   * template apply has already cleared `proxy-password-{id}` and published a NEW
-   * proxy endpoint. Storing unconditionally would repopulate the key with the OLD
-   * endpoint's credential, which the factory would then send to the server's NEW
-   * proxy — the exact leak the pre-apply hygiene prevents, recreated on the store
-   * side. Guard: re-read the live server and store ONLY IF it still names the SAME
-   * authenticated endpoint this connection actually used. A live proxy that is
-   * undefined, a different endpoint, a different type, or ssh/none means the
-   * endpoint changed under us → skip the store (the stale credential must not be
-   * repopulated). Best-effort throughout: a lookup miss or a keychain-store failure
-   * must never abort an already-established connection. `connectionProxy` is
-   * password-bearing socks5/http (we only reach the prompt/store path for a
-   * username-bearing proxy), so `isSameAuthenticatedEndpoint` compares like-for-like.
+   * The password is keyed by endpoint (`proxyPasswordSecretKey(id, proxy)`,
+   * proxyPasswordKeys.ts), so a password can never be read for, or sent to, a
+   * different endpoint: this guard is NOT a cross-endpoint safety measure. What it
+   * prevents is re-creating a credential for an endpoint the server has since moved
+   * AWAY from (an edit or a template apply published a new proxy while this
+   * connect was in flight). Storing then would leave an orphaned secret under a key
+   * no record uses, which nothing would ever read or delete. So: re-read the live
+   * server and store ONLY IF its proxy is still the SAME authenticated endpoint
+   * (`isSameAuthenticatedEndpoint`); a live proxy that is undefined, a different
+   * endpoint or type, or ssh/none means skip. `connectionProxy` is password-bearing
+   * socks5/http (only a username-bearing proxy reaches the prompt/store path), so
+   * the comparison is like-for-like. Best-effort: a lookup miss or a keychain-store
+   * failure must never abort an already-established connection.
    *
-   * SECURITY (issue #48 PR-T1b / PR #62 Codex round 9) — the round-8 re-read closed
-   * the ordering hole but not the ATOMICITY hole: the sync `serverLookup` re-read +
-   * `isSameAuthenticatedEndpoint` check and the async `await this.vault.store(...)`
-   * were two separate steps, not one critical section. A template apply's
-   * clear-then-publish (`clearStaleProxyPasswordSecretsBeforeApply` → publish new
-   * endpoint) could land in the await window BETWEEN a passing check and the store
-   * completing: the check saw the still-old endpoint and passed, then the apply
-   * cleared `proxy-password-{id}` and published the NEW proxy, then the pending
-   * store wrote the OLD endpoint's credential back under the server-only key — sent
-   * to the new proxy = the same leak, again. Fix: run the re-read + check + store as
-   * a single critical section under `configMutationLock` — the SAME lock the template
-   * apply (manual and sync) holds across its clear+publish. With them mutually
-   * exclusive, both orderings are safe: (a) store-then-apply — the store writes while
-   * the endpoint is still old, then the apply's pre-publish clear deletes it before
-   * publishing the new proxy; (b) apply-then-store — the apply clears+publishes first,
-   * then the store re-reads the NEW endpoint, `isSameAuthenticatedEndpoint` is false,
-   * and it skips. No interleaving leaves a mismatched secret.
-   *
-   * NO REENTRANCY: `configMutationLock` is NOT re-entrant, but the proxy connect/store
-   * path is otherwise lock-free — it runs AFTER `authFactory.connect` resolved and
-   * never itself holds the lock (mirrors the command-layer discipline: the connect
-   * path is a lock-free consumer that briefly takes the lock only for this store), so
-   * acquiring it here cannot deadlock. Accepted cost: a first-time proxy-authenticated
-   * connection's password store briefly waits for any in-flight config mutation
-   * (sync/apply) to release the lock before the connection object is returned — rare
-   * (only the first prompt for a server's proxy), short, and the correctness win is
-   * the point. The whole thing stays best-effort inside the try/catch.
+   * The re-read, the check and the store run as ONE critical section under
+   * `configMutationLock`, the lock every config writer that publishes a proxy
+   * (manual and sync template apply) holds, so no publish can land between the
+   * check and the store. `configMutationLock` is not re-entrant, but the connect
+   * path is otherwise lock-free (this runs after `authFactory.connect` resolved),
+   * so taking it here cannot deadlock. The accepted cost is that a first-time
+   * proxy-authenticated connection's password store briefly waits for an in-flight
+   * config mutation before the connection object is returned; rare (only the first
+   * prompt for a server's proxy) and short.
    */
   private async persistProxyPasswordIfEndpointUnchanged(
     target: ServerConfig,

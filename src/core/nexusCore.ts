@@ -367,7 +367,7 @@ export class NexusCore {
         this.emitConnectionConfigMutation({ kind: "authProfile", id, prev, next });
       }
     }
-    // What was just loaded is what is stored: tentative changes settle now.
+    // What was just loaded is what is stored: announce it as persisted so anything waiting on durability settles now.
     this.emitServersPersisted([...this.servers.values()]);
     if (normalizedServers.changed) {
       await this.persistServers(normalizedServers.servers);
@@ -468,8 +468,9 @@ export class NexusCore {
    * Fires after the servers collection was successfully persisted, carrying the
    * records that were written. Also fires once for `initialize()`, whose loaded
    * state is by definition what is stored. Unlike `onDidChange` it says nothing
-   * about runtime-only changes, so it is the signal for "this tentative change
-   * is now durable".
+   * about runtime-only changes, so it is the signal for "this change is now
+   * durable". A `runServerBatch` ending is a separate signal
+   * (`onDidEndServerBatch`) and claims nothing about persistence.
    */
   public onDidPersistServers(listener: (servers: readonly ServerConfig[]) => void): () => void {
     this.serverPersistedListeners.add(listener);

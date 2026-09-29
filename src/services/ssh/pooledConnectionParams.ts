@@ -61,7 +61,8 @@ const POOLED_KEYS = (Object.keys(POOLED_CONNECTION_FIELDS) as Array<keyof Server
  * connect-fallback (`SshPty`) can establish the pooled connection against the
  * ALTERNATE address, so a cached connection to the OLD alternate must not be reused.
  * `proxy` is compared structurally (proxyConfigsEqual). Pure and vscode-free; the
- * separate proxy-password clear stays in `extension.ts`.
+ * saved proxy password of an endpoint a server left is cleaned up separately, after
+ * persistence, by poolConfigInvalidation.ts.
  */
 export function pooledConnectionParamsChanged(prev: ServerConfig, next: ServerConfig): boolean {
   return POOLED_KEYS.some((key) => {

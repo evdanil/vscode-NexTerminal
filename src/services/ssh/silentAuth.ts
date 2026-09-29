@@ -60,10 +60,13 @@ export { proxyPasswordSecretKey, legacyProxyPasswordSecretKey } from "./proxyPas
 
 /**
  * Deletes every secret saved under a server's own id — its password, key
- * passphrase and the LEGACY per-server proxy password. Endpoint-keyed proxy
- * passwords are removed by the pool-invalidation hook when the server's record
- * goes (or its proxy changes), from the record's own proxy. Every path that deletes a server calls this,
- * so a key added here is deleted by all of them.
+ * passphrase, the LEGACY per-server proxy password, and the endpoint-keyed proxy
+ * passwords: the ones for the `proxies` a caller passes, plus, when the vault can
+ * list its keys, every `proxy-password-{id}-{hash}` stored for this id (so an
+ * id-only caller that no longer knows the record's proxy still leaves none behind).
+ * The pool-invalidation hook also cleans up an endpoint after the server leaves it
+ * or is removed. Every path that deletes a server calls this, so a key added here
+ * is deleted by all of them.
  *
  * By default the first failed delete rejects, for a caller that has not removed
  * the record yet and can stop. `bestEffort` is for cleanup after the record is

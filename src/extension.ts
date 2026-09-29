@@ -519,7 +519,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     // Per-connect proxy-password prompt (design doc §5.3; §11 OQ2) — realizes the
     // prompt §5.3 assumed for a template's authenticated socks5/http proxy, which
     // carries no secret. Fired by ProxySshFactory only for a username-bearing proxy
-    // with no stored `proxy-password-{id}`. Masked, never logged (matching the
+    // with no saved password for that endpoint (`proxyPasswordSecretKey(id, proxy)`). Masked, never logged (matching the
     // VscodePasswordPrompt discipline); a chosen save is deferred until proxy and
     // SSH authentication succeed. Returning undefined on cancel makes
     // ProxySshFactory abort every connect sharing that prompt before a handshake.

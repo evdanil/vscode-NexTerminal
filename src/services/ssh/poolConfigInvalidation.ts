@@ -43,9 +43,10 @@ export function watchPoolInvalidationOnConfigMutation(
   /**
    * Housekeeping for endpoint-keyed proxy passwords (see proxyPasswordKeys.ts).
    * A password is stored per proxy endpoint, so a stale one is never READ for
-   * another endpoint and no ordering against connects matters. Once a change is
-   * persisted, `deleteEndpoint` is called for each endpoint the server no longer
-   * uses; a lost delete leaks nothing readable.
+   * another endpoint and no ordering against connects matters. `deleteEndpoint` is
+   * called for each endpoint the server left once neither the last persisted record
+   * nor the in-memory one uses it (settled on a successful save and at a server
+   * batch's end, never inside a batch); a lost delete leaks nothing readable.
    */
   proxySecrets?: {
     /**
@@ -105,11 +106,10 @@ export function watchPoolInvalidationOnConfigMutation(
     indexServer(server.id, server);
   }
 
-  // Cleanup runs only on the explicit persistence signal (or a batch's end) (never onDidChange, which
-  // also fires for sessions, tunnels and focus while a save is pending): an endpoint
-  // the persisted record no longer uses has its saved password deleted. A save
-  // that fails settles nothing, and a rolled-back edit finds its original
-  // endpoint's password untouched, because nothing was deleted before persistence.
+  // Cleanup of the saved password of an endpoint a server left (see the settle rules
+  // below): a save that fails settles nothing, and a rolled-back edit finds its
+  // original endpoint's password untouched, because nothing was deleted before
+  // persistence.
   // An endpoint is in use when the last PERSISTED record or the in-memory one has it.
   const inUse = (serverId: string, endpoint: PasswordBearingProxy): boolean =>
     proxyConfigsEqual(lastPersisted.get(serverId)?.proxy, endpoint) ||
