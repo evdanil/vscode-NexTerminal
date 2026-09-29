@@ -1884,6 +1884,17 @@ describe("ScriptRuntimeManager — a wait the run left pending ends with the run
     expect(h.output.join("\n")).not.toContain("← timeout");
   });
 
+  it.each(endings)("%s: an unawaited sleep leaves no timer after the run", async (_name, end) => {
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    h.worker.emit({ kind: "rpc", id: 1, method: "sleep", args: [3_600_000] });
+    expect(vi.getTimerCount()).toBe(1);
+    end(h);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("refuses a wait dispatched after the run ended", async () => {
     const h = await createHarness(`/**\n * @nexus-script\n */\n`);
     await h.manager.runScript(h.scriptUri as never, "test-session");

@@ -725,7 +725,28 @@ export class ScriptRuntimeManager implements vscode.Disposable {
         return undefined;
       }
       case "sleep":
-        return new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, Number(args[0] ?? 0))));
+        // Registered in pendingRpcs so every ending clears the timer: a bare
+        // setTimeout would hold this record for the full delay of an unawaited sleep.
+        return new Promise<void>((resolve, reject) => {
+          const key = ++pendingIdCounter;
+          const timer = setTimeout(() => {
+            record.pendingRpcs.delete(key);
+            resolve();
+          }, Math.max(0, Number(args[0] ?? 0)));
+          record.pendingRpcs.set(key, {
+            resolve: () => {},
+            reject: (e) => {
+              clearTimeout(timer);
+              record.pendingRpcs.delete(key);
+              reject(e);
+            },
+            cancel: () => {
+              clearTimeout(timer);
+              record.pendingRpcs.delete(key);
+              resolve();
+            }
+          });
+        });
       case "tail": {
         // Default 512 chars; cap negative input at 0 and huge input at the buffer's own cap.
         const requested = args[0] === undefined ? 512 : Number(args[0]);
@@ -961,8 +982,9 @@ export class ScriptRuntimeManager implements vscode.Disposable {
 
   /**
    * Scan a record's output buffer for a single pattern with a timeout, subscribing
-   * for new output and registering in `pendingRpcs` so that Stopped / ConnectionLost
-   * can cancel the wait (rather than letting the timer leak until its deadline).
+   * for new output and registering in `pendingRpcs` so that every ending of the run
+   * (see scanForMatchGeneric) can cancel the wait rather than letting the timer
+   * leak until its deadline.
    */
   private scanForMatch(
     record: RunningScriptRecord,
