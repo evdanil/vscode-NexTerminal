@@ -2490,6 +2490,30 @@ describe("a share never hands over a shell command or an unattended tunnel (#254
     // Padding never reaches the SSH server: the normalized host is what is kept.
     expect(bind(" localhost ")).toBe("localhost");
     expect(bind(" 127.0.0.1\t")).toBe("127.0.0.1");
+    // Bracketed IPv6 is normalized to the bare address SSH expects.
+    expect(bind("[::1]")).toBe("::1");
+    expect(bind(" [::1] ")).toBe("::1");
+    expect(bind("[::2]")).toBeUndefined();
+  });
+
+  it("import: a tunnel whose only change is a normalized address or a dropped loopback listener address is counted (⊘ counting only non-loopback values)", async () => {
+    const recipient = await makeMachine();
+    const base = { remoteIP: "127.0.0.1", remotePort: 80, autoStart: false };
+    await importShare(
+      recipient,
+      shareJson({
+        tunnels: [
+          { ...base, id: "w1", name: "padded", localPort: 18100, remoteBindAddress: " localhost " },
+          { ...base, id: "w2", name: "loopback-listener", localPort: 18101, localBindAddress: "127.0.0.1" },
+          { ...base, id: "w3", name: "untouched", localPort: 18102, remoteBindAddress: "localhost" }
+        ]
+      })
+    );
+
+    const tunnels = recipient.core.getSnapshot().tunnels;
+    expect(tunnels.find((t) => t.name === "padded")!.remoteBindAddress).toBe("localhost");
+    expect(tunnels.find((t) => t.name === "loopback-listener")!.localBindAddress).toBeUndefined();
+    expect(lastInfoMessage()).toContain("2 tunnels arrived adjusted");
   });
 
   it("export: none of auto-start, a bind address or a URL login survives (⊘ \"keep\")", () => {

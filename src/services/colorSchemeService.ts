@@ -47,6 +47,13 @@ export class ColorSchemeService {
     this.fontConfig = storage.getFontConfig();
   }
 
+  /**
+   * Residual race (see `storage/resetGeneration.ts`): this covers an action that
+   * starts after the reset is visible to this window. A save already in flight
+   * when another window resets, or one that starts before the new generation
+   * reaches this window, can still commit; there is no compare-and-swap on
+   * `globalState` to prevent it, and reloading the window clears it.
+   */
   private syncAfterReset(): void {
     if (this.resetGuard?.consumeIfChanged()) {
       this.userSchemes = [...this.storage.getUserSchemes()];

@@ -1986,14 +1986,19 @@ function loopbackAddressOnly(value: string | undefined): string | undefined {
   if (typeof value !== "string") {
     return undefined;
   }
-  const host = value.trim().toLowerCase();
+  // A bracketed IPv6 literal (`[::1]`) is normalized to the bare address: SSH
+  // `forwardIn` and `listen` take the address, not URL syntax.
+  let host = value.trim().toLowerCase();
+  if (host.startsWith("[") && host.endsWith("]")) {
+    host = host.slice(1, -1);
+  }
   // 127.x.y.z with each octet 0-255 and no leading zero (`127.01.0.1` reads as
   // octal in some resolvers): anything else is not a loopback address, and the
   // value is forwarded to the SSH server as written.
   const octets = host.split(".");
   const isIpv4Loopback =
     octets.length === 4 && octets[0] === "127" && octets.every((octet) => /^(0|[1-9]\d{0,2})$/.test(octet) && Number(octet) <= 255);
-  return host === "localhost" || host === "::1" || host === "[::1]" || isIpv4Loopback ? host : undefined;
+  return host === "localhost" || host === "::1" || isIpv4Loopback ? host : undefined;
 }
 
 /**
@@ -2043,17 +2048,16 @@ function stripBrowserUrlUserinfo(value: string | undefined): string | undefined 
   return value.replace(/^(\s*(?:[a-z][a-z0-9+.-]*:)?\/\/)?[^/?#]*@/i, (_match, prefix: string | undefined) => prefix?.trimStart() ?? "");
 }
 
-/** Whether a tunnel record as read from a file carries anything `SHARED_TUNNEL_RULES` resets. */
-function tunnelHadResetSettings(tunnel: TunnelProfile): boolean {
-  const nonLoopback = (address: unknown): boolean =>
-    typeof address === "string" && loopbackAddressOnly(address) === undefined;
-  return (
-    tunnel.autoStart === true ||
-    nonLoopback(tunnel.localBindAddress) ||
-    nonLoopback(tunnel.remoteBindAddress) ||
-    // A login stripped from the browser URL (or the URL dropped) is a change too.
-    (typeof tunnel.browserUrl === "string" && stripBrowserUrlUserinfo(tunnel.browserUrl) !== tunnel.browserUrl)
-  );
+/**
+ * Whether `SHARED_TUNNEL_RULES` changed anything the file said about a tunnel:
+ * each of the four fields it rewrites is compared with what the rules produced,
+ * so a padded address that was normalized or a loopback listener address that
+ * was dropped counts, not only a non-loopback one.
+ */
+function tunnelWasAdjustedByShare(original: TunnelProfile, shared: TunnelProfile): boolean {
+  const changed = <K extends "autoStart" | "localBindAddress" | "remoteBindAddress" | "browserUrl">(key: K): boolean =>
+    original[key] !== undefined && original[key] !== shared[key];
+  return changed("autoStart") || changed("localBindAddress") || changed("remoteBindAddress") || changed("browserUrl");
 }
 
 /**
@@ -4006,7 +4010,7 @@ export function registerConfigCommands(
         defaultServerId: (serverId) => (serverId ? idMap.get(serverId) : undefined)
       }) as TunnelProfile;
       const added = await addIfValid(remappedTunnel, validateTunnelProfile, (e) => core.addOrUpdateTunnel(e));
-      if (added && tunnelHadResetSettings(tunnel)) tunnelsWithSettingsReset++;
+      if (added && tunnelWasAdjustedByShare(tunnel, remappedTunnel)) tunnelsWithSettingsReset++;
       tally(added);
     }
     // Keep profile-scoped macro links only after each target survives validation,

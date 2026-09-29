@@ -9,8 +9,18 @@
  * writes it asks the guard, and when the counter has moved it reloads from
  * storage (now empty) instead of persisting stale data.
  *
- * Best effort by nature: it cannot reach a window that has not yet observed the
- * bump, and it acts only at the owner's next action, not immediately.
+ * It acts only at the owner's next action, never immediately, and it cannot
+ * reach a window that has not yet observed the bump.
+ *
+ * RESIDUAL RACE, deliberately not closed here: the guard stops stale state from
+ * being written by any action that STARTS after the reset has become visible to
+ * this window. A write already in flight when the reset lands, or one that starts
+ * before the new generation reaches this window, can still commit. `globalState`
+ * has no compare-and-swap and cross-window propagation is asynchronous, so that
+ * check-then-write gap cannot be closed at this layer (the same limit as the
+ * cross-window note atop `vscodeConfigRepository.ts`); a compensating re-clear
+ * after the write would erase legitimate writes made after the reset. Reloading
+ * the other window clears whatever such a write left.
  */
 export const RESET_GENERATION_KEY = "nexus.resetGeneration";
 

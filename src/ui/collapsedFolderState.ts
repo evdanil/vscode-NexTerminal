@@ -28,6 +28,10 @@ export function createCollapsedFolderState(options: {
   provider.loadCollapsedFolders(state.get<string[]>(storageKey, []));
   const persistence = createCollapsedFolderStatePersistence(
     async (paths) => {
+      // Residual race (see `resetGeneration.ts`): this check happens before the
+      // awaited update below, and a reset from another window can land in between
+      // or not yet be visible here. That write can still commit; reloading the
+      // window clears it. It cannot be closed without compare-and-swap.
       if (guard.hasChanged()) {
         return;
       }
