@@ -171,6 +171,27 @@ describe("MacroAutoTrigger", () => {
     obs.dispose();
   });
 
+  it("keeps advancing the escape carry while auto-trigger is disabled", () => {
+    const macros = [{ name: "pw", text: "secret\n", triggerPattern: "Password: $" }];
+    setConfig(macros, true);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    // The title opens while matching is on and closes while it is off, so its
+    // held opener must not survive to be prepended to output after re-enable.
+    obs.onOutput("\x1b]0;user@host");
+    setConfig(macros, false);
+    trigger.reload();
+    obs.onOutput(": ~\x07");
+    setConfig(macros, true);
+    trigger.reload();
+    obs.onOutput("Password: ");
+    flush();
+    expect(sent).toEqual(["secret\n"]);
+    obs.dispose();
+  });
+
   it("defers writeBack to next event-loop turn", () => {
     setConfig([
       { name: "pw", text: "secret\n", triggerPattern: "Password:" }

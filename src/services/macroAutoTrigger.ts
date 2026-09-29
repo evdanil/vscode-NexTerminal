@@ -606,7 +606,15 @@ export class MacroAutoTrigger implements vscode.Disposable {
 
     const observer: PtyOutputObserver & { __bindSessionId?: (id: string) => void } = {
       onOutput: (text: string) => {
-        if (disposed || !this.enabled || this.rules.length === 0) {
+        if (disposed) {
+          return;
+        }
+        if (!this.enabled || this.rules.length === 0) {
+          // Matching is off, but the stream is not: keep advancing the escape
+          // carry so an opener whose terminator arrives now is not prepended to
+          // unrelated output after re-enable (a stale OSC would swallow later
+          // prompts, a stale CSI would eat the first character of one).
+          escapeCarry = stripChunk(escapeCarry, text.length > MAX_INPUT_LENGTH ? text.slice(text.length - MAX_INPUT_LENGTH) : text).carry;
           return;
         }
 
