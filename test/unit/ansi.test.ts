@@ -98,6 +98,22 @@ describe("createAnsiRegex", () => {
       expect(run(["a\x1bPpayload\x1b", "\x1b[31mred"]).replace(/\x1b/g, "")).toBe("ared");
     });
 
+    it("BEL is payload inside DCS/APC/PM/SOS, whole or split on either side of it", () => {
+      for (const intro of ["P", "_", "^", "X"]) {
+        const open = `a\x1b${intro}pay`;
+        expect(run([`${open}\x07load\x1b\\b`])).toBe("ab");
+        expect(run([open, `\x07load\x1b\\b`])).toBe("ab");
+        expect(run([`${open}\x07`, `load\x1b\\b`])).toBe("ab");
+        expect(run([open, "\x07", "load", "\x1b", "\\b"])).toBe("ab");
+      }
+      expect(strip("a\x1bPpay\x07load\x1b\\b")).toBe("ab");
+    });
+
+    it("BEL still ends an OSC string", () => {
+      expect(run(["a\x1b]0;title\x07Password: "])).toBe("aPassword: ");
+      expect(run(["a\x1b]0;title", "\x07Password: "])).toBe("aPassword: ");
+    });
+
     it("keeps text after an aborting ESC and after a bare ESC pair", () => {
       expect(run(["a\x1bPpayload", "more\x1b[31mred"])).toBe("ared");
     });
