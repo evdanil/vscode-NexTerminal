@@ -1997,6 +1997,8 @@ function loopbackAddressOnly(value: string | undefined): string | undefined {
  *     that a browser normalizes into a URL that still carries the login. Only a
  *     URL that really holds credentials is rewritten (cleared, serialized, the
  *     placeholder restored); any other value comes back byte-identical.
+ *     When no free port exists to stand in for the placeholder, the URL is
+ *     dropped (`undefined`) rather than kept with its login.
  *  2. For what never parses as an authority-bearing URL (no scheme, or a bare
  *     `//`), whatever sits before the first `/`, `?` or `#` loses everything up
  *     to its last `@`.
@@ -2005,18 +2007,29 @@ function stripBrowserUrlUserinfo(value: string | undefined): string | undefined 
   if (typeof value !== "string") {
     return value;
   }
-  const port = ["65533", "65532", "65531", "65530"].find((candidate) => !value.includes(candidate));
-  if (port !== undefined) {
-    try {
-      const parsed = new URL(value.replaceAll("{localPort}", port));
-      if (parsed.username !== "" || parsed.password !== "") {
-        parsed.username = "";
-        parsed.password = "";
-        return parsed.href.replaceAll(port, "{localPort}");
-      }
-    } catch {
-      // Not an absolute URL: fall through to the pattern.
+  // Detection needs no free placeholder: any valid port parses the same way.
+  let hasLogin = false;
+  try {
+    const probe = new URL(value.replaceAll("{localPort}", "1"));
+    hasLogin = probe.username !== "" || probe.password !== "";
+  } catch {
+    // Not an absolute URL: the pattern below handles it.
+  }
+  if (hasLogin) {
+    // Rewriting has to restore `{localPort}` afterwards, which needs a port that
+    // is not already in the string. If none is free the URL cannot be rewritten
+    // safely, so it is dropped rather than shipped with its login (fail closed).
+    let port: string | undefined;
+    for (let candidate = 60000; candidate < 61000 && port === undefined; candidate++) {
+      if (!value.includes(String(candidate))) port = String(candidate);
     }
+    if (port === undefined) {
+      return undefined;
+    }
+    const parsed = new URL(value.replaceAll("{localPort}", port));
+    parsed.username = "";
+    parsed.password = "";
+    return parsed.href.replaceAll(port, "{localPort}");
   }
   return value.replace(/^(\s*(?:[a-z][a-z0-9+.-]*:)?\/\/)?[^/?#]*@/i, (_match, prefix: string | undefined) => prefix?.trimStart() ?? "");
 }
@@ -2025,7 +2038,13 @@ function stripBrowserUrlUserinfo(value: string | undefined): string | undefined 
 function tunnelHadResetSettings(tunnel: TunnelProfile): boolean {
   const nonLoopback = (address: unknown): boolean =>
     typeof address === "string" && loopbackAddressOnly(address) === undefined;
-  return tunnel.autoStart === true || nonLoopback(tunnel.localBindAddress) || nonLoopback(tunnel.remoteBindAddress);
+  return (
+    tunnel.autoStart === true ||
+    nonLoopback(tunnel.localBindAddress) ||
+    nonLoopback(tunnel.remoteBindAddress) ||
+    // A login stripped from the browser URL (or the URL dropped) is a change too.
+    (typeof tunnel.browserUrl === "string" && stripBrowserUrlUserinfo(tunnel.browserUrl) !== tunnel.browserUrl)
+  );
 }
 
 /**
@@ -4115,7 +4134,7 @@ export function registerConfigCommands(
         : "";
     const tunnelNote =
       tunnelsWithSettingsReset > 0
-        ? ` ${plural(tunnelsWithSettingsReset, "tunnel")} arrived with auto-start off and a loopback-only listener — edit the tunnel to change that.`
+        ? ` ${plural(tunnelsWithSettingsReset, "tunnel")} arrived adjusted (auto-start off, loopback-only listener, no login in its browser URL) — edit the tunnel to change that.`
         : "";
     // Counts only — a name from the file never reaches this message. Profiles
     // lead, as they always have, unless the file landed only inventory records,

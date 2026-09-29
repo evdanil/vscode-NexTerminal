@@ -2458,7 +2458,23 @@ describe("a share never hands over a shell command or an unattended tunnel (#254
     expect(byName("web").browserUrl).toBe("http://localhost:{localPort}/");
     expect(byName("kept").browserUrl).toBe("http://localhost:{localPort}/a@b");
     expect(JSON.stringify(tunnels)).not.toContain("secret@");
-    expect(lastInfoMessage()).toContain("3 tunnels arrived with auto-start off and a loopback-only listener");
+    expect(lastInfoMessage()).toContain("4 tunnels arrived adjusted (auto-start off, loopback-only listener, no login in its browser URL)");
+  });
+
+  it("import: a tunnel changed only by its browser URL login is counted (⊘ counting auto-start and bind addresses alone)", async () => {
+    const recipient = await makeMachine();
+    await importShare(
+      recipient,
+      shareJson({
+        tunnels: [
+          { id: "b1", name: "only-url", localPort: 18090, remoteIP: "127.0.0.1", remotePort: 80, autoStart: false, browserUrl: "http://admin:secret@localhost:{localPort}/" },
+          { id: "b2", name: "clean", localPort: 18091, remoteIP: "127.0.0.1", remotePort: 81, autoStart: false, browserUrl: "http://localhost:{localPort}/" }
+        ]
+      })
+    );
+
+    expect(lastInfoMessage()).toContain("1 tunnel arrived adjusted");
+    expect(recipient.core.getSnapshot().tunnels.find((t) => t.name === "only-url")!.browserUrl).toBe("http://localhost:{localPort}/");
   });
 
   it("export: none of auto-start, a bind address or a URL login survives (⊘ \"keep\")", () => {
@@ -2475,6 +2491,15 @@ describe("a share never hands over a shell command or an unattended tunnel (#254
       const shared = sanitizeForSharing([], [{ ...t, browserUrl } as unknown as TunnelProfile], [], []);
       expect(shared.tunnels[0].browserUrl).not.toContain("secret@");
     }
+    // Every candidate stand-in port already present: the URL cannot be rewritten
+    // safely, so it is dropped, never shipped with its login.
+    const crowded = "http:/\\admin:secret@localhost:{localPort}/?x=" + Array.from({ length: 1000 }, (_v, n) => 60000 + n).join(",");
+    const dropped = sanitizeForSharing([], [{ ...t, browserUrl: crowded } as unknown as TunnelProfile], [], []);
+    expect(dropped.tunnels[0].browserUrl).toBeUndefined();
+    expect(JSON.stringify(dropped)).not.toContain("secret");
+    const exact = "http:/\\admin:secret@localhost:{localPort}/?x=65533,65532,65531,65530";
+    const exactOut = sanitizeForSharing([], [{ ...t, browserUrl: exact } as unknown as TunnelProfile], [], []);
+    expect(exactOut.tunnels[0].browserUrl).toBe("http://localhost:{localPort}/?x=65533,65532,65531,65530");
     // A path or query that merely contains an "@" is not a credential.
     const plain = sanitizeForSharing([], [{ ...t, browserUrl: "http://localhost:{localPort}/@me?x=a@b" } as unknown as TunnelProfile], [], []);
     expect(plain.tunnels[0].browserUrl).toBe("http://localhost:{localPort}/@me?x=a@b");
