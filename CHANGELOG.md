@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.296] — 2026-09-29
+
+### Fixed
+
+- **A script's unawaited wait now ends with the run.** A `waitFor` / `expect` / `waitAny` still pending when a run completed, failed or lost its worker (a `Promise.race` loser, a call the script never awaited) kept its timer and the run's output buffer for its whole timeout, then wrote a stray `← timeout` line to the "Nexus Scripts" channel after `end:`. Every ending now cancels pending waits, and a wait posted just before the run ended is refused.
+
 ## [2.8.295] — 2026-09-28
 
 ### Fixed
