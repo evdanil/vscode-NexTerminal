@@ -168,9 +168,36 @@ export class TunnelRegistrySync {
   }
 
   public async initialize(): Promise<void> {
-    await this.syncWithProbe();
-    this.pollTimer = setInterval(() => void this.syncFast(), POLL_INTERVAL_MS);
-    this.reprobeTimer = setInterval(() => void this.syncWithProbe(), SLOW_REPROBE_INTERVAL_MS);
+    try {
+      await this.syncWithProbe();
+    } catch (error) {
+      // Registry storage trouble must not stop the whole extension activating.
+      // The timers below retry, so a later sweep recovers once it clears.
+      console.error("[Nexus] initial tunnel registry sync failed", error);
+    }
+    this.pollTimer = setInterval(() => {
+      this.syncFast().catch((error: unknown) => console.error("[Nexus] tunnel registry sync failed", error));
+    }, POLL_INTERVAL_MS);
+    this.reprobeTimer = setInterval(() => {
+      this.syncWithProbe().catch((error: unknown) => console.error("[Nexus] tunnel registry sweep failed", error));
+    }, SLOW_REPROBE_INTERVAL_MS);
+  }
+
+  /**
+   * For the stopped-tunnel listener: local teardown is already done, so a
+   * registry failure is logged instead of rejecting stop() and aborting the
+   * caller's remaining cleanup. The call is still awaited, which keeps a
+   * reverse-bind fence published before stop() resolves.
+   */
+  public async unregisterTunnelAfterStop(
+    profileId: string,
+    options?: { tunnel: ActiveTunnel; retiredReverseBind?: RetiredReverseBindFence }
+  ): Promise<void> {
+    try {
+      await this.unregisterTunnel(profileId, options);
+    } catch (error) {
+      console.error("[Nexus] tunnel registry update after stop failed", error);
+    }
   }
 
   public async registerTunnel(tunnel: ActiveTunnel): Promise<void> {

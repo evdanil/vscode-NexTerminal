@@ -1348,7 +1348,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
         return;
       }
       core.registerTunnel(event.tunnel);
-      void registrySync.registerTunnel(event.tunnel);
+      registrySync.registerTunnel(event.tunnel).catch((error: unknown) => {
+        console.error("[Nexus] tunnel registry registration failed", error);
+      });
       const logger = loggerFactory.create("tunnel", event.tunnel.id);
       logger.log(
         `started profile=${event.tunnel.profileId} local=${event.tunnel.localPort} remote=${event.tunnel.remoteIP}:${event.tunnel.remotePort}`
@@ -1365,7 +1367,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
         ?? (event.retiredReverseBind ? event.tunnel : undefined);
       core.unregisterTunnel(event.tunnelId);
       if (stoppingTunnel) {
-        return registrySync.unregisterTunnel(stoppingTunnel.profileId, {
+        return registrySync.unregisterTunnelAfterStop(stoppingTunnel.profileId, {
           tunnel: stoppingTunnel,
           ...(event.retiredReverseBind ? { retiredReverseBind: event.retiredReverseBind } : {})
         });
@@ -1418,7 +1420,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
 
   const windowFocusListener = vscode.window.onDidChangeWindowState((state) => {
     if (state.focused) {
-      void registrySync.syncNow();
+      registrySync.syncNow().catch((error: unknown) => {
+        console.error("[Nexus] tunnel registry sync failed", error);
+      });
     }
   });
 
