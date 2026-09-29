@@ -66,7 +66,8 @@ class PooledSshConnection implements SshConnection {
     private readonly releasePooled: () => void,
     private readonly createFallback?: () => Promise<SshConnection>,
     private readonly isReused = false,
-    private readonly retireEntry: () => Promise<void> = () => Promise.resolve()
+    private readonly retireEntry: () => Promise<void> = () => Promise.resolve(),
+    private readonly evictDeadEntry?: () => void
   ) {}
 
   /** See `SshConnectionPool.retire`. */
@@ -87,7 +88,7 @@ class PooledSshConnection implements SshConnection {
       return await this.active.openShell(ptyOptions);
     } catch (err) {
       if (this.shouldAttemptFallback(err)) {
-        const fb = await this.tryFallback();
+        const fb = await this.tryFallback(err);
         if (fb) {
           return fb.openShell(ptyOptions);
         }
@@ -103,7 +104,7 @@ class PooledSshConnection implements SshConnection {
       return await this.active.openDirectTcp(remoteIP, remotePort);
     } catch (err) {
       if (this.shouldAttemptFallback(err)) {
-        const fb = await this.tryFallback();
+        const fb = await this.tryFallback(err);
         if (fb) {
           return fb.openDirectTcp(remoteIP, remotePort);
         }
@@ -119,7 +120,7 @@ class PooledSshConnection implements SshConnection {
       return await this.active.openSftp();
     } catch (err) {
       if (this.shouldAttemptFallback(err)) {
-        const fb = await this.tryFallback();
+        const fb = await this.tryFallback(err);
         if (fb) {
           return fb.openSftp();
         }
@@ -135,7 +136,7 @@ class PooledSshConnection implements SshConnection {
       return await this.active.exec(command);
     } catch (err) {
       if (this.shouldAttemptFallback(err)) {
-        const fb = await this.tryFallback();
+        const fb = await this.tryFallback(err);
         if (fb) {
           return fb.exec(command);
         }
@@ -214,7 +215,7 @@ class PooledSshConnection implements SshConnection {
     return this.isReused && shouldFallbackForChannelLimit(error);
   }
 
-  private tryFallback(): Promise<SshConnection | undefined> {
+  private tryFallback(error: unknown): Promise<SshConnection | undefined> {
     if (this.fallbackUsed) {
       return Promise.resolve(this.fallbackConnection);
     }
@@ -223,16 +224,23 @@ class PooledSshConnection implements SshConnection {
     }
     // Cache the promise so concurrent callers share a single fallback attempt
     if (!this.fallbackPromise) {
-      this.fallbackPromise = this.executeFallback();
+      this.fallbackPromise = this.executeFallback(error);
     }
     return this.fallbackPromise;
   }
 
-  private async executeFallback(): Promise<SshConnection | undefined> {
+  private async executeFallback(error: unknown): Promise<SshConnection | undefined> {
     if (this.disposed) {
       // Disposed while the original channel open was in flight: dialing (and
       // possibly prompting for a password/2FA) for a closed lease is unwanted.
       this.fallbackUsed = true;
+      // The dead transport must still leave the pool: createFallback was the
+      // only place that evicted it, and a stale entry would otherwise be
+      // handed to new consumers. A channel-limit error says nothing about
+      // transport health, so it evicts nothing.
+      if (isStaleConnectionError(error)) {
+        this.evictDeadEntry?.();
+      }
       return undefined;
     }
     try {
@@ -329,14 +337,22 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
     // Soft-remove the pool entry (mark unhealthy, remove from map) but do NOT
     // dispose the underlying connection — other leases may still hold active
     // streams. The last lease to release will dispose it via orphan cleanup.
-    const createFallback = async (): Promise<SshConnection> => {
+    const evictDeadEntry = (): void => {
       if (this.entries.get(server.id) === entry) {
         entry.healthy = false;
         this.cancelIdleTimer(entry);
         this.entries.delete(server.id);
-        this.trackRetired(entry);
         this.emit({ type: "disconnected", serverId: server.id });
+        if (entry.refCount === 0) {
+          // A disposed lease already released it: nobody else will close it.
+          entry.connection.dispose();
+        } else {
+          this.trackRetired(entry);
+        }
       }
+    };
+    const createFallback = async (): Promise<SshConnection> => {
+      evictDeadEntry();
       return this.connectInner(server, context);
     };
 
@@ -361,7 +377,7 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
         entry.connection.dispose();
       }
       return entry.closePromise;
-    });
+    }, evictDeadEntry);
   }
 
   /**

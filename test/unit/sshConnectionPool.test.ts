@@ -915,6 +915,50 @@ describe("SshConnectionPool", () => {
     expect(f.connect).toHaveBeenCalledTimes(1);
   });
 
+  it("evicts a dead transport when the lease is disposed before a stale error, so new leases get a fresh connection", async () => {
+    const deadConn = createMockConnection();
+    let rejectOpen!: (e: Error) => void;
+    deadConn.openShell = vi.fn(() => new Promise<any>((_, reject) => { rejectOpen = reject; }));
+    const freshConn = createMockConnection();
+    const f = createMockFactory([deadConn, freshConn]);
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 0 });
+
+    const lease = await p.connect(testServer);
+    const opening = lease.openShell();
+    opening.catch(() => {});
+    lease.dispose();
+    rejectOpen(new Error("Not connected"));
+    await expect(opening).rejects.toThrow("Cannot use a disposed SSH connection lease");
+
+    const next = await p.connect(testServer);
+    expect(f.connect).toHaveBeenCalledTimes(2);
+    await next.openShell();
+    expect(freshConn.openShell).toHaveBeenCalled();
+    expect(deadConn.dispose).toHaveBeenCalled();
+  });
+
+  it("keeps a healthy pooled entry when a disposed lease's open fails with a channel-limit error", async () => {
+    const pooledConn = createMockConnection();
+    let rejectOpen!: (e: Error) => void;
+    pooledConn.openShell = vi.fn(() => new Promise<any>((_, reject) => { rejectOpen = reject; }));
+    const f = createMockFactory([pooledConn]);
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 5000 });
+
+    const keeper = await p.connect(testServer);
+    const lease = await p.connect(testServer);
+    const opening = lease.openShell();
+    opening.catch(() => {});
+    lease.dispose();
+    rejectOpen(new Error("Channel open failure: Administratively prohibited"));
+    await expect(opening).rejects.toThrow("Cannot use a disposed SSH connection lease");
+
+    const next = await p.connect(testServer);
+    expect(f.connect).toHaveBeenCalledTimes(1);
+    expect(pooledConn.dispose).not.toHaveBeenCalled();
+    keeper.dispose();
+    next.dispose();
+  });
+
   it("pool.dispose closes a transport soft-removed by fallback while another lease still holds it", async () => {
     const pooledConn = createMockConnection();
     let shellCalls = 0;
