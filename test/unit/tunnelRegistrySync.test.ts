@@ -7,7 +7,13 @@ import { InMemoryTunnelRegistryStore } from "../../src/storage/inMemoryTunnelReg
 import { VscodeTunnelRegistryStore } from "../../src/storage/vscodeTunnelRegistryStore";
 
 const fakeFenceFiles = vi.hoisted(() => new Map<string, Uint8Array>());
-const fakeFenceRead = vi.hoisted(() => ({ beforeRead: undefined as (() => Promise<void>) | undefined }));
+const fakeFenceMtimes = vi.hoisted(() => new Map<string, number>());
+const fakeFenceRead = vi.hoisted(() => ({
+  beforeRead: undefined as (() => Promise<void>) | undefined,
+  failPath: undefined as string | undefined,
+  statFailPath: undefined as string | undefined,
+  deleteFailPath: undefined as string | undefined
+}));
 vi.mock("vscode", () => {
   class FakeFileSystemError extends Error {
     public constructor(public readonly code: string) {
@@ -35,20 +41,30 @@ vi.mock("vscode", () => {
           const beforeRead = fakeFenceRead.beforeRead;
           fakeFenceRead.beforeRead = undefined;
           await beforeRead?.();
+          if (uri.path === fakeFenceRead.failPath) throw new FakeFileSystemError("NoPermissions");
           const value = fakeFenceFiles.get(uri.path);
           if (!value) throw new FakeFileSystemError("FileNotFound");
           return value;
         },
+        stat: async (uri: { path: string }) => {
+          if (uri.path === fakeFenceRead.statFailPath) throw new FakeFileSystemError("Unavailable");
+          if (!fakeFenceFiles.has(uri.path)) throw new FakeFileSystemError("FileNotFound");
+          return { mtime: fakeFenceMtimes.get(uri.path) ?? Date.now() };
+        },
         writeFile: async (uri: { path: string }, value: Uint8Array) => {
           fakeFenceFiles.set(uri.path, new Uint8Array(value));
+          fakeFenceMtimes.set(uri.path, Date.now());
         },
         rename: async (source: { path: string }, target: { path: string }) => {
           const value = fakeFenceFiles.get(source.path);
           if (!value) throw new FakeFileSystemError("FileNotFound");
           fakeFenceFiles.set(target.path, value);
+          fakeFenceMtimes.set(target.path, fakeFenceMtimes.get(source.path) ?? Date.now());
           fakeFenceFiles.delete(source.path);
+          fakeFenceMtimes.delete(source.path);
         },
         delete: async (uri: { path: string }) => {
+          if (uri.path === fakeFenceRead.deleteFailPath) throw new FakeFileSystemError("NoPermissions");
           if (!fakeFenceFiles.delete(uri.path)) throw new FakeFileSystemError("FileNotFound");
         }
       }
@@ -132,7 +148,11 @@ describe("TunnelRegistrySync", () => {
   beforeEach(async () => {
     vi.useFakeTimers();
     fakeFenceFiles.clear();
+    fakeFenceMtimes.clear();
     fakeFenceRead.beforeRead = undefined;
+    fakeFenceRead.failPath = undefined;
+    fakeFenceRead.statFailPath = undefined;
+    fakeFenceRead.deleteFailPath = undefined;
     store = new InMemoryTunnelRegistryStore();
     core = new NexusCore(new InMemoryConfigRepository());
     await core.initialize();
@@ -141,6 +161,7 @@ describe("TunnelRegistrySync", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     sync.dispose();
     vi.useRealTimers();
   });
@@ -901,5 +922,412 @@ describe("TunnelRegistrySync", () => {
     // Should be evicted since startedAt is too old
     const entries = await store.getEntries();
     expect(entries).toHaveLength(0);
+  });
+  const reverseRoute = { kind: "direct", endpoint: { hosts: ["bastion"], port: 22 } } as const;
+  const seedRaw = (name: string, contents: string, ageMs: number): string => {
+    const path = `/shared/reverse-bind-fences/${name}`;
+    fakeFenceFiles.set(path, new TextEncoder().encode(contents));
+    fakeFenceMtimes.set(path, Date.now() - ageMs);
+    return path;
+  };
+
+  it("keeps an unsettled fence live for other windows past the stale threshold", async () => {
+    const [ownerStore, otherStore] = sharedWindowStores();
+    const owner = new TunnelRegistrySync(ownerStore, core, "owner", probePort);
+    const other = new TunnelRegistrySync(otherStore, core, "other", probePort);
+    const tunnel = makeTunnel({ id: "hb", tunnelType: "reverse", remotePort: 9000 });
+    await owner.initialize();
+    await owner.unregisterTunnel(tunnel.profileId, {
+      tunnel,
+      retiredReverseBind: {
+        fenceId: tunnel.id, routeIdentity: reverseRoute, remotePort: 9000, settled: new Promise<void>(() => {})
+      }
+    });
+    let cancelled = false;
+    let resolved = false;
+    void other.waitForRemoteReverseBindClear({ routeIdentity: reverseRoute, remotePort: 9000 }, () => cancelled)
+      .then((value) => { resolved = value; });
+
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(await other.checkRemoteOwnership("elsewhere", 1, { routeIdentity: reverseRoute, remotePort: 9000 }))
+      .toMatchObject({ retiredReverseBind: { fenceId: "hb" } });
+    expect(resolved).toBe(false);
+    cancelled = true;
+    owner.dispose();
+  });
+
+  it("does not let an expired foreign fence block a replacement start", async () => {
+    const [ownerStore, otherStore] = sharedWindowStores();
+    const other = new TunnelRegistrySync(otherStore, core, "other", probePort);
+    await ownerStore.publishFence(makeEntry({
+      ownerSessionId: "crashed", tunnelType: "reverse", lastSeen: Date.now() - 31_000,
+      retiredReverseBind: { fenceId: "dead", routeIdentity: JSON.stringify(reverseRoute), remotePort: 9000 }
+    }));
+    let result: boolean | undefined;
+    void other.waitForRemoteReverseBindClear({ routeIdentity: reverseRoute, remotePort: 9000 }, () => false)
+      .then((value) => { result = value; });
+
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(result).toBe(true);
+  });
+
+  it.each([
+    ["truncated JSON", "{trunc"],
+    ["an empty file", ""],
+    ["JSON null", "null"],
+    ["a non-fence object", "{\"profileId\":\"t1\"}"]
+  ])("skips %s in the fence directory and sweeps it once stale", async (_label, contents) => {
+    const [ownerStore, otherStore] = sharedWindowStores();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    await ownerStore.publishFence(makeEntry({
+      ownerSessionId: "owner", tunnelType: "reverse", lastSeen: Date.now(),
+      retiredReverseBind: { fenceId: "good", routeIdentity: JSON.stringify(reverseRoute), remotePort: 9000 }
+    }));
+    const fresh = seedRaw("fresh--1.json", contents, 0);
+    const old = seedRaw("old--1.json", contents, 31_000);
+    // A versioned name carries the writer's clock; a recent one keeps the file.
+    const versioned = seedRaw(`v--${Date.now().toString().padStart(13, "0")}-000001-abc.json`, contents, 31_000);
+    const other = new TunnelRegistrySync(otherStore, core, "other", probePort);
+
+    await other.initialize();
+
+    expect((await otherStore.getEntries()).map((entry) => entry.retiredReverseBind?.fenceId)).toEqual(["good"]);
+    expect(fakeFenceFiles.has(old)).toBe(false);
+    expect(fakeFenceFiles.has(versioned)).toBe(true);
+    // A file that just appeared might still be settling; only stale ones go.
+    expect(fakeFenceFiles.has(fresh)).toBe(true);
+    await vi.advanceTimersByTimeAsync(61_000);
+    expect(fakeFenceFiles.has(fresh)).toBe(false);
+    other.dispose();
+    log.mockRestore();
+  });
+
+  it("skips a partial fence file so it cannot block a start, and sweeps it once stale", async () => {
+    const [ownerStore, otherStore] = sharedWindowStores();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    probePort.mockClear();
+    const partial = JSON.stringify({
+      profileId: "t1", ownerSessionId: "crashed",
+      retiredReverseBind: { fenceId: "partial", routeIdentity: JSON.stringify(reverseRoute), remotePort: 9000 }
+    });
+    const fresh = seedRaw("partial-fresh--1.json", partial, 0);
+    const old = seedRaw("partial-old--1.json", partial, 31_000);
+    const other = new TunnelRegistrySync(otherStore, core, "other", probePort);
+
+    await other.initialize();
+
+    expect(await otherStore.getEntries()).toEqual([]);
+    expect(await other.checkRemoteOwnership("elsewhere", 1, { routeIdentity: reverseRoute, remotePort: 9000 }))
+      .toBeUndefined();
+    expect(probePort).not.toHaveBeenCalled();
+    expect(fakeFenceFiles.has(old)).toBe(false);
+    expect(fakeFenceFiles.has(fresh)).toBe(true);
+    void ownerStore;
+    other.dispose();
+    log.mockRestore();
+  });
+
+  it("skips a fence file typed as a non-reverse tunnel so it cannot make a start probe a local port", async () => {
+    const [, otherStore] = sharedWindowStores();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    probePort.mockClear();
+    probePort.mockResolvedValue(true);
+    const path = seedRaw("local-typed--1.json", JSON.stringify(makeEntry({
+      ownerSessionId: "crashed", tunnelType: "local", localPort: 8080, lastSeen: Date.now(),
+      retiredReverseBind: { fenceId: "typed", routeIdentity: JSON.stringify(reverseRoute), remotePort: 9000 }
+    })), 0);
+    const other = new TunnelRegistrySync(otherStore, core, "other", probePort);
+
+    expect(await otherStore.getEntries()).toEqual([]);
+    expect(await other.checkRemoteOwnership("elsewhere", 1, { routeIdentity: reverseRoute, remotePort: 9000 }))
+      .toBeUndefined();
+    expect(probePort).not.toHaveBeenCalled();
+    expect(fakeFenceFiles.has(path)).toBe(true);
+    probePort.mockResolvedValue(false);
+    log.mockRestore();
+  });
+
+  it("keeps heartbeating an owned fence while an unrelated fresh fence file is unreadable", async () => {
+    const [ownerStore, otherStore] = sharedWindowStores();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const owner = new TunnelRegistrySync(ownerStore, core, "owner", probePort);
+    const other = new TunnelRegistrySync(otherStore, core, "other", probePort);
+    const tunnel = makeTunnel({ id: "held", tunnelType: "reverse", remotePort: 9000 });
+    await owner.initialize();
+    await owner.unregisterTunnel(tunnel.profileId, {
+      tunnel,
+      retiredReverseBind: {
+        fenceId: tunnel.id, routeIdentity: reverseRoute, remotePort: 9000, settled: new Promise<void>(() => {})
+      }
+    });
+    const ownedLastSeen = (): number => {
+      const seen = [...fakeFenceFiles.entries()]
+        .filter(([path]) => path.includes("held"))
+        .map(([, bytes]) => (JSON.parse(new TextDecoder().decode(bytes)) as { lastSeen: number }).lastSeen);
+      return Math.max(...seen);
+    };
+    fakeFenceRead.failPath = seedRaw("foreign--1.json", "{}", 0);
+    await other.initialize();
+
+    await vi.advanceTimersByTimeAsync(25_000);
+    await expect(otherStore.getEntries()).rejects.toThrow();
+    expect(Date.now() - ownedLastSeen()).toBeLessThan(5_000);
+
+    // Past 30 s the foreign file is stale and skipped; the owned fence must
+    // still be live for other windows and must not have been swept.
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(await other.checkRemoteOwnership("elsewhere", 1, { routeIdentity: reverseRoute, remotePort: 9000 }))
+      .toMatchObject({ retiredReverseBind: { fenceId: "held" } });
+    expect([...fakeFenceFiles.keys()].some((path) => path.includes("held"))).toBe(true);
+    owner.dispose();
+    other.dispose();
+    log.mockRestore();
+  });
+
+  it("ignores an unreadable, unstattable versioned fence once its embedded timestamp is stale", async () => {
+    const [, otherStore] = sharedWindowStores();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const name = (ts: number) => `v--${ts.toString().padStart(13, "0")}-000001-abc.json`;
+    const old = seedRaw(name(Date.now() - 31_000), "{", 0);
+    fakeFenceRead.failPath = old;
+    fakeFenceRead.statFailPath = old;
+
+    await expect(otherStore.getEntries()).resolves.toEqual([]);
+    expect(fakeFenceFiles.has(old)).toBe(false);
+
+    const fresh = seedRaw(name(Date.now()).replace("abc", "def"), "{", 0);
+    fakeFenceRead.failPath = fresh;
+    fakeFenceRead.statFailPath = fresh;
+    await expect(otherStore.getEntries()).rejects.toThrow();
+    log.mockRestore();
+  });
+
+  it("ages out an unreadable, unstattable unversioned fence from when it was first seen failing", async () => {
+    const [, otherStore] = sharedWindowStores();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const path = seedRaw("legacy.json", "{", 0);
+    fakeFenceRead.failPath = path;
+    fakeFenceRead.statFailPath = path;
+
+    await expect(otherStore.getEntries()).rejects.toThrow();
+    await vi.advanceTimersByTimeAsync(20_000);
+    await expect(otherStore.getEntries()).rejects.toThrow();
+    await vi.advanceTimersByTimeAsync(11_000);
+
+    await expect(otherStore.getEntries()).resolves.toEqual([]);
+    expect(fakeFenceFiles.has(path)).toBe(false);
+    log.mockRestore();
+  });
+
+  it("does not fail initialize or syncNow when one stale fence file cannot be read", async () => {
+    const [ownerStore, otherStore] = sharedWindowStores();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    await ownerStore.publishFence(makeEntry({
+      ownerSessionId: "owner", tunnelType: "reverse", lastSeen: Date.now(),
+      retiredReverseBind: { fenceId: "good", routeIdentity: JSON.stringify(reverseRoute), remotePort: 9000 }
+    }));
+    fakeFenceRead.failPath = seedRaw("locked--1.json", "{}", 31_000);
+    const other = new TunnelRegistrySync(otherStore, core, "other", probePort);
+
+    await expect(other.initialize()).resolves.toBeUndefined();
+    await expect(other.syncNow()).resolves.toBeUndefined();
+    expect((await otherStore.getEntries()).map((entry) => entry.retiredReverseBind?.fenceId)).toEqual(["good"]);
+    other.dispose();
+    log.mockRestore();
+  });
+
+  it("fails closed instead of hiding a fresh fence that cannot be read", async () => {
+    const [ownerStore, otherStore] = sharedWindowStores();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    fakeFenceRead.failPath = seedRaw("live--1.json", "{}", 1_000);
+    const other = new TunnelRegistrySync(otherStore, core, "other", probePort);
+
+    await expect(otherStore.getEntries()).rejects.toMatchObject({
+      cause: expect.objectContaining({ code: "NoPermissions" })
+    });
+    await expect(
+      other.waitForRemoteReverseBindClear({ routeIdentity: reverseRoute, remotePort: 9000 }, () => false)
+    ).rejects.toThrow();
+    expect(fakeFenceFiles.has(fakeFenceRead.failPath)).toBe(true);
+    void ownerStore;
+    log.mockRestore();
+  });
+
+  it("fails closed for an unreadable versioned fence whose mtime lags but whose name is current", async () => {
+    const [, otherStore] = sharedWindowStores();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const path = seedRaw(`live--${Date.now().toString().padStart(13, "0")}-000001-abc.json`, "{}", 120_000);
+    fakeFenceRead.failPath = path;
+
+    await expect(otherStore.getEntries()).rejects.toThrow();
+    expect(fakeFenceFiles.has(path)).toBe(true);
+    log.mockRestore();
+  });
+
+  it("does not consume the one-time warning when only a later registry save fails", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.fn();
+    const warning = new TunnelRegistrySync(store, core, "w", probePort, warn);
+    const tunnel = makeTunnel({ id: "w2", tunnelType: "reverse", remotePort: 9001 });
+    const options = {
+      tunnel,
+      retiredReverseBind: { fenceId: "w2", routeIdentity: reverseRoute, remotePort: 9001, settled: new Promise<void>(() => {}) }
+    };
+    vi.spyOn(store, "saveEntries").mockRejectedValueOnce(new Error("state write failed"));
+
+    await warning.unregisterTunnelAfterStop(tunnel.profileId, options);
+    expect(warn).not.toHaveBeenCalled();
+
+    vi.spyOn(store, "publishFence").mockRejectedValue(new Error("disk full"));
+    await warning.unregisterTunnelAfterStop(tunnel.profileId, options);
+    await warning.unregisterTunnelAfterStop(tunnel.profileId, options);
+    expect(warn).toHaveBeenCalledTimes(1);
+    log.mockRestore();
+  });
+
+  it("warns when the registry read fails before the reservation is published", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.fn();
+    const warning = new TunnelRegistrySync(store, core, "w", probePort, warn);
+    const tunnel = makeTunnel({ id: "w3", tunnelType: "reverse", remotePort: 9002 });
+    const options = {
+      tunnel,
+      retiredReverseBind: { fenceId: "w3", routeIdentity: reverseRoute, remotePort: 9002, settled: new Promise<void>(() => {}) }
+    };
+    const publish = vi.spyOn(store, "publishFence");
+    vi.spyOn(store, "getEntries").mockRejectedValue(new Error("fresh unreadable fence"));
+
+    await warning.unregisterTunnelAfterStop(tunnel.profileId, options);
+    await warning.unregisterTunnelAfterStop(tunnel.profileId, options);
+
+    expect(publish).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1);
+    log.mockRestore();
+  });
+
+  it("warns once when a stopped reverse tunnel's reservation cannot be published", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.fn();
+    const warning = new TunnelRegistrySync(store, core, "w", probePort, warn);
+    const tunnel = makeTunnel({ id: "w1", tunnelType: "reverse", remotePort: 9000 });
+    vi.spyOn(store, "publishFence").mockRejectedValue(new Error("disk full"));
+    const options = {
+      tunnel,
+      retiredReverseBind: { fenceId: "w1", routeIdentity: reverseRoute, remotePort: 9000, settled: new Promise<void>(() => {}) }
+    };
+
+    await warning.unregisterTunnelAfterStop(tunnel.profileId, options);
+    await warning.unregisterTunnelAfterStop(tunnel.profileId, options);
+    await warning.unregisterTunnelAfterStop("t1");
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain("9000");
+    expect(warn.mock.calls[0][0]).toContain("reload this window");
+    log.mockRestore();
+  });
+
+  it("reports a failing orphan cleanup once per file, not on every poll", async () => {
+    const [, otherStore] = sharedWindowStores();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    fakeFenceRead.deleteFailPath = seedRaw(".z.1.tmp", "{", 60_000);
+    const other = new TunnelRegistrySync(otherStore, core, "other", probePort);
+
+    await other.initialize();
+    await vi.advanceTimersByTimeAsync(30_000);
+    other.dispose();
+
+    expect(log).toHaveBeenCalledTimes(1);
+    log.mockRestore();
+  });
+
+  it("does not sweep a temporary file whose embedded writer timestamp is recent despite an old mtime", async () => {
+    const [, otherStore] = sharedWindowStores();
+    const path = seedRaw(`.x.${Date.now() - 1_000}-abc.tmp`, "{", 60_000);
+    const other = new TunnelRegistrySync(otherStore, core, "other", probePort);
+
+    await other.initialize();
+    other.dispose();
+
+    expect(fakeFenceFiles.has(path)).toBe(true);
+  });
+
+  it("initialize survives a failing registry and its timers raise no unhandled rejections", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+    vi.spyOn(store, "getEntries").mockRejectedValue(new Error("storage down"));
+
+    await expect(sync.initialize()).resolves.toBeUndefined();
+    await vi.advanceTimersByTimeAsync(91_000);
+    await vi.advanceTimersByTimeAsync(0);
+    process.off("unhandledRejection", onUnhandled);
+
+    expect(unhandled).toEqual([]);
+    expect(log).toHaveBeenCalled();
+    log.mockRestore();
+  });
+
+  it("logs instead of rejecting when the registry write after a stop fails", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const tunnel = makeTunnel({ id: "stopping", tunnelType: "reverse", remotePort: 9000 });
+    vi.spyOn(store, "publishFence").mockRejectedValue(new Error("disk full"));
+
+    await expect(sync.unregisterTunnelAfterStop(tunnel.profileId, {
+      tunnel,
+      retiredReverseBind: {
+        fenceId: tunnel.id, routeIdentity: reverseRoute, remotePort: 9000, settled: new Promise<void>(() => {})
+      }
+    })).resolves.toBeUndefined();
+    vi.spyOn(store, "getEntries").mockRejectedValue(new Error("storage down"));
+    await expect(sync.unregisterTunnelAfterStop("t1")).resolves.toBeUndefined();
+    expect(log).toHaveBeenCalledTimes(2);
+    log.mockRestore();
+  });
+
+  it("awaits durable fence publication before the after-stop call resolves", async () => {
+    const [ownerStore] = sharedWindowStores();
+    const owner = new TunnelRegistrySync(ownerStore, core, "owner", probePort);
+    const tunnel = makeTunnel({ id: "ordered", tunnelType: "reverse", remotePort: 9000 });
+
+    await owner.unregisterTunnelAfterStop(tunnel.profileId, {
+      tunnel,
+      retiredReverseBind: {
+        fenceId: tunnel.id, routeIdentity: reverseRoute, remotePort: 9000, settled: new Promise<void>(() => {})
+      }
+    });
+
+    expect(fakeFenceFiles.size).toBe(1);
+  });
+
+  it("forgets a published fence id once its stop succeeds", async () => {
+    const [ownerStore] = sharedWindowStores();
+    const owner = new TunnelRegistrySync(ownerStore, core, "owner", probePort);
+    for (const id of ["done-1", "done-2"]) {
+      const tunnel = makeTunnel({ id, tunnelType: "reverse", remotePort: 9000 });
+      await owner.unregisterTunnelAfterStop(tunnel.profileId, {
+        tunnel,
+        retiredReverseBind: {
+          fenceId: id, routeIdentity: reverseRoute, remotePort: 9000, settled: new Promise<void>(() => {})
+        }
+      });
+    }
+
+    expect((owner as unknown as { publishedFences: Set<string> }).publishedFences.size).toBe(0);
+  });
+
+  it("sweeps stale orphan temporary files but never a fresh in-flight one", async () => {
+    const [, otherStore] = sharedWindowStores();
+    const stale = seedRaw(".x.1.tmp", "{", 31_000);
+    const fresh = seedRaw(".y.2.tmp", "{", 1_000);
+    const other = new TunnelRegistrySync(otherStore, core, "other", probePort);
+
+    await other.initialize();
+    other.dispose();
+
+    expect(fakeFenceFiles.has(stale)).toBe(false);
+    expect(fakeFenceFiles.has(fresh)).toBe(true);
   });
 });

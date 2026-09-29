@@ -45,6 +45,36 @@ export async function stopTunnelsForShutdown(
   }
 }
 
+/** Minimal event shape the `stopped` listener needs (see TunnelEvent). */
+export interface TunnelStoppedEvent {
+  tunnelId: string;
+  tunnel: ActiveTunnel;
+  retiredReverseBind?: RetiredReverseBindFence;
+}
+
+/**
+ * The `stopped` listener body. Local teardown (core.unregisterTunnel) happens
+ * first, and a registry failure afterwards is absorbed by
+ * unregisterTunnelAfterStop so stop() and its callers keep going. Do not swap
+ * in unregisterTunnel: a rejection would abort server removal partway.
+ */
+export function handleTunnelStopped(
+  core: Pick<NexusCore, "getSnapshot" | "unregisterTunnel">,
+  registrySync: Pick<TunnelRegistrySync, "unregisterTunnelAfterStop">,
+  event: TunnelStoppedEvent
+): Promise<void> | undefined {
+  const stoppingTunnel = core.getSnapshot().activeTunnels.find((t) => t.id === event.tunnelId)
+    ?? (event.retiredReverseBind ? event.tunnel : undefined);
+  core.unregisterTunnel(event.tunnelId);
+  if (!stoppingTunnel) {
+    return undefined;
+  }
+  return registrySync.unregisterTunnelAfterStop(stoppingTunnel.profileId, {
+    tunnel: stoppingTunnel,
+    ...(event.retiredReverseBind ? { retiredReverseBind: event.retiredReverseBind } : {})
+  });
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -157,20 +187,79 @@ export class TunnelRegistrySync {
     hasSettled: () => boolean;
   }>();
   private mutationTail: Promise<void> = Promise.resolve();
+  private warnedFencePublishFailure = false;
+  /** Fence ids whose publishFence completed during the current stop call. */
+  private readonly publishedFences = new Set<string>();
+  /**
+   * The latest entry this window published for each of its unsettled fences.
+   * The heartbeat rewrites from this, not from a directory read, so an
+   * unrelated unreadable fence file (which makes every read fail closed)
+   * cannot stop our live reservations being refreshed and expiring.
+   */
+  private readonly ownedFenceEntries = new Map<string, TunnelRegistryEntry>();
 
   public constructor(
     private readonly store: TunnelRegistryStore,
     private readonly core: NexusCore,
     private readonly sessionId: string,
-    probePortFn?: ProbePortFn
+    probePortFn?: ProbePortFn,
+    private readonly notifyWarning?: (message: string) => void
   ) {
     this.probePort = probePortFn ?? defaultProbePort;
   }
 
   public async initialize(): Promise<void> {
-    await this.syncWithProbe();
-    this.pollTimer = setInterval(() => void this.syncFast(), POLL_INTERVAL_MS);
-    this.reprobeTimer = setInterval(() => void this.syncWithProbe(), SLOW_REPROBE_INTERVAL_MS);
+    try {
+      await this.syncWithProbe();
+    } catch (error) {
+      // Registry storage trouble must not stop the whole extension activating.
+      // The timers below retry, so a later sweep recovers once it clears.
+      console.error("[Nexus] initial tunnel registry sync failed", error);
+    }
+    this.pollTimer = setInterval(() => {
+      this.syncFast().catch((error: unknown) => console.error("[Nexus] tunnel registry sync failed", error));
+    }, POLL_INTERVAL_MS);
+    this.reprobeTimer = setInterval(() => {
+      this.syncWithProbe().catch((error: unknown) => console.error("[Nexus] tunnel registry sweep failed", error));
+    }, SLOW_REPROBE_INTERVAL_MS);
+  }
+
+  /**
+   * For the stopped-tunnel listener: local teardown is already done, so a
+   * registry failure is logged instead of rejecting stop() and aborting the
+   * caller's remaining cleanup. The call is still awaited, which keeps a
+   * reverse-bind fence published before stop() resolves.
+   */
+  public async unregisterTunnelAfterStop(
+    profileId: string,
+    options?: { tunnel: ActiveTunnel; retiredReverseBind?: RetiredReverseBindFence }
+  ): Promise<void> {
+    if (options?.retiredReverseBind) {
+      this.publishedFences.delete(options.retiredReverseBind.fenceId);
+    }
+    try {
+      await this.unregisterTunnel(profileId, options);
+      // Active tunnel ids are never reused, so a successful stop must drop its
+      // id here or the set grows for the lifetime of the extension host.
+      if (options?.retiredReverseBind) {
+        this.publishedFences.delete(options.retiredReverseBind.fenceId);
+      }
+    } catch (error) {
+      console.error("[Nexus] tunnel registry update after stop failed", error);
+      // Any failure before the fence was published (its own write, or the
+      // registry read ahead of it) leaves no reservation and warns. A later
+      // active-array save failing after publication is not a missing
+      // reservation, so it must neither warn nor consume the one-time warning.
+      const fenceId = options?.retiredReverseBind?.fenceId;
+      const publishFailed = fenceId !== undefined && !this.publishedFences.delete(fenceId);
+      if (publishFailed && options?.retiredReverseBind && !this.warnedFencePublishFailure) {
+        this.warnedFencePublishFailure = true;
+        this.notifyWarning?.(
+          `Nexus could not record a reservation for remote port ${options.retiredReverseBind.remotePort} of a stopped reverse tunnel. ` +
+          "Another VS Code window may collide on that port until the old connection closes: close this server's terminals, SFTP views and tunnels, or reload this window to release it, and wait before starting the same reverse tunnel elsewhere."
+        );
+      }
+    }
   }
 
   public async registerTunnel(tunnel: ActiveTunnel): Promise<void> {
@@ -233,8 +322,11 @@ export class TunnelRegistrySync {
           // Publish first: a stale Memento write from another window cannot
           // remove this file, and removal of our active row follows it.
           await this.store.publishFence(fenceEntry);
+          this.publishedFences.add(fence.fenceId);
+          this.ownedFenceEntries.set(fence.fenceId, fenceEntry);
         } catch (error) {
           this.unsettledReverseBindFenceIds.delete(fence.fenceId);
+          this.ownedFenceEntries.delete(fence.fenceId);
           throw error;
         }
         // A later active-array save can fail. The already-published fence must
@@ -255,16 +347,15 @@ export class TunnelRegistrySync {
           if (!this.unsettledReverseBindFenceIds.has(fence.fenceId)) {
             return;
           }
-          const current = await this.store.getEntries();
-          const entry = current.find((item) =>
-            item.ownerSessionId === this.sessionId && item.retiredReverseBind?.fenceId === fence.fenceId
-          );
+          const entry = this.ownedFenceEntries.get(fence.fenceId);
           if (entry?.retiredReverseBind) {
-            await this.store.publishFence({
+            const moved = {
               ...entry,
               remotePort: port,
               retiredReverseBind: { ...entry.retiredReverseBind, remotePort: port }
-            });
+            };
+            await this.store.publishFence(moved);
+            this.ownedFenceEntries.set(fence.fenceId, moved);
           }
         });
       });
@@ -292,6 +383,7 @@ export class TunnelRegistrySync {
         // Settlement is final even when storage fails. The next slow sweep can
         // remove an unrefreshed file; heartbeat must not keep it live forever.
         this.unsettledReverseBindFenceIds.delete(fence.fenceId);
+        this.ownedFenceEntries.delete(fence.fenceId);
       }
     }));
     const pending = { settled, cleanup, hasSettled: () => hasSettled };
@@ -407,8 +499,35 @@ export class TunnelRegistrySync {
     }
   }
 
+  /**
+   * Refresh lastSeen on our unsettled fences straight from memory. This must
+   * not depend on reading the registry: while an unrelated fence file is
+   * unreadable every read fails closed, and a heartbeat gated on it would let
+   * a live reservation age past the stale threshold and be reused or swept.
+   * (The active-row heartbeat below still needs a read because rows share one
+   * globalState array; a missed refresh there only makes a reverse row look
+   * stale to other windows, it does not release a remote bind.)
+   */
+  private async heartbeatOwnFences(): Promise<void> {
+    const now = Date.now();
+    for (const [fenceId, entry] of [...this.ownedFenceEntries]) {
+      if (!this.unsettledReverseBindFenceIds.has(fenceId)) {
+        this.ownedFenceEntries.delete(fenceId);
+        continue;
+      }
+      const refreshed = { ...entry, lastSeen: now };
+      await this.store.publishFence(refreshed);
+      this.ownedFenceEntries.set(fenceId, refreshed);
+    }
+  }
+
   private async syncFast(): Promise<void> {
     await this.mutateEntries(async () => {
+      try {
+        await this.heartbeatOwnFences();
+      } catch (error) {
+        console.error("[Nexus] reverse-bind fence heartbeat failed", error);
+      }
       const entries = await this.store.getEntries();
       const remote = entries.filter((e) => e.ownerSessionId !== this.sessionId && !e.retiredReverseBind);
       const remoteJson = JSON.stringify(remote);
@@ -426,9 +545,8 @@ export class TunnelRegistrySync {
       // Update lastSeen on existing own entries
       for (const entry of ownEntries) {
         if (entry.retiredReverseBind) {
-          if (this.unsettledReverseBindFenceIds.has(entry.retiredReverseBind.fenceId)) {
-            await this.store.publishFence({ ...entry, lastSeen: now });
-          }
+          // Fences are refreshed from memory by heartbeatOwnFences.
+          continue;
         } else if (activeTunnels.some((t) => matchesActiveTunnel(entry, t))) {
           entry.lastSeen = now;
           changed = true;
@@ -480,7 +598,8 @@ export class TunnelRegistrySync {
           entry.retiredReverseBind &&
           (entry.ownerSessionId !== this.sessionId ||
             !this.unsettledReverseBindFenceIds.has(entry.retiredReverseBind.fenceId)) &&
-          now - (entry.lastSeen ?? entry.startedAt) >= STALE_THRESHOLD_MS
+          // Negated so a non-finite age counts as stale rather than kept forever.
+          !(now - (entry.lastSeen ?? entry.startedAt) < STALE_THRESHOLD_MS)
         ) {
           try {
             await this.store.removeObservedFence(entry);

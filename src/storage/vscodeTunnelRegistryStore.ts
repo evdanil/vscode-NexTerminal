@@ -4,10 +4,52 @@ import type { TunnelRegistryEntry } from "../models/config";
 
 const STORAGE_KEY = "nexus.activeTunnelRegistry";
 const FENCE_DIRECTORY = "reverse-bind-fences";
+/**
+ * A live fence is republished every few seconds and a temporary file exists
+ * only between writeFile and rename, so a file older than this is never a live
+ * reservation or an in-flight write. Matches the registry's staleness window.
+ */
+const ORPHAN_FILE_AGE_MS = 30_000;
+
+/** Writer-clock timestamp embedded in a versioned fence name, if it has one. */
+function versionedFenceTimestamp(name: string): number | undefined {
+  const embedded = /--(\d{13})-\d{6}-[^.]*\.json$/.exec(name);
+  return embedded ? Number(embedded[1]) : undefined;
+}
+
+const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+
+/**
+ * Every field the registry sync consumes must be well-typed: a partial file
+ * that passed would reach probePort(undefined) or produce a NaN age that the
+ * stale sweep can never delete. Such a file is treated as unusable instead.
+ */
+function isFenceEntry(value: unknown): value is TunnelRegistryEntry {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const entry = value as Record<string, unknown>;
+  const retired = entry.retiredReverseBind;
+  if (typeof retired !== "object" || retired === null) {
+    return false;
+  }
+  const { fenceId, routeIdentity, remotePort } = retired as Record<string, unknown>;
+  return typeof fenceId === "string" && fenceId.length > 0 &&
+    typeof routeIdentity === "string" && finite(remotePort) &&
+    typeof entry.profileId === "string" && typeof entry.ownerSessionId === "string" &&
+    // A retired bind is only ever a reverse tunnel; any other type would make
+    // checkRemoteOwnership probe a local port instead of using the heartbeat.
+    entry.tunnelType === "reverse" &&
+    finite(entry.localPort) && finite(entry.remotePort) && finite(entry.startedAt) &&
+    (entry.lastSeen === undefined || finite(entry.lastSeen));
+}
 
 export class VscodeTunnelRegistryStore implements TunnelRegistryStore {
   private readonly observedFenceFiles = new WeakMap<TunnelRegistryEntry, vscode.Uri>();
   private fenceSequence = 0;
+  private readonly reportedUnusableFiles = new Set<string>();
+  private readonly reportedCleanupFailures = new Set<string>();
+  private readonly firstSeenUnstatable = new Map<string, number>();
 
   public constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -35,34 +77,122 @@ export class VscodeTunnelRegistryStore implements TunnelRegistryStore {
     }
   }
 
+  /**
+   * When the file was last written, as best we can tell. A network
+   * filesystem's clock can lag ours, so the later of mtime and the writer's
+   * own timestamp in the name wins. If stat fails too, the name's timestamp
+   * is used; a name without one (legacy or unversioned) is aged from the first
+   * moment this process saw it failing, so the file still ages out after the
+   * threshold instead of failing every read forever.
+   */
+  private async writtenAt(uri: vscode.Uri, embeddedTimestamp?: number): Promise<number> {
+    try {
+      const { mtime } = await vscode.workspace.fs.stat(uri);
+      return Math.max(mtime, embeddedTimestamp ?? -Infinity);
+    } catch {
+      if (embeddedTimestamp !== undefined) {
+        return embeddedTimestamp;
+      }
+      let firstSeen = this.firstSeenUnstatable.get(uri.path);
+      if (firstSeen === undefined) {
+        firstSeen = Date.now();
+        this.firstSeenUnstatable.set(uri.path, firstSeen);
+      }
+      return firstSeen;
+    }
+  }
+
+  /**
+   * Remove a file only once it is old enough that it cannot be another window's
+   * in-flight write or live fence. Failure to delete leaves it for the next
+   * sweep; it must never turn into a registry read failure.
+   */
+  private async deleteIfOrphaned(uri: vscode.Uri, embeddedTimestamp?: number): Promise<void> {
+    try {
+      if (Date.now() - await this.writtenAt(uri, embeddedTimestamp) >= ORPHAN_FILE_AGE_MS) {
+        await this.deleteFileIfPresent(uri);
+        this.firstSeenUnstatable.delete(uri.path);
+      }
+    } catch (error) {
+      // Runs on every 3 s poll, so report each file once.
+      if (!this.reportedCleanupFailures.has(uri.path)) {
+        this.reportedCleanupFailures.add(uri.path);
+        console.error("[Nexus] orphan reverse-bind fence file cleanup failed", error);
+      }
+    }
+  }
+
+  private async isFresh(uri: vscode.Uri, embeddedTimestamp?: number): Promise<boolean> {
+    return Date.now() - await this.writtenAt(uri, embeddedTimestamp) < ORPHAN_FILE_AGE_MS;
+  }
+
+  private async skipUnusableFence(name: string, uri: vscode.Uri, reason: unknown): Promise<undefined> {
+    // One file nobody can interpret as a reservation must not fail every
+    // registry read. It is not churn, so it is skipped rather than retried.
+    if (!this.reportedUnusableFiles.has(name)) {
+      this.reportedUnusableFiles.add(name);
+      console.error(`[Nexus] ignoring unusable reverse-bind fence file ${name}`, reason);
+    }
+    await this.deleteIfOrphaned(uri, versionedFenceTimestamp(name));
+    return undefined;
+  }
+
+  private async sweepOrphanTemporaries(files: [string, vscode.FileType][]): Promise<void> {
+    for (const [name, type] of files) {
+      if (type === vscode.FileType.File && name.startsWith(".") && name.endsWith(".tmp")) {
+        // Temporary names are `.<id>.<Date.now()>-<random>.tmp`.
+        const embedded = /\.(\d{10,})-[^.]*\.tmp$/.exec(name);
+        await this.deleteIfOrphaned(
+          vscode.Uri.joinPath(this.fenceDirectory, name),
+          embedded ? Number(embedded[1]) : undefined
+        );
+      }
+    }
+  }
+
   public async getEntries(): Promise<TunnelRegistryEntry[]> {
     const entries = this.context.globalState.get<TunnelRegistryEntry[]>(STORAGE_KEY, [])
       .filter((entry) => !entry.retiredReverseBind);
     await vscode.workspace.fs.createDirectory(this.fenceDirectory);
+    let lastReadError: unknown;
     for (let attempt = 0; attempt < 3; attempt++) {
       const files = await vscode.workspace.fs.readDirectory(this.fenceDirectory);
+      await this.sweepOrphanTemporaries(files);
       const fences = await Promise.all(files
         .filter(([name, type]) => type === vscode.FileType.File && name.endsWith(".json"))
         .map(async ([name]) => {
+          const uri = vscode.Uri.joinPath(this.fenceDirectory, name);
+          let entry: unknown;
           try {
-            const uri = vscode.Uri.joinPath(this.fenceDirectory, name);
             const contents = await vscode.workspace.fs.readFile(uri);
-            const entry = JSON.parse(new TextDecoder().decode(contents)) as TunnelRegistryEntry;
-            this.observedFenceFiles.set(entry, uri);
-            return { entry, name };
+            entry = JSON.parse(new TextDecoder().decode(contents));
           } catch (error) {
             if (error instanceof vscode.FileSystemError && error.code === "FileNotFound") {
               // A replacement may have been published after the listing.
-              return undefined;
+              return { missing: true as const };
             }
-            throw error;
+            if (!(error instanceof SyntaxError) && await this.isFresh(uri, versionedFenceTimestamp(name))) {
+              // A fence that is being refreshed right now (for example a
+              // delete-pending file under a rename) may fail to read
+              // transiently. Skipping it would hide a live reservation, so
+              // re-list; persistent failure makes the read fail closed.
+              lastReadError = error;
+              return { missing: true as const };
+            }
+            return { missing: false as const, fence: await this.skipUnusableFence(name, uri, error) };
           }
+          if (!isFenceEntry(entry)) {
+            return { missing: false as const, fence: await this.skipUnusableFence(name, uri, "not a fence entry") };
+          }
+          this.observedFenceFiles.set(entry, uri);
+          return { missing: false as const, fence: { entry, name } };
         }));
-      if (fences.some((fence) => fence === undefined)) {
+      if (fences.some((fence) => fence.missing)) {
         continue;
       }
       const latest = new Map<string, { entry: TunnelRegistryEntry; name: string }>();
-      for (const fence of fences) {
+      for (const item of fences) {
+        const fence = item.missing ? undefined : item.fence;
         const fenceId = fence?.entry.retiredReverseBind?.fenceId;
         if (!fence || !fenceId) continue;
         const previous = latest.get(fenceId);
@@ -78,7 +208,9 @@ export class VscodeTunnelRegistryStore implements TunnelRegistryStore {
       return [...[...latest.values()].map(({ entry }) => entry), ...entries];
     }
     // A continuously changing directory must not look like an empty registry.
-    throw new Error("Reverse-bind fence files changed during registry read");
+    throw new Error("Reverse-bind fence files changed or could not be read during registry read", {
+      cause: lastReadError
+    });
   }
 
   public async saveEntries(entries: TunnelRegistryEntry[]): Promise<void> {
