@@ -1227,6 +1227,22 @@ describe("TunnelRegistrySync", () => {
     expect(fakeFenceFiles.size).toBe(1);
   });
 
+  it("forgets a published fence id once its stop succeeds", async () => {
+    const [ownerStore] = sharedWindowStores();
+    const owner = new TunnelRegistrySync(ownerStore, core, "owner", probePort);
+    for (const id of ["done-1", "done-2"]) {
+      const tunnel = makeTunnel({ id, tunnelType: "reverse", remotePort: 9000 });
+      await owner.unregisterTunnelAfterStop(tunnel.profileId, {
+        tunnel,
+        retiredReverseBind: {
+          fenceId: id, routeIdentity: reverseRoute, remotePort: 9000, settled: new Promise<void>(() => {})
+        }
+      });
+    }
+
+    expect((owner as unknown as { publishedFences: Set<string> }).publishedFences.size).toBe(0);
+  });
+
   it("sweeps stale orphan temporary files but never a fresh in-flight one", async () => {
     const [, otherStore] = sharedWindowStores();
     const stale = seedRaw(".x.1.tmp", "{", 31_000);

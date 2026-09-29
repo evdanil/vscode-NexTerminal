@@ -232,6 +232,11 @@ export class TunnelRegistrySync {
     }
     try {
       await this.unregisterTunnel(profileId, options);
+      // Active tunnel ids are never reused, so a successful stop must drop its
+      // id here or the set grows for the lifetime of the extension host.
+      if (options?.retiredReverseBind) {
+        this.publishedFences.delete(options.retiredReverseBind.fenceId);
+      }
     } catch (error) {
       console.error("[Nexus] tunnel registry update after stop failed", error);
       // Any failure before the fence was published (its own write, or the
