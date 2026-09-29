@@ -92,6 +92,7 @@ class PooledSshConnection implements SshConnection {
           return fb.openShell(ptyOptions);
         }
       }
+      this.assertNotDisposed();
       throw err;
     }
   }
@@ -107,6 +108,7 @@ class PooledSshConnection implements SshConnection {
           return fb.openDirectTcp(remoteIP, remotePort);
         }
       }
+      this.assertNotDisposed();
       throw err;
     }
   }
@@ -122,6 +124,7 @@ class PooledSshConnection implements SshConnection {
           return fb.openSftp();
         }
       }
+      this.assertNotDisposed();
       throw err;
     }
   }
@@ -137,6 +140,7 @@ class PooledSshConnection implements SshConnection {
           return fb.exec(command);
         }
       }
+      this.assertNotDisposed();
       throw err;
     }
   }
@@ -225,6 +229,12 @@ class PooledSshConnection implements SshConnection {
   }
 
   private async executeFallback(): Promise<SshConnection | undefined> {
+    if (this.disposed) {
+      // Disposed while the original channel open was in flight: dialing (and
+      // possibly prompting for a password/2FA) for a closed lease is unwanted.
+      this.fallbackUsed = true;
+      return undefined;
+    }
     try {
       const fallback = await this.createFallback!();
       this.fallbackUsed = true;
@@ -324,6 +334,7 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
         entry.healthy = false;
         this.cancelIdleTimer(entry);
         this.entries.delete(server.id);
+        this.trackRetired(entry);
         this.emit({ type: "disconnected", serverId: server.id });
       }
       return this.connectInner(server, context);
@@ -342,8 +353,7 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
         }
       }
     }, createFallback, isReused, () => {
-      this.retiredEntries.add(entry);
-      void entry.closePromise.then(() => { this.retiredEntries.delete(entry); });
+      this.trackRetired(entry);
       if (this.entries.get(server.id) === entry) {
         this.softRemoveEntry(server.id, entry);
       }
@@ -549,7 +559,18 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
     this.emit({ type: "disconnected", serverId });
     if (entry.refCount === 0) {
       entry.connection.dispose();
+    } else {
+      this.trackRetired(entry);
     }
+  }
+
+  /**
+   * An entry out of `entries` but still leased is otherwise invisible to
+   * pool.dispose(), which would leave its transport open at shutdown.
+   */
+  private trackRetired(entry: PoolEntry): void {
+    this.retiredEntries.add(entry);
+    void entry.closePromise.then(() => { this.retiredEntries.delete(entry); });
   }
 
   private startIdleTimer(serverId: string, entry: PoolEntry): void {
