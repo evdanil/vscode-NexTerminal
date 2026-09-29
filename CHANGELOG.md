@@ -1,6 +1,6 @@
 # Changelog
 
-## [2.8.304] — 2026-09-29
+## [2.8.305] — 2026-09-29
 
 ### Fixed
 
@@ -8,6 +8,12 @@
 - **Shared tunnels no longer act on their own.** A tunnel from a share arrives with Auto-start off, no listener address (loopback until you choose one in Edit), a loopback-only remote bind address and no login in its browser URL, on export and on import; the import message counts the tunnels it changed.
 - **Delete All Data clears Terminal Appearance and the Local Shell auto-trigger acknowledgement.** Imported colour schemes, the selected scheme and the font choice are removed and an open panel refreshes; it also clears remembered view state and dismissed hints (collapsed folders, follow-terminal-directory, macro hint), other open windows that observe the reset (a reset-generation counter) reload instead of writing stale collapsed-folder or appearance data back at their next action; a write already in flight, or one that starts before the reset reaches that window, can still land until it is reloaded. Follow Terminal Directory stays on in memory there until toggled or reloaded. The confirmation and completion message both say what is kept: the terminal colours and font already written to VS Code user settings, trusted host keys, scripts and logs stay.
 - **A duplicate id in a share no longer overwrites a record.** The first server or auth profile under an id that passes validation lands; a later one in the same file is skipped and counted instead of replacing it and being counted as imported.
+
+## [2.8.304] — 2026-09-29
+
+### Fixed
+
+- **A serial open that timed out no longer leaves the port held.** When a port took longer than the 10 s RPC budget to open (Windows Bluetooth COM ports, slow USB-serial drivers), the tab reported "Connection failed" but the sidecar kept waiting on the native open and, once it finished, held the port under a session nobody owned, so every later Connect and Smart Follow poll failed with "busy" until a window reload. The sidecar manager now sends a cancel to the sidecar that owns the abandoned open (never spawning a new one), and the sidecar closes the port and frees its session ID as soon as the open completes. If the port still cannot be released after about 30 s of retries, a warning names the port and offers Reload Window.
 
 ## [2.8.303] — 2026-09-29
 

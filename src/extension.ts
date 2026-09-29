@@ -35,6 +35,7 @@ import { NexusCore } from "./core/nexusCore";
 import { TerminalLoggerFactory, type LoggerRotationOptions } from "./logging/terminalLogger";
 import { flushSessionTranscripts } from "./logging/sessionTranscriptLogger";
 import { SerialSidecarManager } from "./services/serial/serialSidecarManager";
+import { buildPortReleaseFailedMessage } from "./services/serial/portReleaseNotice";
 import { NexusFileSystemProvider, NEXTERM_SCHEME } from "./services/sftp/nexusFileSystemProvider";
 import { registerEditAsRootHint } from "./services/sftp/editAsRootHint";
 import { SftpService } from "./services/sftp/sftpService";
@@ -555,6 +556,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     extensionRoot,
     readBoundedMs("nexus.serial", "rpcTimeout", 10, 2, 60)
   );
+  context.subscriptions.push({
+    dispose: serialSidecar.onPortReleaseFailed((portPath) => {
+      void vscode.window
+        .showWarningMessage(buildPortReleaseFailedMessage(portPath), "Reload Window")
+        .then((choice) => (choice === "Reload Window" ? vscode.commands.executeCommand("workbench.action.reloadWindow") : undefined));
+    })
+  });
   const registryStore = new VscodeTunnelRegistryStore(context);
   const registrySync = new TunnelRegistrySync(
     registryStore, core, vscode.env.sessionId, undefined,
