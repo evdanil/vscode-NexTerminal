@@ -17,7 +17,8 @@ import { authProfileOwnershipSignature } from "../../src/models/config";
 import { FolderTreeItem, ServerTreeItem } from "../../src/ui/nexusTreeProvider";
 import { readFile } from "node:fs/promises";
 import { defaultSshDir, deployPublicKeyToRemote, findLocalKeyPairs, generateKeyPair } from "../../src/services/ssh/deploySshKey";
-import { SilentAuthSshFactory, passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
+import { SilentAuthSshFactory, passphraseSecretKey, passwordSecretKey, legacyProxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
+import { currentProxyPasswordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/proxyPasswordKeys";
 import { SshPty } from "../../src/services/ssh/sshPty";
 import { TelnetPty } from "../../src/services/telnet/telnetPty";
 import { AsyncMutex, configMutationLock } from "../../src/services/configMutationLock";
@@ -48,10 +49,17 @@ vi.mock("../../src/services/ssh/deploySshKey", () => ({
   deployPublicKeyToRemote: vi.fn(async () => ({ alreadyDeployed: false }))
 }));
 
+const mockStartTunnel = vi.fn(async (..._args: unknown[]) => {});
+vi.mock("../../src/commands/tunnelCommands", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/commands/tunnelCommands")>()),
+  startTunnel: (...args: unknown[]) => mockStartTunnel(...args),
+  resolveTunnelConnectionMode: vi.fn(async () => "shared")
+}));
+
 const mockAddOutputObserver = vi.fn((_observer: unknown) => ({ dispose: vi.fn() }));
 
 vi.mock("../../src/services/ssh/sshPty", () => ({
-  SshPty: vi.fn(function () { return { addOutputObserver: mockAddOutputObserver }; })
+  SshPty: vi.fn(function () { return { addOutputObserver: mockAddOutputObserver, releaseConnectFence: vi.fn() }; })
 }));
 
 vi.mock("../../src/services/telnet/telnetPty", () => ({
@@ -181,6 +189,399 @@ describe("connectServer — server removed while progress is pending", () => {
   });
 });
 
+describe("connectServer — equal-content replacement while progress is pending", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function holdProgress(): () => void {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(
+      async (_options: unknown, task: () => Promise<unknown>) => {
+        await pending;
+        return task();
+      }
+    );
+    return release;
+  }
+
+  it.each(["ssh", "telnet"] as const)("still opens the %s terminal after an equal-content save", async (protocol) => {
+    const server = makeServer({ protocol });
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const release = holdProgress();
+
+    const run = connectServer(ctx, server.id);
+    await addOrUpdateServer({ ...server });
+    release();
+    await run;
+
+    expect(vscode.window.createTerminal).toHaveBeenCalled();
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(["ssh", "telnet"] as const)("cancels a %s connect on a real change with a visible Retry, even without onConnectFailed", async (protocol) => {
+    const server = makeServer({ protocol });
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const release = holdProgress();
+    mockShowWarningMessage.mockResolvedValueOnce("Retry");
+
+    const run = connectServer(ctx, server.id);
+    await addOrUpdateServer({ ...server, host: "changed.example" });
+    release();
+    await run;
+    await flushPromises();
+
+    expect(vscode.window.createTerminal).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("changed while the connection was starting"), "Retry");
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("nexus.server.connect", "srv-1");
+  });
+
+  it("does not cancel for a folder rename or a notes-style edit that leaves the connection alone", async () => {
+    const server = makeServer();
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const release = holdProgress();
+
+    const run = connectServer(ctx, server.id);
+    await addOrUpdateServer({ ...server, group: "Renamed", isHidden: true });
+    release();
+    await run;
+
+    expect(vscode.window.createTerminal).toHaveBeenCalled();
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("Retry re-runs the originating command when the caller supplies retryCommand", async () => {
+    const server = makeServer();
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const release = holdProgress();
+    mockShowWarningMessage.mockResolvedValueOnce("Retry");
+
+    const run = connectServer(ctx, server.id, { retryCommand: "nexus.server.runWithScript" });
+    await addOrUpdateServer({ ...server, port: 2222 });
+    release();
+    await run;
+    await flushPromises();
+
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("nexus.server.runWithScript", "srv-1");
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexus.server.connect", "srv-1");
+  });
+
+  it("flattens a hostile server name (newline, bidi control) in the cancellation warning and onConnectFailed text", async () => {
+    const hostile = "evil\nSpoof: click here\u202Etxt";
+    const server = makeServer({ name: hostile });
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const release = holdProgress();
+    const onConnectFailed = vi.fn();
+
+    const run = connectServer(ctx, server.id, { onConnectFailed });
+    await addOrUpdateServer({ ...server, host: "changed.example" });
+    release();
+    await run;
+
+    for (const text of [String(mockShowWarningMessage.mock.calls[0][0]), String(onConnectFailed.mock.calls[0][0])]) {
+      expect(text).not.toMatch(/[\n\u202E]/);
+      expect(text).toContain("evil Spoof: click here");
+    }
+  });
+
+  it("does not cancel a pending telnet connect when its auth profile link is cleared", async () => {
+    const server = makeServer({ protocol: "telnet", authProfileId: "ap1" });
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const release = holdProgress();
+
+    const run = connectServer(ctx, server.id);
+    // What removeAuthProfile's sweep does to a linked server.
+    await addOrUpdateServer({ ...server, authProfileId: undefined });
+    release();
+    await run;
+
+    expect(vscode.window.createTerminal).toHaveBeenCalled();
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("offers no Retry and says what to re-run when retryCommand is null", async () => {
+    const server = makeServer();
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const release = holdProgress();
+
+    const run = connectServer(ctx, server.id, { retryCommand: null });
+    await addOrUpdateServer({ ...server, port: 2222 });
+    release();
+    await run;
+    await flushPromises();
+
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    expect(mockShowWarningMessage.mock.calls[0]).toHaveLength(1);
+    expect(String(mockShowWarningMessage.mock.calls[0][0])).toContain("Run the original command again");
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("compares multiplexing against the pool's captured default, not the live setting", async () => {
+    const server = makeServer();
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    // The pool captured "off" at activation; the live setting has since been
+    // toggled on (it needs a reload, so the pool is still running with off).
+    (ctx.sshPool as { multiplexingDefault?: boolean }).multiplexingDefault = false;
+    vi.mocked(vscode.workspace.getConfiguration as any).mockReturnValue({ get: vi.fn(() => true) });
+    const release = holdProgress();
+
+    const run = connectServer(ctx, server.id);
+    await addOrUpdateServer({ ...server, multiplexing: true });
+    release();
+    await run;
+
+    expect(vscode.window.createTerminal).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalled();
+  });
+
+  it("does not run Retry when the server was removed between the warning and the click", async () => {
+    const server = makeServer({ name: "gone\nname" });
+    const { ctx, addOrUpdateServer, removeServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const release = holdProgress();
+    let click!: (value: string) => void;
+    mockShowWarningMessage.mockReturnValueOnce(new Promise((resolve) => { click = resolve; }));
+
+    const run = connectServer(ctx, server.id, { retryCommand: "nexus.server.runWithScript" });
+    await addOrUpdateServer({ ...server, port: 2222 });
+    release();
+    await run;
+    await removeServer(server.id);
+    click("Retry");
+    await flushPromises();
+
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexus.server.runWithScript", "srv-1");
+    expect(mockShowWarningMessage).toHaveBeenLastCalledWith(expect.stringContaining("was removed. The connection was not retried"));
+    expect(String(mockShowWarningMessage.mock.calls.at(-1)![0])).not.toContain("\n");
+  });
+
+  it("shows a removal message without Retry when the server is gone", async () => {
+    const server = makeServer();
+    const { ctx, removeServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const release = holdProgress();
+
+    const run = connectServer(ctx, server.id);
+    await removeServer(server.id);
+    release();
+    await run;
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("was removed while the connection was starting"));
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexus.server.connect", "srv-1");
+  });
+});
+
+describe("connectServer — auto-start sweep compares the connect attempt's captured descriptor", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(
+      async (_options: unknown, task: () => Promise<unknown>) => task()
+    );
+  });
+
+  type Cb = ReturnType<typeof latestSshCallbacks> & {
+    captureConnectDescriptor(): { descriptor: string; isDirty(): boolean; dispose(): void };
+  };
+
+  async function connected(options: { servers?: ServerConfig[]; authProfiles?: AuthProfile[]; target?: Partial<ServerConfig> } = {}) {
+    const server = makeServer(options.target);
+    const tunnel = makeTunnel({ autoStart: true, defaultServerId: "srv-1" });
+    const harness = setupHarness({
+      profiles: [tunnel], activeTunnels: [], servers: [server, ...(options.servers ?? [])], authProfiles: options.authProfiles
+    });
+    await connectServer(harness.ctx, server.id);
+    const callbacks = latestSshCallbacks() as Cb;
+    const pty = vi.mocked(SshPty).mock.results.at(-1)!.value as Record<string, unknown>;
+    /** What SshPty.start does at the top of every connect attempt, before any acquire. */
+    const startAttempt = (): void => {
+      (pty.releaseConnectFence as (() => void) | undefined)?.();
+      const fence = callbacks.captureConnectDescriptor();
+      Object.defineProperties(pty, {
+        connectedDescriptor: { get: () => fence.descriptor, configurable: true },
+        connectFenceDirty: { get: () => fence.isDirty(), configurable: true },
+        releaseConnectFence: { value: () => fence.dispose(), configurable: true }
+      });
+    };
+    return { ...harness, server, callbacks, pty, startAttempt };
+  }
+
+  async function open(callbacks: Cb): Promise<void> {
+    callbacks.onSessionOpened("session-1");
+    await flushPromises();
+  }
+
+  function expectOneWarning(): void {
+    expect(mockStartTunnel).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    const message = String(mockShowWarningMessage.mock.calls[0][0]);
+    expect(message).toContain("connection settings changed since this session opened");
+    expect(message).toContain("Close and reopen the terminal");
+    expect(message).not.toContain("\n");
+    expect(mockShowWarningMessage.mock.calls[0]).toHaveLength(1);
+  }
+
+  it("normal path: starts the tunnel on the session's server", async () => {
+    const { callbacks, server, startAttempt } = await connected();
+    startAttempt();
+    await open(callbacks);
+
+    expect(mockStartTunnel).toHaveBeenCalledTimes(1);
+    expect(mockStartTunnel.mock.calls[0][4]).toMatchObject({ id: server.id, host: server.host });
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("a rename before or after the attempt never blocks auto-start", async () => {
+    const { callbacks, server, addOrUpdateServer, startAttempt } = await connected();
+    await addOrUpdateServer({ ...server, name: "Renamed", group: "Other" });
+    startAttempt();
+    await open(callbacks);
+    expect(mockStartTunnel).toHaveBeenCalledTimes(1);
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("a profile edited BEFORE the attempt is captured: capture and live agree, tunnels start", async () => {
+    const { callbacks, harnessProfile, startAttempt } = await withProfile();
+    await harnessProfile({ username: "root" });
+    startAttempt();
+    await open(callbacks);
+    expect(mockStartTunnel).toHaveBeenCalledTimes(1);
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  async function withProfile() {
+    const c = await connected({
+      target: { authProfileId: "ap1" },
+      authProfiles: [{ id: "ap1", name: "AP", username: "ops", authType: "password" }]
+    });
+    return {
+      ...c,
+      harnessProfile: (patch: Partial<AuthProfile>) =>
+        c.addOrUpdateAuthProfile({ id: "ap1", name: "AP", username: "ops", authType: "password", ...patch })
+    };
+  }
+
+  it("a linked profile edited between capture and session open (initial connect): nothing starts, one warning", async () => {
+    const { callbacks, harnessProfile, startAttempt } = await withProfile();
+    startAttempt();
+    await harnessProfile({ username: "root" });
+    await open(callbacks);
+    expectOneWarning();
+  });
+
+  it("a jump host's host edited between capture and session open: nothing starts, one warning", async () => {
+    const jump = makeServer({ id: "jump", name: "Jump", host: "jump.example" });
+    const { callbacks, addOrUpdateServer, startAttempt } = await connected({
+      servers: [jump], target: { proxy: { type: "ssh", jumpHostId: "jump" } }
+    });
+    startAttempt();
+    await addOrUpdateServer({ ...jump, host: "jump2.example" });
+    await open(callbacks);
+    expectOneWarning();
+  });
+
+  it("a jump host removed between capture and session open: nothing starts, one warning (captured holds the hop, live says missing)", async () => {
+    const jump = makeServer({ id: "jump", name: "Jump", host: "jump.example" });
+    const { callbacks, removeServer, startAttempt } = await connected({
+      servers: [jump], target: { proxy: { type: "ssh", jumpHostId: "jump" } }
+    });
+    startAttempt();
+    await removeServer("jump");
+    await open(callbacks);
+    expectOneWarning();
+  });
+
+  it("a jump host's host changed A -> B -> A between capture and open still warns (the fence latched at B)", async () => {
+    const jump = makeServer({ id: "jump", name: "Jump", host: "jump.example" });
+    const { callbacks, addOrUpdateServer, startAttempt } = await connected({
+      servers: [jump], target: { proxy: { type: "ssh", jumpHostId: "jump" } }
+    });
+    startAttempt();
+    await addOrUpdateServer({ ...jump, host: "jump2.example" });
+    await addOrUpdateServer({ ...jump, host: "jump.example" });
+    await open(callbacks);
+    expectOneWarning();
+  });
+
+  it("a linked profile changed A -> B -> A between capture and open still warns", async () => {
+    const { callbacks, harnessProfile, startAttempt } = await withProfile();
+    startAttempt();
+    await harnessProfile({ username: "root" });
+    await harnessProfile({ username: "ops" });
+    await open(callbacks);
+    expectOneWarning();
+  });
+
+  it("raw-only changes the connect never reads do not cancel auto-start", async () => {
+    const { callbacks, server, addOrUpdateServer, startAttempt } = await connected();
+    startAttempt();
+    // multiplexing omitted -> explicit true (the pool default) and an unused key path on a password server
+    await addOrUpdateServer({ ...server, multiplexing: true });
+    await addOrUpdateServer({ ...server, multiplexing: true, keyPath: "/unused" });
+    await open(callbacks);
+    expect(mockStartTunnel).toHaveBeenCalledTimes(1);
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("the attempt's fence stops watching once the sweep ran; the connect fence stops once its check ran", async () => {
+    const { ctx, callbacks, startAttempt } = await connected();
+    const active = () => (ctx.core as unknown as { onDidMutateConnectionConfig: { mock: { results: Array<{ value: () => void }> } } });
+    void active;
+    // connect fence: created and disposed within connectServer's progress callback -> nothing left subscribed
+    expect(mutationListenerCount(ctx)).toBe(0);
+    startAttempt();
+    expect(mutationListenerCount(ctx)).toBe(1);
+    await open(callbacks);
+    expect(mutationListenerCount(ctx)).toBe(0);
+  });
+
+  it("R reconnect: a profile edited after the reconnect's capture warns; before it, tunnels start", async () => {
+    const first = await withProfile();
+    first.startAttempt();
+    await open(first.callbacks);
+    expect(mockStartTunnel).toHaveBeenCalledTimes(1);
+    mockStartTunnel.mockClear();
+
+    // Reconnect 1: edit lands before the attempt captures, so it agrees.
+    await first.harnessProfile({ username: "root" });
+    first.startAttempt();
+    await open(first.callbacks);
+    expect(mockStartTunnel).toHaveBeenCalledTimes(1);
+    mockStartTunnel.mockClear();
+    mockShowWarningMessage.mockClear();
+
+    // Reconnect 2: edit lands after the capture.
+    first.startAttempt();
+    await first.harnessProfile({ username: "admin" });
+    await open(first.callbacks);
+    expectOneWarning();
+  });
+
+  it("R reconnect after a host edit made before the attempt: SshPty reconnects with its constructor-captured server (old host), so nothing starts on the new host", async () => {
+    const { callbacks, server, addOrUpdateServer, startAttempt } = await connected();
+    await addOrUpdateServer({ ...server, host: "new.example" });
+    startAttempt();
+    await open(callbacks);
+    expectOneWarning();
+  });
+
+  it("a host edit between capture and open warns with the name flattened", async () => {
+    const { callbacks, server, addOrUpdateServer, startAttempt } = await connected({ target: { name: "evil\nname" } });
+    startAttempt();
+    await addOrUpdateServer({ ...server, host: "new.example" });
+    await open(callbacks);
+    expectOneWarning();
+  });
+
+  it("fails safe when the pty never captured a descriptor", async () => {
+    const { callbacks } = await connected();
+    await open(callbacks);
+    expectOneWarning();
+  });
+});
+
+function mutationListenerCount(ctx: CommandContext): number {
+  return (ctx.core as unknown as { __mutationListenerCount(): number }).__mutationListenerCount();
+}
+
 function makeTunnel(overrides: Partial<TunnelProfile> = {}): TunnelProfile {
   return {
     id: "t1",
@@ -250,10 +651,12 @@ function setupHarness(options: {
   });
   const disconnectPool = vi.fn();
   const removeServer = vi.fn(async (serverId: string) => {
+    const prevServer = snapshot.servers.find((item) => item.id === serverId);
     snapshot = {
       ...snapshot,
       servers: snapshot.servers.filter((item) => item.id !== serverId)
     };
+    emitMutation({ kind: "server", id: serverId, prev: prevServer, next: undefined });
   });
   const addOrUpdateServer = vi.fn(async (server: ServerConfig) => {
     // Mirrors NexusCore.addOrUpdateServer's single-owner enforcement for
@@ -262,6 +665,7 @@ function setupHarness(options: {
     // currently holds it. Kept in sync with production so displaced-owner
     // rollback tests actually exercise a real displacement instead of a
     // mock that never clears anyone.
+    const prevRecord = snapshot.servers.find((item) => item.id === server.id);
     let servers = snapshot.servers;
     if (server.openFileExplorerOnFirstConnect) {
       servers = servers.map((existing) =>
@@ -274,12 +678,15 @@ function setupHarness(options: {
       ...snapshot,
       servers: [...servers.filter((item) => item.id !== server.id), server]
     };
+    emitMutation({ kind: "server", id: server.id, prev: prevRecord, next: server });
   });
   const addOrUpdateAuthProfile = vi.fn(async (profile: AuthProfile) => {
+    const prevProfile = snapshot.authProfiles.find((item) => item.id === profile.id);
     snapshot = {
       ...snapshot,
       authProfiles: [...snapshot.authProfiles.filter((item) => item.id !== profile.id), profile]
     };
+    emitMutation({ kind: "authProfile", id: profile.id, prev: prevProfile, next: profile });
   });
   const secrets = new Map(Object.entries(options.initialSecrets ?? {}));
   const secretDelete = vi.fn(async (key: string) => {
@@ -299,7 +706,15 @@ function setupHarness(options: {
     }
   };
 
+  const mutationListeners = new Set<(m: unknown) => void>();
+  const emitMutation = (m: unknown) => { for (const l of [...mutationListeners]) l(m); };
   const core = {
+    __mutationListenerCount: () => mutationListeners.size,
+    runServerBatch: vi.fn(async (operation: () => Promise<unknown>) => operation()),
+    onDidMutateConnectionConfig: vi.fn((listener: (m: unknown) => void) => {
+      mutationListeners.add(listener);
+      return () => { mutationListeners.delete(listener); };
+    }),
     getServer: vi.fn((id: string) => snapshot.servers.find((s) => s.id === id)),
     getAuthProfile: vi.fn((id: string) => snapshot.authProfiles.find((p) => p.id === id)),
     getTunnel: vi.fn((id: string) => snapshot.tunnels.find((t) => t.id === id)),
@@ -569,6 +984,19 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(disconnectPool).toHaveBeenCalledWith("srv-1");
   });
 
+  it("remove command deletes the endpoint-keyed proxy password of the removed server's own proxy, plus the legacy key", async () => {
+    const proxy = { type: "socks5" as const, host: "proxy.example.com", port: 1080, username: "pu" };
+    const { ctx, secretDelete } = setupHarness({
+      profiles: [], activeTunnels: [], servers: [makeServer({ proxy })]
+    });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.remove")!("srv-1");
+
+    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1", proxy));
+    expect(secretDelete).toHaveBeenCalledWith(legacyProxyPasswordSecretKey("srv-1"));
+  });
+
   it("remove command stops all remaining tunnels, disconnects pool, and disposes terminals via teardownServerRuntime", async () => {
     const autoStopProfile = makeTunnel({ id: "tp-stop", autoStop: true });
     const keepProfile = makeTunnel({ id: "tp-keep", autoStop: false });
@@ -597,7 +1025,7 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(disconnectPool).toHaveBeenCalledWith("srv-1");
     expect(secretDelete).toHaveBeenCalledWith(passwordSecretKey("srv-1"));
     expect(secretDelete).toHaveBeenCalledWith(passphraseSecretKey("srv-1"));
-    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
+    expect(secretDelete).toHaveBeenCalledWith(legacyProxyPasswordSecretKey("srv-1"));
     expect(removeServer).toHaveBeenCalledWith("srv-1");
   });
 
@@ -778,7 +1206,7 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(disconnectPool).toHaveBeenCalledWith("srv-1");
     expect(secretDelete).toHaveBeenCalledWith(passwordSecretKey("srv-1"));
     expect(secretDelete).toHaveBeenCalledWith(passphraseSecretKey("srv-1"));
-    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
+    expect(secretDelete).toHaveBeenCalledWith(legacyProxyPasswordSecretKey("srv-1"));
     expect(removeServer).toHaveBeenCalledWith("srv-1");
     // Substring on the NEGATIVE side on purpose: an exact string here would go
     // green again the moment the refusal is reworded, which is the one thing
@@ -1600,41 +2028,69 @@ describe("formValuesToServer group normalization", () => {
   });
 });
 
+const NEW_ENDPOINT_KEY = proxyPasswordSecretKey("srv-1", { type: "socks5", host: "new-proxy.example.com", port: 1080, username: "proxyuser" });
+const LOCK_TEST_PRIOR_PROXY = { type: "socks5" as const, host: "old-proxy.example.com", port: 1080, username: "proxyuser" };
+
 describe("syncProxyPasswordSecret", () => {
-  it("stores SOCKS5 proxy password when username is set and password provided", async () => {
+  // Stored per endpoint (type + host + port + user name); see proxyPasswordKeys.ts.
+  const socksKey = proxyPasswordSecretKey("srv-1", { type: "socks5", host: "proxy.example.com", port: 1080, username: "user1" });
+  const httpKey = proxyPasswordSecretKey("srv-1", { type: "http", host: "proxy.example.com", port: 3128, username: "user1" });
+
+  it("stores SOCKS5 proxy password under that endpoint's key when username is set and password provided", async () => {
     const { ctx, secretStore } = setupHarness({ profiles: [], activeTunnels: [] });
     await syncProxyPasswordSecret(ctx, "srv-1", {
       proxyType: "socks5",
+      proxySocks5Host: "proxy.example.com",
+      proxySocks5Port: 1080,
       proxySocks5Username: "user1",
       proxySocks5Password: "secret-socks5"
     });
-    expect(secretStore).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"), "secret-socks5");
+    expect(secretStore).toHaveBeenCalledWith(socksKey, "secret-socks5");
+    // Never the legacy per-server key.
+    expect(secretStore).not.toHaveBeenCalledWith(legacyProxyPasswordSecretKey("srv-1"), expect.anything());
   });
 
-  it("stores HTTP proxy password when username is set and password provided", async () => {
+  it("stores HTTP proxy password under that endpoint's key when username is set and password provided", async () => {
     const { ctx, secretStore } = setupHarness({ profiles: [], activeTunnels: [] });
     await syncProxyPasswordSecret(ctx, "srv-1", {
       proxyType: "http",
+      proxyHttpHost: "proxy.example.com",
+      proxyHttpPort: 3128,
       proxyHttpUsername: "user1",
       proxyHttpPassword: "secret-http"
     });
-    expect(secretStore).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"), "secret-http");
+    expect(secretStore).toHaveBeenCalledWith(httpKey, "secret-http");
   });
 
-  it("deletes proxy password when username is removed", async () => {
+  it("a new endpoint's password never lands under the old endpoint's key", async () => {
+    const { ctx, secretStore } = setupHarness({ profiles: [], activeTunnels: [] });
+    await syncProxyPasswordSecret(ctx, "srv-1", {
+      proxyType: "socks5", proxySocks5Host: "other-proxy.example.com", proxySocks5Port: 1080,
+      proxySocks5Username: "user1", proxySocks5Password: "pw-b"
+    });
+    expect(secretStore).toHaveBeenCalledTimes(1);
+    expect(secretStore).not.toHaveBeenCalledWith(socksKey, expect.anything());
+  });
+
+  it("deletes that endpoint's proxy password when its username is removed", async () => {
     const { ctx, secretDelete } = setupHarness({ profiles: [], activeTunnels: [] });
     await syncProxyPasswordSecret(ctx, "srv-1", {
       proxyType: "socks5",
+      proxySocks5Host: "proxy.example.com",
+      proxySocks5Port: 1080,
       proxySocks5Username: "",
       proxySocks5Password: ""
     });
-    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
+    expect(secretDelete).toHaveBeenCalledWith(
+      proxyPasswordSecretKey("srv-1", { type: "socks5", host: "proxy.example.com", port: 1080 })
+    );
   });
 
-  it("deletes proxy password when proxy is disabled", async () => {
-    const { ctx, secretDelete } = setupHarness({ profiles: [], activeTunnels: [] });
+  it("touches nothing when the proxy is disabled: the endpoint the server left is cleaned up after persistence", async () => {
+    const { ctx, secretDelete, secretStore } = setupHarness({ profiles: [], activeTunnels: [] });
     await syncProxyPasswordSecret(ctx, "srv-1", { proxyType: "none" });
-    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
+    expect(secretDelete).not.toHaveBeenCalled();
+    expect(secretStore).not.toHaveBeenCalled();
   });
 
   it("keeps existing secret when password field is blank", async () => {
@@ -3333,8 +3789,8 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     const { ctx, addOrUpdateServer, secretStore } = setupHarness({
       profiles: [],
       activeTunnels: [],
-      servers: [makeServer()],
-      initialSecrets: { [proxyPasswordSecretKey("srv-1")]: "old-proxy-pw" }
+      servers: [makeServer({ proxy: LOCK_TEST_PRIOR_PROXY })],
+      initialSecrets: { [proxyPasswordSecretKey("srv-1", LOCK_TEST_PRIOR_PROXY)]: "old-proxy-pw" }
     });
 
     // Same call-ordering spy as test/unit/configMutationLockRace.test.ts —
@@ -3373,7 +3829,8 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     const capturePromise = configMutationLock.runExclusive(async () => {
       const server = ctx.core.getServer("srv-1")!;
       await gate;
-      const proxyPw = await ctx.secretVault!.get(proxyPasswordSecretKey("srv-1"));
+      // The pre-edit record's proxy endpoint decides which saved password belongs to it.
+      const proxyPw = await ctx.secretVault!.get(currentProxyPasswordSecretKey(server)!);
       return { server, proxyPw };
     });
 
@@ -3422,7 +3879,7 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     // before the capture's gate is ever released — so by the time the
     // gate opens and the capture finally reads the vault, it would read
     // back "new-proxy-pw" instead: a torn pair this assertion catches.
-    expect(captured.server.proxy).toBeUndefined();
+    expect(captured.server.proxy).toEqual(LOCK_TEST_PRIOR_PROXY);
     expect(captured.proxyPw).toBe("old-proxy-pw");
 
     // The edit itself was never blocked forever — once the lock freed up
@@ -3430,7 +3887,11 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     // new generation.
     const saved = addOrUpdateServer.mock.calls[0][0] as ServerConfig;
     expect(saved.proxy).toEqual({ type: "socks5", host: "proxy.example.com", port: 1080, username: "proxyuser" });
-    expect(secretStore).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"), "new-proxy-pw");
+    // Stored under the NEW endpoint's key; the old endpoint's key is untouched here.
+    expect(secretStore).toHaveBeenCalledWith(
+      proxyPasswordSecretKey("srv-1", { type: "socks5", host: "proxy.example.com", port: 1080, username: "proxyuser" }),
+      "new-proxy-pw"
+    );
   });
 
   it("restores the prior server record and the prior proxy-secret value when syncProxyPasswordSecret rejects after addOrUpdateServer already committed the new record, and surfaces the failure (kills committed-record-with-old-secret leftover)", async () => {
@@ -3439,7 +3900,12 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
       profiles: [],
       activeTunnels: [],
       servers: [makeServer({ proxy: priorProxy })],
-      initialSecrets: { [proxyPasswordSecretKey("srv-1")]: "old-proxy-pw" }
+      initialSecrets: {
+        // A password previously saved for the endpoint this edit switches TO (the key the save writes),
+        // and the one saved for the endpoint it leaves, which the edit must never touch.
+        [NEW_ENDPOINT_KEY]: "old-proxy-pw",
+        [proxyPasswordSecretKey("srv-1", { type: "socks5", host: "old-proxy.example.com", port: 1080, username: "proxyuser" })]: "prior-endpoint-pw"
+      }
     });
 
     // syncProxyPasswordSecret's store call for the NEW proxy password fails —
@@ -3477,8 +3943,10 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     // failed store call notwithstanding, a partial-write vault could still
     // have latched it) or leave the key deleted — either way this would not
     // read back the prior "old-proxy-pw".
-    const finalSecret = await ctx.secretVault!.get(proxyPasswordSecretKey("srv-1"));
+    const finalSecret = await ctx.secretVault!.get(NEW_ENDPOINT_KEY);
     expect(finalSecret).toBe("old-proxy-pw");
+    // The endpoint the edit was leaving is never touched, so a rollback finds its own password.
+    expect(await ctx.secretVault!.get(proxyPasswordSecretKey("srv-1", priorProxy))).toBe("prior-endpoint-pw");
   });
 
   it("(FINDING 1, P2) restores the LIVE record committed between form-open and lock acquisition, not the stale form-open snapshot, when the secret write then fails", async () => {
@@ -4140,13 +4608,28 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     expect(finalB?.openFileExplorerOnFirstConnect).toBeUndefined();
   });
 
+  it("runs the editor's record + proxy-secret transaction inside one server batch, so housekeeping settles only after any rollback", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [makeServer()], initialSecrets: {} });
+    registerServerCommands(ctx);
+    const editCmd = registeredCommands.get("nexus.server.edit");
+    await editCmd!("srv-1");
+    const options = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> };
+    await options.onSubmit({ name: "Server 1", host: "example.com", port: 22, username: "dev", authType: "password" });
+    expect((ctx.core as unknown as { runServerBatch: ReturnType<typeof vi.fn> }).runServerBatch).toHaveBeenCalledTimes(1);
+  });
+
   it("(FINDING 3, P2) a server removed concurrently while the proxy-secret restore is pending stays removed, and the vault ends up with no proxy-secret key for its id, instead of an unconditional restore recreating an orphaned secret (kills unconditional restore)", async () => {
     const priorProxy = { type: "socks5" as const, host: "old-proxy.example.com", port: 1080, username: "proxyuser" };
     const { ctx, secretStore } = setupHarness({
       profiles: [],
       activeTunnels: [],
       servers: [makeServer({ proxy: priorProxy })],
-      initialSecrets: { [proxyPasswordSecretKey("srv-1")]: "old-proxy-pw" }
+      initialSecrets: {
+        // A password previously saved for the endpoint this edit switches TO (the key the save writes),
+        // and the one saved for the endpoint it leaves, which the edit must never touch.
+        [NEW_ENDPOINT_KEY]: "old-proxy-pw",
+        [proxyPasswordSecretKey("srv-1", { type: "socks5", host: "old-proxy.example.com", port: 1080, username: "proxyuser" })]: "prior-endpoint-pw"
+      }
     });
 
     registerServerCommands(ctx);
@@ -4200,7 +4683,7 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     // that no longer has a record (nexus.server.remove already deleted this
     // key). This assertion fails against that implementation because the
     // vault would read back "old-proxy-pw" instead of undefined.
-    const finalSecret = await ctx.secretVault!.get(proxyPasswordSecretKey("srv-1"));
+    const finalSecret = await ctx.secretVault!.get(NEW_ENDPOINT_KEY);
     expect(finalSecret).toBeUndefined();
   });
 
@@ -4314,7 +4797,7 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     expect(removeServer).toHaveBeenCalledWith("srv-1");
     expect(secretDelete).toHaveBeenCalledWith(passwordSecretKey("srv-1"));
     expect(secretDelete).toHaveBeenCalledWith(passphraseSecretKey("srv-1"));
-    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
+    expect(secretDelete).toHaveBeenCalledWith(legacyProxyPasswordSecretKey("srv-1"));
   });
 
   it("(FINDING 2, P2) the edit rollback's post-store presence re-check deletes the just-restored proxy-secret key when the record vanishes between the store landing and the re-check (kills a missing belt-and-braces post-store check)", async () => {
@@ -4323,7 +4806,12 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
       profiles: [],
       activeTunnels: [],
       servers: [makeServer({ proxy: priorProxy })],
-      initialSecrets: { [proxyPasswordSecretKey("srv-1")]: "old-proxy-pw" }
+      initialSecrets: {
+        // A password previously saved for the endpoint this edit switches TO (the key the save writes),
+        // and the one saved for the endpoint it leaves, which the edit must never touch.
+        [NEW_ENDPOINT_KEY]: "old-proxy-pw",
+        [proxyPasswordSecretKey("srv-1", { type: "socks5", host: "old-proxy.example.com", port: 1080, username: "proxyuser" })]: "prior-endpoint-pw"
+      }
     });
 
     registerServerCommands(ctx);
@@ -4383,8 +4871,8 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     // record it belongs to no longer exists — an orphaned key. The fix
     // re-checks presence immediately after the store settles and
     // best-effort deletes the key it just wrote when the record is gone.
-    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
-    const finalSecret = await ctx.secretVault!.get(proxyPasswordSecretKey("srv-1"));
+    expect(secretDelete).toHaveBeenCalledWith(NEW_ENDPOINT_KEY);
+    const finalSecret = await ctx.secretVault!.get(NEW_ENDPOINT_KEY);
     expect(finalSecret).toBeUndefined();
   });
 });
@@ -5215,7 +5703,7 @@ describe("nexus.server.edit — flipping protocol must not destroy the other pro
   // the stored password — the SSH config would come back on a flip-back with a
   // credential silently missing.
   it("keeps the stored proxy password across a flip to Telnet", async () => {
-    const secretKey = proxyPasswordSecretKey("srv-1");
+    const secretKey = currentProxyPasswordSecretKey(CONFIGURED)!;
     const { ctx, secretDelete } = setupHarness({
       profiles: [],
       activeTunnels: [],

@@ -81,7 +81,7 @@ vi.mock("../../src/ui/managementListPanel", () => ({
 // Imported AFTER the mocks so the command module binds to them.
 const { registerDeviceTemplateCommands, parseDeviceTemplateFormValues, applyPlanWrites } = await import("../../src/commands/deviceTemplateCommands");
 const { FolderTreeItem } = await import("../../src/ui/nexusTreeProvider");
-const { proxyPasswordSecretKey } = await import("../../src/services/ssh/silentAuth");
+const { legacyProxyPasswordSecretKey } = await import("../../src/services/ssh/silentAuth");
 const { planManualTemplateApply } = await import("../../src/services/inventory/templateApply");
 
 const P: ProxyConfig = { type: "socks5", host: "10.0.0.9", port: 1080 };
@@ -667,7 +667,7 @@ describe("Fix A (PR #62 Codex round 2, SECURITY) — manual apply clears the sta
     const core = makeCore();
     await seedProxyServer(core);
     await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Reproxy", fields: { proxy: { mode: "override", value: Y } } });
-    const key = proxyPasswordSecretKey("srv-1");
+    const key = legacyProxyPasswordSecretKey("srv-1");
     const vault = makeVault(core, { [key]: "topsecret" });
     registerWithVault(core, vault);
 
@@ -693,7 +693,7 @@ describe("Fix A (PR #62 Codex round 2, SECURITY) — manual apply clears the sta
     const core = makeCore();
     await seedProxyServer(core);
     await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Reproxy", fields: { proxy: { mode: "override", value: Y } } });
-    const key = proxyPasswordSecretKey("srv-1");
+    const key = legacyProxyPasswordSecretKey("srv-1");
     const vault = makeVault(core, { [key]: "topsecret" }, { failDeleteFor: key });
     registerWithVault(core, vault);
 
@@ -719,7 +719,7 @@ describe("Fix A (PR #62 Codex round 2, SECURITY) — manual apply clears the sta
     // Override to the SAME endpoint X (same type/host/port/username) — the stored
     // password still applies, so it must be kept.
     await core.addOrUpdateDeviceTemplate({ id: "t1", name: "SameProxy", fields: { proxy: { mode: "override", value: X } } });
-    const key = proxyPasswordSecretKey("srv-1");
+    const key = legacyProxyPasswordSecretKey("srv-1");
     const vault = makeVault(core, { [key]: "topsecret" });
     registerWithVault(core, vault);
 
@@ -803,8 +803,8 @@ describe("Fix A′ (PR #62 Codex round 3, SECURITY) — restore-on-apply-failure
   it("partial-commit leak — server committed on the NEW proxy must NOT be re-armed with the OLD endpoint's secret", async () => {
     const core = makeCore();
     await seedTwoProxyServers(core);
-    const k1 = proxyPasswordSecretKey("srv-1");
-    const k2 = proxyPasswordSecretKey("srv-2");
+    const k1 = legacyProxyPasswordSecretKey("srv-1");
+    const k2 = legacyProxyPasswordSecretKey("srv-2");
     const vault = makeVault(core, { [k1]: "secret-1", [k2]: "secret-2" });
 
     // Fail on the SECOND apply call: the first server commits to Y, the second stays on X.
@@ -813,8 +813,8 @@ describe("Fix A′ (PR #62 Codex round 3, SECURITY) — restore-on-apply-failure
     expect(failed).toBeDefined();
     const committedId = committed[0];
     const failedId = failed!;
-    const committedKey = proxyPasswordSecretKey(committedId);
-    const failedKey = proxyPasswordSecretKey(failedId);
+    const committedKey = legacyProxyPasswordSecretKey(committedId);
+    const failedKey = legacyProxyPasswordSecretKey(failedId);
 
     // The committed server is now on the NEW proxy Y in the live core...
     expect(core.getServer(committedId)!.proxy).toEqual(Y);
@@ -833,8 +833,8 @@ describe("Fix A′ (PR #62 Codex round 3, SECURITY) — restore-on-apply-failure
   it("full success — both servers land on the NEW proxy, NEITHER secret is restored", async () => {
     const core = makeCore();
     await seedTwoProxyServers(core);
-    const k1 = proxyPasswordSecretKey("srv-1");
-    const k2 = proxyPasswordSecretKey("srv-2");
+    const k1 = legacyProxyPasswordSecretKey("srv-1");
+    const k2 = legacyProxyPasswordSecretKey("srv-2");
     const vault = makeVault(core, { [k1]: "secret-1", [k2]: "secret-2" });
 
     await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Reproxy", fields: { proxy: { mode: "override", value: Y } } });
@@ -856,8 +856,8 @@ describe("Fix A′ (PR #62 Codex round 3, SECURITY) — restore-on-apply-failure
   it("full failure — the FIRST server's write throws, nothing commits, BOTH secrets restored", async () => {
     const core = makeCore();
     await seedTwoProxyServers(core);
-    const k1 = proxyPasswordSecretKey("srv-1");
-    const k2 = proxyPasswordSecretKey("srv-2");
+    const k1 = legacyProxyPasswordSecretKey("srv-1");
+    const k2 = legacyProxyPasswordSecretKey("srv-2");
     const vault = makeVault(core, { [k1]: "secret-1", [k2]: "secret-2" });
 
     // Fail on the FIRST apply call: no server ever commits, both stay on X.

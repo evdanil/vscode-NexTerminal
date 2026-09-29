@@ -9,7 +9,10 @@ import type {
   TunnelProfile,
   TunnelType
 } from "../models/config";
-import { resolveTunnelType } from "../models/config";
+import { flattenProviderText } from "../models/inventory";
+import { cloneServerConfig, resolveTunnelType } from "../models/config";
+import { tunnelStartDescriptor } from "../models/startDescriptors";
+import { watchStartFence } from "../services/ssh/startFenceWatcher";
 import { configMutationLock } from "../services/configMutationLock";
 import type { SshFactory } from "../services/ssh/contracts";
 import { TunnelStartCancelledError, TunnelStoppedError, type TunnelManager } from "../services/tunnel/tunnelManager";
@@ -30,6 +33,15 @@ export function getDefaultTunnelConnectionMode(): ResolvedTunnelConnectionMode {
     .getConfiguration("nexus.tunnel")
     .get<ResolvedTunnelConnectionMode>("defaultConnectionMode", "shared");
   return configured === "isolated" ? "isolated" : "shared";
+}
+
+/** The global default mode; "shared" if settings are unavailable (matches the setting's own default). */
+function readGlobalTunnelMode(): ResolvedTunnelConnectionMode {
+  try {
+    return getDefaultTunnelConnectionMode();
+  } catch {
+    return "shared";
+  }
 }
 
 function getDefaultReverseBindAddress(): string {
@@ -125,6 +137,21 @@ export async function resolveServerForTunnel(
   return pick?.server;
 }
 
+/**
+ * Content fences of tunnel starts currently inside `tunnelManager.start`, by
+ * profile id. Lets the "started" listener apply the same predicate as
+ * `startTunnel` instead of a weaker presence check.
+ */
+const pendingStartFences = new Map<string, () => boolean>();
+
+/** Whether a just-started tunnel should be registered (false: startTunnel is about to stop it). */
+export function isTunnelStartCurrent(core: NexusCore, profileId: string, serverId: string): boolean {
+  if (!core.getTunnel(profileId) || !core.getServer(serverId)) {
+    return false;
+  }
+  return pendingStartFences.get(profileId)?.() ?? true;
+}
+
 export async function startTunnel(
   core: NexusCore,
   tunnelManager: TunnelManager,
@@ -132,9 +159,83 @@ export async function startTunnel(
   profile: TunnelProfile,
   server: ServerConfig,
   connectionMode: ResolvedTunnelConnectionMode,
-  registrySync?: TunnelRegistrySync
+  registrySync?: TunnelRegistrySync,
+  // The pool's captured default (SshPoolControl.multiplexingDefault), not the live setting.
+  multiplexingDefault?: boolean
 ): Promise<void> {
-  const stillCurrent = () => core.getTunnel(profile.id) === profile && core.getServer(server.id) === server;
+  // Content, not identity: an unchanged editor Save or a Refresh replaces a
+  // record with an equal copy, which must not cancel a start. A different
+  // record restored under the same id still differs in what the start uses, so
+  // the bulk removal fence is preserved. The descriptor holds the RESOLVED
+  // values this attempt uses (effective mode, the pool's multiplexing default,
+  // the per-type route fields, the server fields the tunnel path reads, the
+  // jump chain), captured now, before any await. altHost is mode-dependent: it
+  // counts for a shared, multiplexed tunnel, whose pooled lease may have been
+  // made through a terminal's alternate-host fallback, and is ignored for an
+  // isolated tunnel and for a shared one that bypasses the pool.
+  const profileAtStart = { ...profile };
+  const serverAtStart = cloneServerConfig(server);
+  const inputs = { mode: connectionMode, multiplexingDefault, authProfileLookup: (id: string) => core.getAuthProfile(id),
+    serverLookup: (id: string) => core.getServer(id)
+  };
+  const descriptorAtStart = tunnelStartDescriptor(profileAtStart, serverAtStart, inputs);
+  // Equality of descriptors at the end is not enough: an A -> B -> A change to the
+  // linked profile or a jump host during the login or handshake can leave the
+  // transport authenticated with B while the final descriptor reads A again. The
+  // fence therefore also watches every mutation and latches the first time this
+  // start's OWN descriptor (mode-aware, so an altHost edit during an isolated
+  // start is invisible to it) differs from the captured one. It is disposed when
+  // the start settles, on every path (see the try/finally below).
+  const liveDescriptor = (): string | undefined => {
+    const liveProfile = core.getTunnel(profile.id);
+    const liveServer = core.getServer(server.id);
+    if (!liveProfile || !liveServer) {
+      return undefined;
+    }
+    // A profile whose stored mode is untouched keeps the mode captured for this
+    // attempt (it may have been chosen interactively for an "ask" profile);
+    // an edited stored mode is resolved fresh, as the next start would.
+    const liveMode = liveProfile.connectionMode === profileAtStart.connectionMode
+      ? connectionMode
+      : liveProfile.connectionMode === "ask"
+        ? "ask"
+        : liveProfile.connectionMode ?? readGlobalTunnelMode();
+    return tunnelStartDescriptor(liveProfile, liveServer, { ...inputs, mode: liveMode });
+  };
+  const fence = watchStartFence(core, descriptorAtStart, () => liveDescriptor() ?? "<gone>");
+  const stillCurrent = (): boolean => !fence.isDirty() && liveDescriptor() === descriptorAtStart;
+  const reportCancelled = (): void => {
+    // Names can come from an inventory sync; flatten them where they enter the message.
+    const safeProfileName = flattenProviderText(profile.name);
+    const safeServerName = flattenProviderText(server.name);
+    const liveProfile = core.getTunnel(profile.id);
+    if (!liveProfile || !core.getServer(server.id)) {
+      void vscode.window.showWarningMessage(
+        `Tunnel "${safeProfileName}" or its server was removed while the tunnel was starting. The start was cancelled.`
+      );
+      return;
+    }
+    void Promise.resolve(vscode.window.showWarningMessage(
+      `Tunnel "${safeProfileName}" or its server "${safeServerName}" changed while the tunnel was starting. The start was cancelled. Retry on "${safeServerName}" with the current settings.`,
+      "Retry"
+    )).then((choice) => {
+      if (choice === "Retry") {
+        // A profile deleted while the warning was open would resolve to nothing
+        // and fall through to the tunnel picker; a deleted server is refused by
+        // the command itself. Refuse here rather than offer another target.
+        if (!core.getTunnel(profile.id) || !core.getServer(server.id)) {
+          void vscode.window.showWarningMessage(
+            `Tunnel "${safeProfileName}" or its server was removed. The tunnel was not retried.`
+          );
+          return;
+        }
+        // Carry the server this start was aimed at: a drag-and-drop or an
+        // edit-then-restart may target a server other than the default one.
+        void vscode.commands.executeCommand("nexus.tunnel.start", { profile: { id: profile.id }, serverId: server.id });
+      }
+    });
+  };
+  try {
   // TELNET (Phase 0) — port forwarding is an SSH channel feature and telnet has
   // no equivalent. THE one guard for every route into starting a tunnel: the
   // command, the tree's drag-and-drop of a tunnel profile onto a server, the
@@ -230,9 +331,10 @@ export async function startTunnel(
   }
 
   // Registry and authentication work can outlive Replace or Delete All Data.
-  // Checking object identity also rejects a different profile restored with
-  // the same ID before this start resumes.
+  // Comparing content also rejects a different profile restored with the same
+  // ID before this start resumes.
   if (!stillCurrent()) {
+    reportCancelled();
     return;
   }
 
@@ -244,9 +346,29 @@ export async function startTunnel(
           }
         }
       : undefined;
-    const active = await tunnelManager.start(profile, server, { connectionMode, beforeReverseForward });
-    if (!stillCurrent()) {
+    // The manager emits "started" from inside start(), before it returns, so
+    // the extension.ts listener consults this fence to keep a start that is
+    // about to be stopped out of the registry.
+    // TunnelManager.start coalesces an overlapping start of the same profile
+    // onto the first attempt's promise. Only the caller that actually began the
+    // attempt owns its fence and its stop-if-stale decision; a coalesced caller
+    // just observes the first attempt's outcome, so an edit to ITS target must
+    // not reject or stop the first caller's valid tunnel.
+    const ownsAttempt = !pendingStartFences.has(profile.id);
+    if (ownsAttempt) {
+      pendingStartFences.set(profile.id, stillCurrent);
+    }
+    let active;
+    try {
+      active = await tunnelManager.start(profile, server, { connectionMode, beforeReverseForward });
+    } finally {
+      if (ownsAttempt && pendingStartFences.get(profile.id) === stillCurrent) {
+        pendingStartFences.delete(profile.id);
+      }
+    }
+    if (ownsAttempt && !stillCurrent()) {
       await tunnelManager.stop(active.id);
+      reportCancelled();
     }
   } catch (error) {
     // Stopped before it finished connecting: the stop was asked for, so there
@@ -255,6 +377,9 @@ export async function startTunnel(
       return;
     }
     throw error;
+  }
+  } finally {
+    fence.dispose();
   }
 }
 
@@ -340,7 +465,23 @@ async function startTunnelCommand(ctx: CommandContext, arg?: unknown): Promise<v
   if (!profile) {
     return;
   }
-  const server = await resolveServerForTunnel(ctx.core, profile);
+  const preferredServerId = typeof arg === "object" && arg
+    ? (arg as { serverId?: unknown }).serverId
+    : undefined;
+  // A pinned server (Retry after a cancelled start) must not silently fall
+  // back to the default/sole/picked server: that would start the tunnel on a
+  // different host than the one the cancelled start was aimed at.
+  if (typeof preferredServerId === "string" && !ctx.core.getServer(preferredServerId)) {
+    void vscode.window.showWarningMessage(
+      `The server for tunnel "${flattenProviderText(profile.name)}" was removed. The tunnel was not started.`
+    );
+    return;
+  }
+  const server = await resolveServerForTunnel(
+    ctx.core,
+    profile,
+    typeof preferredServerId === "string" ? preferredServerId : undefined
+  );
   if (!server) {
     return;
   }
@@ -348,7 +489,7 @@ async function startTunnelCommand(ctx: CommandContext, arg?: unknown): Promise<v
   if (!connectionMode) {
     return;
   }
-  await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, profile, server, connectionMode, ctx.registrySync);
+  await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, profile, server, connectionMode, ctx.registrySync, ctx.sshPool.multiplexingDefault);
 }
 
 async function stopTunnelCommand(ctx: CommandContext, arg?: unknown): Promise<void> {
@@ -542,7 +683,7 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
           if (!mode) {
             return;
           }
-          await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, updated, server, mode, ctx.registrySync);
+          await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, updated, server, mode, ctx.registrySync, ctx.sshPool.multiplexingDefault);
         },
         onCreateInline: (key) => {
           if (key === "defaultServerId") {
@@ -708,7 +849,7 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
       if (!mode) {
         return;
       }
-      await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, profile, server, mode, ctx.registrySync);
+      await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, profile, server, mode, ctx.registrySync, ctx.sshPool.multiplexingDefault);
     }),
 
     vscode.commands.registerCommand("nexus.tunnel.copyInfo", async (arg?: unknown) => {

@@ -3,7 +3,8 @@ import type { CommandContext } from "../../src/commands/types";
 import { NexusCore } from "../../src/core/nexusCore";
 import type { ActiveTunnel, TunnelProfile, TunnelRegistryEntry } from "../../src/models/config";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
-import { registerTunnelCommands, startTunnel } from "../../src/commands/tunnelCommands";
+import { watchPoolInvalidationOnConfigMutation } from "../../src/services/ssh/poolConfigInvalidation";
+import { isTunnelStartCurrent, registerTunnelCommands, startTunnel } from "../../src/commands/tunnelCommands";
 import type { ServerConfig } from "../../src/models/config";
 import { configMutationLock } from "../../src/services/configMutationLock";
 import { TunnelStoppedError } from "../../src/services/tunnel/tunnelManager";
@@ -860,5 +861,466 @@ describe("startTunnel — profile removed while start is pending", () => {
     await run;
 
     expect(stop).toHaveBeenCalledWith("at-1");
+  });
+
+  it("keeps a start pending across an equal-content replacement of tunnel and server", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const sync = deferred<void>();
+    const start = vi.fn(async () => makeActiveTunnel("t1"));
+    const stop = vi.fn(async () => {});
+    const run = startTunnel(
+      core, { start, stop } as never, { connect: vi.fn() } as never,
+      profile, capturedServer, "isolated",
+      { syncNow: () => sync.promise, checkRemoteOwnership: async () => undefined } as never
+    );
+
+    await core.addOrUpdateTunnel({ ...profile });
+    await core.addOrUpdateServer({ ...capturedServer });
+    sync.resolve();
+    await run;
+
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(stop).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not stop a running start after an equal-content replacement", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const starting = deferred<ActiveTunnel>();
+    const start = vi.fn(() => starting.promise);
+    const stop = vi.fn(async () => {});
+    const run = startTunnel(
+      core, { start, stop } as never, { connect: vi.fn() } as never,
+      profile, capturedServer, "isolated"
+    );
+
+    await core.addOrUpdateTunnel({ ...profile });
+    expect(isTunnelStartCurrent(core, "t1", "srv-1")).toBe(true);
+    starting.resolve(makeActiveTunnel("t1"));
+    await run;
+
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it("tells the user a real change cancelled the start and Retry restarts by id", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const sync = deferred<void>();
+    const start = vi.fn(async () => makeActiveTunnel("t1"));
+    mockShowWarningMessage.mockResolvedValueOnce("Retry");
+    const run = startTunnel(
+      core, { start } as never, { connect: vi.fn() } as never,
+      profile, capturedServer, "isolated",
+      { syncNow: () => sync.promise, checkRemoteOwnership: async () => undefined } as never
+    );
+
+    await core.addOrUpdateTunnel({ ...profile, localPort: profile.localPort + 1 });
+    sync.resolve();
+    await run;
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(start).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("changed while the tunnel was starting"), "Retry");
+    const vscode = await import("vscode");
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("nexus.tunnel.start", { profile: { id: "t1" }, serverId: "srv-1" });
+  });
+
+  it("warns without Retry and keeps a started tunnel out of the registry check when removed", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const starting = deferred<ActiveTunnel>();
+    const start = vi.fn(() => starting.promise);
+    const stop = vi.fn(async () => {});
+    const run = startTunnel(
+      core, { start, stop } as never, { connect: vi.fn() } as never,
+      profile, capturedServer, "isolated"
+    );
+
+    await core.removeTunnel("t1");
+    expect(isTunnelStartCurrent(core, "t1", "srv-1")).toBe(false);
+    starting.resolve(makeActiveTunnel("t1"));
+    await run;
+
+    expect(stop).toHaveBeenCalledWith("at-1");
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("was removed while the tunnel was starting"));
+  });
+
+  it("rejects an in-flight start for a real change via the started-listener predicate", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const starting = deferred<ActiveTunnel>();
+    const run = startTunnel(
+      core, { start: () => starting.promise, stop: vi.fn(async () => {}) } as never, { connect: vi.fn() } as never,
+      profile, capturedServer, "isolated"
+    );
+
+    await core.addOrUpdateTunnel({ ...profile, remotePort: 9999 });
+    expect(isTunnelStartCurrent(core, "t1", "srv-1")).toBe(false);
+    starting.resolve(makeActiveTunnel("t1"));
+    await run;
+    expect(isTunnelStartCurrent(core, "t1", "srv-1")).toBe(true);
+  });
+
+  it("does not cancel for a folder rename or a notes/browserUrl/autoStart edit, but does for a host change", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const starting = deferred<ActiveTunnel>();
+    const start = vi.fn(() => starting.promise);
+    const stop = vi.fn(async () => {});
+    const run = startTunnel(
+      core, { start, stop } as never, { connect: vi.fn() } as never,
+      profile, capturedServer, "isolated"
+    );
+
+    await core.addOrUpdateServer({ ...capturedServer, group: "Renamed" });
+    await core.addOrUpdateTunnel({ ...profile, notes: "n", browserUrl: "http://x", autoStart: true });
+    expect(isTunnelStartCurrent(core, "t1", "srv-1")).toBe(true);
+    await core.addOrUpdateServer({ ...capturedServer, group: "Renamed", host: "10.9.9.9" });
+    expect(isTunnelStartCurrent(core, "t1", "srv-1")).toBe(false);
+    starting.resolve(makeActiveTunnel("t1"));
+    await run;
+    expect(stop).toHaveBeenCalledWith("at-1");
+  });
+
+  it("clears the pending start fence when tunnelManager.start rejects", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const start = vi.fn(async () => { throw new Error("boom"); });
+    await expect(
+      startTunnel(core, { start } as never, { connect: vi.fn() } as never, profile, capturedServer, "isolated")
+    ).rejects.toThrow("boom");
+    // A leaked fence would keep judging this profile by the failed start's snapshot.
+    await core.addOrUpdateTunnel({ ...profile, localPort: profile.localPort + 5 });
+    expect(isTunnelStartCurrent(core, "t1", "srv-1")).toBe(true);
+  });
+
+  it("Retry after a cancelled start targets the server the start was aimed at", async () => {
+    const other: ServerConfig = { ...server, id: "srv-2", name: "Other" };
+    const ctx = await setupContext([makeTunnel({ defaultServerId: "srv-1", connectionMode: "isolated" })]);
+    await ctx.core.addOrUpdateServer(server);
+    await ctx.core.addOrUpdateServer(other);
+    const start = vi.fn(async () => makeActiveTunnel("t1"));
+    ctx.tunnelManager = { start } as never;
+    registerTunnelCommands(ctx);
+    await registeredCommands.get("nexus.tunnel.start")!({ profile: { id: "t1" }, serverId: "srv-2" });
+    expect(start).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ id: "srv-2" }), expect.anything());
+  });
+
+  it("flattens hostile profile and server names in the cancellation warning", async () => {
+    const hostile = "evil\nSpoof: click here\u202Etxt";
+    const { core, profile, server: capturedServer } = await fixture();
+    const hostileServer = { ...capturedServer, name: hostile };
+    await core.addOrUpdateServer(hostileServer);
+    const live = core.getServer("srv-1")!;
+    const sync = deferred<void>();
+    const run = startTunnel(
+      core, { start: vi.fn() } as never, { connect: vi.fn() } as never,
+      profile, live, "isolated",
+      { syncNow: () => sync.promise, checkRemoteOwnership: async () => undefined } as never
+    );
+    await core.addOrUpdateServer({ ...live, host: "10.7.7.7" });
+    sync.resolve();
+    await run;
+
+    const message = String(mockShowWarningMessage.mock.calls[0][0]);
+    expect(message).not.toMatch(/[\n\u202E]/);
+    expect(message).toContain("evil Spoof: click here");
+  });
+
+  it("does not fall back to another server when a pinned Retry server was removed", async () => {
+    const other: ServerConfig = { ...server, id: "srv-2", name: "Other" };
+    const ctx = await setupContext([makeTunnel({ defaultServerId: "srv-1", connectionMode: "isolated" })]);
+    await ctx.core.addOrUpdateServer(server);
+    await ctx.core.addOrUpdateServer(other);
+    await ctx.core.removeServer("srv-2");
+    const start = vi.fn(async () => makeActiveTunnel("t1"));
+    ctx.tunnelManager = { start } as never;
+    registerTunnelCommands(ctx);
+    await registeredCommands.get("nexus.tunnel.start")!({ profile: { id: "t1" }, serverId: "srv-2" });
+    expect(start).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("was removed"));
+  });
+
+  it("does not run Retry when the tunnel or server was removed between the warning and the click", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const sync = deferred<void>();
+    let click!: (value: string) => void;
+    mockShowWarningMessage.mockReturnValueOnce(new Promise((resolve) => { click = resolve; }));
+    const run = startTunnel(
+      core, { start: vi.fn() } as never, { connect: vi.fn() } as never,
+      profile, capturedServer, "isolated",
+      { syncNow: () => sync.promise, checkRemoteOwnership: async () => undefined } as never
+    );
+    await core.addOrUpdateTunnel({ ...profile, localPort: profile.localPort + 1 });
+    sync.resolve();
+    await run;
+    await core.removeTunnel("t1");
+    click("Retry");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const vscode = await import("vscode");
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexus.tunnel.start", expect.anything());
+    expect(mockShowWarningMessage).toHaveBeenLastCalledWith(expect.stringContaining("was not retried"));
+  });
+
+  it("a coalesced second start does not take over the first start's fence or stop its tunnel", async () => {
+    const { core, profile, server: first } = await fixture();
+    const second: ServerConfig = { ...server, id: "srv-2", name: "Second" };
+    await core.addOrUpdateServer(second);
+    const starting = deferred<ActiveTunnel>();
+    // Mirrors TunnelManager.start: the second call returns the first's promise.
+    const start = vi.fn(() => starting.promise);
+    const stop = vi.fn(async () => {});
+    const manager = { start, stop } as never;
+    const run1 = startTunnel(core, manager, { connect: vi.fn() } as never, profile, first, "isolated");
+    const run2 = startTunnel(core, manager, { connect: vi.fn() } as never, profile, core.getServer("srv-2")!, "isolated");
+
+    await core.addOrUpdateServer({ ...second, host: "10.8.8.8" });
+    expect(isTunnelStartCurrent(core, "t1", "srv-1")).toBe(true);
+    starting.resolve(makeActiveTunnel("t1"));
+    await Promise.all([run1, run2]);
+
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it("does not cancel when an unset mode is saved back as the explicit effective mode", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const starting = deferred<ActiveTunnel>();
+    const start = vi.fn(() => starting.promise);
+    const stop = vi.fn(async () => {});
+    const run = startTunnel(
+      core, { start, stop } as never,
+      { connect: vi.fn(async () => ({ dispose: vi.fn() })) } as never,
+      profile, capturedServer, "shared"
+    );
+
+    await core.addOrUpdateTunnel({ ...profile, connectionMode: "shared" });
+    await Promise.resolve();
+    starting.resolve(makeActiveTunnel("t1"));
+    await run;
+
+    expect(stop).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not cancel an isolated start when only the server's altHost changes", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const starting = deferred<ActiveTunnel>();
+    const start = vi.fn(() => starting.promise);
+    const stop = vi.fn(async () => {});
+    const run = startTunnel(
+      core, { start, stop } as never, { connect: vi.fn() } as never,
+      profile, capturedServer, "isolated"
+    );
+
+    await core.addOrUpdateServer({ ...capturedServer, altHost: "alt.example" });
+    expect(isTunnelStartCurrent(core, "t1", "srv-1")).toBe(true);
+    starting.resolve(makeActiveTunnel("t1"));
+    await run;
+
+    expect(stop).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  describe("effective mode resolution across an edit", () => {
+    async function pending(startProfile: Partial<TunnelProfile>, pickedMode: "isolated" | "shared") {
+      const { core, profile, server: capturedServer } = await fixture();
+      const seeded = { ...profile, ...startProfile };
+      await core.addOrUpdateTunnel(seeded);
+      const starting = deferred<ActiveTunnel>();
+      const stop = vi.fn(async () => {});
+      const run = startTunnel(
+        core, { start: () => starting.promise, stop } as never,
+        { connect: vi.fn(async () => ({ dispose: vi.fn() })) } as never,
+        core.getTunnel("t1")!, capturedServer, pickedMode
+      );
+      return { core, seeded, starting, stop, run };
+    }
+
+    it("an ask profile whose pick was isolated is cancelled when its stored mode is edited to shared", async () => {
+      const { core, seeded, starting, stop, run } = await pending({ connectionMode: "ask" }, "isolated");
+      await core.addOrUpdateTunnel({ ...seeded, connectionMode: "shared" });
+      starting.resolve(makeActiveTunnel("t1"));
+      await run;
+      // Cancelled either before the manager started (no start) or after (stopped).
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("changed while the tunnel was starting"), "Retry");
+    });
+
+    it("the same ask profile with its stored mode left as ask is not cancelled", async () => {
+      const { core, seeded, starting, stop, run } = await pending({ connectionMode: "ask" }, "isolated");
+      await core.addOrUpdateTunnel({ ...seeded });
+      starting.resolve(makeActiveTunnel("t1"));
+      await run;
+      expect(stop).not.toHaveBeenCalled();
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    });
+
+    it("an unset mode edited to an explicit different mode is cancelled", async () => {
+      const { core, seeded, starting, stop, run } = await pending({}, "shared");
+      await core.addOrUpdateTunnel({ ...seeded, connectionMode: "isolated" });
+      starting.resolve(makeActiveTunnel("t1"));
+      await run;
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("changed while the tunnel was starting"), "Retry");
+    });
+  });
+
+  it("cancels a pending start when the linked auth profile's username is edited", async () => {
+    const { core, profile, server: base } = await fixture();
+    await core.addOrUpdateAuthProfile({ id: "ap1", name: "AP", username: "ops", authType: "password" });
+    await core.addOrUpdateServer({ ...base, authProfileId: "ap1" });
+    const linked = core.getServer("srv-1")!;
+    const sync = deferred<void>();
+    const start = vi.fn(async () => makeActiveTunnel("t1"));
+    const run = startTunnel(
+      core, { start } as never, { connect: vi.fn() } as never,
+      profile, linked, "isolated",
+      { syncNow: () => sync.promise, checkRemoteOwnership: async () => undefined } as never
+    );
+
+    await core.addOrUpdateAuthProfile({ id: "ap1", name: "AP", username: "root", authType: "password" });
+    sync.resolve();
+    await run;
+
+    expect(start).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("changed while the tunnel was starting"), "Retry");
+  });
+
+  it("does not cancel when only the linked auth profile's name is edited", async () => {
+    const { core, profile, server: base } = await fixture();
+    await core.addOrUpdateAuthProfile({ id: "ap1", name: "AP", username: "ops", authType: "password" });
+    await core.addOrUpdateServer({ ...base, authProfileId: "ap1" });
+    const linked = core.getServer("srv-1")!;
+    const sync = deferred<void>();
+    const start = vi.fn(async () => makeActiveTunnel("t1"));
+    const run = startTunnel(
+      core, { start } as never, { connect: vi.fn() } as never,
+      profile, linked, "isolated",
+      { syncNow: () => sync.promise, checkRemoteOwnership: async () => undefined } as never
+    );
+
+    await core.addOrUpdateAuthProfile({ id: "ap1", name: "Renamed", username: "ops", authType: "password" });
+    sync.resolve();
+    await run;
+
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+
+  describe("sticky fence (A -> B -> A during the start; raw-only changes ignored)", () => {
+    async function linked(serverExtra: Partial<ServerConfig> = {}) {
+      const { core, profile, server: base } = await fixture();
+      await core.addOrUpdateAuthProfile({ id: "ap1", name: "AP", username: "ops", authType: "password" });
+      await core.addOrUpdateServer({ ...base, authProfileId: "ap1", ...serverExtra });
+      // The pool hook stays attached: its raw invalidations must NOT decide these fences.
+      const stop = watchPoolInvalidationOnConfigMutation(core, { invalidate: () => {} });
+      return { core, profile, server: core.getServer("srv-1")!, stop };
+    }
+    const held = () => {
+      const sync = deferred<void>();
+      return { sync, registry: { syncNow: () => sync.promise, checkRemoteOwnership: async () => undefined } as never };
+    };
+
+    it("a linked profile changed A -> B -> A while the start waits cancels it", async () => {
+      const { core, profile, server, stop } = await linked();
+      const { sync, registry } = held();
+      const start = vi.fn(async () => makeActiveTunnel("t1"));
+      const run = startTunnel(core, { start } as never, { connect: vi.fn() } as never, profile, server, "isolated", registry);
+      await core.addOrUpdateAuthProfile({ id: "ap1", name: "AP", username: "root", authType: "password" });
+      await core.addOrUpdateAuthProfile({ id: "ap1", name: "AP", username: "ops", authType: "password" });
+      sync.resolve();
+      await run;
+
+      expect(start).not.toHaveBeenCalled();
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("changed while the tunnel was starting"), "Retry");
+      stop();
+    });
+
+    it("a jump host's host changed A -> B -> A cancels a start that rides it", async () => {
+      const jump: ServerConfig = { id: "jump", name: "Jump", host: "j.example", port: 22, username: "u", authType: "password", isHidden: false };
+      const { core, profile, server: base } = await fixture();
+      await core.addOrUpdateServer(jump);
+      await core.addOrUpdateServer({ ...base, proxy: { type: "ssh", jumpHostId: "jump" } });
+      const server = core.getServer("srv-1")!;
+      const { sync, registry } = held();
+      const start = vi.fn(async () => makeActiveTunnel("t1"));
+      const run = startTunnel(core, { start } as never, { connect: vi.fn() } as never, profile, server, "isolated", registry);
+      await core.addOrUpdateServer({ ...jump, host: "moved.example" });
+      await core.addOrUpdateServer({ ...jump });
+      sync.resolve();
+      await run;
+      expect(start).not.toHaveBeenCalled();
+    });
+
+    it.each<[string, Partial<ServerConfig>, (s: ServerConfig) => ServerConfig]>([
+      ["multiplexing omitted -> explicit true (the pool default)", {}, (s) => ({ ...s, multiplexing: true })],
+      ["a key path on a password server", {}, (s) => ({ ...s, keyPath: "/unused" })],
+      ["an altHost during an isolated tunnel start", {}, (s) => ({ ...s, altHost: "alt.example" })]
+    ])("does not cancel for %s", async (_label, extra, edit) => {
+      const { core, profile, server, stop } = await linked(extra);
+      const { sync, registry } = held();
+      const start = vi.fn(async () => makeActiveTunnel("t1"));
+      const run = startTunnel(core, { start } as never, { connect: vi.fn() } as never, profile, server, "isolated", registry, true);
+      await core.addOrUpdateServer(edit(core.getServer("srv-1")!));
+      sync.resolve();
+      await run;
+
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+      stop();
+    });
+
+    it("a linked profile that disappears (fields equal to the server's) cancels a pending start", async () => {
+      const { core, profile, server: base } = await fixture();
+      // Profile fields equal the server's own: only the credential scope differs when it vanishes.
+      const same = { id: "ap1", name: "AP", username: base.username, authType: base.authType };
+      await core.addOrUpdateAuthProfile(same);
+      await core.addOrUpdateServer({ ...base, authProfileId: "ap1" });
+      const server = core.getServer("srv-1")!;
+      const { sync, registry } = held();
+      const lookup = vi.spyOn(core, "getAuthProfile");
+      const start = vi.fn(async () => makeActiveTunnel("t1"));
+      const run = startTunnel(core, { start } as never, { connect: vi.fn() } as never, profile, server, "isolated", registry);
+      // Another window's removeAuthProfile persisted the profiles before the servers: the link is
+      // still there, the lookup fails. Any mutation makes the fence recompute.
+      lookup.mockReturnValue(undefined);
+      await core.addOrUpdateServer({ ...core.getServer("srv-1")! });
+      sync.resolve();
+      await run;
+
+      expect(start).not.toHaveBeenCalled();
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("changed while the tunnel was starting"), "Retry");
+    });
+
+    it("a no-op save does not cancel", async () => {
+      const { core, profile, server, stop } = await linked();
+      const { sync, registry } = held();
+      const start = vi.fn(async () => makeActiveTunnel("t1"));
+      const run = startTunnel(core, { start } as never, { connect: vi.fn() } as never, profile, server, "isolated", registry);
+      await core.addOrUpdateAuthProfile({ id: "ap1", name: "Renamed", username: "ops", authType: "password" });
+      await core.addOrUpdateServer({ ...core.getServer("srv-1")! });
+      sync.resolve();
+      await run;
+      expect(start).toHaveBeenCalledTimes(1);
+      stop();
+    });
+
+    it("stops watching once the start settles, on success and on failure", async () => {
+      const { core, profile, server, stop } = await linked();
+      let active = 0;
+      const original = core.onDidMutateConnectionConfig.bind(core);
+      vi.spyOn(core, "onDidMutateConnectionConfig").mockImplementation((listener) => {
+        active++;
+        const unsubscribe = original(listener);
+        return () => { active--; unsubscribe(); };
+      });
+      const ok = startTunnel(core, { start: vi.fn(async () => makeActiveTunnel("t1")) } as never, { connect: vi.fn() } as never, profile, server, "isolated");
+      expect(active).toBe(1);
+      await ok;
+      expect(active).toBe(0);
+
+      const failing = startTunnel(
+        core, { start: vi.fn(async () => { throw new Error("boom"); }) } as never, { connect: vi.fn() } as never,
+        profile, server, "isolated"
+      );
+      await expect(failing).rejects.toThrow("boom");
+      expect(active).toBe(0);
+      stop();
+    });
   });
 });

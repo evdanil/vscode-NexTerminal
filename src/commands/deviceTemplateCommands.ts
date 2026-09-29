@@ -24,7 +24,7 @@ import {
   isSameAuthenticatedEndpoint,
   type CapturedProxyPasswordSecret
 } from "../services/inventory/proxySecretHygiene";
-import { proxyPasswordSecretKey } from "../services/ssh/silentAuth";
+import { legacyProxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { deviceTemplateFormDefinition, type ServerListEntry , toSshInfrastructureServerList } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
@@ -1124,13 +1124,16 @@ export function registerDeviceTemplateCommands(ctx: CommandContext, registry: In
             // FIX A (issue #48 PR-T1b / PR #62 Codex review round 2, SECURITY) — the
             // manual apply is the SECOND writer of server proxy config, and until now
             // it published `write.proxy` (applyPlanWrites, below) without clearing the
-            // server's stale `proxy-password-{id}`. `ProxySshFactory` reads that secret
-            // by server id and would send the OLD endpoint's password to the NEW proxy
+            // server's stale `proxy-password-{id}`. At the time, `ProxySshFactory` read that
+            // secret by server id and would send the OLD endpoint's password to the NEW proxy
             // — the exact round-9/11 leak the sync path already closes. Route this path
             // through the SAME shared hygiene helper (proxySecretHygiene.ts), clearing
             // BEFORE applyPlanWrites publishes, inside this same locked section,
             // fail-closed with restore-on-failure — mirroring the sync ordering exactly
-            // (capture+delete → publish → restore-on-failure). §5.3: templates never
+            // (capture+delete → publish → restore-on-failure). NOTE: passwords are now keyed per
+            // proxy endpoint, so this helper only clears the LEGACY per-server key today
+            // (see proxySecretHygiene.ts); the endpoint the server leaves is cleaned up after
+            // persistence by poolConfigInvalidation.ts. §5.3: templates never
             // carry proxy SECRETS, so the new proxy prompts per-connect and clearing
             // the stale secret loses nothing the new proxy should have.
             //
@@ -1193,7 +1196,7 @@ export function registerDeviceTemplateCommands(ctx: CommandContext, registry: In
               if (vault) {
                 const beforeProxyByKey = new Map<string, { id: string; beforeProxy: typeof proxyChanges[number]["before"]["proxy"] }>();
                 for (const { before } of proxyChanges) {
-                  beforeProxyByKey.set(proxyPasswordSecretKey(before.id), { id: before.id, beforeProxy: before.proxy });
+                  beforeProxyByKey.set(legacyProxyPasswordSecretKey(before.id), { id: before.id, beforeProxy: before.proxy });
                 }
                 const restorable = capturedProxySecrets.filter((secret) => {
                   const origin = beforeProxyByKey.get(secret.key);

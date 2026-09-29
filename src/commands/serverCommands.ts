@@ -15,13 +15,17 @@ import {
   resolveServerProtocol,
   serverConfigsEqual
 } from "../models/config";
+import { connectDescriptor, type ConnectDescriptorInputs } from "../models/startDescriptors";
+import { watchStartFence, type StartFence } from "../services/ssh/startFenceWatcher";
+import { flattenProviderText } from "../models/inventory";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SshPty } from "../services/ssh/sshPty";
 import { TelnetPty } from "../services/telnet/telnetPty";
 import type { PtyOutputObserver } from "../services/macroAutoTrigger";
 import { Osc7Parser } from "../services/terminal/osc7Parser";
-import { deleteServerSecrets, passwordSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
+import { deleteServerSecrets, passwordSecretKey } from "../services/ssh/silentAuth";
+import { currentProxyPasswordSecretKey } from "../services/ssh/proxyPasswordKeys";
 import { serverFormDefinition, toSshInfrastructureServerList } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, ServerTreeItem, SessionTreeItem } from "../ui/nexusTreeProvider";
@@ -637,7 +641,14 @@ export async function syncProxyPasswordSecret(ctx: CommandContext, serverId: str
   if (!ctx.secretVault) {
     return;
   }
-  const secretKey = proxyPasswordSecretKey(serverId);
+  // The password belongs to the proxy ENDPOINT the form describes, so it is stored
+  // under that endpoint's key (see proxyPasswordKeys.ts). The endpoint the server
+  // used before is not touched here: its key is removed after persistence by the
+  // pool-invalidation hook, and until then it is simply never read for this endpoint.
+  const secretKey = currentProxyPasswordSecretKey({ id: serverId, proxy: formValuesToProxy(values) });
+  if (secretKey === undefined) {
+    return;
+  }
   const proxyType = typeof values.proxyType === "string" ? values.proxyType : "none";
 
   if (proxyType === "socks5") {
@@ -665,8 +676,6 @@ export async function syncProxyPasswordSecret(ctx: CommandContext, serverId: str
     }
     return;
   }
-
-  await ctx.secretVault.delete(secretKey);
 }
 
 // ADDRESSLESS (Codex P2-a) — the sentinel port an addressless placeholder carries
@@ -1035,6 +1044,108 @@ export interface ConnectServerOptions {
    * fires; a handler should say only what it adds (what did not happen next).
    */
   onConnectFailed?: (message: string) => void;
+  /** Command a cancelled-start Retry re-runs; defaults to plain Connect. Wrappers (run-script, run-macro) set their own so Retry repeats the original action. */
+  retryCommand?: string | null;
+}
+
+/**
+ * A connect is cancelled only when its server record is gone or differs in
+ * content from the one the connect began with. This is checked once, at the top
+ * of the progress callback, before the terminal and PTY exist; after that the
+ * PTY runs on its own start-time snapshot (an edit applies at the next connect),
+ * so the check does not cover a password prompt or the handshake. An equal-content replacement (an
+ * unchanged editor Save, a Refresh after another window wrote globalState) is
+ * not a change, so object identity is the wrong test — the same reasoning the
+ * Serial and Local Shell start fences use.
+ */
+function connectDescriptorInputs(ctx: CommandContext): ConnectDescriptorInputs {
+  return {
+    multiplexingDefault: ctx.sshPool.multiplexingDefault,
+    authProfileLookup: (id) => ctx.core.getAuthProfile(id),
+    serverLookup: (id) => ctx.core.getServer(id)
+  };
+}
+
+/**
+ * The fence of a pending connect: the effective connection descriptor captured
+ * when it began, plus a sticky watcher (see startFenceWatcher.ts) that latches if
+ * any mutation, even one later reverted (A -> B -> A), moved the live descriptor
+ * away from it. Comparing only the final state would miss the intermediate value;
+ * comparing raw pool invalidations would cancel on changes the connect never
+ * reads, so the fence recomputes its own descriptor per mutation.
+ */
+function watchConnectStart(ctx: CommandContext, server: ServerConfig): StartFence {
+  return watchStartFence(ctx.core, connectDescriptor(server, connectDescriptorInputs(ctx)), () => {
+    const current = ctx.core.getServer(server.id);
+    return current ? connectDescriptor(current, connectDescriptorInputs(ctx)) : "<removed>";
+  });
+}
+
+/**
+ * The fence of one terminal connect ATTEMPT (SshPty captures it before it acquires
+ * a connection). The PTY connects with its constructor-captured `server`, so the
+ * watched descriptor is that server's, with the live auth profile and jump
+ * lookups the connection applies at handshake time.
+ */
+function watchTerminalAttempt(ctx: CommandContext, server: ServerConfig): StartFence {
+  return watchStartFence(ctx.core, connectDescriptor(server, connectDescriptorInputs(ctx)), () =>
+    connectDescriptor(server, connectDescriptorInputs(ctx))
+  );
+}
+
+/**
+ * Whether the connect is still current: the fence never latched, the record
+ * still exists, and its effective descriptor still equals the captured one,
+ * using the same inputs the runtime uses, so only a value the connect actually
+ * uses can cancel it. Checked once, at the top of the progress callback.
+ */
+function isServerUnchangedSince(ctx: CommandContext, atStart: ServerConfig, fence: StartFence): boolean {
+  const current = ctx.core.getServer(atStart.id);
+  return (
+    !fence.isDirty() &&
+    current !== undefined &&
+    connectDescriptor(current, connectDescriptorInputs(ctx)) === fence.descriptor
+  );
+}
+
+/** Tells the user why a connect was cancelled and, if the record still exists, offers a Retry that can succeed. */
+function reportCancelledConnect(ctx: CommandContext, atStart: ServerConfig, options: ConnectServerOptions): void {
+  // The name can come from an inventory sync; flatten it where it enters the message.
+  const safeName = flattenProviderText(atStart.name);
+  const removed = ctx.core.getServer(atStart.id) === undefined;
+  options.onConnectFailed?.(
+    `Connection to "${safeName}" canceled because its server profile ${removed ? "was removed" : "changed"}.`
+  );
+  if (removed) {
+    void vscode.window.showWarningMessage(
+      `Server "${safeName}" was removed while the connection was starting. The connection was cancelled.`
+    );
+    return;
+  }
+  if (options.retryCommand === null) {
+    // The connect is a sub-step of a larger action (for example an IPMI gateway
+    // for a macro on another server). A Retry that re-ran only this server's
+    // command would drop the original target and macro, so say what to do.
+    void vscode.window.showWarningMessage(
+      `Server "${safeName}" changed while the connection was starting. The connection was cancelled. Run the original command again to use the current settings.`
+    );
+    return;
+  }
+  void Promise.resolve(vscode.window.showWarningMessage(
+    `Server "${safeName}" changed while the connection was starting. The connection was cancelled. Retry with the current settings.`,
+    "Retry"
+  )).then((choice) => {
+    if (choice === "Retry") {
+      // The id would no longer resolve if the server was deleted while the
+      // warning was open, and the command would fall through to a picker that
+      // could act on a different server. Refuse instead.
+      if (!ctx.core.getServer(atStart.id)) {
+        void vscode.window.showWarningMessage(`Server "${safeName}" was removed. The connection was not retried.`);
+        return;
+      }
+      void vscode.commands.executeCommand(options.retryCommand ?? "nexus.server.connect", atStart.id);
+    }
+  });
 }
 
 /**
@@ -1054,6 +1165,8 @@ async function connectTelnetServer(
   server: ServerConfig,
   options: ConnectServerOptions
 ): Promise<void> {
+  const serverAtStart = cloneServerConfig(server);
+  const startFence = watchConnectStart(ctx, serverAtStart);
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
@@ -1061,8 +1174,10 @@ async function connectTelnetServer(
       cancellable: false
     },
     async () => {
-      if (ctx.core.getServer(server.id) !== server) {
-        options.onConnectFailed?.(`Connection to "${server.name}" canceled because its server profile changed.`);
+      const unchanged = isServerUnchangedSince(ctx, serverAtStart, startFence);
+      startFence.dispose(); // settled: the one check has run, nothing stays subscribed
+      if (!unchanged) {
+        reportCancelledConnect(ctx, serverAtStart, options);
         return;
       }
       const terminalName = `Nexus Telnet: ${server.name}`;
@@ -1246,6 +1361,8 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
   }
   const allowAutoFileExplorer = options.allowAutoFileExplorer ?? true;
   let autoFileExplorerHandled = false;
+  const serverAtStart = cloneServerConfig(server);
+  const startFence = watchConnectStart(ctx, serverAtStart);
 
   await vscode.window.withProgress(
     {
@@ -1254,8 +1371,10 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
       cancellable: false
     },
     async () => {
-      if (ctx.core.getServer(server.id) !== server) {
-        options.onConnectFailed?.(`Connection to "${server.name}" canceled because its server profile changed.`);
+      const unchanged = isServerUnchangedSince(ctx, serverAtStart, startFence);
+      startFence.dispose(); // settled: the one check has run, nothing stays subscribed
+      if (!unchanged) {
+        reportCancelledConnect(ctx, serverAtStart, options);
         return;
       }
       const terminalName = `Nexus SSH: ${server.name}`;
@@ -1273,6 +1392,7 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
         server,
         ctx.sshFactory,
         {
+          captureConnectDescriptor: () => watchTerminalAttempt(ctx, server),
           onSessionOpened: (sessionId) => {
             ctx.core.registerSession({
               id: sessionId,
@@ -1314,20 +1434,64 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
               }
             }
 
-            for (const tunnel of ctx.core.getSnapshot().tunnels) {
-              if (tunnel.autoStart && tunnel.defaultServerId === server.id) {
-                // Silently skip tunnels that are already running
-                if (ctx.core.getSnapshot().activeTunnels.some((t) => t.profileId === tunnel.id)) {
-                  continue;
+            // onSessionOpened also fires on every R reconnect, and each connect
+            // attempt (initial or reconnect) captured its own effective descriptor
+            // before it acquired a connection (SshPtyCallbacks.captureConnectDescriptor).
+            // Auto-tunnels must ride the same effective connection: compare that
+            // capture with what a tunnel would use now (live server, live profile,
+            // live jump chain). A change after the capture means the terminal is on
+            // the old credentials or route, so start nothing and say so (fail-safe);
+            // a change before it was already reflected in the pool: NexusCore
+            // reports every in-memory server / auth-profile mutation synchronously,
+            // before persistence, and the pool entries built from the old settings
+            // (and those of the servers riding a changed jump) are soft-invalidated
+            // there (poolConfigInvalidation.ts), so the acquire built afresh and the
+            // two agree. A
+            // rename or other non-connection edit changes neither side.
+            const liveServer = ctx.core.getServer(server.id);
+            const pending = liveServer
+              ? ctx.core.getSnapshot().tunnels.filter(
+                  (tunnel) =>
+                    tunnel.autoStart &&
+                    tunnel.defaultServerId === server.id &&
+                    // Silently skip tunnels that are already running
+                    !ctx.core.getSnapshot().activeTunnels.some((t) => t.profileId === tunnel.id)
+                )
+              : [];
+            if (liveServer && pending.length > 0) {
+              // Deliberately gated on the TERMINAL's connect descriptor, not the
+              // tunnel one: a session whose alt host (or anything else the terminal
+              // reads) has moved on is stale as a whole, so an altHost edit also
+              // skips auto-start. No capture (a pty not created by this path)
+              // fails safe the same way.
+              const captured = ptyRef?.connectedDescriptor;
+              // The capture's sticky fence covers an A -> B -> A change to the linked
+              // profile or the jump chain made after the attempt began; the
+              // descriptor comparison covers a net difference from the live server.
+              // Both are consumed here, so stop watching.
+              const captureDirty = ptyRef?.connectFenceDirty ?? true;
+              ptyRef?.releaseConnectFence();
+              if (
+                captured === undefined ||
+                captureDirty ||
+                captured !== connectDescriptor(liveServer, connectDescriptorInputs(ctx))
+              ) {
+                void vscode.window.showWarningMessage(
+                  `Auto-start tunnels for "${flattenProviderText(server.name)}" were not started because the server's connection settings changed since this session opened. Close and reopen the terminal to use the new settings.`
+                );
+              } else {
+                for (const tunnel of pending) {
+                  void resolveTunnelConnectionMode(tunnel, false).then((mode) => {
+                    if (!mode) {
+                      return;
+                    }
+                    return startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, tunnel, server, mode, ctx.registrySync, ctx.sshPool.multiplexingDefault);
+                  });
                 }
-                void resolveTunnelConnectionMode(tunnel, false).then((mode) => {
-                  if (!mode) {
-                    return;
-                  }
-                  return startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, tunnel, server, mode, ctx.registrySync);
-                });
               }
             }
+            // Nothing more to gate for this attempt: stop watching whether or not tunnels were pending.
+            ptyRef?.releaseConnectFence();
           },
           onSessionClosed: (sessionId) => {
             ctx.core.unregisterSession(sessionId);
@@ -1549,6 +1713,7 @@ async function connectAndRunScript(ctx: CommandContext, arg?: unknown): Promise<
   try {
     await connectServer(ctx, server.id, {
       allowAutoFileExplorer: false,
+      retryCommand: "nexus.server.runWithScript",
       // REVIEW FINDING (P2) — an initial-connect failure (or an addressless
       // refusal) never produces a session, so the change-event subscription
       // above stays silent and, without this, the timer would sit out the full
@@ -1775,7 +1940,11 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           // point shows UI — see the lock's own contract — the info message
           // just after is fire-and-forget (`void`, never awaited) and stays
           // outside the lock regardless.
-          await configMutationLock.runExclusive(async () => {
+          // One server batch around the record + proxy-secret transaction: the housekeeping that
+          // deletes the endpoint a proxy edit leaves settles only when the whole transaction ends.
+          // If the secret write fails and the catch restores the record to the old proxy, that
+          // endpoint's password is still there (the batch ends with the old record in place).
+          await configMutationLock.runExclusive(() => ctx.core.runServerBatch(async () => {
             // REVIEW FINDING (P1) — the profile is re-resolved against LIVE
             // core state (the select was populated when the form opened and
             // the form can sit open indefinitely) and checked against what
@@ -1850,7 +2019,8 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             // Which submitted credentials are this user's own, and which the
             // stored record keeps — see preserveLinkedServerCredentials.
             const linked = preserveLinkedServerCredentials(existing, candidate, linkedProfile);
-            const proxySecretKey = proxyPasswordSecretKey(existing.id);
+            // The endpoint key this save will write (undefined: no password-bearing proxy).
+            const proxySecretKey = currentProxyPasswordSecretKey({ id: existing.id, proxy: formValuesToProxy(values) });
             // FINDING 1 (P2, baseline-before-vault-read review) — this
             // secret-capture await MUST run BEFORE the baseline snapshot
             // (liveRecord) below, and nothing may await between that
@@ -1868,7 +2038,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             // this await settles — and keeping everything from liveRecord
             // through addOrUpdateServer synchronous, with no further await
             // in between — closes that gap entirely.
-            const priorSecretValue = ctx.secretVault ? await ctx.secretVault.get(proxySecretKey) : undefined;
+            const priorSecretValue = ctx.secretVault && proxySecretKey !== undefined ? await ctx.secretVault.get(proxySecretKey) : undefined;
             // FINDING 1 (P2, edit-rollback-staleness review) — capture the
             // LIVE record via ctx.core.getServer(existing.id), not the
             // form-open `existing` snapshot, and do it here — synchronously,
@@ -2154,7 +2324,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
               // otherwise make sure the vault key ends up deleted too
               // (best-effort, same treatment as the no-prior-value case).
               const recordStillPresentAfterRollback = ctx.core.getServer(existing.id) !== undefined;
-              if (ctx.secretVault) {
+              if (ctx.secretVault && proxySecretKey !== undefined) {
                 try {
                   if (recordStillPresentAfterRollback && priorSecretValue !== undefined) {
                     await ctx.secretVault.store(proxySecretKey, priorSecretValue);
@@ -2189,7 +2359,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
               }
               throw new Error(`Could not store proxy credentials for "${existing.name}" — changes were not saved.`);
             }
-          });
+          }));
           if (ctx.core.isServerConnected(existing.id)) {
             void vscode.window.showInformationMessage(
               "Server profile updated. Existing sessions keep current connection settings until reconnect."
@@ -2352,7 +2522,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         }
         await teardownServerRuntime(ctx, server.id);
         if (ctx.secretVault) {
-          await deleteServerSecrets(ctx.secretVault, server.id);
+          await deleteServerSecrets(ctx.secretVault, server.id, { proxies: [server.proxy] });
         }
         await ctx.core.removeServer(server.id);
       });

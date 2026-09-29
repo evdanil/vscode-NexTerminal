@@ -65,7 +65,7 @@ import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { FolderTreeItem } from "../../src/ui/nexusTreeProvider";
 import { configMutationLock } from "../../src/services/configMutationLock";
-import { passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
+import { passphraseSecretKey, passwordSecretKey, legacyProxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
 import type { ServerConfig } from "../../src/models/config";
 import type { LocalServerConfig } from "../../src/models/localServer";
 
@@ -153,7 +153,7 @@ async function fixture(options: { gateTunnel?: string; rejectTunnel?: string } =
   for (const id of ["srv-lab", "srv-keep"]) {
     vault.set(passwordSecretKey(id), "pw");
     vault.set(passphraseSecretKey(id), "pp");
-    vault.set(proxyPasswordSecretKey(id), "proxy");
+    vault.set(legacyProxyPasswordSecretKey(id), "proxy");
   }
 
   const ctx = {
@@ -208,7 +208,7 @@ async function addSecondLabServer(f: Awaited<ReturnType<typeof fixture>>) {
   f.ctx.terminalsByServer.set("srv-lab2", new Set([terminal]));
   f.vault.set(passwordSecretKey("srv-lab2"), "pw2");
   f.vault.set(passphraseSecretKey("srv-lab2"), "pp2");
-  f.vault.set(proxyPasswordSecretKey("srv-lab2"), "proxy2");
+  f.vault.set(legacyProxyPasswordSecretKey("srv-lab2"), "proxy2");
   return terminal;
 }
 
@@ -309,11 +309,11 @@ describe("Remove Folder → Delete contents (#158)", () => {
     // ⊘ the pre-fix cascade: all three stayed in SecretStorage, orphaned.
     expect(f.vault.has(passwordSecretKey("srv-lab"))).toBe(false);
     expect(f.vault.has(passphraseSecretKey("srv-lab"))).toBe(false);
-    expect(f.vault.has(proxyPasswordSecretKey("srv-lab"))).toBe(false);
+    expect(f.vault.has(legacyProxyPasswordSecretKey("srv-lab"))).toBe(false);
     // ⊘ clearing by kind: the survivor keeps every credential.
     expect(f.vault.get(passwordSecretKey("srv-keep"))).toBe("pw");
     expect(f.vault.get(passphraseSecretKey("srv-keep"))).toBe("pp");
-    expect(f.vault.get(proxyPasswordSecretKey("srv-keep"))).toBe("proxy");
+    expect(f.vault.get(legacyProxyPasswordSecretKey("srv-keep"))).toBe("proxy");
   });
 
   it("says in the confirmation that Delete contents closes sessions and stops running Local Servers — naming Local Servers only when the folder has one", async () => {
@@ -433,7 +433,7 @@ describe("Remove Folder → Delete contents (#158)", () => {
     expect(f.calls).toContain("disconnectPool:srv-lab2");
     expect(f.vault.has(passwordSecretKey("srv-lab2"))).toBe(false);
     expect(f.vault.has(passphraseSecretKey("srv-lab2"))).toBe(false);
-    expect(f.vault.has(proxyPasswordSecretKey("srv-lab2"))).toBe(false);
+    expect(f.vault.has(legacyProxyPasswordSecretKey("srv-lab2"))).toBe(false);
     // The failed one's record is gone, so its credentials go too.
     expect(f.vault.has(passwordSecretKey("srv-lab"))).toBe(false);
 
@@ -462,7 +462,7 @@ describe("Remove Folder → Delete contents (#158)", () => {
       // stay saved for as long as its stop hangs.
       expect(f.vault.has(passwordSecretKey("srv-lab"))).toBe(false);
       expect(f.vault.has(passphraseSecretKey("srv-lab"))).toBe(false);
-      expect(f.vault.has(proxyPasswordSecretKey("srv-lab"))).toBe(false);
+      expect(f.vault.has(legacyProxyPasswordSecretKey("srv-lab"))).toBe(false);
     } finally {
       f.releaseTunnelStop();
       await removing;
@@ -571,7 +571,7 @@ describe("Remove Folder → Delete contents (#158)", () => {
     // restart with no password, passphrase or proxy password.
     expect(f.vault.get(passwordSecretKey("srv-lab"))).toBe("pw");
     expect(f.vault.get(passphraseSecretKey("srv-lab"))).toBe("pp");
-    expect(f.vault.get(proxyPasswordSecretKey("srv-lab"))).toBe("proxy");
+    expect(f.vault.get(legacyProxyPasswordSecretKey("srv-lab"))).toBe("proxy");
     // ⊘ skipping all cleanup on this failure: the record is out of memory
     // already, so a session left open would have no row to close it from.
     expect(f.core.getServer("srv-lab")).toBeUndefined();

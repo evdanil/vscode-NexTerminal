@@ -42,8 +42,9 @@ import { SftpService } from "./services/sftp/sftpService";
 import { SudoElevationBroker } from "./services/sftp/sudoElevationBroker";
 import { SilentAuthSshFactory, proxyPasswordSecretKey } from "./services/ssh/silentAuth";
 import { createSshTransportStack } from "./services/ssh/sshTransportStack";
-import { pooledConnectionParamsChanged } from "./services/ssh/pooledConnectionParams";
-import { watchSshPoolServerRemovals } from "./services/ssh/sshPoolServerRemovalObserver";
+import { KeySerializedSecretVault } from "./services/ssh/keySerializedSecretVault";
+import { migrateLegacyProxyPasswords } from "./services/ssh/proxyPasswordKeys";
+import { watchPoolInvalidationOnConfigMutation } from "./services/ssh/poolConfigInvalidation";
 import { Ssh2Connector } from "./services/ssh/ssh2Connector";
 import { VscodeHostKeyVerifier } from "./services/ssh/vscodeHostKeyVerifier";
 import { VscodePasswordPrompt } from "./services/ssh/vscodePasswordPrompt";
@@ -89,7 +90,7 @@ import { InventoryProviderRegistry } from "./services/inventory/providerRegistry
 import { createBuiltInProviders } from "./services/inventory/builtInProviders";
 import { statusPollSources } from "./services/inventory/statusPollSources";
 import { createNexusExtensionApi, type NexusExtensionApi } from "./services/inventory/publicApi";
-import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
+import { isTunnelStartCurrent, resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
 import { MacroTreeItem, MacroTreeProvider } from "./ui/macroTreeProvider";
 import { buildMacroProfileInputsFromSnapshot } from "./ui/macroProfileOptions";
 import { VscodeColorSchemeStorage } from "./storage/vscodeColorSchemeStorage";
@@ -381,7 +382,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     resolveLogRotationOptions,
     () => terminalOutputTraceEnabled
   );
-  const secretVault = new VscodeSecretVault(context);
+  // One shared vault whose writes are serialized per key, so this window's stores and deletes of a
+  // secret take effect in issue order (a fresh password queued after a stale delete survives).
+  const secretVault = new KeySerializedSecretVault(new VscodeSecretVault(context));
+  // Move legacy per-server proxy passwords to their endpoint keys before anything
+  // can connect (see proxyPasswordKeys.ts). Idempotent and cross-window safe.
+  await migrateLegacyProxyPasswords(secretVault, core.getSnapshot().servers);
 
   // B4 — the built-in providers are registered up front so they're available
   // to registerInventoryCommands (below) and to any third party registering
@@ -513,7 +519,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     // Per-connect proxy-password prompt (design doc §5.3; §11 OQ2) — realizes the
     // prompt §5.3 assumed for a template's authenticated socks5/http proxy, which
     // carries no secret. Fired by ProxySshFactory only for a username-bearing proxy
-    // with no stored `proxy-password-{id}`. Masked, never logged (matching the
+    // with no saved password for that endpoint (`proxyPasswordSecretKey(id, proxy)`). Masked, never logged (matching the
     // VscodePasswordPrompt discipline); a chosen save is deferred until proxy and
     // SSH authentication succeed. Returning undefined on cancel makes
     // ProxySshFactory abort every connect sharing that prompt before a handshake.
@@ -902,7 +908,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
         return; // User canceled — intentional
       }
       try {
-        await startTunnel(core, tunnelManager, pool, profile, server, connectionMode, registrySync);
+        await startTunnel(core, tunnelManager, pool, profile, server, connectionMode, registrySync, pool.multiplexingDefault);
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown error";
         vscode.window.showErrorMessage(`Failed to start tunnel "${profile.name}": ${message}`);
@@ -1268,12 +1274,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     applyActiveTerminalChange(focusChangeOptions, terminal ?? undefined);
   });
 
-  let previousServers = new Map<string, import("./models/config").ServerConfig>(
-    core.getSnapshot().servers.map(s => [s.id, s])
-  );
-  let previousAuthProfiles = new Map<string, import("./models/config").AuthProfile>(
-    core.getSnapshot().authProfiles.map((profile) => [profile.id, profile])
-  );
 
   // The two capability probes above answer from the LIVE registry each time a
   // row is built, and a third-party provider registers through the public API
@@ -1291,57 +1291,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const unsubscribeProviderRegistry = inventoryProviderRegistry.onDidChange(() => {
     syncViews();
   });
-  const unsubscribeRemovedSshServerPoolEntries = watchSshPoolServerRemovals(core, pool);
-  const unsubscribeCore = core.onDidChange((snapshot) => {
+  // The ONE source of pooled-connection invalidation: synchronous with each
+  // in-memory server / auth-profile mutation (initialize() included), ahead of
+  // persistence. Nothing invalidates the pool again on the change event below, on
+  // purpose (see poolConfigInvalidation.ts).
+  // Also housekeeping for endpoint-keyed proxy passwords: once a proxy change is
+  // persisted, the password saved for the endpoint the server left is deleted.
+  // Safety does not depend on it: a password is read only for the endpoint it was
+  // entered for (proxyPasswordKeys.ts).
+  const unsubscribeSyncPoolInvalidation = watchPoolInvalidationOnConfigMutation(core, pool, {
+    deleteEndpoint: (serverId, proxy, stillUnused) =>
+      secretVault.deleteIf(proxyPasswordSecretKey(serverId, proxy), stillUnused)
+  });
+  const unsubscribeCore = core.onDidChange(() => {
     syncViews();
-    for (const server of snapshot.servers) {
-      const prev = previousServers.get(server.id);
-      if (prev && pooledConnectionParamsChanged(prev, server)) {
-        pool.invalidate(server.id);
-        // Clear stale proxy password when proxy endpoint changes to prevent
-        // sending one proxy's credentials to a different proxy server.
-        if (JSON.stringify(prev.proxy) !== JSON.stringify(server.proxy)) {
-          void secretVault.delete(proxyPasswordSecretKey(server.id));
-        }
-      }
-    }
-    const changedAuthProfileIds = new Set<string>();
-    const currentAuthProfileIds = new Set(snapshot.authProfiles.map((profile) => profile.id));
-    for (const profile of snapshot.authProfiles) {
-      if (previousAuthProfiles.get(profile.id) !== profile) {
-        changedAuthProfileIds.add(profile.id);
-      }
-    }
-    for (const profileId of previousAuthProfiles.keys()) {
-      if (!currentAuthProfileIds.has(profileId)) {
-        changedAuthProfileIds.add(profileId);
-      }
-    }
-    if (changedAuthProfileIds.size > 0) {
-      const affectedServerIds = new Set<string>();
-      for (const server of snapshot.servers) {
-        if (server.authProfileId && changedAuthProfileIds.has(server.authProfileId)) {
-          affectedServerIds.add(server.id);
-        }
-      }
-      for (const server of previousServers.values()) {
-        if (server.authProfileId && changedAuthProfileIds.has(server.authProfileId)) {
-          affectedServerIds.add(server.id);
-        }
-      }
-      for (const serverId of affectedServerIds) {
-        pool.invalidate(serverId);
-      }
-    }
-    previousServers = new Map(snapshot.servers.map(s => [s.id, s]));
-    previousAuthProfiles = new Map(snapshot.authProfiles.map((profile) => [profile.id, profile]));
   });
   const unsubscribeTunnel = tunnelManager.onDidChange((event) => {
     if (event.type === "started") {
       // A start already in progress can emit after bulk removal. Keep that
       // orphan out of both the core snapshot and the cross-window registry;
       // startTunnel stops it as soon as the manager returns.
-      if (!core.getTunnel(event.tunnel.profileId) || !core.getServer(event.tunnel.serverId)) {
+      if (!isTunnelStartCurrent(core, event.tunnel.profileId, event.tunnel.serverId)) {
         return;
       }
       core.registerTunnel(event.tunnel);
@@ -1738,7 +1708,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     },
     {
       dispose: () => {
-        unsubscribeRemovedSshServerPoolEntries();
+        unsubscribeSyncPoolInvalidation();
         unsubscribeCore();
         unsubscribeProviderRegistry();
         const shutdownReason = "Nexus extension is shutting down. This session has been closed.";

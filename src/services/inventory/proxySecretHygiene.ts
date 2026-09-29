@@ -1,8 +1,20 @@
 import type { HttpConnectProxy, ProxyConfig, ServerConfig, Socks5Proxy } from "../../models/config";
 import type { SecretVault } from "../ssh/contracts";
-import { proxyPasswordSecretKey } from "../ssh/silentAuth";
+import { legacyProxyPasswordSecretKey } from "../ssh/silentAuth";
 
 /**
+ * CURRENT STATUS — LEGACY KEYS ONLY. A saved proxy password is now keyed per proxy
+ * ENDPOINT (`proxy-password-{id}-{endpointHash}`, ../ssh/proxyPasswordKeys.ts), so a
+ * password entered for one proxy can never be read for, or sent to, another: the
+ * cross-endpoint leak this module was written to close cannot happen any more, and
+ * an endpoint a server has left is cleaned up after persistence by
+ * poolConfigInvalidation.ts. What this module still touches is only the LEGACY
+ * per-server key `proxy-password-{id}` (installs before endpoint keys; activation
+ * migrates it and deletes it), so today it is inert belt-and-braces for a legacy key
+ * that reappears (an older window, an old backup restore). Everything below
+ * describes the pre-endpoint-key design and the rounds that shaped it; read
+ * `proxy-password-{id}` in it as the legacy per-server key.
+ *
  * PROXY-SECRET HYGIENE — the ONE shared rule for clearing a stale per-server
  * `proxy-password-{id}` secret when a proxy config write moves the server's
  * proxy identity AWAY from the authenticated SOCKS5/HTTP endpoint that secret
@@ -153,7 +165,7 @@ export async function clearStaleProxyPasswordSecretsBeforeApply(
     if (isSameAuthenticatedEndpoint(bp, ap)) {
       continue; // still the same authenticated endpoint — the stored password still applies
     }
-    const key = proxyPasswordSecretKey(id);
+    const key = legacyProxyPasswordSecretKey(id);
     let existing: string | undefined;
     try {
       existing = await vault.get(key);

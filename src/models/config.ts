@@ -24,7 +24,7 @@ export interface Socks5Proxy {
   host: string;
   port: number;
   username?: string;
-  // password stored in SecretStorage: "proxy-password-{serverId}"
+  // password stored in SecretStorage per endpoint: "proxy-password-{serverId}-{endpointHash}" (proxyPasswordKeys.ts)
 }
 
 export interface HttpConnectProxy {
@@ -32,7 +32,7 @@ export interface HttpConnectProxy {
   host: string;
   port: number;
   username?: string;
-  // password stored in SecretStorage: "proxy-password-{serverId}"
+  // password stored in SecretStorage per endpoint: "proxy-password-{serverId}-{endpointHash}" (proxyPasswordKeys.ts)
 }
 
 export type ProxyConfig = SshJumpProxy | Socks5Proxy | HttpConnectProxy;
@@ -851,6 +851,24 @@ export function cloneServerConfig(server: ServerConfig): ServerConfig {
   };
 }
 
+const TUNNEL_DEFAULT_ADDRESS = "127.0.0.1";
+
+/**
+ * The address fields exactly as TunnelManager applies them: `??`, no trimming,
+ * so an empty or whitespace-only value is passed through, not defaulted. Shared
+ * by the manager and `tunnelStartDescriptor` so the start fence cannot judge
+ * two values equal that the manager would treat differently.
+ */
+export function resolveTunnelLocalBindAddress(profile: Pick<TunnelProfile, "localBindAddress">): string {
+  return profile.localBindAddress ?? TUNNEL_DEFAULT_ADDRESS;
+}
+export function resolveTunnelRemoteBindAddress(profile: Pick<TunnelProfile, "remoteBindAddress">): string {
+  return profile.remoteBindAddress ?? TUNNEL_DEFAULT_ADDRESS;
+}
+export function resolveTunnelLocalTargetIP(profile: Pick<TunnelProfile, "localTargetIP">): string {
+  return profile.localTargetIP ?? TUNNEL_DEFAULT_ADDRESS;
+}
+
 export function proxyConfigsEqual(a: ProxyConfig | undefined, b: ProxyConfig | undefined): boolean {
   if (a === b) return true;
   if (!a || !b || a.type !== b.type) return false;
@@ -1441,6 +1459,18 @@ export function authProfileOwnedCredentials(profile: AuthProfile | undefined): A
     owned.keyPath = keyPath;
   }
   return owned;
+}
+
+/**
+ * The server as a connection actually sees it: the linked auth profile's
+ * supplied credential fields applied over the server's own (a missing profile,
+ * for example one deleted while the server is still linked, leaves the server
+ * as it is). Shared by SilentAuthSshFactory.resolveServer and the start
+ * descriptors so the two cannot disagree about the effective username, auth
+ * type and key path.
+ */
+export function applyAuthProfile(server: ServerConfig, profile: AuthProfile | undefined): ServerConfig {
+  return profile ? { ...server, ...authProfileOwnedCredentials(profile) } : server;
 }
 
 /**
