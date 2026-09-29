@@ -959,6 +959,25 @@ describe("SshConnectionPool", () => {
     next.dispose();
   });
 
+  it("rejects and opens nothing when the lease is disposed right after the fallback settles", async () => {
+    const pooledConn = createMockConnection();
+    pooledConn.openShell = vi.fn(async () => {
+      throw new Error("Not connected");
+    });
+    const standaloneConn = createMockConnection();
+    const f = createMockFactory([pooledConn, standaloneConn]);
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 5000 });
+
+    const lease = await p.connect(testServer);
+    // Releasing the pooled reference disposes the orphaned transport; disposing
+    // the lease from there lands between the fallback settling and openShell resuming.
+    pooledConn.dispose = vi.fn(() => lease.dispose());
+
+    await expect(lease.openShell()).rejects.toThrow("Cannot use a disposed SSH connection lease");
+    expect(standaloneConn.openShell).not.toHaveBeenCalled();
+    expect(standaloneConn.dispose).toHaveBeenCalledTimes(1);
+  });
+
   it("pool.dispose closes a transport soft-removed by fallback while another lease still holds it", async () => {
     const pooledConn = createMockConnection();
     let shellCalls = 0;

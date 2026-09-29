@@ -89,6 +89,9 @@ class PooledSshConnection implements SshConnection {
     } catch (err) {
       if (this.shouldAttemptFallback(err)) {
         const fb = await this.tryFallback(err);
+        // dispose() may have run between the fallback settling and this
+        // continuation; the fallback is closed then, so never open on it.
+        this.assertNotDisposed();
         if (fb) {
           return fb.openShell(ptyOptions);
         }
@@ -105,6 +108,9 @@ class PooledSshConnection implements SshConnection {
     } catch (err) {
       if (this.shouldAttemptFallback(err)) {
         const fb = await this.tryFallback(err);
+        // dispose() may have run between the fallback settling and this
+        // continuation; the fallback is closed then, so never open on it.
+        this.assertNotDisposed();
         if (fb) {
           return fb.openDirectTcp(remoteIP, remotePort);
         }
@@ -121,6 +127,9 @@ class PooledSshConnection implements SshConnection {
     } catch (err) {
       if (this.shouldAttemptFallback(err)) {
         const fb = await this.tryFallback(err);
+        // dispose() may have run between the fallback settling and this
+        // continuation; the fallback is closed then, so never open on it.
+        this.assertNotDisposed();
         if (fb) {
           return fb.openSftp();
         }
@@ -137,6 +146,9 @@ class PooledSshConnection implements SshConnection {
     } catch (err) {
       if (this.shouldAttemptFallback(err)) {
         const fb = await this.tryFallback(err);
+        // dispose() may have run between the fallback settling and this
+        // continuation; the fallback is closed then, so never open on it.
+        this.assertNotDisposed();
         if (fb) {
           return fb.exec(command);
         }
@@ -254,10 +266,11 @@ class PooledSshConnection implements SshConnection {
         return undefined;
       }
       this.fallbackConnection = fallback;
-      // Release the pooled reference — we no longer use it
-      this.releasePooledOnce();
-      // Future dispose should clean up the standalone connection
+      // Hand ownership to the fallback before releasing the pooled reference:
+      // releasing can run arbitrary close handlers that dispose this lease, and
+      // that dispose must then close the fallback rather than a stale release.
       this.onRelease = () => this.fallbackConnection?.dispose();
+      this.releasePooledOnce();
       return this.fallbackConnection;
     } catch {
       this.fallbackUsed = true; // prevent retries
