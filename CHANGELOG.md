@@ -1,10 +1,29 @@
 # Changelog
 
-## [2.8.300] — 2026-09-29
+## [2.8.303] — 2026-09-29
 
 ### Fixed
 
 - **Kitty keyboard, modifyOtherKeys, cursor-shape and save/restore-cursor sequences no longer leak into captured text.** The shared ANSI stripper now follows the ECMA-48 CSI grammar (`<` `=` `>` `?` parameter prefixes and intermediate bytes such as `ESC[2 q`) and removes two-byte forms like `ESC 7`, `ESC 8`, `ESC =` and `ESC >`, plus terminated DCS/APC/PM/SOS strings. Copy All, session transcripts and script `waitFor`/`expect` matching no longer show fragments such as `[>4;2m` or `[=5u`, so end-anchored prompt patterns match after vim, fish or neovim output, even when a sequence (including a terminal title) is split across two chunks: Copy All, transcripts, script output and macro trigger matching each hold an unfinished CSI escape (at most 64 characters) until the next chunk, and drop an unterminated OSC/DCS/APC/PM/SOS payload (Sixel, Kitty graphics, XTGETTCAP) across chunks until its terminator, giving up after 1 MiB. Private-prefix CSI ending in `m` (such as `ESC[>4;m`) is no longer mistaken for an SGR reset by the highlighter.
+
+## [2.8.302] — 2026-09-29
+
+### Fixed
+
+- **A malformed provider host no longer downgrades or re-points an already-synced server.** When a device's primary or alternate console endpoint host, or the endpoint for a server's saved protocol, was rejected (invisible character, embedded whitespace), an owned server was blanked to an addressless placeholder, or its alternate address was promoted into `host`, and the plan claimed the device had lost its console. The device is now skipped like a malformed port: the server is left untouched and the plan says `has an unusable host and was skipped`. New devices still arrive as addressless placeholders. The host normalizer's own warnings now travel as engine warnings instead of provider notices.
+
+## [2.8.301] — 2026-09-29
+
+### Fixed
+
+- **An ended or dropped SSH login no longer deletes a valid saved password or passphrase.** Closing or reconnecting a terminal while it connects, a connection that closes cleanly before login finishes, and a dismissed verification-code prompt were all read as a server rejection because their messages contain the word "authentication". They now carry their own error type, and a saved password is now cleared only when the server rejects it, and a saved key passphrase only when it fails to decrypt the key. A connection that drops mid-login is reported as a connection failure — in the terminal and in Test Connection and Copy Details — without a password prompt.
+- **Port-forwarding guide no longer says concurrent jump-host password prompts dismiss each other.** Since 2.8.280 they appear one after another.
+
+## [2.8.300] — 2026-09-29
+
+### Fixed
+
+- **Serial, Telnet and Smart Follow terminals reset interactive modes on disconnect, and a focus or mouse report no longer closes a dead tab.** The reset that SSH ran now lives in one shared sequence used by all four remote terminals (Smart Follow also repeats it before reattaching, ahead of the new device's output). It additionally turns off alternate-scroll (wheel-to-arrow-keys), bracketed paste and application cursor/keypad modes and shows the cursor, so a same-tab SSH reconnect no longer starts with a hidden cursor or wrapped pastes. The alternate screen is still left alone so the last frame stays readable. In a disconnected Serial or Telnet tab, terminal-generated focus, mouse and color-scheme reports and up/down arrow sequences (wheel scrolling in an alternate screen) are ignored; a real key still closes the tab.
 
 ## [2.8.299] — 2026-09-29
 

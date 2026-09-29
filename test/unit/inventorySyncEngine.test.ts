@@ -4761,12 +4761,13 @@ describe("normalizeInventoryTreeHosts", () => {
   it("trims a provider endpoint before an add and leaves the fetched tree untouched", () => {
     const endpoint = Object.freeze({ kind: "ssh", host: " 10.0.0.9 ", port: 22 });
     const tree = Object.freeze({ contractVersion: 1 as const, devices: [Object.freeze({ externalId: "d1", name: "Device", endpoints: [endpoint] })] });
-    const normalized = normalizeInventoryTreeHosts(tree);
+    const { tree: normalized, ...hostNormalization } = normalizeInventoryTreeHosts(tree);
 
     expect(endpoint.host).toBe(" 10.0.0.9 ");
     expect(normalized.devices[0].endpoints[0].host).toBe("10.0.0.9");
-    expect(normalized.warnings).toEqual([]);
-    const plan = computeSyncPlan({ source: makeSource(), tree: normalized, currentServers: [], now: 2 });
+    expect(normalized.warnings ?? []).toEqual([]);
+    expect(hostNormalization.warnings).toEqual([]);
+    const plan = computeSyncPlan({ source: makeSource(), tree: normalized, hostNormalization, currentServers: [], now: 2 });
     expect(plan.adds[0].host).toBe("10.0.0.9");
     expect(plan.adds[0].origin?.syncedHost).toBe("10.0.0.9");
   });
@@ -4776,10 +4777,10 @@ describe("normalizeInventoryTreeHosts", () => {
       host: "10.0.0.9",
       origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1, syncedHost: "10.0.0.1", syncedPort: 22 }
     });
-    const tree = normalizeInventoryTreeHosts(makeTree([
+    const { tree, ...hostNormalization } = normalizeInventoryTreeHosts(makeTree([
       makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.9 ", port: 22 }] })
     ]));
-    const plan = computeSyncPlan({ source: makeSource(), tree, currentServers: [before], now: 2 });
+    const plan = computeSyncPlan({ source: makeSource(), tree, hostNormalization, currentServers: [before], now: 2 });
 
     expect(plan.updates).toHaveLength(1);
     expect(plan.updates[0].after.host).toBe("10.0.0.9");
@@ -4799,14 +4800,17 @@ describe("normalizeInventoryTreeHosts", () => {
   ])(
     "drops an unusable endpoint instead of storing its host (%s)", (host) => {
       const tree: InventoryTree = { contractVersion: 1, devices: [{ externalId: "d1", name: "Device", endpoints: [{ kind: "ssh", host }] }] };
-      const normalized = normalizeInventoryTreeHosts(tree);
+      const { tree: normalized, ...hostNormalization } = normalizeInventoryTreeHosts(tree);
       expect(normalized.devices[0].endpoints).toEqual([]);
-      expect(normalized.warnings).toEqual([
+      // The engine's own sentence must not ride the provider-notice channel.
+      expect(normalized.warnings ?? []).toEqual([]);
+      expect(hostNormalization.warnings).toEqual([
         "Ignored an endpoint for Device because its host is empty or contains unsupported characters."
       ]);
-      const plan = computeSyncPlan({ source: makeSource(), tree: normalized, currentServers: [], now: 2 });
+      const plan = computeSyncPlan({ source: makeSource(), tree: normalized, hostNormalization, currentServers: [], now: 2 });
       expect(plan.adds[0].addressless).toBe(true);
       expect(plan.adds[0].host).toBe("");
+      expect(plan.warnings).toContain(hostNormalization.warnings[0]);
     }
   );
 
@@ -4817,10 +4821,124 @@ describe("normalizeInventoryTreeHosts", () => {
       devices: [{ externalId: "d1", name: "Device", endpoints: [{ kind: "ssh", host }] }]
     };
 
-    const normalized = normalizeInventoryTreeHosts(tree);
+    const { tree: normalized, warnings } = normalizeInventoryTreeHosts(tree);
 
     expect(normalized.devices[0].endpoints[0].host).toBe(host);
-    expect(normalized.warnings).toEqual([]);
+    expect(warnings).toEqual([]);
+  });
+
+  it("keeps provider notices in tree.warnings and routes the normalizer line through the engine channel", () => {
+    const tree: InventoryTree = {
+      contractVersion: 1,
+      warnings: ["provider notice"],
+      devices: [{ externalId: "d1", name: "Device", endpoints: [{ kind: "ssh", host: "10.0.0.9\u200b" }] }]
+    };
+    const { tree: normalized, ...hostNormalization } = normalizeInventoryTreeHosts(tree);
+    expect(normalized.warnings).toEqual(["provider notice"]);
+    const plan = computeSyncPlan({ source: makeSource(), tree: normalized, hostNormalization, currentServers: [], now: 2 });
+    expect(plan.warnings).toContain("Ignored an endpoint for Device because its host is empty or contains unsupported characters.");
+  });
+
+  it("skips an owned telnet server whose only endpoint host is malformed instead of downgrading it", () => {
+    const before = makeOwnedServer({
+      host: "10.0.0.1",
+      port: 23,
+      protocol: "telnet",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1, syncedHost: "10.0.0.1", syncedPort: 23, syncedProtocol: "telnet" }
+    });
+    const { tree, ...hostNormalization } = normalizeInventoryTreeHosts(
+      makeTree([makeDevice({ endpoints: [{ kind: "telnet", host: "10.0.0.1\u200b", port: 23 }] })])
+    );
+    const plan = computeSyncPlan({ source: makeSource(), tree, hostNormalization, currentServers: [before], now: 2 });
+
+    expect(plan.updates).toEqual([]);
+    expect(plan.prunes).toEqual([]);
+    expect(plan.warnings.join("\n")).not.toContain("lost its console address");
+    expect(plan.warnings).toContain('Device "core-sw-1" (device:1) has an unusable host and was skipped.');
+  });
+
+  it("does not promote the alternate address when an owned server's primary host is malformed", () => {
+    const before = makeOwnedServer({
+      host: "10.0.0.1",
+      altHost: "10.0.0.2",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1, syncedHost: "10.0.0.1", syncedPort: 22, syncedAltHost: "10.0.0.2" }
+    });
+    const { tree, ...hostNormalization } = normalizeInventoryTreeHosts(
+      makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.1\u200b", port: 22 }, { kind: "ssh", host: "10.0.0.2", port: 22 }] })])
+    );
+    const plan = computeSyncPlan({ source: makeSource(), tree, hostNormalization, currentServers: [before], now: 2 });
+
+    expect(plan.updates).toEqual([]);
+    expect(plan.warnings.join("\n")).toContain("has an unusable host and was skipped");
+    expect(plan.warnings.join("\n")).not.toContain("lost its console address");
+  });
+
+  it.each([
+    ["a malformed telnet endpoint behind a valid ssh one", [{ kind: "ssh", host: "10.0.0.7", port: 22 }, { kind: "telnet", host: "10.0.0.9\u200b", port: 23 }]],
+    ["a malformed third ssh endpoint", [{ kind: "ssh", host: "10.0.0.7", port: 22 }, { kind: "ssh", host: "10.0.0.8", port: 22 }, { kind: "ssh", host: "10.0.0.9\u200b", port: 22 }]]
+  ] as const)("does not skip an owned server over %s", (_label, endpoints) => {
+    const before = makeOwnedServer({
+      host: "10.0.0.1",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1, syncedHost: "10.0.0.1", syncedPort: 22 }
+    });
+    const { tree, ...hostNormalization } = normalizeInventoryTreeHosts(
+      makeTree([makeDevice({ endpoints: endpoints.map((e) => ({ ...e })) })])
+    );
+    const plan = computeSyncPlan({ source: makeSource(), tree, hostNormalization, currentServers: [before], now: 2 });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.host).toBe("10.0.0.7");
+    expect(plan.warnings.join("\n")).not.toContain("unusable host and was skipped");
+  });
+
+  it("skips an owned telnet-protocol server whose telnet host is malformed even though a valid ssh endpoint exists", () => {
+    const before = makeOwnedServer({
+      host: "10.0.0.1",
+      port: 23,
+      protocol: "telnet",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1, syncedHost: "10.0.0.1", syncedPort: 23, syncedProtocol: "ssh" }
+    });
+    const { tree, ...hostNormalization } = normalizeInventoryTreeHosts(
+      makeTree([makeDevice({ name: "renamed-sw", endpoints: [{ kind: "ssh", host: "10.0.0.7", port: 22 }, { kind: "telnet", host: "10.0.0.9\u200b", port: 23 }] })])
+    );
+    const plan = computeSyncPlan({ source: makeSource(), tree, hostNormalization, currentServers: [before], now: 2 });
+
+    expect(plan.updates).toEqual([]);
+    expect(plan.warnings).toContain('Device "renamed-sw" (device:1) has an unusable host and was skipped.');
+  });
+
+  it("does not let a malformed later duplicate device ID condemn the valid first row", () => {
+    const before = makeOwnedServer({
+      host: "10.0.0.1",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1, syncedHost: "10.0.0.1", syncedPort: 22 }
+    });
+    const { tree, ...hostNormalization } = normalizeInventoryTreeHosts(
+      makeTree([
+        makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.7", port: 22 }] }),
+        makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.9\u200b", port: 22 }] })
+      ])
+    );
+    const plan = computeSyncPlan({ source: makeSource(), tree, hostNormalization, currentServers: [before], now: 2 });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.host).toBe("10.0.0.7");
+    expect(plan.warnings.join("\n")).toContain("Duplicate device ID");
+    expect(plan.warnings.join("\n")).not.toContain("unusable host and was skipped");
+  });
+
+  it.each(["redfish", "ipmi-sol"] as const)("does not skip an owned server over a malformed %s host", (kind) => {
+    const before = makeOwnedServer({
+      host: "10.0.0.1",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1, syncedHost: "10.0.0.1", syncedPort: 22 }
+    });
+    const { tree, ...hostNormalization } = normalizeInventoryTreeHosts(
+      makeTree([makeDevice({ endpoints: [{ kind: "ssh", host: "10.0.0.7", port: 22 }, { kind, host: "10.0.1.1\u200b" }] })])
+    );
+    const plan = computeSyncPlan({ source: makeSource(), tree, hostNormalization, currentServers: [before], now: 2 });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.host).toBe("10.0.0.7");
+    expect(plan.warnings.join("\n")).not.toContain("unusable host and was skipped");
   });
 
   it("keeps grapheme joiners, combining marks, and tag characters in provider prose", () => {

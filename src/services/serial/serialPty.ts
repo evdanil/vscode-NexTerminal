@@ -3,7 +3,7 @@ import type { SessionLogger } from "../../logging/terminalLogger";
 import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
 import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
-import { CLEAR_VISIBLE_SCREEN } from "../terminal/terminalEscapes";
+import { CLEAR_VISIBLE_SCREEN, RESET_INTERACTIVE_MODES, isTerminalGeneratedReport } from "../terminal/terminalEscapes";
 import { PtyObserverHub } from "../terminal/ptyObserverHub";
 import { toParityCode } from "../../utils/helpers";
 import type { OpenPortParams } from "./protocol";
@@ -120,6 +120,10 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
       return;
     }
     if (this.failed || this.disconnected) {
+      // Reports the terminal generates itself (focus, mouse) are not a key press.
+      if (isTerminalGeneratedReport(data)) {
+        return;
+      }
       this.dispose();
       return;
     }
@@ -150,6 +154,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.transcript?.flush?.();
     this.releaseSubscriptions();
     this.activityIndicator = false;
+    this.writeEmitter.fire(RESET_INTERACTIVE_MODES);
     this.nameEmitter.fire(`${this.baseName} [Disconnected]`);
     this.writeEmitter.fire(`\r\n\r\n[Nexus Serial] ${reason}\r\n`);
     this.writeEmitter.fire("[Nexus Serial] Close this terminal and reopen the serial profile to reconnect.\r\n");
@@ -217,6 +222,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     }
 
     this.activityIndicator = false;
+    this.writeEmitter.fire(RESET_INTERACTIVE_MODES);
     this.nameEmitter.fire(`${this.baseName} [Disconnected]`);
     this.writeEmitter.fire(`\r\n\r\n[Nexus Serial] Port disconnected.\r\n`);
     this.writeEmitter.fire("[Nexus Serial] Press any key to close this terminal.\r\n");

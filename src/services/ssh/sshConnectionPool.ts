@@ -12,6 +12,7 @@ import type {
 } from "./contracts";
 import { hasContextAwareConnect } from "./contracts";
 import { isStaleConnectionError, shouldFallbackForChannelLimit } from "./channelErrors";
+import { AuthNotJudgedError } from "./authErrors";
 
 export interface PoolOptions {
   enabled: boolean;
@@ -344,7 +345,7 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
       throw new Error("Connection pool is disposed");
     }
     if (context?.isActive?.() === false) {
-      throw new Error("SSH connection attempt ended before authentication completed");
+      throw new AuthNotJudgedError("SSH connection attempt ended before authentication completed");
     }
     const multiplexingEnabled = server.multiplexing ?? this.options.enabled;
     if (!multiplexingEnabled) {
@@ -353,7 +354,7 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
 
     const entry = await this.getOrCreateEntry(server, context);
     if (context?.isActive?.() === false) {
-      throw new Error("SSH connection attempt ended before authentication completed");
+      throw new AuthNotJudgedError("SSH connection attempt ended before authentication completed");
     }
     this.cancelIdleTimer(entry);
     entry.refCount++;
@@ -531,7 +532,7 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
 
     if (context?.isActive?.() === false) {
       connection.dispose();
-      throw new Error("SSH connection attempt ended before authentication completed");
+      throw new AuthNotJudgedError("SSH connection attempt ended before authentication completed");
     }
     if (this.disposed) {
       connection.dispose();

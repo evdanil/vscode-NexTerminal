@@ -119,6 +119,28 @@ export interface InventoryTree {
   status?: InventoryStatusReport;
 }
 
+// U+2800 renders as a blank in many fonts but is a symbol, not whitespace or
+// Default_Ignorable_Code_Point; it needs an explicit host-only exclusion.
+const INVENTORY_HOST_INVISIBLE_CHAR_RE = /[\p{Default_Ignorable_Code_Point}\u2800]/u;
+
+/**
+ * Normalize an inventory endpoint host and reject values that cannot be safely
+ * matched as an address. Provider status reports and tree endpoints use this
+ * same boundary before their values can reach a persisted server.
+ */
+export function normalizeInventoryEndpointHost(raw: string): string | undefined {
+  const host = raw.trim();
+  if (
+    host === "" ||
+    /\s/u.test(host) ||
+    INVENTORY_HOST_INVISIBLE_CHAR_RE.test(host) ||
+    flattenProviderText(host) !== host
+  ) {
+    return undefined;
+  }
+  return host;
+}
+
 /**
  * LIVE STATUS (Phase 2) — one device's running/stopped state, as reported by a
  * provider's optional `fetchStatus`. Deliberately smaller than a full
@@ -656,28 +678,6 @@ export function resolveProviderInstanceKey(
  * update, since the tree would then show some nodes stale and some fresh with no
  * way to tell which.
  */
-// U+2800 renders as a blank in many fonts but is a symbol, not whitespace or
-// Default_Ignorable_Code_Point; it needs an explicit host-only exclusion.
-const INVENTORY_HOST_INVISIBLE_CHAR_RE = /[\p{Default_Ignorable_Code_Point}\u2800]/u;
-
-/**
- * Normalize an inventory endpoint host and reject values that cannot be safely
- * matched as an address. Provider status reports and tree endpoints use this
- * same boundary before their values can reach a persisted server.
- */
-export function normalizeInventoryEndpointHost(raw: string): string | undefined {
-  const host = raw.trim();
-  if (
-    host === "" ||
-    /\s/u.test(host) ||
-    INVENTORY_HOST_INVISIBLE_CHAR_RE.test(host) ||
-    flattenProviderText(host) !== host
-  ) {
-    return undefined;
-  }
-  return host;
-}
-
 export function validateInventoryStatusReport(raw: unknown): InventoryStatusReport | undefined {
   if (typeof raw !== "object" || raw === null) {
     return undefined;
