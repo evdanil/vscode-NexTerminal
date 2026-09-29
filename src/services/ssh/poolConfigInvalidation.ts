@@ -1,5 +1,5 @@
 import type { NexusCore } from "../../core/nexusCore";
-import { authProfileOwnedCredentials, type AuthProfile } from "../../models/config";
+import { authProfileOwnedCredentials, proxyConfigsEqual, type AuthProfile } from "../../models/config";
 import { pooledConnectionParamsChanged, ridersFromIndex } from "./pooledConnectionParams";
 
 /** What a linked profile contributes to a connection; a rename or an equal reload contributes nothing. */
@@ -38,7 +38,13 @@ function authProfileConnectionChanged(prev: AuthProfile | undefined, next: AuthP
  */
 export function watchPoolInvalidationOnConfigMutation(
   core: Pick<NexusCore, "onDidMutateConnectionConfig" | "getSnapshot">,
-  pool: { invalidate(serverId: string): void }
+  pool: { invalidate(serverId: string): void },
+  /**
+   * Called synchronously when a server's proxy endpoint changes, so the
+   * endpoint-specific saved proxy password can be made unusable before any
+   * connect that starts ahead of the persistence await reads it.
+   */
+  onProxyChanged?: (serverId: string) => void
 ): () => void {
   const jumpOf = new Map<string, string>();
   const ridersOf = new Map<string, Set<string>>();
@@ -79,6 +85,9 @@ export function watchPoolInvalidationOnConfigMutation(
     const invalidated = new Set<string>();
     if (mutation.kind === "server") {
       indexServer(mutation.id, mutation.next);
+      if (mutation.prev && mutation.next && !proxyConfigsEqual(mutation.prev.proxy, mutation.next.proxy)) {
+        onProxyChanged?.(mutation.id);
+      }
       if (mutation.next === undefined || (mutation.prev && pooledConnectionParamsChanged(mutation.prev, mutation.next))) {
         invalidated.add(mutation.id);
       }

@@ -8,6 +8,6 @@ describe("pool invalidation has a single source", () => {
   it("extension.ts does not invalidate the pool on the change event (a second bump would discard a reconnect's handshake)", () => {
     expect(extension).not.toContain("pool.invalidate(");
     expect(extension).not.toContain("watchSshPoolServerRemovals");
-    expect(extension).toContain("watchPoolInvalidationOnConfigMutation(core, pool)");
+    expect(extension).toMatch(/watchPoolInvalidationOnConfigMutation\(\s*core,\s*pool/);
   });
 });

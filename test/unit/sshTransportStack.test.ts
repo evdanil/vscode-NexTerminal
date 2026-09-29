@@ -1022,9 +1022,11 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
     release();
     await persisting;
 
-    // Nothing invalidates again once persistence resolves and the change event fires,
-    // so the reconnect's entry stays installed and the next acquire reuses it
-    // instead of triggering a third handshake (and a second password prompt).
+    // Regression guard for the pool side: with only the mutation hook wired, nothing
+    // invalidates again once persistence resolves, so the reconnect's entry stays
+    // installed and the next acquire reuses it instead of a third handshake. (It
+    // does not reproduce the removed emit-time bump in extension.ts; that absence is
+    // pinned by poolInvalidationSingleSource.test.ts.)
     expect(invalidate.mock.calls.length).toBe(invalidationsBeforeSave);
     const third = await stack.pool.connect(target);
     cleanups.push(() => third.dispose());

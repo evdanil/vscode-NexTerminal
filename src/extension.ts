@@ -42,6 +42,7 @@ import { SftpService } from "./services/sftp/sftpService";
 import { SudoElevationBroker } from "./services/sftp/sudoElevationBroker";
 import { SilentAuthSshFactory, proxyPasswordSecretKey } from "./services/ssh/silentAuth";
 import { createSshTransportStack } from "./services/ssh/sshTransportStack";
+import { TombstonedSecretVault } from "./services/ssh/tombstonedSecretVault";
 import { watchPoolInvalidationOnConfigMutation } from "./services/ssh/poolConfigInvalidation";
 import { Ssh2Connector } from "./services/ssh/ssh2Connector";
 import { VscodeHostKeyVerifier } from "./services/ssh/vscodeHostKeyVerifier";
@@ -380,7 +381,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     resolveLogRotationOptions,
     () => terminalOutputTraceEnabled
   );
-  const secretVault = new VscodeSecretVault(context);
+  // Every consumer shares one vault so a stale proxy password can be tombstoned
+  // synchronously (see TombstonedSecretVault) and a password stored by the server
+  // editor for the NEW endpoint clears that tombstone.
+  const secretVault = new TombstonedSecretVault(new VscodeSecretVault(context));
 
   // B4 — the built-in providers are registered up front so they're available
   // to registerInventoryCommands (below) and to any third party registering
@@ -1267,9 +1271,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     applyActiveTerminalChange(focusChangeOptions, terminal ?? undefined);
   });
 
-  let previousServers = new Map<string, import("./models/config").ServerConfig>(
-    core.getSnapshot().servers.map(s => [s.id, s])
-  );
 
   // The two capability probes above answer from the LIVE registry each time a
   // row is built, and a third-party provider registers through the public API
@@ -1291,18 +1292,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // in-memory server / auth-profile mutation (initialize() included), ahead of
   // persistence. Nothing invalidates the pool again on the change event below, on
   // purpose (see poolConfigInvalidation.ts).
-  const unsubscribeSyncPoolInvalidation = watchPoolInvalidationOnConfigMutation(core, pool);
-  const unsubscribeCore = core.onDidChange((snapshot) => {
-    syncViews();
-    for (const server of snapshot.servers) {
-      const prev = previousServers.get(server.id);
-      // Clear stale proxy password when proxy endpoint changes to prevent
-      // sending one proxy's credentials to a different proxy server.
-      if (prev && JSON.stringify(prev.proxy) !== JSON.stringify(server.proxy)) {
-        void secretVault.delete(proxyPasswordSecretKey(server.id));
-      }
+  // Also the one place that drops the endpoint-specific saved proxy password when a
+  // proxy endpoint changes: tombstoned synchronously (a connect ahead of the save
+  // must not send one proxy's credentials to another), then deleted.
+  const unsubscribeSyncPoolInvalidation = watchPoolInvalidationOnConfigMutation(
+    core,
+    pool,
+    (serverId) => {
+      void secretVault.markStale(proxyPasswordSecretKey(serverId)).catch((error) => {
+        console.error("[Nexus] Could not delete the stale proxy password:", error);
+      });
     }
-    previousServers = new Map(snapshot.servers.map(s => [s.id, s]));
+  );
+  const unsubscribeCore = core.onDidChange(() => {
+    syncViews();
   });
   const unsubscribeTunnel = tunnelManager.onDidChange((event) => {
     if (event.type === "started") {
