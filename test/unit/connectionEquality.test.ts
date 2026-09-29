@@ -73,3 +73,34 @@ describe("tunnelConnectionEqual — explicit default vs absent", () => {
     expect(tunnelConnectionEqual(tunnel, { ...tunnel, notes: "n", name: "x", browserUrl: "u", autoStart: true })).toBe(true);
   });
 });
+
+describe("tunnelConnectionEqual — only the fields the resolved type uses", () => {
+  const dynamic: TunnelProfile = { ...tunnel, tunnelType: "dynamic", remoteIP: "0.0.0.0", remotePort: 0 };
+  const reverse: TunnelProfile = {
+    ...tunnel, tunnelType: "reverse", remoteIP: "127.0.0.1", remoteBindAddress: "127.0.0.1",
+    localTargetIP: "127.0.0.1", connectionMode: "shared"
+  };
+
+  it("ignores a noncanonical remoteIP/remotePort on a dynamic tunnel", () => {
+    expect(tunnelConnectionEqual({ ...dynamic, remoteIP: "10.9.9.9", remotePort: 443 }, dynamic)).toBe(true);
+  });
+  it("detects a real dynamic change (localPort, localBindAddress)", () => {
+    expect(tunnelConnectionEqual(dynamic, { ...dynamic, localPort: 5 })).toBe(false);
+    expect(tunnelConnectionEqual(dynamic, { ...dynamic, localBindAddress: "0.0.0.0" })).toBe(false);
+  });
+
+  it("ignores remoteIP and a stored mode on a reverse tunnel", () => {
+    expect(tunnelConnectionEqual({ ...reverse, remoteIP: "10.9.9.9", connectionMode: undefined }, reverse)).toBe(true);
+  });
+  it("detects a real reverse change (remotePort, remoteBindAddress, localTargetIP)", () => {
+    expect(tunnelConnectionEqual(reverse, { ...reverse, remotePort: 9 })).toBe(false);
+    expect(tunnelConnectionEqual(reverse, { ...reverse, remoteBindAddress: "0.0.0.0" })).toBe(false);
+    expect(tunnelConnectionEqual(reverse, { ...reverse, localTargetIP: "10.0.0.5" })).toBe(false);
+  });
+
+  it("ignores reverse-only address fields on a local tunnel but not its remote target", () => {
+    expect(tunnelConnectionEqual(tunnel, { ...tunnel, remoteBindAddress: "0.0.0.0", localTargetIP: "10.1.1.1" })).toBe(true);
+    expect(tunnelConnectionEqual(tunnel, { ...tunnel, remoteIP: "10.0.0.2" })).toBe(false);
+    expect(tunnelConnectionEqual(tunnel, { ...tunnel, remotePort: 3 })).toBe(false);
+  });
+});

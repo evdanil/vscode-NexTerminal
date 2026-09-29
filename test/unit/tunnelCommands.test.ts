@@ -1058,4 +1058,24 @@ describe("startTunnel — profile removed while start is pending", () => {
     expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexus.tunnel.start", expect.anything());
     expect(mockShowWarningMessage).toHaveBeenLastCalledWith(expect.stringContaining("was not retried"));
   });
+
+  it("a coalesced second start does not take over the first start's fence or stop its tunnel", async () => {
+    const { core, profile, server: first } = await fixture();
+    const second: ServerConfig = { ...server, id: "srv-2", name: "Second" };
+    await core.addOrUpdateServer(second);
+    const starting = deferred<ActiveTunnel>();
+    // Mirrors TunnelManager.start: the second call returns the first's promise.
+    const start = vi.fn(() => starting.promise);
+    const stop = vi.fn(async () => {});
+    const manager = { start, stop } as never;
+    const run1 = startTunnel(core, manager, { connect: vi.fn() } as never, profile, first, "isolated");
+    const run2 = startTunnel(core, manager, { connect: vi.fn() } as never, profile, core.getServer("srv-2")!, "isolated");
+
+    await core.addOrUpdateServer({ ...second, host: "10.8.8.8" });
+    expect(isTunnelStartCurrent(core, "t1", "srv-1")).toBe(true);
+    starting.resolve(makeActiveTunnel("t1"));
+    await Promise.all([run1, run2]);
+
+    expect(stop).not.toHaveBeenCalled();
+  });
 });

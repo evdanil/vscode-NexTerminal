@@ -892,24 +892,34 @@ export function serverConnectionEqual(a: ServerConfig, b: ServerConfig): boolean
 /** The tunnel fields that decide what is listened on and where it forwards; notes, name and browser URL are excluded. */
 export function tunnelConnectionEqual(a: TunnelProfile, b: TunnelProfile): boolean {
   const type = resolveTunnelType(a);
-  // Reverse tunnels are always shared (the editor forces it), so an absent mode
-  // on a reverse tunnel equals an explicit "shared".
-  const mode = (t: TunnelProfile): TunnelConnectionMode | undefined =>
-    resolveTunnelType(t) === "reverse" ? "shared" : t.connectionMode;
-  // 127.0.0.1 is the editor's default for all three addresses and is written
-  // as absent (local bind) or explicit (reverse) depending on the type.
+  if (type !== resolveTunnelType(b) || a.id !== b.id || a.localPort !== b.localPort) {
+    return false;
+  }
+  // 127.0.0.1 is the editor's default for the address fields and is stored as
+  // absent (local bind) or explicit (reverse) depending on the type.
   const addr = (value: string | undefined): string => value?.trim() || "127.0.0.1";
-  return (
-    a.id === b.id &&
-    a.localPort === b.localPort &&
-    a.remoteIP === b.remoteIP &&
-    a.remotePort === b.remotePort &&
-    type === resolveTunnelType(b) &&
-    mode(a) === mode(b) &&
-    addr(a.remoteBindAddress) === addr(b.remoteBindAddress) &&
-    addr(a.localTargetIP) === addr(b.localTargetIP) &&
-    addr(a.localBindAddress) === addr(b.localBindAddress)
-  );
+  // Only the fields TunnelManager reads for the resolved type are compared; the
+  // editor canonicalizes the rest (dynamic: remoteIP "0.0.0.0" / remotePort 0;
+  // reverse: remoteIP mirrors remoteBindAddress), so an unchanged Save must not
+  // register them as changes.
+  switch (type) {
+    case "dynamic":
+      return addr(a.localBindAddress) === addr(b.localBindAddress) && (a.connectionMode === b.connectionMode);
+    case "reverse":
+      // Reverse tunnels are always shared, so the stored mode is irrelevant.
+      return (
+        a.remotePort === b.remotePort &&
+        addr(a.remoteBindAddress) === addr(b.remoteBindAddress) &&
+        addr(a.localTargetIP) === addr(b.localTargetIP)
+      );
+    default:
+      return (
+        a.remoteIP === b.remoteIP &&
+        a.remotePort === b.remotePort &&
+        addr(a.localBindAddress) === addr(b.localBindAddress) &&
+        a.connectionMode === b.connectionMode
+      );
+  }
 }
 
 export function proxyConfigsEqual(a: ProxyConfig | undefined, b: ProxyConfig | undefined): boolean {

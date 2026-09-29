@@ -310,16 +310,24 @@ export async function startTunnel(
     // The manager emits "started" from inside start(), before it returns, so
     // the extension.ts listener consults this fence to keep a start that is
     // about to be stopped out of the registry.
-    pendingStartFences.set(profile.id, stillCurrent);
+    // TunnelManager.start coalesces an overlapping start of the same profile
+    // onto the first attempt's promise. Only the caller that actually began the
+    // attempt owns its fence and its stop-if-stale decision; a coalesced caller
+    // just observes the first attempt's outcome, so an edit to ITS target must
+    // not reject or stop the first caller's valid tunnel.
+    const ownsAttempt = !pendingStartFences.has(profile.id);
+    if (ownsAttempt) {
+      pendingStartFences.set(profile.id, stillCurrent);
+    }
     let active;
     try {
       active = await tunnelManager.start(profile, server, { connectionMode, beforeReverseForward });
     } finally {
-      if (pendingStartFences.get(profile.id) === stillCurrent) {
+      if (ownsAttempt && pendingStartFences.get(profile.id) === stillCurrent) {
         pendingStartFences.delete(profile.id);
       }
     }
-    if (!stillCurrent()) {
+    if (ownsAttempt && !stillCurrent()) {
       await tunnelManager.stop(active.id);
       reportCancelled();
     }
