@@ -41,15 +41,19 @@
 // incomplete CSI. That is deliberately out of scope of the latency work: this
 // regex is also the stripper for transcripts and capture buffers, where a
 // never-terminated OSC would then stop stripping anything after it.
+// Byte classes are spelled as explicit hex ranges (ECMA-48): \x30-\x3F CSI
+// parameter bytes, \x20-\x2F intermediate bytes, \x40-\x7E CSI final bytes,
+// and \x30-\x5A \x5C \x5E-\x7E the two-byte ESC finals (0x30-0x7E without
+// `[` 0x5B and `]` 0x5D, which introduce CSI and OSC).
 export function createAnsiRegex(): RegExp {
-  return /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[PX^_][^\x07\x1b]*\x1b\\|[ -/]*[0-Z\\^-~])/g;
+  return /\x1b(?:\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[PX^_][^\x07\x1b]*\x1b\\|[\x20-\x2F]*[\x30-\x5A\x5C\x5E-\x7E])/g;
 }
 
 // Longest trailing escape prefix a chunk-wise stripper will hold back. Real
 // CSI/nF sequences and terminal titles are far shorter; the cap keeps a stray
 // ESC from retaining data indefinitely.
 const MAX_HELD_ESCAPE = 64;
-const INCOMPLETE_ESCAPE_TAIL_RE = /\x1b(?:\[[0-?]*[ -/]*|[ -/]+)?$/;
+const INCOMPLETE_ESCAPE_TAIL_RE = /\x1b(?:\[[\x30-\x3F]*[\x20-\x2F]*|[\x20-\x2F]+)?$/;
 // An OSC/DCS/APC/PM/SOS string still waiting for its terminator; a trailing
 // ESC may be the first half of ST (`ESC \`).
 const INCOMPLETE_STRING_TAIL_RE = /\x1b[\]PX^_][^\x07\x1b]*\x1b?$/;

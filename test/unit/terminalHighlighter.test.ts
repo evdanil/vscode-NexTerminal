@@ -775,7 +775,7 @@ describe("TerminalHighlighter", () => {
     stream.push(payload);
     expect(emitted.length).toBeGreaterThan(0);
     for (const chunk of emitted) {
-      expect(chunk).not.toMatch(/\x1b\[[0-?]*[ -/]*$/);
+      expect(chunk).not.toMatch(/\x1b\[[\x30-\x3F]*[\x20-\x2F]*$/);
     }
     stream.flush();
     expect(emitted.join("")).toContain(seq);
