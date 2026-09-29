@@ -1,10 +1,19 @@
 # Changelog
 
-## [2.8.305] — 2026-09-29
+## [2.8.306] — 2026-09-29
 
 ### Fixed
 
 - **SSH, Telnet and tunnel starts are no longer cancelled by an unchanged save or Refresh.** A pending Connect or Start Tunnel compared the profile by object identity, so saving a server or tunnel without changes (or refreshing after another window wrote settings) silently cancelled it. Starts now compare only the fields the connection uses (address, port, protocol, credentials, proxy and the like; a folder rename or notes edit does not count), like Serial and Local Shell. A real change or removal cancels with a visible notice. For a Connect the check runs once, just before the terminal opens; once the terminal is open (including during a password or verification prompt, or the Telnet dial) the session keeps the settings it started with and an edit applies at the next connect. A tunnel start is checked before the tunnel manager starts and again when it returns, so an edit during the registry check, the shared-mode login or the tunnel handshake stops the tunnel once the start returns. The notice offers **Retry** on the current settings when the profile still exists (Retry repeats the original action, such as Connect and Run Script; a macro's IPMI-gateway connect offers no Retry and says to re-run the macro; and a tunnel retry targets the same server, or reports it removed rather than starting elsewhere), and a cancelled tunnel start no longer registers briefly before being stopped. The auto-start tunnel sweep now starts tunnels with the config the session connected with and, if the server's connection settings changed since the session opened, skips them with a warning to close and reopen the terminal; a rename or other non-connection edit no longer blocks auto-start on an **R** reconnect.
+
+## [2.8.305] — 2026-09-29
+
+### Fixed
+
+- **A share no longer hands over a shell command.** Custom Local Shell profiles (their shell path and arguments run the moment the profile opens) are left out of Export for Sharing and skipped by a share import, and both messages count them and say to use Add Local Shell Profile. A VS Code-profile one still travels, without a shell path or arguments.
+- **Shared tunnels no longer act on their own.** A tunnel from a share arrives with Auto-start off, no listener address (loopback until you choose one in Edit), a loopback-only remote bind address and no login in its browser URL, on export and on import; the import message counts the tunnels it changed.
+- **Delete All Data clears Terminal Appearance and the Local Shell auto-trigger acknowledgement.** Imported colour schemes, the selected scheme and the font choice are removed and an open panel refreshes; it also clears remembered view state and dismissed hints (collapsed folders, follow-terminal-directory, macro hint), other open windows that observe the reset (a reset-generation counter) reload instead of writing stale collapsed-folder or appearance data back at their next action; a write already in flight, or one that starts before the reset reaches that window, can still land until it is reloaded. Follow Terminal Directory stays on in memory there until toggled or reloaded. The confirmation and completion message both say what is kept: the terminal colours and font already written to VS Code user settings, trusted host keys, scripts and logs stay.
+- **A duplicate id in a share no longer overwrites a record.** The first server or auth profile under an id that passes validation lands; a later one in the same file is skipped and counted instead of replacing it and being counted as imported.
 
 ## [2.8.304] — 2026-09-29
 

@@ -15,6 +15,10 @@ Use a launchable VS Code terminal profile from the profile dropdown, including c
 
 If the profile is removed or changed while a confirmation prompt is open, Nexus cancels that pending launch. A notice explains why and offers **Retry** when the profile still exists.
 
+## Sharing
+
+A custom Local Shell profile is never included in **Export for Sharing** and is skipped by a share import, because its shell path and arguments are a command that runs as soon as the profile opens. Add your own with **Add Local Shell Profile**. A profile that uses a VS Code terminal profile does travel, without a working directory, startup command, environment or any shell path. Backups keep every profile.
+
 ## Macros and Scripts in Local Shells
 
 Manual macros, auto-trigger macros, and Nexus scripts work with Local Shell sessions.

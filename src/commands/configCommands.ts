@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { isIP } from "node:net";
 import { chmod } from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
@@ -8,6 +9,8 @@ import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials, cloneTempla
 import type { InventorySourceConfig, InventorySourceValues, TemplateRule } from "../models/inventory";
 import { inventorySecretKey } from "../models/inventory";
 import type { DeviceTemplateProfile, TemplateField } from "../models/deviceTemplate";
+import { RESET_CLEARED_BY_STORE_GLOBAL_STATE_KEYS, RESET_CLEARED_GLOBAL_STATE_KEYS } from "../storage/globalStateKeys";
+import { bumpResetGeneration } from "../storage/resetGeneration";
 import type { LocalServerConfig } from "../models/localServer";
 import type { DhcpConfigProfile, TftpConfigProfile } from "../models/networkServerProfile";
 import type { SavedFilterDefinition } from "../models/savedFilter";
@@ -233,6 +236,23 @@ export interface ConfigRuntimeHooks {
   activeTunnelIdForProfile(profileId: string): string | undefined;
   closeSerialProfileTerminals(profileId: string): void;
   closeLocalShellProfileTerminals(profileId: string): void;
+  /**
+   * Delete All Data: forget the Terminal Appearance colour schemes, the active
+   * selection and the font choice held by the running `ColorSchemeService`, and
+   * refresh an open panel. The stored keys are cleared by the command itself.
+   */
+  resetTerminalAppearance?(): Promise<void>;
+  /**
+   * Delete All Data: empty the collapsed-folder sets the tree providers hold in
+   * memory, drop their pending writes and turn Follow Terminal Directory off.
+   * Called BEFORE the stored keys are cleared, and leaves the collapsed-folder
+   * persistence suspended: `completeReset` calls `resumeViewState` only after the
+   * keys are cleared and the generation bumped, so a collapse in between cannot
+   * schedule a write that lands after the clear.
+   */
+  resetViewState?(): Promise<void>;
+  /** Lift the suspension `resetViewState` left; called from a `finally` once the clears are done. */
+  resumeViewState?(): void;
 }
 
 interface RemovedProfileIds {
@@ -1650,6 +1670,8 @@ interface SanitizedSnapshot {
   tunnels: TunnelProfile[];
   serialProfiles: SerialProfile[];
   localShellProfiles: LocalShellProfile[];
+  /** Custom Local Shell profiles left out of the share (see `isShareableLocalShellProfile`). */
+  omittedLocalShellProfiles: number;
   authProfiles: AuthProfile[];
   macros: TerminalMacro[];
   settings: Record<string, unknown>;
@@ -1960,6 +1982,132 @@ const SHARED_SERVER_RULES = {
   formerlySynced: "drop"
 } satisfies ShareRules<ServerConfig>;
 
+/**
+ * Whether `host` is the IPv6 loopback address in any spelling (`::1`,
+ * `0:0:0:0:0:0:0:1`, `0000::1`): expanded to its eight groups and compared.
+ * IPv4-mapped forms (`::ffff:127.0.0.1`) and zone ids are NOT accepted: they are
+ * other spellings of other things, and dropping them only costs the default.
+ */
+function isIpv6Loopback(host: string): boolean {
+  if (!isIP(host) || !host.includes(":") || host.includes(".") || host.includes("%")) {
+    return false;
+  }
+  const halves = host.split("::");
+  if (halves.length > 2) {
+    return false;
+  }
+  const groupsOf = (part: string | undefined): string[] => (part ? part.split(":") : []);
+  const head = groupsOf(halves[0]);
+  const tail = halves.length === 2 ? groupsOf(halves[1]) : [];
+  const missing = halves.length === 2 ? 8 - head.length - tail.length : 0;
+  const groups = [...head, ...new Array<string>(Math.max(missing, 0)).fill("0"), ...tail];
+  return groups.length === 8 && groups.every((group, index) => parseInt(group, 16) === (index === 7 ? 1 : 0));
+}
+
+/**
+ * A loopback address, trimmed and lower-cased, or `undefined` for anything else.
+ * Only a loopback address means the same thing on the recipient's machine as on
+ * the sender's; the normalized host is returned, so padding never reaches the SSH
+ * server.
+ */
+function loopbackAddressOnly(value: string | undefined): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  // A bracketed IPv6 literal (`[::1]`) is normalized to the bare address: SSH
+  // `forwardIn` and `listen` take the address, not URL syntax.
+  let host = value.trim().toLowerCase();
+  if (host.startsWith("[") && host.endsWith("]")) {
+    host = host.slice(1, -1);
+  }
+  // 127.x.y.z with each octet 0-255 and no leading zero (`127.01.0.1` reads as
+  // octal in some resolvers): anything else is not a loopback address, and the
+  // value is forwarded to the SSH server as written.
+  const octets = host.split(".");
+  const isIpv4Loopback =
+    octets.length === 4 && octets[0] === "127" && octets.every((octet) => /^(0|[1-9]\d{0,2})$/.test(octet) && Number(octet) <= 255);
+  if (isIpv6Loopback(host)) {
+    return "::1"; // the canonical spelling, whatever the file wrote
+  }
+  return host === "localhost" || isIpv4Loopback ? host : undefined;
+}
+
+/**
+ * `browserUrl` without a login typed into it. It holds a `{localPort}`
+ * placeholder, so it usually does not parse as a URL as written
+ * (`stripUrlUserinfo` would hand it back untouched). Two layers:
+ *  1. The WHATWG parser, which is what a browser applies, with the placeholder
+ *     swapped for a port that is not in the string. It sees through forms a
+ *     pattern would miss — a leading space, `http:/\host`, `http:////host` —
+ *     that a browser normalizes into a URL that still carries the login. Only a
+ *     URL that really holds credentials is rewritten (cleared, serialized, the
+ *     placeholder restored); any other value comes back byte-identical.
+ *     When no free port exists to stand in for the placeholder, the URL is
+ *     dropped (`undefined`) rather than kept with its login.
+ *  2. For what never parses as an authority-bearing URL (no scheme, or a bare
+ *     `//`), whatever sits before the first `/`, `?` or `#` loses everything up
+ *     to its last `@`.
+ */
+function stripBrowserUrlUserinfo(value: string | undefined): string | undefined {
+  if (typeof value !== "string") {
+    return value;
+  }
+  // Detection needs no free placeholder: any valid port parses the same way.
+  let hasLogin = false;
+  try {
+    const probe = new URL(value.replaceAll("{localPort}", "1"));
+    hasLogin = probe.username !== "" || probe.password !== "";
+  } catch {
+    // Not an absolute URL: the pattern below handles it.
+  }
+  if (hasLogin) {
+    // Rewriting has to restore `{localPort}` afterwards, which needs a port that
+    // is not already in the string. If none is free the URL cannot be rewritten
+    // safely, so it is dropped rather than shipped with its login (fail closed).
+    let port: string | undefined;
+    for (let candidate = 60000; candidate < 61000 && port === undefined; candidate++) {
+      if (!value.includes(String(candidate))) port = String(candidate);
+    }
+    if (port === undefined) {
+      return undefined;
+    }
+    const parsed = new URL(value.replaceAll("{localPort}", port));
+    parsed.username = "";
+    parsed.password = "";
+    return parsed.href.replaceAll(port, "{localPort}");
+  }
+  return value.replace(/^(\s*(?:[a-z][a-z0-9+.-]*:)?\/\/)?[^/?#]*@/i, (_match, prefix: string | undefined) => prefix?.trimStart() ?? "");
+}
+
+/**
+ * Whether `SHARED_TUNNEL_RULES` changed anything the file said about a tunnel:
+ * each of the four fields it rewrites is compared with what the rules produced,
+ * so a padded address that was normalized or a loopback listener address that
+ * was dropped counts, not only a non-loopback one.
+ */
+function tunnelWasAdjustedByShare(original: TunnelProfile, shared: TunnelProfile): boolean {
+  const changed = <K extends "autoStart" | "localBindAddress" | "remoteBindAddress" | "browserUrl">(key: K): boolean =>
+    original[key] !== undefined && original[key] !== shared[key];
+  return changed("autoStart") || changed("localBindAddress") || changed("remoteBindAddress") || changed("browserUrl");
+}
+
+/**
+ * A tunnel profile, in both directions. The sender's unattended-action and
+ * network-exposure choices do not travel — the same principle as an inventory
+ * source's `statusPollSeconds` and `allowInsecureTls`, and as the settings
+ * policy that keeps listener addresses local:
+ *  - `autoStart` is always `false`. It starts the tunnel, unprompted, the first
+ *    time the recipient connects to the linked server; a share (or a hand-edited
+ *    one) must not decide that for them.
+ *  - `localBindAddress` is dropped, so the listener falls back to 127.0.0.1. The
+ *    sender's interface address means nothing here, and `0.0.0.0` would expose a
+ *    forward or SOCKS5 listener to the recipient's whole LAN. They pick an
+ *    interface in Edit Tunnel.
+ *  - `remoteBindAddress` keeps loopback values only; anything else is dropped
+ *    (the default is 127.0.0.1) so the share's server cannot be handed a
+ *    listener on all its interfaces.
+ *  - `browserUrl` loses any login typed into it.
+ */
 const SHARED_TUNNEL_RULES = {
   id: "link",
   name: "keep",
@@ -1967,15 +2115,15 @@ const SHARED_TUNNEL_RULES = {
   remoteIP: "keep",
   remotePort: "keep",
   defaultServerId: "link",
-  autoStart: "keep",
+  autoStart: () => false,
   autoStop: "keep",
   connectionMode: "keep",
   tunnelType: "keep",
-  remoteBindAddress: "keep",
+  remoteBindAddress: loopbackAddressOnly,
   localTargetIP: "keep",
-  localBindAddress: "keep",
+  localBindAddress: "drop",
   notes: "keep",
-  browserUrl: "keep"
+  browserUrl: stripBrowserUrlUserinfo
 } satisfies ShareRules<TunnelProfile>;
 
 /** A serial profile: `deviceHint`, the identity of the sender's USB adapter that Smart Follow learned, never travels. */
@@ -1994,10 +2142,23 @@ const SHARED_SERIAL_PROFILE_RULES = {
   deviceHint: "drop"
 } satisfies ShareRules<SerialProfile>;
 
+/** Whether a Local Shell profile may cross a share: only one that names a VS Code terminal profile of the recipient's own. */
+function isShareableLocalShellProfile(profile: LocalShellProfile): boolean {
+  return profile.launchMode === "vscodeProfile";
+}
+
 /**
  * A Local Shell profile: the working directory, the startup command — which
  * runs the moment the profile opens — and the environment variables, which
  * routinely carry tokens (issue #159), never travel.
+ *
+ * A `custom` profile does not travel at all (`isShareableLocalShellProfile`,
+ * on both sides): its shell path and arguments ARE a command line that runs the
+ * moment it opens, exactly as `startupCommand` does, and it names the sender's
+ * absolute paths. A `vscodeProfile` one only names a terminal profile on the
+ * recipient's own machine, so it stays. `shellPath` and `shellArgs` are dropped
+ * for that kind too: it never uses them, and a later switch to Custom Shell in
+ * Edit must not find a command line a file put there.
  */
 const SHARED_LOCAL_SHELL_PROFILE_RULES = {
   id: "link",
@@ -2005,8 +2166,8 @@ const SHARED_LOCAL_SHELL_PROFILE_RULES = {
   group: "keep",
   launchMode: "keep",
   vscodeProfileName: "keep",
-  shellPath: "keep",
-  shellArgs: "keep",
+  shellPath: "drop",
+  shellArgs: "drop",
   cwd: "drop",
   env: "drop",
   startupCommand: "drop"
@@ -2510,7 +2671,8 @@ export function sanitizeForSharing(
     return shareRecord(profile, SHARED_SERIAL_PROFILE_RULES, { id: () => id }) as SerialProfile;
   });
 
-  const newLocalShellProfiles = localShellProfiles.map((profile) => {
+  const shareableLocalShells = localShellProfiles.filter(isShareableLocalShellProfile);
+  const newLocalShellProfiles = shareableLocalShells.map((profile) => {
     const id = randomUUID();
     macroProfileIdMap.set(profile.id, id);
     return shareRecord(profile, SHARED_LOCAL_SHELL_PROFILE_RULES, { id: () => id }) as LocalShellProfile;
@@ -2532,6 +2694,7 @@ export function sanitizeForSharing(
     tunnels: newTunnels,
     serialProfiles: newSerialProfiles,
     localShellProfiles: newLocalShellProfiles,
+    omittedLocalShellProfiles: localShellProfiles.length - shareableLocalShells.length,
     authProfiles: newAuthProfiles,
     macros: sanitizedMacros,
     settings: sanitizedSettings,
@@ -3060,6 +3223,50 @@ export async function captureBackupStateForExport(
  * threaded-through dependency with no reader is an invitation to give it a
  * second, unexamined job.
  */
+interface UnvalidatedSecretOwners {
+  servers: string[];
+  authProfiles: string[];
+  sources: Array<{ id: string; fieldIds: string[] }>;
+}
+
+/**
+ * The stored rows Delete All Data will never see through `core.getSnapshot()`
+ * because they fail validation (a version-skewed list, say), read leniently: any
+ * object with a non-empty string `id` names a record whose saved secrets are
+ * still in the keychain. Must be read BEFORE the snapshot-driven removals, which
+ * persist the validated list and so overwrite these rows. `SecretStorage.keys()`
+ * is not relied on here (it is a newer API than the engine floor guarantees); it
+ * only widens the inventory-source sweep when the host has it.
+ */
+function collectUnvalidatedSecretOwners(
+  state: { get<T>(key: string): T | undefined },
+  known: { servers: Set<string>; authProfiles: Set<string>; sources: Set<string> }
+): UnvalidatedSecretOwners {
+  const rows = (key: string): Array<Record<string, unknown>> => {
+    const raw = state.get<unknown>(key);
+    return Array.isArray(raw) ? raw.filter((row): row is Record<string, unknown> => isRecordValue(row)) : [];
+  };
+  const idOf = (row: Record<string, unknown>): string | undefined =>
+    typeof row.id === "string" && row.id !== "" ? row.id : undefined;
+  const owners: UnvalidatedSecretOwners = { servers: [], authProfiles: [], sources: [] };
+  for (const row of rows("nexus.servers")) {
+    const id = idOf(row);
+    if (id && !known.servers.has(id)) owners.servers.push(id);
+  }
+  for (const row of rows("nexus.authProfiles")) {
+    const id = idOf(row);
+    if (id && !known.authProfiles.has(id)) owners.authProfiles.push(id);
+  }
+  for (const row of rows("nexus.inventorySources")) {
+    const id = idOf(row);
+    if (id && !known.sources.has(id)) {
+      const fieldIds = Array.isArray(row.secretFieldIds) ? row.secretFieldIds.filter((f): f is string => typeof f === "string") : [];
+      owners.sources.push({ id, fieldIds });
+    }
+  }
+  return owners;
+}
+
 export function registerConfigCommands(
   core: NexusCore,
   vault: SecretVault,
@@ -3272,7 +3479,14 @@ export function registerConfigCommands(
     const suffix = excludedSecretCount > 0
       ? ` (${excludedSecretCount} secret macro${excludedSecretCount === 1 ? "" : "s"} excluded)`
       : "";
-    void vscode.window.showInformationMessage(`${base}${suffix}.`);
+    // A custom Local Shell profile is a command line that runs when it opens, so
+    // a share never carries one; the sender is told, and the recipient adds their
+    // own with Add Local Shell Profile.
+    const shellNote =
+      sanitized.omittedLocalShellProfiles > 0
+        ? ` ${plural(sanitized.omittedLocalShellProfiles, "custom Local Shell profile")} left out: a shell command does not travel in a share, so the recipient adds their own with Add Local Shell Profile.`
+        : "";
+    void vscode.window.showInformationMessage(`${base}${suffix}.${shellNote}`);
   }
 
   /**
@@ -3469,6 +3683,10 @@ export function registerConfigCommands(
     const savedFilters = data.savedFilters ?? [];
 
     // First pass: assign new IDs for auth profiles and servers so links can be remapped.
+    // `ensureId` first, so two rows with blank ids get distinct ids and both
+    // import. Rows sharing an id share ONE fresh id here; the write loops below
+    // let only the first row that VALIDATES land under it (see `landedAuthIds`
+    // and `landedServerIds`), so every reference to the id resolves to it.
     for (const profile of authProfiles) {
       ensureId(profile as unknown as Record<string, unknown>);
       idMap.set(profile.id, randomUUID());
@@ -3511,11 +3729,22 @@ export function registerConfigCommands(
     // before validation: a hand-edited file cannot land a login, a key path or a
     // member the model does not declare, and a malformed key path cannot cost
     // the profile.
+    //
+    // The first row under an id that VALIDATES wins, as for templates and
+    // sources: a later row with the same id would be written under the same fresh
+    // id and overwrite it (the upsert) while still being counted. It is skipped
+    // and counted instead; a malformed earlier row does not reserve the id.
+    const landedAuthIds = new Set<string>();
     for (const profile of authProfiles) {
+      if (landedAuthIds.has(profile.id)) {
+        skipped++;
+        continue;
+      }
       const newId = idMap.get(profile.id)!;
       const remappedProfile = shareRecord(profile, SHARED_AUTH_PROFILE_RULES, { id: () => newId }) as AuthProfile;
       const added = await addIfValid(remappedProfile, validateAuthProfile, (e) => core.addOrUpdateAuthProfile(e));
       if (added) {
+        landedAuthIds.add(profile.id);
         importedProfiles.set(newId, remappedProfile);
       }
       tally(added);
@@ -3722,6 +3951,9 @@ export function registerConfigCommands(
      */
     const remappedServers: ServerConfig[] = [];
     const importedServerIds = new Set<string>();
+    // Payload ids of servers that will land: the first VALID row under an id wins
+    // (see `landedAuthIds`); a later valid one is skipped and counted.
+    const landedServerIds = new Set<string>();
     for (const server of servers) {
       // The sync's own link to a key profile that landed with no key file is
       // left out with its stamp, exactly as on export — and only on a row that
@@ -3786,8 +4018,14 @@ export function registerConfigCommands(
       // surviving-server set is known (`linkToImportedServer`), because a raw
       // remap alone keeps a fresh id even for a gateway that failed import.
       const remappedServer = shareServer(server, idMap.get(server.id)!, lenses, origin, origin !== undefined && syncAuthLinkUnusable);
+      const serverIsValid = validateServerConfig(remappedServer);
+      if (serverIsValid && landedServerIds.has(server.id)) {
+        skipped++;
+        continue;
+      }
       remappedServers.push(remappedServer);
-      if (validateServerConfig(remappedServer)) {
+      if (serverIsValid) {
+        landedServerIds.add(server.id);
         importedServerIds.add(remappedServer.id);
       }
     }
@@ -3840,12 +4078,15 @@ export function registerConfigCommands(
     // working directory, startup command and environment), and any member the
     // model does not declare, cannot land from a hand-edited file. A tunnel's
     // server link is remapped through `idMap`, as it always has been.
+    let tunnelsWithSettingsReset = 0;
     for (const tunnel of tunnels) {
       const remappedTunnel = shareRecord(tunnel, SHARED_TUNNEL_RULES, {
         id: () => randomUUID(),
         defaultServerId: (serverId) => (serverId ? idMap.get(serverId) : undefined)
       }) as TunnelProfile;
-      tally(await addIfValid(remappedTunnel, validateTunnelProfile, (e) => core.addOrUpdateTunnel(e)));
+      const added = await addIfValid(remappedTunnel, validateTunnelProfile, (e) => core.addOrUpdateTunnel(e));
+      if (added && tunnelWasAdjustedByShare(tunnel, remappedTunnel)) tunnelsWithSettingsReset++;
+      tally(added);
     }
     // Keep profile-scoped macro links only after each target survives validation,
     // so a rejected profile cannot leave a live-looking rule.
@@ -3858,7 +4099,16 @@ export function registerConfigCommands(
       tally(added);
     }
     const importedLocalShellProfileIds = new Map<string, string>();
+    let customLocalShellsLeftOut = 0;
     for (const profile of localShellProfiles) {
+      // A custom profile is a command line that runs when it opens: a file must
+      // not be able to hand one over, whoever wrote it (see
+      // `isShareableLocalShellProfile`). Counted apart from `skipped` because
+      // the file is not malformed, and named in the message with its remedy.
+      if (profile.launchMode === "custom") {
+        customLocalShellsLeftOut++;
+        continue;
+      }
       const id = randomUUID();
       const remappedProfile = shareRecord(profile, SHARED_LOCAL_SHELL_PROFILE_RULES, { id: () => id }) as LocalShellProfile;
       const added = await addIfValid(remappedProfile, validateLocalShellProfile, (e) => core.addOrUpdateLocalShellProfile(e));
@@ -3966,6 +4216,14 @@ export function registerConfigCommands(
     }
 
     const skipNote = skipped > 0 ? ` (${skipped} skipped)` : "";
+    const shellNote =
+      customLocalShellsLeftOut > 0
+        ? ` ${plural(customLocalShellsLeftOut, "custom Local Shell profile")} not imported: a shell command does not travel in a share — add your own with Add Local Shell Profile.`
+        : "";
+    const tunnelNote =
+      tunnelsWithSettingsReset > 0
+        ? ` ${plural(tunnelsWithSettingsReset, "tunnel")} arrived adjusted (auto-start off, loopback-only listener, no login in its browser URL) — edit the tunnel to change that.`
+        : "";
     // Counts only — a name from the file never reaches this message. Profiles
     // lead, as they always have, unless the file landed only inventory records,
     // where "0 profiles" would read as if nothing had.
@@ -3978,7 +4236,7 @@ export function registerConfigCommands(
     if (importedFilterCount > 0) landed.push(plural(importedFilterCount, "saved filter"));
     const summary = `Imported ${
       landed.length > 1 ? `${landed.slice(0, -1).join(", ")} and ${landed[landed.length - 1]}` : landed[0]
-    }${skipNote}.`;
+    }${skipNote}.${shellNote}${tunnelNote}`;
     if (importedSourceIds.length === 0) {
       void vscode.window.showInformationMessage(summary);
       return;
@@ -5111,7 +5369,9 @@ export function registerConfigCommands(
     const confirm = await vscode.window.showWarningMessage(
       "This will permanently delete ALL servers, tunnels, serial profiles, local shell profiles, Local Server profiles, " +
         "saved TFTP/DHCP profiles, inventory sources, device templates, saved filters, macros, groups, and saved passwords, " +
-        "and reset every Nexus setting. Running Local Servers and TFTP/DHCP services are stopped before their configuration is removed. " +
+        "Terminal Appearance colour schemes and font choice, and remembered view state and dismissed hints, and reset every Nexus setting. " +
+        "Kept: values Terminal Appearance already wrote into your VS Code user settings (terminal colours and font), " +
+        "trusted SSH host keys, script files, session logs, the one-time ~/.ssh/config import offer and settings-guard bookkeeping. Running Local Servers and TFTP/DHCP services are stopped before their configuration is removed. " +
         "Open sessions and tunnels will be closed. " +
         "This cannot be undone.",
       { modal: true },
@@ -5140,6 +5400,13 @@ export function registerConfigCommands(
     const removed = emptyRemovedProfileIds();
     const resetMutation = async (): Promise<void> => {
       const snapshot = core.getSnapshot();
+      const unvalidatedOwners = context
+        ? collectUnvalidatedSecretOwners(context.globalState, {
+            servers: new Set(snapshot.servers.map((server) => server.id)),
+            authProfiles: new Set(snapshot.authProfiles.map((profile) => profile.id)),
+            sources: new Set(snapshot.inventorySources.map((source) => source.id))
+          })
+        : undefined;
       removed.tunnelProfiles.push(...snapshot.tunnels.map(({ id }) => id));
       removed.activeTunnels.push(...snapshot.activeTunnels.map(({ id, profileId, serverId }) => ({ id, profileId, serverId })));
 
@@ -5218,8 +5485,81 @@ export function registerConfigCommands(
 
       // Clear macros (globalState + vault entries)
       await getActiveMacroStore().clearAll();
+      // Raw leftovers: the removals above are driven by the validated snapshot, so
+      // a collection whose stored rows all fail validation (a version-skewed
+      // list, say) removed nothing and its raw value would survive. Clear every
+      // such key explicitly. An empty array is what a clean removal leaves and is
+      // left alone: writing `undefined` over it would make the repository's
+      // concurrent-write check report a foreign change on the next save.
+      if (context && unvalidatedOwners) {
+        // Their secrets first, best effort — one failed delete must not strand
+        // the rest — and BEFORE the raw rows are cleared: those rows are the only
+        // record naming these keychain entries.
+        const bestEffortDelete = async (key: string): Promise<void> => {
+          try {
+            await vault.delete(key);
+          } catch (error) {
+            console.warn(`[Nexus] Failed to delete secret key "${key}":`, error);
+          }
+        };
+        for (const id of unvalidatedOwners.servers) {
+          await deleteServerSecrets(vault, id, { bestEffort: true });
+        }
+        for (const id of unvalidatedOwners.authProfiles) {
+          await bestEffortDelete(authProfilePasswordSecretKey(id));
+          await bestEffortDelete(authProfilePassphraseSecretKey(id));
+        }
+        const secretKeys = async (): Promise<string[]> => {
+          try {
+            const keys = (context.secrets as { keys?: () => PromiseLike<string[]> } | undefined)?.keys;
+            return typeof keys === "function" ? [...(await keys.call(context.secrets))] : [];
+          } catch {
+            return [];
+          }
+        };
+        const allKeys = unvalidatedOwners.sources.length > 0 ? await secretKeys() : [];
+        for (const { id, fieldIds } of unvalidatedOwners.sources) {
+          const prefix = inventorySecretKey(id, "");
+          const keys = new Set([...fieldIds.map((fieldId) => inventorySecretKey(id, fieldId)), ...allKeys.filter((key) => key.startsWith(prefix))]);
+          for (const key of keys) await bestEffortDelete(key);
+        }
+      }
       if (context) {
-        await context.globalState.update("nexus.macros.migrationNoticeShown", undefined);
+        for (const key of RESET_CLEARED_BY_STORE_GLOBAL_STATE_KEYS) {
+          const raw = context.globalState.get<unknown>(key);
+          if (raw !== undefined && !(Array.isArray(raw) && raw.length === 0)) {
+            await context.globalState.update(key, undefined);
+          }
+        }
+      }
+      await runtime?.resetViewState?.();
+      try {
+        if (context) {
+          // Notices, hints, collapsed-folder and follow-directory choices, and the
+          // Terminal Appearance store (schemes, selection, font), which lives in
+          // globalState outside NexusCore. The Local Shell auto-trigger
+          // acknowledgement is among them because it belongs to the
+          // `nexus.terminal.macros.autoTrigger` setting reset just below: left
+          // behind, a user who once chose Disable would get auto-trigger back on and
+          // never see the warning again. What stays is listed in
+          // RESET_KEPT_GLOBAL_STATE_KEYS.
+          for (const key of RESET_CLEARED_GLOBAL_STATE_KEYS) {
+            await context.globalState.update(key, undefined);
+          }
+        }
+        // The running service caches those values and an open panel shows them.
+        await runtime?.resetTerminalAppearance?.();
+        // AFTER everything above is cleared: other windows keep collapsed-folder
+        // sets and the appearance cache in memory, and on their next action they
+        // see this counter move and reload from the (now empty) store instead of
+        // writing their stale copy back. Never cleared, so it stays monotonic.
+        if (context) {
+          await bumpResetGeneration(context.globalState);
+        }
+      } finally {
+        // Only now may a collapse persist again: the keys are cleared and the
+        // generation bumped. Also runs if any of that threw.
+        runtime?.resumeViewState?.();
       }
 
       // Reset all settings to defaults
@@ -5244,7 +5584,9 @@ export function registerConfigCommands(
     }
 
     if (failedTeardowns === 0) {
-      void vscode.window.showInformationMessage("All Nexus data has been deleted.");
+      void vscode.window.showInformationMessage(
+        "Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files, session logs and the terminal colours and font already written to your VS Code user settings were kept."
+      );
     }
   }
 
