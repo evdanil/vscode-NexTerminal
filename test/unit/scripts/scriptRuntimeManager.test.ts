@@ -1851,3 +1851,53 @@ describe("ScriptRuntimeManager — the output a run starts with (#166)", () => {
     expect(h.pty.live()).toBe(0);
   });
 });
+
+describe("ScriptRuntimeManager — a wait the run left pending ends with the run (#263)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const endings: Array<[string, (h: Harness) => void]> = [
+    ["complete", (h) => h.worker.emit({ kind: "complete" })],
+    ["failed", (h) => h.worker.emit({ kind: "failed", error: { message: "boom", code: "Error" } })],
+    ["worker error", (h) => { for (const l of h.worker.errorListeners) l(new Error("worker crashed")); }],
+    ["worker exit", (h) => { for (const l of h.worker.exitListeners) l(1); }]
+  ];
+
+  it.each(endings)("%s: no timer, event, or output line outlives the run", async (_name, end) => {
+    const h = await createHarness(`/**\n * @nexus-script\n * @name Repro\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    h.worker.emit({ kind: "rpc", id: 1, method: "waitFor", args: ["NEVER", { timeout: 3_600_000 }] });
+    expect(vi.getTimerCount()).toBe(1);
+    end(h);
+    await vi.advanceTimersByTimeAsync(0);
+    // The scan's timer is gone, not merely harmless.
+    expect(vi.getTimerCount()).toBe(0);
+    const endedAt = h.events.findIndex((e) => e.kind === "ended");
+    expect(endedAt).toBeGreaterThanOrEqual(0);
+    expect((h.events[endedAt].data as { run: { currentOperation: unknown } }).run.currentOperation).toBeNull();
+    const endLine = h.output.findIndex((l) => l.includes("end: "));
+    await vi.advanceTimersByTimeAsync(3_600_000);
+    expect(h.events.slice(endedAt + 1).map((e) => e.kind)).toEqual([]);
+    expect(h.output.slice(endLine + 1)).toEqual([]);
+    expect(h.output.join("\n")).not.toContain("← timeout");
+  });
+
+  it("refuses a wait dispatched after the run ended", async () => {
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    h.worker.emit({ kind: "complete" });
+    const linesAtEnd = h.output.length;
+    h.worker.emit({ kind: "rpc", id: 7, method: "waitFor", args: ["NEVER", { timeout: 3_600_000 }] });
+    await vi.advanceTimersByTimeAsync(0);
+    const result = h.worker.posted.find((m) => m.kind === "rpc-result" && (m as { id: number }).id === 7) as
+      | { ok: boolean; error?: { code: string } }
+      | undefined;
+    expect(result?.ok).toBe(false);
+    expect(result?.error?.code).toBe("Stopped");
+    expect(vi.getTimerCount()).toBe(0);
+    expect(h.output.slice(linesAtEnd)).toEqual([]);
+  });
+});

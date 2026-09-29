@@ -697,6 +697,13 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     if (ACTS_ON_TERMINAL_OR_USER.has(method) && runIsOver(record)) {
       throw makeScriptError("Stopped", `Script run has ended — ${method} refused`);
     }
+    // A wait posted just before the worker's complete/failed and dispatched
+    // after cleanupRun would open a scan nothing will ever reject. (A requested
+    // stop is not refused here: stopScript already drained pendingRpcs and
+    // cleanupRun drains whatever this opens.)
+    if (record.cleanedUp && (method === "waitFor" || method === "expect" || method === "waitAny")) {
+      throw makeScriptError("Stopped", `Script run has ended — ${method} refused`);
+    }
     switch (method) {
       case "waitFor":
         return this.doWait(record, args[0] as string | RegExp, args[1] as WaitOpts | undefined, /*throwOnTimeout*/ false);
@@ -974,7 +981,8 @@ export class ScriptRuntimeManager implements vscode.Disposable {
   /**
    * Shared scan-with-cancellation helper: runs `attempt` immediately, then re-runs
    * it on each new output event until it returns non-null, the timeout expires, or
-   * the record is cancelled via `pendingRpcs` (Stop / ConnectionLost).
+   * the record is cancelled via `pendingRpcs` (every ending: Stop, ConnectionLost,
+   * deactivation, and cleanupRun for complete / failed / worker error / exit).
    */
   private scanForMatchGeneric<T>(
     record: RunningScriptRecord,
@@ -1029,6 +1037,9 @@ export class ScriptRuntimeManager implements vscode.Disposable {
   }
 
   private endOp(record: RunningScriptRecord, result: "matched" | "timeout" | "user-input" | "tick" | "elapsed"): void {
+    // Nothing may be logged or emitted after "ended" — an orphaned operation
+    // settling late would look like a line of a re-run on the same session.
+    if (record.cleanedUp) return;
     this.emit({ kind: "operationEnd", run: this.toSnapshot(record), result });
     this.logEvent(record, `← ${result}`);
     record.currentOperation = null;
@@ -1060,6 +1071,15 @@ export class ScriptRuntimeManager implements vscode.Disposable {
   private cleanupRun(record: RunningScriptRecord, finalState: FinalState): void {
     if (record.cleanedUp) return;
     record.cleanedUp = true;
+    // Every ending, not only Stop / ConnectionLost / deactivation: a wait the
+    // script left unawaited (a Promise.race loser, a Promise.all partner)
+    // would otherwise keep its timer, buffer subscription and this record
+    // alive for its full timeout, then log and emit after "ended". The
+    // rejection settles in a later microtask, by which time cleanedUp is set,
+    // so endOp stays silent. The result goes to a terminated worker — ignored.
+    this.rejectAllPending(record, makeScriptError("Stopped", "Script run has ended"));
+    // The wait just rejected is not an operation the ended run is still in.
+    record.currentOperation = null;
     // The run is over however it ended, so its worker is too. A script that
     // completes or fails does not end its thread: the parentPort listener
     // keeps it alive, so a timer the script left behind could still send to
