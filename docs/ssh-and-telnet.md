@@ -99,7 +99,7 @@ Automatic fallback to standalone connections handles channel failures transparen
 
 Faults that arrive *after* a session is up — a keepalive timeout, a protocol error, the connection closing — are recorded in the **Nexus SSH** output channel, so a terminal that drops on its own leaves a cause behind instead of only "Connection lost".
 
-When an SSH session drops, Nexus disables terminal mouse-tracking, focus-reporting, and color-scheme notification modes, and resets the active screen's Kitty keyboard-mode stack and flags before showing the disconnect banner. Press **R** to reconnect in the same tab; your visible output and scrollback stay available, and late output from the old connection is ignored even after reconnect.
+When an SSH session drops, Nexus disables terminal mouse-tracking, focus-reporting, color-scheme notification, bracketed-paste, application-cursor-key and application-keypad modes, shows the cursor, and resets the active screen's Kitty keyboard-mode stack and flags before showing the disconnect banner. Telnet, Serial and Smart Follow terminals get the same reset, and a disconnected Telnet or Serial tab closes only on a real key press, not on focus or mouse reports. Press **R** to reconnect an SSH session in the same tab; your visible output and scrollback stay available, and late output from the old connection is ignored even after reconnect.
 
 ## Telnet
 

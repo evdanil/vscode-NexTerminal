@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.296] — 2026-09-29
+
+### Fixed
+
+- **Serial, Telnet and Smart Follow terminals reset interactive modes on disconnect, and a focus or mouse report no longer closes a dead tab.** The reset that SSH ran now lives in one shared sequence used by all four remote terminals (Smart Follow also repeats it on reattach). It additionally turns off bracketed paste and application cursor/keypad modes and shows the cursor, so a same-tab SSH reconnect no longer starts with a hidden cursor or wrapped pastes. The alternate screen is still left alone so the last frame stays readable. In a disconnected Serial or Telnet tab, terminal-generated focus, mouse and color-scheme reports are ignored; a real key still closes the tab.
+
 ## [2.8.295] — 2026-09-28
 
 ### Fixed

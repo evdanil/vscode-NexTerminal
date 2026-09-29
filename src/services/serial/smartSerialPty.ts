@@ -4,7 +4,7 @@ import type { SessionLogger } from "../../logging/terminalLogger";
 import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
 import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
-import { CLEAR_VISIBLE_SCREEN } from "../terminal/terminalEscapes";
+import { CLEAR_VISIBLE_SCREEN, RESET_INTERACTIVE_MODES } from "../terminal/terminalEscapes";
 import { PtyObserverHub } from "../terminal/ptyObserverHub";
 import { toParityCode } from "../../utils/helpers";
 import type { SerialTransport } from "./serialPty";
@@ -263,6 +263,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     this.callbacks.onTransportSessionChanged?.(undefined);
     this.callbacks.onActivePortChanged?.(undefined);
     this.nameEmitter.fire(this.buildDisplayName());
+    this.writeEmitter.fire(RESET_INTERACTIVE_MODES);
     this.writeEmitter.fire(`\r\n\r\n[Nexus Smart Follow] ${reason}\r\n`);
     this.writeEmitter.fire("[Nexus Smart Follow] Close this terminal and reopen Smart Follow to reconnect.\r\n");
     this.logger.log(`marked shutting down: ${reason}`);
@@ -598,6 +599,9 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
       this.logger.log(`smart serial profile update failed ${message}`);
     }
     this.callbacks.onStateChanged?.("connected");
+    // Defence in depth: the modes were cleared at disconnect, but a reattach is
+    // exactly where stale ones would reach a new device.
+    this.writeEmitter.fire(RESET_INTERACTIVE_MODES);
 
     if (path !== previousPreferredPath) {
       this.writeBanner(
@@ -621,6 +625,9 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     this.transcript?.flush?.();
     const lostPath = this.currentPath ?? this.preferredPath;
     this.logger.log(`smart serial port disconnected: ${reason}`);
+    // A waiting tab must stop producing focus/mouse reports, and the next
+    // (possibly different) device must not inherit this one's modes.
+    this.writeEmitter.fire(RESET_INTERACTIVE_MODES);
     this.transportSessionId = undefined;
     this.currentPath = undefined;
     this.callbacks.onTransportSessionChanged?.(undefined);
@@ -653,6 +660,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     this.callbacks.onTransportSessionChanged?.(undefined);
     this.callbacks.onActivePortChanged?.(undefined);
     this.nameEmitter.fire(this.buildDisplayName());
+    this.writeEmitter.fire(RESET_INTERACTIVE_MODES);
     this.writeBanner(`${message} Close this terminal to exit.`);
     this.callbacks.onStateChanged?.("waiting");
     this.callbacks.onFatalError?.(message);

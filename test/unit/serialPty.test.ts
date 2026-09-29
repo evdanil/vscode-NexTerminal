@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SerialPty, type SerialTransport } from "../../src/services/serial/serialPty";
-import { CLEAR_VISIBLE_SCREEN } from "../../src/services/terminal/terminalEscapes";
+import { CLEAR_VISIBLE_SCREEN, RESET_INTERACTIVE_MODES } from "../../src/services/terminal/terminalEscapes";
 
 vi.mock("vscode", () => ({
   EventEmitter: class MockEventEmitter<T> {
@@ -189,6 +189,43 @@ describe("SerialPty", () => {
 
     pty.handleInput("x");
     expect(closePort).not.toHaveBeenCalled();
+  });
+
+  it("resets terminal modes before the disconnect banner and ignores terminal-generated reports", async () => {
+    const { transport, emitDisconnect } = createTransport();
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() };
+    const writes: string[] = [];
+    const pty = new SerialPty(transport, { path: "COM9", baudRate: 115200 }, callbacks, { log: vi.fn(), close: vi.fn() } as any);
+    pty.onDidWrite((chunk) => writes.push(chunk));
+    const onDidClose = vi.fn();
+    pty.onDidClose(onDidClose);
+    pty.open();
+    await flushAsync();
+
+    emitDisconnect("session-1", "Port closed");
+    const out = writes.join("");
+    expect(out).toContain(RESET_INTERACTIVE_MODES);
+    expect(out.indexOf(RESET_INTERACTIVE_MODES)).toBeLessThan(out.indexOf("Port disconnected"));
+    expect(out).not.toContain("1049");
+
+    for (const report of ["\x1b[I", "\x1b[O", "\x1b[<0;10;5M", "\x1b[<0;10;5m", "\x1b[M !!", "\x1b[?997;1n"]) {
+      pty.handleInput(report);
+    }
+    expect(onDidClose).not.toHaveBeenCalled();
+
+    pty.handleInput("x");
+    expect(onDidClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("resets terminal modes when markShuttingDown() runs", async () => {
+    const { transport } = createTransport();
+    const writes: string[] = [];
+    const pty = new SerialPty(transport, { path: "COM9", baudRate: 115200 }, { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() }, { log: vi.fn(), close: vi.fn() } as any);
+    pty.onDidWrite((chunk) => writes.push(chunk));
+    pty.open();
+    await flushAsync();
+    pty.markShuttingDown("bye");
+    expect(writes).toContain(RESET_INTERACTIVE_MODES);
   });
 
   it("fires onDataReceived callback when transport data arrives", async () => {
