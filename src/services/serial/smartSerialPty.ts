@@ -533,6 +533,12 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     this.openingSessionId = openingSessionId;
     this.openingPort = true;
     this.openingData.clear();
+    // A reattach must start from plain modes, and the reset has to precede the
+    // new device's first output (replayed opening data or live data), which may
+    // itself set modes. A fresh terminal on the first connect needs no reset.
+    if (this.hasEverConnected) {
+      this.writeEmitter.fire(RESET_INTERACTIVE_MODES);
+    }
     try {
       const sessionId = await this.transport.openPort({
         ...this.openPortOptions,
@@ -599,9 +605,6 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
       this.logger.log(`smart serial profile update failed ${message}`);
     }
     this.callbacks.onStateChanged?.("connected");
-    // Defence in depth: the modes were cleared at disconnect, but a reattach is
-    // exactly where stale ones would reach a new device.
-    this.writeEmitter.fire(RESET_INTERACTIVE_MODES);
 
     if (path !== previousPreferredPath) {
       this.writeBanner(

@@ -446,6 +446,40 @@ describe("SmartSerialPty", () => {
     pty.dispose();
   });
 
+  it("resets before the reattached device's first output, replayed or live, and not on the first connect", async () => {
+    vi.useFakeTimers();
+    let opens = 0;
+    let emit: ((id: string, payload: string) => void) | undefined;
+    const t = createTransport({
+      listPorts: async () => [{ path: "COM5", serialNumber: "ABC123" }],
+      openPort: async (_params, sessionId) => {
+        opens += 1;
+        if (opens === 2) {
+          // Output that arrives while the port is still opening.
+          emit!(sessionId ?? "", "\x1b[?1000h");
+        }
+        return sessionId ?? `session-${opens}`;
+      }
+    });
+    emit = t.emitData;
+    const writes: string[] = [];
+    const pty = new SmartSerialPty(t.transport, makeProfile(), makeCallbacks().callbacks, noopLogger());
+    pty.onDidWrite((chunk) => writes.push(chunk));
+    pty.open();
+    await flushAsync();
+    expect(writes.join("")).not.toContain(RESET_INTERACTIVE_MODES);
+
+    t.emitDisconnect((t.transport.openPort as ReturnType<typeof vi.fn>).mock.calls[0][1], "Port closed");
+    writes.length = 0;
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushAsync();
+    const out = writes.join("");
+    expect(out).toContain("\x1b[?1000h");
+    expect(out.indexOf(RESET_INTERACTIVE_MODES)).toBeGreaterThanOrEqual(0);
+    expect(out.indexOf(RESET_INTERACTIVE_MODES)).toBeLessThan(out.indexOf("\x1b[?1000h"));
+    pty.dispose();
+  });
+
   it("markShuttingDown() resets terminal modes", async () => {
     vi.useFakeTimers();
     const { transport } = createTransport({

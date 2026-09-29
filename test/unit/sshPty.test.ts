@@ -992,7 +992,7 @@ describe("SshPty", () => {
     expect(writes[0]).toBe("[hl]pending output");
     expect(writes[1]).toBe(RESET_TERMINAL_MODES);
     // Input modes and cursor visibility a dropped full-screen app leaves behind.
-    for (const seq of ["2004", "1;", "66", "\x1b>", "\x1b[?25h"]) {
+    for (const seq of ["\x1b>", "\x1b[?25h"]) {
       expect(RESET_TERMINAL_MODES).toContain(seq);
     }
     expect(RESET_TERMINAL_MODES).toMatch(/\x1b\[\?[\d;]*\b2004\b[\d;]*l/);

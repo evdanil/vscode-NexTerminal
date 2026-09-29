@@ -32,10 +32,13 @@ export const RESET_INTERACTIVE_MODES =
 
 // Reports the terminal generates by itself (not key presses): focus in/out,
 // SGR mouse (ESC[<..M/m), legacy X10 mouse (ESC[M + 3 bytes), and color-scheme
-// (ESC[?997;..n). xterm.js delivers them through handleInput, so a "press any
-// key to close" rule must not treat them as a key press. Whole-string match so
-// a real key never hides behind a prefix.
-const TERMINAL_REPORT_RE = /^(?:\x1b\[[IO]|\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[M[\s\S]{3}|\x1b\[\?997;[\d;]*n)+$/;
+// (ESC[?997;..n), plus up/down arrows: xterm.js turns wheel scrolling in the
+// alternate buffer into repeated ESC[A/ESC[B (ESC O A/B in application cursor
+// mode), which a mode reset cannot stop and which is a poor close gesture.
+// xterm.js delivers all of these through handleInput, so a "press any key to
+// close" rule must not treat them as a key press. Whole-string match so a real
+// key never hides behind a prefix.
+const TERMINAL_REPORT_RE = /^(?:\x1b[[O][AB]|\x1b\[[IO]|\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[M[\s\S]{3}|\x1b\[\?997;[\d;]*n)+$/;
 
 export function isTerminalGeneratedReport(data: string): boolean {
   return TERMINAL_REPORT_RE.test(data);

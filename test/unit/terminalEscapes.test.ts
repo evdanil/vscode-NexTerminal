@@ -18,13 +18,13 @@ describe("RESET_INTERACTIVE_MODES", () => {
 
 describe("isTerminalGeneratedReport", () => {
   it("recognises focus, mouse and color-scheme reports", () => {
-    for (const r of ["\x1b[I", "\x1b[O", "\x1b[<64;10;5M", "\x1b[<0;1;1m", "\x1b[M !!", "\x1b[?997;2n", "\x1b[I\x1b[O"]) {
+    for (const r of ["\x1b[I", "\x1b[O", "\x1b[<64;10;5M", "\x1b[<0;1;1m", "\x1b[M !!", "\x1b[?997;2n", "\x1b[I\x1b[O", "\x1b[A", "\x1b[B\x1b[B\x1b[B", "\x1bOA", "\x1bOB"]) {
       expect(isTerminalGeneratedReport(r)).toBe(true);
     }
   });
 
   it("treats real keys as keys", () => {
-    for (const k of ["x", "\r", "\x03", "\x1b", "\x1b[A", "\x1bOA", "\x1b[Ix", "xx", ""]) {
+    for (const k of ["x", "\r", "\x03", "\x1b", "\x1b[C", "\x1b[D", "\x1bOC", "\x1b[Ax", "\x1b[Ix", "xx", ""]) {
       expect(isTerminalGeneratedReport(k)).toBe(false);
     }
   });
