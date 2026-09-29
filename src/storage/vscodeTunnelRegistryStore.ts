@@ -11,6 +11,12 @@ const FENCE_DIRECTORY = "reverse-bind-fences";
  */
 const ORPHAN_FILE_AGE_MS = 30_000;
 
+/** Writer-clock timestamp embedded in a versioned fence name, if it has one. */
+function versionedFenceTimestamp(name: string): number | undefined {
+  const embedded = /--(\d{13})-\d{6}-[^.]*\.json$/.exec(name);
+  return embedded ? Number(embedded[1]) : undefined;
+}
+
 function isFenceEntry(value: unknown): value is TunnelRegistryEntry {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return false;
@@ -78,9 +84,12 @@ export class VscodeTunnelRegistryStore implements TunnelRegistryStore {
     }
   }
 
-  private async isFresh(uri: vscode.Uri): Promise<boolean> {
+  private async isFresh(uri: vscode.Uri, embeddedTimestamp?: number): Promise<boolean> {
     try {
-      return Date.now() - (await vscode.workspace.fs.stat(uri)).mtime < ORPHAN_FILE_AGE_MS;
+      // Same basis as deleteIfOrphaned: a lagging network-filesystem mtime must
+      // not make a just-published fence look stale and hide its reservation.
+      const written = Math.max((await vscode.workspace.fs.stat(uri)).mtime, embeddedTimestamp ?? -Infinity);
+      return Date.now() - written < ORPHAN_FILE_AGE_MS;
     } catch {
       // Cannot tell its age: treat as possibly live rather than hide a reservation.
       return true;
@@ -94,8 +103,7 @@ export class VscodeTunnelRegistryStore implements TunnelRegistryStore {
       this.reportedUnusableFiles.add(name);
       console.error(`[Nexus] ignoring unusable reverse-bind fence file ${name}`, reason);
     }
-    const embedded = /--(\d{13})-\d{6}-[^.]*\.json$/.exec(name);
-    await this.deleteIfOrphaned(uri, embedded ? Number(embedded[1]) : undefined);
+    await this.deleteIfOrphaned(uri, versionedFenceTimestamp(name));
     return undefined;
   }
 
@@ -133,7 +141,7 @@ export class VscodeTunnelRegistryStore implements TunnelRegistryStore {
               // A replacement may have been published after the listing.
               return { missing: true as const };
             }
-            if (!(error instanceof SyntaxError) && await this.isFresh(uri)) {
+            if (!(error instanceof SyntaxError) && await this.isFresh(uri, versionedFenceTimestamp(name))) {
               // A fence that is being refreshed right now (for example a
               // delete-pending file under a rename) may fail to read
               // transiently. Skipping it would hide a live reservation, so

@@ -188,6 +188,8 @@ export class TunnelRegistrySync {
   }>();
   private mutationTail: Promise<void> = Promise.resolve();
   private warnedFencePublishFailure = false;
+  /** Fence ids whose publishFence itself failed, as opposed to a later write. */
+  private readonly failedFencePublications = new Set<string>();
 
   public constructor(
     private readonly store: TunnelRegistryStore,
@@ -229,7 +231,12 @@ export class TunnelRegistrySync {
       await this.unregisterTunnel(profileId, options);
     } catch (error) {
       console.error("[Nexus] tunnel registry update after stop failed", error);
-      if (options?.retiredReverseBind && !this.warnedFencePublishFailure) {
+      // A later active-array save can fail after the fence is already
+      // published; that is not a missing reservation, so it must neither warn
+      // nor consume the one-time warning.
+      const fenceId = options?.retiredReverseBind?.fenceId;
+      const publishFailed = fenceId !== undefined && this.failedFencePublications.delete(fenceId);
+      if (publishFailed && options?.retiredReverseBind && !this.warnedFencePublishFailure) {
         this.warnedFencePublishFailure = true;
         this.notifyWarning?.(
           `Nexus could not record a reservation for remote port ${options.retiredReverseBind.remotePort} of a stopped reverse tunnel. ` +
@@ -301,6 +308,7 @@ export class TunnelRegistrySync {
           await this.store.publishFence(fenceEntry);
         } catch (error) {
           this.unsettledReverseBindFenceIds.delete(fence.fenceId);
+          this.failedFencePublications.add(fence.fenceId);
           throw error;
         }
         // A later active-array save can fail. The already-published fence must

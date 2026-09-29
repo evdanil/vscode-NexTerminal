@@ -1035,6 +1035,38 @@ describe("TunnelRegistrySync", () => {
     log.mockRestore();
   });
 
+  it("fails closed for an unreadable versioned fence whose mtime lags but whose name is current", async () => {
+    const [, otherStore] = sharedWindowStores();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const path = seedRaw(`live--${Date.now().toString().padStart(13, "0")}-000001-abc.json`, "{}", 120_000);
+    fakeFenceRead.failPath = path;
+
+    await expect(otherStore.getEntries()).rejects.toThrow();
+    expect(fakeFenceFiles.has(path)).toBe(true);
+    log.mockRestore();
+  });
+
+  it("does not consume the one-time warning when only a later registry save fails", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.fn();
+    const warning = new TunnelRegistrySync(store, core, "w", probePort, warn);
+    const tunnel = makeTunnel({ id: "w2", tunnelType: "reverse", remotePort: 9001 });
+    const options = {
+      tunnel,
+      retiredReverseBind: { fenceId: "w2", routeIdentity: reverseRoute, remotePort: 9001, settled: new Promise<void>(() => {}) }
+    };
+    vi.spyOn(store, "saveEntries").mockRejectedValueOnce(new Error("state write failed"));
+
+    await warning.unregisterTunnelAfterStop(tunnel.profileId, options);
+    expect(warn).not.toHaveBeenCalled();
+
+    vi.spyOn(store, "publishFence").mockRejectedValue(new Error("disk full"));
+    await warning.unregisterTunnelAfterStop(tunnel.profileId, options);
+    await warning.unregisterTunnelAfterStop(tunnel.profileId, options);
+    expect(warn).toHaveBeenCalledTimes(1);
+    log.mockRestore();
+  });
+
   it("warns once when a stopped reverse tunnel's reservation cannot be published", async () => {
     const log = vi.spyOn(console, "error").mockImplementation(() => {});
     const warn = vi.fn();
