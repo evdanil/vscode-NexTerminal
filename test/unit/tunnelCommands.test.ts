@@ -1159,4 +1159,45 @@ describe("startTunnel — profile removed while start is pending", () => {
       expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("changed while the tunnel was starting"), "Retry");
     });
   });
+
+  it("cancels a pending start when the linked auth profile's username is edited", async () => {
+    const { core, profile, server: base } = await fixture();
+    await core.addOrUpdateAuthProfile({ id: "ap1", name: "AP", username: "ops", authType: "password" });
+    await core.addOrUpdateServer({ ...base, authProfileId: "ap1" });
+    const linked = core.getServer("srv-1")!;
+    const sync = deferred<void>();
+    const start = vi.fn(async () => makeActiveTunnel("t1"));
+    const run = startTunnel(
+      core, { start } as never, { connect: vi.fn() } as never,
+      profile, linked, "isolated",
+      { syncNow: () => sync.promise, checkRemoteOwnership: async () => undefined } as never
+    );
+
+    await core.addOrUpdateAuthProfile({ id: "ap1", name: "AP", username: "root", authType: "password" });
+    sync.resolve();
+    await run;
+
+    expect(start).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("changed while the tunnel was starting"), "Retry");
+  });
+
+  it("does not cancel when only the linked auth profile's name is edited", async () => {
+    const { core, profile, server: base } = await fixture();
+    await core.addOrUpdateAuthProfile({ id: "ap1", name: "AP", username: "ops", authType: "password" });
+    await core.addOrUpdateServer({ ...base, authProfileId: "ap1" });
+    const linked = core.getServer("srv-1")!;
+    const sync = deferred<void>();
+    const start = vi.fn(async () => makeActiveTunnel("t1"));
+    const run = startTunnel(
+      core, { start } as never, { connect: vi.fn() } as never,
+      profile, linked, "isolated",
+      { syncNow: () => sync.promise, checkRemoteOwnership: async () => undefined } as never
+    );
+
+    await core.addOrUpdateAuthProfile({ id: "ap1", name: "Renamed", username: "ops", authType: "password" });
+    sync.resolve();
+    await run;
+
+    expect(start).toHaveBeenCalledTimes(1);
+  });
 });

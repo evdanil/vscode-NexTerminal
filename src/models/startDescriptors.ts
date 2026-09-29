@@ -1,5 +1,6 @@
-import type { ProxyConfig, ResolvedTunnelConnectionMode, ServerConfig, TunnelProfile } from "./config";
+import type { AuthProfile, ProxyConfig, ResolvedTunnelConnectionMode, ServerConfig, TunnelProfile } from "./config";
 import {
+  applyAuthProfile,
   resolveServerProtocol,
   resolveTunnelLocalBindAddress,
   resolveTunnelLocalTargetIP,
@@ -32,6 +33,14 @@ import {
  */
 
 export interface ConnectDescriptorInputs {
+  /**
+   * Looks up the linked auth profile (NexusCore.getAuthProfile). The descriptor
+   * is built from the EFFECTIVE server — profile applied, exactly as
+   * SilentAuthSshFactory.resolveServer applies it — so editing the profile's
+   * username, auth type or key path changes it even though the id is the same.
+   * Absent lookup or a deleted profile leaves the server's own fields.
+   */
+  authProfileLookup?: (id: string) => AuthProfile | undefined;
   /** `SshPoolControl.multiplexingDefault` — the pool's captured default. */
   multiplexingDefault?: boolean;
 }
@@ -44,7 +53,11 @@ function proxyDescriptor(proxy: ProxyConfig | undefined): unknown {
 }
 
 /** Server fields the SSH transport (login identity, key file, proxy, connector) reads; never secrets. */
-function transportDescriptor(server: ServerConfig): unknown[] {
+function transportDescriptor(rawServer: ServerConfig, inputs: ConnectDescriptorInputs): unknown[] {
+  const server = applyAuthProfile(
+    rawServer,
+    rawServer.authProfileId ? inputs.authProfileLookup?.(rawServer.authProfileId) : undefined
+  );
   return [
     server.id,
     server.host,
@@ -53,14 +66,11 @@ function transportDescriptor(server: ServerConfig): unknown[] {
     resolveServerProtocol(server),
     server.username,
     server.authType,
-    // The key file is read only by a key login. A linked auth profile can switch
-    // the effective auth type to "key" (SilentAuthSshFactory.resolveServer) while
-    // the stored one stays "password", and the server's own keyPath is then used,
-    // so the path counts when the stored type is key OR a profile is linked. The
-    // link itself (authProfileId, above) is in the descriptor, so switching
-    // profiles cancels too; the profile's own fields are fenced by the profile.
-    server.authType === "key" || server.authProfileId ? server.keyPath || null : null,
-    server.authProfileId || null,
+    // The key file is read only by a key login, judged on the EFFECTIVE auth type.
+    server.authType === "key" ? server.keyPath || null : null,
+    // The link itself, so switching profiles cancels; the profile's supplied
+    // fields are already folded into the values above.
+    rawServer.authProfileId || null,
     Boolean(server.legacyAlgorithms),
     proxyDescriptor(server.proxy)
   ];
@@ -77,7 +87,7 @@ export function connectDescriptor(server: ServerConfig, inputs: ConnectDescripto
   }
   const altHost = typeof server.altHost === "string" && server.altHost.trim() !== "" ? server.altHost.trim() : null;
   return JSON.stringify([
-    transportDescriptor(server),
+    transportDescriptor(server, inputs),
     altHost,
     server.multiplexing ?? inputs.multiplexingDefault ?? true
   ]);
@@ -124,7 +134,7 @@ export function tunnelStartDescriptor(
     mode,
     profile.localPort,
     route,
-    transportDescriptor(server),
+    transportDescriptor(server, inputs),
     multiplexed,
     // Only a pooled lease can inherit an alternate-host connection.
     multiplexed === true ? altHost : null

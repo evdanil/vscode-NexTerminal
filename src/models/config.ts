@@ -1462,6 +1462,18 @@ export function authProfileOwnedCredentials(profile: AuthProfile | undefined): A
 }
 
 /**
+ * The server as a connection actually sees it: the linked auth profile's
+ * supplied credential fields applied over the server's own (a missing profile,
+ * for example one deleted while the server is still linked, leaves the server
+ * as it is). Shared by SilentAuthSshFactory.resolveServer and the start
+ * descriptors so the two cannot disagree about the effective username, auth
+ * type and key path.
+ */
+export function applyAuthProfile(server: ServerConfig, profile: AuthProfile | undefined): ServerConfig {
+  return profile ? { ...server, ...authProfileOwnedCredentials(profile) } : server;
+}
+
+/**
  * The username a connection to `server` will ACTUALLY log in as, given the auth
  * profile it links to (`undefined` for no link, or a link that resolves to
  * nothing). One line, but it is the one line the CONNECT path decides by —

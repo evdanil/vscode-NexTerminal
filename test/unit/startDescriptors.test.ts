@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ServerConfig, TunnelProfile } from "../../src/models/config";
+import { applyAuthProfile, type AuthProfile, type ServerConfig, type TunnelProfile } from "../../src/models/config";
 import { connectDescriptor, tunnelStartDescriptor } from "../../src/models/startDescriptors";
 
 const server: ServerConfig = {
@@ -62,6 +62,7 @@ const TUNNEL_FIELDS: Record<keyof TunnelProfile, { use: "used" | "ignored"; why:
   browserUrl: { use: "ignored", why: "open-in-browser shortcut", alt: "http://x" }
 };
 
+const profile: AuthProfile = { id: "key-profile", name: "P", username: "pu", authType: "password" };
 const inputs = { multiplexingDefault: true };
 const tinputs = { mode: "isolated" as const, multiplexingDefault: true };
 
@@ -172,11 +173,14 @@ describe("start descriptors — resolved values, not stored representations", ()
 });
 
 describe("start descriptors — keyPath and telnet", () => {
-  it("keyPath counts when a linked auth profile can make the login a key login", () => {
+  it("keyPath counts when a linked auth profile makes the effective login a key login", () => {
     const linked: ServerConfig = { ...server, authType: "password", authProfileId: "key-profile" };
     const moved = { ...linked, keyPath: "/new" };
-    expect(connectDescriptor(moved, inputs)).not.toBe(connectDescriptor(linked, inputs));
-    expect(tunnelStartDescriptor(tunnel, moved, tinputs)).not.toBe(tunnelStartDescriptor(tunnel, linked, tinputs));
+    const lookup = (id: string) => (id === "key-profile" ? { ...profile, authType: "key" as const, keyPath: undefined } : undefined);
+    const i = { ...inputs, authProfileLookup: lookup };
+    expect(connectDescriptor(moved, i)).not.toBe(connectDescriptor(linked, i));
+    expect(tunnelStartDescriptor(tunnel, moved, { ...tinputs, authProfileLookup: lookup }))
+      .not.toBe(tunnelStartDescriptor(tunnel, linked, { ...tinputs, authProfileLookup: lookup }));
   });
 
   it("guard: a password server with no profile link ignores a keyPath change", () => {
@@ -237,5 +241,43 @@ describe("start descriptors — secrets are not part of the fence", () => {
     expect(connectDescriptor(changed, inputs)).toBe(connectDescriptor(withSecrets, inputs));
     expect(tunnelStartDescriptor(tunnel, changed, tinputs)).toBe(tunnelStartDescriptor(tunnel, withSecrets, tinputs));
     expect(connectDescriptor(withSecrets, inputs)).not.toMatch(/"(p1|p2|p3|p4)"|passphrase/i);
+  });
+});
+
+/** Every AuthProfile key must be classified, like the server table. */
+const PROFILE_FIELDS: Record<keyof AuthProfile, { use: "used" | "ignored"; why: string; alt: unknown }> = {
+  id: { use: "ignored", why: "the link (server.authProfileId) is what the descriptor holds", alt: "other" },
+  name: { use: "ignored", why: "display only", alt: "Renamed" },
+  username: { use: "used", why: "supplied login name, applied over the server's", alt: "root" },
+  authType: { use: "used", why: "supplied auth method, applied over the server's", alt: "password" },
+  keyPath: { use: "used", why: "supplied key file (counts when the effective type is key)", alt: "/k" }
+};
+
+describe("start descriptors — linked auth profile is applied", () => {
+  const linked: ServerConfig = { ...server, authProfileId: "key-profile" };
+  const withProfile = (p: AuthProfile) => ({ ...inputs, authProfileLookup: () => p });
+
+  it.each(Object.entries(PROFILE_FIELDS))("profile.%s", (key, { use, alt }) => {
+    // A key profile so keyPath is relevant; the field under test is then varied.
+    const base: AuthProfile = { ...profile, authType: "key", keyPath: "/base" };
+    const edited = { ...base, [key]: alt } as AuthProfile;
+    const differs = connectDescriptor(linked, withProfile(edited)) !== connectDescriptor(linked, withProfile(base));
+    expect(differs).toBe(use === "used");
+    const tDiffers =
+      tunnelStartDescriptor(tunnel, linked, { ...tinputs, ...withProfile(edited) }) !==
+      tunnelStartDescriptor(tunnel, linked, { ...tinputs, ...withProfile(base) });
+    expect(tDiffers).toBe(use === "used");
+  });
+
+  it("a deleted profile leaves the server's own fields, as resolveServer does", () => {
+    const missing = { ...inputs, authProfileLookup: () => undefined };
+    expect(connectDescriptor(linked, missing)).toBe(connectDescriptor(linked, inputs));
+  });
+
+  it("agrees with the shared merge helper SilentAuthSshFactory.resolveServer uses", () => {
+    const p: AuthProfile = { id: "key-profile", name: "P", username: "root", authType: "key", keyPath: "/k" };
+    expect(connectDescriptor(linked, withProfile(p))).toBe(connectDescriptor(applyAuthProfile(linked, p), inputs));
+    expect(tunnelStartDescriptor(tunnel, linked, { ...tinputs, ...withProfile(p) }))
+      .toBe(tunnelStartDescriptor(tunnel, applyAuthProfile(linked, p), tinputs));
   });
 });

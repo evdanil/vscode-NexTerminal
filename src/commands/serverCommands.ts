@@ -1051,13 +1051,21 @@ export interface ConnectServerOptions {
  * not a change, so object identity is the wrong test — the same reasoning the
  * Serial and Local Shell start fences use.
  */
-function isServerUnchangedSince(ctx: CommandContext, atStart: ServerConfig): boolean {
+function connectDescriptorInputs(ctx: CommandContext): { multiplexingDefault?: boolean; authProfileLookup: (id: string) => AuthProfile | undefined } {
+  return {
+    multiplexingDefault: ctx.sshPool.multiplexingDefault,
+    authProfileLookup: (id) => ctx.core.getAuthProfile(id)
+  };
+}
+
+/**
+ * Compares the descriptor captured when the connect began with one recomputed
+ * from the live record and the live linked auth profile, using the same inputs
+ * the runtime uses, so only a value the connect actually uses can cancel it.
+ */
+function isServerUnchangedSince(ctx: CommandContext, atStart: ServerConfig, descriptorAtStart: string): boolean {
   const current = ctx.core.getServer(atStart.id);
-  // Descriptors are computed from the start-time clone and the live record with
-  // the same inputs the runtime uses, so only a value the connect actually uses
-  // can cancel it.
-  const inputs = { multiplexingDefault: ctx.sshPool.multiplexingDefault };
-  return current !== undefined && connectDescriptor(current, inputs) === connectDescriptor(atStart, inputs);
+  return current !== undefined && connectDescriptor(current, connectDescriptorInputs(ctx)) === descriptorAtStart;
 }
 
 /** Tells the user why a connect was cancelled and, if the record still exists, offers a Retry that can succeed. */
@@ -1118,6 +1126,7 @@ async function connectTelnetServer(
   options: ConnectServerOptions
 ): Promise<void> {
   const serverAtStart = cloneServerConfig(server);
+  const descriptorAtStart = connectDescriptor(serverAtStart, connectDescriptorInputs(ctx));
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
@@ -1125,7 +1134,7 @@ async function connectTelnetServer(
       cancellable: false
     },
     async () => {
-      if (!isServerUnchangedSince(ctx, serverAtStart)) {
+      if (!isServerUnchangedSince(ctx, serverAtStart, descriptorAtStart)) {
         reportCancelledConnect(ctx, serverAtStart, options);
         return;
       }
@@ -1311,6 +1320,7 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
   const allowAutoFileExplorer = options.allowAutoFileExplorer ?? true;
   let autoFileExplorerHandled = false;
   const serverAtStart = cloneServerConfig(server);
+  const descriptorAtStart = connectDescriptor(serverAtStart, connectDescriptorInputs(ctx));
 
   await vscode.window.withProgress(
     {
@@ -1319,7 +1329,7 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
       cancellable: false
     },
     async () => {
-      if (!isServerUnchangedSince(ctx, serverAtStart)) {
+      if (!isServerUnchangedSince(ctx, serverAtStart, descriptorAtStart)) {
         reportCancelledConnect(ctx, serverAtStart, options);
         return;
       }
@@ -1401,7 +1411,7 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
               // tunnel one: the tunnels reuse this session's config, and a session
               // whose alt host (or anything else the terminal reads) has moved on
               // is stale as a whole, so an altHost edit also skips auto-start.
-              if (!isServerUnchangedSince(ctx, serverAtStart)) {
+              if (!isServerUnchangedSince(ctx, serverAtStart, descriptorAtStart)) {
                 void vscode.window.showWarningMessage(
                   `Auto-start tunnels for "${flattenProviderText(server.name)}" were not started because the server's connection settings changed since this session opened. Close and reopen the terminal to use the new settings.`
                 );

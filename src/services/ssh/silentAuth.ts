@@ -1,6 +1,6 @@
 import type { Duplex } from "node:stream";
 import type { AuthProfile, ServerConfig } from "../../models/config";
-import { authProfileOwnedCredentials } from "../../models/config";
+import { applyAuthProfile } from "../../models/config";
 import { configMutationLock } from "../configMutationLock";
 import type {
   KeyboardInteractiveHandler,
@@ -320,7 +320,7 @@ export class SilentAuthSshFactory implements SshFactory {
     // taken care to store — and a `key` profile with no key path blanked the
     // server's own `keyPath`, the one the server form now lets you set
     // precisely because the profile does not supply it.
-    const resolved: ServerConfig = { ...server, ...authProfileOwnedCredentials(profile) };
+    const resolved: ServerConfig = applyAuthProfile(server, profile);
     return {
       resolved,
       passwordKey: resolved.authType === "password" ? authProfilePasswordSecretKey(profile.id) : passwordSecretKey(server.id),

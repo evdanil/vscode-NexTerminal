@@ -171,7 +171,7 @@ export async function startTunnel(
   // altHost, which is terminal-only), captured now, before any await.
   const profileAtStart = { ...profile };
   const serverAtStart = cloneServerConfig(server);
-  const inputs = { mode: connectionMode, multiplexingDefault };
+  const inputs = { mode: connectionMode, multiplexingDefault, authProfileLookup: (id: string) => core.getAuthProfile(id) };
   const descriptorAtStart = tunnelStartDescriptor(profileAtStart, serverAtStart, inputs);
   const stillCurrent = (): boolean => {
     const liveProfile = core.getTunnel(profile.id);
