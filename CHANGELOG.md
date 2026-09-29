@@ -1,10 +1,18 @@
 # Changelog
 
-## [2.8.303] — 2026-09-29
+## [2.8.304] — 2026-09-29
 
 ### Fixed
 
 - **Kitty keyboard, modifyOtherKeys, cursor-shape and save/restore-cursor sequences no longer leak into captured text.** The shared ANSI stripper now follows the ECMA-48 CSI grammar (`<` `=` `>` `?` parameter prefixes and intermediate bytes such as `ESC[2 q`) and removes two-byte forms like `ESC 7`, `ESC 8`, `ESC =` and `ESC >`, plus terminated DCS/APC/PM/SOS strings. Copy All, session transcripts and script `waitFor`/`expect` matching no longer show fragments such as `[>4;2m` or `[=5u`, so end-anchored prompt patterns match after vim, fish or neovim output, even when a sequence (including a terminal title) is split across two chunks: Copy All, transcripts, script output and macro trigger matching each strip the same text however the output is split into chunks: an unfinished escape is held until the next chunk, an escape over 512 characters is text, and an unterminated OSC/DCS/APC/PM/SOS payload (Sixel, Kitty graphics, XTGETTCAP) is dropped until its terminator or an aborting ESC, giving up after 1 MiB. Private-prefix CSI ending in `m` (such as `ESC[>4;m`) is no longer mistaken for an SGR reset by the highlighter.
+
+## [2.8.303] — 2026-09-29
+
+### Fixed
+
+- **An unreadable reverse-bind reservation file no longer stops the extension loading.** A corrupt, empty or non-fence file in the cross-window fence directory is now logged and ignored instead of failing every registry read, and is deleted once it is more than 30 seconds old. A file that cannot be read is retried and, while under 30 seconds old, makes the registry read fail so a live reservation is never hidden; once stale it is ignored and deleted. Registry storage errors no longer fail activation, and the background sync timers no longer raise unhandled rejections.
+- **Stopping a tunnel no longer fails when the cross-window registry cannot be updated.** The failure is logged after local teardown, so server and tunnel removal complete instead of stopping partway. A reverse tunnel's reservation is still published before Stop returns when storage allows; if it cannot be, a one-time warning says another window may collide on that port and what to do.
+- **Orphaned temporary reservation files are cleaned up.** Temporary files left by a host killed mid-write are removed once older than 30 seconds.
 
 ## [2.8.302] — 2026-09-29
 
