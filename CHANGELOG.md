@@ -1,12 +1,19 @@
 # Changelog
 
-## [2.8.301] — 2026-09-29
+## [2.8.302] — 2026-09-29
 
 ### Fixed
 
 - **An unreadable reverse-bind reservation file no longer stops the extension loading.** A corrupt, empty or non-fence file in the cross-window fence directory is now logged and ignored instead of failing every registry read, and is deleted once it is more than 30 seconds old. A file that cannot be read is retried and, while under 30 seconds old, makes the registry read fail so a live reservation is never hidden; once stale it is ignored and deleted. Registry storage errors no longer fail activation, and the background sync timers no longer raise unhandled rejections.
 - **Stopping a tunnel no longer fails when the cross-window registry cannot be updated.** The failure is logged after local teardown, so server and tunnel removal complete instead of stopping partway. A reverse tunnel's reservation is still published before Stop returns when storage allows; if it cannot be, a one-time warning says another window may collide on that port and what to do.
 - **Orphaned temporary reservation files are cleaned up.** Temporary files left by a host killed mid-write are removed once older than 30 seconds.
+
+## [2.8.301] — 2026-09-29
+
+### Fixed
+
+- **An ended or dropped SSH login no longer deletes a valid saved password or passphrase.** Closing or reconnecting a terminal while it connects, a connection that closes cleanly before login finishes, and a dismissed verification-code prompt were all read as a server rejection because their messages contain the word "authentication". They now carry their own error type, and a saved password is now cleared only when the server rejects it, and a saved key passphrase only when it fails to decrypt the key. A connection that drops mid-login is reported as a connection failure — in the terminal and in Test Connection and Copy Details — without a password prompt.
+- **Port-forwarding guide no longer says concurrent jump-host password prompts dismiss each other.** Since 2.8.280 they appear one after another.
 
 ## [2.8.300] — 2026-09-29
 

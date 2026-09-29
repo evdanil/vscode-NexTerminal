@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { AuthNotJudgedError } from "../../src/services/ssh/authErrors";
 import { classifySshConnectionError } from "../../src/services/ssh/connectionDiagnostics";
 
 describe("classifySshConnectionError", () => {
@@ -72,6 +73,22 @@ describe("classifySshConnectionError", () => {
     // lockout. This asserts the conservative decision documented in the matcher.
     const result = classifySshConnectionError(new Error("read ECONNRESET"));
     expect(result.stage).toBe("unknown");
+  });
+
+  it.each([
+    "SSH connection closed before authentication completed",
+    "SSH connection attempt ended before authentication completed",
+    "Keyboard-interactive authentication canceled"
+  ])("does not report an unjudged login (%s) as a credential rejection", (message) => {
+    const result = classifySshConnectionError(new AuthNotJudgedError(message));
+    expect(result.stage).toBe("unknown");
+    expect(result.title).toBe("SSH connection failed");
+    expect(result.detail).not.toContain("rejected the");
+    expect(result.title).not.toContain("Authentication");
+  });
+
+  it("still classifies a genuine server rejection as an auth failure", () => {
+    expect(classifySshConnectionError(new Error("All configured authentication methods failed")).stage).toBe("auth");
   });
 
   it("classifies authentication failures without echoing secrets", () => {
