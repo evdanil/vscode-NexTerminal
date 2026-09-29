@@ -55,7 +55,8 @@ import { VscodeConfigRepository } from "./storage/vscodeConfigRepository";
 import { VscodeTunnelRegistryStore } from "./storage/vscodeTunnelRegistryStore";
 import { stopTunnelsForShutdown, TunnelRegistrySync } from "./services/tunnel/tunnelRegistrySync";
 import { FileExplorerTreeProvider } from "./ui/fileExplorerTreeProvider";
-import { createCollapsedFolderStatePersistence } from "./ui/collapsedFolderStatePersistence";
+import { createCollapsedFolderState } from "./ui/collapsedFolderState";
+import { createResetGenerationGuard } from "./storage/resetGeneration";
 import { resetLiveViewState } from "./ui/viewStateReset";
 import { FolderTreeItem, NexusTreeProvider } from "./ui/nexusTreeProvider";
 import { ScriptCodeLensProvider } from "./ui/scriptCodeLensProvider";
@@ -753,7 +754,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     renderScriptStatusBar();
   });
   const colorSchemeStorage = new VscodeColorSchemeStorage(context);
-  const colorSchemeService = new ColorSchemeService(colorSchemeStorage);
+  const colorSchemeService = new ColorSchemeService(colorSchemeStorage, createResetGenerationGuard(context.globalState));
   const sftpService = new SftpService(pool, readSftpServiceConfig(), sshDiagnostics);
   const elevationBroker = new SudoElevationBroker(sftpService, (id) => core.getServer(id));
   const fileSystemProvider = new NexusFileSystemProvider(sftpService, elevationBroker);
@@ -975,30 +976,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // source (name, provider label, last sync) with inline actions, and refresh
   // them on any core change.
   const settingsTreeProvider = new SettingsTreeProvider(core, inventoryProviderRegistry);
-  const savedCollapsed = context.globalState.get<string[]>(COLLAPSED_FOLDERS_KEY, []);
-  nexusTreeProvider.loadCollapsedFolders(savedCollapsed);
-  const collapsedFolderStatePersistence = createCollapsedFolderStatePersistence(
-    (paths) => context.globalState.update(COLLAPSED_FOLDERS_KEY, paths),
-    {
-      onError: (error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        console.error(`Failed to persist collapsed folder state: ${message}`);
-      }
+  const hubCollapsedState = createCollapsedFolderState({
+    state: context.globalState,
+    storageKey: COLLAPSED_FOLDERS_KEY,
+    provider: nexusTreeProvider,
+    guard: createResetGenerationGuard(context.globalState),
+    onError: (error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`Failed to persist collapsed folder state: ${message}`);
     }
-  );
-  const persistCollapsedFolders = (): void => {
-    collapsedFolderStatePersistence.schedule(nexusTreeProvider.getCollapsedFolders());
-  };
+  });
+  const collapsedFolderStatePersistence = hubCollapsedState.persistence;
   const handleFolderStateChange = (element: unknown, isCollapsed: boolean): void => {
     if (!(element instanceof FolderTreeItem)) {
       return;
     }
-    if (isCollapsed) {
-      nexusTreeProvider.collapseFolder(element.folderPath);
-    } else {
-      nexusTreeProvider.expandFolder(element.folderPath);
-    }
-    persistCollapsedFolders();
+    hubCollapsedState.handleChange(element.folderPath, isCollapsed);
   };
 
   const commandCenterView = vscode.window.createTreeView("nexusCommandCenter", {
@@ -1137,35 +1130,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   renderCwdSyncState();
 
   const macroTreeProvider = new MacroTreeProvider((macro) => macroAutoTrigger.isDisabled(macro));
-  const savedMacroCollapsed = context.globalState.get<string[]>(MACRO_COLLAPSED_FOLDERS_KEY, []);
-  macroTreeProvider.loadCollapsedFolders(savedMacroCollapsed);
   // §4.10 — adopts the Hub's hand-rolled collapse persistence with a SEPARATE
   // globalState key: reusing the Hub's `collapsedFolderStatePersistence`/
   // `handleFolderStateChange` would let a macro folder path collapse/expand
   // the Hub's OWN folder of the same name (both are `FolderTreeItem`
   // instances, but each view's collapse state must stay independent).
-  const macroCollapsedFolderStatePersistence = createCollapsedFolderStatePersistence(
-    (paths) => context.globalState.update(MACRO_COLLAPSED_FOLDERS_KEY, paths),
-    {
-      onError: (error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        console.error(`Failed to persist macro collapsed folder state: ${message}`);
-      }
+  const macroCollapsedState = createCollapsedFolderState({
+    state: context.globalState,
+    storageKey: MACRO_COLLAPSED_FOLDERS_KEY,
+    provider: macroTreeProvider,
+    guard: createResetGenerationGuard(context.globalState),
+    onError: (error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`Failed to persist macro collapsed folder state: ${message}`);
     }
-  );
-  const persistMacroCollapsedFolders = (): void => {
-    macroCollapsedFolderStatePersistence.schedule(macroTreeProvider.getCollapsedFolders());
-  };
+  });
+  const macroCollapsedFolderStatePersistence = macroCollapsedState.persistence;
   const handleMacroFolderStateChange = (element: unknown, isCollapsed: boolean): void => {
     if (!(element instanceof FolderTreeItem)) {
       return;
     }
-    if (isCollapsed) {
-      macroTreeProvider.collapseFolder(element.folderPath);
-    } else {
-      macroTreeProvider.expandFolder(element.folderPath);
-    }
-    persistMacroCollapsedFolders();
+    macroCollapsedState.handleChange(element.folderPath, isCollapsed);
   };
   const macroView = vscode.window.createTreeView("nexusMacros", {
     treeDataProvider: macroTreeProvider,

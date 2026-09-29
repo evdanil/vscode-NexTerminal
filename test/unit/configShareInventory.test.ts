@@ -2487,6 +2487,9 @@ describe("a share never hands over a shell command or an unattended tunnel (#254
     for (const valid of ["127.0.0.1", "127.255.255.255", "127.0.0.2", "localhost", "::1"]) {
       expect(bind(valid)).toBe(valid);
     }
+    // Padding never reaches the SSH server: the normalized host is what is kept.
+    expect(bind(" localhost ")).toBe("localhost");
+    expect(bind(" 127.0.0.1\t")).toBe("127.0.0.1");
   });
 
   it("export: none of auto-start, a bind address or a URL login survives (⊘ \"keep\")", () => {

@@ -33,21 +33,40 @@ export class ColorSchemeService {
   private activeId: string;
   private fontConfig: TerminalFontConfig | undefined;
 
-  constructor(private readonly storage: ColorSchemeStorage) {
+  /**
+   * `resetGuard` (optional) notices a Delete All Data run in another window: the
+   * cached copies below are then dropped and reloaded from storage before they
+   * can be read or written back (see `storage/resetGeneration.ts`).
+   */
+  constructor(
+    private readonly storage: ColorSchemeStorage,
+    private readonly resetGuard?: { consumeIfChanged(): boolean }
+  ) {
     this.userSchemes = storage.getUserSchemes();
     this.activeId = storage.getActiveSchemeId();
     this.fontConfig = storage.getFontConfig();
   }
 
+  private syncAfterReset(): void {
+    if (this.resetGuard?.consumeIfChanged()) {
+      this.userSchemes = [...this.storage.getUserSchemes()];
+      this.activeId = this.storage.getActiveSchemeId();
+      this.fontConfig = this.storage.getFontConfig();
+    }
+  }
+
   getAllSchemes(): ColorScheme[] {
+    this.syncAfterReset();
     return [...BUILTIN_SCHEMES, ...this.userSchemes];
   }
 
   getActiveSchemeId(): string {
+    this.syncAfterReset();
     return this.activeId;
   }
 
   async setActiveSchemeId(id: string): Promise<void> {
+    this.syncAfterReset();
     this.activeId = id;
     await this.storage.saveActiveSchemeId(id);
   }
@@ -57,11 +76,13 @@ export class ColorSchemeService {
   }
 
   async addSchemes(schemes: ColorScheme[]): Promise<void> {
+    this.syncAfterReset();
     this.userSchemes.push(...schemes);
     await this.storage.saveUserSchemes(this.userSchemes);
   }
 
   async removeScheme(id: string): Promise<void> {
+    this.syncAfterReset();
     const idx = this.userSchemes.findIndex((s) => s.id === id);
     if (idx === -1) return;
     this.userSchemes.splice(idx, 1);
@@ -72,10 +93,12 @@ export class ColorSchemeService {
   }
 
   getFontConfig(): TerminalFontConfig | undefined {
+    this.syncAfterReset();
     return this.fontConfig;
   }
 
   async saveFontConfig(config: TerminalFontConfig): Promise<void> {
+    this.syncAfterReset();
     this.fontConfig = config;
     await this.storage.saveFontConfig(config);
   }

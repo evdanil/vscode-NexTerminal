@@ -9,6 +9,7 @@ import type { InventorySourceConfig, InventorySourceValues, TemplateRule } from 
 import { inventorySecretKey } from "../models/inventory";
 import type { DeviceTemplateProfile, TemplateField } from "../models/deviceTemplate";
 import { RESET_CLEARED_GLOBAL_STATE_KEYS } from "../storage/globalStateKeys";
+import { bumpResetGeneration } from "../storage/resetGeneration";
 import type { LocalServerConfig } from "../models/localServer";
 import type { DhcpConfigProfile, TftpConfigProfile } from "../models/networkServerProfile";
 import type { SavedFilterDefinition } from "../models/savedFilter";
@@ -1976,8 +1977,10 @@ const SHARED_SERVER_RULES = {
 } satisfies ShareRules<ServerConfig>;
 
 /**
- * A loopback address, or `undefined` for anything else. Only a loopback
- * address means the same thing on the recipient's machine as on the sender's.
+ * A loopback address, trimmed and lower-cased, or `undefined` for anything else.
+ * Only a loopback address means the same thing on the recipient's machine as on
+ * the sender's; the normalized host is returned, so padding never reaches the SSH
+ * server.
  */
 function loopbackAddressOnly(value: string | undefined): string | undefined {
   if (typeof value !== "string") {
@@ -1990,7 +1993,7 @@ function loopbackAddressOnly(value: string | undefined): string | undefined {
   const octets = host.split(".");
   const isIpv4Loopback =
     octets.length === 4 && octets[0] === "127" && octets.every((octet) => /^(0|[1-9]\d{0,2})$/.test(octet) && Number(octet) <= 255);
-  return host === "localhost" || host === "::1" || host === "[::1]" || isIpv4Loopback ? value : undefined;
+  return host === "localhost" || host === "::1" || host === "[::1]" || isIpv4Loopback ? host : undefined;
 }
 
 /**
@@ -5412,6 +5415,13 @@ export function registerConfigCommands(
       }
       // The running service caches those values and an open panel shows them.
       await runtime?.resetTerminalAppearance?.();
+      // AFTER everything above is cleared: other windows keep collapsed-folder
+      // sets and the appearance cache in memory, and on their next action they
+      // see this counter move and reload from the (now empty) store instead of
+      // writing their stale copy back. Never cleared, so it stays monotonic.
+      if (context) {
+        await bumpResetGeneration(context.globalState);
+      }
 
       // Reset all settings to defaults
       for (const { section, key } of SETTINGS_KEYS) {

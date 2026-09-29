@@ -53,6 +53,8 @@ export const RESET_KEPT_GLOBAL_STATE_KEYS: readonly string[] = [
   "nexus.settingsGuard.eventLog",
   // A "this already ran" record; clearing it would rerun a one-time migration.
   "nexus.inventory.statusPollSettingMigrated",
+  // The counter Delete All Data bumps so other windows drop stale caches; clearing it would defeat that.
+  "nexus.resetGeneration",
   // Runtime registry of tunnels running in open windows, not saved data.
   "nexus.activeTunnelRegistry"
 ];
