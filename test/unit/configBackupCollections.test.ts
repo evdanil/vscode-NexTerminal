@@ -122,6 +122,15 @@ import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
 import { currentProxyPasswordSecretKey, legacyProxyPasswordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/proxyPasswordKeys";
 import { watchPoolInvalidationOnConfigMutation } from "../../src/services/ssh/poolConfigInvalidation";
+import { KeySerializedSecretVault } from "../../src/services/ssh/keySerializedSecretVault";
+import type { PasswordBearingProxy } from "../../src/services/ssh/proxyPasswordKeys";
+
+/** The extension's wiring: deletes go through the per-key write queue, guarded by the delete-time re-check. */
+function endpointDeleter(vault: SecretVault) {
+  const serialized = new KeySerializedSecretVault(vault);
+  return (id: string, proxy: PasswordBearingProxy, stillUnused: () => boolean): Promise<boolean> =>
+    serialized.deleteIf(proxyPasswordSecretKey(id, proxy), stillUnused);
+}
 
 // The saved proxy password is keyed by the endpoint it belongs to (LOCAL_ENDPOINT's proxy below).
 const LAB_PROXY = { type: "socks5" as const, host: "proxy.lab", port: 1080, username: "pxuser" };
@@ -2486,7 +2495,7 @@ describe("Replace with the endpoint-key housekeeping attached (#175 keeps a same
     await dest.vault.store(currentProxyPasswordSecretKey(local)!, "proxy-pw");
     // The extension's wiring: an endpoint a server left is deleted once the change is persisted.
     const stop = watchPoolInvalidationOnConfigMutation(dest.core, { invalidate: () => {} }, {
-      deleteEndpoint: (id, proxy) => { void dest.vault.delete(proxyPasswordSecretKey(id, proxy)); }
+      deleteEndpoint: endpointDeleter(dest.vault)
     });
     return { dest, stop };
   }

@@ -10,6 +10,15 @@ import {
   proxyPasswordSecretKey
 } from "../../src/services/ssh/proxyPasswordKeys";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import { KeySerializedSecretVault } from "../../src/services/ssh/keySerializedSecretVault";
+import type { PasswordBearingProxy } from "../../src/services/ssh/proxyPasswordKeys";
+
+/** The extension's wiring: deletes go through the per-key write queue, guarded by the delete-time re-check. */
+function endpointDeleter(vault: SecretVault) {
+  const serialized = new KeySerializedSecretVault(vault);
+  return (id: string, proxy: PasswordBearingProxy, stillUnused: () => boolean): Promise<boolean> =>
+    serialized.deleteIf(proxyPasswordSecretKey(id, proxy), stillUnused);
+}
 
 class MemoryVault implements SecretVault {
   public readonly data = new Map<string, string>();
@@ -43,6 +52,49 @@ describe("endpoint-keyed proxy password keys", () => {
   it("an ssh jump proxy or no proxy has no password key", () => {
     expect(currentProxyPasswordSecretKey({ id: "s1", proxy: { type: "ssh", jumpHostId: "j" } })).toBeUndefined();
     expect(currentProxyPasswordSecretKey({ id: "s1", proxy: undefined })).toBeUndefined();
+  });
+});
+
+describe("legacy proxy password migration ordering", () => {
+  it("a target another window saved before the store is not overwritten by the legacy value", async () => {
+    class RacyVault extends MemoryVault {
+      async get(key: string) {
+        const value = this.data.get(key);
+        // Another window saves the endpoint's new password right after this window reads the legacy key.
+        if (key === legacyProxyPasswordSecretKey("s1")) {
+          this.data.set(proxyPasswordSecretKey("s1", A), "newer-from-other-window");
+        }
+        return value;
+      }
+    }
+    const vault = new RacyVault();
+    vault.data.set(legacyProxyPasswordSecretKey("s1"), "legacy-pw");
+    await migrateLegacyProxyPasswords(vault, [server()]);
+    expect(vault.data.get(proxyPasswordSecretKey("s1", A))).toBe("newer-from-other-window");
+  });
+
+  it("the legacy key is deleted only after the store resolved, and only if it still holds what was migrated", async () => {
+    const order: string[] = [];
+    class TracingVault extends MemoryVault {
+      async store(key: string, value: string) { await Promise.resolve(); order.push("store"); await super.store(key, value); }
+      async delete(key: string) { order.push("delete"); await super.delete(key); }
+    }
+    const vault = new TracingVault();
+    vault.data.set(legacyProxyPasswordSecretKey("s1"), "legacy-pw");
+    await migrateLegacyProxyPasswords(vault, [server()]);
+    expect(order).toEqual(["store", "delete"]);
+
+    // An older window rewrites the legacy key while the store is in flight: it is not destroyed.
+    class RewritingVault extends MemoryVault {
+      async store(key: string, value: string) {
+        await super.store(key, value);
+        this.data.set(legacyProxyPasswordSecretKey("s1"), "rewritten-by-older-window");
+      }
+    }
+    const other = new RewritingVault();
+    other.data.set(legacyProxyPasswordSecretKey("s1"), "legacy-pw");
+    await migrateLegacyProxyPasswords(other, [server()]);
+    expect(other.data.get(legacyProxyPasswordSecretKey("s1"))).toBe("rewritten-by-older-window");
   });
 });
 
@@ -98,7 +150,7 @@ describe("a pending proxy edit never exposes one endpoint's password under anoth
     const core = new NexusCore(repo);
     await core.initialize();
     const stop = watchPoolInvalidationOnConfigMutation(core, { invalidate: () => {} }, {
-      deleteEndpoint: (id, proxy) => { void vault.delete(proxyPasswordSecretKey(id, proxy)); }
+      deleteEndpoint: endpointDeleter(vault)
     });
     const readForCurrent = () => vault.get(currentProxyPasswordSecretKey(core.getServer("s1")!)!);
     return { vault, repo, core, stop, readForCurrent };
@@ -169,6 +221,66 @@ describe("a pending proxy edit never exposes one endpoint's password under anoth
     stop();
   });
 
+  it("a same-window store for A queued after the pending delete of A survives it", async () => {
+    const inner = new MemoryVault();
+    inner.data.set(proxyPasswordSecretKey("s1", A), "pw-A");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const realDelete = inner.delete.bind(inner);
+    inner.delete = async (key: string) => { await gate; await realDelete(key); };
+    const serialized = new KeySerializedSecretVault(inner);
+    const repo = new SlowRepo([server()], []);
+    const core = new NexusCore(repo);
+    await core.initialize();
+    const stop = watchPoolInvalidationOnConfigMutation(core, { invalidate: () => {} }, {
+      // Not "still unused" is decided at run time; here A is genuinely left, so the delete runs.
+      deleteEndpoint: (id, proxy, unused) => serialized.deleteIf(proxyPasswordSecretKey(id, proxy), unused)
+    });
+    const pending = core.addOrUpdateServer(server({ proxy: B }));
+    repo.release?.();
+    await pending;
+    await tick(); // A's delete is queued and blocked on the gate
+    // The user re-enters a password for A (a prompt of a server briefly on A): queued behind the delete.
+    const storing = serialized.store(proxyPasswordSecretKey("s1", A), "fresh-A");
+    await tick();
+    release();
+    await storing;
+    await tick();
+    expect(inner.data.get(proxyPasswordSecretKey("s1", A))).toBe("fresh-A");
+    stop();
+  });
+
+  it("a queued delete whose endpoint came back into use before it runs is skipped, and the endpoint stays listed for a later persist", async () => {
+    const inner = new MemoryVault();
+    inner.data.set(proxyPasswordSecretKey("s1", A), "pw-A");
+    // Hold the key's queue with an earlier write so the guarded delete waits.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const realStore = inner.store.bind(inner);
+    inner.store = async (key: string, value: string) => { await gate; await realStore(key, value); };
+    const serialized = new KeySerializedSecretVault(inner);
+    const repo = new SlowRepo([server()], []);
+    const core = new NexusCore(repo);
+    await core.initialize();
+    const stop = watchPoolInvalidationOnConfigMutation(core, { invalidate: () => {} }, {
+      deleteEndpoint: (id, proxy, unused) => serialized.deleteIf(proxyPasswordSecretKey(id, proxy), unused)
+    });
+    void serialized.store(proxyPasswordSecretKey("s1", A), "pw-A"); // earlier write holds the queue
+    const first = core.addOrUpdateServer(server({ proxy: B }));
+    repo.release?.();
+    await first; // persisted on B: A's delete is now queued behind the held store
+    await tick();
+    // Before it runs, this window's state moves back to A (or a reload from another window reached it).
+    const back = core.addOrUpdateServer(server({ proxy: A }));
+    release();
+    repo.release?.();
+    await back;
+    await tick();
+    await tick();
+    expect(inner.data.get(proxyPasswordSecretKey("s1", A))).toBe("pw-A");
+    stop();
+  });
+
   it("A -> B -> A before the save deletes nothing", async () => {
     const { vault, repo, core, stop, readForCurrent } = await setup();
     const original = core.getServer("s1")!;
@@ -214,7 +326,7 @@ describe("a pending proxy edit never exposes one endpoint's password under anoth
     const core = new NexusCore(repo);
     await core.initialize();
     const stop = watchPoolInvalidationOnConfigMutation(core, { invalidate: () => {} }, {
-      deleteEndpoint: (id, proxy) => { void vault.delete(proxyPasswordSecretKey(id, proxy)); }
+      deleteEndpoint: endpointDeleter(vault)
     });
     const pending = core.removeFolderCascade("G", true);
     expect(vault.deleted).toEqual([]);
@@ -234,7 +346,7 @@ describe("a pending proxy edit never exposes one endpoint's password under anoth
     const core = new NexusCore(repo);
     await core.initialize();
     const stop = watchPoolInvalidationOnConfigMutation(core, { invalidate: () => {} }, {
-      deleteEndpoint: (id, proxy) => { void vault.delete(proxyPasswordSecretKey(id, proxy)); }
+      deleteEndpoint: endpointDeleter(vault)
     });
     const batch = core.runServerBatch(async () => {
       await core.removeServer("s1"); // persists the removal BEFORE the re-add

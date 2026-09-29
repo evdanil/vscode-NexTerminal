@@ -1,5 +1,5 @@
 import type { NexusCore } from "../../core/nexusCore";
-import { authProfileOwnedCredentials, proxyConfigsEqual, type AuthProfile } from "../../models/config";
+import { authProfileOwnedCredentials, proxyConfigsEqual, type AuthProfile, type ProxyConfig } from "../../models/config";
 import { pooledConnectionParamsChanged, ridersFromIndex } from "./pooledConnectionParams";
 import { isPasswordBearingProxy, type PasswordBearingProxy } from "./proxyPasswordKeys";
 
@@ -47,10 +47,23 @@ export function watchPoolInvalidationOnConfigMutation(
    * persisted, `deleteEndpoint` is called for each endpoint the server no longer
    * uses; a lost delete leaks nothing readable.
    */
-  proxySecrets?: { deleteEndpoint(serverId: string, proxy: PasswordBearingProxy): void }
+  proxySecrets?: {
+    /**
+     * Deletes the saved password of an endpoint the server left, through the key's write
+     * queue. `stillUnused()` is evaluated right before the delete executes (after every
+     * write issued earlier for that key): it returns false when the endpoint has come back
+     * into use (this window's own state moved back, or a reload from another window reached
+     * it), and the delete must then be skipped. Resolves true if deleted, false if skipped.
+     */
+    deleteEndpoint(serverId: string, proxy: PasswordBearingProxy, stillUnused: () => boolean): Promise<boolean>;
+  }
 ): () => void {
   /** serverId -> password-bearing endpoints the server left since the last persist. */
   const leftEndpoints = new Map<string, PasswordBearingProxy[]>();
+  /** Endpoints whose delete is queued or running (kept listed until it settles). */
+  const deleting: Array<{ serverId: string; proxy: PasswordBearingProxy }> = [];
+  /** The servers as last persisted (the latest persistence event), for the delete-time re-check. */
+  const lastPersisted = new Map<string, { proxy: ProxyConfig | undefined }>();
   const jumpOf = new Map<string, string>();
   const ridersOf = new Map<string, Set<string>>();
   const profileOf = new Map<string, string>();
@@ -93,6 +106,10 @@ export function watchPoolInvalidationOnConfigMutation(
   // endpoint's password untouched, because nothing was deleted before persistence.
   const unsubscribePersisted = proxySecrets
     ? core.onDidPersistServers((persisted) => {
+        lastPersisted.clear();
+        for (const server of persisted) {
+          lastPersisted.set(server.id, { proxy: server.proxy });
+        }
         // Inside a server batch (a Replace import, the editor's record + secret
         // transaction) nothing settles until the batch ends: a removal may be followed by a
         // re-add on the same endpoint, and a failed secret write rolls the record back to the
@@ -100,28 +117,36 @@ export function watchPoolInvalidationOnConfigMutation(
         if (leftEndpoints.size === 0 || core.isServerBatchActive()) {
           return;
         }
-        const byId = new Map(persisted.map((server) => [server.id, server]));
+        // An endpoint is in use when the persisted record OR the in-memory one has it.
+        const inUse = (serverId: string, endpoint: PasswordBearingProxy): boolean =>
+          proxyConfigsEqual(lastPersisted.get(serverId)?.proxy, endpoint) ||
+          proxyConfigsEqual(core.getServer(serverId)?.proxy, endpoint);
         for (const [serverId, endpoints] of [...leftEndpoints]) {
-          const stored = byId.get(serverId);
-          const current = core.getServer(serverId);
-          // An endpoint is deletable only when NEITHER the persisted record NOR the
-          // in-memory one uses it: the persisted list can predate a later revert that is
-          // still waiting for its own save. Endpoints still in use stay listed for the
-          // next persist.
-          const stillUsed = (endpoint: PasswordBearingProxy): boolean =>
-            (stored !== undefined && proxyConfigsEqual(stored.proxy, endpoint)) ||
-            (current !== undefined && proxyConfigsEqual(current.proxy, endpoint));
-          const remaining = endpoints.filter((endpoint) => {
-            if (stillUsed(endpoint)) {
-              return true;
+          for (const endpoint of endpoints) {
+            const queued = deleting.some((d) => d.serverId === serverId && proxyConfigsEqual(d.proxy, endpoint));
+            if (queued || inUse(serverId, endpoint)) {
+              continue;
             }
-            proxySecrets.deleteEndpoint(serverId, endpoint);
-            return false;
-          });
-          if (remaining.length > 0) {
-            leftEndpoints.set(serverId, remaining);
-          } else {
-            leftEndpoints.delete(serverId);
+            const entry = { serverId, proxy: endpoint };
+            deleting.push(entry);
+            const forget = (): void => {
+              deleting.splice(deleting.indexOf(entry), 1);
+            };
+            // Re-checked when the delete actually runs, after earlier writes to the key.
+            void proxySecrets.deleteEndpoint(serverId, endpoint, () => !inUse(serverId, endpoint)).then(
+              (deleted) => {
+                forget();
+                if (deleted) {
+                  const rest = (leftEndpoints.get(serverId) ?? []).filter((known) => !proxyConfigsEqual(known, endpoint));
+                  if (rest.length > 0) leftEndpoints.set(serverId, rest);
+                  else leftEndpoints.delete(serverId);
+                }
+              },
+              (error) => {
+                forget(); // stays listed: retried at the next persistence event
+                console.error("[Nexus] Could not delete a stale proxy password:", error);
+              }
+            );
           }
         }
       })

@@ -42,6 +42,7 @@ import { SftpService } from "./services/sftp/sftpService";
 import { SudoElevationBroker } from "./services/sftp/sudoElevationBroker";
 import { SilentAuthSshFactory, proxyPasswordSecretKey } from "./services/ssh/silentAuth";
 import { createSshTransportStack } from "./services/ssh/sshTransportStack";
+import { KeySerializedSecretVault } from "./services/ssh/keySerializedSecretVault";
 import { migrateLegacyProxyPasswords } from "./services/ssh/proxyPasswordKeys";
 import { watchPoolInvalidationOnConfigMutation } from "./services/ssh/poolConfigInvalidation";
 import { Ssh2Connector } from "./services/ssh/ssh2Connector";
@@ -381,7 +382,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     resolveLogRotationOptions,
     () => terminalOutputTraceEnabled
   );
-  const secretVault = new VscodeSecretVault(context);
+  // One shared vault whose writes are serialized per key, so this window's stores and deletes of a
+  // secret take effect in issue order (a fresh password queued after a stale delete survives).
+  const secretVault = new KeySerializedSecretVault(new VscodeSecretVault(context));
   // Move legacy per-server proxy passwords to their endpoint keys before anything
   // can connect (see proxyPasswordKeys.ts). Idempotent and cross-window safe.
   await migrateLegacyProxyPasswords(secretVault, core.getSnapshot().servers);
@@ -1297,11 +1300,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // Safety does not depend on it: a password is read only for the endpoint it was
   // entered for (proxyPasswordKeys.ts).
   const unsubscribeSyncPoolInvalidation = watchPoolInvalidationOnConfigMutation(core, pool, {
-    deleteEndpoint: (serverId, proxy) => {
-      void secretVault.delete(proxyPasswordSecretKey(serverId, proxy)).catch((error) => {
-        console.error("[Nexus] Could not delete a stale proxy password:", error);
-      });
-    }
+    deleteEndpoint: (serverId, proxy, stillUnused) =>
+      secretVault.deleteIf(proxyPasswordSecretKey(serverId, proxy), stillUnused)
   });
   const unsubscribeCore = core.onDidChange(() => {
     syncViews();

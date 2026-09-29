@@ -15,6 +15,13 @@ import type { SecretVault } from "./contracts";
  * housekeeping after persistence, not a safety requirement: a stale key is
  * never read for another endpoint.
  *
+ * Cross-window writes to one secret key are last-writer-wins, like `globalState`
+ * (SecretStorage has no compare-and-swap); this window orders only its own operations
+ * (KeySerializedSecretVault). The worst case of a lost race is a password that is
+ * missing or is an older one for the SAME endpoint, which shows up as a re-prompt after
+ * an authentication failure. Because the key names the endpoint, a password can never
+ * be read for, or sent to, a different endpoint.
+ *
  * `proxy-password-{serverId}` is the LEGACY per-server key (installs before
  * endpoint keys); it is migrated at activation and still cleared on delete.
  */
@@ -62,6 +69,14 @@ export function currentProxyPasswordSecretKey(server: Pick<ServerConfig, "id" | 
  * (the old code deleted it whenever the endpoint changed), so it moves to that
  * endpoint's key and the legacy key is deleted. Idempotent and safe across
  * windows: if the endpoint key already exists the legacy one is just deleted.
+ * Residual cross-window risk: SecretStorage has no compare-and-swap, so between the
+ * target read and the store another window could save a new password for this exact
+ * endpoint and be overwritten by the legacy value. That needs a concurrent save for the
+ * same endpoint during this window's activation, and the worst outcome is that the
+ * endpoint holds the legacy value, which WAS valid for it: a wrong password fails
+ * authentication, which invalidates the saved password and re-prompts. No data is lost
+ * and nothing is sent to a different endpoint.
+ *
  * Only servers with a password-bearing proxy are visited (an orphan legacy key on
  * any other server can never be read and is still cleared with the server), in
  * bounded parallel so a large inventory does not delay activation.
@@ -79,10 +94,17 @@ export async function migrateLegacyProxyPasswords(
         return;
       }
       const target = currentProxyPasswordSecretKey(server);
+      // Read the target immediately before the store and skip when it exists: a password
+      // another window saved for this endpoint meanwhile is newer than the legacy value.
       if (target !== undefined && (await vault.get(target)) === undefined) {
         await vault.store(target, legacy);
       }
-      await vault.delete(legacyKey);
+      // Delete the legacy key only after the store has resolved, and only if it still holds
+      // what was migrated: an older window rewriting it in the meantime keeps its value
+      // for the next activation instead of losing it.
+      if ((await vault.get(legacyKey)) === legacy) {
+        await vault.delete(legacyKey);
+      }
     } catch (error) {
       console.warn(`[Nexus] Could not migrate the legacy proxy password for server ${server.id}:`, error);
     }
