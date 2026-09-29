@@ -118,9 +118,9 @@ describe("createAnsiRegex", () => {
       expect(run(["a\x1bPpayload", "more\x1b[31mred"])).toBe("ared");
     });
 
-    it("holds a split CSI within the 64-char cap and releases a longer run", () => {
+    it("holds a split CSI and releases a run past the 512-char bound as text", () => {
       expect(run(["a\x1b[>4;", "2mb"])).toBe("ab");
-      expect(run(["\x1b[" + "1".repeat(100)]).length).toBeGreaterThan(90);
+      expect(run(["\x1b[" + "1".repeat(600)]).length).toBeGreaterThan(590);
     });
 
     it("gives up discarding after 1 MiB and resumes normal text", () => {
@@ -146,7 +146,7 @@ describe("createAnsiRegex", () => {
 });
 
 describe("stripChunk chunk-independence", () => {
-  const stripAll = (chunks: string[], limit?: number): string => {
+  const stripFull = (chunks: string[], limit?: number): { text: string; carry: unknown } => {
     let carry = EMPTY_STRIP_CARRY;
     let out = "";
     for (const c of chunks) {
@@ -154,8 +154,9 @@ describe("stripChunk chunk-independence", () => {
       out += r.text;
       carry = r.carry;
     }
-    return out;
+    return { text: out, carry };
   };
+  const stripAll = (chunks: string[], limit?: number): string => stripFull(chunks, limit).text;
 
   // Tricky inputs: every string terminator and abort, CSI with private and
   // intermediate forms, nF, malformed escapes, and lone ESC at the end.
@@ -184,13 +185,19 @@ describe("stripChunk chunk-independence", () => {
     "a\x1b[1\x1b[31mb",
     "a\x1b[1;\nb\x1b[>\x07c",
     "a\x1b (b\x1b\x1b\x1bc",
-    "a\x1b[" + "1".repeat(70) + "mb",
-    "a\x1b " + " ".repeat(70) + "~b",
+    "a\x1b[0;1;3;4;5;7;9;38;2;255;255;255;48;2;255;255;255;58;2;255;255;255mb",
     "trailing lone ESC\x1b",
     "trailing CSI\x1b[>4;",
     "trailing OSC\x1b]0;ti",
     "trailing DCS\x1bPpay\x1b",
     "\x1b\x1b\x1b"
+  ];
+
+  // Escapes past the 512-char bound: too long for the all-splits sweep, so they
+  // go through the per-character and random-split checks only.
+  const longCorpus = [
+    "a\x1b[" + "1".repeat(600) + "mb",
+    "a\x1b " + " ".repeat(600) + "~b"
   ];
 
   function* splits(text: string): Generator<string[]> {
@@ -214,18 +221,18 @@ describe("stripChunk chunk-independence", () => {
 
   it.each([undefined, 3])("every 1- and 2-cut split matches the one-shot result (discard limit %s)", (limit) => {
     for (const input of corpus) {
-      const whole = stripAll([input], limit);
+      const whole = stripFull([input], limit);
       for (const parts of splits(input)) {
-        expect(stripAll(parts, limit), JSON.stringify({ input, parts })).toBe(whole);
+        expect(stripFull(parts, limit), JSON.stringify({ input, parts })).toEqual(whole);
       }
     }
   });
 
   it("random multi-cut splits (fixed seed) and 1-character streams match the one-shot result", () => {
     const rand = rng(251);
-    for (const input of corpus) {
-      const whole = stripAll([input]);
-      expect(stripAll([...input]), JSON.stringify({ input, mode: "per-char" })).toBe(whole);
+    for (const input of [...corpus, ...longCorpus]) {
+      const whole = stripFull([input]);
+      expect(stripFull([...input]), JSON.stringify({ input, mode: "per-char" })).toEqual(whole);
       for (let k = 0; k < 25; k++) {
         const cuts = new Set<number>();
         const count = 1 + Math.floor(rand() * 6);
@@ -238,9 +245,27 @@ describe("stripChunk chunk-independence", () => {
           prev = cut;
         }
         parts.push(input.slice(prev));
-        expect(stripAll(parts), JSON.stringify({ input, parts })).toBe(whole);
+        expect(stripFull(parts), JSON.stringify({ input, parts })).toEqual(whole);
       }
     }
+  });
+
+  it("strips a long real SGR (67 chars) whole and split", () => {
+    const sgr = "\x1b[0;1;3;4;5;7;9;38;2;255;255;255;48;2;255;255;255;58;2;255;255;255m";
+    expect(sgr.length).toBeGreaterThan(64);
+    expect(stripAll([`a${sgr}b`])).toBe("ab");
+    expect(stripAll([`a${sgr.slice(0, 30)}`, `${sgr.slice(30)}b`])).toBe("ab");
+    expect(stripAll([...`a${sgr}b`])).toBe("ab");
+    const colon = "\x1b[38:2::255:255:255;48:2::255:255:255;58:2::255:255:255;4:3;1;3;9;53m";
+    expect(stripAll([`a${colon}b`])).toBe("ab");
+  });
+
+  it("does not resume the text with a low surrogate orphaned by the discard cap", () => {
+    // cap 2 drops "a" and the high surrogate, then hits the low half.
+    const out = stripAll(["\x1bPa\u{1F600}b"], 2);
+    expect(out).toBe("b");
+    expect(out).not.toMatch(/[\udc00-\udfff]/);
+    expect(stripAll(["\x1bPa\ud83d", "\ude00b"], 2)).toBe("b");
   });
 
   it("the corpus is stripped as intended, not vacuously equal", () => {

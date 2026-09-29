@@ -59,9 +59,11 @@ export function createAnsiRegex(): RegExp {
 }
 
 // Longest CSI/nF escape stripChunk() will treat as a sequence, ESC included.
-// Real sequences are far shorter; a longer run is text. It is a property of
+// Real sequences are far shorter (a truecolor SGR with several colour
+// parameters is under 100); a longer run is text, which only bounds memory and
+// stray ESCs. It is a property of
 // the grammar, not of chunking, so one-shot and chunked results still agree.
-const MAX_ESCAPE_LENGTH = 64;
+const MAX_ESCAPE_LENGTH = 512;
 // Payload characters an unterminated string sequence may drop before it is
 // abandoned and output resumes as ordinary text, so a lone `ESC P` in binary
 // output cannot swallow the session. Sixel, Kitty graphics and XTGETTCAP
@@ -105,13 +107,13 @@ export const EMPTY_STRIP_CARRY: StripCarry = { state: S.Text, hold: "", discarde
  *   (OSC only), `ESC \`, the 8-bit ST U+009C, or CAN/SUB, which consume the
  *   byte. An ESC followed by anything else aborts the string and starts a new
  *   sequence at that ESC;
- * - an escape that turns out malformed (or longer than 64 chars) is emitted
+ * - an escape that turns out malformed (or longer than 512 chars) is emitted
  *   as text, and the byte that broke it is reparsed as text.
  *
  * INVARIANT: for any input, calling this over any split into chunks (threading
  * the carry) yields the same concatenated `text` as one call over the whole
  * input. Nothing depends on where a chunk boundary falls; the only bounds are
- * per-sequence (64-char escape, `discardLimit` payload characters). Bytes of a
+ * per-sequence (512-char escape, `discardLimit` payload characters). Bytes of a
  * still-unfinished escape are held in the carry, so a trailing incomplete
  * escape is not in `text` yet.
  */
@@ -199,8 +201,13 @@ export function stripChunk(
         } else if (c === 0x1b) {
           state = state === S.Osc ? S.OscEsc : S.StrEsc;
         } else if (discarded >= discardLimit) {
-          // Cap reached: stop discarding; this byte and the rest are text.
+          // Cap reached: stop discarding; this byte and the rest are text. A
+          // low surrogate here is orphaned by the cut (its high half was
+          // dropped), so it goes too rather than start the text as a lone half.
           state = S.Text;
+          if (c >= 0xdc00 && c <= 0xdfff) {
+            i++;
+          }
           continue;
         } else {
           discarded++;
