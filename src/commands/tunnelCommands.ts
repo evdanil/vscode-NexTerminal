@@ -10,7 +10,8 @@ import type {
   TunnelType
 } from "../models/config";
 import { flattenProviderText } from "../models/inventory";
-import { cloneServerConfig, resolveTunnelType, serverConnectionEqual, tunnelConnectionEqual } from "../models/config";
+import { cloneServerConfig, resolveTunnelType } from "../models/config";
+import { tunnelStartDescriptor } from "../models/startDescriptors";
 import { configMutationLock } from "../services/configMutationLock";
 import type { SshFactory } from "../services/ssh/contracts";
 import { TunnelStartCancelledError, TunnelStoppedError, type TunnelManager } from "../services/tunnel/tunnelManager";
@@ -31,6 +32,15 @@ export function getDefaultTunnelConnectionMode(): ResolvedTunnelConnectionMode {
     .getConfiguration("nexus.tunnel")
     .get<ResolvedTunnelConnectionMode>("defaultConnectionMode", "shared");
   return configured === "isolated" ? "isolated" : "shared";
+}
+
+/** The global default mode; "shared" if settings are unavailable (matches the setting's own default). */
+function readGlobalTunnelMode(): ResolvedTunnelConnectionMode {
+  try {
+    return getDefaultTunnelConnectionMode();
+  } catch {
+    return "shared";
+  }
 }
 
 function getDefaultReverseBindAddress(): string {
@@ -154,19 +164,30 @@ export async function startTunnel(
 ): Promise<void> {
   // Content, not identity: an unchanged editor Save or a Refresh replaces a
   // record with an equal copy, which must not cancel a start. A different
-  // record restored under the same id still differs in content, so the bulk
-  // removal fence is preserved. Snapshots are taken now, before any await.
+  // record restored under the same id still differs in what the start uses, so
+  // the bulk removal fence is preserved. The descriptor holds the RESOLVED
+  // values this attempt uses (effective mode, the pool's multiplexing default,
+  // the per-type route fields, the server fields the tunnel path reads — not
+  // altHost, which is terminal-only), captured now, before any await.
   const profileAtStart = { ...profile };
   const serverAtStart = cloneServerConfig(server);
+  const inputs = { mode: connectionMode, multiplexingDefault };
+  const descriptorAtStart = tunnelStartDescriptor(profileAtStart, serverAtStart, inputs);
   const stillCurrent = (): boolean => {
     const liveProfile = core.getTunnel(profile.id);
     const liveServer = core.getServer(server.id);
-    return (
-      liveProfile !== undefined &&
-      tunnelConnectionEqual(liveProfile, profileAtStart) &&
-      liveServer !== undefined &&
-      serverConnectionEqual(liveServer, serverAtStart, { multiplexingDefault })
-    );
+    if (!liveProfile || !liveServer) {
+      return false;
+    }
+    // A profile whose stored mode is untouched keeps the mode captured for this
+    // attempt (it may have been chosen interactively for an "ask" profile);
+    // an edited stored mode is resolved fresh, as the next start would.
+    const liveMode = liveProfile.connectionMode === profileAtStart.connectionMode
+      ? connectionMode
+      : liveProfile.connectionMode === "ask"
+        ? "ask"
+        : liveProfile.connectionMode ?? readGlobalTunnelMode();
+    return tunnelStartDescriptor(liveProfile, liveServer, { ...inputs, mode: liveMode }) === descriptorAtStart;
   };
   const reportCancelled = (): void => {
     // Names can come from an inventory sync; flatten them where they enter the message.

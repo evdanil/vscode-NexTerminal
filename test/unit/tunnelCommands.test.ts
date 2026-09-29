@@ -1078,4 +1078,43 @@ describe("startTunnel — profile removed while start is pending", () => {
 
     expect(stop).not.toHaveBeenCalled();
   });
+
+  it("does not cancel when an unset mode is saved back as the explicit effective mode", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const starting = deferred<ActiveTunnel>();
+    const start = vi.fn(() => starting.promise);
+    const stop = vi.fn(async () => {});
+    const run = startTunnel(
+      core, { start, stop } as never,
+      { connect: vi.fn(async () => ({ dispose: vi.fn() })) } as never,
+      profile, capturedServer, "shared"
+    );
+
+    await core.addOrUpdateTunnel({ ...profile, connectionMode: "shared" });
+    await Promise.resolve();
+    starting.resolve(makeActiveTunnel("t1"));
+    await run;
+
+    expect(stop).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not cancel an isolated start when only the server's altHost changes", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const starting = deferred<ActiveTunnel>();
+    const start = vi.fn(() => starting.promise);
+    const stop = vi.fn(async () => {});
+    const run = startTunnel(
+      core, { start, stop } as never, { connect: vi.fn() } as never,
+      profile, capturedServer, "isolated"
+    );
+
+    await core.addOrUpdateServer({ ...capturedServer, altHost: "alt.example" });
+    expect(isTunnelStartCurrent(core, "t1", "srv-1")).toBe(true);
+    starting.resolve(makeActiveTunnel("t1"));
+    await run;
+
+    expect(stop).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
 });

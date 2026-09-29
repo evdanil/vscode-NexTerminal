@@ -851,50 +851,6 @@ export function cloneServerConfig(server: ServerConfig): ServerConfig {
   };
 }
 
-/**
- * The fields a connect (or a tunnel's SSH login) actually reads from a server.
- * A pending start is cancelled only when one of these changes; renaming the
- * folder, toggling hidden, or editing IPMI/inventory bookkeeping does not
- * affect the connection being opened. Explicit comparators, not JSON, so key
- * order cannot register as a change.
- */
-export function serverConnectionEqual(
-  a: ServerConfig,
-  b: ServerConfig,
-  options: { multiplexingDefault?: boolean } = {}
-): boolean {
-  const multiplexingDefault = options.multiplexingDefault ?? true;
-  // Each optional field is compared after the same canonicalization the editor
-  // save applies (see formValuesToServer): an explicit default and an absent
-  // value mean the same thing, and an unchanged Save must not read as a change.
-  const text = (value: string | undefined): string | undefined => {
-    const trimmed = typeof value === "string" ? value.trim() : undefined;
-    return trimmed ? trimmed : undefined;
-  };
-  return (
-    a.id === b.id &&
-    a.host === b.host &&
-    a.port === b.port &&
-    (a.addressless ?? false) === (b.addressless ?? false) &&
-    resolveServerProtocol(a) === resolveServerProtocol(b) &&
-    text(a.altHost) === text(b.altHost) &&
-    a.username === b.username &&
-    a.authType === b.authType &&
-    (a.keyPath || undefined) === (b.keyPath || undefined) &&
-    (a.authProfileId || undefined) === (b.authProfileId || undefined) &&
-    // Effective value, as the pool resolves it (`server.multiplexing ?? global`):
-    // absent equals an explicit value only when that value is the global setting.
-    (a.multiplexing ?? multiplexingDefault) === (b.multiplexing ?? multiplexingDefault) &&
-    // Read as a truthy flag by the connector; absent and false are the same.
-    Boolean(a.legacyAlgorithms) === Boolean(b.legacyAlgorithms) &&
-    // logSession is deliberately not compared: the editor writes the current
-    // global default into an unset value on every Save, and a transcript
-    // preference is not part of the connection being opened.
-    proxyConfigsEqual(a.proxy, b.proxy)
-  );
-}
-
-/** The tunnel fields that decide what is listened on and where it forwards; notes, name and browser URL are excluded. */
 const TUNNEL_DEFAULT_ADDRESS = "127.0.0.1";
 
 /**
@@ -911,35 +867,6 @@ export function resolveTunnelRemoteBindAddress(profile: Pick<TunnelProfile, "rem
 }
 export function resolveTunnelLocalTargetIP(profile: Pick<TunnelProfile, "localTargetIP">): string {
   return profile.localTargetIP ?? TUNNEL_DEFAULT_ADDRESS;
-}
-
-export function tunnelConnectionEqual(a: TunnelProfile, b: TunnelProfile): boolean {
-  const type = resolveTunnelType(a);
-  if (type !== resolveTunnelType(b) || a.id !== b.id || a.localPort !== b.localPort) {
-    return false;
-  }
-  // Only the fields TunnelManager reads for the resolved type are compared; the
-  // editor canonicalizes the rest (dynamic: remoteIP "0.0.0.0" / remotePort 0;
-  // reverse: remoteIP mirrors remoteBindAddress), so an unchanged Save must not
-  // register them as changes.
-  switch (type) {
-    case "dynamic":
-      return resolveTunnelLocalBindAddress(a) === resolveTunnelLocalBindAddress(b) && (a.connectionMode === b.connectionMode);
-    case "reverse":
-      // Reverse tunnels are always shared, so the stored mode is irrelevant.
-      return (
-        a.remotePort === b.remotePort &&
-        resolveTunnelRemoteBindAddress(a) === resolveTunnelRemoteBindAddress(b) &&
-        resolveTunnelLocalTargetIP(a) === resolveTunnelLocalTargetIP(b)
-      );
-    default:
-      return (
-        a.remoteIP === b.remoteIP &&
-        a.remotePort === b.remotePort &&
-        resolveTunnelLocalBindAddress(a) === resolveTunnelLocalBindAddress(b) &&
-        a.connectionMode === b.connectionMode
-      );
-  }
 }
 
 export function proxyConfigsEqual(a: ProxyConfig | undefined, b: ProxyConfig | undefined): boolean {
