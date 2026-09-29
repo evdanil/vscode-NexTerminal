@@ -9,6 +9,7 @@ import type {
   TunnelProfile,
   TunnelType
 } from "../models/config";
+import { flattenProviderText } from "../models/inventory";
 import { cloneServerConfig, resolveTunnelType, serverConnectionEqual, tunnelConnectionEqual } from "../models/config";
 import { configMutationLock } from "../services/configMutationLock";
 import type { SshFactory } from "../services/ssh/contracts";
@@ -166,15 +167,18 @@ export async function startTunnel(
     );
   };
   const reportCancelled = (): void => {
+    // Names can come from an inventory sync; flatten them where they enter the message.
+    const safeProfileName = flattenProviderText(profile.name);
+    const safeServerName = flattenProviderText(server.name);
     const liveProfile = core.getTunnel(profile.id);
     if (!liveProfile || !core.getServer(server.id)) {
       void vscode.window.showWarningMessage(
-        `Tunnel "${profile.name}" or its server was removed while the tunnel was starting. The start was cancelled.`
+        `Tunnel "${safeProfileName}" or its server was removed while the tunnel was starting. The start was cancelled.`
       );
       return;
     }
     void Promise.resolve(vscode.window.showWarningMessage(
-      `Tunnel "${profile.name}" or its server "${server.name}" changed while the tunnel was starting. The start was cancelled. Retry on "${server.name}" with the current settings.`,
+      `Tunnel "${safeProfileName}" or its server "${safeServerName}" changed while the tunnel was starting. The start was cancelled. Retry on "${safeServerName}" with the current settings.`,
       "Retry"
     )).then((choice) => {
       if (choice === "Retry") {
@@ -405,6 +409,15 @@ async function startTunnelCommand(ctx: CommandContext, arg?: unknown): Promise<v
   const preferredServerId = typeof arg === "object" && arg
     ? (arg as { serverId?: unknown }).serverId
     : undefined;
+  // A pinned server (Retry after a cancelled start) must not silently fall
+  // back to the default/sole/picked server: that would start the tunnel on a
+  // different host than the one the cancelled start was aimed at.
+  if (typeof preferredServerId === "string" && !ctx.core.getServer(preferredServerId)) {
+    void vscode.window.showWarningMessage(
+      `The server for tunnel "${flattenProviderText(profile.name)}" was removed. The tunnel was not started.`
+    );
+    return;
+  }
   const server = await resolveServerForTunnel(
     ctx.core,
     profile,

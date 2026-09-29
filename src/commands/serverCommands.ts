@@ -16,6 +16,7 @@ import {
   serverConfigsEqual,
   serverConnectionEqual
 } from "../models/config";
+import { flattenProviderText } from "../models/inventory";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SshPty } from "../services/ssh/sshPty";
@@ -1054,18 +1055,20 @@ function isServerUnchangedSince(ctx: CommandContext, atStart: ServerConfig): boo
 
 /** Tells the user why a connect was cancelled and, if the record still exists, offers a Retry that can succeed. */
 function reportCancelledConnect(ctx: CommandContext, atStart: ServerConfig, options: ConnectServerOptions): void {
+  // The name can come from an inventory sync; flatten it where it enters the message.
+  const safeName = flattenProviderText(atStart.name);
   const removed = ctx.core.getServer(atStart.id) === undefined;
   options.onConnectFailed?.(
-    `Connection to "${atStart.name}" canceled because its server profile ${removed ? "was removed" : "changed"}.`
+    `Connection to "${safeName}" canceled because its server profile ${removed ? "was removed" : "changed"}.`
   );
   if (removed) {
     void vscode.window.showWarningMessage(
-      `Server "${atStart.name}" was removed while the connection was starting. The connection was cancelled.`
+      `Server "${safeName}" was removed while the connection was starting. The connection was cancelled.`
     );
     return;
   }
   void Promise.resolve(vscode.window.showWarningMessage(
-    `Server "${atStart.name}" changed while the connection was starting. The connection was cancelled. Retry with the current settings.`,
+    `Server "${safeName}" changed while the connection was starting. The connection was cancelled. Retry with the current settings.`,
     "Retry"
   )).then((choice) => {
     if (choice === "Retry") {

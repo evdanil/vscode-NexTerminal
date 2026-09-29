@@ -1000,4 +1000,39 @@ describe("startTunnel — profile removed while start is pending", () => {
     await registeredCommands.get("nexus.tunnel.start")!({ profile: { id: "t1" }, serverId: "srv-2" });
     expect(start).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ id: "srv-2" }), expect.anything());
   });
+
+  it("flattens hostile profile and server names in the cancellation warning", async () => {
+    const hostile = "evil\nSpoof: click here\u202Etxt";
+    const { core, profile, server: capturedServer } = await fixture();
+    const hostileServer = { ...capturedServer, name: hostile };
+    await core.addOrUpdateServer(hostileServer);
+    const live = core.getServer("srv-1")!;
+    const sync = deferred<void>();
+    const run = startTunnel(
+      core, { start: vi.fn() } as never, { connect: vi.fn() } as never,
+      profile, live, "isolated",
+      { syncNow: () => sync.promise, checkRemoteOwnership: async () => undefined } as never
+    );
+    await core.addOrUpdateServer({ ...live, host: "10.7.7.7" });
+    sync.resolve();
+    await run;
+
+    const message = String(mockShowWarningMessage.mock.calls[0][0]);
+    expect(message).not.toMatch(/[\n\u202E]/);
+    expect(message).toContain("evil Spoof: click here");
+  });
+
+  it("does not fall back to another server when a pinned Retry server was removed", async () => {
+    const other: ServerConfig = { ...server, id: "srv-2", name: "Other" };
+    const ctx = await setupContext([makeTunnel({ defaultServerId: "srv-1", connectionMode: "isolated" })]);
+    await ctx.core.addOrUpdateServer(server);
+    await ctx.core.addOrUpdateServer(other);
+    await ctx.core.removeServer("srv-2");
+    const start = vi.fn(async () => makeActiveTunnel("t1"));
+    ctx.tunnelManager = { start } as never;
+    registerTunnelCommands(ctx);
+    await registeredCommands.get("nexus.tunnel.start")!({ profile: { id: "t1" }, serverId: "srv-2" });
+    expect(start).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("was removed"));
+  });
 });

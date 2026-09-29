@@ -264,6 +264,24 @@ describe("connectServer — equal-content replacement while progress is pending"
     expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexus.server.connect", "srv-1");
   });
 
+  it("flattens a hostile server name (newline, bidi control) in the cancellation warning and onConnectFailed text", async () => {
+    const hostile = "evil\nSpoof: click here\u202Etxt";
+    const server = makeServer({ name: hostile });
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const release = holdProgress();
+    const onConnectFailed = vi.fn();
+
+    const run = connectServer(ctx, server.id, { onConnectFailed });
+    await addOrUpdateServer({ ...server, host: "changed.example" });
+    release();
+    await run;
+
+    for (const text of [String(mockShowWarningMessage.mock.calls[0][0]), String(onConnectFailed.mock.calls[0][0])]) {
+      expect(text).not.toMatch(/[\n\u202E]/);
+      expect(text).toContain("evil Spoof: click here");
+    }
+  });
+
   it("shows a removal message without Retry when the server is gone", async () => {
     const server = makeServer();
     const { ctx, removeServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
