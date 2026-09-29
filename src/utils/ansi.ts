@@ -29,6 +29,10 @@
 // alphabet is wider than the old `[0-9;?]*` and now contains digits and dots,
 // so the back-off is load-bearing, not merely defensive.
 //
+// The same gap applies to a DCS/APC/PM/SOS string split across chunks: only a
+// terminated one is removed whole, so a payload whose ST arrives in a later
+// chunk is stripped as a bare `ESC P` and its text is left behind.
+//
 // The durable fix is requiring the terminator here, so an unterminated OSC
 // reads as incomplete and safeCutIndex protects it exactly as it protects an
 // incomplete CSI. That is deliberately out of scope of the latency work: this
@@ -36,4 +40,25 @@
 // never-terminated OSC would then stop stripping anything after it.
 export function createAnsiRegex(): RegExp {
   return /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[PX^_][^\x07\x1b]*\x1b\\|[ -/]*[0-Z\\^-~])/g;
+}
+
+// Longest trailing escape prefix a chunk-wise stripper will hold back. Real
+// CSI/nF sequences are far shorter; the cap keeps a stray ESC from retaining
+// data indefinitely.
+const MAX_HELD_ESCAPE = 64;
+const INCOMPLETE_ESCAPE_TAIL_RE = /\x1b(?:\[[0-?]*[ -/]*|[ -/]+)?$/;
+
+/**
+ * Index where a trailing, not-yet-complete CSI / nF escape starts, or -1.
+ * A chunk-wise stripper must not strip such a tail (it would leave the
+ * fragment as text once the rest arrives); it holds it and prepends it to the
+ * next chunk. Incomplete OSC/DCS are not reported: OSC matches without its
+ * terminator by design (see the known gap above).
+ */
+export function findIncompleteEscapeStart(text: string): number {
+  const esc = text.lastIndexOf("\x1b");
+  if (esc < 0 || text.length - esc > MAX_HELD_ESCAPE) {
+    return -1;
+  }
+  return INCOMPLETE_ESCAPE_TAIL_RE.test(text.slice(esc)) ? esc : -1;
 }

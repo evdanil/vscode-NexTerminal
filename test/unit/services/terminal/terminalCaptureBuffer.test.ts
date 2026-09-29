@@ -57,6 +57,16 @@ describe("TerminalCaptureBuffer", () => {
       expect(text).not.toContain("[=");
     });
 
+    it("strips an escape sequence split across two appends", () => {
+      const buf = new TerminalCaptureBuffer();
+      buf.append("a\x1b[>4;");
+      buf.append("2mb\x1b");
+      buf.append("[=5ucd\n");
+      const text = buf.getText();
+      expect(text).toBe("abcd");
+      expect(text).not.toContain("[>");
+    });
+
     it("removes C0 control characters except newline, carriage-return, and tab", () => {
       const buf = new TerminalCaptureBuffer();
       buf.append("bell\x07here\n");

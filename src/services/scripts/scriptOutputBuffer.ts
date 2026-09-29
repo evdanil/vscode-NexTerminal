@@ -1,4 +1,4 @@
-import { createAnsiRegex } from "../../utils/ansi";
+import { createAnsiRegex, findIncompleteEscapeStart } from "../../utils/ansi";
 
 export interface Match {
   text: string;
@@ -32,8 +32,14 @@ export class ScriptOutputBuffer {
     this.capacity = opts.capacity ?? DEFAULT_CAPACITY;
   }
 
+  /** Trailing incomplete escape held back so a sequence split across chunks is stripped whole. */
+  private carry = "";
+
   public append(raw: string): void {
-    const stripped = raw.replace(createAnsiRegex(), "");
+    const joined = this.carry + raw;
+    const hold = findIncompleteEscapeStart(joined);
+    this.carry = hold < 0 ? "" : joined.slice(hold);
+    const stripped = (hold < 0 ? joined : joined.slice(0, hold)).replace(createAnsiRegex(), "");
     if (stripped.length === 0) return;
     this.text += stripped;
     this.writeHead += stripped.length;

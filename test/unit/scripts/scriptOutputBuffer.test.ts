@@ -24,6 +24,26 @@ describe("ScriptOutputBuffer", () => {
     expect(buf.scan(/\$ $/)?.text).toBe("$ ");
   });
 
+  it("strips an escape sequence split across two appends", () => {
+    const buf = new ScriptOutputBuffer();
+    buf.append("a\x1b[>4;");
+    expect(buf.writeHead).toBe(1);
+    buf.append("2mb\x1b");
+    buf.append("7c");
+    expect(buf.tail(10)).toBe("abc");
+    expect(buf.writeHead).toBe(3);
+  });
+
+  it("never withholds ordinary text and bounds a stray ESC hold-back", () => {
+    const buf = new ScriptOutputBuffer();
+    buf.append("prompt$ ");
+    expect(buf.scan(/\$ $/)?.text).toBe("$ ");
+    // An ESC[ followed by a never-ending parameter run is released once it
+    // exceeds the hold-back cap instead of retaining data forever.
+    buf.append("\x1b[" + "1".repeat(100));
+    expect(buf.tail(200)).toContain("1".repeat(50));
+  });
+
   it("rolls trim when text exceeds capacity", () => {
     const buf = new ScriptOutputBuffer({ capacity: 10 });
     buf.append("1234567890");

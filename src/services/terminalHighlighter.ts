@@ -131,6 +131,15 @@ function classifySgr(seq: string): SgrClass {
     return SgrClass.None;
   }
 
+  // Private-prefix (`ESC[>4;m` modifyOtherKeys, `ESC[?…m`) and intermediate
+  // (`ESC[0 m`) forms end in `m` but are not SGR: treating them as one would
+  // read `ESC[>4;m` as a reset and recolour text the app still has coloured.
+  const first = seq.charCodeAt(2);
+  const beforeFinal = seq.charCodeAt(seq.length - 2);
+  if ((first >= 0x3c && first <= 0x3f) || (beforeFinal >= 0x20 && beforeFinal <= 0x2f)) {
+    return SgrClass.None;
+  }
+
   // Parse semicolon-separated numeric params in-place
   let num = 0;
   let hasDigit = false;

@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { createAnsiRegex } from "../../utils/ansi";
+import { createAnsiRegex, findIncompleteEscapeStart } from "../../utils/ansi";
 
 const ANSI_RE = createAnsiRegex();
 const CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
@@ -39,6 +39,8 @@ function readScrollbackSetting(): number {
 export class TerminalCaptureBuffer {
   private lines: string[] = [];
   private pending = "";
+  /** Trailing incomplete escape held back so a sequence split across chunks is stripped whole. */
+  private carry = "";
   private maxLines: number;
   private readonly configSubscription: vscode.Disposable;
 
@@ -54,7 +56,10 @@ export class TerminalCaptureBuffer {
   public append(data: string): void {
     ANSI_RE.lastIndex = 0;
     CONTROL_CHAR_RE.lastIndex = 0;
-    const stripped = data.replace(ANSI_RE, "").replace(CONTROL_CHAR_RE, "");
+    const joined = this.carry + data;
+    const hold = findIncompleteEscapeStart(joined);
+    this.carry = hold < 0 ? "" : joined.slice(hold);
+    const stripped = (hold < 0 ? joined : joined.slice(0, hold)).replace(ANSI_RE, "").replace(CONTROL_CHAR_RE, "");
     if (stripped.length === 0) return;
     const combined = this.pending + stripped;
     const segments = combined.split("\n");
@@ -68,6 +73,7 @@ export class TerminalCaptureBuffer {
   public clear(): void {
     this.lines = [];
     this.pending = "";
+    this.carry = "";
   }
 
   public getText(): string {

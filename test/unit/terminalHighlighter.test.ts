@@ -691,6 +691,17 @@ describe("TerminalHighlighter", () => {
     expect(result).toContain("\x1b[31mTEST\x1b[39m");
   });
 
+  it("private-prefix and intermediate CSI ending in m are not read as SGR", () => {
+    setConfig(true, [{ pattern: "\\d+", color: "red", flags: "g" }]);
+    const h = new TerminalHighlighter();
+    // ESC[>4;m (modifyOtherKeys reset) is not an SGR reset: foo is still coloured,
+    // so 123 must not be recoloured by the rule.
+    expect(h.apply("\x1b[31mfoo\x1b[>4;m123 bar")).toBe("\x1b[31mfoo\x1b[>4;m123 bar");
+    expect(h.apply("\x1b[31mfoo\x1b[0 m123")).toBe("\x1b[31mfoo\x1b[0 m123");
+    // A real SGR reset still re-enables highlighting.
+    expect(h.apply("\x1b[31mfoo\x1b[0m123")).toContain("\x1b[31m123\x1b[39m");
+  });
+
   it("CSI sequence with tilde final byte is recognized as ANSI, not plain text", () => {
     setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi", bold: true }]);
     const h = new TerminalHighlighter();
