@@ -160,6 +160,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ONE changelog, ONE set of release notes. Unreleased changes accumulate
+      # in a single CHANGELOG entry headed with the version a release tags
+      # (AGENTS.md), so that entry IS this release's notes — the same text the
+      # Marketplace and Open VSX show from the CHANGELOG.md packed in the VSIX.
+      # GitHub's generate_release_notes is deliberately OFF: it would add a
+      # second, differently worded account (a PR-title list) of the same
+      # release.
+      #
+      # THE GATE FOR EVERY PUBLISH IN THIS JOB. It runs first, straight after
+      # checkout, and both publishing steps below (GitHub Release, Marketplace)
+      # are later steps of this same job without always(), so a failure here
+      # skips them. It also runs for a manual workflow_dispatch Marketplace
+      # publish, which has no tag — then against package.json's version, the
+      # version that publish ships. publish-openvsx.yml runs the same script
+      # before its own publish, so a bad entry stops both workflows and the
+      # script's "nothing has been published" stays true.
+      - name: Extract and validate release notes from CHANGELOG
+        if: env.RELEASE_TAG != '' || inputs.publish_marketplace
+        run: |
+          set -euo pipefail
+          if [ -n "$RELEASE_TAG" ]; then
+            version="${RELEASE_TAG#v}"
+          else
+            version=$(node -p "require('./package.json').version")
+          fi
+          node scripts/extractReleaseNotes.mjs "$version" "$RUNNER_TEMP/release-notes.md"
+
       - uses: actions/download-artifact@v4
         with:
           pattern: local-pty-*
@@ -265,7 +292,8 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           make_latest: ${{ steps.latest.outputs.make_latest }}
           files: "*.vsix"
-          generate_release_notes: true
+          body_path: ${{ runner.temp }}/release-notes.md
+          generate_release_notes: false
 
       - name: Publish to VS Code Marketplace
         if: >-

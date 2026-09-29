@@ -1,0 +1,103 @@
+# A new release tag invalidates the "Version / changelog" gate on every open
+# maintainer pull request.
+#
+# WHY. The gate (ci.yml `policy`) requires package.json to be STRICTLY GREATER
+# than the highest v* tag. A pull request that passed at 2.8.296 stays green
+# after v2.8.296 is released — nothing re-evaluates it, because a tag push does
+# not touch a pull request — and merging it would add bullets to an entry that
+# is already published. Re-running the gate job makes it fetch the tags again,
+# so such a pull request goes red until it opens the next entry.
+#
+# TRIGGERS. A tag pushed by hand fires `push`. A tag auto-release.yml creates
+# with GITHUB_TOKEN does NOT (GitHub's recursion safeguard), so auto-release
+# calls this workflow directly, exactly as it calls release.yml and
+# publish-openvsx.yml. `workflow_dispatch` is there to run it by hand.
+#
+# It runs as soon as the tag exists, not after publishing: the tag alone is what
+# the gate compares against, and waiting would only widen the window below.
+#
+# NEVER FAILS THE RELEASE. It is a separate workflow (or a separate job of
+# auto-release with nothing depending on it), and every failure below — listing
+# pull requests, finding a run, re-running a job — is a ::warning and the step
+# still exits 0. A warning names the pull request to re-check by hand.
+#
+# RESIDUAL GAPS, stated plainly:
+#   - A pull request merged between the tag push and this re-run (seconds to a
+#     minute or two) is not caught. Its bullets land under the released
+#     heading; move them into a new entry by hand.
+#   - A CI run still IN PROGRESS cannot be re-run. If its gate job already
+#     finished before the tag existed, it stays green: this logs a warning for
+#     it; re-run the gate by hand once that run completes.
+#   - GitHub refuses to re-run runs older than 30 days (warning, re-run by
+#     pushing to the branch).
+#   - Only OWNER-authored pull requests are re-checked, because the gate job
+#     runs only for those (see ci.yml).
+
+name: Re-check open PRs after a release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  pull-requests: read
+  contents: read
+
+jobs:
+  recheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-run "Version / changelog" on open maintainer pull requests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Deliberately no `set -e`: a failure here is a warning, never a
+          # failed release.
+          set -uo pipefail
+          warn() { echo "::warning title=PR gate re-run::$*"; }
+
+          if ! prs=$(gh api --paginate "repos/$REPO/pulls?state=open&base=main&per_page=100" \
+              --jq '.[] | select(.author_association == "OWNER") | "\(.number) \(.head.sha)"'); then
+            warn "Could not list open pull requests. Re-run the Version / changelog check on open maintainer pull requests by hand."
+            exit 0
+          fi
+          if [ -z "$prs" ]; then
+            echo "No open OWNER pull requests targeting main; nothing to re-check."
+            exit 0
+          fi
+
+          # The list is read on fd 3 so no gh call inside the loop can consume it
+          # from stdin.
+          while read -r number sha <&3; do
+            [ -n "$number" ] || continue
+            # The latest CI run for the pull request's current head commit.
+            if ! run=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$sha&event=pull_request&per_page=100" \
+                --jq '.workflow_runs | sort_by(.run_number) | last | .id // empty'); then
+              warn "PR #$number: could not look up its CI runs; re-run Version / changelog by hand."
+              continue
+            fi
+            if [ -z "$run" ]; then
+              warn "PR #$number: no CI run for head $sha; push to the branch to run the check."
+              continue
+            fi
+            if ! job=$(gh api --paginate "repos/$REPO/actions/runs/$run/jobs?filter=latest&per_page=100" \
+                --jq '.jobs[] | select(.name == "Version / changelog") | .id'); then
+              warn "PR #$number: could not list the jobs of CI run $run; re-run Version / changelog by hand."
+              continue
+            fi
+            job=$(printf '%s\n' "$job" | head -n 1)
+            if [ -z "$job" ]; then
+              warn "PR #$number: CI run $run has no Version / changelog job; re-run it by hand."
+              continue
+            fi
+            if gh run rerun "$run" --job "$job" --repo "$REPO"; then
+              echo "PR #$number: re-running Version / changelog (run $run, job $job)."
+            else
+              warn "PR #$number: could not re-run CI run $run job $job (still in progress, or too old). Re-run Version / changelog by hand once the run completes."
+            fi
+          done 3<<< "$prs"

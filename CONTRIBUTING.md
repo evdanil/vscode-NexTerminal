@@ -145,9 +145,9 @@ If your change adds or alters user-facing behaviour, update the matching guide u
 - Keep unrelated reformatting out of the diff.
 - Rebase on `main` rather than merging it in, if you're comfortable doing so.
 
-**Do not bump the version.** Leave `package.json` alone. Concurrent pull requests would otherwise collide on that one line, and release timing stays a maintainer decision.
+**Do not bump the version.** Leave `package.json`, `package-lock.json` and the CHANGELOG headings alone. Release timing and version numbers are a maintainer decision.
 
-To be concrete about what happens instead, since nothing automates it: the maintainer bumps the patch version in a separate commit when merging your work. There is no merge-time bump in CI — `release.yml` only sets `package.json` to match a tag that already exists at publish time, which is not the same thing. If you see `CLAUDE.md` say that every change pull request bumps the patch version, that rule is addressed to maintainer-authored pull requests, not to yours.
+Unreleased changes accumulate in a single entry at the top of `CHANGELOG.md`, headed with the next release version. If your change is visible to users and the top entry's version has not been released yet (there is no `v{version}` tag for it), you may add a bullet to that entry under the matching section (Added / Changed / Fixed / …). If it has already been released, or you are unsure, describe the user-visible change in your pull request instead. Either way, the maintainer adds or moves your notes into the unreleased entry when merging, and opens that entry after a release if it does not exist yet. There is no per-merge version bump, and nothing in CI bumps it — `release.yml` only sets `package.json` to match a tag that already exists at publish time.
 
 **Never put a line containing only `[release]` in a commit message.** That string on its own line is the live release trigger for this repository — it publishes to the VS Code Marketplace and Open VSX, irreversibly, and a published version can never be withdrawn or re-used.
 

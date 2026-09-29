@@ -156,6 +156,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The same release-notes gate release.yml runs, against the same commit.
+      # A v* tag starts this workflow and release.yml independently; without
+      # this, Open VSX could publish an immutable version whose CHANGELOG entry
+      # is missing or empty while release.yml fails and tells the maintainer
+      # nothing was published. First step, before any build or publish.
+      - name: Validate release notes in CHANGELOG
+        run: node scripts/extractReleaseNotes.mjs "${RELEASE_TAG#v}" "$RUNNER_TEMP/release-notes.md"
+
       - uses: actions/download-artifact@v4
         with:
           pattern: local-pty-*
