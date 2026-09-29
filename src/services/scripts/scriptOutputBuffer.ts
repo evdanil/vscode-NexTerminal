@@ -1,4 +1,4 @@
-import { createAnsiRegex } from "../../utils/ansi";
+import { EMPTY_STRIP_CARRY, stripChunk, type StripCarry } from "../../utils/ansi";
 
 export interface Match {
   text: string;
@@ -32,8 +32,17 @@ export class ScriptOutputBuffer {
     this.capacity = opts.capacity ?? DEFAULT_CAPACITY;
   }
 
+  /** Trailing incomplete escape held back so a sequence split across chunks is stripped whole. */
+  private carry: StripCarry = EMPTY_STRIP_CARRY;
+
+  /** Drop the escape carry: the session's transport restarted (see PtyOutputObserver.onTransportReset). */
+  public resetEscapeState(): void {
+    this.carry = EMPTY_STRIP_CARRY;
+  }
+
   public append(raw: string): void {
-    const stripped = raw.replace(createAnsiRegex(), "");
+    const { text: stripped, carry } = stripChunk(this.carry, raw);
+    this.carry = carry;
     if (stripped.length === 0) return;
     this.text += stripped;
     this.writeHead += stripped.length;

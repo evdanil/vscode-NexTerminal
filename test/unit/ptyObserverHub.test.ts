@@ -33,6 +33,18 @@ function throwingObserver(message = "boom"): PtyOutputObserver {
   };
 }
 
+describe("PtyObserverHub.notifyTransportReset", () => {
+  it("calls onTransportReset on every observer, tolerating a throwing or absent hook", () => {
+    const hub = new PtyObserverHub();
+    const calls: string[] = [];
+    hub.addOutputObserver({ ...makeObserver(), onTransportReset: () => { throw new Error("boom"); } });
+    hub.addOutputObserver({ ...makeObserver(), onTransportReset: () => calls.push("b") });
+    hub.addOutputObserver(makeObserver()); // no hook
+    expect(() => hub.notifyTransportReset()).not.toThrow();
+    expect(calls).toEqual(["b"]);
+  });
+});
+
 describe("PtyObserverHub.notifyOutput", () => {
   it("delivers output to every observer when none throw", () => {
     const hub = new PtyObserverHub();

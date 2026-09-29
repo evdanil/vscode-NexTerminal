@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.307] — 2026-09-29
+
+### Fixed
+
+- **Kitty keyboard, modifyOtherKeys, cursor-shape and save/restore-cursor sequences no longer leak into captured text.** The shared ANSI stripper now follows the ECMA-48 CSI grammar (`<` `=` `>` `?` parameter prefixes and intermediate bytes such as `ESC[2 q`) and removes two-byte forms like `ESC 7`, `ESC 8`, `ESC =` and `ESC >`, plus terminated DCS/APC/PM/SOS strings. Copy All, session transcripts and script `waitFor`/`expect` matching no longer show fragments such as `[>4;2m` or `[=5u`, so end-anchored prompt patterns match after vim, fish or neovim output, even when a sequence (including a terminal title) is split across two chunks: Copy All, transcripts, script output and macro trigger matching each strip the same text however the output is split into chunks: an unfinished escape is held until the next chunk, an escape over 512 characters is text, and an unterminated OSC/DCS/APC/PM/SOS payload (Sixel, Kitty graphics, XTGETTCAP) is dropped until its terminator or an aborting ESC, giving up after 1 MiB. An SSH reconnect and a Smart Follow reattach start each of them from a clean slate, so an escape the lost connection or device left unfinished cannot swallow its replacement's prompt. Private-prefix CSI ending in `m` (such as `ESC[>4;m`) is no longer mistaken for an SGR reset by the highlighter.
+
 ## [2.8.305] — 2026-09-29
 
 ### Fixed

@@ -725,7 +725,10 @@ Add a **Trigger Pattern** to make a macro run when terminal output matches a
 regular expression. Nexus watches the output of every Nexus terminal — SSH,
 Telnet, Serial and Local Shell — removes ANSI escape codes and most control
 characters, keeps a bounded tail buffer, and tests the trigger pattern against
-that buffer.
+that buffer. Stripping covers CSI (including private-prefix forms such as Kitty
+keyboard and modifyOtherKeys), two-byte escapes, and OSC/DCS/APC/PM/SOS strings,
+also when a sequence is split across two chunks of output (see
+[Terminal](terminal.md)).
 
 Enter only the JavaScript regex pattern, without surrounding slashes or flags.
 Use `[Pp]assword:\s*$`, not `/password:\s*$/i`. Macro triggers do not have a

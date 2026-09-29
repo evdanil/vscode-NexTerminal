@@ -1,7 +1,6 @@
 import * as vscode from "vscode";
-import { createAnsiRegex } from "../../utils/ansi";
+import { EMPTY_STRIP_CARRY, stripChunk, type StripCarry } from "../../utils/ansi";
 
-const ANSI_RE = createAnsiRegex();
 const CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
 const SCROLLBACK_SECTION = "terminal.integrated";
 const SCROLLBACK_KEY = "scrollback";
@@ -39,6 +38,12 @@ function readScrollbackSetting(): number {
 export class TerminalCaptureBuffer {
   private lines: string[] = [];
   private pending = "";
+  /**
+   * Trailing incomplete escape held back so a sequence split across chunks is
+   * stripped whole. Not reset by clear(): Clear Scrollback does not interrupt
+   * the byte stream, so the sequence's second half still arrives.
+   */
+  private carry: StripCarry = EMPTY_STRIP_CARRY;
   private maxLines: number;
   private readonly configSubscription: vscode.Disposable;
 
@@ -52,9 +57,10 @@ export class TerminalCaptureBuffer {
   }
 
   public append(data: string): void {
-    ANSI_RE.lastIndex = 0;
     CONTROL_CHAR_RE.lastIndex = 0;
-    const stripped = data.replace(ANSI_RE, "").replace(CONTROL_CHAR_RE, "");
+    const { text: ansiFree, carry } = stripChunk(this.carry, data);
+    this.carry = carry;
+    const stripped = ansiFree.replace(CONTROL_CHAR_RE, "");
     if (stripped.length === 0) return;
     const combined = this.pending + stripped;
     const segments = combined.split("\n");
@@ -63,6 +69,15 @@ export class TerminalCaptureBuffer {
       this.lines.push(line);
     }
     this.trim();
+  }
+
+  /**
+   * Drop the escape carry because the session's transport restarted (see
+   * PtyOutputObserver.onTransportReset). clear() deliberately does not: Clear
+   * Scrollback leaves the byte stream running.
+   */
+  public resetEscapeState(): void {
+    this.carry = EMPTY_STRIP_CARRY;
   }
 
   public clear(): void {
@@ -93,6 +108,7 @@ export class TerminalCaptureBuffer {
   public dispose(): void {
     this.configSubscription.dispose();
     this.clear();
+    this.carry = EMPTY_STRIP_CARRY;
   }
 
   /** Keep only the last MAX_PENDING_CHARS of an unterminated line. */

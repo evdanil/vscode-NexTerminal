@@ -691,6 +691,17 @@ describe("TerminalHighlighter", () => {
     expect(result).toContain("\x1b[31mTEST\x1b[39m");
   });
 
+  it("private-prefix and intermediate CSI ending in m are not read as SGR", () => {
+    setConfig(true, [{ pattern: "\\d+", color: "red", flags: "g" }]);
+    const h = new TerminalHighlighter();
+    // ESC[>4;m (modifyOtherKeys reset) is not an SGR reset: foo is still coloured,
+    // so 123 must not be recoloured by the rule.
+    expect(h.apply("\x1b[31mfoo\x1b[>4;m123 bar")).toBe("\x1b[31mfoo\x1b[>4;m123 bar");
+    expect(h.apply("\x1b[31mfoo\x1b[0 m123")).toBe("\x1b[31mfoo\x1b[0 m123");
+    // A real SGR reset still re-enables highlighting.
+    expect(h.apply("\x1b[31mfoo\x1b[0m123")).toContain("\x1b[31m123\x1b[39m");
+  });
+
   it("CSI sequence with tilde final byte is recognized as ANSI, not plain text", () => {
     setConfig(true, [{ pattern: "\\bERROR\\b", color: "red", flags: "gi", bold: true }]);
     const h = new TerminalHighlighter();
@@ -746,6 +757,28 @@ describe("TerminalHighlighter", () => {
 
     // The original CSI must be present verbatim in the reassembled output
     expect(full).toContain(csi);
+  });
+
+  it("stream never emits a slice that cuts inside a private-prefix CSI at the retention boundary", () => {
+    setConfig(true, [{ pattern: "\\d+", color: "red", flags: "g" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), 20);
+
+    // Same geometry as the SGR case above: cut = 16128 lands 4 bytes into
+    // ESC[>4;2m, i.e. right after "ESC[>4;" whose "4" a digit rule would recolour.
+    const seq = "\x1b[>4;2m";
+    const seqStart = 16128 - 4;
+    const payload = ".".repeat(seqStart) + seq + ".".repeat(16384 - seqStart - seq.length);
+    expect(payload.length).toBe(16384);
+
+    stream.push(payload);
+    expect(emitted.length).toBeGreaterThan(0);
+    for (const chunk of emitted) {
+      expect(chunk).not.toMatch(/\x1b\[[\x30-\x3F]*[\x20-\x2F]*$/);
+    }
+    stream.flush();
+    expect(emitted.join("")).toContain(seq);
   });
 
   it("stream never emits a slice that cuts inside an OSC sequence at the retention boundary", () => {

@@ -555,6 +555,12 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
       this.openingSessionId = undefined;
       this.openingPort = false;
       this.callbacks.onTransportSessionChanged?.(sessionId);
+      // A new device is now the transport (Smart Follow reattaches inside this
+      // one PTY, keeping the observers and the transcript). Drop the ANSI
+      // stripper carries the lost device left behind before its replacement's
+      // first output, replayed or live, can be swallowed by them.
+      this.observerHub.notifyTransportReset();
+      this.transcript?.resetEscapeState?.();
       for (const data of this.openingData.takeFor(sessionId)) {
         this.handleData(data);
       }

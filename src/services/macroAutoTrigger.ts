@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { createAnsiRegex } from "../utils/ansi";
+import { EMPTY_STRIP_CARRY, stripChunk, type StripCarry } from "../utils/ansi";
 import { normalizeBoundedNumber as clampLength } from "../utils/helpers";
 import { validateRegexSafety } from "../utils/regexSafety";
 import type { MacroTriggerScope, TerminalMacro } from "../models/terminalMacro";
@@ -168,6 +168,14 @@ export interface PtyOutputObserver {
   onOutput(text: string): void;
   pauseIntervalMacros(): void;
   dispose(): void;
+  /**
+   * The PTY is starting a new transport inside the same instance (an SSH
+   * reconnect or a Smart Follow reattach reuses the same observers). Observers that keep parser state across chunks, such as the
+   * ANSI stripper's carry, must drop it: whatever the dead connection left
+   * half-sent must not swallow or corrupt the new connection's first output.
+   * Not fired for a buffer clear or Clear Scrollback: the byte stream goes on.
+   */
+  onTransportReset?(): void;
 }
 
 interface CompiledTriggerRule {
@@ -411,7 +419,9 @@ export class MacroAutoTrigger implements vscode.Disposable {
     const scheduledTimers = new Map<string, ReturnType<typeof setTimeout>>();
     const ownedIntervals = new Set<string>();
     let disposed = false;
-    const ansiRe = createAnsiRegex();
+    // Incomplete escape tail of the previous chunk; not cleared with `buffer`
+    // because the output stream continues across a buffer reset.
+    let escapeCarry: StripCarry = EMPTY_STRIP_CARRY;
 
     const clearScheduledTimer = (stateKey: string): boolean => {
       const timer = scheduledTimers.get(stateKey);
@@ -592,6 +602,7 @@ export class MacroAutoTrigger implements vscode.Disposable {
         this.pauseOwnedIntervals(observerState);
         disposed = true;
         buffer = "";
+        escapeCarry = EMPTY_STRIP_CARRY;
         lastFired.clear();
         readyMatches.clear();
         ownedIntervals.clear();
@@ -603,18 +614,30 @@ export class MacroAutoTrigger implements vscode.Disposable {
 
     const observer: PtyOutputObserver & { __bindSessionId?: (id: string) => void } = {
       onOutput: (text: string) => {
-        if (disposed || !this.enabled || this.rules.length === 0) {
+        if (disposed) {
+          return;
+        }
+        if (!this.enabled || this.rules.length === 0) {
+          // Matching is off, but the stream is not: keep advancing the escape
+          // carry so an opener whose terminator arrives now is not prepended to
+          // unrelated output after re-enable (a stale OSC would swallow later
+          // prompts, a stale CSI would eat the first character of one).
+          escapeCarry = stripChunk(escapeCarry, text).carry;
           return;
         }
 
+        // Strip the complete chunk first so the carry advances over the whole
+        // stream: truncating before stripping could drop the terminator of a
+        // carried opener and have it swallow the retained tail.
+        const chunk = stripChunk(escapeCarry, text);
+        escapeCarry = chunk.carry;
+        let stripped = chunk.text.replace(CONTROL_CHARS_RE, "");
+
         // Keep the tail of oversized output chunks so prompts arriving with
         // banners/login noise can still be matched without scanning unbounded text.
-        if (text.length > MAX_INPUT_LENGTH) {
-          text = text.slice(text.length - MAX_INPUT_LENGTH);
+        if (stripped.length > MAX_INPUT_LENGTH) {
+          stripped = stripped.slice(stripped.length - MAX_INPUT_LENGTH);
         }
-
-        let stripped = text.replace(ansiRe, "");
-        stripped = stripped.replace(CONTROL_CHARS_RE, "");
 
         buffer += stripped;
         if (buffer.length > this.maxBufferLength) {
@@ -626,6 +649,9 @@ export class MacroAutoTrigger implements vscode.Disposable {
         if (!disposed) {
           this.pauseOwnedIntervals(observerState);
         }
+      },
+      onTransportReset: () => {
+        escapeCarry = EMPTY_STRIP_CARRY;
       },
       dispose: () => observerState.dispose()
     };

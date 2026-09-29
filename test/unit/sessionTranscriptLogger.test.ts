@@ -39,6 +39,46 @@ describe("createSessionTranscript", () => {
     expect(readFileSync(path.join(dir, `${base}.1`), "utf8").length).toBeGreaterThan(0);
   });
 
+  it("strips an escape sequence split across writes", () => {
+    const dir = makeTempDir();
+    const transcript = createSessionTranscript(dir, "split", true);
+    transcript.write("a\x1b[>4;");
+    transcript.write("2mb\x1b]0;user@host: ~");
+    transcript.write("\x07c\n");
+    transcript.close();
+    const base = readdirSync(dir).find((name) => /^split_.*\.log$/.test(name))!;
+    const body = readFileSync(path.join(dir, base), "utf8");
+    expect(body).toContain("abc\n");
+    expect(body).not.toContain("[>");
+    expect(body).not.toContain("2m");
+    expect(body).not.toContain("user@host");
+  });
+
+  it("drops a DCS payload longer than the hold cap split across writes", () => {
+    const dir = makeTempDir();
+    const transcript = createSessionTranscript(dir, "dcs", true);
+    const payload = "q" + "#0;2;0;0;0".repeat(50);
+    transcript.write("a\x1bP" + payload);
+    transcript.write(payload);
+    transcript.write("\x1b\\b\n");
+    transcript.close();
+    const base = readdirSync(dir).find((name) => /^dcs_.*\.log$/.test(name))!;
+    const body = readFileSync(path.join(dir, base), "utf8");
+    expect(body).toContain("ab\n");
+    expect(body).not.toContain("#0;2");
+  });
+
+  it("resetEscapeState drops an unterminated string so the next write is kept", () => {
+    const dir = makeTempDir();
+    const transcript = createSessionTranscript(dir, "reset", true);
+    transcript.write("a\x1bPpayload");
+    transcript.resetEscapeState?.();
+    transcript.write("Password: \n");
+    transcript.close();
+    const base = readdirSync(dir).find((name) => /^reset_.*\.log$/.test(name))!;
+    expect(readFileSync(path.join(dir, base), "utf8")).toContain("aPassword: \n");
+  });
+
   /**
    * The writer queues chunks and drains them asynchronously instead of doing a
    * blocking writeSync per chunk. What must not change: what ends up on disk,

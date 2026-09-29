@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { outputBufferObserver } from "../../../src/services/scripts/sessionOutputCapture";
 import { ScriptOutputBuffer } from "../../../src/services/scripts/scriptOutputBuffer";
 
 describe("ScriptOutputBuffer", () => {
@@ -15,6 +16,67 @@ describe("ScriptOutputBuffer", () => {
     expect(buf.writeHead).toBe(3);
     const m = buf.scan("red");
     expect(m?.text).toBe("red");
+  });
+
+  it("strips Kitty, modifyOtherKeys and ESC 7/8/=/> so an end-anchored prompt matches", () => {
+    const buf = new ScriptOutputBuffer();
+    buf.append("\x1b[=5u\x1b7\x1b[>4;1m\x1b=$ ");
+    expect(buf.writeHead).toBe(2);
+    expect(buf.scan(/\$ $/)?.text).toBe("$ ");
+  });
+
+  it("strips an escape sequence split across two appends", () => {
+    const buf = new ScriptOutputBuffer();
+    buf.append("a\x1b[>4;");
+    expect(buf.writeHead).toBe(1);
+    buf.append("2mb\x1b");
+    buf.append("7c");
+    expect(buf.tail(10)).toBe("abc");
+    expect(buf.writeHead).toBe(3);
+  });
+
+  it("never withholds ordinary text and bounds a stray ESC hold-back", () => {
+    const buf = new ScriptOutputBuffer();
+    buf.append("prompt$ ");
+    expect(buf.scan(/\$ $/)?.text).toBe("$ ");
+    // An ESC[ followed by a never-ending parameter run is released once it
+    // exceeds the hold-back cap instead of retaining data forever.
+    buf.append("\x1b[" + "1".repeat(600));
+    expect(buf.tail(700)).toContain("1".repeat(50));
+  });
+
+  it("strips a terminal title split before the prompt", () => {
+    const buf = new ScriptOutputBuffer();
+    buf.append("\x1b]0;user@host: ~/dir");
+    buf.append("\x07$ ");
+    expect(buf.tail(20)).toBe("$ ");
+  });
+
+  it("drops a DCS payload longer than the hold cap split across chunks", () => {
+    const payload = "q" + "#0;2;0;0;0".repeat(50);
+    const buf = new ScriptOutputBuffer();
+    buf.append("a\x1bP" + payload);
+    buf.append(payload);
+    buf.append("\x1b\\b$ ");
+    expect(buf.tail(50)).toBe("ab$ ");
+    expect(buf.scan("#0;2")).toBeNull();
+  });
+
+  it("resetEscapeState drops an unterminated string so the next output is kept", () => {
+    const buf = new ScriptOutputBuffer();
+    buf.append("\x1bPpayload");
+    buf.resetEscapeState();
+    buf.append("Password: ");
+    expect(buf.scan(/Password: $/)?.text).toBe("Password: ");
+  });
+
+  it("the session output observer resets the carry on a transport reset", () => {
+    const buf = new ScriptOutputBuffer();
+    const obs = outputBufferObserver(buf);
+    obs.onOutput("\x1bPpayload");
+    obs.onTransportReset?.();
+    obs.onOutput("Password: ");
+    expect(buf.tail(20)).toBe("Password: ");
   });
 
   it("rolls trim when text exceeds capacity", () => {
