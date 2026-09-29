@@ -1,81 +1,44 @@
 # Changelog
 
-## [2.8.308] — 2026-09-29
+## [2.8.296] — 2026-09-29
 
 ### Fixed
 
 - **SSH, Telnet and tunnel starts are no longer cancelled by an unchanged save or Refresh.** A pending Connect or Start Tunnel compared the profile by object identity, so saving a server or tunnel without changes (or refreshing after another window wrote settings) silently cancelled it. Starts now compare only the fields the connection uses (address, port, protocol, user name, authentication method and key file as they end up after the linked auth profile is applied, so editing that profile also cancels, auth profile link, proxy or jump host including the jump host's own connection settings, and the like — not saved passwords or passphrases, which are used at the next login; a folder rename or notes edit does not count), like Serial and Local Shell. A real change or removal cancels with a visible notice. For a Connect the check runs once, just before the terminal opens; once the terminal is open (including during a password or verification prompt, or the Telnet dial) the session keeps the settings it started with and an edit applies at the next connect. A tunnel start is checked before the tunnel manager starts and again when it returns, so an edit during the registry check, the shared-mode login or the tunnel handshake stops the tunnel once the start returns. The notice offers **Retry** on the current settings when the profile still exists (Retry repeats the original action, such as Connect and Run Script; a macro's IPMI-gateway connect offers no Retry and says to re-run the macro; and a tunnel retry targets the same server, or reports it removed rather than starting elsewhere), and a cancelled tunnel start no longer registers briefly before being stopped. Each terminal connect attempt (the first and every **R** reconnect) now records the effective connection it is about to use, before it acquires a connection. The auto-start tunnel sweep compares that record with the current server, linked auth profile and jump chain and, if they differ (an edit landed after the attempt began, or no record exists), starts nothing and warns to close and reopen the terminal; a rename or other non-connection edit no longer blocks auto-start on an **R** reconnect. Pooled connections are now retired synchronously with the in-memory edit, before the save finishes, so a reconnect in that window cannot reuse a connection built from the old settings. A Refresh (or a reload after another window saved) now retires the connections of hosts whose settings changed, and their jump riders, the same way, and an edit followed by an **R** reconnect no longer repeats the handshake or password prompt once the save lands. A change to the server, its linked auth profile or its jump chain that is made and then reverted while a start is pending still cancels it (the connection may have authenticated with the intermediate value). A saved proxy password is now stored per proxy endpoint (server, proxy type, host, port and user name) instead of per server, so a password entered for one proxy can never be sent to another, including while an edit is still being saved, and a rolled-back edit finds its own proxy's password untouched. Existing passwords are moved to the new keys when Nexus starts; the password of a proxy a server has left, or of a server that was deleted, is removed once the change is saved (a Replace import that brings a server back on the same proxy keeps it). Deleting a server, or Complete Reset, removes every proxy password stored for that server id, including for a stored row that no longer validates, and a failed proxy edit that is rolled back keeps the old proxy's password. Editing or removing a jump host (or editing its auth profile) now also retires the pooled connections of the servers that connect through it, without closing live sessions, so an **R** reconnect or new tunnel builds a fresh connection over the current route instead of reusing one made through the old jump host.
 
-## [2.8.307] — 2026-09-29
-
-### Fixed
-
 - **Kitty keyboard, modifyOtherKeys, cursor-shape and save/restore-cursor sequences no longer leak into captured text.** The shared ANSI stripper now follows the ECMA-48 CSI grammar (`<` `=` `>` `?` parameter prefixes and intermediate bytes such as `ESC[2 q`) and removes two-byte forms like `ESC 7`, `ESC 8`, `ESC =` and `ESC >`, plus terminated DCS/APC/PM/SOS strings. Copy All, session transcripts and script `waitFor`/`expect` matching no longer show fragments such as `[>4;2m` or `[=5u`, so end-anchored prompt patterns match after vim, fish or neovim output, even when a sequence (including a terminal title) is split across two chunks: Copy All, transcripts, script output and macro trigger matching each strip the same text however the output is split into chunks: an unfinished escape is held until the next chunk, an escape over 512 characters is text, and an unterminated OSC/DCS/APC/PM/SOS payload (Sixel, Kitty graphics, XTGETTCAP) is dropped until its terminator or an aborting ESC, giving up after 1 MiB. An SSH reconnect and a Smart Follow reattach start each of them from a clean slate, so an escape the lost connection or device left unfinished cannot swallow its replacement's prompt. Private-prefix CSI ending in `m` (such as `ESC[>4;m`) is no longer mistaken for an SGR reset by the highlighter.
 
-## [2.8.305] — 2026-09-29
-
-### Fixed
-
 - **A share no longer hands over a shell command.** Custom Local Shell profiles (their shell path and arguments run the moment the profile opens) are left out of Export for Sharing and skipped by a share import, and both messages count them and say to use Add Local Shell Profile. A VS Code-profile one still travels, without a shell path or arguments.
+
 - **Shared tunnels no longer act on their own.** A tunnel from a share arrives with Auto-start off, no listener address (loopback until you choose one in Edit), a loopback-only remote bind address and no login in its browser URL, on export and on import; the import message counts the tunnels it changed.
+
 - **Delete All Data clears Terminal Appearance and the Local Shell auto-trigger acknowledgement.** Imported colour schemes, the selected scheme and the font choice are removed and an open panel refreshes; it also clears remembered view state and dismissed hints (collapsed folders, follow-terminal-directory, macro hint), other open windows that observe the reset (a reset-generation counter) reload instead of writing stale collapsed-folder or appearance data back at their next action; a write already in flight, or one that starts before the reset reaches that window, can still land until it is reloaded. Follow Terminal Directory stays on in memory there until toggled or reloaded. The confirmation and completion message both say what is kept: the terminal colours and font already written to VS Code user settings, trusted host keys, scripts and logs stay.
+
 - **A duplicate id in a share no longer overwrites a record.** The first server or auth profile under an id that passes validation lands; a later one in the same file is skipped and counted instead of replacing it and being counted as imported.
-
-## [2.8.304] — 2026-09-29
-
-### Fixed
 
 - **A serial open that timed out no longer leaves the port held.** When a port took longer than the 10 s RPC budget to open (Windows Bluetooth COM ports, slow USB-serial drivers), the tab reported "Connection failed" but the sidecar kept waiting on the native open and, once it finished, held the port under a session nobody owned, so every later Connect and Smart Follow poll failed with "busy" until a window reload. The sidecar manager now sends a cancel to the sidecar that owns the abandoned open (never spawning a new one), and the sidecar closes the port and frees its session ID as soon as the open completes. If the port still cannot be released after about 30 s of retries, a warning names the port and offers Reload Window.
 
-## [2.8.303] — 2026-09-29
-
-### Fixed
-
 - **An unreadable reverse-bind reservation file no longer stops the extension loading.** A corrupt, empty or non-fence file in the cross-window fence directory is now logged and ignored instead of failing every registry read, and is deleted once it is more than 30 seconds old. A file that cannot be read is retried and, while under 30 seconds old, makes the registry read fail so a live reservation is never hidden; once stale it is ignored and deleted. Registry storage errors no longer fail activation, and the background sync timers no longer raise unhandled rejections.
+
 - **Stopping a tunnel no longer fails when the cross-window registry cannot be updated.** The failure is logged after local teardown, so server and tunnel removal complete instead of stopping partway. A reverse tunnel's reservation is still published before Stop returns when storage allows; if it cannot be, a one-time warning says another window may collide on that port and what to do.
+
 - **Orphaned temporary reservation files are cleaned up.** Temporary files left by a host killed mid-write are removed once older than 30 seconds.
-
-## [2.8.302] — 2026-09-29
-
-### Fixed
 
 - **A malformed provider host no longer downgrades or re-points an already-synced server.** When a device's primary or alternate console endpoint host, or the endpoint for a server's saved protocol, was rejected (invisible character, embedded whitespace), an owned server was blanked to an addressless placeholder, or its alternate address was promoted into `host`, and the plan claimed the device had lost its console. The device is now skipped like a malformed port: the server is left untouched and the plan says `has an unusable host and was skipped`. New devices still arrive as addressless placeholders. The host normalizer's own warnings now travel as engine warnings instead of provider notices.
 
-## [2.8.301] — 2026-09-29
-
-### Fixed
-
 - **An ended or dropped SSH login no longer deletes a valid saved password or passphrase.** Closing or reconnecting a terminal while it connects, a connection that closes cleanly before login finishes, and a dismissed verification-code prompt were all read as a server rejection because their messages contain the word "authentication". They now carry their own error type, and a saved password is now cleared only when the server rejects it, and a saved key passphrase only when it fails to decrypt the key. A connection that drops mid-login is reported as a connection failure — in the terminal and in Test Connection and Copy Details — without a password prompt.
+
 - **Port-forwarding guide no longer says concurrent jump-host password prompts dismiss each other.** Since 2.8.280 they appear one after another.
-
-## [2.8.300] — 2026-09-29
-
-### Fixed
 
 - **Serial, Telnet and Smart Follow terminals reset interactive modes on disconnect, and a focus or mouse report no longer closes a dead tab.** The reset that SSH ran now lives in one shared sequence used by all four remote terminals (Smart Follow also repeats it before reattaching, ahead of the new device's output). It additionally turns off alternate-scroll (wheel-to-arrow-keys), bracketed paste and application cursor/keypad modes and shows the cursor, so a same-tab SSH reconnect no longer starts with a hidden cursor or wrapped pastes. The alternate screen is still left alone so the last frame stays readable. In a disconnected Serial or Telnet tab, terminal-generated focus, mouse and color-scheme reports and up/down arrow sequences (wheel scrolling in an alternate screen) are ignored; a real key still closes the tab.
 
-## [2.8.299] — 2026-09-29
-
-### Fixed
-
 - **Disposing an SSH lease while its standalone fallback is still connecting no longer drops other sessions or leaks a connection.** A pooled lease that fell back to its own connection (channel-limited device or stale transport) released its pooled reference a second time if it was disposed mid-connect, which could close the shared transport under another live terminal. The pooled reference is now released once, and a fallback that finishes after disposal is closed instead of being used.
-
-## [2.8.298] — 2026-09-29
-
-### Fixed
 
 - **The Session-terminal IPMI hint no longer disappears when an `ipmitool` command has a substitution or heredoc in its arguments.** A macro such as `ipmitool -P "$(cat ~/.bmcpw)" sol activate`, or one with a here-string, heredoc or `$(...)` redirect target, now gets the editor hint and the send-confirmation note again; a dynamic command word, a heredoc body and text after an unparsed substitution are still left alone. The detector also accepts `command -p --`, `time -p --`, `nice -5` and the sudo `-r`/`-t`/`-c`/`-a` value options (and their long forms).
 
-## [2.8.297] — 2026-09-29
-
-### Fixed
-
 - **A large inventory sync no longer holds the config lock for thousands of sequential keychain deletes.** The add-time clearing of leftover saved credentials (three keys per added server) and the delete-prune credential cleanup now run up to 16 servers at a time. An add-time clear that fails still aborts the whole sync with nothing applied, and the apply still waits for every clear to settle.
+
 - **Re-registering a disposed inventory provider object now says what to do.** The rejection is unchanged (a form or prompt may still hold the old object), but the error now tells the provider author to register a new provider object, and the public API contract says the same.
-
-## [2.8.296] — 2026-09-29
-
-### Fixed
 
 - **A script's unawaited wait now ends with the run.** A `waitFor` / `expect` / `waitAny` still pending when a run completed, failed or lost its worker (a `Promise.race` loser, a call the script never awaited) kept its timer and the run's output buffer for its whole timeout, then wrote a stray `← timeout` line to the "Nexus Scripts" channel after `end:`. Every ending now cancels pending waits, and a wait posted just before the run ended is refused.
 
