@@ -48,6 +48,18 @@ describe("pool invalidation is synchronous with the in-memory mutation", () => {
     stop();
   });
 
+  it("switching a jump host from SSH to Telnet retires it and its transitive dependents before persistence resolves", async () => {
+    const { core, repo, ids, stop } = await setup([
+      server("jump"), server("mid", { proxy: { type: "ssh", jumpHostId: "jump" } }),
+      server("far", { proxy: { type: "ssh", jumpHostId: "mid" } }), server("x")
+    ]);
+    const pending = core.addOrUpdateServer({ ...core.getServer("jump")!, protocol: "telnet" });
+    expect(ids()).toEqual(new Set(["jump", "mid", "far"]));
+    repo.release?.();
+    await pending;
+    stop();
+  });
+
   it("a non-connection edit invalidates nothing", async () => {
     const { core, repo, ids, stop } = await setup([server("a")]);
     const pending = core.addOrUpdateServer({ ...core.getServer("a")!, name: "Renamed", group: "G" });
