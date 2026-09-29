@@ -1408,7 +1408,10 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     // host is malformed. For an OWNED server that must behave like a malformed
     // port (skip, record untouched): treating the removal as absence would blank
     // its address or promote its alternate into `host`. A NEW device keeps the
-    // documented addressless placeholder, so it falls through.
+    // documented addressless placeholder, so it falls through. Deliberately also
+    // skipped when only the ALTERNATE was rejected (primary fine) and when the
+    // owned row is an addressless placeholder awaiting its fill-in: a device
+    // whose source data is half-malformed is held back whole until it is clean.
     if (isOwned && hostRejectedIds?.has(device.externalId)) {
       warnings.push(`Device "${device.name}" (${device.externalId}) has an unusable host and was skipped.`);
       continue;
