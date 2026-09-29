@@ -68,6 +68,17 @@ describe("createSessionTranscript", () => {
     expect(body).not.toContain("#0;2");
   });
 
+  it("resetEscapeState drops an unterminated string so the next write is kept", () => {
+    const dir = makeTempDir();
+    const transcript = createSessionTranscript(dir, "reset", true);
+    transcript.write("a\x1bPpayload");
+    transcript.resetEscapeState?.();
+    transcript.write("Password: \n");
+    transcript.close();
+    const base = readdirSync(dir).find((name) => /^reset_.*\.log$/.test(name))!;
+    expect(readFileSync(path.join(dir, base), "utf8")).toContain("aPassword: \n");
+  });
+
   /**
    * The writer queues chunks and drains them asynchronously instead of doing a
    * blocking writeSync per chunk. What must not change: what ends up on disk,

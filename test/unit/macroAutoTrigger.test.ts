@@ -265,6 +265,20 @@ describe("MacroAutoTrigger", () => {
     obs.dispose();
   });
 
+  it("a transport reset drops the escape carry so the new connection's prompt matches", () => {
+    setConfig([{ name: "pw", text: "secret\n", triggerPattern: "Password: $" }]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    obs.onOutput("\x1bPpayload from the dead connection");
+    obs.onTransportReset?.();
+    obs.onOutput("Password: ");
+    flush();
+    expect(sent).toEqual(["secret\n"]);
+    obs.dispose();
+  });
+
   it("defers writeBack to next event-loop turn", () => {
     setConfig([
       { name: "pw", text: "secret\n", triggerPattern: "Password:" }

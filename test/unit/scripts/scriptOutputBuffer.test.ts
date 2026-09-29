@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { outputBufferObserver } from "../../../src/services/scripts/sessionOutputCapture";
 import { ScriptOutputBuffer } from "../../../src/services/scripts/scriptOutputBuffer";
 
 describe("ScriptOutputBuffer", () => {
@@ -59,6 +60,23 @@ describe("ScriptOutputBuffer", () => {
     buf.append("\x1b\\b$ ");
     expect(buf.tail(50)).toBe("ab$ ");
     expect(buf.scan("#0;2")).toBeNull();
+  });
+
+  it("resetEscapeState drops an unterminated string so the next output is kept", () => {
+    const buf = new ScriptOutputBuffer();
+    buf.append("\x1bPpayload");
+    buf.resetEscapeState();
+    buf.append("Password: ");
+    expect(buf.scan(/Password: $/)?.text).toBe("Password: ");
+  });
+
+  it("the session output observer resets the carry on a transport reset", () => {
+    const buf = new ScriptOutputBuffer();
+    const obs = outputBufferObserver(buf);
+    obs.onOutput("\x1bPpayload");
+    obs.onTransportReset?.();
+    obs.onOutput("Password: ");
+    expect(buf.tail(20)).toBe("Password: ");
   });
 
   it("rolls trim when text exceeds capacity", () => {

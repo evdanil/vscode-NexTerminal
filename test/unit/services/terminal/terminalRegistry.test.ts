@@ -61,12 +61,14 @@ interface FakeNexusCore {
   onDidChange(l: () => void): () => void;
 }
 
-function makePty(): SessionPtyHandle & { resetTerminal: () => void; onOutput(text: string): void; __observers: Array<(text: string) => void> } {
+function makePty(): SessionPtyHandle & { resetTerminal: () => void; onOutput(text: string): void; transportReset(): void; __observers: Array<(text: string) => void> } {
   const observers: Array<(text: string) => void> = [];
+  const resetHooks: Array<() => void> = [];
   return {
     addOutputObserver(o: Parameters<SessionPtyHandle["addOutputObserver"]>[0]) {
       const wrapped = (text: string) => o.onOutput(text);
       observers.push(wrapped);
+      resetHooks.push(() => o.onTransportReset?.());
       return {
         dispose: () => {
           const i = observers.indexOf(wrapped);
@@ -80,6 +82,9 @@ function makePty(): SessionPtyHandle & { resetTerminal: () => void; onOutput(tex
     markShuttingDown: () => {},
     onOutput(text: string) {
       observers.forEach((cb) => cb(text));
+    },
+    transportReset() {
+      resetHooks.forEach((cb) => cb());
     },
     __observers: observers
   };
@@ -152,6 +157,25 @@ describe("TerminalRegistry", () => {
     expect(reg.get(terminal)?.pty).toBe(pty);
     reg.unregister(terminal);
     expect(reg.get(terminal)).toBeUndefined();
+    reg.dispose();
+  });
+
+  it("a transport reset drops the capture buffer's escape carry, but Clear Scrollback does not", () => {
+    const reg = new TerminalRegistry(makeCore());
+    const terminal = {} as never;
+    const pty = makePty();
+    reg.register(terminal, pty);
+    const entry = reg.get(terminal)!;
+
+    pty.onOutput("a\x1bPpayload");
+    entry.buffer.clear(); // Clear Scrollback: the stream continues
+    pty.onOutput("more\x1b\\b\n");
+    expect(entry.buffer.getText()).toBe("b");
+
+    pty.onOutput("c\x1bPdead connection payload");
+    pty.transportReset(); // reconnect: new transport
+    pty.onOutput("Password: ");
+    expect(entry.buffer.getText()).toContain("cPassword: ");
     reg.dispose();
   });
 

@@ -271,6 +271,10 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     // sequence stranded by a disconnect cannot prepend to this session's first
     // chunk. No-op on first connect; idempotent with the dispose() reset.
     this.oscFilter.reset();
+    // Same for the ANSI stripper carries held by observers and the transcript:
+    // the hub and the transcript outlive the connection.
+    this.observerHub.notifyTransportReset();
+    this.transcript?.resetEscapeState?.();
     let connection: SshConnection | undefined;
     // Relays live auth messages (USERAUTH_BANNER, keyboard-interactive
     // name/instructions — e.g. Duo's option menu) to the terminal while the

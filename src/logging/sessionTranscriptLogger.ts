@@ -110,6 +110,12 @@ export interface SessionTranscript {
    * extension-host teardown needs.
    */
   flush?(): void;
+  /**
+   * Drop the ANSI stripper's carry: the PTY is starting a new transport (an SSH
+   * reconnect), so an escape the old one left unfinished must not swallow the
+   * new one's output. Optional for the same reason as {@link flush}.
+   */
+  resetEscapeState?(): void;
   close(): void;
 }
 
@@ -291,6 +297,10 @@ class FileSessionTranscript implements SessionTranscript {
 
   /** Incomplete escape tail of the previous write, so a sequence split across writes is stripped whole. */
   private escapeCarry: StripCarry = EMPTY_STRIP_CARRY;
+
+  public resetEscapeState(): void {
+    this.escapeCarry = EMPTY_STRIP_CARRY;
+  }
 
   public write(data: string): void {
     if (this.closed) {

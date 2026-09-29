@@ -7,6 +7,7 @@ import { ScriptOutputBuffer } from "./scriptOutputBuffer";
 export function outputBufferObserver(buffer: ScriptOutputBuffer): PtyOutputObserver {
   return {
     onOutput: (text) => buffer.append(text),
+    onTransportReset: () => buffer.resetEscapeState(),
     pauseIntervalMacros: () => {},
     dispose: () => {}
   };

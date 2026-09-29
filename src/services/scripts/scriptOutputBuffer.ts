@@ -35,6 +35,11 @@ export class ScriptOutputBuffer {
   /** Trailing incomplete escape held back so a sequence split across chunks is stripped whole. */
   private carry: StripCarry = EMPTY_STRIP_CARRY;
 
+  /** Drop the escape carry: the session's transport restarted (see PtyOutputObserver.onTransportReset). */
+  public resetEscapeState(): void {
+    this.carry = EMPTY_STRIP_CARRY;
+  }
+
   public append(raw: string): void {
     const { text: stripped, carry } = stripChunk(this.carry, raw);
     this.carry = carry;

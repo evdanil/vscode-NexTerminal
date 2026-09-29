@@ -115,6 +115,14 @@ describe("TerminalCaptureBuffer", () => {
       expect(buf.getText()).toBe("abc\ndef");
     });
 
+    it("resetEscapeState drops an unterminated string so the next output is kept", () => {
+      const buf = new TerminalCaptureBuffer();
+      buf.append("a\x1bPpayload");
+      buf.resetEscapeState();
+      buf.append("Password: ");
+      expect(buf.getText()).toBe("aPassword: ");
+    });
+
     it("removes C0 control characters except newline, carriage-return, and tab", () => {
       const buf = new TerminalCaptureBuffer();
       buf.append("bell\x07here\n");

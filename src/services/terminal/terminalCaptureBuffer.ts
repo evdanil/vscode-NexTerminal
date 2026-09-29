@@ -71,6 +71,15 @@ export class TerminalCaptureBuffer {
     this.trim();
   }
 
+  /**
+   * Drop the escape carry because the session's transport restarted (see
+   * PtyOutputObserver.onTransportReset). clear() deliberately does not: Clear
+   * Scrollback leaves the byte stream running.
+   */
+  public resetEscapeState(): void {
+    this.carry = EMPTY_STRIP_CARRY;
+  }
+
   public clear(): void {
     this.lines = [];
     this.pending = "";

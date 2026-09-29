@@ -922,6 +922,39 @@ describe("SshPty", () => {
     pty.dispose();
   });
 
+  it("signals a transport reset to observers and the transcript on connect and on each reconnect", async () => {
+    const first = createConnection(new PassThrough());
+    const second = createConnection(new PassThrough());
+    const sshFactory = {
+      connect: vi.fn().mockResolvedValueOnce(first.connection).mockResolvedValueOnce(second.connection)
+    };
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn(), onDisconnected: vi.fn(), onDataReceived: vi.fn() };
+    const logger = { log: vi.fn(), logOutput: vi.fn(), close: vi.fn() };
+    const transcript = { write: vi.fn(), flush: vi.fn(), close: vi.fn(), resetEscapeState: vi.fn() };
+    const onTransportReset = vi.fn();
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any, transcript as any);
+    pty.addOutputObserver({
+      onOutput: vi.fn(),
+      onTransportReset,
+      pauseIntervalMacros: vi.fn(),
+      dispose: vi.fn()
+    } as any);
+
+    pty.open();
+    await flushAsync();
+    expect(onTransportReset).toHaveBeenCalledTimes(1);
+    expect(transcript.resetEscapeState).toHaveBeenCalledTimes(1);
+
+    first.emitClose();
+    await flushAsync();
+    pty.handleInput("R");
+    await flushAsync();
+    expect(onTransportReset).toHaveBeenCalledTimes(2);
+    expect(transcript.resetEscapeState).toHaveBeenCalledTimes(2);
+
+    pty.dispose();
+  });
+
   it("resetTerminal() emits CLEAR_VISIBLE_SCREEN via writeEmitter and does not write to the transport", () => {
     const stream = new PassThrough();
     const { connection } = createConnection(stream);
