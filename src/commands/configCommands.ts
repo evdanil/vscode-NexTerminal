@@ -5450,7 +5450,7 @@ export function registerConfigCommands(
 
     if (failedTeardowns === 0) {
       void vscode.window.showInformationMessage(
-        "Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files and session logs were kept."
+        "Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files, session logs and the terminal colours and font already written to your VS Code user settings were kept."
       );
     }
   }

@@ -7079,7 +7079,8 @@ describe("complete reset", () => {
     expect(await vault.get("passphrase-s1")).toBeUndefined();
     expect(await vault.get("auth-profile-password-ap1")).toBeUndefined();
     expect(await vault.get("auth-profile-passphrase-ap1")).toBeUndefined();
-    expect(mockShowInformationMessage).toHaveBeenCalledWith("Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files and session logs were kept.");
+    expect(mockShowInformationMessage).toHaveBeenCalledWith("Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files, session logs and the terminal colours and font already written to your VS Code user settings were kept.");
+    expect(mockShowInformationMessage).not.toHaveBeenCalledWith("Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files and session logs were kept.");
   });
 
   it("aborts when user cancels warning", async () => {

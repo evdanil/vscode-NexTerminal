@@ -2136,7 +2136,7 @@ describe("bulk removal closes runtime owned by deleted profiles", () => {
       expect.stringContaining("connection could not be stopped"),
       "Reload Window"
     );
-    expect(mockShowInformationMessage).not.toHaveBeenCalledWith("Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files and session logs were kept.");
+    expect(mockShowInformationMessage).not.toHaveBeenCalledWith("Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files, session logs and the terminal colours and font already written to your VS Code user settings were kept.");
   });
 
   it("Delete All Data reports a tunnel stop that never settles", async () => {
@@ -2162,7 +2162,7 @@ describe("bulk removal closes runtime owned by deleted profiles", () => {
         expect.stringContaining("connection could not be stopped"),
         "Reload Window"
       );
-      expect(mockShowInformationMessage).not.toHaveBeenCalledWith("Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files and session logs were kept.");
+      expect(mockShowInformationMessage).not.toHaveBeenCalledWith("Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files, session logs and the terminal colours and font already written to your VS Code user settings were kept.");
     } finally {
       vi.useRealTimers();
     }
@@ -2253,7 +2253,7 @@ describe("Delete All Data (nexus.config.completeReset) covers Local Servers and 
     expect(snapshot.localServers).toEqual([]);
     expect(snapshot.tftpProfiles).toEqual([]);
     expect(snapshot.dhcpProfiles).toEqual([]);
-    expect(mockShowInformationMessage).toHaveBeenCalledWith("Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files and session logs were kept.");
+    expect(mockShowInformationMessage).toHaveBeenCalledWith("Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files, session logs and the terminal colours and font already written to your VS Code user settings were kept.");
   });
 
   it("runs the Local Server teardown for every profile, and stops the TFTP/DHCP services, BEFORE anything is removed", async () => {
