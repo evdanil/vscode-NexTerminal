@@ -50,7 +50,7 @@ export interface InventoryHostNormalization {
   warnings: string[];
   /**
    * The normalized tree's device OBJECTS (by identity, not externalId) whose
-   * ssh/telnet (primary or alternate) endpoint was rejected. Identity, because
+   * endpoint that would have been the primary or alternate was rejected. Identity, because
    * a provider may repeat an externalId: the engine keeps the first row, so a
    * malformed LATER duplicate must not condemn the valid first one.
    */
@@ -1409,8 +1409,8 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     }
     seenExternalIds.set(device.externalId, device.name);
 
-    // HOST-REJECTED SKIP — the normalizer removed an ssh/telnet endpoint whose
-    // host is malformed. For an OWNED server that must behave like a malformed
+    // HOST-REJECTED SKIP — the normalizer removed the endpoint that would have
+    // been this device's primary or alternate because its host is malformed. For an OWNED server that must behave like a malformed
     // port (skip, record untouched): treating the removal as absence would blank
     // its address or promote its alternate into `host`. A NEW device keeps the
     // documented addressless placeholder, so it falls through. Deliberately also
@@ -4851,22 +4851,28 @@ export function normalizeInventoryTreeHosts(tree: InventoryTree): { tree: Invent
   const warnings: string[] = [];
   const rejectedConsoleDevices = new Set<InventoryDevice>();
   const devices = tree.devices.map((device) => {
-    let consoleRejected = false;
+    const rejected = new Set<InventoryEndpoint>();
     const endpoints = device.endpoints.flatMap((endpoint) => {
       const host = normalizeInventoryEndpointHost(endpoint.host);
       if (host === undefined) {
         // Device name is provider text: flattened where it enters the sentence.
         warnings.push(`Ignored an endpoint for ${flattenProviderText(device.name) || "(unnamed device)"} because its host is empty or contains unsupported characters.`);
-        if (endpoint.kind === "ssh" || endpoint.kind === "telnet") {
-          consoleRejected = true;
-        }
+        rejected.add(endpoint);
         return [];
       }
       return [{ ...endpoint, host }];
     });
     const normalizedDevice = { ...device, endpoints };
-    if (consoleRejected) {
-      rejectedConsoleDevices.add(normalizedDevice);
+    // Only a rejection that changes the mapped server counts: run the engine's
+    // own selection over the UNFILTERED endpoints and ask whether the primary or
+    // alternate it picks is a rejected one. A malformed telnet endpoint behind a
+    // valid ssh one, or a third-or-later ssh endpoint, is never mapped anyway.
+    if (rejected.size > 0) {
+      const primary = selectPrimaryEndpoint(device)?.endpoint;
+      const alternate = selectAltEndpoint(device);
+      if ((primary && rejected.has(primary)) || (alternate && rejected.has(alternate))) {
+        rejectedConsoleDevices.add(normalizedDevice);
+      }
     }
     return normalizedDevice;
   });

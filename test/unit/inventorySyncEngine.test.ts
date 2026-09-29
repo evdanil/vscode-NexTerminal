@@ -4873,6 +4873,24 @@ describe("normalizeInventoryTreeHosts", () => {
     expect(plan.warnings.join("\n")).not.toContain("lost its console address");
   });
 
+  it.each([
+    ["a malformed telnet endpoint behind a valid ssh one", [{ kind: "ssh", host: "10.0.0.7", port: 22 }, { kind: "telnet", host: "10.0.0.9\u200b", port: 23 }]],
+    ["a malformed third ssh endpoint", [{ kind: "ssh", host: "10.0.0.7", port: 22 }, { kind: "ssh", host: "10.0.0.8", port: 22 }, { kind: "ssh", host: "10.0.0.9\u200b", port: 22 }]]
+  ] as const)("does not skip an owned server over %s", (_label, endpoints) => {
+    const before = makeOwnedServer({
+      host: "10.0.0.1",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1, syncedHost: "10.0.0.1", syncedPort: 22 }
+    });
+    const { tree, ...hostNormalization } = normalizeInventoryTreeHosts(
+      makeTree([makeDevice({ endpoints: endpoints.map((e) => ({ ...e })) })])
+    );
+    const plan = computeSyncPlan({ source: makeSource(), tree, hostNormalization, currentServers: [before], now: 2 });
+
+    expect(plan.updates).toHaveLength(1);
+    expect(plan.updates[0].after.host).toBe("10.0.0.7");
+    expect(plan.warnings.join("\n")).not.toContain("unusable host and was skipped");
+  });
+
   it("does not let a malformed later duplicate device ID condemn the valid first row", () => {
     const before = makeOwnedServer({
       host: "10.0.0.1",
