@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { isTerminalGeneratedReport, RESET_INTERACTIVE_MODES } from "../../src/services/terminal/terminalEscapes";
 
+// Every parameter of every DEC private-mode set/reset group (ESC[?...h / ESC[?...l),
+// so an alternate-screen mode hidden inside a grouped list (";47") is still caught.
+function privateModeParams(seq: string): string[] {
+  return [...seq.matchAll(/\x1b\[\?([\d;]*)[hl]/g)].flatMap((m) => m[1].split(";"));
+}
+
 describe("RESET_INTERACTIVE_MODES", () => {
   it("clears input modes and shows the cursor", () => {
     expect(RESET_INTERACTIVE_MODES).toContain("\x1b[?9;1000;1002;1003;1004;1005;1006;1007;1015;1016;2031;2004;1;66l");
@@ -11,8 +17,11 @@ describe("RESET_INTERACTIVE_MODES", () => {
   });
 
   it("does not leave the alternate screen or full-reset the terminal", () => {
-    expect(RESET_INTERACTIVE_MODES).not.toContain("1049");
-    expect(RESET_INTERACTIVE_MODES).not.toContain("?47");
+    const params = privateModeParams(RESET_INTERACTIVE_MODES);
+    expect(params).toContain("1007");
+    for (const alt of ["47", "1047", "1048", "1049"]) {
+      expect(params).not.toContain(alt);
+    }
     expect(RESET_INTERACTIVE_MODES).not.toContain("\x1bc");
   });
 });

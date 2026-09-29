@@ -999,8 +999,11 @@ describe("SshPty", () => {
     expect(RESET_TERMINAL_MODES).toMatch(/\x1b\[\?[\d;]*\b2004\b[\d;]*l/);
     expect(RESET_TERMINAL_MODES).toMatch(/\x1b\[\?[\d;]*\b1\b[\d;]*l/);
     // The alternate screen and RIS stay untouched so the last frame survives.
-    expect(RESET_TERMINAL_MODES).not.toContain("1049");
-    expect(RESET_TERMINAL_MODES).not.toContain("?47");
+    const modeParams = [...RESET_TERMINAL_MODES.matchAll(/\x1b\[\?([\d;]*)[hl]/g)].flatMap((m) => m[1].split(";"));
+    expect(modeParams).toContain("2004");
+    for (const alt of ["47", "1047", "1048", "1049"]) {
+      expect(modeParams).not.toContain(alt);
+    }
     expect(RESET_TERMINAL_MODES).not.toContain("\x1bc");
     expect(writes.join("")).toContain("Nexus extension is shutting down");
     expect(writes.join("")).toContain("Close this terminal and start a new session to reconnect.");
