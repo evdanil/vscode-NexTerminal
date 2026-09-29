@@ -1397,6 +1397,10 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
                 )
               : [];
             if (liveServer && pending.length > 0) {
+              // Deliberately gated on the TERMINAL's connect descriptor, not the
+              // tunnel one: the tunnels reuse this session's config, and a session
+              // whose alt host (or anything else the terminal reads) has moved on
+              // is stale as a whole, so an altHost edit also skips auto-start.
               if (!isServerUnchangedSince(ctx, serverAtStart)) {
                 void vscode.window.showWarningMessage(
                   `Auto-start tunnels for "${flattenProviderText(server.name)}" were not started because the server's connection settings changed since this session opened. Close and reopen the terminal to use the new settings.`

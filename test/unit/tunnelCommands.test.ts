@@ -1117,4 +1117,46 @@ describe("startTunnel — profile removed while start is pending", () => {
     expect(stop).not.toHaveBeenCalled();
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
   });
+
+  describe("effective mode resolution across an edit", () => {
+    async function pending(startProfile: Partial<TunnelProfile>, pickedMode: "isolated" | "shared") {
+      const { core, profile, server: capturedServer } = await fixture();
+      const seeded = { ...profile, ...startProfile };
+      await core.addOrUpdateTunnel(seeded);
+      const starting = deferred<ActiveTunnel>();
+      const stop = vi.fn(async () => {});
+      const run = startTunnel(
+        core, { start: () => starting.promise, stop } as never,
+        { connect: vi.fn(async () => ({ dispose: vi.fn() })) } as never,
+        core.getTunnel("t1")!, capturedServer, pickedMode
+      );
+      return { core, seeded, starting, stop, run };
+    }
+
+    it("an ask profile whose pick was isolated is cancelled when its stored mode is edited to shared", async () => {
+      const { core, seeded, starting, stop, run } = await pending({ connectionMode: "ask" }, "isolated");
+      await core.addOrUpdateTunnel({ ...seeded, connectionMode: "shared" });
+      starting.resolve(makeActiveTunnel("t1"));
+      await run;
+      // Cancelled either before the manager started (no start) or after (stopped).
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("changed while the tunnel was starting"), "Retry");
+    });
+
+    it("the same ask profile with its stored mode left as ask is not cancelled", async () => {
+      const { core, seeded, starting, stop, run } = await pending({ connectionMode: "ask" }, "isolated");
+      await core.addOrUpdateTunnel({ ...seeded });
+      starting.resolve(makeActiveTunnel("t1"));
+      await run;
+      expect(stop).not.toHaveBeenCalled();
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    });
+
+    it("an unset mode edited to an explicit different mode is cancelled", async () => {
+      const { core, seeded, starting, stop, run } = await pending({}, "shared");
+      await core.addOrUpdateTunnel({ ...seeded, connectionMode: "isolated" });
+      starting.resolve(makeActiveTunnel("t1"));
+      await run;
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("changed while the tunnel was starting"), "Retry");
+    });
+  });
 });

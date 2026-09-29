@@ -284,6 +284,21 @@ describe("connectServer — equal-content replacement while progress is pending"
     }
   });
 
+  it("does not cancel a pending telnet connect when its auth profile link is cleared", async () => {
+    const server = makeServer({ protocol: "telnet", authProfileId: "ap1" });
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const release = holdProgress();
+
+    const run = connectServer(ctx, server.id);
+    // What removeAuthProfile's sweep does to a linked server.
+    await addOrUpdateServer({ ...server, authProfileId: undefined });
+    release();
+    await run;
+
+    expect(vscode.window.createTerminal).toHaveBeenCalled();
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
   it("offers no Retry and says what to re-run when retryCommand is null", async () => {
     const server = makeServer();
     const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });

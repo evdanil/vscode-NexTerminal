@@ -46,7 +46,10 @@ function transportDescriptor(server: ServerConfig): unknown[] {
     resolveServerProtocol(server),
     server.username,
     server.authType,
-    server.keyPath || null,
+    // Only a key login reads the key file; a stale path on a password or agent
+    // server must not cancel a start. (An auth-profile override of the auth type
+    // is deliberately not resolved here.)
+    server.authType === "key" ? server.keyPath || null : null,
     server.authProfileId || null,
     Boolean(server.legacyAlgorithms),
     proxyDescriptor(server.proxy)
@@ -55,6 +58,13 @@ function transportDescriptor(server: ServerConfig): unknown[] {
 
 /** What a terminal connect uses; includes the alternate host SshPty falls back to. */
 export function connectDescriptor(server: ServerConfig, inputs: ConnectDescriptorInputs = {}): string {
+  // TelnetPty dials host:port and reads nothing else, so SSH-only fields
+  // (credentials, proxy, key, alt host, multiplexing) must not cancel a telnet
+  // connect — for example the auth-profile removal sweep or an inventory sync
+  // writing username/proxy during the dial.
+  if (resolveServerProtocol(server) === "telnet") {
+    return JSON.stringify([server.id, server.host, server.port, server.addressless ?? false, "telnet"]);
+  }
   const altHost = typeof server.altHost === "string" && server.altHost.trim() !== "" ? server.altHost.trim() : null;
   return JSON.stringify([
     transportDescriptor(server),

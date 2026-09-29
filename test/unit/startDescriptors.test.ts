@@ -67,12 +67,14 @@ const tinputs = { mode: "isolated" as const, multiplexingDefault: true };
 
 describe("start descriptors — every field is classified", () => {
   it.each(Object.entries(SERVER_FIELDS))("server.%s", (key, { use, alt }) => {
-    const changed = { ...server, [key]: alt } as ServerConfig;
-    const connectChanges = connectDescriptor(changed, inputs) !== connectDescriptor(server, inputs);
+    // keyPath is read only by a key login, so it is judged on a key server.
+    const base: ServerConfig = key === "keyPath" ? { ...server, authType: "key" } : server;
+    const changed = { ...base, [key]: alt } as ServerConfig;
+    const connectChanges = connectDescriptor(changed, inputs) !== connectDescriptor(base, inputs);
     expect(connectChanges).toBe(use === "connect" || use === "connect+tunnel");
     if (key === "multiplexing") return; // tunnel side depends on the mode; see below
     const tunnelChanges =
-      tunnelStartDescriptor(tunnel, changed, tinputs) !== tunnelStartDescriptor(tunnel, server, tinputs);
+      tunnelStartDescriptor(tunnel, changed, tinputs) !== tunnelStartDescriptor(tunnel, base, tinputs);
     expect(tunnelChanges).toBe(use === "tunnel" || use === "connect+tunnel");
   });
 
@@ -154,5 +156,36 @@ describe("start descriptors — resolved values, not stored representations", ()
     const b = { ...server, proxy: { port: 1, host: "p", type: "socks5" as const } };
     expect(connectDescriptor(a, inputs)).toBe(connectDescriptor(b, inputs));
     expect(connectDescriptor({ ...a, proxy: { ...a.proxy, port: 2 } }, inputs)).not.toBe(connectDescriptor(a, inputs));
+  });
+});
+
+describe("start descriptors — keyPath and telnet", () => {
+  it("keyPath counts only for a key login", () => {
+    expect(connectDescriptor({ ...server, keyPath: "/k" }, inputs)).toBe(connectDescriptor(server, inputs));
+    const keyServer: ServerConfig = { ...server, authType: "key" };
+    expect(connectDescriptor({ ...keyServer, keyPath: "/k" }, inputs)).not.toBe(connectDescriptor(keyServer, inputs));
+  });
+
+  const telnet: ServerConfig = { ...server, protocol: "telnet" };
+  const SSH_ONLY: Array<[string, Partial<ServerConfig>]> = [
+    ["username", { username: "root" }],
+    ["authType", { authType: "key" }],
+    ["keyPath", { keyPath: "/k" }],
+    ["authProfileId", { authProfileId: "ap1" }],
+    ["legacyAlgorithms", { legacyAlgorithms: true }],
+    ["proxy", { proxy: { type: "ssh", jumpHostId: "j" } }],
+    ["multiplexing", { multiplexing: false }],
+    ["altHost", { altHost: "alt.example" }]
+  ];
+
+  it.each(SSH_ONLY)("a telnet connect ignores SSH-only %s", (_key, patch) => {
+    expect(connectDescriptor({ ...telnet, ...patch }, inputs)).toBe(connectDescriptor(telnet, inputs));
+  });
+
+  it("a telnet connect still tracks host, port, addressless and the protocol itself", () => {
+    expect(connectDescriptor({ ...telnet, host: "other" }, inputs)).not.toBe(connectDescriptor(telnet, inputs));
+    expect(connectDescriptor({ ...telnet, port: 2323 }, inputs)).not.toBe(connectDescriptor(telnet, inputs));
+    expect(connectDescriptor({ ...telnet, addressless: true }, inputs)).not.toBe(connectDescriptor(telnet, inputs));
+    expect(connectDescriptor({ ...telnet, protocol: undefined }, inputs)).not.toBe(connectDescriptor(telnet, inputs));
   });
 });

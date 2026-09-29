@@ -856,7 +856,7 @@ const TUNNEL_DEFAULT_ADDRESS = "127.0.0.1";
 /**
  * The address fields exactly as TunnelManager applies them: `??`, no trimming,
  * so an empty or whitespace-only value is passed through, not defaulted. Shared
- * by the manager and `tunnelConnectionEqual` so the start fence cannot judge
+ * by the manager and `tunnelStartDescriptor` so the start fence cannot judge
  * two values equal that the manager would treat differently.
  */
 export function resolveTunnelLocalBindAddress(profile: Pick<TunnelProfile, "localBindAddress">): string {
