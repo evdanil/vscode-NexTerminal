@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.299] — 2026-09-29
+
+### Fixed
+
+- **Disposing an SSH lease while its standalone fallback is still connecting no longer drops other sessions or leaks a connection.** A pooled lease that fell back to its own connection (channel-limited device or stale transport) released its pooled reference a second time if it was disposed mid-connect, which could close the shared transport under another live terminal. The pooled reference is now released once, and a fallback that finishes after disposal is closed instead of being used.
+
 ## [2.8.298] — 2026-09-29
 
 ### Fixed
