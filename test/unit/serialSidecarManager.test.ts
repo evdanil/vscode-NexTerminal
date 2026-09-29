@@ -83,6 +83,22 @@ describe("SerialSidecarManager open cancellation", () => {
     manager.dispose();
   });
 
+  it("emits onPortReleaseFailed with the port path when the worker reports an unreleasable abandoned open", async () => {
+    const manager = new SerialSidecarManager("worker.js");
+    const events: Array<[string, string]> = [];
+    manager.onPortReleaseFailed((portPath, message) => events.push([portPath, message]));
+    const opening = manager.openPort({ path: "COM9", baudRate: 9600 }, "rel-1");
+    opening.catch(() => {});
+    await tick();
+    children[0].stdout.write(
+      `${JSON.stringify({ method: "portReleaseFailed", params: { sessionId: "rel-1", path: "COM9", message: "EBUSY" } })}\n`
+    );
+    await tick();
+
+    expect(events).toEqual([["COM9", "EBUSY"]]);
+    manager.dispose();
+  });
+
   it("does not spawn a replacement sidecar to cancel an open interrupted by dispose", async () => {
     const manager = new SerialSidecarManager("worker.js");
     const opening = manager.openPort({ path: "COM9", baudRate: 9600 }, "opening-2");

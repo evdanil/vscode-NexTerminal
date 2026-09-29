@@ -4,6 +4,7 @@ import {
   PORT_DATA_NOTIFICATION,
   PORT_DISCONNECTED_NOTIFICATION,
   PORT_ERROR_NOTIFICATION,
+  PORT_RELEASE_FAILED_NOTIFICATION,
   type OpenPortParams,
   type RpcNotification,
   type RpcRequest,
@@ -116,7 +117,7 @@ export function createSerialSidecarRequestHandler(dependencies: {
       }
     });
 
-  async function releaseAbandonedPort(sessionId: string, port: PortRecord, firstError: Error): Promise<void> {
+  async function releaseAbandonedPort(sessionId: string, portPath: string, port: PortRecord, firstError: Error): Promise<void> {
     let lastError = firstError;
     for (const delay of BACKGROUND_CLOSE_DELAYS_MS) {
       await sleep(delay);
@@ -138,8 +139,10 @@ export function createSerialSidecarRequestHandler(dependencies: {
     }
     port.removeAllListeners();
     const message = `Could not release a cancelled serial open (${lastError.message}). The port may stay busy until the sidecar restarts: unplug and replug the device or run Reload Window.`;
-    writeLine({ method: PORT_ERROR_NOTIFICATION, params: { sessionId, message } });
-    // The sidecar's stderr is logged by the manager, unlike the unowned id above.
+    // Nobody owns this session id any more, so a portError would be ignored;
+    // the manager turns this dedicated notification into a user-visible warning.
+    writeLine({ method: PORT_RELEASE_FAILED_NOTIFICATION, params: { sessionId, path: portPath, message } });
+    // Also on stderr, which the manager logs.
     console.error(`[Nexus Serial Sidecar] ${message}`);
   }
 
@@ -251,7 +254,7 @@ export function createSerialSidecarRequestHandler(dependencies: {
           // later closePort will come. Keep the id reserved (the port stays
           // reachable) while the worker keeps retrying on its own.
           ports.set(sessionId, port);
-          void releaseAbandonedPort(sessionId, port, closeError);
+          void releaseAbandonedPort(sessionId, params.path, port, closeError);
           return response(request.id, undefined, `Serial port open cancelled; close failed: ${closeError.message}`);
         }
         port.removeAllListeners();

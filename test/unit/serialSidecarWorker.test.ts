@@ -192,8 +192,8 @@ describe("production serial sidecar worker request handler", () => {
       expect(stderr).toHaveBeenCalledTimes(1);
       expect(String(stderr.mock.calls[0][0])).toContain("Reload Window");
       expect(output).toContainEqual({
-        method: "portError",
-        params: { sessionId: "session-17", message: expect.stringContaining("EBUSY close") }
+        method: "portReleaseFailed",
+        params: { sessionId: "session-17", path: "/dev/ttyUSB0", message: expect.stringContaining("EBUSY close") }
       });
       // Tracking is dropped, so the id is not reserved forever.
       await expect(

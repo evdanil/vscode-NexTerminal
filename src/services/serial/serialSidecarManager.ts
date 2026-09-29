@@ -6,6 +6,7 @@ import {
   PORT_DATA_NOTIFICATION,
   PORT_DISCONNECTED_NOTIFICATION,
   PORT_ERROR_NOTIFICATION,
+  PORT_RELEASE_FAILED_NOTIFICATION,
   type OpenPortParams,
   type RpcNotification,
   type RpcRequest,
@@ -15,6 +16,7 @@ import {
 
 type DataListener = (sessionId: string, data: Buffer) => void;
 type ErrorListener = (sessionId: string, message: string) => void;
+type PortReleaseFailedListener = (portPath: string, message: string) => void;
 type DisconnectListener = (sessionId: string, reason: string) => void;
 
 /**
@@ -40,6 +42,7 @@ export class SerialSidecarManager {
   private readonly dataListeners = new Set<DataListener>();
   private readonly errorListeners = new Set<ErrorListener>();
   private readonly disconnectListeners = new Set<DisconnectListener>();
+  private readonly portReleaseFailedListeners = new Set<PortReleaseFailedListener>();
   private rpcTimeoutMs: number;
 
   public constructor(
@@ -67,6 +70,12 @@ export class SerialSidecarManager {
   public onDidDisconnect(listener: DisconnectListener): () => void {
     this.disconnectListeners.add(listener);
     return () => this.disconnectListeners.delete(listener);
+  }
+
+  /** An abandoned open completed but the sidecar could not close the port. */
+  public onPortReleaseFailed(listener: PortReleaseFailedListener): () => void {
+    this.portReleaseFailedListeners.add(listener);
+    return () => this.portReleaseFailedListeners.delete(listener);
   }
 
   public async listPorts(): Promise<SerialPortInfo[]> {
@@ -154,6 +163,7 @@ export class SerialSidecarManager {
     this.dataListeners.clear();
     this.errorListeners.clear();
     this.disconnectListeners.clear();
+    this.portReleaseFailedListeners.clear();
     this.processRef?.kill();
     this.processRef = undefined;
   }
@@ -260,6 +270,16 @@ export class SerialSidecarManager {
       const reason = disconnected.reason ?? "Port closed";
       for (const listener of this.disconnectListeners) {
         listener(disconnected.sessionId, reason);
+      }
+      return;
+    }
+    if (notification.method === PORT_RELEASE_FAILED_NOTIFICATION) {
+      const failed = notification.params as { path?: string; message?: string };
+      if (!failed.path) {
+        return;
+      }
+      for (const listener of this.portReleaseFailedListeners) {
+        listener(failed.path, failed.message ?? "");
       }
       return;
     }

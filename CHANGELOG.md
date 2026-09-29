@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- **A serial open that timed out no longer leaves the port held.** When a port took longer than the 10 s RPC budget to open (Windows Bluetooth COM ports, slow USB-serial drivers), the tab reported "Connection failed" but the sidecar kept waiting on the native open and, once it finished, held the port under a session nobody owned, so every later Connect and Smart Follow poll failed with "busy" until a window reload. The sidecar manager now sends a cancel to the sidecar that owns the abandoned open (never spawning a new one), and the sidecar closes the port and frees its session ID as soon as the open completes.
+- **A serial open that timed out no longer leaves the port held.** When a port took longer than the 10 s RPC budget to open (Windows Bluetooth COM ports, slow USB-serial drivers), the tab reported "Connection failed" but the sidecar kept waiting on the native open and, once it finished, held the port under a session nobody owned, so every later Connect and Smart Follow poll failed with "busy" until a window reload. The sidecar manager now sends a cancel to the sidecar that owns the abandoned open (never spawning a new one), and the sidecar closes the port and frees its session ID as soon as the open completes. If the port still cannot be released after about 30 s of retries, a warning names the port and offers Reload Window.
 
 ## [2.8.302] — 2026-09-29
 
