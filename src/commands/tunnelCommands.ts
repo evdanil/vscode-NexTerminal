@@ -9,6 +9,7 @@ import type {
   TunnelProfile,
   TunnelType
 } from "../models/config";
+import { readMultiplexingDefault } from "../utils/multiplexingDefault";
 import { flattenProviderText } from "../models/inventory";
 import { cloneServerConfig, resolveTunnelType, serverConnectionEqual, tunnelConnectionEqual } from "../models/config";
 import { configMutationLock } from "../services/configMutationLock";
@@ -163,7 +164,7 @@ export async function startTunnel(
       liveProfile !== undefined &&
       tunnelConnectionEqual(liveProfile, profileAtStart) &&
       liveServer !== undefined &&
-      serverConnectionEqual(liveServer, serverAtStart)
+      serverConnectionEqual(liveServer, serverAtStart, { multiplexingDefault: readMultiplexingDefault() })
     );
   };
   const reportCancelled = (): void => {

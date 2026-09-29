@@ -19,7 +19,6 @@ describe("serverConnectionEqual — explicit default vs absent", () => {
     ["altHost empty/whitespace", { altHost: "  " }],
     ["keyPath empty", { keyPath: "" }],
     ["authProfileId empty", { authProfileId: "" }],
-    ["multiplexing on (form default)", { multiplexing: true }],
     ["legacyAlgorithms false", { legacyAlgorithms: false }],
     ["addressless false", { addressless: false }],
     ["logSession written by the editor", { logSession: false }]
@@ -37,6 +36,15 @@ describe("serverConnectionEqual — explicit default vs absent", () => {
     ["proxy", { proxy: { type: "ssh", jumpHostId: "j" } }]
   ])("still detects a real change: %s", (_label, patch) => {
     expect(serverConnectionEqual(server, { ...server, ...patch })).toBe(false);
+  });
+
+  it("compares effective multiplexing against the global default", () => {
+    const on = { ...server, multiplexing: true };
+    expect(serverConnectionEqual(server, on, { multiplexingDefault: true })).toBe(true);
+    expect(serverConnectionEqual(server, on, { multiplexingDefault: false })).toBe(false);
+    const off = { ...server, multiplexing: false };
+    expect(serverConnectionEqual(server, off, { multiplexingDefault: false })).toBe(true);
+    expect(serverConnectionEqual(server, off, { multiplexingDefault: true })).toBe(false);
   });
 
   it("ignores folder and hidden edits", () => {

@@ -282,6 +282,40 @@ describe("connectServer — equal-content replacement while progress is pending"
     }
   });
 
+  it("offers no Retry and says what to re-run when retryCommand is null", async () => {
+    const server = makeServer();
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const release = holdProgress();
+
+    const run = connectServer(ctx, server.id, { retryCommand: null });
+    await addOrUpdateServer({ ...server, port: 2222 });
+    release();
+    await run;
+    await flushPromises();
+
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    expect(mockShowWarningMessage.mock.calls[0]).toHaveLength(1);
+    expect(String(mockShowWarningMessage.mock.calls[0][0])).toContain("Run the original command again");
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("compares multiplexing against the global setting when deciding a change", async () => {
+    const server = makeServer();
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    vi.mocked(vscode.workspace.getConfiguration as any).mockReturnValue({ get: vi.fn(() => false) });
+    const release = holdProgress();
+
+    const run = connectServer(ctx, server.id);
+    await addOrUpdateServer({ ...server, multiplexing: true });
+    release();
+    await run;
+
+    vi.mocked(vscode.workspace.getConfiguration as any).mockReturnValue({ get: vi.fn(() => true) });
+
+    expect(vscode.window.createTerminal).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalled();
+  });
+
   it("does not run Retry when the server was removed between the warning and the click", async () => {
     const server = makeServer({ name: "gone\nname" });
     const { ctx, addOrUpdateServer, removeServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });

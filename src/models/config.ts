@@ -858,7 +858,12 @@ export function cloneServerConfig(server: ServerConfig): ServerConfig {
  * affect the connection being opened. Explicit comparators, not JSON, so key
  * order cannot register as a change.
  */
-export function serverConnectionEqual(a: ServerConfig, b: ServerConfig): boolean {
+export function serverConnectionEqual(
+  a: ServerConfig,
+  b: ServerConfig,
+  options: { multiplexingDefault?: boolean } = {}
+): boolean {
+  const multiplexingDefault = options.multiplexingDefault ?? true;
   // Each optional field is compared after the same canonicalization the editor
   // save applies (see formValuesToServer): an explicit default and an absent
   // value mean the same thing, and an unchanged Save must not read as a change.
@@ -877,9 +882,9 @@ export function serverConnectionEqual(a: ServerConfig, b: ServerConfig): boolean
     a.authType === b.authType &&
     (a.keyPath || undefined) === (b.keyPath || undefined) &&
     (a.authProfileId || undefined) === (b.authProfileId || undefined) &&
-    // The form's checkbox seeds an unset multiplexing as on, so Save turns
-    // absent into true.
-    (a.multiplexing ?? true) === (b.multiplexing ?? true) &&
+    // Effective value, as the pool resolves it (`server.multiplexing ?? global`):
+    // absent equals an explicit value only when that value is the global setting.
+    (a.multiplexing ?? multiplexingDefault) === (b.multiplexing ?? multiplexingDefault) &&
     // Read as a truthy flag by the connector; absent and false are the same.
     Boolean(a.legacyAlgorithms) === Boolean(b.legacyAlgorithms) &&
     // logSession is deliberately not compared: the editor writes the current

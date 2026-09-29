@@ -16,6 +16,7 @@ import {
   serverConfigsEqual,
   serverConnectionEqual
 } from "../models/config";
+import { readMultiplexingDefault } from "../utils/multiplexingDefault";
 import { flattenProviderText } from "../models/inventory";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
@@ -1038,7 +1039,7 @@ export interface ConnectServerOptions {
    */
   onConnectFailed?: (message: string) => void;
   /** Command a cancelled-start Retry re-runs; defaults to plain Connect. Wrappers (run-script, run-macro) set their own so Retry repeats the original action. */
-  retryCommand?: string;
+  retryCommand?: string | null;
 }
 
 /**
@@ -1050,7 +1051,7 @@ export interface ConnectServerOptions {
  */
 function isServerUnchangedSince(ctx: CommandContext, atStart: ServerConfig): boolean {
   const current = ctx.core.getServer(atStart.id);
-  return current !== undefined && serverConnectionEqual(current, atStart);
+  return current !== undefined && serverConnectionEqual(current, atStart, { multiplexingDefault: readMultiplexingDefault() });
 }
 
 /** Tells the user why a connect was cancelled and, if the record still exists, offers a Retry that can succeed. */
@@ -1064,6 +1065,15 @@ function reportCancelledConnect(ctx: CommandContext, atStart: ServerConfig, opti
   if (removed) {
     void vscode.window.showWarningMessage(
       `Server "${safeName}" was removed while the connection was starting. The connection was cancelled.`
+    );
+    return;
+  }
+  if (options.retryCommand === null) {
+    // The connect is a sub-step of a larger action (for example an IPMI gateway
+    // for a macro on another server). A Retry that re-ran only this server's
+    // command would drop the original target and macro, so say what to do.
+    void vscode.window.showWarningMessage(
+      `Server "${safeName}" changed while the connection was starting. The connection was cancelled. Run the original command again to use the current settings.`
     );
     return;
   }

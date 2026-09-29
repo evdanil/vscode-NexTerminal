@@ -838,6 +838,21 @@ describe("nexus.server.runMacro — connect-first flow", () => {
     }
   });
 
+  it("asks connectServer for no Retry: a re-run of the gateway alone would lose the target and macro", async () => {
+    await setMacros([SESSION_MACRO]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+    showWarningMessage.mockResolvedValue("Connect and Run");
+    connectServer.mockImplementation(async (_ctx: unknown, _id: unknown, options?: { onConnectFailed?: (message: string) => void }) => {
+      options?.onConnectFailed?.("cancelled");
+    });
+    const { core } = connectableCore();
+
+    await runMacroOnServer(context({ core } as unknown as Partial<CommandContext>), { server: server() });
+
+    const options = connectServer.mock.calls[0][2] as { retryCommand?: string | null } | undefined;
+    expect(options?.retryCommand).toBeNull();
+  });
+
   it("still falls back to the timeout when the connect neither fails nor produces a session", async () => {
     await setMacros([SESSION_MACRO]);
     showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);

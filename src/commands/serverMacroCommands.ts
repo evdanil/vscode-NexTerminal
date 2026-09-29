@@ -577,7 +577,10 @@ async function connectAndAwaitSessionTerminal(
   try {
     await connectServer(ctx, server.id, {
       allowAutoFileExplorer: false,
-      retryCommand: "nexus.server.runMacro",
+      // No Retry: this server may be only the IPMI gateway for a macro on another
+      // target, and re-running the macro command on it would lose that target and
+      // the chosen macro.
+      retryCommand: null,
       onConnectFailed: () => settle({ kind: "connect-failed" })
     });
     const outcome = await settled;
