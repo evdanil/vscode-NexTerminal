@@ -571,15 +571,51 @@ function isSourceConfigMismatchError(error: unknown): boolean {
  * update's proxy change makes stale is `clearStaleProxyPasswordSecretsBeforeApply`'s.
  */
 async function clearLeftoverSecretsOfAdds(vault: SecretVault, adds: ReadonlyArray<ServerConfig>): Promise<void> {
-  for (const add of adds) {
-    try {
-      await deleteServerSecrets(vault, add.id);
-    } catch (error) {
-      throw new Error(
-        "Could not clear old saved credentials for a server this sync adds from the system keychain — nothing was applied, try again.",
-        { cause: error }
-      );
+  try {
+    await runBounded(adds, SECRET_CLEAR_CONCURRENCY, (add) => deleteServerSecrets(vault, add.id));
+  } catch (error) {
+    throw new Error(
+      "Could not clear old saved credentials for a server this sync adds from the system keychain — nothing was applied, try again.",
+      { cause: error }
+    );
+  }
+}
+
+/**
+ * How many servers' secret clears may be in flight at once. A first sync of a
+ * source adds every device (up to 10,000), each needing three vault deletes,
+ * and this runs inside `configMutationLock`; one at a time, the lock is held
+ * for 3 x devices round trips (minutes on a remote extension host). A bound,
+ * not "all at once", keeps the number of pending host-to-window calls small.
+ */
+const SECRET_CLEAR_CONCURRENCY = 16;
+
+/**
+ * Runs `task` over `items` with at most `limit` in flight, resolving once every
+ * started task has settled. The first rejection stops new tasks from starting
+ * and is rethrown after the in-flight ones settle, so a caller that treats a
+ * rejection as "abort" never proceeds while a task it started is still running.
+ */
+async function runBounded<T>(items: ReadonlyArray<T>, limit: number, task: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  let failed = false;
+  let firstError: unknown;
+  const worker = async (): Promise<void> => {
+    while (!failed && next < items.length) {
+      const item = items[next++];
+      try {
+        await task(item);
+      } catch (error) {
+        if (!failed) {
+          failed = true;
+          firstError = error;
+        }
+      }
     }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  if (failed) {
+    throw firstError;
   }
 }
 
@@ -3586,13 +3622,15 @@ export function registerInventoryCommands(
           // #200 — a key this loop fails to delete is reachable by a sync add
           // only if this source id comes back (a restored backup), and syncNow
           // deletes it before publishing that add (`clearLeftoverSecretsOfAdds`).
-          for (const id of removedServerIds) {
+          // Bounded-concurrent (see SECRET_CLEAR_CONCURRENCY): the re-check
+          // stays immediately before each id's own delete.
+          await runBounded([...removedServerIds], SECRET_CLEAR_CONCURRENCY, async (id) => {
             if (core.getServer(id) !== undefined) {
               recreatedIds.add(id);
-              continue;
+              return;
             }
             await deleteServerSecrets(vault, id, { bestEffort: true });
-          }
+          });
         } else if (choice === "Keep Servers") {
           // ADOPT 1 — strip AND STAMP. The strip is unchanged and stays
           // non-negotiable (a dangling origin must never let any sync act on a
@@ -5022,13 +5060,15 @@ export function registerInventoryCommands(
           // outage into a failed prune and need a capture-and-restore for an
           // apply that then fails; the add-time clear covers both ways a key
           // survives without either.
-          for (const id of prunedServerIdsForSecretCleanup(finalPlan)) {
+          // Bounded-concurrent (see SECRET_CLEAR_CONCURRENCY): a large prune
+          // otherwise holds the lock for 3 x pruned round trips.
+          await runBounded([...prunedServerIdsForSecretCleanup(finalPlan)], SECRET_CLEAR_CONCURRENCY, async (id) => {
             if (core.getServer(id) !== undefined) {
               recreatedIds.add(id);
-              continue;
+              return;
             }
             await deleteServerSecrets(vault, id, { bestEffort: true });
-          }
+          });
 
           return {
             kind: "success",

@@ -1,3 +1,5 @@
+import { isAuthNotJudged } from "./authErrors";
+
 export type ConnectionDiagnosticStage =
   | "dns"
   | "tcp"
@@ -134,6 +136,22 @@ export function classifySshConnectionError(error: unknown): ConnectionDiagnostic
       title: "Proxy connection failed",
       detail: "Nexus could not complete the configured proxy or jump-host connection.",
       suggestion: "Check the proxy server, credentials, and jump-host settings before retrying."
+    };
+  }
+
+  // A login that ended without the server ruling on the credential (owner went
+  // away, transport closed before ready, prompt dismissed) says nothing about it,
+  // yet its wording contains "auth". Left to the branch below it would read as
+  // "the server rejected the configured credentials" — the same misreading that
+  // used to delete the saved password. Placed after the network and proxy
+  // signatures so those keep their stage, and before `auth` to stop the regex.
+  if (isAuthNotJudged(error)) {
+    return {
+      ok: false,
+      stage: "unknown",
+      title: "SSH connection failed",
+      detail: "The SSH connection ended before the server accepted or rejected a login.",
+      suggestion: "Retry the connection. If it keeps failing, check the network path and the extension logs for more detail."
     };
   }
 
