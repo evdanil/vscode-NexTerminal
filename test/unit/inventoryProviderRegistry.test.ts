@@ -421,8 +421,9 @@ describe("InventoryProviderRegistry configFieldsOf", () => {
     } catch (error) {
       message = (error as Error).message;
     }
-    expect(message).toMatch(/disposed provider object cannot be registered again/);
+    expect(message).toMatch(/accepted only once, including after its registration is disposed/);
     expect(message).toMatch(/Register a new provider object/);
+    expect(registry.get(provider.id)).toBeUndefined();
     // A fresh object with the same id is the remedy the message names, and it works.
     expect(() => registry.register(makeProvider())).not.toThrow();
   });

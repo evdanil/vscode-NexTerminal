@@ -403,7 +403,7 @@ export class InventoryProviderRegistry {
       // A flow can keep this provider object after its id is disposed. Reusing
       // it would replace the copy that flow rendered or fingerprinted.
       throw new Error(
-        `Inventory provider object "${id}" was already registered with this registry, and a disposed provider object cannot be registered again. Register a new provider object (a fresh instance with the same id is fine).`
+        `Inventory provider object "${id}" was already registered with this registry; a provider object is accepted only once, including after its registration is disposed. Register a new provider object (a fresh instance with the same id is fine).`
       );
     }
     this.providers.set(id, registration);

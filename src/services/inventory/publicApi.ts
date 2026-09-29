@@ -131,7 +131,11 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  */
 export interface NexusExtensionApi {
   readonly contractVersion: 1;
-  /** Throws (via the registry's own validation) on a malformed provider or a duplicate id. */
+  /**
+   * Throws (via the registry's own validation) on a malformed provider, a duplicate id, or a
+   * provider object this registry has already accepted (even after its registration was
+   * disposed) — register a new provider object instead.
+   */
   registerInventoryProvider(provider: InventoryProvider): { dispose(): void };
 }
 
