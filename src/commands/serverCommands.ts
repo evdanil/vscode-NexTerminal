@@ -1349,6 +1349,7 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
         server,
         ctx.sshFactory,
         {
+          captureConnectDescriptor: () => connectDescriptor(server, connectDescriptorInputs(ctx)),
           onSessionOpened: (sessionId) => {
             ctx.core.registerSession({
               id: sessionId,
@@ -1390,13 +1391,16 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
               }
             }
 
-            // onSessionOpened also fires on every R reconnect, and SshPty
-            // reconnects with the config it was constructed with, not the live
-            // record. Auto-tunnels must use that same config, or an isolated one
-            // could dial a different host than the terminal and a shared one
-            // could reuse the old pooled transport under the new config. If the
-            // live record's connection fields have moved on, skip and say so;
-            // a change that leaves them alone (a rename) still auto-starts.
+            // onSessionOpened also fires on every R reconnect, and each connect
+            // attempt (initial or reconnect) captured its own effective descriptor
+            // before it acquired a connection (SshPtyCallbacks.captureConnectDescriptor).
+            // Auto-tunnels must ride the same effective connection: compare that
+            // capture with what a tunnel would use now (live server, live profile,
+            // live jump chain). A change after the capture means the terminal is on
+            // the old credentials or route, so start nothing and say so (fail-safe);
+            // a change before it invalidated the pool entries, so the terminal
+            // already built its connection on the new state and the two agree. A
+            // rename or other non-connection edit changes neither side.
             const liveServer = ctx.core.getServer(server.id);
             const pending = liveServer
               ? ctx.core.getSnapshot().tunnels.filter(
@@ -1409,17 +1413,12 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
               : [];
             if (liveServer && pending.length > 0) {
               // Deliberately gated on the TERMINAL's connect descriptor, not the
-              // tunnel one: the tunnels reuse this session's config, and a session
-              // whose alt host (or anything else the terminal reads) has moved on
-              // is stale as a whole, so an altHost edit also skips auto-start.
-              // On an R reconnect SilentAuthSshFactory applies the LIVE auth profile to
-              // the session's constructor-captured server, so compare the effective
-              // connection that just opened (session server + live profile) with what
-              // a tunnel would use now (live server + live profile). descriptorAtStart
-              // holds the profile as it was when the terminal first opened, which
-              // would warn after a profile edit the reconnect already picked up.
-              const sweepInputs = connectDescriptorInputs(ctx);
-              if (connectDescriptor(serverAtStart, sweepInputs) !== connectDescriptor(liveServer, sweepInputs)) {
+              // tunnel one: a session whose alt host (or anything else the terminal
+              // reads) has moved on is stale as a whole, so an altHost edit also
+              // skips auto-start. No capture (a pty not created by this path)
+              // fails safe the same way.
+              const captured = ptyRef?.connectedDescriptor;
+              if (captured === undefined || captured !== connectDescriptor(liveServer, connectDescriptorInputs(ctx))) {
                 void vscode.window.showWarningMessage(
                   `Auto-start tunnels for "${flattenProviderText(server.name)}" were not started because the server's connection settings changed since this session opened. Close and reopen the terminal to use the new settings.`
                 );

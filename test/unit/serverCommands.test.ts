@@ -369,7 +369,7 @@ describe("connectServer — equal-content replacement while progress is pending"
   });
 });
 
-describe("connectServer — auto-start sweep follows the session's connection config", () => {
+describe("connectServer — auto-start sweep compares the connect attempt's captured descriptor", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(vscode.window.withProgress as any).mockImplementation(
@@ -377,59 +377,30 @@ describe("connectServer — auto-start sweep follows the session's connection co
     );
   });
 
-  async function connected(serverOverrides: Partial<ServerConfig> = {}) {
-    const server = makeServer(serverOverrides);
-    const tunnel = makeTunnel({ autoStart: true, defaultServerId: "srv-1" });
-    const harness = setupHarness({ profiles: [tunnel], activeTunnels: [], servers: [server] });
-    await connectServer(harness.ctx, server.id);
-    return { ...harness, server, callbacks: latestSshCallbacks() };
-  }
+  type Cb = ReturnType<typeof latestSshCallbacks> & { captureConnectDescriptor(): string };
 
-  it("normal path: starts the tunnel on the session's server", async () => {
-    const { callbacks, server } = await connected();
-    callbacks.onSessionOpened("session-1");
-    await flushPromises();
-
-    expect(mockStartTunnel).toHaveBeenCalledTimes(1);
-    expect(mockStartTunnel.mock.calls[0][4]).toMatchObject({ id: server.id, host: server.host });
-    expect(mockShowWarningMessage).not.toHaveBeenCalled();
-  });
-
-  it("R-reconnect after a rename or equal save still starts the tunnel", async () => {
-    const { callbacks, server, addOrUpdateServer } = await connected();
-    await addOrUpdateServer({ ...server, name: "Renamed", group: "Other" });
-    callbacks.onSessionOpened("session-1");
-    await flushPromises();
-
-    expect(mockStartTunnel).toHaveBeenCalledTimes(1);
-    // The config the session actually connected with, not the live record.
-    expect(mockStartTunnel.mock.calls[0][4]).toMatchObject({ name: server.name });
-    expect(mockShowWarningMessage).not.toHaveBeenCalled();
-  });
-
-  it("R-reconnect after the linked auth profile was edited still auto-starts (the reconnect applies the live profile)", async () => {
-    const server = makeServer({ authProfileId: "ap1" });
+  async function connected(options: { servers?: ServerConfig[]; authProfiles?: AuthProfile[]; target?: Partial<ServerConfig> } = {}) {
+    const server = makeServer(options.target);
     const tunnel = makeTunnel({ autoStart: true, defaultServerId: "srv-1" });
     const harness = setupHarness({
-      profiles: [tunnel], activeTunnels: [], servers: [server],
-      authProfiles: [{ id: "ap1", name: "AP", username: "ops", authType: "password" }]
+      profiles: [tunnel], activeTunnels: [], servers: [server, ...(options.servers ?? [])], authProfiles: options.authProfiles
     });
     await connectServer(harness.ctx, server.id);
-    const callbacks = latestSshCallbacks();
-    await harness.addOrUpdateAuthProfile({ id: "ap1", name: "AP", username: "root", authType: "password" });
+    const callbacks = latestSshCallbacks() as Cb;
+    const pty = vi.mocked(SshPty).mock.results.at(-1)!.value as { connectedDescriptor?: string };
+    /** What SshPty.start does at the top of every connect attempt, before any acquire. */
+    const startAttempt = (): void => {
+      pty.connectedDescriptor = callbacks.captureConnectDescriptor();
+    };
+    return { ...harness, server, callbacks, pty, startAttempt };
+  }
+
+  async function open(callbacks: Cb): Promise<void> {
     callbacks.onSessionOpened("session-1");
     await flushPromises();
+  }
 
-    expect(mockStartTunnel).toHaveBeenCalledTimes(1);
-    expect(mockShowWarningMessage).not.toHaveBeenCalled();
-  });
-
-  it("R-reconnect after a host edit starts nothing on the new host and warns", async () => {
-    const { callbacks, server, addOrUpdateServer } = await connected({ name: "evil\nname" });
-    await addOrUpdateServer({ ...server, host: "new.example" });
-    callbacks.onSessionOpened("session-1");
-    await flushPromises();
-
+  function expectOneWarning(): void {
     expect(mockStartTunnel).not.toHaveBeenCalled();
     expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
     const message = String(mockShowWarningMessage.mock.calls[0][0]);
@@ -437,6 +408,109 @@ describe("connectServer — auto-start sweep follows the session's connection co
     expect(message).toContain("Close and reopen the terminal");
     expect(message).not.toContain("\n");
     expect(mockShowWarningMessage.mock.calls[0]).toHaveLength(1);
+  }
+
+  it("normal path: starts the tunnel on the session's server", async () => {
+    const { callbacks, server, startAttempt } = await connected();
+    startAttempt();
+    await open(callbacks);
+
+    expect(mockStartTunnel).toHaveBeenCalledTimes(1);
+    expect(mockStartTunnel.mock.calls[0][4]).toMatchObject({ id: server.id, host: server.host });
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("a rename before or after the attempt never blocks auto-start", async () => {
+    const { callbacks, server, addOrUpdateServer, startAttempt } = await connected();
+    await addOrUpdateServer({ ...server, name: "Renamed", group: "Other" });
+    startAttempt();
+    await open(callbacks);
+    expect(mockStartTunnel).toHaveBeenCalledTimes(1);
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("a profile edited BEFORE the attempt is captured: capture and live agree, tunnels start", async () => {
+    const { callbacks, harnessProfile, startAttempt } = await withProfile();
+    await harnessProfile({ username: "root" });
+    startAttempt();
+    await open(callbacks);
+    expect(mockStartTunnel).toHaveBeenCalledTimes(1);
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  async function withProfile() {
+    const c = await connected({
+      target: { authProfileId: "ap1" },
+      authProfiles: [{ id: "ap1", name: "AP", username: "ops", authType: "password" }]
+    });
+    return {
+      ...c,
+      harnessProfile: (patch: Partial<AuthProfile>) =>
+        c.addOrUpdateAuthProfile({ id: "ap1", name: "AP", username: "ops", authType: "password", ...patch })
+    };
+  }
+
+  it("a linked profile edited between capture and session open (initial connect): nothing starts, one warning", async () => {
+    const { callbacks, harnessProfile, startAttempt } = await withProfile();
+    startAttempt();
+    await harnessProfile({ username: "root" });
+    await open(callbacks);
+    expectOneWarning();
+  });
+
+  it("a jump host's host edited between capture and session open: nothing starts, one warning", async () => {
+    const jump = makeServer({ id: "jump", name: "Jump", host: "jump.example" });
+    const { callbacks, addOrUpdateServer, startAttempt } = await connected({
+      servers: [jump], target: { proxy: { type: "ssh", jumpHostId: "jump" } }
+    });
+    startAttempt();
+    await addOrUpdateServer({ ...jump, host: "jump2.example" });
+    await open(callbacks);
+    expectOneWarning();
+  });
+
+  it("R reconnect: a profile edited after the reconnect's capture warns; before it, tunnels start", async () => {
+    const first = await withProfile();
+    first.startAttempt();
+    await open(first.callbacks);
+    expect(mockStartTunnel).toHaveBeenCalledTimes(1);
+    mockStartTunnel.mockClear();
+
+    // Reconnect 1: edit lands before the attempt captures, so it agrees.
+    await first.harnessProfile({ username: "root" });
+    first.startAttempt();
+    await open(first.callbacks);
+    expect(mockStartTunnel).toHaveBeenCalledTimes(1);
+    mockStartTunnel.mockClear();
+    mockShowWarningMessage.mockClear();
+
+    // Reconnect 2: edit lands after the capture.
+    first.startAttempt();
+    await first.harnessProfile({ username: "admin" });
+    await open(first.callbacks);
+    expectOneWarning();
+  });
+
+  it("R reconnect after a host edit made before the attempt: SshPty reconnects with its constructor-captured server (old host), so nothing starts on the new host", async () => {
+    const { callbacks, server, addOrUpdateServer, startAttempt } = await connected();
+    await addOrUpdateServer({ ...server, host: "new.example" });
+    startAttempt();
+    await open(callbacks);
+    expectOneWarning();
+  });
+
+  it("a host edit between capture and open warns with the name flattened", async () => {
+    const { callbacks, server, addOrUpdateServer, startAttempt } = await connected({ target: { name: "evil\nname" } });
+    startAttempt();
+    await addOrUpdateServer({ ...server, host: "new.example" });
+    await open(callbacks);
+    expectOneWarning();
+  });
+
+  it("fails safe when the pty never captured a descriptor", async () => {
+    const { callbacks } = await connected();
+    await open(callbacks);
+    expectOneWarning();
   });
 });
 

@@ -43,6 +43,16 @@ export interface SshPtyCallbacks {
    * rethrows to `reconnect()` above, which owns its own reporting.
    */
   onConnectFailed?(sessionId: string, message: string): void;
+  /**
+   * Captures the effective connection descriptor (see models/startDescriptors)
+   * for THIS connect attempt. Called at the very start of every attempt, the
+   * initial connect and each R reconnect, before any pool or factory acquire,
+   * and the result is exposed as `connectedDescriptor`. A change that lands
+   * after the capture makes the captured value differ from a live rebuild, so a
+   * caller comparing the two fails safe; a change that lands before it has
+   * already invalidated the pool entries, so the acquire builds afresh.
+   */
+  captureConnectDescriptor?(): string;
 }
 
 export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
@@ -59,6 +69,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
   private shuttingDown = false;
   private lastDimensions?: vscode.TerminalDimensions;
   private connectionGeneration = 0;
+  private capturedConnectDescriptor?: string;
   private activityIndicator = false;
   private readonly highlighterStream?: TerminalHighlighterStream;
 
@@ -265,8 +276,15 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     }
   }
 
+  /** The descriptor captured at the start of the latest connect attempt, or undefined if no capture was supplied. */
+  public get connectedDescriptor(): string | undefined {
+    return this.capturedConnectDescriptor;
+  }
+
   private async start(dimensions?: vscode.TerminalDimensions): Promise<void> {
     const generation = ++this.connectionGeneration;
+    // Before ANY acquire (see SshPtyCallbacks.captureConnectDescriptor).
+    this.capturedConnectDescriptor = this.callbacks.captureConnectDescriptor?.();
     // Clear any OSC-3008 carry held from a previous session so a partial
     // sequence stranded by a disconnect cannot prepend to this session's first
     // chunk. No-op on first connect; idempotent with the dispose() reset.
