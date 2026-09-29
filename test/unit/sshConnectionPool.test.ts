@@ -826,6 +826,77 @@ describe("SshConnectionPool", () => {
     expect(f.connect).toHaveBeenCalledTimes(2);
   });
 
+  it("lease disposed during an in-flight fallback releases the pool once and closes the fallback", async () => {
+    const pooledConn = createMockConnection();
+    let shellCalls = 0;
+    pooledConn.openShell = vi.fn(async () => {
+      shellCalls++;
+      if (shellCalls > 1) {
+        throw new Error("Channel open failure: Administratively prohibited");
+      }
+      return {} as any;
+    });
+    const standaloneConn = createMockConnection();
+    let resolveStandalone!: (c: SshConnection) => void;
+    const pending = new Promise<SshConnection>((resolve) => { resolveStandalone = resolve; });
+    let connectCalls = 0;
+    const f: SshFactory = {
+      connect: vi.fn(async () => {
+        connectCalls++;
+        return connectCalls === 1 ? pooledConn : pending;
+      }),
+    };
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 5000 });
+
+    const leaseB = await p.connect(testServer);
+    await leaseB.openShell();
+    const leaseA = await p.connect(testServer);
+    const opening = leaseA.openShell();
+    const settled = opening.then(() => "resolved", () => "rejected");
+    await vi.waitFor(() => expect(f.connect).toHaveBeenCalledTimes(2));
+
+    leaseA.dispose();
+    resolveStandalone(standaloneConn);
+
+    expect(await settled).toBe("rejected");
+    expect(standaloneConn.dispose).toHaveBeenCalledTimes(1);
+    expect(standaloneConn.openShell).not.toHaveBeenCalled();
+    // B still holds the pooled transport: A's late fallback must not release it again.
+    expect(pooledConn.dispose).not.toHaveBeenCalled();
+
+    leaseB.dispose();
+    expect(pooledConn.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("lease disposed during an in-flight stale-connection fallback closes the fallback without using it", async () => {
+    const staleConn = createMockConnection();
+    staleConn.openDirectTcp = vi.fn(async () => {
+      throw new Error("Not connected");
+    });
+    const freshConn = createMockConnection();
+    let resolveFresh!: (c: SshConnection) => void;
+    const pending = new Promise<SshConnection>((resolve) => { resolveFresh = resolve; });
+    let connectCalls = 0;
+    const f: SshFactory = {
+      connect: vi.fn(async () => {
+        connectCalls++;
+        return connectCalls === 1 ? staleConn : pending;
+      }),
+    };
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 5000 });
+
+    const lease = await p.connect(testServer);
+    const opening = lease.openDirectTcp("127.0.0.1", 80).then(() => "resolved", () => "rejected");
+    await vi.waitFor(() => expect(f.connect).toHaveBeenCalledTimes(2));
+
+    lease.dispose();
+    resolveFresh(freshConn);
+
+    expect(await opening).toBe("rejected");
+    expect(freshConn.dispose).toHaveBeenCalledTimes(1);
+    expect(freshConn.openDirectTcp).not.toHaveBeenCalled();
+  });
+
   it("idle timeout 0 means keep alive until explicit disconnect", async () => {
     const conn = createMockConnection();
     const f = createMockFactory([conn]);

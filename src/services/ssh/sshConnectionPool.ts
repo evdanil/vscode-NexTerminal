@@ -58,10 +58,12 @@ class PooledSshConnection implements SshConnection {
   private readonly closeUnsubscribes: Array<() => void> = [];
   private fallbackConnection?: SshConnection;
   private fallbackUsed = false;
+  private pooledReleased = false;
+  private onRelease: () => void = () => this.releasePooledOnce();
 
   public constructor(
     private readonly inner: SshConnection,
-    private onRelease: () => void,
+    private readonly releasePooled: () => void,
     private readonly createFallback?: () => Promise<SshConnection>,
     private readonly isReused = false,
     private readonly retireEntry: () => Promise<void> = () => Promise.resolve()
@@ -185,6 +187,17 @@ class PooledSshConnection implements SshConnection {
     this.onRelease();
   }
 
+  /**
+   * The pooled reference must drop exactly once: dispose() and a fallback that
+   * settles afterwards both want to release it, and a second decrement would
+   * orphan-dispose the shared transport under another live lease.
+   */
+  private releasePooledOnce(): void {
+    if (this.pooledReleased) return;
+    this.pooledReleased = true;
+    this.releasePooled();
+  }
+
   private fallbackPromise?: Promise<SshConnection | undefined>;
 
   private shouldAttemptFallback(error: unknown): boolean {
@@ -213,10 +226,18 @@ class PooledSshConnection implements SshConnection {
 
   private async executeFallback(): Promise<SshConnection | undefined> {
     try {
-      this.fallbackConnection = await this.createFallback!();
+      const fallback = await this.createFallback!();
       this.fallbackUsed = true;
+      if (this.disposed) {
+        // The lease was disposed while the fallback was connecting: nobody owns
+        // this connection, so close it rather than hand it to the pending call.
+        // dispose() already released the pooled reference.
+        fallback.dispose();
+        return undefined;
+      }
+      this.fallbackConnection = fallback;
       // Release the pooled reference — we no longer use it
-      this.onRelease();
+      this.releasePooledOnce();
       // Future dispose should clean up the standalone connection
       this.onRelease = () => this.fallbackConnection?.dispose();
       return this.fallbackConnection;
