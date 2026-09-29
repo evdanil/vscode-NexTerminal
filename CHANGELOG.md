@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.296] — 2026-09-29
+
+### Fixed
+
+- **A malformed provider host no longer downgrades or re-points an already-synced server.** When a device's ssh or telnet endpoint host was rejected (invisible character, embedded whitespace), an owned server was blanked to an addressless placeholder, or its alternate address was promoted into `host`, and the plan claimed the device had lost its console. The device is now skipped like a malformed port: the server is left untouched and the plan says `has an unusable host and was skipped`. New devices still arrive as addressless placeholders. The host normalizer's own warnings now travel as engine warnings instead of provider notices.
+
 ## [2.8.295] — 2026-09-28
 
 ### Fixed

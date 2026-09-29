@@ -40,9 +40,30 @@ export const ORPHAN_FOLDER_NAME = "_orphaned";
  */
 const ADDRESSLESS_PORT = 0;
 
+/** Result of `normalizeInventoryTreeHosts` beyond the tree itself. */
+export interface InventoryHostNormalization {
+  /**
+   * The engine's OWN sentences about dropped endpoints. Kept out of
+   * `tree.warnings` (provider notices, sanitized under provider-text rules) so
+   * they take the engine-warning choke point in `computeSyncPlan`.
+   */
+  warnings: string[];
+  /** externalIds of devices whose ssh/telnet (primary or alternate) endpoint was rejected. */
+  rejectedConsoleDeviceIds: ReadonlySet<string>;
+}
+
 export interface ComputeSyncPlanInput {
   source: InventorySourceConfig;
   tree: InventoryTree;
+  /**
+   * What `normalizeInventoryTreeHosts` did to `tree`. The normalizer removes a
+   * malformed endpoint, and without this the engine could not tell "the device
+   * reported a console address we refuse" from "the device has no console". It
+   * matters for an OWNED server: absence would downgrade it to an addressless
+   * placeholder (or promote its alternate into `host`), so the engine skips it
+   * instead, exactly like a malformed port. Omitted = nothing was rejected.
+   */
+  hostNormalization?: InventoryHostNormalization;
   currentServers: ServerConfig[]; // ALL servers; engine filters by origin itself
   now: number;
   /**
@@ -918,13 +939,17 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // return (which keeps the order users see: notices, then the auth warning
   // spliced in at `authWarningIndex`, then per-device warnings).
   //
-  // A NOTICE is provider text end to end; the engine frames none of it, and the
+  // A NOTICE is provider text end to end; the engine frames none of it (its own
+  // host-normalizer lines arrive via `hostNormalization`, not here), and the
   // `string[]` member already hands a provider one line per entry. So it keeps
   // its line breaks and loses only what no auditable text may carry — see
   // `sanitizeProviderNotice`. An entry left with nothing visible is dropped
   // rather than printed as a blank line and counted in "N warnings".
   const providerNotices = (tree.warnings ?? []).map(sanitizeProviderNotice).filter((notice) => notice.length > 0);
-  const warnings: string[] = [];
+  // The host normalizer's own lines are engine text, not provider text, so they
+  // start the engine list (and are flattened with it at the return).
+  const warnings: string[] = [...(input.hostNormalization?.warnings ?? [])];
+  const hostRejectedIds = input.hostNormalization?.rejectedConsoleDeviceIds;
 
   // AUTH 1 — the source names a profile by id; the caller supplies the profile
   // it resolved to. The engine only accepts the pair when the two agree.
@@ -1378,6 +1403,16 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       continue;
     }
     seenExternalIds.set(device.externalId, device.name);
+
+    // HOST-REJECTED SKIP — the normalizer removed an ssh/telnet endpoint whose
+    // host is malformed. For an OWNED server that must behave like a malformed
+    // port (skip, record untouched): treating the removal as absence would blank
+    // its address or promote its alternate into `host`. A NEW device keeps the
+    // documented addressless placeholder, so it falls through.
+    if (isOwned && hostRejectedIds?.has(device.externalId)) {
+      warnings.push(`Device "${device.name}" (${device.externalId}) has an unusable host and was skipped.`);
+      continue;
+    }
 
     // TELNET (Phase 0) — ssh endpoint if the device has one, else its telnet
     // endpoint (see `selectPrimaryEndpoint` for why ssh always wins).
@@ -4798,24 +4833,34 @@ export function prunedServerIdsForSecretCleanup(plan: InventorySyncPlan): string
   return plan.prunes.filter((p) => p.policy === "delete").map((p) => p.server.id);
 }
 
-/** Copy provider endpoints into the host spelling that sync and its remedies can use. */
-export function normalizeInventoryTreeHosts(tree: InventoryTree): InventoryTree {
+/**
+ * Copy provider endpoints into the host spelling that sync and its remedies can
+ * use. A malformed endpoint is removed from the copy; `rejectedConsoleDeviceIds`
+ * and `warnings` (engine-authored, so NOT merged into `tree.warnings`) tell
+ * `computeSyncPlan` what was removed.
+ */
+export function normalizeInventoryTreeHosts(tree: InventoryTree): { tree: InventoryTree } & InventoryHostNormalization {
   const warnings: string[] = [];
-  return {
+  const rejectedConsoleDeviceIds = new Set<string>();
+  const normalized: InventoryTree = {
     ...tree,
     devices: tree.devices.map((device) => ({
       ...device,
       endpoints: device.endpoints.flatMap((endpoint) => {
         const host = normalizeInventoryEndpointHost(endpoint.host);
         if (host === undefined) {
+          // Device name is provider text: flattened where it enters the sentence.
           warnings.push(`Ignored an endpoint for ${flattenProviderText(device.name) || "(unnamed device)"} because its host is empty or contains unsupported characters.`);
+          if (endpoint.kind === "ssh" || endpoint.kind === "telnet") {
+            rejectedConsoleDeviceIds.add(device.externalId);
+          }
           return [];
         }
         return [{ ...endpoint, host }];
       })
-    })),
-    warnings: [...(tree.warnings ?? []), ...warnings]
+    }))
   };
+  return { tree: normalized, warnings, rejectedConsoleDeviceIds };
 }
 
 /**
