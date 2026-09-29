@@ -14,7 +14,10 @@ export const CLEAR_VISIBLE_SCREEN = "\x1b[H\x1b[2J";
 // Covers every mode that changes what the terminal SENDS to the host, plus
 // cursor visibility, so replies and key encodings from a dead session cannot
 // leak into the next one (same-tab reconnect, Smart Follow reattach):
-//   ?9/1000/1002/1003/1006/1016  mouse tracking and encodings
+//   ?9/1000/1002/1003            mouse tracking
+//   ?1005/1006/1015/1016         mouse encodings (cheap to clear even where unimplemented)
+//   ?1007                        alternate scroll: wheel -> arrow keys on the alternate
+//                                screen, which survives because that screen is kept
 //   ?1004                        focus reports (ESC[I / ESC[O)
 //   ?2031                        color-scheme notifications
 //   ?2004                        bracketed paste
@@ -23,12 +26,14 @@ export const CLEAR_VISIBLE_SCREEN = "\x1b[H\x1b[2J";
 // Kitty keeps a bounded keyboard-mode stack per screen: drain the active stack
 // (CSI < 9999 u) before zeroing its flags (CSI = 0;1 u) so a later pop cannot
 // restore stale key modes.
+// ?1036/?1039 (meta/alt send-escape) are left alone: xterm defaults them ON, so
+// resetting them would move a fresh terminal away from its default.
 //
 // Deliberately NOT included: leaving the alternate screen (?1049l / ?47l) and
 // RIS (ESC c). Both would discard the dead app's last frame, which the docs
 // promise stays readable after a disconnect.
 export const RESET_INTERACTIVE_MODES =
-  "\x1b[?9;1000;1002;1003;1004;1006;1016;2031;2004;1;66l\x1b>\x1b[?25h\x1b[<9999u\x1b[=0;1u";
+  "\x1b[?9;1000;1002;1003;1004;1005;1006;1007;1015;1016;2031;2004;1;66l\x1b>\x1b[?25h\x1b[<9999u\x1b[=0;1u";
 
 // Reports the terminal generates by itself (not key presses): focus in/out,
 // SGR mouse (ESC[<..M/m), legacy X10 mouse (ESC[M + 3 bytes), and color-scheme

@@ -3,7 +3,8 @@ import { isTerminalGeneratedReport, RESET_INTERACTIVE_MODES } from "../../src/se
 
 describe("RESET_INTERACTIVE_MODES", () => {
   it("clears input modes and shows the cursor", () => {
-    expect(RESET_INTERACTIVE_MODES).toContain("\x1b[?9;1000;1002;1003;1004;1006;1016;2031;2004;1;66l");
+    expect(RESET_INTERACTIVE_MODES).toContain("\x1b[?9;1000;1002;1003;1004;1005;1006;1007;1015;1016;2031;2004;1;66l");
+    expect(RESET_INTERACTIVE_MODES).toMatch(/\x1b\[\?[\d;]*\b1007\b[\d;]*l/);
     expect(RESET_INTERACTIVE_MODES).toContain("\x1b>");
     expect(RESET_INTERACTIVE_MODES).toContain("\x1b[?25h");
     expect(RESET_INTERACTIVE_MODES.indexOf("\x1b[<9999u")).toBeLessThan(RESET_INTERACTIVE_MODES.indexOf("\x1b[=0;1u"));

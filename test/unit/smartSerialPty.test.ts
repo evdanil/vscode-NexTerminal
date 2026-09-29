@@ -475,6 +475,7 @@ describe("SmartSerialPty", () => {
     await flushAsync();
     const out = writes.join("");
     expect(out).toContain("\x1b[?1000h");
+    expect(RESET_INTERACTIVE_MODES).toMatch(/\?[\d;]*\b1007\b[\d;]*l/);
     expect(out.indexOf(RESET_INTERACTIVE_MODES)).toBeGreaterThanOrEqual(0);
     expect(out.indexOf(RESET_INTERACTIVE_MODES)).toBeLessThan(out.indexOf("\x1b[?1000h"));
     pty.dispose();

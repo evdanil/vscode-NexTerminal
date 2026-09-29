@@ -986,7 +986,7 @@ describe("SshPty", () => {
 
     pty.markShuttingDown("Nexus extension is shutting down. This session has been closed.");
 
-    expect(writes.filter((text) => text.includes("\x1b[?9;1000;1002;1003;1004;1006;1016;2031;2004;1;66l"))).toHaveLength(1);
+    expect(writes.filter((text) => text.includes("\x1b[?9;1000;1002;1003;1004;1005;1006;1007;1015;1016;2031;2004;1;66l"))).toHaveLength(1);
     expect(writes.filter((text) => text === RESET_TERMINAL_MODES)).toHaveLength(1);
     expect(highlighterStream.flush).toHaveBeenCalledTimes(1);
     expect(writes[0]).toBe("[hl]pending output");
@@ -995,6 +995,7 @@ describe("SshPty", () => {
     for (const seq of ["\x1b>", "\x1b[?25h"]) {
       expect(RESET_TERMINAL_MODES).toContain(seq);
     }
+    expect(RESET_TERMINAL_MODES).toMatch(/\x1b\[\?[\d;]*\b1007\b[\d;]*l/);
     expect(RESET_TERMINAL_MODES).toMatch(/\x1b\[\?[\d;]*\b2004\b[\d;]*l/);
     expect(RESET_TERMINAL_MODES).toMatch(/\x1b\[\?[\d;]*\b1\b[\d;]*l/);
     // The alternate screen and RIS stay untouched so the last frame survives.
