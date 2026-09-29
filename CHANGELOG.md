@@ -1,10 +1,18 @@
 # Changelog
 
-## [2.8.303] — 2026-09-29
+## [2.8.304] — 2026-09-29
 
 ### Fixed
 
 - **SSH, Telnet and tunnel starts are no longer cancelled by an unchanged save or Refresh.** A pending Connect or Start Tunnel compared the profile by object identity, so saving a server or tunnel without changes (or refreshing after another window wrote settings) silently cancelled it. Starts now compare only the fields the connection uses (address, port, protocol, credentials, proxy and the like; a folder rename or notes edit does not count), like Serial and Local Shell. A real change or removal cancels with a visible notice, with **Retry** on the current settings when the profile still exists (Retry repeats the original action, such as Connect and Run Script; a macro's IPMI-gateway connect offers no Retry and says to re-run the macro; and a tunnel retry targets the same server, or reports it removed rather than starting elsewhere), and a cancelled tunnel start no longer registers briefly before being stopped. The auto-start tunnel sweep now starts tunnels with the config the session connected with and, if the server's connection settings changed since the session opened, skips them with a warning to close and reopen the terminal; a rename or other non-connection edit no longer blocks auto-start on an **R** reconnect.
+
+## [2.8.303] — 2026-09-29
+
+### Fixed
+
+- **An unreadable reverse-bind reservation file no longer stops the extension loading.** A corrupt, empty or non-fence file in the cross-window fence directory is now logged and ignored instead of failing every registry read, and is deleted once it is more than 30 seconds old. A file that cannot be read is retried and, while under 30 seconds old, makes the registry read fail so a live reservation is never hidden; once stale it is ignored and deleted. Registry storage errors no longer fail activation, and the background sync timers no longer raise unhandled rejections.
+- **Stopping a tunnel no longer fails when the cross-window registry cannot be updated.** The failure is logged after local teardown, so server and tunnel removal complete instead of stopping partway. A reverse tunnel's reservation is still published before Stop returns when storage allows; if it cannot be, a one-time warning says another window may collide on that port and what to do.
+- **Orphaned temporary reservation files are cleaned up.** Temporary files left by a host killed mid-write are removed once older than 30 seconds.
 
 ## [2.8.302] — 2026-09-29
 

@@ -24,6 +24,8 @@ import { AsyncMutex, configMutationLock } from "../../src/services/configMutatio
 import { validateServerConfig } from "../../src/utils/validation";
 import { computeSyncPlan } from "../../src/services/inventory/syncEngine";
 import { NexusCore } from "../../src/core/nexusCore";
+import { handleTunnelStopped, TunnelRegistrySync } from "../../src/services/tunnel/tunnelRegistrySync";
+import { InMemoryTunnelRegistryStore } from "../../src/storage/inMemoryTunnelRegistryStore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import type { CommandContext as CmdCtx } from "../../src/commands/types";
 import { registerProfileCommands } from "../../src/commands/profileCommands";
@@ -646,6 +648,31 @@ describe("server disconnect with tunnel autoStop", () => {
       addMode: "ssh",
       profileType: "ssh"
     });
+  });
+
+  it("a registry write failing inside the stopped listener neither rejects stop() nor skips the pool disconnect (pins unregisterTunnelAfterStop in handleTunnelStopped)", async () => {
+    const profile = makeTunnel({ id: "tp-1", autoStop: false });
+    const { ctx, stopTunnel, disconnectPool } = setupHarness({
+      servers: [],
+      profiles: [profile],
+      activeTunnels: [{ id: "at-1", profileId: "tp-1", serverId: "srv-1" }]
+    });
+    const store = new InMemoryTunnelRegistryStore();
+    vi.spyOn(store, "getEntries").mockRejectedValue(new Error("storage down"));
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const registrySync = new TunnelRegistrySync(store, ctx.core, "w1");
+    // Mirrors TunnelManager.stop(): the stopped listener is awaited.
+    stopTunnel.mockImplementation(async (id: string) => {
+      await handleTunnelStopped({ getSnapshot: () => ctx.core.getSnapshot(), unregisterTunnel: () => {} }, registrySync, {
+        tunnelId: id,
+        tunnel: ctx.core.getSnapshot().activeTunnels[0]
+      });
+    });
+
+    await expect(teardownServerRuntime(ctx, "srv-1")).resolves.toBeUndefined();
+
+    expect(disconnectPool).toHaveBeenCalledWith("srv-1");
+    log.mockRestore();
   });
 
   it("(FINDING 5 — removal-teardown review) teardownServerRuntime tears down a server's runtime state by id alone even after its record no longer exists in NexusCore — it never falls back to an interactive server picker (kills a core.getServer dependency that would otherwise prompt the user)", async () => {
