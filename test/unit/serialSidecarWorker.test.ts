@@ -153,42 +153,110 @@ describe("production serial sidecar worker request handler", () => {
     });
   });
 
-  it("keeps a cancelled open's port tracked and reports it when close keeps failing, so closePort can retry", async () => {
-    const { handler, output } = makeHandler();
+  describe("a cancelled open whose close fails", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    async function cancelledOpen(handler: ReturnType<typeof makeHandler>["handler"]) {
+      let finishOpen!: OpenCallback;
+      ControlledSerialPort.openBehavior = (_port, callback) => {
+        finishOpen = callback;
+      };
+      const opening = handler(openRequest("open-slow"));
+      await handler({ id: "close-1", method: "closePort", params: { sessionId: "session-17" } });
+      finishOpen();
+      return opening;
+    }
+
+    it("keeps retrying by itself, then reports and frees the id when the close never succeeds", async () => {
+      vi.useFakeTimers();
+      const { handler, output } = makeHandler();
+      const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+      const closeSpy = vi
+        .spyOn(ControlledSerialPort.prototype, "close")
+        .mockImplementation((callback: OpenCallback) => callback(new Error("EBUSY close")));
+
+      const opening = cancelledOpen(handler);
+      await vi.advanceTimersByTimeAsync(500);
+      await expect(opening).resolves.toEqual({
+        id: "open-slow",
+        error: { message: "Serial port open cancelled; close failed: EBUSY close" }
+      });
+      const afterFirstRound = closeSpy.mock.calls.length;
+      expect(stderr).not.toHaveBeenCalled();
+
+      // Nobody sends another closePort: the worker keeps trying on its own.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(closeSpy.mock.calls.length).toBeGreaterThan(afterFirstRound);
+      expect(stderr).toHaveBeenCalledTimes(1);
+      expect(String(stderr.mock.calls[0][0])).toContain("Reload Window");
+      expect(output).toContainEqual({
+        method: "portError",
+        params: { sessionId: "session-17", message: expect.stringContaining("EBUSY close") }
+      });
+      // Tracking is dropped, so the id is not reserved forever.
+      await expect(
+        handler({ id: "w-2", method: "writePort", params: { sessionId: "session-17", data: "eA==" } })
+      ).resolves.toEqual({ id: "w-2", error: { message: "unknown serial session" } });
+    });
+
+    it("releases the port on a later background retry once the close succeeds", async () => {
+      vi.useFakeTimers();
+      const { handler } = makeHandler();
+      const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+      let failures = 5;
+      const closeSpy = vi
+        .spyOn(ControlledSerialPort.prototype, "close")
+        .mockImplementation((callback: OpenCallback) => callback(failures-- > 0 ? new Error("EBUSY close") : undefined));
+
+      const opening = cancelledOpen(handler);
+      await vi.advanceTimersByTimeAsync(500);
+      await opening;
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(closeSpy).toHaveBeenCalledTimes(6);
+      expect(stderr).not.toHaveBeenCalled();
+    });
+  });
+
+  it("does not close again a port that closed itself before the cancel was processed", async () => {
+    const { handler } = makeHandler();
     let finishOpen!: OpenCallback;
-    ControlledSerialPort.openBehavior = (_port, callback) => {
+    ControlledSerialPort.openBehavior = (port, callback) => {
       finishOpen = callback;
+      void port;
     };
-    let closeFails = true;
     const closeSpy = vi
       .spyOn(ControlledSerialPort.prototype, "close")
-      .mockImplementation((callback: OpenCallback) => callback(closeFails ? new Error("EBUSY close") : undefined));
+      .mockImplementation((callback: OpenCallback) => callback(new Error("Port is not open")));
 
     const opening = handler(openRequest("open-slow"));
+    ControlledSerialPort.instances[0].emit("close");
     await handler({ id: "close-1", method: "closePort", params: { sessionId: "session-17" } });
     finishOpen();
-    const result = await opening;
 
-    expect(result).toEqual({
-      id: "open-slow",
-      error: { message: "Serial port open cancelled; close failed: EBUSY close" }
+    await expect(opening).resolves.toEqual({ id: "open-slow", error: { message: "Serial port open cancelled" } });
+    expect(closeSpy).not.toHaveBeenCalled();
+    ControlledSerialPort.openBehavior = (_port, callback) => callback();
+    await expect(handler(openRequest("open-again"))).resolves.toEqual({
+      id: "open-again",
+      result: { sessionId: "session-17" }
     });
-    expect(closeSpy.mock.calls.length).toBeGreaterThan(1);
-    expect(output).toContainEqual({
-      method: "portError",
-      params: { sessionId: "session-17", message: "Could not release cancelled port: EBUSY close" }
-    });
+  });
 
-    // Still reachable: a later closePort retries and releases it.
-    closeFails = false;
-    const before = closeSpy.mock.calls.length;
-    await expect(handler({ id: "close-2", method: "closePort", params: { sessionId: "session-17" } })).resolves.toEqual({
-      id: "close-2",
+  it("treats a 'Port is not open' close as released", async () => {
+    const { handler } = makeHandler();
+    await handler(openRequest("open-1"));
+    vi.spyOn(ControlledSerialPort.prototype, "close").mockImplementation((callback: OpenCallback) =>
+      callback(new Error("Port is not open"))
+    );
+    await expect(handler({ id: "c", method: "closePort", params: { sessionId: "session-17" } })).resolves.toEqual({
+      id: "c",
       result: { ok: true }
     });
-    expect(closeSpy.mock.calls.length).toBe(before + 1);
     await expect(
-      handler({ id: "w-2", method: "writePort", params: { sessionId: "session-17", data: "eA==" } })
-    ).resolves.toEqual({ id: "w-2", error: { message: "unknown serial session" } });
+      handler({ id: "w", method: "writePort", params: { sessionId: "session-17", data: "eA==" } })
+    ).resolves.toEqual({ id: "w", error: { message: "unknown serial session" } });
   });
 });

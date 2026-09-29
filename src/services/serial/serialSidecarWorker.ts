@@ -58,18 +58,34 @@ function friendlyOpenError(portPath: string, error: Error): Error {
 }
 
 const CLOSE_RETRY_DELAYS_MS = [50, 150];
+// Total ~30 s. Used after a cancelled open whose close kept failing: the owner
+// has already timed out and will never send another closePort, so the worker
+// must keep trying on its own.
+const BACKGROUND_CLOSE_DELAYS_MS = [250, 500, 1000, 2000, 4000, 8000, 15000];
 
-/** Resolves with the last close error, or undefined once the port closed. */
-async function closeWithRetry(port: PortRecord): Promise<Error | undefined> {
+/** serialport reports closing a port that is already closed as "Port is not open". */
+function isAlreadyClosed(error: Error): boolean {
+  return /not open|already closed/i.test(error.message);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+}
+
+/** Resolves with the last close error, or undefined once the port is closed. */
+async function closeWithRetry(port: PortRecord, delays: readonly number[] = CLOSE_RETRY_DELAYS_MS): Promise<Error | undefined> {
   let lastError: Error | undefined;
-  for (let attempt = 0; attempt <= CLOSE_RETRY_DELAYS_MS.length; attempt += 1) {
+  for (let attempt = 0; attempt <= delays.length; attempt += 1) {
     if (attempt > 0) {
-      await new Promise<void>((resolve) => setTimeout(resolve, CLOSE_RETRY_DELAYS_MS[attempt - 1]));
+      await sleep(delays[attempt - 1]);
     }
     lastError = await new Promise<Error | undefined>((resolve) => {
       port.close((error) => resolve(error ?? undefined));
     });
-    if (!lastError) {
+    if (!lastError || isAlreadyClosed(lastError)) {
       return undefined;
     }
   }
@@ -99,6 +115,33 @@ export function createSerialSidecarRequestHandler(dependencies: {
         return undefined;
       }
     });
+
+  async function releaseAbandonedPort(sessionId: string, port: PortRecord, firstError: Error): Promise<void> {
+    let lastError = firstError;
+    for (const delay of BACKGROUND_CLOSE_DELAYS_MS) {
+      await sleep(delay);
+      if (ports.get(sessionId) !== port) {
+        return; // released meanwhile (explicit closePort or the close event)
+      }
+      const error = await closeWithRetry(port, []);
+      if (!error) {
+        if (ports.get(sessionId) === port) {
+          ports.delete(sessionId);
+        }
+        port.removeAllListeners();
+        return;
+      }
+      lastError = error;
+    }
+    if (ports.get(sessionId) === port) {
+      ports.delete(sessionId);
+    }
+    port.removeAllListeners();
+    const message = `Could not release a cancelled serial open (${lastError.message}). The port may stay busy until the sidecar restarts: unplug and replug the device or run Reload Window.`;
+    writeLine({ method: PORT_ERROR_NOTIFICATION, params: { sessionId, message } });
+    // The sidecar's stderr is logged by the manager, unlike the unowned id above.
+    console.error(`[Nexus Serial Sidecar] ${message}`);
+  }
 
   return async (request: RpcRequest): Promise<RpcResponse> => {
     if (request.method === "listPorts") {
@@ -196,15 +239,19 @@ export function createSerialSidecarRequestHandler(dependencies: {
         if (ports.get(sessionId) === port) {
           ports.delete(sessionId);
         }
+        if (closedWhileOpening) {
+          // The port closed itself before the cancel arrived; there is nothing
+          // left to release, and closing again would only fail "not open".
+          port.removeAllListeners();
+          return response(request.id, undefined, "Serial port open cancelled");
+        }
         const closeError = await closeWithRetry(port);
         if (closeError) {
-          // The descriptor may still be held. Keep the port and its listeners
-          // tracked under its id so a later closePort can retry, and say so.
+          // The descriptor may still be held and the owner has given up, so no
+          // later closePort will come. Keep the id reserved (the port stays
+          // reachable) while the worker keeps retrying on its own.
           ports.set(sessionId, port);
-          writeLine({
-            method: PORT_ERROR_NOTIFICATION,
-            params: { sessionId, message: `Could not release cancelled port: ${closeError.message}` }
-          });
+          void releaseAbandonedPort(sessionId, port, closeError);
           return response(request.id, undefined, `Serial port open cancelled; close failed: ${closeError.message}`);
         }
         port.removeAllListeners();
@@ -271,7 +318,7 @@ export function createSerialSidecarRequestHandler(dependencies: {
       ports.delete(params.sessionId);
       try {
         await new Promise<void>((resolve, reject) => {
-          port.close((error) => (error ? reject(error) : resolve()));
+          port.close((error) => (error && !isAlreadyClosed(error) ? reject(error) : resolve()));
         });
       } catch (error) {
         // Still possibly open: stay reachable so the close can be retried.
