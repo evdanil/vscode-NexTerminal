@@ -84,11 +84,13 @@ class PooledSshConnection implements SshConnection {
 
   public async openShell(ptyOptions?: PtyOptions): Promise<Duplex> {
     this.assertNotDisposed();
+    const source = this.active;
     try {
       return await this.active.openShell(ptyOptions);
     } catch (err) {
+      this.evictIfStale(err, source);
       if (this.shouldAttemptFallback(err)) {
-        const fb = await this.tryFallback(err);
+        const fb = await this.tryFallback();
         // dispose() may have run between the fallback settling and this
         // continuation; the fallback is closed then, so never open on it.
         this.assertNotDisposed();
@@ -103,11 +105,13 @@ class PooledSshConnection implements SshConnection {
 
   public async openDirectTcp(remoteIP: string, remotePort: number): Promise<Duplex> {
     this.assertNotDisposed();
+    const source = this.active;
     try {
       return await this.active.openDirectTcp(remoteIP, remotePort);
     } catch (err) {
+      this.evictIfStale(err, source);
       if (this.shouldAttemptFallback(err)) {
-        const fb = await this.tryFallback(err);
+        const fb = await this.tryFallback();
         // dispose() may have run between the fallback settling and this
         // continuation; the fallback is closed then, so never open on it.
         this.assertNotDisposed();
@@ -122,11 +126,13 @@ class PooledSshConnection implements SshConnection {
 
   public async openSftp(): Promise<SFTPWrapper> {
     this.assertNotDisposed();
+    const source = this.active;
     try {
       return await this.active.openSftp();
     } catch (err) {
+      this.evictIfStale(err, source);
       if (this.shouldAttemptFallback(err)) {
-        const fb = await this.tryFallback(err);
+        const fb = await this.tryFallback();
         // dispose() may have run between the fallback settling and this
         // continuation; the fallback is closed then, so never open on it.
         this.assertNotDisposed();
@@ -141,11 +147,13 @@ class PooledSshConnection implements SshConnection {
 
   public async exec(command: string): Promise<Duplex> {
     this.assertNotDisposed();
+    const source = this.active;
     try {
       return await this.active.exec(command);
     } catch (err) {
+      this.evictIfStale(err, source);
       if (this.shouldAttemptFallback(err)) {
-        const fb = await this.tryFallback(err);
+        const fb = await this.tryFallback();
         // dispose() may have run between the fallback settling and this
         // continuation; the fallback is closed then, so never open on it.
         this.assertNotDisposed();
@@ -217,6 +225,20 @@ class PooledSshConnection implements SshConnection {
 
   private fallbackPromise?: Promise<SshConnection | undefined>;
 
+  /**
+   * A stale-connection error from the pooled transport means the entry is
+   * dead, whatever became of this lease or its fallback: a disposed lease
+   * skips the dial, and with several opens in flight an earlier channel-limit
+   * rejection may already have latched `fallbackUsed`. Keyed on the failing
+   * connection so a fallback's own error never evicts a healthy pooled entry.
+   * evictDeadEntry is idempotent.
+   */
+  private evictIfStale(error: unknown, source: SshConnection): void {
+    if (source === this.inner && isStaleConnectionError(error)) {
+      this.evictDeadEntry?.();
+    }
+  }
+
   private shouldAttemptFallback(error: unknown): boolean {
     if (this.fallbackUsed || !this.createFallback) return false;
     // Stale connections ("Not connected") should always retry — the pooled
@@ -227,7 +249,7 @@ class PooledSshConnection implements SshConnection {
     return this.isReused && shouldFallbackForChannelLimit(error);
   }
 
-  private tryFallback(error: unknown): Promise<SshConnection | undefined> {
+  private tryFallback(): Promise<SshConnection | undefined> {
     if (this.fallbackUsed) {
       return Promise.resolve(this.fallbackConnection);
     }
@@ -236,23 +258,16 @@ class PooledSshConnection implements SshConnection {
     }
     // Cache the promise so concurrent callers share a single fallback attempt
     if (!this.fallbackPromise) {
-      this.fallbackPromise = this.executeFallback(error);
+      this.fallbackPromise = this.executeFallback();
     }
     return this.fallbackPromise;
   }
 
-  private async executeFallback(error: unknown): Promise<SshConnection | undefined> {
+  private async executeFallback(): Promise<SshConnection | undefined> {
     if (this.disposed) {
       // Disposed while the original channel open was in flight: dialing (and
       // possibly prompting for a password/2FA) for a closed lease is unwanted.
       this.fallbackUsed = true;
-      // The dead transport must still leave the pool: createFallback was the
-      // only place that evicted it, and a stale entry would otherwise be
-      // handed to new consumers. A channel-limit error says nothing about
-      // transport health, so it evicts nothing.
-      if (isStaleConnectionError(error)) {
-        this.evictDeadEntry?.();
-      }
       return undefined;
     }
     try {

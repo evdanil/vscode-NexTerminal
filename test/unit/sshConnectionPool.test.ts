@@ -978,6 +978,33 @@ describe("SshConnectionPool", () => {
     expect(standaloneConn.dispose).toHaveBeenCalledTimes(1);
   });
 
+  it("evicts the dead transport when a stale error follows a channel-limit error on a disposed lease", async () => {
+    const deadConn = createMockConnection();
+    const rejects: Array<(e: Error) => void> = [];
+    deadConn.openDirectTcp = vi.fn(() => new Promise<any>((_, reject) => { rejects.push(reject); }));
+    const freshConn = createMockConnection();
+    const f = createMockFactory([deadConn, freshConn]);
+    const p = new SshConnectionPool(f, { enabled: true, idleTimeoutMs: 0 });
+
+    const keeper = await p.connect(testServer); // makes the lease "reused"
+    const lease = await p.connect(testServer);
+    const first = lease.openDirectTcp("127.0.0.1", 1);
+    const second = lease.openDirectTcp("127.0.0.1", 2);
+    first.catch(() => {});
+    second.catch(() => {});
+    lease.dispose();
+    rejects[0](new Error("Channel open failure: Administratively prohibited"));
+    await expect(first).rejects.toThrow("Cannot use a disposed SSH connection lease");
+    rejects[1](new Error("Not connected"));
+    await expect(second).rejects.toThrow("Cannot use a disposed SSH connection lease");
+
+    const next = await p.connect(testServer);
+    expect(f.connect).toHaveBeenCalledTimes(2);
+    await next.openShell();
+    expect(freshConn.openShell).toHaveBeenCalled();
+    keeper.dispose();
+  });
+
   it("pool.dispose closes a transport soft-removed by fallback while another lease still holds it", async () => {
     const pooledConn = createMockConnection();
     let shellCalls = 0;
