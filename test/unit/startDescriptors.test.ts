@@ -28,7 +28,7 @@ const SERVER_FIELDS: Record<keyof ServerConfig, { use: Use; why: string; alt: un
   altHost: { use: "connect", why: "SshPty fallback address; tunnels never dial it", alt: "alt.example" },
   username: { use: "connect+tunnel", why: "login", alt: "root" },
   authType: { use: "connect+tunnel", why: "login", alt: "key" },
-  keyPath: { use: "connect+tunnel", why: "login key", alt: "/k" },
+  keyPath: { use: "connect+tunnel", why: "login key (key auth, or any server linked to an auth profile that may switch to key)", alt: "/k" },
   isHidden: { use: "ignored", why: "tree visibility", alt: true },
   logSession: { use: "ignored", why: "transcript preference; editor writes the global default on every Save", alt: true },
   multiplexing: { use: "connect", why: "pool use; tunnels only when shared (covered separately)", alt: false },
@@ -160,6 +160,19 @@ describe("start descriptors — resolved values, not stored representations", ()
 });
 
 describe("start descriptors — keyPath and telnet", () => {
+  it("keyPath counts when a linked auth profile can make the login a key login", () => {
+    const linked: ServerConfig = { ...server, authType: "password", authProfileId: "key-profile" };
+    const moved = { ...linked, keyPath: "/new" };
+    expect(connectDescriptor(moved, inputs)).not.toBe(connectDescriptor(linked, inputs));
+    expect(tunnelStartDescriptor(tunnel, moved, tinputs)).not.toBe(tunnelStartDescriptor(tunnel, linked, tinputs));
+  });
+
+  it("guard: a password server with no profile link ignores a keyPath change", () => {
+    const moved = { ...server, keyPath: "/new" };
+    expect(connectDescriptor(moved, inputs)).toBe(connectDescriptor(server, inputs));
+    expect(tunnelStartDescriptor(tunnel, moved, tinputs)).toBe(tunnelStartDescriptor(tunnel, server, tinputs));
+  });
+
   it("keyPath counts only for a key login", () => {
     expect(connectDescriptor({ ...server, keyPath: "/k" }, inputs)).toBe(connectDescriptor(server, inputs));
     const keyServer: ServerConfig = { ...server, authType: "key" };

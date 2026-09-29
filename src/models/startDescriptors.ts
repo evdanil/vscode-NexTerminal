@@ -46,10 +46,13 @@ function transportDescriptor(server: ServerConfig): unknown[] {
     resolveServerProtocol(server),
     server.username,
     server.authType,
-    // Only a key login reads the key file; a stale path on a password or agent
-    // server must not cancel a start. (An auth-profile override of the auth type
-    // is deliberately not resolved here.)
-    server.authType === "key" ? server.keyPath || null : null,
+    // The key file is read only by a key login. A linked auth profile can switch
+    // the effective auth type to "key" (SilentAuthSshFactory.resolveServer) while
+    // the stored one stays "password", and the server's own keyPath is then used,
+    // so the path counts when the stored type is key OR a profile is linked. The
+    // link itself (authProfileId, above) is in the descriptor, so switching
+    // profiles cancels too; the profile's own fields are fenced by the profile.
+    server.authType === "key" || server.authProfileId ? server.keyPath || null : null,
     server.authProfileId || null,
     Boolean(server.legacyAlgorithms),
     proxyDescriptor(server.proxy)
