@@ -130,6 +130,7 @@ class MockVault implements SecretVault {
   async get(key: string) { return this.secrets.get(key); }
   async store(key: string, value: string) { this.secrets.set(key, value); }
   async delete(key: string) { this.secrets.delete(key); }
+  keys(): string[] { return [...this.secrets.keys()]; }
 }
 
 /** A fingerprint in exactly the shape VscodeHostKeyVerifier writes. */
@@ -2365,5 +2366,46 @@ describe("Delete All Data (nexus.config.completeReset) covers Local Servers and 
     expect(machine.ctx.state.get("nexus.groups")).toEqual([]);
     // Kept keys stay.
     expect(machine.ctx.state.has("nexus.resetGeneration")).toBe(true);
+  });
+
+  it("deletes the saved secrets of stored records that fail validation, before their raw rows are cleared (⊘ clearing the raw rows, the only record naming those keychain entries)", async () => {
+    const machine = await makeMachine();
+    machine.ctx.state.set("nexus.servers", [{ id: "bad-srv", name: 42 }, "junk"]);
+    machine.ctx.state.set("nexus.authProfiles", [{ id: "bad-ap", authType: "nope" }]);
+    machine.ctx.state.set("nexus.inventorySources", [{ id: "bad-src", providerId: 7, secretFieldIds: ["apiToken"] }]);
+    const kept = ["password-other", "auth-profile-password-other"];
+    const doomed = [
+      "password-bad-srv", "passphrase-bad-srv", "proxy-password-bad-srv",
+      "auth-profile-password-bad-ap", "auth-profile-passphrase-bad-ap",
+      "inventory-source-7:bad-src:apiToken"
+    ];
+    for (const key of [...doomed, ...kept]) await machine.vault.store(key, "secret");
+    // A host with SecretStorage.keys() also sweeps field ids the row did not list.
+    const extra = "inventory-source-7:bad-src:hiddenField";
+    await machine.vault.store(extra, "secret");
+    (machine.ctx.context as unknown as { secrets: unknown }).secrets = { keys: async () => machine.vault.keys() };
+
+    await runReset(machine, recordingRuntime(machine.core));
+
+    for (const key of [...doomed, extra]) expect(await machine.vault.get(key)).toBeUndefined();
+    // A secret of a record Nexus never held a row for is not this reset's to touch.
+    for (const key of kept) expect(await machine.vault.get(key)).toBe("secret");
+    expect(machine.ctx.state.has("nexus.servers")).toBe(false);
+  });
+
+  it("a failed secret delete does not stop the rest of the reset", async () => {
+    const machine = await makeMachine();
+    machine.ctx.state.set("nexus.servers", [{ id: "bad-a" }, { id: "bad-b" }]);
+    await machine.vault.store("password-bad-b", "secret");
+    const realDelete = machine.vault.delete.bind(machine.vault);
+    machine.vault.delete = async (key: string) => {
+      if (key === "password-bad-a") throw new Error("keychain locked");
+      await realDelete(key);
+    };
+
+    await runReset(machine, recordingRuntime(machine.core));
+
+    expect(await machine.vault.get("password-bad-b")).toBeUndefined();
+    expect(machine.ctx.state.has("nexus.servers")).toBe(false);
   });
 });

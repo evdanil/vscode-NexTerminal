@@ -3223,6 +3223,50 @@ export async function captureBackupStateForExport(
  * threaded-through dependency with no reader is an invitation to give it a
  * second, unexamined job.
  */
+interface UnvalidatedSecretOwners {
+  servers: string[];
+  authProfiles: string[];
+  sources: Array<{ id: string; fieldIds: string[] }>;
+}
+
+/**
+ * The stored rows Delete All Data will never see through `core.getSnapshot()`
+ * because they fail validation (a version-skewed list, say), read leniently: any
+ * object with a non-empty string `id` names a record whose saved secrets are
+ * still in the keychain. Must be read BEFORE the snapshot-driven removals, which
+ * persist the validated list and so overwrite these rows. `SecretStorage.keys()`
+ * is not relied on here (it is a newer API than the engine floor guarantees); it
+ * only widens the inventory-source sweep when the host has it.
+ */
+function collectUnvalidatedSecretOwners(
+  state: { get<T>(key: string): T | undefined },
+  known: { servers: Set<string>; authProfiles: Set<string>; sources: Set<string> }
+): UnvalidatedSecretOwners {
+  const rows = (key: string): Array<Record<string, unknown>> => {
+    const raw = state.get<unknown>(key);
+    return Array.isArray(raw) ? raw.filter((row): row is Record<string, unknown> => isRecordValue(row)) : [];
+  };
+  const idOf = (row: Record<string, unknown>): string | undefined =>
+    typeof row.id === "string" && row.id !== "" ? row.id : undefined;
+  const owners: UnvalidatedSecretOwners = { servers: [], authProfiles: [], sources: [] };
+  for (const row of rows("nexus.servers")) {
+    const id = idOf(row);
+    if (id && !known.servers.has(id)) owners.servers.push(id);
+  }
+  for (const row of rows("nexus.authProfiles")) {
+    const id = idOf(row);
+    if (id && !known.authProfiles.has(id)) owners.authProfiles.push(id);
+  }
+  for (const row of rows("nexus.inventorySources")) {
+    const id = idOf(row);
+    if (id && !known.sources.has(id)) {
+      const fieldIds = Array.isArray(row.secretFieldIds) ? row.secretFieldIds.filter((f): f is string => typeof f === "string") : [];
+      owners.sources.push({ id, fieldIds });
+    }
+  }
+  return owners;
+}
+
 export function registerConfigCommands(
   core: NexusCore,
   vault: SecretVault,
@@ -5356,6 +5400,13 @@ export function registerConfigCommands(
     const removed = emptyRemovedProfileIds();
     const resetMutation = async (): Promise<void> => {
       const snapshot = core.getSnapshot();
+      const unvalidatedOwners = context
+        ? collectUnvalidatedSecretOwners(context.globalState, {
+            servers: new Set(snapshot.servers.map((server) => server.id)),
+            authProfiles: new Set(snapshot.authProfiles.map((profile) => profile.id)),
+            sources: new Set(snapshot.inventorySources.map((source) => source.id))
+          })
+        : undefined;
       removed.tunnelProfiles.push(...snapshot.tunnels.map(({ id }) => id));
       removed.activeTunnels.push(...snapshot.activeTunnels.map(({ id, profileId, serverId }) => ({ id, profileId, serverId })));
 
@@ -5440,6 +5491,39 @@ export function registerConfigCommands(
       // such key explicitly. An empty array is what a clean removal leaves and is
       // left alone: writing `undefined` over it would make the repository's
       // concurrent-write check report a foreign change on the next save.
+      if (context && unvalidatedOwners) {
+        // Their secrets first, best effort — one failed delete must not strand
+        // the rest — and BEFORE the raw rows are cleared: those rows are the only
+        // record naming these keychain entries.
+        const bestEffortDelete = async (key: string): Promise<void> => {
+          try {
+            await vault.delete(key);
+          } catch (error) {
+            console.warn(`[Nexus] Failed to delete secret key "${key}":`, error);
+          }
+        };
+        for (const id of unvalidatedOwners.servers) {
+          await deleteServerSecrets(vault, id, { bestEffort: true });
+        }
+        for (const id of unvalidatedOwners.authProfiles) {
+          await bestEffortDelete(authProfilePasswordSecretKey(id));
+          await bestEffortDelete(authProfilePassphraseSecretKey(id));
+        }
+        const secretKeys = async (): Promise<string[]> => {
+          try {
+            const keys = (context.secrets as { keys?: () => PromiseLike<string[]> } | undefined)?.keys;
+            return typeof keys === "function" ? [...(await keys.call(context.secrets))] : [];
+          } catch {
+            return [];
+          }
+        };
+        const allKeys = unvalidatedOwners.sources.length > 0 ? await secretKeys() : [];
+        for (const { id, fieldIds } of unvalidatedOwners.sources) {
+          const prefix = inventorySecretKey(id, "");
+          const keys = new Set([...fieldIds.map((fieldId) => inventorySecretKey(id, fieldId)), ...allKeys.filter((key) => key.startsWith(prefix))]);
+          for (const key of keys) await bestEffortDelete(key);
+        }
+      }
       if (context) {
         for (const key of RESET_CLEARED_BY_STORE_GLOBAL_STATE_KEYS) {
           const raw = context.globalState.get<unknown>(key);
