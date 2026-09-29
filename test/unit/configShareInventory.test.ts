@@ -2477,6 +2477,18 @@ describe("a share never hands over a shell command or an unattended tunnel (#254
     expect(recipient.core.getSnapshot().tunnels.find((t) => t.name === "only-url")!.browserUrl).toBe("http://localhost:{localPort}/");
   });
 
+  it("a remote bind address is kept only when it is a valid loopback address (⊘ /^127(\\.\\d{1,3}){3}$/, which accepts 127.256.0.1)", () => {
+    const [t] = hostileTunnels;
+    const bind = (remoteBindAddress: string) =>
+      sanitizeForSharing([], [{ ...t, remoteBindAddress } as unknown as TunnelProfile], [], []).tunnels[0].remoteBindAddress;
+    for (const invalid of ["127.256.0.1", "127.999.999.999", "127.0.0.256", "127.01.0.1", "127.0.0", "127.0.0.1.1", "127.0.0.-1"]) {
+      expect(bind(invalid)).toBeUndefined();
+    }
+    for (const valid of ["127.0.0.1", "127.255.255.255", "127.0.0.2", "localhost", "::1"]) {
+      expect(bind(valid)).toBe(valid);
+    }
+  });
+
   it("export: none of auto-start, a bind address or a URL login survives (⊘ \"keep\")", () => {
     const [t] = hostileTunnels;
     for (const browserUrl of [

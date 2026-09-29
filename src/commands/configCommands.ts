@@ -1984,7 +1984,13 @@ function loopbackAddressOnly(value: string | undefined): string | undefined {
     return undefined;
   }
   const host = value.trim().toLowerCase();
-  return host === "localhost" || host === "::1" || host === "[::1]" || /^127(\.\d{1,3}){3}$/.test(host) ? value : undefined;
+  // 127.x.y.z with each octet 0-255 and no leading zero (`127.01.0.1` reads as
+  // octal in some resolvers): anything else is not a loopback address, and the
+  // value is forwarded to the SSH server as written.
+  const octets = host.split(".");
+  const isIpv4Loopback =
+    octets.length === 4 && octets[0] === "127" && octets.every((octet) => /^(0|[1-9]\d{0,2})$/.test(octet) && Number(octet) <= 255);
+  return host === "localhost" || host === "::1" || host === "[::1]" || isIpv4Loopback ? value : undefined;
 }
 
 /**

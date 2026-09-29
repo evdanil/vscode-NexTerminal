@@ -64,4 +64,42 @@ describe("Delete All Data resets the live view state", () => {
     await reset;
     expect(finished).toBe(true);
   });
+
+  it("a toggle made while the in-flight write settles queues nothing stale (⊘ discard() clearing the pending write once)", async () => {
+    vi.useFakeTimers();
+    try {
+      const stored: string[][] = [];
+      let release!: () => void;
+      const persistence = createCollapsedFolderStatePersistence(
+        (paths) => new Promise<void>((resolve) => { stored.push(paths); release = resolve; }),
+        { debounceMs: 10 }
+      );
+      const tree = new FakeTree();
+      tree.loadCollapsedFolders(["Old"]);
+      persistence.schedule(tree.getCollapsedFolders());
+      await vi.advanceTimersByTimeAsync(20); // the write is now in flight
+      expect(stored).toEqual([["Old"]]);
+
+      const reset = resetLiveViewState({ trees: [{ provider: tree, persistence }], cwdSync: { setFollowing: () => undefined } });
+      await Promise.resolve();
+      // The user collapses a folder during the wait: the provider still holds the old set.
+      tree.collapseFolder("DuringWait");
+      persistence.schedule(tree.getCollapsedFolders());
+      release();
+      await reset;
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(stored).toEqual([["Old"]]);
+      expect(tree.getCollapsedFolders()).toEqual([]);
+
+      // Writes are allowed again once the providers are empty.
+      tree.collapseFolder("After");
+      persistence.schedule(tree.getCollapsedFolders());
+      release();
+      await vi.advanceTimersByTimeAsync(500);
+      expect(stored).toEqual([["Old"], ["After"]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
