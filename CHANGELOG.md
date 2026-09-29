@@ -1,6 +1,6 @@
 # Changelog
 
-## [2.8.303] — 2026-09-29
+## [2.8.304] — 2026-09-29
 
 ### Fixed
 
@@ -8,6 +8,14 @@
 - **Shared tunnels no longer act on their own.** A tunnel from a share arrives with Auto-start off, no listener address (loopback until you choose one in Edit), a loopback-only remote bind address and no login in its browser URL, on export and on import; the import message counts the tunnels it changed.
 - **Delete All Data clears Terminal Appearance and the Local Shell auto-trigger acknowledgement.** Imported colour schemes, the selected scheme and the font choice are removed and an open panel refreshes; it also clears remembered view state and dismissed hints (collapsed folders, follow-terminal-directory, macro hint), other open windows that observe the reset (a reset-generation counter) reload instead of writing stale collapsed-folder or appearance data back at their next action; a write already in flight, or one that starts before the reset reaches that window, can still land until it is reloaded. Follow Terminal Directory stays on in memory there until toggled or reloaded. The confirmation and completion message both say what is kept: the terminal colours and font already written to VS Code user settings, trusted host keys, scripts and logs stay.
 - **A duplicate id in a share no longer overwrites a record.** The first server or auth profile under an id that passes validation lands; a later one in the same file is skipped and counted instead of replacing it and being counted as imported.
+
+## [2.8.303] — 2026-09-29
+
+### Fixed
+
+- **An unreadable reverse-bind reservation file no longer stops the extension loading.** A corrupt, empty or non-fence file in the cross-window fence directory is now logged and ignored instead of failing every registry read, and is deleted once it is more than 30 seconds old. A file that cannot be read is retried and, while under 30 seconds old, makes the registry read fail so a live reservation is never hidden; once stale it is ignored and deleted. Registry storage errors no longer fail activation, and the background sync timers no longer raise unhandled rejections.
+- **Stopping a tunnel no longer fails when the cross-window registry cannot be updated.** The failure is logged after local teardown, so server and tunnel removal complete instead of stopping partway. A reverse tunnel's reservation is still published before Stop returns when storage allows; if it cannot be, a one-time warning says another window may collide on that port and what to do.
+- **Orphaned temporary reservation files are cleaned up.** Temporary files left by a host killed mid-write are removed once older than 30 seconds.
 
 ## [2.8.302] — 2026-09-29
 
