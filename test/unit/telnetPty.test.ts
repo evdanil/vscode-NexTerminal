@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as vscode from "vscode";
 import { TelnetPty, type TelnetSocket, type TelnetSocketFactory } from "../../src/services/telnet/telnetPty";
 import { DO, IAC, OPT_ECHO, WILL } from "../../src/services/telnet/telnetProtocol";
-import { CLEAR_VISIBLE_SCREEN } from "../../src/services/terminal/terminalEscapes";
+import { CLEAR_VISIBLE_SCREEN, RESET_INTERACTIVE_MODES } from "../../src/services/terminal/terminalEscapes";
 import { INPUT_LOCKED_NOTICE } from "../../src/services/terminal/ptyObserverHub";
 import type { ServerConfig } from "../../src/models/config";
 
@@ -241,6 +241,36 @@ describe("TelnetPty — connect lifecycle", () => {
 
     expect(rendered(h)).toContain("[Nexus Telnet] Remote host closed the connection.");
     expect(rendered(h)).toContain("Press any key to close");
+  });
+
+  it("resets terminal modes before the close banner and ignores terminal-generated reports", () => {
+    const h = harness();
+    const onDidClose = vi.fn();
+    h.pty.onDidClose(onDidClose);
+    h.pty.open();
+    h.fake.emitConnect();
+    h.fake.emitClose();
+
+    const out = rendered(h);
+    expect(out).toContain(RESET_INTERACTIVE_MODES);
+    expect(out.indexOf(RESET_INTERACTIVE_MODES)).toBeLessThan(out.indexOf("Remote host closed"));
+    expect(out).not.toContain("1049");
+
+    for (const report of ["\x1b[I", "\x1b[O", "\x1b[<0;10;5M", "\x1b[<0;10;5m", "\x1b[M !!", "\x1b[0;10;5M", "\x1b[?997;1n"]) {
+      h.pty.handleInput(report);
+    }
+    expect(onDidClose).not.toHaveBeenCalled();
+
+    h.pty.handleInput("x");
+    expect(onDidClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("resets terminal modes when markShuttingDown() runs", () => {
+    const h = harness();
+    h.pty.open();
+    h.fake.emitConnect();
+    h.pty.markShuttingDown("bye");
+    expect(rendered(h)).toContain(RESET_INTERACTIVE_MODES);
   });
 
   // ⊘ A pty that leaves the session registered after the remote hangs up leaves
