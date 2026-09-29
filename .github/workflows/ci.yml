@@ -176,16 +176,16 @@ jobs:
           npm run test:network-server-daemon:rust
 
   policy:
-    name: Version bump
+    name: Version / changelog
     # OWNER-authored pull requests only, and never on push (a push to main has
     # already merged — failing it reports a fact nobody can act on).
     #
-    # CONTRIBUTING.md:147 tells outside contributors NOT to bump the version:
-    # concurrent pull requests would collide on that line, and the maintainer
-    # bumps separately when merging. Running this check on their pull requests
-    # would post a permanent red mark they are forbidden to clear. CLAUDE.md's
-    # per-pull-request bump rule is addressed to maintainer-authored work, and
-    # so is this job.
+    # CONTRIBUTING.md tells outside contributors to leave the version and the
+    # CHANGELOG heading alone: release timing is a maintainer decision, and the
+    # maintainer opens the next entry and folds contributed notes into it on
+    # merge. Running this check on their pull requests would post a red mark
+    # they are told not to clear. The version / top-entry rule in AGENTS.md is
+    # addressed to maintainer-authored work, and so is this job.
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.author_association == 'OWNER'
@@ -195,78 +195,120 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Require the version to have moved
+      - name: Require the next unreleased version, stated consistently
         env:
           # The pull request's OWN head commit — not the merge commit GitHub
-          # checks out — read on TWO axes below: against its own fork point,
-          # and against current origin/main. Neither axis alone is enough.
-          # Head-vs-origin/main alone misses a branch that forked BEFORE
-          # main's own last bump and never bumped at all: if main moves on
-          # while the branch sits still, head and origin/main end up unequal
-          # even though this pull request changed nothing, and an unrelated
-          # main bump satisfies the comparison by accident. Head-vs-fork-point
-          # alone misses the opposite case: two branches independently bump to
-          # the same next version, and this one merges cleanly after the other
-          # already claimed that version's tag. Both checks are needed; see
-          # below for which failure each one guards.
+          # checks out — because that is what the author controls and can fix.
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
 
-          read_version() {
-            git show "$1:package.json" \
-              | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version"
+          # THE POLICY (AGENTS.md). Unreleased changes accumulate in ONE
+          # CHANGELOG entry headed with the NEXT release version; package.json
+          # and package-lock.json carry that same version; a release tags
+          # exactly it. So the version does NOT move per pull request — many
+          # consecutive pull requests leave it where it is, and equality with
+          # origin/main is the normal case, not a mistake.
+          #
+          # WHY THE OLD RULES ARE GONE. This job used to require the version to
+          # differ from the fork point and be greater than origin/main. Both
+          # were proxies for "a release will not land on an existing tag" under
+          # a per-pull-request bump policy, and both now reject correct work:
+          # every pull request after the first in a release cycle keeps the
+          # version, and consolidating stray per-PR versions back down to the
+          # real next release (main at 2.8.307, latest tag v2.8.295, this
+          # branch at 2.8.296) moves the version BACKWARD relative to main on
+          # purpose. The property that actually matters is never reusing a
+          # released version, so the version is compared against the released
+          # tags directly.
+          #
+          # Tags: checkout with fetch-depth 0 normally brings them, but fetch
+          # explicitly so this does not depend on that; --force so a stale
+          # local tag cannot mask the remote one.
+          git fetch --force --tags --quiet origin
+
+          work=$(mktemp -d)
+          for f in package.json package-lock.json CHANGELOG.md; do
+            git show "$HEAD_SHA:$f" > "$work/$f"
+          done
+          git tag -l 'v*' > "$work/tags"
+
+          node - "$work" <<'EOF'
+          const fs = require("fs");
+          const path = require("path");
+          const dir = process.argv[2];
+          const read = (f) => fs.readFileSync(path.join(dir, f), "utf8");
+
+          // Plain x.y.z only; the node comparison below is numeric per field,
+          // so 2.8.10 > 2.8.9 (a string compare gets that wrong).
+          const parse = (v) => {
+            const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(v).trim());
+            return m ? m.slice(1, 4).map(Number) : null;
+          };
+          const cmp = (a, b) => {
+            for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] - b[i];
+            return 0;
+          };
+
+          const errors = [];
+          const fail = (title, msg) => errors.push(`::error title=${title}::${msg}`);
+
+          const version = JSON.parse(read("package.json")).version;
+          const v = parse(version);
+          if (!v) {
+            console.log(`::error title=Unparseable version::package.json version "${version}" is not x.y.z; this check compares plain x.y.z versions only.`);
+            process.exit(1);
           }
 
-          git fetch --no-tags origin main
-          base_version=$(read_version "origin/main")
-          head_version=$(read_version "$HEAD_SHA")
-          merge_base=$(git merge-base "$HEAD_SHA" origin/main)
-          fork_version=$(read_version "$merge_base")
+          // 1. package-lock.json carries the same version in both places npm
+          //    writes it; a mismatch means a hand edit updated only one file.
+          const lock = JSON.parse(read("package-lock.json"));
+          const lockTop = lock.version;
+          const lockRoot = lock.packages && lock.packages[""] ? lock.packages[""].version : undefined;
+          if (lockTop !== version || lockRoot !== version) {
+            fail("package-lock.json out of step",
+              `package-lock.json has version ${lockTop} and packages[""].version ${lockRoot}; both must equal package.json's ${version}. Set all three together (npm version ${version} --no-git-tag-version --allow-same-version).`);
+          }
 
-          echo "fork point:        $fork_version"
-          echo "origin/main:       $base_version"
-          echo "pull request head: $head_version"
+          // 2. The top CHANGELOG entry is the one unreleased entry, headed
+          //    with the version that will be released.
+          const heading = /^## \[([^\]]+)\]/m.exec(read("CHANGELOG.md"));
+          const top = heading ? heading[1] : undefined;
+          if (top !== version) {
+            fail("CHANGELOG heading mismatch",
+              `The top CHANGELOG.md entry is ${top ? `[${top}]` : "missing"}, but package.json is ${version}. They must match: unreleased changes go in ONE entry headed with the next release version, which package.json and package-lock.json also carry. Add this pull request's notes to that entry instead of opening a new heading per pull request.`);
+          }
 
-          # This pull request itself must have changed the version. Compares
-          # against the version AT THE FORK POINT, not against current
-          # origin/main, precisely so a stale branch that forked before main's
-          # last bump can't pass just because main moved on without it.
-          if [ "$head_version" = "$fork_version" ]; then
-            echo "::error title=Version not bumped::package.json is still $head_version, unchanged since this pull request's fork point. Every maintainer-authored change pull request bumps the patch version (CLAUDE.md), so main is always ready to release — without the bump, auto-release later refuses with \"tag v$head_version already exists\" and does not say why. Bump the patch version in package.json on this branch and push."
-            exit 1
-          fi
+          // 3. The version is STRICTLY GREATER than every released tag, so a
+          //    release can never land on a version already published (and
+          //    never on an existing tag, which auto-release refuses without
+          //    saying why). Not "equal to latest + 1 patch": a minor or major
+          //    bump is the maintainer's call and must pass.
+          const released = read("tags").split(/\r?\n/)
+            .map((t) => t.trim())
+            .filter(Boolean)
+            .map((t) => ({ tag: t, parts: parse(t.slice(1)) }))
+            .filter((t) => t.parts);
+          let latest;
+          for (const t of released) if (!latest || cmp(t.parts, latest.parts) > 0) latest = t;
 
-          # ...and it must be STRICTLY GREATER than what origin/main holds
-          # (Codex review, P2). Equality alone was not enough, and passed two
-          # bad cases:
-          #   - the STALE BUMP: fork at 2.8.207, branch bumps to 2.8.208, main
-          #     meanwhile advances to 2.8.209. 2.8.208 differs from both, so
-          #     both equality tests passed — yet merging moves main BACKWARD to
-          #     a version whose tag may already exist, and auto-release then
-          #     refuses the next release with "tag already exists".
-          #   - the DOWNGRADE: any accidental edit to a lower version passed for
-          #     exactly the same reason.
-          # Ordering is the property actually wanted; equality was only ever a
-          # proxy for it. Deliberately NOT "must equal main's next patch" — a
-          # minor or major bump is legitimate and this must not reject one.
-          if ! node -e '
-            const parse = (v) => {
-              const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(v.trim());
-              if (!m) {
-                console.error(`Cannot compare non x.y.z version: "${v}"`);
-                process.exit(2);
-              }
-              return m.slice(1, 4).map(Number);
-            };
-            const [a, b] = [parse(process.argv[1]), parse(process.argv[2])];
-            for (let i = 0; i < 3; i++) {
-              if (a[i] !== b[i]) process.exit(a[i] > b[i] ? 0 : 1);
-            }
+          console.log(`package.json:           ${version}`);
+          console.log(`package-lock.json:      ${lockTop} / packages[""] ${lockRoot}`);
+          console.log(`CHANGELOG top entry:    ${top ?? "(none)"}`);
+          console.log(`latest release tag:     ${latest ? latest.tag : "(none)"}`);
+
+          if (latest && cmp(v, latest.parts) <= 0) {
+            const next = `${latest.parts[0]}.${latest.parts[1]}.${latest.parts[2] + 1}`;
+            const already = cmp(v, latest.parts) === 0 ? `${version} is already released. ` : "";
+            fail("Version already released",
+              `package.json is ${version}, not greater than the latest release tag ${latest.tag}. ${already}Open the next unreleased entry: set package.json, package-lock.json and a new top CHANGELOG heading to ${next} (or a minor/major bump if intended) and put this pull request's notes there. Published entries are never edited.`);
+          }
+
+          if (errors.length) {
+            for (const e of errors) console.log(e);
             process.exit(1);
-          ' "$head_version" "$base_version"; then
-            echo "::error title=Version must move forward::package.json is $head_version, which is not greater than origin/main's $base_version. Merging this would move main backward, onto a version whose tag may already exist — auto-release would then refuse the next release with \"tag already exists\" without saying why. Bump package.json above $base_version on this branch and push."
-            exit 1
-          fi
-
-          echo "Version moved $fork_version -> $head_version, ahead of origin/main ($base_version)."
+          }
+          console.log(latest
+            ? `OK: ${version} is the next unreleased version (after ${latest.tag}) and is stated consistently.`
+            : `OK: no v* release tag yet; ${version} is stated consistently.`);
+          EOF
