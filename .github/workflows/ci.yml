@@ -238,7 +238,9 @@ jobs:
           done
           git tag -l 'v*' > "$work/tags"
 
-          node - "$work" <<'EOF'
+          # Both checks below always run, so one push reports every problem.
+          status=0
+          node - "$work" <<'EOF' || status=1
           const fs = require("fs");
           const path = require("path");
           const dir = process.argv[2];
@@ -317,3 +319,14 @@ jobs:
             ? `OK: ${version} is the next unreleased version (after ${latest.tag}) and is stated consistently.`
             : `OK: no v* release tag yet; ${version} is stated consistently.`);
           EOF
+
+          # PUBLISHED ENTRIES ARE NEVER EDITED. "Version > latest tag" and "top
+          # heading == version" both still pass if a pull request RENAMES the
+          # released "## [2.8.296]" heading to 2.8.297 — which deletes the
+          # published entry. So each released entry, as it reads in its own
+          # tag's CHANGELOG.md, must appear unchanged below the top entry at the
+          # pull request head. Covers every tag from v2.8.58 up; older history
+          # has known drift (see PUBLISHED_ENTRY_FLOOR in the script).
+          node scripts/checkPublishedEntries.mjs "$HEAD_SHA" || status=1
+
+          exit "$status"
