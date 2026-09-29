@@ -160,6 +160,42 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ONE changelog, ONE set of release notes. Unreleased changes accumulate
+      # in a single CHANGELOG entry headed with the version a release tags
+      # (AGENTS.md), so that entry IS this release's notes — the same text the
+      # Marketplace and Open VSX show from the CHANGELOG.md packed in the VSIX.
+      # GitHub's generate_release_notes is deliberately OFF: it would add a
+      # second, differently worded account (a PR-title list) of the same
+      # release. Runs first, straight after checkout, so a missing entry stops
+      # the release before the long build and before anything is published.
+      - name: Extract release notes from CHANGELOG
+        if: env.RELEASE_TAG != ''
+        run: |
+          set -euo pipefail
+          node - "${RELEASE_TAG#v}" CHANGELOG.md "$RUNNER_TEMP/release-notes.md" <<'EOF'
+          const fs = require("fs");
+          const [version, changelog, out] = process.argv.slice(2);
+          const lines = fs.readFileSync(changelog, "utf8").split(/\r?\n/);
+          // Exact heading for this version: the whole version inside the
+          // brackets, so 2.8.29 never matches the 2.8.295 entry.
+          const esc = version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const head = new RegExp(`^## \\[${esc}\\](\\s|$)`);
+          const start = lines.findIndex((l) => head.test(l));
+          if (start < 0) {
+            console.log(`::error title=No CHANGELOG entry::CHANGELOG.md has no "## [${version}]" heading, so this release has no notes. Nothing has been published yet: delete the tag v${version}, add the entry (the top entry, headed with this version) on main, and tag again.`);
+            process.exit(1);
+          }
+          let end = lines.findIndex((l, i) => i > start && l.startsWith("## ["));
+          if (end < 0) end = lines.length;
+          const body = lines.slice(start, end).join("\n").trim();
+          if (!lines.slice(start + 1, end).some((l) => l.trim())) {
+            console.log(`::error title=Empty CHANGELOG entry::The "## [${version}]" entry in CHANGELOG.md has no content, so this release has no notes. Nothing has been published yet: delete the tag v${version}, fill the entry on main, and tag again.`);
+            process.exit(1);
+          }
+          fs.writeFileSync(out, body + "\n");
+          console.log(body);
+          EOF
+
       - uses: actions/download-artifact@v4
         with:
           pattern: local-pty-*
@@ -265,7 +301,8 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           make_latest: ${{ steps.latest.outputs.make_latest }}
           files: "*.vsix"
-          generate_release_notes: true
+          body_path: ${{ runner.temp }}/release-notes.md
+          generate_release_notes: false
 
       - name: Publish to VS Code Marketplace
         if: >-
