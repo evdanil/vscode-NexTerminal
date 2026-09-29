@@ -351,7 +351,7 @@ describe("connectServer — equal-content replacement while progress is pending"
   });
 });
 
-describe("connectServer — auto-start sweep uses the live server record", () => {
+describe("connectServer — auto-start sweep follows the session's connection config", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(vscode.window.withProgress as any).mockImplementation(
@@ -359,20 +359,49 @@ describe("connectServer — auto-start sweep uses the live server record", () =>
     );
   });
 
-  it("starts an autoStart tunnel on reconnect with the record saved after connect began", async () => {
-    const server = makeServer();
+  async function connected(serverOverrides: Partial<ServerConfig> = {}) {
+    const server = makeServer(serverOverrides);
     const tunnel = makeTunnel({ autoStart: true, defaultServerId: "srv-1" });
-    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [tunnel], activeTunnels: [], servers: [server] });
+    const harness = setupHarness({ profiles: [tunnel], activeTunnels: [], servers: [server] });
+    await connectServer(harness.ctx, server.id);
+    return { ...harness, server, callbacks: latestSshCallbacks() };
+  }
 
-    await connectServer(ctx, server.id);
-    const callbacks = latestSshCallbacks();
-    const saved = { ...server };
-    await addOrUpdateServer(saved);
+  it("normal path: starts the tunnel on the session's server", async () => {
+    const { callbacks, server } = await connected();
     callbacks.onSessionOpened("session-1");
     await flushPromises();
 
     expect(mockStartTunnel).toHaveBeenCalledTimes(1);
-    expect(mockStartTunnel.mock.calls[0][4]).toBe(saved);
+    expect(mockStartTunnel.mock.calls[0][4]).toMatchObject({ id: server.id, host: server.host });
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("R-reconnect after a rename or equal save still starts the tunnel", async () => {
+    const { callbacks, server, addOrUpdateServer } = await connected();
+    await addOrUpdateServer({ ...server, name: "Renamed", group: "Other" });
+    callbacks.onSessionOpened("session-1");
+    await flushPromises();
+
+    expect(mockStartTunnel).toHaveBeenCalledTimes(1);
+    // The config the session actually connected with, not the live record.
+    expect(mockStartTunnel.mock.calls[0][4]).toMatchObject({ name: server.name });
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("R-reconnect after a host edit starts nothing on the new host and warns", async () => {
+    const { callbacks, server, addOrUpdateServer } = await connected({ name: "evil\nname" });
+    await addOrUpdateServer({ ...server, host: "new.example" });
+    callbacks.onSessionOpened("session-1");
+    await flushPromises();
+
+    expect(mockStartTunnel).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    const message = String(mockShowWarningMessage.mock.calls[0][0]);
+    expect(message).toContain("connection settings changed since this session opened");
+    expect(message).toContain("Close and reopen the terminal");
+    expect(message).not.toContain("\n");
+    expect(mockShowWarningMessage.mock.calls[0]).toHaveLength(1);
   });
 });
 

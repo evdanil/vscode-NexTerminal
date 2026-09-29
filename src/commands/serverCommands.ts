@@ -1373,22 +1373,37 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
               }
             }
 
-            // onSessionOpened also fires on every R reconnect, so `server` (the
-            // connect-time object) can be stale by hours. Start tunnels against
-            // the live record; if it is gone there is nothing to start.
+            // onSessionOpened also fires on every R reconnect, and SshPty
+            // reconnects with the config it was constructed with, not the live
+            // record. Auto-tunnels must use that same config, or an isolated one
+            // could dial a different host than the terminal and a shared one
+            // could reuse the old pooled transport under the new config. If the
+            // live record's connection fields have moved on, skip and say so;
+            // a change that leaves them alone (a rename) still auto-starts.
             const liveServer = ctx.core.getServer(server.id);
-            for (const tunnel of liveServer ? ctx.core.getSnapshot().tunnels : []) {
-              if (tunnel.autoStart && tunnel.defaultServerId === server.id) {
-                // Silently skip tunnels that are already running
-                if (ctx.core.getSnapshot().activeTunnels.some((t) => t.profileId === tunnel.id)) {
-                  continue;
+            const pending = liveServer
+              ? ctx.core.getSnapshot().tunnels.filter(
+                  (tunnel) =>
+                    tunnel.autoStart &&
+                    tunnel.defaultServerId === server.id &&
+                    // Silently skip tunnels that are already running
+                    !ctx.core.getSnapshot().activeTunnels.some((t) => t.profileId === tunnel.id)
+                )
+              : [];
+            if (liveServer && pending.length > 0) {
+              if (!serverConnectionEqual(liveServer, serverAtStart, { multiplexingDefault: readMultiplexingDefault() })) {
+                void vscode.window.showWarningMessage(
+                  `Auto-start tunnels for "${flattenProviderText(server.name)}" were not started because the server's connection settings changed since this session opened. Close and reopen the terminal to use the new settings.`
+                );
+              } else {
+                for (const tunnel of pending) {
+                  void resolveTunnelConnectionMode(tunnel, false).then((mode) => {
+                    if (!mode) {
+                      return;
+                    }
+                    return startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, tunnel, server, mode, ctx.registrySync);
+                  });
                 }
-                void resolveTunnelConnectionMode(tunnel, false).then((mode) => {
-                  if (!mode) {
-                    return;
-                  }
-                  return startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, tunnel, liveServer!, mode, ctx.registrySync);
-                });
               }
             }
           },
