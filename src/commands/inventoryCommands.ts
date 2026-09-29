@@ -31,6 +31,7 @@ import { sourceDescription } from "../services/inventory/sourceDescription";
 import {
   computeSyncPlan,
   normalizeInventoryTreeHosts,
+  type InventoryHostNormalization,
   planToApplication,
   prunedServerIdsForSecretCleanup,
   validateInventoryTree,
@@ -3901,6 +3902,7 @@ export function registerInventoryCommands(
       }
 
       let tree: InventoryTree;
+      let hostNormalization: InventoryHostNormalization;
       try {
         const fetched = await vscode.window.withProgress(
           { location: vscode.ProgressLocation.Notification, title: `Syncing inventory from "${source.name}"…` },
@@ -3915,7 +3917,7 @@ export function registerInventoryCommands(
           const reason = validationError instanceof Error ? validationError.message : String(validationError);
           throw new InventoryProviderError("protocol", `Provider returned an invalid inventory tree: ${reason}`);
         }
-        tree = normalizeInventoryTreeHosts(fetched);
+        ({ tree, ...hostNormalization } = normalizeInventoryTreeHosts(fetched));
       } catch (error) {
         void vscode.window.showErrorMessage(`Inventory sync failed: ${describeInventoryError(error)}`);
         return;
@@ -4036,6 +4038,7 @@ export function registerInventoryCommands(
       let plan = computeSyncPlan({
         source,
         tree,
+        hostNormalization,
         currentServers: core.getSnapshot().servers,
         now: Date.now(),
         authProfile: planAuthProfile,
@@ -4111,6 +4114,7 @@ export function registerInventoryCommands(
           const recomputed = computeSyncPlan({
             source: freshSource,
             tree,
+            hostNormalization,
             currentServers: core.getSnapshot().servers,
             now: Date.now(),
             authProfile: freshAuthProfile,
@@ -4491,6 +4495,7 @@ export function registerInventoryCommands(
           plan = computeSyncPlan({
             source,
             tree,
+            hostNormalization,
             currentServers: core.getSnapshot().servers,
             now: Date.now(),
             authProfile: planAuthProfile,
@@ -4712,6 +4717,7 @@ export function registerInventoryCommands(
           const recomputed = computeSyncPlan({
             source: freshSource,
             tree,
+            hostNormalization,
             currentServers: freshServersForRecompute,
             now: Date.now(),
             authProfile: freshAuthProfile,
@@ -4837,6 +4843,7 @@ export function registerInventoryCommands(
           const finalPlan = computeSyncPlan({
             source: freshSource,
             tree,
+            hostNormalization,
             currentServers: finalServersForRecompute,
             now: Date.now(),
             authProfile: finalAuthProfile,
