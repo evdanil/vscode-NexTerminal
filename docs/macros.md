@@ -525,8 +525,12 @@ such as `/usr/bin/ipmitool`, a redirection attached to its name, and supported
 mention, a comment, a `sudo -u` username, or a redirection target (including
 after Bash's `>|` operator) does not count. After an `env` assignment, later
 option-looking words are treated
-as the attempted command, not as options. Nested shell commands that cannot be
-placed reliably get no hint.
+as the attempted command, not as options. Once `ipmitool` has been read as the
+command, a later substitution, backtick, here-string or heredoc in its arguments
+does not hide the hint (`ipmitool -P "$(cat ~/.bmcpw)" sol activate`). Nested
+shell commands and heredoc bodies, a command word that is itself dynamic
+(`$(which ipmitool)`), and commands that only follow such a substitution on a
+later line get no hint, because they cannot be placed reliably.
 The alternative is to delete the macro and re-insert the shipped template, which
 already has all of this set.
 
