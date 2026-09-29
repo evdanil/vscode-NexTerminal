@@ -39,7 +39,7 @@ class ControlledSerialPort extends EventEmitter {
 
   public override removeAllListeners(event?: string | symbol): this {
     this.removeAllListenersCalls += 1;
-    return super.removeAllListeners(event);
+    return event === undefined ? super.removeAllListeners() : super.removeAllListeners(event);
   }
 }
 
@@ -118,5 +118,190 @@ describe("production serial sidecar worker request handler", () => {
       error: { message: "invalid serial session ID" }
     });
     expect(ControlledSerialPort.instances).toHaveLength(0);
+  });
+
+  it("closes a port whose open completes after closePort cancelled it, and frees the session ID", async () => {
+    const { handler, output } = makeHandler();
+    let finishOpen!: OpenCallback;
+    ControlledSerialPort.openBehavior = (_port, callback) => {
+      finishOpen = callback;
+    };
+    const closeSpy = vi.spyOn(ControlledSerialPort.prototype, "close");
+
+    const opening = handler(openRequest("open-slow"));
+    const closed = await handler({ id: "close-1", method: "closePort", params: { sessionId: "session-17" } });
+    expect(closed).toEqual({ id: "close-1", result: { ok: true } });
+    // The native open is still pending, so nothing can be closed yet.
+    expect(closeSpy).not.toHaveBeenCalled();
+
+    finishOpen();
+    await expect(opening).resolves.toEqual({
+      id: "open-slow",
+      error: { message: "Serial port open cancelled" }
+    });
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+    await expect(
+      handler({ id: "w-1", method: "writePort", params: { sessionId: "session-17", data: "eA==" } })
+    ).resolves.toEqual({ id: "w-1", error: { message: "unknown serial session" } });
+    // No disconnect notification for a port the caller already abandoned.
+    expect(output.filter((m) => "method" in m && m.method !== PORT_DATA_NOTIFICATION)).toEqual([]);
+
+    ControlledSerialPort.openBehavior = (_port, callback) => callback();
+    await expect(handler(openRequest("open-again"))).resolves.toEqual({
+      id: "open-again",
+      result: { sessionId: "session-17" }
+    });
+  });
+
+  describe("a cancelled open whose close fails", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    async function cancelledOpen(handler: ReturnType<typeof makeHandler>["handler"]) {
+      let finishOpen!: OpenCallback;
+      ControlledSerialPort.openBehavior = (_port, callback) => {
+        finishOpen = callback;
+      };
+      const opening = handler(openRequest("open-slow"));
+      await handler({ id: "cancel-1", method: "cancelAbandonedOpen", params: { sessionId: "session-17" } });
+      finishOpen();
+      return opening;
+    }
+
+    it("keeps retrying by itself, then reports and frees the id when the close never succeeds", async () => {
+      vi.useFakeTimers();
+      const { handler, output } = makeHandler();
+      const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+      const closeSpy = vi
+        .spyOn(ControlledSerialPort.prototype, "close")
+        .mockImplementation((callback: OpenCallback) => callback(new Error("EBUSY close")));
+
+      const opening = cancelledOpen(handler);
+      await vi.advanceTimersByTimeAsync(500);
+      await expect(opening).resolves.toEqual({
+        id: "open-slow",
+        error: { message: "Serial port open cancelled; close failed: EBUSY close" }
+      });
+      const afterFirstRound = closeSpy.mock.calls.length;
+      expect(stderr).not.toHaveBeenCalled();
+
+      // Nobody sends another closePort: the worker keeps trying on its own.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(closeSpy.mock.calls.length).toBeGreaterThan(afterFirstRound);
+      expect(stderr).toHaveBeenCalledTimes(1);
+      expect(String(stderr.mock.calls[0][0])).toContain("Reload Window");
+      expect(output).toContainEqual({
+        method: "portReleaseFailed",
+        params: { sessionId: "session-17", path: "/dev/ttyUSB0", message: expect.stringContaining("EBUSY close") }
+      });
+      // The descriptor may still be live: a late error (e.g. replug) must not
+      // throw as an unhandled 'error' event and take the shared sidecar down.
+      const port = ControlledSerialPort.instances[0];
+      expect(() => port.emit("error", new Error("device replugged"))).not.toThrow();
+      expect(port.listenerCount("error")).toBe(1);
+      // Tracking is dropped, so the id is not reserved forever.
+      await expect(
+        handler({ id: "w-2", method: "writePort", params: { sessionId: "session-17", data: "eA==" } })
+      ).resolves.toEqual({ id: "w-2", error: { message: "unknown serial session" } });
+    });
+
+    it("releases the port on a later background retry once the close succeeds", async () => {
+      vi.useFakeTimers();
+      const { handler } = makeHandler();
+      const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+      let failures = 5;
+      const closeSpy = vi
+        .spyOn(ControlledSerialPort.prototype, "close")
+        .mockImplementation((callback: OpenCallback) => callback(failures-- > 0 ? new Error("EBUSY close") : undefined));
+
+      const opening = cancelledOpen(handler);
+      await vi.advanceTimersByTimeAsync(500);
+      await opening;
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(closeSpy).toHaveBeenCalledTimes(6);
+      expect(stderr).not.toHaveBeenCalled();
+    });
+  });
+
+  it("releases in the background, then reports, when the open settled just before the cancel arrived", async () => {
+    vi.useFakeTimers();
+    try {
+      const { handler, output } = makeHandler();
+      const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+      const closeSpy = vi
+        .spyOn(ControlledSerialPort.prototype, "close")
+        .mockImplementation((callback: OpenCallback) => callback(new Error("EBUSY close")));
+
+      // The open succeeded (its reply was lost to the manager's timeout) and the
+      // session is registered when the cancel arrives.
+      await expect(handler(openRequest("open-late"))).resolves.toEqual({
+        id: "open-late",
+        result: { sessionId: "session-17" }
+      });
+      const cancel = handler({ id: "cancel-1", method: "cancelAbandonedOpen", params: { sessionId: "session-17" } });
+      await vi.advanceTimersByTimeAsync(500);
+      await expect(cancel).resolves.toEqual({ id: "cancel-1", result: { ok: true } });
+      const afterFirstRound = closeSpy.mock.calls.length;
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(closeSpy.mock.calls.length).toBeGreaterThan(afterFirstRound);
+      expect(output).toContainEqual({
+        method: "portReleaseFailed",
+        params: { sessionId: "session-17", path: "/dev/ttyUSB0", message: expect.stringContaining("EBUSY close") }
+      });
+      expect(stderr).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores cancelAbandonedOpen for an unknown or already released session", async () => {
+    const { handler } = makeHandler();
+    await expect(handler({ id: "c", method: "cancelAbandonedOpen", params: { sessionId: "nope" } })).resolves.toEqual({
+      id: "c",
+      result: { ok: true }
+    });
+  });
+
+  it("does not close again a port that closed itself before the cancel was processed", async () => {
+    const { handler } = makeHandler();
+    let finishOpen!: OpenCallback;
+    ControlledSerialPort.openBehavior = (port, callback) => {
+      finishOpen = callback;
+      void port;
+    };
+    const closeSpy = vi
+      .spyOn(ControlledSerialPort.prototype, "close")
+      .mockImplementation((callback: OpenCallback) => callback(new Error("Port is not open")));
+
+    const opening = handler(openRequest("open-slow"));
+    ControlledSerialPort.instances[0].emit("close");
+    await handler({ id: "close-1", method: "closePort", params: { sessionId: "session-17" } });
+    finishOpen();
+
+    await expect(opening).resolves.toEqual({ id: "open-slow", error: { message: "Serial port open cancelled" } });
+    expect(closeSpy).not.toHaveBeenCalled();
+    ControlledSerialPort.openBehavior = (_port, callback) => callback();
+    await expect(handler(openRequest("open-again"))).resolves.toEqual({
+      id: "open-again",
+      result: { sessionId: "session-17" }
+    });
+  });
+
+  it("treats a 'Port is not open' close as released", async () => {
+    const { handler } = makeHandler();
+    await handler(openRequest("open-1"));
+    vi.spyOn(ControlledSerialPort.prototype, "close").mockImplementation((callback: OpenCallback) =>
+      callback(new Error("Port is not open"))
+    );
+    await expect(handler({ id: "c", method: "closePort", params: { sessionId: "session-17" } })).resolves.toEqual({
+      id: "c",
+      result: { ok: true }
+    });
+    await expect(
+      handler({ id: "w", method: "writePort", params: { sessionId: "session-17", data: "eA==" } })
+    ).resolves.toEqual({ id: "w", error: { message: "unknown serial session" } });
   });
 });

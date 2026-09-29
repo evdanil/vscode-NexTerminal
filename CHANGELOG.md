@@ -1,10 +1,16 @@
 # Changelog
 
-## [2.8.304] — 2026-09-29
+## [2.8.305] — 2026-09-29
 
 ### Fixed
 
 - **SSH, Telnet and tunnel starts are no longer cancelled by an unchanged save or Refresh.** A pending Connect or Start Tunnel compared the profile by object identity, so saving a server or tunnel without changes (or refreshing after another window wrote settings) silently cancelled it. Starts now compare only the fields the connection uses (address, port, protocol, credentials, proxy and the like; a folder rename or notes edit does not count), like Serial and Local Shell. A real change or removal cancels with a visible notice, with **Retry** on the current settings when the profile still exists (Retry repeats the original action, such as Connect and Run Script; a macro's IPMI-gateway connect offers no Retry and says to re-run the macro; and a tunnel retry targets the same server, or reports it removed rather than starting elsewhere), and a cancelled tunnel start no longer registers briefly before being stopped. The auto-start tunnel sweep now starts tunnels with the config the session connected with and, if the server's connection settings changed since the session opened, skips them with a warning to close and reopen the terminal; a rename or other non-connection edit no longer blocks auto-start on an **R** reconnect.
+
+## [2.8.304] — 2026-09-29
+
+### Fixed
+
+- **A serial open that timed out no longer leaves the port held.** When a port took longer than the 10 s RPC budget to open (Windows Bluetooth COM ports, slow USB-serial drivers), the tab reported "Connection failed" but the sidecar kept waiting on the native open and, once it finished, held the port under a session nobody owned, so every later Connect and Smart Follow poll failed with "busy" until a window reload. The sidecar manager now sends a cancel to the sidecar that owns the abandoned open (never spawning a new one), and the sidecar closes the port and frees its session ID as soon as the open completes. If the port still cannot be released after about 30 s of retries, a warning names the port and offers Reload Window.
 
 ## [2.8.303] — 2026-09-29
 
