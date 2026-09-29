@@ -410,6 +410,23 @@ describe("InventoryProviderRegistry configFieldsOf", () => {
     expect(registry.configFieldsOf(replacement)).toEqual([token()]);
   });
 
+  it("rejects registering a disposed provider object again, and the error names the remedy: register a new provider object", () => {
+    const registry = new InventoryProviderRegistry();
+    const provider = makeProvider();
+    registry.register(provider).dispose();
+
+    let message = "";
+    try {
+      registry.register(provider);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toMatch(/disposed provider object cannot be registered again/);
+    expect(message).toMatch(/Register a new provider object/);
+    // A fresh object with the same id is the remedy the message names, and it works.
+    expect(() => registry.register(makeProvider())).not.toThrow();
+  });
+
   it("rejects registering the same provider object again after its id and fields change, preserving its first copy", () => {
     const registry = new InventoryProviderRegistry();
     const provider = makeProvider({ id: "first", configFields: [host()] });
