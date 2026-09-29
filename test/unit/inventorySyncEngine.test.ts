@@ -4891,6 +4891,22 @@ describe("normalizeInventoryTreeHosts", () => {
     expect(plan.warnings.join("\n")).not.toContain("unusable host and was skipped");
   });
 
+  it("skips an owned telnet-protocol server whose telnet host is malformed even though a valid ssh endpoint exists", () => {
+    const before = makeOwnedServer({
+      host: "10.0.0.1",
+      port: 23,
+      protocol: "telnet",
+      origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1, syncedHost: "10.0.0.1", syncedPort: 23, syncedProtocol: "ssh" }
+    });
+    const { tree, ...hostNormalization } = normalizeInventoryTreeHosts(
+      makeTree([makeDevice({ name: "renamed-sw", endpoints: [{ kind: "ssh", host: "10.0.0.7", port: 22 }, { kind: "telnet", host: "10.0.0.9\u200b", port: 23 }] })])
+    );
+    const plan = computeSyncPlan({ source: makeSource(), tree, hostNormalization, currentServers: [before], now: 2 });
+
+    expect(plan.updates).toEqual([]);
+    expect(plan.warnings).toContain('Device "renamed-sw" (device:1) has an unusable host and was skipped.');
+  });
+
   it("does not let a malformed later duplicate device ID condemn the valid first row", () => {
     const before = makeOwnedServer({
       host: "10.0.0.1",

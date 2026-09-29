@@ -49,12 +49,15 @@ export interface InventoryHostNormalization {
    */
   warnings: string[];
   /**
-   * The normalized tree's device OBJECTS (by identity, not externalId) whose
-   * endpoint that would have been the primary or alternate was rejected. Identity, because
-   * a provider may repeat an externalId: the engine keeps the first row, so a
-   * malformed LATER duplicate must not condemn the valid first one.
+   * Devices that lost at least one endpoint to host rejection, keyed by the
+   * normalized tree's device OBJECT (identity, not externalId: a provider may
+   * repeat an externalId, and the engine keeps the first row, so a malformed
+   * LATER duplicate must not condemn the valid first one). `source` is the
+   * device as fetched, with every endpoint still present, so the engine can run
+   * its own selection rules and ask whether a rejected endpoint is one that
+   * would have been mapped for a given owned server.
    */
-  rejectedConsoleDevices: ReadonlySet<InventoryDevice>;
+  rejectedEndpoints: ReadonlyMap<InventoryDevice, { source: InventoryDevice; rejected: ReadonlySet<InventoryEndpoint> }>;
 }
 
 export interface ComputeSyncPlanInput {
@@ -954,7 +957,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // The host normalizer's own lines are engine text, not provider text, so they
   // start the engine list (and are flattened with it at the return).
   const warnings: string[] = [...(input.hostNormalization?.warnings ?? [])];
-  const hostRejectedDevices = input.hostNormalization?.rejectedConsoleDevices;
+  const hostRejections = input.hostNormalization?.rejectedEndpoints;
 
   // AUTH 1 — the source names a profile by id; the caller supplies the profile
   // it resolved to. The engine only accepts the pair when the two agree.
@@ -1409,15 +1412,17 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     }
     seenExternalIds.set(device.externalId, device.name);
 
-    // HOST-REJECTED SKIP — the normalizer removed the endpoint that would have
-    // been this device's primary or alternate because its host is malformed. For an OWNED server that must behave like a malformed
+    // HOST-REJECTED SKIP — the normalizer removed an endpoint whose host is
+    // malformed, and it is one that would have been mapped for THIS owned
+    // server (see `hostRejectionChangesOwnedServer`). That must behave like a malformed
     // port (skip, record untouched): treating the removal as absence would blank
     // its address or promote its alternate into `host`. A NEW device keeps the
     // documented addressless placeholder, so it falls through. Deliberately also
     // skipped when only the ALTERNATE was rejected (primary fine) and when the
     // owned row is an addressless placeholder awaiting its fill-in: a device
     // whose source data is half-malformed is held back whole until it is clean.
-    if (isOwned && hostRejectedDevices?.has(device)) {
+    const hostRejection = isOwned ? hostRejections?.get(device) : undefined;
+    if (hostRejection && hostRejectionChangesOwnedServer(hostRejection, ownedByExternalId.get(device.externalId))) {
       warnings.push(`Device "${device.name}" (${device.externalId}) has an unusable host and was skipped.`);
       continue;
     }
@@ -4842,14 +4847,35 @@ export function prunedServerIdsForSecretCleanup(plan: InventorySyncPlan): string
 }
 
 /**
+ * Would a rejected endpoint have been mapped onto this owned server? Runs the
+ * engine's own selection over the endpoints AS FETCHED: the primary, the
+ * alternate, and the endpoint of the record's own transport (a telnet-protocol
+ * record follows the telnet endpoint even when an ssh one exists — see
+ * `selectEndpointForProtocol`). A rejected endpoint nothing would have mapped (a
+ * third ssh endpoint, telnet behind a valid ssh one for an ssh record) changes
+ * nothing, so it must not hold the device back.
+ */
+function hostRejectionChangesOwnedServer(
+  { source, rejected }: { source: InventoryDevice; rejected: ReadonlySet<InventoryEndpoint> },
+  owned: ServerConfig | undefined
+): boolean {
+  const mapped = [
+    selectPrimaryEndpoint(source)?.endpoint,
+    selectAltEndpoint(source),
+    selectEndpointForProtocol(source, owned?.protocol)?.endpoint
+  ];
+  return mapped.some((endpoint) => endpoint !== undefined && rejected.has(endpoint));
+}
+
+/**
  * Copy provider endpoints into the host spelling that sync and its remedies can
- * use. A malformed endpoint is removed from the copy; `rejectedConsoleDevices`
+ * use. A malformed endpoint is removed from the copy; `rejectedEndpoints`
  * and `warnings` (engine-authored, so NOT merged into `tree.warnings`) tell
  * `computeSyncPlan` what was removed.
  */
 export function normalizeInventoryTreeHosts(tree: InventoryTree): { tree: InventoryTree } & InventoryHostNormalization {
   const warnings: string[] = [];
-  const rejectedConsoleDevices = new Set<InventoryDevice>();
+  const rejectedEndpoints = new Map<InventoryDevice, { source: InventoryDevice; rejected: ReadonlySet<InventoryEndpoint> }>();
   const devices = tree.devices.map((device) => {
     const rejected = new Set<InventoryEndpoint>();
     const endpoints = device.endpoints.flatMap((endpoint) => {
@@ -4863,20 +4889,14 @@ export function normalizeInventoryTreeHosts(tree: InventoryTree): { tree: Invent
       return [{ ...endpoint, host }];
     });
     const normalizedDevice = { ...device, endpoints };
-    // Only a rejection that changes the mapped server counts: run the engine's
-    // own selection over the UNFILTERED endpoints and ask whether the primary or
-    // alternate it picks is a rejected one. A malformed telnet endpoint behind a
-    // valid ssh one, or a third-or-later ssh endpoint, is never mapped anyway.
+    // Whether a rejection matters depends on the owned server, so the engine
+    // decides (`hostRejectionChangesOwnedServer`); here we only record it.
     if (rejected.size > 0) {
-      const primary = selectPrimaryEndpoint(device)?.endpoint;
-      const alternate = selectAltEndpoint(device);
-      if ((primary && rejected.has(primary)) || (alternate && rejected.has(alternate))) {
-        rejectedConsoleDevices.add(normalizedDevice);
-      }
+      rejectedEndpoints.set(normalizedDevice, { source: device, rejected });
     }
     return normalizedDevice;
   });
-  return { tree: { ...tree, devices }, warnings, rejectedConsoleDevices };
+  return { tree: { ...tree, devices }, warnings, rejectedEndpoints };
 }
 
 /**
