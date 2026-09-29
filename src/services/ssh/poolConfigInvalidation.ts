@@ -1,5 +1,5 @@
 import type { NexusCore } from "../../core/nexusCore";
-import { authProfileOwnedCredentials, proxyConfigsEqual, type AuthProfile } from "../../models/config";
+import { authProfileOwnedCredentials, proxyConfigsEqual, type AuthProfile, type ProxyConfig } from "../../models/config";
 import { pooledConnectionParamsChanged, ridersFromIndex } from "./pooledConnectionParams";
 
 /** What a linked profile contributes to a connection; a rename or an equal reload contributes nothing. */
@@ -37,15 +37,24 @@ function authProfileConnectionChanged(prev: AuthProfile | undefined, next: AuthP
  * only the servers it actually invalidates, with no snapshot copy and no scan.
  */
 export function watchPoolInvalidationOnConfigMutation(
-  core: Pick<NexusCore, "onDidMutateConnectionConfig" | "getSnapshot">,
+  core: Pick<NexusCore, "onDidMutateConnectionConfig" | "onDidChange" | "getServer" | "getSnapshot">,
   pool: { invalidate(serverId: string): void },
   /**
-   * Called synchronously when a server's proxy endpoint changes, so the
-   * endpoint-specific saved proxy password can be made unusable before any
-   * connect that starts ahead of the persistence await reads it.
+   * Endpoint-specific saved proxy password handling, in three reversible steps.
+   * `suspect` runs synchronously when a server's proxy changes: reads must stop
+   * returning the old password while the change is tentative (a connect ahead of
+   * the persistence await must not send it to the new proxy), but nothing is
+   * deleted yet. `lift` runs when a later mutation puts back a proxy equal to the
+   * original (a rollback of a failed save, a manual revert, A -> B -> A). `commit`
+   * runs once the change is persisted (core's change event) and the server's proxy
+   * still differs from the original: only then is the password deleted. A save
+   * that fails with no rollback mutation leaves the tombstone in place, the safe
+   * side: the old password is never sent to the new proxy and is not lost.
    */
-  onProxyChanged?: (serverId: string) => void
+  proxySecrets?: { suspect(serverId: string): void; lift(serverId: string): void; commit(serverId: string): void }
 ): () => void {
+  /** serverId -> the proxy that was in place before the first tentative change. */
+  const originalProxy = new Map<string, ProxyConfig | undefined>();
   const jumpOf = new Map<string, string>();
   const ridersOf = new Map<string, Set<string>>();
   const profileOf = new Map<string, string>();
@@ -81,12 +90,40 @@ export function watchPoolInvalidationOnConfigMutation(
     indexServer(server.id, server);
   }
 
-  return core.onDidMutateConnectionConfig((mutation) => {
+  // The change event fires after a successful save (and after a rollback's
+  // restore): settle every tentative proxy change against the server as it is now.
+  const unsubscribePersisted = proxySecrets
+    ? core.onDidChange(() => {
+        for (const [serverId, original] of [...originalProxy]) {
+          originalProxy.delete(serverId);
+          const current = core.getServer(serverId);
+          if (current && proxyConfigsEqual(original, current.proxy)) {
+            proxySecrets.lift(serverId);
+          } else {
+            proxySecrets.commit(serverId);
+          }
+        }
+      })
+    : undefined;
+
+  const unsubscribeMutations = core.onDidMutateConnectionConfig((mutation) => {
     const invalidated = new Set<string>();
     if (mutation.kind === "server") {
       indexServer(mutation.id, mutation.next);
-      if (mutation.prev && mutation.next && !proxyConfigsEqual(mutation.prev.proxy, mutation.next.proxy)) {
-        onProxyChanged?.(mutation.id);
+      if (proxySecrets && mutation.next) {
+        if (originalProxy.has(mutation.id)) {
+          // Already tentative: the original stays the first one; reverting to it lifts.
+          if (proxyConfigsEqual(originalProxy.get(mutation.id), mutation.next.proxy)) {
+            originalProxy.delete(mutation.id);
+            proxySecrets.lift(mutation.id);
+          }
+        } else if (mutation.prev && !proxyConfigsEqual(mutation.prev.proxy, mutation.next.proxy)) {
+          originalProxy.set(mutation.id, mutation.prev.proxy);
+          proxySecrets.suspect(mutation.id);
+        }
+      } else if (proxySecrets && mutation.next === undefined && originalProxy.delete(mutation.id)) {
+        // The server is gone: its secrets are removed by the removal flow; nothing tentative remains.
+        proxySecrets.commit(mutation.id);
       }
       if (mutation.next === undefined || (mutation.prev && pooledConnectionParamsChanged(mutation.prev, mutation.next))) {
         invalidated.add(mutation.id);
@@ -106,4 +143,8 @@ export function watchPoolInvalidationOnConfigMutation(
       pool.invalidate(dependentId);
     }
   });
+  return () => {
+    unsubscribeMutations();
+    unsubscribePersisted?.();
+  };
 }

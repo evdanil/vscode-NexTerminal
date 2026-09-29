@@ -1294,16 +1294,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // purpose (see poolConfigInvalidation.ts).
   // Also the one place that drops the endpoint-specific saved proxy password when a
   // proxy endpoint changes: tombstoned synchronously (a connect ahead of the save
-  // must not send one proxy's credentials to another), then deleted.
-  const unsubscribeSyncPoolInvalidation = watchPoolInvalidationOnConfigMutation(
-    core,
-    pool,
-    (serverId) => {
-      void secretVault.markStale(proxyPasswordSecretKey(serverId)).catch((error) => {
+  // must not send one proxy's credentials to another), lifted again if the change
+  // is rolled back or reverted, and deleted only once it is persisted.
+  const unsubscribeSyncPoolInvalidation = watchPoolInvalidationOnConfigMutation(core, pool, {
+    suspect: (serverId) => secretVault.suspect(proxyPasswordSecretKey(serverId)),
+    lift: (serverId) => secretVault.lift(proxyPasswordSecretKey(serverId)),
+    commit: (serverId) => {
+      void secretVault.commit(proxyPasswordSecretKey(serverId)).catch((error) => {
         console.error("[Nexus] Could not delete the stale proxy password:", error);
       });
     }
-  );
+  });
   const unsubscribeCore = core.onDidChange(() => {
     syncViews();
   });

@@ -11,11 +11,13 @@ class MemoryVault implements SecretVault {
   public readonly data = new Map<string, string>();
   public deleteGate?: Promise<void>;
   public failDelete = false;
+  public readonly deleted: string[] = [];
   async get(key: string) { return this.data.get(key); }
   async store(key: string, value: string) { this.data.set(key, value); }
   async delete(key: string) {
     await this.deleteGate;
     if (this.failDelete) throw new Error("boom");
+    this.deleted.push(key);
     this.data.delete(key);
   }
 }
@@ -222,9 +224,18 @@ describe("TombstonedSecretVault — ordering", () => {
 
 describe("proxy endpoint edit tombstones the saved proxy password synchronously", () => {
   class SlowRepo extends InMemoryConfigRepository {
-    public release?: () => void;
+    private gates: Array<() => void> = [];
+    public failNext = false;
+    /** Resolves every held save. */
+    public get release(): (() => void) | undefined {
+      return this.gates.length > 0 ? () => { const g = this.gates; this.gates = []; g.forEach((r) => r()); } : undefined;
+    }
     public override async saveServers(servers: ServerConfig[]): Promise<void> {
-      await new Promise<void>((resolve) => { this.release = resolve; });
+      await new Promise<void>((resolve) => { this.gates.push(resolve); });
+      if (this.failNext) {
+        this.failNext = false;
+        throw new Error("save failed");
+      }
       return super.saveServers(servers);
     }
   }
@@ -237,10 +248,12 @@ describe("proxy endpoint edit tombstones the saved proxy password synchronously"
     const repo = new SlowRepo([server()], []);
     const core = new NexusCore(repo);
     await core.initialize();
-    const stop = watchPoolInvalidationOnConfigMutation(core, { invalidate: () => {} }, (id) => {
-      void vault.markStale(proxyPasswordSecretKey(id));
+    const stop = watchPoolInvalidationOnConfigMutation(core, { invalidate: () => {} }, {
+      suspect: (id) => vault.suspect(proxyPasswordSecretKey(id)),
+      lift: (id) => vault.lift(proxyPasswordSecretKey(id)),
+      commit: (id) => { void vault.commit(proxyPasswordSecretKey(id)); }
     });
-    return { core, repo, vault, inner, stop };
+    return { core, repo, vault, inner, stop, deletes: () => inner.deleted };
   }
 
   it("a connect that starts while the save is pending does not see the old proxy's password", async () => {
@@ -272,5 +285,95 @@ describe("proxy endpoint edit tombstones the saved proxy password synchronously"
     await pending;
     expect(await vault.get(key)).toBe("old-secret");
     stop();
+  });
+
+  const newProxy = { type: "socks5" as const, host: "new-proxy", port: 1080, username: "pu" };
+
+  it("a successful save deletes the old password only after persistence; reads stay absent in between", async () => {
+    const { core, repo, vault, inner, stop } = await setup();
+    const pending = core.addOrUpdateServer(server({ proxy: newProxy }));
+    expect(await vault.get(key)).toBeUndefined();
+    expect(inner.deleted).toEqual([]);
+    repo.release?.();
+    await pending;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(inner.deleted).toEqual([key]);
+    expect(await vault.get(key)).toBeUndefined();
+    stop();
+  });
+
+  it("a failed save followed by a rollback restoring the old proxy keeps the old password, never deleted", async () => {
+    const { core, repo, vault, inner, stop } = await setup();
+    const original = core.getServer("s1")!;
+    repo.failNext = true;
+    const failing = core.addOrUpdateServer(server({ proxy: newProxy }));
+    expect(await vault.get(key)).toBeUndefined(); // tentative: not sent to the new proxy
+    repo.release?.();
+    await expect(failing).rejects.toThrow("save failed");
+    expect(await vault.get(key)).toBeUndefined(); // still tentative: no rollback yet, the safe side
+
+    // What an inventory sync's rollback does: put the previous record back.
+    const restoring = core.addOrUpdateServer(original);
+    expect(await vault.get(key)).toBe("old-secret");
+    repo.release?.();
+    await restoring;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(await vault.get(key)).toBe("old-secret");
+    expect(inner.deleted).toEqual([]);
+    stop();
+  });
+
+  it("A -> B -> A before the save lifts the tombstone and deletes nothing", async () => {
+    const { core, repo, vault, inner, stop } = await setup();
+    const original = core.getServer("s1")!;
+    const first = core.addOrUpdateServer(server({ proxy: newProxy }));
+    const second = core.addOrUpdateServer(original);
+    expect(await vault.get(key)).toBe("old-secret");
+    for (let i = 0; i < 2; i++) { repo.release?.(); await new Promise((resolve) => setTimeout(resolve, 0)); }
+    await Promise.all([first, second]);
+    expect(await vault.get(key)).toBe("old-secret");
+    expect(inner.deleted).toEqual([]);
+    stop();
+  });
+
+  it("A -> B -> C keeps the original A: reverting to A lifts it, settling on C deletes once", async () => {
+    const { core, repo, vault, inner, stop } = await setup();
+    const proxyC = { ...newProxy, host: "proxy-c" };
+    const a = core.addOrUpdateServer(server({ proxy: newProxy }));
+    const b = core.addOrUpdateServer(server({ proxy: proxyC }));
+    expect(await vault.get(key)).toBeUndefined();
+    for (let i = 0; i < 2; i++) { repo.release?.(); await new Promise((resolve) => setTimeout(resolve, 0)); }
+    await Promise.all([a, b]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(inner.deleted).toEqual([key]);
+    stop();
+  });
+});
+
+describe("TombstonedSecretVault — suspect / lift / commit", () => {
+  const key = proxyPasswordSecretKey("s1");
+
+  it("suspect hides the value without deleting; lift restores it", async () => {
+    const inner = new MemoryVault();
+    inner.data.set(key, "v");
+    const vault = new TombstonedSecretVault(inner);
+    vault.suspect(key);
+    expect(await vault.get(key)).toBeUndefined();
+    vault.lift(key);
+    expect(await vault.get(key)).toBe("v");
+    expect(inner.deleted).toEqual([]);
+    await vault.commit(key); // nothing pending: no delete
+    expect(inner.data.get(key)).toBe("v");
+  });
+
+  it("a value stored while a deletion is uncommitted cancels that deletion", async () => {
+    const inner = new MemoryVault();
+    inner.data.set(key, "old");
+    const vault = new TombstonedSecretVault(inner);
+    vault.suspect(key);
+    await vault.store(key, "new");
+    await vault.commit(key);
+    expect(await vault.get(key)).toBe("new");
+    expect(inner.deleted).toEqual([]);
   });
 });

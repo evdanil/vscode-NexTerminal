@@ -21,6 +21,10 @@ import type { SecretVault } from "./contracts";
  * A failed delete keeps the tombstone: not sending a possibly stale secret is the
  * safe side.
  *
+ * Reversible for tentative changes: `suspect` tombstones without deleting,
+ * `lift` undoes it (a rolled-back save keeps the original password), and `commit`
+ * deletes once the change is persisted. `markStale` is suspect + commit.
+ *
  * Writes on one key run in order, so a store issued after a stale delete cannot
  * be overtaken and erased by it.
  */
@@ -29,6 +33,8 @@ export class TombstonedSecretVault implements SecretVault {
   /** Bumped by every markStale; a store or delete may clear only the tombstone of its own generation. */
   private readonly generations = new Map<string, number>();
   private readonly tails = new Map<string, Promise<unknown>>();
+  /** Keys tombstoned by suspect() whose deletion has not been committed (and may still be lifted). */
+  private readonly pendingDeletes = new Set<string>();
 
   public constructor(private readonly inner: SecretVault) {}
 
@@ -45,6 +51,9 @@ export class TombstonedSecretVault implements SecretVault {
     // Queued behind any stale delete, so reads stay tombstoned until it is written.
     // It may lift the tombstone only if no markStale happened after it was issued:
     // an older store settling must not clear a newer tombstone.
+    // A value stored for the new endpoint replaces the old one: a still-uncommitted
+    // deletion of the old password must not later erase it.
+    this.pendingDeletes.delete(key);
     const issuedAt = this.generation(key);
     const write = this.enqueue(key, () => this.inner.store(key, value));
     void write.then(
@@ -63,18 +72,45 @@ export class TombstonedSecretVault implements SecretVault {
     return this.enqueue(key, () => this.inner.delete(key));
   }
 
-  /** Makes `key` read as absent immediately, then deletes it. Resolves when the delete has finished. */
-  public markStale(key: string): Promise<void> {
-    const generation = this.generation(key) + 1;
-    this.generations.set(key, generation);
+  /**
+   * Makes `key` read as absent immediately WITHOUT deleting it: the change that
+   * made it stale is still tentative (it may be rolled back). Call `commit` once
+   * it is persisted, or `lift` if it is undone.
+   */
+  public suspect(key: string): void {
+    this.generations.set(key, this.generation(key) + 1);
     this.tombstones.add(key);
+    this.pendingDeletes.add(key);
+  }
+
+  /** The suspected change was undone: the stored value is valid again and was never deleted. */
+  public lift(key: string): void {
+    if (!this.pendingDeletes.delete(key)) {
+      return; // already committed (or never suspected): the value is gone or replaced
+    }
+    this.generations.set(key, this.generation(key) + 1);
+    this.tombstones.delete(key);
+  }
+
+  /** The suspected change is persisted: delete the value. A newer stored value cancels this. Resolves when done. */
+  public commit(key: string): Promise<void> {
+    if (!this.pendingDeletes.delete(key)) {
+      return Promise.resolve();
+    }
+    const generation = this.generation(key);
     return this.enqueue(key, () => this.inner.delete(key)).then(() => {
-      // Only this generation's own tombstone: a newer markStale keeps it until
-      // its own delete lands. A failed delete never reaches here and keeps it.
+      // Only this generation's own tombstone: a newer suspect keeps it until its
+      // own commit lands. A failed delete never reaches here and keeps it.
       if (this.generation(key) === generation) {
         this.tombstones.delete(key);
       }
     });
+  }
+
+  /** Suspect and commit at once: absent immediately, then deleted. Resolves when the delete has finished. */
+  public markStale(key: string): Promise<void> {
+    this.suspect(key);
+    return this.commit(key);
   }
 
   private generation(key: string): number {
