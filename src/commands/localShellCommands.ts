@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as vscode from "vscode";
 import { getMacros } from "../macroSettings";
 import type { LocalShellProfile } from "../models/config";
+import { LOCAL_SHELL_AUTOTRIGGER_WARNING_KEY } from "../storage/noticeKeys";
 import { LocalShellPty, resolveLocalPtySidecarPath } from "../services/local/localShellPty";
 import { configMutationLock } from "../services/configMutationLock";
 import { pickScriptFromWorkspace } from "../services/scripts/scriptPicker";
@@ -38,7 +39,6 @@ interface OpenLocalShellOptions {
 
 const SOURCE_PROFILE_GUIDANCE =
   "This VS Code profile uses source/autodetect and does not expose a launchable executable path to extensions. Auto-trigger macros require Nexus to launch the shell directly. Choose Custom Shell and enter the command, for example pwsh.exe, powershell.exe, cmd.exe, wsl.exe, /bin/bash, or /bin/zsh.";
-const LOCAL_SHELL_AUTOTRIGGER_WARNING_KEY = "nexus.localShell.autoTriggerWarningShown";
 const REVIEW_MACROS_ACTION = "Review Macros";
 const DISABLE_AUTOTRIGGER_ACTION = "Disable Globally";
 const CONTINUE_ACTION = "Continue";

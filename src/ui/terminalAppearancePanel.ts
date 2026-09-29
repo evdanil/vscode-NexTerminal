@@ -57,6 +57,11 @@ export class TerminalAppearancePanel {
     TerminalAppearancePanel.instance = new TerminalAppearancePanel(service);
   }
 
+  /** Re-render an open panel after the service's data changed underneath it (Delete All Data). */
+  public static refreshOpen(): void {
+    TerminalAppearancePanel.instance?.render();
+  }
+
   private render(): void {
     const nonce = createWebviewNonce();
     const fontConfig = this.service.getFontConfig() ?? this.readVsCodeFontConfig();
