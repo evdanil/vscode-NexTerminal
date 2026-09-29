@@ -43,12 +43,16 @@
 // incomplete CSI. That is deliberately out of scope of the latency work: this
 // regex is also the stripper for transcripts and capture buffers, where a
 // never-terminated OSC would then stop stripping anything after it.
+// CAN (0x18) and SUB (0x1a) cancel a control string (OSC/DCS/APC/PM/SOS) per
+// ECMA-48: both the whole-sequence match and the chunk-wise discard state end
+// at them and consume the byte, so text after a cancelled string is kept.
+//
 // Byte classes are spelled as explicit hex ranges (ECMA-48): \x30-\x3F CSI
 // parameter bytes, \x20-\x2F intermediate bytes, \x40-\x7E CSI final bytes,
 // and \x30-\x5A \x5C \x5E-\x7E the two-byte ESC finals (0x30-0x7E without
 // `[` 0x5B and `]` 0x5D, which introduce CSI and OSC).
 export function createAnsiRegex(): RegExp {
-  return /\x1b(?:\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[PX^_][^\x07\x1b]*\x1b\\|[\x20-\x2F]*[\x30-\x5A\x5C\x5E-\x7E])/g;
+  return /\x1b(?:\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]|\][^\x07\x18\x1a\x1b]*(?:[\x07\x18\x1a]|\x1b\\)?|[PX^_][^\x07\x18\x1a\x1b]*(?:\x1b\\|[\x18\x1a])|[\x20-\x2F]*[\x30-\x5A\x5C\x5E-\x7E])/g;
 }
 
 // Longest trailing CSI/nF escape prefix a chunk-wise stripper will hold back.
@@ -64,7 +68,7 @@ const MAX_DISCARDED_STRING = 1024 * 1024;
 const INCOMPLETE_ESCAPE_TAIL_RE = /\x1b(?:\[[\x30-\x3F]*[\x20-\x2F]*|[\x20-\x2F]+)?$/;
 // An OSC/DCS/APC/PM/SOS string still waiting for its terminator; a trailing
 // ESC may be the first half of ST (`ESC \`).
-const INCOMPLETE_STRING_TAIL_RE = /\x1b[\]PX^_][^\x07\x1b]*\x1b?$/;
+const INCOMPLETE_STRING_TAIL_RE = /\x1b[\]PX^_][^\x07\x18\x1a\x1b]*\x1b?$/;
 
 /**
  * State a chunk-wise stripper carries between chunks. Opaque to callers:
@@ -97,7 +101,7 @@ export function stripChunk(carry: StripCarry, chunk: string): { text: string; ca
   let text = "";
 
   if (carry.discarding !== "") {
-    const end = (carry.discarding === "osc" ? /[\x07\x1b]/ : /\x1b/).exec(joined);
+    const end = (carry.discarding === "osc" ? /[\x07\x18\x1a\x1b]/ : /[\x18\x1a\x1b]/).exec(joined);
     if (end === null) {
       const discarded = carry.discarded + joined.length;
       if (discarded > MAX_DISCARDED_STRING) {
@@ -107,7 +111,10 @@ export function stripChunk(carry: StripCarry, chunk: string): { text: string; ca
       return { text: "", carry: { tail: "", discarding: carry.discarding, discarded } };
     }
     let resume = end.index;
-    if (joined.charCodeAt(resume) === 0x07) {
+    const stop = joined.charCodeAt(resume);
+    if (stop === 0x07 || stop === 0x18 || stop === 0x1a) {
+      // BEL (OSC only, by the regex above) or CAN/SUB, which cancel a control
+      // string; the byte itself is consumed, as xterm does.
       resume += 1;
     } else if (resume === joined.length - 1) {
       // ESC at the very end: it may be the first half of ST.

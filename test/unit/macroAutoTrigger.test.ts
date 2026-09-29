@@ -224,6 +224,19 @@ describe("MacroAutoTrigger", () => {
     obs.dispose();
   });
 
+  it("a CAN-cancelled string does not swallow the prompt that follows", () => {
+    setConfig([{ name: "pw", text: "secret\n", triggerPattern: "Password: $" }]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    obs.onOutput("\x1bPpayload");
+    obs.onOutput("\x18Password: ");
+    flush();
+    expect(sent).toEqual(["secret\n"]);
+    obs.dispose();
+  });
+
   it("defers writeBack to next event-loop turn", () => {
     setConfig([
       { name: "pw", text: "secret\n", triggerPattern: "Password:" }

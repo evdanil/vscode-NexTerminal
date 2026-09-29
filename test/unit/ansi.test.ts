@@ -62,6 +62,16 @@ describe("createAnsiRegex", () => {
       expect(run(["a\x1b]0;" + title, "\x1b", "\\b"])).toBe("ab");
     });
 
+    it.each([["CAN", "\x18"], ["SUB", "\x1a"]])("%s cancels a DCS or OSC string, split or in one chunk", (_n, cancel) => {
+      // single chunk, via the regex
+      expect(run([`a\x1bPpayload${cancel}Password: `])).toBe("aPassword: ");
+      expect(run([`a\x1b]0;title${cancel}Password: `])).toBe("aPassword: ");
+      // split: the string is open at the chunk boundary, the cancel arrives later
+      expect(run(["a\x1bPpayload", `more${cancel}Password: `])).toBe("aPassword: ");
+      expect(run(["a\x1b]0;title", `more${cancel}Password: `])).toBe("aPassword: ");
+      expect(run(["a\x1bPpayload", "more", `${cancel}Password: `])).toBe("aPassword: ");
+    });
+
     it("keeps text after an aborting ESC and after a bare ESC pair", () => {
       expect(run(["a\x1bPpayload", "more\x1b[31mred"])).toBe("ared");
     });

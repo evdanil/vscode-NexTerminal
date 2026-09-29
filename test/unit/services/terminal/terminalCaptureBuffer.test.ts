@@ -107,6 +107,14 @@ describe("TerminalCaptureBuffer", () => {
       expect(buf.getText()).toBe("ab");
     });
 
+    it("keeps text after a SUB-cancelled string, split or in one chunk", () => {
+      const buf = new TerminalCaptureBuffer();
+      buf.append("a\x1b]0;title\x1abc\n");
+      buf.append("d\x1bPpayload");
+      buf.append("\x1aef\n");
+      expect(buf.getText()).toBe("abc\ndef");
+    });
+
     it("removes C0 control characters except newline, carriage-return, and tab", () => {
       const buf = new TerminalCaptureBuffer();
       buf.append("bell\x07here\n");
