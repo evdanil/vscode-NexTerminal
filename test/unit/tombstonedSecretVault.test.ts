@@ -323,6 +323,40 @@ describe("proxy endpoint edit tombstones the saved proxy password synchronously"
     stop();
   });
 
+  it("a runtime-only change event while the save is pending does not commit the deletion (the save then fails and rolls back)", async () => {
+    const { core, repo, vault, inner, stop } = await setup();
+    const original = core.getServer("s1")!;
+    repo.failNext = true;
+    const failing = core.addOrUpdateServer(server({ proxy: newProxy }));
+    // A session registering (like tunnels, activity, focus) emits onDidChange with the save still pending.
+    core.registerSession({ id: "sess-1", serverId: "s1", terminalName: "t", startedAt: Date.now() });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(inner.deleted).toEqual([]);
+    expect(await vault.get(key)).toBeUndefined();
+
+    repo.release?.();
+    await expect(failing).rejects.toThrow("save failed");
+    const restoring = core.addOrUpdateServer(original);
+    repo.release?.();
+    await restoring;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(await vault.get(key)).toBe("old-secret");
+    expect(inner.deleted).toEqual([]);
+    stop();
+  });
+
+  it("a failed save alone (no rollback) settles nothing", async () => {
+    const { core, repo, vault, inner, stop } = await setup();
+    repo.failNext = true;
+    const failing = core.addOrUpdateServer(server({ proxy: newProxy }));
+    repo.release?.();
+    await expect(failing).rejects.toThrow("save failed");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(inner.deleted).toEqual([]);
+    expect(await vault.get(key)).toBeUndefined();
+    stop();
+  });
+
   it("A -> B -> A before the save lifts the tombstone and deletes nothing", async () => {
     const { core, repo, vault, inner, stop } = await setup();
     const original = core.getServer("s1")!;
@@ -375,5 +409,39 @@ describe("TombstonedSecretVault — suspect / lift / commit", () => {
     await vault.commit(key);
     expect(await vault.get(key)).toBe("new");
     expect(inner.deleted).toEqual([]);
+  });
+});
+
+describe("wholesale reload settles tentative proxy changes as persisted", () => {
+  const key = proxyPasswordSecretKey("s1");
+  async function reloadWith(reloadedProxy: ServerConfig["proxy"]) {
+    const inner = new MemoryVault();
+    inner.data.set(key, "old-secret");
+    const vault = new TombstonedSecretVault(inner);
+    const repo = new InMemoryConfigRepository([server()], []);
+    const core = new NexusCore(repo);
+    await core.initialize();
+    const stop = watchPoolInvalidationOnConfigMutation(core, { invalidate: () => {} }, {
+      suspect: (id) => vault.suspect(proxyPasswordSecretKey(id)),
+      lift: (id) => vault.lift(proxyPasswordSecretKey(id)),
+      commit: (id) => { void vault.commit(proxyPasswordSecretKey(id)); }
+    });
+    await repo.saveServers([server({ proxy: reloadedProxy })]);
+    await core.initialize();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    stop();
+    return { vault, inner };
+  }
+
+  it("a reload with a changed proxy commits the deletion", async () => {
+    const { vault, inner } = await reloadWith({ type: "socks5", host: "other-proxy", port: 1080, username: "pu" });
+    expect(inner.deleted).toEqual([key]);
+    expect(await vault.get(key)).toBeUndefined();
+  });
+
+  it("a reload with an unchanged proxy touches nothing", async () => {
+    const { vault, inner } = await reloadWith({ type: "socks5", host: "old-proxy", port: 1080, username: "pu" });
+    expect(inner.deleted).toEqual([]);
+    expect(await vault.get(key)).toBe("old-secret");
   });
 });

@@ -191,6 +191,7 @@ export class FolderCascadeSaveError extends Error {
 export class NexusCore {
   private readonly listeners = new Set<NexusListener>();
   private readonly serverRemovalListeners = new Set<ServerRemovalListener>();
+  private readonly serverPersistedListeners = new Set<(servers: readonly ServerConfig[]) => void>();
   private readonly connectionConfigMutationListeners = new Set<ConnectionConfigMutationListener>();
   private readonly servers = new ObservedMap<ServerConfig>((id, prev, next) =>
     this.emitConnectionConfigMutation({ kind: "server", id, prev, next })
@@ -364,8 +365,10 @@ export class NexusCore {
         this.emitConnectionConfigMutation({ kind: "authProfile", id, prev, next });
       }
     }
+    // What was just loaded is what is stored: tentative changes settle now.
+    this.emitServersPersisted([...this.servers.values()]);
     if (normalizedServers.changed) {
-      await this.repository.saveServers(normalizedServers.servers);
+      await this.persistServers(normalizedServers.servers);
     }
     this.emitChanged();
   }
@@ -420,6 +423,18 @@ export class NexusCore {
    * that restores a prior record fires again; the extra invalidation only costs
    * a fresh connection later.
    */
+  /**
+   * Fires after the servers collection was successfully persisted, carrying the
+   * records that were written. Also fires once for `initialize()`, whose loaded
+   * state is by definition what is stored. Unlike `onDidChange` it says nothing
+   * about runtime-only changes, so it is the signal for "this tentative change
+   * is now durable".
+   */
+  public onDidPersistServers(listener: (servers: readonly ServerConfig[]) => void): () => void {
+    this.serverPersistedListeners.add(listener);
+    return () => this.serverPersistedListeners.delete(listener);
+  }
+
   public onDidMutateConnectionConfig(listener: ConnectionConfigMutationListener): () => void {
     this.connectionConfigMutationListeners.add(listener);
     return () => this.connectionConfigMutationListeners.delete(listener);
@@ -734,7 +749,7 @@ export class NexusCore {
         await this.repository.saveAuthProfiles([...this.authProfiles.values()]);
         deletionCommitted = true;
         if (serversChanged) {
-          await this.repository.saveServers([...this.servers.values()]);
+          await this.persistServers([...this.servers.values()]);
         }
         if (previousSources.size > 0) {
           await this.repository.saveInventorySources([...this.inventorySources.values()]);
@@ -1877,7 +1892,7 @@ export class NexusCore {
     this.inventorySyncApplyInFlight = true;
     this.inventorySyncTombstonedSessionIds.clear();
     const results = await Promise.allSettled([
-      this.repository.saveServers([...this.servers.values()]),
+      this.persistServers([...this.servers.values()]),
       this.repository.saveGroups([...this.explicitGroups]),
       this.repository.saveInventorySources([...this.inventorySources.values()])
     ]);
@@ -2212,7 +2227,7 @@ export class NexusCore {
       // the store is still down, memory stays authoritative and the next
       // successful persist heals disk.
       await Promise.allSettled([
-        this.repository.saveServers([...this.servers.values()]),
+        this.persistServers([...this.servers.values()]),
         this.repository.saveGroups([...this.explicitGroups]),
         this.repository.saveInventorySources([...this.inventorySources.values()])
       ]);
@@ -2276,7 +2291,7 @@ export class NexusCore {
       }
     }
     this.servers.set(next.id, next);
-    await this.repository.saveServers([...this.servers.values()]);
+    await this.persistServers([...this.servers.values()]);
     this.emitChanged();
   }
 
@@ -2313,7 +2328,7 @@ export class NexusCore {
       this.servers.set(server.id, server);
     }
     if (servers.length > 0) {
-      await this.repository.saveServers([...this.servers.values()]);
+      await this.persistServers([...this.servers.values()]);
     }
     this.emitChanged();
   }
@@ -2430,7 +2445,7 @@ export class NexusCore {
     // folded into the SINGLE saveServers persist below and the one-shot emit.
     this.clearGatewayReferencesTo(new Set([serverId]));
     this.removeServerSessions(serverId);
-    await this.repository.saveServers([...this.servers.values()]);
+    await this.persistServers([...this.servers.values()]);
     this.emitChanged();
   }
 
@@ -3156,7 +3171,7 @@ export class NexusCore {
     // note at the top of this method), folded into the persist just below.
     this.clearGatewayReferencesTo(cascadeDeletedServerIds);
     const [servers, ...others] = await Promise.allSettled([
-      this.repository.saveServers([...this.servers.values()]),
+      this.persistServers([...this.servers.values()]),
       this.repository.saveSerialProfiles([...this.serialProfiles.values()]),
       this.repository.saveLocalShellProfiles([...this.localShellProfiles.values()]),
       this.repository.saveLocalServers([...this.localServers.values()]),
@@ -3249,7 +3264,7 @@ export class NexusCore {
     }
 
     await Promise.all([
-      this.repository.saveServers([...this.servers.values()]),
+      this.persistServers([...this.servers.values()]),
       this.repository.saveSerialProfiles([...this.serialProfiles.values()]),
       this.repository.saveLocalShellProfiles([...this.localShellProfiles.values()]),
       this.repository.saveLocalServers([...this.localServers.values()]),
@@ -3292,6 +3307,27 @@ export class NexusCore {
   }
 
   private suppressConnectionConfigMutations = false;
+
+  /**
+   * THE way servers reach the repository. Every server-persisting path goes
+   * through here, so `onDidPersistServers` cannot be skipped: it fires only after
+   * `repository.saveServers` resolved, never for runtime-only change events
+   * (sessions, tunnels, focus) and never for a save that rejected.
+   */
+  private async persistServers(servers: ServerConfig[]): Promise<void> {
+    await this.repository.saveServers(servers);
+    this.emitServersPersisted(servers);
+  }
+
+  private emitServersPersisted(servers: readonly ServerConfig[]): void {
+    for (const listener of this.serverPersistedListeners) {
+      try {
+        listener(servers);
+      } catch (error) {
+        console.error("[Nexus] NexusCore onDidPersistServers listener threw; the save already succeeded:", error);
+      }
+    }
+  }
 
   private emitConnectionConfigMutation(mutation: ConnectionConfigMutation): void {
     if (this.suppressConnectionConfigMutations) {

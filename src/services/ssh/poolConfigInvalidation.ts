@@ -37,7 +37,7 @@ function authProfileConnectionChanged(prev: AuthProfile | undefined, next: AuthP
  * only the servers it actually invalidates, with no snapshot copy and no scan.
  */
 export function watchPoolInvalidationOnConfigMutation(
-  core: Pick<NexusCore, "onDidMutateConnectionConfig" | "onDidChange" | "getServer" | "getSnapshot">,
+  core: Pick<NexusCore, "onDidMutateConnectionConfig" | "onDidPersistServers" | "getServer" | "getSnapshot">,
   pool: { invalidate(serverId: string): void },
   /**
    * Endpoint-specific saved proxy password handling, in three reversible steps.
@@ -46,7 +46,7 @@ export function watchPoolInvalidationOnConfigMutation(
    * the persistence await must not send it to the new proxy), but nothing is
    * deleted yet. `lift` runs when a later mutation puts back a proxy equal to the
    * original (a rollback of a failed save, a manual revert, A -> B -> A). `commit`
-   * runs once the change is persisted (core's change event) and the server's proxy
+   * runs once the change is persisted (core's onDidPersistServers) and the server's proxy
    * still differs from the original: only then is the password deleted. A save
    * that fails with no rollback mutation leaves the tombstone in place, the safe
    * side: the old password is never sent to the new proxy and is not lost.
@@ -90,17 +90,25 @@ export function watchPoolInvalidationOnConfigMutation(
     indexServer(server.id, server);
   }
 
-  // The change event fires after a successful save (and after a rollback's
-  // restore): settle every tentative proxy change against the server as it is now.
+  // Settled only by the explicit persistence signal (never by onDidChange, which
+  // also fires for sessions, tunnels and focus while a save is still pending): a
+  // change that reached durable storage commits the deletion if the persisted
+  // proxy still differs from the original, and lifts it if it equals it. A save
+  // that fails settles nothing; a rollback's restore lifts through the mutation
+  // hook above, because the restored proxy equals the original again.
   const unsubscribePersisted = proxySecrets
-    ? core.onDidChange(() => {
+    ? core.onDidPersistServers((persisted) => {
+        if (originalProxy.size === 0) {
+          return;
+        }
+        const byId = new Map(persisted.map((server) => [server.id, server]));
         for (const [serverId, original] of [...originalProxy]) {
           originalProxy.delete(serverId);
-          const current = core.getServer(serverId);
-          if (current && proxyConfigsEqual(original, current.proxy)) {
+          const stored = byId.get(serverId);
+          if (stored && proxyConfigsEqual(original, stored.proxy)) {
             proxySecrets.lift(serverId);
           } else {
-            proxySecrets.commit(serverId);
+            proxySecrets.commit(serverId); // durable state no longer has the original proxy (or the server is gone)
           }
         }
       })
