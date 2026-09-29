@@ -31,3 +31,38 @@ export function pooledConnectionParamsChanged(prev: ServerConfig, next: ServerCo
     JSON.stringify(prev.proxy) !== JSON.stringify(next.proxy)
   );
 }
+
+/**
+ * The servers whose pooled connection rides one of `changedIds` as a jump host,
+ * directly or through further hops (a cycle terminates: each id is visited once).
+ * When a jump host's connection params change, its own pool entry is
+ * soft-invalidated, but a target's pooled transport was built THROUGH the old
+ * jump and would otherwise be reused for the next terminal reconnect or tunnel
+ * over that stale route. Soft invalidation keeps live leases running and only
+ * makes new acquisitions build a fresh connection over the current route.
+ * A linear scan is enough: the servers list is small and this runs on edits.
+ */
+export function serversRidingChangedJumps(
+  servers: readonly ServerConfig[],
+  changedIds: ReadonlySet<string>
+): Set<string> {
+  const affected = new Set<string>();
+  let frontier = new Set(changedIds);
+  while (frontier.size > 0) {
+    const next = new Set<string>();
+    for (const server of servers) {
+      if (
+        server.proxy?.type === "ssh" &&
+        frontier.has(server.proxy.jumpHostId) &&
+        !changedIds.has(server.id) &&
+        !affected.has(server.id)
+      ) {
+        affected.add(server.id);
+        next.add(server.id);
+      }
+    }
+    // Only newly affected servers can lead to further dependents.
+    frontier = next;
+  }
+  return affected;
+}

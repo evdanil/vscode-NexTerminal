@@ -167,8 +167,11 @@ export async function startTunnel(
   // record restored under the same id still differs in what the start uses, so
   // the bulk removal fence is preserved. The descriptor holds the RESOLVED
   // values this attempt uses (effective mode, the pool's multiplexing default,
-  // the per-type route fields, the server fields the tunnel path reads — not
-  // altHost, which is terminal-only), captured now, before any await.
+  // the per-type route fields, the server fields the tunnel path reads, the
+  // jump chain), captured now, before any await. altHost is mode-dependent: it
+  // counts for a shared, multiplexed tunnel, whose pooled lease may have been
+  // made through a terminal's alternate-host fallback, and is ignored for an
+  // isolated tunnel and for a shared one that bypasses the pool.
   const profileAtStart = { ...profile };
   const serverAtStart = cloneServerConfig(server);
   const inputs = { mode: connectionMode, multiplexingDefault, authProfileLookup: (id: string) => core.getAuthProfile(id),

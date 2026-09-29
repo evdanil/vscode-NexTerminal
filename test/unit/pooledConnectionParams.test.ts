@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { pooledConnectionParamsChanged } from "../../src/services/ssh/pooledConnectionParams";
+import { pooledConnectionParamsChanged, serversRidingChangedJumps } from "../../src/services/ssh/pooledConnectionParams";
 import type { ServerConfig } from "../../src/models/config";
 
 function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
@@ -40,5 +40,25 @@ describe("pooledConnectionParamsChanged (PR #67 Codex round 2 — altHost pool i
     const prev = makeServer({ altHost: "2001:db8::1", name: "Old" });
     const next = makeServer({ altHost: "2001:db8::1", name: "Renamed", group: "Folder" });
     expect(pooledConnectionParamsChanged(prev, next)).toBe(false);
+  });
+});
+
+describe("serversRidingChangedJumps", () => {
+  const srv = (id: string, jump?: string) =>
+    ({ id, name: id, host: id, port: 22, username: "u", authType: "password", isHidden: false,
+       ...(jump ? { proxy: { type: "ssh" as const, jumpHostId: jump } } : {}) }) as import("../../src/models/config").ServerConfig;
+
+  it("finds direct and transitive dependents of a changed jump, excluding the changed ones", () => {
+    const servers = [srv("j"), srv("mid", "j"), srv("far", "mid"), srv("other")];
+    expect([...serversRidingChangedJumps(servers, new Set(["j"]))].sort()).toEqual(["far", "mid"]);
+  });
+
+  it("terminates on a cycle", () => {
+    const servers = [srv("a", "b"), srv("b", "a"), srv("t", "a")];
+    expect([...serversRidingChangedJumps(servers, new Set(["a"]))].sort()).toEqual(["b", "t"]);
+  });
+
+  it("finds nothing when no server rides the changed one", () => {
+    expect(serversRidingChangedJumps([srv("x"), srv("y")], new Set(["x"])).size).toBe(0);
   });
 });

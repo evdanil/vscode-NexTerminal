@@ -7,6 +7,7 @@ import type { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 import { createSshTransportStack, type SshTransportStack } from "../../src/services/ssh/sshTransportStack";
 import { handleSocks5Handshake, sendSocks5Success } from "../../src/services/tunnel/socks5";
 import { TunnelStoppedError, type TunnelEvent } from "../../src/services/tunnel/tunnelManager";
+import { serversRidingChangedJumps } from "../../src/services/ssh/pooledConnectionParams";
 import type { PoolEvent } from "../../src/services/ssh/sshConnectionPool";
 
 /**
@@ -918,6 +919,42 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
         await replacement;
       }
     }
+  });
+
+  it("soft-invalidating the targets that ride an edited jump keeps live leases and rebuilds new ones over the current route", async () => {
+    const auth = createAuthFactory();
+    const target = targetServer({ type: "ssh", jumpHostId: jumpServer.id });
+    const stack = buildStack(auth, [jumpServer, target]);
+    const liveLease = await stack.pool.connect(target);
+    cleanups.push(() => liveLease.dispose());
+    expect(auth.callsFor(target.id)).toEqual(["via-proxy"]);
+
+    // What extension.ts does when the jump's params change.
+    stack.pool.invalidate(jumpServer.id);
+    for (const dependent of serversRidingChangedJumps([jumpServer, target], new Set([jumpServer.id]))) {
+      stack.pool.invalidate(dependent);
+    }
+
+    // The live session keeps its transport.
+    expect(auth.disposedIds).not.toContain(target.id);
+    // A reconnect (new acquisition) builds a fresh target connection instead of
+    // reusing the one that rides the old jump.
+    const reconnect = await stack.pool.connect(target);
+    cleanups.push(() => reconnect.dispose());
+    expect(auth.callsFor(target.id)).toEqual(["via-proxy", "via-proxy"]);
+    expect(auth.disposedIds).not.toContain(target.id);
+  });
+
+  it("without invalidating dependents, a reconnect reuses the target transport built through the old jump (the gap the fix closes)", async () => {
+    const auth = createAuthFactory();
+    const target = targetServer({ type: "ssh", jumpHostId: jumpServer.id });
+    const stack = buildStack(auth, [jumpServer, target]);
+    const liveLease = await stack.pool.connect(target);
+    cleanups.push(() => liveLease.dispose());
+    stack.pool.invalidate(jumpServer.id);
+    const reconnect = await stack.pool.connect(target);
+    cleanups.push(() => reconnect.dispose());
+    expect(auth.callsFor(target.id)).toEqual(["via-proxy"]);
   });
 
   it("tags a target connection with its pooled jump's actual route after live jump config changes", async () => {

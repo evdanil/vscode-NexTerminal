@@ -42,7 +42,7 @@ import { SftpService } from "./services/sftp/sftpService";
 import { SudoElevationBroker } from "./services/sftp/sudoElevationBroker";
 import { SilentAuthSshFactory, proxyPasswordSecretKey } from "./services/ssh/silentAuth";
 import { createSshTransportStack } from "./services/ssh/sshTransportStack";
-import { pooledConnectionParamsChanged } from "./services/ssh/pooledConnectionParams";
+import { pooledConnectionParamsChanged, serversRidingChangedJumps } from "./services/ssh/pooledConnectionParams";
 import { watchSshPoolServerRemovals } from "./services/ssh/sshPoolServerRemovalObserver";
 import { Ssh2Connector } from "./services/ssh/ssh2Connector";
 import { VscodeHostKeyVerifier } from "./services/ssh/vscodeHostKeyVerifier";
@@ -1294,10 +1294,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const unsubscribeRemovedSshServerPoolEntries = watchSshPoolServerRemovals(core, pool);
   const unsubscribeCore = core.onDidChange((snapshot) => {
     syncViews();
+    const invalidatedServerIds = new Set<string>();
     for (const server of snapshot.servers) {
       const prev = previousServers.get(server.id);
       if (prev && pooledConnectionParamsChanged(prev, server)) {
         pool.invalidate(server.id);
+        invalidatedServerIds.add(server.id);
         // Clear stale proxy password when proxy endpoint changes to prevent
         // sending one proxy's credentials to a different proxy server.
         if (JSON.stringify(prev.proxy) !== JSON.stringify(server.proxy)) {
@@ -1331,6 +1333,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
       }
       for (const serverId of affectedServerIds) {
         pool.invalidate(serverId);
+        invalidatedServerIds.add(serverId);
+      }
+    }
+    // A target's pooled transport was built through its jump host(s). Editing a
+    // jump (or its auth profile) invalidates only the jump's own entry, so
+    // soft-invalidate every target riding it as well: live sessions keep their
+    // connection, but the next reconnect or tunnel builds a fresh one over the
+    // current route instead of reusing the stale one.
+    if (invalidatedServerIds.size > 0) {
+      for (const dependentId of serversRidingChangedJumps(snapshot.servers, invalidatedServerIds)) {
+        pool.invalidate(dependentId);
       }
     }
     previousServers = new Map(snapshot.servers.map(s => [s.id, s]));
