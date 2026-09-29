@@ -1,4 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { resetLiveViewState } from "../../src/ui/viewStateReset";
+import { createCollapsedFolderStatePersistence } from "../../src/ui/collapsedFolderStatePersistence";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { getMacros, setActiveMacroStore } from "../../src/macroSettings";
 
@@ -1306,5 +1308,20 @@ describe("MacroTreeProvider collapse state (§4.10)", () => {
 
     provider.loadCollapsedFolders(["Cisco"]);
     expect(provider.getCollapsedFolders()).toEqual(["Cisco"]);
+  });
+
+  it("Delete All Data empties the real provider's collapsed set and a later collapse persists only itself (⊘ clearing only the stored key)", async () => {
+    const stored: string[][] = [];
+    const persistence = createCollapsedFolderStatePersistence(async (paths) => { stored.push(paths); }, { debounceMs: 0 });
+    const provider = new MacroTreeProvider();
+    provider.loadCollapsedFolders(["Cisco", "Cisco/Core"]);
+
+    await resetLiveViewState({ trees: [{ provider, persistence }], cwdSync: { setFollowing: () => undefined } });
+
+    expect(provider.getCollapsedFolders()).toEqual([]);
+    provider.collapseFolder("Juniper");
+    persistence.schedule(provider.getCollapsedFolders());
+    await persistence.flush();
+    expect(stored).toEqual([["Juniper"]]);
   });
 });

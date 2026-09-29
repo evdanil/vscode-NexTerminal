@@ -2466,7 +2466,11 @@ describe("a share never hands over a shell command or an unattended tunnel (#254
     for (const browserUrl of [
       "admin:secret@localhost:{localPort}",
       "//admin:secret@host:{localPort}/x",
-      "https://admin:secret@localhost:{localPort}/?a=b@c"
+      "https://admin:secret@localhost:{localPort}/?a=b@c",
+      // Forms a browser normalizes into a URL that still carries the login.
+      " http://admin:secret@localhost:{localPort}/",
+      "http:/\\admin:secret@localhost:{localPort}/",
+      "http:////admin:secret@localhost:{localPort}/"
     ]) {
       const shared = sanitizeForSharing([], [{ ...t, browserUrl } as unknown as TunnelProfile], [], []);
       expect(shared.tunnels[0].browserUrl).not.toContain("secret@");

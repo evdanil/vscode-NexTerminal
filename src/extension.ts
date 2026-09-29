@@ -56,6 +56,7 @@ import { VscodeTunnelRegistryStore } from "./storage/vscodeTunnelRegistryStore";
 import { stopTunnelsForShutdown, TunnelRegistrySync } from "./services/tunnel/tunnelRegistrySync";
 import { FileExplorerTreeProvider } from "./ui/fileExplorerTreeProvider";
 import { createCollapsedFolderStatePersistence } from "./ui/collapsedFolderStatePersistence";
+import { resetLiveViewState } from "./ui/viewStateReset";
 import { FolderTreeItem, NexusTreeProvider } from "./ui/nexusTreeProvider";
 import { ScriptCodeLensProvider } from "./ui/scriptCodeLensProvider";
 import { ScriptTreeProvider } from "./ui/scriptTreeProvider";
@@ -1601,6 +1602,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     activeTunnelIdForProfile: (profileId) => ctx.tunnelManager.getActiveTunnelId(profileId),
     closeSerialProfileTerminals: (profileId) => closeSerialProfileTerminals(ctx, profileId),
     closeLocalShellProfileTerminals: (profileId) => closeLocalShellProfileTerminals(ctx, profileId),
+    resetViewState: () =>
+      resetLiveViewState({
+        trees: [
+          { provider: nexusTreeProvider, persistence: collapsedFolderStatePersistence },
+          { provider: macroTreeProvider, persistence: macroCollapsedFolderStatePersistence }
+        ],
+        cwdSync: cwdSyncCoordinator
+      }),
     resetTerminalAppearance: async () => {
       await colorSchemeService.reset();
       TerminalAppearancePanel.refreshOpen();

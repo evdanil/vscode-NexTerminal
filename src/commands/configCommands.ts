@@ -240,6 +240,12 @@ export interface ConfigRuntimeHooks {
    * refresh an open panel. The stored keys are cleared by the command itself.
    */
   resetTerminalAppearance?(): Promise<void>;
+  /**
+   * Delete All Data: empty the collapsed-folder sets the tree providers hold in
+   * memory, drop their pending writes and turn Follow Terminal Directory off.
+   * Called BEFORE the stored keys are cleared, so no queued write lands after.
+   */
+  resetViewState?(): Promise<void>;
 }
 
 interface RemovedProfileIds {
@@ -1983,19 +1989,36 @@ function loopbackAddressOnly(value: string | undefined): string | undefined {
 
 /**
  * `browserUrl` without a login typed into it. It holds a `{localPort}`
- * placeholder, so it usually does not parse as a URL (`stripUrlUserinfo` would
- * hand it back untouched); the authority is cut out by hand instead: whatever
- * sits between `scheme://` (or `//`, or nothing) and the first `/`, `?` or `#`
- * loses everything up to its last `@`.
+ * placeholder, so it usually does not parse as a URL as written
+ * (`stripUrlUserinfo` would hand it back untouched). Two layers:
+ *  1. The WHATWG parser, which is what a browser applies, with the placeholder
+ *     swapped for a port that is not in the string. It sees through forms a
+ *     pattern would miss — a leading space, `http:/\host`, `http:////host` —
+ *     that a browser normalizes into a URL that still carries the login. Only a
+ *     URL that really holds credentials is rewritten (cleared, serialized, the
+ *     placeholder restored); any other value comes back byte-identical.
+ *  2. For what never parses as an authority-bearing URL (no scheme, or a bare
+ *     `//`), whatever sits before the first `/`, `?` or `#` loses everything up
+ *     to its last `@`.
  */
 function stripBrowserUrlUserinfo(value: string | undefined): string | undefined {
   if (typeof value !== "string") {
     return value;
   }
-  // The scheme is optional, so `admin:secret@localhost:{localPort}` and
-  // `//admin:secret@host/` lose their login too; whatever precedes the first
-  // `/`, `?` or `#` is the authority, and only an authority can hold userinfo.
-  return value.replace(/^((?:[a-z][a-z0-9+.-]*:)?\/\/)?[^/?#]*@/i, (_match, prefix: string | undefined) => prefix ?? "");
+  const port = ["65533", "65532", "65531", "65530"].find((candidate) => !value.includes(candidate));
+  if (port !== undefined) {
+    try {
+      const parsed = new URL(value.replaceAll("{localPort}", port));
+      if (parsed.username !== "" || parsed.password !== "") {
+        parsed.username = "";
+        parsed.password = "";
+        return parsed.href.replaceAll(port, "{localPort}");
+      }
+    } catch {
+      // Not an absolute URL: fall through to the pattern.
+    }
+  }
+  return value.replace(/^(\s*(?:[a-z][a-z0-9+.-]*:)?\/\/)?[^/?#]*@/i, (_match, prefix: string | undefined) => prefix?.trimStart() ?? "");
 }
 
 /** Whether a tunnel record as read from a file carries anything `SHARED_TUNNEL_RULES` resets. */
@@ -5348,6 +5371,7 @@ export function registerConfigCommands(
 
       // Clear macros (globalState + vault entries)
       await getActiveMacroStore().clearAll();
+      await runtime?.resetViewState?.();
       if (context) {
         // Notices, hints, collapsed-folder and follow-directory choices, and the
         // Terminal Appearance store (schemes, selection, font), which lives in

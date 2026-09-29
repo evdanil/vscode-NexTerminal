@@ -1,6 +1,8 @@
 export interface CollapsedFolderStatePersistence {
   schedule(paths: string[]): void;
   flush(): Promise<void>;
+  /** Drop a scheduled write and wait for one already in flight, so nothing lands afterwards. */
+  discard(): Promise<void>;
   dispose(): void;
 }
 
@@ -68,5 +70,14 @@ export function createCollapsedFolderStatePersistence(
     }
   };
 
-  return { schedule, flush, dispose };
+  const discard = async (): Promise<void> => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+    pendingPaths = undefined;
+    await writeChain;
+  };
+
+  return { schedule, flush, discard, dispose };
 }

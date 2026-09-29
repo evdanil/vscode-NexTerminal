@@ -2317,7 +2317,11 @@ describe("Delete All Data (nexus.config.completeReset) covers Local Servers and 
     machine.ctx.state.set("nexus.import.sshConfigOffer.v1", true);
     machine.ctx.state.set("nexus.settingsGuard.eventLog", []);
     const resetTerminalAppearance = vi.fn(async () => undefined);
-    const runtime = { ...recordingRuntime(machine.core), resetTerminalAppearance };
+    let keysWhenViewStateReset = -1;
+    const resetViewState = vi.fn(async () => {
+      keysWhenViewStateReset = machine.ctx.state.has("nexus.ui.collapsedFolders") ? 1 : 0;
+    });
+    const runtime = { ...recordingRuntime(machine.core), resetTerminalAppearance, resetViewState };
 
     await runReset(machine, runtime);
 
@@ -2325,6 +2329,9 @@ describe("Delete All Data (nexus.config.completeReset) covers Local Servers and 
       expect(machine.ctx.state.has(key)).toBe(false);
     }
     expect(resetTerminalAppearance).toHaveBeenCalledTimes(1);
+    // Before the stored keys are cleared, so no queued write can land after them.
+    expect(resetViewState).toHaveBeenCalledTimes(1);
+    expect(keysWhenViewStateReset).toBe(1);
     // Deliberately kept, and named in the confirmation.
     expect(machine.ctx.state.has("nexus.ssh.knownHostFingerprints.v1")).toBe(true);
     expect(machine.ctx.state.has("nexus.import.sshConfigOffer.v1")).toBe(true);

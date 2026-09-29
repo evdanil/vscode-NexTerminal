@@ -5,6 +5,7 @@ import {
   type CwdSyncActiveSessionLike,
   type CwdSyncDeps
 } from "../../src/services/sftp/cwdSyncCoordinator";
+import { resetLiveViewState } from "../../src/ui/viewStateReset";
 import type { CwdRecord } from "../../src/services/terminal/cwdTracker";
 
 // No `vi.mock("vscode")` anywhere in this file — the coordinator must not
@@ -1201,5 +1202,15 @@ describe("CwdSyncCoordinator", () => {
     core.fireChange();
     await vi.advanceTimersByTimeAsync(DEBOUNCE_MS);
     expect(provider.setRootPath).not.toHaveBeenCalled();
+  });
+
+  it("Delete All Data turns a live follow off through the real coordinator (⊘ clearing only the stored flag)", async () => {
+    const { coordinator } = setup();
+    coordinator.setFollowing(true);
+    expect(coordinator.isFollowing()).toBe(true);
+
+    await resetLiveViewState({ trees: [], cwdSync: coordinator });
+
+    expect(coordinator.isFollowing()).toBe(false);
   });
 });
