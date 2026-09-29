@@ -27,6 +27,7 @@ vi.mock("ssh2", () => {
   return { Client: MockClient };
 });
 
+import { isAuthNotJudged } from "../../src/services/ssh/authErrors";
 import { buildConnectConfig, LEGACY_ALGORITHMS, Ssh2Connector } from "../../src/services/ssh/ssh2Connector";
 
 function appendedAlgorithms(value: unknown): readonly string[] {
@@ -152,6 +153,16 @@ describe("Ssh2Connector.connect banner handling", () => {
     client.emit("error", new Error("Timed out while waiting for handshake"));
     await expect(connecting).rejects.toThrow("Timed out while waiting for handshake");
     expect(signal?.aborted).toBe(true);
+  });
+
+  it("rejects a close before ready as an unjudged login, not a credential verdict", async () => {
+    const connector = new Ssh2Connector();
+    const connecting = connector.connect(makeServer(), { password: "pw" });
+    await flushMicrotasks();
+    mockClients.at(-1).emit("close");
+    const error = await connecting.then(() => undefined, (e: unknown) => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(isAuthNotJudged(error)).toBe(true);
   });
 
   it("routes the banner to onAuthMessage immediately and does not buffer it when a callback is provided", async () => {

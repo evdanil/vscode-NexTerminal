@@ -17,6 +17,7 @@ import { promptUntilOwnersInactive, proxyPasswordSecretKey } from "./silentAuth"
 import { isSameAuthenticatedEndpoint } from "../inventory/proxySecretHygiene";
 import { configMutationLock } from "../configMutationLock";
 import { addresslessUnavailableMessage, telnetUnsupportedMessage } from "../../utils/protocolGuards";
+import { AuthNotJudgedError } from "./authErrors";
 
 const MAX_HTTP_RESPONSE_SIZE = 65536; // 64KB — more than enough for CONNECT headers
 
@@ -627,7 +628,7 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       if (shared.owners.every((owner) => owner?.() === false)) {
         this.forgetSharedProxyPassword(target.id, shared);
       }
-      throw new Error("SSH connection attempt ended before authentication completed");
+      throw new AuthNotJudgedError("SSH connection attempt ended before authentication completed");
     }
     return {
       password: result.password,
@@ -666,7 +667,7 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       owners,
       answer: this.authFactory.promptExclusively(() => promptUntilOwnersInactive((signal) => {
         if (owners.every((owner) => owner?.() === false)) {
-          throw new Error("SSH connection attempt ended before its prompt opened");
+          throw new AuthNotJudgedError("SSH connection attempt ended before its prompt opened");
         }
         if (credentialEndpointSignature !== undefined) {
           const live = this.serverLookup(target.id);
