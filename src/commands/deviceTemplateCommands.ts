@@ -24,7 +24,7 @@ import {
   isSameAuthenticatedEndpoint,
   type CapturedProxyPasswordSecret
 } from "../services/inventory/proxySecretHygiene";
-import { proxyPasswordSecretKey } from "../services/ssh/silentAuth";
+import { legacyProxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { deviceTemplateFormDefinition, type ServerListEntry , toSshInfrastructureServerList } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
@@ -1193,7 +1193,7 @@ export function registerDeviceTemplateCommands(ctx: CommandContext, registry: In
               if (vault) {
                 const beforeProxyByKey = new Map<string, { id: string; beforeProxy: typeof proxyChanges[number]["before"]["proxy"] }>();
                 for (const { before } of proxyChanges) {
-                  beforeProxyByKey.set(proxyPasswordSecretKey(before.id), { id: before.id, beforeProxy: before.proxy });
+                  beforeProxyByKey.set(legacyProxyPasswordSecretKey(before.id), { id: before.id, beforeProxy: before.proxy });
                 }
                 const restorable = capturedProxySecrets.filter((secret) => {
                   const origin = beforeProxyByKey.get(secret.key);

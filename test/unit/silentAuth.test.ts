@@ -11,7 +11,8 @@ import {
   authProfilePasswordSecretKey,
   authProfilePassphraseSecretKey,
   passphraseSecretKey,
-  proxyPasswordSecretKey
+  proxyPasswordSecretKey,
+  legacyProxyPasswordSecretKey
 } from "../../src/services/ssh/silentAuth";
 import { AuthNotJudgedError } from "../../src/services/ssh/authErrors";
 import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
@@ -1426,11 +1427,21 @@ describe("deleteServerSecrets", () => {
     return { vault, attempted };
   }
 
-  it("deletes the server's password, passphrase and proxy password — every key saved under its id", async () => {
+  it("deletes the server's password, passphrase and legacy proxy password — every key saved under its id", async () => {
     const { vault, attempted } = vaultFailingOn("none");
     await deleteServerSecrets(vault, "srv-1");
     // ⊘ a list missing a key strands that secret on every delete path.
-    expect(attempted).toEqual([passwordSecretKey("srv-1"), passphraseSecretKey("srv-1"), proxyPasswordSecretKey("srv-1")]);
+    expect(attempted).toEqual([passwordSecretKey("srv-1"), passphraseSecretKey("srv-1"), legacyProxyPasswordSecretKey("srv-1")]);
+  });
+
+  it("also deletes the endpoint-keyed proxy password of every password-bearing proxy it is given", async () => {
+    const { vault, attempted } = vaultFailingOn("none");
+    const socks = { type: "socks5" as const, host: "p", port: 1080, username: "u" };
+    await deleteServerSecrets(vault, "srv-1", { proxies: [socks, { type: "ssh", jumpHostId: "j" }, undefined, socks] });
+    expect(attempted).toEqual([
+      passwordSecretKey("srv-1"), passphraseSecretKey("srv-1"), legacyProxyPasswordSecretKey("srv-1"),
+      proxyPasswordSecretKey("srv-1", socks)
+    ]);
   });
 
   it("rejects on the first failure by default, so a caller that still holds the record can stop", async () => {
@@ -1445,7 +1456,7 @@ describe("deleteServerSecrets", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     // ⊘ stopping at the failure strands the proxy password behind it.
     await expect(deleteServerSecrets(vault, "srv-1", { bestEffort: true })).resolves.toBeUndefined();
-    expect(attempted).toEqual([passwordSecretKey("srv-1"), passphraseSecretKey("srv-1"), proxyPasswordSecretKey("srv-1")]);
+    expect(attempted).toEqual([passwordSecretKey("srv-1"), passphraseSecretKey("srv-1"), legacyProxyPasswordSecretKey("srv-1")]);
     expect(warn).toHaveBeenCalledTimes(1);
     warn.mockRestore();
   });

@@ -1,5 +1,5 @@
 import type { Duplex } from "node:stream";
-import type { AuthProfile, ServerConfig } from "../../models/config";
+import type { AuthProfile, ProxyConfig, ServerConfig } from "../../models/config";
 import { applyAuthProfile } from "../../models/config";
 import { configMutationLock } from "../configMutationLock";
 import type {
@@ -12,6 +12,7 @@ import type {
   SshFactory
 } from "./contracts";
 import { AuthNotJudgedError, isAuthNotJudged } from "./authErrors";
+import { isPasswordBearingProxy, legacyProxyPasswordSecretKey, proxyPasswordSecretKey } from "./proxyPasswordKeys";
 
 export type InputPromptFn = (message: string, password: boolean, signal?: AbortSignal) => Promise<string | undefined>;
 
@@ -50,13 +51,13 @@ export function passphraseSecretKey(serverId: string): string {
   return `passphrase-${serverId}`;
 }
 
-export function proxyPasswordSecretKey(serverId: string): string {
-  return `proxy-password-${serverId}`;
-}
+export { proxyPasswordSecretKey, legacyProxyPasswordSecretKey } from "./proxyPasswordKeys";
 
 /**
  * Deletes every secret saved under a server's own id — its password, key
- * passphrase and proxy password. Every path that deletes a server calls this,
+ * passphrase and the LEGACY per-server proxy password. Endpoint-keyed proxy
+ * passwords are removed by the pool-invalidation hook when the server's record
+ * goes (or its proxy changes), from the record's own proxy. Every path that deletes a server calls this,
  * so a key added here is deleted by all of them.
  *
  * By default the first failed delete rejects, for a caller that has not removed
@@ -67,9 +68,20 @@ export function proxyPasswordSecretKey(serverId: string): string {
 export async function deleteServerSecrets(
   vault: SecretVault,
   serverId: string,
-  options: { bestEffort?: boolean } = {}
+  options: { bestEffort?: boolean; proxies?: ReadonlyArray<ProxyConfig | undefined> } = {}
 ): Promise<void> {
-  for (const key of [passwordSecretKey(serverId), passphraseSecretKey(serverId), proxyPasswordSecretKey(serverId)]) {
+  // Endpoint keys of every proxy the caller knows this id may inherit a password
+  // for: a record about to be replaced or re-added under the same id must not
+  // pick up a secret saved for the same endpoint.
+  const endpointKeys = (options.proxies ?? [])
+    .filter(isPasswordBearingProxy)
+    .map((proxy) => proxyPasswordSecretKey(serverId, proxy));
+  for (const key of [
+    passwordSecretKey(serverId),
+    passphraseSecretKey(serverId),
+    legacyProxyPasswordSecretKey(serverId),
+    ...new Set(endpointKeys)
+  ]) {
     if (!options.bestEffort) {
       await vault.delete(key);
       continue;

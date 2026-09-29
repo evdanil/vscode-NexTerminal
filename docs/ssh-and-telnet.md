@@ -67,7 +67,7 @@ Three proxy types are supported per server:
 If your target server is behind a firewall or bastion host:
 
 1. **SSH Jump Host** — First add the bastion server as a regular server profile, then edit the target server and set its proxy to "SSH Jump Host", selecting the bastion from the dropdown. Multi-hop chains (A → B → C) work automatically.
-2. **SOCKS5 / HTTP CONNECT** — Edit the target server and set its proxy type, entering the proxy host, port, and optional credentials. Proxy passwords are stored securely in VS Code SecretStorage.
+2. **SOCKS5 / HTTP CONNECT** — Edit the target server and set its proxy type, entering the proxy host, port, and optional credentials. Proxy passwords are stored securely in VS Code SecretStorage, one per proxy (type, host, port and user name): changing the proxy stops the old password from being used, and switching back to a proxy finds its saved password again until you save a change that leaves it.
 
 ## Alternate Host
 

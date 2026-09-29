@@ -17,7 +17,8 @@ import { authProfileOwnershipSignature } from "../../src/models/config";
 import { FolderTreeItem, ServerTreeItem } from "../../src/ui/nexusTreeProvider";
 import { readFile } from "node:fs/promises";
 import { defaultSshDir, deployPublicKeyToRemote, findLocalKeyPairs, generateKeyPair } from "../../src/services/ssh/deploySshKey";
-import { SilentAuthSshFactory, passphraseSecretKey, passwordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
+import { SilentAuthSshFactory, passphraseSecretKey, passwordSecretKey, legacyProxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
+import { currentProxyPasswordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/proxyPasswordKeys";
 import { SshPty } from "../../src/services/ssh/sshPty";
 import { TelnetPty } from "../../src/services/telnet/telnetPty";
 import { AsyncMutex, configMutationLock } from "../../src/services/configMutationLock";
@@ -982,6 +983,19 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(disconnectPool).toHaveBeenCalledWith("srv-1");
   });
 
+  it("remove command deletes the endpoint-keyed proxy password of the removed server's own proxy, plus the legacy key", async () => {
+    const proxy = { type: "socks5" as const, host: "proxy.example.com", port: 1080, username: "pu" };
+    const { ctx, secretDelete } = setupHarness({
+      profiles: [], activeTunnels: [], servers: [makeServer({ proxy })]
+    });
+    registerServerCommands(ctx);
+
+    await registeredCommands.get("nexus.server.remove")!("srv-1");
+
+    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1", proxy));
+    expect(secretDelete).toHaveBeenCalledWith(legacyProxyPasswordSecretKey("srv-1"));
+  });
+
   it("remove command stops all remaining tunnels, disconnects pool, and disposes terminals via teardownServerRuntime", async () => {
     const autoStopProfile = makeTunnel({ id: "tp-stop", autoStop: true });
     const keepProfile = makeTunnel({ id: "tp-keep", autoStop: false });
@@ -1010,7 +1024,7 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(disconnectPool).toHaveBeenCalledWith("srv-1");
     expect(secretDelete).toHaveBeenCalledWith(passwordSecretKey("srv-1"));
     expect(secretDelete).toHaveBeenCalledWith(passphraseSecretKey("srv-1"));
-    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
+    expect(secretDelete).toHaveBeenCalledWith(legacyProxyPasswordSecretKey("srv-1"));
     expect(removeServer).toHaveBeenCalledWith("srv-1");
   });
 
@@ -1191,7 +1205,7 @@ describe("server disconnect with tunnel autoStop", () => {
     expect(disconnectPool).toHaveBeenCalledWith("srv-1");
     expect(secretDelete).toHaveBeenCalledWith(passwordSecretKey("srv-1"));
     expect(secretDelete).toHaveBeenCalledWith(passphraseSecretKey("srv-1"));
-    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
+    expect(secretDelete).toHaveBeenCalledWith(legacyProxyPasswordSecretKey("srv-1"));
     expect(removeServer).toHaveBeenCalledWith("srv-1");
     // Substring on the NEGATIVE side on purpose: an exact string here would go
     // green again the moment the refusal is reworded, which is the one thing
@@ -2013,41 +2027,69 @@ describe("formValuesToServer group normalization", () => {
   });
 });
 
+const NEW_ENDPOINT_KEY = proxyPasswordSecretKey("srv-1", { type: "socks5", host: "new-proxy.example.com", port: 1080, username: "proxyuser" });
+const LOCK_TEST_PRIOR_PROXY = { type: "socks5" as const, host: "old-proxy.example.com", port: 1080, username: "proxyuser" };
+
 describe("syncProxyPasswordSecret", () => {
-  it("stores SOCKS5 proxy password when username is set and password provided", async () => {
+  // Stored per endpoint (type + host + port + user name); see proxyPasswordKeys.ts.
+  const socksKey = proxyPasswordSecretKey("srv-1", { type: "socks5", host: "proxy.example.com", port: 1080, username: "user1" });
+  const httpKey = proxyPasswordSecretKey("srv-1", { type: "http", host: "proxy.example.com", port: 3128, username: "user1" });
+
+  it("stores SOCKS5 proxy password under that endpoint's key when username is set and password provided", async () => {
     const { ctx, secretStore } = setupHarness({ profiles: [], activeTunnels: [] });
     await syncProxyPasswordSecret(ctx, "srv-1", {
       proxyType: "socks5",
+      proxySocks5Host: "proxy.example.com",
+      proxySocks5Port: 1080,
       proxySocks5Username: "user1",
       proxySocks5Password: "secret-socks5"
     });
-    expect(secretStore).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"), "secret-socks5");
+    expect(secretStore).toHaveBeenCalledWith(socksKey, "secret-socks5");
+    // Never the legacy per-server key.
+    expect(secretStore).not.toHaveBeenCalledWith(legacyProxyPasswordSecretKey("srv-1"), expect.anything());
   });
 
-  it("stores HTTP proxy password when username is set and password provided", async () => {
+  it("stores HTTP proxy password under that endpoint's key when username is set and password provided", async () => {
     const { ctx, secretStore } = setupHarness({ profiles: [], activeTunnels: [] });
     await syncProxyPasswordSecret(ctx, "srv-1", {
       proxyType: "http",
+      proxyHttpHost: "proxy.example.com",
+      proxyHttpPort: 3128,
       proxyHttpUsername: "user1",
       proxyHttpPassword: "secret-http"
     });
-    expect(secretStore).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"), "secret-http");
+    expect(secretStore).toHaveBeenCalledWith(httpKey, "secret-http");
   });
 
-  it("deletes proxy password when username is removed", async () => {
+  it("a new endpoint's password never lands under the old endpoint's key", async () => {
+    const { ctx, secretStore } = setupHarness({ profiles: [], activeTunnels: [] });
+    await syncProxyPasswordSecret(ctx, "srv-1", {
+      proxyType: "socks5", proxySocks5Host: "other-proxy.example.com", proxySocks5Port: 1080,
+      proxySocks5Username: "user1", proxySocks5Password: "pw-b"
+    });
+    expect(secretStore).toHaveBeenCalledTimes(1);
+    expect(secretStore).not.toHaveBeenCalledWith(socksKey, expect.anything());
+  });
+
+  it("deletes that endpoint's proxy password when its username is removed", async () => {
     const { ctx, secretDelete } = setupHarness({ profiles: [], activeTunnels: [] });
     await syncProxyPasswordSecret(ctx, "srv-1", {
       proxyType: "socks5",
+      proxySocks5Host: "proxy.example.com",
+      proxySocks5Port: 1080,
       proxySocks5Username: "",
       proxySocks5Password: ""
     });
-    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
+    expect(secretDelete).toHaveBeenCalledWith(
+      proxyPasswordSecretKey("srv-1", { type: "socks5", host: "proxy.example.com", port: 1080 })
+    );
   });
 
-  it("deletes proxy password when proxy is disabled", async () => {
-    const { ctx, secretDelete } = setupHarness({ profiles: [], activeTunnels: [] });
+  it("touches nothing when the proxy is disabled: the endpoint the server left is cleaned up after persistence", async () => {
+    const { ctx, secretDelete, secretStore } = setupHarness({ profiles: [], activeTunnels: [] });
     await syncProxyPasswordSecret(ctx, "srv-1", { proxyType: "none" });
-    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
+    expect(secretDelete).not.toHaveBeenCalled();
+    expect(secretStore).not.toHaveBeenCalled();
   });
 
   it("keeps existing secret when password field is blank", async () => {
@@ -3746,8 +3788,8 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     const { ctx, addOrUpdateServer, secretStore } = setupHarness({
       profiles: [],
       activeTunnels: [],
-      servers: [makeServer()],
-      initialSecrets: { [proxyPasswordSecretKey("srv-1")]: "old-proxy-pw" }
+      servers: [makeServer({ proxy: LOCK_TEST_PRIOR_PROXY })],
+      initialSecrets: { [proxyPasswordSecretKey("srv-1", LOCK_TEST_PRIOR_PROXY)]: "old-proxy-pw" }
     });
 
     // Same call-ordering spy as test/unit/configMutationLockRace.test.ts —
@@ -3786,7 +3828,8 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     const capturePromise = configMutationLock.runExclusive(async () => {
       const server = ctx.core.getServer("srv-1")!;
       await gate;
-      const proxyPw = await ctx.secretVault!.get(proxyPasswordSecretKey("srv-1"));
+      // The pre-edit record's proxy endpoint decides which saved password belongs to it.
+      const proxyPw = await ctx.secretVault!.get(currentProxyPasswordSecretKey(server)!);
       return { server, proxyPw };
     });
 
@@ -3835,7 +3878,7 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     // before the capture's gate is ever released — so by the time the
     // gate opens and the capture finally reads the vault, it would read
     // back "new-proxy-pw" instead: a torn pair this assertion catches.
-    expect(captured.server.proxy).toBeUndefined();
+    expect(captured.server.proxy).toEqual(LOCK_TEST_PRIOR_PROXY);
     expect(captured.proxyPw).toBe("old-proxy-pw");
 
     // The edit itself was never blocked forever — once the lock freed up
@@ -3843,7 +3886,11 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     // new generation.
     const saved = addOrUpdateServer.mock.calls[0][0] as ServerConfig;
     expect(saved.proxy).toEqual({ type: "socks5", host: "proxy.example.com", port: 1080, username: "proxyuser" });
-    expect(secretStore).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"), "new-proxy-pw");
+    // Stored under the NEW endpoint's key; the old endpoint's key is untouched here.
+    expect(secretStore).toHaveBeenCalledWith(
+      proxyPasswordSecretKey("srv-1", { type: "socks5", host: "proxy.example.com", port: 1080, username: "proxyuser" }),
+      "new-proxy-pw"
+    );
   });
 
   it("restores the prior server record and the prior proxy-secret value when syncProxyPasswordSecret rejects after addOrUpdateServer already committed the new record, and surfaces the failure (kills committed-record-with-old-secret leftover)", async () => {
@@ -3852,7 +3899,12 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
       profiles: [],
       activeTunnels: [],
       servers: [makeServer({ proxy: priorProxy })],
-      initialSecrets: { [proxyPasswordSecretKey("srv-1")]: "old-proxy-pw" }
+      initialSecrets: {
+        // A password previously saved for the endpoint this edit switches TO (the key the save writes),
+        // and the one saved for the endpoint it leaves, which the edit must never touch.
+        [NEW_ENDPOINT_KEY]: "old-proxy-pw",
+        [proxyPasswordSecretKey("srv-1", { type: "socks5", host: "old-proxy.example.com", port: 1080, username: "proxyuser" })]: "prior-endpoint-pw"
+      }
     });
 
     // syncProxyPasswordSecret's store call for the NEW proxy password fails —
@@ -3890,8 +3942,10 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     // failed store call notwithstanding, a partial-write vault could still
     // have latched it) or leave the key deleted — either way this would not
     // read back the prior "old-proxy-pw".
-    const finalSecret = await ctx.secretVault!.get(proxyPasswordSecretKey("srv-1"));
+    const finalSecret = await ctx.secretVault!.get(NEW_ENDPOINT_KEY);
     expect(finalSecret).toBe("old-proxy-pw");
+    // The endpoint the edit was leaving is never touched, so a rollback finds its own password.
+    expect(await ctx.secretVault!.get(proxyPasswordSecretKey("srv-1", priorProxy))).toBe("prior-endpoint-pw");
   });
 
   it("(FINDING 1, P2) restores the LIVE record committed between form-open and lock acquisition, not the stale form-open snapshot, when the secret write then fails", async () => {
@@ -4559,7 +4613,12 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
       profiles: [],
       activeTunnels: [],
       servers: [makeServer({ proxy: priorProxy })],
-      initialSecrets: { [proxyPasswordSecretKey("srv-1")]: "old-proxy-pw" }
+      initialSecrets: {
+        // A password previously saved for the endpoint this edit switches TO (the key the save writes),
+        // and the one saved for the endpoint it leaves, which the edit must never touch.
+        [NEW_ENDPOINT_KEY]: "old-proxy-pw",
+        [proxyPasswordSecretKey("srv-1", { type: "socks5", host: "old-proxy.example.com", port: 1080, username: "proxyuser" })]: "prior-endpoint-pw"
+      }
     });
 
     registerServerCommands(ctx);
@@ -4613,7 +4672,7 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     // that no longer has a record (nexus.server.remove already deleted this
     // key). This assertion fails against that implementation because the
     // vault would read back "old-proxy-pw" instead of undefined.
-    const finalSecret = await ctx.secretVault!.get(proxyPasswordSecretKey("srv-1"));
+    const finalSecret = await ctx.secretVault!.get(NEW_ENDPOINT_KEY);
     expect(finalSecret).toBeUndefined();
   });
 
@@ -4727,7 +4786,7 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     expect(removeServer).toHaveBeenCalledWith("srv-1");
     expect(secretDelete).toHaveBeenCalledWith(passwordSecretKey("srv-1"));
     expect(secretDelete).toHaveBeenCalledWith(passphraseSecretKey("srv-1"));
-    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
+    expect(secretDelete).toHaveBeenCalledWith(legacyProxyPasswordSecretKey("srv-1"));
   });
 
   it("(FINDING 2, P2) the edit rollback's post-store presence re-check deletes the just-restored proxy-secret key when the record vanishes between the store landing and the re-check (kills a missing belt-and-braces post-store check)", async () => {
@@ -4736,7 +4795,12 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
       profiles: [],
       activeTunnels: [],
       servers: [makeServer({ proxy: priorProxy })],
-      initialSecrets: { [proxyPasswordSecretKey("srv-1")]: "old-proxy-pw" }
+      initialSecrets: {
+        // A password previously saved for the endpoint this edit switches TO (the key the save writes),
+        // and the one saved for the endpoint it leaves, which the edit must never touch.
+        [NEW_ENDPOINT_KEY]: "old-proxy-pw",
+        [proxyPasswordSecretKey("srv-1", { type: "socks5", host: "old-proxy.example.com", port: 1080, username: "proxyuser" })]: "prior-endpoint-pw"
+      }
     });
 
     registerServerCommands(ctx);
@@ -4796,8 +4860,8 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     // record it belongs to no longer exists — an orphaned key. The fix
     // re-checks presence immediately after the store settles and
     // best-effort deletes the key it just wrote when the record is gone.
-    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-1"));
-    const finalSecret = await ctx.secretVault!.get(proxyPasswordSecretKey("srv-1"));
+    expect(secretDelete).toHaveBeenCalledWith(NEW_ENDPOINT_KEY);
+    const finalSecret = await ctx.secretVault!.get(NEW_ENDPOINT_KEY);
     expect(finalSecret).toBeUndefined();
   });
 });
@@ -5628,7 +5692,7 @@ describe("nexus.server.edit — flipping protocol must not destroy the other pro
   // the stored password — the SSH config would come back on a flip-back with a
   // credential silently missing.
   it("keeps the stored proxy password across a flip to Telnet", async () => {
-    const secretKey = proxyPasswordSecretKey("srv-1");
+    const secretKey = currentProxyPasswordSecretKey(CONFIGURED)!;
     const { ctx, secretDelete } = setupHarness({
       profiles: [],
       activeTunnels: [],

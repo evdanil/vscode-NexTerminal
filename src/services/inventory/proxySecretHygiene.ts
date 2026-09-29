@@ -1,6 +1,6 @@
 import type { HttpConnectProxy, ProxyConfig, ServerConfig, Socks5Proxy } from "../../models/config";
 import type { SecretVault } from "../ssh/contracts";
-import { proxyPasswordSecretKey } from "../ssh/silentAuth";
+import { legacyProxyPasswordSecretKey } from "../ssh/silentAuth";
 
 /**
  * PROXY-SECRET HYGIENE — the ONE shared rule for clearing a stale per-server
@@ -153,7 +153,7 @@ export async function clearStaleProxyPasswordSecretsBeforeApply(
     if (isSameAuthenticatedEndpoint(bp, ap)) {
       continue; // still the same authenticated endpoint — the stored password still applies
     }
-    const key = proxyPasswordSecretKey(id);
+    const key = legacyProxyPasswordSecretKey(id);
     let existing: string | undefined;
     try {
       existing = await vault.get(key);

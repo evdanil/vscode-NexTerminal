@@ -16,7 +16,8 @@ import { FolderCascadeSaveError } from "../core/nexusCore";
 import { serverConfigsEqual, type ServerConfig } from "../models/config";
 import { configMutationLock } from "../services/configMutationLock";
 import type { LocalServerManager } from "../services/local/localServerManager";
-import { deleteServerSecrets, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
+import { deleteServerSecrets } from "../services/ssh/silentAuth";
+import { currentProxyPasswordSecretKey } from "../services/ssh/proxyPasswordKeys";
 import { closeSerialProfileTerminals, formValuesToSerial, scanForPort } from "./serialCommands";
 import {
   closeLocalShellProfileTerminals,
@@ -312,9 +313,10 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
                 );
               }
             }
-            if (ctx.secretVault) {
+            const proxySecretKey = currentProxyPasswordSecretKey(server);
+            if (ctx.secretVault && proxySecretKey !== undefined) {
               try {
-                await ctx.secretVault.delete(proxyPasswordSecretKey(server.id));
+                await ctx.secretVault.delete(proxySecretKey);
               } catch {
                 // best-effort rollback — ignore
               }

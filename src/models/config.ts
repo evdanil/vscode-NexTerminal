@@ -24,7 +24,7 @@ export interface Socks5Proxy {
   host: string;
   port: number;
   username?: string;
-  // password stored in SecretStorage: "proxy-password-{serverId}"
+  // password stored in SecretStorage per endpoint: "proxy-password-{serverId}-{endpointHash}" (proxyPasswordKeys.ts)
 }
 
 export interface HttpConnectProxy {
@@ -32,7 +32,7 @@ export interface HttpConnectProxy {
   host: string;
   port: number;
   username?: string;
-  // password stored in SecretStorage: "proxy-password-{serverId}"
+  // password stored in SecretStorage per endpoint: "proxy-password-{serverId}-{endpointHash}" (proxyPasswordKeys.ts)
 }
 
 export type ProxyConfig = SshJumpProxy | Socks5Proxy | HttpConnectProxy;

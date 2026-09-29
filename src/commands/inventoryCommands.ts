@@ -572,7 +572,7 @@ function isSourceConfigMismatchError(error: unknown): boolean {
  */
 async function clearLeftoverSecretsOfAdds(vault: SecretVault, adds: ReadonlyArray<ServerConfig>): Promise<void> {
   try {
-    await runBounded(adds, SECRET_CLEAR_CONCURRENCY, (add) => deleteServerSecrets(vault, add.id));
+    await runBounded(adds, SECRET_CLEAR_CONCURRENCY, (add) => deleteServerSecrets(vault, add.id, { proxies: [add.proxy] }));
   } catch (error) {
     throw new Error(
       "Could not clear old saved credentials for a server this sync adds from the system keychain — nothing was applied, try again.",

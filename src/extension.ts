@@ -42,7 +42,7 @@ import { SftpService } from "./services/sftp/sftpService";
 import { SudoElevationBroker } from "./services/sftp/sudoElevationBroker";
 import { SilentAuthSshFactory, proxyPasswordSecretKey } from "./services/ssh/silentAuth";
 import { createSshTransportStack } from "./services/ssh/sshTransportStack";
-import { TombstonedSecretVault } from "./services/ssh/tombstonedSecretVault";
+import { migrateLegacyProxyPasswords } from "./services/ssh/proxyPasswordKeys";
 import { watchPoolInvalidationOnConfigMutation } from "./services/ssh/poolConfigInvalidation";
 import { Ssh2Connector } from "./services/ssh/ssh2Connector";
 import { VscodeHostKeyVerifier } from "./services/ssh/vscodeHostKeyVerifier";
@@ -381,10 +381,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     resolveLogRotationOptions,
     () => terminalOutputTraceEnabled
   );
-  // Every consumer shares one vault so a stale proxy password can be tombstoned
-  // synchronously (see TombstonedSecretVault) and a password stored by the server
-  // editor for the NEW endpoint clears that tombstone.
-  const secretVault = new TombstonedSecretVault(new VscodeSecretVault(context));
+  const secretVault = new VscodeSecretVault(context);
+  // Move legacy per-server proxy passwords to their endpoint keys before anything
+  // can connect (see proxyPasswordKeys.ts). Idempotent and cross-window safe.
+  await migrateLegacyProxyPasswords(secretVault, core.getSnapshot().servers);
 
   // B4 — the built-in providers are registered up front so they're available
   // to registerInventoryCommands (below) and to any third party registering
@@ -1292,16 +1292,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // in-memory server / auth-profile mutation (initialize() included), ahead of
   // persistence. Nothing invalidates the pool again on the change event below, on
   // purpose (see poolConfigInvalidation.ts).
-  // Also the one place that drops the endpoint-specific saved proxy password when a
-  // proxy endpoint changes: tombstoned synchronously (a connect ahead of the save
-  // must not send one proxy's credentials to another), lifted again if the change
-  // is rolled back or reverted, and deleted only once it is persisted.
+  // Also housekeeping for endpoint-keyed proxy passwords: once a proxy change is
+  // persisted, the password saved for the endpoint the server left is deleted.
+  // Safety does not depend on it: a password is read only for the endpoint it was
+  // entered for (proxyPasswordKeys.ts).
   const unsubscribeSyncPoolInvalidation = watchPoolInvalidationOnConfigMutation(core, pool, {
-    suspect: (serverId) => secretVault.suspect(proxyPasswordSecretKey(serverId)),
-    lift: (serverId) => secretVault.lift(proxyPasswordSecretKey(serverId)),
-    commit: (serverId) => {
-      void secretVault.commit(proxyPasswordSecretKey(serverId)).catch((error) => {
-        console.error("[Nexus] Could not delete the stale proxy password:", error);
+    deleteEndpoint: (serverId, proxy) => {
+      void secretVault.delete(proxyPasswordSecretKey(serverId, proxy)).catch((error) => {
+        console.error("[Nexus] Could not delete a stale proxy password:", error);
       });
     }
   });

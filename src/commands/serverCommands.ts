@@ -24,7 +24,8 @@ import { SshPty } from "../services/ssh/sshPty";
 import { TelnetPty } from "../services/telnet/telnetPty";
 import type { PtyOutputObserver } from "../services/macroAutoTrigger";
 import { Osc7Parser } from "../services/terminal/osc7Parser";
-import { deleteServerSecrets, passwordSecretKey, proxyPasswordSecretKey } from "../services/ssh/silentAuth";
+import { deleteServerSecrets, passwordSecretKey } from "../services/ssh/silentAuth";
+import { currentProxyPasswordSecretKey } from "../services/ssh/proxyPasswordKeys";
 import { serverFormDefinition, toSshInfrastructureServerList } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, ServerTreeItem, SessionTreeItem } from "../ui/nexusTreeProvider";
@@ -640,7 +641,14 @@ export async function syncProxyPasswordSecret(ctx: CommandContext, serverId: str
   if (!ctx.secretVault) {
     return;
   }
-  const secretKey = proxyPasswordSecretKey(serverId);
+  // The password belongs to the proxy ENDPOINT the form describes, so it is stored
+  // under that endpoint's key (see proxyPasswordKeys.ts). The endpoint the server
+  // used before is not touched here: its key is removed after persistence by the
+  // pool-invalidation hook, and until then it is simply never read for this endpoint.
+  const secretKey = currentProxyPasswordSecretKey({ id: serverId, proxy: formValuesToProxy(values) });
+  if (secretKey === undefined) {
+    return;
+  }
   const proxyType = typeof values.proxyType === "string" ? values.proxyType : "none";
 
   if (proxyType === "socks5") {
@@ -668,8 +676,6 @@ export async function syncProxyPasswordSecret(ctx: CommandContext, serverId: str
     }
     return;
   }
-
-  await ctx.secretVault.delete(secretKey);
 }
 
 // ADDRESSLESS (Codex P2-a) — the sentinel port an addressless placeholder carries
@@ -2009,7 +2015,8 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             // Which submitted credentials are this user's own, and which the
             // stored record keeps — see preserveLinkedServerCredentials.
             const linked = preserveLinkedServerCredentials(existing, candidate, linkedProfile);
-            const proxySecretKey = proxyPasswordSecretKey(existing.id);
+            // The endpoint key this save will write (undefined: no password-bearing proxy).
+            const proxySecretKey = currentProxyPasswordSecretKey({ id: existing.id, proxy: formValuesToProxy(values) });
             // FINDING 1 (P2, baseline-before-vault-read review) — this
             // secret-capture await MUST run BEFORE the baseline snapshot
             // (liveRecord) below, and nothing may await between that
@@ -2027,7 +2034,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             // this await settles — and keeping everything from liveRecord
             // through addOrUpdateServer synchronous, with no further await
             // in between — closes that gap entirely.
-            const priorSecretValue = ctx.secretVault ? await ctx.secretVault.get(proxySecretKey) : undefined;
+            const priorSecretValue = ctx.secretVault && proxySecretKey !== undefined ? await ctx.secretVault.get(proxySecretKey) : undefined;
             // FINDING 1 (P2, edit-rollback-staleness review) — capture the
             // LIVE record via ctx.core.getServer(existing.id), not the
             // form-open `existing` snapshot, and do it here — synchronously,
@@ -2313,7 +2320,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
               // otherwise make sure the vault key ends up deleted too
               // (best-effort, same treatment as the no-prior-value case).
               const recordStillPresentAfterRollback = ctx.core.getServer(existing.id) !== undefined;
-              if (ctx.secretVault) {
+              if (ctx.secretVault && proxySecretKey !== undefined) {
                 try {
                   if (recordStillPresentAfterRollback && priorSecretValue !== undefined) {
                     await ctx.secretVault.store(proxySecretKey, priorSecretValue);
@@ -2511,7 +2518,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         }
         await teardownServerRuntime(ctx, server.id);
         if (ctx.secretVault) {
-          await deleteServerSecrets(ctx.secretVault, server.id);
+          await deleteServerSecrets(ctx.secretVault, server.id, { proxies: [server.proxy] });
         }
         await ctx.core.removeServer(server.id);
       });

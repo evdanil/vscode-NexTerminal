@@ -599,7 +599,7 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     if (!proxy.username) {
       return { password: undefined };
     }
-    const stored = await this.vault.get(proxyPasswordSecretKey(target.id));
+    const stored = await this.vault.get(proxyPasswordSecretKey(target.id, proxy));
     if (stored !== undefined) {
       return { password: stored };
     }
@@ -633,7 +633,7 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     return {
       password: result.password,
       ...(result.save && {
-        storeOnSuccess: { key: proxyPasswordSecretKey(target.id), value: result.password }
+        storeOnSuccess: { key: proxyPasswordSecretKey(target.id, proxy), value: result.password }
       }),
       settle: () => this.forgetSharedProxyPassword(target.id, shared)
     };

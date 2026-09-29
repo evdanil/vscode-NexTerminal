@@ -1,6 +1,7 @@
 import type { NexusCore } from "../../core/nexusCore";
-import { authProfileOwnedCredentials, proxyConfigsEqual, type AuthProfile, type ProxyConfig } from "../../models/config";
+import { authProfileOwnedCredentials, proxyConfigsEqual, type AuthProfile } from "../../models/config";
 import { pooledConnectionParamsChanged, ridersFromIndex } from "./pooledConnectionParams";
+import { isPasswordBearingProxy, type PasswordBearingProxy } from "./proxyPasswordKeys";
 
 /** What a linked profile contributes to a connection; a rename or an equal reload contributes nothing. */
 function authProfileConnectionChanged(prev: AuthProfile | undefined, next: AuthProfile | undefined): boolean {
@@ -40,21 +41,16 @@ export function watchPoolInvalidationOnConfigMutation(
   core: Pick<NexusCore, "onDidMutateConnectionConfig" | "onDidPersistServers" | "getServer" | "getSnapshot">,
   pool: { invalidate(serverId: string): void },
   /**
-   * Endpoint-specific saved proxy password handling, in three reversible steps.
-   * `suspect` runs synchronously when a server's proxy changes: reads must stop
-   * returning the old password while the change is tentative (a connect ahead of
-   * the persistence await must not send it to the new proxy), but nothing is
-   * deleted yet. `lift` runs when a later mutation puts back a proxy equal to the
-   * original (a rollback of a failed save, a manual revert, A -> B -> A). `commit`
-   * runs once the change is persisted (core's onDidPersistServers) and the server's proxy
-   * still differs from the original: only then is the password deleted. A save
-   * that fails with no rollback mutation leaves the tombstone in place, the safe
-   * side: the old password is never sent to the new proxy and is not lost.
+   * Housekeeping for endpoint-keyed proxy passwords (see proxyPasswordKeys.ts).
+   * A password is stored per proxy endpoint, so a stale one is never READ for
+   * another endpoint and no ordering against connects matters. Once a change is
+   * persisted, `deleteEndpoint` is called for each endpoint the server no longer
+   * uses; a lost delete leaks nothing readable.
    */
-  proxySecrets?: { suspect(serverId: string): void; lift(serverId: string): void; commit(serverId: string): void }
+  proxySecrets?: { deleteEndpoint(serverId: string, proxy: PasswordBearingProxy): void }
 ): () => void {
-  /** serverId -> the proxy that was in place before the first tentative change. */
-  const originalProxy = new Map<string, ProxyConfig | undefined>();
+  /** serverId -> password-bearing endpoints the server left since the last persist. */
+  const leftEndpoints = new Map<string, PasswordBearingProxy[]>();
   const jumpOf = new Map<string, string>();
   const ridersOf = new Map<string, Set<string>>();
   const profileOf = new Map<string, string>();
@@ -90,25 +86,38 @@ export function watchPoolInvalidationOnConfigMutation(
     indexServer(server.id, server);
   }
 
-  // Settled only by the explicit persistence signal (never by onDidChange, which
-  // also fires for sessions, tunnels and focus while a save is still pending): a
-  // change that reached durable storage commits the deletion if the persisted
-  // proxy still differs from the original, and lifts it if it equals it. A save
-  // that fails settles nothing; a rollback's restore lifts through the mutation
-  // hook above, because the restored proxy equals the original again.
+  // Cleanup runs only on the explicit persistence signal (never onDidChange, which
+  // also fires for sessions, tunnels and focus while a save is pending): an endpoint
+  // the persisted record no longer uses has its saved password deleted. A save
+  // that fails settles nothing, and a rolled-back edit finds its original
+  // endpoint's password untouched, because nothing was deleted before persistence.
   const unsubscribePersisted = proxySecrets
     ? core.onDidPersistServers((persisted) => {
-        if (originalProxy.size === 0) {
+        if (leftEndpoints.size === 0) {
           return;
         }
         const byId = new Map(persisted.map((server) => [server.id, server]));
-        for (const [serverId, original] of [...originalProxy]) {
-          originalProxy.delete(serverId);
+        for (const [serverId, endpoints] of [...leftEndpoints]) {
           const stored = byId.get(serverId);
-          if (stored && proxyConfigsEqual(original, stored.proxy)) {
-            proxySecrets.lift(serverId);
+          const current = core.getServer(serverId);
+          // An endpoint is deletable only when NEITHER the persisted record NOR the
+          // in-memory one uses it: the persisted list can predate a later revert that is
+          // still waiting for its own save. Endpoints still in use stay listed for the
+          // next persist.
+          const stillUsed = (endpoint: PasswordBearingProxy): boolean =>
+            (stored !== undefined && proxyConfigsEqual(stored.proxy, endpoint)) ||
+            (current !== undefined && proxyConfigsEqual(current.proxy, endpoint));
+          const remaining = endpoints.filter((endpoint) => {
+            if (stillUsed(endpoint)) {
+              return true;
+            }
+            proxySecrets.deleteEndpoint(serverId, endpoint);
+            return false;
+          });
+          if (remaining.length > 0) {
+            leftEndpoints.set(serverId, remaining);
           } else {
-            proxySecrets.commit(serverId); // durable state no longer has the original proxy (or the server is gone)
+            leftEndpoints.delete(serverId);
           }
         }
       })
@@ -118,20 +127,16 @@ export function watchPoolInvalidationOnConfigMutation(
     const invalidated = new Set<string>();
     if (mutation.kind === "server") {
       indexServer(mutation.id, mutation.next);
-      if (proxySecrets && mutation.next) {
-        if (originalProxy.has(mutation.id)) {
-          // Already tentative: the original stays the first one; reverting to it lifts.
-          if (proxyConfigsEqual(originalProxy.get(mutation.id), mutation.next.proxy)) {
-            originalProxy.delete(mutation.id);
-            proxySecrets.lift(mutation.id);
-          }
-        } else if (mutation.prev && !proxyConfigsEqual(mutation.prev.proxy, mutation.next.proxy)) {
-          originalProxy.set(mutation.id, mutation.prev.proxy);
-          proxySecrets.suspect(mutation.id);
+      const left = mutation.prev?.proxy;
+      // Only a SURVIVING server's change: a removal's own flow clears its endpoint key
+      // (it knows the record, and Replace deliberately keeps a re-created same-endpoint
+      // server's password, #175), so it must not be deleted here on the removal's persist.
+      if (proxySecrets && isPasswordBearingProxy(left) && mutation.next !== undefined && !proxyConfigsEqual(left, mutation.next.proxy)) {
+        const list = leftEndpoints.get(mutation.id) ?? [];
+        if (!list.some((known) => proxyConfigsEqual(known, left))) {
+          list.push(left);
         }
-      } else if (proxySecrets && mutation.next === undefined && originalProxy.delete(mutation.id)) {
-        // The server is gone: its secrets are removed by the removal flow; nothing tentative remains.
-        proxySecrets.commit(mutation.id);
+        leftEndpoints.set(mutation.id, list);
       }
       if (mutation.next === undefined || (mutation.prev && pooledConnectionParamsChanged(mutation.prev, mutation.next))) {
         invalidated.add(mutation.id);
