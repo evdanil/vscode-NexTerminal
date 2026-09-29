@@ -3,7 +3,7 @@ import type { CommandContext } from "../../src/commands/types";
 import { NexusCore } from "../../src/core/nexusCore";
 import type { ActiveTunnel, TunnelProfile, TunnelRegistryEntry } from "../../src/models/config";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
-import { registerTunnelCommands, startTunnel } from "../../src/commands/tunnelCommands";
+import { isTunnelStartCurrent, registerTunnelCommands, startTunnel } from "../../src/commands/tunnelCommands";
 import type { ServerConfig } from "../../src/models/config";
 import { configMutationLock } from "../../src/services/configMutationLock";
 import { TunnelStoppedError } from "../../src/services/tunnel/tunnelManager";
@@ -860,5 +860,101 @@ describe("startTunnel — profile removed while start is pending", () => {
     await run;
 
     expect(stop).toHaveBeenCalledWith("at-1");
+  });
+
+  it("keeps a start pending across an equal-content replacement of tunnel and server", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const sync = deferred<void>();
+    const start = vi.fn(async () => makeActiveTunnel("t1"));
+    const stop = vi.fn(async () => {});
+    const run = startTunnel(
+      core, { start, stop } as never, { connect: vi.fn() } as never,
+      profile, capturedServer, "isolated",
+      { syncNow: () => sync.promise, checkRemoteOwnership: async () => undefined } as never
+    );
+
+    await core.addOrUpdateTunnel({ ...profile });
+    await core.addOrUpdateServer({ ...capturedServer });
+    sync.resolve();
+    await run;
+
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(stop).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not stop a running start after an equal-content replacement", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const starting = deferred<ActiveTunnel>();
+    const start = vi.fn(() => starting.promise);
+    const stop = vi.fn(async () => {});
+    const run = startTunnel(
+      core, { start, stop } as never, { connect: vi.fn() } as never,
+      profile, capturedServer, "isolated"
+    );
+
+    await core.addOrUpdateTunnel({ ...profile });
+    expect(isTunnelStartCurrent(core, "t1", "srv-1")).toBe(true);
+    starting.resolve(makeActiveTunnel("t1"));
+    await run;
+
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it("tells the user a real change cancelled the start and Retry restarts by id", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const sync = deferred<void>();
+    const start = vi.fn(async () => makeActiveTunnel("t1"));
+    mockShowWarningMessage.mockResolvedValueOnce("Retry");
+    const run = startTunnel(
+      core, { start } as never, { connect: vi.fn() } as never,
+      profile, capturedServer, "isolated",
+      { syncNow: () => sync.promise, checkRemoteOwnership: async () => undefined } as never
+    );
+
+    await core.addOrUpdateTunnel({ ...profile, localPort: profile.localPort + 1 });
+    sync.resolve();
+    await run;
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(start).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("changed while the tunnel was starting"), "Retry");
+    const vscode = await import("vscode");
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("nexus.tunnel.start", "t1");
+  });
+
+  it("warns without Retry and keeps a started tunnel out of the registry check when removed", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const starting = deferred<ActiveTunnel>();
+    const start = vi.fn(() => starting.promise);
+    const stop = vi.fn(async () => {});
+    const run = startTunnel(
+      core, { start, stop } as never, { connect: vi.fn() } as never,
+      profile, capturedServer, "isolated"
+    );
+
+    await core.removeTunnel("t1");
+    expect(isTunnelStartCurrent(core, "t1", "srv-1")).toBe(false);
+    starting.resolve(makeActiveTunnel("t1"));
+    await run;
+
+    expect(stop).toHaveBeenCalledWith("at-1");
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("was removed while the tunnel was starting"));
+  });
+
+  it("rejects an in-flight start for a real change via the started-listener predicate", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const starting = deferred<ActiveTunnel>();
+    const run = startTunnel(
+      core, { start: () => starting.promise, stop: vi.fn(async () => {}) } as never, { connect: vi.fn() } as never,
+      profile, capturedServer, "isolated"
+    );
+
+    await core.addOrUpdateTunnel({ ...profile, remotePort: 9999 });
+    expect(isTunnelStartCurrent(core, "t1", "srv-1")).toBe(false);
+    starting.resolve(makeActiveTunnel("t1"));
+    await run;
+    expect(isTunnelStartCurrent(core, "t1", "srv-1")).toBe(true);
   });
 });

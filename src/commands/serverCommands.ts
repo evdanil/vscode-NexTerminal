@@ -1038,6 +1038,40 @@ export interface ConnectServerOptions {
 }
 
 /**
+ * A connect is cancelled only when its server record is gone or differs in
+ * content from the one the connect began with. An equal-content replacement (an
+ * unchanged editor Save, a Refresh after another window wrote globalState) is
+ * not a change, so object identity is the wrong test — the same reasoning the
+ * Serial and Local Shell start fences use.
+ */
+function isServerUnchangedSince(ctx: CommandContext, atStart: ServerConfig): boolean {
+  const current = ctx.core.getServer(atStart.id);
+  return current !== undefined && serverConfigsEqual(current, atStart);
+}
+
+/** Tells the user why a connect was cancelled and, if the record still exists, offers a Retry that can succeed. */
+function reportCancelledConnect(ctx: CommandContext, atStart: ServerConfig, options: ConnectServerOptions): void {
+  const removed = ctx.core.getServer(atStart.id) === undefined;
+  options.onConnectFailed?.(
+    `Connection to "${atStart.name}" canceled because its server profile ${removed ? "was removed" : "changed"}.`
+  );
+  if (removed) {
+    void vscode.window.showWarningMessage(
+      `Server "${atStart.name}" was removed while the connection was starting. The connection was cancelled.`
+    );
+    return;
+  }
+  void Promise.resolve(vscode.window.showWarningMessage(
+    `Server "${atStart.name}" changed while the connection was starting. The connection was cancelled. Retry with the current settings.`,
+    "Retry"
+  )).then((choice) => {
+    if (choice === "Retry") {
+      void vscode.commands.executeCommand("nexus.server.connect", atStart.id);
+    }
+  });
+}
+
+/**
  * TELNET (Phase 0) — the telnet half of `connectServer`, split out rather than
  * threaded through the SSH one because almost nothing is shared: no auth factory
  * (so no password prompt and no vault read), no OSC 7 / cwd tracking, no SFTP
@@ -1054,6 +1088,7 @@ async function connectTelnetServer(
   server: ServerConfig,
   options: ConnectServerOptions
 ): Promise<void> {
+  const serverAtStart = cloneServerConfig(server);
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
@@ -1061,8 +1096,8 @@ async function connectTelnetServer(
       cancellable: false
     },
     async () => {
-      if (ctx.core.getServer(server.id) !== server) {
-        options.onConnectFailed?.(`Connection to "${server.name}" canceled because its server profile changed.`);
+      if (!isServerUnchangedSince(ctx, serverAtStart)) {
+        reportCancelledConnect(ctx, serverAtStart, options);
         return;
       }
       const terminalName = `Nexus Telnet: ${server.name}`;
@@ -1246,6 +1281,7 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
   }
   const allowAutoFileExplorer = options.allowAutoFileExplorer ?? true;
   let autoFileExplorerHandled = false;
+  const serverAtStart = cloneServerConfig(server);
 
   await vscode.window.withProgress(
     {
@@ -1254,8 +1290,8 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
       cancellable: false
     },
     async () => {
-      if (ctx.core.getServer(server.id) !== server) {
-        options.onConnectFailed?.(`Connection to "${server.name}" canceled because its server profile changed.`);
+      if (!isServerUnchangedSince(ctx, serverAtStart)) {
+        reportCancelledConnect(ctx, serverAtStart, options);
         return;
       }
       const terminalName = `Nexus SSH: ${server.name}`;
@@ -1314,7 +1350,11 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
               }
             }
 
-            for (const tunnel of ctx.core.getSnapshot().tunnels) {
+            // onSessionOpened also fires on every R reconnect, so `server` (the
+            // connect-time object) can be stale by hours. Start tunnels against
+            // the live record; if it is gone there is nothing to start.
+            const liveServer = ctx.core.getServer(server.id);
+            for (const tunnel of liveServer ? ctx.core.getSnapshot().tunnels : []) {
               if (tunnel.autoStart && tunnel.defaultServerId === server.id) {
                 // Silently skip tunnels that are already running
                 if (ctx.core.getSnapshot().activeTunnels.some((t) => t.profileId === tunnel.id)) {
@@ -1324,7 +1364,7 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
                   if (!mode) {
                     return;
                   }
-                  return startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, tunnel, server, mode, ctx.registrySync);
+                  return startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, tunnel, liveServer!, mode, ctx.registrySync);
                 });
               }
             }

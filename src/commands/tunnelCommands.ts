@@ -9,7 +9,7 @@ import type {
   TunnelProfile,
   TunnelType
 } from "../models/config";
-import { resolveTunnelType } from "../models/config";
+import { cloneServerConfig, resolveTunnelType, serverConfigsEqual } from "../models/config";
 import { configMutationLock } from "../services/configMutationLock";
 import type { SshFactory } from "../services/ssh/contracts";
 import { TunnelStartCancelledError, TunnelStoppedError, type TunnelManager } from "../services/tunnel/tunnelManager";
@@ -125,6 +125,21 @@ export async function resolveServerForTunnel(
   return pick?.server;
 }
 
+/**
+ * Content fences of tunnel starts currently inside `tunnelManager.start`, by
+ * profile id. Lets the "started" listener apply the same predicate as
+ * `startTunnel` instead of a weaker presence check.
+ */
+const pendingStartFences = new Map<string, () => boolean>();
+
+/** Whether a just-started tunnel should be registered (false: startTunnel is about to stop it). */
+export function isTunnelStartCurrent(core: NexusCore, profileId: string, serverId: string): boolean {
+  if (!core.getTunnel(profileId) || !core.getServer(serverId)) {
+    return false;
+  }
+  return pendingStartFences.get(profileId)?.() ?? true;
+}
+
 export async function startTunnel(
   core: NexusCore,
   tunnelManager: TunnelManager,
@@ -134,7 +149,39 @@ export async function startTunnel(
   connectionMode: ResolvedTunnelConnectionMode,
   registrySync?: TunnelRegistrySync
 ): Promise<void> {
-  const stillCurrent = () => core.getTunnel(profile.id) === profile && core.getServer(server.id) === server;
+  // Content, not identity: an unchanged editor Save or a Refresh replaces a
+  // record with an equal copy, which must not cancel a start. A different
+  // record restored under the same id still differs in content, so the bulk
+  // removal fence is preserved. Snapshots are taken now, before any await.
+  const profileAtStart = JSON.stringify(profile);
+  const serverAtStart = cloneServerConfig(server);
+  const stillCurrent = (): boolean => {
+    const liveProfile = core.getTunnel(profile.id);
+    const liveServer = core.getServer(server.id);
+    return (
+      liveProfile !== undefined &&
+      JSON.stringify(liveProfile) === profileAtStart &&
+      liveServer !== undefined &&
+      serverConfigsEqual(liveServer, serverAtStart)
+    );
+  };
+  const reportCancelled = (): void => {
+    const liveProfile = core.getTunnel(profile.id);
+    if (!liveProfile || !core.getServer(server.id)) {
+      void vscode.window.showWarningMessage(
+        `Tunnel "${profile.name}" or its server was removed while the tunnel was starting. The start was cancelled.`
+      );
+      return;
+    }
+    void Promise.resolve(vscode.window.showWarningMessage(
+      `Tunnel "${profile.name}" or its server changed while the tunnel was starting. The start was cancelled. Retry with the current settings.`,
+      "Retry"
+    )).then((choice) => {
+      if (choice === "Retry") {
+        void vscode.commands.executeCommand("nexus.tunnel.start", profile.id);
+      }
+    });
+  };
   // TELNET (Phase 0) — port forwarding is an SSH channel feature and telnet has
   // no equivalent. THE one guard for every route into starting a tunnel: the
   // command, the tree's drag-and-drop of a tunnel profile onto a server, the
@@ -230,9 +277,10 @@ export async function startTunnel(
   }
 
   // Registry and authentication work can outlive Replace or Delete All Data.
-  // Checking object identity also rejects a different profile restored with
-  // the same ID before this start resumes.
+  // Comparing content also rejects a different profile restored with the same
+  // ID before this start resumes.
   if (!stillCurrent()) {
+    reportCancelled();
     return;
   }
 
@@ -244,9 +292,21 @@ export async function startTunnel(
           }
         }
       : undefined;
-    const active = await tunnelManager.start(profile, server, { connectionMode, beforeReverseForward });
+    // The manager emits "started" from inside start(), before it returns, so
+    // the extension.ts listener consults this fence to keep a start that is
+    // about to be stopped out of the registry.
+    pendingStartFences.set(profile.id, stillCurrent);
+    let active;
+    try {
+      active = await tunnelManager.start(profile, server, { connectionMode, beforeReverseForward });
+    } finally {
+      if (pendingStartFences.get(profile.id) === stillCurrent) {
+        pendingStartFences.delete(profile.id);
+      }
+    }
     if (!stillCurrent()) {
       await tunnelManager.stop(active.id);
+      reportCancelled();
     }
   } catch (error) {
     // Stopped before it finished connecting: the stop was asked for, so there

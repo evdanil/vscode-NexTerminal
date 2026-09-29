@@ -46,6 +46,13 @@ vi.mock("../../src/services/ssh/deploySshKey", () => ({
   deployPublicKeyToRemote: vi.fn(async () => ({ alreadyDeployed: false }))
 }));
 
+const mockStartTunnel = vi.fn(async (..._args: unknown[]) => {});
+vi.mock("../../src/commands/tunnelCommands", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/commands/tunnelCommands")>()),
+  startTunnel: (...args: unknown[]) => mockStartTunnel(...args),
+  resolveTunnelConnectionMode: vi.fn(async () => "shared")
+}));
+
 const mockAddOutputObserver = vi.fn((_observer: unknown) => ({ dispose: vi.fn() }));
 
 vi.mock("../../src/services/ssh/sshPty", () => ({
@@ -176,6 +183,94 @@ describe("connectServer — server removed while progress is pending", () => {
     expect(TelnetPty).not.toHaveBeenCalled();
     expect(vscode.window.createTerminal).not.toHaveBeenCalled();
     expect(onConnectFailed).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("connectServer — equal-content replacement while progress is pending", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function holdProgress(): () => void {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(
+      async (_options: unknown, task: () => Promise<unknown>) => {
+        await pending;
+        return task();
+      }
+    );
+    return release;
+  }
+
+  it.each(["ssh", "telnet"] as const)("still opens the %s terminal after an equal-content save", async (protocol) => {
+    const server = makeServer({ protocol });
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const release = holdProgress();
+
+    const run = connectServer(ctx, server.id);
+    await addOrUpdateServer({ ...server });
+    release();
+    await run;
+
+    expect(vscode.window.createTerminal).toHaveBeenCalled();
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it.each(["ssh", "telnet"] as const)("cancels a %s connect on a real change with a visible Retry, even without onConnectFailed", async (protocol) => {
+    const server = makeServer({ protocol });
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const release = holdProgress();
+    mockShowWarningMessage.mockResolvedValueOnce("Retry");
+
+    const run = connectServer(ctx, server.id);
+    await addOrUpdateServer({ ...server, host: "changed.example" });
+    release();
+    await run;
+    await flushPromises();
+
+    expect(vscode.window.createTerminal).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("changed while the connection was starting"), "Retry");
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("nexus.server.connect", "srv-1");
+  });
+
+  it("shows a removal message without Retry when the server is gone", async () => {
+    const server = makeServer();
+    const { ctx, removeServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const release = holdProgress();
+
+    const run = connectServer(ctx, server.id);
+    await removeServer(server.id);
+    release();
+    await run;
+
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("was removed while the connection was starting"));
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexus.server.connect", "srv-1");
+  });
+});
+
+describe("connectServer — auto-start sweep uses the live server record", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(vscode.window.withProgress as any).mockImplementation(
+      async (_options: unknown, task: () => Promise<unknown>) => task()
+    );
+  });
+
+  it("starts an autoStart tunnel on reconnect with the record saved after connect began", async () => {
+    const server = makeServer();
+    const tunnel = makeTunnel({ autoStart: true, defaultServerId: "srv-1" });
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [tunnel], activeTunnels: [], servers: [server] });
+
+    await connectServer(ctx, server.id);
+    const callbacks = latestSshCallbacks();
+    const saved = { ...server };
+    await addOrUpdateServer(saved);
+    callbacks.onSessionOpened("session-1");
+    await flushPromises();
+
+    expect(mockStartTunnel).toHaveBeenCalledTimes(1);
+    expect(mockStartTunnel.mock.calls[0][4]).toBe(saved);
   });
 });
 

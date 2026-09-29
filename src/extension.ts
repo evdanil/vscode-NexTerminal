@@ -86,7 +86,7 @@ import { InventoryProviderRegistry } from "./services/inventory/providerRegistry
 import { createBuiltInProviders } from "./services/inventory/builtInProviders";
 import { statusPollSources } from "./services/inventory/statusPollSources";
 import { createNexusExtensionApi, type NexusExtensionApi } from "./services/inventory/publicApi";
-import { resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
+import { isTunnelStartCurrent, resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
 import { MacroTreeItem, MacroTreeProvider } from "./ui/macroTreeProvider";
 import { buildMacroProfileInputsFromSnapshot } from "./ui/macroProfileOptions";
 import { VscodeColorSchemeStorage } from "./storage/vscodeColorSchemeStorage";
@@ -1344,7 +1344,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
       // A start already in progress can emit after bulk removal. Keep that
       // orphan out of both the core snapshot and the cross-window registry;
       // startTunnel stops it as soon as the manager returns.
-      if (!core.getTunnel(event.tunnel.profileId) || !core.getServer(event.tunnel.serverId)) {
+      if (!isTunnelStartCurrent(core, event.tunnel.profileId, event.tunnel.serverId)) {
         return;
       }
       core.registerTunnel(event.tunnel);

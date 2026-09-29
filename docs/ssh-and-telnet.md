@@ -95,6 +95,10 @@ Per-server toggle lets you disable multiplexing for devices that don't support m
 
 Automatic fallback to standalone connections handles channel failures transparently.
 
+## If the Server Changes While Connecting
+
+If the server is removed or its settings change while a connection is still starting, Nexus cancels the connect and shows a notice, with **Retry** when the server still exists. Saving the server without changes, or refreshing after another window saved, does not cancel it. This applies to SSH and Telnet.
+
 ## When a Session Drops
 
 Faults that arrive *after* a session is up — a keepalive timeout, a protocol error, the connection closing — are recorded in the **Nexus SSH** output channel, so a terminal that drops on its own leaves a cause behind instead of only "Connection lost".
