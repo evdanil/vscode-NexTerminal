@@ -164,7 +164,7 @@ describe("production serial sidecar worker request handler", () => {
         finishOpen = callback;
       };
       const opening = handler(openRequest("open-slow"));
-      await handler({ id: "close-1", method: "closePort", params: { sessionId: "session-17" } });
+      await handler({ id: "cancel-1", method: "cancelAbandonedOpen", params: { sessionId: "session-17" } });
       finishOpen();
       return opening;
     }
@@ -222,6 +222,46 @@ describe("production serial sidecar worker request handler", () => {
 
       expect(closeSpy).toHaveBeenCalledTimes(6);
       expect(stderr).not.toHaveBeenCalled();
+    });
+  });
+
+  it("releases in the background, then reports, when the open settled just before the cancel arrived", async () => {
+    vi.useFakeTimers();
+    try {
+      const { handler, output } = makeHandler();
+      const stderr = vi.spyOn(console, "error").mockImplementation(() => {});
+      const closeSpy = vi
+        .spyOn(ControlledSerialPort.prototype, "close")
+        .mockImplementation((callback: OpenCallback) => callback(new Error("EBUSY close")));
+
+      // The open succeeded (its reply was lost to the manager's timeout) and the
+      // session is registered when the cancel arrives.
+      await expect(handler(openRequest("open-late"))).resolves.toEqual({
+        id: "open-late",
+        result: { sessionId: "session-17" }
+      });
+      const cancel = handler({ id: "cancel-1", method: "cancelAbandonedOpen", params: { sessionId: "session-17" } });
+      await vi.advanceTimersByTimeAsync(500);
+      await expect(cancel).resolves.toEqual({ id: "cancel-1", result: { ok: true } });
+      const afterFirstRound = closeSpy.mock.calls.length;
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(closeSpy.mock.calls.length).toBeGreaterThan(afterFirstRound);
+      expect(output).toContainEqual({
+        method: "portReleaseFailed",
+        params: { sessionId: "session-17", path: "/dev/ttyUSB0", message: expect.stringContaining("EBUSY close") }
+      });
+      expect(stderr).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores cancelAbandonedOpen for an unknown or already released session", async () => {
+    const { handler } = makeHandler();
+    await expect(handler({ id: "c", method: "cancelAbandonedOpen", params: { sessionId: "nope" } })).resolves.toEqual({
+      id: "c",
+      result: { ok: true }
     });
   });
 

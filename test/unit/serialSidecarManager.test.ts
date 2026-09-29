@@ -53,7 +53,7 @@ describe("SerialSidecarManager open cancellation", () => {
     vi.useRealTimers();
   });
 
-  it("sends closePort for the opening session id to the same child when openPort times out", async () => {
+  it("sends cancelAbandonedOpen for the opening session id to the same child when openPort times out", async () => {
     const manager = new SerialSidecarManager("worker.js", undefined, 2000);
     const opening = manager.openPort({ path: "COM9", baudRate: 9600 }, "opening-1");
     const assertion = expect(opening).rejects.toThrow("timed out");
@@ -61,13 +61,14 @@ describe("SerialSidecarManager open cancellation", () => {
     await assertion;
 
     expect(spawnMock).toHaveBeenCalledTimes(1);
-    const closes = children[0].writes.filter((w) => w.method === "closePort");
+    const closes = children[0].writes.filter((w) => w.method === "cancelAbandonedOpen");
+    expect(children[0].writes.filter((w) => w.method === "closePort")).toEqual([]);
     expect(closes).toHaveLength(1);
     expect(closes[0].params.sessionId).toBe("opening-1");
     manager.dispose();
   });
 
-  it("sends no closePort when the worker rejects the open itself, e.g. a duplicate session id", async () => {
+  it("sends no cancel when the worker rejects the open itself, e.g. a duplicate session id", async () => {
     const manager = new SerialSidecarManager("worker.js");
     const opening = manager.openPort({ path: "COM9", baudRate: 9600 }, "dup-1");
     const assertion = expect(opening).rejects.toThrow("serial session ID is already in use");
@@ -79,7 +80,7 @@ describe("SerialSidecarManager open cancellation", () => {
     await assertion;
     await tick();
 
-    expect(children[0].writes.filter((w) => w.method === "closePort")).toEqual([]);
+    expect(children[0].writes.filter((w) => w.method !== "openPort")).toEqual([]);
     manager.dispose();
   });
 

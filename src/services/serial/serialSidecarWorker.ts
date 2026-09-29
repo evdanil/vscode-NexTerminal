@@ -115,6 +115,7 @@ export function createSerialSidecarRequestHandler(dependencies: {
   // open would then complete unreachable), so it flags the open as cancelled
   // and the openPort handler closes the port once open() settles.
   const openingSessions = new Map<string, { cancelled: boolean }>();
+  const portPaths = new WeakMap<PortRecord, string>();
   let serialLoadError = "serialport module not available";
   const writeLine = dependencies.writeLine ?? writeOutputLine;
   const loadSerialModule =
@@ -128,6 +129,26 @@ export function createSerialSidecarRequestHandler(dependencies: {
         return undefined;
       }
     });
+
+  /**
+   * Releases a registered port whose owner has walked away. Unregisters first
+   * so the close event is not reported as a disconnect; on a failed close the
+   * port stays reserved while the worker keeps retrying without an owner.
+   * Returns the close error, if any.
+   */
+  async function abandonPort(sessionId: string, port: PortRecord): Promise<Error | undefined> {
+    if (ports.get(sessionId) === port) {
+      ports.delete(sessionId);
+    }
+    const closeError = await closeWithRetry(port);
+    if (closeError) {
+      ports.set(sessionId, port);
+      void releaseAbandonedPort(sessionId, portPaths.get(port) ?? "", port, closeError);
+      return closeError;
+    }
+    detachPort(port);
+    return undefined;
+  }
 
   async function releaseAbandonedPort(sessionId: string, portPath: string, port: PortRecord, firstError: Error): Promise<void> {
     let lastError = firstError;
@@ -231,6 +252,7 @@ export function createSerialSidecarRequestHandler(dependencies: {
         }
       });
       ports.set(sessionId, port);
+      portPaths.set(port, params.path);
       const openState = { cancelled: false };
       openingSessions.set(sessionId, openState);
       try {
@@ -249,28 +271,22 @@ export function createSerialSidecarRequestHandler(dependencies: {
         }
       }
       if (openState.cancelled) {
-        // The caller gave up on this open. Unregister first so the close event
-        // is not reported as a disconnect, then release the device.
-        if (ports.get(sessionId) === port) {
-          ports.delete(sessionId);
-        }
+        // The caller gave up on this open; release the device it just opened.
         if (closedWhileOpening) {
           // The port closed itself before the cancel arrived; there is nothing
           // left to release, and closing again would only fail "not open".
+          if (ports.get(sessionId) === port) {
+            ports.delete(sessionId);
+          }
           detachPort(port);
           return response(request.id, undefined, "Serial port open cancelled");
         }
-        const closeError = await closeWithRetry(port);
-        if (closeError) {
-          // The descriptor may still be held and the owner has given up, so no
-          // later closePort will come. Keep the id reserved (the port stays
-          // reachable) while the worker keeps retrying on its own.
-          ports.set(sessionId, port);
-          void releaseAbandonedPort(sessionId, params.path, port, closeError);
-          return response(request.id, undefined, `Serial port open cancelled; close failed: ${closeError.message}`);
-        }
-        detachPort(port);
-        return response(request.id, undefined, "Serial port open cancelled");
+        const closeError = await abandonPort(sessionId, port);
+        return response(
+          request.id,
+          undefined,
+          closeError ? `Serial port open cancelled; close failed: ${closeError.message}` : "Serial port open cancelled"
+        );
       }
       if (closedWhileOpening) {
         detachPort(port);
@@ -313,6 +329,25 @@ export function createSerialSidecarRequestHandler(dependencies: {
       await new Promise<void>((resolve, reject) => {
         port.set({ brk: false }, (error) => (error ? reject(error) : resolve()));
       });
+      return response(request.id, { ok: true });
+    }
+
+    if (request.method === "cancelAbandonedOpen") {
+      // The owner timed out waiting for an open and will never close this id, so
+      // it is handled the same whichever side of the native open it landed on.
+      const params = request.params as { sessionId?: string };
+      if (!params?.sessionId) {
+        return response(request.id, undefined, "invalid cancelAbandonedOpen parameters");
+      }
+      const openState = openingSessions.get(params.sessionId);
+      if (openState) {
+        openState.cancelled = true;
+        return response(request.id, { ok: true });
+      }
+      const port = ports.get(params.sessionId);
+      if (port) {
+        await abandonPort(params.sessionId, port);
+      }
       return response(request.id, { ok: true });
     }
 

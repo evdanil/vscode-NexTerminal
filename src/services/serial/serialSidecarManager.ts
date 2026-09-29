@@ -132,7 +132,7 @@ export class SerialSidecarManager {
     if (this.processRef !== child || child.killed) {
       return;
     }
-    const payload: RpcRequest = { id: randomUUID(), method: "closePort", params: { sessionId } };
+    const payload: RpcRequest = { id: randomUUID(), method: "cancelAbandonedOpen", params: { sessionId } };
     try {
       child.stdin.write(`${JSON.stringify(payload)}\n`);
     } catch {
