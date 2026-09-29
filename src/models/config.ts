@@ -859,36 +859,56 @@ export function cloneServerConfig(server: ServerConfig): ServerConfig {
  * order cannot register as a change.
  */
 export function serverConnectionEqual(a: ServerConfig, b: ServerConfig): boolean {
+  // Each optional field is compared after the same canonicalization the editor
+  // save applies (see formValuesToServer): an explicit default and an absent
+  // value mean the same thing, and an unchanged Save must not read as a change.
+  const text = (value: string | undefined): string | undefined => {
+    const trimmed = typeof value === "string" ? value.trim() : undefined;
+    return trimmed ? trimmed : undefined;
+  };
   return (
     a.id === b.id &&
     a.host === b.host &&
     a.port === b.port &&
     (a.addressless ?? false) === (b.addressless ?? false) &&
-    a.protocol === b.protocol &&
-    a.altHost === b.altHost &&
+    resolveServerProtocol(a) === resolveServerProtocol(b) &&
+    text(a.altHost) === text(b.altHost) &&
     a.username === b.username &&
     a.authType === b.authType &&
-    a.keyPath === b.keyPath &&
-    a.authProfileId === b.authProfileId &&
-    a.multiplexing === b.multiplexing &&
-    a.legacyAlgorithms === b.legacyAlgorithms &&
-    a.logSession === b.logSession &&
+    (a.keyPath || undefined) === (b.keyPath || undefined) &&
+    (a.authProfileId || undefined) === (b.authProfileId || undefined) &&
+    // The form's checkbox seeds an unset multiplexing as on, so Save turns
+    // absent into true.
+    (a.multiplexing ?? true) === (b.multiplexing ?? true) &&
+    // Read as a truthy flag by the connector; absent and false are the same.
+    Boolean(a.legacyAlgorithms) === Boolean(b.legacyAlgorithms) &&
+    // logSession is deliberately not compared: the editor writes the current
+    // global default into an unset value on every Save, and a transcript
+    // preference is not part of the connection being opened.
     proxyConfigsEqual(a.proxy, b.proxy)
   );
 }
 
 /** The tunnel fields that decide what is listened on and where it forwards; notes, name and browser URL are excluded. */
 export function tunnelConnectionEqual(a: TunnelProfile, b: TunnelProfile): boolean {
+  const type = resolveTunnelType(a);
+  // Reverse tunnels are always shared (the editor forces it), so an absent mode
+  // on a reverse tunnel equals an explicit "shared".
+  const mode = (t: TunnelProfile): TunnelConnectionMode | undefined =>
+    resolveTunnelType(t) === "reverse" ? "shared" : t.connectionMode;
+  // 127.0.0.1 is the editor's default for all three addresses and is written
+  // as absent (local bind) or explicit (reverse) depending on the type.
+  const addr = (value: string | undefined): string => value?.trim() || "127.0.0.1";
   return (
     a.id === b.id &&
     a.localPort === b.localPort &&
     a.remoteIP === b.remoteIP &&
     a.remotePort === b.remotePort &&
-    a.tunnelType === b.tunnelType &&
-    a.connectionMode === b.connectionMode &&
-    a.remoteBindAddress === b.remoteBindAddress &&
-    a.localTargetIP === b.localTargetIP &&
-    a.localBindAddress === b.localBindAddress
+    type === resolveTunnelType(b) &&
+    mode(a) === mode(b) &&
+    addr(a.remoteBindAddress) === addr(b.remoteBindAddress) &&
+    addr(a.localTargetIP) === addr(b.localTargetIP) &&
+    addr(a.localBindAddress) === addr(b.localBindAddress)
   );
 }
 
