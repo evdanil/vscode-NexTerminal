@@ -921,7 +921,7 @@ describe("startTunnel — profile removed while start is pending", () => {
     expect(start).not.toHaveBeenCalled();
     expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("changed while the tunnel was starting"), "Retry");
     const vscode = await import("vscode");
-    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("nexus.tunnel.start", "t1");
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("nexus.tunnel.start", { profile: { id: "t1" }, serverId: "srv-1" });
   });
 
   it("warns without Retry and keeps a started tunnel out of the registry check when removed", async () => {
@@ -956,5 +956,48 @@ describe("startTunnel — profile removed while start is pending", () => {
     starting.resolve(makeActiveTunnel("t1"));
     await run;
     expect(isTunnelStartCurrent(core, "t1", "srv-1")).toBe(true);
+  });
+
+  it("does not cancel for a folder rename or a notes/browserUrl/autoStart edit, but does for a host change", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const starting = deferred<ActiveTunnel>();
+    const start = vi.fn(() => starting.promise);
+    const stop = vi.fn(async () => {});
+    const run = startTunnel(
+      core, { start, stop } as never, { connect: vi.fn() } as never,
+      profile, capturedServer, "isolated"
+    );
+
+    await core.addOrUpdateServer({ ...capturedServer, group: "Renamed" });
+    await core.addOrUpdateTunnel({ ...profile, notes: "n", browserUrl: "http://x", autoStart: true });
+    expect(isTunnelStartCurrent(core, "t1", "srv-1")).toBe(true);
+    await core.addOrUpdateServer({ ...capturedServer, group: "Renamed", host: "10.9.9.9" });
+    expect(isTunnelStartCurrent(core, "t1", "srv-1")).toBe(false);
+    starting.resolve(makeActiveTunnel("t1"));
+    await run;
+    expect(stop).toHaveBeenCalledWith("at-1");
+  });
+
+  it("clears the pending start fence when tunnelManager.start rejects", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const start = vi.fn(async () => { throw new Error("boom"); });
+    await expect(
+      startTunnel(core, { start } as never, { connect: vi.fn() } as never, profile, capturedServer, "isolated")
+    ).rejects.toThrow("boom");
+    // A leaked fence would keep judging this profile by the failed start's snapshot.
+    await core.addOrUpdateTunnel({ ...profile, localPort: profile.localPort + 5 });
+    expect(isTunnelStartCurrent(core, "t1", "srv-1")).toBe(true);
+  });
+
+  it("Retry after a cancelled start targets the server the start was aimed at", async () => {
+    const other: ServerConfig = { ...server, id: "srv-2", name: "Other" };
+    const ctx = await setupContext([makeTunnel({ defaultServerId: "srv-1", connectionMode: "isolated" })]);
+    await ctx.core.addOrUpdateServer(server);
+    await ctx.core.addOrUpdateServer(other);
+    const start = vi.fn(async () => makeActiveTunnel("t1"));
+    ctx.tunnelManager = { start } as never;
+    registerTunnelCommands(ctx);
+    await registeredCommands.get("nexus.tunnel.start")!({ profile: { id: "t1" }, serverId: "srv-2" });
+    expect(start).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ id: "srv-2" }), expect.anything());
   });
 });

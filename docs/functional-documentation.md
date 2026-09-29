@@ -51,7 +51,7 @@ Nexus Terminal provides one operational surface in VS Code for:
 - Serial profile actions include **Connect**, **Test Connection**, **Connect and Run Script**, **Edit**, **Duplicate**, **Copy Port Info**, and **Delete**.
 - Local Shell profile actions include **Open Local Shell**, **Open and Run Script**, **Edit**, **Duplicate**, **Copy Shell Info**, and **Delete**. Local Shell profiles do not show a Test Connection action.
 - A Local Shell launch waiting on the auto-trigger confirmation is cancelled if its profile is removed or changed before the prompt resolves; it does not create a stale terminal. A notice offers **Retry** when the profile still exists.
-- An SSH or Telnet **Connect** still starting is cancelled only if its server is removed or its content actually changes (compared by content, not object identity, so an unchanged Save or Refresh does not cancel it). The cancellation shows a notice, with **Retry** when the server still exists. The auto-start tunnel sweep on session open (including an **R** reconnect) uses the current server record.
+- An SSH or Telnet **Connect** still starting is cancelled only if its server is removed or a field the connection uses (address, port, protocol, credentials, proxy) changes, compared by value rather than object identity, so an unchanged Save, Refresh or folder rename does not cancel it. The cancellation shows a notice, with **Retry** when the server still exists. The auto-start tunnel sweep on session open (including an **R** reconnect) uses the current server record.
 - The Local Shell VS Code profile dropdown lists only terminal profiles that expose an explicit executable path to extensions. For WSL, use a custom Local Shell profile with `wsl.exe` as the shell path and any distribution arguments as shell arguments.
 - Folder actions use folder-specific labels for bulk operations: **Connect Folder Servers** and **Disconnect Folder Servers**.
 
@@ -679,7 +679,7 @@ Export for Sharing uses an explicit settings policy: only individually allowlist
 | `nexus.sftp.deleteOperationLimit` | number | `10000` | 100–100000 | Safety limit: max items removed by one recursive delete |
 ### 5.3 Tunnels
 
-A tunnel start still in progress (login, password prompt, remote-owner check) is cancelled only if the tunnel profile or its server is removed or actually changes; an unchanged Save or Refresh does not cancel it. A cancellation shows a notice, with **Retry** when the profile still exists, and a cancelled start is not registered as a running tunnel.
+A tunnel start still in progress (login, password prompt, remote-owner check) is cancelled only if the tunnel profile or its server is removed or a connection field changes (server address, credentials, proxy; tunnel ports, addresses, type, mode); an unchanged Save, Refresh, folder rename or notes edit does not cancel it. A cancellation shows a notice, with **Retry** on the same server when the profile still exists, and a cancelled start is not registered as a running tunnel.
 
 Shared local and dynamic tunnels use one in-flight SSH login for their listener and arriving clients. A repeated start waits for the first start to announce the tunnel; stopping it while login is pending prevents an announcement. An unexpected shared-connection close releases the tunnel's lease and its jump-host resources. Concurrent isolated clients whose shared credential prompt is canceled produce one tunnel error notification across tunnel profiles, including when a jump-host prompt is canceled; a later attempt can report a new cancellation.
 

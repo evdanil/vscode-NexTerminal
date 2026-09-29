@@ -234,6 +234,36 @@ describe("connectServer — equal-content replacement while progress is pending"
     expect(vscode.commands.executeCommand).toHaveBeenCalledWith("nexus.server.connect", "srv-1");
   });
 
+  it("does not cancel for a folder rename or a notes-style edit that leaves the connection alone", async () => {
+    const server = makeServer();
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const release = holdProgress();
+
+    const run = connectServer(ctx, server.id);
+    await addOrUpdateServer({ ...server, group: "Renamed", isHidden: true });
+    release();
+    await run;
+
+    expect(vscode.window.createTerminal).toHaveBeenCalled();
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("Retry re-runs the originating command when the caller supplies retryCommand", async () => {
+    const server = makeServer();
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const release = holdProgress();
+    mockShowWarningMessage.mockResolvedValueOnce("Retry");
+
+    const run = connectServer(ctx, server.id, { retryCommand: "nexus.server.runWithScript" });
+    await addOrUpdateServer({ ...server, port: 2222 });
+    release();
+    await run;
+    await flushPromises();
+
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("nexus.server.runWithScript", "srv-1");
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexus.server.connect", "srv-1");
+  });
+
   it("shows a removal message without Retry when the server is gone", async () => {
     const server = makeServer();
     const { ctx, removeServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });

@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- **SSH, Telnet and tunnel starts are no longer cancelled by an unchanged save or Refresh.** A pending Connect or Start Tunnel compared the profile by object identity, so saving a server or tunnel without changes (or refreshing after another window wrote settings) silently cancelled it. Starts now compare content, like Serial and Local Shell. A real change or removal cancels with a visible notice, with **Retry** when the profile still exists, and a cancelled tunnel start no longer registers briefly before being stopped. The auto-start tunnel sweep now uses the current server record, so auto-start tunnels start again on an **R** reconnect after the server was edited.
+- **SSH, Telnet and tunnel starts are no longer cancelled by an unchanged save or Refresh.** A pending Connect or Start Tunnel compared the profile by object identity, so saving a server or tunnel without changes (or refreshing after another window wrote settings) silently cancelled it. Starts now compare only the fields the connection uses (address, port, protocol, credentials, proxy and the like; a folder rename or notes edit does not count), like Serial and Local Shell. A real change or removal cancels with a visible notice, with **Retry** on the current settings when the profile still exists (Retry repeats the original action, such as Connect and Run Script, and a tunnel retry targets the same server), and a cancelled tunnel start no longer registers briefly before being stopped. The auto-start tunnel sweep now uses the current server record, so auto-start tunnels start again on an **R** reconnect after the server was edited.
 
 ## [2.8.296] — 2026-09-29
 

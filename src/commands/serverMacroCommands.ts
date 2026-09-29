@@ -577,6 +577,7 @@ async function connectAndAwaitSessionTerminal(
   try {
     await connectServer(ctx, server.id, {
       allowAutoFileExplorer: false,
+      retryCommand: "nexus.server.runMacro",
       onConnectFailed: () => settle({ kind: "connect-failed" })
     });
     const outcome = await settled;

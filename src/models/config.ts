@@ -851,6 +851,47 @@ export function cloneServerConfig(server: ServerConfig): ServerConfig {
   };
 }
 
+/**
+ * The fields a connect (or a tunnel's SSH login) actually reads from a server.
+ * A pending start is cancelled only when one of these changes; renaming the
+ * folder, toggling hidden, or editing IPMI/inventory bookkeeping does not
+ * affect the connection being opened. Explicit comparators, not JSON, so key
+ * order cannot register as a change.
+ */
+export function serverConnectionEqual(a: ServerConfig, b: ServerConfig): boolean {
+  return (
+    a.id === b.id &&
+    a.host === b.host &&
+    a.port === b.port &&
+    (a.addressless ?? false) === (b.addressless ?? false) &&
+    a.protocol === b.protocol &&
+    a.altHost === b.altHost &&
+    a.username === b.username &&
+    a.authType === b.authType &&
+    a.keyPath === b.keyPath &&
+    a.authProfileId === b.authProfileId &&
+    a.multiplexing === b.multiplexing &&
+    a.legacyAlgorithms === b.legacyAlgorithms &&
+    a.logSession === b.logSession &&
+    proxyConfigsEqual(a.proxy, b.proxy)
+  );
+}
+
+/** The tunnel fields that decide what is listened on and where it forwards; notes, name and browser URL are excluded. */
+export function tunnelConnectionEqual(a: TunnelProfile, b: TunnelProfile): boolean {
+  return (
+    a.id === b.id &&
+    a.localPort === b.localPort &&
+    a.remoteIP === b.remoteIP &&
+    a.remotePort === b.remotePort &&
+    a.tunnelType === b.tunnelType &&
+    a.connectionMode === b.connectionMode &&
+    a.remoteBindAddress === b.remoteBindAddress &&
+    a.localTargetIP === b.localTargetIP &&
+    a.localBindAddress === b.localBindAddress
+  );
+}
+
 export function proxyConfigsEqual(a: ProxyConfig | undefined, b: ProxyConfig | undefined): boolean {
   if (a === b) return true;
   if (!a || !b || a.type !== b.type) return false;

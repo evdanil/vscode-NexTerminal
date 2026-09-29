@@ -9,7 +9,7 @@ import type {
   TunnelProfile,
   TunnelType
 } from "../models/config";
-import { cloneServerConfig, resolveTunnelType, serverConfigsEqual } from "../models/config";
+import { cloneServerConfig, resolveTunnelType, serverConnectionEqual, tunnelConnectionEqual } from "../models/config";
 import { configMutationLock } from "../services/configMutationLock";
 import type { SshFactory } from "../services/ssh/contracts";
 import { TunnelStartCancelledError, TunnelStoppedError, type TunnelManager } from "../services/tunnel/tunnelManager";
@@ -153,16 +153,16 @@ export async function startTunnel(
   // record with an equal copy, which must not cancel a start. A different
   // record restored under the same id still differs in content, so the bulk
   // removal fence is preserved. Snapshots are taken now, before any await.
-  const profileAtStart = JSON.stringify(profile);
+  const profileAtStart = { ...profile };
   const serverAtStart = cloneServerConfig(server);
   const stillCurrent = (): boolean => {
     const liveProfile = core.getTunnel(profile.id);
     const liveServer = core.getServer(server.id);
     return (
       liveProfile !== undefined &&
-      JSON.stringify(liveProfile) === profileAtStart &&
+      tunnelConnectionEqual(liveProfile, profileAtStart) &&
       liveServer !== undefined &&
-      serverConfigsEqual(liveServer, serverAtStart)
+      serverConnectionEqual(liveServer, serverAtStart)
     );
   };
   const reportCancelled = (): void => {
@@ -174,11 +174,13 @@ export async function startTunnel(
       return;
     }
     void Promise.resolve(vscode.window.showWarningMessage(
-      `Tunnel "${profile.name}" or its server changed while the tunnel was starting. The start was cancelled. Retry with the current settings.`,
+      `Tunnel "${profile.name}" or its server "${server.name}" changed while the tunnel was starting. The start was cancelled. Retry on "${server.name}" with the current settings.`,
       "Retry"
     )).then((choice) => {
       if (choice === "Retry") {
-        void vscode.commands.executeCommand("nexus.tunnel.start", profile.id);
+        // Carry the server this start was aimed at: a drag-and-drop or an
+        // edit-then-restart may target a server other than the default one.
+        void vscode.commands.executeCommand("nexus.tunnel.start", { profile: { id: profile.id }, serverId: server.id });
       }
     });
   };
@@ -400,7 +402,14 @@ async function startTunnelCommand(ctx: CommandContext, arg?: unknown): Promise<v
   if (!profile) {
     return;
   }
-  const server = await resolveServerForTunnel(ctx.core, profile);
+  const preferredServerId = typeof arg === "object" && arg
+    ? (arg as { serverId?: unknown }).serverId
+    : undefined;
+  const server = await resolveServerForTunnel(
+    ctx.core,
+    profile,
+    typeof preferredServerId === "string" ? preferredServerId : undefined
+  );
   if (!server) {
     return;
   }

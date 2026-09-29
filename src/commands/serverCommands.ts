@@ -13,7 +13,8 @@ import {
   mergeServerConfigFields,
   proxyConfigsEqual,
   resolveServerProtocol,
-  serverConfigsEqual
+  serverConfigsEqual,
+  serverConnectionEqual
 } from "../models/config";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
@@ -1035,6 +1036,8 @@ export interface ConnectServerOptions {
    * fires; a handler should say only what it adds (what did not happen next).
    */
   onConnectFailed?: (message: string) => void;
+  /** Command a cancelled-start Retry re-runs; defaults to plain Connect. Wrappers (run-script, run-macro) set their own so Retry repeats the original action. */
+  retryCommand?: string;
 }
 
 /**
@@ -1046,7 +1049,7 @@ export interface ConnectServerOptions {
  */
 function isServerUnchangedSince(ctx: CommandContext, atStart: ServerConfig): boolean {
   const current = ctx.core.getServer(atStart.id);
-  return current !== undefined && serverConfigsEqual(current, atStart);
+  return current !== undefined && serverConnectionEqual(current, atStart);
 }
 
 /** Tells the user why a connect was cancelled and, if the record still exists, offers a Retry that can succeed. */
@@ -1066,7 +1069,7 @@ function reportCancelledConnect(ctx: CommandContext, atStart: ServerConfig, opti
     "Retry"
   )).then((choice) => {
     if (choice === "Retry") {
-      void vscode.commands.executeCommand("nexus.server.connect", atStart.id);
+      void vscode.commands.executeCommand(options.retryCommand ?? "nexus.server.connect", atStart.id);
     }
   });
 }
@@ -1589,6 +1592,7 @@ async function connectAndRunScript(ctx: CommandContext, arg?: unknown): Promise<
   try {
     await connectServer(ctx, server.id, {
       allowAutoFileExplorer: false,
+      retryCommand: "nexus.server.runWithScript",
       // REVIEW FINDING (P2) — an initial-connect failure (or an addressless
       // refusal) never produces a session, so the change-event subscription
       // above stays silent and, without this, the timer would sit out the full
