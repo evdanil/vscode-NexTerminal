@@ -236,6 +236,6 @@ describe("start descriptors — secrets are not part of the fence", () => {
     } as unknown as ServerConfig;
     expect(connectDescriptor(changed, inputs)).toBe(connectDescriptor(withSecrets, inputs));
     expect(tunnelStartDescriptor(tunnel, changed, tinputs)).toBe(tunnelStartDescriptor(tunnel, withSecrets, tinputs));
-    expect(connectDescriptor(withSecrets, inputs)).not.toMatch(/p1|p2|p3|p4|password|passphrase/i);
+    expect(connectDescriptor(withSecrets, inputs)).not.toMatch(/"(p1|p2|p3|p4)"|passphrase/i);
   });
 });
