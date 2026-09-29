@@ -15,7 +15,7 @@ Built for embedded and firmware developers on serial consoles — Smart Follow r
 
 **Smart Follow** mode is for Windows COM-port renumbering: it retries the preferred port, silently reconnects only to the previously approved device when metadata matches, prompts before switching to unfamiliar replacement ports, updates the saved preferred port after a successful move, and keeps the terminal open while waiting or stopped instead of tearing the tab down on serial errors.
 
-Smart Follow profiles coexist with other serial sessions on different ports, print status updates in the terminal when they switch ports or wait for reattach, silently reconnect only to the previously approved device, and prompt before switching to unfamiliar free ports.
+Smart Follow profiles coexist with other serial sessions on different ports, print status updates in the terminal when they switch ports or wait for reattach, silently reconnect only to the previously approved device, and prompt before switching to unfamiliar free ports. Terminal input modes (mouse, focus reporting, bracketed paste, Kitty keyboard) are reset when the port is lost and again before a reattach, so the next device does not inherit the previous one's modes.
 
 ## Several Serial Sessions at Once
 
