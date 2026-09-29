@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createAnsiRegex } from "../../src/utils/ansi";
+import { createAnsiRegex, stripChunk } from "../../src/utils/ansi";
 
 const strip = (s: string): string => s.replace(createAnsiRegex(), "");
 
@@ -35,6 +35,14 @@ describe("createAnsiRegex", () => {
   it("does not over-strip ordinary text", () => {
     const text = "ls > out; echo [>4;2m] 7 8 = > <u [2 q (B #8 P+q";
     expect(strip(text)).toBe(text);
+  });
+
+  it("holds an unterminated OSC/DCS tail, including a half ST, within the cap", () => {
+    expect(stripChunk("", "a\x1b]0;title")).toEqual({ text: "a", carry: "\x1b]0;title" });
+    expect(stripChunk("", "a\x1bP+q54\x1b")).toEqual({ text: "a", carry: "\x1bP+q54\x1b" });
+    expect(stripChunk("\x1b]0;title", "\x07$ ")).toEqual({ text: "$ ", carry: "" });
+    const long = "\x1b]0;" + "t".repeat(100);
+    expect(stripChunk("", long).carry).toBe("");
   });
 
   it("leaves an incomplete CSI unmatched so the highlighter can hold it back", () => {

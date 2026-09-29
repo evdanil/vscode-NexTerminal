@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { createAnsiRegex } from "../utils/ansi";
+import { stripChunk } from "../utils/ansi";
 import { normalizeBoundedNumber as clampLength } from "../utils/helpers";
 import { validateRegexSafety } from "../utils/regexSafety";
 import type { MacroTriggerScope, TerminalMacro } from "../models/terminalMacro";
@@ -411,7 +411,9 @@ export class MacroAutoTrigger implements vscode.Disposable {
     const scheduledTimers = new Map<string, ReturnType<typeof setTimeout>>();
     const ownedIntervals = new Set<string>();
     let disposed = false;
-    const ansiRe = createAnsiRegex();
+    // Incomplete escape tail of the previous chunk; not cleared with `buffer`
+    // because the output stream continues across a buffer reset.
+    let escapeCarry = "";
 
     const clearScheduledTimer = (stateKey: string): boolean => {
       const timer = scheduledTimers.get(stateKey);
@@ -592,6 +594,7 @@ export class MacroAutoTrigger implements vscode.Disposable {
         this.pauseOwnedIntervals(observerState);
         disposed = true;
         buffer = "";
+        escapeCarry = "";
         lastFired.clear();
         readyMatches.clear();
         ownedIntervals.clear();
@@ -613,8 +616,9 @@ export class MacroAutoTrigger implements vscode.Disposable {
           text = text.slice(text.length - MAX_INPUT_LENGTH);
         }
 
-        let stripped = text.replace(ansiRe, "");
-        stripped = stripped.replace(CONTROL_CHARS_RE, "");
+        const chunk = stripChunk(escapeCarry, text);
+        escapeCarry = chunk.carry;
+        const stripped = chunk.text.replace(CONTROL_CHARS_RE, "");
 
         buffer += stripped;
         if (buffer.length > this.maxBufferLength) {

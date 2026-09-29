@@ -44,6 +44,13 @@ describe("ScriptOutputBuffer", () => {
     expect(buf.tail(200)).toContain("1".repeat(50));
   });
 
+  it("strips a terminal title split before the prompt", () => {
+    const buf = new ScriptOutputBuffer();
+    buf.append("\x1b]0;user@host: ~/dir");
+    buf.append("\x07$ ");
+    expect(buf.tail(20)).toBe("$ ");
+  });
+
   it("rolls trim when text exceeds capacity", () => {
     const buf = new ScriptOutputBuffer({ capacity: 10 });
     buf.append("1234567890");

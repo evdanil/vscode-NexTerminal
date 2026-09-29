@@ -67,6 +67,37 @@ describe("TerminalCaptureBuffer", () => {
       expect(text).not.toContain("[>");
     });
 
+    it("keeps stripping a split sequence across clear()", () => {
+      const buf = new TerminalCaptureBuffer();
+      buf.append("foo\x1b[>4;");
+      buf.clear();
+      buf.append("2mbar");
+      expect(buf.getText()).toBe("bar");
+      expect(buf.getText()).not.toContain("2m");
+    });
+
+    it("strips a terminal title split before the prompt", () => {
+      const buf = new TerminalCaptureBuffer();
+      buf.append("out\n\x1b]0;user@host: ~/dir");
+      buf.append("\x07$ ");
+      expect(buf.getText()).toBe("out\n$ ");
+    });
+
+    it("releases an unterminated escape after the 64-char hold-back cap", () => {
+      const buf = new TerminalCaptureBuffer();
+      buf.append("\x1b[" + "1".repeat(100));
+      expect(buf.getText()).toContain("1".repeat(50));
+    });
+
+    it("does not retain text after a lone trailing ESC", () => {
+      const buf = new TerminalCaptureBuffer();
+      // The held ESC is completed by the next byte: "ESC a" would be a real
+      // two-byte sequence, so the follow-up starts with a non-final byte.
+      buf.append("x\x1b");
+      buf.append("\nabc");
+      expect(buf.getText()).toBe("x\nabc");
+    });
+
     it("removes C0 control characters except newline, carriage-return, and tab", () => {
       const buf = new TerminalCaptureBuffer();
       buf.append("bell\x07here\n");

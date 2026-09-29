@@ -1,4 +1,4 @@
-import { createAnsiRegex, findIncompleteEscapeStart } from "../../utils/ansi";
+import { stripChunk } from "../../utils/ansi";
 
 export interface Match {
   text: string;
@@ -36,10 +36,8 @@ export class ScriptOutputBuffer {
   private carry = "";
 
   public append(raw: string): void {
-    const joined = this.carry + raw;
-    const hold = findIncompleteEscapeStart(joined);
-    this.carry = hold < 0 ? "" : joined.slice(hold);
-    const stripped = (hold < 0 ? joined : joined.slice(0, hold)).replace(createAnsiRegex(), "");
+    const { text: stripped, carry } = stripChunk(this.carry, raw);
+    this.carry = carry;
     if (stripped.length === 0) return;
     this.text += stripped;
     this.writeHead += stripped.length;

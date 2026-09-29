@@ -156,6 +156,21 @@ describe("MacroAutoTrigger", () => {
     obs.dispose();
   });
 
+  it("strips an escape sequence split across output chunks before matching", () => {
+    setConfig([
+      { name: "pw", text: "secret\n", triggerPattern: "Password: $" }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    obs.onOutput("Password: \x1b[>4;");
+    obs.onOutput("2m");
+    flush();
+    expect(sent).toEqual(["secret\n"]);
+    obs.dispose();
+  });
+
   it("defers writeBack to next event-loop turn", () => {
     setConfig([
       { name: "pw", text: "secret\n", triggerPattern: "Password:" }

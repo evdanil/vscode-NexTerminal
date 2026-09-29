@@ -1,7 +1,7 @@
 import { closeSync, existsSync, mkdirSync, openSync, renameSync, statSync, unlinkSync, write, writeSync } from "node:fs";
 import * as path from "node:path";
 import { normalizeLoggerRotationOptions, type LoggerRotationOptions } from "./terminalLogger";
-import { createAnsiRegex } from "../utils/ansi";
+import { stripChunk } from "../utils/ansi";
 
 // Control characters except \n, \r, \t
 const CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
@@ -74,8 +74,9 @@ const NO_FD = -1;
 /** A shared zero-length buffer: `owed` is never null, only empty. */
 const NO_BYTES = Buffer.alloc(0);
 
-function stripTerminalCodes(data: string): string {
-  return data.replace(createAnsiRegex(), "").replace(CTRL_RE, "");
+function stripTerminalCodes(carry: string, data: string): { text: string; carry: string } {
+  const r = stripChunk(carry, data);
+  return { text: r.text.replace(CTRL_RE, ""), carry: r.carry };
 }
 
 /**
@@ -288,11 +289,16 @@ class FileSessionTranscript implements SessionTranscript {
     liveTranscripts.add(this);
   }
 
+  /** Incomplete escape tail of the previous write, so a sequence split across writes is stripped whole. */
+  private escapeCarry = "";
+
   public write(data: string): void {
     if (this.closed) {
       return;
     }
-    const clean = stripTerminalCodes(data);
+    const stripped = stripTerminalCodes(this.escapeCarry, data);
+    this.escapeCarry = stripped.carry;
+    const clean = stripped.text;
     if (clean) {
       this.enqueue(clean);
     }
