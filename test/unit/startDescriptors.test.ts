@@ -281,3 +281,104 @@ describe("start descriptors — linked auth profile is applied", () => {
       .toBe(tunnelStartDescriptor(tunnel, applyAuthProfile(linked, p), tinputs));
   });
 });
+
+describe("start descriptors — proxy username and other empty-vs-absent values", () => {
+  it("an empty proxy username equals an absent one (runtime: no proxy auth)", () => {
+    const a = { ...server, proxy: { type: "socks5" as const, host: "p", port: 1, username: "" } };
+    const b = { ...server, proxy: { type: "socks5" as const, host: "p", port: 1 } };
+    expect(connectDescriptor(a, inputs)).toBe(connectDescriptor(b, inputs));
+    expect(connectDescriptor({ ...b, proxy: { ...b.proxy, username: "u" } }, inputs)).not.toBe(connectDescriptor(b, inputs));
+    const h = { ...server, proxy: { type: "http" as const, host: "p", port: 1, username: "" } };
+    expect(connectDescriptor(h, inputs)).toBe(connectDescriptor({ ...h, proxy: { type: "http", host: "p", port: 1 } }, inputs));
+  });
+
+  it("whitespace altHost is absent, an empty keyPath and authProfileId are absent, addressless absent is false", () => {
+    expect(connectDescriptor({ ...server, altHost: " \t" }, inputs)).toBe(connectDescriptor(server, inputs));
+    expect(connectDescriptor({ ...server, authType: "key", keyPath: "" }, inputs)).toBe(connectDescriptor({ ...server, authType: "key" }, inputs));
+    expect(connectDescriptor({ ...server, authProfileId: "" }, inputs)).toBe(connectDescriptor(server, inputs));
+    expect(connectDescriptor({ ...server, addressless: false }, inputs)).toBe(connectDescriptor(server, inputs));
+  });
+});
+
+describe("start descriptors — jump-host chain", () => {
+  const jump: ServerConfig = { id: "j1", name: "Jump", host: "jh", port: 22, username: "ju", authType: "password", isHidden: false };
+  const far: ServerConfig = { id: "j2", name: "Far", host: "fh", port: 22, username: "fu", authType: "password", isHidden: false };
+  const target: ServerConfig = { ...server, proxy: { type: "ssh", jumpHostId: "j1" } };
+
+  function world(records: ServerConfig[], profiles: AuthProfile[] = []) {
+    return {
+      ...inputs,
+      serverLookup: (id: string) => records.find((r) => r.id === id),
+      authProfileLookup: (id: string) => profiles.find((p) => p.id === id)
+    };
+  }
+  const both = (t: ServerConfig, w: ReturnType<typeof world>) =>
+    [connectDescriptor(t, w), tunnelStartDescriptor(tunnel, t, { ...tinputs, ...w })];
+
+  it("a jump host's own host, port, user, auth, key, proxy and legacy flag change both descriptors", () => {
+    const base = both(target, world([target, jump]));
+    for (const patch of [
+      { host: "other" }, { port: 2222 }, { username: "x" }, { authType: "key" as const },
+      { legacyAlgorithms: true }, { proxy: { type: "socks5" as const, host: "p", port: 1 } }
+    ]) {
+      expect(both(target, world([target, { ...jump, ...patch }]))).not.toEqual(base);
+    }
+  });
+
+  it("a jump host's key path counts for a key hop, and its multiplexing and pooled alt host count", () => {
+    const keyJump = { ...jump, authType: "key" as const };
+    expect(both(target, world([target, { ...keyJump, keyPath: "/k" }]))).not.toEqual(both(target, world([target, keyJump])));
+    expect(both(target, world([target, { ...jump, altHost: "alt" }]))).not.toEqual(both(target, world([target, jump])));
+    expect(both(target, world([target, { ...jump, multiplexing: false }]))).not.toEqual(both(target, world([target, jump])));
+    // Alt host is moot when the hop bypasses the pool.
+    const off = { ...jump, multiplexing: false };
+    expect(both(target, world([target, { ...off, altHost: "alt" }]))).toEqual(both(target, world([target, off])));
+  });
+
+  it("a jump host's linked profile username edit changes both descriptors", () => {
+    const linked = { ...jump, authProfileId: "ap1" };
+    const p1: AuthProfile = { id: "ap1", name: "P", username: "a", authType: "password" };
+    expect(both(target, world([target, linked], [{ ...p1, username: "b" }]))).not.toEqual(both(target, world([target, linked], [p1])));
+    expect(both(target, world([target, linked], [{ ...p1, name: "Renamed" }]))).toEqual(both(target, world([target, linked], [p1])));
+  });
+
+  it("the far hop of a two-hop chain counts", () => {
+    const mid = { ...jump, proxy: { type: "ssh" as const, jumpHostId: "j2" } };
+    expect(both(target, world([target, mid, { ...far, host: "changed" }]))).not.toEqual(both(target, world([target, mid, far])));
+  });
+
+  it("renaming or moving the jump server does not change them", () => {
+    expect(both(target, world([target, { ...jump, name: "Renamed", group: "G", isHidden: true }])))
+      .toEqual(both(target, world([target, jump])));
+  });
+
+  it("a cycle terminates with a stable descriptor", () => {
+    const a = { ...jump, proxy: { type: "ssh" as const, jumpHostId: "j2" } };
+    const b = { ...far, proxy: { type: "ssh" as const, jumpHostId: "j1" } };
+    const w = world([target, a, b]);
+    expect(connectDescriptor(target, w)).toBe(connectDescriptor(target, w));
+    expect(connectDescriptor(target, w)).toContain("cycle");
+  });
+
+  it("a missing jump server is a distinct value, not a crash", () => {
+    const missing = connectDescriptor(target, world([target]));
+    expect(missing).toContain("missing");
+    expect(missing).not.toBe(connectDescriptor(target, world([target, jump])));
+  });
+
+  /** The per-hop fields reuse the server classification table: what a tunnel/connect reads on a target, a hop reads too. */
+  it.each(Object.entries(SERVER_FIELDS).filter(([k, v]) => v.use === "connect+tunnel" && k !== "id" && k !== "keyPath"))(
+    "hop.%s follows its classification",
+    (key, { alt }) => {
+      const base = both(target, world([target, jump]));
+      const changed = both(target, world([target, { ...jump, [key]: alt } as ServerConfig]));
+      // keyPath is excluded from this loop: it counts only for a key hop (see above).
+      expect(changed).not.toEqual(base);
+    }
+  );
+
+  it.each(Object.entries(SERVER_FIELDS).filter(([, v]) => v.use === "ignored"))("hop.%s is ignored", (key, { alt }) => {
+    expect(both(target, world([target, { ...jump, [key]: alt } as ServerConfig])))
+      .toEqual(both(target, world([target, jump])));
+  });
+});

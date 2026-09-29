@@ -15,7 +15,7 @@ import {
   resolveServerProtocol,
   serverConfigsEqual
 } from "../models/config";
-import { connectDescriptor } from "../models/startDescriptors";
+import { connectDescriptor, type ConnectDescriptorInputs } from "../models/startDescriptors";
 import { flattenProviderText } from "../models/inventory";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
@@ -1051,10 +1051,11 @@ export interface ConnectServerOptions {
  * not a change, so object identity is the wrong test — the same reasoning the
  * Serial and Local Shell start fences use.
  */
-function connectDescriptorInputs(ctx: CommandContext): { multiplexingDefault?: boolean; authProfileLookup: (id: string) => AuthProfile | undefined } {
+function connectDescriptorInputs(ctx: CommandContext): ConnectDescriptorInputs {
   return {
     multiplexingDefault: ctx.sshPool.multiplexingDefault,
-    authProfileLookup: (id) => ctx.core.getAuthProfile(id)
+    authProfileLookup: (id) => ctx.core.getAuthProfile(id),
+    serverLookup: (id) => ctx.core.getServer(id)
   };
 }
 
@@ -1411,7 +1412,14 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
               // tunnel one: the tunnels reuse this session's config, and a session
               // whose alt host (or anything else the terminal reads) has moved on
               // is stale as a whole, so an altHost edit also skips auto-start.
-              if (!isServerUnchangedSince(ctx, serverAtStart, descriptorAtStart)) {
+              // On an R reconnect SilentAuthSshFactory applies the LIVE auth profile to
+              // the session's constructor-captured server, so compare the effective
+              // connection that just opened (session server + live profile) with what
+              // a tunnel would use now (live server + live profile). descriptorAtStart
+              // holds the profile as it was when the terminal first opened, which
+              // would warn after a profile edit the reconnect already picked up.
+              const sweepInputs = connectDescriptorInputs(ctx);
+              if (connectDescriptor(serverAtStart, sweepInputs) !== connectDescriptor(liveServer, sweepInputs)) {
                 void vscode.window.showWarningMessage(
                   `Auto-start tunnels for "${flattenProviderText(server.name)}" were not started because the server's connection settings changed since this session opened. Close and reopen the terminal to use the new settings.`
                 );

@@ -407,6 +407,23 @@ describe("connectServer — auto-start sweep follows the session's connection co
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
   });
 
+  it("R-reconnect after the linked auth profile was edited still auto-starts (the reconnect applies the live profile)", async () => {
+    const server = makeServer({ authProfileId: "ap1" });
+    const tunnel = makeTunnel({ autoStart: true, defaultServerId: "srv-1" });
+    const harness = setupHarness({
+      profiles: [tunnel], activeTunnels: [], servers: [server],
+      authProfiles: [{ id: "ap1", name: "AP", username: "ops", authType: "password" }]
+    });
+    await connectServer(harness.ctx, server.id);
+    const callbacks = latestSshCallbacks();
+    await harness.addOrUpdateAuthProfile({ id: "ap1", name: "AP", username: "root", authType: "password" });
+    callbacks.onSessionOpened("session-1");
+    await flushPromises();
+
+    expect(mockStartTunnel).toHaveBeenCalledTimes(1);
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
   it("R-reconnect after a host edit starts nothing on the new host and warns", async () => {
     const { callbacks, server, addOrUpdateServer } = await connected({ name: "evil\nname" });
     await addOrUpdateServer({ ...server, host: "new.example" });

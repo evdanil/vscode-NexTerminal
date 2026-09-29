@@ -41,23 +41,52 @@ export interface ConnectDescriptorInputs {
    * Absent lookup or a deleted profile leaves the server's own fields.
    */
   authProfileLookup?: (id: string) => AuthProfile | undefined;
+  /**
+   * Looks up a jump-host server by id (NexusCore.getServer). A jump hop is part
+   * of the connection, so its own effective transport fields count, recursively.
+   * A missing hop is a distinct value, not a crash.
+   */
+  serverLookup?: (id: string) => ServerConfig | undefined;
   /** `SshPoolControl.multiplexingDefault` — the pool's captured default. */
   multiplexingDefault?: boolean;
 }
 
-function proxyDescriptor(proxy: ProxyConfig | undefined): unknown {
+function proxyDescriptor(proxy: ProxyConfig | undefined, inputs: ConnectDescriptorInputs, visited: ReadonlySet<string>): unknown {
   if (!proxy) return null;
-  return proxy.type === "ssh"
-    ? ["ssh", proxy.jumpHostId]
-    : [proxy.type, proxy.host, proxy.port, proxy.username ?? null];
+  if (proxy.type !== "ssh") {
+    // An empty username is "no proxy auth" at runtime, the same as absent.
+    return [proxy.type, proxy.host, proxy.port, proxy.username || null];
+  }
+  const hop = inputs.serverLookup?.(proxy.jumpHostId);
+  if (!hop) return ["ssh", proxy.jumpHostId, "missing"];
+  // ProxySshFactory rejects a cycle; the descriptor terminates on one with a
+  // sentinel so it stays finite and stable.
+  if (visited.has(hop.id)) return ["ssh", proxy.jumpHostId, "cycle"];
+  const hopMultiplexed = hop.multiplexing ?? inputs.multiplexingDefault ?? true;
+  const hopAltHost = typeof hop.altHost === "string" && hop.altHost.trim() !== "" ? hop.altHost.trim() : null;
+  return [
+    "ssh",
+    proxy.jumpHostId,
+    // The hop's own effective transport (its profile applied, its own proxy or
+    // jump), and — because a jump hop always leases the pool unless multiplexing
+    // is off for it — its multiplexing and, when pooled, its alternate host.
+    transportDescriptor(hop, inputs, visited),
+    hopMultiplexed,
+    hopMultiplexed ? hopAltHost : null
+  ];
 }
 
 /** Server fields the SSH transport (login identity, key file, proxy, connector) reads; never secrets. */
-function transportDescriptor(rawServer: ServerConfig, inputs: ConnectDescriptorInputs): unknown[] {
+function transportDescriptor(
+  rawServer: ServerConfig,
+  inputs: ConnectDescriptorInputs,
+  visited: ReadonlySet<string> = new Set()
+): unknown[] {
   const server = applyAuthProfile(
     rawServer,
     rawServer.authProfileId ? inputs.authProfileLookup?.(rawServer.authProfileId) : undefined
   );
+  const chain = new Set(visited).add(server.id);
   return [
     server.id,
     server.host,
@@ -72,7 +101,7 @@ function transportDescriptor(rawServer: ServerConfig, inputs: ConnectDescriptorI
     // fields are already folded into the values above.
     rawServer.authProfileId || null,
     Boolean(server.legacyAlgorithms),
-    proxyDescriptor(server.proxy)
+    proxyDescriptor(server.proxy, inputs, chain)
   ];
 }
 
