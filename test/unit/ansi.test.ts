@@ -79,6 +79,25 @@ describe("createAnsiRegex", () => {
       expect(run(["a\x1b]0;title", "more", "\x9cPassword: "])).toBe("aPassword: ");
     });
 
+    it.each([
+      ["ESC \\ (7-bit ST)", "\\", "aPassword: "],
+      ["CAN", "\x18", "aPassword: "],
+      ["SUB", "\x1a", "aPassword: "],
+      ["8-bit ST", "\x9c", "aPassword: "]
+    ])("a carried lone ESC followed by %s ends the string without re-emitting either byte", (_n, next, expected) => {
+      expect(run(["a\x1bPpayload\x1b", `${next}Password: `])).toBe(expected);
+      expect(run(["a\x1b]0;title\x1b", `${next}Password: `])).toBe(expected);
+    });
+
+    it("a carried lone ESC followed by another ESC or an ordinary char aborts and starts a new sequence", () => {
+      // ESC [ 3 1 m is a complete SGR that starts at the carried ESC.
+      expect(run(["a\x1bPpayload\x1b", "[31mred"])).toBe("ared");
+      // ESC followed by an ordinary char: two-byte ESC sequence, removed whole.
+      expect(run(["a\x1bPpayload\x1b", "7rest"])).toBe("arest");
+      // Another ESC: the first aborts, the second begins the SGR.
+      expect(run(["a\x1bPpayload\x1b", "\x1b[31mred"]).replace(/\x1b/g, "")).toBe("ared");
+    });
+
     it("keeps text after an aborting ESC and after a bare ESC pair", () => {
       expect(run(["a\x1bPpayload", "more\x1b[31mred"])).toBe("ared");
     });

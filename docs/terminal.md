@@ -20,6 +20,8 @@ Right-click any Nexus terminal tab for three PuTTY-style commands (plus **Go to 
 - *Clear Scrollback* — clears visible and captured transcript together
 - *Copy All to Clipboard* — ANSI-stripped transcript of the session
 
+*What "ANSI-stripped" removes.* Copy All, transcripts, script output and macro trigger matching share one stripper. It removes CSI sequences including private-prefix and intermediate forms (Kitty keyboard, modifyOtherKeys, cursor shape), two-byte and `ESC`-plus-intermediate sequences (such as `ESC 7`, `ESC 8`, `ESC =`), and OSC/DCS/APC/PM/SOS strings ended by BEL, `ESC \` or the 8-bit ST and cancelled by CAN or SUB. A sequence split across two chunks of output is still removed whole: an unfinished CSI is held for up to 64 characters, and the payload of an unterminated control string is dropped until its terminator, giving up after 1 MiB and treating the rest as text.
+
 After a session disconnects, Reset and Clear grey out; Copy All stays enabled so a run can always be captured for a ticket or chat.
 
 ## Session Transcript Logging

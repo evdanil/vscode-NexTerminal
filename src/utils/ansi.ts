@@ -124,10 +124,17 @@ export function stripChunk(carry: StripCarry, chunk: string): { text: string; ca
     } else if (resume === joined.length - 1) {
       // ESC at the very end: it may be the first half of ST.
       return { text: "", carry: { tail: "\x1b", discarding: carry.discarding, discarded: carry.discarded + resume } };
-    } else if (joined.charCodeAt(resume + 1) === 0x5c) {
-      resume += 2;
+    } else {
+      const next = joined.charCodeAt(resume + 1);
+      if (next === 0x5c || next === 0x18 || next === 0x1a || next === 0x9c) {
+        // ESC \ is the 7-bit ST. ESC followed by CAN/SUB/8-bit ST is the string
+        // ending with a stray ESC in front of its terminator (typically the ESC
+        // carried from the previous chunk): consume both bytes so the ESC is
+        // never re-emitted and the terminator is not parsed as text.
+        resume += 2;
+      }
+      // Any other ESC aborts the string and starts a new sequence at that ESC.
     }
-    // Any other ESC aborts the string and starts a new sequence at that ESC.
     joined = joined.slice(resume);
   }
 
