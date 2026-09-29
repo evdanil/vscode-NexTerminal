@@ -1043,7 +1043,10 @@ export interface ConnectServerOptions {
 
 /**
  * A connect is cancelled only when its server record is gone or differs in
- * content from the one the connect began with. An equal-content replacement (an
+ * content from the one the connect began with. This is checked once, at the top
+ * of the progress callback, before the terminal and PTY exist; after that the
+ * PTY runs on its own start-time snapshot (an edit applies at the next connect),
+ * so the check does not cover a password prompt or the handshake. An equal-content replacement (an
  * unchanged editor Save, a Refresh after another window wrote globalState) is
  * not a change, so object identity is the wrong test — the same reasoning the
  * Serial and Local Shell start fences use.
