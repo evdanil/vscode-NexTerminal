@@ -7657,7 +7657,7 @@ echo hi</textarea>
 				argvAssignmentsAllowed = true;
 				while (index < words.length && words[index].startsWith("-")) {
 					const option = words[index++];
-					const shortValueOption = /^-[EABbnSHkisP]*[ugpCDTR](.*)$/.exec(option);
+					const shortValueOption = /^-[EABbnSHkisP]*[ugpCDTRrtca](.*)$/.exec(option);
 					if ([
 						"-u",
 						"--user",
@@ -7672,7 +7672,15 @@ echo hi</textarea>
 						"-T",
 						"--command-timeout",
 						"-R",
-						"--chroot"
+						"--chroot",
+						"-r",
+						"--role",
+						"-t",
+						"--type",
+						"-c",
+						"--login-class",
+						"-a",
+						"--auth-type"
 					].includes(option)) {
 						if (index >= words.length) return false;
 						index++;
@@ -7681,7 +7689,7 @@ echo hi</textarea>
 							if (index >= words.length) return false;
 							index++;
 						}
-					} else if (!/^(?:--(?:user|group|prompt|close-from|chdir|preserve-env|command-timeout|chroot)=.+|-[ugpCDTR].+)$/.test(option) && ![
+					} else if (!/^(?:--(?:user|group|prompt|close-from|chdir|preserve-env|command-timeout|chroot|role|type|auth-type|login-class)=.+|-[ugpCDTRrtca].+)$/.test(option) && ![
 						"--login",
 						"--shell",
 						"--non-interactive",
@@ -7749,7 +7757,8 @@ echo hi</textarea>
 				index++;
 				allowAssignments = false;
 				if (words[index] === "-v" || words[index] === "-V") return false;
-				if (words[index] === "-p" || words[index] === "--") index++;
+				while (words[index] === "-p") index++;
+				if (words[index] === "--") index++;
 				if (words[index]?.startsWith("-")) return false;
 				continue;
 			};
@@ -7771,7 +7780,9 @@ echo hi</textarea>
 			if (name === "time") {
 				index++;
 				allowAssignments = false;
-				if (words[index] === "-p" || words[index] === "--") index++;
+				// Bash \`time [-p] [--] pipeline\`: a second -p is the command, not an option.
+				if (words[index] === "-p") index++;
+				if (words[index] === "--") index++;
 				if (words[index]?.startsWith("-")) return false;
 				continue;
 			};
@@ -7781,7 +7792,7 @@ echo hi</textarea>
 				if (words[index] === "-n" || words[index] === "--adjustment") {
 					if (!/^[+-]?\\d+$/.test(words[index + 1] ?? "")) return false;
 					index += 2;
-				} else if (/^(?:-n[+-]?\\d+|--adjustment=[+-]?\\d+)$/.test(words[index] ?? "")) {
+				} else if (/^(?:-n[+-]?\\d+|-\\d+|--adjustment=[+-]?\\d+)$/.test(words[index] ?? "")) {
 					index++;
 				};
 				if (words[index] === "--") index++;
@@ -7818,6 +7829,11 @@ echo hi</textarea>
 		redirectionAllowed = [];
 		return result;
 	};
+	// The "$" placeholder stands in for the in-progress word: it can satisfy a
+	// dangling redirect operator (\`ipmitool sdr > /tmp/x-$(date)\`) or a wrapper
+	// operand, but never classifies as ipmitool itself (it contains "$"), so a
+	// dynamic head such as \`ipmi$(echo tool)\` stays unclassified.
+	const headAlreadyIpmitool = () => runsIpmitool([...words, "$"], [...assignmentAllowed, false], [...redirectionAllowed, false]);
 	for (let i = 0; i < text.length; i++) {
 		const char = text[i];
 		if (quote === "'") {
@@ -7835,7 +7851,7 @@ echo hi</textarea>
 				} else {
 					word += char;
 				}
-			} else if (char === "\`" || char === "$" && text[i + 1] === "(") return false;
+			} else if (char === "\`" || char === "$" && text[i + 1] === "(") return headAlreadyIpmitool();
 			else word += char;
 			continue;
 		};
@@ -7861,9 +7877,15 @@ echo hi</textarea>
 			while (i + 1 < text.length && text[i + 1] !== "\\n" && text[i + 1] !== "\\r") i++;
 			continue;
 		};
-		// Dynamic substitutions and heredocs need a real shell parser. Ignore
-		// these markers in comments and single quotes, where they are inert.
-		if (char === "\`" || char === "$" && text[i + 1] === "(" || (char === "<" || char === ">") && text[i + 1] === "(" || char === "<" && text[i + 1] === "<") return false;
+		// Dynamic substitutions and heredocs need a real shell parser to find where
+		// the nested command or heredoc body ends, so nothing AFTER the marker can
+		// be classified. Words completed BEFORE it are different: a leading
+		// ipmitool word already fixes which program runs. Ignore these markers in
+		// comments and single quotes, where they are inert.
+		// A heredoc or here-string touching the executable (\`ipmitool<<<foo\`) is a
+		// redirection: the executable word is complete, like \`ipmitool>file\`.
+		if (char === "<" && text[i + 1] === "<" && inWord && (!wordAllowsRedirection || !/^(?:\\d*)$/.test(word))) finishWord();
+		if (char === "\`" || char === "$" && text[i + 1] === "(" || (char === "<" || char === ">") && text[i + 1] === "(" || char === "<" && text[i + 1] === "<") return headAlreadyIpmitool();
 		if (char === "&" && (text[i - 1] === ">" || text[i - 1] === "<" || text[i + 1] === ">")) {
 			if (text[i + 1] === ">" && inWord && !/^(?:\\d*)$/.test(word)) finishWord();
 			word += char;

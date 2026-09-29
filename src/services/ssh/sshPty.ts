@@ -9,7 +9,7 @@ import { hasContextAwareConnect } from "./contracts";
 import { classifySshConnectionError } from "./connectionDiagnostics";
 import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
-import { CLEAR_VISIBLE_SCREEN } from "../terminal/terminalEscapes";
+import { CLEAR_VISIBLE_SCREEN, RESET_INTERACTIVE_MODES } from "../terminal/terminalEscapes";
 import { PtyObserverHub } from "../terminal/ptyObserverHub";
 import { OscContextFilter } from "../terminal/oscContextFilter";
 import { createAnsiRegex } from "../../utils/ansi";
@@ -21,9 +21,6 @@ import { createAnsiRegex } from "../../utils/ansi";
 // malicious banner can't manipulate terminal state or spoof the prompt.
 const AUTH_MESSAGE_ANSI_RE = createAnsiRegex();
 const AUTH_MESSAGE_CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
-// Kitty keeps a bounded keyboard-mode stack per screen. Drain the active
-// stack before zeroing its flags so a later pop cannot restore stale key modes.
-const RESET_TERMINAL_MODES = "\x1b[?9;1000;1002;1003;1004;1006;1016;2031l\x1b[<9999u\x1b[=0;1u";
 
 export interface SshPtyCallbacks {
   onSessionOpened(sessionId: string): void;
@@ -178,7 +175,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.connection?.dispose();
     this.stream = undefined;
     this.connection = undefined;
-    this.writeEmitter.fire(RESET_TERMINAL_MODES);
+    this.writeEmitter.fire(RESET_INTERACTIVE_MODES);
     this.activityIndicator = false;
     this.nameEmitter.fire(`${this.baseName} [Disconnected]`);
     this.writeEmitter.fire(`\r\n\r\n[Nexus SSH] ${reason}\r\n`);
@@ -223,7 +220,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.connection?.dispose();
     this.stream = undefined;
     this.connection = undefined;
-    this.writeEmitter.fire(RESET_TERMINAL_MODES);
+    this.writeEmitter.fire(RESET_INTERACTIVE_MODES);
     this.logger.log(
       reason === "remote-closed"
         ? "remote host closed the session - entering disconnected state"

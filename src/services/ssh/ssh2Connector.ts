@@ -25,6 +25,7 @@ import type {
   SshConnector,
   TcpConnectionInfo
 } from "./contracts";
+import { AuthNotJudgedError } from "./authErrors";
 
 /**
  * Legacy SSH algorithms appended as fallbacks when `ServerConfig.legacyAlgorithms`
@@ -372,7 +373,7 @@ export class Ssh2Connector implements SshConnector {
       });
       client.on("close", () => {
         authAbort.abort();
-        if (!settled) reject(new Error("SSH connection closed before authentication completed"));
+        if (!settled) reject(new AuthNotJudgedError("SSH connection closed before authentication completed"));
       });
       client.connect(config);
     });

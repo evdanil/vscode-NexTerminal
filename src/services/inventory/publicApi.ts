@@ -106,7 +106,8 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  * it. Neither change takes effect on a registered object; use a new registration:
  * dispose the old registration, then register a fresh provider object with the
  * same id. The registry rejects the same provider object again, even after
- * disposal, because a form or prompt may still be holding it. Every such
+ * disposal, because a form or prompt may still be holding it; the error says
+ * to register a new provider object (a fresh instance, not the disposed one). Every such
  * change is a new shape. Each existing STAMPED source stops reporting live
  * status until its user has confirmed the change once — so the blast radius is
  * every source saved by a current build, which in practice is all of them.
@@ -130,7 +131,11 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  */
 export interface NexusExtensionApi {
   readonly contractVersion: 1;
-  /** Throws (via the registry's own validation) on a malformed provider or a duplicate id. */
+  /**
+   * Throws (via the registry's own validation) on a malformed provider, a duplicate id, or a
+   * provider object this registry has already accepted (even after its registration was
+   * disposed) — register a new provider object instead.
+   */
   registerInventoryProvider(provider: InventoryProvider): { dispose(): void };
 }
 
