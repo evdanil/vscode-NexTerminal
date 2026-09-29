@@ -1026,6 +1026,26 @@ describe("TunnelRegistrySync", () => {
     log.mockRestore();
   });
 
+  it("skips a fence file typed as a non-reverse tunnel so it cannot make a start probe a local port", async () => {
+    const [, otherStore] = sharedWindowStores();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    probePort.mockClear();
+    probePort.mockResolvedValue(true);
+    const path = seedRaw("local-typed--1.json", JSON.stringify(makeEntry({
+      ownerSessionId: "crashed", tunnelType: "local", localPort: 8080, lastSeen: Date.now(),
+      retiredReverseBind: { fenceId: "typed", routeIdentity: JSON.stringify(reverseRoute), remotePort: 9000 }
+    })), 0);
+    const other = new TunnelRegistrySync(otherStore, core, "other", probePort);
+
+    expect(await otherStore.getEntries()).toEqual([]);
+    expect(await other.checkRemoteOwnership("elsewhere", 1, { routeIdentity: reverseRoute, remotePort: 9000 }))
+      .toBeUndefined();
+    expect(probePort).not.toHaveBeenCalled();
+    expect(fakeFenceFiles.has(path)).toBe(true);
+    probePort.mockResolvedValue(false);
+    log.mockRestore();
+  });
+
   it("does not fail initialize or syncNow when one stale fence file cannot be read", async () => {
     const [ownerStore, otherStore] = sharedWindowStores();
     const log = vi.spyOn(console, "error").mockImplementation(() => {});

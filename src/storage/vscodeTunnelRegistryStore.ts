@@ -37,7 +37,9 @@ function isFenceEntry(value: unknown): value is TunnelRegistryEntry {
   return typeof fenceId === "string" && fenceId.length > 0 &&
     typeof routeIdentity === "string" && finite(remotePort) &&
     typeof entry.profileId === "string" && typeof entry.ownerSessionId === "string" &&
-    typeof entry.tunnelType === "string" &&
+    // A retired bind is only ever a reverse tunnel; any other type would make
+    // checkRemoteOwnership probe a local port instead of using the heartbeat.
+    entry.tunnelType === "reverse" &&
     finite(entry.localPort) && finite(entry.remotePort) && finite(entry.startedAt) &&
     (entry.lastSeen === undefined || finite(entry.lastSeen));
 }
