@@ -235,16 +235,27 @@ describe("start descriptors — linked auth profile is applied", () => {
     expect(tDiffers).toBe(use === "used");
   });
 
-  it("a deleted profile leaves the server's own fields, as resolveServer does", () => {
+  it("a linked profile that disappears changes the credential scope even when its fields equalled the server's", () => {
+    const same: AuthProfile = { id: "key-profile", name: "P", username: server.username, authType: server.authType };
+    const resolved = { ...inputs, authProfileLookup: () => same };
     const missing = { ...inputs, authProfileLookup: () => undefined };
-    expect(connectDescriptor(linked, missing)).toBe(connectDescriptor(linked, inputs));
+    expect(connectDescriptor(linked, missing)).not.toBe(connectDescriptor(linked, resolved));
+    expect(tunnelStartDescriptor(tunnel, linked, { ...tinputs, ...missing })).not.toBe(tunnelStartDescriptor(tunnel, linked, { ...tinputs, ...resolved }));
+    // A server with no link at all is a third, distinct state from a link whose profile is missing.
+    expect(connectDescriptor(server, resolved)).not.toBe(connectDescriptor(linked, missing));
+  });
+
+  it("a resolved profile's rename changes nothing", () => {
+    const p: AuthProfile = { id: "key-profile", name: "P", username: "root", authType: "password" };
+    expect(connectDescriptor(linked, withProfile({ ...p, name: "Renamed" }))).toBe(connectDescriptor(linked, withProfile(p)));
   });
 
   it("agrees with the shared merge helper SilentAuthSshFactory.resolveServer uses", () => {
     const p: AuthProfile = { id: "key-profile", name: "P", username: "root", authType: "key", keyPath: "/k" };
-    expect(connectDescriptor(linked, withProfile(p))).toBe(connectDescriptor(applyAuthProfile(linked, p), inputs));
+    // The pre-merged server carries the profile's fields itself; the profile is still resolved, so the scope matches.
+    expect(connectDescriptor(linked, withProfile(p))).toBe(connectDescriptor(applyAuthProfile(linked, p), withProfile(p)));
     expect(tunnelStartDescriptor(tunnel, linked, { ...tinputs, ...withProfile(p) }))
-      .toBe(tunnelStartDescriptor(tunnel, applyAuthProfile(linked, p), tinputs));
+      .toBe(tunnelStartDescriptor(tunnel, applyAuthProfile(linked, p), { ...tinputs, ...withProfile(p) }));
   });
 });
 

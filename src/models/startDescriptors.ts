@@ -82,10 +82,8 @@ function transportDescriptor(
   inputs: ConnectDescriptorInputs,
   visited: ReadonlySet<string> = new Set()
 ): unknown[] {
-  const server = applyAuthProfile(
-    rawServer,
-    rawServer.authProfileId ? inputs.authProfileLookup?.(rawServer.authProfileId) : undefined
-  );
+  const profile = rawServer.authProfileId ? inputs.authProfileLookup?.(rawServer.authProfileId) : undefined;
+  const server = applyAuthProfile(rawServer, profile);
   const chain = new Set(visited).add(server.id);
   return [
     server.id,
@@ -98,8 +96,14 @@ function transportDescriptor(
     // The key file is read only by a key login, judged on the EFFECTIVE auth type.
     server.authType === "key" ? server.keyPath || null : null,
     // The link itself, so switching profiles cancels; the profile's supplied
-    // fields are already folded into the values above.
+    // fields are already folded into the values above. And which credential scope
+    // is actually selected, mirroring SilentAuthSshFactory.resolveServer: the
+    // profile-scoped password/passphrase key only when the link is set AND the
+    // profile was found, the server-scoped key otherwise. A profile that vanishes
+    // (another window between removeAuthProfile's two saves) can leave every
+    // effective field equal to the server's own yet switch the credential source.
     rawServer.authProfileId || null,
+    profile !== undefined,
     Boolean(server.legacyAlgorithms),
     proxyDescriptor(server.proxy, inputs, chain)
   ];

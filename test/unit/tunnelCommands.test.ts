@@ -1265,6 +1265,28 @@ describe("startTunnel — profile removed while start is pending", () => {
       stop();
     });
 
+    it("a linked profile that disappears (fields equal to the server's) cancels a pending start", async () => {
+      const { core, profile, server: base } = await fixture();
+      // Profile fields equal the server's own: only the credential scope differs when it vanishes.
+      const same = { id: "ap1", name: "AP", username: base.username, authType: base.authType };
+      await core.addOrUpdateAuthProfile(same);
+      await core.addOrUpdateServer({ ...base, authProfileId: "ap1" });
+      const server = core.getServer("srv-1")!;
+      const { sync, registry } = held();
+      const lookup = vi.spyOn(core, "getAuthProfile");
+      const start = vi.fn(async () => makeActiveTunnel("t1"));
+      const run = startTunnel(core, { start } as never, { connect: vi.fn() } as never, profile, server, "isolated", registry);
+      // Another window's removeAuthProfile persisted the profiles before the servers: the link is
+      // still there, the lookup fails. Any mutation makes the fence recompute.
+      lookup.mockReturnValue(undefined);
+      await core.addOrUpdateServer({ ...core.getServer("srv-1")! });
+      sync.resolve();
+      await run;
+
+      expect(start).not.toHaveBeenCalled();
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("changed while the tunnel was starting"), "Retry");
+    });
+
     it("a no-op save does not cancel", async () => {
       const { core, profile, server, stop } = await linked();
       const { sync, registry } = held();

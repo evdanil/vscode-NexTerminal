@@ -30,7 +30,7 @@ export const SERVER_FIELDS: Record<keyof ServerConfig, { use: Use; why: string; 
   ipmiGatewayServerId: { use: "ignored", why: "macro routing, not this connection", alt: "gw" },
   openFileExplorerOnFirstConnect: { use: "ignored", why: "post-connect convenience", alt: true },
   proxy: { use: "connect+tunnel", why: "route to the host", alt: { type: "socks5", host: "p", port: 1080 } },
-  authProfileId: { use: "connect+tunnel", why: "credential source", alt: "ap1" },
+  authProfileId: { use: "connect+tunnel", why: "credential source: the link itself, and (in the descriptor) whether the linked profile RESOLVED, since that selects the profile-scoped vs server-scoped secret key even when every effective field is equal", alt: "ap1" },
   origin: { use: "ignored", why: "inventory bookkeeping", alt: { sourceId: "x", externalId: "y" } },
   formerlySynced: { use: "ignored", why: "inventory bookkeeping", alt: { sourceId: "x", externalId: "y" } },
 };
