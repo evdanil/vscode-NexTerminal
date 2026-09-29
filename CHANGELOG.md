@@ -1,10 +1,35 @@
 # Changelog
 
-## [2.8.296] — 2026-09-29
+## [2.8.300] — 2026-09-29
 
 ### Fixed
 
 - **Kitty keyboard, modifyOtherKeys, cursor-shape and save/restore-cursor sequences no longer leak into captured text.** The shared ANSI stripper now follows the ECMA-48 CSI grammar (`<` `=` `>` `?` parameter prefixes and intermediate bytes such as `ESC[2 q`) and removes two-byte forms like `ESC 7`, `ESC 8`, `ESC =` and `ESC >`, plus terminated DCS/APC/PM/SOS strings. Copy All, session transcripts and script `waitFor`/`expect` matching no longer show fragments such as `[>4;2m` or `[=5u`, so end-anchored prompt patterns match after vim, fish or neovim output, even when a sequence (including a terminal title) is split across two chunks: Copy All, transcripts, script output and macro trigger matching each hold an unfinished CSI escape (at most 64 characters) until the next chunk, and drop an unterminated OSC/DCS/APC/PM/SOS payload (Sixel, Kitty graphics, XTGETTCAP) across chunks until its terminator, giving up after 1 MiB. Private-prefix CSI ending in `m` (such as `ESC[>4;m`) is no longer mistaken for an SGR reset by the highlighter.
+
+## [2.8.299] — 2026-09-29
+
+### Fixed
+
+- **Disposing an SSH lease while its standalone fallback is still connecting no longer drops other sessions or leaks a connection.** A pooled lease that fell back to its own connection (channel-limited device or stale transport) released its pooled reference a second time if it was disposed mid-connect, which could close the shared transport under another live terminal. The pooled reference is now released once, and a fallback that finishes after disposal is closed instead of being used.
+
+## [2.8.298] — 2026-09-29
+
+### Fixed
+
+- **The Session-terminal IPMI hint no longer disappears when an `ipmitool` command has a substitution or heredoc in its arguments.** A macro such as `ipmitool -P "$(cat ~/.bmcpw)" sol activate`, or one with a here-string, heredoc or `$(...)` redirect target, now gets the editor hint and the send-confirmation note again; a dynamic command word, a heredoc body and text after an unparsed substitution are still left alone. The detector also accepts `command -p --`, `time -p --`, `nice -5` and the sudo `-r`/`-t`/`-c`/`-a` value options (and their long forms).
+
+## [2.8.297] — 2026-09-29
+
+### Fixed
+
+- **A large inventory sync no longer holds the config lock for thousands of sequential keychain deletes.** The add-time clearing of leftover saved credentials (three keys per added server) and the delete-prune credential cleanup now run up to 16 servers at a time. An add-time clear that fails still aborts the whole sync with nothing applied, and the apply still waits for every clear to settle.
+- **Re-registering a disposed inventory provider object now says what to do.** The rejection is unchanged (a form or prompt may still hold the old object), but the error now tells the provider author to register a new provider object, and the public API contract says the same.
+
+## [2.8.296] — 2026-09-29
+
+### Fixed
+
+- **A script's unawaited wait now ends with the run.** A `waitFor` / `expect` / `waitAny` still pending when a run completed, failed or lost its worker (a `Promise.race` loser, a call the script never awaited) kept its timer and the run's output buffer for its whole timeout, then wrote a stray `← timeout` line to the "Nexus Scripts" channel after `end:`. Every ending now cancels pending waits, and a wait posted just before the run ended is refused.
 
 ## [2.8.295] — 2026-09-28
 
