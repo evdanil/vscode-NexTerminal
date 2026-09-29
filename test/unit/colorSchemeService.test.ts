@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ColorScheme } from "../../src/models/colorScheme";
-import { ColorSchemeService, InMemoryColorSchemeStorage } from "../../src/services/colorSchemeService";
+import { ColorSchemeService, InMemoryColorSchemeStorage, type ColorSchemeStorage } from "../../src/services/colorSchemeService";
 import { BUILTIN_SCHEMES } from "../../src/services/builtinSchemes";
 
 describe("ColorSchemeService", () => {
@@ -77,5 +77,40 @@ describe("ColorSchemeService", () => {
     expect(storage.getUserSchemes()).toEqual([]);
     expect(storage.getActiveSchemeId()).toBe("");
     expect(storage.getFontConfig()).toBeUndefined();
+  });
+
+  it("a panel action taken while a reset awaits storage is queued behind it and applies to the emptied store (⊘ interleaving, where the reset's late clear erases the new scheme from storage while memory still shows it)", async () => {
+    const stored = { schemes: [{ id: "old" } as unknown as ColorScheme], active: "old" };
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const storage: ColorSchemeStorage = {
+      getUserSchemes: () => [...stored.schemes],
+      saveUserSchemes: async (v) => { stored.schemes = [...v]; },
+      getActiveSchemeId: () => stored.active,
+      saveActiveSchemeId: async (v) => { stored.active = v; },
+      getFontConfig: () => undefined,
+      saveFontConfig: async () => undefined,
+      // The reset's first update is held pending.
+      clearAll: async () => { await held; stored.schemes = []; stored.active = ""; }
+    };
+    const service = new ColorSchemeService(storage);
+
+    const reset = service.reset();
+    const added = service.addSchemes([{ id: "fresh" } as unknown as ColorScheme]);
+    await Promise.resolve();
+    release();
+    await Promise.all([reset, added]);
+
+    // Intended semantics: the action ran AFTER the reset, on a clean store, so it survives — and nothing from before does.
+    expect(stored.schemes).toEqual([{ id: "fresh" }]);
+    expect(service.getAllSchemes().filter((s) => s.id === "old")).toEqual([]);
+    expect(service.getAllSchemes().some((s) => s.id === "fresh")).toBe(true);
+  });
+
+  it("removing the active scheme still clears the selection (the chained mutators do not wait on themselves)", async () => {
+    const storage = new InMemoryColorSchemeStorage([{ id: "u1" } as unknown as ColorScheme], "u1");
+    const service = new ColorSchemeService(storage);
+    await service.removeScheme("u1");
+    expect(service.getActiveSchemeId()).toBe("");
   });
 });

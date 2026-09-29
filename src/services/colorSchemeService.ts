@@ -32,6 +32,21 @@ export class ColorSchemeService {
   private userSchemes: ColorScheme[];
   private activeId: string;
   private fontConfig: TerminalFontConfig | undefined;
+  /**
+   * Every mutation — and `reset()` — runs on this one chain, so a Terminal
+   * Appearance action taken while Delete All Data is awaiting its storage updates
+   * cannot interleave with them: it either finishes before the reset and is
+   * cleared by it, or runs after it, against the empty store. NEW WRITERS MUST
+   * ENLIST via `runExclusive`, and must not call another enlisted method from
+   * inside it (that would wait on itself); use the private `*Unlocked` helpers.
+   */
+  private chain: Promise<unknown> = Promise.resolve();
+
+  private runExclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.chain.then(operation, operation);
+    this.chain = result.catch(() => undefined);
+    return result;
+  }
 
   /**
    * `resetGuard` (optional) notices a Delete All Data run in another window: the
@@ -72,7 +87,11 @@ export class ColorSchemeService {
     return this.activeId;
   }
 
-  async setActiveSchemeId(id: string): Promise<void> {
+  setActiveSchemeId(id: string): Promise<void> {
+    return this.runExclusive(() => this.setActiveSchemeIdUnlocked(id));
+  }
+
+  private async setActiveSchemeIdUnlocked(id: string): Promise<void> {
     this.syncAfterReset();
     this.activeId = id;
     await this.storage.saveActiveSchemeId(id);
@@ -82,21 +101,25 @@ export class ColorSchemeService {
     return this.getAllSchemes().find((s) => s.id === id);
   }
 
-  async addSchemes(schemes: ColorScheme[]): Promise<void> {
-    this.syncAfterReset();
-    this.userSchemes.push(...schemes);
-    await this.storage.saveUserSchemes(this.userSchemes);
+  addSchemes(schemes: ColorScheme[]): Promise<void> {
+    return this.runExclusive(async () => {
+      this.syncAfterReset();
+      this.userSchemes.push(...schemes);
+      await this.storage.saveUserSchemes(this.userSchemes);
+    });
   }
 
-  async removeScheme(id: string): Promise<void> {
-    this.syncAfterReset();
-    const idx = this.userSchemes.findIndex((s) => s.id === id);
-    if (idx === -1) return;
-    this.userSchemes.splice(idx, 1);
-    await this.storage.saveUserSchemes(this.userSchemes);
-    if (this.activeId === id) {
-      await this.setActiveSchemeId("");
-    }
+  removeScheme(id: string): Promise<void> {
+    return this.runExclusive(async () => {
+      this.syncAfterReset();
+      const idx = this.userSchemes.findIndex((s) => s.id === id);
+      if (idx === -1) return;
+      this.userSchemes.splice(idx, 1);
+      await this.storage.saveUserSchemes(this.userSchemes);
+      if (this.activeId === id) {
+        await this.setActiveSchemeIdUnlocked("");
+      }
+    });
   }
 
   getFontConfig(): TerminalFontConfig | undefined {
@@ -104,17 +127,21 @@ export class ColorSchemeService {
     return this.fontConfig;
   }
 
-  async saveFontConfig(config: TerminalFontConfig): Promise<void> {
-    this.syncAfterReset();
-    this.fontConfig = config;
-    await this.storage.saveFontConfig(config);
+  saveFontConfig(config: TerminalFontConfig): Promise<void> {
+    return this.runExclusive(async () => {
+      this.syncAfterReset();
+      this.fontConfig = config;
+      await this.storage.saveFontConfig(config);
+    });
   }
 
   /** Delete All Data: drop the user schemes, the selection and the font choice, in memory and in storage. */
-  async reset(): Promise<void> {
-    this.userSchemes = [];
-    this.activeId = "";
-    this.fontConfig = undefined;
-    await this.storage.clearAll();
+  reset(): Promise<void> {
+    return this.runExclusive(async () => {
+      this.userSchemes = [];
+      this.activeId = "";
+      this.fontConfig = undefined;
+      await this.storage.clearAll();
+    });
   }
 }
