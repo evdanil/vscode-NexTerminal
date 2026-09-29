@@ -10,9 +10,14 @@ import type { SecretVault } from "./contracts";
  * starts before the SecretStorage delete lands would build a fresh connection to
  * the NEW proxy and read the OLD proxy's password. `markStale` tombstones the key
  * in memory (reads return undefined, as if nothing were saved) and then deletes.
- * The tombstone is dropped when the delete finishes, or once a new value stored
- * under the key (the password the user just typed for the new endpoint) has been
- * written; until then reads stay absent rather than return the old value.
+ * Tombstone clearing is generation-aware. Each markStale bumps a per-key
+ * generation. Its delete clears only its own generation's tombstone, and a store
+ * (the password the user just typed for the new endpoint) clears it only if no
+ * markStale happened after that store was issued, so an older store settling can
+ * never lift a newer tombstone. Until a store issued after the last markStale has
+ * been written, or that markStale's delete has finished, reads stay absent rather
+ * than return the old value. A read already in flight when a tombstone appears is
+ * discarded too.
  * A failed delete keeps the tombstone: not sending a possibly stale secret is the
  * safe side.
  *
@@ -21,8 +26,9 @@ import type { SecretVault } from "./contracts";
  */
 export class TombstonedSecretVault implements SecretVault {
   private readonly tombstones = new Set<string>();
+  /** Bumped by every markStale; a store or delete may clear only the tombstone of its own generation. */
+  private readonly generations = new Map<string, number>();
   private readonly tails = new Map<string, Promise<unknown>>();
-  private readonly pendingStores = new Map<string, number>();
 
   public constructor(private readonly inner: SecretVault) {}
 
@@ -30,41 +36,49 @@ export class TombstonedSecretVault implements SecretVault {
     if (this.tombstones.has(key)) {
       return undefined;
     }
-    return this.inner.get(key);
+    const value = await this.inner.get(key);
+    // A tombstone set while the read was in flight makes that value stale too.
+    return this.tombstones.has(key) ? undefined : value;
   }
 
   public store(key: string, value: string): Promise<void> {
-    // The new value belongs to the new endpoint, but it is queued behind any stale
-    // delete, so reads stay tombstoned until it has actually been written.
-    this.pendingStores.set(key, (this.pendingStores.get(key) ?? 0) + 1);
+    // Queued behind any stale delete, so reads stay tombstoned until it is written.
+    // It may lift the tombstone only if no markStale happened after it was issued:
+    // an older store settling must not clear a newer tombstone.
+    const issuedAt = this.generation(key);
     const write = this.enqueue(key, () => this.inner.store(key, value));
-    const settled = (): void => {
-      const left = (this.pendingStores.get(key) ?? 1) - 1;
-      if (left <= 0) this.pendingStores.delete(key);
-      else this.pendingStores.set(key, left);
-    };
     void write.then(
-      () => { settled(); this.tombstones.delete(key); },
-      settled
+      () => {
+        if (this.generation(key) === issuedAt) {
+          this.tombstones.delete(key);
+        }
+      },
+      () => undefined
     );
     return write;
   }
 
+  /** Direct deletes do not touch the tombstone; only markStale does. */
   public delete(key: string): Promise<void> {
     return this.enqueue(key, () => this.inner.delete(key));
   }
 
   /** Makes `key` read as absent immediately, then deletes it. Resolves when the delete has finished. */
   public markStale(key: string): Promise<void> {
+    const generation = this.generation(key) + 1;
+    this.generations.set(key, generation);
     this.tombstones.add(key);
-    const pending = this.enqueue(key, () => this.inner.delete(key));
-    return pending.then(() => {
-      // Dropped once the delete really finished, unless a newer value is still
-      // being written (its own completion drops the tombstone then).
-      if (!this.pendingStores.has(key)) {
+    return this.enqueue(key, () => this.inner.delete(key)).then(() => {
+      // Only this generation's own tombstone: a newer markStale keeps it until
+      // its own delete lands. A failed delete never reaches here and keeps it.
+      if (this.generation(key) === generation) {
         this.tombstones.delete(key);
       }
     });
+  }
+
+  private generation(key: string): number {
+    return this.generations.get(key) ?? 0;
   }
 
   private enqueue(key: string, op: () => Promise<void>): Promise<void> {

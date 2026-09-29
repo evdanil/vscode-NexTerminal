@@ -80,6 +80,146 @@ describe("TombstonedSecretVault", () => {
   });
 });
 
+/** A vault whose store and delete calls are held until the test releases them. */
+class GatedVault implements SecretVault {
+  public readonly data = new Map<string, string>();
+  public readonly storeGates: Array<() => void> = [];
+  public readonly deleteGates: Array<() => void> = [];
+  public getGate?: Promise<void>;
+  public failStore = false;
+  async get(key: string) { const v = this.data.get(key); await this.getGate; return v; }
+  async store(key: string, value: string) {
+    await new Promise<void>((resolve) => this.storeGates.push(resolve));
+    if (this.failStore) throw new Error("store failed");
+    this.data.set(key, value);
+  }
+  async delete(key: string) {
+    await new Promise<void>((resolve) => this.deleteGates.push(resolve));
+    this.data.delete(key);
+  }
+}
+const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+describe("TombstonedSecretVault — ordering", () => {
+  const key = proxyPasswordSecretKey("s1");
+
+  it("an older store settling does not lift a newer tombstone (absent until the delete lands)", async () => {
+    const inner = new GatedVault();
+    const vault = new TombstonedSecretVault(inner);
+    const oldStore = vault.store(key, "old-endpoint-secret"); // e.g. a post-auth store for the old proxy
+    await tick();
+    const deleting = vault.markStale(key); // queued behind the store
+    inner.storeGates.shift()!(); // the older store succeeds
+    await oldStore;
+    await tick();
+    expect(inner.data.get(key)).toBe("old-endpoint-secret");
+    expect(await vault.get(key)).toBeUndefined();
+    inner.deleteGates.shift()!();
+    await deleting;
+    expect(await vault.get(key)).toBeUndefined();
+    expect(inner.data.has(key)).toBe(false);
+  });
+
+  it("a store issued after markStale lifts the tombstone once written, and the new value is returned", async () => {
+    const inner = new GatedVault();
+    const vault = new TombstonedSecretVault(inner);
+    const deleting = vault.markStale(key);
+    const storing = vault.store(key, "new-endpoint-secret");
+    await tick();
+    inner.deleteGates.shift()!();
+    await deleting;
+    await tick();
+    inner.storeGates.shift()!();
+    await storing;
+    await tick();
+    expect(await vault.get(key)).toBe("new-endpoint-secret");
+  });
+
+  it("a double markStale stays absent until the last delete resolves", async () => {
+    const inner = new GatedVault();
+    inner.data.set(key, "old");
+    const vault = new TombstonedSecretVault(inner);
+    const first = vault.markStale(key);
+    const second = vault.markStale(key);
+    await tick();
+    inner.deleteGates.shift()!();
+    await first;
+    await tick();
+    expect(await vault.get(key)).toBeUndefined(); // second delete still pending
+    inner.deleteGates.shift()!();
+    await second;
+    expect(await vault.get(key)).toBeUndefined();
+    expect(inner.data.has(key)).toBe(false);
+  });
+
+  it("a store issued between two markStales does not lift the second tombstone", async () => {
+    const inner = new GatedVault();
+    const vault = new TombstonedSecretVault(inner);
+    const first = vault.markStale(key);
+    const storing = vault.store(key, "between");
+    const second = vault.markStale(key);
+    await tick();
+    inner.deleteGates.shift()!();
+    await first;
+    await tick();
+    inner.storeGates.shift()!();
+    await storing;
+    await tick();
+    expect(await vault.get(key)).toBeUndefined();
+    inner.deleteGates.shift()!();
+    await second;
+    expect(await vault.get(key)).toBeUndefined();
+  });
+
+  it("a read already in flight when the tombstone appears is discarded", async () => {
+    const inner = new GatedVault();
+    inner.data.set(key, "old");
+    let open!: () => void;
+    inner.getGate = new Promise<void>((resolve) => { open = resolve; });
+    const vault = new TombstonedSecretVault(inner);
+    const reading = vault.get(key);
+    const deleting = vault.markStale(key);
+    open();
+    expect(await reading).toBeUndefined();
+    inner.deleteGates.shift()!();
+    await deleting;
+  });
+
+  it("a failed store does not lift the tombstone, and later operations still run", async () => {
+    const inner = new GatedVault();
+    inner.failStore = true;
+    const vault = new TombstonedSecretVault(inner);
+    const deleting = vault.markStale(key);
+    const storing = vault.store(key, "x");
+    const outcome = storing.catch((e: Error) => e.message);
+    await tick();
+    inner.deleteGates.shift()!();
+    await deleting;
+    await tick();
+    inner.storeGates.shift()!();
+    expect(await outcome).toBe("store failed");
+    // The delete already lifted its own generation's tombstone, and nothing was written.
+    expect(await vault.get(key)).toBeUndefined();
+    inner.failStore = false;
+    const again = vault.store(key, "y");
+    await tick();
+    inner.storeGates.shift()!();
+    await again;
+    expect(await vault.get(key)).toBe("y");
+  });
+
+  it("a direct delete leaves the tombstone state alone and is ordered with stores", async () => {
+    const inner = new GatedVault();
+    inner.data.set(key, "old");
+    const vault = new TombstonedSecretVault(inner);
+    const deleting = vault.delete(key);
+    expect(await vault.get(key)).toBe("old"); // not stale-marked: still readable until it lands
+    inner.deleteGates.shift()!();
+    await deleting;
+    expect(await vault.get(key)).toBeUndefined();
+  });
+});
+
 describe("proxy endpoint edit tombstones the saved proxy password synchronously", () => {
   class SlowRepo extends InMemoryConfigRepository {
     public release?: () => void;
