@@ -17,16 +17,29 @@ function versionedFenceTimestamp(name: string): number | undefined {
   return embedded ? Number(embedded[1]) : undefined;
 }
 
+const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+
+/**
+ * Every field the registry sync consumes must be well-typed: a partial file
+ * that passed would reach probePort(undefined) or produce a NaN age that the
+ * stale sweep can never delete. Such a file is treated as unusable instead.
+ */
 function isFenceEntry(value: unknown): value is TunnelRegistryEntry {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return false;
   }
-  const retired = (value as { retiredReverseBind?: unknown }).retiredReverseBind;
+  const entry = value as Record<string, unknown>;
+  const retired = entry.retiredReverseBind;
   if (typeof retired !== "object" || retired === null) {
     return false;
   }
-  const fenceId = (retired as { fenceId?: unknown }).fenceId;
-  return typeof fenceId === "string" && fenceId.length > 0;
+  const { fenceId, routeIdentity, remotePort } = retired as Record<string, unknown>;
+  return typeof fenceId === "string" && fenceId.length > 0 &&
+    typeof routeIdentity === "string" && finite(remotePort) &&
+    typeof entry.profileId === "string" && typeof entry.ownerSessionId === "string" &&
+    typeof entry.tunnelType === "string" &&
+    finite(entry.localPort) && finite(entry.remotePort) && finite(entry.startedAt) &&
+    (entry.lastSeen === undefined || finite(entry.lastSeen));
 }
 
 export class VscodeTunnelRegistryStore implements TunnelRegistryStore {

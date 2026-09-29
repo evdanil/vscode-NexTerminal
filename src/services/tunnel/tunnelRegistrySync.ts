@@ -558,7 +558,8 @@ export class TunnelRegistrySync {
           entry.retiredReverseBind &&
           (entry.ownerSessionId !== this.sessionId ||
             !this.unsettledReverseBindFenceIds.has(entry.retiredReverseBind.fenceId)) &&
-          now - (entry.lastSeen ?? entry.startedAt) >= STALE_THRESHOLD_MS
+          // Negated so a non-finite age counts as stale rather than kept forever.
+          !(now - (entry.lastSeen ?? entry.startedAt) < STALE_THRESHOLD_MS)
         ) {
           try {
             await this.store.removeObservedFence(entry);

@@ -1001,6 +1001,31 @@ describe("TunnelRegistrySync", () => {
     log.mockRestore();
   });
 
+  it("skips a partial fence file so it cannot block a start, and sweeps it once stale", async () => {
+    const [ownerStore, otherStore] = sharedWindowStores();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    probePort.mockClear();
+    const partial = JSON.stringify({
+      profileId: "t1", ownerSessionId: "crashed",
+      retiredReverseBind: { fenceId: "partial", routeIdentity: JSON.stringify(reverseRoute), remotePort: 9000 }
+    });
+    const fresh = seedRaw("partial-fresh--1.json", partial, 0);
+    const old = seedRaw("partial-old--1.json", partial, 31_000);
+    const other = new TunnelRegistrySync(otherStore, core, "other", probePort);
+
+    await other.initialize();
+
+    expect(await otherStore.getEntries()).toEqual([]);
+    expect(await other.checkRemoteOwnership("elsewhere", 1, { routeIdentity: reverseRoute, remotePort: 9000 }))
+      .toBeUndefined();
+    expect(probePort).not.toHaveBeenCalled();
+    expect(fakeFenceFiles.has(old)).toBe(false);
+    expect(fakeFenceFiles.has(fresh)).toBe(true);
+    void ownerStore;
+    other.dispose();
+    log.mockRestore();
+  });
+
   it("does not fail initialize or syncNow when one stale fence file cannot be read", async () => {
     const [ownerStore, otherStore] = sharedWindowStores();
     const log = vi.spyOn(console, "error").mockImplementation(() => {});
