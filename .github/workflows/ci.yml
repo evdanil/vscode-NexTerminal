@@ -222,6 +222,11 @@ jobs:
           # released version, so the version is compared against the released
           # tags directly.
           #
+          # A pass is only as fresh as the tags it saw: a release tagged while
+          # this pull request is open makes it stale. recheck-open-prs.yml
+          # re-runs this job on open maintainer pull requests when a v* tag is
+          # created, which is why it must stay named "Version / changelog".
+          #
           # Tags: checkout with fetch-depth 0 normally brings them, but fetch
           # explicitly so this does not depend on that; --force so a stale
           # local tag cannot mask the remote one.

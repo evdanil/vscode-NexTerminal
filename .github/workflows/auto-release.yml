@@ -177,3 +177,19 @@ jobs:
     with:
       tag: ${{ needs.decide.outputs.tag }}
     secrets: inherit
+
+  # The tag this run just created makes the "Version / changelog" gate stale on
+  # open pull requests that still carry the released version; re-run it there.
+  # Called directly for the same reason as the two above: a GITHUB_TOKEN tag
+  # push fires no `push` workflow. Nothing depends on this job and it never
+  # fails on its own, so it cannot hold up or fail the release. The job-level
+  # permissions are needed because a called workflow gets at most what its
+  # caller grants, and pull-requests is not in this file's top-level set.
+  recheck-open-prs:
+    needs: [tag]
+    if: needs.tag.outputs.created == 'true'
+    permissions:
+      actions: write
+      pull-requests: read
+      contents: read
+    uses: ./.github/workflows/recheck-open-prs.yml
