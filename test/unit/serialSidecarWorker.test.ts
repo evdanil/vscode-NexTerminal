@@ -39,7 +39,7 @@ class ControlledSerialPort extends EventEmitter {
 
   public override removeAllListeners(event?: string | symbol): this {
     this.removeAllListenersCalls += 1;
-    return super.removeAllListeners(event);
+    return event === undefined ? super.removeAllListeners() : super.removeAllListeners(event);
   }
 }
 
@@ -195,6 +195,11 @@ describe("production serial sidecar worker request handler", () => {
         method: "portReleaseFailed",
         params: { sessionId: "session-17", path: "/dev/ttyUSB0", message: expect.stringContaining("EBUSY close") }
       });
+      // The descriptor may still be live: a late error (e.g. replug) must not
+      // throw as an unhandled 'error' event and take the shared sidecar down.
+      const port = ControlledSerialPort.instances[0];
+      expect(() => port.emit("error", new Error("device replugged"))).not.toThrow();
+      expect(port.listenerCount("error")).toBe(1);
       // Tracking is dropped, so the id is not reserved forever.
       await expect(
         handler({ id: "w-2", method: "writePort", params: { sessionId: "session-17", data: "eA==" } })

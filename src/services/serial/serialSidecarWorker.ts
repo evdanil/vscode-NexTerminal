@@ -58,6 +58,18 @@ function friendlyOpenError(portPath: string, error: Error): Error {
   return error;
 }
 
+// EventEmitter throws an unhandled 'error' when nobody listens, and the sidecar
+// is shared by every serial session. A port we stop tracking may still be live
+// (a close that never succeeded), so it keeps this one sink for a late error,
+// e.g. the device being replugged.
+function ignoreDetachedPortError(): void {}
+
+/** Stops forwarding a port's events, but leaves it a single error sink. */
+function detachPort(port: PortRecord): void {
+  port.removeAllListeners();
+  port.on("error", ignoreDetachedPortError);
+}
+
 const CLOSE_RETRY_DELAYS_MS = [50, 150];
 // Total ~30 s. Used after a cancelled open whose close kept failing: the owner
 // has already timed out and will never send another closePort, so the worker
@@ -129,7 +141,7 @@ export function createSerialSidecarRequestHandler(dependencies: {
         if (ports.get(sessionId) === port) {
           ports.delete(sessionId);
         }
-        port.removeAllListeners();
+        detachPort(port);
         return;
       }
       lastError = error;
@@ -137,7 +149,7 @@ export function createSerialSidecarRequestHandler(dependencies: {
     if (ports.get(sessionId) === port) {
       ports.delete(sessionId);
     }
-    port.removeAllListeners();
+    detachPort(port);
     const message = `Could not release a cancelled serial open (${lastError.message}). The port may stay busy until the sidecar restarts: unplug and replug the device or run Reload Window.`;
     // Nobody owns this session id any more, so a portError would be ignored;
     // the manager turns this dedicated notification into a user-visible warning.
@@ -229,7 +241,7 @@ export function createSerialSidecarRequestHandler(dependencies: {
         if (ports.get(sessionId) === port) {
           ports.delete(sessionId);
         }
-        port.removeAllListeners();
+        detachPort(port);
         throw error;
       } finally {
         if (openingSessions.get(sessionId) === openState) {
@@ -245,7 +257,7 @@ export function createSerialSidecarRequestHandler(dependencies: {
         if (closedWhileOpening) {
           // The port closed itself before the cancel arrived; there is nothing
           // left to release, and closing again would only fail "not open".
-          port.removeAllListeners();
+          detachPort(port);
           return response(request.id, undefined, "Serial port open cancelled");
         }
         const closeError = await closeWithRetry(port);
@@ -257,11 +269,11 @@ export function createSerialSidecarRequestHandler(dependencies: {
           void releaseAbandonedPort(sessionId, params.path, port, closeError);
           return response(request.id, undefined, `Serial port open cancelled; close failed: ${closeError.message}`);
         }
-        port.removeAllListeners();
+        detachPort(port);
         return response(request.id, undefined, "Serial port open cancelled");
       }
       if (closedWhileOpening) {
-        port.removeAllListeners();
+        detachPort(port);
         return response(request.id, undefined, "Serial port closed while opening");
       }
       opening = false;
