@@ -2321,7 +2321,11 @@ describe("Delete All Data (nexus.config.completeReset) covers Local Servers and 
     const resetViewState = vi.fn(async () => {
       keysWhenViewStateReset = machine.ctx.state.has("nexus.ui.collapsedFolders") ? 1 : 0;
     });
-    const runtime = { ...recordingRuntime(machine.core), resetTerminalAppearance, resetViewState };
+    let keysWhenViewStateResumed = -1;
+    const resumeViewState = vi.fn(() => {
+      keysWhenViewStateResumed = !machine.ctx.state.has("nexus.ui.collapsedFolders") && machine.ctx.state.has("nexus.resetGeneration") ? 1 : 0;
+    });
+    const runtime = { ...recordingRuntime(machine.core), resetTerminalAppearance, resetViewState, resumeViewState };
 
     await runReset(machine, runtime);
 
@@ -2332,6 +2336,9 @@ describe("Delete All Data (nexus.config.completeReset) covers Local Servers and 
     // Before the stored keys are cleared, so no queued write can land after them.
     expect(resetViewState).toHaveBeenCalledTimes(1);
     expect(keysWhenViewStateReset).toBe(1);
+    // Resumed only after the keys are cleared AND the generation bumped.
+    expect(resumeViewState).toHaveBeenCalledTimes(1);
+    expect(keysWhenViewStateResumed).toBe(1);
     // Deliberately kept, and named in the confirmation.
     expect(machine.ctx.state.has("nexus.ssh.knownHostFingerprints.v1")).toBe(true);
     expect(machine.ctx.state.has("nexus.import.sshConfigOffer.v1")).toBe(true);

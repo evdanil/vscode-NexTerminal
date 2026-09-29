@@ -244,9 +244,14 @@ export interface ConfigRuntimeHooks {
   /**
    * Delete All Data: empty the collapsed-folder sets the tree providers hold in
    * memory, drop their pending writes and turn Follow Terminal Directory off.
-   * Called BEFORE the stored keys are cleared, so no queued write lands after.
+   * Called BEFORE the stored keys are cleared, and leaves the collapsed-folder
+   * persistence suspended: `completeReset` calls `resumeViewState` only after the
+   * keys are cleared and the generation bumped, so a collapse in between cannot
+   * schedule a write that lands after the clear.
    */
   resetViewState?(): Promise<void>;
+  /** Lift the suspension `resetViewState` left; called from a `finally` once the clears are done. */
+  resumeViewState?(): void;
 }
 
 interface RemovedProfileIds {
@@ -5404,27 +5409,33 @@ export function registerConfigCommands(
       // Clear macros (globalState + vault entries)
       await getActiveMacroStore().clearAll();
       await runtime?.resetViewState?.();
-      if (context) {
-        // Notices, hints, collapsed-folder and follow-directory choices, and the
-        // Terminal Appearance store (schemes, selection, font), which lives in
-        // globalState outside NexusCore. The Local Shell auto-trigger
-        // acknowledgement is among them because it belongs to the
-        // `nexus.terminal.macros.autoTrigger` setting reset just below: left
-        // behind, a user who once chose Disable would get auto-trigger back on and
-        // never see the warning again. What stays is listed in
-        // RESET_KEPT_GLOBAL_STATE_KEYS.
-        for (const key of RESET_CLEARED_GLOBAL_STATE_KEYS) {
-          await context.globalState.update(key, undefined);
+      try {
+        if (context) {
+          // Notices, hints, collapsed-folder and follow-directory choices, and the
+          // Terminal Appearance store (schemes, selection, font), which lives in
+          // globalState outside NexusCore. The Local Shell auto-trigger
+          // acknowledgement is among them because it belongs to the
+          // `nexus.terminal.macros.autoTrigger` setting reset just below: left
+          // behind, a user who once chose Disable would get auto-trigger back on and
+          // never see the warning again. What stays is listed in
+          // RESET_KEPT_GLOBAL_STATE_KEYS.
+          for (const key of RESET_CLEARED_GLOBAL_STATE_KEYS) {
+            await context.globalState.update(key, undefined);
+          }
         }
-      }
-      // The running service caches those values and an open panel shows them.
-      await runtime?.resetTerminalAppearance?.();
-      // AFTER everything above is cleared: other windows keep collapsed-folder
-      // sets and the appearance cache in memory, and on their next action they
-      // see this counter move and reload from the (now empty) store instead of
-      // writing their stale copy back. Never cleared, so it stays monotonic.
-      if (context) {
-        await bumpResetGeneration(context.globalState);
+        // The running service caches those values and an open panel shows them.
+        await runtime?.resetTerminalAppearance?.();
+        // AFTER everything above is cleared: other windows keep collapsed-folder
+        // sets and the appearance cache in memory, and on their next action they
+        // see this counter move and reload from the (now empty) store instead of
+        // writing their stale copy back. Never cleared, so it stays monotonic.
+        if (context) {
+          await bumpResetGeneration(context.globalState);
+        }
+      } finally {
+        // Only now may a collapse persist again: the keys are cleared and the
+        // generation bumped. Also runs if any of that threw.
+        runtime?.resumeViewState?.();
       }
 
       // Reset all settings to defaults

@@ -57,7 +57,7 @@ import { stopTunnelsForShutdown, TunnelRegistrySync } from "./services/tunnel/tu
 import { FileExplorerTreeProvider } from "./ui/fileExplorerTreeProvider";
 import { createCollapsedFolderState } from "./ui/collapsedFolderState";
 import { createResetGenerationGuard } from "./storage/resetGeneration";
-import { resetLiveViewState } from "./ui/viewStateReset";
+import { resetLiveViewState, resumeLiveViewState } from "./ui/viewStateReset";
 import { FolderTreeItem, NexusTreeProvider } from "./ui/nexusTreeProvider";
 import { ScriptCodeLensProvider } from "./ui/scriptCodeLensProvider";
 import { ScriptTreeProvider } from "./ui/scriptTreeProvider";
@@ -1579,6 +1579,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // Bulk config changes remove profiles without going through their individual
   // Remove commands. Supply the same teardown operations here; configCommands
   // releases its mutation lock before waiting on SSH tunnels.
+  const liveViewTrees = () => [
+    { provider: nexusTreeProvider, persistence: collapsedFolderStatePersistence },
+    { provider: macroTreeProvider, persistence: macroCollapsedFolderStatePersistence }
+  ];
   const configDisposables = registerConfigCommands(core, secretVault, context, {
     stopLocalServer: (configId) => stopLocalServerForRemoval(localServerCtx, configId),
     stopNetworkServices: () => stopRunningNetworkServices(core, networkServerManager),
@@ -1587,14 +1591,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     activeTunnelIdForProfile: (profileId) => ctx.tunnelManager.getActiveTunnelId(profileId),
     closeSerialProfileTerminals: (profileId) => closeSerialProfileTerminals(ctx, profileId),
     closeLocalShellProfileTerminals: (profileId) => closeLocalShellProfileTerminals(ctx, profileId),
-    resetViewState: () =>
-      resetLiveViewState({
-        trees: [
-          { provider: nexusTreeProvider, persistence: collapsedFolderStatePersistence },
-          { provider: macroTreeProvider, persistence: macroCollapsedFolderStatePersistence }
-        ],
-        cwdSync: cwdSyncCoordinator
-      }),
+    resetViewState: () => resetLiveViewState({ trees: liveViewTrees(), cwdSync: cwdSyncCoordinator }),
+    resumeViewState: () => resumeLiveViewState(liveViewTrees()),
     resetTerminalAppearance: async () => {
       await colorSchemeService.reset();
       TerminalAppearancePanel.refreshOpen();

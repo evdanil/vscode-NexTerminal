@@ -19,8 +19,10 @@ export async function resetLiveViewState(deps: {
   cwdSync: { setFollowing(on: boolean): void };
 }): Promise<void> {
   // Each persistence ignores schedules from `discard()` until `resume()`, so a
-  // toggle made while an in-flight write settles cannot queue the old paths; the
-  // providers are emptied before writes are allowed again.
+  // toggle made while an in-flight write settles cannot queue the old paths. It
+  // is left suspended on success: the caller resumes it (`resumeLiveViewState`)
+  // once the stored keys are cleared, or a collapse in between could schedule a
+  // write that lands after the clear. If this throws, nothing else will resume.
   try {
     await Promise.all(deps.trees.map(({ persistence }) => persistence.discard()));
     for (const { provider } of deps.trees) {
@@ -28,9 +30,15 @@ export async function resetLiveViewState(deps: {
       provider.refresh();
     }
     deps.cwdSync.setFollowing(false);
-  } finally {
-    for (const { persistence } of deps.trees) {
-      persistence.resume();
-    }
+  } catch (error) {
+    resumeLiveViewState(deps.trees);
+    throw error;
+  }
+}
+
+/** End the suspension `resetLiveViewState` leaves in place. */
+export function resumeLiveViewState(trees: Array<{ persistence: CollapsedFolderStatePersistence }>): void {
+  for (const { persistence } of trees) {
+    persistence.resume();
   }
 }

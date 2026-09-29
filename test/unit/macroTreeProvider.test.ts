@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { resetLiveViewState } from "../../src/ui/viewStateReset";
+import { resetLiveViewState, resumeLiveViewState } from "../../src/ui/viewStateReset";
 import { createCollapsedFolderStatePersistence } from "../../src/ui/collapsedFolderStatePersistence";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { getMacros, setActiveMacroStore } from "../../src/macroSettings";
@@ -1319,6 +1319,7 @@ describe("MacroTreeProvider collapse state (§4.10)", () => {
     await resetLiveViewState({ trees: [{ provider, persistence }], cwdSync: { setFollowing: () => undefined } });
 
     expect(provider.getCollapsedFolders()).toEqual([]);
+    resumeLiveViewState([{ persistence }]);
     provider.collapseFolder("Juniper");
     persistence.schedule(provider.getCollapsedFolders());
     await persistence.flush();
