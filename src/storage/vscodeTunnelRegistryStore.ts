@@ -27,6 +27,7 @@ export class VscodeTunnelRegistryStore implements TunnelRegistryStore {
   private readonly observedFenceFiles = new WeakMap<TunnelRegistryEntry, vscode.Uri>();
   private fenceSequence = 0;
   private readonly reportedUnusableFiles = new Set<string>();
+  private readonly reportedCleanupFailures = new Set<string>();
 
   public constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -59,14 +60,30 @@ export class VscodeTunnelRegistryStore implements TunnelRegistryStore {
    * in-flight write or live fence. Failure to stat or delete leaves it for the
    * next sweep; it must never turn into a registry read failure.
    */
-  private async deleteIfOrphaned(uri: vscode.Uri): Promise<void> {
+  private async deleteIfOrphaned(uri: vscode.Uri, embeddedTimestamp?: number): Promise<void> {
     try {
       const { mtime } = await vscode.workspace.fs.stat(uri);
-      if (Date.now() - mtime >= ORPHAN_FILE_AGE_MS) {
+      // A network filesystem's clock can lag ours; the writer's own timestamp
+      // in the name keeps a foreign sweep from deleting an in-flight write.
+      const written = Math.max(mtime, embeddedTimestamp ?? -Infinity);
+      if (Date.now() - written >= ORPHAN_FILE_AGE_MS) {
         await this.deleteFileIfPresent(uri);
       }
     } catch (error) {
-      console.error("[Nexus] orphan reverse-bind fence file cleanup failed", error);
+      // Runs on every 3 s poll, so report each file once.
+      if (!this.reportedCleanupFailures.has(uri.path)) {
+        this.reportedCleanupFailures.add(uri.path);
+        console.error("[Nexus] orphan reverse-bind fence file cleanup failed", error);
+      }
+    }
+  }
+
+  private async isFresh(uri: vscode.Uri): Promise<boolean> {
+    try {
+      return Date.now() - (await vscode.workspace.fs.stat(uri)).mtime < ORPHAN_FILE_AGE_MS;
+    } catch {
+      // Cannot tell its age: treat as possibly live rather than hide a reservation.
+      return true;
     }
   }
 
@@ -84,7 +101,12 @@ export class VscodeTunnelRegistryStore implements TunnelRegistryStore {
   private async sweepOrphanTemporaries(files: [string, vscode.FileType][]): Promise<void> {
     for (const [name, type] of files) {
       if (type === vscode.FileType.File && name.startsWith(".") && name.endsWith(".tmp")) {
-        await this.deleteIfOrphaned(vscode.Uri.joinPath(this.fenceDirectory, name));
+        // Temporary names are `.<id>.<Date.now()>-<random>.tmp`.
+        const embedded = /\.(\d{10,})-[^.]*\.tmp$/.exec(name);
+        await this.deleteIfOrphaned(
+          vscode.Uri.joinPath(this.fenceDirectory, name),
+          embedded ? Number(embedded[1]) : undefined
+        );
       }
     }
   }
@@ -107,6 +129,13 @@ export class VscodeTunnelRegistryStore implements TunnelRegistryStore {
           } catch (error) {
             if (error instanceof vscode.FileSystemError && error.code === "FileNotFound") {
               // A replacement may have been published after the listing.
+              return { missing: true as const };
+            }
+            if (!(error instanceof SyntaxError) && await this.isFresh(uri)) {
+              // A fence that is being refreshed right now (for example a
+              // delete-pending file under a rename) may fail to read
+              // transiently. Skipping it would hide a live reservation, so
+              // re-list; persistent failure makes the read fail closed.
               return { missing: true as const };
             }
             return { missing: false as const, fence: await this.skipUnusableFence(name, uri, error) };

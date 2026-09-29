@@ -45,6 +45,36 @@ export async function stopTunnelsForShutdown(
   }
 }
 
+/** Minimal event shape the `stopped` listener needs (see TunnelEvent). */
+export interface TunnelStoppedEvent {
+  tunnelId: string;
+  tunnel: ActiveTunnel;
+  retiredReverseBind?: RetiredReverseBindFence;
+}
+
+/**
+ * The `stopped` listener body. Local teardown (core.unregisterTunnel) happens
+ * first, and a registry failure afterwards is absorbed by
+ * unregisterTunnelAfterStop so stop() and its callers keep going. Do not swap
+ * in unregisterTunnel: a rejection would abort server removal partway.
+ */
+export function handleTunnelStopped(
+  core: Pick<NexusCore, "getSnapshot" | "unregisterTunnel">,
+  registrySync: Pick<TunnelRegistrySync, "unregisterTunnelAfterStop">,
+  event: TunnelStoppedEvent
+): Promise<void> | undefined {
+  const stoppingTunnel = core.getSnapshot().activeTunnels.find((t) => t.id === event.tunnelId)
+    ?? (event.retiredReverseBind ? event.tunnel : undefined);
+  core.unregisterTunnel(event.tunnelId);
+  if (!stoppingTunnel) {
+    return undefined;
+  }
+  return registrySync.unregisterTunnelAfterStop(stoppingTunnel.profileId, {
+    tunnel: stoppingTunnel,
+    ...(event.retiredReverseBind ? { retiredReverseBind: event.retiredReverseBind } : {})
+  });
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -157,12 +187,14 @@ export class TunnelRegistrySync {
     hasSettled: () => boolean;
   }>();
   private mutationTail: Promise<void> = Promise.resolve();
+  private warnedFencePublishFailure = false;
 
   public constructor(
     private readonly store: TunnelRegistryStore,
     private readonly core: NexusCore,
     private readonly sessionId: string,
-    probePortFn?: ProbePortFn
+    probePortFn?: ProbePortFn,
+    private readonly notifyWarning?: (message: string) => void
   ) {
     this.probePort = probePortFn ?? defaultProbePort;
   }
@@ -197,6 +229,13 @@ export class TunnelRegistrySync {
       await this.unregisterTunnel(profileId, options);
     } catch (error) {
       console.error("[Nexus] tunnel registry update after stop failed", error);
+      if (options?.retiredReverseBind && !this.warnedFencePublishFailure) {
+        this.warnedFencePublishFailure = true;
+        this.notifyWarning?.(
+          `Nexus could not record a reservation for remote port ${options.retiredReverseBind.remotePort} of a stopped reverse tunnel. ` +
+          "Another VS Code window may collide on that port until the old connection closes: close this server's terminals or reload this window to release it, and wait before starting the same reverse tunnel elsewhere."
+        );
+      }
     }
   }
 
