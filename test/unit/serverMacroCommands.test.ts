@@ -1284,7 +1284,18 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     ['an env option after an assignment', 'env FOO=1 -u BAR ipmitool -E\n'],
     ['an env debug option after an assignment', 'env FOO=1 --debug ipmitool -E\n'],
     ['a nice option after the terminator', 'nice -- -n5 ipmitool -E\n'],
-    ['a quoted leading redirection', '">/tmp/log" ipmitool -E\n']
+    ['a quoted leading redirection', '">/tmp/log" ipmitool -E\n'],
+    ["a heredoc body", "cat <<EOF\nipmitool -E\nEOF\n"],
+    ["a nested shell heredoc", "sh <<'EOF'\nipmitool -E\nEOF\n"],
+    ["a dynamic head with a substitution", "ipmi$(echo tool) -E\n"],
+    ["a quoted head with a substitution", "\"ipmitool$(x)\" -E\n"],
+    ["a dynamic head from a substitution", "$(which ipmitool) -E\n"],
+    ["a leading redirection target substitution", "> $(mktemp) ipmitool -E\n"],
+    ["a leading process substitution", "<(true) ipmitool -E\n"],
+    ["a later segment after a substitution", "echo $(date); ipmitool -E\n"],
+    ["a later line after a backtick", "echo `date`\nipmitool -E\n"],
+    ["a dynamic sudo operand", "sudo -u $(whoami) ipmitool -E\n"],
+    ["a dynamic env operand", "env $(x) ipmitool -E\n"]
   ])("does not treat %s as an ipmitool command", (_case, text) => {
     expect(sessionIpmiHintNote({ id: "a", name: "X", text, runIn: "session" })).toBeUndefined();
   });
@@ -1337,7 +1348,24 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     ["a command after a bare carriage return", "echo ready\ripmitool -E\r"],
     ["a command after a comment with backticks", "# log with `hostname`\nipmitool -E\n"],
     ["a command after a single quoted substitution", "echo '$(hostname)'; ipmitool -E\n"],
-    ["a command after an assignment with a quoted value", 'FOO="bar" ipmitool -E\n']
+    ["a command after an assignment with a quoted value", 'FOO="bar" ipmitool -E\n'],
+    ["a substitution after the ipmitool head", "ipmitool -H $(cat h) mc info\n"],
+    ["a backtick after the ipmitool head", "ipmitool -H `x` mc info\n"],
+    ["a substitution inside double quotes after the head", "sudo ipmitool -H h -P \"$(cat pw)\" sol activate\n"],
+    ["a here-string after the head", "ipmitool raw 0x06 0x01 <<< foo\n"],
+    ["a heredoc after the head", "ipmitool shell <<EOF\nmc info\nEOF\n"],
+    ["a substitution in a redirection target", "ipmitool sdr > /tmp/sdr-$(date +%s).txt\n"],
+    ["an arithmetic expansion after the head", "ipmitool -t $((0x20)) raw 6 1\n"],
+    ["a legacy variable and substitution style", "ipmitool -H $host -U $user -P $(pass bmc) sol activate\n"],
+    ["a command wrapper with -p and --", "command -p -- ipmitool -E\n"],
+    ["an obsolescent nice adjustment", "nice -5 ipmitool -E\n"],
+    ["a sudo SELinux role", "sudo -r role_r ipmitool -E\n"],
+    ["an attached sudo SELinux role", "sudo --role=role_r ipmitool -E\n"],
+    ["a sudo SELinux type", "sudo -t type_t ipmitool -E\n"],
+    ["an attached sudo SELinux type", "sudo --type=type_t ipmitool -E\n"],
+    ["a sudo login class", "sudo -c class ipmitool -E\n"],
+    ["a sudo auth type", "sudo -a auth ipmitool -E\n"],
+    ["a time wrapper with -p and --", "time -p -- ipmitool -E\n"]
   ])("recognizes ipmitool in command position with %s", (_case, text) => {
     expect(sessionIpmiHintNote({ id: "a", name: "X", text, runIn: "session" })).toBeDefined();
   });

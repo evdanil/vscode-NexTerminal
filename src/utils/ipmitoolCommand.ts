@@ -35,8 +35,8 @@ export function textRunsIpmitool(text: string): boolean {
         argvAssignmentsAllowed = true;
         while (index < words.length && words[index].startsWith("-")) {
           const option = words[index++];
-          const shortValueOption = /^-[EABbnSHkisP]*[ugpCDTR](.*)$/.exec(option);
-          if (["-u", "--user", "-g", "--group", "-p", "--prompt", "-C", "--close-from", "-D", "--chdir", "-T", "--command-timeout", "-R", "--chroot"].includes(option)) {
+          const shortValueOption = /^-[EABbnSHkisP]*[ugpCDTRrtca](.*)$/.exec(option);
+          if (["-u", "--user", "-g", "--group", "-p", "--prompt", "-C", "--close-from", "-D", "--chdir", "-T", "--command-timeout", "-R", "--chroot", "-r", "--role", "-t", "--type", "-c", "-a"].includes(option)) {
             if (index >= words.length) return false;
             index++;
           } else if (shortValueOption) {
@@ -45,7 +45,7 @@ export function textRunsIpmitool(text: string): boolean {
               index++;
             }
           } else if (
-            !/^(?:--(?:user|group|prompt|close-from|chdir|preserve-env|command-timeout|chroot)=.+|-[ugpCDTR].+)$/.test(option) &&
+            !/^(?:--(?:user|group|prompt|close-from|chdir|preserve-env|command-timeout|chroot|role|type)=.+|-[ugpCDTRrtca].+)$/.test(option) &&
             !["--login", "--shell", "--non-interactive", "--askpass", "--background", "--bell", "--set-home", "--stdin", "--reset-timestamp", "--preserve-env", "--preserve-groups"].includes(option) &&
             option !== "--" && !/^-[EABbnSHkisP]+$/.test(option)
           ) {
@@ -87,7 +87,8 @@ export function textRunsIpmitool(text: string): boolean {
         index++;
         allowAssignments = false;
         if (words[index] === "-v" || words[index] === "-V") return false;
-        if (words[index] === "-p" || words[index] === "--") index++;
+        while (words[index] === "-p") index++;
+        if (words[index] === "--") index++;
         if (words[index]?.startsWith("-")) return false;
         continue;
       }
@@ -109,7 +110,8 @@ export function textRunsIpmitool(text: string): boolean {
       if (name === "time") {
         index++;
         allowAssignments = false;
-        if (words[index] === "-p" || words[index] === "--") index++;
+        while (words[index] === "-p") index++;
+        if (words[index] === "--") index++;
         if (words[index]?.startsWith("-")) return false;
         continue;
       }
@@ -119,7 +121,7 @@ export function textRunsIpmitool(text: string): boolean {
         if (words[index] === "-n" || words[index] === "--adjustment") {
           if (!/^[+-]?\d+$/.test(words[index + 1] ?? "")) return false;
           index += 2;
-        } else if (/^(?:-n[+-]?\d+|--adjustment=[+-]?\d+)$/.test(words[index] ?? "")) {
+        } else if (/^(?:-n[+-]?\d+|-\d+|--adjustment=[+-]?\d+)$/.test(words[index] ?? "")) {
           index++;
         }
         if (words[index] === "--") index++;
@@ -158,6 +160,13 @@ export function textRunsIpmitool(text: string): boolean {
     return result;
   };
 
+  // The "$" placeholder stands in for the in-progress word: it can satisfy a
+  // dangling redirect operator (`ipmitool sdr > /tmp/x-$(date)`) or a wrapper
+  // operand, but never classifies as ipmitool itself (it contains "$"), so a
+  // dynamic head such as `ipmi$(echo tool)` stays unclassified.
+  const headAlreadyIpmitool = () =>
+    runsIpmitool([...words, "$"], [...assignmentAllowed, false], [...redirectionAllowed, false]);
+
   for (let i = 0; i < text.length; i++) {
     const char = text[i];
     if (quote === "'") {
@@ -177,7 +186,7 @@ export function textRunsIpmitool(text: string): boolean {
         }
       }
       // Substitutions are active inside double quotes, but inert inside single quotes.
-      else if (char === "`" || (char === "$" && text[i + 1] === "(")) return false;
+      else if (char === "`" || (char === "$" && text[i + 1] === "(")) return headAlreadyIpmitool();
       else word += char;
       continue;
     }
@@ -203,11 +212,14 @@ export function textRunsIpmitool(text: string): boolean {
       while (i + 1 < text.length && text[i + 1] !== "\n" && text[i + 1] !== "\r") i++;
       continue;
     }
-    // Dynamic substitutions and heredocs need a real shell parser. Ignore
-    // these markers in comments and single quotes, where they are inert.
+    // Dynamic substitutions and heredocs need a real shell parser to find where
+    // the nested command or heredoc body ends, so nothing AFTER the marker can
+    // be classified. Words completed BEFORE it are different: a leading
+    // ipmitool word already fixes which program runs. Ignore these markers in
+    // comments and single quotes, where they are inert.
     if (char === "`" || (char === "$" && text[i + 1] === "(") ||
         ((char === "<" || char === ">") && text[i + 1] === "(") ||
-        (char === "<" && text[i + 1] === "<")) return false;
+        (char === "<" && text[i + 1] === "<")) return headAlreadyIpmitool();
     if (char === "&" && (text[i - 1] === ">" || text[i - 1] === "<" || text[i + 1] === ">")) {
       if (text[i + 1] === ">" && inWord && !/^(?:\d*)$/.test(word)) finishWord();
       word += char;

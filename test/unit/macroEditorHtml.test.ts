@@ -231,6 +231,17 @@ describe("renderMacroEditorHtml", () => {
     ["env FOO=1 -u BAR ipmitool -E", "none"],
     ["env FOO=1 --debug ipmitool -E", "none"],
     ['">/tmp/log" ipmitool -E', "none"],
+    ["cat <<EOF\nipmitool -E\nEOF\n", "none"],
+    ["sh <<'EOF'\nipmitool -E\nEOF\n", "none"],
+    ["ipmi$(echo tool) -E\n", "none"],
+    ["\"ipmitool$(x)\" -E\n", "none"],
+    ["$(which ipmitool) -E\n", "none"],
+    ["> $(mktemp) ipmitool -E\n", "none"],
+    ["<(true) ipmitool -E\n", "none"],
+    ["echo $(date); ipmitool -E\n", "none"],
+    ["echo `date`\nipmitool -E\n", "none"],
+    ["sudo -u $(whoami) ipmitool -E\n", "none"],
+    ["env $(x) ipmitool -E\n", "none"],
     ["/usr/bin/ipmitool -E", ""],
     ["sudo -i ipmitool -E", ""],
     ["sudo -s ipmitool -E", ""],
@@ -273,7 +284,6 @@ describe("renderMacroEditorHtml", () => {
     ['FOO="bar" ipmitool -E', ""],
     ["echo ready\ripmitool -E\r", ""],
     ["# log with `hostname`\nipmitool -E\n", ""],
-    ["echo '$(hostname)'; ipmitool -E\n", ""]
   ])("classifies the command position in the live Session hint for %s", (text, expectedDisplay) => {
     const html = render([], null);
     const match = /function updateSessionIpmitoolHint\(\) \{[\s\S]*?\n      \}/.exec(html);

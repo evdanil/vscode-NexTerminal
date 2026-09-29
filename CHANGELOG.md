@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.296] — 2026-09-29
+
+### Fixed
+
+- **The Session-terminal IPMI hint no longer disappears when an `ipmitool` command has a substitution or heredoc in its arguments.** A macro such as `ipmitool -P "$(cat ~/.bmcpw)" sol activate`, or one with a here-string, heredoc or `$(...)` redirect target, now gets the editor hint and the send-confirmation note again; a dynamic command word, a heredoc body and text after an unparsed substitution are still left alone. The detector also accepts `command -p --`, `nice -5` and the sudo `-r`/`-t`/`-c`/`-a` value options.
+
 ## [2.8.295] — 2026-09-28
 
 ### Fixed
