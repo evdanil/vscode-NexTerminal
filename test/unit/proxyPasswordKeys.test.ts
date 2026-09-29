@@ -281,6 +281,62 @@ describe("a pending proxy edit never exposes one endpoint's password under anoth
     stop();
   });
 
+  it("an editor edit A -> B whose server save rejects (no rollback runs) keeps A's password and deletes nothing", async () => {
+    const { vault, repo, core, stop, readForCurrent } = await setup();
+    repo.failNext = true;
+    const transaction = core.runServerBatch(async () => {
+      await core.addOrUpdateServer(server({ proxy: B })); // rejects before the secret-sync try: nothing rolls back
+    });
+    repo.release?.();
+    await expect(transaction).rejects.toThrow("save failed");
+    await tick();
+    // Memory says B, storage still says A: A's endpoint is in use by what is stored.
+    expect(core.getServer("s1")!.proxy).toEqual(B);
+    expect(vault.deleted).toEqual([]);
+    expect(vault.data.get(proxyPasswordSecretKey("s1", A))).toBe("pw-A");
+    void readForCurrent;
+    stop();
+  });
+
+  it("a successful batch A -> B still cleans A up when it ends", async () => {
+    const { vault, repo, core, stop } = await setup();
+    const transaction = core.runServerBatch(async () => {
+      await core.addOrUpdateServer(server({ proxy: B }));
+    });
+    repo.release?.();
+    await transaction;
+    await tick();
+    expect(vault.deleted).toEqual([proxyPasswordSecretKey("s1", A)]);
+    stop();
+  });
+
+  it("a Replace-like batch that fails partway deletes nothing that is still stored, and cleans what really left storage", async () => {
+    const vault = new MemoryVault();
+    vault.data.set(proxyPasswordSecretKey("s1", A), "pw-1");
+    vault.data.set(proxyPasswordSecretKey("s2", A), "pw-2");
+    let saves = 0;
+    class FailSecondRepo extends InMemoryConfigRepository {
+      public override async saveServers(servers: ServerConfig[]): Promise<void> {
+        saves++;
+        if (saves === 2) throw new Error("save failed");
+        return super.saveServers(servers);
+      }
+    }
+    const core = new NexusCore(new FailSecondRepo([server(), server({ id: "s2" })], []));
+    await core.initialize();
+    const stop = watchPoolInvalidationOnConfigMutation(core, { invalidate: () => {} }, {
+      deleteEndpoint: endpointDeleter(vault)
+    });
+    await expect(core.runServerBatch(async () => {
+      await core.removeServer("s1"); // persisted
+      await core.removeServer("s2"); // in memory only: its save rejected, storage still holds s2
+    })).rejects.toThrow("save failed");
+    await tick();
+    expect(vault.data.has(proxyPasswordSecretKey("s1", A))).toBe(false); // really left storage
+    expect(vault.data.get(proxyPasswordSecretKey("s2", A))).toBe("pw-2"); // still stored
+    stop();
+  });
+
   it("A -> B -> A before the save deletes nothing", async () => {
     const { vault, repo, core, stop, readForCurrent } = await setup();
     const original = core.getServer("s1")!;
