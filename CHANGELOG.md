@@ -1,11 +1,17 @@
 # Changelog
 
-## [2.8.296] — 2026-09-29
+## [2.8.297] — 2026-09-29
 
 ### Fixed
 
 - **An ended or dropped SSH login no longer deletes a valid saved password or passphrase.** Closing or reconnecting a terminal while it connects, a connection that closes cleanly before login finishes, and a dismissed verification-code prompt were all read as a server rejection because their messages contain the word "authentication". They now carry their own error type, and only the server's own rejection clears a saved secret. A connection that drops mid-login is reported as a connection failure — in the terminal and in Test Connection and Copy Details — without a password prompt.
 - **Port-forwarding guide no longer says concurrent jump-host password prompts dismiss each other.** Since 2.8.280 they appear one after another.
+
+## [2.8.296] — 2026-09-29
+
+### Fixed
+
+- **A script's unawaited wait now ends with the run.** A `waitFor` / `expect` / `waitAny` still pending when a run completed, failed or lost its worker (a `Promise.race` loser, a call the script never awaited) kept its timer and the run's output buffer for its whole timeout, then wrote a stray `← timeout` line to the "Nexus Scripts" channel after `end:`. Every ending now cancels pending waits, and a wait posted just before the run ended is refused.
 
 ## [2.8.295] — 2026-09-28
 
