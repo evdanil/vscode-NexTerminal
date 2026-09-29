@@ -54,7 +54,7 @@ import { VscodeMacroStore } from "./storage/vscodeMacroStore";
 import { setActiveMacroStore } from "./macroSettings";
 import { VscodeConfigRepository } from "./storage/vscodeConfigRepository";
 import { VscodeTunnelRegistryStore } from "./storage/vscodeTunnelRegistryStore";
-import { stopTunnelsForShutdown, TunnelRegistrySync } from "./services/tunnel/tunnelRegistrySync";
+import { handleTunnelStopped, stopTunnelsForShutdown, TunnelRegistrySync } from "./services/tunnel/tunnelRegistrySync";
 import { FileExplorerTreeProvider } from "./ui/fileExplorerTreeProvider";
 import { createCollapsedFolderStatePersistence } from "./ui/collapsedFolderStatePersistence";
 import { FolderTreeItem, NexusTreeProvider } from "./ui/nexusTreeProvider";
@@ -562,7 +562,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     })
   });
   const registryStore = new VscodeTunnelRegistryStore(context);
-  const registrySync = new TunnelRegistrySync(registryStore, core, vscode.env.sessionId);
+  const registrySync = new TunnelRegistrySync(
+    registryStore, core, vscode.env.sessionId, undefined,
+    (message) => { void vscode.window.showWarningMessage(message); }
+  );
   await registrySync.initialize();
 
   const terminalsByServer: ServerTerminalMap = new Map();
@@ -1356,7 +1359,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
         return;
       }
       core.registerTunnel(event.tunnel);
-      void registrySync.registerTunnel(event.tunnel);
+      registrySync.registerTunnel(event.tunnel).catch((error: unknown) => {
+        console.error("[Nexus] tunnel registry registration failed", error);
+      });
       const logger = loggerFactory.create("tunnel", event.tunnel.id);
       logger.log(
         `started profile=${event.tunnel.profileId} local=${event.tunnel.localPort} remote=${event.tunnel.remoteIP}:${event.tunnel.remotePort}`
@@ -1369,16 +1374,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
       return;
     }
     if (event.type === "stopped") {
-      const stoppingTunnel = core.getSnapshot().activeTunnels.find((t) => t.id === event.tunnelId)
-        ?? (event.retiredReverseBind ? event.tunnel : undefined);
-      core.unregisterTunnel(event.tunnelId);
-      if (stoppingTunnel) {
-        return registrySync.unregisterTunnel(stoppingTunnel.profileId, {
-          tunnel: stoppingTunnel,
-          ...(event.retiredReverseBind ? { retiredReverseBind: event.retiredReverseBind } : {})
-        });
-      }
-      return;
+      return handleTunnelStopped(core, registrySync, event);
     }
     if (event.type === "error") {
       const message = event.error instanceof Error ? event.error.message : event.message;
@@ -1426,7 +1422,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
 
   const windowFocusListener = vscode.window.onDidChangeWindowState((state) => {
     if (state.focused) {
-      void registrySync.syncNow();
+      registrySync.syncNow().catch((error: unknown) => {
+        console.error("[Nexus] tunnel registry sync failed", error);
+      });
     }
   });
 

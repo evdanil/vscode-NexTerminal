@@ -121,8 +121,11 @@ interface ForwardWaitMatch {
  * How long a start stopped mid-request waits for the server to answer that
  * request, and then to withdraw a forward it granted too late. Bounded
  * because a start's caller is waiting on it and ssh2 has no timeout for
- * either (issue #184). A replacement start waits for its stopped predecessor
- * without a timeout of its own: these two phases are what bound that wait.
+ * either (issue #184). These two phases bound only the stopped start itself.
+ * A replacement start additionally waits on the retired transport and on the
+ * cross-window reverse-bind fence until refusal, withdrawal or transport
+ * close; that wait has no timer (another lease can keep the transport open)
+ * and ends only when the user cancels or the start is stopped.
  */
 const LATE_FORWARD_CANCEL_TIMEOUT_MS = 5_000;
 // Bound an unanswered ssh2 unforward request so Stop and bulk cleanup finish.
