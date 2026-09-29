@@ -49,6 +49,7 @@ export class VscodeTunnelRegistryStore implements TunnelRegistryStore {
   private fenceSequence = 0;
   private readonly reportedUnusableFiles = new Set<string>();
   private readonly reportedCleanupFailures = new Set<string>();
+  private readonly firstSeenUnstatable = new Map<string, number>();
 
   public constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -77,18 +78,40 @@ export class VscodeTunnelRegistryStore implements TunnelRegistryStore {
   }
 
   /**
+   * When the file was last written, as best we can tell. A network
+   * filesystem's clock can lag ours, so the later of mtime and the writer's
+   * own timestamp in the name wins. If stat fails too, the name's timestamp
+   * is used; a name without one (legacy or unversioned) is aged from the first
+   * moment this process saw it failing, so the file still ages out after the
+   * threshold instead of failing every read forever.
+   */
+  private async writtenAt(uri: vscode.Uri, embeddedTimestamp?: number): Promise<number> {
+    try {
+      const { mtime } = await vscode.workspace.fs.stat(uri);
+      return Math.max(mtime, embeddedTimestamp ?? -Infinity);
+    } catch {
+      if (embeddedTimestamp !== undefined) {
+        return embeddedTimestamp;
+      }
+      let firstSeen = this.firstSeenUnstatable.get(uri.path);
+      if (firstSeen === undefined) {
+        firstSeen = Date.now();
+        this.firstSeenUnstatable.set(uri.path, firstSeen);
+      }
+      return firstSeen;
+    }
+  }
+
+  /**
    * Remove a file only once it is old enough that it cannot be another window's
-   * in-flight write or live fence. Failure to stat or delete leaves it for the
-   * next sweep; it must never turn into a registry read failure.
+   * in-flight write or live fence. Failure to delete leaves it for the next
+   * sweep; it must never turn into a registry read failure.
    */
   private async deleteIfOrphaned(uri: vscode.Uri, embeddedTimestamp?: number): Promise<void> {
     try {
-      const { mtime } = await vscode.workspace.fs.stat(uri);
-      // A network filesystem's clock can lag ours; the writer's own timestamp
-      // in the name keeps a foreign sweep from deleting an in-flight write.
-      const written = Math.max(mtime, embeddedTimestamp ?? -Infinity);
-      if (Date.now() - written >= ORPHAN_FILE_AGE_MS) {
+      if (Date.now() - await this.writtenAt(uri, embeddedTimestamp) >= ORPHAN_FILE_AGE_MS) {
         await this.deleteFileIfPresent(uri);
+        this.firstSeenUnstatable.delete(uri.path);
       }
     } catch (error) {
       // Runs on every 3 s poll, so report each file once.
@@ -100,15 +123,7 @@ export class VscodeTunnelRegistryStore implements TunnelRegistryStore {
   }
 
   private async isFresh(uri: vscode.Uri, embeddedTimestamp?: number): Promise<boolean> {
-    try {
-      // Same basis as deleteIfOrphaned: a lagging network-filesystem mtime must
-      // not make a just-published fence look stale and hide its reservation.
-      const written = Math.max((await vscode.workspace.fs.stat(uri)).mtime, embeddedTimestamp ?? -Infinity);
-      return Date.now() - written < ORPHAN_FILE_AGE_MS;
-    } catch {
-      // Cannot tell its age: treat as possibly live rather than hide a reservation.
-      return true;
-    }
+    return Date.now() - await this.writtenAt(uri, embeddedTimestamp) < ORPHAN_FILE_AGE_MS;
   }
 
   private async skipUnusableFence(name: string, uri: vscode.Uri, reason: unknown): Promise<undefined> {
