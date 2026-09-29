@@ -1,10 +1,19 @@
 # Changelog
 
-## [2.8.305] — 2026-09-29
+## [2.8.307] — 2026-09-29
 
 ### Fixed
 
 - **Kitty keyboard, modifyOtherKeys, cursor-shape and save/restore-cursor sequences no longer leak into captured text.** The shared ANSI stripper now follows the ECMA-48 CSI grammar (`<` `=` `>` `?` parameter prefixes and intermediate bytes such as `ESC[2 q`) and removes two-byte forms like `ESC 7`, `ESC 8`, `ESC =` and `ESC >`, plus terminated DCS/APC/PM/SOS strings. Copy All, session transcripts and script `waitFor`/`expect` matching no longer show fragments such as `[>4;2m` or `[=5u`, so end-anchored prompt patterns match after vim, fish or neovim output, even when a sequence (including a terminal title) is split across two chunks: Copy All, transcripts, script output and macro trigger matching each strip the same text however the output is split into chunks: an unfinished escape is held until the next chunk, an escape over 512 characters is text, and an unterminated OSC/DCS/APC/PM/SOS payload (Sixel, Kitty graphics, XTGETTCAP) is dropped until its terminator or an aborting ESC, giving up after 1 MiB. An SSH reconnect and a Smart Follow reattach start each of them from a clean slate, so an escape the lost connection or device left unfinished cannot swallow its replacement's prompt. Private-prefix CSI ending in `m` (such as `ESC[>4;m`) is no longer mistaken for an SGR reset by the highlighter.
+
+## [2.8.305] — 2026-09-29
+
+### Fixed
+
+- **A share no longer hands over a shell command.** Custom Local Shell profiles (their shell path and arguments run the moment the profile opens) are left out of Export for Sharing and skipped by a share import, and both messages count them and say to use Add Local Shell Profile. A VS Code-profile one still travels, without a shell path or arguments.
+- **Shared tunnels no longer act on their own.** A tunnel from a share arrives with Auto-start off, no listener address (loopback until you choose one in Edit), a loopback-only remote bind address and no login in its browser URL, on export and on import; the import message counts the tunnels it changed.
+- **Delete All Data clears Terminal Appearance and the Local Shell auto-trigger acknowledgement.** Imported colour schemes, the selected scheme and the font choice are removed and an open panel refreshes; it also clears remembered view state and dismissed hints (collapsed folders, follow-terminal-directory, macro hint), other open windows that observe the reset (a reset-generation counter) reload instead of writing stale collapsed-folder or appearance data back at their next action; a write already in flight, or one that starts before the reset reaches that window, can still land until it is reloaded. Follow Terminal Directory stays on in memory there until toggled or reloaded. The confirmation and completion message both say what is kept: the terminal colours and font already written to VS Code user settings, trusted host keys, scripts and logs stay.
+- **A duplicate id in a share no longer overwrites a record.** The first server or auth profile under an id that passes validation lands; a later one in the same file is skipped and counted instead of replacing it and being counted as imported.
 
 ## [2.8.304] — 2026-09-29
 

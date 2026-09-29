@@ -1486,7 +1486,7 @@ describe("config import command (legacy)", () => {
       [],
       [],
       [],
-      [makeLocalShellProfile({ cwd: "/home/alice/project", startupCommand: "npm run dev" })],
+      [makeLocalShellProfile({ launchMode: "vscodeProfile", vscodeProfileName: "bash", shellPath: undefined, cwd: "/home/alice/project", startupCommand: "npm run dev" })],
       {}
     );
     const partialExport = {
@@ -6799,7 +6799,7 @@ describe("sanitizeForSharing", () => {
     const servers = [makeServer({ username: "alice", keyPath: "/home/alice/.ssh/id_rsa" })];
     const tunnels = [makeTunnel({ defaultServerId: "s1" })];
     const serialProfiles = [makeSerialProfile({ deviceHint: { serialNumber: "ABC123", vendorId: "1111", productId: "2222" } })];
-    const localShellProfiles = [makeLocalShellProfile({ cwd: "/home/alice/project", startupCommand: "npm run dev" })];
+    const localShellProfiles = [makeLocalShellProfile({ launchMode: "vscodeProfile", vscodeProfileName: "bash", shellPath: undefined, cwd: "/home/alice/project", startupCommand: "npm run dev" })];
     const settings: Record<string, unknown> = {
       "nexus.logging.sessionLogDirectory": "/home/alice/logs"
     };
@@ -7079,7 +7079,8 @@ describe("complete reset", () => {
     expect(await vault.get("passphrase-s1")).toBeUndefined();
     expect(await vault.get("auth-profile-password-ap1")).toBeUndefined();
     expect(await vault.get("auth-profile-passphrase-ap1")).toBeUndefined();
-    expect(mockShowInformationMessage).toHaveBeenCalledWith("All Nexus data has been deleted.");
+    expect(mockShowInformationMessage).toHaveBeenCalledWith("Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files, session logs and the terminal colours and font already written to your VS Code user settings were kept.");
+    expect(mockShowInformationMessage).not.toHaveBeenCalledWith("Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files and session logs were kept.");
   });
 
   it("aborts when user cancels warning", async () => {

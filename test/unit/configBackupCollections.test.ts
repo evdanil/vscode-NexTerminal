@@ -130,6 +130,7 @@ class MockVault implements SecretVault {
   async get(key: string) { return this.secrets.get(key); }
   async store(key: string, value: string) { this.secrets.set(key, value); }
   async delete(key: string) { this.secrets.delete(key); }
+  keys(): string[] { return [...this.secrets.keys()]; }
 }
 
 /** A fingerprint in exactly the shape VscodeHostKeyVerifier writes. */
@@ -552,9 +553,11 @@ describe("Export for Sharing — backup-only collections stay out", () => {
    * travelled in a file whose whole promise is "credentials stripped". The
    * backup now treats that map as secret; a share cannot carry it at all.
    */
-  it("keeps Local Shell profiles but never their environment variables", async () => {
+  it("keeps VS Code-profile Local Shell profiles but never their environment variables", async () => {
     const source = await makeMachine();
-    await source.core.addOrUpdateLocalShellProfile(makeLocalShell());
+    await source.core.addOrUpdateLocalShellProfile(
+      makeLocalShell({ launchMode: "vscodeProfile", vscodeProfileName: "bash", shellPath: undefined, shellArgs: undefined })
+    );
 
     const json = await exportShare(source);
     const exported = JSON.parse(json) as { localShellProfiles?: LocalShellProfile[] };
@@ -2134,7 +2137,7 @@ describe("bulk removal closes runtime owned by deleted profiles", () => {
       expect.stringContaining("connection could not be stopped"),
       "Reload Window"
     );
-    expect(mockShowInformationMessage).not.toHaveBeenCalledWith("All Nexus data has been deleted.");
+    expect(mockShowInformationMessage).not.toHaveBeenCalledWith("Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files, session logs and the terminal colours and font already written to your VS Code user settings were kept.");
   });
 
   it("Delete All Data reports a tunnel stop that never settles", async () => {
@@ -2160,7 +2163,7 @@ describe("bulk removal closes runtime owned by deleted profiles", () => {
         expect.stringContaining("connection could not be stopped"),
         "Reload Window"
       );
-      expect(mockShowInformationMessage).not.toHaveBeenCalledWith("All Nexus data has been deleted.");
+      expect(mockShowInformationMessage).not.toHaveBeenCalledWith("Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files, session logs and the terminal colours and font already written to your VS Code user settings were kept.");
     } finally {
       vi.useRealTimers();
     }
@@ -2251,7 +2254,7 @@ describe("Delete All Data (nexus.config.completeReset) covers Local Servers and 
     expect(snapshot.localServers).toEqual([]);
     expect(snapshot.tftpProfiles).toEqual([]);
     expect(snapshot.dhcpProfiles).toEqual([]);
-    expect(mockShowInformationMessage).toHaveBeenCalledWith("All Nexus data has been deleted.");
+    expect(mockShowInformationMessage).toHaveBeenCalledWith("Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files, session logs and the terminal colours and font already written to your VS Code user settings were kept.");
   });
 
   it("runs the Local Server teardown for every profile, and stops the TFTP/DHCP services, BEFORE anything is removed", async () => {
@@ -2299,5 +2302,110 @@ describe("Delete All Data (nexus.config.completeReset) covers Local Servers and 
     expect(confirmation).toContain("Open sessions and tunnels will be closed");
     expect(confirmation).not.toBe(OLD_CONFIRMATION);
     expect(confirmation).not.toContain("local shell profiles, inventory sources, macros");
+  });
+
+  it("clears Terminal Appearance data and the Local Shell auto-trigger acknowledgement, resets the running service, and says what it keeps (⊘ leaving nexus.colorSchemes / activeColorScheme / terminalFont and the acknowledgement behind)", async () => {
+    const machine = await makeMachine();
+    const cleared = [
+      "nexus.colorSchemes", "nexus.activeColorScheme", "nexus.terminalFont", "nexus.localShell.autoTriggerWarningShown",
+      "nexus.ui.collapsedFolders", "nexus.macros.ui.collapsedFolders", "nexus.ui.followTerminalDirectory",
+      "nexus.files.followTerminalNudgeShown", "nexus.macros.keybindingBlockerHintDismissed"
+    ];
+    for (const key of cleared) {
+      machine.ctx.state.set(key, key === "nexus.colorSchemes" ? [{ id: "moba-1" }] : "seeded");
+    }
+    machine.ctx.state.set("nexus.ssh.knownHostFingerprints.v1", { "h:22": "SHA256:x" });
+    machine.ctx.state.set("nexus.import.sshConfigOffer.v1", true);
+    machine.ctx.state.set("nexus.settingsGuard.eventLog", []);
+    const resetTerminalAppearance = vi.fn(async () => undefined);
+    let keysWhenViewStateReset = -1;
+    const resetViewState = vi.fn(async () => {
+      keysWhenViewStateReset = machine.ctx.state.has("nexus.ui.collapsedFolders") ? 1 : 0;
+    });
+    let keysWhenViewStateResumed = -1;
+    const resumeViewState = vi.fn(() => {
+      keysWhenViewStateResumed = !machine.ctx.state.has("nexus.ui.collapsedFolders") && machine.ctx.state.has("nexus.resetGeneration") ? 1 : 0;
+    });
+    const runtime = { ...recordingRuntime(machine.core), resetTerminalAppearance, resetViewState, resumeViewState };
+
+    await runReset(machine, runtime);
+
+    for (const key of cleared) {
+      expect(machine.ctx.state.has(key)).toBe(false);
+    }
+    expect(resetTerminalAppearance).toHaveBeenCalledTimes(1);
+    // Before the stored keys are cleared, so no queued write can land after them.
+    expect(resetViewState).toHaveBeenCalledTimes(1);
+    expect(keysWhenViewStateReset).toBe(1);
+    // Resumed only after the keys are cleared AND the generation bumped.
+    expect(resumeViewState).toHaveBeenCalledTimes(1);
+    expect(keysWhenViewStateResumed).toBe(1);
+    // Deliberately kept, and named in the confirmation.
+    expect(machine.ctx.state.has("nexus.ssh.knownHostFingerprints.v1")).toBe(true);
+    expect(machine.ctx.state.has("nexus.import.sshConfigOffer.v1")).toBe(true);
+    expect(machine.ctx.state.has("nexus.settingsGuard.eventLog")).toBe(true);
+    expect(mockShowInformationMessage).not.toHaveBeenCalledWith("All Nexus data has been deleted.");
+    const confirmation = String(mockShowWarningMessage.mock.calls[0]?.[0]);
+    expect(confirmation).toContain("Terminal Appearance colour schemes and font choice");
+    expect(confirmation).toContain("VS Code user settings");
+    expect(confirmation).toContain("trusted SSH host keys, script files, session logs, the one-time ~/.ssh/config import offer and settings-guard bookkeeping");
+    expect(confirmation).toContain("remembered view state and dismissed hints");
+  });
+
+  it("clears a collection key whose stored rows are all invalid, which the snapshot-driven removals never touch (⊘ classifying it as cleared without clearing it)", async () => {
+    const machine = await makeMachine();
+    machine.ctx.state.set("nexus.servers", [{ id: "", name: 42 }, "not-a-record"]);
+    machine.ctx.state.set("nexus.tunnels", [{ garbage: true }]);
+    machine.ctx.state.set("nexus.groups", []);
+
+    await runReset(machine, recordingRuntime(machine.core));
+
+    expect(machine.ctx.state.has("nexus.servers")).toBe(false);
+    expect(machine.ctx.state.has("nexus.tunnels")).toBe(false);
+    // An empty collection is what a clean removal leaves; it is not rewritten.
+    expect(machine.ctx.state.get("nexus.groups")).toEqual([]);
+    // Kept keys stay.
+    expect(machine.ctx.state.has("nexus.resetGeneration")).toBe(true);
+  });
+
+  it("deletes the saved secrets of stored records that fail validation, before their raw rows are cleared (⊘ clearing the raw rows, the only record naming those keychain entries)", async () => {
+    const machine = await makeMachine();
+    machine.ctx.state.set("nexus.servers", [{ id: "bad-srv", name: 42 }, "junk"]);
+    machine.ctx.state.set("nexus.authProfiles", [{ id: "bad-ap", authType: "nope" }]);
+    machine.ctx.state.set("nexus.inventorySources", [{ id: "bad-src", providerId: 7, secretFieldIds: ["apiToken"] }]);
+    const kept = ["password-other", "auth-profile-password-other"];
+    const doomed = [
+      "password-bad-srv", "passphrase-bad-srv", "proxy-password-bad-srv",
+      "auth-profile-password-bad-ap", "auth-profile-passphrase-bad-ap",
+      "inventory-source-7:bad-src:apiToken"
+    ];
+    for (const key of [...doomed, ...kept]) await machine.vault.store(key, "secret");
+    // A host with SecretStorage.keys() also sweeps field ids the row did not list.
+    const extra = "inventory-source-7:bad-src:hiddenField";
+    await machine.vault.store(extra, "secret");
+    (machine.ctx.context as unknown as { secrets: unknown }).secrets = { keys: async () => machine.vault.keys() };
+
+    await runReset(machine, recordingRuntime(machine.core));
+
+    for (const key of [...doomed, extra]) expect(await machine.vault.get(key)).toBeUndefined();
+    // A secret of a record Nexus never held a row for is not this reset's to touch.
+    for (const key of kept) expect(await machine.vault.get(key)).toBe("secret");
+    expect(machine.ctx.state.has("nexus.servers")).toBe(false);
+  });
+
+  it("a failed secret delete does not stop the rest of the reset", async () => {
+    const machine = await makeMachine();
+    machine.ctx.state.set("nexus.servers", [{ id: "bad-a" }, { id: "bad-b" }]);
+    await machine.vault.store("password-bad-b", "secret");
+    const realDelete = machine.vault.delete.bind(machine.vault);
+    machine.vault.delete = async (key: string) => {
+      if (key === "password-bad-a") throw new Error("keychain locked");
+      await realDelete(key);
+    };
+
+    await runReset(machine, recordingRuntime(machine.core));
+
+    expect(await machine.vault.get("password-bad-b")).toBeUndefined();
+    expect(machine.ctx.state.has("nexus.servers")).toBe(false);
   });
 });
