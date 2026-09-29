@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.297] — 2026-09-29
+
+### Fixed
+
+- **A serial open that timed out no longer leaves the port held.** When a port took longer than the 10 s RPC budget to open (Windows Bluetooth COM ports, slow USB-serial drivers), the tab reported "Connection failed" but the sidecar kept waiting on the native open and, once it finished, held the port under a session nobody owned, so every later Connect and Smart Follow poll failed with "busy" until a window reload. Standard Serial and Smart Follow now send a cancel for the abandoned open, and the sidecar closes the port and frees its session ID as soon as the open completes.
+
 ## [2.8.296] — 2026-09-29
 
 ### Fixed

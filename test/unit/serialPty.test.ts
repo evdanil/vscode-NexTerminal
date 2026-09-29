@@ -97,6 +97,28 @@ describe("SerialPty", () => {
     vi.clearAllMocks();
   });
 
+  it("cancels the sidecar open when openPort fails on a client-side timeout", async () => {
+    const { transport, closePort } = createTransport();
+    let passedId = "";
+    transport.openPort = vi.fn(async (_options: unknown, sessionId?: string) => {
+      passedId = sessionId ?? "";
+      throw new Error("Serial sidecar RPC timed out after 10s (method=openPort)");
+    });
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const pty = new SerialPty(
+      transport,
+      { path: "COM9", baudRate: 115200 },
+      { onSessionOpened: vi.fn(), onSessionClosed: vi.fn() },
+      logger as any
+    );
+
+    pty.open();
+    await flushAsync();
+
+    expect(passedId).not.toBe("");
+    expect(closePort).toHaveBeenCalledExactlyOnceWith(passedId);
+  });
+
   it("closes a port that finishes opening after its profile was removed, without registering a session", async () => {
     const { transport, dataListenerCount } = createTransport();
     let resolveOpen!: (sessionId: string) => void;

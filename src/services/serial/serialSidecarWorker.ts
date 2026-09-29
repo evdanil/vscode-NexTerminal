@@ -62,6 +62,11 @@ export function createSerialSidecarRequestHandler(dependencies: {
   writeLine?: (message: RpcResponse | RpcNotification) => void;
 } = {}): (request: RpcRequest) => Promise<RpcResponse> {
   const ports = new Map<string, PortRecord>();
+  // Session ids whose native open() is still pending. A closePort for one of
+  // these cannot close the port yet (close() on a not-open port errors, and the
+  // open would then complete unreachable), so it flags the open as cancelled
+  // and the openPort handler closes the port once open() settles.
+  const openingSessions = new Map<string, { cancelled: boolean }>();
   let serialLoadError = "serialport module not available";
   const writeLine = dependencies.writeLine ?? writeOutputLine;
   const loadSerialModule =
@@ -149,6 +154,8 @@ export function createSerialSidecarRequestHandler(dependencies: {
         }
       });
       ports.set(sessionId, port);
+      const openState = { cancelled: false };
+      openingSessions.set(sessionId, openState);
       try {
         await new Promise<void>((resolve, reject) => {
           port.open((error) => (error ? reject(friendlyOpenError(params.path, error)) : resolve()));
@@ -159,6 +166,22 @@ export function createSerialSidecarRequestHandler(dependencies: {
         }
         port.removeAllListeners();
         throw error;
+      } finally {
+        if (openingSessions.get(sessionId) === openState) {
+          openingSessions.delete(sessionId);
+        }
+      }
+      if (openState.cancelled) {
+        // The caller gave up on this open. Unregister first so the close event
+        // is not reported as a disconnect, then release the device.
+        if (ports.get(sessionId) === port) {
+          ports.delete(sessionId);
+        }
+        await new Promise<void>((resolve) => {
+          port.close(() => resolve());
+        });
+        port.removeAllListeners();
+        return response(request.id, undefined, "Serial port open cancelled");
       }
       if (closedWhileOpening) {
         port.removeAllListeners();
@@ -208,6 +231,11 @@ export function createSerialSidecarRequestHandler(dependencies: {
       const params = request.params as { sessionId?: string };
       if (!params.sessionId) {
         return response(request.id, undefined, "invalid closePort parameters");
+      }
+      const openState = openingSessions.get(params.sessionId);
+      if (openState) {
+        openState.cancelled = true;
+        return response(request.id, { ok: true });
       }
       const port = ports.get(params.sessionId);
       if (!port) {

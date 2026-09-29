@@ -119,4 +119,37 @@ describe("production serial sidecar worker request handler", () => {
     });
     expect(ControlledSerialPort.instances).toHaveLength(0);
   });
+
+  it("closes a port whose open completes after closePort cancelled it, and frees the session ID", async () => {
+    const { handler, output } = makeHandler();
+    let finishOpen!: OpenCallback;
+    ControlledSerialPort.openBehavior = (_port, callback) => {
+      finishOpen = callback;
+    };
+    const closeSpy = vi.spyOn(ControlledSerialPort.prototype, "close");
+
+    const opening = handler(openRequest("open-slow"));
+    const closed = await handler({ id: "close-1", method: "closePort", params: { sessionId: "session-17" } });
+    expect(closed).toEqual({ id: "close-1", result: { ok: true } });
+    // The native open is still pending, so nothing can be closed yet.
+    expect(closeSpy).not.toHaveBeenCalled();
+
+    finishOpen();
+    await expect(opening).resolves.toEqual({
+      id: "open-slow",
+      error: { message: "Serial port open cancelled" }
+    });
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+    await expect(
+      handler({ id: "w-1", method: "writePort", params: { sessionId: "session-17", data: "eA==" } })
+    ).resolves.toEqual({ id: "w-1", error: { message: "unknown serial session" } });
+    // No disconnect notification for a port the caller already abandoned.
+    expect(output.filter((m) => "method" in m && m.method !== PORT_DATA_NOTIFICATION)).toEqual([]);
+
+    ControlledSerialPort.openBehavior = (_port, callback) => callback();
+    await expect(handler(openRequest("open-again"))).resolves.toEqual({
+      id: "open-again",
+      result: { sessionId: "session-17" }
+    });
+  });
 });

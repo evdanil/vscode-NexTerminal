@@ -533,10 +533,22 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     this.openingPort = true;
     this.openingData.clear();
     try {
-      const sessionId = await this.transport.openPort({
-        ...this.openPortOptions,
-        path
-      }, openingSessionId);
+      let sessionId: string;
+      try {
+        sessionId = await this.transport.openPort({
+          ...this.openPortOptions,
+          path
+        }, openingSessionId);
+      } catch (error) {
+        // Best-effort cancel: after a client-side RPC timeout the sidecar's open
+        // is still in flight and would otherwise hold the port, making every
+        // later poll fail with "busy".
+        void this.transport.closePort(openingSessionId).catch((closeError: unknown) => {
+          const closeMessage = closeError instanceof Error ? closeError.message : "unknown serial close error";
+          this.logger.log(`smart serial open cancel failed path=${path} ${closeMessage}`);
+        });
+        throw error;
+      }
       if (this.disposed) {
         this.openingSessionId = undefined;
         this.openingPort = false;
