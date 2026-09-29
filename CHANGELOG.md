@@ -1,10 +1,16 @@
 # Changelog
 
-## [2.8.296] — 2026-09-29
+## [2.8.297] — 2026-09-29
 
 ### Fixed
 
 - **Disposing an SSH lease while its standalone fallback is still connecting no longer drops other sessions or leaks a connection.** A pooled lease that fell back to its own connection (channel-limited device or stale transport) released its pooled reference a second time if it was disposed mid-connect, which could close the shared transport under another live terminal. The pooled reference is now released once, and a fallback that finishes after disposal is closed instead of being used.
+
+## [2.8.296] — 2026-09-29
+
+### Fixed
+
+- **A script's unawaited wait now ends with the run.** A `waitFor` / `expect` / `waitAny` still pending when a run completed, failed or lost its worker (a `Promise.race` loser, a call the script never awaited) kept its timer and the run's output buffer for its whole timeout, then wrote a stray `← timeout` line to the "Nexus Scripts" channel after `end:`. Every ending now cancels pending waits, and a wait posted just before the run ended is refused.
 
 ## [2.8.295] — 2026-09-28
 
