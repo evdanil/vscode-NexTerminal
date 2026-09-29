@@ -2350,4 +2350,20 @@ describe("Delete All Data (nexus.config.completeReset) covers Local Servers and 
     expect(confirmation).toContain("trusted SSH host keys, script files, session logs, the one-time ~/.ssh/config import offer and settings-guard bookkeeping");
     expect(confirmation).toContain("remembered view state and dismissed hints");
   });
+
+  it("clears a collection key whose stored rows are all invalid, which the snapshot-driven removals never touch (⊘ classifying it as cleared without clearing it)", async () => {
+    const machine = await makeMachine();
+    machine.ctx.state.set("nexus.servers", [{ id: "", name: 42 }, "not-a-record"]);
+    machine.ctx.state.set("nexus.tunnels", [{ garbage: true }]);
+    machine.ctx.state.set("nexus.groups", []);
+
+    await runReset(machine, recordingRuntime(machine.core));
+
+    expect(machine.ctx.state.has("nexus.servers")).toBe(false);
+    expect(machine.ctx.state.has("nexus.tunnels")).toBe(false);
+    // An empty collection is what a clean removal leaves; it is not rewritten.
+    expect(machine.ctx.state.get("nexus.groups")).toEqual([]);
+    // Kept keys stay.
+    expect(machine.ctx.state.has("nexus.resetGeneration")).toBe(true);
+  });
 });

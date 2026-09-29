@@ -2494,6 +2494,14 @@ describe("a share never hands over a shell command or an unattended tunnel (#254
     expect(bind("[::1]")).toBe("::1");
     expect(bind(" [::1] ")).toBe("::1");
     expect(bind("[::2]")).toBeUndefined();
+    // Every spelling of ::1 is kept, as the canonical address.
+    for (const spelling of ["0:0:0:0:0:0:0:1", "0000::1", "0:0::1", "0000:0000:0000:0000:0000:0000:0000:0001", "::0001", "[0:0:0:0:0:0:0:1]", "::1"]) {
+      expect(bind(spelling)).toBe("::1");
+    }
+    // Other addresses, IPv4-mapped forms, zone ids and malformed spellings are not loopback.
+    for (const other of ["::2", "0:0:0:0:0:0:0:2", "::", "1::1", "::ffff:127.0.0.1", "::1%lo", "1:::1", "0:0:0:0:0:0:0:0:1", "::1::1"]) {
+      expect(bind(other)).toBeUndefined();
+    }
   });
 
   it("import: a tunnel whose only change is a normalized address or a dropped loopback listener address is counted (⊘ counting only non-loopback values)", async () => {

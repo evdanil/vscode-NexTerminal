@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { isIP } from "node:net";
 import { chmod } from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
@@ -8,7 +9,7 @@ import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials, cloneTempla
 import type { InventorySourceConfig, InventorySourceValues, TemplateRule } from "../models/inventory";
 import { inventorySecretKey } from "../models/inventory";
 import type { DeviceTemplateProfile, TemplateField } from "../models/deviceTemplate";
-import { RESET_CLEARED_GLOBAL_STATE_KEYS } from "../storage/globalStateKeys";
+import { RESET_CLEARED_BY_STORE_GLOBAL_STATE_KEYS, RESET_CLEARED_GLOBAL_STATE_KEYS } from "../storage/globalStateKeys";
 import { bumpResetGeneration } from "../storage/resetGeneration";
 import type { LocalServerConfig } from "../models/localServer";
 import type { DhcpConfigProfile, TftpConfigProfile } from "../models/networkServerProfile";
@@ -1982,6 +1983,28 @@ const SHARED_SERVER_RULES = {
 } satisfies ShareRules<ServerConfig>;
 
 /**
+ * Whether `host` is the IPv6 loopback address in any spelling (`::1`,
+ * `0:0:0:0:0:0:0:1`, `0000::1`): expanded to its eight groups and compared.
+ * IPv4-mapped forms (`::ffff:127.0.0.1`) and zone ids are NOT accepted: they are
+ * other spellings of other things, and dropping them only costs the default.
+ */
+function isIpv6Loopback(host: string): boolean {
+  if (!isIP(host) || !host.includes(":") || host.includes(".") || host.includes("%")) {
+    return false;
+  }
+  const halves = host.split("::");
+  if (halves.length > 2) {
+    return false;
+  }
+  const groupsOf = (part: string | undefined): string[] => (part ? part.split(":") : []);
+  const head = groupsOf(halves[0]);
+  const tail = halves.length === 2 ? groupsOf(halves[1]) : [];
+  const missing = halves.length === 2 ? 8 - head.length - tail.length : 0;
+  const groups = [...head, ...new Array<string>(Math.max(missing, 0)).fill("0"), ...tail];
+  return groups.length === 8 && groups.every((group, index) => parseInt(group, 16) === (index === 7 ? 1 : 0));
+}
+
+/**
  * A loopback address, trimmed and lower-cased, or `undefined` for anything else.
  * Only a loopback address means the same thing on the recipient's machine as on
  * the sender's; the normalized host is returned, so padding never reaches the SSH
@@ -2003,7 +2026,10 @@ function loopbackAddressOnly(value: string | undefined): string | undefined {
   const octets = host.split(".");
   const isIpv4Loopback =
     octets.length === 4 && octets[0] === "127" && octets.every((octet) => /^(0|[1-9]\d{0,2})$/.test(octet) && Number(octet) <= 255);
-  return host === "localhost" || host === "::1" || isIpv4Loopback ? host : undefined;
+  if (isIpv6Loopback(host)) {
+    return "::1"; // the canonical spelling, whatever the file wrote
+  }
+  return host === "localhost" || isIpv4Loopback ? host : undefined;
 }
 
 /**
@@ -5408,6 +5434,20 @@ export function registerConfigCommands(
 
       // Clear macros (globalState + vault entries)
       await getActiveMacroStore().clearAll();
+      // Raw leftovers: the removals above are driven by the validated snapshot, so
+      // a collection whose stored rows all fail validation (a version-skewed
+      // list, say) removed nothing and its raw value would survive. Clear every
+      // such key explicitly. An empty array is what a clean removal leaves and is
+      // left alone: writing `undefined` over it would make the repository's
+      // concurrent-write check report a foreign change on the next save.
+      if (context) {
+        for (const key of RESET_CLEARED_BY_STORE_GLOBAL_STATE_KEYS) {
+          const raw = context.globalState.get<unknown>(key);
+          if (raw !== undefined && !(Array.isArray(raw) && raw.length === 0)) {
+            await context.globalState.update(key, undefined);
+          }
+        }
+      }
       await runtime?.resetViewState?.();
       try {
         if (context) {
