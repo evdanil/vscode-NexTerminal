@@ -23,10 +23,10 @@ import {
   deleteServerSecrets,
   passwordSecretKey,
   passphraseSecretKey,
-  proxyPasswordSecretKey,
   authProfilePasswordSecretKey,
   authProfilePassphraseSecretKey
 } from "../services/ssh/silentAuth";
+import { currentProxyPasswordSecretKey } from "../services/ssh/proxyPasswordKeys";
 import { validateAuthProfile } from "../utils/validation";
 import { encrypt, decrypt, type EncryptedPayload } from "../utils/configCrypto";
 import { parseMobaxtermSessions, type ImportedSession } from "../utils/mobaxtermParser";
@@ -1498,14 +1498,17 @@ async function addIfValid<T>(
  */
 async function restoreSecrets(
   record: Record<string, string> | undefined,
-  keyFn: (id: string) => string,
+  keyFn: (id: string) => string | undefined,
   vault: SecretVault,
   importedIds: Set<string>
 ): Promise<void> {
   if (!record) return;
   for (const [id, secret] of Object.entries(record)) {
     if (!importedIds.has(id)) continue;
-    await vault.store(keyFn(id), secret);
+    const key = keyFn(id);
+    // No key: the record has no destination for this secret (e.g. a proxy password
+    // for a server whose imported proxy is not a password-bearing one).
+    if (key !== undefined) await vault.store(key, secret);
   }
 }
 
@@ -1516,18 +1519,27 @@ async function restoreSecrets(
  * cleared secrets the backup did NOT put back) cannot disagree about which is
  * which.
  */
+/**
+ * Each entry's `key` maps a server record to the key its secret lives under. The
+ * proxy password is keyed by the record's proxy ENDPOINT, so it needs the record,
+ * not just the id (undefined when the record has no password-bearing proxy).
+ */
 const SERVER_SECRETS = [
-  { key: passwordSecretKey, bucket: "passwords" },
-  { key: passphraseSecretKey, bucket: "passphrases" },
-  { key: proxyPasswordSecretKey, bucket: "proxyPasswords" }
+  { key: (server: Pick<ServerConfig, "id" | "proxy">) => passwordSecretKey(server.id), bucket: "passwords" },
+  { key: (server: Pick<ServerConfig, "id" | "proxy">) => passphraseSecretKey(server.id), bucket: "passphrases" },
+  { key: (server: Pick<ServerConfig, "id" | "proxy">) => currentProxyPasswordSecretKey(server), bucket: "proxyPasswords" }
 ] as const;
 type ServerSecretBucket = (typeof SERVER_SECRETS)[number]["bucket"];
 
 /** The buckets of the secrets actually saved under a server's own id. */
-async function savedServerSecretBuckets(vault: SecretVault, serverId: string): Promise<ServerSecretBucket[]> {
+async function savedServerSecretBuckets(
+  vault: SecretVault,
+  server: Pick<ServerConfig, "id" | "proxy">
+): Promise<ServerSecretBucket[]> {
   const saved: ServerSecretBucket[] = [];
   for (const { key, bucket } of SERVER_SECRETS) {
-    if ((await vault.get(key(serverId))) !== undefined) {
+    const secretKey = key(server);
+    if (secretKey !== undefined && (await vault.get(secretKey)) !== undefined) {
       saved.push(bucket);
     }
   }
@@ -1551,8 +1563,9 @@ async function savedServerSecretBuckets(vault: SecretVault, serverId: string): P
  *    proxy password goes to the proxy itself: none on either side (absent and
  *    `null` alike — `validateServerConfig` admits both), or the same kind with
  *    the same members — `jumpHostId` for an SSH jump host; `host`, `port` and
- *    `username` for SOCKS5/HTTP, the identity the proxy-password hygiene
- *    already keeps a secret by (`isSameAuthenticatedEndpoint`).
+ *    `username` for SOCKS5/HTTP, the identity a saved proxy password is keyed by
+ *    (`proxyPasswordSecretKey`, proxyPasswordKeys.ts; see also
+ *    `isSameAuthenticatedEndpoint`).
  * Nothing else counts: a renamed, moved or re-flagged server at the same
  * endpoint keeps its secrets. SSH jump hosts additionally compare their
  * auth-profile identity and effective connection fields: replacing a profile
@@ -3168,7 +3181,8 @@ export async function captureBackupStateForExport(
       if (pw) passwords[server.id] = pw;
       const pp = await vault.get(passphraseSecretKey(server.id));
       if (pp) passphrases[server.id] = pp;
-      const proxyPw = await vault.get(proxyPasswordSecretKey(server.id));
+      const proxyKey = currentProxyPasswordSecretKey(server);
+      const proxyPw = proxyKey === undefined ? undefined : await vault.get(proxyKey);
       if (proxyPw) proxyPasswords[server.id] = proxyPw;
     }
 
@@ -4297,7 +4311,12 @@ export function registerConfigCommands(
   ): Promise<void> {
     const removed = emptyRemovedProfileIds();
     try {
-      await configMutationLock.runExclusive(() => importMergeReplaceLocked(data, mode, decryptedSecrets, removed));
+      await configMutationLock.runExclusive(() =>
+        // A Replace removes every server and re-creates some under the same ids: batch it so
+        // endpoint-key housekeeping settles once the whole operation is done (#175 keeps a
+        // re-created same-endpoint server's proxy password).
+        core.runServerBatch(() => importMergeReplaceLocked(data, mode, decryptedSecrets, removed))
+      );
     } finally {
       await teardownRemovedProfiles(core, runtime, removed);
     }
@@ -4320,12 +4339,13 @@ export function registerConfigCommands(
     decryptedSecrets: Record<string, unknown> | undefined,
     removed: RemovedProfileIds
   ): Promise<void> {
-    const awaitingVerdict = new Set<string>();
+    // id -> the proxy the removed server had, so its endpoint-keyed proxy password can be cleared.
+    const awaitingVerdict = new Map<string, ProxyConfig | undefined>();
     try {
       await applyMergeReplace(data, mode, decryptedSecrets, awaitingVerdict, removed);
     } catch (error) {
-      for (const id of awaitingVerdict) {
-        await deleteServerSecrets(vault, id, { bestEffort: true });
+      for (const [id, proxy] of awaitingVerdict) {
+        await deleteServerSecrets(vault, id, { bestEffort: true, proxies: [proxy] });
       }
       throw error;
     }
@@ -4335,7 +4355,7 @@ export function registerConfigCommands(
     data: NexusConfigExport,
     mode: "merge" | "replace",
     decryptedSecrets: Record<string, unknown> | undefined,
-    awaitingVerdict: Set<string>,
+    awaitingVerdict: Map<string, ProxyConfig | undefined>,
     removed: RemovedProfileIds
   ): Promise<void> {
     const snapshot = core.getSnapshot();
@@ -4364,7 +4384,7 @@ export function registerConfigCommands(
         // Tracked BEFORE the await: `removeServer` drops the record from memory
         // before it persists, so a rejected persist still leaves the server gone
         // for this session — and a retry could bring its id back anywhere.
-        awaitingVerdict.add(server.id);
+        awaitingVerdict.set(server.id, server.proxy);
         removed.servers.push(server.id);
         await core.removeServer(server.id);
       }
@@ -4505,11 +4525,14 @@ export function registerConfigCommands(
     const clearedSecretBuckets = new Map<string, ServerSecretBucket[]>();
     const serverTally = await importPreservingIds(data.servers, existingIds, validateServerConfig, async (e) => {
       if (awaitingVerdict.has(e.id) && !keepSecrets.has(e.id)) {
-        const saved = await savedServerSecretBuckets(vault, e.id);
+        // The record being replaced (its proxy endpoint decides which proxy password is
+        // "saved here") and the imported one (whose endpoint must not inherit it).
+        const replacedProxy = awaitingVerdict.get(e.id);
+        const saved = await savedServerSecretBuckets(vault, { id: e.id, proxy: replacedProxy });
         if (saved.length > 0) {
           clearedSecretBuckets.set(e.id, saved);
         }
-        await deleteServerSecrets(vault, e.id);
+        await deleteServerSecrets(vault, e.id, { proxies: [replacedProxy, e.proxy] });
         awaitingVerdict.delete(e.id);
       }
       await addServerSanitizingOrigin(e, (s) => core.addOrUpdateServer(s));
@@ -4521,8 +4544,8 @@ export function registerConfigCommands(
     for (const id of serverTally.importedIds) {
       awaitingVerdict.delete(id);
     }
-    for (const id of [...awaitingVerdict]) {
-      await deleteServerSecrets(vault, id);
+    for (const [id, proxy] of [...awaitingVerdict]) {
+      await deleteServerSecrets(vault, id, { proxies: [proxy] });
       awaitingVerdict.delete(id);
     }
     const tunnelTally = await importPreservingIds(data.tunnels, existingIds, validateTunnelProfile, (e) => core.addOrUpdateTunnel(e));
@@ -5011,7 +5034,13 @@ export function registerConfigCommands(
       const importedServerIds = new Set(serverTally.importedIds);
       const importedAuthProfileIds = new Set(authProfileTally.importedIds);
       for (const { key, bucket } of SERVER_SECRETS) {
-        await restoreSecrets(decryptedSecrets[bucket] as Record<string, string> | undefined, key, vault, importedServerIds);
+        // Keyed by the imported record as it now stands (the proxy password by its endpoint).
+        await restoreSecrets(
+          decryptedSecrets[bucket] as Record<string, string> | undefined,
+          (id) => { const server = core.getServer(id); return server ? key(server) : undefined; },
+          vault,
+          importedServerIds
+        );
       }
       await restoreSecrets(decryptedSecrets.authProfilePasswords as Record<string, string> | undefined, authProfilePasswordSecretKey, vault, importedAuthProfileIds);
       await restoreSecrets(decryptedSecrets.authProfilePassphrases as Record<string, string> | undefined, authProfilePassphraseSecretKey, vault, importedAuthProfileIds);
@@ -5412,7 +5441,7 @@ export function registerConfigCommands(
 
       // Delete all passwords/passphrases first (before removing servers)
       for (const server of snapshot.servers) {
-        await deleteServerSecrets(vault, server.id);
+        await deleteServerSecrets(vault, server.id, { proxies: [server.proxy] });
       }
 
       // Remove all servers

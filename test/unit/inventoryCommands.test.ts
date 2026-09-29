@@ -34,7 +34,7 @@ import {
   authProfilePasswordSecretKey,
   passphraseSecretKey,
   passwordSecretKey,
-  proxyPasswordSecretKey,
+  legacyProxyPasswordSecretKey,
   SilentAuthSshFactory
 } from "../../src/services/ssh/silentAuth";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
@@ -1882,7 +1882,7 @@ describe("inventoryCommands", () => {
         [inventorySecretKey("src-1", "apiToken")]: "tok",
         [passwordSecretKey("owned-1")]: "pw",
         [passphraseSecretKey("owned-1")]: "pp",
-        [proxyPasswordSecretKey("owned-1")]: "proxpw"
+        [legacyProxyPasswordSecretKey("owned-1")]: "proxpw"
       });
       const teardown = makeTeardown();
       registerInventoryCommands(core, registry, vault, teardown);
@@ -1898,7 +1898,7 @@ describe("inventoryCommands", () => {
       expect(core.getSnapshot().inventorySources).toHaveLength(0);
       expect(await vault.get(passwordSecretKey("owned-1"))).toBeUndefined();
       expect(await vault.get(passphraseSecretKey("owned-1"))).toBeUndefined();
-      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBeUndefined();
+      expect(await vault.get(legacyProxyPasswordSecretKey("owned-1"))).toBeUndefined();
       expect(await vault.get(inventorySecretKey("src-1", "apiToken"))).toBeUndefined();
     });
 
@@ -1924,10 +1924,10 @@ describe("inventoryCommands", () => {
         [inventorySecretKey("src-1", "apiToken")]: "tok",
         [passwordSecretKey("owned-1")]: "pw1",
         [passphraseSecretKey("owned-1")]: "pp1",
-        [proxyPasswordSecretKey("owned-1")]: "proxy1",
+        [legacyProxyPasswordSecretKey("owned-1")]: "proxy1",
         [passwordSecretKey("owned-2")]: "pw2",
         [passphraseSecretKey("owned-2")]: "pp2",
-        [proxyPasswordSecretKey("owned-2")]: "proxy2"
+        [legacyProxyPasswordSecretKey("owned-2")]: "proxy2"
       });
       const teardown = makeTeardown();
       registerInventoryCommands(core, registry, vault, teardown);
@@ -1967,10 +1967,10 @@ describe("inventoryCommands", () => {
       // exactly what they were.
       expect(await vault.get(passwordSecretKey("owned-1"))).toBeUndefined();
       expect(await vault.get(passphraseSecretKey("owned-1"))).toBeUndefined();
-      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBeUndefined();
+      expect(await vault.get(legacyProxyPasswordSecretKey("owned-1"))).toBeUndefined();
       expect(await vault.get(passwordSecretKey("owned-2"))).toBe("pw2");
       expect(await vault.get(passphraseSecretKey("owned-2"))).toBe("pp2");
-      expect(await vault.get(proxyPasswordSecretKey("owned-2"))).toBe("proxy2");
+      expect(await vault.get(legacyProxyPasswordSecretKey("owned-2"))).toBe("proxy2");
 
       // The skip is surfaced to the user rather than silently dropped.
       expect(mockShowInformationMessage).toHaveBeenCalledWith(expect.stringMatching(/1 server.*changed during removal/i));
@@ -1998,10 +1998,10 @@ describe("inventoryCommands", () => {
         [inventorySecretKey("src-1", "apiToken")]: "tok",
         [passwordSecretKey("owned-1")]: "pw1",
         [passphraseSecretKey("owned-1")]: "pp1",
-        [proxyPasswordSecretKey("owned-1")]: "proxy1",
+        [legacyProxyPasswordSecretKey("owned-1")]: "proxy1",
         [passwordSecretKey("owned-2")]: "pw2",
         [passphraseSecretKey("owned-2")]: "pp2",
-        [proxyPasswordSecretKey("owned-2")]: "proxy2"
+        [legacyProxyPasswordSecretKey("owned-2")]: "proxy2"
       });
       const teardown = {
         // Simulate the race the finding describes: an unlocked
@@ -2031,13 +2031,13 @@ describe("inventoryCommands", () => {
       expect(core.getServer("owned-2")).toBeDefined();
       expect(await vault.get(passwordSecretKey("owned-2"))).toBe("pw2");
       expect(await vault.get(passphraseSecretKey("owned-2"))).toBe("pp2");
-      expect(await vault.get(proxyPasswordSecretKey("owned-2"))).toBe("proxy2");
+      expect(await vault.get(legacyProxyPasswordSecretKey("owned-2"))).toBe("proxy2");
 
       // "owned-1" was never re-created — it's genuinely gone, credentials included.
       expect(core.getServer("owned-1")).toBeUndefined();
       expect(await vault.get(passwordSecretKey("owned-1"))).toBeUndefined();
       expect(await vault.get(passphraseSecretKey("owned-1"))).toBeUndefined();
-      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBeUndefined();
+      expect(await vault.get(legacyProxyPasswordSecretKey("owned-1"))).toBeUndefined();
 
       expect(mockShowInformationMessage).toHaveBeenCalledWith(
         expect.stringMatching(/1 re-created server.*kept.*credentials/i)
@@ -2256,7 +2256,7 @@ describe("inventoryCommands", () => {
         [inventorySecretKey("src-1", "apiToken")]: "tok",
         [passwordSecretKey("owned-1")]: "pw",
         [passphraseSecretKey("owned-1")]: "pp",
-        [proxyPasswordSecretKey("owned-1")]: "proxpw"
+        [legacyProxyPasswordSecretKey("owned-1")]: "proxpw"
       });
       const teardown = makeTeardown();
       registerInventoryCommands(core, registry, vault, teardown);
@@ -2288,7 +2288,7 @@ describe("inventoryCommands", () => {
       expect(core.getServer("owned-1")?.origin?.sourceId).toBe("src-1");
       expect(await vault.get(passwordSecretKey("owned-1"))).toBe("pw");
       expect(await vault.get(passphraseSecretKey("owned-1"))).toBe("pp");
-      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBe("proxpw");
+      expect(await vault.get(legacyProxyPasswordSecretKey("owned-1"))).toBe("proxpw");
     });
 
     it("(FINDING 1 / FINDING 2) a replace-mode import recreating the source id DURING the awaited vault deletes aborts removeInventorySource — the replacement record survives, its (deleted) credential slot is NOT restored to the old value, and disposition never runs (kills an unconditional delete of the replacement record, and kills a stale-secret restore over a replacement)", async () => {
@@ -2773,10 +2773,10 @@ describe("inventoryCommands", () => {
       const vault = makeVault({
         [passwordSecretKey("owned-1")]: "pw1",
         [passphraseSecretKey("owned-1")]: "pp1",
-        [proxyPasswordSecretKey("owned-1")]: "proxy1",
+        [legacyProxyPasswordSecretKey("owned-1")]: "proxy1",
         [passwordSecretKey("owned-2")]: "pw2",
         [passphraseSecretKey("owned-2")]: "pp2",
-        [proxyPasswordSecretKey("owned-2")]: "proxy2",
+        [legacyProxyPasswordSecretKey("owned-2")]: "proxy2",
         [inventorySecretKey("src-1", "apiToken")]: "tok"
       });
       const teardown = {
@@ -2805,10 +2805,10 @@ describe("inventoryCommands", () => {
 
       expect(await vault.get(passwordSecretKey("owned-1"))).toBeUndefined();
       expect(await vault.get(passphraseSecretKey("owned-1"))).toBeUndefined();
-      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBeUndefined();
+      expect(await vault.get(legacyProxyPasswordSecretKey("owned-1"))).toBeUndefined();
       expect(await vault.get(passwordSecretKey("owned-2"))).toBe("pw2");
       expect(await vault.get(passphraseSecretKey("owned-2"))).toBe("pp2");
-      expect(await vault.get(proxyPasswordSecretKey("owned-2"))).toBe("proxy2");
+      expect(await vault.get(legacyProxyPasswordSecretKey("owned-2"))).toBe("proxy2");
     });
 
     // -------- Codex round 9 (P1, SECURITY) — the inventory apply clears a stale
@@ -2851,7 +2851,7 @@ describe("inventoryCommands", () => {
       const registry = new InventoryProviderRegistry();
       registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
       const vault = makeVault({
-        [proxyPasswordSecretKey("owned-1")]: "old-proxy-pw",
+        [legacyProxyPasswordSecretKey("owned-1")]: "old-proxy-pw",
         [inventorySecretKey("src-1", "apiToken")]: "tok"
       });
       registerInventoryCommands(core, registry, vault, makeTeardown());
@@ -2865,8 +2865,8 @@ describe("inventoryCommands", () => {
       // ...so the password saved for X is stale and MUST be cleared. Against
       // e2553fe the apply never touched the secret → the old X password would be
       // sent to Y.
-      expect(vault.delete).toHaveBeenCalledWith(proxyPasswordSecretKey("owned-1"));
-      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBeUndefined();
+      expect(vault.delete).toHaveBeenCalledWith(legacyProxyPasswordSecretKey("owned-1"));
+      expect(await vault.get(legacyProxyPasswordSecretKey("owned-1"))).toBeUndefined();
     });
 
     it("(round 9, SECURITY) an applied template override that changes a SOCKS5 proxy to an SSH jump-host proxy clears the stale proxy-password-{id} (the ssh proxy never uses it)", async () => {
@@ -2882,7 +2882,7 @@ describe("inventoryCommands", () => {
       const registry = new InventoryProviderRegistry();
       registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
       const vault = makeVault({
-        [proxyPasswordSecretKey("owned-1")]: "old-proxy-pw",
+        [legacyProxyPasswordSecretKey("owned-1")]: "old-proxy-pw",
         [inventorySecretKey("src-1", "apiToken")]: "tok"
       });
       registerInventoryCommands(core, registry, vault, makeTeardown());
@@ -2892,8 +2892,8 @@ describe("inventoryCommands", () => {
       await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
 
       expect(core.getServer("owned-1")?.proxy).toEqual({ type: "ssh", jumpHostId: "bastion-1" });
-      expect(vault.delete).toHaveBeenCalledWith(proxyPasswordSecretKey("owned-1"));
-      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBeUndefined();
+      expect(vault.delete).toHaveBeenCalledWith(legacyProxyPasswordSecretKey("owned-1"));
+      expect(await vault.get(legacyProxyPasswordSecretKey("owned-1"))).toBeUndefined();
     });
 
     it("(round 9, SECURITY — over-clear guard) an update that KEEPS the SAME socks5 host+port+username (a rename, proxy unchanged) does NOT clear the still-valid proxy-password-{id}", async () => {
@@ -2919,7 +2919,7 @@ describe("inventoryCommands", () => {
         })
       );
       const vault = makeVault({
-        [proxyPasswordSecretKey("owned-1")]: "still-valid-pw",
+        [legacyProxyPasswordSecretKey("owned-1")]: "still-valid-pw",
         [inventorySecretKey("src-1", "apiToken")]: "tok"
       });
       registerInventoryCommands(core, registry, vault, makeTeardown());
@@ -2930,8 +2930,8 @@ describe("inventoryCommands", () => {
 
       expect(core.getServer("owned-1")?.name).toBe("renamed-sw"); // the update landed
       expect(core.getServer("owned-1")?.proxy).toEqual({ type: "socks5", host: "10.9.9.1", port: 1080, username: "puser" }); // proxy unchanged
-      expect(vault.delete).not.toHaveBeenCalledWith(proxyPasswordSecretKey("owned-1")); // secret KEPT
-      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBe("still-valid-pw");
+      expect(vault.delete).not.toHaveBeenCalledWith(legacyProxyPasswordSecretKey("owned-1")); // secret KEPT
+      expect(await vault.get(legacyProxyPasswordSecretKey("owned-1"))).toBe("still-valid-pw");
     });
 
     it("(round 9, SECURITY — no-op guard) an update on an SSH-proxied server (ssh↔ssh, no socks5/http before) performs no proxy-secret operation", async () => {
@@ -2963,7 +2963,7 @@ describe("inventoryCommands", () => {
       await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
 
       expect(core.getServer("owned-1")?.name).toBe("renamed-sw"); // update landed
-      expect(vault.delete).not.toHaveBeenCalledWith(proxyPasswordSecretKey("owned-1")); // no proxy-secret op
+      expect(vault.delete).not.toHaveBeenCalledWith(legacyProxyPasswordSecretKey("owned-1")); // no proxy-secret op
     });
 
     // -------- Codex round 10 (P1, SECURITY) — the stale proxy-password clear must
@@ -2992,7 +2992,7 @@ describe("inventoryCommands", () => {
 
     it("(round 10, SECURITY — ordering) the stale proxy-password DELETE happens BEFORE applyInventorySyncPlan publishes the new proxy — falsifies the round-9 after-apply clear (connect never takes the lock, so an after-apply clear leaks the old password to the new endpoint)", async () => {
       const { core, registry } = await setupProxyMoveScenario();
-      const proxyKey = proxyPasswordSecretKey("owned-1");
+      const proxyKey = legacyProxyPasswordSecretKey("owned-1");
 
       const callOrder: string[] = [];
       const store = new Map<string, string>([
@@ -3032,7 +3032,7 @@ describe("inventoryCommands", () => {
 
     it("(round 10, SECURITY — delete fails CLOSED) a vault.delete throw for the stale proxy key ABORTS the sync (applyInventorySyncPlan never called, new proxy never published) and RESTORES the captured secret — falsifies the round-9 best-effort swallow", async () => {
       const { core, registry } = await setupProxyMoveScenario();
-      const proxyKey = proxyPasswordSecretKey("owned-1");
+      const proxyKey = legacyProxyPasswordSecretKey("owned-1");
 
       const store = new Map<string, string>([
         [proxyKey, "old-proxy-pw"],
@@ -3069,7 +3069,7 @@ describe("inventoryCommands", () => {
 
     it("(round 10, SECURITY — apply fails, restore) delete succeeds but applyInventorySyncPlan throws → the captured secret is RESTORED (old proxy config is still live and needs its password) and the failure surfaces", async () => {
       const { core, registry } = await setupProxyMoveScenario();
-      const proxyKey = proxyPasswordSecretKey("owned-1");
+      const proxyKey = legacyProxyPasswordSecretKey("owned-1");
 
       const store = new Map<string, string>([
         [proxyKey, "old-proxy-pw"],
@@ -3101,7 +3101,7 @@ describe("inventoryCommands", () => {
 
     it("(round 10, SECURITY — happy path) delete succeeds and apply succeeds → the stale secret is gone, the new proxy is live, and nothing is restored", async () => {
       const { core, registry } = await setupProxyMoveScenario();
-      const proxyKey = proxyPasswordSecretKey("owned-1");
+      const proxyKey = legacyProxyPasswordSecretKey("owned-1");
       const vault = makeVault({
         [proxyKey]: "old-proxy-pw",
         [inventorySecretKey("src-1", "apiToken")]: "tok"
@@ -3152,7 +3152,7 @@ describe("inventoryCommands", () => {
       const registry = new InventoryProviderRegistry();
       registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
 
-      const proxyKey = proxyPasswordSecretKey("owned-1");
+      const proxyKey = legacyProxyPasswordSecretKey("owned-1");
       const callOrder: string[] = [];
       const store = new Map<string, string>([
         [proxyKey, "orphan-pw"], // legacy-backup orphan, no current socks5/http proxy behind it
@@ -3203,7 +3203,7 @@ describe("inventoryCommands", () => {
       const registry = new InventoryProviderRegistry();
       registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
 
-      const proxyKey = proxyPasswordSecretKey("owned-1");
+      const proxyKey = legacyProxyPasswordSecretKey("owned-1");
       const store = new Map<string, string>([
         [proxyKey, "orphan-pw"],
         [inventorySecretKey("src-1", "apiToken"), "tok"]
@@ -3258,7 +3258,7 @@ describe("inventoryCommands", () => {
         })
       );
       const vault = makeVault({
-        [proxyPasswordSecretKey("owned-1")]: "orphan-pw", // orphan under an ssh proxy
+        [legacyProxyPasswordSecretKey("owned-1")]: "orphan-pw", // orphan under an ssh proxy
         [inventorySecretKey("src-1", "apiToken")]: "tok"
       });
       registerInventoryCommands(core, registry, vault, makeTeardown());
@@ -3268,8 +3268,8 @@ describe("inventoryCommands", () => {
       await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
 
       expect(core.getServer("owned-1")?.name).toBe("renamed-sw"); // the update landed
-      expect(vault.delete).not.toHaveBeenCalledWith(proxyPasswordSecretKey("owned-1")); // orphan KEPT
-      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBe("orphan-pw");
+      expect(vault.delete).not.toHaveBeenCalledWith(legacyProxyPasswordSecretKey("owned-1")); // orphan KEPT
+      expect(await vault.get(legacyProxyPasswordSecretKey("owned-1"))).toBe("orphan-pw");
     });
 
     // -------- Codex round 12 (P1, SECURITY) — the fail-closed pre-apply clear must
@@ -3298,7 +3298,7 @@ describe("inventoryCommands", () => {
       const registry = new InventoryProviderRegistry();
       registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
 
-      const proxyKey = proxyPasswordSecretKey(addId());
+      const proxyKey = legacyProxyPasswordSecretKey(addId());
       const callOrder: string[] = [];
       const store = new Map<string, string>([
         [proxyKey, "orphan-pw"], // relic of an earlier delete-prune whose best-effort delete failed
@@ -3348,7 +3348,7 @@ describe("inventoryCommands", () => {
       const registry = new InventoryProviderRegistry();
       registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
 
-      const proxyKey = proxyPasswordSecretKey(addId());
+      const proxyKey = legacyProxyPasswordSecretKey(addId());
       const store = new Map<string, string>([
         [proxyKey, "orphan-pw"],
         [inventorySecretKey("src-1", "apiToken"), "tok"]
@@ -3395,7 +3395,7 @@ describe("inventoryCommands", () => {
       const registry = new InventoryProviderRegistry();
       registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
 
-      const proxyKey = proxyPasswordSecretKey(addId());
+      const proxyKey = legacyProxyPasswordSecretKey(addId());
       const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" }); // no proxy secret
 
       registerInventoryCommands(core, registry, vault, makeTeardown());
@@ -3423,7 +3423,7 @@ describe("inventoryCommands", () => {
       const registry = new InventoryProviderRegistry();
       registry.register(makeProvider({ fetchInventory: vi.fn(async () => deviceMappingOwned1()) }));
 
-      const proxyKey = proxyPasswordSecretKey(addId());
+      const proxyKey = legacyProxyPasswordSecretKey(addId());
       const vault = makeVault({
         [proxyKey]: "orphan-pw", // orphan under what becomes an ssh-proxied add
         [inventorySecretKey("src-1", "apiToken")]: "tok"
@@ -3453,7 +3453,7 @@ describe("inventoryCommands", () => {
     // `proxy-password-{id}` behind for the next server under that id. --------
     describe("#200 — secrets left under a reused id", () => {
       const reusedId = deterministicServerId("src-1", "device:1");
-      const leftoverKeys = [passwordSecretKey(reusedId), passphraseSecretKey(reusedId), proxyPasswordSecretKey(reusedId)];
+      const leftoverKeys = [passwordSecretKey(reusedId), passphraseSecretKey(reusedId), legacyProxyPasswordSecretKey(reusedId)];
 
       function deviceAt(host: string): InventoryTree {
         return { contractVersion: 1 as const, devices: [{ externalId: "device:1", name: "vm-101", endpoints: [{ kind: "ssh" as const, host, port: 22 }] }] };
@@ -3500,7 +3500,7 @@ describe("inventoryCommands", () => {
         const { vault, state } = lockableVault({
           [passwordSecretKey(reusedId)]: "old-pw",
           [passphraseSecretKey(reusedId)]: "old-pp",
-          [proxyPasswordSecretKey(reusedId)]: "old-proxy-pw",
+          [legacyProxyPasswordSecretKey(reusedId)]: "old-proxy-pw",
           [inventorySecretKey("src-1", "apiToken")]: "tok"
         });
         registerInventoryCommands(core, registry, vault, makeTeardown());
@@ -3694,7 +3694,7 @@ describe("inventoryCommands", () => {
         const vault = makeVault({
           [passwordSecretKey(reusedId)]: "pw",
           [passphraseSecretKey(reusedId)]: "pp",
-          [proxyPasswordSecretKey(reusedId)]: "proxy-pw",
+          [legacyProxyPasswordSecretKey(reusedId)]: "proxy-pw",
           [inventorySecretKey("src-1", "apiToken")]: "tok"
         });
         registerInventoryCommands(core, registry, vault, makeTeardown());
@@ -3706,7 +3706,7 @@ describe("inventoryCommands", () => {
         expect(core.getServer(reusedId)?.host).toBe("10.0.0.99");
         expect(await vault.get(passwordSecretKey(reusedId))).toBe("pw");
         expect(await vault.get(passphraseSecretKey(reusedId))).toBe("pp");
-        expect(await vault.get(proxyPasswordSecretKey(reusedId))).toBe("proxy-pw");
+        expect(await vault.get(legacyProxyPasswordSecretKey(reusedId))).toBe("proxy-pw");
       });
     });
 
@@ -4059,7 +4059,7 @@ describe("inventoryCommands", () => {
       const vault = makeVault({
         [passwordSecretKey("owned-1")]: "pw1",
         [passphraseSecretKey("owned-1")]: "pp1",
-        [proxyPasswordSecretKey("owned-1")]: "proxy1",
+        [legacyProxyPasswordSecretKey("owned-1")]: "proxy1",
         [inventorySecretKey("src-1", "apiToken")]: "tok"
       });
       registerInventoryCommands(core, registry, vault, makeTeardown());
@@ -4076,7 +4076,7 @@ describe("inventoryCommands", () => {
       expect(core.getServer("owned-1")).toBeDefined();
       expect(await vault.get(passwordSecretKey("owned-1"))).toBe("pw1");
       expect(await vault.get(passphraseSecretKey("owned-1"))).toBe("pp1");
-      expect(await vault.get(proxyPasswordSecretKey("owned-1"))).toBe("proxy1");
+      expect(await vault.get(legacyProxyPasswordSecretKey("owned-1"))).toBe("proxy1");
 
       expect(mockShowInformationMessage).toHaveBeenCalledWith(
         expect.stringMatching(/1 re-created server.*kept.*credentials/i)
@@ -7694,7 +7694,7 @@ describe("inventoryCommands", () => {
         secrets: {
           [passwordSecretKey(ADD_PATH_ID)]: "pw",
           [passphraseSecretKey(ADD_PATH_ID)]: "pp",
-          [proxyPasswordSecretKey(ADD_PATH_ID)]: "proxy-pw"
+          [legacyProxyPasswordSecretKey(ADD_PATH_ID)]: "proxy-pw"
         }
       });
 
@@ -7704,7 +7704,7 @@ describe("inventoryCommands", () => {
       expect(core.getServer(ADD_PATH_ID)?.origin?.sourceId).toBe("src-1");
       expect(await vault.get(passwordSecretKey(ADD_PATH_ID))).toBe("pw");
       expect(await vault.get(passphraseSecretKey(ADD_PATH_ID))).toBe("pp");
-      expect(await vault.get(proxyPasswordSecretKey(ADD_PATH_ID))).toBe("proxy-pw");
+      expect(await vault.get(legacyProxyPasswordSecretKey(ADD_PATH_ID))).toBe("proxy-pw");
     });
 
     // REVIEW FINDING (P2, "avoid promising a separate add when the ID is

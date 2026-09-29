@@ -67,7 +67,7 @@ Three proxy types are supported per server:
 If your target server is behind a firewall or bastion host:
 
 1. **SSH Jump Host** — First add the bastion server as a regular server profile, then edit the target server and set its proxy to "SSH Jump Host", selecting the bastion from the dropdown. Multi-hop chains (A → B → C) work automatically.
-2. **SOCKS5 / HTTP CONNECT** — Edit the target server and set its proxy type, entering the proxy host, port, and optional credentials. Proxy passwords are stored securely in VS Code SecretStorage.
+2. **SOCKS5 / HTTP CONNECT** — Edit the target server and set its proxy type, entering the proxy host, port, and optional credentials. Proxy passwords are stored securely in VS Code SecretStorage, one per proxy (type, host, port and user name): changing the proxy stops the old password from being used, and switching back to a proxy finds its saved password again until you save a change that leaves it.
 
 ## Alternate Host
 
@@ -91,9 +91,15 @@ A per-server legacy algorithm toggle is there for older devices (Cisco IOS, embe
 
 Share SSH connections across terminals, tunnels (in their default shared mode), and SFTP for the same server. A jump host's connection is shared the same way by everything routed through it, isolated-mode tunnels included, unless multiplexing is off for the jump host. Reduces connection overhead with automatic ref-counting and configurable idle timeout.
 
+Editing a jump host's connection settings (or its auth profile), or removing the jump host (or refreshing after another window saved a change), also retires the shared connections of the servers that go through it. Sessions already open keep running on their old connection; the next reconnect or tunnel start builds a new one over the current route.
+
 Per-server toggle lets you disable multiplexing for devices that don't support multiple channels (e.g. Cisco).
 
 Automatic fallback to standalone connections handles channel failures transparently.
+
+## If the Server Changes While Connecting
+
+If the server is removed or its connection settings (address, port, protocol, user name, authentication method, key file, auth profile link, proxy or jump host) change before the terminal opens (the user name, authentication method and key file count as they end up after the linked auth profile is applied, and a jump host's own connection settings count too), Nexus cancels the connect and shows a notice, with **Retry** on the current settings when the server still exists (it repeats the original action, such as Connect and Run Script). Saving the server without changes, renaming its folder, or refreshing after another window saved, does not cancel it. This applies to SSH and Telnet, and the check happens once, just before the terminal is created. Once the terminal is open — including while it waits for a password or verification code, or for the Telnet connection — the session keeps the settings it started with, and an edit applies at the next connect. These checks compare the saved configuration; a saved password, key passphrase or proxy password changed in the secret store does not cancel a pending start, and the new value is used at the next login.
 
 ## When a Session Drops
 

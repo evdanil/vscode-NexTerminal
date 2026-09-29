@@ -4,6 +4,10 @@ import type { SecretVault } from "./contracts";
 export class VscodeSecretVault implements SecretVault {
   public constructor(private readonly context: vscode.ExtensionContext) {}
 
+  public async keys(): Promise<string[]> {
+    return [...(await this.context.secrets.keys())];
+  }
+
   public async get(key: string): Promise<string | undefined> {
     return this.context.secrets.get(key);
   }

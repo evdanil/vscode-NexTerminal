@@ -1,6 +1,6 @@
 import type { Duplex } from "node:stream";
-import type { AuthProfile, ServerConfig } from "../../models/config";
-import { authProfileOwnedCredentials } from "../../models/config";
+import type { AuthProfile, ProxyConfig, ServerConfig } from "../../models/config";
+import { applyAuthProfile } from "../../models/config";
 import { configMutationLock } from "../configMutationLock";
 import type {
   KeyboardInteractiveHandler,
@@ -12,6 +12,12 @@ import type {
   SshFactory
 } from "./contracts";
 import { AuthNotJudgedError, isAuthNotJudged } from "./authErrors";
+import {
+  endpointProxyPasswordKeysOf,
+  isPasswordBearingProxy,
+  legacyProxyPasswordSecretKey,
+  proxyPasswordSecretKey
+} from "./proxyPasswordKeys";
 
 export type InputPromptFn = (message: string, password: boolean, signal?: AbortSignal) => Promise<string | undefined>;
 
@@ -50,14 +56,17 @@ export function passphraseSecretKey(serverId: string): string {
   return `passphrase-${serverId}`;
 }
 
-export function proxyPasswordSecretKey(serverId: string): string {
-  return `proxy-password-${serverId}`;
-}
+export { proxyPasswordSecretKey, legacyProxyPasswordSecretKey } from "./proxyPasswordKeys";
 
 /**
  * Deletes every secret saved under a server's own id — its password, key
- * passphrase and proxy password. Every path that deletes a server calls this,
- * so a key added here is deleted by all of them.
+ * passphrase, the LEGACY per-server proxy password, and the endpoint-keyed proxy
+ * passwords: the ones for the `proxies` a caller passes, plus, when the vault can
+ * list its keys, every `proxy-password-{id}-{hash}` stored for this id (so an
+ * id-only caller that no longer knows the record's proxy still leaves none behind).
+ * The pool-invalidation hook also cleans up an endpoint after the server leaves it
+ * or is removed. Every path that deletes a server calls this, so a key added here
+ * is deleted by all of them.
  *
  * By default the first failed delete rejects, for a caller that has not removed
  * the record yet and can stop. `bestEffort` is for cleanup after the record is
@@ -67,9 +76,31 @@ export function proxyPasswordSecretKey(serverId: string): string {
 export async function deleteServerSecrets(
   vault: SecretVault,
   serverId: string,
-  options: { bestEffort?: boolean } = {}
+  options: { bestEffort?: boolean; proxies?: ReadonlyArray<ProxyConfig | undefined> } = {}
 ): Promise<void> {
-  for (const key of [passwordSecretKey(serverId), passphraseSecretKey(serverId), proxyPasswordSecretKey(serverId)]) {
+  // Endpoint keys of every proxy the caller knows this id may inherit a password
+  // for: a record about to be replaced or re-added under the same id must not
+  // pick up a secret saved for the same endpoint.
+  const endpointKeys = (options.proxies ?? [])
+    .filter(isPasswordBearingProxy)
+    .map((proxy) => proxyPasswordSecretKey(serverId, proxy));
+  // An id-only caller (Complete Reset of a raw row that no longer validates, inventory
+  // prune, profile teardown) does not know the proxy: sweep every endpoint key stored for
+  // this id instead, so none survives the server.
+  if (vault.keys) {
+    try {
+      endpointKeys.push(...endpointProxyPasswordKeysOf(serverId, await vault.keys()));
+    } catch (error) {
+      if (!options.bestEffort) throw error;
+      console.warn(`[Nexus] Could not list secret keys to sweep proxy passwords for ${serverId}:`, error);
+    }
+  }
+  for (const key of [
+    passwordSecretKey(serverId),
+    passphraseSecretKey(serverId),
+    legacyProxyPasswordSecretKey(serverId),
+    ...new Set(endpointKeys)
+  ]) {
     if (!options.bestEffort) {
       await vault.delete(key);
       continue;
@@ -320,7 +351,7 @@ export class SilentAuthSshFactory implements SshFactory {
     // taken care to store — and a `key` profile with no key path blanked the
     // server's own `keyPath`, the one the server form now lets you set
     // precisely because the profile does not supply it.
-    const resolved: ServerConfig = { ...server, ...authProfileOwnedCredentials(profile) };
+    const resolved: ServerConfig = applyAuthProfile(server, profile);
     return {
       resolved,
       passwordKey: resolved.authType === "password" ? authProfilePasswordSecretKey(profile.id) : passwordSecretKey(server.id),

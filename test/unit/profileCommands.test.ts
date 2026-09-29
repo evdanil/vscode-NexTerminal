@@ -73,7 +73,11 @@ vi.mock("../../src/commands/inlineAuthProfileCreation", () => ({
 import { openUnifiedForm, registerProfileCommands } from "../../src/commands/profileCommands";
 import { LocalShellProfileTreeItem, ServerTreeItem } from "../../src/ui/nexusTreeProvider";
 import { AsyncMutex, configMutationLock } from "../../src/services/configMutationLock";
-import { proxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
+import { proxyPasswordSecretKey } from "../../src/services/ssh/proxyPasswordKeys";
+
+// The password is stored per endpoint: the socks5 proxy the create-form submissions below describe.
+const NEW_SERVER_PROXY = { type: "socks5" as const, host: "proxy.example.com", port: 1080, username: "pu" };
+const NEW_SERVER_PROXY_FIELDS = { proxyType: "socks5", proxySocks5Host: "proxy.example.com", proxySocks5Port: 1080, proxySocks5Username: "pu" };
 
 function makeCtx() {
   return {
@@ -850,7 +854,7 @@ describe("openUnifiedForm SSH submit — create rollback on secret-storage failu
     });
     mockShowQuickPick.mockReset();
     mockWebviewOpen.mockReturnValue({ dispose: vi.fn() });
-    mockFormValuesToServer.mockReturnValue({ id: "srv-new", name: "New Server" });
+    mockFormValuesToServer.mockReturnValue({ id: "srv-new", name: "New Server", proxy: NEW_SERVER_PROXY });
   });
 
   it("removes the just-created server and cleans up any partial proxy secret when syncProxyPasswordSecret rejects, and surfaces the failure (kills persisted-without-secret leftover that would duplicate on retry)", async () => {
@@ -889,7 +893,7 @@ describe("openUnifiedForm SSH submit — create rollback on secret-storage failu
     const { onSubmit } = latestFormOptions();
 
     await expect(
-      onSubmit({ profileType: "ssh", name: "New Server", host: "example.com", username: "me" })
+      onSubmit({ profileType: "ssh", name: "New Server", host: "example.com", username: "me", ...NEW_SERVER_PROXY_FIELDS })
     ).rejects.toThrow(/server was not created/i);
 
     // Kill check: a wrong implementation that only surfaces the failure
@@ -899,8 +903,8 @@ describe("openUnifiedForm SSH submit — create rollback on secret-storage failu
     expect(addOrUpdateServer).toHaveBeenCalledTimes(1);
     expect(removeServer).toHaveBeenCalledWith("srv-new");
     expect(servers.has("srv-new")).toBe(false);
-    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-new"));
-    expect(secrets.has(proxyPasswordSecretKey("srv-new"))).toBe(false);
+    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-new", NEW_SERVER_PROXY));
+    expect(secrets.has(proxyPasswordSecretKey("srv-new", NEW_SERVER_PROXY))).toBe(false);
   });
 
   it("(FINDING 2, P2) reports that the partially created server could not be removed, instead of claiming it was never created, when removeServer's own rollback persist rejects", async () => {
@@ -954,7 +958,7 @@ describe("openUnifiedForm SSH submit — create rollback on secret-storage failu
     // that prior behavior.
     let caught: unknown;
     try {
-      await onSubmit({ profileType: "ssh", name: "New Server", host: "example.com", username: "me" });
+      await onSubmit({ profileType: "ssh", name: "New Server", host: "example.com", username: "me", ...NEW_SERVER_PROXY_FIELDS });
     } catch (error) {
       caught = error;
     }
@@ -967,7 +971,7 @@ describe("openUnifiedForm SSH submit — create rollback on secret-storage failu
     expect(removeServer).toHaveBeenCalledWith("srv-new");
     // The secret delete stays best-effort regardless of the removeServer
     // outcome.
-    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-new"));
+    expect(secretDelete).toHaveBeenCalledWith(proxyPasswordSecretKey("srv-new", NEW_SERVER_PROXY));
   });
 
   it("(FINDINGS 2+3, P2) restores the displaced owner's auto-open flag when the newly created server's flag rollback removes it, after a failed secret write (kills owner-left-cleared, create variant)", async () => {

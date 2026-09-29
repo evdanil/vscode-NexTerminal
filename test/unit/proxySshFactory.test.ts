@@ -4,6 +4,12 @@ import type { SFTPWrapper } from "ssh2";
 import type { HttpConnectProxy, ServerConfig, Socks5Proxy } from "../../src/models/config";
 import type { PasswordPrompt, SecretVault, SshConnection, SshConnector } from "../../src/services/ssh/contracts";
 import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
+import { proxyPasswordSecretKey } from "../../src/services/ssh/proxyPasswordKeys";
+
+// The saved proxy password is keyed by the endpoint it was entered for.
+const SOCKS_KEY = proxyPasswordSecretKey("srv-target", { type: "socks5", host: "proxy.local", port: 1080, username: "puser" });
+const HTTP_KEY = proxyPasswordSecretKey("srv-target", { type: "http", host: "proxy.local", port: 3128, username: "puser" });
+const HTTP_CRLF_KEY = proxyPasswordSecretKey("srv-target", { type: "http", host: "proxy.local", port: 3128, username: "attacker\r\nX-Auth: 1" });
 import { ProxiedSshConnection, jumpHostCleanup, socketCleanup } from "../../src/services/ssh/proxiedSshConnection";
 import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
 
@@ -984,7 +990,7 @@ describe("ProxySshFactory", () => {
         username: "attacker\r\nX-Auth: 1"
       }
     });
-    vault = createVault({ "proxy-password-srv-target": "pw-1" });
+    vault = createVault({ [HTTP_CRLF_KEY]: "pw-1" });
 
     const socket = createMockHttpSocket();
     await mockNetCreateConnectionWithSocket(socket);
@@ -1373,7 +1379,7 @@ describe("ProxySshFactory", () => {
         proxy: expect.objectContaining({ userId: "puser", password: "pw" })
       })
     );
-    expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
+    expect(vault.store).toHaveBeenCalledWith(SOCKS_KEY, "pw");
   });
 
   it("Fix A — HTTP CONNECT authenticated proxy with no stored secret prompts, uses the entered password, and stores it", async () => {
@@ -1396,7 +1402,7 @@ describe("ProxySshFactory", () => {
     expect(headerMatch).toBeTruthy();
     const decoded = Buffer.from(headerMatch![1], "base64").toString("utf8");
     expect(decoded).toBe("puser:pw");
-    expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
+    expect(vault.store).toHaveBeenCalledWith(HTTP_KEY, "pw");
   });
 
   it("a cancelled proxy password prompt aborts before a handshake or save", async () => {
@@ -1433,7 +1439,7 @@ describe("ProxySshFactory", () => {
 
   it("Fix A — an already-stored secret is used without prompting", async () => {
     const server = makeServer({ proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });
-    vault = createVault({ "proxy-password-srv-target": "stored-pw" });
+    vault = createVault({ [SOCKS_KEY]: "stored-pw" });
     const socket = makeSimpleSocks5Socket();
     const socksMod = await import("socks");
     (socksMod.SocksClient.createConnection as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ socket } as any);
@@ -1565,7 +1571,7 @@ describe("ProxySshFactory", () => {
 
       expect(prompt).toHaveBeenCalledTimes(1);
       expect(sentPasswords()).toEqual(["pw", "pw"]);
-      expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
+      expect(vault.store).toHaveBeenCalledWith(SOCKS_KEY, "pw");
     });
 
     it("asks again after a cancelled prompt", async () => {
@@ -1605,7 +1611,7 @@ describe("ProxySshFactory", () => {
 
       expect(prompt).toHaveBeenCalledTimes(2);
       expect(sentPasswords()).toEqual(["pw"]);
-      expect(vault.store).not.toHaveBeenCalledWith("proxy-password-srv-target", "wrong");
+      expect(vault.store).not.toHaveBeenCalledWith(SOCKS_KEY, "wrong");
     });
 
     it("asks again once the stored password is gone, rather than reusing an answer already stored", async () => {
@@ -1621,7 +1627,7 @@ describe("ProxySshFactory", () => {
       const factory = await createFactoryWithPrompt(prompt);
 
       await factory.connect(server);
-      await vault.delete("proxy-password-srv-target");
+      await vault.delete(SOCKS_KEY);
       await factory.connect(server);
 
       expect(prompt).toHaveBeenCalledTimes(2);
@@ -1699,7 +1705,7 @@ describe("ProxySshFactory", () => {
     await factory.connect(server);
     expect(prompt).toHaveBeenCalledTimes(2);
     // This time the connect succeeded, so the (re-typed) password is stored after success.
-    expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "wrong");
+    expect(vault.store).toHaveBeenCalledWith(SOCKS_KEY, "wrong");
   });
 
   it("Fix B — a keychain-store failure after a successful connect is swallowed; the connection is still returned", async () => {
@@ -1718,7 +1724,7 @@ describe("ProxySshFactory", () => {
 
     const connection = await factory.connect(server);
     expect(connection).toBeInstanceOf(ProxiedSshConnection);
-    expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
+    expect(vault.store).toHaveBeenCalledWith(SOCKS_KEY, "pw");
   });
 
   it("Fix B — a correct first-time password is stored exactly once after the connection succeeds, and the proxied connection is returned", async () => {
@@ -1736,7 +1742,7 @@ describe("ProxySshFactory", () => {
 
     expect(connection).toBeInstanceOf(ProxiedSshConnection);
     expect(vault.store).toHaveBeenCalledTimes(1);
-    expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
+    expect(vault.store).toHaveBeenCalledWith(SOCKS_KEY, "pw");
   });
 
   // Fix C (issue #48 PR-T1b / PR #62 Codex round 8, SECURITY) — the round-7 deferred
@@ -1780,7 +1786,7 @@ describe("ProxySshFactory", () => {
     await factory.connect({ ...server });
 
     expect(vault.store).toHaveBeenCalledTimes(1);
-    expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
+    expect(vault.store).toHaveBeenCalledWith(SOCKS_KEY, "pw");
   });
 
   it("does NOT store a proxy password after the same server id is re-added with identical values", async () => {
@@ -1804,12 +1810,12 @@ describe("ProxySshFactory", () => {
     // Re-add the same values as a new live object while the deferred store is
     // queued behind Replace's lock; endpoint-only comparison would pass.
     servers.set(server.id, { ...server });
-    await vault.delete("proxy-password-srv-target");
+    await vault.delete(SOCKS_KEY);
     releaseLock();
     await lockDone;
     await connectPromise;
 
-    expect(vault.store).not.toHaveBeenCalledWith("proxy-password-srv-target", "old-record-proxy-password");
+    expect(vault.store).not.toHaveBeenCalledWith(SOCKS_KEY, "old-record-proxy-password");
   });
 
   it("Fix C — live server moved off an authenticated proxy (ssh) does NOT store", async () => {
@@ -1887,7 +1893,7 @@ describe("ProxySshFactory", () => {
     await connectPromise;
 
     expect(vault.store).toHaveBeenCalledTimes(1);
-    expect(vault.store).toHaveBeenCalledWith("proxy-password-srv-target", "pw");
+    expect(vault.store).toHaveBeenCalledWith(SOCKS_KEY, "pw");
   });
 
   it("emits onClose when a SOCKS5 proxy socket closes after connection", async () => {

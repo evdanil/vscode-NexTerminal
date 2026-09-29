@@ -16,6 +16,11 @@ export interface HostKeyVerifier {
 }
 
 export interface SecretVault {
+  /**
+   * Every key the extension stored (SecretStorage.keys()). Optional so a vault that cannot
+   * list its keys still works; used to sweep endpoint-keyed proxy passwords by server id.
+   */
+  keys?(): Promise<string[]> | string[];
   get(key: string): Promise<string | undefined>;
   store(key: string, value: string): Promise<void>;
   delete(key: string): Promise<void>;
@@ -108,6 +113,13 @@ export interface ContextAwareSshFactory extends SshFactory {
 }
 
 export interface SshPoolControl {
+  /**
+   * The multiplexing default the pool actually applies to a server that sets no
+   * value of its own. Captured when the pool is built (the setting needs a
+   * window reload to change), so callers comparing a server's effective
+   * multiplexing must use this rather than re-read the live setting.
+   */
+  readonly multiplexingDefault?: boolean;
   disconnect(serverId: string): void;
   dispose(): void;
 }

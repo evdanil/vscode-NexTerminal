@@ -328,6 +328,11 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
     private readonly options: PoolOptions
   ) {}
 
+  /** The default a server with no `multiplexing` of its own gets; see SshPoolControl. */
+  public get multiplexingDefault(): boolean {
+    return this.options.enabled;
+  }
+
   public onDidChange(listener: (event: PoolEvent) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);

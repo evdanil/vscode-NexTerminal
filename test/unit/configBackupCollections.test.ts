@@ -120,8 +120,22 @@ import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, Tunne
 import { ProxySshFactory } from "../../src/services/ssh/proxySshFactory";
 import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
-import { watchSshPoolServerRemovals } from "../../src/services/ssh/sshPoolServerRemovalObserver";
+import { currentProxyPasswordSecretKey, legacyProxyPasswordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/proxyPasswordKeys";
+import { watchPoolInvalidationOnConfigMutation } from "../../src/services/ssh/poolConfigInvalidation";
+import { KeySerializedSecretVault } from "../../src/services/ssh/keySerializedSecretVault";
+import type { PasswordBearingProxy } from "../../src/services/ssh/proxyPasswordKeys";
 
+/** The extension's wiring: deletes go through the per-key write queue, guarded by the delete-time re-check. */
+function endpointDeleter(vault: SecretVault) {
+  const serialized = new KeySerializedSecretVault(vault);
+  return (id: string, proxy: PasswordBearingProxy, stillUnused: () => boolean): Promise<boolean> =>
+    serialized.deleteIf(proxyPasswordSecretKey(id, proxy), stillUnused);
+}
+
+// The saved proxy password is keyed by the endpoint it belongs to (LOCAL_ENDPOINT's proxy below).
+const LAB_PROXY = { type: "socks5" as const, host: "proxy.lab", port: 1080, username: "pxuser" };
+const PROXY_KEY_1 = proxyPasswordSecretKey("srv-1", LAB_PROXY);
+const PROXY_KEY_2 = proxyPasswordSecretKey("srv-2", LAB_PROXY);
 const KNOWN_HOSTS_KEY = "nexus.ssh.knownHostFingerprints.v1";
 const PASSWORD = "backup-pass-1";
 
@@ -960,7 +974,7 @@ describe("Encrypted Backup — the readable half is sealed by the encrypted half
  * endpoint: host, alternate host, port, username and proxy.
  */
 describe("Replace keeps a removed server's saved secrets only when its endpoint is unchanged (#175)", () => {
-  const SECRET_KEYS = ["password-srv-1", "passphrase-srv-1", "proxy-password-srv-1"];
+  const SECRET_KEYS = ["password-srv-1", "passphrase-srv-1", PROXY_KEY_1];
   const KEPT = ["router-pw", "router-pp", "proxy-pw"];
   const GONE = [undefined, undefined, undefined];
   const LOCAL_ENDPOINT: Partial<ServerConfig> = {
@@ -970,15 +984,22 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
 
   async function destWithSavedSecrets(overrides: Partial<ServerConfig> = {}, vault: MockVault = new MockVault()): Promise<Machine> {
     const dest = { ...(await makeMachine()), vault };
-    await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, ...overrides }));
+    const local = makeServer({ ...LOCAL_ENDPOINT, ...overrides });
+    await dest.core.addOrUpdateServer(local);
     await vault.store("password-srv-1", "router-pw");
     await vault.store("passphrase-srv-1", "router-pp");
-    await vault.store("proxy-password-srv-1", "proxy-pw");
+    // A proxy password lives under its endpoint's key; a record with no password-bearing proxy
+    // (an SSH jump host, or none) can only have a legacy per-server one left behind.
+    await vault.store(currentProxyPasswordSecretKey(local) ?? legacyProxyPasswordSecretKey("srv-1"), "proxy-pw");
     return dest;
   }
 
-  function savedSecrets(machine: Machine): Promise<Array<string | undefined>> {
-    return Promise.all(SECRET_KEYS.map((key) => machine.vault.get(key)));
+  async function savedSecrets(machine: Machine): Promise<Array<string | undefined>> {
+    const values = await Promise.all(SECRET_KEYS.map((key) => machine.vault.get(key)));
+    // The proxy password is the endpoint-keyed one, or the legacy per-server key for a
+    // record with no password-bearing proxy.
+    values[2] = values[2] ?? (await machine.vault.get(legacyProxyPasswordSecretKey("srv-1")));
+    return values;
   }
 
   /** A file that carries no seal and no secrets: the only secrets in play are the ones already on this machine. */
@@ -1295,7 +1316,7 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
     const proxyFactory = new ProxySshFactory(authFactory, (id) => dest.core.getServer(id), dest.vault);
     const pool = new SshConnectionPool(proxyFactory, { enabled: true, idleTimeoutMs: 0 });
     proxyFactory.setJumpHostConnectionFactory(pool);
-    const unsubscribeRemovedServerPoolEntries = watchSshPoolServerRemovals(dest.core, pool);
+    const unsubscribeRemovedServerPoolEntries = watchPoolInvalidationOnConfigMutation(dest.core, pool);
 
     let oldTargetConnection: SshConnection | undefined;
     let newTargetConnection: SshConnection | undefined;
@@ -1425,7 +1446,7 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
     const proxyFactory = new ProxySshFactory(authFactory, (id) => dest.core.getServer(id), authVault);
     const pool = new SshConnectionPool(proxyFactory, { enabled: true, idleTimeoutMs: 0 });
     proxyFactory.setJumpHostConnectionFactory(pool);
-    const unsubscribeRemovedServerPoolEntries = watchSshPoolServerRemovals(dest.core, pool);
+    const unsubscribeRemovedServerPoolEntries = watchPoolInvalidationOnConfigMutation(dest.core, pool);
 
     let staleTargetAttempt: Promise<SshConnection> | undefined;
     let freshTargetConnection: SshConnection | undefined;
@@ -1614,7 +1635,7 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
       }
     };
     const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
-    const unsubscribeRemovedServerPoolEntries = watchSshPoolServerRemovals(machine.core, pool);
+    const unsubscribeRemovedServerPoolEntries = watchPoolInvalidationOnConfigMutation(machine.core, pool);
 
     try {
       const idleLease = await pool.connect(server);
@@ -1656,7 +1677,7 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
       }
     };
     const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
-    const unsubscribeRemovedServerPoolEntries = watchSshPoolServerRemovals(core, pool);
+    const unsubscribeRemovedServerPoolEntries = watchPoolInvalidationOnConfigMutation(core, pool);
 
     try {
       const firstLease = await pool.connect(server);
@@ -1702,14 +1723,14 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
     const dest = await makeMachine();
     await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT }));
     await dest.vault.store("password-srv-1", "router-pw");
-    await dest.vault.store("proxy-password-srv-1", "proxy-pw");
+    await dest.vault.store(PROXY_KEY_1, "proxy-pw");
     await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, id: "srv-2", name: "srv-2" }));
     await dest.vault.store("password-srv-2", "router-pw-2");
 
     await runImport(dest, json, "replace");
 
     // srv-1 will still ask for its proxy password; srv-2 got everything it lost back.
-    expect(await dest.vault.get("proxy-password-srv-1")).toBeUndefined();
+    expect(await dest.vault.get(PROXY_KEY_1)).toBeUndefined();
     expect(await dest.vault.get("password-srv-2")).toBe("file-pw-2");
     expect(lastInfoMessage()).toContain(
       "1 server came back at a different address or route; the credentials saved here for it were cleared."
@@ -1737,7 +1758,7 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
     const dest = await makeMachine();
     await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT }));
     await dest.vault.store("password-srv-1", "router-pw");
-    await dest.vault.store("proxy-password-srv-1", "proxy-pw");
+    await dest.vault.store(PROXY_KEY_1, "proxy-pw");
 
     await runImport(dest, json, "replace");
 
@@ -1928,7 +1949,7 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
     const dest = await destWithSavedSecrets({}, new FailingVault());
     await dest.core.addOrUpdateServer(makeServer({ ...LOCAL_ENDPOINT, id: "srv-2", name: "srv-2" }));
     await dest.vault.store("password-srv-2", "srv-2-pw");
-    await dest.vault.store("proxy-password-srv-2", "srv-2-proxy");
+    await dest.vault.store(PROXY_KEY_2, "srv-2-proxy");
     await dest.core.addOrUpdateAuthProfile({ id: "ap-1", name: "Ops", username: "ops", authType: "password" });
 
     register(dest);
@@ -1942,7 +1963,7 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
     // Every key that can be deleted is: the one that cannot does not stop the rest.
     expect(await savedSecrets(dest)).toEqual([undefined, "router-pp", undefined]);
     expect(await dest.vault.get("password-srv-2")).toBeUndefined();
-    expect(await dest.vault.get("proxy-password-srv-2")).toBeUndefined();
+    expect(await dest.vault.get(PROXY_KEY_2)).toBeUndefined();
   });
 
   it("a server whose removal fails to persist still has its secrets swept — it is already gone from this session", async () => {
@@ -2393,6 +2414,20 @@ describe("Delete All Data (nexus.config.completeReset) covers Local Servers and 
     expect(machine.ctx.state.has("nexus.servers")).toBe(false);
   });
 
+  it("Complete Reset deletes the endpoint-keyed proxy password of a stored row that fails validation, and no other server's", async () => {
+    const machine = await makeMachine();
+    machine.ctx.state.set("nexus.servers", [{ id: "bad-srv", name: 42 }]);
+    const doomed = proxyPasswordSecretKey("bad-srv", LAB_PROXY);
+    const otherServer = proxyPasswordSecretKey("bad-srv-2", LAB_PROXY); // an id that merely starts with bad-srv
+    await machine.vault.store(doomed, "secret");
+    await machine.vault.store(otherServer, "secret");
+
+    await runReset(machine, recordingRuntime(machine.core));
+
+    expect(await machine.vault.get(doomed)).toBeUndefined();
+    expect(await machine.vault.get(otherServer)).toBe("secret");
+  });
+
   it("a failed secret delete does not stop the rest of the reset", async () => {
     const machine = await makeMachine();
     machine.ctx.state.set("nexus.servers", [{ id: "bad-a" }, { id: "bad-b" }]);
@@ -2407,5 +2442,86 @@ describe("Delete All Data (nexus.config.completeReset) covers Local Servers and 
 
     expect(await machine.vault.get("password-bad-b")).toBeUndefined();
     expect(machine.ctx.state.has("nexus.servers")).toBe(false);
+  });
+});
+
+describe("proxy passwords are keyed by endpoint through backup, restore and Delete All Data", () => {
+  const proxyServer = () => makeServer({ proxy: { type: "socks5", host: "proxy.lab", port: 1080, username: "pxuser" } });
+
+  it("a sealed backup carries the proxy password and restores it under the imported record's endpoint key (merge and replace)", async () => {
+    for (const mode of ["merge", "replace"] as const) {
+      const source = await makeMachine();
+      await source.core.addOrUpdateServer(proxyServer());
+      await source.vault.store(PROXY_KEY_1, "endpoint-pw");
+      await source.vault.store("password-srv-1", "login-pw");
+      const json = await exportBackup(source);
+      expect(decryptedSecretsOf(json).proxyPasswords).toEqual({ "srv-1": "endpoint-pw" });
+
+      const dest = await makeMachine();
+      await runImport(dest, json, mode);
+
+      const restored = dest.core.getServer("srv-1")!;
+      // What ProxySshFactory reads for this record.
+      expect(await dest.vault.get(currentProxyPasswordSecretKey(restored)!)).toBe("endpoint-pw");
+      expect(await dest.vault.get(legacyProxyPasswordSecretKey("srv-1"))).toBeUndefined();
+    }
+  });
+
+  it("Delete All Data clears every server's endpoint-keyed proxy password", async () => {
+    const machine = await makeMachine();
+    await machine.core.addOrUpdateServer(proxyServer());
+    await machine.vault.store(PROXY_KEY_1, "endpoint-pw");
+    await machine.vault.store(legacyProxyPasswordSecretKey("srv-1"), "legacy-pw");
+    register(machine);
+    mockShowWarningMessage.mockResolvedValueOnce("Delete Everything");
+    mockShowInputBox.mockResolvedValueOnce("DELETE");
+
+    await registeredCommands.get("nexus.config.completeReset")!();
+
+    expect(await machine.vault.get(PROXY_KEY_1)).toBeUndefined();
+    expect(await machine.vault.get(legacyProxyPasswordSecretKey("srv-1"))).toBeUndefined();
+  });
+});
+
+describe("Replace with the endpoint-key housekeeping attached (#175 keeps a same-endpoint server's proxy password)", () => {
+  const LOCAL_ENDPOINT: Partial<ServerConfig> = { altHost: "10.0.1.1", proxy: LAB_PROXY };
+  const unsealedJson = (servers: unknown[]): string =>
+    JSON.stringify({ version: 2, exportType: "backup", exportedAt: new Date().toISOString(), servers });
+  async function destWithHook(overrides: Partial<ServerConfig> = {}) {
+    const dest = await makeMachine();
+    const local = makeServer({ ...LOCAL_ENDPOINT, ...overrides });
+    await dest.core.addOrUpdateServer(local);
+    await dest.vault.store("password-srv-1", "router-pw");
+    await dest.vault.store(currentProxyPasswordSecretKey(local)!, "proxy-pw");
+    // The extension's wiring: an endpoint a server left is deleted once the change is persisted.
+    const stop = watchPoolInvalidationOnConfigMutation(dest.core, { invalidate: () => {} }, {
+      deleteEndpoint: endpointDeleter(dest.vault)
+    });
+    return { dest, stop };
+  }
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it("re-creating the server on the same endpoint keeps its proxy password", async () => {
+    const { dest, stop } = await destWithHook();
+    await runImport(dest, unsealedJson([makeServer({ ...LOCAL_ENDPOINT })]), "replace");
+    await settle();
+    expect(await dest.vault.get(PROXY_KEY_1)).toBe("proxy-pw");
+    stop();
+  });
+
+  it("re-creating it on another endpoint deletes the old endpoint's proxy password", async () => {
+    const { dest, stop } = await destWithHook();
+    await runImport(dest, unsealedJson([makeServer({ ...LOCAL_ENDPOINT, proxy: { type: "socks5", host: "other.lab", port: 1080, username: "pxuser" } })]), "replace");
+    await settle();
+    expect(await dest.vault.get(PROXY_KEY_1)).toBeUndefined();
+    stop();
+  });
+
+  it("a Replace that does not bring the server back deletes its proxy password", async () => {
+    const { dest, stop } = await destWithHook();
+    await runImport(dest, unsealedJson([makeServer({ id: "other", name: "Other" })]), "replace");
+    await settle();
+    expect(await dest.vault.get(PROXY_KEY_1)).toBeUndefined();
+    stop();
   });
 });

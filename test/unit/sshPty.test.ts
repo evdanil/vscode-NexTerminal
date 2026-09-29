@@ -378,6 +378,69 @@ describe("SshPty", () => {
     pty.dispose();
   });
 
+  it("captures the connect descriptor at the start of every attempt, before any acquire", async () => {
+    const stream1 = new PassThrough();
+    const first = createConnection(stream1);
+    const stream2 = new PassThrough();
+    const second = createConnection(stream2);
+    const order: string[] = [];
+    let attempt = 0;
+    const sshFactory = {
+      connect: vi.fn(async () => {
+        order.push("acquire");
+        return attempt === 1 ? first.connection : second.connection;
+      })
+    };
+    const callbacks = {
+      captureConnectDescriptor: vi.fn(() => {
+        attempt += 1;
+        order.push(`capture-${attempt}`);
+        const n = attempt;
+        return { descriptor: `descriptor-${n}`, isDirty: () => false, dispose: () => order.push(`dispose-${n}`) };
+      }),
+      onSessionOpened: vi.fn(() => order.push("opened")),
+      onSessionClosed: vi.fn(),
+      onDisconnected: vi.fn()
+    };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+
+    expect(pty.connectedDescriptor).toBeUndefined();
+    pty.open();
+    await flushAsync();
+    expect(order.slice(0, 3)).toEqual(["capture-1", "acquire", "opened"]);
+    expect(pty.connectedDescriptor).toBe("descriptor-1");
+
+    first.emitClose();
+    await flushAsync();
+    pty.handleInput("R");
+    await flushAsync();
+    // The previous attempt's fence is released before the next capture.
+    expect(order.slice(3, 7)).toEqual(["dispose-1", "capture-2", "acquire", "opened"]);
+    expect(pty.connectedDescriptor).toBe("descriptor-2");
+
+    pty.dispose();
+    expect(order).toContain("dispose-2");
+    expect(pty.connectedDescriptor).toBeUndefined();
+  });
+
+  it("releases the capture's fence when the attempt fails, and on an explicit release", async () => {
+    const disposed: string[] = [];
+    const sshFactory = { connect: vi.fn(async () => { throw new Error("nope"); }) };
+    const callbacks = {
+      captureConnectDescriptor: vi.fn(() => ({ descriptor: "d", isDirty: () => false, dispose: () => disposed.push("d") })),
+      onSessionOpened: vi.fn(),
+      onSessionClosed: vi.fn()
+    };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+    pty.open();
+    await flushAsync();
+    expect(disposed).toEqual(["d"]);
+    expect(pty.connectedDescriptor).toBeUndefined();
+    pty.dispose();
+  });
+
   it("fires onDataReceived callback when stream data arrives", async () => {
     const stream = new PassThrough();
     const { connection } = createConnection(stream);

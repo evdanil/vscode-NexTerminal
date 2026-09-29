@@ -7,6 +7,10 @@ import type { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 import { createSshTransportStack, type SshTransportStack } from "../../src/services/ssh/sshTransportStack";
 import { handleSocks5Handshake, sendSocks5Success } from "../../src/services/tunnel/socks5";
 import { TunnelStoppedError, type TunnelEvent } from "../../src/services/tunnel/tunnelManager";
+import { NexusCore } from "../../src/core/nexusCore";
+import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import { watchPoolInvalidationOnConfigMutation } from "../../src/services/ssh/poolConfigInvalidation";
+import { serversRidingChangedJumps } from "../../src/services/ssh/pooledConnectionParams";
 import type { PoolEvent } from "../../src/services/ssh/sshConnectionPool";
 
 /**
@@ -918,6 +922,127 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
         await replacement;
       }
     }
+  });
+
+  it("soft-invalidating the targets that ride an edited jump keeps live leases and rebuilds new ones over the current route", async () => {
+    const auth = createAuthFactory();
+    const target = targetServer({ type: "ssh", jumpHostId: jumpServer.id });
+    const stack = buildStack(auth, [jumpServer, target]);
+    const liveLease = await stack.pool.connect(target);
+    cleanups.push(() => liveLease.dispose());
+    expect(auth.callsFor(target.id)).toEqual(["via-proxy"]);
+
+    // What extension.ts does when the jump's params change.
+    stack.pool.invalidate(jumpServer.id);
+    for (const dependent of serversRidingChangedJumps([jumpServer, target], new Set([jumpServer.id]))) {
+      stack.pool.invalidate(dependent);
+    }
+
+    // The live session keeps its transport.
+    expect(auth.disposedIds).not.toContain(target.id);
+    // A reconnect (new acquisition) builds a fresh target connection instead of
+    // reusing the one that rides the old jump.
+    const reconnect = await stack.pool.connect(target);
+    cleanups.push(() => reconnect.dispose());
+    expect(auth.callsFor(target.id)).toEqual(["via-proxy", "via-proxy"]);
+    expect(auth.disposedIds).not.toContain(target.id);
+  });
+
+  it("removing a jump host retires the pooled target that rode it: live lease survives, a new acquire builds afresh", async () => {
+    const auth = createAuthFactory();
+    const target = targetServer({ type: "ssh", jumpHostId: jumpServer.id });
+    const stack = buildStack(auth, [jumpServer, target]);
+    const core = new NexusCore(new InMemoryConfigRepository([jumpServer, target], []));
+    await core.initialize();
+    const stopWatching = watchPoolInvalidationOnConfigMutation(core, stack.pool);
+    cleanups.push(stopWatching);
+    const liveLease = await stack.pool.connect(target);
+    cleanups.push(() => liveLease.dispose());
+
+    await core.removeServer(jumpServer.id);
+
+    expect(auth.disposedIds).not.toContain(target.id);
+    const reconnect = await stack.pool.connect(target);
+    cleanups.push(() => reconnect.dispose());
+    expect(auth.callsFor(target.id)).toEqual(["via-proxy", "via-proxy"]);
+  });
+
+  it("an acquire that starts while a jump edit is still being persisted builds afresh, not on the stale pooled target", async () => {
+    const auth = createAuthFactory();
+    const target = targetServer({ type: "ssh", jumpHostId: jumpServer.id });
+    const stack = buildStack(auth, [jumpServer, target]);
+    let release!: () => void;
+    class SlowRepo extends InMemoryConfigRepository {
+      public override async saveServers(servers: ServerConfig[]): Promise<void> {
+        await new Promise<void>((resolve) => { release = resolve; });
+        return super.saveServers(servers);
+      }
+    }
+    const core = new NexusCore(new SlowRepo([jumpServer, target], []));
+    await core.initialize();
+    cleanups.push(watchPoolInvalidationOnConfigMutation(core, stack.pool));
+    const liveLease = await stack.pool.connect(target);
+    cleanups.push(() => liveLease.dispose());
+
+    const persisting = core.addOrUpdateServer({ ...jumpServer, host: "moved.example.test" });
+    // Persistence has not finished and no change event has fired, yet a reconnect
+    // in this window must not be handed the transport built through the old jump.
+    const reconnect = await stack.pool.connect(target);
+    cleanups.push(() => reconnect.dispose());
+    expect(auth.callsFor(target.id)).toEqual(["via-proxy", "via-proxy"]);
+    expect(auth.disposedIds).not.toContain(target.id);
+    release();
+    await persisting;
+  });
+
+  it("an edit, a reconnect during the pending save, then the save resolving: one handshake, installed, then reused", async () => {
+    const auth = createAuthFactory();
+    const target = targetServer({ type: "ssh", jumpHostId: jumpServer.id });
+    const stack = buildStack(auth, [jumpServer, target]);
+    let release!: () => void;
+    class SlowRepo extends InMemoryConfigRepository {
+      public override async saveServers(servers: ServerConfig[]): Promise<void> {
+        await new Promise<void>((resolve) => { release = resolve; });
+        return super.saveServers(servers);
+      }
+    }
+    const core = new NexusCore(new SlowRepo([jumpServer, target], []));
+    await core.initialize();
+    const invalidate = vi.spyOn(stack.pool, "invalidate");
+    cleanups.push(watchPoolInvalidationOnConfigMutation(core, stack.pool));
+    const liveLease = await stack.pool.connect(target);
+    cleanups.push(() => liveLease.dispose());
+
+    const persisting = core.addOrUpdateServer({ ...jumpServer, host: "moved.example.test" });
+    const reconnect = await stack.pool.connect(target);
+    cleanups.push(() => reconnect.dispose());
+    expect(auth.callsFor(target.id)).toEqual(["via-proxy", "via-proxy"]);
+    const invalidationsBeforeSave = invalidate.mock.calls.length;
+
+    release();
+    await persisting;
+
+    // Regression guard for the pool side: with only the mutation hook wired, nothing
+    // invalidates again once persistence resolves, so the reconnect's entry stays
+    // installed and the next acquire reuses it instead of a third handshake. (It
+    // does not reproduce the removed emit-time bump in extension.ts; that absence is
+    // pinned by poolInvalidationSingleSource.test.ts.)
+    expect(invalidate.mock.calls.length).toBe(invalidationsBeforeSave);
+    const third = await stack.pool.connect(target);
+    cleanups.push(() => third.dispose());
+    expect(auth.callsFor(target.id)).toEqual(["via-proxy", "via-proxy"]);
+  });
+
+  it("without invalidating dependents, a reconnect reuses the target transport built through the old jump (the gap the fix closes)", async () => {
+    const auth = createAuthFactory();
+    const target = targetServer({ type: "ssh", jumpHostId: jumpServer.id });
+    const stack = buildStack(auth, [jumpServer, target]);
+    const liveLease = await stack.pool.connect(target);
+    cleanups.push(() => liveLease.dispose());
+    stack.pool.invalidate(jumpServer.id);
+    const reconnect = await stack.pool.connect(target);
+    cleanups.push(() => reconnect.dispose());
+    expect(auth.callsFor(target.id)).toEqual(["via-proxy"]);
   });
 
   it("tags a target connection with its pooled jump's actual route after live jump config changes", async () => {
