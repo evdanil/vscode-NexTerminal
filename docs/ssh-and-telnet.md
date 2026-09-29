@@ -91,7 +91,7 @@ A per-server legacy algorithm toggle is there for older devices (Cisco IOS, embe
 
 Share SSH connections across terminals, tunnels (in their default shared mode), and SFTP for the same server. A jump host's connection is shared the same way by everything routed through it, isolated-mode tunnels included, unless multiplexing is off for the jump host. Reduces connection overhead with automatic ref-counting and configurable idle timeout.
 
-Editing a jump host's connection settings (or its auth profile) also retires the shared connections of the servers that go through it. Sessions already open keep running on their old connection; the next reconnect or tunnel start builds a new one over the current route.
+Editing a jump host's connection settings (or its auth profile), or removing the jump host, also retires the shared connections of the servers that go through it. Sessions already open keep running on their old connection; the next reconnect or tunnel start builds a new one over the current route.
 
 Per-server toggle lets you disable multiplexing for devices that don't support multiple channels (e.g. Cisco).
 

@@ -7,6 +7,9 @@ import type { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 import { createSshTransportStack, type SshTransportStack } from "../../src/services/ssh/sshTransportStack";
 import { handleSocks5Handshake, sendSocks5Success } from "../../src/services/tunnel/socks5";
 import { TunnelStoppedError, type TunnelEvent } from "../../src/services/tunnel/tunnelManager";
+import { NexusCore } from "../../src/core/nexusCore";
+import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import { watchSshPoolServerRemovals } from "../../src/services/ssh/sshPoolServerRemovalObserver";
 import { serversRidingChangedJumps } from "../../src/services/ssh/pooledConnectionParams";
 import type { PoolEvent } from "../../src/services/ssh/sshConnectionPool";
 
@@ -943,6 +946,25 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
     cleanups.push(() => reconnect.dispose());
     expect(auth.callsFor(target.id)).toEqual(["via-proxy", "via-proxy"]);
     expect(auth.disposedIds).not.toContain(target.id);
+  });
+
+  it("removing a jump host retires the pooled target that rode it: live lease survives, a new acquire builds afresh", async () => {
+    const auth = createAuthFactory();
+    const target = targetServer({ type: "ssh", jumpHostId: jumpServer.id });
+    const stack = buildStack(auth, [jumpServer, target]);
+    const core = new NexusCore(new InMemoryConfigRepository([jumpServer, target], []));
+    await core.initialize();
+    const stopWatching = watchSshPoolServerRemovals(core, stack.pool);
+    cleanups.push(stopWatching);
+    const liveLease = await stack.pool.connect(target);
+    cleanups.push(() => liveLease.dispose());
+
+    await core.removeServer(jumpServer.id);
+
+    expect(auth.disposedIds).not.toContain(target.id);
+    const reconnect = await stack.pool.connect(target);
+    cleanups.push(() => reconnect.dispose());
+    expect(auth.callsFor(target.id)).toEqual(["via-proxy", "via-proxy"]);
   });
 
   it("without invalidating dependents, a reconnect reuses the target transport built through the old jump (the gap the fix closes)", async () => {

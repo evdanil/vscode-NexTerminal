@@ -469,6 +469,17 @@ describe("connectServer — auto-start sweep compares the connect attempt's capt
     expectOneWarning();
   });
 
+  it("a jump host removed between capture and session open: nothing starts, one warning (captured holds the hop, live says missing)", async () => {
+    const jump = makeServer({ id: "jump", name: "Jump", host: "jump.example" });
+    const { callbacks, removeServer, startAttempt } = await connected({
+      servers: [jump], target: { proxy: { type: "ssh", jumpHostId: "jump" } }
+    });
+    startAttempt();
+    await removeServer("jump");
+    await open(callbacks);
+    expectOneWarning();
+  });
+
   it("R reconnect: a profile edited after the reconnect's capture warns; before it, tunnels start", async () => {
     const first = await withProfile();
     first.startAttempt();
