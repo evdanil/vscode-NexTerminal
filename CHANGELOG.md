@@ -1,11 +1,17 @@
 # Changelog
 
-## [2.8.296] — 2026-09-29
+## [2.8.297] — 2026-09-29
 
 ### Fixed
 
 - **A large inventory sync no longer holds the config lock for thousands of sequential keychain deletes.** The add-time clearing of leftover saved credentials (three keys per added server) and the delete-prune credential cleanup now run up to 16 servers at a time. An add-time clear that fails still aborts the whole sync with nothing applied, and the apply still waits for every clear to settle.
 - **Re-registering a disposed inventory provider object now says what to do.** The rejection is unchanged (a form or prompt may still hold the old object), but the error now tells the provider author to register a new provider object, and the public API contract says the same.
+
+## [2.8.296] — 2026-09-29
+
+### Fixed
+
+- **A script's unawaited wait now ends with the run.** A `waitFor` / `expect` / `waitAny` still pending when a run completed, failed or lost its worker (a `Promise.race` loser, a call the script never awaited) kept its timer and the run's output buffer for its whole timeout, then wrote a stray `← timeout` line to the "Nexus Scripts" channel after `end:`. Every ending now cancels pending waits, and a wait posted just before the run ended is refused.
 
 ## [2.8.295] — 2026-09-28
 
