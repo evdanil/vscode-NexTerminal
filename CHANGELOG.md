@@ -1,10 +1,16 @@
 # Changelog
 
-## [2.8.302] — 2026-09-29
+## [2.8.303] — 2026-09-29
 
 ### Fixed
 
 - **A serial open that timed out no longer leaves the port held.** When a port took longer than the 10 s RPC budget to open (Windows Bluetooth COM ports, slow USB-serial drivers), the tab reported "Connection failed" but the sidecar kept waiting on the native open and, once it finished, held the port under a session nobody owned, so every later Connect and Smart Follow poll failed with "busy" until a window reload. The sidecar manager now sends a cancel to the sidecar that owns the abandoned open (never spawning a new one), and the sidecar closes the port and frees its session ID as soon as the open completes.
+
+## [2.8.302] — 2026-09-29
+
+### Fixed
+
+- **A malformed provider host no longer downgrades or re-points an already-synced server.** When a device's primary or alternate console endpoint host, or the endpoint for a server's saved protocol, was rejected (invisible character, embedded whitespace), an owned server was blanked to an addressless placeholder, or its alternate address was promoted into `host`, and the plan claimed the device had lost its console. The device is now skipped like a malformed port: the server is left untouched and the plan says `has an unusable host and was skipped`. New devices still arrive as addressless placeholders. The host normalizer's own warnings now travel as engine warnings instead of provider notices.
 
 ## [2.8.301] — 2026-09-29
 
