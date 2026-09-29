@@ -188,8 +188,19 @@ jobs:
           let end = lines.findIndex((l, i) => i > start && l.startsWith("## ["));
           if (end < 0) end = lines.length;
           const body = lines.slice(start, end).join("\n").trim();
-          if (!lines.slice(start + 1, end).some((l) => l.trim())) {
+          const content = lines.slice(start + 1, end).filter((l) => l.trim());
+          if (content.length === 0) {
             console.log(`::error title=Empty CHANGELOG entry::The "## [${version}]" entry in CHANGELOG.md has no content, so this release has no notes. Nothing has been published yet: delete the tag v${version}, fill the entry on main, and tag again.`);
+            process.exit(1);
+          }
+          // Section headings alone ("### Fixed" with nothing under it) are
+          // not notes: at least one bullet or prose line must exist. Only a
+          // release enforces this — the PR check does not, because the first
+          // PR after a release may legitimately open the entry before it has
+          // anything to say.
+          const isHeading = (l) => /^ {0,3}#{1,6}(\s|$)/.test(l);
+          if (content.every(isHeading)) {
+            console.log(`::error title=CHANGELOG entry has no notes::The "## [${version}]" entry in CHANGELOG.md has section headings but no bullet or text under them, so this release has no notes. Nothing has been published yet: delete the tag v${version}, add the notes to the entry on main, and tag again.`);
             process.exit(1);
           }
           fs.writeFileSync(out, body + "\n");
