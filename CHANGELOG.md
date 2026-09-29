@@ -1,10 +1,16 @@
 # Changelog
 
-## [2.8.304] — 2026-09-29
+## [2.8.305] — 2026-09-29
 
 ### Fixed
 
 - **Kitty keyboard, modifyOtherKeys, cursor-shape and save/restore-cursor sequences no longer leak into captured text.** The shared ANSI stripper now follows the ECMA-48 CSI grammar (`<` `=` `>` `?` parameter prefixes and intermediate bytes such as `ESC[2 q`) and removes two-byte forms like `ESC 7`, `ESC 8`, `ESC =` and `ESC >`, plus terminated DCS/APC/PM/SOS strings. Copy All, session transcripts and script `waitFor`/`expect` matching no longer show fragments such as `[>4;2m` or `[=5u`, so end-anchored prompt patterns match after vim, fish or neovim output, even when a sequence (including a terminal title) is split across two chunks: Copy All, transcripts, script output and macro trigger matching each strip the same text however the output is split into chunks: an unfinished escape is held until the next chunk, an escape over 512 characters is text, and an unterminated OSC/DCS/APC/PM/SOS payload (Sixel, Kitty graphics, XTGETTCAP) is dropped until its terminator or an aborting ESC, giving up after 1 MiB. An SSH reconnect starts each of them from a clean slate, so an escape the dropped connection left unfinished cannot swallow the new connection's prompt. Private-prefix CSI ending in `m` (such as `ESC[>4;m`) is no longer mistaken for an SGR reset by the highlighter.
+
+## [2.8.304] — 2026-09-29
+
+### Fixed
+
+- **A serial open that timed out no longer leaves the port held.** When a port took longer than the 10 s RPC budget to open (Windows Bluetooth COM ports, slow USB-serial drivers), the tab reported "Connection failed" but the sidecar kept waiting on the native open and, once it finished, held the port under a session nobody owned, so every later Connect and Smart Follow poll failed with "busy" until a window reload. The sidecar manager now sends a cancel to the sidecar that owns the abandoned open (never spawning a new one), and the sidecar closes the port and frees its session ID as soon as the open completes. If the port still cannot be released after about 30 s of retries, a warning names the port and offers Reload Window.
 
 ## [2.8.303] — 2026-09-29
 

@@ -6,6 +6,7 @@ import {
   PORT_DATA_NOTIFICATION,
   PORT_DISCONNECTED_NOTIFICATION,
   PORT_ERROR_NOTIFICATION,
+  PORT_RELEASE_FAILED_NOTIFICATION,
   type OpenPortParams,
   type RpcNotification,
   type RpcRequest,
@@ -15,7 +16,15 @@ import {
 
 type DataListener = (sessionId: string, data: Buffer) => void;
 type ErrorListener = (sessionId: string, message: string) => void;
+type PortReleaseFailedListener = (portPath: string, message: string) => void;
 type DisconnectListener = (sessionId: string, reason: string) => void;
+
+/**
+ * The manager gave up waiting; the worker never answered, so whatever the
+ * request started there may still be running. Distinct from a worker-reported
+ * error, which means the worker already settled the request.
+ */
+class SerialRpcTimeoutError extends Error {}
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
@@ -33,6 +42,7 @@ export class SerialSidecarManager {
   private readonly dataListeners = new Set<DataListener>();
   private readonly errorListeners = new Set<ErrorListener>();
   private readonly disconnectListeners = new Set<DisconnectListener>();
+  private readonly portReleaseFailedListeners = new Set<PortReleaseFailedListener>();
   private rpcTimeoutMs: number;
 
   public constructor(
@@ -62,6 +72,12 @@ export class SerialSidecarManager {
     return () => this.disconnectListeners.delete(listener);
   }
 
+  /** An abandoned open completed but the sidecar could not close the port. */
+  public onPortReleaseFailed(listener: PortReleaseFailedListener): () => void {
+    this.portReleaseFailedListeners.add(listener);
+    return () => this.portReleaseFailedListeners.delete(listener);
+  }
+
   public async listPorts(): Promise<SerialPortInfo[]> {
     const result = await this.request("listPorts");
     return (result as SerialPortInfo[]) ?? [];
@@ -82,15 +98,46 @@ export class SerialSidecarManager {
         : pathOrOptions;
     const requestedSessionId =
       typeof pathOrOptions !== "string" && typeof sessionIdOrBaudRate === "string" ? sessionIdOrBaudRate : undefined;
-    const result = await this.request(
-      "openPort",
-      requestedSessionId !== undefined ? { ...params, sessionId: requestedSessionId } : params
-    );
+    const child = this.ensureStarted();
+    let result: unknown;
+    try {
+      result = await this.request(
+        "openPort",
+        requestedSessionId !== undefined ? { ...params, sessionId: requestedSessionId } : params
+      );
+    } catch (error) {
+      // Only a timeout leaves the worker's open in flight. A worker-reported
+      // error (e.g. "session ID is already in use") settled the request, and a
+      // cancel there would close the legitimate session that owns that id.
+      if (requestedSessionId !== undefined && error instanceof SerialRpcTimeoutError) {
+        this.cancelAbandonedOpen(child, requestedSessionId);
+      }
+      throw error;
+    }
     const openedSessionId = (result as { sessionId?: string }).sessionId;
     if (!openedSessionId) {
       throw new Error("Serial sidecar returned invalid openPort response");
     }
     return openedSessionId;
+  }
+
+  /**
+   * After a client-side RPC timeout the worker is still waiting on the native open
+   * and would keep the port once it succeeds. Tell that same worker to cancel.
+   * This writes to the child that owned the open and never goes through
+   * ensureStarted(): if it was disposed or exited, its ports died with it and
+   * spawning a fresh sidecar just to cancel would leak an unowned process.
+   */
+  private cancelAbandonedOpen(child: ChildProcessWithoutNullStreams, sessionId: string): void {
+    if (this.processRef !== child || child.killed) {
+      return;
+    }
+    const payload: RpcRequest = { id: randomUUID(), method: "cancelAbandonedOpen", params: { sessionId } };
+    try {
+      child.stdin.write(`${JSON.stringify(payload)}\n`);
+    } catch {
+      // Best effort: the child is going away, and so is its open port.
+    }
   }
 
   public async writePort(sessionId: string, data: Buffer): Promise<void> {
@@ -116,6 +163,7 @@ export class SerialSidecarManager {
     this.dataListeners.clear();
     this.errorListeners.clear();
     this.disconnectListeners.clear();
+    this.portReleaseFailedListeners.clear();
     this.processRef?.kill();
     this.processRef = undefined;
   }
@@ -163,7 +211,7 @@ export class SerialSidecarManager {
           return;
         }
         this.pending.delete(id);
-        pending.reject(new Error(`Serial sidecar RPC timed out after ${this.rpcTimeoutMs / 1000}s (method=${method})`));
+        pending.reject(new SerialRpcTimeoutError(`Serial sidecar RPC timed out after ${this.rpcTimeoutMs / 1000}s (method=${method})`));
       }, this.rpcTimeoutMs);
       this.pending.set(id, deferred);
     });
@@ -222,6 +270,16 @@ export class SerialSidecarManager {
       const reason = disconnected.reason ?? "Port closed";
       for (const listener of this.disconnectListeners) {
         listener(disconnected.sessionId, reason);
+      }
+      return;
+    }
+    if (notification.method === PORT_RELEASE_FAILED_NOTIFICATION) {
+      const failed = notification.params as { path?: string; message?: string };
+      if (!failed.path) {
+        return;
+      }
+      for (const listener of this.portReleaseFailedListeners) {
+        listener(failed.path, failed.message ?? "");
       }
       return;
     }

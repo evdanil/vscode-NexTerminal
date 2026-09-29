@@ -23,6 +23,8 @@ export interface RpcNotification {
 
 export const PORT_DATA_NOTIFICATION = "portData";
 export const PORT_ERROR_NOTIFICATION = "portError";
+/** An open the client abandoned finished, and the worker could not release the port. */
+export const PORT_RELEASE_FAILED_NOTIFICATION = "portReleaseFailed";
 export const PORT_DISCONNECTED_NOTIFICATION = "portDisconnected";
 
 export interface SerialPortInfo {
