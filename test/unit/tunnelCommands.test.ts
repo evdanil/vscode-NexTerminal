@@ -1202,23 +1202,25 @@ describe("startTunnel — profile removed while start is pending", () => {
     expect(start).toHaveBeenCalledTimes(1);
   });
 
-  describe("connection generation (A -> B -> A during the start)", () => {
-    async function linked() {
+  describe("sticky fence (A -> B -> A during the start; raw-only changes ignored)", () => {
+    async function linked(serverExtra: Partial<ServerConfig> = {}) {
       const { core, profile, server: base } = await fixture();
       await core.addOrUpdateAuthProfile({ id: "ap1", name: "AP", username: "ops", authType: "password" });
-      await core.addOrUpdateServer({ ...base, authProfileId: "ap1" });
+      await core.addOrUpdateServer({ ...base, authProfileId: "ap1", ...serverExtra });
+      // The pool hook stays attached: its raw invalidations must NOT decide these fences.
       const stop = watchPoolInvalidationOnConfigMutation(core, { invalidate: () => {} });
       return { core, profile, server: core.getServer("srv-1")!, stop };
     }
+    const held = () => {
+      const sync = deferred<void>();
+      return { sync, registry: { syncNow: () => sync.promise, checkRemoteOwnership: async () => undefined } as never };
+    };
 
     it("a linked profile changed A -> B -> A while the start waits cancels it", async () => {
       const { core, profile, server, stop } = await linked();
-      const sync = deferred<void>();
+      const { sync, registry } = held();
       const start = vi.fn(async () => makeActiveTunnel("t1"));
-      const run = startTunnel(
-        core, { start } as never, { connect: vi.fn() } as never, profile, server, "isolated",
-        { syncNow: () => sync.promise, checkRemoteOwnership: async () => undefined } as never
-      );
+      const run = startTunnel(core, { start } as never, { connect: vi.fn() } as never, profile, server, "isolated", registry);
       await core.addOrUpdateAuthProfile({ id: "ap1", name: "AP", username: "root", authType: "password" });
       await core.addOrUpdateAuthProfile({ id: "ap1", name: "AP", username: "ops", authType: "password" });
       sync.resolve();
@@ -1229,22 +1231,73 @@ describe("startTunnel — profile removed while start is pending", () => {
       stop();
     });
 
-    it("a no-op save leaves the generation alone and does not cancel", async () => {
-      const { core, profile, server, stop } = await linked();
-      const before = core.getConnectionGeneration("srv-1");
-      const sync = deferred<void>();
+    it("a jump host's host changed A -> B -> A cancels a start that rides it", async () => {
+      const jump: ServerConfig = { id: "jump", name: "Jump", host: "j.example", port: 22, username: "u", authType: "password", isHidden: false };
+      const { core, profile, server: base } = await fixture();
+      await core.addOrUpdateServer(jump);
+      await core.addOrUpdateServer({ ...base, proxy: { type: "ssh", jumpHostId: "jump" } });
+      const server = core.getServer("srv-1")!;
+      const { sync, registry } = held();
       const start = vi.fn(async () => makeActiveTunnel("t1"));
-      const run = startTunnel(
-        core, { start } as never, { connect: vi.fn() } as never, profile, server, "isolated",
-        { syncNow: () => sync.promise, checkRemoteOwnership: async () => undefined } as never
-      );
+      const run = startTunnel(core, { start } as never, { connect: vi.fn() } as never, profile, server, "isolated", registry);
+      await core.addOrUpdateServer({ ...jump, host: "moved.example" });
+      await core.addOrUpdateServer({ ...jump });
+      sync.resolve();
+      await run;
+      expect(start).not.toHaveBeenCalled();
+    });
+
+    it.each<[string, Partial<ServerConfig>, (s: ServerConfig) => ServerConfig]>([
+      ["multiplexing omitted -> explicit true (the pool default)", {}, (s) => ({ ...s, multiplexing: true })],
+      ["a key path on a password server", {}, (s) => ({ ...s, keyPath: "/unused" })],
+      ["an altHost during an isolated tunnel start", {}, (s) => ({ ...s, altHost: "alt.example" })]
+    ])("does not cancel for %s", async (_label, extra, edit) => {
+      const { core, profile, server, stop } = await linked(extra);
+      const { sync, registry } = held();
+      const start = vi.fn(async () => makeActiveTunnel("t1"));
+      const run = startTunnel(core, { start } as never, { connect: vi.fn() } as never, profile, server, "isolated", registry, true);
+      await core.addOrUpdateServer(edit(core.getServer("srv-1")!));
+      sync.resolve();
+      await run;
+
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+      stop();
+    });
+
+    it("a no-op save does not cancel", async () => {
+      const { core, profile, server, stop } = await linked();
+      const { sync, registry } = held();
+      const start = vi.fn(async () => makeActiveTunnel("t1"));
+      const run = startTunnel(core, { start } as never, { connect: vi.fn() } as never, profile, server, "isolated", registry);
       await core.addOrUpdateAuthProfile({ id: "ap1", name: "Renamed", username: "ops", authType: "password" });
       await core.addOrUpdateServer({ ...core.getServer("srv-1")! });
       sync.resolve();
       await run;
-
-      expect(core.getConnectionGeneration("srv-1")).toBe(before);
       expect(start).toHaveBeenCalledTimes(1);
+      stop();
+    });
+
+    it("stops watching once the start settles, on success and on failure", async () => {
+      const { core, profile, server, stop } = await linked();
+      let active = 0;
+      const original = core.onDidMutateConnectionConfig.bind(core);
+      vi.spyOn(core, "onDidMutateConnectionConfig").mockImplementation((listener) => {
+        active++;
+        const unsubscribe = original(listener);
+        return () => { active--; unsubscribe(); };
+      });
+      const ok = startTunnel(core, { start: vi.fn(async () => makeActiveTunnel("t1")) } as never, { connect: vi.fn() } as never, profile, server, "isolated");
+      expect(active).toBe(1);
+      await ok;
+      expect(active).toBe(0);
+
+      const failing = startTunnel(
+        core, { start: vi.fn(async () => { throw new Error("boom"); }) } as never, { connect: vi.fn() } as never,
+        profile, server, "isolated"
+      );
+      await expect(failing).rejects.toThrow("boom");
+      expect(active).toBe(0);
       stop();
     });
   });

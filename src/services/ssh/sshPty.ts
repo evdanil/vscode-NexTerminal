@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Duplex } from "node:stream";
 import * as vscode from "vscode";
 import type { ServerConfig } from "../../models/config";
+import type { StartFence } from "./startFenceWatcher";
 import type { SessionLogger } from "../../logging/terminalLogger";
 import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
 import type { SshConnection, SshFactory } from "./contracts";
@@ -52,7 +53,7 @@ export interface SshPtyCallbacks {
    * caller comparing the two fails safe; a change that lands before it has
    * already invalidated the pool entries, so the acquire builds afresh.
    */
-  captureConnectDescriptor?(): string;
+  captureConnectDescriptor?(): StartFence;
 }
 
 export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
@@ -69,7 +70,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
   private shuttingDown = false;
   private lastDimensions?: vscode.TerminalDimensions;
   private connectionGeneration = 0;
-  private capturedConnectDescriptor?: string;
+  private connectFence?: StartFence;
   private activityIndicator = false;
   private readonly highlighterStream?: TerminalHighlighterStream;
 
@@ -199,6 +200,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       return;
     }
     this.disposed = true;
+    this.releaseConnectFence();
     this.oscFilter.reset();
     this.highlighterStream?.dispose();
     this.stream?.destroy();
@@ -278,13 +280,25 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
 
   /** The descriptor captured at the start of the latest connect attempt, or undefined if no capture was supplied. */
   public get connectedDescriptor(): string | undefined {
-    return this.capturedConnectDescriptor;
+    return this.connectFence?.descriptor;
+  }
+
+  /** True once a mutation moved the captured connection away from the live one at any point since the capture. */
+  public get connectFenceDirty(): boolean {
+    return this.connectFence?.isDirty() ?? true;
+  }
+
+  /** Stops watching (nothing stays subscribed): call once the capture has been consumed. */
+  public releaseConnectFence(): void {
+    this.connectFence?.dispose();
+    this.connectFence = undefined;
   }
 
   private async start(dimensions?: vscode.TerminalDimensions): Promise<void> {
     const generation = ++this.connectionGeneration;
     // Before ANY acquire (see SshPtyCallbacks.captureConnectDescriptor).
-    this.capturedConnectDescriptor = this.callbacks.captureConnectDescriptor?.();
+    this.releaseConnectFence();
+    this.connectFence = this.callbacks.captureConnectDescriptor?.();
     // Clear any OSC-3008 carry held from a previous session so a partial
     // sequence stranded by a disconnect cannot prepend to this session's first
     // chunk. No-op on first connect; idempotent with the dispose() reset.
@@ -458,6 +472,8 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
         this.handleDisconnect(generation);
       });
     } catch (error) {
+      // A failed attempt has no session for a sweep to gate: stop watching.
+      this.releaseConnectFence();
       if (connection && this.connection !== connection) {
         connection.dispose();
       }

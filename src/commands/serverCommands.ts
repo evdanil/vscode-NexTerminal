@@ -16,6 +16,7 @@ import {
   serverConfigsEqual
 } from "../models/config";
 import { connectDescriptor, type ConnectDescriptorInputs } from "../models/startDescriptors";
+import { watchStartFence, type StartFence } from "../services/ssh/startFenceWatcher";
 import { flattenProviderText } from "../models/inventory";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
@@ -1060,30 +1061,45 @@ function connectDescriptorInputs(ctx: CommandContext): ConnectDescriptorInputs {
 }
 
 /**
- * What a connect fence compares: the effective connection descriptor AND the
- * server's connection generation. Equality of descriptors alone misses an
- * A -> B -> A change made while the attempt was in flight (the transport may have
- * authenticated with B); the generation, bumped by the mutation hook on every
- * pool invalidation of this server (its own, its linked profile's, its jump
- * chain's), catches it. A telnet server has no pooled SSH route, so only its
- * descriptor counts.
+ * The fence of a pending connect: the effective connection descriptor captured
+ * when it began, plus a sticky watcher (see startFenceWatcher.ts) that latches if
+ * any mutation, even one later reverted (A -> B -> A), moved the live descriptor
+ * away from it. Comparing only the final state would miss the intermediate value;
+ * comparing raw pool invalidations would cancel on changes the connect never
+ * reads, so the fence recomputes its own descriptor per mutation.
  */
-function connectFenceToken(ctx: CommandContext, server: ServerConfig): string {
-  const descriptor = connectDescriptor(server, connectDescriptorInputs(ctx));
-  if (resolveServerProtocol(server) === "telnet") {
-    return descriptor;
-  }
-  return JSON.stringify([descriptor, ctx.core.getConnectionGeneration?.(server.id) ?? 0]);
+function watchConnectStart(ctx: CommandContext, server: ServerConfig): StartFence {
+  return watchStartFence(ctx.core, connectDescriptor(server, connectDescriptorInputs(ctx)), () => {
+    const current = ctx.core.getServer(server.id);
+    return current ? connectDescriptor(current, connectDescriptorInputs(ctx)) : "<removed>";
+  });
 }
 
 /**
- * Compares the token captured when the connect began with one recomputed
- * from the live record and the live linked auth profile, using the same inputs
- * the runtime uses, so only a value the connect actually uses can cancel it.
+ * The fence of one terminal connect ATTEMPT (SshPty captures it before it acquires
+ * a connection). The PTY connects with its constructor-captured `server`, so the
+ * watched descriptor is that server's, with the live auth profile and jump
+ * lookups the connection applies at handshake time.
  */
-function isServerUnchangedSince(ctx: CommandContext, atStart: ServerConfig, tokenAtStart: string): boolean {
+function watchTerminalAttempt(ctx: CommandContext, server: ServerConfig): StartFence {
+  return watchStartFence(ctx.core, connectDescriptor(server, connectDescriptorInputs(ctx)), () =>
+    connectDescriptor(server, connectDescriptorInputs(ctx))
+  );
+}
+
+/**
+ * Whether the connect is still current: the fence never latched, the record
+ * still exists, and its effective descriptor still equals the captured one,
+ * using the same inputs the runtime uses, so only a value the connect actually
+ * uses can cancel it. Checked once, at the top of the progress callback.
+ */
+function isServerUnchangedSince(ctx: CommandContext, atStart: ServerConfig, fence: StartFence): boolean {
   const current = ctx.core.getServer(atStart.id);
-  return current !== undefined && connectFenceToken(ctx, current) === tokenAtStart;
+  return (
+    !fence.isDirty() &&
+    current !== undefined &&
+    connectDescriptor(current, connectDescriptorInputs(ctx)) === fence.descriptor
+  );
 }
 
 /** Tells the user why a connect was cancelled and, if the record still exists, offers a Retry that can succeed. */
@@ -1144,7 +1160,7 @@ async function connectTelnetServer(
   options: ConnectServerOptions
 ): Promise<void> {
   const serverAtStart = cloneServerConfig(server);
-  const descriptorAtStart = connectFenceToken(ctx, serverAtStart);
+  const startFence = watchConnectStart(ctx, serverAtStart);
   await vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Notification,
@@ -1152,7 +1168,9 @@ async function connectTelnetServer(
       cancellable: false
     },
     async () => {
-      if (!isServerUnchangedSince(ctx, serverAtStart, descriptorAtStart)) {
+      const unchanged = isServerUnchangedSince(ctx, serverAtStart, startFence);
+      startFence.dispose(); // settled: the one check has run, nothing stays subscribed
+      if (!unchanged) {
         reportCancelledConnect(ctx, serverAtStart, options);
         return;
       }
@@ -1338,7 +1356,7 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
   const allowAutoFileExplorer = options.allowAutoFileExplorer ?? true;
   let autoFileExplorerHandled = false;
   const serverAtStart = cloneServerConfig(server);
-  const descriptorAtStart = connectFenceToken(ctx, serverAtStart);
+  const startFence = watchConnectStart(ctx, serverAtStart);
 
   await vscode.window.withProgress(
     {
@@ -1347,7 +1365,9 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
       cancellable: false
     },
     async () => {
-      if (!isServerUnchangedSince(ctx, serverAtStart, descriptorAtStart)) {
+      const unchanged = isServerUnchangedSince(ctx, serverAtStart, startFence);
+      startFence.dispose(); // settled: the one check has run, nothing stays subscribed
+      if (!unchanged) {
         reportCancelledConnect(ctx, serverAtStart, options);
         return;
       }
@@ -1366,7 +1386,7 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
         server,
         ctx.sshFactory,
         {
-          captureConnectDescriptor: () => connectFenceToken(ctx, server),
+          captureConnectDescriptor: () => watchTerminalAttempt(ctx, server),
           onSessionOpened: (sessionId) => {
             ctx.core.registerSession({
               id: sessionId,
@@ -1439,7 +1459,17 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
               // skips auto-start. No capture (a pty not created by this path)
               // fails safe the same way.
               const captured = ptyRef?.connectedDescriptor;
-              if (captured === undefined || captured !== connectFenceToken(ctx, liveServer)) {
+              // The capture's sticky fence covers an A -> B -> A change to the linked
+              // profile or the jump chain made after the attempt began; the
+              // descriptor comparison covers a net difference from the live server.
+              // Both are consumed here, so stop watching.
+              const captureDirty = ptyRef?.connectFenceDirty ?? true;
+              ptyRef?.releaseConnectFence();
+              if (
+                captured === undefined ||
+                captureDirty ||
+                captured !== connectDescriptor(liveServer, connectDescriptorInputs(ctx))
+              ) {
                 void vscode.window.showWarningMessage(
                   `Auto-start tunnels for "${flattenProviderText(server.name)}" were not started because the server's connection settings changed since this session opened. Close and reopen the terminal to use the new settings.`
                 );
@@ -1454,6 +1484,8 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
                 }
               }
             }
+            // Nothing more to gate for this attempt: stop watching whether or not tunnels were pending.
+            ptyRef?.releaseConnectFence();
           },
           onSessionClosed: (sessionId) => {
             ctx.core.unregisterSession(sessionId);

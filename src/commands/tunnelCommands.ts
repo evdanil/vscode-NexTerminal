@@ -12,6 +12,7 @@ import type {
 import { flattenProviderText } from "../models/inventory";
 import { cloneServerConfig, resolveTunnelType } from "../models/config";
 import { tunnelStartDescriptor } from "../models/startDescriptors";
+import { watchStartFence } from "../services/ssh/startFenceWatcher";
 import { configMutationLock } from "../services/configMutationLock";
 import type { SshFactory } from "../services/ssh/contracts";
 import { TunnelStartCancelledError, TunnelStoppedError, type TunnelManager } from "../services/tunnel/tunnelManager";
@@ -178,19 +179,18 @@ export async function startTunnel(
     serverLookup: (id: string) => core.getServer(id)
   };
   const descriptorAtStart = tunnelStartDescriptor(profileAtStart, serverAtStart, inputs);
-  // Equality of descriptors is not enough: an A -> B -> A change to the linked
-  // profile or a jump host during the login or handshake can leave the transport
-  // authenticated with B while the final descriptor reads A again. The server's
-  // connection generation (bumped by the mutation hook on every pool invalidation
-  // of it, riders and profile changes included) catches any such mutation. The
-  // tunnel profile's own fields need no generation: TunnelManager runs on the
-  // profile object passed in, so only the descriptor guards them.
-  const generationAtStart = core.getConnectionGeneration?.(server.id) ?? 0;
-  const stillCurrent = (): boolean => {
+  // Equality of descriptors at the end is not enough: an A -> B -> A change to the
+  // linked profile or a jump host during the login or handshake can leave the
+  // transport authenticated with B while the final descriptor reads A again. The
+  // fence therefore also watches every mutation and latches the first time this
+  // start's OWN descriptor (mode-aware, so an altHost edit during an isolated
+  // start is invisible to it) differs from the captured one. It is disposed when
+  // the start settles, on every path (see the try/finally below).
+  const liveDescriptor = (): string | undefined => {
     const liveProfile = core.getTunnel(profile.id);
     const liveServer = core.getServer(server.id);
     if (!liveProfile || !liveServer) {
-      return false;
+      return undefined;
     }
     // A profile whose stored mode is untouched keeps the mode captured for this
     // attempt (it may have been chosen interactively for an "ask" profile);
@@ -200,11 +200,10 @@ export async function startTunnel(
       : liveProfile.connectionMode === "ask"
         ? "ask"
         : liveProfile.connectionMode ?? readGlobalTunnelMode();
-    return (
-      (core.getConnectionGeneration?.(server.id) ?? 0) === generationAtStart &&
-      tunnelStartDescriptor(liveProfile, liveServer, { ...inputs, mode: liveMode }) === descriptorAtStart
-    );
+    return tunnelStartDescriptor(liveProfile, liveServer, { ...inputs, mode: liveMode });
   };
+  const fence = watchStartFence(core, descriptorAtStart, () => liveDescriptor() ?? "<gone>");
+  const stillCurrent = (): boolean => !fence.isDirty() && liveDescriptor() === descriptorAtStart;
   const reportCancelled = (): void => {
     // Names can come from an inventory sync; flatten them where they enter the message.
     const safeProfileName = flattenProviderText(profile.name);
@@ -236,6 +235,7 @@ export async function startTunnel(
       }
     });
   };
+  try {
   // TELNET (Phase 0) — port forwarding is an SSH channel feature and telnet has
   // no equivalent. THE one guard for every route into starting a tunnel: the
   // command, the tree's drag-and-drop of a tunnel profile onto a server, the
@@ -377,6 +377,9 @@ export async function startTunnel(
       return;
     }
     throw error;
+  }
+  } finally {
+    fence.dispose();
   }
 }
 

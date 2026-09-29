@@ -395,7 +395,8 @@ describe("SshPty", () => {
       captureConnectDescriptor: vi.fn(() => {
         attempt += 1;
         order.push(`capture-${attempt}`);
-        return `descriptor-${attempt}`;
+        const n = attempt;
+        return { descriptor: `descriptor-${n}`, isDirty: () => false, dispose: () => order.push(`dispose-${n}`) };
       }),
       onSessionOpened: vi.fn(() => order.push("opened")),
       onSessionClosed: vi.fn(),
@@ -414,9 +415,29 @@ describe("SshPty", () => {
     await flushAsync();
     pty.handleInput("R");
     await flushAsync();
-    expect(order.slice(3, 6)).toEqual(["capture-2", "acquire", "opened"]);
+    // The previous attempt's fence is released before the next capture.
+    expect(order.slice(3, 7)).toEqual(["dispose-1", "capture-2", "acquire", "opened"]);
     expect(pty.connectedDescriptor).toBe("descriptor-2");
 
+    pty.dispose();
+    expect(order).toContain("dispose-2");
+    expect(pty.connectedDescriptor).toBeUndefined();
+  });
+
+  it("releases the capture's fence when the attempt fails, and on an explicit release", async () => {
+    const disposed: string[] = [];
+    const sshFactory = { connect: vi.fn(async () => { throw new Error("nope"); }) };
+    const callbacks = {
+      captureConnectDescriptor: vi.fn(() => ({ descriptor: "d", isDirty: () => false, dispose: () => disposed.push("d") })),
+      onSessionOpened: vi.fn(),
+      onSessionClosed: vi.fn()
+    };
+    const logger = { log: vi.fn(), close: vi.fn() };
+    const pty = new SshPty(makeServer(), sshFactory as any, callbacks, logger as any);
+    pty.open();
+    await flushAsync();
+    expect(disposed).toEqual(["d"]);
+    expect(pty.connectedDescriptor).toBeUndefined();
     pty.dispose();
   });
 
