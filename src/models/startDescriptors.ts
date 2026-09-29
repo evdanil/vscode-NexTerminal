@@ -15,6 +15,13 @@ import {
  * (or a rename, folder move, notes edit) can never read as a change, and a value
  * the attempt does not use can never cancel it.
  *
+ * Secrets are deliberately NOT part of a descriptor: a saved SSH password, key
+ * passphrase or proxy password lives in SecretStorage, not in ServerConfig or
+ * ProxyConfig, and these fences compare configuration records. A secret changed
+ * mid-start therefore does not cancel it; the new value is used at the next
+ * login. test/unit/startDescriptors.test.ts pins that no secret-bearing field
+ * enters a descriptor.
+ *
  * The field classification is pinned by test/unit/startDescriptors.test.ts,
  * which lists every ServerConfig and TunnelProfile key: adding a field fails
  * that test until someone decides whether the connect path, the tunnel path or
@@ -36,7 +43,7 @@ function proxyDescriptor(proxy: ProxyConfig | undefined): unknown {
     : [proxy.type, proxy.host, proxy.port, proxy.username ?? null];
 }
 
-/** Server fields the SSH transport (credentials, proxy, connector) reads. */
+/** Server fields the SSH transport (login identity, key file, proxy, connector) reads; never secrets. */
 function transportDescriptor(server: ServerConfig): unknown[] {
   return [
     server.id,

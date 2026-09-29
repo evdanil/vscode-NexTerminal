@@ -214,3 +214,28 @@ describe("start descriptors — keyPath and telnet", () => {
     expect(connectDescriptor({ ...telnet, protocol: undefined }, inputs)).not.toBe(connectDescriptor(telnet, inputs));
   });
 });
+
+describe("start descriptors — secrets are not part of the fence", () => {
+  it("no ServerConfig or TunnelProfile field is secret-bearing (they live in SecretStorage)", () => {
+    const names = [...Object.keys(SERVER_FIELDS), ...Object.keys(TUNNEL_FIELDS)];
+    expect(names.filter((n) => /password|passphrase|secret/i.test(n))).toEqual([]);
+  });
+
+  it("a password, passphrase or proxy password smuggled onto a record does not enter a descriptor", () => {
+    const withSecrets = {
+      ...server,
+      password: "p1",
+      passphrase: "p2",
+      proxy: { type: "socks5", host: "p", port: 1, password: "p3", proxyPassword: "p4" }
+    } as unknown as ServerConfig;
+    const changed = {
+      ...withSecrets,
+      password: "other",
+      passphrase: "other",
+      proxy: { type: "socks5", host: "p", port: 1, password: "other", proxyPassword: "other" }
+    } as unknown as ServerConfig;
+    expect(connectDescriptor(changed, inputs)).toBe(connectDescriptor(withSecrets, inputs));
+    expect(tunnelStartDescriptor(tunnel, changed, tinputs)).toBe(tunnelStartDescriptor(tunnel, withSecrets, tinputs));
+    expect(connectDescriptor(withSecrets, inputs)).not.toMatch(/p1|p2|p3|p4|password|passphrase/i);
+  });
+});
