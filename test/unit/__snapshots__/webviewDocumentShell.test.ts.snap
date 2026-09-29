@@ -7678,7 +7678,9 @@ echo hi</textarea>
 						"-t",
 						"--type",
 						"-c",
-						"-a"
+						"--login-class",
+						"-a",
+						"--auth-type"
 					].includes(option)) {
 						if (index >= words.length) return false;
 						index++;

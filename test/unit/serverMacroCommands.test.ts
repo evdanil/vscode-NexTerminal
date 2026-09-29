@@ -1295,7 +1295,10 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     ["a later segment after a substitution", "echo $(date); ipmitool -E\n"],
     ["a later line after a backtick", "echo `date`\nipmitool -E\n"],
     ["a dynamic sudo operand", "sudo -u $(whoami) ipmitool -E\n"],
-    ["a dynamic env operand", "env $(x) ipmitool -E\n"]
+    ["a dynamic env operand", "env $(x) ipmitool -E\n"],
+    ["a sudo long option value 0", "sudo --user ipmitool\n"],
+    ["a sudo long option value 1", "sudo --auth-type ipmitool\n"],
+    ["a sudo long option value 2", "sudo --login-class ipmitool -E\n"]
   ])("does not treat %s as an ipmitool command", (_case, text) => {
     expect(sessionIpmiHintNote({ id: "a", name: "X", text, runIn: "session" })).toBeUndefined();
   });
@@ -1353,6 +1356,10 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     ["a heredoc attached to the head", "ipmitool<<EOF\nmc info\nEOF\n"],
     ["a sudo auth-type long option", "sudo --auth-type=x ipmitool -E\n"],
     ["a sudo login-class long option", "sudo --login-class=x ipmitool -E\n"],
+    ["a separated sudo long option 0", "sudo --role role_r ipmitool -E\n"],
+    ["a separated sudo long option 1", "sudo --type type_t ipmitool -E\n"],
+    ["a separated sudo long option 2", "sudo --auth-type pam ipmitool -E\n"],
+    ["a separated sudo long option 3", "sudo --login-class staff ipmitool -E\n"],
     ["a substitution after the ipmitool head", "ipmitool -H $(cat h) mc info\n"],
     ["a backtick after the ipmitool head", "ipmitool -H `x` mc info\n"],
     ["a substitution inside double quotes after the head", "sudo ipmitool -H h -P \"$(cat pw)\" sol activate\n"],

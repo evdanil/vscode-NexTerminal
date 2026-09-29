@@ -36,7 +36,7 @@ export function textRunsIpmitool(text: string): boolean {
         while (index < words.length && words[index].startsWith("-")) {
           const option = words[index++];
           const shortValueOption = /^-[EABbnSHkisP]*[ugpCDTRrtca](.*)$/.exec(option);
-          if (["-u", "--user", "-g", "--group", "-p", "--prompt", "-C", "--close-from", "-D", "--chdir", "-T", "--command-timeout", "-R", "--chroot", "-r", "--role", "-t", "--type", "-c", "-a"].includes(option)) {
+          if (["-u", "--user", "-g", "--group", "-p", "--prompt", "-C", "--close-from", "-D", "--chdir", "-T", "--command-timeout", "-R", "--chroot", "-r", "--role", "-t", "--type", "-c", "--login-class", "-a", "--auth-type"].includes(option)) {
             if (index >= words.length) return false;
             index++;
           } else if (shortValueOption) {

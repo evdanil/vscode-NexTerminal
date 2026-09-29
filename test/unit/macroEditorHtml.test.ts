@@ -231,6 +231,9 @@ describe("renderMacroEditorHtml", () => {
     ["env FOO=1 -u BAR ipmitool -E", "none"],
     ["env FOO=1 --debug ipmitool -E", "none"],
     ['">/tmp/log" ipmitool -E', "none"],
+    ["sudo --user ipmitool\n", "none"],
+    ["sudo --auth-type ipmitool\n", "none"],
+    ["sudo --login-class ipmitool -E\n", "none"],
     ["cat <<EOF\nipmitool -E\nEOF\n", "none"],
     ["sh <<'EOF'\nipmitool -E\nEOF\n", "none"],
     ["ipmi$(echo tool) -E\n", "none"],
@@ -293,6 +296,10 @@ describe("renderMacroEditorHtml", () => {
     ["ipmitool<<EOF\nmc info\nEOF\n", ""],
     ["sudo --auth-type=x ipmitool -E\n", ""],
     ["sudo --login-class=x ipmitool -E\n", ""],
+    ["sudo --role role_r ipmitool -E\n", ""],
+    ["sudo --type type_t ipmitool -E\n", ""],
+    ["sudo --auth-type pam ipmitool -E\n", ""],
+    ["sudo --login-class staff ipmitool -E\n", ""],
   ])("classifies the command position in the live Session hint for %s", (text, expectedDisplay) => {
     const html = render([], null);
     const match = /function updateSessionIpmitoolHint\(\) \{[\s\S]*?\n      \}/.exec(html);

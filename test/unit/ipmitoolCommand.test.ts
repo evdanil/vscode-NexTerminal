@@ -26,7 +26,11 @@ describe("textRunsIpmitool", () => {
     ["a here-string attached to the head", "ipmitool<<<foo\n"],
     ["a heredoc attached to the head", "ipmitool<<EOF\nmc info\nEOF\n"],
     ["a sudo auth-type long option", "sudo --auth-type=x ipmitool -E\n"],
-    ["a sudo login-class long option", "sudo --login-class=x ipmitool -E\n"]
+    ["a sudo login-class long option", "sudo --login-class=x ipmitool -E\n"],
+    ["a separated sudo long option 0", "sudo --role role_r ipmitool -E\n"],
+    ["a separated sudo long option 1", "sudo --type type_t ipmitool -E\n"],
+    ["a separated sudo long option 2", "sudo --auth-type pam ipmitool -E\n"],
+    ["a separated sudo long option 3", "sudo --login-class staff ipmitool -E\n"]
   ])("detects ipmitool with %s", (_case, text) => {
     expect(textRunsIpmitool(text)).toBe(true);
   });
@@ -42,7 +46,10 @@ describe("textRunsIpmitool", () => {
   ["a later segment after a substitution", "echo $(date); ipmitool -E\n"],
   ["a later line after a backtick", "echo `date`\nipmitool -E\n"],
   ["a dynamic sudo operand", "sudo -u $(whoami) ipmitool -E\n"],
-  ["a dynamic env operand", "env $(x) ipmitool -E\n"]
+  ["a dynamic env operand", "env $(x) ipmitool -E\n"],
+  ["a sudo long option value 0", "sudo --user ipmitool\n"],
+  ["a sudo long option value 1", "sudo --auth-type ipmitool\n"],
+  ["a sudo long option value 2", "sudo --login-class ipmitool -E\n"]
   ])("does not detect ipmitool with %s", (_case, text) => {
     expect(textRunsIpmitool(text)).toBe(false);
   });
