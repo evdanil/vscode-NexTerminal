@@ -10,7 +10,6 @@ import { TunnelStoppedError, type TunnelEvent } from "../../src/services/tunnel/
 import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { watchPoolInvalidationOnConfigMutation } from "../../src/services/ssh/poolConfigInvalidation";
-import { watchSshPoolServerRemovals } from "../../src/services/ssh/sshPoolServerRemovalObserver";
 import { serversRidingChangedJumps } from "../../src/services/ssh/pooledConnectionParams";
 import type { PoolEvent } from "../../src/services/ssh/sshConnectionPool";
 
@@ -955,7 +954,7 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
     const stack = buildStack(auth, [jumpServer, target]);
     const core = new NexusCore(new InMemoryConfigRepository([jumpServer, target], []));
     await core.initialize();
-    const stopWatching = watchSshPoolServerRemovals(core, stack.pool);
+    const stopWatching = watchPoolInvalidationOnConfigMutation(core, stack.pool);
     cleanups.push(stopWatching);
     const liveLease = await stack.pool.connect(target);
     cleanups.push(() => liveLease.dispose());
@@ -994,6 +993,42 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
     expect(auth.disposedIds).not.toContain(target.id);
     release();
     await persisting;
+  });
+
+  it("an edit, a reconnect during the pending save, then the save resolving: one handshake, installed, then reused", async () => {
+    const auth = createAuthFactory();
+    const target = targetServer({ type: "ssh", jumpHostId: jumpServer.id });
+    const stack = buildStack(auth, [jumpServer, target]);
+    let release!: () => void;
+    class SlowRepo extends InMemoryConfigRepository {
+      public override async saveServers(servers: ServerConfig[]): Promise<void> {
+        await new Promise<void>((resolve) => { release = resolve; });
+        return super.saveServers(servers);
+      }
+    }
+    const core = new NexusCore(new SlowRepo([jumpServer, target], []));
+    await core.initialize();
+    const invalidate = vi.spyOn(stack.pool, "invalidate");
+    cleanups.push(watchPoolInvalidationOnConfigMutation(core, stack.pool));
+    const liveLease = await stack.pool.connect(target);
+    cleanups.push(() => liveLease.dispose());
+
+    const persisting = core.addOrUpdateServer({ ...jumpServer, host: "moved.example.test" });
+    const reconnect = await stack.pool.connect(target);
+    cleanups.push(() => reconnect.dispose());
+    expect(auth.callsFor(target.id)).toEqual(["via-proxy", "via-proxy"]);
+    const invalidationsBeforeSave = invalidate.mock.calls.length;
+
+    release();
+    await persisting;
+
+    // Nothing invalidates again once persistence resolves and the change event fires,
+    // so the reconnect's entry stays installed and the next acquire reuses it
+    // instead of triggering a third handshake (and a second password prompt).
+    expect(invalidate.mock.calls.length).toBe(invalidationsBeforeSave);
+    const third = await stack.pool.connect(target);
+    cleanups.push(() => third.dispose());
+    expect(auth.callsFor(target.id)).toEqual(["via-proxy", "via-proxy"]);
   });
 
   it("without invalidating dependents, a reconnect reuses the target transport built through the old jump (the gap the fix closes)", async () => {

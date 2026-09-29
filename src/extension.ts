@@ -42,9 +42,7 @@ import { SftpService } from "./services/sftp/sftpService";
 import { SudoElevationBroker } from "./services/sftp/sudoElevationBroker";
 import { SilentAuthSshFactory, proxyPasswordSecretKey } from "./services/ssh/silentAuth";
 import { createSshTransportStack } from "./services/ssh/sshTransportStack";
-import { pooledConnectionParamsChanged, serversRidingChangedJumps } from "./services/ssh/pooledConnectionParams";
 import { watchPoolInvalidationOnConfigMutation } from "./services/ssh/poolConfigInvalidation";
-import { watchSshPoolServerRemovals } from "./services/ssh/sshPoolServerRemovalObserver";
 import { Ssh2Connector } from "./services/ssh/ssh2Connector";
 import { VscodeHostKeyVerifier } from "./services/ssh/vscodeHostKeyVerifier";
 import { VscodePasswordPrompt } from "./services/ssh/vscodePasswordPrompt";
@@ -1272,9 +1270,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   let previousServers = new Map<string, import("./models/config").ServerConfig>(
     core.getSnapshot().servers.map(s => [s.id, s])
   );
-  let previousAuthProfiles = new Map<string, import("./models/config").AuthProfile>(
-    core.getSnapshot().authProfiles.map((profile) => [profile.id, profile])
-  );
 
   // The two capability probes above answer from the LIVE registry each time a
   // row is built, and a third-party provider registers through the public API
@@ -1292,67 +1287,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const unsubscribeProviderRegistry = inventoryProviderRegistry.onDidChange(() => {
     syncViews();
   });
-  const unsubscribeRemovedSshServerPoolEntries = watchSshPoolServerRemovals(core, pool);
-  // Synchronous with the in-memory mutation, ahead of persistence and of the
-  // change event below, which stays as the backstop for wholesale replacement
-  // (initialize) that the mutation hook does not report.
+  // The ONE source of pooled-connection invalidation: synchronous with each
+  // in-memory server / auth-profile mutation (initialize() included), ahead of
+  // persistence. Nothing invalidates the pool again on the change event below, on
+  // purpose (see poolConfigInvalidation.ts).
   const unsubscribeSyncPoolInvalidation = watchPoolInvalidationOnConfigMutation(core, pool);
   const unsubscribeCore = core.onDidChange((snapshot) => {
     syncViews();
-    const invalidatedServerIds = new Set<string>();
     for (const server of snapshot.servers) {
       const prev = previousServers.get(server.id);
-      if (prev && pooledConnectionParamsChanged(prev, server)) {
-        pool.invalidate(server.id);
-        invalidatedServerIds.add(server.id);
-        // Clear stale proxy password when proxy endpoint changes to prevent
-        // sending one proxy's credentials to a different proxy server.
-        if (JSON.stringify(prev.proxy) !== JSON.stringify(server.proxy)) {
-          void secretVault.delete(proxyPasswordSecretKey(server.id));
-        }
-      }
-    }
-    const changedAuthProfileIds = new Set<string>();
-    const currentAuthProfileIds = new Set(snapshot.authProfiles.map((profile) => profile.id));
-    for (const profile of snapshot.authProfiles) {
-      if (previousAuthProfiles.get(profile.id) !== profile) {
-        changedAuthProfileIds.add(profile.id);
-      }
-    }
-    for (const profileId of previousAuthProfiles.keys()) {
-      if (!currentAuthProfileIds.has(profileId)) {
-        changedAuthProfileIds.add(profileId);
-      }
-    }
-    if (changedAuthProfileIds.size > 0) {
-      const affectedServerIds = new Set<string>();
-      for (const server of snapshot.servers) {
-        if (server.authProfileId && changedAuthProfileIds.has(server.authProfileId)) {
-          affectedServerIds.add(server.id);
-        }
-      }
-      for (const server of previousServers.values()) {
-        if (server.authProfileId && changedAuthProfileIds.has(server.authProfileId)) {
-          affectedServerIds.add(server.id);
-        }
-      }
-      for (const serverId of affectedServerIds) {
-        pool.invalidate(serverId);
-        invalidatedServerIds.add(serverId);
-      }
-    }
-    // A target's pooled transport was built through its jump host(s). Editing a
-    // jump (or its auth profile) invalidates only the jump's own entry, so
-    // soft-invalidate every target riding it as well: live sessions keep their
-    // connection, but the next reconnect or tunnel builds a fresh one over the
-    // current route instead of reusing the stale one.
-    if (invalidatedServerIds.size > 0) {
-      for (const dependentId of serversRidingChangedJumps(snapshot.servers, invalidatedServerIds)) {
-        pool.invalidate(dependentId);
+      // Clear stale proxy password when proxy endpoint changes to prevent
+      // sending one proxy's credentials to a different proxy server.
+      if (prev && JSON.stringify(prev.proxy) !== JSON.stringify(server.proxy)) {
+        void secretVault.delete(proxyPasswordSecretKey(server.id));
       }
     }
     previousServers = new Map(snapshot.servers.map(s => [s.id, s]));
-    previousAuthProfiles = new Map(snapshot.authProfiles.map((profile) => [profile.id, profile]));
   });
   const unsubscribeTunnel = tunnelManager.onDidChange((event) => {
     if (event.type === "started") {
@@ -1756,7 +1706,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     },
     {
       dispose: () => {
-        unsubscribeRemovedSshServerPoolEntries();
         unsubscribeSyncPoolInvalidation();
         unsubscribeCore();
         unsubscribeProviderRegistry();

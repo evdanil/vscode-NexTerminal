@@ -120,7 +120,7 @@ import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, Tunne
 import { ProxySshFactory } from "../../src/services/ssh/proxySshFactory";
 import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
-import { watchSshPoolServerRemovals } from "../../src/services/ssh/sshPoolServerRemovalObserver";
+import { watchPoolInvalidationOnConfigMutation } from "../../src/services/ssh/poolConfigInvalidation";
 
 const KNOWN_HOSTS_KEY = "nexus.ssh.knownHostFingerprints.v1";
 const PASSWORD = "backup-pass-1";
@@ -1295,7 +1295,7 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
     const proxyFactory = new ProxySshFactory(authFactory, (id) => dest.core.getServer(id), dest.vault);
     const pool = new SshConnectionPool(proxyFactory, { enabled: true, idleTimeoutMs: 0 });
     proxyFactory.setJumpHostConnectionFactory(pool);
-    const unsubscribeRemovedServerPoolEntries = watchSshPoolServerRemovals(dest.core, pool);
+    const unsubscribeRemovedServerPoolEntries = watchPoolInvalidationOnConfigMutation(dest.core, pool);
 
     let oldTargetConnection: SshConnection | undefined;
     let newTargetConnection: SshConnection | undefined;
@@ -1425,7 +1425,7 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
     const proxyFactory = new ProxySshFactory(authFactory, (id) => dest.core.getServer(id), authVault);
     const pool = new SshConnectionPool(proxyFactory, { enabled: true, idleTimeoutMs: 0 });
     proxyFactory.setJumpHostConnectionFactory(pool);
-    const unsubscribeRemovedServerPoolEntries = watchSshPoolServerRemovals(dest.core, pool);
+    const unsubscribeRemovedServerPoolEntries = watchPoolInvalidationOnConfigMutation(dest.core, pool);
 
     let staleTargetAttempt: Promise<SshConnection> | undefined;
     let freshTargetConnection: SshConnection | undefined;
@@ -1614,7 +1614,7 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
       }
     };
     const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
-    const unsubscribeRemovedServerPoolEntries = watchSshPoolServerRemovals(machine.core, pool);
+    const unsubscribeRemovedServerPoolEntries = watchPoolInvalidationOnConfigMutation(machine.core, pool);
 
     try {
       const idleLease = await pool.connect(server);
@@ -1656,7 +1656,7 @@ describe("Replace keeps a removed server's saved secrets only when its endpoint 
       }
     };
     const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 60_000 });
-    const unsubscribeRemovedServerPoolEntries = watchSshPoolServerRemovals(core, pool);
+    const unsubscribeRemovedServerPoolEntries = watchPoolInvalidationOnConfigMutation(core, pool);
 
     try {
       const firstLease = await pool.connect(server);

@@ -86,29 +86,37 @@ export function pooledConnectionParamsChanged(prev: ServerConfig, next: ServerCo
  * jump and would otherwise be reused for the next terminal reconnect or tunnel
  * over that stale route. Soft invalidation keeps live leases running and only
  * makes new acquisitions build a fresh connection over the current route.
- * A linear scan is enough: the servers list is small and this runs on edits.
+ * Linear: one reverse jumpHostId -> dependents index, then a BFS.
  */
 export function serversRidingChangedJumps(
   servers: readonly ServerConfig[],
   changedIds: ReadonlySet<string>
 ): Set<string> {
+  const ridersOf = new Map<string, string[]>();
+  for (const server of servers) {
+    if (server.proxy?.type === "ssh") {
+      const riders = ridersOf.get(server.proxy.jumpHostId);
+      if (riders) riders.push(server.id);
+      else ridersOf.set(server.proxy.jumpHostId, [server.id]);
+    }
+  }
+  return ridersFromIndex(ridersOf, changedIds);
+}
+
+/** BFS over a jumpHostId -> riders index. Excludes the seeds; terminates on a cycle. */
+export function ridersFromIndex(
+  ridersOf: ReadonlyMap<string, Iterable<string>>,
+  seeds: ReadonlySet<string>
+): Set<string> {
   const affected = new Set<string>();
-  let frontier = new Set(changedIds);
-  while (frontier.size > 0) {
-    const next = new Set<string>();
-    for (const server of servers) {
-      if (
-        server.proxy?.type === "ssh" &&
-        frontier.has(server.proxy.jumpHostId) &&
-        !changedIds.has(server.id) &&
-        !affected.has(server.id)
-      ) {
-        affected.add(server.id);
-        next.add(server.id);
+  const queue = [...seeds];
+  for (let i = 0; i < queue.length; i++) {
+    for (const rider of ridersOf.get(queue[i]) ?? []) {
+      if (!seeds.has(rider) && !affected.has(rider)) {
+        affected.add(rider);
+        queue.push(rider);
       }
     }
-    // Only newly affected servers can lead to further dependents.
-    frontier = next;
   }
   return affected;
 }

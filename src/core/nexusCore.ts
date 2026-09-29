@@ -78,7 +78,8 @@ type ConnectionConfigMutationListener = (mutation: ConnectionConfigMutation) => 
  * assigns to the servers or auth-profiles collections (single edits, bulk sync,
  * import, rollback) goes through these two methods, so none can bypass the
  * notification. `clear` is deliberately silent: `initialize()` replaces the whole
- * collection and its change event carries the full diff.
+ * collection and reports each prior record as prev/next itself, once the
+ * collection is repopulated, so a reload is compared rather than seen as adds.
  */
 class ObservedMap<V> extends Map<string, V> {
   public constructor(private readonly onMutate: (id: string, prev: V | undefined, next: V | undefined) => void) {
@@ -285,6 +286,15 @@ export class NexusCore {
         this.repository.getTftpProfiles(),
         this.repository.getDhcpProfiles()
       ]);
+    // Kept so the wholesale reload can be reported as prev/next below: clear()
+    // and the repopulating sets alone would show every record as newly added.
+    const priorServers = new Map(this.servers);
+    const priorAuthProfiles = new Map(this.authProfiles);
+    // The clear + repopulating sets below are not real mutations (they would
+    // read as adds of every record); the diff is reported once, after them.
+    const normalizedServers = normalizeFileExplorerAutoOpenOwner(servers);
+    this.suppressConnectionConfigMutations = true;
+    try {
     this.servers.clear();
     this.tunnels.clear();
     this.serialProfiles.clear();
@@ -297,7 +307,6 @@ export class NexusCore {
     this.savedFilters.clear();
     this.tftpProfiles.clear();
     this.dhcpProfiles.clear();
-    const normalizedServers = normalizeFileExplorerAutoOpenOwner(servers);
     for (const server of normalizedServers.servers) {
       this.servers.set(server.id, server);
     }
@@ -333,6 +342,27 @@ export class NexusCore {
     }
     for (const profile of dhcpProfiles) {
       this.dhcpProfiles.set(profile.id, profile);
+    }
+    } finally {
+      this.suppressConnectionConfigMutations = false;
+    }
+    // Report the reload synchronously, before any await below (the normalization
+    // repair save can be slow): a record that changed, vanished or appeared is a
+    // mutation like any other, so pool invalidation cannot lag the refreshed
+    // settings.
+    for (const id of new Set([...priorServers.keys(), ...this.servers.keys()])) {
+      const prev = priorServers.get(id);
+      const next = this.servers.get(id);
+      if (next !== prev) {
+        this.emitConnectionConfigMutation({ kind: "server", id, prev, next });
+      }
+    }
+    for (const id of new Set([...priorAuthProfiles.keys(), ...this.authProfiles.keys()])) {
+      const prev = priorAuthProfiles.get(id);
+      const next = this.authProfiles.get(id);
+      if (next !== prev) {
+        this.emitConnectionConfigMutation({ kind: "authProfile", id, prev, next });
+      }
     }
     if (normalizedServers.changed) {
       await this.repository.saveServers(normalizedServers.servers);
@@ -3261,7 +3291,12 @@ export class NexusCore {
     }
   }
 
+  private suppressConnectionConfigMutations = false;
+
   private emitConnectionConfigMutation(mutation: ConnectionConfigMutation): void {
+    if (this.suppressConnectionConfigMutations) {
+      return;
+    }
     for (const listener of this.connectionConfigMutationListeners) {
       try {
         listener(mutation);
