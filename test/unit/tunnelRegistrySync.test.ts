@@ -1067,6 +1067,26 @@ describe("TunnelRegistrySync", () => {
     log.mockRestore();
   });
 
+  it("warns when the registry read fails before the reservation is published", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.fn();
+    const warning = new TunnelRegistrySync(store, core, "w", probePort, warn);
+    const tunnel = makeTunnel({ id: "w3", tunnelType: "reverse", remotePort: 9002 });
+    const options = {
+      tunnel,
+      retiredReverseBind: { fenceId: "w3", routeIdentity: reverseRoute, remotePort: 9002, settled: new Promise<void>(() => {}) }
+    };
+    const publish = vi.spyOn(store, "publishFence");
+    vi.spyOn(store, "getEntries").mockRejectedValue(new Error("fresh unreadable fence"));
+
+    await warning.unregisterTunnelAfterStop(tunnel.profileId, options);
+    await warning.unregisterTunnelAfterStop(tunnel.profileId, options);
+
+    expect(publish).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1);
+    log.mockRestore();
+  });
+
   it("warns once when a stopped reverse tunnel's reservation cannot be published", async () => {
     const log = vi.spyOn(console, "error").mockImplementation(() => {});
     const warn = vi.fn();

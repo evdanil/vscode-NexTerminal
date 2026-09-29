@@ -188,8 +188,8 @@ export class TunnelRegistrySync {
   }>();
   private mutationTail: Promise<void> = Promise.resolve();
   private warnedFencePublishFailure = false;
-  /** Fence ids whose publishFence itself failed, as opposed to a later write. */
-  private readonly failedFencePublications = new Set<string>();
+  /** Fence ids whose publishFence completed during the current stop call. */
+  private readonly publishedFences = new Set<string>();
 
   public constructor(
     private readonly store: TunnelRegistryStore,
@@ -227,15 +227,19 @@ export class TunnelRegistrySync {
     profileId: string,
     options?: { tunnel: ActiveTunnel; retiredReverseBind?: RetiredReverseBindFence }
   ): Promise<void> {
+    if (options?.retiredReverseBind) {
+      this.publishedFences.delete(options.retiredReverseBind.fenceId);
+    }
     try {
       await this.unregisterTunnel(profileId, options);
     } catch (error) {
       console.error("[Nexus] tunnel registry update after stop failed", error);
-      // A later active-array save can fail after the fence is already
-      // published; that is not a missing reservation, so it must neither warn
-      // nor consume the one-time warning.
+      // Any failure before the fence was published (its own write, or the
+      // registry read ahead of it) leaves no reservation and warns. A later
+      // active-array save failing after publication is not a missing
+      // reservation, so it must neither warn nor consume the one-time warning.
       const fenceId = options?.retiredReverseBind?.fenceId;
-      const publishFailed = fenceId !== undefined && this.failedFencePublications.delete(fenceId);
+      const publishFailed = fenceId !== undefined && !this.publishedFences.delete(fenceId);
       if (publishFailed && options?.retiredReverseBind && !this.warnedFencePublishFailure) {
         this.warnedFencePublishFailure = true;
         this.notifyWarning?.(
@@ -306,9 +310,9 @@ export class TunnelRegistrySync {
           // Publish first: a stale Memento write from another window cannot
           // remove this file, and removal of our active row follows it.
           await this.store.publishFence(fenceEntry);
+          this.publishedFences.add(fence.fenceId);
         } catch (error) {
           this.unsettledReverseBindFenceIds.delete(fence.fenceId);
-          this.failedFencePublications.add(fence.fenceId);
           throw error;
         }
         // A later active-array save can fail. The already-published fence must
