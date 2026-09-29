@@ -53,6 +53,7 @@ export class TerminalRegistry implements vscode.Disposable {
     const buffer = new TerminalCaptureBuffer();
     const observer: PtyOutputObserver = {
       onOutput: (text) => buffer.append(text),
+      onTransportReset: () => buffer.resetEscapeState(),
       pauseIntervalMacros: () => {},
       dispose: () => {}
     };

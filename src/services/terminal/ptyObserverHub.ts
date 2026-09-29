@@ -108,6 +108,21 @@ export class PtyObserverHub {
     }
   }
 
+  /**
+   * Tell every observer a new transport is starting on this PTY (an SSH reconnect or
+   * a Smart Follow reattach reuses the hub), so per-stream parser state such as the ANSI stripper's
+   * carry is dropped. Deliberately separate from any buffer clear.
+   */
+  public notifyTransportReset(): void {
+    this.observers.forEach((o) => {
+      try {
+        o.onTransportReset?.();
+      } catch {
+        /* tolerate misbehaving observer */
+      }
+    });
+  }
+
   /** Pause interval macros on every observer (disconnect / shutdown paths). */
   public pauseIntervalMacros(): void {
     this.observers.forEach((o) => o.pauseIntervalMacros());

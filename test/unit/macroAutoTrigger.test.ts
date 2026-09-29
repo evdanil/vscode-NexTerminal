@@ -156,6 +156,129 @@ describe("MacroAutoTrigger", () => {
     obs.dispose();
   });
 
+  it("strips an escape sequence split across output chunks before matching", () => {
+    setConfig([
+      { name: "pw", text: "secret\n", triggerPattern: "Password: $" }
+    ]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    obs.onOutput("Password: \x1b[>4;");
+    obs.onOutput("2m");
+    flush();
+    expect(sent).toEqual(["secret\n"]);
+    obs.dispose();
+  });
+
+  it("keeps advancing the escape carry while auto-trigger is disabled", () => {
+    const macros = [{ name: "pw", text: "secret\n", triggerPattern: "Password: $" }];
+    setConfig(macros, true);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    // The title opens while matching is on and closes while it is off, so its
+    // held opener must not survive to be prepended to output after re-enable.
+    obs.onOutput("\x1b]0;user@host");
+    setConfig(macros, false);
+    trigger.reload();
+    obs.onOutput(": ~\x07");
+    setConfig(macros, true);
+    trigger.reload();
+    obs.onOutput("Password: ");
+    flush();
+    expect(sent).toEqual(["secret\n"]);
+    obs.dispose();
+  });
+
+  it("advances the escape carry over the whole oversized chunk before truncating", () => {
+    setConfig([{ name: "pw", text: "secret\n", triggerPattern: "Password: $" }]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    // The carried title's BEL sits at the start of a chunk far larger than the
+    // input cap; truncating first would drop it and swallow the prompt.
+    obs.onOutput("\x1b]0;user@host");
+    obs.onOutput(": ~\x07" + "banner line\n".repeat(2000) + "Password: ");
+    flush();
+    expect(sent).toEqual(["secret\n"]);
+    obs.dispose();
+  });
+
+  it("does not let a long DCS payload split across chunks satisfy or block matching", () => {
+    setConfig([{ name: "pw", text: "secret\n", triggerPattern: "Password: $" }]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+    const payload = "q" + "Password: ".repeat(20);
+
+    obs.onOutput("\x1bP" + payload);
+    obs.onOutput(payload);
+    flush();
+    expect(sent).toEqual([]); // payload text must not match
+    obs.onOutput("\x1b\\Password: ");
+    flush();
+    expect(sent).toEqual(["secret\n"]);
+    obs.dispose();
+  });
+
+  it("a CAN-cancelled string does not swallow the prompt that follows", () => {
+    setConfig([{ name: "pw", text: "secret\n", triggerPattern: "Password: $" }]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    obs.onOutput("\x1bPpayload");
+    obs.onOutput("\x18Password: ");
+    flush();
+    expect(sent).toEqual(["secret\n"]);
+    obs.dispose();
+  });
+
+  it("an 8-bit ST ends a title string so the prompt after it still matches", () => {
+    setConfig([{ name: "pw", text: "secret\n", triggerPattern: "Password: $" }]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    obs.onOutput("\x1b]0;title");
+    obs.onOutput("\x9cPassword: ");
+    flush();
+    expect(sent).toEqual(["secret\n"]);
+    obs.dispose();
+  });
+
+  it("a DCS payload containing BEL does not leak into trigger matching", () => {
+    setConfig([{ name: "pw", text: "secret\n", triggerPattern: "Password: $" }]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    obs.onOutput("\x1bPq\x07Password: ");
+    flush();
+    expect(sent).toEqual([]);
+    obs.onOutput("\x1b\\Password: ");
+    flush();
+    expect(sent).toEqual(["secret\n"]);
+    obs.dispose();
+  });
+
+  it("a transport reset drops the escape carry so the new connection's prompt matches", () => {
+    setConfig([{ name: "pw", text: "secret\n", triggerPattern: "Password: $" }]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    obs.onOutput("\x1bPpayload from the dead connection");
+    obs.onTransportReset?.();
+    obs.onOutput("Password: ");
+    flush();
+    expect(sent).toEqual(["secret\n"]);
+    obs.dispose();
+  });
+
   it("defers writeBack to next event-loop turn", () => {
     setConfig([
       { name: "pw", text: "secret\n", triggerPattern: "Password:" }

@@ -48,6 +48,81 @@ describe("TerminalCaptureBuffer", () => {
       expect(buf.getText()).toBe("red");
     });
 
+    it("removes CSI private-prefix, intermediate and ESC 7/8/=/> forms", () => {
+      const buf = new TerminalCaptureBuffer();
+      buf.append("a\x1b[>4;2mb\x1b7c\x1b8d\x1b[=5ue\x1b[<uf\x1b[2 qg\x1b[!ph\x1b=i\x1b>\n");
+      const text = buf.getText();
+      expect(text).toBe("abcdefghi");
+      expect(text).not.toContain("[>");
+      expect(text).not.toContain("[=");
+    });
+
+    it("strips an escape sequence split across two appends", () => {
+      const buf = new TerminalCaptureBuffer();
+      buf.append("a\x1b[>4;");
+      buf.append("2mb\x1b");
+      buf.append("[=5ucd\n");
+      const text = buf.getText();
+      expect(text).toBe("abcd");
+      expect(text).not.toContain("[>");
+    });
+
+    it("keeps stripping a split sequence across clear()", () => {
+      const buf = new TerminalCaptureBuffer();
+      buf.append("foo\x1b[>4;");
+      buf.clear();
+      buf.append("2mbar");
+      expect(buf.getText()).toBe("bar");
+      expect(buf.getText()).not.toContain("2m");
+    });
+
+    it("strips a terminal title split before the prompt", () => {
+      const buf = new TerminalCaptureBuffer();
+      buf.append("out\n\x1b]0;user@host: ~/dir");
+      buf.append("\x07$ ");
+      expect(buf.getText()).toBe("out\n$ ");
+    });
+
+    it("releases an unterminated escape after the 512-char escape bound", () => {
+      const buf = new TerminalCaptureBuffer();
+      buf.append("\x1b[" + "1".repeat(600));
+      expect(buf.getText()).toContain("1".repeat(50));
+    });
+
+    it("does not retain text after a lone trailing ESC", () => {
+      const buf = new TerminalCaptureBuffer();
+      // The held ESC is completed by the next byte: "ESC a" would be a real
+      // two-byte sequence, so the follow-up starts with a non-final byte.
+      buf.append("x\x1b");
+      buf.append("\nabc");
+      expect(buf.getText()).toBe("x\nabc");
+    });
+
+    it("drops a DCS payload longer than the hold cap split across chunks", () => {
+      const payload = "q" + "#0;2;0;0;0".repeat(50);
+      const buf = new TerminalCaptureBuffer();
+      buf.append("a\x1bP" + payload);
+      buf.append(payload);
+      buf.append("\x1b\\b\n");
+      expect(buf.getText()).toBe("ab");
+    });
+
+    it("keeps text after a SUB-cancelled string, split or in one chunk", () => {
+      const buf = new TerminalCaptureBuffer();
+      buf.append("a\x1b]0;title\x1abc\n");
+      buf.append("d\x1bPpayload");
+      buf.append("\x1aef\n");
+      expect(buf.getText()).toBe("abc\ndef");
+    });
+
+    it("resetEscapeState drops an unterminated string so the next output is kept", () => {
+      const buf = new TerminalCaptureBuffer();
+      buf.append("a\x1bPpayload");
+      buf.resetEscapeState();
+      buf.append("Password: ");
+      expect(buf.getText()).toBe("aPassword: ");
+    });
+
     it("removes C0 control characters except newline, carriage-return, and tab", () => {
       const buf = new TerminalCaptureBuffer();
       buf.append("bell\x07here\n");

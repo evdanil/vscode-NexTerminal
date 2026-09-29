@@ -1,10 +1,16 @@
 # Changelog
 
-## [2.8.306] — 2026-09-29
+## [2.8.308] — 2026-09-29
 
 ### Fixed
 
 - **SSH, Telnet and tunnel starts are no longer cancelled by an unchanged save or Refresh.** A pending Connect or Start Tunnel compared the profile by object identity, so saving a server or tunnel without changes (or refreshing after another window wrote settings) silently cancelled it. Starts now compare only the fields the connection uses (address, port, protocol, credentials, proxy and the like; a folder rename or notes edit does not count), like Serial and Local Shell. A real change or removal cancels with a visible notice. For a Connect the check runs once, just before the terminal opens; once the terminal is open (including during a password or verification prompt, or the Telnet dial) the session keeps the settings it started with and an edit applies at the next connect. A tunnel start is checked before the tunnel manager starts and again when it returns, so an edit during the registry check, the shared-mode login or the tunnel handshake stops the tunnel once the start returns. The notice offers **Retry** on the current settings when the profile still exists (Retry repeats the original action, such as Connect and Run Script; a macro's IPMI-gateway connect offers no Retry and says to re-run the macro; and a tunnel retry targets the same server, or reports it removed rather than starting elsewhere), and a cancelled tunnel start no longer registers briefly before being stopped. The auto-start tunnel sweep now starts tunnels with the config the session connected with and, if the server's connection settings changed since the session opened, skips them with a warning to close and reopen the terminal; a rename or other non-connection edit no longer blocks auto-start on an **R** reconnect.
+
+## [2.8.307] — 2026-09-29
+
+### Fixed
+
+- **Kitty keyboard, modifyOtherKeys, cursor-shape and save/restore-cursor sequences no longer leak into captured text.** The shared ANSI stripper now follows the ECMA-48 CSI grammar (`<` `=` `>` `?` parameter prefixes and intermediate bytes such as `ESC[2 q`) and removes two-byte forms like `ESC 7`, `ESC 8`, `ESC =` and `ESC >`, plus terminated DCS/APC/PM/SOS strings. Copy All, session transcripts and script `waitFor`/`expect` matching no longer show fragments such as `[>4;2m` or `[=5u`, so end-anchored prompt patterns match after vim, fish or neovim output, even when a sequence (including a terminal title) is split across two chunks: Copy All, transcripts, script output and macro trigger matching each strip the same text however the output is split into chunks: an unfinished escape is held until the next chunk, an escape over 512 characters is text, and an unterminated OSC/DCS/APC/PM/SOS payload (Sixel, Kitty graphics, XTGETTCAP) is dropped until its terminator or an aborting ESC, giving up after 1 MiB. An SSH reconnect and a Smart Follow reattach start each of them from a clean slate, so an escape the lost connection or device left unfinished cannot swallow its replacement's prompt. Private-prefix CSI ending in `m` (such as `ESC[>4;m`) is no longer mistaken for an SGR reset by the highlighter.
 
 ## [2.8.305] — 2026-09-29
 
