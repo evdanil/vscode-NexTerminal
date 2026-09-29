@@ -57,6 +57,25 @@ function friendlyOpenError(portPath: string, error: Error): Error {
   return error;
 }
 
+const CLOSE_RETRY_DELAYS_MS = [50, 150];
+
+/** Resolves with the last close error, or undefined once the port closed. */
+async function closeWithRetry(port: PortRecord): Promise<Error | undefined> {
+  let lastError: Error | undefined;
+  for (let attempt = 0; attempt <= CLOSE_RETRY_DELAYS_MS.length; attempt += 1) {
+    if (attempt > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, CLOSE_RETRY_DELAYS_MS[attempt - 1]));
+    }
+    lastError = await new Promise<Error | undefined>((resolve) => {
+      port.close((error) => resolve(error ?? undefined));
+    });
+    if (!lastError) {
+      return undefined;
+    }
+  }
+  return lastError;
+}
+
 export function createSerialSidecarRequestHandler(dependencies: {
   loadSerialModule?: () => SerialPortModule | undefined;
   writeLine?: (message: RpcResponse | RpcNotification) => void;
@@ -177,9 +196,17 @@ export function createSerialSidecarRequestHandler(dependencies: {
         if (ports.get(sessionId) === port) {
           ports.delete(sessionId);
         }
-        await new Promise<void>((resolve) => {
-          port.close(() => resolve());
-        });
+        const closeError = await closeWithRetry(port);
+        if (closeError) {
+          // The descriptor may still be held. Keep the port and its listeners
+          // tracked under its id so a later closePort can retry, and say so.
+          ports.set(sessionId, port);
+          writeLine({
+            method: PORT_ERROR_NOTIFICATION,
+            params: { sessionId, message: `Could not release cancelled port: ${closeError.message}` }
+          });
+          return response(request.id, undefined, `Serial port open cancelled; close failed: ${closeError.message}`);
+        }
         port.removeAllListeners();
         return response(request.id, undefined, "Serial port open cancelled");
       }
@@ -242,9 +269,15 @@ export function createSerialSidecarRequestHandler(dependencies: {
         return response(request.id, { ok: true });
       }
       ports.delete(params.sessionId);
-      await new Promise<void>((resolve, reject) => {
-        port.close((error) => (error ? reject(error) : resolve()));
-      });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          port.close((error) => (error ? reject(error) : resolve()));
+        });
+      } catch (error) {
+        // Still possibly open: stay reachable so the close can be retried.
+        ports.set(params.sessionId, port);
+        throw error;
+      }
       return response(request.id, { ok: true });
     }
 

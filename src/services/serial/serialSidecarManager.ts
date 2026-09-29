@@ -17,6 +17,13 @@ type DataListener = (sessionId: string, data: Buffer) => void;
 type ErrorListener = (sessionId: string, message: string) => void;
 type DisconnectListener = (sessionId: string, reason: string) => void;
 
+/**
+ * The manager gave up waiting; the worker never answered, so whatever the
+ * request started there may still be running. Distinct from a worker-reported
+ * error, which means the worker already settled the request.
+ */
+class SerialRpcTimeoutError extends Error {}
+
 interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (error: unknown) => void;
@@ -90,7 +97,10 @@ export class SerialSidecarManager {
         requestedSessionId !== undefined ? { ...params, sessionId: requestedSessionId } : params
       );
     } catch (error) {
-      if (requestedSessionId !== undefined) {
+      // Only a timeout leaves the worker's open in flight. A worker-reported
+      // error (e.g. "session ID is already in use") settled the request, and a
+      // cancel there would close the legitimate session that owns that id.
+      if (requestedSessionId !== undefined && error instanceof SerialRpcTimeoutError) {
         this.cancelAbandonedOpen(child, requestedSessionId);
       }
       throw error;
@@ -103,7 +113,7 @@ export class SerialSidecarManager {
   }
 
   /**
-   * After a client-side timeout the worker is still waiting on the native open
+   * After a client-side RPC timeout the worker is still waiting on the native open
    * and would keep the port once it succeeds. Tell that same worker to cancel.
    * This writes to the child that owned the open and never goes through
    * ensureStarted(): if it was disposed or exited, its ports died with it and
@@ -191,7 +201,7 @@ export class SerialSidecarManager {
           return;
         }
         this.pending.delete(id);
-        pending.reject(new Error(`Serial sidecar RPC timed out after ${this.rpcTimeoutMs / 1000}s (method=${method})`));
+        pending.reject(new SerialRpcTimeoutError(`Serial sidecar RPC timed out after ${this.rpcTimeoutMs / 1000}s (method=${method})`));
       }, this.rpcTimeoutMs);
       this.pending.set(id, deferred);
     });
