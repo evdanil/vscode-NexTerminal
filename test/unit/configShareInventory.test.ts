@@ -2400,6 +2400,7 @@ describe("a share never hands over a shell command or an unattended tunnel (#254
     { id: "t1", name: "socks", tunnelType: "dynamic", localPort: 1080, remoteIP: "0.0.0.0", remotePort: 0, localBindAddress: "0.0.0.0", defaultServerId: "s1", autoStart: true, connectionMode: "shared" },
     { id: "t2", name: "rev", tunnelType: "reverse", localPort: 22, remoteIP: "0.0.0.0", remotePort: 2222, remoteBindAddress: "0.0.0.0", localTargetIP: "10.0.0.5", defaultServerId: "s1", autoStart: true },
     { id: "t3", name: "web", localPort: 18080, remoteIP: "127.0.0.1", remotePort: 80, defaultServerId: "s1", autoStart: false, browserUrl: "http://admin:secret@localhost:{localPort}/" },
+    { id: "t5", name: "blank", localPort: 18082, remoteIP: "127.0.0.1", remotePort: 82, defaultServerId: "s1", autoStart: false, remoteBindAddress: "" },
     { id: "t4", name: "kept", localPort: 18081, remoteIP: "127.0.0.1", remotePort: 81, defaultServerId: "s1", autoStart: false, remoteBindAddress: "127.0.0.1", browserUrl: "http://localhost:{localPort}/a@b" }
   ];
 
@@ -2445,7 +2446,7 @@ describe("a share never hands over a shell command or an unattended tunnel (#254
     );
 
     const tunnels = recipient.core.getSnapshot().tunnels;
-    expect(tunnels).toHaveLength(4);
+    expect(tunnels).toHaveLength(5);
     for (const tunnel of tunnels) {
       expect(tunnel.autoStart).toBe(false);
       expect(tunnel.localBindAddress).toBeUndefined();
@@ -2457,11 +2458,22 @@ describe("a share never hands over a shell command or an unattended tunnel (#254
     expect(byName("web").browserUrl).toBe("http://localhost:{localPort}/");
     expect(byName("kept").browserUrl).toBe("http://localhost:{localPort}/a@b");
     expect(JSON.stringify(tunnels)).not.toContain("secret@");
-    expect(lastInfoMessage()).toContain("2 tunnels arrived with auto-start off and a loopback-only listener");
+    expect(lastInfoMessage()).toContain("3 tunnels arrived with auto-start off and a loopback-only listener");
   });
 
   it("export: none of auto-start, a bind address or a URL login survives (⊘ \"keep\")", () => {
     const [t] = hostileTunnels;
+    for (const browserUrl of [
+      "admin:secret@localhost:{localPort}",
+      "//admin:secret@host:{localPort}/x",
+      "https://admin:secret@localhost:{localPort}/?a=b@c"
+    ]) {
+      const shared = sanitizeForSharing([], [{ ...t, browserUrl } as unknown as TunnelProfile], [], []);
+      expect(shared.tunnels[0].browserUrl).not.toContain("secret@");
+    }
+    // A path or query that merely contains an "@" is not a credential.
+    const plain = sanitizeForSharing([], [{ ...t, browserUrl: "http://localhost:{localPort}/@me?x=a@b" } as unknown as TunnelProfile], [], []);
+    expect(plain.tunnels[0].browserUrl).toBe("http://localhost:{localPort}/@me?x=a@b");
     const out = sanitizeForSharing(
       [],
       [
@@ -2501,6 +2513,29 @@ describe("duplicate ids inside one share (#257)", () => {
     expect(snapshot.authProfiles.map((p) => p.name)).toEqual(["First"]);
     expect(snapshot.servers[0].authProfileId).toBe(snapshot.authProfiles[0].id);
     expect(lastInfoMessage()).toBe("Imported 2 profiles (1 skipped).");
+  });
+
+  it("a malformed first row does not reserve the id: the first VALID row under it lands (⊘ reserving the id before validation, which skips both)", async () => {
+    const recipient = await makeMachine();
+    await importShare(recipient, shareJson({ servers: [{ ...dup("Bad", "192.0.2.1"), host: "" }, dup("B", "192.0.2.2"), dup("C", "192.0.2.3")] }));
+
+    expect(recipient.core.getSnapshot().servers.map((s) => s.name)).toEqual(["B"]);
+    expect(lastInfoMessage()).toBe("Imported 1 profiles (2 skipped).");
+  });
+
+  it("same for auth profiles: a malformed first row does not cost the valid second one", async () => {
+    const recipient = await makeMachine();
+    await importShare(
+      recipient,
+      shareJson({
+        authProfiles: [{ ...makeProfile({ id: "ap", name: "Bad" }), authType: "nope" }, makeProfile({ id: "ap", name: "Good", username: "user" })],
+        servers: [makeServer({ id: "s", name: "Linked", username: "user", authProfileId: "ap" })]
+      })
+    );
+
+    const snapshot = recipient.core.getSnapshot();
+    expect(snapshot.authProfiles.map((p) => p.name)).toEqual(["Good"]);
+    expect(snapshot.servers[0].authProfileId).toBe(snapshot.authProfiles[0].id);
   });
 
   it("two rows with blank ids both import (ensureId gives each its own)", async () => {

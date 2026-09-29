@@ -7079,7 +7079,7 @@ describe("complete reset", () => {
     expect(await vault.get("passphrase-s1")).toBeUndefined();
     expect(await vault.get("auth-profile-password-ap1")).toBeUndefined();
     expect(await vault.get("auth-profile-passphrase-ap1")).toBeUndefined();
-    expect(mockShowInformationMessage).toHaveBeenCalledWith("All Nexus data has been deleted.");
+    expect(mockShowInformationMessage).toHaveBeenCalledWith("Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files and session logs were kept.");
   });
 
   it("aborts when user cancels warning", async () => {

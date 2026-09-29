@@ -8,8 +8,7 @@ import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials, cloneTempla
 import type { InventorySourceConfig, InventorySourceValues, TemplateRule } from "../models/inventory";
 import { inventorySecretKey } from "../models/inventory";
 import type { DeviceTemplateProfile, TemplateField } from "../models/deviceTemplate";
-import { LOCAL_SHELL_AUTOTRIGGER_WARNING_KEY } from "../storage/noticeKeys";
-import { ACTIVE_SCHEME_KEY, FONT_KEY, SCHEMES_KEY } from "../storage/vscodeColorSchemeStorage";
+import { RESET_CLEARED_GLOBAL_STATE_KEYS } from "../storage/globalStateKeys";
 import type { LocalServerConfig } from "../models/localServer";
 import type { DhcpConfigProfile, TftpConfigProfile } from "../models/networkServerProfile";
 import type { SavedFilterDefinition } from "../models/savedFilter";
@@ -1986,20 +1985,23 @@ function loopbackAddressOnly(value: string | undefined): string | undefined {
  * `browserUrl` without a login typed into it. It holds a `{localPort}`
  * placeholder, so it usually does not parse as a URL (`stripUrlUserinfo` would
  * hand it back untouched); the authority is cut out by hand instead: whatever
- * sits between `scheme://` and the first `/`, `?` or `#` loses everything up to
- * its last `@`.
+ * sits between `scheme://` (or `//`, or nothing) and the first `/`, `?` or `#`
+ * loses everything up to its last `@`.
  */
 function stripBrowserUrlUserinfo(value: string | undefined): string | undefined {
   if (typeof value !== "string") {
     return value;
   }
-  return value.replace(/^([a-z][a-z0-9+.-]*:\/\/)([^/?#]*)@/i, "$1");
+  // The scheme is optional, so `admin:secret@localhost:{localPort}` and
+  // `//admin:secret@host/` lose their login too; whatever precedes the first
+  // `/`, `?` or `#` is the authority, and only an authority can hold userinfo.
+  return value.replace(/^((?:[a-z][a-z0-9+.-]*:)?\/\/)?[^/?#]*@/i, (_match, prefix: string | undefined) => prefix ?? "");
 }
 
 /** Whether a tunnel record as read from a file carries anything `SHARED_TUNNEL_RULES` resets. */
 function tunnelHadResetSettings(tunnel: TunnelProfile): boolean {
   const nonLoopback = (address: unknown): boolean =>
-    typeof address === "string" && address.trim() !== "" && loopbackAddressOnly(address) === undefined;
+    typeof address === "string" && loopbackAddressOnly(address) === undefined;
   return tunnel.autoStart === true || nonLoopback(tunnel.localBindAddress) || nonLoopback(tunnel.remoteBindAddress);
 }
 
@@ -3535,8 +3537,8 @@ export function registerConfigCommands(
 
     // These are file-controlled lists. Filter before the ID pre-pass or any
     // earlier collection writes, and carry each bad row into the one summary.
-    const rawAuthProfiles = recordRows<AuthProfile>(data.authProfiles);
-    const rawServers = recordRows<ServerConfig>(data.servers);
+    const authProfiles = recordRows<AuthProfile>(data.authProfiles);
+    const servers = recordRows<ServerConfig>(data.servers);
     const tunnels = recordRows<TunnelProfile>(data.tunnels);
     const serialProfiles = recordRows<SerialProfile>(data.serialProfiles);
     const localShellProfiles = recordRows<LocalShellProfile>(data.localShellProfiles);
@@ -3551,33 +3553,16 @@ export function registerConfigCommands(
     const savedFilters = data.savedFilters ?? [];
 
     // First pass: assign new IDs for auth profiles and servers so links can be remapped.
-    //
-    // The first row under an id wins, as for templates and sources: a second one
-    // would replace the first's `idMap` entry, both would be written under that
-    // one fresh id, the upsert would overwrite the earlier record, and the tally
-    // would count both. It is skipped and counted instead. The check runs after
-    // `ensureId`, so two rows with blank ids, which it fills with distinct ids,
-    // both still import.
-    const firstRowPerId = <T extends { id: string }>(rows: T[]): T[] => {
-      const seenIds = new Set<string>();
-      const kept: T[] = [];
-      for (const row of rows) {
-        ensureId(row as unknown as Record<string, unknown>);
-        if (seenIds.has(row.id)) {
-          skipped++;
-          continue;
-        }
-        seenIds.add(row.id);
-        kept.push(row);
-      }
-      return kept;
-    };
-    const authProfiles = firstRowPerId(rawAuthProfiles);
-    const servers = firstRowPerId(rawServers);
+    // `ensureId` first, so two rows with blank ids get distinct ids and both
+    // import. Rows sharing an id share ONE fresh id here; the write loops below
+    // let only the first row that VALIDATES land under it (see `landedAuthIds`
+    // and `landedServerIds`), so every reference to the id resolves to it.
     for (const profile of authProfiles) {
+      ensureId(profile as unknown as Record<string, unknown>);
       idMap.set(profile.id, randomUUID());
     }
     for (const server of servers) {
+      ensureId(server as unknown as Record<string, unknown>);
       idMap.set(server.id, randomUUID());
     }
 
@@ -3614,11 +3599,22 @@ export function registerConfigCommands(
     // before validation: a hand-edited file cannot land a login, a key path or a
     // member the model does not declare, and a malformed key path cannot cost
     // the profile.
+    //
+    // The first row under an id that VALIDATES wins, as for templates and
+    // sources: a later row with the same id would be written under the same fresh
+    // id and overwrite it (the upsert) while still being counted. It is skipped
+    // and counted instead; a malformed earlier row does not reserve the id.
+    const landedAuthIds = new Set<string>();
     for (const profile of authProfiles) {
+      if (landedAuthIds.has(profile.id)) {
+        skipped++;
+        continue;
+      }
       const newId = idMap.get(profile.id)!;
       const remappedProfile = shareRecord(profile, SHARED_AUTH_PROFILE_RULES, { id: () => newId }) as AuthProfile;
       const added = await addIfValid(remappedProfile, validateAuthProfile, (e) => core.addOrUpdateAuthProfile(e));
       if (added) {
+        landedAuthIds.add(profile.id);
         importedProfiles.set(newId, remappedProfile);
       }
       tally(added);
@@ -3825,6 +3821,9 @@ export function registerConfigCommands(
      */
     const remappedServers: ServerConfig[] = [];
     const importedServerIds = new Set<string>();
+    // Payload ids of servers that will land: the first VALID row under an id wins
+    // (see `landedAuthIds`); a later valid one is skipped and counted.
+    const landedServerIds = new Set<string>();
     for (const server of servers) {
       // The sync's own link to a key profile that landed with no key file is
       // left out with its stamp, exactly as on export — and only on a row that
@@ -3889,8 +3888,14 @@ export function registerConfigCommands(
       // surviving-server set is known (`linkToImportedServer`), because a raw
       // remap alone keeps a fresh id even for a gateway that failed import.
       const remappedServer = shareServer(server, idMap.get(server.id)!, lenses, origin, origin !== undefined && syncAuthLinkUnusable);
+      const serverIsValid = validateServerConfig(remappedServer);
+      if (serverIsValid && landedServerIds.has(server.id)) {
+        skipped++;
+        continue;
+      }
       remappedServers.push(remappedServer);
-      if (validateServerConfig(remappedServer)) {
+      if (serverIsValid) {
+        landedServerIds.add(server.id);
         importedServerIds.add(remappedServer.id);
       }
     }
@@ -5234,9 +5239,9 @@ export function registerConfigCommands(
     const confirm = await vscode.window.showWarningMessage(
       "This will permanently delete ALL servers, tunnels, serial profiles, local shell profiles, Local Server profiles, " +
         "saved TFTP/DHCP profiles, inventory sources, device templates, saved filters, macros, groups, and saved passwords, " +
-        "Terminal Appearance colour schemes and font choice, and reset every Nexus setting. " +
-        "Values Terminal Appearance already wrote into your VS Code user settings (terminal colours and font) stay as they are; " +
-        "trusted SSH host keys, script files and session logs are kept too. Running Local Servers and TFTP/DHCP services are stopped before their configuration is removed. " +
+        "Terminal Appearance colour schemes and font choice, and remembered view state and dismissed hints, and reset every Nexus setting. " +
+        "Kept: values Terminal Appearance already wrote into your VS Code user settings (terminal colours and font), " +
+        "trusted SSH host keys, script files, session logs, the one-time ~/.ssh/config import offer and settings-guard bookkeeping. Running Local Servers and TFTP/DHCP services are stopped before their configuration is removed. " +
         "Open sessions and tunnels will be closed. " +
         "This cannot be undone.",
       { modal: true },
@@ -5344,16 +5349,17 @@ export function registerConfigCommands(
       // Clear macros (globalState + vault entries)
       await getActiveMacroStore().clearAll();
       if (context) {
-        await context.globalState.update("nexus.macros.migrationNoticeShown", undefined);
-        // The Local Shell auto-trigger acknowledgement belongs to the
+        // Notices, hints, collapsed-folder and follow-directory choices, and the
+        // Terminal Appearance store (schemes, selection, font), which lives in
+        // globalState outside NexusCore. The Local Shell auto-trigger
+        // acknowledgement is among them because it belongs to the
         // `nexus.terminal.macros.autoTrigger` setting reset just below: left
-        // behind, a user who once chose Disable would get auto-trigger back on
-        // and never see the warning again.
-        await context.globalState.update(LOCAL_SHELL_AUTOTRIGGER_WARNING_KEY, undefined);
-        // Terminal Appearance keeps its own store in globalState, outside NexusCore.
-        await context.globalState.update(SCHEMES_KEY, undefined);
-        await context.globalState.update(ACTIVE_SCHEME_KEY, undefined);
-        await context.globalState.update(FONT_KEY, undefined);
+        // behind, a user who once chose Disable would get auto-trigger back on and
+        // never see the warning again. What stays is listed in
+        // RESET_KEPT_GLOBAL_STATE_KEYS.
+        for (const key of RESET_CLEARED_GLOBAL_STATE_KEYS) {
+          await context.globalState.update(key, undefined);
+        }
       }
       // The running service caches those values and an open panel shows them.
       await runtime?.resetTerminalAppearance?.();
@@ -5380,7 +5386,9 @@ export function registerConfigCommands(
     }
 
     if (failedTeardowns === 0) {
-      void vscode.window.showInformationMessage("All Nexus data has been deleted.");
+      void vscode.window.showInformationMessage(
+        "Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files and session logs were kept."
+      );
     }
   }
 

@@ -2136,7 +2136,7 @@ describe("bulk removal closes runtime owned by deleted profiles", () => {
       expect.stringContaining("connection could not be stopped"),
       "Reload Window"
     );
-    expect(mockShowInformationMessage).not.toHaveBeenCalledWith("All Nexus data has been deleted.");
+    expect(mockShowInformationMessage).not.toHaveBeenCalledWith("Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files and session logs were kept.");
   });
 
   it("Delete All Data reports a tunnel stop that never settles", async () => {
@@ -2162,7 +2162,7 @@ describe("bulk removal closes runtime owned by deleted profiles", () => {
         expect.stringContaining("connection could not be stopped"),
         "Reload Window"
       );
-      expect(mockShowInformationMessage).not.toHaveBeenCalledWith("All Nexus data has been deleted.");
+      expect(mockShowInformationMessage).not.toHaveBeenCalledWith("Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files and session logs were kept.");
     } finally {
       vi.useRealTimers();
     }
@@ -2253,7 +2253,7 @@ describe("Delete All Data (nexus.config.completeReset) covers Local Servers and 
     expect(snapshot.localServers).toEqual([]);
     expect(snapshot.tftpProfiles).toEqual([]);
     expect(snapshot.dhcpProfiles).toEqual([]);
-    expect(mockShowInformationMessage).toHaveBeenCalledWith("All Nexus data has been deleted.");
+    expect(mockShowInformationMessage).toHaveBeenCalledWith("Nexus profiles, credentials, settings and appearance data have been deleted. Trusted SSH host keys, script files and session logs were kept.");
   });
 
   it("runs the Local Server teardown for every profile, and stops the TFTP/DHCP services, BEFORE anything is removed", async () => {
@@ -2305,24 +2305,35 @@ describe("Delete All Data (nexus.config.completeReset) covers Local Servers and 
 
   it("clears Terminal Appearance data and the Local Shell auto-trigger acknowledgement, resets the running service, and says what it keeps (⊘ leaving nexus.colorSchemes / activeColorScheme / terminalFont and the acknowledgement behind)", async () => {
     const machine = await makeMachine();
-    for (const key of ["nexus.colorSchemes", "nexus.activeColorScheme", "nexus.terminalFont", "nexus.localShell.autoTriggerWarningShown"]) {
+    const cleared = [
+      "nexus.colorSchemes", "nexus.activeColorScheme", "nexus.terminalFont", "nexus.localShell.autoTriggerWarningShown",
+      "nexus.ui.collapsedFolders", "nexus.macros.ui.collapsedFolders", "nexus.ui.followTerminalDirectory",
+      "nexus.files.followTerminalNudgeShown", "nexus.macros.keybindingBlockerHintDismissed"
+    ];
+    for (const key of cleared) {
       machine.ctx.state.set(key, key === "nexus.colorSchemes" ? [{ id: "moba-1" }] : "seeded");
     }
     machine.ctx.state.set("nexus.ssh.knownHostFingerprints.v1", { "h:22": "SHA256:x" });
+    machine.ctx.state.set("nexus.import.sshConfigOffer.v1", true);
+    machine.ctx.state.set("nexus.settingsGuard.eventLog", []);
     const resetTerminalAppearance = vi.fn(async () => undefined);
     const runtime = { ...recordingRuntime(machine.core), resetTerminalAppearance };
 
     await runReset(machine, runtime);
 
-    for (const key of ["nexus.colorSchemes", "nexus.activeColorScheme", "nexus.terminalFont", "nexus.localShell.autoTriggerWarningShown"]) {
+    for (const key of cleared) {
       expect(machine.ctx.state.has(key)).toBe(false);
     }
     expect(resetTerminalAppearance).toHaveBeenCalledTimes(1);
     // Deliberately kept, and named in the confirmation.
     expect(machine.ctx.state.has("nexus.ssh.knownHostFingerprints.v1")).toBe(true);
+    expect(machine.ctx.state.has("nexus.import.sshConfigOffer.v1")).toBe(true);
+    expect(machine.ctx.state.has("nexus.settingsGuard.eventLog")).toBe(true);
+    expect(mockShowInformationMessage).not.toHaveBeenCalledWith("All Nexus data has been deleted.");
     const confirmation = String(mockShowWarningMessage.mock.calls[0]?.[0]);
     expect(confirmation).toContain("Terminal Appearance colour schemes and font choice");
     expect(confirmation).toContain("VS Code user settings");
-    expect(confirmation).toContain("trusted SSH host keys, script files and session logs are kept");
+    expect(confirmation).toContain("trusted SSH host keys, script files, session logs, the one-time ~/.ssh/config import offer and settings-guard bookkeeping");
+    expect(confirmation).toContain("remembered view state and dismissed hints");
   });
 });
