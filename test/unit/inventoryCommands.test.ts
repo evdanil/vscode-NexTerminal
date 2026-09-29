@@ -3575,6 +3575,84 @@ describe("inventoryCommands", () => {
         );
       });
 
+      /** A vault whose deletes park until released, recording the peak number in flight. */
+      function gatedVault(failKey?: string) {
+        const base = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "tok" });
+        const state = { inFlight: 0, peak: 0, started: [] as string[], waiting: [] as Array<() => void> };
+        base.delete = vi.fn(async (key: string) => {
+          if (key === inventorySecretKey("src-1", "apiToken")) return;
+          state.started.push(key);
+          state.inFlight++;
+          state.peak = Math.max(state.peak, state.inFlight);
+          await new Promise<void>((resolve) => state.waiting.push(resolve));
+          state.inFlight--;
+          if (key === failKey) throw new Error("keyring locked");
+        });
+        const release = async () => {
+          // Drain until quiet: releasing a delete lets the pool start the next ones.
+          for (let i = 0; i < 2000; i++) {
+            await new Promise((r) => setTimeout(r, 0));
+            const batch = state.waiting.splice(0);
+            if (batch.length === 0 && state.inFlight === 0) break;
+            batch.forEach((fn) => fn());
+          }
+        };
+        return { vault: base, state, release };
+      }
+
+      async function syncManyAdds(vault: ReturnType<typeof makeVault>, count: number) {
+        const devices = Array.from({ length: count }, (_, i) => ({
+          externalId: `device:${i}`,
+          name: `vm-${i}`,
+          endpoints: [{ kind: "ssh" as const, host: `10.1.0.${i + 1}`, port: 22 }]
+        }));
+        const core = new NexusCore(new InMemoryConfigRepository());
+        await core.initialize();
+        const registry = new InventoryProviderRegistry();
+        registry.register(makeProvider({ fetchInventory: vi.fn(async () => ({ contractVersion: 1 as const, devices })) }));
+        registerInventoryCommands(core, registry, vault, makeTeardown());
+        await core.addOrUpdateInventorySource(makeSource());
+        mockShowInformationMessage.mockResolvedValueOnce("Apply");
+        const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+        const done = Promise.resolve(registeredCommands.get("nexus.inventory.syncNow")!("src-1"));
+        return { core, applySpy, done };
+      }
+
+      it("clears the add-time secrets of a large sync with several deletes in flight, and applies only after every delete settled (kills the serial per-add loop that holds configMutationLock for 3 x adds round trips, and kills publishing without awaiting)", async () => {
+        const { vault, state, release } = gatedVault();
+        const { core, applySpy, done } = await syncManyAdds(vault, 100);
+
+        await vi.waitFor(() => expect(state.peak).toBeGreaterThanOrEqual(8));
+        expect(applySpy).not.toHaveBeenCalled();
+        expect(state.peak).toBeLessThanOrEqual(16);
+
+        await release();
+        await done;
+
+        expect(state.started).toHaveLength(300);
+        expect(new Set(state.started).size).toBe(300);
+        expect(applySpy).toHaveBeenCalledTimes(1);
+        expect(core.getSnapshot().servers).toHaveLength(100);
+      });
+
+      it("a single rejected delete in the concurrent clear still aborts with nothing applied (kills a pool that publishes adds whose own deletes succeeded)", async () => {
+        const failKey = passwordSecretKey(deterministicServerId("src-1", "device:37"));
+        const { vault, state, release } = gatedVault(failKey);
+        const { core, applySpy, done } = await syncManyAdds(vault, 100);
+
+        await vi.waitFor(() => expect(state.peak).toBeGreaterThan(1));
+        await release();
+        await done;
+
+        expect(applySpy).not.toHaveBeenCalled();
+        expect(core.getSnapshot().servers).toHaveLength(0);
+        // Fail closed also stops starting new clears once one has failed.
+        expect(state.started.length).toBeLessThan(300);
+        expect(mockShowErrorMessage).toHaveBeenCalledWith(
+          "Inventory sync failed: Could not clear old saved credentials for a server this sync adds from the system keychain — nothing was applied, try again."
+        );
+      });
+
       it("a first add with nothing under its id is published as before, and neither a password auth profile it links nor another server loses a saved secret (kills clearing the credential key connect resolves for the add instead of the add's own keys — for a linked password profile that key is the profile's, shared by every server linked to it)", async () => {
         const other = makeServer({ id: "hand-1", name: "bastion", host: "10.0.0.9", authType: "password" });
         const core = new NexusCore(new InMemoryConfigRepository([other]));
