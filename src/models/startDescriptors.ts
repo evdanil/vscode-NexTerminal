@@ -82,9 +82,13 @@ export interface TunnelDescriptorInputs extends ConnectDescriptorInputs {
 }
 
 /**
- * What a tunnel start uses. Unlike a terminal connect it never dials `altHost`
- * (an isolated tunnel goes through ProxySshFactory to the primary host; a shared
- * one leases the pool), and multiplexing matters only when the pool is used.
+ * What a tunnel start uses. A tunnel never dials `altHost` itself: an isolated
+ * one goes through ProxySshFactory to the primary host, and a shared one with
+ * multiplexing off bypasses the pool. But a shared, multiplexed tunnel leases
+ * the pool entry keyed by server id, and a terminal's alternate-host fallback
+ * (SshPty, sshPty.ts) can have established that entry against `altHost`, so an
+ * `altHost` edit changes which endpoint the lease reaches; it counts only when
+ * the pool is used. Multiplexing itself matters only when the mode is shared.
  */
 export function tunnelStartDescriptor(
   profile: TunnelProfile,
@@ -105,6 +109,8 @@ export function tunnelStartDescriptor(
       route = [profile.remoteIP, profile.remotePort, resolveTunnelLocalBindAddress(profile)];
       break;
   }
+  const multiplexed = mode === "shared" ? server.multiplexing ?? inputs.multiplexingDefault ?? true : null;
+  const altHost = typeof server.altHost === "string" && server.altHost.trim() !== "" ? server.altHost.trim() : null;
   return JSON.stringify([
     profile.id,
     type,
@@ -112,6 +118,8 @@ export function tunnelStartDescriptor(
     profile.localPort,
     route,
     transportDescriptor(server),
-    mode === "shared" ? server.multiplexing ?? inputs.multiplexingDefault ?? true : null
+    multiplexed,
+    // Only a pooled lease can inherit an alternate-host connection.
+    multiplexed === true ? altHost : null
   ]);
 }

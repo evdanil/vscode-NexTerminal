@@ -25,7 +25,7 @@ const SERVER_FIELDS: Record<keyof ServerConfig, { use: Use; why: string; alt: un
   port: { use: "connect+tunnel", why: "dialled port", alt: 2222 },
   addressless: { use: "connect+tunnel", why: "placeholder with nothing to dial", alt: true },
   protocol: { use: "connect+tunnel", why: "telnet vs ssh transport", alt: "telnet" },
-  altHost: { use: "connect", why: "SshPty fallback address; tunnels never dial it", alt: "alt.example" },
+  altHost: { use: "connect", why: "SshPty fallback address; tunnels never dial it (only a pooled lease can inherit it: see the shared-mode test)", alt: "alt.example" },
   username: { use: "connect+tunnel", why: "login", alt: "root" },
   authType: { use: "connect+tunnel", why: "login", alt: "key" },
   keyPath: { use: "connect+tunnel", why: "login key (key auth, or any server linked to an auth profile that may switch to key)", alt: "/k" },
@@ -97,13 +97,25 @@ describe("start descriptors — reported regressions", () => {
     expect(c).not.toBe(a);
   });
 
-  it("an altHost edit does not change a tunnel start but does change a terminal connect", () => {
+  it("an altHost edit does not change an isolated tunnel start but does change a terminal connect", () => {
     const edited = { ...server, altHost: "alt.example" };
-    for (const mode of ["isolated", "shared"] as const) {
-      const i = { mode, multiplexingDefault: true };
-      expect(tunnelStartDescriptor(tunnel, edited, i)).toBe(tunnelStartDescriptor(tunnel, server, i));
-    }
+    const i = { mode: "isolated" as const, multiplexingDefault: true };
+    expect(tunnelStartDescriptor(tunnel, edited, i)).toBe(tunnelStartDescriptor(tunnel, server, i));
     expect(connectDescriptor(edited, inputs)).not.toBe(connectDescriptor(server, inputs));
+  });
+
+  it("an altHost edit changes a shared, multiplexed tunnel start (the pooled lease may be via altHost)", () => {
+    const edited = { ...server, altHost: "alt.example" };
+    const i = { mode: "shared" as const, multiplexingDefault: true };
+    expect(tunnelStartDescriptor(tunnel, edited, i)).not.toBe(tunnelStartDescriptor(tunnel, server, i));
+    // A blank alt host is no alt host.
+    expect(tunnelStartDescriptor(tunnel, { ...server, altHost: "  " }, i)).toBe(tunnelStartDescriptor(tunnel, server, i));
+  });
+
+  it("an altHost edit is ignored by a shared tunnel when multiplexing is off (pool bypassed)", () => {
+    const off = { ...server, multiplexing: false };
+    const i = { mode: "shared" as const, multiplexingDefault: true };
+    expect(tunnelStartDescriptor(tunnel, { ...off, altHost: "alt.example" }, i)).toBe(tunnelStartDescriptor(tunnel, off, i));
   });
 });
 
