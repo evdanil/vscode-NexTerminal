@@ -72,6 +72,13 @@ describe("createAnsiRegex", () => {
       expect(run(["a\x1bPpayload", "more", `${cancel}Password: `])).toBe("aPassword: ");
     });
 
+    it("the 8-bit ST (U+009C) terminates DCS and OSC, in one chunk or split", () => {
+      expect(run(["a\x1bPpayload\x9cPassword: "])).toBe("aPassword: ");
+      expect(run(["a\x1b]0;title\x9cPassword: "])).toBe("aPassword: ");
+      expect(run(["a\x1bPpayload", "more\x9cPassword: "])).toBe("aPassword: ");
+      expect(run(["a\x1b]0;title", "more", "\x9cPassword: "])).toBe("aPassword: ");
+    });
+
     it("keeps text after an aborting ESC and after a bare ESC pair", () => {
       expect(run(["a\x1bPpayload", "more\x1b[31mred"])).toBe("ared");
     });

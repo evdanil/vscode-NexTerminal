@@ -237,6 +237,19 @@ describe("MacroAutoTrigger", () => {
     obs.dispose();
   });
 
+  it("an 8-bit ST ends a title string so the prompt after it still matches", () => {
+    setConfig([{ name: "pw", text: "secret\n", triggerPattern: "Password: $" }]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    obs.onOutput("\x1b]0;title");
+    obs.onOutput("\x9cPassword: ");
+    flush();
+    expect(sent).toEqual(["secret\n"]);
+    obs.dispose();
+  });
+
   it("defers writeBack to next event-loop turn", () => {
     setConfig([
       { name: "pw", text: "secret\n", triggerPattern: "Password:" }
