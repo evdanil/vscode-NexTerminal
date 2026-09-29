@@ -19,6 +19,8 @@ describe("createAnsiRegex", () => {
     ["DECKPNM", "\x1b>"],
     ["charset designation", "\x1b(B"],
     ["DECALN", "\x1b#8"],
+    ["nF with [ final", "\x1b(["],
+    ["nF with ] final", "\x1b#]"],
     ["DCS XTGETTCAP with ST", "\x1bP+q544e\x1b\\"],
     ["existing: SGR", "\x1b[1;31m"],
     ["existing: DEC private mode", "\x1b[?2004h"],
@@ -165,6 +167,7 @@ describe("stripChunk chunk-independence", () => {
     "a\x1b[31mred\x1b[0mb",
     "a\x1b[>4;2mb\x1b[=5ucd\x1b[<ue\x1b[?2004hf",
     "a\x1b[2 qb\x1b[!pc\x1b[1;2 !qd",
+    "a\x1b([b\x1b#]c\x1b[31md\x1b]0;t\x07e",
     "a\x1b7b\x1b8c\x1b=d\x1b>e\x1b(Bf\x1b#8g\x1b ~h",
     "a\x1b]0;title\x07b",
     "a\x1b]0;title\x1b\\b",
@@ -248,6 +251,16 @@ describe("stripChunk chunk-independence", () => {
         expect(stripFull(parts), JSON.stringify({ input, parts })).toEqual(whole);
       }
     }
+  });
+
+  it("nF sequences may end in [ or ], while a bare ESC [ or ESC ] still opens CSI or OSC", () => {
+    expect(stripAll(["a\x1b([b\x1b#]c"])).toBe("abc");
+    expect(stripAll(["a\x1b(", "[b\x1b#", "]c"])).toBe("abc");
+    expect(stripAll([..."a\x1b([b\x1b#]c"])).toBe("abc");
+    expect(strip("a\x1b([b\x1b#]c")).toBe("abc");
+    expect(stripAll(["a\x1b[31mb"])).toBe("ab");
+    expect(stripAll(["a\x1b]0;t\x07b"])).toBe("ab");
+    expect(strip("a\x1b[31mb\x1b]0;t\x07c")).toBe("abc");
   });
 
   it("strips a long real SGR (67 chars) whole and split", () => {

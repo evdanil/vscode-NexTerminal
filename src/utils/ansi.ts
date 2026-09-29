@@ -53,9 +53,11 @@
 // Byte classes are spelled as explicit hex ranges (ECMA-48): \x30-\x3F CSI
 // parameter bytes, \x20-\x2F intermediate bytes, \x40-\x7E CSI final bytes,
 // and \x30-\x5A \x5C \x5E-\x7E the two-byte ESC finals (0x30-0x7E without
-// `[` 0x5B and `]` 0x5D, which introduce CSI and OSC).
+// `[` 0x5B and `]` 0x5D, which introduce CSI and OSC). After at least one
+// intermediate byte the final is the full 0x30-0x7E, so `ESC ( [` and
+// `ESC # ]` are complete nF sequences.
 export function createAnsiRegex(): RegExp {
-  return /\x1b(?:\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]|\][^\x07\x18\x1a\x1b\x9c]*(?:[\x07\x18\x1a\x9c]|\x1b\\)?|[PX^_][^\x18\x1a\x1b\x9c]*(?:\x1b\\|[\x18\x1a\x9c])|[\x20-\x2F]*[\x30-\x5A\x5C\x5E-\x7E])/g;
+  return /\x1b(?:\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]|\][^\x07\x18\x1a\x1b\x9c]*(?:[\x07\x18\x1a\x9c]|\x1b\\)?|[PX^_][^\x18\x1a\x1b\x9c]*(?:\x1b\\|[\x18\x1a\x9c])|[\x30-\x5A\x5C\x5E-\x7E]|[\x20-\x2F]+[\x30-\x7E])/g;
 }
 
 // Longest CSI/nF escape stripChunk() will treat as a sequence, ESC included.
@@ -162,7 +164,7 @@ export function stripChunk(
         } else if (c >= 0x20 && c <= 0x2f && hold.length < MAX_ESCAPE_LENGTH) {
           hold += chunk[i];
           state = S.Nf;
-        } else if (c >= 0x30 && c <= 0x7e && c !== 0x5b && c !== 0x5d && hold.length < MAX_ESCAPE_LENGTH) {
+        } else if (c >= 0x30 && c <= 0x7e && (state === S.Nf || (c !== 0x5b && c !== 0x5d)) && hold.length < MAX_ESCAPE_LENGTH) {
           hold = "";
           state = S.Text;
         } else {
