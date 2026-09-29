@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { stripChunk } from "../utils/ansi";
+import { EMPTY_STRIP_CARRY, stripChunk, type StripCarry } from "../utils/ansi";
 import { normalizeBoundedNumber as clampLength } from "../utils/helpers";
 import { validateRegexSafety } from "../utils/regexSafety";
 import type { MacroTriggerScope, TerminalMacro } from "../models/terminalMacro";
@@ -413,7 +413,7 @@ export class MacroAutoTrigger implements vscode.Disposable {
     let disposed = false;
     // Incomplete escape tail of the previous chunk; not cleared with `buffer`
     // because the output stream continues across a buffer reset.
-    let escapeCarry = "";
+    let escapeCarry: StripCarry = EMPTY_STRIP_CARRY;
 
     const clearScheduledTimer = (stateKey: string): boolean => {
       const timer = scheduledTimers.get(stateKey);
@@ -594,7 +594,7 @@ export class MacroAutoTrigger implements vscode.Disposable {
         this.pauseOwnedIntervals(observerState);
         disposed = true;
         buffer = "";
-        escapeCarry = "";
+        escapeCarry = EMPTY_STRIP_CARRY;
         lastFired.clear();
         readyMatches.clear();
         ownedIntervals.clear();

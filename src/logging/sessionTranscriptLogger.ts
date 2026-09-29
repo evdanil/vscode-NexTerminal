@@ -1,7 +1,7 @@
 import { closeSync, existsSync, mkdirSync, openSync, renameSync, statSync, unlinkSync, write, writeSync } from "node:fs";
 import * as path from "node:path";
 import { normalizeLoggerRotationOptions, type LoggerRotationOptions } from "./terminalLogger";
-import { stripChunk } from "../utils/ansi";
+import { EMPTY_STRIP_CARRY, stripChunk, type StripCarry } from "../utils/ansi";
 
 // Control characters except \n, \r, \t
 const CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
@@ -74,7 +74,7 @@ const NO_FD = -1;
 /** A shared zero-length buffer: `owed` is never null, only empty. */
 const NO_BYTES = Buffer.alloc(0);
 
-function stripTerminalCodes(carry: string, data: string): { text: string; carry: string } {
+function stripTerminalCodes(carry: StripCarry, data: string): { text: string; carry: StripCarry } {
   const r = stripChunk(carry, data);
   return { text: r.text.replace(CTRL_RE, ""), carry: r.carry };
 }
@@ -290,7 +290,7 @@ class FileSessionTranscript implements SessionTranscript {
   }
 
   /** Incomplete escape tail of the previous write, so a sequence split across writes is stripped whole. */
-  private escapeCarry = "";
+  private escapeCarry: StripCarry = EMPTY_STRIP_CARRY;
 
   public write(data: string): void {
     if (this.closed) {

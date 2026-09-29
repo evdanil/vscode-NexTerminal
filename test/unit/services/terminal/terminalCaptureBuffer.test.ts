@@ -98,6 +98,15 @@ describe("TerminalCaptureBuffer", () => {
       expect(buf.getText()).toBe("x\nabc");
     });
 
+    it("drops a DCS payload longer than the hold cap split across chunks", () => {
+      const payload = "q" + "#0;2;0;0;0".repeat(50);
+      const buf = new TerminalCaptureBuffer();
+      buf.append("a\x1bP" + payload);
+      buf.append(payload);
+      buf.append("\x1b\\b\n");
+      expect(buf.getText()).toBe("ab");
+    });
+
     it("removes C0 control characters except newline, carriage-return, and tab", () => {
       const buf = new TerminalCaptureBuffer();
       buf.append("bell\x07here\n");

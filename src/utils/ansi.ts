@@ -30,11 +30,13 @@
 // so the back-off is load-bearing, not merely defensive.
 //
 // Chunk-wise consumers (capture buffer, script buffer, transcripts, macro
-// triggers) close this gap for OSC/DCS/APC/PM/SOS and for CSI with
-// stripChunk(), which holds an unfinished tail (at most 64 chars) until the
-// next chunk. The highlighter cannot: it must emit what it has. There a DCS
-// string split across chunks is stripped as a bare `ESC P` and its payload is
-// left behind, the same known gap as OSC.
+// triggers) close this gap with stripChunk(): an unfinished CSI/nF escape (at
+// most 64 chars) is held until the next chunk, and an unterminated
+// OSC/DCS/APC/PM/SOS string switches to a "discarding" state that drops the
+// payload across chunks until its terminator, giving up after 1 MiB. The
+// highlighter cannot do this: it must emit what it has. There a DCS string
+// split across chunks is stripped as a bare `ESC P` and its payload is left
+// behind, the same known gap as OSC.
 //
 // The durable fix is requiring the terminator here, so an unterminated OSC
 // reads as incomplete and safeCutIndex protects it exactly as it protects an
@@ -49,49 +51,93 @@ export function createAnsiRegex(): RegExp {
   return /\x1b(?:\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[PX^_][^\x07\x1b]*\x1b\\|[\x20-\x2F]*[\x30-\x5A\x5C\x5E-\x7E])/g;
 }
 
-// Longest trailing escape prefix a chunk-wise stripper will hold back. Real
-// CSI/nF sequences and terminal titles are far shorter; the cap keeps a stray
-// ESC from retaining data indefinitely.
+// Longest trailing CSI/nF escape prefix a chunk-wise stripper will hold back.
+// Real sequences are far shorter; the cap keeps a stray ESC from retaining
+// data indefinitely.
 const MAX_HELD_ESCAPE = 64;
+// An unterminated string sequence is discarded, not held, so its payload
+// (Sixel, Kitty graphics and XTGETTCAP run to kilobytes) never becomes text.
+// If no terminator arrives within this many characters the discard is
+// abandoned and output resumes as ordinary text, so a lone `ESC P` in binary
+// output cannot swallow the session.
+const MAX_DISCARDED_STRING = 1024 * 1024;
 const INCOMPLETE_ESCAPE_TAIL_RE = /\x1b(?:\[[\x30-\x3F]*[\x20-\x2F]*|[\x20-\x2F]+)?$/;
 // An OSC/DCS/APC/PM/SOS string still waiting for its terminator; a trailing
 // ESC may be the first half of ST (`ESC \`).
 const INCOMPLETE_STRING_TAIL_RE = /\x1b[\]PX^_][^\x07\x1b]*\x1b?$/;
 
 /**
- * Index where a trailing, not-yet-complete escape sequence starts, or -1:
- * a CSI/nF escape, or an OSC/DCS/APC/PM/SOS string without its terminator.
- * A chunk-wise stripper must not strip such a tail (it would leave the rest as
- * text once it arrives); it holds the tail and prepends it to the next chunk.
- * Only the last {@link MAX_HELD_ESCAPE} characters are considered, so an
- * unterminated sequence is released as text rather than retained forever.
+ * State a chunk-wise stripper carries between chunks. Opaque to callers:
+ * start from {@link EMPTY_STRIP_CARRY} and pass back what stripChunk returns.
+ * It belongs with the caller's stream, not with a display: clearing a buffer
+ * does not interrupt the byte stream, so it must not reset the carry.
  */
-export function findIncompleteEscapeStart(text: string): number {
-  const windowStart = Math.max(0, text.length - MAX_HELD_ESCAPE);
-  let start = -1;
-  const esc = text.lastIndexOf("\x1b");
-  if (esc >= windowStart && INCOMPLETE_ESCAPE_TAIL_RE.test(text.slice(esc))) {
-    start = esc;
-  }
-  const str = INCOMPLETE_STRING_TAIL_RE.exec(text.slice(windowStart));
-  if (str !== null) {
-    const at = windowStart + str.index;
-    start = start < 0 ? at : Math.min(start, at);
-  }
-  return start;
+export interface StripCarry {
+  /** Held CSI/nF prefix, or (while discarding) a lone trailing ESC that may start ST. */
+  readonly tail: string;
+  /** Terminator rules of the string being discarded: OSC ends at BEL or ST, the rest at ST only. */
+  readonly discarding: "" | "osc" | "st";
+  /** Characters dropped so far in the current discard, for the give-up bound. */
+  readonly discarded: number;
 }
 
+export const EMPTY_STRIP_CARRY: StripCarry = { tail: "", discarding: "", discarded: 0 };
+
 /**
- * Chunk-safe ANSI stripping: prepends the escape tail held back from the
- * previous chunk, strips everything complete, and returns the new tail to
- * carry. The carry belongs with the caller's stream state; it is not reset by
- * clearing a display or buffer, because the byte stream itself continues.
+ * Chunk-safe ANSI stripping. Returns the text with every complete escape
+ * removed and the carry for the next chunk:
+ * - a trailing incomplete CSI/nF escape is held (at most 64 chars);
+ * - a trailing unterminated OSC/DCS/APC/PM/SOS string is dropped and the
+ *   carry enters a discarding state that drops payload in later chunks until
+ *   the terminator, resuming normal text after it (or after 1 MiB, or when a
+ *   new ESC aborts the string).
  */
-export function stripChunk(carry: string, chunk: string): { text: string; carry: string } {
-  const joined = carry + chunk;
-  const hold = findIncompleteEscapeStart(joined);
-  if (hold < 0) {
-    return { text: joined.replace(createAnsiRegex(), ""), carry: "" };
+export function stripChunk(carry: StripCarry, chunk: string): { text: string; carry: StripCarry } {
+  let joined = carry.tail + chunk;
+  let text = "";
+
+  if (carry.discarding !== "") {
+    const end = (carry.discarding === "osc" ? /[\x07\x1b]/ : /\x1b/).exec(joined);
+    if (end === null) {
+      const discarded = carry.discarded + joined.length;
+      if (discarded > MAX_DISCARDED_STRING) {
+        // Give up: treat the rest as ordinary text, and never re-enter.
+        return { text: joined.replace(createAnsiRegex(), ""), carry: EMPTY_STRIP_CARRY };
+      }
+      return { text: "", carry: { tail: "", discarding: carry.discarding, discarded } };
+    }
+    let resume = end.index;
+    if (joined.charCodeAt(resume) === 0x07) {
+      resume += 1;
+    } else if (resume === joined.length - 1) {
+      // ESC at the very end: it may be the first half of ST.
+      return { text: "", carry: { tail: "\x1b", discarding: carry.discarding, discarded: carry.discarded + resume } };
+    } else if (joined.charCodeAt(resume + 1) === 0x5c) {
+      resume += 2;
+    }
+    // Any other ESC aborts the string and starts a new sequence at that ESC.
+    joined = joined.slice(resume);
   }
-  return { text: joined.slice(0, hold).replace(createAnsiRegex(), ""), carry: joined.slice(hold) };
+
+  const stringTail = INCOMPLETE_STRING_TAIL_RE.exec(joined);
+  if (stringTail !== null) {
+    const at = stringTail.index;
+    const half = stringTail[0].endsWith("\x1b") && stringTail[0].length > 2;
+    text = joined.slice(0, at).replace(createAnsiRegex(), "");
+    return {
+      text,
+      carry: {
+        tail: half ? "\x1b" : "",
+        discarding: joined.charCodeAt(at + 1) === 0x5d ? "osc" : "st",
+        discarded: stringTail[0].length - (half ? 1 : 0)
+      }
+    };
+  }
+
+  const windowStart = Math.max(0, joined.length - MAX_HELD_ESCAPE);
+  const esc = joined.lastIndexOf("\x1b");
+  if (esc >= windowStart && INCOMPLETE_ESCAPE_TAIL_RE.test(joined.slice(esc))) {
+    return { text: joined.slice(0, esc).replace(createAnsiRegex(), ""), carry: { tail: joined.slice(esc), discarding: "", discarded: 0 } };
+  }
+  return { text: joined.replace(createAnsiRegex(), ""), carry: EMPTY_STRIP_CARRY };
 }

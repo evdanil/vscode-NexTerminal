@@ -54,6 +54,20 @@ describe("createSessionTranscript", () => {
     expect(body).not.toContain("user@host");
   });
 
+  it("drops a DCS payload longer than the hold cap split across writes", () => {
+    const dir = makeTempDir();
+    const transcript = createSessionTranscript(dir, "dcs", true);
+    const payload = "q" + "#0;2;0;0;0".repeat(50);
+    transcript.write("a\x1bP" + payload);
+    transcript.write(payload);
+    transcript.write("\x1b\\b\n");
+    transcript.close();
+    const base = readdirSync(dir).find((name) => /^dcs_.*\.log$/.test(name))!;
+    const body = readFileSync(path.join(dir, base), "utf8");
+    expect(body).toContain("ab\n");
+    expect(body).not.toContain("#0;2");
+  });
+
   /**
    * The writer queues chunks and drains them asynchronously instead of doing a
    * blocking writeSync per chunk. What must not change: what ends up on disk,

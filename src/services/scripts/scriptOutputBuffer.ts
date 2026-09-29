@@ -1,4 +1,4 @@
-import { stripChunk } from "../../utils/ansi";
+import { EMPTY_STRIP_CARRY, stripChunk, type StripCarry } from "../../utils/ansi";
 
 export interface Match {
   text: string;
@@ -33,7 +33,7 @@ export class ScriptOutputBuffer {
   }
 
   /** Trailing incomplete escape held back so a sequence split across chunks is stripped whole. */
-  private carry = "";
+  private carry: StripCarry = EMPTY_STRIP_CARRY;
 
   public append(raw: string): void {
     const { text: stripped, carry } = stripChunk(this.carry, raw);

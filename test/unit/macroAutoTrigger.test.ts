@@ -207,6 +207,23 @@ describe("MacroAutoTrigger", () => {
     obs.dispose();
   });
 
+  it("does not let a long DCS payload split across chunks satisfy or block matching", () => {
+    setConfig([{ name: "pw", text: "secret\n", triggerPattern: "Password: $" }]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+    const payload = "q" + "Password: ".repeat(20);
+
+    obs.onOutput("\x1bP" + payload);
+    obs.onOutput(payload);
+    flush();
+    expect(sent).toEqual([]); // payload text must not match
+    obs.onOutput("\x1b\\Password: ");
+    flush();
+    expect(sent).toEqual(["secret\n"]);
+    obs.dispose();
+  });
+
   it("defers writeBack to next event-loop turn", () => {
     setConfig([
       { name: "pw", text: "secret\n", triggerPattern: "Password:" }

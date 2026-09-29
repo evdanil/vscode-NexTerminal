@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { stripChunk } from "../../utils/ansi";
+import { EMPTY_STRIP_CARRY, stripChunk, type StripCarry } from "../../utils/ansi";
 
 const CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
 const SCROLLBACK_SECTION = "terminal.integrated";
@@ -43,7 +43,7 @@ export class TerminalCaptureBuffer {
    * stripped whole. Not reset by clear(): Clear Scrollback does not interrupt
    * the byte stream, so the sequence's second half still arrives.
    */
-  private carry = "";
+  private carry: StripCarry = EMPTY_STRIP_CARRY;
   private maxLines: number;
   private readonly configSubscription: vscode.Disposable;
 
@@ -99,7 +99,7 @@ export class TerminalCaptureBuffer {
   public dispose(): void {
     this.configSubscription.dispose();
     this.clear();
-    this.carry = "";
+    this.carry = EMPTY_STRIP_CARRY;
   }
 
   /** Keep only the last MAX_PENDING_CHARS of an unterminated line. */

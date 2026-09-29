@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createAnsiRegex, stripChunk } from "../../src/utils/ansi";
+import { createAnsiRegex, EMPTY_STRIP_CARRY, stripChunk } from "../../src/utils/ansi";
 
 const strip = (s: string): string => s.replace(createAnsiRegex(), "");
 
@@ -37,12 +37,50 @@ describe("createAnsiRegex", () => {
     expect(strip(text)).toBe(text);
   });
 
-  it("holds an unterminated OSC/DCS tail, including a half ST, within the cap", () => {
-    expect(stripChunk("", "a\x1b]0;title")).toEqual({ text: "a", carry: "\x1b]0;title" });
-    expect(stripChunk("", "a\x1bP+q54\x1b")).toEqual({ text: "a", carry: "\x1bP+q54\x1b" });
-    expect(stripChunk("\x1b]0;title", "\x07$ ")).toEqual({ text: "$ ", carry: "" });
-    const long = "\x1b]0;" + "t".repeat(100);
-    expect(stripChunk("", long).carry).toBe("");
+  describe("stripChunk", () => {
+    const run = (chunks: string[]): string => {
+      let carry = EMPTY_STRIP_CARRY;
+      let out = "";
+      for (const c of chunks) {
+        const r = stripChunk(carry, c);
+        out += r.text;
+        carry = r.carry;
+      }
+      return out;
+    };
+
+    it("drops a DCS payload far longer than 64 chars split across two or three chunks", () => {
+      const payload = "q" + "#0;2;0;0;0".repeat(50);
+      expect(run(["a\x1bP" + payload, payload + "\x1b\\b"])).toBe("ab");
+      expect(run(["a\x1bP" + payload, payload, payload + "\x1b", "\\b"])).toBe("ab");
+      expect(run(["a\x1b_Gf=100;" + payload + "\x1b\\b"])).toBe("ab");
+    });
+
+    it("drops an OSC payload across chunks until BEL or ST", () => {
+      const title = "t".repeat(200);
+      expect(run(["a\x1b]0;" + title, title + "\x07b"])).toBe("ab");
+      expect(run(["a\x1b]0;" + title, "\x1b", "\\b"])).toBe("ab");
+    });
+
+    it("keeps text after an aborting ESC and after a bare ESC pair", () => {
+      expect(run(["a\x1bPpayload", "more\x1b[31mred"])).toBe("ared");
+    });
+
+    it("holds a split CSI within the 64-char cap and releases a longer run", () => {
+      expect(run(["a\x1b[>4;", "2mb"])).toBe("ab");
+      expect(run(["\x1b[" + "1".repeat(100)]).length).toBeGreaterThan(90);
+    });
+
+    it("gives up discarding after 1 MiB and resumes normal text", () => {
+      const big = "x".repeat(600 * 1024);
+      const out = run(["a\x1bP" + big, big, "visible"]);
+      expect(out.endsWith("visible")).toBe(true);
+      expect(out.startsWith("a")).toBe(true);
+    });
+
+    it("releases ordinary text after a trailing ESC that does not extend (control pass removes the ESC)", () => {
+      expect(run(["x\x1b", "\nabc"])).toBe("x\x1b\nabc");
+    });
   });
 
   it("leaves an incomplete CSI unmatched so the highlighter can hold it back", () => {

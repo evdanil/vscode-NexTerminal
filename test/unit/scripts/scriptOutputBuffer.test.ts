@@ -51,6 +51,16 @@ describe("ScriptOutputBuffer", () => {
     expect(buf.tail(20)).toBe("$ ");
   });
 
+  it("drops a DCS payload longer than the hold cap split across chunks", () => {
+    const payload = "q" + "#0;2;0;0;0".repeat(50);
+    const buf = new ScriptOutputBuffer();
+    buf.append("a\x1bP" + payload);
+    buf.append(payload);
+    buf.append("\x1b\\b$ ");
+    expect(buf.tail(50)).toBe("ab$ ");
+    expect(buf.scan("#0;2")).toBeNull();
+  });
+
   it("rolls trim when text exceeds capacity", () => {
     const buf = new ScriptOutputBuffer({ capacity: 10 });
     buf.append("1234567890");
