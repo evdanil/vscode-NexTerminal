@@ -1398,8 +1398,12 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
             // capture with what a tunnel would use now (live server, live profile,
             // live jump chain). A change after the capture means the terminal is on
             // the old credentials or route, so start nothing and say so (fail-safe);
-            // a change before it invalidated the pool entries, so the terminal
-            // already built its connection on the new state and the two agree. A
+            // a change before it was already reflected in the pool: NexusCore
+            // reports every in-memory server / auth-profile mutation synchronously,
+            // before persistence, and the pool entries built from the old settings
+            // (and those of the servers riding a changed jump) are soft-invalidated
+            // there (poolConfigInvalidation.ts), so the acquire built afresh and the
+            // two agree. A
             // rename or other non-connection edit changes neither side.
             const liveServer = ctx.core.getServer(server.id);
             const pending = liveServer

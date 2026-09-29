@@ -43,6 +43,7 @@ import { SudoElevationBroker } from "./services/sftp/sudoElevationBroker";
 import { SilentAuthSshFactory, proxyPasswordSecretKey } from "./services/ssh/silentAuth";
 import { createSshTransportStack } from "./services/ssh/sshTransportStack";
 import { pooledConnectionParamsChanged, serversRidingChangedJumps } from "./services/ssh/pooledConnectionParams";
+import { watchPoolInvalidationOnConfigMutation } from "./services/ssh/poolConfigInvalidation";
 import { watchSshPoolServerRemovals } from "./services/ssh/sshPoolServerRemovalObserver";
 import { Ssh2Connector } from "./services/ssh/ssh2Connector";
 import { VscodeHostKeyVerifier } from "./services/ssh/vscodeHostKeyVerifier";
@@ -1292,6 +1293,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     syncViews();
   });
   const unsubscribeRemovedSshServerPoolEntries = watchSshPoolServerRemovals(core, pool);
+  // Synchronous with the in-memory mutation, ahead of persistence and of the
+  // change event below, which stays as the backstop for wholesale replacement
+  // (initialize) that the mutation hook does not report.
+  const unsubscribeSyncPoolInvalidation = watchPoolInvalidationOnConfigMutation(core, pool);
   const unsubscribeCore = core.onDidChange((snapshot) => {
     syncViews();
     const invalidatedServerIds = new Set<string>();
@@ -1752,6 +1757,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     {
       dispose: () => {
         unsubscribeRemovedSshServerPoolEntries();
+        unsubscribeSyncPoolInvalidation();
         unsubscribeCore();
         unsubscribeProviderRegistry();
         const shutdownReason = "Nexus extension is shutting down. This session has been closed.";

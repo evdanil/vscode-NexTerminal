@@ -9,6 +9,7 @@ import { handleSocks5Handshake, sendSocks5Success } from "../../src/services/tun
 import { TunnelStoppedError, type TunnelEvent } from "../../src/services/tunnel/tunnelManager";
 import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import { watchPoolInvalidationOnConfigMutation } from "../../src/services/ssh/poolConfigInvalidation";
 import { watchSshPoolServerRemovals } from "../../src/services/ssh/sshPoolServerRemovalObserver";
 import { serversRidingChangedJumps } from "../../src/services/ssh/pooledConnectionParams";
 import type { PoolEvent } from "../../src/services/ssh/sshConnectionPool";
@@ -965,6 +966,34 @@ describe("TunnelManager — a shared tunnel stopped while its connection logs in
     const reconnect = await stack.pool.connect(target);
     cleanups.push(() => reconnect.dispose());
     expect(auth.callsFor(target.id)).toEqual(["via-proxy", "via-proxy"]);
+  });
+
+  it("an acquire that starts while a jump edit is still being persisted builds afresh, not on the stale pooled target", async () => {
+    const auth = createAuthFactory();
+    const target = targetServer({ type: "ssh", jumpHostId: jumpServer.id });
+    const stack = buildStack(auth, [jumpServer, target]);
+    let release!: () => void;
+    class SlowRepo extends InMemoryConfigRepository {
+      public override async saveServers(servers: ServerConfig[]): Promise<void> {
+        await new Promise<void>((resolve) => { release = resolve; });
+        return super.saveServers(servers);
+      }
+    }
+    const core = new NexusCore(new SlowRepo([jumpServer, target], []));
+    await core.initialize();
+    cleanups.push(watchPoolInvalidationOnConfigMutation(core, stack.pool));
+    const liveLease = await stack.pool.connect(target);
+    cleanups.push(() => liveLease.dispose());
+
+    const persisting = core.addOrUpdateServer({ ...jumpServer, host: "moved.example.test" });
+    // Persistence has not finished and no change event has fired, yet a reconnect
+    // in this window must not be handed the transport built through the old jump.
+    const reconnect = await stack.pool.connect(target);
+    cleanups.push(() => reconnect.dispose());
+    expect(auth.callsFor(target.id)).toEqual(["via-proxy", "via-proxy"]);
+    expect(auth.disposedIds).not.toContain(target.id);
+    release();
+    await persisting;
   });
 
   it("without invalidating dependents, a reconnect reuses the target transport built through the old jump (the gap the fix closes)", async () => {

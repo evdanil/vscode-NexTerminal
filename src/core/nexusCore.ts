@@ -64,6 +64,45 @@ type NexusListener = (snapshot: SessionSnapshot) => void;
 type ServerRemovalListener = (serverId: string) => void;
 
 /**
+ * A synchronous notification of one in-memory change to a server or auth
+ * profile record, fired immediately after the assignment and before any
+ * persistence await. `next` is undefined for a removal, `prev` for an addition.
+ */
+export type ConnectionConfigMutation =
+  | { kind: "server"; id: string; prev: ServerConfig | undefined; next: ServerConfig | undefined }
+  | { kind: "authProfile"; id: string; prev: AuthProfile | undefined; next: AuthProfile | undefined };
+type ConnectionConfigMutationListener = (mutation: ConnectionConfigMutation) => void;
+
+/**
+ * A Map that reports each `set` and `delete` synchronously. Every code path that
+ * assigns to the servers or auth-profiles collections (single edits, bulk sync,
+ * import, rollback) goes through these two methods, so none can bypass the
+ * notification. `clear` is deliberately silent: `initialize()` replaces the whole
+ * collection and its change event carries the full diff.
+ */
+class ObservedMap<V> extends Map<string, V> {
+  public constructor(private readonly onMutate: (id: string, prev: V | undefined, next: V | undefined) => void) {
+    super();
+  }
+
+  public override set(key: string, value: V): this {
+    const prev = this.get(key);
+    super.set(key, value);
+    this.onMutate(key, prev, value);
+    return this;
+  }
+
+  public override delete(key: string): boolean {
+    const prev = this.get(key);
+    const existed = super.delete(key);
+    if (existed) {
+      this.onMutate(key, prev, undefined);
+    }
+    return existed;
+  }
+}
+
+/**
  * Result of a sync engine run (see services/inventory/syncEngine.ts), reduced
  * to exactly what NexusCore needs to mutate in one atomic batch: which
  * servers to upsert/remove and which folders must exist. Defined here (not
@@ -151,7 +190,10 @@ export class FolderCascadeSaveError extends Error {
 export class NexusCore {
   private readonly listeners = new Set<NexusListener>();
   private readonly serverRemovalListeners = new Set<ServerRemovalListener>();
-  private readonly servers = new Map<string, ServerConfig>();
+  private readonly connectionConfigMutationListeners = new Set<ConnectionConfigMutationListener>();
+  private readonly servers = new ObservedMap<ServerConfig>((id, prev, next) =>
+    this.emitConnectionConfigMutation({ kind: "server", id, prev, next })
+  );
   private readonly tunnels = new Map<string, TunnelProfile>();
   private readonly serialProfiles = new Map<string, SerialProfile>();
   private readonly localShellProfiles = new Map<string, LocalShellProfile>();
@@ -191,7 +233,9 @@ export class NexusCore {
   private focusedSessionId: string | undefined = undefined;
   private remoteTunnels: TunnelRegistryEntry[] = [];
   private readonly explicitGroups = new Set<string>();
-  private readonly authProfiles = new Map<string, AuthProfile>();
+  private readonly authProfiles = new ObservedMap<AuthProfile>((id, prev, next) =>
+    this.emitConnectionConfigMutation({ kind: "authProfile", id, prev, next })
+  );
   private readonly inventorySources = new Map<string, InventorySourceConfig>();
   private readonly deviceTemplates = new Map<string, DeviceTemplateProfile>();
   private readonly savedFilters = new Map<string, SavedFilterDefinition>();
@@ -336,6 +380,19 @@ export class NexusCore {
   public onDidRemoveServer(listener: ServerRemovalListener): () => void {
     this.serverRemovalListeners.add(listener);
     return () => this.serverRemovalListeners.delete(listener);
+  }
+
+  /**
+   * Fires synchronously, right after each in-memory change to a server or auth
+   * profile and BEFORE its persistence await or the change event. Connection
+   * pool invalidation hangs here so that no reader can observe the new settings
+   * while the pool still hands out an entry built from the old ones. A rollback
+   * that restores a prior record fires again; the extra invalidation only costs
+   * a fresh connection later.
+   */
+  public onDidMutateConnectionConfig(listener: ConnectionConfigMutationListener): () => void {
+    this.connectionConfigMutationListeners.add(listener);
+    return () => this.connectionConfigMutationListeners.delete(listener);
   }
 
   public getServer(id: string): ServerConfig | undefined {
@@ -3200,6 +3257,16 @@ export class NexusCore {
         listener(snapshot);
       } catch (error) {
         console.error("[Nexus] NexusCore onDidChange listener threw; the change was persisted and other listeners still run:", error);
+      }
+    }
+  }
+
+  private emitConnectionConfigMutation(mutation: ConnectionConfigMutation): void {
+    for (const listener of this.connectionConfigMutationListeners) {
+      try {
+        listener(mutation);
+      } catch (error) {
+        console.error("[Nexus] NexusCore onDidMutateConnectionConfig listener threw; the mutation continues:", error);
       }
     }
   }
