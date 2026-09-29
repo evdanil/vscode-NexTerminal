@@ -48,8 +48,13 @@ export interface InventoryHostNormalization {
    * they take the engine-warning choke point in `computeSyncPlan`.
    */
   warnings: string[];
-  /** externalIds of devices whose ssh/telnet (primary or alternate) endpoint was rejected. */
-  rejectedConsoleDeviceIds: ReadonlySet<string>;
+  /**
+   * The normalized tree's device OBJECTS (by identity, not externalId) whose
+   * ssh/telnet (primary or alternate) endpoint was rejected. Identity, because
+   * a provider may repeat an externalId: the engine keeps the first row, so a
+   * malformed LATER duplicate must not condemn the valid first one.
+   */
+  rejectedConsoleDevices: ReadonlySet<InventoryDevice>;
 }
 
 export interface ComputeSyncPlanInput {
@@ -949,7 +954,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // The host normalizer's own lines are engine text, not provider text, so they
   // start the engine list (and are flattened with it at the return).
   const warnings: string[] = [...(input.hostNormalization?.warnings ?? [])];
-  const hostRejectedIds = input.hostNormalization?.rejectedConsoleDeviceIds;
+  const hostRejectedDevices = input.hostNormalization?.rejectedConsoleDevices;
 
   // AUTH 1 — the source names a profile by id; the caller supplies the profile
   // it resolved to. The engine only accepts the pair when the two agree.
@@ -1412,7 +1417,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     // skipped when only the ALTERNATE was rejected (primary fine) and when the
     // owned row is an addressless placeholder awaiting its fill-in: a device
     // whose source data is half-malformed is held back whole until it is clean.
-    if (isOwned && hostRejectedIds?.has(device.externalId)) {
+    if (isOwned && hostRejectedDevices?.has(device)) {
       warnings.push(`Device "${device.name}" (${device.externalId}) has an unusable host and was skipped.`);
       continue;
     }
@@ -4838,32 +4843,34 @@ export function prunedServerIdsForSecretCleanup(plan: InventorySyncPlan): string
 
 /**
  * Copy provider endpoints into the host spelling that sync and its remedies can
- * use. A malformed endpoint is removed from the copy; `rejectedConsoleDeviceIds`
+ * use. A malformed endpoint is removed from the copy; `rejectedConsoleDevices`
  * and `warnings` (engine-authored, so NOT merged into `tree.warnings`) tell
  * `computeSyncPlan` what was removed.
  */
 export function normalizeInventoryTreeHosts(tree: InventoryTree): { tree: InventoryTree } & InventoryHostNormalization {
   const warnings: string[] = [];
-  const rejectedConsoleDeviceIds = new Set<string>();
-  const normalized: InventoryTree = {
-    ...tree,
-    devices: tree.devices.map((device) => ({
-      ...device,
-      endpoints: device.endpoints.flatMap((endpoint) => {
-        const host = normalizeInventoryEndpointHost(endpoint.host);
-        if (host === undefined) {
-          // Device name is provider text: flattened where it enters the sentence.
-          warnings.push(`Ignored an endpoint for ${flattenProviderText(device.name) || "(unnamed device)"} because its host is empty or contains unsupported characters.`);
-          if (endpoint.kind === "ssh" || endpoint.kind === "telnet") {
-            rejectedConsoleDeviceIds.add(device.externalId);
-          }
-          return [];
+  const rejectedConsoleDevices = new Set<InventoryDevice>();
+  const devices = tree.devices.map((device) => {
+    let consoleRejected = false;
+    const endpoints = device.endpoints.flatMap((endpoint) => {
+      const host = normalizeInventoryEndpointHost(endpoint.host);
+      if (host === undefined) {
+        // Device name is provider text: flattened where it enters the sentence.
+        warnings.push(`Ignored an endpoint for ${flattenProviderText(device.name) || "(unnamed device)"} because its host is empty or contains unsupported characters.`);
+        if (endpoint.kind === "ssh" || endpoint.kind === "telnet") {
+          consoleRejected = true;
         }
-        return [{ ...endpoint, host }];
-      })
-    }))
-  };
-  return { tree: normalized, warnings, rejectedConsoleDeviceIds };
+        return [];
+      }
+      return [{ ...endpoint, host }];
+    });
+    const normalizedDevice = { ...device, endpoints };
+    if (consoleRejected) {
+      rejectedConsoleDevices.add(normalizedDevice);
+    }
+    return normalizedDevice;
+  });
+  return { tree: { ...tree, devices }, warnings, rejectedConsoleDevices };
 }
 
 /**
