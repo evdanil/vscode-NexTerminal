@@ -29,20 +29,14 @@
 // alphabet is wider than the old `[0-9;?]*` and now contains digits and dots,
 // so the back-off is load-bearing, not merely defensive.
 //
-// Chunk-wise consumers (capture buffer, script buffer, transcripts, macro
-// triggers) close this gap with stripChunk(): an unfinished CSI/nF escape (at
-// most 64 chars) is held until the next chunk, and an unterminated
-// OSC/DCS/APC/PM/SOS string switches to a "discarding" state that drops the
-// payload across chunks until its terminator, giving up after 1 MiB. The
-// highlighter cannot do this: it must emit what it has. There a DCS string
-// split across chunks is stripped as a bare `ESC P` and its payload is left
-// behind, the same known gap as OSC.
+// The regex above is for the highlighter, which must emit what it has and so
+// cannot carry state. Every chunk-wise consumer (capture buffer, script buffer,
+// transcripts, macro triggers) uses stripChunk() below instead, a single-pass
+// state machine over the same grammar with one invariant: the concatenated
+// text is identical for ANY split of the input into chunks. In the highlighter
+// a DCS string split across chunks is stripped as a bare `ESC P` and its
+// payload is left behind, the same known gap as OSC.
 //
-// The durable fix is requiring the terminator here, so an unterminated OSC
-// reads as incomplete and safeCutIndex protects it exactly as it protects an
-// incomplete CSI. That is deliberately out of scope of the latency work: this
-// regex is also the stripper for transcripts and capture buffers, where a
-// never-terminated OSC would then stop stripping anything after it.
 // CAN (0x18) and SUB (0x1a) cancel a control string (OSC/DCS/APC/PM/SOS) per
 // ECMA-48: both the whole-sequence match and the chunk-wise discard state end
 // at them and consume the byte, so text after a cancelled string is kept.
@@ -64,20 +58,27 @@ export function createAnsiRegex(): RegExp {
   return /\x1b(?:\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]|\][^\x07\x18\x1a\x1b\x9c]*(?:[\x07\x18\x1a\x9c]|\x1b\\)?|[PX^_][^\x18\x1a\x1b\x9c]*(?:\x1b\\|[\x18\x1a\x9c])|[\x20-\x2F]*[\x30-\x5A\x5C\x5E-\x7E])/g;
 }
 
-// Longest trailing CSI/nF escape prefix a chunk-wise stripper will hold back.
-// Real sequences are far shorter; the cap keeps a stray ESC from retaining
-// data indefinitely.
-const MAX_HELD_ESCAPE = 64;
-// An unterminated string sequence is discarded, not held, so its payload
-// (Sixel, Kitty graphics and XTGETTCAP run to kilobytes) never becomes text.
-// If no terminator arrives within this many characters the discard is
+// Longest CSI/nF escape stripChunk() will treat as a sequence, ESC included.
+// Real sequences are far shorter; a longer run is text. It is a property of
+// the grammar, not of chunking, so one-shot and chunked results still agree.
+const MAX_ESCAPE_LENGTH = 64;
+// Payload characters an unterminated string sequence may drop before it is
 // abandoned and output resumes as ordinary text, so a lone `ESC P` in binary
-// output cannot swallow the session.
+// output cannot swallow the session. Sixel, Kitty graphics and XTGETTCAP
+// payloads run to kilobytes, hence the generous bound.
 const MAX_DISCARDED_STRING = 1024 * 1024;
-const INCOMPLETE_ESCAPE_TAIL_RE = /\x1b(?:\[[\x30-\x3F]*[\x20-\x2F]*|[\x20-\x2F]+)?$/;
-// An OSC/DCS/APC/PM/SOS string still waiting for its terminator; a trailing
-// ESC may be the first half of ST (`ESC \`).
-const INCOMPLETE_STRING_TAIL_RE = /\x1b(?:\][^\x07\x18\x1a\x1b\x9c]*|[PX^_][^\x18\x1a\x1b\x9c]*)\x1b?$/;
+
+const enum S {
+  Text,
+  Esc, // after ESC
+  CsiParam, // ESC [ then parameter bytes
+  CsiInter, // ... then intermediate bytes
+  Nf, // ESC then intermediate bytes
+  Osc, // discarding an OSC string
+  OscEsc, // ... just saw ESC inside it
+  Str, // discarding DCS/APC/PM/SOS
+  StrEsc
+}
 
 /**
  * State a chunk-wise stripper carries between chunks. Opaque to callers:
@@ -86,81 +87,142 @@ const INCOMPLETE_STRING_TAIL_RE = /\x1b(?:\][^\x07\x18\x1a\x1b\x9c]*|[PX^_][^\x1
  * does not interrupt the byte stream, so it must not reset the carry.
  */
 export interface StripCarry {
-  /** Held CSI/nF prefix, or (while discarding) a lone trailing ESC that may start ST. */
-  readonly tail: string;
-  /** Terminator rules of the string being discarded: OSC ends at BEL or ST, the rest at ST only. */
-  readonly discarding: "" | "osc" | "st";
-  /** Characters dropped so far in the current discard, for the give-up bound. */
+  /** Parser state (opaque). */
+  readonly state: number;
+  /** Text of an escape still being recognised, emitted verbatim if it turns out not to be one. */
+  readonly hold: string;
+  /** Payload characters dropped so far in the current control string, for the give-up bound. */
   readonly discarded: number;
 }
 
-export const EMPTY_STRIP_CARRY: StripCarry = { tail: "", discarding: "", discarded: 0 };
+export const EMPTY_STRIP_CARRY: StripCarry = { state: S.Text, hold: "", discarded: 0 };
 
 /**
- * Chunk-safe ANSI stripping. Returns the text with every complete escape
- * removed and the carry for the next chunk:
- * - a trailing incomplete CSI/nF escape is held (at most 64 chars);
- * - a trailing unterminated OSC/DCS/APC/PM/SOS string is dropped and the
- *   carry enters a discarding state that drops payload in later chunks until
- *   the terminator, resuming normal text after it (or after 1 MiB, or when a
- *   new ESC aborts the string).
+ * Chunk-safe ANSI stripping as a single-pass state machine, ECMA-48 grammar:
+ * - CSI (ESC [, parameter 0x30-0x3F, intermediate 0x20-0x2F, final 0x40-0x7E),
+ *   two-byte and nF escapes (ESC, intermediates, final 0x30-0x7E) are removed;
+ * - OSC, and DCS/APC/PM/SOS, payloads are dropped until their terminator: BEL
+ *   (OSC only), `ESC \`, the 8-bit ST U+009C, or CAN/SUB, which consume the
+ *   byte. An ESC followed by anything else aborts the string and starts a new
+ *   sequence at that ESC;
+ * - an escape that turns out malformed (or longer than 64 chars) is emitted
+ *   as text, and the byte that broke it is reparsed as text.
+ *
+ * INVARIANT: for any input, calling this over any split into chunks (threading
+ * the carry) yields the same concatenated `text` as one call over the whole
+ * input. Nothing depends on where a chunk boundary falls; the only bounds are
+ * per-sequence (64-char escape, `discardLimit` payload characters). Bytes of a
+ * still-unfinished escape are held in the carry, so a trailing incomplete
+ * escape is not in `text` yet.
  */
-export function stripChunk(carry: StripCarry, chunk: string): { text: string; carry: StripCarry } {
-  let joined = carry.tail + chunk;
+export function stripChunk(
+  carry: StripCarry,
+  chunk: string,
+  discardLimit: number = MAX_DISCARDED_STRING
+): { text: string; carry: StripCarry } {
+  let state: number = carry.state;
+  let hold = carry.hold;
+  let discarded = carry.discarded;
   let text = "";
+  let i = 0;
+  const n = chunk.length;
 
-  if (carry.discarding !== "") {
-    const end = (carry.discarding === "osc" ? /[\x07\x18\x1a\x1b\x9c]/ : /[\x18\x1a\x1b\x9c]/).exec(joined);
-    if (end === null) {
-      const discarded = carry.discarded + joined.length;
-      if (discarded > MAX_DISCARDED_STRING) {
-        // Give up: treat the rest as ordinary text, and never re-enter.
-        return { text: joined.replace(createAnsiRegex(), ""), carry: EMPTY_STRIP_CARRY };
+  while (i < n) {
+    if (state === S.Text) {
+      const j = chunk.indexOf("\x1b", i);
+      if (j < 0) {
+        text += i === 0 ? chunk : chunk.slice(i);
+        i = n;
+        break;
       }
-      return { text: "", carry: { tail: "", discarding: carry.discarding, discarded } };
+      text += chunk.slice(i, j);
+      hold = "\x1b";
+      state = S.Esc;
+      i = j + 1;
+      continue;
     }
-    let resume = end.index;
-    const stop = joined.charCodeAt(resume);
-    if (stop === 0x07 || stop === 0x18 || stop === 0x1a || stop === 0x9c) {
-      // BEL (OSC only, by the regex above), the 8-bit ST (U+009C), or CAN/SUB,
-      // which cancel a control string; the byte itself is consumed, as xterm does.
-      resume += 1;
-    } else if (resume === joined.length - 1) {
-      // ESC at the very end: it may be the first half of ST.
-      return { text: "", carry: { tail: "\x1b", discarding: carry.discarding, discarded: carry.discarded + resume } };
-    } else {
-      const next = joined.charCodeAt(resume + 1);
-      if (next === 0x5c || next === 0x18 || next === 0x1a || next === 0x9c) {
-        // ESC \ is the 7-bit ST. ESC followed by CAN/SUB/8-bit ST is the string
-        // ending with a stray ESC in front of its terminator (typically the ESC
-        // carried from the previous chunk): consume both bytes so the ESC is
-        // never re-emitted and the terminator is not parsed as text.
-        resume += 2;
+
+    const c = chunk.charCodeAt(i);
+    switch (state) {
+      case S.Esc:
+      case S.Nf: {
+        if (state === S.Esc && c === 0x5b) {
+          hold += "[";
+          state = S.CsiParam;
+        } else if (state === S.Esc && c === 0x5d) {
+          hold = "";
+          discarded = 0;
+          state = S.Osc;
+        } else if (state === S.Esc && (c === 0x50 || c === 0x58 || c === 0x5e || c === 0x5f)) {
+          hold = "";
+          discarded = 0;
+          state = S.Str;
+        } else if (c >= 0x20 && c <= 0x2f && hold.length < MAX_ESCAPE_LENGTH) {
+          hold += chunk[i];
+          state = S.Nf;
+        } else if (c >= 0x30 && c <= 0x7e && c !== 0x5b && c !== 0x5d && hold.length < MAX_ESCAPE_LENGTH) {
+          hold = "";
+          state = S.Text;
+        } else {
+          text += hold;
+          hold = "";
+          state = S.Text;
+          continue; // reparse this byte as text
+        }
+        i++;
+        break;
       }
-      // Any other ESC aborts the string and starts a new sequence at that ESC.
+      case S.CsiParam:
+      case S.CsiInter: {
+        const tooLong = hold.length >= MAX_ESCAPE_LENGTH;
+        if (!tooLong && state === S.CsiParam && c >= 0x30 && c <= 0x3f) {
+          hold += chunk[i];
+        } else if (!tooLong && c >= 0x20 && c <= 0x2f) {
+          hold += chunk[i];
+          state = S.CsiInter;
+        } else if (!tooLong && c >= 0x40 && c <= 0x7e) {
+          hold = "";
+          state = S.Text;
+        } else {
+          text += hold;
+          hold = "";
+          state = S.Text;
+          continue;
+        }
+        i++;
+        break;
+      }
+      case S.Osc:
+      case S.Str: {
+        if (c === 0x18 || c === 0x1a || c === 0x9c || (state === S.Osc && c === 0x07)) {
+          state = S.Text;
+        } else if (c === 0x1b) {
+          state = state === S.Osc ? S.OscEsc : S.StrEsc;
+        } else if (discarded >= discardLimit) {
+          // Cap reached: stop discarding; this byte and the rest are text.
+          state = S.Text;
+          continue;
+        } else {
+          discarded++;
+        }
+        i++;
+        break;
+      }
+      default: {
+        // OscEsc / StrEsc: ESC seen inside a control string.
+        if (c === 0x5c || c === 0x18 || c === 0x1a || c === 0x9c) {
+          state = S.Text;
+          i++;
+        } else {
+          // Anything else aborts the string; the ESC starts a new sequence.
+          hold = "\x1b";
+          state = S.Esc;
+          // reparse this byte in the Esc state
+        }
+        break;
+      }
     }
-    joined = joined.slice(resume);
   }
 
-  const stringTail = INCOMPLETE_STRING_TAIL_RE.exec(joined);
-  if (stringTail !== null) {
-    const at = stringTail.index;
-    const half = stringTail[0].endsWith("\x1b") && stringTail[0].length > 2;
-    text = joined.slice(0, at).replace(createAnsiRegex(), "");
-    return {
-      text,
-      carry: {
-        tail: half ? "\x1b" : "",
-        discarding: joined.charCodeAt(at + 1) === 0x5d ? "osc" : "st",
-        discarded: stringTail[0].length - (half ? 1 : 0)
-      }
-    };
-  }
-
-  const windowStart = Math.max(0, joined.length - MAX_HELD_ESCAPE);
-  const esc = joined.lastIndexOf("\x1b");
-  if (esc >= windowStart && INCOMPLETE_ESCAPE_TAIL_RE.test(joined.slice(esc))) {
-    return { text: joined.slice(0, esc).replace(createAnsiRegex(), ""), carry: { tail: joined.slice(esc), discarding: "", discarded: 0 } };
-  }
-  return { text: joined.replace(createAnsiRegex(), ""), carry: EMPTY_STRIP_CARRY };
+  return { text, carry: { state, hold, discarded } };
 }
