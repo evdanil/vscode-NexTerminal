@@ -614,19 +614,22 @@ export class MacroAutoTrigger implements vscode.Disposable {
           // carry so an opener whose terminator arrives now is not prepended to
           // unrelated output after re-enable (a stale OSC would swallow later
           // prompts, a stale CSI would eat the first character of one).
-          escapeCarry = stripChunk(escapeCarry, text.length > MAX_INPUT_LENGTH ? text.slice(text.length - MAX_INPUT_LENGTH) : text).carry;
+          escapeCarry = stripChunk(escapeCarry, text).carry;
           return;
         }
 
-        // Keep the tail of oversized output chunks so prompts arriving with
-        // banners/login noise can still be matched without scanning unbounded text.
-        if (text.length > MAX_INPUT_LENGTH) {
-          text = text.slice(text.length - MAX_INPUT_LENGTH);
-        }
-
+        // Strip the complete chunk first so the carry advances over the whole
+        // stream: truncating before stripping could drop the terminator of a
+        // carried opener and have it swallow the retained tail.
         const chunk = stripChunk(escapeCarry, text);
         escapeCarry = chunk.carry;
-        const stripped = chunk.text.replace(CONTROL_CHARS_RE, "");
+        let stripped = chunk.text.replace(CONTROL_CHARS_RE, "");
+
+        // Keep the tail of oversized output chunks so prompts arriving with
+        // banners/login noise can still be matched without scanning unbounded text.
+        if (stripped.length > MAX_INPUT_LENGTH) {
+          stripped = stripped.slice(stripped.length - MAX_INPUT_LENGTH);
+        }
 
         buffer += stripped;
         if (buffer.length > this.maxBufferLength) {

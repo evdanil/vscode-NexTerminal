@@ -192,6 +192,21 @@ describe("MacroAutoTrigger", () => {
     obs.dispose();
   });
 
+  it("advances the escape carry over the whole oversized chunk before truncating", () => {
+    setConfig([{ name: "pw", text: "secret\n", triggerPattern: "Password: $" }]);
+    const trigger = new MacroAutoTrigger();
+    const sent: string[] = [];
+    const obs = trigger.createObserver((text) => sent.push(text));
+
+    // The carried title's BEL sits at the start of a chunk far larger than the
+    // input cap; truncating first would drop it and swallow the prompt.
+    obs.onOutput("\x1b]0;user@host");
+    obs.onOutput(": ~\x07" + "banner line\n".repeat(2000) + "Password: ");
+    flush();
+    expect(sent).toEqual(["secret\n"]);
+    obs.dispose();
+  });
+
   it("defers writeBack to next event-loop turn", () => {
     setConfig([
       { name: "pw", text: "secret\n", triggerPattern: "Password:" }
