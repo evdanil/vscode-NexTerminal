@@ -1895,6 +1895,35 @@ describe("ScriptRuntimeManager — a wait the run left pending ends with the run
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("stop and connection-lost do not reject a sleeping script, but the run's end still clears the timer", async () => {
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    h.worker.emit({ kind: "rpc", id: 1, method: "sleep", args: [3_600_000] });
+    h.core.removeSession();
+    h.core.emitChange();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.worker.posted.filter((m) => m.kind === "rpc-result")).toEqual([]);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.events.some((e) => e.kind === "ended")).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("refuses a sleep dispatched after the run ended", async () => {
+    const h = await createHarness(`/**\n * @nexus-script\n */\n`);
+    await h.manager.runScript(h.scriptUri as never, "test-session");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    h.worker.emit({ kind: "complete" });
+    h.worker.emit({ kind: "rpc", id: 8, method: "sleep", args: [3_600_000] });
+    await vi.advanceTimersByTimeAsync(0);
+    const result = h.worker.posted.find((m) => m.kind === "rpc-result" && (m as { id: number }).id === 8) as
+      | { ok: boolean; error?: { code: string } }
+      | undefined;
+    expect(result?.ok).toBe(false);
+    expect(result?.error?.code).toBe("Stopped");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("refuses a wait dispatched after the run ended", async () => {
     const h = await createHarness(`/**\n * @nexus-script\n */\n`);
     await h.manager.runScript(h.scriptUri as never, "test-session");

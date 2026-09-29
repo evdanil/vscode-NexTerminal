@@ -118,6 +118,8 @@ interface RunningScriptRecord {
   includeState: ScriptIncludeState;
   worker: WorkerLike;
   pendingRpcs: Map<number, PendingRpc>;
+  /** Live `sleep` timers — cleared by cleanupRun, never rejected (see invokeMethod). */
+  sleepTimers: Set<ReturnType<typeof setTimeout>>;
   /** Closers for this run's open `prompt` input boxes — cleanupRun cancels them (see doUserInteraction). */
   openInputBoxes: Set<vscode.CancellationTokenSource>;
   observerSubscription?: vscode.Disposable;
@@ -295,6 +297,7 @@ export class ScriptRuntimeManager implements vscode.Disposable {
       includeState: undefined as unknown as ScriptIncludeState,
       worker: this.createWorker(),
       pendingRpcs: new Map(),
+      sleepTimers: new Set(),
       openInputBoxes: new Set(),
       inputLockHeld: false,
       pty,
@@ -697,11 +700,11 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     if (ACTS_ON_TERMINAL_OR_USER.has(method) && runIsOver(record)) {
       throw makeScriptError("Stopped", `Script run has ended — ${method} refused`);
     }
-    // A wait posted just before the worker's complete/failed and dispatched
+    // A wait or sleep posted just before the worker's complete/failed and dispatched
     // after cleanupRun would open a scan nothing will ever reject. (A requested
     // stop is not refused here: stopScript already drained pendingRpcs and
     // cleanupRun drains whatever this opens.)
-    if (record.cleanedUp && (method === "waitFor" || method === "expect" || method === "waitAny")) {
+    if (record.cleanedUp && (method === "waitFor" || method === "expect" || method === "waitAny" || method === "sleep")) {
       throw makeScriptError("Stopped", `Script run has ended — ${method} refused`);
     }
     switch (method) {
@@ -725,27 +728,15 @@ export class ScriptRuntimeManager implements vscode.Disposable {
         return undefined;
       }
       case "sleep":
-        // Registered in pendingRpcs so every ending clears the timer: a bare
-        // setTimeout would hold this record for the full delay of an unawaited sleep.
-        return new Promise<void>((resolve, reject) => {
-          const key = ++pendingIdCounter;
+        // Deliberately NOT in pendingRpcs: stop / connection-lost must not
+        // reject a sleeping script (documented contract). cleanupRun clears the
+        // timer instead, so an unawaited sleep does not hold the record.
+        return new Promise<void>((resolve) => {
           const timer = setTimeout(() => {
-            record.pendingRpcs.delete(key);
+            record.sleepTimers.delete(timer);
             resolve();
           }, Math.max(0, Number(args[0] ?? 0)));
-          record.pendingRpcs.set(key, {
-            resolve: () => {},
-            reject: (e) => {
-              clearTimeout(timer);
-              record.pendingRpcs.delete(key);
-              reject(e);
-            },
-            cancel: () => {
-              clearTimeout(timer);
-              record.pendingRpcs.delete(key);
-              resolve();
-            }
-          });
+          record.sleepTimers.add(timer);
         });
       case "tail": {
         // Default 512 chars; cap negative input at 0 and huge input at the buffer's own cap.
@@ -1100,6 +1091,8 @@ export class ScriptRuntimeManager implements vscode.Disposable {
     // rejection settles in a later microtask, by which time cleanedUp is set,
     // so endOp stays silent. The result goes to a terminated worker — ignored.
     this.rejectAllPending(record, makeScriptError("Stopped", "Script run has ended"));
+    for (const t of record.sleepTimers) clearTimeout(t);
+    record.sleepTimers.clear();
     // The wait just rejected is not an operation the ended run is still in.
     record.currentOperation = null;
     // The run is over however it ended, so its worker is too. A script that
