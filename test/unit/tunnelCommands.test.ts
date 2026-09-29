@@ -1035,4 +1035,27 @@ describe("startTunnel — profile removed while start is pending", () => {
     expect(start).not.toHaveBeenCalled();
     expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("was removed"));
   });
+
+  it("does not run Retry when the tunnel or server was removed between the warning and the click", async () => {
+    const { core, profile, server: capturedServer } = await fixture();
+    const sync = deferred<void>();
+    let click!: (value: string) => void;
+    mockShowWarningMessage.mockReturnValueOnce(new Promise((resolve) => { click = resolve; }));
+    const run = startTunnel(
+      core, { start: vi.fn() } as never, { connect: vi.fn() } as never,
+      profile, capturedServer, "isolated",
+      { syncNow: () => sync.promise, checkRemoteOwnership: async () => undefined } as never
+    );
+    await core.addOrUpdateTunnel({ ...profile, localPort: profile.localPort + 1 });
+    sync.resolve();
+    await run;
+    await core.removeTunnel("t1");
+    click("Retry");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const vscode = await import("vscode");
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexus.tunnel.start", expect.anything());
+    expect(mockShowWarningMessage).toHaveBeenLastCalledWith(expect.stringContaining("was not retried"));
+  });
 });

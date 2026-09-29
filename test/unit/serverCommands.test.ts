@@ -282,6 +282,26 @@ describe("connectServer — equal-content replacement while progress is pending"
     }
   });
 
+  it("does not run Retry when the server was removed between the warning and the click", async () => {
+    const server = makeServer({ name: "gone\nname" });
+    const { ctx, addOrUpdateServer, removeServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const release = holdProgress();
+    let click!: (value: string) => void;
+    mockShowWarningMessage.mockReturnValueOnce(new Promise((resolve) => { click = resolve; }));
+
+    const run = connectServer(ctx, server.id, { retryCommand: "nexus.server.runWithScript" });
+    await addOrUpdateServer({ ...server, port: 2222 });
+    release();
+    await run;
+    await removeServer(server.id);
+    click("Retry");
+    await flushPromises();
+
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexus.server.runWithScript", "srv-1");
+    expect(mockShowWarningMessage).toHaveBeenLastCalledWith(expect.stringContaining("was removed. The connection was not retried"));
+    expect(String(mockShowWarningMessage.mock.calls.at(-1)![0])).not.toContain("\n");
+  });
+
   it("shows a removal message without Retry when the server is gone", async () => {
     const server = makeServer();
     const { ctx, removeServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });

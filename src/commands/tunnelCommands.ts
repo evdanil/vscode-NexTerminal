@@ -182,6 +182,15 @@ export async function startTunnel(
       "Retry"
     )).then((choice) => {
       if (choice === "Retry") {
+        // A profile deleted while the warning was open would resolve to nothing
+        // and fall through to the tunnel picker; a deleted server is refused by
+        // the command itself. Refuse here rather than offer another target.
+        if (!core.getTunnel(profile.id) || !core.getServer(server.id)) {
+          void vscode.window.showWarningMessage(
+            `Tunnel "${safeProfileName}" or its server was removed. The tunnel was not retried.`
+          );
+          return;
+        }
         // Carry the server this start was aimed at: a drag-and-drop or an
         // edit-then-restart may target a server other than the default one.
         void vscode.commands.executeCommand("nexus.tunnel.start", { profile: { id: profile.id }, serverId: server.id });

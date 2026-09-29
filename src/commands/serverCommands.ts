@@ -1072,6 +1072,13 @@ function reportCancelledConnect(ctx: CommandContext, atStart: ServerConfig, opti
     "Retry"
   )).then((choice) => {
     if (choice === "Retry") {
+      // The id would no longer resolve if the server was deleted while the
+      // warning was open, and the command would fall through to a picker that
+      // could act on a different server. Refuse instead.
+      if (!ctx.core.getServer(atStart.id)) {
+        void vscode.window.showWarningMessage(`Server "${safeName}" was removed. The connection was not retried.`);
+        return;
+      }
       void vscode.commands.executeCommand(options.retryCommand ?? "nexus.server.connect", atStart.id);
     }
   });
