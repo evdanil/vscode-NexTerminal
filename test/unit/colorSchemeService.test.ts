@@ -64,4 +64,18 @@ describe("ColorSchemeService", () => {
     await service.removeScheme("active-del");
     expect(service.getActiveSchemeId()).toBe("");
   });
+
+  it("reset drops user schemes, the selection and the font in memory and in storage", async () => {
+    const storage = new InMemoryColorSchemeStorage([{ id: "u1", name: "U", source: "user" } as unknown as ColorScheme], "u1", { family: "Fira", size: 12, weight: "normal" });
+    const service = new ColorSchemeService(storage);
+
+    await service.reset();
+
+    expect(service.getAllSchemes()).toEqual(BUILTIN_SCHEMES);
+    expect(service.getActiveSchemeId()).toBe("");
+    expect(service.getFontConfig()).toBeUndefined();
+    expect(storage.getUserSchemes()).toEqual([]);
+    expect(storage.getActiveSchemeId()).toBe("");
+    expect(storage.getFontConfig()).toBeUndefined();
+  });
 });

@@ -552,9 +552,11 @@ describe("Export for Sharing — backup-only collections stay out", () => {
    * travelled in a file whose whole promise is "credentials stripped". The
    * backup now treats that map as secret; a share cannot carry it at all.
    */
-  it("keeps Local Shell profiles but never their environment variables", async () => {
+  it("keeps VS Code-profile Local Shell profiles but never their environment variables", async () => {
     const source = await makeMachine();
-    await source.core.addOrUpdateLocalShellProfile(makeLocalShell());
+    await source.core.addOrUpdateLocalShellProfile(
+      makeLocalShell({ launchMode: "vscodeProfile", vscodeProfileName: "bash", shellPath: undefined, shellArgs: undefined })
+    );
 
     const json = await exportShare(source);
     const exported = JSON.parse(json) as { localShellProfiles?: LocalShellProfile[] };
@@ -2299,5 +2301,28 @@ describe("Delete All Data (nexus.config.completeReset) covers Local Servers and 
     expect(confirmation).toContain("Open sessions and tunnels will be closed");
     expect(confirmation).not.toBe(OLD_CONFIRMATION);
     expect(confirmation).not.toContain("local shell profiles, inventory sources, macros");
+  });
+
+  it("clears Terminal Appearance data and the Local Shell auto-trigger acknowledgement, resets the running service, and says what it keeps (⊘ leaving nexus.colorSchemes / activeColorScheme / terminalFont and the acknowledgement behind)", async () => {
+    const machine = await makeMachine();
+    for (const key of ["nexus.colorSchemes", "nexus.activeColorScheme", "nexus.terminalFont", "nexus.localShell.autoTriggerWarningShown"]) {
+      machine.ctx.state.set(key, key === "nexus.colorSchemes" ? [{ id: "moba-1" }] : "seeded");
+    }
+    machine.ctx.state.set("nexus.ssh.knownHostFingerprints.v1", { "h:22": "SHA256:x" });
+    const resetTerminalAppearance = vi.fn(async () => undefined);
+    const runtime = { ...recordingRuntime(machine.core), resetTerminalAppearance };
+
+    await runReset(machine, runtime);
+
+    for (const key of ["nexus.colorSchemes", "nexus.activeColorScheme", "nexus.terminalFont", "nexus.localShell.autoTriggerWarningShown"]) {
+      expect(machine.ctx.state.has(key)).toBe(false);
+    }
+    expect(resetTerminalAppearance).toHaveBeenCalledTimes(1);
+    // Deliberately kept, and named in the confirmation.
+    expect(machine.ctx.state.has("nexus.ssh.knownHostFingerprints.v1")).toBe(true);
+    const confirmation = String(mockShowWarningMessage.mock.calls[0]?.[0]);
+    expect(confirmation).toContain("Terminal Appearance colour schemes and font choice");
+    expect(confirmation).toContain("VS Code user settings");
+    expect(confirmation).toContain("trusted SSH host keys, script files and session logs are kept");
   });
 });

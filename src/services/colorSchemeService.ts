@@ -8,6 +8,8 @@ export interface ColorSchemeStorage {
   saveActiveSchemeId(id: string): Promise<void>;
   getFontConfig(): TerminalFontConfig | undefined;
   saveFontConfig(config: TerminalFontConfig): Promise<void>;
+  /** Forget every user scheme, the active selection and the font choice. */
+  clearAll(): Promise<void>;
 }
 
 export class InMemoryColorSchemeStorage implements ColorSchemeStorage {
@@ -23,6 +25,7 @@ export class InMemoryColorSchemeStorage implements ColorSchemeStorage {
   async saveActiveSchemeId(id: string): Promise<void> { this.activeId = id; }
   getFontConfig(): TerminalFontConfig | undefined { return this.font; }
   async saveFontConfig(config: TerminalFontConfig): Promise<void> { this.font = config; }
+  async clearAll(): Promise<void> { this.schemes = []; this.activeId = ""; this.font = undefined; }
 }
 
 export class ColorSchemeService {
@@ -75,5 +78,13 @@ export class ColorSchemeService {
   async saveFontConfig(config: TerminalFontConfig): Promise<void> {
     this.fontConfig = config;
     await this.storage.saveFontConfig(config);
+  }
+
+  /** Delete All Data: drop the user schemes, the selection and the font choice, in memory and in storage. */
+  async reset(): Promise<void> {
+    this.userSchemes = [];
+    this.activeId = "";
+    this.fontConfig = undefined;
+    await this.storage.clearAll();
   }
 }

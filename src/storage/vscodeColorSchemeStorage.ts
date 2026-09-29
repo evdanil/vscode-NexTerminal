@@ -2,9 +2,9 @@ import * as vscode from "vscode";
 import type { ColorScheme, TerminalFontConfig } from "../models/colorScheme";
 import type { ColorSchemeStorage } from "../services/colorSchemeService";
 
-const SCHEMES_KEY = "nexus.colorSchemes";
-const ACTIVE_SCHEME_KEY = "nexus.activeColorScheme";
-const FONT_KEY = "nexus.terminalFont";
+export const SCHEMES_KEY = "nexus.colorSchemes";
+export const ACTIVE_SCHEME_KEY = "nexus.activeColorScheme";
+export const FONT_KEY = "nexus.terminalFont";
 
 export class VscodeColorSchemeStorage implements ColorSchemeStorage {
   constructor(private readonly context: vscode.ExtensionContext) {}
@@ -31,5 +31,11 @@ export class VscodeColorSchemeStorage implements ColorSchemeStorage {
 
   async saveFontConfig(config: TerminalFontConfig): Promise<void> {
     await this.context.globalState.update(FONT_KEY, config);
+  }
+
+  async clearAll(): Promise<void> {
+    await this.context.globalState.update(SCHEMES_KEY, undefined);
+    await this.context.globalState.update(ACTIVE_SCHEME_KEY, undefined);
+    await this.context.globalState.update(FONT_KEY, undefined);
   }
 }

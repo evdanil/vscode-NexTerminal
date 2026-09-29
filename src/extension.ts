@@ -1600,7 +1600,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     stopTunnel: (activeTunnelId) => ctx.tunnelManager.stop(activeTunnelId),
     activeTunnelIdForProfile: (profileId) => ctx.tunnelManager.getActiveTunnelId(profileId),
     closeSerialProfileTerminals: (profileId) => closeSerialProfileTerminals(ctx, profileId),
-    closeLocalShellProfileTerminals: (profileId) => closeLocalShellProfileTerminals(ctx, profileId)
+    closeLocalShellProfileTerminals: (profileId) => closeLocalShellProfileTerminals(ctx, profileId),
+    resetTerminalAppearance: async () => {
+      await colorSchemeService.reset();
+      TerminalAppearancePanel.refreshOpen();
+    }
   });
 
   // One-time offer to import ~/.ssh/config, shown at most once ever. Strictly

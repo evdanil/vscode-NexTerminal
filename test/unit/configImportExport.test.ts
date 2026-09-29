@@ -1486,7 +1486,7 @@ describe("config import command (legacy)", () => {
       [],
       [],
       [],
-      [makeLocalShellProfile({ cwd: "/home/alice/project", startupCommand: "npm run dev" })],
+      [makeLocalShellProfile({ launchMode: "vscodeProfile", vscodeProfileName: "bash", shellPath: undefined, cwd: "/home/alice/project", startupCommand: "npm run dev" })],
       {}
     );
     const partialExport = {
@@ -6799,7 +6799,7 @@ describe("sanitizeForSharing", () => {
     const servers = [makeServer({ username: "alice", keyPath: "/home/alice/.ssh/id_rsa" })];
     const tunnels = [makeTunnel({ defaultServerId: "s1" })];
     const serialProfiles = [makeSerialProfile({ deviceHint: { serialNumber: "ABC123", vendorId: "1111", productId: "2222" } })];
-    const localShellProfiles = [makeLocalShellProfile({ cwd: "/home/alice/project", startupCommand: "npm run dev" })];
+    const localShellProfiles = [makeLocalShellProfile({ launchMode: "vscodeProfile", vscodeProfileName: "bash", shellPath: undefined, cwd: "/home/alice/project", startupCommand: "npm run dev" })];
     const settings: Record<string, unknown> = {
       "nexus.logging.sessionLogDirectory": "/home/alice/logs"
     };

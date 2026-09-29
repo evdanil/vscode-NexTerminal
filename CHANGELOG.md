@@ -1,5 +1,14 @@
 # Changelog
 
+## [2.8.296] — 2026-09-29
+
+### Fixed
+
+- **A share no longer hands over a shell command.** Custom Local Shell profiles (their shell path and arguments run the moment the profile opens) are left out of Export for Sharing and skipped by a share import, and both messages count them and say to use Add Local Shell Profile. A VS Code-profile one still travels, without a shell path or arguments.
+- **Shared tunnels no longer act on their own.** A tunnel from a share arrives with Auto-start off, no listener address (loopback until you choose one in Edit), a loopback-only remote bind address and no login in its browser URL, on export and on import; the import message counts the tunnels it changed.
+- **Delete All Data clears Terminal Appearance and the Local Shell auto-trigger acknowledgement.** Imported colour schemes, the selected scheme and the font choice are removed and an open panel refreshes; the confirmation says the terminal colours and font already written to VS Code user settings, trusted host keys, scripts and logs stay.
+- **A duplicate id in a share no longer overwrites a record.** The first server or auth profile under an id lands; a later one in the same file is skipped and counted instead of replacing it and being counted as imported.
+
 ## [2.8.295] — 2026-09-28
 
 ### Fixed

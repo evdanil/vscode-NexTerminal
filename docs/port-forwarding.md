@@ -34,6 +34,8 @@ During extension shutdown, Nexus closes retired SSH transports even if another s
 
 ## Which Servers Can Carry a Tunnel
 
+A tunnel that arrives in a shared export starts with **Auto-start** off, no local listener address (it listens on `127.0.0.1` until you pick another interface in Edit), a loopback-only remote bind address, and no login typed into its browser URL. Turn Auto-start back on in Edit if you want it.
+
 A tunnel reaches its server the way a terminal does — through the server's [jump host or proxy](ssh-and-telnet.md#jump-hosts-and-proxies) when it has one — in shared and isolated mode alike. In isolated mode each client gets its own connection to the server, but a jump-host hop underneath it is shared through [connection multiplexing](ssh-and-telnet.md#connection-multiplexing), as a terminal's is.
 
 Each isolated client logs in to the server on its own, but a password is not asked for per client. The server's password or key passphrase, or a SOCKS5 or HTTP proxy's password, is asked for once, and clients that arrive while you answer it — or before the first login using it has finished — use the same answer. A server password or passphrase you chose not to save is asked for again by the next client after that. The exception is a server behind a jump host with [multiplexing](ssh-and-telnet.md#connection-multiplexing) turned off: each client then reaches the server over a jump connection of its own and is asked for the server password separately, and prompts that open together dismiss each other — save the password, or keep multiplexing on for the jump host.
