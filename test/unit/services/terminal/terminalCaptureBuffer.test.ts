@@ -83,9 +83,9 @@ describe("TerminalCaptureBuffer", () => {
       expect(buf.getText()).toBe("out\n$ ");
     });
 
-    it("releases an unterminated escape after the 64-char hold-back cap", () => {
+    it("releases an unterminated escape after the 512-char escape bound", () => {
       const buf = new TerminalCaptureBuffer();
-      buf.append("\x1b[" + "1".repeat(100));
+      buf.append("\x1b[" + "1".repeat(600));
       expect(buf.getText()).toContain("1".repeat(50));
     });
 

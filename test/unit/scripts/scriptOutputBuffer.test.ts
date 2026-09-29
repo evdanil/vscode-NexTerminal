@@ -40,8 +40,8 @@ describe("ScriptOutputBuffer", () => {
     expect(buf.scan(/\$ $/)?.text).toBe("$ ");
     // An ESC[ followed by a never-ending parameter run is released once it
     // exceeds the hold-back cap instead of retaining data forever.
-    buf.append("\x1b[" + "1".repeat(100));
-    expect(buf.tail(200)).toContain("1".repeat(50));
+    buf.append("\x1b[" + "1".repeat(600));
+    expect(buf.tail(700)).toContain("1".repeat(50));
   });
 
   it("strips a terminal title split before the prompt", () => {
