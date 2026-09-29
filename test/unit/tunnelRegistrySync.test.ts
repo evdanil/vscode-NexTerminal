@@ -1046,6 +1046,43 @@ describe("TunnelRegistrySync", () => {
     log.mockRestore();
   });
 
+  it("keeps heartbeating an owned fence while an unrelated fresh fence file is unreadable", async () => {
+    const [ownerStore, otherStore] = sharedWindowStores();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const owner = new TunnelRegistrySync(ownerStore, core, "owner", probePort);
+    const other = new TunnelRegistrySync(otherStore, core, "other", probePort);
+    const tunnel = makeTunnel({ id: "held", tunnelType: "reverse", remotePort: 9000 });
+    await owner.initialize();
+    await owner.unregisterTunnel(tunnel.profileId, {
+      tunnel,
+      retiredReverseBind: {
+        fenceId: tunnel.id, routeIdentity: reverseRoute, remotePort: 9000, settled: new Promise<void>(() => {})
+      }
+    });
+    const ownedLastSeen = (): number => {
+      const seen = [...fakeFenceFiles.entries()]
+        .filter(([path]) => path.includes("held"))
+        .map(([, bytes]) => (JSON.parse(new TextDecoder().decode(bytes)) as { lastSeen: number }).lastSeen);
+      return Math.max(...seen);
+    };
+    fakeFenceRead.failPath = seedRaw("foreign--1.json", "{}", 0);
+    await other.initialize();
+
+    await vi.advanceTimersByTimeAsync(25_000);
+    await expect(otherStore.getEntries()).rejects.toThrow();
+    expect(Date.now() - ownedLastSeen()).toBeLessThan(5_000);
+
+    // Past 30 s the foreign file is stale and skipped; the owned fence must
+    // still be live for other windows and must not have been swept.
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(await other.checkRemoteOwnership("elsewhere", 1, { routeIdentity: reverseRoute, remotePort: 9000 }))
+      .toMatchObject({ retiredReverseBind: { fenceId: "held" } });
+    expect([...fakeFenceFiles.keys()].some((path) => path.includes("held"))).toBe(true);
+    owner.dispose();
+    other.dispose();
+    log.mockRestore();
+  });
+
   it("does not fail initialize or syncNow when one stale fence file cannot be read", async () => {
     const [ownerStore, otherStore] = sharedWindowStores();
     const log = vi.spyOn(console, "error").mockImplementation(() => {});

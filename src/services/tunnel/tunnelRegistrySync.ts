@@ -190,6 +190,13 @@ export class TunnelRegistrySync {
   private warnedFencePublishFailure = false;
   /** Fence ids whose publishFence completed during the current stop call. */
   private readonly publishedFences = new Set<string>();
+  /**
+   * The latest entry this window published for each of its unsettled fences.
+   * The heartbeat rewrites from this, not from a directory read, so an
+   * unrelated unreadable fence file (which makes every read fail closed)
+   * cannot stop our live reservations being refreshed and expiring.
+   */
+  private readonly ownedFenceEntries = new Map<string, TunnelRegistryEntry>();
 
   public constructor(
     private readonly store: TunnelRegistryStore,
@@ -316,8 +323,10 @@ export class TunnelRegistrySync {
           // remove this file, and removal of our active row follows it.
           await this.store.publishFence(fenceEntry);
           this.publishedFences.add(fence.fenceId);
+          this.ownedFenceEntries.set(fence.fenceId, fenceEntry);
         } catch (error) {
           this.unsettledReverseBindFenceIds.delete(fence.fenceId);
+          this.ownedFenceEntries.delete(fence.fenceId);
           throw error;
         }
         // A later active-array save can fail. The already-published fence must
@@ -338,16 +347,15 @@ export class TunnelRegistrySync {
           if (!this.unsettledReverseBindFenceIds.has(fence.fenceId)) {
             return;
           }
-          const current = await this.store.getEntries();
-          const entry = current.find((item) =>
-            item.ownerSessionId === this.sessionId && item.retiredReverseBind?.fenceId === fence.fenceId
-          );
+          const entry = this.ownedFenceEntries.get(fence.fenceId);
           if (entry?.retiredReverseBind) {
-            await this.store.publishFence({
+            const moved = {
               ...entry,
               remotePort: port,
               retiredReverseBind: { ...entry.retiredReverseBind, remotePort: port }
-            });
+            };
+            await this.store.publishFence(moved);
+            this.ownedFenceEntries.set(fence.fenceId, moved);
           }
         });
       });
@@ -375,6 +383,7 @@ export class TunnelRegistrySync {
         // Settlement is final even when storage fails. The next slow sweep can
         // remove an unrefreshed file; heartbeat must not keep it live forever.
         this.unsettledReverseBindFenceIds.delete(fence.fenceId);
+        this.ownedFenceEntries.delete(fence.fenceId);
       }
     }));
     const pending = { settled, cleanup, hasSettled: () => hasSettled };
@@ -490,8 +499,35 @@ export class TunnelRegistrySync {
     }
   }
 
+  /**
+   * Refresh lastSeen on our unsettled fences straight from memory. This must
+   * not depend on reading the registry: while an unrelated fence file is
+   * unreadable every read fails closed, and a heartbeat gated on it would let
+   * a live reservation age past the stale threshold and be reused or swept.
+   * (The active-row heartbeat below still needs a read because rows share one
+   * globalState array; a missed refresh there only makes a reverse row look
+   * stale to other windows, it does not release a remote bind.)
+   */
+  private async heartbeatOwnFences(): Promise<void> {
+    const now = Date.now();
+    for (const [fenceId, entry] of [...this.ownedFenceEntries]) {
+      if (!this.unsettledReverseBindFenceIds.has(fenceId)) {
+        this.ownedFenceEntries.delete(fenceId);
+        continue;
+      }
+      const refreshed = { ...entry, lastSeen: now };
+      await this.store.publishFence(refreshed);
+      this.ownedFenceEntries.set(fenceId, refreshed);
+    }
+  }
+
   private async syncFast(): Promise<void> {
     await this.mutateEntries(async () => {
+      try {
+        await this.heartbeatOwnFences();
+      } catch (error) {
+        console.error("[Nexus] reverse-bind fence heartbeat failed", error);
+      }
       const entries = await this.store.getEntries();
       const remote = entries.filter((e) => e.ownerSessionId !== this.sessionId && !e.retiredReverseBind);
       const remoteJson = JSON.stringify(remote);
@@ -509,9 +545,8 @@ export class TunnelRegistrySync {
       // Update lastSeen on existing own entries
       for (const entry of ownEntries) {
         if (entry.retiredReverseBind) {
-          if (this.unsettledReverseBindFenceIds.has(entry.retiredReverseBind.fenceId)) {
-            await this.store.publishFence({ ...entry, lastSeen: now });
-          }
+          // Fences are refreshed from memory by heartbeatOwnFences.
+          continue;
         } else if (activeTunnels.some((t) => matchesActiveTunnel(entry, t))) {
           entry.lastSeen = now;
           changed = true;
