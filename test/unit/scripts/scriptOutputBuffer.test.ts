@@ -17,6 +17,13 @@ describe("ScriptOutputBuffer", () => {
     expect(m?.text).toBe("red");
   });
 
+  it("strips Kitty, modifyOtherKeys and ESC 7/8/=/> so an end-anchored prompt matches", () => {
+    const buf = new ScriptOutputBuffer();
+    buf.append("\x1b[=5u\x1b7\x1b[>4;1m\x1b=$ ");
+    expect(buf.writeHead).toBe(2);
+    expect(buf.scan(/\$ $/)?.text).toBe("$ ");
+  });
+
   it("rolls trim when text exceeds capacity", () => {
     const buf = new ScriptOutputBuffer({ capacity: 10 });
     buf.append("1234567890");

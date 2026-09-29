@@ -48,6 +48,15 @@ describe("TerminalCaptureBuffer", () => {
       expect(buf.getText()).toBe("red");
     });
 
+    it("removes CSI private-prefix, intermediate and ESC 7/8/=/> forms", () => {
+      const buf = new TerminalCaptureBuffer();
+      buf.append("a\x1b[>4;2mb\x1b7c\x1b8d\x1b[=5ue\x1b[<uf\x1b[2 qg\x1b[!ph\x1b=i\x1b>\n");
+      const text = buf.getText();
+      expect(text).toBe("abcdefghi");
+      expect(text).not.toContain("[>");
+      expect(text).not.toContain("[=");
+    });
+
     it("removes C0 control characters except newline, carriage-return, and tab", () => {
       const buf = new TerminalCaptureBuffer();
       buf.append("bell\x07here\n");

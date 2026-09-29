@@ -748,6 +748,28 @@ describe("TerminalHighlighter", () => {
     expect(full).toContain(csi);
   });
 
+  it("stream never emits a slice that cuts inside a private-prefix CSI at the retention boundary", () => {
+    setConfig(true, [{ pattern: "\\d+", color: "red", flags: "g" }]);
+    const h = new TerminalHighlighter();
+    const emitted: string[] = [];
+    const stream = new TerminalHighlighterStream(h, (text) => emitted.push(text), 20);
+
+    // Same geometry as the SGR case above: cut = 16128 lands 4 bytes into
+    // ESC[>4;2m, i.e. right after "ESC[>4;" whose "4" a digit rule would recolour.
+    const seq = "\x1b[>4;2m";
+    const seqStart = 16128 - 4;
+    const payload = ".".repeat(seqStart) + seq + ".".repeat(16384 - seqStart - seq.length);
+    expect(payload.length).toBe(16384);
+
+    stream.push(payload);
+    expect(emitted.length).toBeGreaterThan(0);
+    for (const chunk of emitted) {
+      expect(chunk).not.toMatch(/\x1b\[[0-?]*[ -/]*$/);
+    }
+    stream.flush();
+    expect(emitted.join("")).toContain(seq);
+  });
+
   it("stream never emits a slice that cuts inside an OSC sequence at the retention boundary", () => {
     // Use a rule that could match chars inside OSC payload
     setConfig(true, [{ pattern: "\\w+", color: "magenta", flags: "g" }]);
