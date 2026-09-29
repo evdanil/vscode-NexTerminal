@@ -3,6 +3,7 @@ import type { CommandContext } from "../../src/commands/types";
 import { NexusCore } from "../../src/core/nexusCore";
 import type { ActiveTunnel, TunnelProfile, TunnelRegistryEntry } from "../../src/models/config";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import { watchPoolInvalidationOnConfigMutation } from "../../src/services/ssh/poolConfigInvalidation";
 import { isTunnelStartCurrent, registerTunnelCommands, startTunnel } from "../../src/commands/tunnelCommands";
 import type { ServerConfig } from "../../src/models/config";
 import { configMutationLock } from "../../src/services/configMutationLock";
@@ -1199,5 +1200,52 @@ describe("startTunnel — profile removed while start is pending", () => {
     await run;
 
     expect(start).toHaveBeenCalledTimes(1);
+  });
+
+  describe("connection generation (A -> B -> A during the start)", () => {
+    async function linked() {
+      const { core, profile, server: base } = await fixture();
+      await core.addOrUpdateAuthProfile({ id: "ap1", name: "AP", username: "ops", authType: "password" });
+      await core.addOrUpdateServer({ ...base, authProfileId: "ap1" });
+      const stop = watchPoolInvalidationOnConfigMutation(core, { invalidate: () => {} });
+      return { core, profile, server: core.getServer("srv-1")!, stop };
+    }
+
+    it("a linked profile changed A -> B -> A while the start waits cancels it", async () => {
+      const { core, profile, server, stop } = await linked();
+      const sync = deferred<void>();
+      const start = vi.fn(async () => makeActiveTunnel("t1"));
+      const run = startTunnel(
+        core, { start } as never, { connect: vi.fn() } as never, profile, server, "isolated",
+        { syncNow: () => sync.promise, checkRemoteOwnership: async () => undefined } as never
+      );
+      await core.addOrUpdateAuthProfile({ id: "ap1", name: "AP", username: "root", authType: "password" });
+      await core.addOrUpdateAuthProfile({ id: "ap1", name: "AP", username: "ops", authType: "password" });
+      sync.resolve();
+      await run;
+
+      expect(start).not.toHaveBeenCalled();
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("changed while the tunnel was starting"), "Retry");
+      stop();
+    });
+
+    it("a no-op save leaves the generation alone and does not cancel", async () => {
+      const { core, profile, server, stop } = await linked();
+      const before = core.getConnectionGeneration("srv-1");
+      const sync = deferred<void>();
+      const start = vi.fn(async () => makeActiveTunnel("t1"));
+      const run = startTunnel(
+        core, { start } as never, { connect: vi.fn() } as never, profile, server, "isolated",
+        { syncNow: () => sync.promise, checkRemoteOwnership: async () => undefined } as never
+      );
+      await core.addOrUpdateAuthProfile({ id: "ap1", name: "Renamed", username: "ops", authType: "password" });
+      await core.addOrUpdateServer({ ...core.getServer("srv-1")! });
+      sync.resolve();
+      await run;
+
+      expect(core.getConnectionGeneration("srv-1")).toBe(before);
+      expect(start).toHaveBeenCalledTimes(1);
+      stop();
+    });
   });
 });

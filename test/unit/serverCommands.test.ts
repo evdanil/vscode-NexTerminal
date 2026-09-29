@@ -480,6 +480,32 @@ describe("connectServer — auto-start sweep compares the connect attempt's capt
     expectOneWarning();
   });
 
+  it("a jump host's host changed A -> B -> A between capture and open still warns (the generation moved, the descriptors are equal again)", async () => {
+    const jump = makeServer({ id: "jump", name: "Jump", host: "jump.example" });
+    const { ctx, callbacks, addOrUpdateServer, startAttempt } = await connected({
+      servers: [jump], target: { proxy: { type: "ssh", jumpHostId: "jump" } }
+    });
+    startAttempt();
+    await addOrUpdateServer({ ...jump, host: "jump2.example" });
+    ctx.core.bumpConnectionGeneration("srv-1"); // what the mutation hook does for a rider of the edited jump
+    await addOrUpdateServer({ ...jump, host: "jump.example" });
+    ctx.core.bumpConnectionGeneration("srv-1");
+    await open(callbacks);
+    expectOneWarning();
+  });
+
+  it("without any generation movement, an unchanged descriptor still auto-starts", async () => {
+    const jump = makeServer({ id: "jump", name: "Jump", host: "jump.example" });
+    const { callbacks, addOrUpdateServer, startAttempt } = await connected({
+      servers: [jump], target: { proxy: { type: "ssh", jumpHostId: "jump" } }
+    });
+    startAttempt();
+    await addOrUpdateServer({ ...jump }); // no-op save: the hook sees nothing and bumps nothing
+    await open(callbacks);
+    expect(mockStartTunnel).toHaveBeenCalledTimes(1);
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+  });
+
   it("R reconnect: a profile edited after the reconnect's capture warns; before it, tunnels start", async () => {
     const first = await withProfile();
     first.startAttempt();
@@ -643,7 +669,10 @@ function setupHarness(options: {
     }
   };
 
+  const generations = new Map<string, number>();
   const core = {
+    getConnectionGeneration: vi.fn((id: string) => generations.get(id) ?? 0),
+    bumpConnectionGeneration: vi.fn((id: string) => { generations.set(id, (generations.get(id) ?? 0) + 1); }),
     getServer: vi.fn((id: string) => snapshot.servers.find((s) => s.id === id)),
     getAuthProfile: vi.fn((id: string) => snapshot.authProfiles.find((p) => p.id === id)),
     getTunnel: vi.fn((id: string) => snapshot.tunnels.find((t) => t.id === id)),

@@ -191,6 +191,7 @@ export class FolderCascadeSaveError extends Error {
 export class NexusCore {
   private readonly listeners = new Set<NexusListener>();
   private readonly serverRemovalListeners = new Set<ServerRemovalListener>();
+  private readonly connectionGenerations = new Map<string, number>();
   private readonly connectionConfigMutationListeners = new Set<ConnectionConfigMutationListener>();
   private readonly servers = new ObservedMap<ServerConfig>((id, prev, next) =>
     this.emitConnectionConfigMutation({ kind: "server", id, prev, next })
@@ -423,6 +424,22 @@ export class NexusCore {
   public onDidMutateConnectionConfig(listener: ConnectionConfigMutationListener): () => void {
     this.connectionConfigMutationListeners.add(listener);
     return () => this.connectionConfigMutationListeners.delete(listener);
+  }
+
+  /**
+   * A monotonic per-server counter bumped every time pool invalidation retires
+   * that server's pooled route (its own pooled params, a linked profile's
+   * credentials, a jump host it rides, a removal, a reload diff; see
+   * poolConfigInvalidation.ts). A pending start captures it and cancels if it
+   * moved, so an A -> B -> A change during the start cannot pass as "unchanged":
+   * the transport may have authenticated with B in between.
+   */
+  public getConnectionGeneration(serverId: string): number {
+    return this.connectionGenerations.get(serverId) ?? 0;
+  }
+
+  public bumpConnectionGeneration(serverId: string): void {
+    this.connectionGenerations.set(serverId, this.getConnectionGeneration(serverId) + 1);
   }
 
   public getServer(id: string): ServerConfig | undefined {

@@ -37,7 +37,7 @@ function authProfileConnectionChanged(prev: AuthProfile | undefined, next: AuthP
  * only the servers it actually invalidates, with no snapshot copy and no scan.
  */
 export function watchPoolInvalidationOnConfigMutation(
-  core: Pick<NexusCore, "onDidMutateConnectionConfig" | "getSnapshot">,
+  core: Pick<NexusCore, "onDidMutateConnectionConfig" | "getSnapshot" | "bumpConnectionGeneration">,
   pool: { invalidate(serverId: string): void },
   /**
    * Called synchronously when a server's proxy endpoint changes, so the
@@ -99,11 +99,15 @@ export function watchPoolInvalidationOnConfigMutation(
     if (invalidated.size === 0) {
       return;
     }
+    // Every invalidation also advances the server's connection generation, so a
+    // pending start that saw an A -> B -> A change (equal descriptors) still cancels.
     for (const id of invalidated) {
       pool.invalidate(id);
+      core.bumpConnectionGeneration(id);
     }
     for (const dependentId of ridersFromIndex(ridersOf, invalidated)) {
       pool.invalidate(dependentId);
+      core.bumpConnectionGeneration(dependentId);
     }
   });
 }

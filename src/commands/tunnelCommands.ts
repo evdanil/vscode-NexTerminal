@@ -178,6 +178,14 @@ export async function startTunnel(
     serverLookup: (id: string) => core.getServer(id)
   };
   const descriptorAtStart = tunnelStartDescriptor(profileAtStart, serverAtStart, inputs);
+  // Equality of descriptors is not enough: an A -> B -> A change to the linked
+  // profile or a jump host during the login or handshake can leave the transport
+  // authenticated with B while the final descriptor reads A again. The server's
+  // connection generation (bumped by the mutation hook on every pool invalidation
+  // of it, riders and profile changes included) catches any such mutation. The
+  // tunnel profile's own fields need no generation: TunnelManager runs on the
+  // profile object passed in, so only the descriptor guards them.
+  const generationAtStart = core.getConnectionGeneration?.(server.id) ?? 0;
   const stillCurrent = (): boolean => {
     const liveProfile = core.getTunnel(profile.id);
     const liveServer = core.getServer(server.id);
@@ -192,7 +200,10 @@ export async function startTunnel(
       : liveProfile.connectionMode === "ask"
         ? "ask"
         : liveProfile.connectionMode ?? readGlobalTunnelMode();
-    return tunnelStartDescriptor(liveProfile, liveServer, { ...inputs, mode: liveMode }) === descriptorAtStart;
+    return (
+      (core.getConnectionGeneration?.(server.id) ?? 0) === generationAtStart &&
+      tunnelStartDescriptor(liveProfile, liveServer, { ...inputs, mode: liveMode }) === descriptorAtStart
+    );
   };
   const reportCancelled = (): void => {
     // Names can come from an inventory sync; flatten them where they enter the message.
