@@ -233,7 +233,7 @@ export class TunnelRegistrySync {
         this.warnedFencePublishFailure = true;
         this.notifyWarning?.(
           `Nexus could not record a reservation for remote port ${options.retiredReverseBind.remotePort} of a stopped reverse tunnel. ` +
-          "Another VS Code window may collide on that port until the old connection closes: close this server's terminals or reload this window to release it, and wait before starting the same reverse tunnel elsewhere."
+          "Another VS Code window may collide on that port until the old connection closes: close this server's terminals, SFTP views and tunnels, or reload this window to release it, and wait before starting the same reverse tunnel elsewhere."
         );
       }
     }

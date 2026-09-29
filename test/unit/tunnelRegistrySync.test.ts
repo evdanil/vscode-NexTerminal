@@ -158,6 +158,7 @@ describe("TunnelRegistrySync", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     sync.dispose();
     vi.useRealTimers();
   });
@@ -983,12 +984,15 @@ describe("TunnelRegistrySync", () => {
     }));
     const fresh = seedRaw("fresh--1.json", contents, 0);
     const old = seedRaw("old--1.json", contents, 31_000);
+    // A versioned name carries the writer's clock; a recent one keeps the file.
+    const versioned = seedRaw(`v--${Date.now().toString().padStart(13, "0")}-000001-abc.json`, contents, 31_000);
     const other = new TunnelRegistrySync(otherStore, core, "other", probePort);
 
     await other.initialize();
 
     expect((await otherStore.getEntries()).map((entry) => entry.retiredReverseBind?.fenceId)).toEqual(["good"]);
     expect(fakeFenceFiles.has(old)).toBe(false);
+    expect(fakeFenceFiles.has(versioned)).toBe(true);
     // A file that just appeared might still be settling; only stale ones go.
     expect(fakeFenceFiles.has(fresh)).toBe(true);
     await vi.advanceTimersByTimeAsync(61_000);
@@ -1020,7 +1024,9 @@ describe("TunnelRegistrySync", () => {
     fakeFenceRead.failPath = seedRaw("live--1.json", "{}", 1_000);
     const other = new TunnelRegistrySync(otherStore, core, "other", probePort);
 
-    await expect(otherStore.getEntries()).rejects.toThrow();
+    await expect(otherStore.getEntries()).rejects.toMatchObject({
+      cause: expect.objectContaining({ code: "NoPermissions" })
+    });
     await expect(
       other.waitForRemoteReverseBindClear({ routeIdentity: reverseRoute, remotePort: 9000 }, () => false)
     ).rejects.toThrow();

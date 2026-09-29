@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- **An unreadable reverse-bind reservation file no longer stops the extension loading.** A corrupt, empty or unreadable file in the cross-window fence directory is now logged and ignored instead of failing every registry read, and it is deleted once it is more than 30 seconds old. Registry storage errors no longer fail activation, and the background sync timers no longer raise unhandled rejections.
+- **An unreadable reverse-bind reservation file no longer stops the extension loading.** A corrupt, empty or non-fence file in the cross-window fence directory is now logged and ignored instead of failing every registry read, and is deleted once it is more than 30 seconds old. A file that cannot be read is retried and, while under 30 seconds old, makes the registry read fail so a live reservation is never hidden; once stale it is ignored and deleted. Registry storage errors no longer fail activation, and the background sync timers no longer raise unhandled rejections.
 - **Stopping a tunnel no longer fails when the cross-window registry cannot be updated.** The failure is logged after local teardown, so server and tunnel removal complete instead of stopping partway. A reverse tunnel's reservation is still published before Stop returns when storage allows; if it cannot be, a one-time warning says another window may collide on that port and what to do.
 - **Orphaned temporary reservation files are cleaned up.** Temporary files left by a host killed mid-write are removed once older than 30 seconds.
 

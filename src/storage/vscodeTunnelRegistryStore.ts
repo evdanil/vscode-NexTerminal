@@ -94,7 +94,8 @@ export class VscodeTunnelRegistryStore implements TunnelRegistryStore {
       this.reportedUnusableFiles.add(name);
       console.error(`[Nexus] ignoring unusable reverse-bind fence file ${name}`, reason);
     }
-    await this.deleteIfOrphaned(uri);
+    const embedded = /--(\d{13})-\d{6}-[^.]*\.json$/.exec(name);
+    await this.deleteIfOrphaned(uri, embedded ? Number(embedded[1]) : undefined);
     return undefined;
   }
 
@@ -115,6 +116,7 @@ export class VscodeTunnelRegistryStore implements TunnelRegistryStore {
     const entries = this.context.globalState.get<TunnelRegistryEntry[]>(STORAGE_KEY, [])
       .filter((entry) => !entry.retiredReverseBind);
     await vscode.workspace.fs.createDirectory(this.fenceDirectory);
+    let lastReadError: unknown;
     for (let attempt = 0; attempt < 3; attempt++) {
       const files = await vscode.workspace.fs.readDirectory(this.fenceDirectory);
       await this.sweepOrphanTemporaries(files);
@@ -136,6 +138,7 @@ export class VscodeTunnelRegistryStore implements TunnelRegistryStore {
               // delete-pending file under a rename) may fail to read
               // transiently. Skipping it would hide a live reservation, so
               // re-list; persistent failure makes the read fail closed.
+              lastReadError = error;
               return { missing: true as const };
             }
             return { missing: false as const, fence: await this.skipUnusableFence(name, uri, error) };
@@ -167,7 +170,9 @@ export class VscodeTunnelRegistryStore implements TunnelRegistryStore {
       return [...[...latest.values()].map(({ entry }) => entry), ...entries];
     }
     // A continuously changing directory must not look like an empty registry.
-    throw new Error("Reverse-bind fence files changed during registry read");
+    throw new Error("Reverse-bind fence files changed or could not be read during registry read", {
+      cause: lastReadError
+    });
   }
 
   public async saveEntries(entries: TunnelRegistryEntry[]): Promise<void> {
