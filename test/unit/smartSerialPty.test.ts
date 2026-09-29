@@ -337,26 +337,6 @@ describe("SmartSerialPty", () => {
     expect(writes.join("")).not.toContain("must be discarded");
   });
 
-  it("cancels the sidecar open when openPort fails on a client-side timeout", async () => {
-    let openingSessionId = "";
-    const { transport, closePort } = createTransport({
-      listPorts: async () => [{ path: "COM5" }],
-      openPort: async (_params, sessionId) => {
-        openingSessionId = sessionId ?? "";
-        throw new Error("Serial sidecar RPC timed out after 10s (method=openPort)");
-      }
-    });
-    const harness = makeCallbacks();
-    const pty = new SmartSerialPty(transport, makeProfile(), harness.callbacks, noopLogger());
-
-    pty.open();
-    await flushAsync();
-
-    expect(openingSessionId).not.toBe("");
-    expect(closePort).toHaveBeenCalledWith(openingSessionId);
-    pty.dispose();
-  });
-
   it("prompts a picker when a single non-hint port is available and connects on user selection", async () => {
     const com9: SerialPortInfo = { path: "COM9", vendorId: "1111", productId: "2222", serialNumber: "ABC123" };
     const { transport, openPort } = createTransport({

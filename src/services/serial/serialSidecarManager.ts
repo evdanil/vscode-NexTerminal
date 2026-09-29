@@ -82,15 +82,43 @@ export class SerialSidecarManager {
         : pathOrOptions;
     const requestedSessionId =
       typeof pathOrOptions !== "string" && typeof sessionIdOrBaudRate === "string" ? sessionIdOrBaudRate : undefined;
-    const result = await this.request(
-      "openPort",
-      requestedSessionId !== undefined ? { ...params, sessionId: requestedSessionId } : params
-    );
+    const child = this.ensureStarted();
+    let result: unknown;
+    try {
+      result = await this.request(
+        "openPort",
+        requestedSessionId !== undefined ? { ...params, sessionId: requestedSessionId } : params
+      );
+    } catch (error) {
+      if (requestedSessionId !== undefined) {
+        this.cancelAbandonedOpen(child, requestedSessionId);
+      }
+      throw error;
+    }
     const openedSessionId = (result as { sessionId?: string }).sessionId;
     if (!openedSessionId) {
       throw new Error("Serial sidecar returned invalid openPort response");
     }
     return openedSessionId;
+  }
+
+  /**
+   * After a client-side timeout the worker is still waiting on the native open
+   * and would keep the port once it succeeds. Tell that same worker to cancel.
+   * This writes to the child that owned the open and never goes through
+   * ensureStarted(): if it was disposed or exited, its ports died with it and
+   * spawning a fresh sidecar just to cancel would leak an unowned process.
+   */
+  private cancelAbandonedOpen(child: ChildProcessWithoutNullStreams, sessionId: string): void {
+    if (this.processRef !== child || child.killed) {
+      return;
+    }
+    const payload: RpcRequest = { id: randomUUID(), method: "closePort", params: { sessionId } };
+    try {
+      child.stdin.write(`${JSON.stringify(payload)}\n`);
+    } catch {
+      // Best effort: the child is going away, and so is its open port.
+    }
   }
 
   public async writePort(sessionId: string, data: Buffer): Promise<void> {

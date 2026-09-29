@@ -222,13 +222,6 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.writeEmitter.fire("[Nexus Serial] Press any key to close this terminal.\r\n");
   }
 
-  private cancelAbandonedOpen(sessionId: string): void {
-    void this.transport.closePort(sessionId).catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : "unknown serial close error";
-      this.logger.log(`serial open cancel failed ${message}`);
-    });
-  }
-
   private async start(): Promise<void> {
     try {
       // The sidecar may emit portData before its openPort response reaches this PTY.
@@ -246,16 +239,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
         this.handleData(eventSessionId, data);
       });
 
-      let sessionId: string;
-      try {
-        sessionId = await this.transport.openPort(this.options, openingSessionId);
-      } catch (error) {
-        // A client-side RPC timeout leaves the sidecar's open in flight; tell it
-        // to cancel so the port is released when the open completes instead of
-        // staying held (and reporting "busy" to every later connect).
-        this.cancelAbandonedOpen(openingSessionId);
-        throw error;
-      }
+      const sessionId = await this.transport.openPort(this.options, openingSessionId);
       if (this.disposed) {
         this.openingPort = false;
         this.openingData.clear();
