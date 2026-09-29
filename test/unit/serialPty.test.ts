@@ -208,7 +208,7 @@ describe("SerialPty", () => {
     expect(out.indexOf(RESET_INTERACTIVE_MODES)).toBeLessThan(out.indexOf("Port disconnected"));
     expect(out).not.toContain("1049");
 
-    for (const report of ["\x1b[I", "\x1b[O", "\x1b[<0;10;5M", "\x1b[<0;10;5m", "\x1b[M !!", "\x1b[?997;1n"]) {
+    for (const report of ["\x1b[I", "\x1b[O", "\x1b[<0;10;5M", "\x1b[<0;10;5m", "\x1b[M !!", "\x1b[0;10;5M", "\x1b[?997;1n"]) {
       pty.handleInput(report);
     }
     expect(onDidClose).not.toHaveBeenCalled();
