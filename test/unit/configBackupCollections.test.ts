@@ -2459,3 +2459,46 @@ describe("proxy passwords are keyed by endpoint through backup, restore and Dele
     expect(await machine.vault.get(legacyProxyPasswordSecretKey("srv-1"))).toBeUndefined();
   });
 });
+
+describe("Replace with the endpoint-key housekeeping attached (#175 keeps a same-endpoint server's proxy password)", () => {
+  const LOCAL_ENDPOINT: Partial<ServerConfig> = { altHost: "10.0.1.1", proxy: LAB_PROXY };
+  const unsealedJson = (servers: unknown[]): string =>
+    JSON.stringify({ version: 2, exportType: "backup", exportedAt: new Date().toISOString(), servers });
+  async function destWithHook(overrides: Partial<ServerConfig> = {}) {
+    const dest = await makeMachine();
+    const local = makeServer({ ...LOCAL_ENDPOINT, ...overrides });
+    await dest.core.addOrUpdateServer(local);
+    await dest.vault.store("password-srv-1", "router-pw");
+    await dest.vault.store(currentProxyPasswordSecretKey(local)!, "proxy-pw");
+    // The extension's wiring: an endpoint a server left is deleted once the change is persisted.
+    const stop = watchPoolInvalidationOnConfigMutation(dest.core, { invalidate: () => {} }, {
+      deleteEndpoint: (id, proxy) => { void dest.vault.delete(proxyPasswordSecretKey(id, proxy)); }
+    });
+    return { dest, stop };
+  }
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it("re-creating the server on the same endpoint keeps its proxy password", async () => {
+    const { dest, stop } = await destWithHook();
+    await runImport(dest, unsealedJson([makeServer({ ...LOCAL_ENDPOINT })]), "replace");
+    await settle();
+    expect(await dest.vault.get(PROXY_KEY_1)).toBe("proxy-pw");
+    stop();
+  });
+
+  it("re-creating it on another endpoint deletes the old endpoint's proxy password", async () => {
+    const { dest, stop } = await destWithHook();
+    await runImport(dest, unsealedJson([makeServer({ ...LOCAL_ENDPOINT, proxy: { type: "socks5", host: "other.lab", port: 1080, username: "pxuser" } })]), "replace");
+    await settle();
+    expect(await dest.vault.get(PROXY_KEY_1)).toBeUndefined();
+    stop();
+  });
+
+  it("a Replace that does not bring the server back deletes its proxy password", async () => {
+    const { dest, stop } = await destWithHook();
+    await runImport(dest, unsealedJson([makeServer({ id: "other", name: "Other" })]), "replace");
+    await settle();
+    expect(await dest.vault.get(PROXY_KEY_1)).toBeUndefined();
+    stop();
+  });
+});

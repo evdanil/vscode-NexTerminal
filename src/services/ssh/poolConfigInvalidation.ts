@@ -38,7 +38,7 @@ function authProfileConnectionChanged(prev: AuthProfile | undefined, next: AuthP
  * only the servers it actually invalidates, with no snapshot copy and no scan.
  */
 export function watchPoolInvalidationOnConfigMutation(
-  core: Pick<NexusCore, "onDidMutateConnectionConfig" | "onDidPersistServers" | "getServer" | "getSnapshot">,
+  core: Pick<NexusCore, "onDidMutateConnectionConfig" | "onDidPersistServers" | "isServerBatchActive" | "getServer" | "getSnapshot">,
   pool: { invalidate(serverId: string): void },
   /**
    * Housekeeping for endpoint-keyed proxy passwords (see proxyPasswordKeys.ts).
@@ -50,7 +50,7 @@ export function watchPoolInvalidationOnConfigMutation(
   proxySecrets?: { deleteEndpoint(serverId: string, proxy: PasswordBearingProxy): void }
 ): () => void {
   /** serverId -> password-bearing endpoints the server left since the last persist. */
-  const leftEndpoints = new Map<string, PasswordBearingProxy[]>();
+  const leftEndpoints = new Map<string, Array<{ proxy: PasswordBearingProxy; removal: boolean }>>();
   const jumpOf = new Map<string, string>();
   const ridersOf = new Map<string, Set<string>>();
   const profileOf = new Map<string, string>();
@@ -86,7 +86,7 @@ export function watchPoolInvalidationOnConfigMutation(
     indexServer(server.id, server);
   }
 
-  // Cleanup runs only on the explicit persistence signal (never onDidChange, which
+  // Cleanup runs only on the explicit persistence signal (or a batch's end) (never onDidChange, which
   // also fires for sessions, tunnels and focus while a save is pending): an endpoint
   // the persisted record no longer uses has its saved password deleted. A save
   // that fails settles nothing, and a rolled-back edit finds its original
@@ -107,8 +107,9 @@ export function watchPoolInvalidationOnConfigMutation(
           const stillUsed = (endpoint: PasswordBearingProxy): boolean =>
             (stored !== undefined && proxyConfigsEqual(stored.proxy, endpoint)) ||
             (current !== undefined && proxyConfigsEqual(current.proxy, endpoint));
-          const remaining = endpoints.filter((endpoint) => {
-            if (stillUsed(endpoint)) {
+          const batchActive = core.isServerBatchActive();
+          const remaining = endpoints.filter(({ proxy: endpoint, removal }) => {
+            if (stillUsed(endpoint) || (removal && batchActive)) {
               return true;
             }
             proxySecrets.deleteEndpoint(serverId, endpoint);
@@ -128,13 +129,14 @@ export function watchPoolInvalidationOnConfigMutation(
     if (mutation.kind === "server") {
       indexServer(mutation.id, mutation.next);
       const left = mutation.prev?.proxy;
-      // Only a SURVIVING server's change: a removal's own flow clears its endpoint key
-      // (it knows the record, and Replace deliberately keeps a re-created same-endpoint
-      // server's password, #175), so it must not be deleted here on the removal's persist.
-      if (proxySecrets && isPasswordBearingProxy(left) && mutation.next !== undefined && !proxyConfigsEqual(left, mutation.next.proxy)) {
+      // Edits AND removals: the endpoint a server leaves is cleaned up after the change is
+      // durable, under one rule (see the persistence handler). A removal that is part of a
+      // batch (Replace) waits for the batch to end, since the same id may come back on the
+      // same endpoint, which keeps the key.
+      if (proxySecrets && isPasswordBearingProxy(left) && (mutation.next === undefined || !proxyConfigsEqual(left, mutation.next.proxy))) {
         const list = leftEndpoints.get(mutation.id) ?? [];
-        if (!list.some((known) => proxyConfigsEqual(known, left))) {
-          list.push(left);
+        if (!list.some((known) => proxyConfigsEqual(known.proxy, left))) {
+          list.push({ proxy: left, removal: mutation.next === undefined });
         }
         leftEndpoints.set(mutation.id, list);
       }

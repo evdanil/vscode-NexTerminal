@@ -168,13 +168,69 @@ describe("a pending proxy edit never exposes one endpoint's password under anoth
     stop();
   });
 
-  it("removing a server leaves its endpoint key to the removal flow (which knows the record)", async () => {
+  it("removing a server deletes its endpoint key after the removal is persisted, not before", async () => {
     const { vault, repo, core, stop } = await setup();
     const pending = core.removeServer("s1");
+    expect(vault.deleted).toEqual([]);
     repo.release?.();
     await pending;
     await tick();
+    expect(vault.deleted).toEqual([proxyPasswordSecretKey("s1", A)]);
+    stop();
+  });
+
+  it("a folder delete that removes servers deletes their endpoint keys after persistence", async () => {
+    const vault = new MemoryVault();
+    vault.data.set(proxyPasswordSecretKey("s1", A), "pw-A");
+    vault.data.set(proxyPasswordSecretKey("s2", B), "pw-B");
+    const repo = new SlowRepo([server({ group: "G" }), server({ id: "s2", proxy: B })], []);
+    const core = new NexusCore(repo);
+    await core.initialize();
+    const stop = watchPoolInvalidationOnConfigMutation(core, { invalidate: () => {} }, {
+      deleteEndpoint: (id, proxy) => { void vault.delete(proxyPasswordSecretKey(id, proxy)); }
+    });
+    const pending = core.removeFolderCascade("G", true);
     expect(vault.deleted).toEqual([]);
+    for (let i = 0; i < 2; i++) { repo.release?.(); await tick(); }
+    await pending;
+    await tick();
+    expect(vault.deleted).toEqual([proxyPasswordSecretKey("s1", A)]);
+    expect(vault.data.get(proxyPasswordSecretKey("s2", B))).toBe("pw-B");
+    stop();
+  });
+
+  it("inside a batch (Replace), a removed server re-created on the same endpoint keeps its key; on another endpoint the old key is deleted", async () => {
+    const vault = new MemoryVault();
+    vault.data.set(proxyPasswordSecretKey("s1", A), "pw-A");
+    vault.data.set(proxyPasswordSecretKey("s2", A), "pw-A2");
+    const repo = new SlowRepo([server(), server({ id: "s2" })], []);
+    const core = new NexusCore(repo);
+    await core.initialize();
+    const stop = watchPoolInvalidationOnConfigMutation(core, { invalidate: () => {} }, {
+      deleteEndpoint: (id, proxy) => { void vault.delete(proxyPasswordSecretKey(id, proxy)); }
+    });
+    const batch = core.runServerBatch(async () => {
+      await core.removeServer("s1"); // persists the removal BEFORE the re-add
+      await core.removeServer("s2");
+      await core.addOrUpdateServer(server()); // same endpoint: keeps the key
+      await core.addOrUpdateServer(server({ id: "s2", proxy: B })); // another endpoint: old key goes
+    });
+    for (let i = 0; i < 8; i++) { repo.release?.(); await tick(); }
+    await batch;
+    await tick();
+    expect(vault.data.get(proxyPasswordSecretKey("s1", A))).toBe("pw-A");
+    expect(vault.data.has(proxyPasswordSecretKey("s2", A))).toBe(false);
+    expect(vault.deleted).toEqual([proxyPasswordSecretKey("s2", A)]);
+    stop();
+  });
+
+  it("a batch that removes and never re-creates a server deletes its key when the batch ends", async () => {
+    const { vault, repo, core, stop } = await setup();
+    const batch = core.runServerBatch(async () => { await core.removeServer("s1"); });
+    for (let i = 0; i < 3; i++) { repo.release?.(); await tick(); }
+    await batch;
+    await tick();
+    expect(vault.deleted).toEqual([proxyPasswordSecretKey("s1", A)]);
     stop();
   });
 });

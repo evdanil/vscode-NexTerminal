@@ -4310,7 +4310,12 @@ export function registerConfigCommands(
   ): Promise<void> {
     const removed = emptyRemovedProfileIds();
     try {
-      await configMutationLock.runExclusive(() => importMergeReplaceLocked(data, mode, decryptedSecrets, removed));
+      await configMutationLock.runExclusive(() =>
+        // A Replace removes every server and re-creates some under the same ids: batch it so
+        // endpoint-key housekeeping settles once the whole operation is done (#175 keeps a
+        // re-created same-endpoint server's proxy password).
+        core.runServerBatch(() => importMergeReplaceLocked(data, mode, decryptedSecrets, removed))
+      );
     } finally {
       await teardownRemovedProfiles(core, runtime, removed);
     }

@@ -191,6 +191,7 @@ export class FolderCascadeSaveError extends Error {
 export class NexusCore {
   private readonly listeners = new Set<NexusListener>();
   private readonly serverRemovalListeners = new Set<ServerRemovalListener>();
+  private serverBatchDepth = 0;
   private readonly serverPersistedListeners = new Set<(servers: readonly ServerConfig[]) => void>();
   private readonly connectionConfigMutationListeners = new Set<ConnectionConfigMutationListener>();
   private readonly servers = new ObservedMap<ServerConfig>((id, prev, next) =>
@@ -423,6 +424,31 @@ export class NexusCore {
    * that restores a prior record fires again; the extra invalidation only costs
    * a fresh connection later.
    */
+  /** True while a `runServerBatch` operation is running. */
+  public isServerBatchActive(): boolean {
+    return this.serverBatchDepth > 0;
+  }
+
+  /**
+   * Runs an operation that removes servers and may bring the same ids back (a Replace
+   * import). While it runs, per-server housekeeping that keys off removals waits, so a
+   * removal's persist cannot delete a secret the operation is about to keep for a
+   * re-created record of the same endpoint. When the outermost batch ends, the servers
+   * are announced through `onDidPersistServers` (carrying the in-memory state, the
+   * state the operation left) so the deferred housekeeping settles.
+   */
+  public async runServerBatch<T>(operation: () => Promise<T>): Promise<T> {
+    this.serverBatchDepth++;
+    try {
+      return await operation();
+    } finally {
+      this.serverBatchDepth--;
+      if (this.serverBatchDepth === 0) {
+        this.emitServersPersisted([...this.servers.values()]);
+      }
+    }
+  }
+
   /**
    * Fires after the servers collection was successfully persisted, carrying the
    * records that were written. Also fires once for `initialize()`, whose loaded
