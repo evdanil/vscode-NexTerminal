@@ -112,7 +112,7 @@ export interface SessionTranscript {
   flush?(): void;
   /**
    * Drop the ANSI stripper's carry: the PTY is starting a new transport (an SSH
-   * reconnect), so an escape the old one left unfinished must not swallow the
+   * reconnect or Smart Follow reattach), so an escape the old one left unfinished must not swallow the
    * new one's output. Optional for the same reason as {@link flush}.
    */
   resetEscapeState?(): void;

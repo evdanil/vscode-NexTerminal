@@ -109,8 +109,8 @@ export class PtyObserverHub {
   }
 
   /**
-   * Tell every observer a new transport is starting on this PTY (SSH reconnect
-   * reuses the hub), so per-stream parser state such as the ANSI stripper's
+   * Tell every observer a new transport is starting on this PTY (an SSH reconnect or
+   * a Smart Follow reattach reuses the hub), so per-stream parser state such as the ANSI stripper's
    * carry is dropped. Deliberately separate from any buffer clear.
    */
   public notifyTransportReset(): void {

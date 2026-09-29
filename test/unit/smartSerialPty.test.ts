@@ -6,6 +6,8 @@ import {
   type SmartSerialPtyCallbacks,
   type SmartSerialTransport
 } from "../../src/services/serial/smartSerialPty";
+import { ScriptOutputBuffer } from "../../src/services/scripts/scriptOutputBuffer";
+import { outputBufferObserver } from "../../src/services/scripts/sessionOutputCapture";
 import type { SerialProfile } from "../../src/models/config";
 import type { OpenPortParams, SerialPortInfo } from "../../src/services/serial/protocol";
 import { CLEAR_VISIBLE_SCREEN, RESET_INTERACTIVE_MODES } from "../../src/services/terminal/terminalEscapes";
@@ -478,6 +480,66 @@ describe("SmartSerialPty", () => {
     expect(RESET_INTERACTIVE_MODES).toMatch(/\?[\d;]*\b1007\b[\d;]*l/);
     expect(out.indexOf(RESET_INTERACTIVE_MODES)).toBeGreaterThanOrEqual(0);
     expect(out.indexOf(RESET_INTERACTIVE_MODES)).toBeLessThan(out.indexOf("\x1b[?1000h"));
+    pty.dispose();
+  });
+
+  it("a reattach drops the ANSI carries of the lost device before the replacement's replayed output", async () => {
+    vi.useFakeTimers();
+    let opens = 0;
+    let emit: ((id: string, payload: string) => void) | undefined;
+    const t = createTransport({
+      listPorts: async () => [{ path: "COM5", serialNumber: "ABC123" }],
+      openPort: async (_params, sessionId) => {
+        opens += 1;
+        if (opens === 2) {
+          emit!(sessionId ?? "", "Password: "); // buffered while the port opens
+        }
+        return sessionId ?? `session-${opens}`;
+      }
+    });
+    emit = t.emitData;
+    const events: string[] = [];
+    const transcript = {
+      write: vi.fn((text: string) => events.push(`write:${text}`)),
+      resetEscapeState: vi.fn(() => events.push("transcript-reset")),
+      flush: vi.fn(),
+      close: vi.fn()
+    };
+    const buffer = new ScriptOutputBuffer();
+    const observer = {
+      ...outputBufferObserver(buffer),
+      onOutput: (text: string) => {
+        events.push(`observe:${text}`);
+        buffer.append(text);
+      },
+      onTransportReset: () => {
+        events.push("observer-reset");
+        buffer.resetEscapeState();
+      }
+    };
+    const pty = new SmartSerialPty(
+      t.transport,
+      makeProfile(),
+      makeCallbacks().callbacks,
+      noopLogger(),
+      transcript as never,
+      undefined,
+      observer
+    );
+    pty.open();
+    await flushAsync();
+
+    t.emitData((t.transport.openPort as ReturnType<typeof vi.fn>).mock.calls[0][1], "ok\x1bPunterminated payload");
+    t.emitDisconnect((t.transport.openPort as ReturnType<typeof vi.fn>).mock.calls[0][1], "Port closed");
+    events.length = 0;
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushAsync();
+
+    expect(events.indexOf("observer-reset")).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf("transcript-reset")).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf("observer-reset")).toBeLessThan(events.indexOf("observe:Password: "));
+    expect(events.indexOf("transcript-reset")).toBeLessThan(events.indexOf("write:Password: "));
+    expect(buffer.tail(40)).toBe("okPassword: ");
     pty.dispose();
   });
 

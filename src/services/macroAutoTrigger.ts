@@ -169,8 +169,8 @@ export interface PtyOutputObserver {
   pauseIntervalMacros(): void;
   dispose(): void;
   /**
-   * The PTY is starting a new transport (an SSH reconnect reuses the same
-   * observers). Observers that keep parser state across chunks, such as the
+   * The PTY is starting a new transport inside the same instance (an SSH
+   * reconnect or a Smart Follow reattach reuses the same observers). Observers that keep parser state across chunks, such as the
    * ANSI stripper's carry, must drop it: whatever the dead connection left
    * half-sent must not swallow or corrupt the new connection's first output.
    * Not fired for a buffer clear or Clear Scrollback: the byte stream goes on.
