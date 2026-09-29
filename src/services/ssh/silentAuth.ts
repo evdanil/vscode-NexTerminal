@@ -11,6 +11,7 @@ import type {
   SshConnector,
   SshFactory
 } from "./contracts";
+import { AuthNotJudgedError, isAuthNotJudged } from "./authErrors";
 
 export type InputPromptFn = (message: string, password: boolean, signal?: AbortSignal) => Promise<string | undefined>;
 
@@ -25,7 +26,7 @@ export async function promptUntilOwnersInactive<T>(
   const checkOwners = (): void => {
     const current = owners();
     if (current.length > 0 && current.every((owner) => owner?.() === false)) {
-      rejectAbandoned(new Error("SSH connection attempt ended during its prompt"));
+      rejectAbandoned(new AuthNotJudgedError("SSH connection attempt ended during its prompt"));
       controller.abort();
     }
   };
@@ -89,20 +90,29 @@ export function authProfilePassphraseSecretKey(profileId: string): string {
   return `auth-profile-passphrase-${profileId}`;
 }
 
+/**
+ * True only when the server rejected the credential. Failures that never got
+ * a verdict (`AuthNotJudgedError`) are excluded first, and the text match is
+ * limited to ssh2's rejection wording: a bare "authentication" substring also
+ * matched unrelated errors, and a false positive deletes a valid saved secret.
+ */
 function isAuthError(error: unknown): boolean {
-  if (!(error instanceof Error)) {
+  if (!(error instanceof Error) || isAuthNotJudged(error)) {
     return false;
+  }
+  if ((error as { level?: unknown }).level === "client-authentication") {
+    return true;
   }
   const message = error.message.toLowerCase();
   return (
-    message.includes("authentication") ||
+    message.includes("authentication failed") ||
     message.includes("auth fail") ||
     message.includes("all configured authentication methods failed")
   );
 }
 
 function isPassphraseError(error: unknown): boolean {
-  if (!(error instanceof Error)) {
+  if (!(error instanceof Error) || isAuthNotJudged(error)) {
     return false;
   }
   const message = error.message.toLowerCase();
@@ -250,7 +260,7 @@ export class SilentAuthSshFactory implements SshFactory {
     await previous;
     try {
       if (signal?.aborted) {
-        throw new Error("SSH authentication attempt ended before its prompt opened");
+        throw new AuthNotJudgedError("SSH authentication attempt ended before its prompt opened");
       }
       return await ask();
     } finally {
@@ -337,7 +347,7 @@ export class SilentAuthSshFactory implements SshFactory {
     return (name, instructions, prompts, signal) => {
       const answer = async (): Promise<string[]> => {
         if (signal?.aborted) {
-          throw new Error("SSH authentication attempt ended before its prompt opened");
+          throw new AuthNotJudgedError("SSH authentication attempt ended before its prompt opened");
         }
         this.assertAttemptActive(isActive);
         this.assertCredentialRecordCurrent(provenance);
@@ -369,10 +379,10 @@ export class SilentAuthSshFactory implements SshFactory {
           } else {
             const answer = await promptFn(p.prompt, !p.echo, signal);
             if (answer === undefined) {
-              throw new Error("Keyboard-interactive authentication canceled");
+              throw new AuthNotJudgedError("Keyboard-interactive authentication canceled");
             }
             if (signal?.aborted) {
-              throw new Error("SSH authentication attempt ended during its prompt");
+              throw new AuthNotJudgedError("SSH authentication attempt ended during its prompt");
             }
             this.assertAttemptActive(isActive);
             this.assertCredentialRecordCurrent(provenance);
@@ -747,7 +757,7 @@ export class SilentAuthSshFactory implements SshFactory {
     if (typedFor === undefined) {
       const result = await this.promptExclusively(() => promptUntilOwnersInactive((signal) => {
         if (isActive?.() === false) {
-          throw new Error("SSH connection attempt ended before its prompt opened");
+          throw new AuthNotJudgedError("SSH connection attempt ended before its prompt opened");
         }
         this.assertCredentialRecordCurrent(provenance);
         return ask(signal);
@@ -766,7 +776,7 @@ export class SilentAuthSshFactory implements SshFactory {
         return current.ask(signal);
       }
       if (shared.requests.every((waiting) => waiting.isActive?.() === false)) {
-        throw new Error("SSH connection attempt ended before its prompt opened");
+        throw new AuthNotJudgedError("SSH connection attempt ended before its prompt opened");
       }
       throw new Error("The server configuration changed while connecting; the credential was not sent. Connect again.");
     };
@@ -822,14 +832,14 @@ export class SilentAuthSshFactory implements SshFactory {
       if (own.requests.every((waiting) => waiting.isActive?.() === false)) {
         settle();
       }
-      throw new Error("SSH connection attempt ended before authentication completed");
+      throw new AuthNotJudgedError("SSH connection attempt ended before authentication completed");
     }
     return { result, settle, joined, provenance: own.provenance };
   }
 
   private assertAttemptActive(isActive?: () => boolean): void {
     if (isActive?.() === false) {
-      throw new Error("SSH connection attempt ended before authentication completed");
+      throw new AuthNotJudgedError("SSH connection attempt ended before authentication completed");
     }
   }
 }

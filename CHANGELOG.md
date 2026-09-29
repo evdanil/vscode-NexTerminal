@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.8.301] — 2026-09-29
+
+### Fixed
+
+- **An ended or dropped SSH login no longer deletes a valid saved password or passphrase.** Closing or reconnecting a terminal while it connects, a connection that closes cleanly before login finishes, and a dismissed verification-code prompt were all read as a server rejection because their messages contain the word "authentication". They now carry their own error type, and a saved password is now cleared only when the server rejects it, and a saved key passphrase only when it fails to decrypt the key. A connection that drops mid-login is reported as a connection failure — in the terminal and in Test Connection and Copy Details — without a password prompt.
+- **Port-forwarding guide no longer says concurrent jump-host password prompts dismiss each other.** Since 2.8.280 they appear one after another.
+
 ## [2.8.300] — 2026-09-29
 
 ### Fixed
