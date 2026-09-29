@@ -50,7 +50,7 @@ export function watchPoolInvalidationOnConfigMutation(
   proxySecrets?: { deleteEndpoint(serverId: string, proxy: PasswordBearingProxy): void }
 ): () => void {
   /** serverId -> password-bearing endpoints the server left since the last persist. */
-  const leftEndpoints = new Map<string, Array<{ proxy: PasswordBearingProxy; removal: boolean }>>();
+  const leftEndpoints = new Map<string, PasswordBearingProxy[]>();
   const jumpOf = new Map<string, string>();
   const ridersOf = new Map<string, Set<string>>();
   const profileOf = new Map<string, string>();
@@ -93,7 +93,11 @@ export function watchPoolInvalidationOnConfigMutation(
   // endpoint's password untouched, because nothing was deleted before persistence.
   const unsubscribePersisted = proxySecrets
     ? core.onDidPersistServers((persisted) => {
-        if (leftEndpoints.size === 0) {
+        // Inside a server batch (a Replace import, the editor's record + secret
+        // transaction) nothing settles until the batch ends: a removal may be followed by a
+        // re-add on the same endpoint, and a failed secret write rolls the record back to the
+        // old proxy, whose password must still be there.
+        if (leftEndpoints.size === 0 || core.isServerBatchActive()) {
           return;
         }
         const byId = new Map(persisted.map((server) => [server.id, server]));
@@ -107,9 +111,8 @@ export function watchPoolInvalidationOnConfigMutation(
           const stillUsed = (endpoint: PasswordBearingProxy): boolean =>
             (stored !== undefined && proxyConfigsEqual(stored.proxy, endpoint)) ||
             (current !== undefined && proxyConfigsEqual(current.proxy, endpoint));
-          const batchActive = core.isServerBatchActive();
-          const remaining = endpoints.filter(({ proxy: endpoint, removal }) => {
-            if (stillUsed(endpoint) || (removal && batchActive)) {
+          const remaining = endpoints.filter((endpoint) => {
+            if (stillUsed(endpoint)) {
               return true;
             }
             proxySecrets.deleteEndpoint(serverId, endpoint);
@@ -130,13 +133,12 @@ export function watchPoolInvalidationOnConfigMutation(
       indexServer(mutation.id, mutation.next);
       const left = mutation.prev?.proxy;
       // Edits AND removals: the endpoint a server leaves is cleaned up after the change is
-      // durable, under one rule (see the persistence handler). A removal that is part of a
-      // batch (Replace) waits for the batch to end, since the same id may come back on the
-      // same endpoint, which keeps the key.
+      // durable, under one rule (see the persistence handler); inside a server batch it waits
+      // for the batch to end.
       if (proxySecrets && isPasswordBearingProxy(left) && (mutation.next === undefined || !proxyConfigsEqual(left, mutation.next.proxy))) {
         const list = leftEndpoints.get(mutation.id) ?? [];
-        if (!list.some((known) => proxyConfigsEqual(known.proxy, left))) {
-          list.push({ proxy: left, removal: mutation.next === undefined });
+        if (!list.some((known) => proxyConfigsEqual(known, left))) {
+          list.push(left);
         }
         leftEndpoints.set(mutation.id, list);
       }

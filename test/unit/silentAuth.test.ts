@@ -1444,6 +1444,23 @@ describe("deleteServerSecrets", () => {
     ]);
   });
 
+  it("with a vault that lists its keys, sweeps every endpoint-keyed proxy password of that id and no other id's", async () => {
+    const socks = { type: "socks5" as const, host: "p", port: 1080, username: "u" };
+    const http = { type: "http" as const, host: "q", port: 3128, username: "u" };
+    const keys = [
+      proxyPasswordSecretKey("srv-1", socks), proxyPasswordSecretKey("srv-1", http),
+      proxyPasswordSecretKey("srv-1-b", socks), // another server whose id merely starts with srv-1
+      proxyPasswordSecretKey("srv-2", socks), "password-srv-1", "unrelated"
+    ];
+    const { vault, attempted } = vaultFailingOn("none");
+    (vault as { keys?: () => Promise<string[]> }).keys = async () => keys;
+    await deleteServerSecrets(vault, "srv-1", { bestEffort: true });
+    expect(attempted).toEqual([
+      passwordSecretKey("srv-1"), passphraseSecretKey("srv-1"), legacyProxyPasswordSecretKey("srv-1"),
+      proxyPasswordSecretKey("srv-1", socks), proxyPasswordSecretKey("srv-1", http)
+    ]);
+  });
+
   it("rejects on the first failure by default, so a caller that still holds the record can stop", async () => {
     const { vault, attempted } = vaultFailingOn(passphraseSecretKey("srv-1"));
     // ⊘ swallowing by default: nexus.server.remove would delete the record anyway.

@@ -16,6 +16,11 @@ export interface HostKeyVerifier {
 }
 
 export interface SecretVault {
+  /**
+   * Every key the extension stored (SecretStorage.keys()). Optional so a vault that cannot
+   * list its keys still works; used to sweep endpoint-keyed proxy passwords by server id.
+   */
+  keys?(): Promise<string[]> | string[];
   get(key: string): Promise<string | undefined>;
   store(key: string, value: string): Promise<void>;
   delete(key: string): Promise<void>;

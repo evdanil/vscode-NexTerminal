@@ -41,6 +41,16 @@ export function proxyPasswordSecretKey(serverId: string, proxy: PasswordBearingP
   return `proxy-password-${serverId}-${hash}`;
 }
 
+/**
+ * Every endpoint-keyed proxy password key that belongs to `serverId` in `allKeys`. Exact:
+ * `proxy-password-{id}-` followed by the 24-hex endpoint hash and nothing else, so a
+ * server whose id starts with another's (`srv` and `srv-1`) never matches the wrong keys.
+ */
+export function endpointProxyPasswordKeysOf(serverId: string, allKeys: readonly string[]): string[] {
+  const prefix = `proxy-password-${serverId}-`;
+  return allKeys.filter((key) => key.startsWith(prefix) && /^[0-9a-f]{24}$/.test(key.slice(prefix.length)));
+}
+
 /** The key for the server's CURRENT proxy, or undefined when it has no password-bearing proxy. */
 export function currentProxyPasswordSecretKey(server: Pick<ServerConfig, "id" | "proxy">): string | undefined {
   return isPasswordBearingProxy(server.proxy) ? proxyPasswordSecretKey(server.id, server.proxy) : undefined;

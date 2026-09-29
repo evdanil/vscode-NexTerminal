@@ -142,6 +142,33 @@ describe("a pending proxy edit never exposes one endpoint's password under anoth
     stop();
   });
 
+  it("inside a server batch, an A -> B edit whose secret write then fails and rolls back to A keeps A's password", async () => {
+    const { vault, repo, core, stop, readForCurrent } = await setup();
+    const original = core.getServer("s1")!;
+    // The editor's record + secret transaction.
+    const transaction = core.runServerBatch(async () => {
+      await core.addOrUpdateServer(server({ proxy: B })); // persisted before the secret write
+      // ...the SecretStorage write for B rejects, so the catch restores the record:
+      await core.addOrUpdateServer(original);
+    });
+    for (let i = 0; i < 4; i++) { repo.release?.(); await tick(); }
+    await transaction;
+    await tick();
+    expect(await readForCurrent()).toBe("pw-A");
+    expect(vault.deleted).not.toContain(proxyPasswordSecretKey("s1", A));
+    stop();
+  });
+
+  it("the same edit outside a batch would have deleted A once B persisted (why the editor batches)", async () => {
+    const { vault, repo, core, stop } = await setup();
+    const pending = core.addOrUpdateServer(server({ proxy: B }));
+    repo.release?.();
+    await pending;
+    await tick();
+    expect(vault.deleted).toEqual([proxyPasswordSecretKey("s1", A)]);
+    stop();
+  });
+
   it("A -> B -> A before the save deletes nothing", async () => {
     const { vault, repo, core, stop, readForCurrent } = await setup();
     const original = core.getServer("s1")!;

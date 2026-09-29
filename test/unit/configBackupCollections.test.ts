@@ -2405,6 +2405,20 @@ describe("Delete All Data (nexus.config.completeReset) covers Local Servers and 
     expect(machine.ctx.state.has("nexus.servers")).toBe(false);
   });
 
+  it("Complete Reset deletes the endpoint-keyed proxy password of a stored row that fails validation, and no other server's", async () => {
+    const machine = await makeMachine();
+    machine.ctx.state.set("nexus.servers", [{ id: "bad-srv", name: 42 }]);
+    const doomed = proxyPasswordSecretKey("bad-srv", LAB_PROXY);
+    const otherServer = proxyPasswordSecretKey("bad-srv-2", LAB_PROXY); // an id that merely starts with bad-srv
+    await machine.vault.store(doomed, "secret");
+    await machine.vault.store(otherServer, "secret");
+
+    await runReset(machine, recordingRuntime(machine.core));
+
+    expect(await machine.vault.get(doomed)).toBeUndefined();
+    expect(await machine.vault.get(otherServer)).toBe("secret");
+  });
+
   it("a failed secret delete does not stop the rest of the reset", async () => {
     const machine = await makeMachine();
     machine.ctx.state.set("nexus.servers", [{ id: "bad-a" }, { id: "bad-b" }]);

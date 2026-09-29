@@ -1940,7 +1940,11 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           // point shows UI — see the lock's own contract — the info message
           // just after is fire-and-forget (`void`, never awaited) and stays
           // outside the lock regardless.
-          await configMutationLock.runExclusive(async () => {
+          // One server batch around the record + proxy-secret transaction: the housekeeping that
+          // deletes the endpoint a proxy edit leaves settles only when the whole transaction ends.
+          // If the secret write fails and the catch restores the record to the old proxy, that
+          // endpoint's password is still there (the batch ends with the old record in place).
+          await configMutationLock.runExclusive(() => ctx.core.runServerBatch(async () => {
             // REVIEW FINDING (P1) — the profile is re-resolved against LIVE
             // core state (the select was populated when the form opened and
             // the form can sit open indefinitely) and checked against what
@@ -2355,7 +2359,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
               }
               throw new Error(`Could not store proxy credentials for "${existing.name}" — changes were not saved.`);
             }
-          });
+          }));
           if (ctx.core.isServerConnected(existing.id)) {
             void vscode.window.showInformationMessage(
               "Server profile updated. Existing sessions keep current connection settings until reconnect."

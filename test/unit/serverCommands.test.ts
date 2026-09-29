@@ -710,6 +710,7 @@ function setupHarness(options: {
   const emitMutation = (m: unknown) => { for (const l of [...mutationListeners]) l(m); };
   const core = {
     __mutationListenerCount: () => mutationListeners.size,
+    runServerBatch: vi.fn(async (operation: () => Promise<unknown>) => operation()),
     onDidMutateConnectionConfig: vi.fn((listener: (m: unknown) => void) => {
       mutationListeners.add(listener);
       return () => { mutationListeners.delete(listener); };
@@ -4605,6 +4606,16 @@ describe("nexus.server.edit — record+secret mutation locking (FINDING 2, P2)",
     const finalC = ctx.core.getServer("srv-3");
     expect(finalC?.openFileExplorerOnFirstConnect).toBe(true);
     expect(finalB?.openFileExplorerOnFirstConnect).toBeUndefined();
+  });
+
+  it("runs the editor's record + proxy-secret transaction inside one server batch, so housekeeping settles only after any rollback", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [makeServer()], initialSecrets: {} });
+    registerServerCommands(ctx);
+    const editCmd = registeredCommands.get("nexus.server.edit");
+    await editCmd!("srv-1");
+    const options = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: Record<string, unknown>) => Promise<void> };
+    await options.onSubmit({ name: "Server 1", host: "example.com", port: 22, username: "dev", authType: "password" });
+    expect((ctx.core as unknown as { runServerBatch: ReturnType<typeof vi.fn> }).runServerBatch).toHaveBeenCalledTimes(1);
   });
 
   it("(FINDING 3, P2) a server removed concurrently while the proxy-secret restore is pending stays removed, and the vault ends up with no proxy-secret key for its id, instead of an unconditional restore recreating an orphaned secret (kills unconditional restore)", async () => {

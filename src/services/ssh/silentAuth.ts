@@ -12,7 +12,12 @@ import type {
   SshFactory
 } from "./contracts";
 import { AuthNotJudgedError, isAuthNotJudged } from "./authErrors";
-import { isPasswordBearingProxy, legacyProxyPasswordSecretKey, proxyPasswordSecretKey } from "./proxyPasswordKeys";
+import {
+  endpointProxyPasswordKeysOf,
+  isPasswordBearingProxy,
+  legacyProxyPasswordSecretKey,
+  proxyPasswordSecretKey
+} from "./proxyPasswordKeys";
 
 export type InputPromptFn = (message: string, password: boolean, signal?: AbortSignal) => Promise<string | undefined>;
 
@@ -76,6 +81,17 @@ export async function deleteServerSecrets(
   const endpointKeys = (options.proxies ?? [])
     .filter(isPasswordBearingProxy)
     .map((proxy) => proxyPasswordSecretKey(serverId, proxy));
+  // An id-only caller (Complete Reset of a raw row that no longer validates, inventory
+  // prune, profile teardown) does not know the proxy: sweep every endpoint key stored for
+  // this id instead, so none survives the server.
+  if (vault.keys) {
+    try {
+      endpointKeys.push(...endpointProxyPasswordKeysOf(serverId, await vault.keys()));
+    } catch (error) {
+      if (!options.bestEffort) throw error;
+      console.warn(`[Nexus] Could not list secret keys to sweep proxy passwords for ${serverId}:`, error);
+    }
+  }
   for (const key of [
     passwordSecretKey(serverId),
     passphraseSecretKey(serverId),
