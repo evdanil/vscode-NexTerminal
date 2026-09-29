@@ -13,6 +13,7 @@ import {
   passphraseSecretKey,
   proxyPasswordSecretKey
 } from "../../src/services/ssh/silentAuth";
+import { AuthNotJudgedError } from "../../src/services/ssh/authErrors";
 import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 import { PassThrough } from "node:stream";
@@ -167,6 +168,107 @@ describe("SilentAuthSshFactory", () => {
 
     await expect(factory.connect(baseServer)).rejects.toThrow("socket timeout");
     expect(prompt.prompt).not.toHaveBeenCalled();
+  });
+
+  describe("a login that never got a verdict keeps the saved password", () => {
+    const savedKey = passwordSecretKey(baseServer.id);
+    const lookup = (id: string) => (id === baseServer.id ? baseServer : undefined);
+
+    it("an attempt that ended before its keyboard-interactive password prompt", async () => {
+      const connector: SshConnector = {
+        connect: vi.fn(async (_server, auth) => {
+          await auth.onKeyboardInteractive!("", "", [{ prompt: "Password: ", echo: false }]);
+          return fakeConnection;
+        })
+      };
+      const vault = createVault({ [savedKey]: "good-secret" });
+      const prompt: PasswordPrompt = { prompt: vi.fn() };
+      const factory = new SilentAuthSshFactory(connector, vault, prompt, async () => "x", undefined, lookup);
+
+      await expect(factory.connect(baseServer, { isActive: () => false })).rejects.toThrow(/ended/);
+
+      expect(vault.delete).not.toHaveBeenCalled();
+      expect(await vault.get(savedKey)).toBe("good-secret");
+      expect(prompt.prompt).not.toHaveBeenCalled();
+    });
+
+    it("a transport that closed before ready", async () => {
+      const connector: SshConnector = {
+        connect: vi.fn(async () => {
+          throw new AuthNotJudgedError("SSH connection closed before authentication completed");
+        })
+      };
+      const vault = createVault({ [savedKey]: "good-secret" });
+      const prompt: PasswordPrompt = { prompt: vi.fn() };
+      const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, undefined, lookup);
+
+      await expect(factory.connect(baseServer)).rejects.toThrow("closed before authentication completed");
+
+      expect(vault.delete).not.toHaveBeenCalled();
+      expect(prompt.prompt).not.toHaveBeenCalled();
+    });
+
+    it("a dismissed verification-code prompt", async () => {
+      const connector: SshConnector = {
+        connect: vi.fn(async (_server, auth) => {
+          await auth.onKeyboardInteractive!("", "", [
+            { prompt: "Password: ", echo: false },
+            { prompt: "Verification code: ", echo: false }
+          ]);
+          return fakeConnection;
+        })
+      };
+      const vault = createVault({ [savedKey]: "good-secret" });
+      const prompt: PasswordPrompt = { prompt: vi.fn() };
+      const factory = new SilentAuthSshFactory(connector, vault, prompt, async () => undefined, undefined, lookup);
+
+      await expect(factory.connect(baseServer)).rejects.toThrow("canceled");
+
+      expect(vault.delete).not.toHaveBeenCalled();
+      expect(prompt.prompt).not.toHaveBeenCalled();
+    });
+
+    it("an ended attempt does not delete a saved key passphrase", async () => {
+      const keyServer: ServerConfig = { ...baseServer, authType: "key", keyPath: "C:/id_rsa" };
+      const connector: SshConnector = {
+        connect: vi.fn(async () => {
+          throw new AuthNotJudgedError("SSH connection attempt ended before authentication completed");
+        })
+      };
+      const vault = createVault({ [passphraseSecretKey(keyServer.id)]: "good-phrase" });
+      const factory = new SilentAuthSshFactory(connector, vault, { prompt: vi.fn() }, undefined, undefined, (id) => (id === keyServer.id ? keyServer : undefined));
+
+      await expect(factory.connect(keyServer)).rejects.toThrow(/ended/);
+      expect(vault.delete).not.toHaveBeenCalled();
+    });
+
+    it("still deletes it when the server rejects the password", async () => {
+      const connector: SshConnector = {
+        connect: vi.fn().mockRejectedValueOnce(new Error("All configured authentication methods failed")).mockResolvedValueOnce(fakeConnection)
+      };
+      const vault = createVault({ [savedKey]: "bad-secret" });
+      const prompt: PasswordPrompt = { prompt: vi.fn(async () => ({ password: "new", save: false })) };
+      const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, undefined, lookup);
+
+      await factory.connect(baseServer);
+
+      expect(vault.delete).toHaveBeenCalledWith(savedKey);
+      expect(prompt.prompt).toHaveBeenCalledOnce();
+    });
+
+    it("does not treat an unrelated error that merely mentions authentication as a rejection", async () => {
+      const connector: SshConnector = {
+        connect: vi.fn(async () => {
+          throw new Error("No authentication methods offered");
+        })
+      };
+      const vault = createVault({ [savedKey]: "good-secret" });
+      const prompt: PasswordPrompt = { prompt: vi.fn() };
+      const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, undefined, lookup);
+
+      await expect(factory.connect(baseServer)).rejects.toThrow("No authentication methods offered");
+      expect(vault.delete).not.toHaveBeenCalled();
+    });
   });
 
   it("throws when user cancels password prompt", async () => {

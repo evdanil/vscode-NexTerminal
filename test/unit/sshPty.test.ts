@@ -2,9 +2,8 @@ import { PassThrough } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ServerConfig } from "../../src/models/config";
 import { SshPty } from "../../src/services/ssh/sshPty";
-import { CLEAR_VISIBLE_SCREEN } from "../../src/services/terminal/terminalEscapes";
+import { CLEAR_VISIBLE_SCREEN, RESET_INTERACTIVE_MODES as RESET_TERMINAL_MODES } from "../../src/services/terminal/terminalEscapes";
 
-const RESET_TERMINAL_MODES = "\x1b[?9;1000;1002;1003;1004;1006;1016;2031l\x1b[<9999u\x1b[=0;1u";
 const KITTY_KEYBOARD_MODE_ENABLE = "\x1b[>1u";
 
 const { mockShowErrorMessage } = vi.hoisted(() => ({
@@ -987,11 +986,25 @@ describe("SshPty", () => {
 
     pty.markShuttingDown("Nexus extension is shutting down. This session has been closed.");
 
-    expect(writes.filter((text) => text.includes("\x1b[?9;1000;1002;1003;1004;1006;1016;2031l"))).toHaveLength(1);
+    expect(writes.filter((text) => text.includes("\x1b[?9;1000;1002;1003;1004;1005;1006;1007;1015;1016;2031;2004;1;66l"))).toHaveLength(1);
     expect(writes.filter((text) => text === RESET_TERMINAL_MODES)).toHaveLength(1);
     expect(highlighterStream.flush).toHaveBeenCalledTimes(1);
     expect(writes[0]).toBe("[hl]pending output");
     expect(writes[1]).toBe(RESET_TERMINAL_MODES);
+    // Input modes and cursor visibility a dropped full-screen app leaves behind.
+    for (const seq of ["\x1b>", "\x1b[?25h"]) {
+      expect(RESET_TERMINAL_MODES).toContain(seq);
+    }
+    expect(RESET_TERMINAL_MODES).toMatch(/\x1b\[\?[\d;]*\b1007\b[\d;]*l/);
+    expect(RESET_TERMINAL_MODES).toMatch(/\x1b\[\?[\d;]*\b2004\b[\d;]*l/);
+    expect(RESET_TERMINAL_MODES).toMatch(/\x1b\[\?[\d;]*\b1\b[\d;]*l/);
+    // The alternate screen and RIS stay untouched so the last frame survives.
+    const modeParams = [...RESET_TERMINAL_MODES.matchAll(/\x1b\[\?([\d;]*)[hl]/g)].flatMap((m) => m[1].split(";"));
+    expect(modeParams).toContain("2004");
+    for (const alt of ["47", "1047", "1048", "1049"]) {
+      expect(modeParams).not.toContain(alt);
+    }
+    expect(RESET_TERMINAL_MODES).not.toContain("\x1bc");
     expect(writes.join("")).toContain("Nexus extension is shutting down");
     expect(writes.join("")).toContain("Close this terminal and start a new session to reconnect.");
     expect(callbacks.onDisconnected).not.toHaveBeenCalled();

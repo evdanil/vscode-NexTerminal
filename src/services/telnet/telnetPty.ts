@@ -7,7 +7,7 @@ import type { SessionLogger } from "../../logging/terminalLogger";
 import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
 import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
-import { CLEAR_VISIBLE_SCREEN } from "../terminal/terminalEscapes";
+import { CLEAR_VISIBLE_SCREEN, RESET_INTERACTIVE_MODES, isTerminalGeneratedReport } from "../terminal/terminalEscapes";
 import { PtyObserverHub } from "../terminal/ptyObserverHub";
 import { TelnetNegotiator } from "./telnetProtocol";
 
@@ -176,7 +176,11 @@ export class TelnetPty implements vscode.Pseudoterminal, vscode.Disposable {
     }
     if (this.connectFailed || this.disconnected) {
       // Nothing to reconnect to — telnet has no session to resume, so the
-      // press-any-key notice means exactly that (mirrors SerialPty).
+      // press-any-key notice means exactly that (mirrors SerialPty). Reports the
+      // terminal generates itself (focus, mouse) are not a key press.
+      if (isTerminalGeneratedReport(data)) {
+        return;
+      }
       this.dispose();
       return;
     }
@@ -203,6 +207,7 @@ export class TelnetPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.options.transcript?.flush?.();
     this.teardownSocket();
     this.activityIndicator = false;
+    this.writeEmitter.fire(RESET_INTERACTIVE_MODES);
     this.nameEmitter.fire(`${this.baseName} [Disconnected]`);
     this.writeEmitter.fire(`\r\n\r\n[Nexus Telnet] ${reason}\r\n`);
     this.writeEmitter.fire("[Nexus Telnet] Close this terminal and connect again to reopen the session.\r\n");
@@ -358,6 +363,7 @@ export class TelnetPty implements vscode.Pseudoterminal, vscode.Disposable {
     }
 
     this.activityIndicator = false;
+    this.writeEmitter.fire(RESET_INTERACTIVE_MODES);
     this.nameEmitter.fire(`${this.baseName} [Disconnected]`);
     this.writeEmitter.fire("\r\n\r\n[Nexus Telnet] Remote host closed the connection.\r\n");
     this.writeEmitter.fire("[Nexus Telnet] Press any key to close this terminal.\r\n");

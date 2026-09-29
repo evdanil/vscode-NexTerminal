@@ -1,6 +1,6 @@
 # Changelog
 
-## [2.8.296] — 2026-09-29
+## [2.8.303] — 2026-09-29
 
 ### Fixed
 
@@ -8,6 +8,50 @@
 - **Shared tunnels no longer act on their own.** A tunnel from a share arrives with Auto-start off, no listener address (loopback until you choose one in Edit), a loopback-only remote bind address and no login in its browser URL, on export and on import; the import message counts the tunnels it changed.
 - **Delete All Data clears Terminal Appearance and the Local Shell auto-trigger acknowledgement.** Imported colour schemes, the selected scheme and the font choice are removed and an open panel refreshes; it also clears remembered view state and dismissed hints (collapsed folders, follow-terminal-directory, macro hint), other open windows that observe the reset (a reset-generation counter) reload instead of writing stale collapsed-folder or appearance data back at their next action; a write already in flight, or one that starts before the reset reaches that window, can still land until it is reloaded. Follow Terminal Directory stays on in memory there until toggled or reloaded. The confirmation and completion message both say what is kept: the terminal colours and font already written to VS Code user settings, trusted host keys, scripts and logs stay.
 - **A duplicate id in a share no longer overwrites a record.** The first server or auth profile under an id that passes validation lands; a later one in the same file is skipped and counted instead of replacing it and being counted as imported.
+
+## [2.8.302] — 2026-09-29
+
+### Fixed
+
+- **A malformed provider host no longer downgrades or re-points an already-synced server.** When a device's primary or alternate console endpoint host, or the endpoint for a server's saved protocol, was rejected (invisible character, embedded whitespace), an owned server was blanked to an addressless placeholder, or its alternate address was promoted into `host`, and the plan claimed the device had lost its console. The device is now skipped like a malformed port: the server is left untouched and the plan says `has an unusable host and was skipped`. New devices still arrive as addressless placeholders. The host normalizer's own warnings now travel as engine warnings instead of provider notices.
+
+## [2.8.301] — 2026-09-29
+
+### Fixed
+
+- **An ended or dropped SSH login no longer deletes a valid saved password or passphrase.** Closing or reconnecting a terminal while it connects, a connection that closes cleanly before login finishes, and a dismissed verification-code prompt were all read as a server rejection because their messages contain the word "authentication". They now carry their own error type, and a saved password is now cleared only when the server rejects it, and a saved key passphrase only when it fails to decrypt the key. A connection that drops mid-login is reported as a connection failure — in the terminal and in Test Connection and Copy Details — without a password prompt.
+- **Port-forwarding guide no longer says concurrent jump-host password prompts dismiss each other.** Since 2.8.280 they appear one after another.
+
+## [2.8.300] — 2026-09-29
+
+### Fixed
+
+- **Serial, Telnet and Smart Follow terminals reset interactive modes on disconnect, and a focus or mouse report no longer closes a dead tab.** The reset that SSH ran now lives in one shared sequence used by all four remote terminals (Smart Follow also repeats it before reattaching, ahead of the new device's output). It additionally turns off alternate-scroll (wheel-to-arrow-keys), bracketed paste and application cursor/keypad modes and shows the cursor, so a same-tab SSH reconnect no longer starts with a hidden cursor or wrapped pastes. The alternate screen is still left alone so the last frame stays readable. In a disconnected Serial or Telnet tab, terminal-generated focus, mouse and color-scheme reports and up/down arrow sequences (wheel scrolling in an alternate screen) are ignored; a real key still closes the tab.
+
+## [2.8.299] — 2026-09-29
+
+### Fixed
+
+- **Disposing an SSH lease while its standalone fallback is still connecting no longer drops other sessions or leaks a connection.** A pooled lease that fell back to its own connection (channel-limited device or stale transport) released its pooled reference a second time if it was disposed mid-connect, which could close the shared transport under another live terminal. The pooled reference is now released once, and a fallback that finishes after disposal is closed instead of being used.
+
+## [2.8.298] — 2026-09-29
+
+### Fixed
+
+- **The Session-terminal IPMI hint no longer disappears when an `ipmitool` command has a substitution or heredoc in its arguments.** A macro such as `ipmitool -P "$(cat ~/.bmcpw)" sol activate`, or one with a here-string, heredoc or `$(...)` redirect target, now gets the editor hint and the send-confirmation note again; a dynamic command word, a heredoc body and text after an unparsed substitution are still left alone. The detector also accepts `command -p --`, `time -p --`, `nice -5` and the sudo `-r`/`-t`/`-c`/`-a` value options (and their long forms).
+
+## [2.8.297] — 2026-09-29
+
+### Fixed
+
+- **A large inventory sync no longer holds the config lock for thousands of sequential keychain deletes.** The add-time clearing of leftover saved credentials (three keys per added server) and the delete-prune credential cleanup now run up to 16 servers at a time. An add-time clear that fails still aborts the whole sync with nothing applied, and the apply still waits for every clear to settle.
+- **Re-registering a disposed inventory provider object now says what to do.** The rejection is unchanged (a form or prompt may still hold the old object), but the error now tells the provider author to register a new provider object, and the public API contract says the same.
+
+## [2.8.296] — 2026-09-29
+
+### Fixed
+
+- **A script's unawaited wait now ends with the run.** A `waitFor` / `expect` / `waitAny` still pending when a run completed, failed or lost its worker (a `Promise.race` loser, a call the script never awaited) kept its timer and the run's output buffer for its whole timeout, then wrote a stray `← timeout` line to the "Nexus Scripts" channel after `end:`. Every ending now cancels pending waits, and a wait posted just before the run ended is refused.
 
 ## [2.8.295] — 2026-09-28
 

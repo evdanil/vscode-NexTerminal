@@ -8,7 +8,7 @@ import {
 } from "../../src/services/serial/smartSerialPty";
 import type { SerialProfile } from "../../src/models/config";
 import type { OpenPortParams, SerialPortInfo } from "../../src/services/serial/protocol";
-import { CLEAR_VISIBLE_SCREEN } from "../../src/services/terminal/terminalEscapes";
+import { CLEAR_VISIBLE_SCREEN, RESET_INTERACTIVE_MODES } from "../../src/services/terminal/terminalEscapes";
 
 vi.mock("vscode", () => ({
   EventEmitter: class MockEventEmitter<T> {
@@ -413,6 +413,88 @@ describe("SmartSerialPty", () => {
     expect(writes.join("")).toContain("Preferred port updated from COM5 to COM9");
 
     pty.dispose();
+  });
+
+  it("resets terminal modes on disconnect and again before the reattach banner", async () => {
+    vi.useFakeTimers();
+    let opens = 0;
+    const { transport, emitDisconnect } = createTransport({
+      listPorts: async () => [{ path: "COM5", serialNumber: "ABC123" }],
+      openPort: async () => `session-${++opens}`
+    });
+    const harness = makeCallbacks();
+    const writes: string[] = [];
+    const pty = new SmartSerialPty(transport, makeProfile(), harness.callbacks, noopLogger());
+    pty.onDidWrite((chunk) => writes.push(chunk));
+    pty.open();
+    await flushAsync();
+    writes.length = 0;
+
+    emitDisconnect("session-1", "Port closed");
+    const afterDisconnect = writes.join("");
+    expect(afterDisconnect).toContain(RESET_INTERACTIVE_MODES);
+    expect(afterDisconnect.indexOf(RESET_INTERACTIVE_MODES)).toBeLessThan(afterDisconnect.indexOf("waiting for it"));
+    expect(afterDisconnect).not.toContain("1049");
+
+    writes.length = 0;
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushAsync();
+    const afterReattach = writes.join("");
+    expect(afterReattach).toContain("Reattached");
+    expect(afterReattach.indexOf(RESET_INTERACTIVE_MODES)).toBeGreaterThanOrEqual(0);
+    expect(afterReattach.indexOf(RESET_INTERACTIVE_MODES)).toBeLessThan(afterReattach.indexOf("Reattached"));
+    pty.dispose();
+  });
+
+  it("resets before the reattached device's first output, replayed or live, and not on the first connect", async () => {
+    vi.useFakeTimers();
+    let opens = 0;
+    let emit: ((id: string, payload: string) => void) | undefined;
+    const t = createTransport({
+      listPorts: async () => [{ path: "COM5", serialNumber: "ABC123" }],
+      openPort: async (_params, sessionId) => {
+        opens += 1;
+        if (opens === 2) {
+          // Output that arrives while the port is still opening.
+          emit!(sessionId ?? "", "\x1b[?1000h");
+        }
+        return sessionId ?? `session-${opens}`;
+      }
+    });
+    emit = t.emitData;
+    const writes: string[] = [];
+    const pty = new SmartSerialPty(t.transport, makeProfile(), makeCallbacks().callbacks, noopLogger());
+    pty.onDidWrite((chunk) => writes.push(chunk));
+    pty.open();
+    await flushAsync();
+    expect(writes.join("")).not.toContain(RESET_INTERACTIVE_MODES);
+
+    t.emitDisconnect((t.transport.openPort as ReturnType<typeof vi.fn>).mock.calls[0][1], "Port closed");
+    writes.length = 0;
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushAsync();
+    const out = writes.join("");
+    expect(out).toContain("\x1b[?1000h");
+    expect(RESET_INTERACTIVE_MODES).toMatch(/\?[\d;]*\b1007\b[\d;]*l/);
+    expect(out.indexOf(RESET_INTERACTIVE_MODES)).toBeGreaterThanOrEqual(0);
+    expect(out.indexOf(RESET_INTERACTIVE_MODES)).toBeLessThan(out.indexOf("\x1b[?1000h"));
+    pty.dispose();
+  });
+
+  it("markShuttingDown() resets terminal modes", async () => {
+    vi.useFakeTimers();
+    const { transport } = createTransport({
+      listPorts: async () => [{ path: "COM5", serialNumber: "ABC123" }],
+      openPort: async () => "session-1"
+    });
+    const pty = new SmartSerialPty(transport, makeProfile(), makeCallbacks().callbacks, noopLogger());
+    const writes: string[] = [];
+    pty.onDidWrite((s) => writes.push(s));
+    pty.open();
+    await flushAsync();
+    writes.length = 0;
+    pty.markShuttingDown("bye");
+    expect(writes).toContain(RESET_INTERACTIVE_MODES);
   });
 
   it("prompts the picker when multiple fallback ports are available and stays silent on the next poll", async () => {
