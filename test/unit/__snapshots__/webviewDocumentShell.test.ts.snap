@@ -7687,7 +7687,7 @@ echo hi</textarea>
 							if (index >= words.length) return false;
 							index++;
 						}
-					} else if (!/^(?:--(?:user|group|prompt|close-from|chdir|preserve-env|command-timeout|chroot|role|type)=.+|-[ugpCDTRrtca].+)$/.test(option) && ![
+					} else if (!/^(?:--(?:user|group|prompt|close-from|chdir|preserve-env|command-timeout|chroot|role|type|auth-type|login-class)=.+|-[ugpCDTRrtca].+)$/.test(option) && ![
 						"--login",
 						"--shell",
 						"--non-interactive",
@@ -7879,6 +7879,9 @@ echo hi</textarea>
 		// be classified. Words completed BEFORE it are different: a leading
 		// ipmitool word already fixes which program runs. Ignore these markers in
 		// comments and single quotes, where they are inert.
+		// A heredoc or here-string touching the executable (\`ipmitool<<<foo\`) is a
+		// redirection: the executable word is complete, like \`ipmitool>file\`.
+		if (char === "<" && text[i + 1] === "<" && inWord && (!wordAllowsRedirection || !/^(?:\\d*)$/.test(word))) finishWord();
 		if (char === "\`" || char === "$" && text[i + 1] === "(" || (char === "<" || char === ">") && text[i + 1] === "(" || char === "<" && text[i + 1] === "<") return headAlreadyIpmitool();
 		if (char === "&" && (text[i - 1] === ">" || text[i - 1] === "<" || text[i + 1] === ">")) {
 			if (text[i + 1] === ">" && inWord && !/^(?:\\d*)$/.test(word)) finishWord();

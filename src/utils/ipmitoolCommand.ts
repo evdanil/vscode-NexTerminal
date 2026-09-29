@@ -45,7 +45,7 @@ export function textRunsIpmitool(text: string): boolean {
               index++;
             }
           } else if (
-            !/^(?:--(?:user|group|prompt|close-from|chdir|preserve-env|command-timeout|chroot|role|type)=.+|-[ugpCDTRrtca].+)$/.test(option) &&
+            !/^(?:--(?:user|group|prompt|close-from|chdir|preserve-env|command-timeout|chroot|role|type|auth-type|login-class)=.+|-[ugpCDTRrtca].+)$/.test(option) &&
             !["--login", "--shell", "--non-interactive", "--askpass", "--background", "--bell", "--set-home", "--stdin", "--reset-timestamp", "--preserve-env", "--preserve-groups"].includes(option) &&
             option !== "--" && !/^-[EABbnSHkisP]+$/.test(option)
           ) {
@@ -217,6 +217,10 @@ export function textRunsIpmitool(text: string): boolean {
     // be classified. Words completed BEFORE it are different: a leading
     // ipmitool word already fixes which program runs. Ignore these markers in
     // comments and single quotes, where they are inert.
+    // A heredoc or here-string touching the executable (`ipmitool<<<foo`) is a
+    // redirection: the executable word is complete, like `ipmitool>file`.
+    if (char === "<" && text[i + 1] === "<" && inWord &&
+        (!wordAllowsRedirection || !/^(?:\d*)$/.test(word))) finishWord();
     if (char === "`" || (char === "$" && text[i + 1] === "(") ||
         ((char === "<" || char === ">") && text[i + 1] === "(") ||
         (char === "<" && text[i + 1] === "<")) return headAlreadyIpmitool();

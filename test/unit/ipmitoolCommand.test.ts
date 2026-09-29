@@ -22,7 +22,11 @@ describe("textRunsIpmitool", () => {
   ["an attached sudo SELinux type", "sudo --type=type_t ipmitool -E\n"],
   ["a sudo login class", "sudo -c class ipmitool -E\n"],
   ["a sudo auth type", "sudo -a auth ipmitool -E\n"],
-  ["a time wrapper with -p and --", "time -p -- ipmitool -E\n"]
+  ["a time wrapper with -p and --", "time -p -- ipmitool -E\n"],
+    ["a here-string attached to the head", "ipmitool<<<foo\n"],
+    ["a heredoc attached to the head", "ipmitool<<EOF\nmc info\nEOF\n"],
+    ["a sudo auth-type long option", "sudo --auth-type=x ipmitool -E\n"],
+    ["a sudo login-class long option", "sudo --login-class=x ipmitool -E\n"]
   ])("detects ipmitool with %s", (_case, text) => {
     expect(textRunsIpmitool(text)).toBe(true);
   });

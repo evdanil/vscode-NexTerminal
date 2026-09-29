@@ -284,6 +284,15 @@ describe("renderMacroEditorHtml", () => {
     ['FOO="bar" ipmitool -E', ""],
     ["echo ready\ripmitool -E\r", ""],
     ["# log with `hostname`\nipmitool -E\n", ""],
+    ["echo '$(hostname)'; ipmitool -E\n", ""],
+    ["ipmitool -H $(cat h) mc info\n", ""],
+    ["sudo ipmitool -H h -P \"$(cat pw)\" sol activate\n", ""],
+    ["ipmitool sdr > /tmp/sdr-$(date +%s).txt\n", ""],
+    ["ipmitool raw 0x06 0x01 <<< foo\n", ""],
+    ["ipmitool<<<foo\n", ""],
+    ["ipmitool<<EOF\nmc info\nEOF\n", ""],
+    ["sudo --auth-type=x ipmitool -E\n", ""],
+    ["sudo --login-class=x ipmitool -E\n", ""],
   ])("classifies the command position in the live Session hint for %s", (text, expectedDisplay) => {
     const html = render([], null);
     const match = /function updateSessionIpmitoolHint\(\) \{[\s\S]*?\n      \}/.exec(html);
