@@ -234,6 +234,7 @@ describe("renderMacroEditorHtml", () => {
     ["sudo --user ipmitool\n", "none"],
     ["sudo --auth-type ipmitool\n", "none"],
     ["sudo --login-class ipmitool -E\n", "none"],
+    ["time -p -p -- ipmitool -E\n", "none"],
     ["cat <<EOF\nipmitool -E\nEOF\n", "none"],
     ["sh <<'EOF'\nipmitool -E\nEOF\n", "none"],
     ["ipmi$(echo tool) -E\n", "none"],

@@ -1298,7 +1298,8 @@ describe("sessionIpmiHintNote — session-target ipmitool hint", () => {
     ["a dynamic env operand", "env $(x) ipmitool -E\n"],
     ["a sudo long option value 0", "sudo --user ipmitool\n"],
     ["a sudo long option value 1", "sudo --auth-type ipmitool\n"],
-    ["a sudo long option value 2", "sudo --login-class ipmitool -E\n"]
+    ["a sudo long option value 2", "sudo --login-class ipmitool -E\n"],
+    ["a repeated time -p", "time -p -p -- ipmitool -E\n"]
   ])("does not treat %s as an ipmitool command", (_case, text) => {
     expect(sessionIpmiHintNote({ id: "a", name: "X", text, runIn: "session" })).toBeUndefined();
   });

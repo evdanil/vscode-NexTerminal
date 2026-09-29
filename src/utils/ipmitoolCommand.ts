@@ -110,7 +110,8 @@ export function textRunsIpmitool(text: string): boolean {
       if (name === "time") {
         index++;
         allowAssignments = false;
-        while (words[index] === "-p") index++;
+        // Bash `time [-p] [--] pipeline`: a second -p is the command, not an option.
+        if (words[index] === "-p") index++;
         if (words[index] === "--") index++;
         if (words[index]?.startsWith("-")) return false;
         continue;
