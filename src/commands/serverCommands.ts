@@ -16,7 +16,6 @@ import {
   serverConfigsEqual,
   serverConnectionEqual
 } from "../models/config";
-import { readMultiplexingDefault } from "../utils/multiplexingDefault";
 import { flattenProviderText } from "../models/inventory";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
@@ -1051,7 +1050,7 @@ export interface ConnectServerOptions {
  */
 function isServerUnchangedSince(ctx: CommandContext, atStart: ServerConfig): boolean {
   const current = ctx.core.getServer(atStart.id);
-  return current !== undefined && serverConnectionEqual(current, atStart, { multiplexingDefault: readMultiplexingDefault() });
+  return current !== undefined && serverConnectionEqual(current, atStart, { multiplexingDefault: ctx.sshPool.multiplexingDefault });
 }
 
 /** Tells the user why a connect was cancelled and, if the record still exists, offers a Retry that can succeed. */
@@ -1391,7 +1390,7 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
                 )
               : [];
             if (liveServer && pending.length > 0) {
-              if (!serverConnectionEqual(liveServer, serverAtStart, { multiplexingDefault: readMultiplexingDefault() })) {
+              if (!serverConnectionEqual(liveServer, serverAtStart, { multiplexingDefault: ctx.sshPool.multiplexingDefault })) {
                 void vscode.window.showWarningMessage(
                   `Auto-start tunnels for "${flattenProviderText(server.name)}" were not started because the server's connection settings changed since this session opened. Close and reopen the terminal to use the new settings.`
                 );
@@ -1401,7 +1400,7 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
                     if (!mode) {
                       return;
                     }
-                    return startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, tunnel, server, mode, ctx.registrySync);
+                    return startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, tunnel, server, mode, ctx.registrySync, ctx.sshPool.multiplexingDefault);
                   });
                 }
               }

@@ -108,6 +108,13 @@ export interface ContextAwareSshFactory extends SshFactory {
 }
 
 export interface SshPoolControl {
+  /**
+   * The multiplexing default the pool actually applies to a server that sets no
+   * value of its own. Captured when the pool is built (the setting needs a
+   * window reload to change), so callers comparing a server's effective
+   * multiplexing must use this rather than re-read the live setting.
+   */
+  readonly multiplexingDefault?: boolean;
   disconnect(serverId: string): void;
   dispose(): void;
 }

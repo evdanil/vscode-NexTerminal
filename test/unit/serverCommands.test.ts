@@ -299,18 +299,19 @@ describe("connectServer — equal-content replacement while progress is pending"
     expect(vscode.commands.executeCommand).not.toHaveBeenCalled();
   });
 
-  it("compares multiplexing against the global setting when deciding a change", async () => {
+  it("compares multiplexing against the pool's captured default, not the live setting", async () => {
     const server = makeServer();
     const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
-    vi.mocked(vscode.workspace.getConfiguration as any).mockReturnValue({ get: vi.fn(() => false) });
+    // The pool captured "off" at activation; the live setting has since been
+    // toggled on (it needs a reload, so the pool is still running with off).
+    (ctx.sshPool as { multiplexingDefault?: boolean }).multiplexingDefault = false;
+    vi.mocked(vscode.workspace.getConfiguration as any).mockReturnValue({ get: vi.fn(() => true) });
     const release = holdProgress();
 
     const run = connectServer(ctx, server.id);
     await addOrUpdateServer({ ...server, multiplexing: true });
     release();
     await run;
-
-    vi.mocked(vscode.workspace.getConfiguration as any).mockReturnValue({ get: vi.fn(() => true) });
 
     expect(vscode.window.createTerminal).not.toHaveBeenCalled();
     expect(mockShowWarningMessage).toHaveBeenCalled();

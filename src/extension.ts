@@ -889,7 +889,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
         return; // User canceled — intentional
       }
       try {
-        await startTunnel(core, tunnelManager, pool, profile, server, connectionMode, registrySync);
+        await startTunnel(core, tunnelManager, pool, profile, server, connectionMode, registrySync, pool.multiplexingDefault);
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown error";
         vscode.window.showErrorMessage(`Failed to start tunnel "${profile.name}": ${message}`);

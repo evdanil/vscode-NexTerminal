@@ -9,7 +9,6 @@ import type {
   TunnelProfile,
   TunnelType
 } from "../models/config";
-import { readMultiplexingDefault } from "../utils/multiplexingDefault";
 import { flattenProviderText } from "../models/inventory";
 import { cloneServerConfig, resolveTunnelType, serverConnectionEqual, tunnelConnectionEqual } from "../models/config";
 import { configMutationLock } from "../services/configMutationLock";
@@ -149,7 +148,9 @@ export async function startTunnel(
   profile: TunnelProfile,
   server: ServerConfig,
   connectionMode: ResolvedTunnelConnectionMode,
-  registrySync?: TunnelRegistrySync
+  registrySync?: TunnelRegistrySync,
+  // The pool's captured default (SshPoolControl.multiplexingDefault), not the live setting.
+  multiplexingDefault?: boolean
 ): Promise<void> {
   // Content, not identity: an unchanged editor Save or a Refresh replaces a
   // record with an equal copy, which must not cancel a start. A different
@@ -164,7 +165,7 @@ export async function startTunnel(
       liveProfile !== undefined &&
       tunnelConnectionEqual(liveProfile, profileAtStart) &&
       liveServer !== undefined &&
-      serverConnectionEqual(liveServer, serverAtStart, { multiplexingDefault: readMultiplexingDefault() })
+      serverConnectionEqual(liveServer, serverAtStart, { multiplexingDefault })
     );
   };
   const reportCancelled = (): void => {
@@ -448,7 +449,7 @@ async function startTunnelCommand(ctx: CommandContext, arg?: unknown): Promise<v
   if (!connectionMode) {
     return;
   }
-  await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, profile, server, connectionMode, ctx.registrySync);
+  await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, profile, server, connectionMode, ctx.registrySync, ctx.sshPool.multiplexingDefault);
 }
 
 async function stopTunnelCommand(ctx: CommandContext, arg?: unknown): Promise<void> {
@@ -642,7 +643,7 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
           if (!mode) {
             return;
           }
-          await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, updated, server, mode, ctx.registrySync);
+          await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, updated, server, mode, ctx.registrySync, ctx.sshPool.multiplexingDefault);
         },
         onCreateInline: (key) => {
           if (key === "defaultServerId") {
@@ -808,7 +809,7 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
       if (!mode) {
         return;
       }
-      await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, profile, server, mode, ctx.registrySync);
+      await startTunnel(ctx.core, ctx.tunnelManager, ctx.sshFactory, profile, server, mode, ctx.registrySync, ctx.sshPool.multiplexingDefault);
     }),
 
     vscode.commands.registerCommand("nexus.tunnel.copyInfo", async (arg?: unknown) => {
