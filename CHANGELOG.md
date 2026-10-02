@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.297] — 2026-10-02
+
+### Security
+
+- **A dependency update closes ten advisories in the packaging toolchain.** `undici` (7.29.0 → 7.30.0) fixes two high-severity issues — a TLS certificate-validation bypass when `BalancedPool` dropped its connect options (GHSA-w293-vg96-wgc3) and a process-terminating error when a WebSocket server selected a subprotocol nobody requested (GHSA-rfgv-xxqx-mfg5) — plus five moderate and three low ones in its WebSocket, shared-cache, decompression, retry and dump code. It reaches this repository only through `@vscode/vsce`, via `cheerio` — build-time only, absent from the production dependency tree and never shipped in the VSIX. No extension code changed; the lockfile is the only edit.
+
 ## [2.8.296] — 2026-09-29
 
 ### Fixed
