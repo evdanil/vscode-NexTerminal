@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.298] — 2026-10-03
+
+### Security
+
+- **A dependency update closes four advisories in the packaging toolchain.** `brace-expansion` (5.0.9 → 5.0.12) fixes two high-severity denial-of-service issues from uncontrolled recursion on nested brace groups (GHSA-qhr7-859c-m2p7, GHSA-6j4f-fj2g-mc7p) and a moderate quadratic-time expansion (GHSA-q2hr-2g5m-vwhr). `markdown-it` (14.2.0 → 14.3.2) fixes a moderate denial of service in which linkify's two quadratic paths let a few hundred KB of Markdown block the event loop (GHSA-253c-mchw-3w2r). Both reach this repository only through `@vscode/vsce` — `brace-expansion` via `minimatch`, `markdown-it` as one of its own dependencies — build-time only, absent from the production dependency tree and never shipped in the VSIX. No extension code changed; the lockfile is the only edit.
+
 ## [2.8.297] — 2026-10-02
 
 ### Security
