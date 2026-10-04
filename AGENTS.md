@@ -98,8 +98,9 @@ system and carry exact file:line spans, kept in sync with the code through git.
 
 For ANY task here — understanding how something works, finding where code lives,
 or scoping a change — get context from the graph before grepping or opening
-source files. Re-ask freely (it's cheap) and reuse literal identifiers you
-already have (symbol, error string, file name) as the query. New to this repo?
+source files. Reuse literal identifiers you already have (symbol, error string,
+file name) as the query; ask once per distinct sub-aspect, never the same
+question reworded. New to this repo?
 Run `graft map` first — a token-budgeted orientation (dir clusters, hubs,
 hotspots), no LLM, no key.
 
@@ -128,6 +129,8 @@ range before finalizing. Only open source files when a node genuinely lacks a
 needed detail, and then at the exact file:line the node points to — never
 re-read whole files.
 
-After big code changes, refresh the graph with `graft build` (deterministic,
-no API key, $0).
+Every graft command refreshes the graph itself before answering, so results
+already reflect uncommitted edits; no rebuild is needed after editing. On a
+fresh clone, `graft build` (deterministic, no API key, $0) creates the local,
+gitignored `graft/`.
 <!-- graft:end -->
