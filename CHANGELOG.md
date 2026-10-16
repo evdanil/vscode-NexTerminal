@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.301] — 2026-10-16
+
+### Fixed
+
+- **Remove Folder in the Macros view asks first when a folder holds only subfolders.** A folder with subfolders but no macro in any of them was removed without asking, and its subfolders silently moved up a level — to the top of the Macros view when the folder was a top-level one. It now asks, as it already did when a folder held macros, and the confirmation counts subfolders alongside macros, with real singular and plural (`It contains 3 macros and 2 subfolders — they will be moved to the parent folder.`; a folder holding a single macro now reads `It contains 1 macro — it will be moved to the root.` rather than `— they will be moved`). Nothing is deleted either way, and an empty folder is still removed without asking.
+
 ## [2.8.300] — 2026-10-16
 
 ### Fixed

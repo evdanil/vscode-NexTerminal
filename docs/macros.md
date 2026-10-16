@@ -698,10 +698,13 @@ Folders are yours to create — an empty folder stays until you remove it.
   Macro** quick pick both honor.
 - **Remove Folder** — right-click a folder and choose **Remove Folder (keep
   macros)**. This never deletes a macro: every macro directly in that folder,
-  and any macro in a nested subfolder, moves up to the removed folder's
+  and every subfolder with the macros in it, moves up to the removed folder's
   parent (or to the root, if the removed folder had no parent), keeping its
   place in any sub-structure that's left. Renaming a folder works the same
-  way — it only rewrites the folder path stored on affected macros.
+  way — it only rewrites the folder path stored on affected macros. A folder
+  that holds macros or subfolders, at any depth, asks first and counts each
+  (`It contains 3 macros and 2 subfolders — they will be moved to the parent folder.`);
+  only a folder with neither is removed without asking.
 - **Add Macro from a folder** — right-click a folder and choose **Add Macro**
   to open the Macro Editor with that folder pre-filled in the **Folder**
   field.

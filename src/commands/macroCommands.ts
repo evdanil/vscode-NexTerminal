@@ -613,6 +613,28 @@ async function renameMacroFolder(oldPath: string, newPath: string): Promise<bool
 }
 
 /**
+ * The confirmation counts each kind of content it found. Subfolders are named
+ * in their own right: a folder holding nothing but subfolders is not empty, and
+ * removing it moves them up a level. The pronoun agrees with the total that
+ * moves, not with either count alone: one macro or one subfolder is "it", but
+ * one macro beside one subfolder is two things, "they". (The single-macro text
+ * used to read "1 macro — they will be moved".)
+ */
+function macroFolderRemovalMessage(path: string, macroCount: number, subfolderCount: number): string {
+  const countOf = (count: number, noun: string): string => `${count} ${noun}${count === 1 ? "" : "s"}`;
+  const parts = [
+    macroCount > 0 ? countOf(macroCount, "macro") : undefined,
+    subfolderCount > 0 ? countOf(subfolderCount, "subfolder") : undefined
+  ].filter((part): part is string => part !== undefined);
+  const pronoun = macroCount + subfolderCount === 1 ? "it" : "they";
+  // Fix 9 — a top-level folder has no parent: its contents land at the root,
+  // not "the parent folder" (there isn't one), so the confirmation must word
+  // the destination correctly for that case too.
+  const destinationPhrase = parentPath(path) ? "moved to the parent folder" : "moved to the root";
+  return `Remove folder "${folderDisplayName(path)}"? It contains ${parts.join(" and ")} — ${pronoun} will be ${destinationPhrase}.`;
+}
+
+/**
  * §4.7 — re-parents descendants to the removed folder's parent, preserving
  * substructure; drops the explicit-folder entry. Never deletes macros. The
  * `suffix.slice(1) || undefined` idiom mirrors `removeFolderCascade`
@@ -626,13 +648,14 @@ async function removeMacroFolder(path: string): Promise<void> {
     const group = sanitizeMacroGroup(m.group);
     return group !== undefined && isDescendantOrSelf(group, path);
   });
-  if (affected.length > 0) {
-    // Fix 9 — a top-level folder has no parent: its macros land at the root,
-    // not "the parent folder" (there isn't one), so the confirmation must
-    // word the destination correctly for that case too.
-    const destinationPhrase = parent ? "moved to the parent folder" : "moved to the root";
+  // #288 — counted from the same folder set the Macros view draws (explicit
+  // folders plus those a macro's folder implies, every level between). Judged
+  // by macros alone, a folder holding only subfolders was removed without
+  // asking while the block below lifted those subfolders a level.
+  const subfolders = allMacroFolders(macros).filter((f) => f !== path && isDescendantOrSelf(f, path));
+  if (affected.length > 0 || subfolders.length > 0) {
     const choice = await vscode.window.showWarningMessage(
-      `Remove folder "${folderDisplayName(path)}"? It contains ${affected.length} macro${affected.length === 1 ? "" : "s"} — they will be ${destinationPhrase}.`,
+      macroFolderRemovalMessage(path, affected.length, subfolders.length),
       { modal: true },
       "Remove Folder"
     );
