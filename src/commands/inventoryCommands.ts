@@ -519,10 +519,15 @@ function describeInventoryError(error: unknown): string {
  * The source id a command invocation names, from any of the three shapes a
  * `nexus.inventory.*` (or `nexus.deviceTemplate.editRules`) handler is called
  * with: a bare id string (the manage hub), a tree item carrying `sourceId`
- * (the Settings tree's per-source rows — VS Code hands `view/item/context`
- * commands the ITEM, never a string), or nothing at all (the palette).
- * `undefined` means "ask", which is the right answer for the last case and for
- * any menu object that names no source.
+ * (the Settings tree's per-source rows and a Command Center folder row —
+ * VS Code hands `view/item/context` commands the ITEM, never a string), or
+ * nothing at all (the palette). `undefined` means "ask", which is the right
+ * answer for the last case and for any menu object that names no source.
+ *
+ * Never for an id on a view's TITLE BAR: VS Code invokes those with the view's
+ * focused row, so "any object carrying `sourceId`" would act on whichever row
+ * was clicked last. `nexus.inventory.syncNow` is one, and reads its argument
+ * itself.
  */
 export function resolveSourceIdArg(arg: unknown): string | undefined {
   if (typeof arg === "string") {
@@ -535,6 +540,23 @@ export function resolveSourceIdArg(arg: unknown): string | undefined {
     }
   }
   return undefined;
+}
+
+/**
+ * The Settings tree's source row (`InventorySourceItem`), recognised by its own
+ * `kind` discriminant rather than by `sourceId` alone — a Command Center folder
+ * row carries `sourceId` too, and must not pass. Duck-typed rather than
+ * `instanceof`: this module imports no tree-view module, and that class extends
+ * `vscode.TreeItem`, so importing it would make every suite that loads this
+ * file mock `TreeItem` as well. folderSyncActionWiring.test.ts drives the
+ * registered handler with a real `InventorySourceItem`, so the two cannot drift.
+ */
+function isSettingsSourceRow(arg: unknown): arg is { kind: "inventorySource"; sourceId: string } {
+  if (arg === null || typeof arg !== "object") {
+    return false;
+  }
+  const row = arg as { kind?: unknown; sourceId?: unknown };
+  return row.kind === "inventorySource" && typeof row.sourceId === "string" && row.sourceId.length > 0;
 }
 
 function isSourceConfigMismatchError(error: unknown): boolean {
@@ -6390,16 +6412,36 @@ export function registerInventoryCommands(
 
   return [
     vscode.commands.registerCommand("nexus.inventory.addSource", addSource),
-    // Arg widening: these four run from the palette (no argument at all), from
-    // the manage hub (a source id string), and from the Settings tree's
-    // per-source rows — where VS Code hands a `view/item/context` command the
-    // TREE ITEM. Reading `sourceId` off it is what makes the inline buttons act
-    // on the row they are attached to; anything else still falls through to the
-    // picker, which is the correct behaviour for a palette invocation and for a
-    // menu object that names no source.
+    // Arg widening: Edit, Remove (and Refresh Status below) run from the
+    // palette (no argument at all), from the manage hub (a source id string),
+    // and from the Settings tree's per-source rows — where VS Code hands a
+    // `view/item/context` command the TREE ITEM. Reading `sourceId` off it is
+    // what makes the inline buttons act on the row they are attached to;
+    // anything else still falls through to the picker, which is the correct
+    // behaviour for a palette invocation and for a menu object that names no
+    // source. None of the three is on a title bar, where that would misfire.
     vscode.commands.registerCommand("nexus.inventory.editSource", (arg?: unknown) => editSource(resolveSourceIdArg(arg))),
     vscode.commands.registerCommand("nexus.inventory.removeSource", (arg?: unknown) => removeSource(resolveSourceIdArg(arg))),
-    vscode.commands.registerCommand("nexus.inventory.syncNow", (arg?: unknown) => syncNow(resolveSourceIdArg(arg))),
+    // NOT `resolveSourceIdArg`. This id is also the Connectivity Hub's TITLE-BAR
+    // Sync Inventory Now, and VS Code invokes a `view/title` command with the
+    // view's FOCUSED row — a Command Center folder row carries `sourceId` when
+    // one source targets it, so reading any `sourceId` silently synced the
+    // last-clicked folder's source instead of asking which (with one source
+    // configured, `pickInventorySource` selects it unprompted either way, so
+    // the leak only bit with two or more). Two shapes stay
+    // legitimate: a bare id string (the manage hub, the add/edit-source
+    // follow-ups, the device-template editor — no tree view passes a string),
+    // and the Settings tree's source row (its inline Sync; the Settings title
+    // bar carries no sync, so that row can only arrive from its own button).
+    // The Hub folder row's own sync is `nexus.inventory.syncFolderSource`.
+    vscode.commands.registerCommand("nexus.inventory.syncNow", (arg?: unknown) =>
+      syncNow(typeof arg === "string" ? arg : isSettingsSourceRow(arg) ? arg.sourceId : undefined)
+    ),
+    // The Hub folder row's inline icon and right-click entry (follow-up #43):
+    // VS Code hands a `view/item/context` command the row itself, whose
+    // `sourceId` names the one source that targets the folder. A row naming no
+    // source falls through to the picker, as the toolbar does.
+    vscode.commands.registerCommand("nexus.inventory.syncFolderSource", (arg?: unknown) => syncNow(resolveSourceIdArg(arg))),
     // The poll fires with a `{ __poll: true }` marker so it stays silent on
     // total failure; every other invocation (palette, title action, a tree row)
     // is the MANUAL path and warns if every source failed.

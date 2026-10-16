@@ -337,7 +337,17 @@
         "icon": "$(play)"
       },
       {
+        "command": "nexus.tunnel.startItem",
+        "title": "Start",
+        "icon": "$(play)"
+      },
+      {
         "command": "nexus.tunnel.stop",
+        "title": "Stop",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "nexus.tunnel.stopItem",
         "title": "Stop",
         "icon": "$(debug-stop)"
       },
@@ -602,12 +612,24 @@
         "icon": "$(add)"
       },
       {
+        "command": "nexus.profile.addToFolder",
+        "title": "Add Profile",
+        "category": "Nexus",
+        "icon": "$(add)"
+      },
+      {
         "command": "nexus.profile.actions",
         "title": "Profile Actions",
         "category": "Nexus"
       },
       {
         "command": "nexus.group.add",
+        "title": "New Folder",
+        "category": "Nexus",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "nexus.group.addToFolder",
         "title": "New Folder",
         "category": "Nexus",
         "icon": "$(new-folder)"
@@ -679,6 +701,12 @@
       },
       {
         "command": "nexus.inventory.syncNow",
+        "title": "Sync Inventory Now",
+        "category": "Nexus",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "nexus.inventory.syncFolderSource",
         "title": "Sync Inventory Now",
         "category": "Nexus",
         "icon": "$(sync)"
@@ -846,6 +874,11 @@
         "icon": "$(cloud-upload)"
       },
       {
+        "command": "nexus.files.uploadToDir",
+        "title": "Upload File",
+        "icon": "$(cloud-upload)"
+      },
+      {
         "command": "nexus.files.download",
         "title": "Download",
         "icon": "$(cloud-download)"
@@ -866,7 +899,17 @@
         "icon": "$(new-folder)"
       },
       {
+        "command": "nexus.files.createDirInDir",
+        "title": "New Directory",
+        "icon": "$(new-folder)"
+      },
+      {
         "command": "nexus.files.createFile",
+        "title": "New File",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "nexus.files.createFileInDir",
         "title": "New File",
         "icon": "$(new-file)"
       },
@@ -963,7 +1006,19 @@
         "icon": "$(new-file)"
       },
       {
+        "command": "nexus.script.newInFolder",
+        "title": "New Nexus Script",
+        "category": "Nexus",
+        "icon": "$(new-file)"
+      },
+      {
         "command": "nexus.script.newFolder",
+        "title": "New Script Folder",
+        "category": "Nexus",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "nexus.script.newFolderInFolder",
         "title": "New Script Folder",
         "category": "Nexus",
         "icon": "$(new-folder)"
@@ -1439,7 +1494,7 @@
           "group": "inline@2"
         },
         {
-          "command": "nexus.inventory.syncNow",
+          "command": "nexus.inventory.syncFolderSource",
           "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?\\.syncSource$/",
           "group": "inline@3"
         },
@@ -1459,12 +1514,12 @@
           "group": "1_manage@1"
         },
         {
-          "command": "nexus.group.add",
+          "command": "nexus.group.addToFolder",
           "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "1_manage@2"
         },
         {
-          "command": "nexus.profile.add",
+          "command": "nexus.profile.addToFolder",
           "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
           "group": "1_manage@3"
         },
@@ -1499,7 +1554,7 @@
           "group": "1_manage@5"
         },
         {
-          "command": "nexus.inventory.syncNow",
+          "command": "nexus.inventory.syncFolderSource",
           "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?\\.syncSource$/",
           "group": "1_manage@6"
         },
@@ -1709,7 +1764,7 @@
           "group": "0_connect@1"
         },
         {
-          "command": "nexus.tunnel.start",
+          "command": "nexus.tunnel.startItem",
           "when": "view == nexusTunnels && viewItem == nexus.tunnel",
           "group": "inline"
         },
@@ -1724,7 +1779,7 @@
           "group": "inline"
         },
         {
-          "command": "nexus.tunnel.stop",
+          "command": "nexus.tunnel.stopItem",
           "when": "view == nexusTunnels && viewItem == nexus.activeTunnel",
           "group": "inline@2"
         },
@@ -1734,7 +1789,7 @@
           "group": "inline@3"
         },
         {
-          "command": "nexus.tunnel.start",
+          "command": "nexus.tunnel.startItem",
           "when": "view == nexusTunnels && viewItem == nexus.tunnel",
           "group": "0_connect"
         },
@@ -1749,7 +1804,7 @@
           "group": "0_connect@1"
         },
         {
-          "command": "nexus.tunnel.stop",
+          "command": "nexus.tunnel.stopItem",
           "when": "view == nexusTunnels && viewItem == nexus.activeTunnel",
           "group": "0_connect@2"
         },
@@ -1869,17 +1924,17 @@
           "group": "inline"
         },
         {
-          "command": "nexus.files.createDir",
+          "command": "nexus.files.createDirInDir",
           "when": "view == nexusFileExplorer && viewItem == nexus.fileExplorer.dir",
           "group": "1_manage@1"
         },
         {
-          "command": "nexus.files.createFile",
+          "command": "nexus.files.createFileInDir",
           "when": "view == nexusFileExplorer && viewItem == nexus.fileExplorer.dir",
           "group": "1_manage@2"
         },
         {
-          "command": "nexus.files.upload",
+          "command": "nexus.files.uploadToDir",
           "when": "view == nexusFileExplorer && viewItem == nexus.fileExplorer.dir",
           "group": "1_manage@3"
         },
@@ -1964,12 +2019,12 @@
           "group": "3_destructive"
         },
         {
-          "command": "nexus.script.new",
+          "command": "nexus.script.newInFolder",
           "when": "view == nexusScripts && viewItem == nexus.scriptFolder",
           "group": "1_manage@0"
         },
         {
-          "command": "nexus.script.newFolder",
+          "command": "nexus.script.newFolderInFolder",
           "when": "view == nexusScripts && viewItem == nexus.scriptFolder",
           "group": "1_manage@1"
         },
@@ -2120,8 +2175,16 @@
           "when": "true"
         },
         {
+          "command": "nexus.tunnel.startItem",
+          "when": "false"
+        },
+        {
           "command": "nexus.tunnel.stop",
           "when": "true"
+        },
+        {
+          "command": "nexus.tunnel.stopItem",
+          "when": "false"
         },
         {
           "command": "nexus.tunnel.restart",
@@ -2324,12 +2387,20 @@
           "when": "true"
         },
         {
+          "command": "nexus.profile.addToFolder",
+          "when": "false"
+        },
+        {
           "command": "nexus.profile.actions",
           "when": "false"
         },
         {
           "command": "nexus.group.add",
           "when": "true"
+        },
+        {
+          "command": "nexus.group.addToFolder",
+          "when": "false"
         },
         {
           "command": "nexus.group.remove",
@@ -2414,6 +2485,10 @@
         {
           "command": "nexus.inventory.syncNow",
           "when": "true"
+        },
+        {
+          "command": "nexus.inventory.syncFolderSource",
+          "when": "false"
         },
         {
           "command": "nexus.inventory.refreshStatus",
@@ -2528,6 +2603,10 @@
           "when": "false"
         },
         {
+          "command": "nexus.files.uploadToDir",
+          "when": "false"
+        },
+        {
           "command": "nexus.files.download",
           "when": "false"
         },
@@ -2544,7 +2623,15 @@
           "when": "false"
         },
         {
+          "command": "nexus.files.createDirInDir",
+          "when": "false"
+        },
+        {
           "command": "nexus.files.createFile",
+          "when": "false"
+        },
+        {
+          "command": "nexus.files.createFileInDir",
           "when": "false"
         },
         {
@@ -2606,6 +2693,14 @@
         {
           "command": "nexus.script.newFolder",
           "when": "true"
+        },
+        {
+          "command": "nexus.script.newInFolder",
+          "when": "false"
+        },
+        {
+          "command": "nexus.script.newFolderInFolder",
+          "when": "false"
         },
         {
           "command": "nexus.script.refresh",

@@ -137,6 +137,13 @@ export class InventorySourcesGroupItem extends vscode.TreeItem {
 }
 
 export class InventorySourceItem extends vscode.TreeItem {
+  // LOAD-BEARING, not just a union tag: `nexus.inventory.syncNow` recognises
+  // this row by `kind` (`isSettingsSourceRow`, commands/inventoryCommands.ts).
+  // That id is also the Connectivity Hub's title-bar sync, which VS Code calls
+  // with the Hub's focused row, and a Command Center folder row carries a
+  // `sourceId` too — so syncNow must accept exactly this row and reject that
+  // one, and `sourceId` alone cannot tell them apart. Renaming it breaks the
+  // inline Sync button (folderSyncActionWiring.test.ts drives a real item).
   public readonly kind = "inventorySource" as const;
   public constructor(
     public readonly sourceId: string,
@@ -151,10 +158,11 @@ export class InventorySourceItem extends vscode.TreeItem {
     this.contextValue = "nexus.inventorySource";
     this.tooltip = `${name} — ${description}`;
     // A click carries the source id as the command argument, so the editor
-    // opens on THIS source directly rather than re-prompting. `resolveSourceIdArg`
-    // (commands/inventoryCommands.ts) accepts either form — this string, or the
-    // tree item itself via its `sourceId` — so the inline menu actions, which
-    // receive the item, resolve to the same source.
+    // opens on THIS source directly rather than re-prompting. The inline menu
+    // actions receive the item itself and resolve to the same source: Edit,
+    // Template Rules and Remove through `resolveSourceIdArg`
+    // (commands/inventoryCommands.ts), which reads `sourceId`; Sync through
+    // `isSettingsSourceRow`, which also requires `kind` (see above).
     this.command = { command: "nexus.inventory.editSource", title: "Edit Inventory Source", arguments: [sourceId] };
   }
 }

@@ -742,16 +742,28 @@ export function registerScriptCommands(
       outputChannel.show(true);
     }),
 
-    // Invoked with no arg from the view-title button / CodeLens / Palette, or
-    // with a folder `ScriptNode` from a folder's right-click menu (§5.7) — in
-    // the latter case the folder path pre-seeds the input box.
-    vscode.commands.registerCommand("nexus.script.new", async (arg?: unknown) => {
+    // TITLE BAR vs FOLDER ROW — two ids per action, never one. VS Code invokes
+    // a `view/title` command with the view's FOCUSED row as its argument (the
+    // last row clicked, still focused after a click on empty space), so a
+    // title-bar id that also served the folder's right-click menu received the
+    // same folder `ScriptNode` from both and pre-seeded whichever folder was
+    // clicked last. The title-bar / welcome-link / Palette ids take no argument;
+    // the `*InFolder` ids carry the folder-row entries (§5.7) and pre-seed it.
+    vscode.commands.registerCommand("nexus.script.new", async () => {
+      await createNewScript(globalStoragePath);
+    }),
+
+    vscode.commands.registerCommand("nexus.script.newInFolder", async (arg?: unknown) => {
       await createNewScript(globalStoragePath, scriptFolderArgPath(arg));
     }),
 
-    // §5.7 — View-title button + folder context menu. Creates a real
-    // directory that renders immediately and persists empty (§1.1, §5.4).
-    vscode.commands.registerCommand("nexus.script.newFolder", async (arg?: unknown) => {
+    // §5.7 — creates a real directory that renders immediately and persists
+    // empty (§1.1, §5.4).
+    vscode.commands.registerCommand("nexus.script.newFolder", async () => {
+      await createNewScriptFolder(globalStoragePath);
+    }),
+
+    vscode.commands.registerCommand("nexus.script.newFolderInFolder", async (arg?: unknown) => {
       await createNewScriptFolder(globalStoragePath, scriptFolderArgPath(arg));
     }),
 

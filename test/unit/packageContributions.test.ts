@@ -1161,13 +1161,13 @@ describe("package contributions", () => {
       const EXPECTED: Record<string, string[]> = {
         "nexus.group.connect|inline@1": WITH_SERVERS,
         "nexus.group.disconnect|inline@2": WITH_SERVERS,
-        "nexus.inventory.syncNow|inline@3": MARKED,
-        "nexus.inventory.syncNow|1_manage@6": MARKED,
+        "nexus.inventory.syncFolderSource|inline@3": MARKED,
+        "nexus.inventory.syncFolderSource|1_manage@6": MARKED,
         "nexus.group.connect|0_connect@1": WITH_SERVERS,
         "nexus.group.disconnect|0_connect@2": WITH_SERVERS,
         "nexus.group.rename|1_manage@1": FOLDER_VALUES,
-        "nexus.group.add|1_manage@2": FOLDER_VALUES,
-        "nexus.profile.add|1_manage@3": FOLDER_VALUES,
+        "nexus.group.addToFolder|1_manage@2": FOLDER_VALUES,
+        "nexus.profile.addToFolder|1_manage@3": FOLDER_VALUES,
         "nexus.authProfile.applyToFolder|1_manage@4": FOLDER_VALUES,
         "nexus.deviceTemplate.applyToFolder|1_manage@5": FOLDER_VALUES,
         "nexus.group.remove|3_destructive": FOLDER_VALUES
@@ -1187,11 +1187,21 @@ describe("package contributions", () => {
       }
     });
 
-    it("the folder sync action reuses nexus.inventory.syncNow with its $(sync) icon and sits AFTER the two connection actions in the inline row (⊘ a second command, or an ordinal before connect/disconnect, reshuffles icons users already know)", () => {
-      const command = packageJson.contributes.commands.find((item) => item.command === "nexus.inventory.syncNow");
-      expect(command?.icon).toBe("$(sync)");
+    /**
+     * Its own id, not the toolbar's `nexus.inventory.syncNow`: VS Code invokes a
+     * `view/title` command with the view's FOCUSED row, so an id shared with the
+     * toolbar cannot tell "this row's icon" from "the toolbar, after this row was
+     * clicked" and the toolbar silently synced the last-clicked folder's source.
+     * Same title and icon as the toolbar's, so the row looks exactly as before.
+     */
+    it("the folder sync action is nexus.inventory.syncFolderSource, wearing syncNow's own title and $(sync) icon, AFTER the two connection actions in the inline row (⊘ a different label or icon, or an ordinal before connect/disconnect, reshuffles icons users already know)", () => {
+      const toolbar = packageJson.contributes.commands.find((item) => item.command === "nexus.inventory.syncNow");
+      const row = packageJson.contributes.commands.find((item) => item.command === "nexus.inventory.syncFolderSource");
+      expect(row?.icon).toBe("$(sync)");
+      expect(row?.icon).toBe(toolbar?.icon);
+      expect(row?.title).toBe(toolbar?.title);
       const entries = (packageJson.contributes.menus["view/item/context"] ?? []).filter(
-        (m) => m.command === "nexus.inventory.syncNow" && (m.when ?? "").includes("nexusCommandCenter")
+        (m) => m.command === "nexus.inventory.syncFolderSource" && (m.when ?? "").includes("nexusCommandCenter")
       );
       expect(entries.some((m) => m.group === "inline@3")).toBe(true);
     });
@@ -1212,7 +1222,7 @@ describe("package contributions", () => {
      */
     it("also contributes Sync Inventory Now to the right-click menu, last in 1_manage, on the same marked-folder matcher as the inline icon (⊘ inline-only leaves the row's whole reason for existing on hover)", () => {
       const contextEntries = (packageJson.contributes.menus["view/item/context"] ?? []).filter(
-        (m) => m.command === "nexus.inventory.syncNow" && (m.when ?? "").includes("nexusCommandCenter") && !(m.group ?? "").startsWith("inline")
+        (m) => m.command === "nexus.inventory.syncFolderSource" && (m.when ?? "").includes("nexusCommandCenter") && !(m.group ?? "").startsWith("inline")
       );
       expect(contextEntries).toHaveLength(1);
       const entry = contextEntries[0];
@@ -1225,7 +1235,7 @@ describe("package contributions", () => {
             (m.when ?? "").includes("nexusCommandCenter") &&
             (m.when ?? "").includes("viewItem =~ /^nexus\\.folder") &&
             (m.group ?? "").startsWith("1_manage@") &&
-            m.command !== "nexus.inventory.syncNow"
+            m.command !== "nexus.inventory.syncFolderSource"
         )
         .map((m) => Number((m.group ?? "").split("@")[1]));
       expect(manageOrdinals.length).toBeGreaterThan(0);
@@ -1234,7 +1244,7 @@ describe("package contributions", () => {
       // Macros folder. (The EXPECTED table above checks this exhaustively; this
       // asserts the two entries cannot drift apart.)
       const inlineEntry = (packageJson.contributes.menus["view/item/context"] ?? []).find(
-        (m) => m.command === "nexus.inventory.syncNow" && m.group === "inline@3"
+        (m) => m.command === "nexus.inventory.syncFolderSource" && m.group === "inline@3"
       );
       expect(entry.when).toBe(inlineEntry?.when);
     });
@@ -1245,6 +1255,142 @@ describe("package contributions", () => {
       );
       expect(macroFolderMenus.length).toBeGreaterThan(0);
       expect(macroFolderMenus.every((m) => (m.when ?? "").includes("viewItem == nexus.folder.macros"))).toBe(true);
+    });
+  });
+
+  /**
+   * TOOLBAR FOCUS LEAK. VS Code does not invoke a `view/title` command with no
+   * argument: it builds the toolbar's action context as `{ $treeViewId,
+   * $focusedTreeItem: true, … }`, and the extension host hands the handler the
+   * view's FOCUSED element — the last row clicked, which stays focused after a
+   * click on empty space (only the selection clears). So one id shared between
+   * a view's toolbar and its row menus gets the same row from both surfaces and
+   * cannot tell them apart; the Hub's toolbar New Folder created the folder
+   * inside whichever folder was clicked last. The only fix is a separate id per
+   * surface, which these tests hold in place.
+   */
+  describe("toolbar ids vs row ids — a view/title command receives the view's focused row", () => {
+    const titleMenus = packageJson.contributes.menus["view/title"] ?? [];
+    const itemMenus = packageJson.contributes.menus["view/item/context"] ?? [];
+    const paletteMenus = packageJson.contributes.menus.commandPalette ?? [];
+    const viewOf = (when?: string): string | undefined => /\bview == ([\w.-]+)/.exec(when ?? "")?.[1];
+
+    // toolbar (root) id → its row twin.
+    const ROW_TWIN: Record<string, string> = {
+      "nexus.group.add": "nexus.group.addToFolder",
+      "nexus.profile.add": "nexus.profile.addToFolder",
+      "nexus.inventory.syncNow": "nexus.inventory.syncFolderSource",
+      "nexus.script.new": "nexus.script.newInFolder",
+      "nexus.script.newFolder": "nexus.script.newFolderInFolder",
+      "nexus.tunnel.start": "nexus.tunnel.startItem",
+      "nexus.tunnel.stop": "nexus.tunnel.stopItem",
+      "nexus.files.createFile": "nexus.files.createFileInDir",
+      "nexus.files.createDir": "nexus.files.createDirInDir",
+      "nexus.files.upload": "nexus.files.uploadToDir"
+    };
+
+    it("each toolbar id is on its view's title bar and on NO row menu of that view (⊘ sharing the id hands the toolbar the last-focused row)", () => {
+      for (const id of Object.keys(ROW_TWIN)) {
+        const toolbarViews = titleMenus.filter((m) => m.command === id).map((m) => viewOf(m.when));
+        expect(toolbarViews.length, `${id} has a title-bar entry`).toBeGreaterThan(0);
+        for (const view of toolbarViews) {
+          expect(
+            itemMenus.filter((m) => m.command === id && viewOf(m.when) === view).map((m) => m.when),
+            `${id} on a ${view} row menu`
+          ).toEqual([]);
+        }
+      }
+    });
+
+    it("the only row menu any toolbar id keeps is Sync Inventory Now on a Settings source row — a different view, whose title bar has no sync for a focused row to leak into", () => {
+      const rowEntries = itemMenus.filter((m) => m.command in ROW_TWIN).map((m) => `${m.command}|${m.when}|${m.group}`);
+      expect(rowEntries).toEqual(["nexus.inventory.syncNow|view == nexusSettings && viewItem == nexus.inventorySource|inline@1"]);
+      expect(titleMenus.filter((m) => m.command === "nexus.inventory.syncNow" && viewOf(m.when) === "nexusSettings")).toEqual([]);
+    });
+
+    it("each row twin is on its toolbar id's view's row menus and on NO title bar (⊘ a twin on a title bar reintroduces the leak under a new name)", () => {
+      for (const [id, twin] of Object.entries(ROW_TWIN)) {
+        const toolbarViews = titleMenus.filter((m) => m.command === id).map((m) => viewOf(m.when));
+        const twinViews = itemMenus.filter((m) => m.command === twin).map((m) => viewOf(m.when));
+        expect(twinViews.length, `${twin} has a row-menu entry`).toBeGreaterThan(0);
+        expect(new Set(twinViews), `${twin} lives in ${id}'s view`).toEqual(new Set(toolbarViews));
+        expect(titleMenus.filter((m) => m.command === twin), `${twin} on a title bar`).toEqual([]);
+      }
+    });
+
+    // The Hub folder entries are pinned by the FOLDER_VALUES table above; these
+    // are the other views' rows, each with its `when` and group as it was.
+    it("the Scripts, Tunnels and File Explorer row entries moved to the twins with their `when` and group unchanged", () => {
+      const rowEntries = itemMenus.map((m) => `${m.command}|${m.when}|${m.group}`);
+      for (const entry of [
+        "nexus.script.newInFolder|view == nexusScripts && viewItem == nexus.scriptFolder|1_manage@0",
+        "nexus.script.newFolderInFolder|view == nexusScripts && viewItem == nexus.scriptFolder|1_manage@1",
+        "nexus.tunnel.startItem|view == nexusTunnels && viewItem == nexus.tunnel|inline",
+        "nexus.tunnel.startItem|view == nexusTunnels && viewItem == nexus.tunnel|0_connect",
+        "nexus.tunnel.stopItem|view == nexusTunnels && viewItem == nexus.activeTunnel|inline@2",
+        "nexus.tunnel.stopItem|view == nexusTunnels && viewItem == nexus.activeTunnel|0_connect@2",
+        "nexus.files.createDirInDir|view == nexusFileExplorer && viewItem == nexus.fileExplorer.dir|1_manage@1",
+        "nexus.files.createFileInDir|view == nexusFileExplorer && viewItem == nexus.fileExplorer.dir|1_manage@2",
+        "nexus.files.uploadToDir|view == nexusFileExplorer && viewItem == nexus.fileExplorer.dir|1_manage@3"
+      ]) {
+        expect(rowEntries).toContain(entry);
+      }
+    });
+
+    it("each row twin is contributed under its toolbar id's title and icon, so no menu label or inline button changes, and is hidden from the Command Palette, where it names no row (⊘ palette-visible it would list those actions twice)", () => {
+      for (const [id, twin] of Object.entries(ROW_TWIN)) {
+        const root = packageJson.contributes.commands.find((c) => c.command === id);
+        const row = packageJson.contributes.commands.find((c) => c.command === twin);
+        expect(row, `${twin} is contributed`).toBeDefined();
+        expect(row?.title, twin).toBe(root?.title);
+        expect(row?.icon, twin).toBe(root?.icon);
+        expect(paletteMenus.filter((m) => m.command === twin).map((m) => m.when), twin).toEqual(["false"]);
+      }
+    });
+
+    /**
+     * THE GENERIC GUARD. Any id on both a view's title bar and one of that same
+     * view's row menus is a deliberate decision, so it has to be named on one of
+     * the two lists below. It reads package.json only, so it cannot see a
+     * title-bar-only handler that starts reading its argument (say
+     * `nexus.files.goToPath` gaining a `FileTreeItem` branch): that handler gets
+     * the focused row just the same, and only a handler test would catch it.
+     */
+    // Shared on purpose: each handler was read and takes nothing from a tree item.
+    const SHARED_ID_EXCEPTIONS: Record<string, string> = {
+      "nexus.files.followTerminal": "takes no argument; it switches the global follow mode on",
+      "nexus.files.unfollowTerminal": "takes no argument; it switches the global follow mode off",
+      "nexus.files.resumeFollowTerminal": "takes no argument; it resumes the paused follow mode",
+      "nexus.files.syncFromTerminal": "reads only a vscode.Terminal (terminal-tab menus); a File Explorer row is not one, so both surfaces sync the focused terminal"
+    };
+    // KNOWN, TRACKED FOLLOW-UP — NOT an accepted exception (tracked in #286). The
+    // handler reads the focused row the toolbar hands it, so the toolbar acts on
+    // a stale row; it is listed only so this guard stays green until it gets the
+    // same split.
+    const KNOWN_FOCUS_LEAK_FOLLOW_UPS: Record<string, string> = {
+      "nexus.networkServer.edit": "the toolbar gear skips the TFTP/DHCP pick and opens the focused row's form"
+    };
+
+    const sharedIdsByView = (): string[] => {
+      const shared = new Set<string>();
+      for (const title of titleMenus) {
+        // A title entry naming no exact view (`view =~ …`) is treated as every view.
+        const view = viewOf(title.when);
+        if (itemMenus.some((item) => item.command === title.command && (view === undefined || viewOf(item.when) === view))) {
+          shared.add(title.command);
+        }
+      }
+      return [...shared].sort();
+    };
+
+    it("every row-menu entry names exactly one view, so the per-view comparison below cannot miss one", () => {
+      for (const item of itemMenus) {
+        expect([...(item.when ?? "").matchAll(/\bview == /g)], `${item.command}: ${item.when}`).toHaveLength(1);
+      }
+    });
+
+    it("no id is on both a view's title bar and that view's row menus unless it is named as a reviewed exception or a tracked follow-up (⊘ a new shared id silently hands its toolbar the last-focused row)", () => {
+      expect(sharedIdsByView()).toEqual([...Object.keys(SHARED_ID_EXCEPTIONS), ...Object.keys(KNOWN_FOCUS_LEAK_FOLLOW_UPS)].sort());
     });
   });
   describe("Live lab status (Phase 2)", () => {

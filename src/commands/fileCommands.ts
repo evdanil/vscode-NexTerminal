@@ -542,8 +542,16 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
     }
   });
 
-  const createFile = vscode.commands.registerCommand("nexus.files.createFile", async (arg?: unknown) => {
-    const target = resolveTargetDirectory(ctx, arg);
+  // TOOLBAR vs DIRECTORY ROW — New File, New Directory and Upload each have two
+  // ids, never one. VS Code invokes a `view/title` command with the view's
+  // FOCUSED row (expanding a directory focuses it, and it stays focused after a
+  // click on empty space), so a toolbar id that also served the directory's
+  // right-click menu received that `FileTreeItem` and wrote into whichever
+  // directory was clicked last. The toolbar ids take no argument and always
+  // target the explorer's current directory; the `*InDir` / `uploadToDir` ids
+  // carry the row entries. Each pair shares one body, given the row or nothing.
+  const createFileIn = async (row?: unknown): Promise<void> => {
+    const target = resolveTargetDirectory(ctx, row);
     if (!target) {
       return;
     }
@@ -566,10 +574,12 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
       const message = error instanceof Error ? error.message : String(error);
       vscode.window.showErrorMessage(`Failed to create file "${name}": ${message}`);
     }
-  });
+  };
+  const createFile = vscode.commands.registerCommand("nexus.files.createFile", () => createFileIn());
+  const createFileInDir = vscode.commands.registerCommand("nexus.files.createFileInDir", (arg?: unknown) => createFileIn(arg));
 
-  const upload = vscode.commands.registerCommand("nexus.files.upload", async (arg?: unknown) => {
-    const target = resolveTargetDirectory(ctx, arg);
+  const uploadTo = async (row?: unknown): Promise<void> => {
+    const target = resolveTargetDirectory(ctx, row);
     if (!target) {
       return;
     }
@@ -679,7 +689,9 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
       return;
     }
     vscode.window.showInformationMessage(`Uploaded ${summary.uploaded} item${summary.uploaded === 1 ? "" : "s"}.`);
-  });
+  };
+  const upload = vscode.commands.registerCommand("nexus.files.upload", () => uploadTo());
+  const uploadToDir = vscode.commands.registerCommand("nexus.files.uploadToDir", (arg?: unknown) => uploadTo(arg));
 
   const download = vscode.commands.registerCommand("nexus.files.download", async (arg?: unknown, allSelected?: unknown) => {
     const items = dedupeDownloadItems(resolveSelectedItems(arg, allSelected));
@@ -890,8 +902,8 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
     ctx.fileExplorerProvider.refresh();
   });
 
-  const createDir = vscode.commands.registerCommand("nexus.files.createDir", async (arg?: unknown) => {
-    const target = resolveTargetDirectory(ctx, arg);
+  const createDirIn = async (row?: unknown): Promise<void> => {
+    const target = resolveTargetDirectory(ctx, row);
     if (!target) {
       return;
     }
@@ -912,7 +924,9 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
       const message = error instanceof Error ? error.message : String(error);
       vscode.window.showErrorMessage(`Failed to create directory "${name}": ${message}`);
     }
-  });
+  };
+  const createDir = vscode.commands.registerCommand("nexus.files.createDir", () => createDirIn());
+  const createDirInDir = vscode.commands.registerCommand("nexus.files.createDirInDir", (arg?: unknown) => createDirIn(arg));
 
   const goToPath = vscode.commands.registerCommand("nexus.files.goToPath", async (arg?: unknown) => {
     const activeId = ctx.fileExplorerProvider.getActiveServerId();
@@ -1011,5 +1025,8 @@ export function registerFileCommands(ctx: CommandContext): vscode.Disposable[] {
     await vscode.commands.executeCommand("vscode.open", uri);
   });
 
-  return [browse, open, createFile, upload, download, deleteCmd, rename, createDir, goToPath, goHome, copyPath, refresh, disconnect, editAsRoot];
+  return [
+    browse, open, createFile, createFileInDir, upload, uploadToDir, download, deleteCmd, rename, createDir, createDirInDir,
+    goToPath, goHome, copyPath, refresh, disconnect, editAsRoot
+  ];
 }

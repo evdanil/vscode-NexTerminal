@@ -22,6 +22,8 @@ All modes support configurable local bind addresses (localhost, LAN, or all inte
 3. Assign an SSH server to the tunnel, or leave it unassigned to choose at start time
 4. Right-click the tunnel and select **Start**
 
+The **Start** and **Stop** buttons on a tunnel's row act on that tunnel; the ones in the Port Forwarding title bar ask which tunnel to start, or which running tunnel to stop, whichever row you clicked last.
+
 You can also drag a tunnel profile onto a server in the [Connectivity Hub](connectivity-hub.md) to start it immediately.
 
 ## Canceling and Stopping
