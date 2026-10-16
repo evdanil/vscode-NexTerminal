@@ -8,7 +8,7 @@
 
 - **Add Profile (`+`) in the Connectivity Hub title bar no longer fills in a folder.** It pre-filled the form's **Folder** with whichever folder you had clicked last; it now opens with no folder, and a folder's right-click **Add Profile** still fills that folder in.
 
-- **Sync Inventory Now in the Connectivity Hub's `...` menu asks which source to sync.** When the folder you had clicked last was an inventory source's target folder, it synced that source without asking. The sync icon and right-click entry on that folder still sync its source directly.
+- **Sync Inventory Now in the Connectivity Hub's `...` menu no longer picks the source from the folder you clicked last.** With two or more inventory sources, it synced whichever source's target folder you had clicked last, without asking; it now shows the source picker. With a single source it syncs that source, as before. The sync icon and right-click entry on that folder still sync its source directly.
 
 - **New Script and New Folder in the Scripts title bar no longer pre-fill a folder.** Both started the name with whichever folder you had clicked last (`cisco/`); they now start empty, and a folder's right-click **New Nexus Script** and **New Script Folder** still pre-fill that folder.
 

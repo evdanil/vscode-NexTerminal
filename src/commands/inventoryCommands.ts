@@ -6426,7 +6426,9 @@ export function registerInventoryCommands(
     // Sync Inventory Now, and VS Code invokes a `view/title` command with the
     // view's FOCUSED row — a Command Center folder row carries `sourceId` when
     // one source targets it, so reading any `sourceId` silently synced the
-    // last-clicked folder's source instead of asking. Two shapes stay
+    // last-clicked folder's source instead of asking which (with one source
+    // configured, `pickInventorySource` selects it unprompted either way, so
+    // the leak only bit with two or more). Two shapes stay
     // legitimate: a bare id string (the manage hub, the add/edit-source
     // follow-ups, the device-template editor — no tree view passes a string),
     // and the Settings tree's source row (its inline Sync; the Settings title
