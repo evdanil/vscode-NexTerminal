@@ -6,6 +6,8 @@
 
 - **Open Full Settings (the gear) in the Network Servers title bar asks which service.** It opened the full form of whichever service, TFTP or DHCP, you had clicked last, without asking, because VS Code hands a title-bar button the view's last-focused row. It now asks TFTP or DHCP; a service's right-click **Open Full Settings** still opens that service's form.
 
+- **Remove Folder asks first when a folder holds only subfolders.** A folder with subfolders but no profile in any of them was removed without asking, and its subfolders silently moved up a level — to the top of the Connectivity Hub when the folder was a top-level one. It now asks whether to **Move to parent** or **Delete contents**, as it already did when a folder held profiles. The confirmation also counts subfolders alongside profiles, with real plurals (`It contains 2 subfolders and 3 items.` rather than `It contains 3 item(s).`). An empty folder is still removed without asking.
+
 ## [2.8.299] — 2026-10-16
 
 ### Fixed

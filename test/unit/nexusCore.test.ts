@@ -1292,6 +1292,54 @@ describe("NexusCore", () => {
     const recursive = core.getItemsInFolder("A", true);
     expect(recursive.servers).toHaveLength(2);
   });
+
+  /**
+   * getItemsInFolder counts profiles only, so a folder holding nothing but empty
+   * subfolders looked empty to Remove Folder, which then removed it without
+   * asking. This is the subfolder half of that question.
+   */
+  it("getSubfolderPaths lists every folder beneath a path at any depth — explicit ones and the ones a profile's group implies — never the path itself or a look-alike sibling", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    // Explicit and empty, the way New Folder makes them.
+    await core.addGroup("TEST1/TEST2/TEST3");
+    // A prefix look-alike: "TEST10" is not inside "TEST1".
+    await core.addGroup("TEST10/Inner");
+    // Implicit: no explicit group names these; the tree shows them anyway,
+    // every level in between included. One per profile kind.
+    await core.addOrUpdateServer({
+      id: "s1", name: "S1", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, group: "TEST1/Lab/Rack"
+    });
+    await core.addOrUpdateSerialProfile({
+      id: "ser1", name: "ser1", group: "TEST1/Serial", path: "/dev/ttyUSB0",
+      baudRate: 9600, dataBits: 8, stopBits: 1, parity: "none", rtscts: false
+    });
+    await core.addOrUpdateLocalShellProfile({ id: "sh1", name: "sh1", group: "TEST1/Shell", launchMode: "custom", shellPath: "/bin/bash" });
+    await core.addOrUpdateLocalServerConfig({ id: "ls1", name: "ls1", group: "TEST1/Local", executable: "node" });
+    // A profile directly in the folder adds no subfolder.
+    await core.addOrUpdateServer({
+      id: "s2", name: "S2", host: "h", port: 22, username: "u",
+      authType: "password", isHidden: false, group: "TEST1"
+    });
+    expect(core.getSnapshot().explicitGroups).not.toContain("TEST1/Lab");
+
+    // ⊘ explicit groups only: the four profile-implied folders are missing.
+    // ⊘ direct children only: TEST1/TEST2/TEST3 and TEST1/Lab/Rack are missing.
+    // ⊘ a bare startsWith(path): TEST10 and TEST10/Inner leak in.
+    expect(core.getSubfolderPaths("TEST1")).toEqual([
+      "TEST1/Lab",
+      "TEST1/Lab/Rack",
+      "TEST1/Local",
+      "TEST1/Serial",
+      "TEST1/Shell",
+      "TEST1/TEST2",
+      "TEST1/TEST2/TEST3"
+    ]);
+    expect(core.getSubfolderPaths("TEST1/TEST2")).toEqual(["TEST1/TEST2/TEST3"]);
+    expect(core.getSubfolderPaths("TEST1/TEST2/TEST3")).toEqual([]);
+    expect(core.getSubfolderPaths("TEST10")).toEqual(["TEST10/Inner"]);
+  });
 });
 
 /**
