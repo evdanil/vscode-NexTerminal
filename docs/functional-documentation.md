@@ -932,7 +932,7 @@ TFTP and DHCP are **fixed singletons, not user-created profiles**. There is exac
 ### 10.1 Flow
 
 1. Open the **Network Servers** view in the Nexus sidebar. Both services render before either has ever run: configuration rows come straight from settings, so the root directory, pool, boot options, and static reservations are visible while the service is stopped.
-2. Click a service row (or run **Quick Settings**) to set the values a bench actually changes. **Open Full Settings** opens the webview form with every field, including the structured ones (ZTP boot options, vendor-specific TLVs, `MAC=IP` reservations) that a one-line input box cannot express: a service row's right-click entry opens that service's form, and the view title-bar gear asks TFTP or DHCP first, whichever row was clicked last (§6.2).
+2. Click a service row (or run **Quick Settings**) to set the values a bench actually changes. **Open Full Settings** opens the webview form with every field, including the structured ones (ZTP boot options, vendor-specific TLVs, `MAC=IP` reservations) that a one-line input box cannot express: a service row's right-click entry opens that service's form, and the view title-bar gear always asks TFTP or DHCP, regardless of which row was clicked last (§6.2).
 3. **Start Service** from the row's inline action. The service binds, the row turns green, and the runtime rows (Active Transfers / Active Leases) begin filling from daemon push updates.
 4. Settings are read at start, so edits made while a service is running do not take effect until **Restart Service**. Quick Settings offers that restart itself, once, when it closes after an actual edit.
 

@@ -3272,6 +3272,10 @@ export class NexusCore {
    * `group` implies, every level in between included — the same derivation as
    * `NexusTreeProvider`'s folder cache. Never `path` itself.
    *
+   * `path` must be a real folder path. The root (`""`) is not a folder — no
+   * folder path is beneath it in the `isDescendantOrSelf` sense — so
+   * `getSubfolderPaths("")` returns `[]`, not the top-level folders.
+   *
    * `getItemsInFolder` sees profiles only, so a folder holding nothing but
    * empty subfolders looks empty to it. Remove Folder asks both before it
    * treats a folder as empty and removes it without a prompt.
