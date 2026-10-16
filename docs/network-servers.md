@@ -4,6 +4,8 @@ Serve firmware and configs to lab hardware, and hand it addresses, without insta
 
 Both services live in the **Network Servers** view of the Nexus sidebar. Each one has **Quick Settings** for everyday changes and **Open Full Settings** for the full form.
 
+**Open Full Settings** on a service's right-click menu opens that service's form; the gear in the view's title bar asks whether to open TFTP or DHCP.
+
 ## Choose an Interface
 
 Both services bind every interface (`0.0.0.0`) unless you pick one, from a live list of this machine's IPv4 addresses, in Quick Settings or the full form.

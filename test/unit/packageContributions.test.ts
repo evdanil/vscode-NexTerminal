@@ -1286,7 +1286,8 @@ describe("package contributions", () => {
       "nexus.tunnel.stop": "nexus.tunnel.stopItem",
       "nexus.files.createFile": "nexus.files.createFileInDir",
       "nexus.files.createDir": "nexus.files.createDirInDir",
-      "nexus.files.upload": "nexus.files.uploadToDir"
+      "nexus.files.upload": "nexus.files.uploadToDir",
+      "nexus.networkServer.edit": "nexus.networkServer.editItem"
     };
 
     it("each toolbar id is on its view's title bar and on NO row menu of that view (⊘ sharing the id hands the toolbar the last-focused row)", () => {
@@ -1320,7 +1321,7 @@ describe("package contributions", () => {
 
     // The Hub folder entries are pinned by the FOLDER_VALUES table above; these
     // are the other views' rows, each with its `when` and group as it was.
-    it("the Scripts, Tunnels and File Explorer row entries moved to the twins with their `when` and group unchanged", () => {
+    it("the Scripts, Tunnels, File Explorer and Network Servers row entries moved to the twins with their `when` and group unchanged", () => {
       const rowEntries = itemMenus.map((m) => `${m.command}|${m.when}|${m.group}`);
       for (const entry of [
         "nexus.script.newInFolder|view == nexusScripts && viewItem == nexus.scriptFolder|1_manage@0",
@@ -1331,27 +1332,29 @@ describe("package contributions", () => {
         "nexus.tunnel.stopItem|view == nexusTunnels && viewItem == nexus.activeTunnel|0_connect@2",
         "nexus.files.createDirInDir|view == nexusFileExplorer && viewItem == nexus.fileExplorer.dir|1_manage@1",
         "nexus.files.createFileInDir|view == nexusFileExplorer && viewItem == nexus.fileExplorer.dir|1_manage@2",
-        "nexus.files.uploadToDir|view == nexusFileExplorer && viewItem == nexus.fileExplorer.dir|1_manage@3"
+        "nexus.files.uploadToDir|view == nexusFileExplorer && viewItem == nexus.fileExplorer.dir|1_manage@3",
+        "nexus.networkServer.editItem|view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\./|1_manage@2"
       ]) {
         expect(rowEntries).toContain(entry);
       }
     });
 
-    it("each row twin is contributed under its toolbar id's title and icon, so no menu label or inline button changes, and is hidden from the Command Palette, where it names no row (⊘ palette-visible it would list those actions twice)", () => {
+    it("each row twin is contributed under its toolbar id's title, icon and category, so no menu label or inline button changes, and is hidden from the Command Palette, where it names no row (⊘ palette-visible it would list those actions twice)", () => {
       for (const [id, twin] of Object.entries(ROW_TWIN)) {
         const root = packageJson.contributes.commands.find((c) => c.command === id);
         const row = packageJson.contributes.commands.find((c) => c.command === twin);
         expect(row, `${twin} is contributed`).toBeDefined();
         expect(row?.title, twin).toBe(root?.title);
         expect(row?.icon, twin).toBe(root?.icon);
+        expect(row?.category, twin).toBe(root?.category);
         expect(paletteMenus.filter((m) => m.command === twin).map((m) => m.when), twin).toEqual(["false"]);
       }
     });
 
     /**
      * THE GENERIC GUARD. Any id on both a view's title bar and one of that same
-     * view's row menus is a deliberate decision, so it has to be named on one of
-     * the two lists below. It reads package.json only, so it cannot see a
+     * view's row menus is a deliberate decision, so it has to be named in the
+     * list below. It reads package.json only, so it cannot see a
      * title-bar-only handler that starts reading its argument (say
      * `nexus.files.goToPath` gaining a `FileTreeItem` branch): that handler gets
      * the focused row just the same, and only a handler test would catch it.
@@ -1363,14 +1366,6 @@ describe("package contributions", () => {
       "nexus.files.resumeFollowTerminal": "takes no argument; it resumes the paused follow mode",
       "nexus.files.syncFromTerminal": "reads only a vscode.Terminal (terminal-tab menus); a File Explorer row is not one, so both surfaces sync the focused terminal"
     };
-    // KNOWN, TRACKED FOLLOW-UP — NOT an accepted exception (tracked in #286). The
-    // handler reads the focused row the toolbar hands it, so the toolbar acts on
-    // a stale row; it is listed only so this guard stays green until it gets the
-    // same split.
-    const KNOWN_FOCUS_LEAK_FOLLOW_UPS: Record<string, string> = {
-      "nexus.networkServer.edit": "the toolbar gear skips the TFTP/DHCP pick and opens the focused row's form"
-    };
-
     const sharedIdsByView = (): string[] => {
       const shared = new Set<string>();
       for (const title of titleMenus) {
@@ -1389,8 +1384,8 @@ describe("package contributions", () => {
       }
     });
 
-    it("no id is on both a view's title bar and that view's row menus unless it is named as a reviewed exception or a tracked follow-up (⊘ a new shared id silently hands its toolbar the last-focused row)", () => {
-      expect(sharedIdsByView()).toEqual([...Object.keys(SHARED_ID_EXCEPTIONS), ...Object.keys(KNOWN_FOCUS_LEAK_FOLLOW_UPS)].sort());
+    it("no id is on both a view's title bar and that view's row menus unless it is named as a reviewed exception (⊘ a new shared id silently hands its toolbar the last-focused row)", () => {
+      expect(sharedIdsByView()).toEqual(Object.keys(SHARED_ID_EXCEPTIONS).sort());
     });
   });
   describe("Live lab status (Phase 2)", () => {

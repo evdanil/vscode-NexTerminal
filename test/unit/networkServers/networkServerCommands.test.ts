@@ -18,6 +18,9 @@
  *     offers a restart when the service is actually running.
  *  4. `.inspectLogs`: reveals the shared channel without stealing focus, and
  *     degrades to an information message when no channel is wired.
+ *  5. The title-bar gear (`.edit`) vs the service row (`.editItem`): the gear
+ *     asks for the service even when VS Code hands it the focused row, and the
+ *     row's own entry opens that row's form.
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -81,7 +84,36 @@ vi.mock("vscode", () => ({
       })
     })
   },
-  ConfigurationTarget: { Global: 1, Workspace: 2 }
+  ConfigurationTarget: { Global: 1, Workspace: 2 },
+  // Enough for the real Network Servers tree to build its rows, so the
+  // toolbar tests below hand the handlers the very objects VS Code would.
+  TreeItem: class {
+    public id?: string;
+    public description?: string;
+    public tooltip?: string;
+    public contextValue?: string;
+    public iconPath?: unknown;
+    public command?: unknown;
+    public constructor(
+      public label: string,
+      public collapsibleState?: number
+    ) {}
+  },
+  TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
+  ThemeIcon: class {
+    public constructor(
+      public id: string,
+      public color?: unknown
+    ) {}
+  },
+  ThemeColor: class {
+    public constructor(public id: string) {}
+  },
+  EventEmitter: class {
+    public readonly event = vi.fn();
+    public fire = vi.fn();
+    public dispose = vi.fn();
+  }
 }));
 
 vi.mock("../../../src/ui/webviewFormPanel", () => ({
@@ -100,6 +132,11 @@ vi.mock("../../../src/ui/formDefinitions", () => ({
 import * as vscode from "vscode";
 import { registerNetworkServerCommands, stopRunningNetworkServices } from "../../../src/commands/networkServerCommands";
 import { networkServerFormDefinition } from "../../../src/ui/formDefinitions";
+import {
+  NetworkServerDetailTreeItem,
+  NetworkServerRootTreeItem,
+  NetworkServerTreeProvider
+} from "../../../src/ui/networkServerTreeProvider";
 
 function fakeManager(overrides: Record<string, unknown> = {}) {
   return {
@@ -138,17 +175,20 @@ beforeEach(() => {
 });
 
 describe("registerNetworkServerCommands — registration", () => {
-  // Six, not five: `quickAdjust` (the Quick Settings pick) is a later addition
+  // Seven, not five: `quickAdjust` (the Quick Settings pick) is a later addition
   // that is contributed in package.json and implemented in
-  // `networkServerQuickAdjust.ts`. It is still not a CRUD surface — there is no
-  // add/remove here, because TFTP and DHCP are singletons, not a list the user
-  // creates entries in. The profile and transfer commands are registered by
-  // their own modules and so are deliberately absent from this assertion.
-  it("registers exactly the six singleton-service commands and no CRUD surface", () => {
+  // `networkServerQuickAdjust.ts`, and `editItem` is the service row's own
+  // Open Full Settings, split from the title-bar gear's `edit` (see the toolbar
+  // block below). It is still not a CRUD surface — there is no add/remove here,
+  // because TFTP and DHCP are singletons, not a list the user creates entries
+  // in. The profile and transfer commands are registered by their own modules
+  // and so are deliberately absent from this assertion.
+  it("registers exactly the seven singleton-service commands and no CRUD surface", () => {
     const disposables = registerNetworkServerCommands(fakeContext(fakeManager()));
-    expect(disposables).toHaveLength(6);
+    expect(disposables).toHaveLength(7);
     expect([...registeredCommands.keys()].sort()).toEqual([
       "nexus.networkServer.edit",
+      "nexus.networkServer.editItem",
       "nexus.networkServer.inspectLogs",
       "nexus.networkServer.quickAdjust",
       "nexus.networkServer.restart",
@@ -212,6 +252,99 @@ describe("registerNetworkServerCommands — kind resolution", () => {
     await cmd("nexus.networkServer.stop")({ kind: "ftp" });
     expect(vscode.window.showQuickPick).toHaveBeenCalledTimes(1);
     expect(manager.stop).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * TOOLBAR FOCUS LEAK (#286). VS Code does not invoke a `view/title` command with
+ * no argument: it hands the handler the view's FOCUSED row — the last service
+ * row clicked, still focused after a click on empty space. So the title-bar gear
+ * receives a real service row exactly as that row's right-click Open Full
+ * Settings does, and when both were one id the gear opened the last-clicked
+ * service's form without asking. Every row here comes from the real tree
+ * provider, because that is what VS Code delivers.
+ */
+describe("Network Servers gear vs service row — the gear ignores the focused row VS Code injects", () => {
+  function treeRows() {
+    const provider = new NetworkServerTreeProvider();
+    provider.setSnapshot({ activeNetworkServerSessions: [] } as never);
+    const roots = provider.getChildren() as NetworkServerRootTreeItem[];
+    const dhcp = roots.find((row) => row.kind === "dhcp")!;
+    const tftp = roots.find((row) => row.kind === "tftp")!;
+    const dhcpDetail = (provider.getChildren(dhcp) as NetworkServerDetailTreeItem[])[0];
+    return { dhcp, tftp, dhcpDetail };
+  }
+
+  const pickerTitles = () =>
+    vi.mocked(vscode.window.showQuickPick).mock.calls.map((call) => (call[1] as { title?: string } | undefined)?.title);
+  const openedForms = () => formPanelOpens.map((open) => open.id);
+
+  it("the rows really are tree items carrying a kind — the shape the old handler read the kind from", () => {
+    const { dhcp, dhcpDetail } = treeRows();
+    expect(dhcp).toBeInstanceOf(vscode.TreeItem);
+    expect(dhcp.kind).toBe("dhcp");
+    expect(dhcpDetail).toBeInstanceOf(vscode.TreeItem);
+  });
+
+  it("nexus.networkServer.edit (the title-bar gear) asks TFTP or DHCP when handed the focused service row, rather than opening that row's form (⊘ reading `kind` off the argument opens the last-clicked service unasked)", async () => {
+    vi.mocked(vscode.window.showQuickPick).mockResolvedValue(undefined as never);
+    const cmd = register(fakeContext(fakeManager()));
+
+    await cmd("nexus.networkServer.edit")(treeRows().dhcp);
+
+    expect(pickerTitles()).toEqual(["Edit Network Server"]);
+    expect(openedForms()).toEqual([]);
+  });
+
+  it("nexus.networkServer.edit opens the service picked, not the focused row's (⊘ the row's kind winning over the pick)", async () => {
+    vi.mocked(vscode.window.showQuickPick).mockResolvedValue({ serviceKind: "tftp" } as never);
+    const cmd = register(fakeContext(fakeManager()));
+
+    await cmd("nexus.networkServer.edit")(treeRows().dhcp);
+
+    expect(openedForms()).toEqual(["network-server-edit-tftp"]);
+    expect(openedForms()).not.toContain("network-server-edit-dhcp");
+  });
+
+  it("nexus.networkServer.edit asks too when the focused row is one of a service's detail rows", async () => {
+    vi.mocked(vscode.window.showQuickPick).mockResolvedValue(undefined as never);
+    const cmd = register(fakeContext(fakeManager()));
+
+    await cmd("nexus.networkServer.edit")(treeRows().dhcpDetail);
+
+    expect(pickerTitles()).toEqual(["Edit Network Server"]);
+    expect(openedForms()).toEqual([]);
+  });
+
+  it("nexus.networkServer.edit still honours the `{ kind }` the Settings panel's TFTP / DHCP buttons send, and a bare kind string (a tree item is the only shape it drops)", async () => {
+    const cmd = register(fakeContext(fakeManager()));
+
+    await cmd("nexus.networkServer.edit")({ kind: "dhcp" });
+    await cmd("nexus.networkServer.edit")("tftp");
+
+    expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
+    expect(openedForms()).toEqual(["network-server-edit-dhcp", "network-server-edit-tftp"]);
+  });
+
+  it("nexus.networkServer.editItem (the service row's right-click Open Full Settings) opens that row's form without asking", async () => {
+    const cmd = register(fakeContext(fakeManager()));
+    const { dhcp, tftp } = treeRows();
+
+    await cmd("nexus.networkServer.editItem")(dhcp);
+    await cmd("nexus.networkServer.editItem")(tftp);
+
+    expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
+    expect(openedForms()).toEqual(["network-server-edit-dhcp", "network-server-edit-tftp"]);
+  });
+
+  it("nexus.networkServer.editItem with no row falls back to the picker instead of throwing", async () => {
+    vi.mocked(vscode.window.showQuickPick).mockResolvedValue(undefined as never);
+    const cmd = register(fakeContext(fakeManager()));
+
+    await expect(cmd("nexus.networkServer.editItem")(undefined)).resolves.toBeUndefined();
+
+    expect(pickerTitles()).toEqual(["Edit Network Server"]);
+    expect(openedForms()).toEqual([]);
   });
 });
 

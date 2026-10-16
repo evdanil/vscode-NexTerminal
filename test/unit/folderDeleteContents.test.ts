@@ -9,6 +9,9 @@
  * Real NexusCore, real profile/server/local-server command modules; only the
  * runtime owners (Local Server manager, tunnel manager, SSH pool, terminals,
  * vault) are fakes, so what is asserted is exactly what they were asked to do.
+ *
+ * The last block covers the confirmation itself: which folders it is shown for
+ * and what it says.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -322,7 +325,8 @@ describe("Remove Folder → Delete contents (#158)", () => {
 
     await removeFolder("Lab");
     const [message, options] = mockShowWarningMessage.mock.calls[0] as [string, { modal?: boolean; detail?: string }];
-    expect(message).toBe('Remove folder "Lab"? It contains 5 item(s).');
+    // Lab/Sub is the folder ls-sub's group implies.
+    expect(message).toBe('Remove folder "Lab"? It contains 1 subfolder and 5 items.');
     expect(options.modal).toBe(true);
     // ⊘ the pre-fix confirmation, which said nothing about either.
     expect(options.detail).toContain("closes their open sessions");
@@ -332,7 +336,9 @@ describe("Remove Folder → Delete contents (#158)", () => {
     await f.core.removeLocalServerConfig("ls-keep");
     mockShowWarningMessage.mockClear();
     await removeFolder("Keep");
-    const [, keepOptions] = mockShowWarningMessage.mock.calls[0] as [string, { detail?: string }];
+    const [keepMessage, keepOptions] = mockShowWarningMessage.mock.calls[0] as [string, { detail?: string }];
+    // Profiles only: no subfolder is mentioned when there is none.
+    expect(keepMessage).toBe('Remove folder "Keep"? It contains 3 items.');
     expect(keepOptions.detail).toContain("closes their open sessions");
     expect(keepOptions.detail).not.toMatch(/local server/i);
   });
@@ -595,5 +601,106 @@ describe("Remove Folder → Delete contents (#158)", () => {
       expect(f.vault.size).toBe(6);
       expect(f.core.getLocalServer("ls-lab")).toBeDefined();
     }
+  });
+});
+
+/**
+ * Remove Folder judged a folder empty by its profiles alone. A folder holding
+ * only subfolders — TEST1 → TEST2 → TEST3, no profile anywhere beneath — was
+ * therefore removed without a prompt, and the move-to-parent cascade that runs
+ * for an "empty" folder silently lifted TEST2 → TEST3 to the top level. Each
+ * test adds its folders to the shared fixture, whose profiles are all in Lab
+ * and Keep, so the folders under test hold no profile unless a test adds one.
+ */
+describe("Remove Folder — the confirmation counts subfolders, not just profiles", () => {
+  type WarningCall = [string, { modal?: boolean; detail?: string }, ...string[]];
+  const warningCall = (): WarningCall => mockShowWarningMessage.mock.calls[0] as WarningCall;
+  const explicitGroups = (f: Awaited<ReturnType<typeof fixture>>) => [...f.core.getSnapshot().explicitGroups].sort();
+
+  it("asks before removing a folder that holds only subfolders, offering both choices in a modal and counting them (⊘ counting profiles alone removes it silently)", async () => {
+    const f = await fixture();
+    await f.core.addGroup("TEST1/TEST2/TEST3");
+
+    await removeFolder("TEST1");
+
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    const [message, options, ...buttons] = warningCall();
+    expect(message).toBe('Remove folder "TEST1"? It contains 2 subfolders.');
+    expect(options.modal).toBe(true);
+    expect(buttons).toEqual(["Move to parent", "Delete contents"]);
+    // ⊘ prompting with the old profiles-only count: "It contains 0 item(s)."
+    expect(message).not.toContain("0 item");
+    expect(message).not.toContain("item(s)");
+    // ⊘ the profile wording: there is no session here to close.
+    expect(options.detail).toBe("Delete contents removes the folder and its subfolders.");
+    expect(options.detail).not.toMatch(/session/i);
+    // Dismissed: nothing was removed.
+    expect(explicitGroups(f)).toEqual(expect.arrayContaining(["TEST1", "TEST1/TEST2", "TEST1/TEST2/TEST3"]));
+  });
+
+  it("Move to parent keeps the subfolders, each one level up: TEST2 becomes a top-level folder and TEST3 stays inside it", async () => {
+    const f = await fixture();
+    await f.core.addGroup("TEST1/TEST2/TEST3");
+    mockShowWarningMessage.mockResolvedValueOnce("Move to parent");
+
+    await removeFolder("TEST1");
+
+    // The outcome came from the choice: the silent path re-parents the same way.
+    expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+    expect(explicitGroups(f)).toEqual(expect.arrayContaining(["TEST2", "TEST2/TEST3"]));
+    expect(explicitGroups(f).filter((g) => g === "TEST1" || g.startsWith("TEST1/"))).toEqual([]);
+    expect((await f.repo.getGroups()).sort()).toEqual(explicitGroups(f));
+  });
+
+  it("Delete contents removes the folder and every subfolder beneath it, on disk too, and touches no other folder's profiles", async () => {
+    const f = await fixture();
+    await f.core.addGroup("TEST1/TEST2/TEST3");
+    mockShowWarningMessage.mockResolvedValueOnce("Delete contents");
+
+    await removeFolder("TEST1");
+
+    const gone = (groups: string[]) => groups.filter((g) => /^TEST[123](\/|$)/.test(g));
+    expect(gone(explicitGroups(f))).toEqual([]);
+    expect(gone(await f.repo.getGroups())).toEqual([]);
+    expect(f.core.getServer("srv-lab")).toBeDefined();
+    expect(f.core.getServer("srv-keep")).toBeDefined();
+  });
+
+  it("says 1 subfolder, singular, for TEST1 → TEST2", async () => {
+    const f = await fixture();
+    await f.core.addGroup("TEST1/TEST2");
+
+    await removeFolder("TEST1");
+
+    const [message, options] = warningCall();
+    expect(message).toBe('Remove folder "TEST1"? It contains 1 subfolder.');
+    expect(options.detail).toBe("Delete contents removes the folder and its subfolder.");
+  });
+
+  it("counts both when a subfolder holds a profile, and keeps the wording about closing sessions", async () => {
+    const f = await fixture();
+    await f.core.addGroup("Outer/Inner");
+    await f.core.addOrUpdateServer(server("srv-inner", "Outer/Inner"));
+
+    await removeFolder("Outer");
+
+    const [message, options] = warningCall();
+    expect(message).toBe('Remove folder "Outer"? It contains 1 subfolder and 1 item.');
+    expect(options.detail).toBe("Delete contents also closes their open sessions.");
+  });
+
+  it("still removes a folder with no subfolder and no profile without asking — including the deepest of a nested chain", async () => {
+    const f = await fixture();
+    await f.core.addGroup("Empty");
+    await f.core.addGroup("TEST1/TEST2/TEST3");
+
+    await removeFolder("Empty");
+    await removeFolder("TEST1/TEST2/TEST3");
+
+    // ⊘ prompting for every folder: an empty one has nothing to move or delete.
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    expect(explicitGroups(f)).not.toContain("Empty");
+    expect(explicitGroups(f)).not.toContain("TEST1/TEST2/TEST3");
+    expect(explicitGroups(f)).toEqual(expect.arrayContaining(["TEST1", "TEST1/TEST2"]));
   });
 });

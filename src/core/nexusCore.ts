@@ -3266,6 +3266,44 @@ export class NexusCore {
     return { servers, serialProfiles: profiles, localShellProfiles, localServers };
   }
 
+  /**
+   * Every folder beneath `path`, at any depth, as the Connectivity Hub shows
+   * them: the explicit folders (which may be empty) and the ones a profile's
+   * `group` implies, every level in between included — the same derivation as
+   * `NexusTreeProvider`'s folder cache. Never `path` itself.
+   *
+   * `path` must be a real folder path. The root (`""`) is not a folder — no
+   * folder path is beneath it in the `isDescendantOrSelf` sense — so
+   * `getSubfolderPaths("")` returns `[]`, not the top-level folders.
+   *
+   * `getItemsInFolder` sees profiles only, so a folder holding nothing but
+   * empty subfolders looks empty to it. Remove Folder asks both before it
+   * treats a folder as empty and removes it without a prompt.
+   */
+  public getSubfolderPaths(path: string): string[] {
+    const groups = [
+      ...this.explicitGroups,
+      ...[
+        ...this.servers.values(),
+        ...this.serialProfiles.values(),
+        ...this.localShellProfiles.values(),
+        ...this.localServers.values()
+      ].map((item) => item.group)
+    ];
+    const subfolders = new Set<string>();
+    for (const group of groups) {
+      if (!group) {
+        continue;
+      }
+      for (const ancestor of getAncestorPaths(group)) {
+        if (ancestor !== path && isDescendantOrSelf(ancestor, path)) {
+          subfolders.add(ancestor);
+        }
+      }
+    }
+    return [...subfolders].sort();
+  }
+
   private async _renameFolderPath(oldPath: string, newPath: string): Promise<void> {
     // Remap all explicitGroups entries
     const toAdd: string[] = [];

@@ -366,14 +366,42 @@ export type ProfileCommandContext = CommandContext & {
   localServerManager: Pick<LocalServerManager, "cancelPendingRestart" | "stopConfig">;
 };
 
+/** What a folder holds beneath it, at any depth: the confirmation's counts. */
+interface FolderContents {
+  subfolders: number;
+  items: number;
+  localServers: number;
+}
+
+const countOf = (count: number, noun: string): string => `${count} ${noun}${count === 1 ? "" : "s"}`;
+
+/**
+ * The confirmation's first line counts each kind of content it found, and
+ * names subfolders even when there is no profile: a folder holding only
+ * subfolders is not empty. The count this replaced named profiles alone
+ * ("It contains 5 item(s)."), so it would have read "0 item(s)" here.
+ */
+function folderRemovalMessage(folderPath: string, contents: FolderContents): string {
+  const parts = [
+    contents.subfolders > 0 ? countOf(contents.subfolders, "subfolder") : undefined,
+    contents.items > 0 ? countOf(contents.items, "item") : undefined
+  ].filter((part): part is string => part !== undefined);
+  return `Remove folder "${folderDisplayName(folderPath)}"? It contains ${parts.join(" and ")}.`;
+}
+
 /**
  * The confirmation's second line: what "Delete contents" does besides deleting.
- * Local Servers are named only when the folder holds one — generic about which
- * are running, as Remove Local Server's own disclosure is, because one can start
- * or stop while the modal is open and the delete stops it either way.
+ * With no profile beneath the folder there is no session to close, so it says
+ * what does go: the folder and its subfolders. Otherwise Local Servers are
+ * named only when the folder holds one — generic about which are running, as
+ * Remove Local Server's own disclosure is, because one can start or stop while
+ * the modal is open and the delete stops it either way.
  */
-function folderDeleteContentsDetail(hasLocalServers: boolean): string {
-  return hasLocalServers
+function folderDeleteContentsDetail(contents: FolderContents): string {
+  if (contents.items === 0) {
+    return `Delete contents removes the folder and its ${contents.subfolders === 1 ? "subfolder" : "subfolders"}.`;
+  }
+  return contents.localServers > 0
     ? "Delete contents also closes their open sessions and stops their running local servers."
     : "Delete contents also closes their open sessions.";
 }
@@ -704,8 +732,16 @@ export function registerProfileCommands(ctx: ProfileCommandContext): vscode.Disp
       }
       const folderPath = arg.folderPath;
       const items = ctx.core.getItemsInFolder(folderPath, true);
-      const itemCount = items.servers.length + items.serialProfiles.length + items.localShellProfiles.length + (items.localServers?.length ?? 0);
-      const hasContents = itemCount > 0;
+      const localServerCount = items.localServers?.length ?? 0;
+      const contents: FolderContents = {
+        // Counted in their own right: a folder holding only empty subfolders has
+        // no profile beneath it, and judged by profiles alone it was removed
+        // without asking while the cascade lifted its subfolders a level.
+        subfolders: ctx.core.getSubfolderPaths(folderPath).length,
+        items: items.servers.length + items.serialProfiles.length + items.localShellProfiles.length + localServerCount,
+        localServers: localServerCount
+      };
+      const hasContents = contents.subfolders > 0 || contents.items > 0;
 
       // #84 P1 (Codex, serialization audit) — removeFolderCascade reassigns or
       // DELETES every server in the subtree and persists a FULL server snapshot.
@@ -716,14 +752,14 @@ export function registerProfileCommands(ctx: ProfileCommandContext): vscode.Disp
       // live server map inside the lock, so no stale snapshot is captured. The
       // confirmation modal has already resolved — no UI held under the lock.
       if (!hasContents) {
-        // Empty folder — remove silently
+        // No subfolder and no profile — nothing to move or delete, so no prompt.
         await configMutationLock.runExclusive(() => ctx.core.removeFolderCascade(folderPath, false));
         return;
       }
 
       const choice = await vscode.window.showWarningMessage(
-        `Remove folder "${folderDisplayName(folderPath)}"? It contains ${itemCount} item(s).`,
-        { modal: true, detail: folderDeleteContentsDetail((items.localServers?.length ?? 0) > 0) },
+        folderRemovalMessage(folderPath, contents),
+        { modal: true, detail: folderDeleteContentsDetail(contents) },
         "Move to parent",
         "Delete contents"
       );
