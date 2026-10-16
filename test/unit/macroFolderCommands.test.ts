@@ -9,7 +9,31 @@ const mockSetStatusBarMessage = vi.fn();
 const mockShowErrorMessage = vi.fn();
 const mockOpenNew = vi.fn();
 
+// The tree-item members below exist so the Remove Folder tests (#288) can hand
+// the command the very FolderTreeItem the Macros view draws, and read the tree
+// back afterwards, instead of a duck-typed stand-in.
 vi.mock("vscode", () => ({
+  TreeItem: class {
+    label?: string;
+    id?: string;
+    description?: string;
+    contextValue?: string;
+    command?: unknown;
+    tooltip?: string;
+    iconPath?: unknown;
+    collapsibleState?: number;
+    constructor(label: string, collapsibleState?: number) {
+      this.label = label;
+      this.collapsibleState = collapsibleState;
+    }
+  },
+  TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
+  ThemeIcon: class { constructor(public id: string) {} },
+  EventEmitter: class {
+    public readonly event = vi.fn();
+    public readonly fire = vi.fn();
+  },
+  workspace: { getConfiguration: vi.fn() },
   commands: {
     registerCommand: vi.fn((id: string, handler: (...args: unknown[]) => unknown) => {
       registeredCommands.set(id, handler);
@@ -63,6 +87,8 @@ import { registerMacroCommands } from "../../src/commands/macroCommands";
 import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
 import { getMacroFolders, getMacros, setActiveMacroStore } from "../../src/macroSettings";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
+import { MacroTreeProvider } from "../../src/ui/macroTreeProvider";
+import { FolderTreeItem } from "../../src/ui/nexusTreeProvider";
 
 /** A tree-item-shaped arg carrying a macro at its TRUE getMacros() index — mirrors MacroTreeItem's duck-typed shape. */
 function macroArg(index: number): { macro: TerminalMacro; index: number } {
@@ -72,6 +98,31 @@ function macroArg(index: number): { macro: TerminalMacro; index: number } {
 /** A folder-tree-item-shaped arg — mirrors FolderTreeItem's duck-typed `folderPath` shape (§4.6, §4.7). */
 function folderArg(path: string): { folderPath: string } {
   return { folderPath: path };
+}
+
+function drawnChildFolders(provider: MacroTreeProvider, parent?: FolderTreeItem): FolderTreeItem[] {
+  return provider.getChildren(parent).filter((c): c is FolderTreeItem => c instanceof FolderTreeItem);
+}
+
+/** Every folder the Macros view draws, depth-first, indented two spaces per level. */
+function drawnTree(provider: MacroTreeProvider, parent?: FolderTreeItem, depth = 0): string[] {
+  return drawnChildFolders(provider, parent).flatMap((folder) => [
+    `${"  ".repeat(depth)}${String(folder.label)}`,
+    ...drawnTree(provider, folder, depth + 1)
+  ]);
+}
+
+/** The FolderTreeItem the Macros view draws for `path`: what a right-click hands the command. */
+function drawnFolder(provider: MacroTreeProvider, path: string, parent?: FolderTreeItem): FolderTreeItem {
+  for (const folder of drawnChildFolders(provider, parent)) {
+    if (folder.folderPath === path) {
+      return folder;
+    }
+    if (path.startsWith(`${folder.folderPath}/`)) {
+      return drawnFolder(provider, path, folder);
+    }
+  }
+  throw new Error(`The Macros view draws no folder "${path}"`);
 }
 
 let store: InMemoryMacroStore;
@@ -460,7 +511,10 @@ describe("macro folder commands", () => {
       // The folder-list mirror of the macro re-parenting asserted above: an
       // explicit "Cisco/Routers/Old" must come back as "Cisco/Old", not vanish
       // with its parent and not keep its old path.
+      // Each folder removed in these three holds a subfolder, so it now asks
+      // first (#288); confirming is what lets the re-parenting run.
       await store.saveFolders(["Cisco", "Cisco/Routers", "Cisco/Routers/Old"]);
+      mockShowWarningMessage.mockResolvedValue("Remove Folder");
 
       await registeredCommands.get("nexus.macro.removeFolder")!(folderArg("Cisco/Routers"));
 
@@ -469,6 +523,7 @@ describe("macro folder commands", () => {
 
     it("an explicit descendant of a TOP-LEVEL folder re-parents to the root", async () => {
       await store.saveFolders(["Cisco", "Cisco/Routers"]);
+      mockShowWarningMessage.mockResolvedValue("Remove Folder");
 
       await registeredCommands.get("nexus.macro.removeFolder")!(folderArg("Cisco"));
 
@@ -477,6 +532,7 @@ describe("macro folder commands", () => {
 
     it("prefix-safety in the explicit list too: 'Network' survives removing 'Net'", async () => {
       await store.saveFolders(["Net", "Net/Sub", "Network"]);
+      mockShowWarningMessage.mockResolvedValue("Remove Folder");
 
       await registeredCommands.get("nexus.macro.removeFolder")!(folderArg("Net"));
 
@@ -507,6 +563,189 @@ describe("macro folder commands", () => {
       expect(macros.map((m) => m.name)).toContain("C"); // must survive the dialog window
       expect(macros.find((m) => m.name === "A")?.group).toBeUndefined(); // still re-parented to root
       expect(macros).toHaveLength(3);
+    });
+  });
+
+  /**
+   * #288 — the confirmation was guarded by the number of MACROS beneath the
+   * folder, so a folder holding only subfolders was removed without asking and
+   * its subfolders silently moved up a level. Each test hands the command the
+   * FolderTreeItem the Macros view itself draws, so the subfolder count is
+   * checked against the folders a user can actually see.
+   */
+  describe("nexus.macro.removeFolder — asks before moving subfolders (#288)", () => {
+    let provider: MacroTreeProvider;
+
+    beforeEach(() => {
+      provider = new MacroTreeProvider();
+    });
+
+    const removeFolder = async (path: string): Promise<void> => {
+      await registeredCommands.get("nexus.macro.removeFolder")!(drawnFolder(provider, path));
+    };
+    const storedFolders = (): string[] => [...store.getFolders()].sort();
+
+    it("a folder holding only subfolders asks first, counts them, and offers the single Remove Folder button", async () => {
+      await store.saveFolders(["TEST1", "TEST1/TEST2", "TEST1/TEST2/TEST3"]);
+      mockShowWarningMessage.mockResolvedValue("Remove Folder");
+
+      await removeFolder("TEST1");
+
+      expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        'Remove folder "TEST1"? It contains 2 subfolders — they will be moved to the root.',
+        { modal: true },
+        "Remove Folder"
+      );
+      // No macro is beneath it, so none is counted: "0 macros" is what a fix
+      // that only widened the guard would print.
+      expect(mockShowWarningMessage.mock.calls[0][0]).not.toMatch(/\b0 macros?\b/);
+    });
+
+    it("confirming moves the subfolders up one level, substructure kept, through the folder-list save", async () => {
+      await store.saveFolders(["TEST1", "TEST1/TEST2", "TEST1/TEST2/TEST3"]);
+      const saveFolders = vi.spyOn(store, "saveFolders");
+      mockShowWarningMessage.mockResolvedValue("Remove Folder");
+
+      await removeFolder("TEST1");
+
+      expect(saveFolders).toHaveBeenCalledTimes(1);
+      expect(storedFolders()).toEqual(["TEST2", "TEST2/TEST3"]);
+      expect(drawnTree(provider)).toEqual(["TEST2", "  TEST3"]);
+    });
+
+    it("dismissing the confirmation removes nothing and saves nothing", async () => {
+      await store.saveFolders(["TEST1", "TEST1/TEST2", "TEST1/TEST2/TEST3"]);
+      const saveFolders = vi.spyOn(store, "saveFolders");
+      const saveMacros = vi.spyOn(store, "save");
+      mockShowWarningMessage.mockResolvedValue(undefined);
+
+      await removeFolder("TEST1");
+
+      expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+      expect(saveFolders).not.toHaveBeenCalled();
+      expect(saveMacros).not.toHaveBeenCalled();
+      expect(storedFolders()).toEqual(["TEST1", "TEST1/TEST2", "TEST1/TEST2/TEST3"]);
+      expect(drawnTree(provider)).toEqual(["TEST1", "  TEST2", "    TEST3"]);
+    });
+
+    it("one subfolder is singular, noun and pronoun, and a nested folder's goes to the parent folder", async () => {
+      await store.saveFolders(["Cisco", "Cisco/Routers", "Cisco/Routers/Old"]);
+      mockShowWarningMessage.mockResolvedValue("Remove Folder");
+
+      await removeFolder("Cisco/Routers");
+
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        'Remove folder "Routers"? It contains 1 subfolder — it will be moved to the parent folder.',
+        { modal: true },
+        "Remove Folder"
+      );
+      expect(mockShowWarningMessage.mock.calls[0][0]).not.toContain("they will be moved");
+      expect(drawnTree(provider)).toEqual(["Cisco", "  Old"]);
+    });
+
+    it("a folder holding only macros: one macro is singular, noun and pronoun; several keep the plural wording", async () => {
+      await store.save([
+        { name: "Top", text: "t", group: "Cisco" },
+        { name: "E1", text: "t", group: "Lab/Edge" },
+        { name: "E2", text: "t", group: "Lab/Edge" }
+      ]);
+      mockShowWarningMessage.mockResolvedValue(undefined);
+
+      await removeFolder("Cisco");
+      await removeFolder("Lab/Edge");
+
+      // The single-macro text used to read "1 macro — they will be moved".
+      expect(mockShowWarningMessage).toHaveBeenNthCalledWith(
+        1,
+        'Remove folder "Cisco"? It contains 1 macro — it will be moved to the root.',
+        { modal: true },
+        "Remove Folder"
+      );
+      expect(mockShowWarningMessage.mock.calls[0][0]).not.toContain("they will be moved");
+      // Unchanged from before subfolders were counted.
+      expect(mockShowWarningMessage).toHaveBeenNthCalledWith(
+        2,
+        'Remove folder "Edge"? It contains 2 macros — they will be moved to the parent folder.',
+        { modal: true },
+        "Remove Folder"
+      );
+    });
+
+    it("one macro beside two subfolders is still several things moving: 'they'", async () => {
+      // The pronoun follows the total, not the macro count alone.
+      await store.saveFolders(["Core", "Core/Lab", "Core/Lab/Spare"]);
+      await store.save([{ name: "C", text: "t", group: "Core/Lab/Edge" }]);
+      mockShowWarningMessage.mockResolvedValue(undefined);
+
+      await removeFolder("Core/Lab");
+
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        'Remove folder "Lab"? It contains 1 macro and 2 subfolders — they will be moved to the parent folder.',
+        { modal: true },
+        "Remove Folder"
+      );
+    });
+
+    it("macros and subfolders are both counted, whether a subfolder was created or is implied by a macro's folder", async () => {
+      await store.saveFolders(["Net", "Net/Lab", "Net/Lab/Spare"]);
+      await store.save([
+        { name: "A", text: "t", group: "Net/Lab" },
+        { name: "B", text: "t", group: "Net/Lab" },
+        { name: "C", text: "t", group: "Net/Lab/Edge" }
+      ]);
+      expect(drawnTree(provider)).toEqual(["Net", "  Lab", "    Edge", "    Spare"]);
+      mockShowWarningMessage.mockResolvedValue("Remove Folder");
+
+      await removeFolder("Net/Lab");
+
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        'Remove folder "Lab"? It contains 3 macros and 2 subfolders — they will be moved to the parent folder.',
+        { modal: true },
+        "Remove Folder"
+      );
+      expect(getMacros().map((m) => m.group)).toEqual(["Net", "Net", "Net/Edge"]);
+      expect(drawnTree(provider)).toEqual(["Net", "  Edge", "  Spare"]);
+    });
+
+    it("an empty folder is still removed without asking", async () => {
+      await store.saveFolders(["Empty"]);
+
+      await removeFolder("Empty");
+
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+      expect(storedFolders()).toEqual([]);
+    });
+
+    it("prefix-safety: 'AB' and 'A-1' are not subfolders of 'A', so an empty 'A' beside them is still removed without asking", async () => {
+      await store.saveFolders(["A", "AB", "AB/Sub", "A-1", "A-1/Sub"]);
+      await store.save([
+        { name: "InAB", text: "t", group: "AB" },
+        { name: "InA1", text: "t", group: "A-1/Deep" }
+      ]);
+
+      await removeFolder("A");
+
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+      expect(storedFolders()).toEqual(["A-1", "A-1/Sub", "AB", "AB/Sub"]);
+    });
+
+    it("prefix-safety: a non-empty 'A' counts only what is really beneath it", async () => {
+      await store.saveFolders(["A", "A/X", "AB", "AB/Sub", "A-1"]);
+      await store.save([
+        { name: "InA", text: "t", group: "A" },
+        { name: "InAB", text: "t", group: "AB/Sub" },
+        { name: "InA1", text: "t", group: "A-1/Deep" }
+      ]);
+      mockShowWarningMessage.mockResolvedValue(undefined);
+
+      await removeFolder("A");
+
+      expect(mockShowWarningMessage).toHaveBeenCalledWith(
+        'Remove folder "A"? It contains 1 macro and 1 subfolder — they will be moved to the root.',
+        { modal: true },
+        "Remove Folder"
+      );
     });
   });
 
