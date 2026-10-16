@@ -510,6 +510,12 @@
         "icon": "$(gear)"
       },
       {
+        "command": "nexus.networkServer.editItem",
+        "title": "Open Full Settings",
+        "category": "Nexus",
+        "icon": "$(gear)"
+      },
+      {
         "command": "nexus.networkServer.inspectLogs",
         "title": "Inspect Logs",
         "category": "Nexus",
@@ -1739,7 +1745,7 @@
           "group": "1_manage@1"
         },
         {
-          "command": "nexus.networkServer.edit",
+          "command": "nexus.networkServer.editItem",
           "when": "view == nexusNetworkServers && viewItem =~ /^nexus\\.networkServer\\./",
           "group": "1_manage@2"
         },
@@ -2349,6 +2355,10 @@
         {
           "command": "nexus.networkServer.edit",
           "when": "true"
+        },
+        {
+          "command": "nexus.networkServer.editItem",
+          "when": "false"
         },
         {
           "command": "nexus.networkServer.inspectLogs",

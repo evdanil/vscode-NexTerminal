@@ -189,6 +189,7 @@ const unsupportedCommands = [
   "nexus.networkServer.restart",
   "nexus.networkServer.quickAdjust",
   "nexus.networkServer.edit",
+  "nexus.networkServer.editItem",
   "nexus.networkServer.inspectLogs",
   "nexus.networkServer.tftp.cancelTransfer",
   "nexus.networkServer.tftp.clearHistory",

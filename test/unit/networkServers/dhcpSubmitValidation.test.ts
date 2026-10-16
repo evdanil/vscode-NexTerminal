@@ -54,7 +54,10 @@ vi.mock("vscode", () => ({
       })
     })
   },
-  ConfigurationTarget: { Global: 1, Workspace: 2 }
+  ConfigurationTarget: { Global: 1, Workspace: 2 },
+  // The title-bar `edit` handler tests its argument against this to drop the
+  // focused tree row VS Code hands it; nothing here passes a tree item.
+  TreeItem: class {}
 }));
 
 vi.mock("../../../src/ui/webviewFormPanel", () => ({

@@ -6,15 +6,18 @@
  *   nexus.networkServer.restart     — stop then start, re-reading settings so
  *                                     edits made while running take effect
  *   nexus.networkServer.quickAdjust — quick pick over the settings that move
- *   nexus.networkServer.edit        — the full form, every setting
+ *   nexus.networkServer.edit        — the full form, every setting (title-bar
+ *                                     gear; asks which service)
+ *   nexus.networkServer.editItem    — the same form for a service row
  *   nexus.networkServer.inspectLogs — reveal the shared diagnostics channel
  *
  * There is no CRUD surface here: TFTP and DHCP are fixed singletons identified
  * by their {@link NetworkServerKind}, not user-created profiles, and everything
  * configurable lives in native VS Code settings rather than ConfigRepository.
  * Every command therefore resolves a *kind* — from a tree item when invoked
- * from the view, or from a quick pick when invoked from the Command Palette
- * with no argument.
+ * from a service row, or from a quick pick when invoked from the Command
+ * Palette with no argument. The title-bar gear (`edit`) always asks: see the
+ * note at its registration for why it cannot trust the row it is handed.
  *
  * Trust is enforced twice by design: the manifest hides Start/Restart from the
  * palette in Restricted Mode, and `manager.assertTrusted()` refuses at runtime
@@ -326,6 +329,13 @@ export function registerNetworkServerCommands(
     });
   };
 
+  // Shared by the gear and the row entry; with no kind in hand it asks.
+  const editNetworkServer = async (arg: unknown): Promise<void> => {
+    const kind = toNetworkServerKindFromArg(arg) ?? (await pickNetworkServerKind("Edit Network Server"));
+    if (!kind) return;
+    openFullForm(kind);
+  };
+
   return [
     vscode.commands.registerCommand("nexus.networkServer.start", async (arg?: unknown) => {
       const kind = toNetworkServerKindFromArg(arg) ?? (await pickNetworkServerKind("Start Network Server"));
@@ -374,15 +384,19 @@ export function registerNetworkServerCommands(
       });
     }),
 
-    // The view-title gear and the row's right-click Edit share this id. VS Code
-    // invokes a title-bar command with the view's FOCUSED row, so the gear opens
-    // the last-clicked row's form (the kind read off it) and asks for the kind
-    // only when no row has focus or the focused one names no kind.
-    vscode.commands.registerCommand("nexus.networkServer.edit", async (arg?: unknown) => {
-      const kind = toNetworkServerKindFromArg(arg) ?? (await pickNetworkServerKind("Edit Network Server"));
-      if (!kind) return;
-      openFullForm(kind);
-    }),
+    // TITLE-BAR GEAR vs SERVICE ROW — two ids, never one. VS Code invokes a
+    // `view/title` command with the view's FOCUSED row (the last row clicked,
+    // still focused after a click on empty space), so while the gear and the
+    // row's right-click Open Full Settings shared one id, the gear read the kind
+    // off that row and opened the last-clicked service's form without asking.
+    // The gear's id therefore drops any tree item — a service row or one of its
+    // detail rows — and asks TFTP or DHCP. It still honours a bare kind and a
+    // plain `{ kind }`, the shape the Settings panel's TFTP / DHCP buttons send.
+    // The row entry is `nexus.networkServer.editItem`, which reads the row.
+    vscode.commands.registerCommand("nexus.networkServer.edit", (arg?: unknown) =>
+      editNetworkServer(arg instanceof vscode.TreeItem ? undefined : arg)
+    ),
+    vscode.commands.registerCommand("nexus.networkServer.editItem", (arg?: unknown) => editNetworkServer(arg)),
 
     vscode.commands.registerCommand("nexus.networkServer.inspectLogs", () => {
       const channel = ctx.networkServerOutputChannel;

@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- **Open Full Settings (the gear) in the Network Servers title bar asks which service.** It opened the full form of whichever service, TFTP or DHCP, you had clicked last, without asking, because VS Code hands a title-bar button the view's last-focused row. It now asks TFTP or DHCP; a service's right-click **Open Full Settings** still opens that service's form.
+
 ## [2.8.299] — 2026-10-16
 
 ### Fixed
