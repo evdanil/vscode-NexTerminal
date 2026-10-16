@@ -629,57 +629,74 @@ export function registerProfileCommands(ctx: ProfileCommandContext): vscode.Disp
     }
   };
 
-  return [
-    vscode.commands.registerCommand("nexus.profile.add", (arg?: unknown) => {
-      if (arg instanceof FolderTreeItem) {
-        openUnifiedForm(ctx, { group: arg.folderPath });
-        return;
+  /** New Folder, at the top level or (with `parentPath`) inside that folder. */
+  const addFolder = async (parentPath?: string): Promise<void> => {
+    const parentDepth = parentPath ? parentPath.split("/").length : 0;
+    if (parentDepth >= MAX_FOLDER_DEPTH) {
+      void vscode.window.showWarningMessage(`Maximum folder nesting depth is ${MAX_FOLDER_DEPTH} levels.`);
+      return;
+    }
+    const title = parentPath ? `New Subfolder in "${folderDisplayName(parentPath)}"` : "New Folder";
+    const name = await vscode.window.showInputBox({
+      title,
+      prompt: "Enter folder name",
+      validateInput: (value) => {
+        const trimmed = value.trim();
+        if (!trimmed) {
+          return "Folder name cannot be empty";
+        }
+        if (trimmed.includes("/")) {
+          return "Folder name cannot contain '/'";
+        }
+        const fullPath = parentPath ? parentPath + "/" + trimmed : trimmed;
+        if (!normalizeFolderPath(fullPath)) {
+          return "Invalid folder name";
+        }
+        const allGroups = new Set(collectGroups(ctx));
+        if (allGroups.has(fullPath)) {
+          return "A folder with this name already exists";
+        }
+        return null;
       }
-      openUnifiedForm(ctx, isUnifiedProfileSeed(arg) ? arg : undefined);
+    });
+    if (!name) {
+      return;
+    }
+    const fullPath = parentPath ? parentPath + "/" + name.trim() : name.trim();
+    // #84 P1 (serialization audit) — addGroup persists the FULL folder list;
+    // serialize it under configMutationLock so two concurrent group writes (or a
+    // group write racing a folder rename/remove) cannot clobber each other's
+    // snapshot. Acquired after the input box resolves — no UI held under the lock.
+    await configMutationLock.runExclusive(() => ctx.core.addGroup(fullPath));
+  };
+
+  // TOOLBAR vs FOLDER ROW — two ids per action, never one. VS Code invokes a
+  // `view/title` command with the view's FOCUSED row as its argument (the last
+  // row clicked, still focused after a click on empty space), so a toolbar id
+  // that also served the folder's right-click menu got the same FolderTreeItem
+  // from both and nested the new folder or profile in whichever folder was
+  // clicked last. The toolbar ids therefore never read a folder off their
+  // argument; the `*.addToFolder` ids carry the folder-row entries.
+  return [
+    // Seeds only: the per-type Add commands (`nexus.server.add`,
+    // `nexus.serial.add`, …) execute this with a plain `UnifiedProfileSeed`,
+    // which no tree view ever hands a command. A tree row (the Hub's focused
+    // folder, from the toolbar `+`) is not a seed and opens the plain form.
+    vscode.commands.registerCommand("nexus.profile.add", (seed?: unknown) => {
+      openUnifiedForm(ctx, isUnifiedProfileSeed(seed) ? seed : undefined);
+    }),
+
+    vscode.commands.registerCommand("nexus.profile.addToFolder", (arg?: unknown) => {
+      openUnifiedForm(ctx, arg instanceof FolderTreeItem ? { group: arg.folderPath } : undefined);
     }),
 
     vscode.commands.registerCommand("nexus.profile.actions", showProfileActions),
 
-    vscode.commands.registerCommand("nexus.group.add", async (arg?: unknown) => {
-      const parentPath = arg instanceof FolderTreeItem ? arg.folderPath : undefined;
-      const parentDepth = parentPath ? parentPath.split("/").length : 0;
-      if (parentDepth >= MAX_FOLDER_DEPTH) {
-        void vscode.window.showWarningMessage(`Maximum folder nesting depth is ${MAX_FOLDER_DEPTH} levels.`);
-        return;
-      }
-      const title = parentPath ? `New Subfolder in "${folderDisplayName(parentPath)}"` : "New Folder";
-      const name = await vscode.window.showInputBox({
-        title,
-        prompt: "Enter folder name",
-        validateInput: (value) => {
-          const trimmed = value.trim();
-          if (!trimmed) {
-            return "Folder name cannot be empty";
-          }
-          if (trimmed.includes("/")) {
-            return "Folder name cannot contain '/'";
-          }
-          const fullPath = parentPath ? parentPath + "/" + trimmed : trimmed;
-          if (!normalizeFolderPath(fullPath)) {
-            return "Invalid folder name";
-          }
-          const allGroups = new Set(collectGroups(ctx));
-          if (allGroups.has(fullPath)) {
-            return "A folder with this name already exists";
-          }
-          return null;
-        }
-      });
-      if (!name) {
-        return;
-      }
-      const fullPath = parentPath ? parentPath + "/" + name.trim() : name.trim();
-      // #84 P1 (serialization audit) — addGroup persists the FULL folder list;
-      // serialize it under configMutationLock so two concurrent group writes (or a
-      // group write racing a folder rename/remove) cannot clobber each other's
-      // snapshot. Acquired after the input box resolves — no UI held under the lock.
-      await configMutationLock.runExclusive(() => ctx.core.addGroup(fullPath));
-    }),
+    vscode.commands.registerCommand("nexus.group.add", () => addFolder()),
+
+    vscode.commands.registerCommand("nexus.group.addToFolder", (arg?: unknown) =>
+      addFolder(arg instanceof FolderTreeItem ? arg.folderPath : undefined)
+    ),
 
     vscode.commands.registerCommand("nexus.group.remove", async (arg?: unknown) => {
       if (!(arg instanceof FolderTreeItem)) {

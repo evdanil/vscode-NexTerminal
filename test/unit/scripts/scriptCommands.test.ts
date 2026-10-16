@@ -285,9 +285,33 @@ describe("scriptCommands", () => {
     it("pre-seeds the input box with 'folder/' when invoked from that folder's context menu", async () => {
       state.inputBoxReturn = undefined; // cancel — only the seeded value matters here
       registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
-      const handler = state.registeredCommands.get("nexus.script.new")!;
+      const handler = state.registeredCommands.get("nexus.script.newInFolder")!;
       await handler({ kind: "folder", path: "cisco", name: "cisco", uri: { fsPath: "/ws/.nexus/scripts/cisco" } });
       expect(state.inputBoxOptions?.value).toBe("cisco/");
+    });
+
+    // TOOLBAR FOCUS LEAK — VS Code invokes a `view/title` command with the
+    // tree's FOCUSED element (the last row clicked, still focused after a click
+    // on empty space), so the title-bar New Script receives the very folder
+    // node a folder's right-click entry does. The toolbar id must not read it.
+    it("the title-bar New Script (nexus.script.new) does NOT pre-seed the folder VS Code hands it as the focused row (⊘ reading a folder node off the argument prefills whichever folder was clicked last)", async () => {
+      state.inputBoxReturn = undefined;
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.new")!;
+      await handler({ kind: "folder", path: "cisco", name: "cisco", uri: { fsPath: "/ws/.nexus/scripts/cisco" } });
+      expect(state.inputBoxOptions).toBeDefined();
+      expect(state.inputBoxOptions?.value).toBeUndefined();
+      expect(state.inputBoxOptions?.value).not.toBe("cisco/");
+      expect(state.inputBoxOptions?.valueSelection).toBeUndefined();
+    });
+
+    it("nexus.script.newInFolder with no folder node falls back to an unseeded prompt instead of throwing", async () => {
+      state.inputBoxReturn = undefined;
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.newInFolder")!;
+      await handler();
+      expect(state.inputBoxOptions).toBeDefined();
+      expect(state.inputBoxOptions?.value).toBeUndefined();
     });
 
     it("the validator rejects '../' traversal in the folder part", async () => {
@@ -348,7 +372,7 @@ describe("scriptCommands", () => {
       // what pre-seeding a folder prefix promises.
       state.inputBoxReturn = "cisco/";
       registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
-      const handler = state.registeredCommands.get("nexus.script.new")!;
+      const handler = state.registeredCommands.get("nexus.script.newInFolder")!;
       await handler({ kind: "folder", path: "cisco", name: "cisco", uri: { fsPath: "/ws/.nexus/scripts/cisco" } });
 
       expect(state.inputBoxValidator).toBeDefined();
@@ -413,9 +437,33 @@ describe("scriptCommands", () => {
     it("pre-seeds the input with 'folder/' when invoked from a folder's context menu (nested folder creation)", async () => {
       state.inputBoxReturn = undefined;
       registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
-      const handler = state.registeredCommands.get("nexus.script.newFolder")!;
+      const handler = state.registeredCommands.get("nexus.script.newFolderInFolder")!;
       await handler({ kind: "folder", path: "cisco", name: "cisco", uri: { fsPath: "/ws/.nexus/scripts/cisco" } });
       expect(state.inputBoxOptions?.value).toBe("cisco/");
+    });
+
+    it("the title-bar New Folder (nexus.script.newFolder) creates at the scripts ROOT even when VS Code hands it the focused folder row (⊘ reading a folder node off the argument nests the new folder inside whichever folder was clicked last)", async () => {
+      state.mockFsStatThrows = true; // doesn't exist yet
+      state.inputBoxReturn = "backup";
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.newFolder")!;
+      await handler({ kind: "folder", path: "cisco", name: "cisco", uri: { fsPath: "/ws/.nexus/scripts/cisco" } });
+      expect(state.inputBoxOptions?.value).toBeUndefined();
+      expect(state.inputBoxOptions?.value).not.toBe("cisco/");
+      const createDirCalls = vi
+        .mocked(vscode.workspace.fs.createDirectory)
+        .mock.calls.map((c) => (c[0] as { fsPath: string }).fsPath);
+      expect(createDirCalls).toContain("/ws/.nexus/scripts/backup");
+      expect(createDirCalls).not.toContain("/ws/.nexus/scripts/cisco/backup");
+    });
+
+    it("nexus.script.newFolderInFolder with no folder node falls back to an unseeded prompt instead of throwing", async () => {
+      state.inputBoxReturn = undefined;
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      const handler = state.registeredCommands.get("nexus.script.newFolderInFolder")!;
+      await handler();
+      expect(state.inputBoxOptions).toBeDefined();
+      expect(state.inputBoxOptions?.value).toBeUndefined();
     });
 
     it("rejects a path containing '..'", async () => {

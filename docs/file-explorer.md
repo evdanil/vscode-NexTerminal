@@ -8,6 +8,8 @@ Browse, download, and manage remote files on connected servers over SFTP. The Fi
 2. Right-click the connected server in the Connectivity Hub and choose **Browse Files** (it is also in the list you get by clicking the server — see [Profile Actions](connectivity-hub.md#profile-actions)), or click **Browse Files** in the **File Explorer** title bar and pick the connected server
 3. The File Explorer opens at the server's home directory — browse, download, or drag files between remote directories
 
+**New File**, **New Directory** and **Upload File** in the File Explorer title bar act on the directory the explorer is showing (the `.` row), whichever row you clicked last; the same entries on a directory's right-click menu act on that directory.
+
 Drag-and-drop is supported for moving files between directories, and for uploading local files and folders onto a remote directory. Every upload and download is size-checked against its source once it finishes, and an item that was attempted and failed is counted as a failure rather than folded into the skip count.
 
 Windows network shares (`\\server\share`) are handled explicitly — see [Windows Network Shares](#windows-network-shares).

@@ -4,6 +4,8 @@ The Connectivity Hub is the sidebar tree view showing all servers, serial device
 
 ## Folders and Drag and Drop
 
+**New Folder** in the Hub title bar's `...` menu always creates a top-level folder; to create one inside a folder, right-click that folder and choose **New Folder** there. Likewise the title bar's `+` opens **Add Profile** with no folder chosen, while a folder's own **Add Profile** fills that folder in.
+
 Drag a server, serial, Local Shell or Local Server profile — or a whole folder — onto another folder, or onto empty space for the top level, to move it there. There is no manual ordering: a folder lists its subfolders first, then its profiles, each in name order. Dropping a tunnel profile onto a server starts that tunnel through the server immediately — it does not change the tunnel's saved server (see [Port Forwarding](port-forwarding.md)).
 
 [Auth profiles](ssh-and-telnet.md#auth-profiles) can be applied to individual servers or entire folders in bulk.

@@ -828,8 +828,25 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
       }
     }),
 
-    vscode.commands.registerCommand("nexus.tunnel.start", (arg?: unknown) => startTunnelCommand(ctx, arg)),
-    vscode.commands.registerCommand("nexus.tunnel.stop", (arg?: unknown) => stopTunnelCommand(ctx, arg)),
+    // TOOLBAR vs TUNNEL ROW — two ids per action, never one. VS Code invokes a
+    // `view/title` command with the view's FOCUSED row (the last tunnel clicked,
+    // still focused after a click on empty space), so the toolbar Start/Stop
+    // used to receive a `TunnelTreeItem` exactly as the row's own buttons do:
+    // Start skipped the picker and started that tunnel, and Stop stopped it
+    // unasked, or did nothing at all when it was not running. A
+    // `TunnelTreeItem` is therefore the one shape the toolbar ids drop. Every
+    // other shape is a deliberate caller and still honoured: the plain
+    // `{ profile: { id }, serverId }` the Retry after a cancelled start sends
+    // (it pins the server that start was aimed at), and a profile id string.
+    // The row entries are `nexus.tunnel.startItem` / `nexus.tunnel.stopItem`.
+    vscode.commands.registerCommand("nexus.tunnel.start", (arg?: unknown) =>
+      startTunnelCommand(ctx, arg instanceof TunnelTreeItem ? undefined : arg)
+    ),
+    vscode.commands.registerCommand("nexus.tunnel.startItem", (arg?: unknown) => startTunnelCommand(ctx, arg)),
+    vscode.commands.registerCommand("nexus.tunnel.stop", (arg?: unknown) =>
+      stopTunnelCommand(ctx, arg instanceof TunnelTreeItem ? undefined : arg)
+    ),
+    vscode.commands.registerCommand("nexus.tunnel.stopItem", (arg?: unknown) => stopTunnelCommand(ctx, arg)),
 
     vscode.commands.registerCommand("nexus.tunnel.restart", async (arg?: unknown) => {
       const profile = toTunnelFromArg(ctx.core, arg);

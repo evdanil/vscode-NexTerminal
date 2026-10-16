@@ -1260,3 +1260,105 @@ describe("fileCommands title bar actions", () => {
     });
   });
 });
+
+/**
+ * TOOLBAR FOCUS LEAK. VS Code does not invoke a `view/title` command with no
+ * argument: it hands the handler the view's FOCUSED row — the last row clicked
+ * (expanding a directory focuses it), still focused after a click on empty
+ * space. So the File Explorer toolbar's New File / New Directory / Upload
+ * receive a real directory `FileTreeItem` exactly as that directory's own
+ * right-click entries do. The toolbar ids must target the explorer's current
+ * directory; the row ids target the row.
+ *
+ * Every test hands the handler a REAL `FileTreeItem`, built by its own
+ * constructor, because that is what the toolbar delivers.
+ */
+describe("File Explorer toolbar vs directory row — the toolbar ids ignore the focused directory VS Code injects", () => {
+  // The explorer is rooted at /home (createContext); `logs` is a directory row
+  // under it, expanded and therefore focused.
+  const focusedDir = () =>
+    new FileTreeItem("srv-1", "/home", { name: "logs", isDirectory: true, isSymlink: false, size: 0, modifiedAt: 0, permissions: 0o755 });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+  });
+
+  it("nexus.files.createFile (toolbar New File) creates in the explorer's current directory when handed the focused directory row (⊘ reading a FileTreeItem off the argument writes into whichever directory was clicked last)", async () => {
+    const ctx = createContext();
+    mockShowInputBox.mockResolvedValue("new.txt");
+    registerFileCommands(ctx);
+
+    await registeredCommands.get("nexus.files.createFile")!(focusedDir());
+
+    expect(ctx.sftpService.writeFile).toHaveBeenCalledWith("srv-1", "/home/new.txt", expect.any(Buffer));
+    expect(ctx.sftpService.writeFile).not.toHaveBeenCalledWith("srv-1", "/home/logs/new.txt", expect.anything());
+  });
+
+  it("nexus.files.createDir (toolbar New Directory) creates in the explorer's current directory when handed the focused directory row (⊘ nests it in whichever directory was clicked last)", async () => {
+    const ctx = createContext();
+    mockShowInputBox.mockResolvedValue("archive");
+    registerFileCommands(ctx);
+
+    await registeredCommands.get("nexus.files.createDir")!(focusedDir());
+
+    expect(ctx.sftpService.createDirectory).toHaveBeenCalledWith("srv-1", "/home/archive");
+    expect(ctx.sftpService.createDirectory).not.toHaveBeenCalledWith("srv-1", "/home/logs/archive");
+  });
+
+  it("nexus.files.upload (toolbar Upload) uploads into the explorer's current directory when handed the focused directory row (⊘ uploads into whichever directory was clicked last)", async () => {
+    const ctx = createContext();
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/tmp/a.txt" }]);
+    registerFileCommands(ctx);
+
+    await registeredCommands.get("nexus.files.upload")!(focusedDir());
+
+    expect(ctx.sftpService.upload).toHaveBeenCalledWith("srv-1", "/tmp/a.txt", "/home/a.txt");
+    expect(ctx.sftpService.upload).not.toHaveBeenCalledWith("srv-1", "/tmp/a.txt", "/home/logs/a.txt");
+  });
+
+  it("nexus.files.createFileInDir (a directory's right-click New File) creates inside that directory", async () => {
+    const ctx = createContext();
+    mockShowInputBox.mockResolvedValue("new.txt");
+    registerFileCommands(ctx);
+
+    await registeredCommands.get("nexus.files.createFileInDir")!(focusedDir());
+
+    expect(ctx.sftpService.writeFile).toHaveBeenCalledWith("srv-1", "/home/logs/new.txt", expect.any(Buffer));
+  });
+
+  it("nexus.files.createDirInDir (a directory's right-click New Directory) creates inside that directory", async () => {
+    const ctx = createContext();
+    mockShowInputBox.mockResolvedValue("archive");
+    registerFileCommands(ctx);
+
+    await registeredCommands.get("nexus.files.createDirInDir")!(focusedDir());
+
+    expect(ctx.sftpService.createDirectory).toHaveBeenCalledWith("srv-1", "/home/logs/archive");
+  });
+
+  it("nexus.files.uploadToDir (a directory's right-click Upload) uploads into that directory", async () => {
+    const ctx = createContext();
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/tmp/a.txt" }]);
+    registerFileCommands(ctx);
+
+    await registeredCommands.get("nexus.files.uploadToDir")!(focusedDir());
+
+    expect(ctx.sftpService.upload).toHaveBeenCalledWith("srv-1", "/tmp/a.txt", "/home/logs/a.txt");
+  });
+
+  it("the directory-row ids with no row fall back to the explorer's current directory instead of throwing", async () => {
+    const ctx = createContext();
+    mockShowInputBox.mockResolvedValueOnce("new.txt").mockResolvedValueOnce("archive");
+    mockShowOpenDialog.mockResolvedValue([{ fsPath: "/tmp/a.txt" }]);
+    registerFileCommands(ctx);
+
+    await registeredCommands.get("nexus.files.createFileInDir")!();
+    await registeredCommands.get("nexus.files.createDirInDir")!();
+    await registeredCommands.get("nexus.files.uploadToDir")!();
+
+    expect(ctx.sftpService.writeFile).toHaveBeenCalledWith("srv-1", "/home/new.txt", expect.any(Buffer));
+    expect(ctx.sftpService.createDirectory).toHaveBeenCalledWith("srv-1", "/home/archive");
+    expect(ctx.sftpService.upload).toHaveBeenCalledWith("srv-1", "/tmp/a.txt", "/home/a.txt");
+  });
+});

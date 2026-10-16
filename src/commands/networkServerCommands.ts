@@ -374,7 +374,10 @@ export function registerNetworkServerCommands(
       });
     }),
 
-    // The view-title gear, which carries no tree item, hence the kind pick.
+    // The view-title gear and the row's right-click Edit share this id. VS Code
+    // invokes a title-bar command with the view's FOCUSED row, so the gear opens
+    // the last-clicked row's form (the kind read off it) and asks for the kind
+    // only when no row has focus or the focused one names no kind.
     vscode.commands.registerCommand("nexus.networkServer.edit", async (arg?: unknown) => {
       const kind = toNetworkServerKindFromArg(arg) ?? (await pickNetworkServerKind("Edit Network Server"));
       if (!kind) return;

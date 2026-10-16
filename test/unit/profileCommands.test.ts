@@ -4,6 +4,7 @@ import type { FormDefinition, FormValues } from "../../src/ui/formTypes";
 const mockExecuteCommand = vi.fn((..._args: unknown[]) => undefined);
 const mockShowWarningMessage = vi.fn();
 const mockShowQuickPick = vi.fn();
+const mockShowInputBox = vi.fn();
 const mockGetConfiguration = vi.fn();
 const mockWebviewOpen = vi.fn();
 const mockFormValuesToServer = vi.fn();
@@ -27,6 +28,7 @@ vi.mock("vscode", () => ({
   window: {
     showWarningMessage: (...args: unknown[]) => mockShowWarningMessage(...args),
     showQuickPick: (...args: unknown[]) => mockShowQuickPick(...args),
+    showInputBox: (...args: unknown[]) => mockShowInputBox(...args),
     showInformationMessage: vi.fn()
   },
   workspace: {
@@ -71,7 +73,7 @@ vi.mock("../../src/commands/inlineAuthProfileCreation", () => ({
 }));
 
 import { openUnifiedForm, registerProfileCommands } from "../../src/commands/profileCommands";
-import { LocalShellProfileTreeItem, ServerTreeItem } from "../../src/ui/nexusTreeProvider";
+import { FolderTreeItem, LocalShellProfileTreeItem, ServerTreeItem } from "../../src/ui/nexusTreeProvider";
 import { AsyncMutex, configMutationLock } from "../../src/services/configMutationLock";
 import { proxyPasswordSecretKey } from "../../src/services/ssh/proxyPasswordKeys";
 
@@ -1465,5 +1467,116 @@ describe("openUnifiedForm submit — the non-SSH create branches serialize on co
 
     expect(events).toEqual(["cascade:start", "cascade:persisted", "cascade:end", "submit:start", "submit:end"]);
     expect(created?.name).toBe("Mock API");
+  });
+});
+
+/**
+ * TOOLBAR FOCUS LEAK. A command in a tree view's `view/title` menu is not
+ * invoked with no argument: VS Code builds the toolbar's action context as
+ * `{ $treeViewId, $focusedTreeItem: true, … }` and the extension host turns
+ * that into the tree's FOCUSED element — the last row the user clicked, which
+ * stays focused after clicking empty space (only the selection clears). So the
+ * Hub toolbar's New Folder / Add Profile receive a real `FolderTreeItem` exactly
+ * as the folder's own right-click entry does, and the two cannot be told apart
+ * at runtime. The toolbar ids must therefore never read a folder off their
+ * argument; the folder variants are separate ids.
+ *
+ * Every test here hands the handler a REAL `FolderTreeItem`, because that is
+ * what the toolbar delivers.
+ */
+describe("Hub toolbar vs folder right-click — the toolbar ids ignore the focused folder VS Code injects", () => {
+  const registeredHandler = async (id: string): Promise<(arg?: unknown) => unknown> => {
+    const { commands } = await import("vscode");
+    const handler = vi.mocked(commands.registerCommand).mock.calls.find(([command]) => command === id)?.[1];
+    expect(handler, `${id} is registered`).toBeDefined();
+    return handler as (arg?: unknown) => unknown;
+  };
+
+  function makeFolderCtx() {
+    const ctx = makeCtx();
+    ctx.core.addGroup = vi.fn(async () => {});
+    return ctx;
+  }
+
+  const groupFieldValue = (): unknown => {
+    const field = latestFormOptions().definition.fields.find((candidate) => "key" in candidate && candidate.key === "group");
+    return field && "value" in field ? field.value : undefined;
+  };
+
+  const inputBoxTitle = (): unknown => (mockShowInputBox.mock.calls.at(-1)?.[0] as { title?: string } | undefined)?.title;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetConfiguration.mockReturnValue({ get: vi.fn((_key: string, fallback: unknown) => fallback) });
+    mockWebviewOpen.mockReturnValue({ dispose: vi.fn() });
+    mockShowInputBox.mockResolvedValue("Ops");
+  });
+
+  it("nexus.group.add (toolbar New Folder) creates a TOP-LEVEL folder even when VS Code hands it the focused folder row (⊘ reading `arg instanceof FolderTreeItem` nests the new folder inside whichever folder was clicked last)", async () => {
+    const ctx = makeFolderCtx();
+    registerProfileCommands(ctx);
+
+    await (await registeredHandler("nexus.group.add"))(new FolderTreeItem("Lab", "Lab"));
+
+    expect(inputBoxTitle()).toBe("New Folder");
+    expect(String(inputBoxTitle())).not.toContain("Subfolder");
+    expect(String(inputBoxTitle())).not.toContain("Lab");
+    expect(ctx.core.addGroup).toHaveBeenCalledWith("Ops");
+    expect(ctx.core.addGroup).not.toHaveBeenCalledWith("Lab/Ops");
+  });
+
+  it("nexus.group.addToFolder (a folder's right-click New Folder) creates the folder INSIDE the row it was invoked on", async () => {
+    const ctx = makeFolderCtx();
+    registerProfileCommands(ctx);
+
+    await (await registeredHandler("nexus.group.addToFolder"))(new FolderTreeItem("Lab", "Lab"));
+
+    expect(inputBoxTitle()).toBe('New Subfolder in "Lab"');
+    expect(ctx.core.addGroup).toHaveBeenCalledWith("Lab/Ops");
+  });
+
+  it("nexus.group.addToFolder with no folder row falls back to the toolbar's top-level behaviour instead of throwing", async () => {
+    const ctx = makeFolderCtx();
+    registerProfileCommands(ctx);
+
+    await (await registeredHandler("nexus.group.addToFolder"))();
+
+    expect(inputBoxTitle()).toBe("New Folder");
+    expect(ctx.core.addGroup).toHaveBeenCalledWith("Ops");
+  });
+
+  it("nexus.profile.add (toolbar +) opens the form with NO folder even when VS Code hands it the focused folder row (⊘ reading `arg instanceof FolderTreeItem` pre-fills the last-clicked folder)", async () => {
+    registerProfileCommands(makeCtx());
+
+    await (await registeredHandler("nexus.profile.add"))(new FolderTreeItem("Lab", "Lab"));
+
+    expect(groupFieldValue()).toBe("");
+    expect(groupFieldValue()).not.toBe("Lab");
+  });
+
+  it("nexus.profile.add still honours an explicit seed object, which only a programmatic caller can pass (the per-type Add commands route through it)", async () => {
+    registerProfileCommands(makeCtx());
+
+    await (await registeredHandler("nexus.profile.add"))({ addMode: "ssh", profileType: "ssh", group: "Lab" });
+
+    expect(mockWebviewOpen.mock.calls.at(-1)?.[0]).toBe("server-add");
+    expect(groupFieldValue()).toBe("Lab");
+  });
+
+  it("nexus.profile.addToFolder (a folder's right-click Add Profile) pre-fills the row's folder", async () => {
+    registerProfileCommands(makeCtx());
+
+    await (await registeredHandler("nexus.profile.addToFolder"))(new FolderTreeItem("Lab/Core", "Core"));
+
+    expect(groupFieldValue()).toBe("Lab/Core");
+  });
+
+  it("nexus.profile.addToFolder with no folder row opens the plain add form instead of throwing", async () => {
+    registerProfileCommands(makeCtx());
+
+    await (await registeredHandler("nexus.profile.addToFolder"))();
+
+    expect(mockWebviewOpen).toHaveBeenCalledTimes(1);
+    expect(groupFieldValue()).toBe("");
   });
 });

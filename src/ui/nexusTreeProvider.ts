@@ -13,10 +13,13 @@ export class FolderTreeItem extends vscode.TreeItem {
   /**
    * PER-SOURCE SYNC (follow-up #43) — the inventory source this folder is the
    * `targetFolder` of, set by `NexusTreeProvider.makeFolderItem` only when
-   * EXACTLY ONE source targets it. It is what makes the row's inline sync icon
-   * act on that source: `resolveSourceIdArg` (commands/inventoryCommands.ts)
-   * already reads `arg.sourceId` off the tree item VS Code hands a
-   * `view/item/context` command, so this needs no command-layer change at all.
+   * EXACTLY ONE source targets it. It is what makes the row's sync icon and
+   * right-click entry (`nexus.inventory.syncFolderSource`) act on that source:
+   * `resolveSourceIdArg` (commands/inventoryCommands.ts) reads `arg.sourceId`
+   * off the tree item VS Code hands a `view/item/context` command. The Hub
+   * title bar's `nexus.inventory.syncNow` deliberately ignores it — VS Code
+   * hands a title-bar command the focused row, so this row arrives there too
+   * whenever it was the last one clicked.
    *
    * Left `undefined` everywhere else — a folder no source targets, a folder two
    * sources share (ambiguous, so no icon), and every Macros-view folder.

@@ -1,6 +1,20 @@
 # Changelog
 
-## [2.8.299] — 2026-10-04
+## [2.8.299] — 2026-10-16
+
+### Fixed
+
+- **New Folder in the Connectivity Hub title bar creates a top-level folder.** It created the new folder inside whichever folder you had clicked last, even after you clicked empty space, because VS Code hands a title-bar button the view's last-focused row. A folder's right-click **New Folder** still creates a subfolder there.
+
+- **Add Profile (`+`) in the Connectivity Hub title bar no longer fills in a folder.** It pre-filled the form's **Folder** with whichever folder you had clicked last; it now opens with no folder, and a folder's right-click **Add Profile** still fills that folder in.
+
+- **Sync Inventory Now in the Connectivity Hub's `...` menu asks which source to sync.** When the folder you had clicked last was an inventory source's target folder, it synced that source without asking. The sync icon and right-click entry on that folder still sync its source directly.
+
+- **New Script and New Folder in the Scripts title bar no longer pre-fill a folder.** Both started the name with whichever folder you had clicked last (`cisco/`); they now start empty, and a folder's right-click **New Nexus Script** and **New Script Folder** still pre-fill that folder.
+
+- **Start and Stop in the Port Forwarding title bar ask which tunnel.** Start started whichever tunnel you had clicked last, and Stop stopped it without asking, or did nothing at all when that tunnel was not running even though others were. They now show the tunnel picker and the running-tunnel picker; the buttons on a tunnel's own row still act on that tunnel.
+
+- **New File, New Directory and Upload File in the File Explorer title bar use the directory the explorer is showing.** They wrote into whichever subdirectory you had last clicked or expanded; a directory's right-click entries still act on that directory.
 
 ## [2.8.298] — 2026-10-03
 

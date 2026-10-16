@@ -9,6 +9,7 @@ import type { ServerConfig } from "../../src/models/config";
 import { configMutationLock } from "../../src/services/configMutationLock";
 import { TunnelStoppedError } from "../../src/services/tunnel/tunnelManager";
 import type { NetworkRouteIdentity } from "../../src/services/ssh/sshNetworkRoute";
+import { TunnelTreeItem } from "../../src/ui/tunnelTreeProvider";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowQuickPick = vi.fn();
@@ -1322,5 +1323,117 @@ describe("startTunnel — profile removed while start is pending", () => {
       expect(active).toBe(0);
       stop();
     });
+  });
+});
+
+/**
+ * TOOLBAR FOCUS LEAK. VS Code does not invoke a `view/title` command with no
+ * argument: it hands the handler the view's FOCUSED row — the last tunnel
+ * clicked, still focused after a click on empty space. So the Tunnels toolbar's
+ * Start and Stop receive a real `TunnelTreeItem` exactly as that row's own
+ * inline button does. The toolbar ids must not act on it; the row ids do.
+ * Every test hands the handler a REAL `TunnelTreeItem`, because that is what
+ * the toolbar delivers.
+ */
+describe("Tunnels toolbar vs tunnel row — the toolbar Start/Stop ignore the focused row VS Code injects", () => {
+  const SERVERS: ServerConfig[] = [
+    { id: "srv-a", name: "Alpha", host: "10.0.0.1", port: 22, username: "u", authType: "password", isHidden: false },
+    { id: "srv-b", name: "Bravo", host: "10.0.0.2", port: 22, username: "u", authType: "password", isHidden: false }
+  ];
+  const T1 = makeTunnel({ id: "t1", name: "Tunnel 1" });
+  const T2 = makeTunnel({ id: "t2", name: "Tunnel 2", localPort: 8081 });
+
+  async function fixture(active: Array<{ profileId: string; id: string }> = []) {
+    const core = new NexusCore(new InMemoryConfigRepository(SERVERS, [T1, T2]));
+    await core.initialize();
+    for (const tunnel of active) {
+      core.registerTunnel({ ...makeActiveTunnel(tunnel.profileId), id: tunnel.id });
+    }
+    const stop = vi.fn(async () => {});
+    const ctx = { ...(await setupContext([])), core, tunnelManager: { stop } as never };
+    registerTunnelCommands(ctx);
+    return { stop, run: (id: string, arg?: unknown) => registeredCommands.get(id)!(arg) };
+  }
+
+  const pickerTitles = () => mockShowQuickPick.mock.calls.map((call) => (call[1] as { title?: string } | undefined)?.title);
+  // With two servers and no default, a start that resolved a tunnel asks for
+  // the server, naming the tunnel it is starting — the observable that says
+  // WHICH tunnel a start went ahead with.
+  const serverPickFor = (name: string) => `Start tunnel "${name}" on which server?`;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockShowQuickPick.mockResolvedValue(undefined);
+  });
+
+  it("nexus.tunnel.start (toolbar) opens the tunnel picker when handed the focused row, rather than starting that tunnel (⊘ reading a TunnelTreeItem off the argument starts whichever tunnel was clicked last)", async () => {
+    const { run } = await fixture();
+
+    await run("nexus.tunnel.start", new TunnelTreeItem(T2));
+
+    expect(pickerTitles()).toEqual(["Select Tunnel Profile"]);
+    expect(pickerTitles()).not.toContain(serverPickFor("Tunnel 2"));
+  });
+
+  it("nexus.tunnel.start still honours a plain `{ profile }` object, the shape the Retry after a cancelled start sends (a TunnelTreeItem is the only shape it drops)", async () => {
+    const { run } = await fixture();
+
+    await run("nexus.tunnel.start", { profile: { id: "t2" } });
+
+    expect(pickerTitles()).toEqual([serverPickFor("Tunnel 2")]);
+  });
+
+  it("nexus.tunnel.startItem (the row's inline ▶ and right-click Start) starts the row's own tunnel without the tunnel picker", async () => {
+    const { run } = await fixture();
+
+    await run("nexus.tunnel.startItem", new TunnelTreeItem(T2));
+
+    expect(pickerTitles()).toEqual([serverPickFor("Tunnel 2")]);
+  });
+
+  it("nexus.tunnel.startItem with no row falls back to the tunnel picker instead of throwing", async () => {
+    const { run } = await fixture();
+
+    await run("nexus.tunnel.startItem");
+
+    expect(pickerTitles()).toEqual(["Select Tunnel Profile"]);
+  });
+
+  it("nexus.tunnel.stop (toolbar) opens the active-tunnel picker when handed the focused running row, rather than stopping it outright (⊘ reading a TunnelTreeItem off the argument stops whichever tunnel was clicked last, unasked)", async () => {
+    const { run, stop } = await fixture([{ profileId: "t1", id: "at-1" }, { profileId: "t2", id: "at-2" }]);
+
+    await run("nexus.tunnel.stop", new TunnelTreeItem(T2, "at-2"));
+
+    expect(pickerTitles()).toEqual(["Stop active tunnel"]);
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it("nexus.tunnel.stop (toolbar) still offers the running tunnels when the focused row is a stopped one (⊘ the leaked row made the button silently do nothing)", async () => {
+    const { run, stop } = await fixture([{ profileId: "t1", id: "at-1" }]);
+
+    await run("nexus.tunnel.stop", new TunnelTreeItem(T2));
+
+    expect(pickerTitles()).toEqual(["Stop active tunnel"]);
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it("nexus.tunnel.stopItem (the running row's inline ■ and right-click Stop) stops the row's own tunnel without asking", async () => {
+    const { run, stop } = await fixture([{ profileId: "t1", id: "at-1" }, { profileId: "t2", id: "at-2" }]);
+
+    await run("nexus.tunnel.stopItem", new TunnelTreeItem(T2, "at-2"));
+
+    expect(mockShowQuickPick).not.toHaveBeenCalled();
+    expect(stop).toHaveBeenCalledWith("at-2");
+    expect(stop).not.toHaveBeenCalledWith("at-1");
+  });
+
+  it("nexus.tunnel.stopItem with no row falls back to the active-tunnel picker instead of throwing", async () => {
+    const { run, stop } = await fixture([{ profileId: "t1", id: "at-1" }]);
+
+    await run("nexus.tunnel.stopItem");
+
+    expect(pickerTitles()).toEqual(["Stop active tunnel"]);
+    expect(stop).not.toHaveBeenCalled();
   });
 });
