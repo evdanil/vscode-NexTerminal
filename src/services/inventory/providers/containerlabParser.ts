@@ -114,43 +114,42 @@ function validateNetworkSettings(raw: unknown, labName: string): Record<string, 
 }
 
 function validIpv4(host: string): boolean {
-  const parts = host.split(".");
-  return parts.length === 4 && parts.every((part) => /^\d{1,3}$/u.test(part) && Number(part) <= 255);
+  return IPV4_DOTTED_QUAD_RE.test(host);
 }
 
 function validIpv6(host: string): boolean {
-  if (host === "" || host.includes("%") || host.includes(":::")) {
-    return false;
-  }
-  const doubleColon = host.indexOf("::");
-  if (doubleColon !== -1 && host.indexOf("::", doubleColon + 2) !== -1) {
-    return false;
-  }
-  const hasCompression = doubleColon !== -1;
-  const [leftText, rightText = ""] = hasCompression ? host.split("::") : [host, ""];
-  const left = leftText === "" ? [] : leftText.split(":");
-  const right = rightText === "" ? [] : rightText.split(":");
-  const groups = [...left, ...right];
-  let groupCount = groups.length;
-  if (groups.some((group) => group.includes("."))) {
-    if (
-      groups.length === 0 ||
-      !groups.at(-1)?.includes(".") ||
-      (hasCompression && left.some((group) => group.includes(".")))
-    ) {
-      return false;
+  const halves = host.split("::");
+  if (halves.length > 2) return false;
+  const compressed = halves.length === 2;
+
+  const countGroups = (side: string, isLast: boolean): number | null => {
+    if (side === "") return 0;
+    const groups = side.split(":");
+    let count = 0;
+    for (let i = 0; i < groups.length; i++) {
+      const group = groups[i];
+      const atEnd = isLast && i === groups.length - 1;
+      if (group.includes(".")) {
+        if (!atEnd || !IPV4_DOTTED_QUAD_RE.test(group)) return null;
+        count += 2;
+        continue;
+      }
+      if (!IPV6_HEXTET_RE.test(group)) return null;
+      count++;
     }
-    const ipv4 = groups.at(-1)!;
-    if (!validIpv4(ipv4)) {
-      return false;
-    }
-    groupCount++;
-  }
-  if (groups.some((group) => group === "" || (group.includes(".") ? false : !/^[0-9a-f]{1,4}$/iu.test(group)))) {
-    return false;
-  }
-  return hasCompression ? groupCount < 8 : groupCount === 8;
+    return count;
+  };
+
+  const left = countGroups(halves[0], !compressed);
+  if (left === null) return false;
+  if (!compressed) return left === 8;
+  const right = countGroups(halves[1], true);
+  if (right === null) return false;
+  return left + right < 8;
 }
+
+const IPV4_DOTTED_QUAD_RE = /^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$/u;
+const IPV6_HEXTET_RE = /^[0-9a-f]{1,4}$/iu;
 
 function parseAddress(
   raw: string,

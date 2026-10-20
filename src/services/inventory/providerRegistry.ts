@@ -125,7 +125,8 @@ function checkProviderShape(provider: unknown): CheckedProviderData {
   if (obj.canWebConsole !== undefined && typeof obj.canWebConsole !== "function") {
     throw new Error("Inventory provider canWebConsole must be a function when present.");
   }
-  if (obj.sourceDefaultRoute !== undefined && typeof obj.sourceDefaultRoute !== "function") {
+  const sourceDefaultRoute = obj.sourceDefaultRoute;
+  if (sourceDefaultRoute !== undefined && typeof sourceDefaultRoute !== "function") {
     throw new Error("Inventory provider sourceDefaultRoute must be a function when present.");
   }
   // TEMPLATE-RULE FILTER KEYS (issue #163) — the twin of the clauses above, for
@@ -148,8 +149,8 @@ function checkProviderShape(provider: unknown): CheckedProviderData {
     label,
     configFields,
     attributeKeys: copyAttributeKeys(obj.attributeKeys),
-    ...(typeof obj.sourceDefaultRoute === "function"
-      ? { sourceDefaultRoute: obj.sourceDefaultRoute as (config: Record<string, string | number | boolean>) => InventorySourceDefaultRoute }
+    ...(typeof sourceDefaultRoute === "function"
+      ? { sourceDefaultRoute: sourceDefaultRoute as (config: Record<string, string | number | boolean>) => InventorySourceDefaultRoute }
       : {})
   };
 }

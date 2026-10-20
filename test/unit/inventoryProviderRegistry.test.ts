@@ -1129,4 +1129,20 @@ describe("InventoryProviderRegistry Containerlab contract extensions", () => {
   it("rejects a non-function source-default route capability", () => {
     expect(() => validateProviderShape(makeProvider({ sourceDefaultRoute: "direct" as never }))).toThrow(/sourceDefaultRoute/i);
   });
+
+  it("reads a source-default route getter once and captures the function that was validated", () => {
+    const registry = new InventoryProviderRegistry();
+    const route = () => ({ kind: "direct" as const });
+    const provider = makeProvider();
+    let reads = 0;
+    Object.defineProperty(provider, "sourceDefaultRoute", {
+      configurable: true,
+      get: () => (++reads <= 3 ? route : "invalid")
+    });
+
+    registry.register(provider);
+    const capability = registry.snapshotOf(provider).sourceDefaultRoute;
+    expect({ reads, capability }).toEqual({ reads: 1, capability: route });
+    expect(capability?.({})).toEqual({ kind: "direct" });
+  });
 });

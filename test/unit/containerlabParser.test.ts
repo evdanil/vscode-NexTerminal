@@ -180,6 +180,30 @@ describe("parseContainerlabInspection", () => {
     expect(() => parseContainerlabInspection(inspection(invalidIpv6), defaultConfig())).toThrow(/address|invalid/i);
   });
 
+  it("rejects leading-zero IPv4 octets rather than accepting ambiguous endpoints", () => {
+    const output = clonedFixture();
+    (onlyRow(output).NetworkSettings as Record<string, unknown>).IPv4addr = "010.020.030.040";
+    expect(() => parseContainerlabInspection(inspection(output), defaultConfig())).toThrow(/address|invalid/i);
+  });
+
+  it("rejects multiple dotted IPv4 groups inside IPv6 literals", () => {
+    const output = clonedFixture();
+    (onlyRow(output).NetworkSettings as Record<string, unknown>).IPv6addr = "::192.0.2.1:198.51.100.2";
+    expect(() => parseContainerlabInspection(inspection(output), defaultConfig())).toThrow(/address|invalid/i);
+  });
+
+  it.each(["::ffff:192.0.2.1", "2001:db8::192.0.2.1", "2001:db8:0:0:0:0:192.0.2.1"])(
+    "accepts an IPv4-embedded IPv6 address only as its terminal dotted-quad tail: %s",
+    (address) => {
+      const output = clonedFixture();
+      const settings = onlyRow(output).NetworkSettings as Record<string, unknown>;
+      settings.IPv6addr = address;
+      settings.IPv6pLen = 128;
+      const tree = parseContainerlabInspection(inspection(output), parseContainerlabConfig({ addressPreference: "ipv6" }));
+      expect(tree.devices[0].endpoints).toEqual([{ kind: "ssh", host: address, port: 22 }]);
+    }
+  );
+
   it("maps created/exited/dead/paused to stopped and clears unfamiliar or transitional states", () => {
     for (const state of ["created", "exited", "dead", "paused"]) {
       const output = clonedFixture();
