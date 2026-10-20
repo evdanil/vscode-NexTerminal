@@ -1,0 +1,39 @@
+{
+  "fixture-lab": [
+    {
+      "Names": ["clab-fixture-lab-node1"],
+      "ID": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "ShortID": "aaaaaaaaaaaa",
+      "Image": "network-node:22.04",
+      "State": "created",
+      "Status": "Created",
+      "Labels": {
+        "clab-node-kind": "linux",
+        "clab-node-longname": "clab-fixture-lab-node1",
+        "clab-node-name": "node1",
+        "clab-owner": "fixture-user",
+        "clab-topo-file": "/fixtures/fixture-lab.clab.yml",
+        "containerlab": "fixture-lab",
+        "nexus.containerlab.validation": "fixture",
+        "org.opencontainers.image.version": "22.04"
+      },
+      "Pid": 0,
+      "NetworkName": "none",
+      "NetworkSettings": {
+        "IPv4addr": "",
+        "IPv4pLen": 0,
+        "IPv4Gw": "",
+        "IPv6addr": "",
+        "IPv6pLen": 0,
+        "IPv6Gw": ""
+      },
+      "Mounts": [
+        {
+          "Source": "",
+          "Destination": ""
+        }
+      ],
+      "Ports": []
+    }
+  ]
+}

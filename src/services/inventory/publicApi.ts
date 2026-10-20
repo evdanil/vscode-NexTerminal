@@ -51,6 +51,13 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  * a backup export, the post-import verification, and the rollback captures in
  * `removeSource`/`persistUpdatedInventorySource` handle the user's own data and
  * have no provider to distrust.
+
+ * Providers may declare `sourceDefaultRoute(config)`, a synchronous,
+ * data-only connection preference for devices from that source. Nexus captures
+ * the capability at registration and validates its result at use; it is not a
+ * connection hook. The optional third argument to Test, inventory, and status
+ * methods carries operation intent, subject identity, and cancellation only.
+ * It contains no credentials or approval token, and older providers can ignore it.
  *
  * ONLY A STAMPED SOURCE IS GATED, which is the limit worth knowing before
  * reading the rest as a guarantee. A source saved before the field existed

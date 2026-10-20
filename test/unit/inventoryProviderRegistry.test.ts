@@ -1103,3 +1103,30 @@ describe("resolveProviderInstanceKey", () => {
     expect(resolveProviderInstanceKey({ instanceKey: () => "https://netbox.example.com" }, uncloneable)).toBeUndefined();
   });
 });
+
+describe("InventoryProviderRegistry Containerlab contract extensions", () => {
+  it("copies the validated ssh-profile field and captures the source-default route capability once", () => {
+    const registry = new InventoryProviderRegistry();
+    const route = (config: Record<string, string | number | boolean>) =>
+      config.location === "ssh" && typeof config.labHostId === "string"
+        ? { kind: "ssh" as const, jumpHostId: config.labHostId }
+        : { kind: "direct" as const };
+    const fields: InventoryConfigField[] = [{ id: "labHostId", label: "Lab Host", type: "ssh-profile" }];
+    const provider = makeProvider({ configFields: fields, sourceDefaultRoute: route });
+
+    registry.register(provider);
+    fields[0].label = "Changed after registration";
+    provider.sourceDefaultRoute = () => ({ kind: "direct" });
+
+    const snapshot = registry.snapshotOf(provider);
+    expect(snapshot.configFields).toEqual([{ id: "labHostId", label: "Lab Host", type: "ssh-profile" }]);
+    expect(Object.isFrozen(snapshot.configFields[0])).toBe(true);
+    expect(snapshot.sourceDefaultRoute).toBe(route);
+    expect(snapshot.sourceDefaultRoute?.({ location: "ssh", labHostId: "profile-1" }))
+      .toEqual({ kind: "ssh", jumpHostId: "profile-1" });
+  });
+
+  it("rejects a non-function source-default route capability", () => {
+    expect(() => validateProviderShape(makeProvider({ sourceDefaultRoute: "direct" as never }))).toThrow(/sourceDefaultRoute/i);
+  });
+});

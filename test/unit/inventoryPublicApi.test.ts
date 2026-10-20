@@ -69,4 +69,13 @@ describe("createNexusExtensionApi", () => {
     ).toThrow();
     expect(registry.get("bad")).toBeUndefined();
   });
+
+  it("retains a source-default route capability in the checked provider snapshot", () => {
+    const registry = new InventoryProviderRegistry();
+    const api = createNexusExtensionApi(registry);
+    const provider = makeProvider({ sourceDefaultRoute: () => ({ kind: "direct" }) });
+    api.registerInventoryProvider(provider);
+
+    expect(registry.snapshotOf(provider).sourceDefaultRoute?.({})).toEqual({ kind: "direct" });
+  });
 });

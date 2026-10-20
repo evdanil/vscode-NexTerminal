@@ -244,7 +244,8 @@ export interface InventoryStatusReport {
   notSyncableReasons?: Record<string, string>;
 }
 
-export type InventoryConfigFieldType = "string" | "password" | "number" | "boolean" | "select";
+/** `ssh-profile` is a host-profile reference resolved by Nexus; providers cannot supply or mutate its choices. */
+export type InventoryConfigFieldType = "string" | "password" | "number" | "boolean" | "select" | "ssh-profile";
 
 export interface InventoryConfigField {
   id: string;
@@ -351,6 +352,24 @@ export interface InventoryConfigField {
 export type InventorySourceValues = Record<string, string | number | boolean>; // secrets NEVER here
 export type InventorySourceSecrets = Record<string, string>; // from SecretStorage
 
+/**
+ * Additive operation metadata for providers that need to distinguish an
+ * interactive action from background work. This carries no credentials or
+ * authorization; callers that do not supply it retain their existing behavior.
+ */
+export interface InventoryOperationContext {
+  readonly intent: "test" | "sync" | "manual-status" | "background-status";
+  readonly subject:
+    | { readonly kind: "source"; readonly sourceId: string; readonly revision: string }
+    | { readonly kind: "form"; readonly sessionId: string };
+  readonly signal?: AbortSignal;
+}
+
+/** Pure connection intent supplied by an inventory source, never a route executor. */
+export type InventorySourceDefaultRoute =
+  | { readonly kind: "direct" }
+  | { readonly kind: "ssh"; readonly jumpHostId: string };
+
 export interface InventoryProvider {
   /** Unique registry key, read once at registration; later edits do not move this registration or its sources. */
   id: string; // e.g. "netbox"
@@ -377,6 +396,13 @@ export interface InventoryProvider {
    */
   configFields: InventoryConfigField[];
   /**
+   * OPTIONAL source-level default connection intent. It is called synchronously
+   * with only source config and returns data; it cannot execute connections or
+   * access secrets. The returned route is validated by consumers and may be absent on existing
+   * providers without changing their behavior.
+   */
+  sourceDefaultRoute?(config: InventorySourceValues): InventorySourceDefaultRoute;
+  /**
    * DEVICE TEMPLATES (issue #48 PR-T2, §2.2 A-M4) — OPTIONAL. The filter keys
    * this provider's `InventoryDevice.attributes` can carry, so the rule-save flow
    * can warn when a filter uses a key outside this list ("Key 'sites' is not one
@@ -394,8 +420,10 @@ export interface InventoryProvider {
    * changing this array afterwards changes nothing.
    */
   attributeKeys?: string[];
-  testConnection(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<void>;
-  fetchInventory(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<InventoryTree>;
+  /** Optional operation context is descriptive/cancellable only; existing providers may ignore it. */
+  testConnection(config: InventorySourceValues, secrets: InventorySourceSecrets, context?: InventoryOperationContext): Promise<void>;
+  /** Optional operation context is descriptive/cancellable only; existing providers may ignore it. */
+  fetchInventory(config: InventorySourceValues, secrets: InventorySourceSecrets, context?: InventoryOperationContext): Promise<InventoryTree>;
   /**
    * ADOPT 1 / REVIEW FINDING (P1, cross-instance adoption) — OPTIONAL. A stable
    * key identifying WHICH DEPLOYMENT of this provider `config` points at: not
@@ -450,7 +478,7 @@ export interface InventoryProvider {
    * "no update" — so an implementation may throw / return garbage without
    * breaking the refresh path, exactly like `instanceKey`.
    */
-  fetchStatus?(config: InventorySourceValues, secrets: InventorySourceSecrets): Promise<InventoryStatusReport>;
+  fetchStatus?(config: InventorySourceValues, secrets: InventorySourceSecrets, context?: InventoryOperationContext): Promise<InventoryStatusReport>;
   /**
    * LIVE STATUS — OPTIONAL, and meaningless without `fetchStatus`. One sentence
    * telling the user how to bring a TRUNCATED status scan of this source inside
@@ -1097,21 +1125,23 @@ export function normalizeNotSyncableReasons(raw: unknown): Record<string, string
  * discipline: undefined when the provider has no `fetchStatus`; the provider is
  * handed a `structuredClone` of the config inside the try (so an in-place
  * normalization cannot mutate the caller's stored source config, and a
- * non-cloneable config degrades to undefined rather than throwing); the return
+ * non-cloneable config degrades to undefined rather than throwing); optional
+ * operation context is forwarded unchanged; the return
  * is validated. A throw or a malformed report both degrade to `undefined` — "no
  * status update" — never an exception escaping into the refresh loop.
  */
 export async function fetchProviderStatus(
   provider: Pick<InventoryProvider, "fetchStatus">,
   config: InventorySourceValues,
-  secrets: InventorySourceSecrets
+  secrets: InventorySourceSecrets,
+  context?: InventoryOperationContext
 ): Promise<InventoryStatusReport | undefined> {
   if (typeof provider.fetchStatus !== "function") {
     return undefined;
   }
   let raw: unknown;
   try {
-    raw = await provider.fetchStatus(structuredClone(config), secrets);
+    raw = await provider.fetchStatus(structuredClone(config), secrets, context);
   } catch {
     return undefined;
   }
