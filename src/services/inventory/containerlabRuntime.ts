@@ -16,6 +16,7 @@ import type {
   ContainerlabExecutionIdentity,
   ContainerlabExecutor,
   ContainerlabExecutorDependencies,
+  ContainerlabLocalExecutableFileSystem,
   ContainerlabInspection,
   ContainerlabRunContext,
   PreparedContainerlabExecution,
@@ -27,6 +28,7 @@ const VERSION_LINE = /^    version: (v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-
 const CONTAINER_ID = /^[a-f0-9]{64}$/iu;
 const IMAGE_ID = /^sha256:[a-f0-9]{64}$/iu;
 const CLEANUP_BUDGET_MS = 5_000;
+const LOCAL_LOOKUP_POLL_MS = 25;
 const MAX_ERROR_TEXT = 400;
 
 type JsonRecord = Record<string, unknown>;
@@ -106,17 +108,87 @@ function metadataCommand(
   };
 }
 
-async function resolveLocalExecutable(value: string, label: "Containerlab" | "Docker"): Promise<string> {
+function awaitLocalFileOperation<T>(
+  operation: () => Promise<T>,
+  config: ContainerlabConfig,
+  context: ContainerlabRunContext,
+  deps: ContainerlabExecutorDependencies
+): Promise<T> {
+  const now = deps.now ?? Date.now;
+  checkContext(now, config, context);
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    let currentTimer: ReturnType<typeof setInterval> | undefined;
+    const cleanup = (): void => {
+      if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+      if (currentTimer !== undefined) clearInterval(currentTimer);
+      context.signal.removeEventListener("abort", checkCurrent);
+    };
+    const fail = (error: unknown): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const finish = (value: T): void => {
+      if (settled) return;
+      try {
+        checkContext(now, config, context);
+      } catch (error) {
+        fail(error);
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+    const checkCurrent = (): void => {
+      try {
+        checkContext(now, config, context);
+      } catch (error) {
+        fail(error);
+      }
+    };
+
+    context.signal.addEventListener("abort", checkCurrent, { once: true });
+    deadlineTimer = setTimeout(checkCurrent, Math.max(0, context.deadline - now()));
+    currentTimer = setInterval(checkCurrent, LOCAL_LOOKUP_POLL_MS);
+    checkCurrent();
+    if (settled) return;
+
+    const pending = Promise.resolve().then(operation);
+    void pending.then(finish, (error: unknown) => fail(error));
+  });
+}
+
+async function resolveLocalExecutable(
+  value: string,
+  label: "Containerlab" | "Docker",
+  config: ContainerlabConfig,
+  context: ContainerlabRunContext,
+  deps: ContainerlabExecutorDependencies
+): Promise<string> {
+  const fileSystem: ContainerlabLocalExecutableFileSystem = deps.localFileSystem ?? { realpath, stat, access };
+  const now = deps.now ?? Date.now;
   const candidates = value.startsWith("/")
     ? [value]
     : SAFE_PATH.split(":").map((directory) => `${directory}/${value}`);
   for (const candidate of candidates) {
     try {
-      const [real, fileStat] = await Promise.all([realpath(candidate), stat(candidate)]);
+      const [real, fileStat] = await awaitLocalFileOperation(
+        () => Promise.all([fileSystem.realpath(candidate), fileSystem.stat(candidate)]), config, context, deps
+      );
       if (!fileStat.isFile()) continue;
-      await access(candidate, fsConstants.X_OK);
+      await awaitLocalFileOperation(() => fileSystem.access(candidate, fsConstants.X_OK), config, context, deps);
       return real;
     } catch {
+      // Context failures must escape the candidate loop; ordinary lookup misses advance through fixed PATH.
+      try {
+        checkContext(now, config, context);
+      } catch (contextError) {
+        throw contextError;
+      }
       // Continue through the fixed allowlisted PATH; never consult process.env.PATH.
     }
   }
@@ -171,7 +243,7 @@ async function resolveExecutable(
 ): Promise<string> {
   if (config.location === "local") {
     checkContext(deps.now ?? Date.now, config, context);
-    const resolved = await resolveLocalExecutable(value, label);
+    const resolved = await resolveLocalExecutable(value, label, config, context, deps);
     checkContext(deps.now ?? Date.now, config, context);
     return resolved;
   }
@@ -367,7 +439,7 @@ async function cleanupHelper(
   };
   const socket = `unix://${config.dockerSocket}`;
   const idsOutput = await run([
-    "--host", socket, "container", "ls", "--all", "--quiet",
+    "--host", socket, "container", "ls", "--all", "--quiet", "--no-trunc",
     "--filter", `name=^/${helper.name}$`, "--filter", `label=${helper.ownershipLabel}`
   ]);
   const ids = idsOutput.split(/\r?\n/u).filter((line) => line.length > 0);

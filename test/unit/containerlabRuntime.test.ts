@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ServerConfig } from "../../src/models/config";
 import { parseContainerlabConfig } from "../../src/services/inventory/providers/containerlabConfig";
 import type {
@@ -6,6 +6,7 @@ import type {
   ContainerlabCommandResult,
   ContainerlabCommandRunner,
   ContainerlabExecutionIdentity,
+  ContainerlabLocalExecutableFileSystem,
   ContainerlabRunContext
 } from "../../src/services/inventory/containerlabRuntimeContracts";
 import { createContainerlabExecutor } from "../../src/services/inventory/containerlabRuntime";
@@ -68,6 +69,17 @@ function executionIdentity(overrides: Partial<ContainerlabExecutionIdentity> = {
 const imageId = `sha256:${"a".repeat(64)}`;
 const containerId = "b".repeat(64);
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+async function flushMicrotasks(): Promise<void> {
+  for (let index = 0; index < 10; index += 1) await Promise.resolve();
+}
+
 function metadataResponse(command: ContainerlabCommand): ContainerlabCommandResult {
   if (command.executable === "/bin/sh") {
     if (command.args[0] !== "-c" || command.args[2] !== "nexus-containerlab-resolve") {
@@ -120,6 +132,128 @@ describe("Containerlab runtime execution", () => {
       remoteConfig(), context("ssh", overrides)
     )).rejects.toThrow(/host|route/i);
     expect(remote.calls).toHaveLength(0);
+  });
+
+  it("bounds a stalled local realpath by the absolute deadline and ignores late completion", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const realpath = deferred<string>();
+    const fileSystem: ContainerlabLocalExecutableFileSystem = {
+      realpath: vi.fn(() => realpath.promise),
+      stat: vi.fn(async () => ({ isFile: () => true })),
+      access: vi.fn(async () => {})
+    };
+    const local = commandRunner(metadataResponse);
+    const executor = createContainerlabExecutor({ localRunner: local.runner, sshRunner: local.runner, localFileSystem: fileSystem });
+    const pending = executor.resolveDependencies(config(), context("local", { deadline: 50 }));
+    let outcome: { status: "resolved" } | { status: "rejected"; error: unknown } | undefined;
+    void pending.then(
+      () => { outcome = { status: "resolved" }; },
+      (error: unknown) => { outcome = { status: "rejected", error }; }
+    );
+    try {
+      await flushMicrotasks();
+      expect(fileSystem.realpath).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(50);
+      await flushMicrotasks();
+      expect(outcome?.status).toBe("rejected");
+      if (outcome?.status === "rejected") {
+        expect(outcome.error).toMatchObject({ message: expect.stringMatching(/cancelled, timed out, or is no longer current/i) });
+      }
+      realpath.resolve("/bin/true");
+      await flushMicrotasks();
+      expect(fileSystem.access).not.toHaveBeenCalled();
+      expect(local.calls).toHaveLength(0);
+    } finally {
+      realpath.resolve("/bin/true");
+      await flushMicrotasks();
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops a stalled local stat immediately on abort and consumes late rejection", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const stat = deferred<{ isFile(): boolean }>();
+    const fileSystem: ContainerlabLocalExecutableFileSystem = {
+      realpath: vi.fn(async () => "/bin/true"),
+      stat: vi.fn(() => stat.promise),
+      access: vi.fn(async () => {})
+    };
+    const local = commandRunner(metadataResponse);
+    const executor = createContainerlabExecutor({ localRunner: local.runner, sshRunner: local.runner, localFileSystem: fileSystem });
+    const controller = new AbortController();
+    const pending = executor.resolveDependencies(config(), context("local", {
+      signal: controller.signal,
+      deadline: 1_000
+    }));
+    let outcome: { status: "resolved" } | { status: "rejected"; error: unknown } | undefined;
+    void pending.then(
+      () => { outcome = { status: "resolved" }; },
+      (error: unknown) => { outcome = { status: "rejected", error }; }
+    );
+    try {
+      await flushMicrotasks();
+      expect(fileSystem.stat).toHaveBeenCalledTimes(1);
+      controller.abort(new Error("test cancellation"));
+      await flushMicrotasks();
+      expect(outcome?.status).toBe("rejected");
+      if (outcome?.status === "rejected") {
+        expect(outcome.error).toMatchObject({ message: expect.stringMatching(/cancelled, timed out, or is no longer current/i) });
+      }
+      stat.reject(new Error("late stat rejection"));
+      await flushMicrotasks();
+      expect(fileSystem.access).not.toHaveBeenCalled();
+      expect(local.calls).toHaveLength(0);
+    } finally {
+      stat.reject(new Error("late stat rejection"));
+      await flushMicrotasks();
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops a stalled local access when the source is no longer current", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const access = deferred<void>();
+    const fileSystem: ContainerlabLocalExecutableFileSystem = {
+      realpath: vi.fn(async () => "/bin/true"),
+      stat: vi.fn(async () => ({ isFile: () => true })),
+      access: vi.fn(() => access.promise)
+    };
+    const local = commandRunner(metadataResponse);
+    const executor = createContainerlabExecutor({ localRunner: local.runner, sshRunner: local.runner, localFileSystem: fileSystem });
+    let current = true;
+    const pending = executor.resolveDependencies(config(), context("local", {
+      deadline: 1_000,
+      isCurrent: () => current
+    }));
+    let outcome: { status: "resolved" } | { status: "rejected"; error: unknown } | undefined;
+    void pending.then(
+      () => { outcome = { status: "resolved" }; },
+      (error: unknown) => { outcome = { status: "rejected", error }; }
+    );
+    try {
+      await flushMicrotasks();
+      expect(fileSystem.access).toHaveBeenCalledTimes(1);
+      current = false;
+      await vi.advanceTimersByTimeAsync(25);
+      await flushMicrotasks();
+      expect(outcome?.status).toBe("rejected");
+      if (outcome?.status === "rejected") {
+        expect(outcome.error).toMatchObject({ message: expect.stringMatching(/cancelled, timed out, or is no longer current/i) });
+      }
+      access.resolve();
+      await flushMicrotasks();
+      expect(fileSystem.realpath).toHaveBeenCalledTimes(1);
+      expect(fileSystem.stat).toHaveBeenCalledTimes(1);
+      expect(fileSystem.access).toHaveBeenCalledTimes(1);
+      expect(local.calls).toHaveLength(0);
+    } finally {
+      access.resolve();
+      await flushMicrotasks();
+      vi.useRealTimers();
+    }
   });
 
   it("rejects a changed deep SSH route before remote executable resolution", async () => {
@@ -431,14 +565,16 @@ describe("Containerlab runtime execution", () => {
   it("does not execute version or inspection when the resolved immutable image changed", async () => {
     const fake = commandRunner(metadataResponse);
     const executor = createContainerlabExecutor({ localRunner: fake.runner, sshRunner: fake.runner });
-    const expected = executionIdentity({
-      executable: "/bin/true", dockerExecutable: "/usr/bin/gnutrue", location: "local",
-      routeIdentity: "local", imageId: `sha256:${"c".repeat(64)}`
-    });
+    const settings = config({ runner: "disposable", runnerImage: "ghcr.io/srl-labs/clab:0.80.0" });
+    const runContext = context();
+    const baseline = await executor.resolveDependencies(settings, runContext);
+    fake.calls.length = 0;
+    const expected = { ...baseline.identity, imageId: `sha256:${"c".repeat(64)}` };
 
-    await expect(executor.resolveDependencies(config({
-      runner: "disposable", runnerImage: "ghcr.io/srl-labs/clab:0.80.0"
-    }), context(), expected)).rejects.toThrow(/immutable Containerlab runner identity changed/i);
+    await expect(executor.resolveDependencies(settings, runContext, expected))
+      .rejects.toThrow(/immutable Containerlab runner identity changed/i);
+    expect(fake.calls.some((call) => call.args.includes("info"))).toBe(true);
+    expect(fake.calls.some((call) => call.args.includes("image"))).toBe(true);
     expect(fake.calls.some((call) => call.args.includes("version"))).toBe(false);
     expect(fake.calls.some((call) => call.args.includes("--runtime"))).toBe(false);
   });
@@ -496,7 +632,9 @@ describe("Containerlab runtime execution", () => {
     const fake = commandRunner((command) => {
       if (command.args.includes("image")) return { stdout: imageId, stderr: "" };
       if (command.args.includes("version")) throw new Error("version process timed out");
-      if (command.args.includes("--quiet")) return { stdout: `${helperId}\n`, stderr: "" };
+      if (command.args.includes("--quiet")) {
+        return { stdout: `${command.args.includes("--no-trunc") ? helperId : helperId.slice(0, 12)}\n`, stderr: "" };
+      }
       if (command.args.includes("inspect") && command.args.includes("--format")) {
         return { stdout: JSON.stringify({
           Id: helperId, Name: "/nexus-inventory-run-123",
@@ -515,6 +653,9 @@ describe("Containerlab runtime execution", () => {
 
     await expect(executor.preflight(settings, resolved, runContext)).rejects.toThrow(/timed out/);
     const removal = fake.calls.find((call) => call.args.includes("rm"));
+    const listing = fake.calls.find((call) => call.args.includes("--quiet"));
+    expect(listing?.args).toContain("--no-trunc");
+    expect(fake.calls.find((call) => call.args.includes("container") && call.args.includes("inspect") && call.args.includes("--format"))?.args).toContain(helperId);
     expect(removal?.args).toContain(helperId);
     expect(fake.calls.some((call) => call.args.includes(`label=nexus.inventory-run=run-123`))).toBe(true);
   });

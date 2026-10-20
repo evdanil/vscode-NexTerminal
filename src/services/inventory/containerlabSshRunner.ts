@@ -138,7 +138,7 @@ function remoteCommandLine(command: ContainerlabCommand): string {
     command.executable,
     ...command.args
   ];
-  return tokens.map(quotePosixToken).join(" ");
+  return `cd ${quotePosixToken(command.cwd)} && exec ${tokens.map(quotePosixToken).join(" ")}`;
 }
 
 function closeOnce(channel: SshCommandChannel): () => void {

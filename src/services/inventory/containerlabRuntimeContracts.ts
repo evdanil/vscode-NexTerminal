@@ -71,8 +71,16 @@ export interface ContainerlabExecutor {
 export interface ContainerlabExecutorDependencies {
   readonly localRunner: ContainerlabCommandRunner;
   readonly sshRunner: ContainerlabCommandRunner;
+  readonly localFileSystem?: ContainerlabLocalExecutableFileSystem;
   readonly now?: () => number;
   readonly createInvocationId?: () => string;
+}
+
+/** Injectable Node filesystem operations used only while resolving local executables. */
+export interface ContainerlabLocalExecutableFileSystem {
+  realpath(path: string): Promise<string>;
+  stat(path: string): Promise<{ isFile(): boolean }>;
+  access(path: string, mode: number): Promise<void>;
 }
 
 /**

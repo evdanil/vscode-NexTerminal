@@ -1,3 +1,7 @@
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { createContainerlabSshRunner } from "../../src/services/inventory/containerlabSshRunner";
@@ -125,6 +129,53 @@ describe("Containerlab SSH command runner", () => {
     expect(line[0]).not.toContain("container;touch /tmp/no' &&");
     expect(connection.exec).not.toHaveBeenCalled();
     expect(connection.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs the quoted command from / with only its allowlisted environment and literal argv", async () => {
+    const channel = makeChannel();
+    let line = "";
+    const connection = makeConnection(vi.fn(async (remoteCommand) => {
+      line = remoteCommand;
+      setImmediate(() => channel.finish());
+      return channel.channel;
+    }));
+    const temporaryDirectory = mkdtempSync(join(tmpdir(), "containerlab-ssh-cwd-"));
+    const argumentMarker = join(temporaryDirectory, "argument-injection");
+    const environmentMarker = join(temporaryDirectory, "environment-injection");
+    const hostileArgument = `; touch ${argumentMarker} ; #`;
+    const hostileEnvironment = `literal ; $(touch ${environmentMarker})`;
+    const runnerCommand = command({
+      executable: process.execPath,
+      args: [
+        "-e",
+        "process.stdout.write(JSON.stringify({ cwd: process.cwd(), value: process.env.NEXUS_TEST_VALUE, args: process.argv.slice(1) }))",
+        hostileArgument,
+        "$(printf injected)",
+        "single'quote"
+      ],
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", LANG: "C", NEXUS_TEST_VALUE: hostileEnvironment }
+    });
+    const runner = createContainerlabSshRunner({ sshFactory: makeFactory(Promise.resolve(connection)) });
+    try {
+      await runner.run(runnerCommand, context());
+      const result = spawnSync("/bin/sh", ["-c", line], {
+        cwd: temporaryDirectory,
+        encoding: "utf8",
+        env: { ...process.env, NEXUS_UNRELATED: "must-be-cleared" }
+      });
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({
+        cwd: "/",
+        value: hostileEnvironment,
+        args: [hostileArgument, "$(printf injected)", "single'quote"]
+      });
+      expect(result.stdout).not.toContain("must-be-cleared");
+      expect(existsSync(argumentMarker)).toBe(false);
+      expect(existsSync(environmentMarker)).toBe(false);
+    } finally {
+      rmSync(temporaryDirectory, { recursive: true, force: true });
+    }
   });
 
   it("rejects an expired context before opening an SSH connection", async () => {
