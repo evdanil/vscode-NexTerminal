@@ -3518,6 +3518,79 @@ describe("nexus.server.edit — origin preservation (P1)", () => {
     expect(saved.origin?.proxyOwnership).toBeUndefined();
   });
 
+  it("a saved Keep Direct choice survives successive source-default SSH syncs", async () => {
+    const source = {
+      id: "netbox-1",
+      providerId: "netbox",
+      name: "NetBox",
+      targetFolder: "DC",
+      prunePolicy: "orphan" as const,
+      defaultUsername: "dev",
+      config: {},
+      secretFieldIds: []
+    };
+    const tree = {
+      contractVersion: 1 as const,
+      devices: [{ externalId: "device:42", name: "Server 1", endpoints: [{ kind: "ssh" as const, host: "example.com", port: 22 }] }]
+    };
+    const initial = computeSyncPlan({
+      source,
+      tree,
+      currentServers: [],
+      now: 1000,
+      sourceDefaultRoute: { kind: "direct" }
+    }).adds[0];
+    expect(initial.origin?.proxyOwnership).toEqual({ owner: "source-default", value: null });
+
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [initial]
+    });
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.edit")!(initial.id);
+    const panel = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as {
+      onSubmit: (values: Record<string, unknown>) => Promise<void>;
+    };
+    await panel.onSubmit({
+      name: initial.name,
+      host: initial.host,
+      port: initial.port,
+      username: initial.username,
+      authType: initial.authType,
+      proxyType: "none",
+      inventoryProxyRouteChoice: "direct"
+    });
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.proxy).toBeUndefined();
+    expect(saved.origin?.proxyOptOut).toBe(true);
+    expect(saved.origin?.proxyOwnership).toBeUndefined();
+
+    const labHost = makeServer({ id: "lab-host", name: "Lab Host", host: "lab.example.test", username: "lab", authType: "agent" });
+    const sourceSshRoute = { kind: "ssh" as const, jumpHostId: labHost.id };
+    const sync = (current: ServerConfig, now: number) =>
+      computeSyncPlan({
+        source,
+        tree,
+        currentServers: [current, labHost],
+        now,
+        sourceDefaultRoute: sourceSshRoute
+      });
+    const first = sync(saved, 2000);
+    expect(first.warnings.join("\n")).not.toMatch(/jump host no longer exists/i);
+    const afterFirst = first.updates.find((update) => update.after.id === saved.id)?.after;
+    expect(afterFirst).toBeDefined();
+    expect(afterFirst?.proxy).toBeUndefined();
+    expect(afterFirst?.origin?.proxyOptOut).toBe(true);
+    expect(afterFirst?.origin?.proxyOwnership).toBeUndefined();
+
+    const second = sync(afterFirst!, 3000);
+    const afterSecond = second.updates.find((update) => update.after.id === saved.id)?.after ?? afterFirst;
+    expect(afterSecond?.proxy).toBeUndefined();
+    expect(afterSecond?.origin?.proxyOptOut).toBe(true);
+    expect(afterSecond?.origin?.proxyOwnership).toBeUndefined();
+  });
+
   it("leaves origin undefined when editing a manually-added (never synced) server", async () => {
     const { ctx, addOrUpdateServer } = setupHarness({
       profiles: [],

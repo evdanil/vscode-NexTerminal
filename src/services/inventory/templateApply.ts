@@ -6,7 +6,12 @@ import type {
   ServerConfig,
   ServerOrigin
 } from "../../models/config";
-import { authProfileNeedsServerKeyPath, templatedHasAnyStamp } from "../../models/config";
+import {
+  authProfileNeedsServerKeyPath,
+  cloneInventoryProxyOwnership,
+  cloneTemplatedStamps,
+  templatedHasAnyStamp
+} from "../../models/config";
 import type { InventoryDevice, InventorySourceConfig, TemplateRule } from "../../models/inventory";
 import type { DeviceTemplateProfile, TemplateField, TemplateFieldMode } from "../../models/deviceTemplate";
 
@@ -896,11 +901,11 @@ export function applyTemplateMatrix(
   let clearProxy = false;
   let proxyWritten = false;
   const carried = ownedServer?.origin?.templated;
-  const templated: NonNullable<ServerOrigin["templated"]> = carried
-    ? { ...carried, proxy: carried.proxy ? { ...carried.proxy } : carried.proxy }
-    : {};
-  let proxyOwnership = ownedServer?.origin?.proxyOwnership;
-  const legacyProxyOwnership = proxyOwnership === undefined && carried?.proxy !== undefined;
+  const templated: NonNullable<ServerOrigin["templated"]> = carried ? cloneTemplatedStamps(carried) : {};
+  let proxyOwnership =
+    ownedServer?.origin?.proxyOwnership !== undefined
+      ? cloneInventoryProxyOwnership(ownedServer.origin.proxyOwnership)
+      : undefined;
   // Old releases stored only a template value stamp. It is enough to preserve
   // the old manual-edit boundary, but never enough to infer source ownership.
   if (proxyOwnership === undefined && carried?.proxy !== undefined) {
@@ -1048,14 +1053,9 @@ export function applyTemplateMatrix(
   applyId("ipmiAuthProfileId");
   applyId("ipmiGatewayServerId");
 
-  if (legacyProxyOwnership && !proxyWritten && carried?.proxy !== undefined) {
-    // An unchanged manual-clear/retained route is not a write. Keep its legacy
-    // receipt until some matrix decision actually writes the proxy.
-    templated.proxy = carried.proxy;
-    proxyOwnership = undefined;
-  } else {
-    delete templated.proxy;
-  }
+  // `templated.proxy` is accepted only as migration input. Every output carries
+  // the canonical ownership receipt, including unchanged/manual-route results.
+  delete templated.proxy;
   return {
     values,
     templated: templatedHasAnyStamp(templated) ? templated : undefined,

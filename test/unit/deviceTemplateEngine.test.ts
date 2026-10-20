@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { computeSyncPlan, type InventorySyncPlan } from "../../src/services/inventory/syncEngine";
-import { clearTemplatedStamps } from "../../src/services/inventory/templateApply";
+import { applyTemplateMatrix, clearTemplatedStamps } from "../../src/services/inventory/templateApply";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 import type { AuthProfile, ProxyConfig, ServerConfig, ServerOrigin } from "../../src/models/config";
 import type { InventoryDevice, InventorySourceConfig, InventorySourceDefaultRoute, InventoryTree, TemplateRule } from "../../src/models/inventory";
@@ -198,7 +198,7 @@ describe("device template matrix — non-auth fields", () => {
     const p = plan({
       source: makeSource({ templateRules: [rule("tmpl-1")] }),
       devices: [makeDevice()],
-      servers: [server],
+      servers: [server, { id: "lab-host", name: "Lab Host", host: "lab.example.test", port: 22, username: "lab", authType: "agent", isHidden: false }],
       templates: [template({ proxy: { mode: "fill", value: P_A } })],
       sourceDefaultRoute: { kind: "ssh", jumpHostId: "lab-host" }
     });
@@ -208,12 +208,14 @@ describe("device template matrix — non-auth fields", () => {
     expect(after.origin?.proxyOwnership).toEqual({ owner: "template", value: P_A });
     expect(after.origin?.templated?.proxy).toBeUndefined();
     expect(p.warnings.some((warning) => warning.includes('Proxy ← "T"'))).toBe(true);
+    expect(p.warnings.join("\n")).not.toMatch(/jump host no longer exists/i);
   });
 
   it("lets explicit template Direct beat the source default and records Direct ownership", () => {
     const p = plan({
       source: makeSource({ templateRules: [rule("tmpl-1")] }),
       devices: [makeDevice()],
+      servers: [{ id: "lab-host", name: "Lab Host", host: "lab.example.test", port: 22, username: "lab", authType: "agent", isHidden: false }],
       templates: [template({ proxy: { mode: "override", value: null } })],
       sourceDefaultRoute: { kind: "ssh", jumpHostId: "lab-host" }
     });
@@ -222,6 +224,7 @@ describe("device template matrix — non-auth fields", () => {
     expect("proxy" in p.adds[0]).toBe(false);
     expect(p.adds[0].origin?.proxyOwnership).toEqual({ owner: "template", value: null });
     expect(p.warnings.some((warning) => warning.includes('Proxy ← "T"'))).toBe(true);
+    expect(p.warnings.join("\n")).not.toMatch(/jump host no longer exists/i);
   });
 
   it("releases a legacy template-owned route to a capable source default and migrates its stamp", () => {
@@ -250,7 +253,7 @@ describe("device template matrix — non-auth fields", () => {
     const p = plan({
       source: makeSource(),
       devices: [makeDevice({ externalId: "device:1", name: "renamed-manual" }), makeDevice({ externalId: "manual-direct", name: "renamed-direct" })],
-      servers: [manual, optOut],
+      servers: [manual, optOut, { id: "lab-host", name: "Lab Host", host: "lab.example.test", port: 22, username: "lab", authType: "agent", isHidden: false }],
       sourceDefaultRoute: { kind: "ssh", jumpHostId: "lab-host" }
     });
 
@@ -259,6 +262,109 @@ describe("device template matrix — non-auth fields", () => {
     expect(afterFor(p, optOut.id)?.proxy).toBeUndefined();
     expect(afterFor(p, optOut.id)?.origin?.proxyOptOut).toBe(true);
     expect(afterFor(p, optOut.id)?.origin?.proxyOwnership).toBeUndefined();
+    expect(p.warnings.join("\n")).not.toMatch(/jump host no longer exists/i);
+  });
+
+  it("migrates a legacy template receipt on an unrelated write without writing a route", () => {
+    const server = ownedServer({ proxy: P_C }, { templated: undefined });
+    server.origin = { ...server.origin!, templated: { proxy: P_A } };
+
+    const matrix = applyTemplateMatrix(server, { multiplexing: { value: true, mode: "override" } });
+
+    expect(matrix.values.multiplexing).toBe(true);
+    expect(matrix.proxyWritten).toBe(false);
+    expect(matrix.values).not.toHaveProperty("proxy");
+    expect(matrix.clearProxy).toBe(false);
+    expect(matrix.proxyOwnership).toEqual({ owner: "template", value: P_A });
+    expect(matrix.templated?.proxy).toBeUndefined();
+  });
+
+  it("prefers canonical ownership over a simultaneous legacy template receipt", () => {
+    const server = ownedServer({ proxy: P_C }, { templated: undefined });
+    server.origin = {
+      ...server.origin!,
+      proxyOwnership: { owner: "source-default", value: P_C },
+      templated: { proxy: P_A }
+    };
+
+    const matrix = applyTemplateMatrix(server, {});
+
+    expect(matrix.proxyWritten).toBe(false);
+    expect(matrix.proxyOwnership).toEqual({ owner: "source-default", value: P_C });
+    expect(matrix.templated?.proxy).toBeUndefined();
+  });
+
+  it("drops a legacy receipt when manual Direct intent is present", () => {
+    const server = ownedServer({ proxy: undefined }, { proxyOptOut: true, templated: undefined });
+    server.origin = { ...server.origin!, proxyOptOut: true, templated: { proxy: P_A } };
+
+    const matrix = applyTemplateMatrix(server, {
+      proxy: { value: P_B, mode: "override", owner: "source-default" }
+    });
+
+    expect(matrix.proxyWritten).toBe(false);
+    expect(matrix.values).not.toHaveProperty("proxy");
+    expect(matrix.proxyOwnership).toBeUndefined();
+    expect(matrix.templated?.proxy).toBeUndefined();
+  });
+
+  it("keeps the old template receipt when a source default meets a manual route", () => {
+    const server = ownedServer({ proxy: P_C }, { templated: undefined });
+    server.origin = { ...server.origin!, templated: { proxy: P_A } };
+
+    const matrix = applyTemplateMatrix(server, {
+      proxy: { value: P_B, mode: "override", owner: "source-default" }
+    });
+
+    expect(matrix.proxyWritten).toBe(false);
+    expect(matrix.values).not.toHaveProperty("proxy");
+    expect(matrix.clearProxy).toBe(false);
+    expect(matrix.proxyOwnership).toEqual({ owner: "template", value: P_A });
+    expect(matrix.templated?.proxy).toBeUndefined();
+  });
+
+  it("clones carried ownership and template stamps when an unchanged matrix returns them", () => {
+    const server = ownedServer({ proxy: P_A }, { templated: undefined });
+    server.origin = {
+      ...server.origin!,
+      proxyOwnership: { owner: "template", value: { ...P_A } },
+      templated: { multiplexing: false }
+    };
+
+    const matrix = applyTemplateMatrix(server, {});
+    expect(matrix.proxyWritten).toBe(false);
+    expect(matrix.proxyOwnership).not.toBe(server.origin.proxyOwnership);
+    expect(matrix.templated).not.toBe(server.origin.templated);
+
+    (matrix.proxyOwnership!.value as typeof P_A).host = "mutated.example.test";
+    matrix.templated!.multiplexing = true;
+
+    expect((server.origin.proxyOwnership!.value as typeof P_A).host).toBe(P_A.host);
+    expect(server.origin.templated!.multiplexing).toBe(false);
+  });
+
+  it("adoption retains a cloned detached proxy receipt", () => {
+    const detachedRoute = { type: "socks5" as const, host: "detached-proxy.example.test", port: 1080 };
+    const kept = keptServer({
+      id: "kept-receipt",
+      proxy: { ...detachedRoute },
+      formerlySynced: {
+        ...keptServer().formerlySynced!,
+        proxyOwnership: { owner: "template", value: { ...detachedRoute } }
+      }
+    });
+    const p = plan({
+      source: makeSource(),
+      devices: [makeDevice()],
+      servers: [kept],
+      adoptionChoice: "adopt",
+      providerInstanceKey: DEVICE_INSTANCE
+    });
+
+    const adopted = afterFor(p, kept.id)!;
+    expect(adopted.origin?.proxyOwnership).toEqual({ owner: "template", value: detachedRoute });
+    (adopted.origin!.proxyOwnership!.value as typeof detachedRoute).host = "mutated-adoption.example.test";
+    expect((kept.formerlySynced!.proxyOwnership!.value as typeof detachedRoute).host).toBe(detachedRoute.host);
   });
 
   it("restores detached proxy ownership and manual Direct intent before the adoption matrix runs", () => {

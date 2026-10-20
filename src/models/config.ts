@@ -1253,7 +1253,7 @@ export function mergeServerConfigFields(prior: ServerConfig, batchSnapshot: Serv
   // an `origin` and a stale marker (inert by the engine's own first clause, but
   // a lie about the record's history either way).
   if (!detachedOriginsEqual(current.formerlySynced, batchSnapshot.formerlySynced)) {
-    merged.formerlySynced = current.formerlySynced ? { ...current.formerlySynced } : current.formerlySynced;
+    merged.formerlySynced = current.formerlySynced ? cloneDetachedServerOrigin(current.formerlySynced) : current.formerlySynced;
   }
   // id never changes across a rollback merge — always prior's (== current's,
   // == batchSnapshot's; the map key this is stored under is invariant).

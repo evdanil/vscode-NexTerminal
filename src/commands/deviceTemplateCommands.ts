@@ -48,13 +48,11 @@ import { resolveSourceIdArg } from "./inventoryCommands";
  * Reads one field's `{mode, value}` off the submitted form, or `undefined` when
  * the mode select is "Not set".
  *
- * P3 (adversarial minor 4) — when the mode IS `fill`/`override` but the value
- * control resolves to nothing usable (proxyType "none"/invalid host, no auth
- * profile picked), the field is NOT silently dropped: that discards a choice the
- * user deliberately made and re-opens showing "Not set" where they chose a mode.
- * Instead throw, routing the message through the form framework's validation
- * channel (`webviewFormPanel`'s submit try/catch surfaces it and keeps the form
- * open), exactly like the "Name is required" reject below.
+ * P3 — when Fill/Override has an explicitly configured value control that is
+ * incomplete (a concrete proxy type without its required fields, or no auth
+ * profile), reject the submit so the user can correct it in place. Old saved
+ * forms also submitted proxyType="none" while retaining a stale mode; that
+ * specific legacy state means no opinion and is omitted before this helper.
  */
 function readTemplateField<T>(
   values: FormValues,
@@ -84,9 +82,16 @@ export function parseDeviceTemplateFormValues(values: FormValues, existingId?: s
     throw new Error("Name is required");
   }
   const fields: DeviceTemplateProfile["fields"] = {};
-  const proxy = readTemplateField<ProxyConfig | null>(values, "proxy", () => values.proxyType === "direct" ? null : formValuesToProxy(values));
-  if (proxy !== undefined) {
-    fields.proxy = proxy;
+  // Older forms could leave Fill/Override selected while Proxy was None. None
+  // and a missing type mean no opinion; explicit Direct remains a configured
+  // null value, and explicit concrete/unknown selections keep strict validation.
+  if (values.proxyType !== undefined && values.proxyType !== "none") {
+    const proxy = readTemplateField<ProxyConfig | null>(values, "proxy", () =>
+      values.proxyType === "direct" ? null : formValuesToProxy(values)
+    );
+    if (proxy !== undefined) {
+      fields.proxy = proxy;
+    }
   }
   const auth = readTemplateField<string>(values, "authProfileId", () => {
     const raw = values.authProfileId;
