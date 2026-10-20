@@ -9,6 +9,7 @@ import type {
   ContainerlabRunContext
 } from "../../src/services/inventory/containerlabRuntimeContracts";
 import { parseContainerlabConfig } from "../../src/services/inventory/providers/containerlabConfig";
+import { CONTAINERLAB_INSPECT_ARGS, CONTAINERLAB_VERSION_ARGS } from "../../src/services/inventory/providers/containerlabCommands";
 import { createContainerlabActivationController } from "../../src/services/inventory/containerlabActivation";
 
 const LOCAL_VALUES: InventorySourceValues = {
@@ -537,16 +538,67 @@ describe("Containerlab activation", () => {
     expect(harness.executor.inspect).not.toHaveBeenCalled();
   });
 
-  it("describes the selected Docker daemon before asking to Run", async () => {
+  it.each([
+    { runner: "host", reference: "", runnerMetadata: "Host mode uses no image/container metadata command.", mount: "Host mode creates no helper or container socket mount." },
+    {
+      runner: "disposable",
+      reference: "example.test/clab:fixed",
+      runnerMetadata: ["/opt/custom/docker", "--host", "unix:///run/custom.sock", "image", "inspect", "--format", "{{.Id}}", "example.test/clab:fixed"],
+      mount: 'Creates a temporary helper with a new read/write bind from "/run/custom.sock" to "/var/run/docker.sock".'
+    },
+    {
+      runner: "existing",
+      reference: "clab-existing",
+      runnerMetadata: ["/opt/custom/docker", "--host", "unix:///run/custom.sock", "container", "inspect", "--format", "{{json .}}", "clab-existing"],
+      mount: 'Requires the existing container to have a read/write bind from "/run/custom.sock" to "/var/run/docker.sock"; discovery does not create this mount.'
+    }
+  ] as const)("discloses the exact $runner execution scope before Run", async ({ runner, reference, runnerMetadata, mount }) => {
+    const values: InventorySourceValues = {
+      ...REMOTE_VALUES,
+      runner,
+      containerlabExecutable: "/opt/custom/clab",
+      dockerExecutable: "/opt/custom/docker",
+      dockerSocket: "/run/custom.sock",
+      sudo: true,
+      ...(runner === "disposable" ? { runnerImage: reference } : {}),
+      ...(runner === "existing" ? { runnerContainer: reference } : {})
+    };
     const descriptions: string[] = [];
-    const harness = await makeHarness({ confirmRun: async (description) => { descriptions.push(description); return true; } });
+    const harness = await makeHarness({
+      confirmRun: async (description) => { descriptions.push(description); return false; },
+      beforeController: async (core) => {
+        await core.addOrUpdateServer({ ...sshServer("lab-host", "lab.example.test"), name: "Lab\nhost" });
+        await core.addOrUpdateInventorySource(makeSource(values, { id: "source-1" }));
+      }
+    });
 
-    await harness.controller.inspect(harness.config, context(harness.source, "test"));
+    await expect(harness.controller.inspect(harness.config, context(harness.source, "test"))).rejects.toThrow(/canceled/i);
 
     expect(descriptions).toHaveLength(1);
-    expect(descriptions[0]).toContain("/var/run/docker.sock");
-    expect(descriptions[0]).toContain("docker");
-    expect(descriptions[0]).toContain("inspect");
+    const description = descriptions[0];
+    const shownArgv = (args: readonly string[]) => `[${args.map((arg) => JSON.stringify(arg)).join(", ")}]`;
+    expect(description).toContain('SSH host "Lab host"');
+    expect(description).toContain('Configured Docker executable: "/opt/custom/docker".');
+    expect(description).toContain("/opt/custom/clab");
+    expect(description).toContain("/run/custom.sock");
+    expect(description).toContain(`Selected Docker daemon info argv: ${shownArgv([
+      "/opt/custom/docker", "--host", "unix:///run/custom.sock", "info", "--format", "{{json .}}"
+    ])}`);
+    expect(description).toContain(`Selected runner metadata: ${typeof runnerMetadata === "string" ? runnerMetadata : shownArgv(runnerMetadata)}`);
+    expect(description).toContain(`Containerlab version preflight argv: ${shownArgv(["/opt/custom/clab", ...CONTAINERLAB_VERSION_ARGS])}`);
+    expect(description).toContain(`Detailed inspection argv: ${shownArgv(["/opt/custom/clab", ...CONTAINERLAB_INSPECT_ARGS])}`);
+    if (reference) expect(description).toContain(reference);
+    const runnerDisclosure = runner === "host"
+      ? 'host mode runs configured Containerlab executable "/opt/custom/clab" directly'
+      : `${runner === "disposable" ? 'disposable Docker image "example.test/clab:fixed"' : 'existing Docker container "clab-existing"'} runs configured Containerlab executable "/opt/custom/clab"`;
+    expect(description).toContain(`Runner: ${runnerDisclosure}.`);
+    expect(description).toContain(mount);
+    expect(description).toMatch(/noninteractive sudo/i);
+    expect(description).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);
+    if (runner === "host") expect(description).not.toMatch(/Creates a temporary helper|Requires the existing container/i);
+    expect(harness.executor.resolveDependencies).not.toHaveBeenCalled();
+    expect(harness.executor.preflight).not.toHaveBeenCalled();
+    expect(harness.executor.inspect).not.toHaveBeenCalled();
   });
 
   it("fails closed when approval state cannot be read or written", async () => {
@@ -566,6 +618,118 @@ describe("Containerlab activation", () => {
     await expect(second.controller.inspect(second.config, context(second.source, "sync"))).rejects.toThrow(/approval|state|read only/i);
     expect(second.executor.preflight).toHaveBeenCalledOnce();
     expect(second.executor.inspect).not.toHaveBeenCalled();
+  });
+
+  it("keeps unrelated provider writes and reference clearing independent of a failed approval store", async () => {
+    const store = memoryStore();
+    store.load.mockRejectedValueOnce(new Error("approval state unavailable"));
+    const templatedSource = makeSource({ baseUrl: "https://netbox.example.test" }, {
+      id: "netbox-template-source",
+      providerId: "netbox",
+      templateRules: [{ id: "rule-1", templateId: "template-1", filter: "role=core" }]
+    });
+    const harness = await makeHarness({
+      store,
+      beforeController: async (core) => {
+        await core.addOrUpdateDeviceTemplate({ id: "template-1", name: "Template", fields: {} });
+        await core.addOrUpdateInventorySource(templatedSource);
+      }
+    });
+
+    await expect(harness.controller.inspect(harness.config, context(harness.source, "sync")))
+      .rejects.toThrow(/approval state unavailable/i);
+    expect(store.load).toHaveBeenCalledOnce();
+
+    await harness.core.addOrUpdateInventorySource(makeSource({ baseUrl: "https://netbox.example.test" }, {
+      id: "netbox-unrelated",
+      providerId: "netbox"
+    }));
+    const created = harness.core.getInventorySource("netbox-unrelated")!;
+    await harness.core.addOrUpdateInventorySource({
+      ...created,
+      config: { baseUrl: "https://renamed.example.test" }
+    });
+    await harness.core.addOrUpdateInventorySource({
+      ...harness.core.getInventorySource(created.id)!,
+      name: "Renamed NetBox"
+    });
+    await harness.core.removeInventorySource(created.id);
+    await harness.core.removeDeviceTemplate("template-1");
+
+    expect(harness.core.getInventorySource(templatedSource.id)?.templateRules).toEqual([]);
+    expect(store.load).toHaveBeenCalledOnce();
+    expect(store.save).not.toHaveBeenCalled();
+  });
+
+  it("does not let a rejecting Containerlab approval save block an unrelated source creation", async () => {
+    const store = memoryStore();
+    store.save.mockRejectedValueOnce(new Error("approval disk unavailable"));
+    const harness = await makeHarness({ store });
+
+    await harness.core.addOrUpdateInventorySource(makeSource({ baseUrl: "https://netbox.example.test" }, {
+      id: "netbox-after-save-failure",
+      providerId: "netbox"
+    }));
+
+    expect(harness.core.getInventorySource("netbox-after-save-failure")).toMatchObject({ providerId: "netbox" });
+    expect(store.load).not.toHaveBeenCalled();
+    expect(store.save).not.toHaveBeenCalled();
+  });
+
+  it("does not let an unrelated create or delete preserve a pending Containerlab Add association", async () => {
+    const harness = await makeHarness();
+    const sessionId = harness.controller.beginFormSession();
+    harness.controller.updateFormSession(sessionId, harness.source.config);
+    await harness.controller.inspect(harness.config, { intent: "test", subject: { kind: "form", sessionId } });
+    const cleanup = harness.controller.prepareFormSourceSave(sessionId, "reused-source-id");
+    try {
+      await harness.core.addOrUpdateInventorySource(makeSource({ baseUrl: "https://netbox.example.test" }, {
+        id: "reused-source-id",
+        providerId: "netbox"
+      }));
+    } finally {
+      cleanup();
+    }
+    await harness.core.removeInventorySource("reused-source-id");
+    await harness.core.addOrUpdateInventorySource(makeSource(LOCAL_VALUES, { id: "reused-source-id" }));
+    const replacement = harness.core.getInventorySource("reused-source-id")!;
+
+    await expect(harness.controller.transferFormApproval(sessionId, replacement)).rejects.toThrow(/save|approval|transfer/i);
+    vi.mocked(harness.executor.resolveDependencies).mockClear();
+    vi.mocked(harness.executor.preflight).mockClear();
+    vi.mocked(harness.executor.inspect).mockClear();
+    await expect(harness.controller.inspect(harness.config, context(replacement, "background-status")))
+      .rejects.toThrow(/Test|Sync|approv/i);
+    expect(harness.executor.resolveDependencies).not.toHaveBeenCalled();
+    expect(harness.executor.preflight).not.toHaveBeenCalled();
+    expect(harness.executor.inspect).not.toHaveBeenCalled();
+  });
+
+  it("does not restore an approval across transitions away from and back to Containerlab", async () => {
+    const harness = await makeHarness();
+    await harness.controller.inspect(harness.config, context(harness.source, "sync"));
+    const opened = harness.core.getInventorySource(harness.source.id)!;
+
+    await harness.core.addOrUpdateInventorySource({
+      ...opened,
+      providerId: "netbox",
+      config: { baseUrl: "https://netbox.example.test" }
+    });
+    await harness.core.addOrUpdateInventorySource({
+      ...harness.core.getInventorySource(opened.id)!,
+      providerId: "containerlab",
+      config: opened.config
+    });
+    const returned = harness.core.getInventorySource(opened.id)!;
+
+    vi.mocked(harness.executor.resolveDependencies).mockClear();
+    vi.mocked(harness.executor.preflight).mockClear();
+    vi.mocked(harness.executor.inspect).mockClear();
+    await expect(harness.controller.inspect(harness.config, context(returned, "background-status")))
+      .rejects.toThrow(/Test|Sync|approv/i);
+    expect(harness.executor.resolveDependencies).not.toHaveBeenCalled();
+    expect(harness.executor.preflight).not.toHaveBeenCalled();
+    expect(harness.executor.inspect).not.toHaveBeenCalled();
   });
 
   it("transfers only the current tested form approval to an exact saved source", async () => {
@@ -713,7 +877,7 @@ describe("Containerlab activation", () => {
     ).rejects.toThrow(/form|session|closed|save/i);
   });
 
-  it("does not transfer a form approval after its tested values change or session closes", async () => {
+  it("does not transfer a staged Add approval after its tested form values change", async () => {
     const harness = await makeHarness();
     const sessionId = harness.controller.beginFormSession();
     harness.controller.updateFormSession(sessionId, harness.source.config);
@@ -721,13 +885,100 @@ describe("Containerlab activation", () => {
       intent: "test",
       subject: { kind: "form", sessionId }
     });
+    const cleanup = harness.controller.prepareFormSourceSave(sessionId, "changed-form-source");
+    try {
+      await harness.core.addOrUpdateInventorySource(makeSource(harness.source.config, { id: "changed-form-source" }));
+    } finally {
+      cleanup();
+    }
+    const saved = harness.core.getInventorySource("changed-form-source")!;
+
+    vi.mocked(harness.executor.resolveDependencies).mockClear();
+    vi.mocked(harness.executor.preflight).mockClear();
+    vi.mocked(harness.executor.inspect).mockClear();
     harness.controller.updateFormSession(sessionId, { ...harness.source.config, sudo: true });
 
-    await expect(harness.controller.transferFormApproval(sessionId, harness.source)).rejects.toThrow(/changed|tested|approval/i);
-    harness.controller.endFormSession(sessionId);
+    await expect(harness.controller.transferFormApproval(sessionId, saved)).rejects.toThrow(/changed|tested|approval|save/i);
     await expect(
-      harness.controller.inspect(harness.config, { intent: "test", subject: { kind: "form", sessionId } })
-    ).rejects.toThrow(/form|session/i);
-    expect(harness.executor.resolveDependencies).toHaveBeenCalledOnce();
+      harness.controller.inspect(harness.config, context(saved, "background-status"))
+    ).rejects.toThrow(/Test|Sync|approv/i);
+    expect(harness.executor.resolveDependencies).not.toHaveBeenCalled();
+    expect(harness.executor.preflight).not.toHaveBeenCalled();
+    expect(harness.executor.inspect).not.toHaveBeenCalled();
+  });
+
+  it("does not transfer a staged Add approval after its SSH dependency chain changes", async () => {
+    const harness = await makeHarness({
+      beforeController: async (core) => {
+        await core.addOrUpdateServer(sshServer("lab-host", "lab.example.test", { type: "ssh", jumpHostId: "jump-host" }));
+        await core.addOrUpdateServer(sshServer("jump-host", "jump.example.test"));
+        await core.addOrUpdateInventorySource(makeSource(REMOTE_VALUES, { id: "source-1" }));
+      }
+    });
+    vi.mocked(harness.executor.resolveDependencies).mockImplementation(async (_config, runContext) => ({
+      identity: identity({ location: "ssh", routeIdentity: runContext.labHostRouteIdentity! })
+    }));
+    const sessionId = harness.controller.beginFormSession();
+    harness.controller.updateFormSession(sessionId, harness.source.config);
+    await harness.controller.inspect(parseContainerlabConfig(harness.source.config), {
+      intent: "test",
+      subject: { kind: "form", sessionId }
+    });
+    const cleanup = harness.controller.prepareFormSourceSave(sessionId, "remote-form-source");
+    try {
+      await harness.core.addOrUpdateInventorySource(makeSource(harness.source.config, { id: "remote-form-source" }));
+    } finally {
+      cleanup();
+    }
+    const saved = harness.core.getInventorySource("remote-form-source")!;
+
+    vi.mocked(harness.executor.resolveDependencies).mockClear();
+    vi.mocked(harness.executor.preflight).mockClear();
+    vi.mocked(harness.executor.inspect).mockClear();
+    await harness.core.addOrUpdateServer(sshServer("jump-host", "changed-jump.example.test"));
+
+    await expect(harness.controller.transferFormApproval(sessionId, saved)).rejects.toThrow(/SSH dependencies|changed/i);
+    await expect(harness.controller.inspect(parseContainerlabConfig(saved.config), context(saved, "background-status")))
+      .rejects.toThrow(/Test|Sync|approv/i);
+    expect(harness.executor.resolveDependencies).not.toHaveBeenCalled();
+    expect(harness.executor.preflight).not.toHaveBeenCalled();
+    expect(harness.executor.inspect).not.toHaveBeenCalled();
+  });
+
+  it("checks form authority again after a staged transfer save completes", async () => {
+    const harness = await makeHarness();
+    const sessionId = harness.controller.beginFormSession();
+    harness.controller.updateFormSession(sessionId, harness.source.config);
+    await harness.controller.inspect(harness.config, { intent: "test", subject: { kind: "form", sessionId } });
+    const cleanup = harness.controller.prepareFormSourceSave(sessionId, "held-transfer-source");
+    try {
+      await harness.core.addOrUpdateInventorySource(makeSource(harness.source.config, { id: "held-transfer-source" }));
+    } finally {
+      cleanup();
+    }
+    const saved = harness.core.getInventorySource("held-transfer-source")!;
+    const saveEntered = deferred<void>();
+    const releaseSave = deferred<void>();
+    const saveNormally = harness.store.save.getMockImplementation()!;
+    harness.store.save.mockClear();
+    harness.store.save.mockImplementationOnce(async (document: unknown) => {
+      saveEntered.resolve();
+      await releaseSave.promise;
+      await saveNormally(document);
+    });
+    vi.mocked(harness.executor.resolveDependencies).mockClear();
+    vi.mocked(harness.executor.preflight).mockClear();
+    vi.mocked(harness.executor.inspect).mockClear();
+
+    const transfer = harness.controller.transferFormApproval(sessionId, saved);
+    await saveEntered.promise;
+    harness.controller.updateFormSession(sessionId, { ...harness.source.config, sudo: true });
+    releaseSave.resolve();
+
+    await expect(transfer).rejects.toThrow(/changed|form|source/i);
+    await expect(harness.controller.inspect(harness.config, context(saved, "background-status"))).rejects.toThrow(/Test|Sync|approv/i);
+    expect(harness.executor.resolveDependencies).not.toHaveBeenCalled();
+    expect(harness.executor.preflight).not.toHaveBeenCalled();
+    expect(harness.executor.inspect).not.toHaveBeenCalled();
   });
 });

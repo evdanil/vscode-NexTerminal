@@ -175,6 +175,25 @@ function makeSource(overrides: Partial<InventorySourceConfig> = {}): InventorySo
   };
 }
 
+const malformedSharedConfigShapes: ReadonlyArray<{ readonly label: string; readonly value?: unknown; readonly absent?: true }> = [
+  { label: "null", value: null },
+  { label: "boolean", value: true },
+  { label: "number", value: 1 },
+  { label: "array", value: [] },
+  { label: "string", value: "malformed" },
+  { label: "absent config", absent: true }
+];
+
+function sourceWithMalformedConfig(providerId: string, id: string, shape: (typeof malformedSharedConfigShapes)[number]): Record<string, unknown> {
+  const source = { ...makeSource({ id, providerId }) } as unknown as Record<string, unknown>;
+  if (shape.absent) {
+    delete source.config;
+  } else {
+    source.config = shape.value;
+  }
+  return source;
+}
+
 function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
   return {
     id: "srv-1",
@@ -228,6 +247,18 @@ beforeEach(async () => {
 describe("sanitizeForSharing — inventory sources", () => {
   const share = (sources: InventorySourceConfig[], servers: ServerConfig[] = [], profiles: AuthProfile[] = [], templates: DeviceTemplateProfile[] = []) =>
     sanitizeForSharing(servers, [], [], [], {}, profiles, [], sources, templates, []);
+
+  it.each(["containerlab", "netbox"] as const)("preserves malformed %s config shapes in the existing export contract", (providerId) => {
+    for (const [index, shape] of malformedSharedConfigShapes.entries()) {
+      const source = sourceWithMalformedConfig(providerId, `malformed-${index}`, shape);
+      const [shipped] = share([source as unknown as InventorySourceConfig]).inventorySources;
+      if (shape.absent) {
+        expect(shipped).not.toHaveProperty("config");
+      } else {
+        expect(shipped.config).toEqual(shape.value);
+      }
+    }
+  });
 
   it("ships each source with a fresh id and WITHOUT its trust stamp, sync bookkeeping or incarnation token (⊘ any of `providerFingerprint`, `revision`, `managedFolders`, `lastSyncAt` surviving the spread)", () => {
     const source = makeSource({
@@ -1259,6 +1290,23 @@ describe("the same rules in both directions — a hand-edited file", () => {
 // ---------------------------------------------------------------------------
 
 describe("share import — inventory sources", () => {
+  it.each(["containerlab", "netbox"] as const)("rejects malformed %s config shapes and continues importing the valid neighbor", async (providerId) => {
+    const recipient = await makeMachine();
+    const malformed = malformedSharedConfigShapes.map((shape, index) => sourceWithMalformedConfig(providerId, `malformed-${index}`, shape));
+    const validNeighbor = makeSource({
+      id: "valid-neighbor",
+      name: "Valid neighbor",
+      providerId,
+      defaultUsername: "user",
+      config: providerId === "containerlab" ? { location: "local", runner: "host" } : { baseUrl: "https://netbox.example.com" }
+    });
+
+    await importShare(recipient, shareJson({ inventorySources: [...malformed, validNeighbor] }));
+
+    expect(recipient.core.getSnapshot().inventorySources.map((source) => source.name)).toEqual(["Valid neighbor"]);
+    expect(lastInfoMessage()).toContain("(6 skipped)");
+  });
+
   it("remaps a Containerlab discovery host through the imported multi-hop SSH chain", async () => {
     const recipient = await makeMachine();
     const source = makeSource({

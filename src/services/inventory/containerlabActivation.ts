@@ -1,5 +1,5 @@
 import { cloneServerConfig, type ServerConfig } from "../../models/config";
-import type { InventoryOperationContext, InventorySourceConfig, InventorySourceValues } from "../../models/inventory";
+import { flattenProviderText, type InventoryOperationContext, type InventorySourceConfig, type InventorySourceValues } from "../../models/inventory";
 import type { NexusCore, InventorySourceMutation, InventorySourceMutationPreparation } from "../../core/nexusCore";
 import {
   assertInventorySourceDependenciesCurrent,
@@ -13,6 +13,7 @@ import type {
   ContainerlabRunContext
 } from "./containerlabRuntimeContracts";
 import { parseContainerlabConfig, type ContainerlabConfig } from "./providers/containerlabConfig";
+import { CONTAINERLAB_INSPECT_ARGS, CONTAINERLAB_VERSION_ARGS } from "./providers/containerlabCommands";
 
 const RUN_DEADLINE_MS = 30_000;
 const APPROVAL_SCHEMA = 1;
@@ -352,14 +353,65 @@ export function createContainerlabActivationController(
   };
 
   const runDescription = (config: ContainerlabConfig, host?: ServerConfig): string => {
-    const location = config.location === "ssh" ? `SSH host ${host?.name ?? config.labHostId}` : "this extension host";
+    const displayArg = (value: string): string => JSON.stringify(flattenProviderText(value));
+    const argv = (args: readonly string[]): string => `[${args.map(displayArg).join(", ")}]`;
+    const location = config.location === "ssh"
+      ? `SSH host ${displayArg(host?.name ?? config.labHostId ?? "unresolved host")}`
+      : "this extension host";
+    const dockerInfoArgs = [
+      config.dockerExecutable,
+      "--host",
+      `unix://${config.dockerSocket}`,
+      "info",
+      "--format",
+      "{{json .}}"
+    ];
     const runner = config.runner === "host"
-      ? `host binary ${config.containerlabExecutable}`
+      ? `host mode runs configured Containerlab executable ${displayArg(config.containerlabExecutable)} directly`
       : config.runner === "disposable"
-        ? `disposable Docker image ${config.runnerImage}`
-        : `existing Docker container ${config.runnerContainer}`;
-    const sudo = config.sudo ? " using noninteractive sudo" : " without sudo";
-    return `Run Containerlab discovery on ${location} with ${runner}${sudo}. Docker daemon: ${config.dockerSocket}. It will check Docker info and the selected runner, run Containerlab version, then inspect all labs with details.`;
+        ? `disposable Docker image ${displayArg(config.runnerImage!)} runs configured Containerlab executable ${displayArg(config.containerlabExecutable)}`
+        : `existing Docker container ${displayArg(config.runnerContainer!)} runs configured Containerlab executable ${displayArg(config.containerlabExecutable)}`;
+    const runnerMetadata = config.runner === "host"
+      ? "Host mode uses no image/container metadata command."
+      : config.runner === "disposable"
+        ? argv([
+            config.dockerExecutable,
+            "--host",
+            `unix://${config.dockerSocket}`,
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+            config.runnerImage!
+          ])
+        : argv([
+            config.dockerExecutable,
+            "--host",
+            `unix://${config.dockerSocket}`,
+            "container",
+            "inspect",
+            "--format",
+            "{{json .}}",
+            config.runnerContainer!
+          ]);
+    const mount = config.runner === "disposable"
+      ? `Creates a temporary helper with a new read/write bind from ${displayArg(config.dockerSocket)} to ${displayArg("/var/run/docker.sock")}.`
+      : config.runner === "existing"
+        ? `Requires the existing container to have a read/write bind from ${displayArg(config.dockerSocket)} to ${displayArg("/var/run/docker.sock")}; discovery does not create this mount.`
+        : "Host mode creates no helper or container socket mount.";
+    const sudo = config.sudo ? "noninteractive sudo enabled" : "sudo disabled";
+    const description = [
+      `Run Containerlab discovery on ${location}.`,
+      `Configured Docker executable: ${displayArg(config.dockerExecutable)}.`,
+      `Selected Docker daemon info argv: ${argv(dockerInfoArgs)}.`,
+      `Runner: ${runner}.`,
+      `Selected runner metadata: ${runnerMetadata}`,
+      `Containerlab version preflight argv: ${argv([config.containerlabExecutable, ...CONTAINERLAB_VERSION_ARGS])}.`,
+      `Detailed inspection argv: ${argv([config.containerlabExecutable, ...CONTAINERLAB_INSPECT_ARGS])}.`,
+      `Sudo policy: ${sudo}.`,
+      mount
+    ].join(" ");
+    return flattenProviderText(description);
   };
 
   const newGeneration = (): string => createId();
@@ -416,7 +468,14 @@ export function createContainerlabActivationController(
 
   const prepareCoreMutation = async (
     mutation: InventorySourceMutation
-  ): Promise<InventorySourceMutationPreparation> => {
+  ): Promise<InventorySourceMutationPreparation | undefined> => {
+    if (mutation.previous?.providerId !== "containerlab" && mutation.next?.providerId !== "containerlab") {
+      // Consume any local association for an intervening ID occupant without
+      // making unrelated providers depend on Containerlab's local state store.
+      revokeSourceMemory(mutation.sourceId, true);
+      return undefined;
+    }
+
     const token = createId();
     pendingSourceMutations.set(mutation.sourceId, token);
     const transferAssociation = mutation.kind === "replace" || mutation.kind === "delete"

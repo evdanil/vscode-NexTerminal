@@ -2358,11 +2358,16 @@ function sanitizeSharedSourceConfig(providerId: unknown, config: InventorySource
 
 function sanitizeAndRemapSharedSourceConfig(
   providerId: unknown,
-  config: InventorySourceValues,
+  config: unknown,
   secretFieldIds: unknown,
   linkServer: (id: string) => string | undefined
-): InventorySourceValues {
-  const next = sanitizeSharedSourceConfig(providerId, config, secretFieldIds);
+): InventorySourceValues | undefined {
+  // Sanitization transforms a config object; it must not make a malformed
+  // payload object-shaped, or import validation would accept it after repair.
+  if (typeof config !== "object" || config === null || Array.isArray(config)) {
+    return config as InventorySourceValues | undefined;
+  }
+  const next = sanitizeSharedSourceConfig(providerId, config as InventorySourceValues, secretFieldIds);
   if (providerId === "containerlab") {
     const sourceHostId = next.labHostId;
     if (typeof sourceHostId === "string") {
