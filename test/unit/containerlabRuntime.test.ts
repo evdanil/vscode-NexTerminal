@@ -589,6 +589,46 @@ describe("Containerlab runtime execution", () => {
     ]);
   });
 
+  it("accepts an exact 64-character name and pins execution to the returned canonical ID", async () => {
+    const containerName = "a".repeat(64);
+    const fake = commandRunner((command) => {
+      if (command.args.includes("container") && command.args.includes("inspect")) {
+        return {
+          stdout: JSON.stringify({
+            Id: containerId,
+            Name: `/${containerName}`,
+            State: { Running: true },
+            Mounts: [{ Type: "bind", Source: "/run/docker.sock", Destination: "/var/run/docker.sock", RW: true }]
+          }),
+          stderr: ""
+        };
+      }
+      return metadataResponse(command);
+    });
+    const executor = createContainerlabExecutor({ localRunner: fake.runner, sshRunner: fake.runner });
+    const settings = config({ runner: "existing", runnerContainer: containerName, dockerSocket: "/run/docker.sock" });
+    const runContext = context();
+
+    const resolved = await executor.resolveDependencies(settings, runContext);
+    const prepared = await executor.preflight(settings, resolved, runContext);
+    await executor.inspect(settings, prepared, runContext);
+
+    expect(resolved.identity.containerId).toBe(containerId);
+    const metadata = fake.calls.find((call) => call.args.includes("container") && call.args.includes("inspect"))!;
+    expect(metadata.args.slice(-1)).toEqual([containerName]);
+    const pinnedExecutions = fake.calls.filter((call) => call.args.includes("exec"));
+    expect(pinnedExecutions).toHaveLength(2);
+    for (const call of pinnedExecutions) {
+      expect(call.args).toContain(containerId);
+      expect(call.args).not.toContain(containerName);
+    }
+    expect(pinnedExecutions[0].args.slice(-1)).toEqual(["version"]);
+    expect(pinnedExecutions[1].args.slice(-11)).toEqual([
+      "--runtime", "docker", "--topo=", "--name=", "--timeout", "20s",
+      "inspect", "--all", "--details", "--format", "json"
+    ]);
+  });
+
   it("rejects an existing-runner reference that matches neither its exact name nor full ID", async () => {
     const fake = commandRunner(metadataResponse);
     const executor = createContainerlabExecutor({ localRunner: fake.runner, sshRunner: fake.runner });

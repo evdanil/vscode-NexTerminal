@@ -327,9 +327,8 @@ function parseExistingContainer(stdout: string, configuredName: string, socketPa
   const matchingMounts = mounts.map(asRecord).filter((mount) =>
     mount?.Type === "bind" && mount.Source === socketPath && mount.Destination === "/var/run/docker.sock" && mount.RW === true
   );
-  const configuredReferenceMatches = CONTAINER_ID.test(configuredName)
-    ? typeof container?.Id === "string" && container.Id.toLowerCase() === configuredName.toLowerCase()
-    : container?.Name === `/${configuredName}`;
+  const configuredReferenceMatches = container?.Name === `/${configuredName}` ||
+    (CONTAINER_ID.test(configuredName) && typeof container?.Id === "string" && container.Id.toLowerCase() === configuredName.toLowerCase());
   if (
     !container ||
     typeof container.Id !== "string" || !CONTAINER_ID.test(container.Id) ||
