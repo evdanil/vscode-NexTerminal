@@ -38,6 +38,135 @@ function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw abortReason(signal);
 }
 
+type Ssh2CommandStream = Duplex & {
+  stderr?: NodeJS.ReadableStream;
+  close?: () => void;
+};
+
+function closeCommandStream(stream: Ssh2CommandStream): void {
+  try {
+    if (stream.close) {
+      stream.close.call(stream);
+    } else {
+      stream.destroy();
+    }
+  } catch {
+    stream.destroy();
+  }
+}
+
+function createCommandChannel(stream: Ssh2CommandStream, signal?: AbortSignal): SshCommandChannel {
+  const stderr = stream.stderr;
+  if (!stderr) {
+    stream.destroy();
+    throw new Error("SSH command channel did not expose stderr");
+  }
+
+  let exit: { readonly code: number | null; readonly signal?: string } | undefined;
+  let channelClosed = false;
+  let stdoutEnded = false;
+  let stdoutClosed = false;
+  let stderrEnded = false;
+  let stderrClosed = false;
+  let settled = false;
+  let rejectCompletion!: (error: Error) => void;
+  let resolveCompletion!: (result: { readonly code: number | null; readonly signal?: string }) => void;
+  const completion = new Promise<{ readonly code: number | null; readonly signal?: string }>((resolve, reject) => {
+    resolveCompletion = resolve;
+    rejectCompletion = reject;
+  });
+  // A short-lived command can fail before its caller attaches to completion.
+  void completion.catch(() => undefined);
+
+  const cleanup = (): void => {
+    stream.removeListener("exit", onExit);
+    stream.removeListener("close", onChannelClose);
+    stream.removeListener("close", onStdoutClose);
+    stream.removeListener("end", onStdoutEnd);
+    stream.removeListener("error", onError);
+    stderr.removeListener("close", onStderrClose);
+    stderr.removeListener("end", onStderrEnd);
+    stderr.removeListener("error", onError);
+    signal?.removeEventListener("abort", onAbort);
+  };
+  const cleanupAfterTeardown = (): void => {
+    // Channel close can arrive before buffered readable data is consumed; keep
+    // the end observers until completion or failure has actually settled.
+    if (settled && channelClosed && (stdoutEnded || stdoutClosed) && (stderrEnded || stderrClosed)) {
+      cleanup();
+    }
+  };
+  const fail = (error: Error): void => {
+    if (!settled) {
+      settled = true;
+      rejectCompletion(error);
+    }
+    cleanupAfterTeardown();
+  };
+  const resolveIfComplete = (): void => {
+    if (!settled && exit && channelClosed && stdoutEnded && stderrEnded) {
+      settled = true;
+      resolveCompletion(exit);
+    }
+    cleanupAfterTeardown();
+  };
+  const onExit = (code: number | null, exitSignal?: string): void => {
+    exit = { code: code ?? null, ...(exitSignal && { signal: exitSignal }) };
+    resolveIfComplete();
+  };
+  const onChannelClose = (): void => {
+    channelClosed = true;
+    if (!exit) {
+      fail(new Error("SSH command channel closed without an exit result"));
+    } else {
+      resolveIfComplete();
+    }
+  };
+  const onStdoutEnd = (): void => {
+    stdoutEnded = true;
+    resolveIfComplete();
+  };
+  const onStdoutClose = (): void => {
+    stdoutClosed = true;
+    cleanupAfterTeardown();
+  };
+  const onStderrEnd = (): void => {
+    stderrEnded = true;
+    resolveIfComplete();
+  };
+  const onStderrClose = (): void => {
+    stderrClosed = true;
+    cleanupAfterTeardown();
+  };
+  const onError = (error: Error): void => {
+    if (!settled) {
+      fail(error);
+      closeCommandStream(stream);
+    } else {
+      cleanupAfterTeardown();
+    }
+  };
+  const onAbort = (): void => {
+    if (settled) return;
+    fail(abortReason(signal!));
+    closeCommandStream(stream);
+  };
+
+  // ssh2 can emit exit synchronously inside exec's callback for a short command.
+  stream.on("exit", onExit);
+  stream.on("close", onChannelClose);
+  stream.on("close", onStdoutClose);
+  stream.on("end", onStdoutEnd);
+  stream.on("error", onError);
+  stderr.on("close", onStderrClose);
+  stderr.on("end", onStderrEnd);
+  stderr.on("error", onError);
+  signal?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted) onAbort();
+
+  return { stdout: stream, stderr, completion, close: () => closeCommandStream(stream) };
+}
+
 function awaitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal, disposeLate?: (value: T) => void): Promise<T> {
   if (!signal) return promise;
   if (signal.aborted) {
@@ -202,75 +331,48 @@ class Ssh2Connection implements SshConnection {
     });
   }
 
-  public async execCommand(command: string, signal?: AbortSignal): Promise<SshCommandChannel> {
+  public execCommand(command: string, signal?: AbortSignal): Promise<SshCommandChannel> {
     throwIfAborted(signal);
-    const stream = await awaitWithSignal(this.exec(command), signal, (late) => late.destroy());
-    throwIfAborted(signal);
-    const commandStream = stream as Duplex & {
-      stderr?: NodeJS.ReadableStream;
-      close?: () => void;
-    };
-    const stderr = commandStream.stderr;
-    if (!stderr) {
-      stream.destroy();
-      throw new Error("SSH command channel did not expose stderr");
-    }
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const cleanup = (): void => signal?.removeEventListener("abort", onAbort);
+      const onAbort = (): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(abortReason(signal!));
+      };
+      const fail = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
 
-    let exit: { readonly code: number | null; readonly signal?: string } | undefined;
-    let settled = false;
-    let rejectCompletion!: (error: Error) => void;
-    let resolveCompletion!: (result: { readonly code: number | null; readonly signal?: string }) => void;
-    const completion = new Promise<{ readonly code: number | null; readonly signal?: string }>((resolve, reject) => {
-      resolveCompletion = resolve;
-      rejectCompletion = reject;
+      signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        this.client.exec(command, (error: Error | undefined, stream: Duplex) => {
+          if (settled || signal?.aborted) {
+            if (stream) closeCommandStream(stream as Ssh2CommandStream);
+            return;
+          }
+          if (error) {
+            fail(error);
+            return;
+          }
+          try {
+            const channel = createCommandChannel(stream as Ssh2CommandStream, signal);
+            settled = true;
+            cleanup();
+            resolve(channel);
+          } catch (channelError) {
+            fail(channelError instanceof Error ? channelError : new Error(String(channelError)));
+          }
+        });
+      } catch (error) {
+        fail(error instanceof Error ? error : new Error(String(error)));
+      }
     });
-    const closeStream = (): void => {
-      if (commandStream.close) {
-        commandStream.close.call(stream);
-      } else {
-        stream.destroy();
-      }
-    };
-    const cleanup = (): void => {
-      stream.removeListener("exit", onExit);
-      stream.removeListener("close", onClose);
-      stream.removeListener("error", onError);
-      stderr.removeListener("error", onError);
-      signal?.removeEventListener("abort", onAbort);
-    };
-    const fail = (error: Error): void => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      rejectCompletion(error);
-    };
-    const onExit = (code: number | null, exitSignal?: string): void => {
-      exit = { code: code ?? null, ...(exitSignal && { signal: exitSignal }) };
-    };
-    const onClose = (): void => {
-      if (!exit) {
-        fail(new Error("SSH command channel closed without an exit result"));
-        return;
-      }
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolveCompletion(exit);
-    };
-    const onError = (error: Error): void => fail(error);
-    const onAbort = (): void => {
-      closeStream();
-      fail(abortReason(signal!));
-    };
-
-    stream.on("exit", onExit);
-    stream.on("close", onClose);
-    stream.on("error", onError);
-    stderr.on("error", onError);
-    signal?.addEventListener("abort", onAbort, { once: true });
-    if (signal?.aborted) onAbort();
-
-    return { stdout: stream, stderr, completion, close: closeStream };
   }
 
   public async requestForwardIn(bindAddr: string, bindPort: number): Promise<number> {

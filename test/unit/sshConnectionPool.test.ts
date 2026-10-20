@@ -462,6 +462,141 @@ describe("SshConnectionPool", () => {
     reusedBackgroundLease.dispose();
   });
 
+  it("pool disposal aborts invalidation-detached groups and disposes late transports", async () => {
+    const attempts: Array<{
+      context?: SshConnectContext;
+      resolve: (connection: SshConnection) => void;
+    }> = [];
+    const awareFactory: ContextAwareSshFactory = {
+      connect: vi.fn(async () => { throw new Error("unexpected direct connect"); }),
+      connectWithContext: vi.fn((_server: ServerConfig, context?: SshConnectContext) =>
+        new Promise<SshConnection>((resolve) => attempts.push({ context, resolve }))
+      )
+    };
+    const awarePool = new SshConnectionPool(awareFactory, { enabled: true, idleTimeoutMs: 5000 });
+    const interactive = awarePool.connectWithContext(testServer, { interaction: "interactive" });
+    const background = awarePool.connectWithContext(testServer, { interaction: "noninteractive" });
+    const settled: boolean[] = [];
+    const observed = [interactive, background].map((pending, index) =>
+      pending.then(() => { settled[index] = true; }, () => { settled[index] = true; })
+    );
+
+    awarePool.invalidate(testServer.id);
+    expect(attempts.map(({ context }) => context?.signal?.aborted)).toEqual([false, false]);
+    awarePool.dispose();
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+    const canceledBeforeLateConnects = [...settled];
+
+    const lateInteractive = createMockConnection();
+    const lateBackground = createMockConnection();
+    attempts[0].resolve(lateInteractive);
+    attempts[1].resolve(lateBackground);
+    await Promise.all(observed);
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+
+    expect(attempts.map(({ context }) => context?.signal?.aborted)).toEqual([true, true]);
+    expect(canceledBeforeLateConnects).toEqual([true, true]);
+    expect(lateInteractive.dispose).toHaveBeenCalledOnce();
+    expect(lateBackground.dispose).toHaveBeenCalledOnce();
+  });
+
+  it.each(["interactive", "noninteractive"] as const)(
+    "keeps the first published transport current when the %s group completes first",
+    async (firstPolicy) => {
+      const secondPolicy = firstPolicy === "interactive" ? "noninteractive" : "interactive";
+      const attempts: Array<{
+        interaction: string | undefined;
+        resolve: (connection: SshConnection) => void;
+      }> = [];
+      const awareFactory: ContextAwareSshFactory = {
+        connect: vi.fn(async () => { throw new Error("unexpected direct connect"); }),
+        connectWithContext: vi.fn((_server: ServerConfig, context?: SshConnectContext) =>
+          new Promise<SshConnection>((resolve) => attempts.push({ interaction: context?.interaction, resolve }))
+        )
+      };
+      const awarePool = new SshConnectionPool(awareFactory, { enabled: true, idleTimeoutMs: 5000 });
+      const first = awarePool.connectWithContext(testServer, { interaction: firstPolicy });
+      const second = awarePool.connectWithContext(testServer, { interaction: secondPolicy });
+      const firstConnection = createMockConnection();
+      const secondConnection = createMockConnection();
+      attempts.find((attempt) => attempt.interaction === firstPolicy)!.resolve(firstConnection);
+      const firstLease = await first;
+      attempts.find((attempt) => attempt.interaction === secondPolicy)!.resolve(secondConnection);
+      const secondLease = await second;
+
+      const currentLease = await awarePool.connectWithContext(testServer, { interaction: "interactive" });
+      await currentLease.openShell();
+      expect(firstConnection.openShell).toHaveBeenCalledOnce();
+      expect(secondConnection.openShell).not.toHaveBeenCalled();
+
+      firstLease.dispose();
+      expect(firstConnection.dispose).not.toHaveBeenCalled();
+      await secondLease.openShell();
+      expect(secondConnection.openShell).toHaveBeenCalledOnce();
+
+      awarePool.dispose();
+      expect(firstConnection.dispose).toHaveBeenCalledOnce();
+      expect(secondConnection.dispose).toHaveBeenCalledOnce();
+    }
+  );
+
+  it("keeps both transports owned when policy groups settle in the same turn", async () => {
+    const attempts: Array<(connection: SshConnection) => void> = [];
+    const awareFactory: ContextAwareSshFactory = {
+      connect: vi.fn(async () => { throw new Error("unexpected direct connect"); }),
+      connectWithContext: vi.fn(() => new Promise<SshConnection>((resolve) => attempts.push(resolve)))
+    };
+    const awarePool = new SshConnectionPool(awareFactory, { enabled: true, idleTimeoutMs: 5000 });
+    const interactive = awarePool.connectWithContext(testServer, { interaction: "interactive" });
+    const background = awarePool.connectWithContext(testServer, { interaction: "noninteractive" });
+    const interactiveConnection = createMockConnection();
+    const backgroundConnection = createMockConnection();
+
+    attempts[0](interactiveConnection);
+    attempts[1](backgroundConnection);
+    const [interactiveLease, backgroundLease] = await Promise.all([interactive, background]);
+    const currentLease = await awarePool.connectWithContext(testServer, { interaction: "interactive" });
+    await currentLease.openShell();
+    expect(interactiveConnection.openShell).toHaveBeenCalledOnce();
+    expect(backgroundConnection.openShell).not.toHaveBeenCalled();
+
+    interactiveLease.dispose();
+    await backgroundLease.openShell();
+    expect(interactiveConnection.dispose).not.toHaveBeenCalled();
+    expect(backgroundConnection.openShell).toHaveBeenCalledOnce();
+
+    awarePool.dispose();
+    expect(interactiveConnection.dispose).toHaveBeenCalledOnce();
+    expect(backgroundConnection.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("lets an idle first transport expire after the other policy group completes", async () => {
+    const attempts: Array<(connection: SshConnection) => void> = [];
+    const awareFactory: ContextAwareSshFactory = {
+      connect: vi.fn(async () => { throw new Error("unexpected direct connect"); }),
+      connectWithContext: vi.fn(() => new Promise<SshConnection>((resolve) => attempts.push(resolve)))
+    };
+    const awarePool = new SshConnectionPool(awareFactory, { enabled: true, idleTimeoutMs: 5000 });
+    const idleFirst = awarePool.connectWithContext(testServer, { interaction: "interactive" });
+    const pendingSecond = awarePool.connectWithContext(testServer, { interaction: "noninteractive" });
+    const idleConnection = createMockConnection();
+    const secondConnection = createMockConnection();
+    attempts[0](idleConnection);
+    const idleLease = await idleFirst;
+    idleLease.dispose();
+    expect(idleConnection.dispose).not.toHaveBeenCalled();
+
+    attempts[1](secondConnection);
+    const secondLease = await pendingSecond;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(idleConnection.dispose).toHaveBeenCalledOnce();
+    expect(secondConnection.dispose).not.toHaveBeenCalled();
+    await secondLease.openShell();
+
+    awarePool.dispose();
+    expect(secondConnection.dispose).toHaveBeenCalledOnce();
+  });
+
   it("does not use a context-free factory for noninteractive acquisition", async () => {
     const plainFactory = createMockFactory();
     const plainPool = new SshConnectionPool(plainFactory, { enabled: true, idleTimeoutMs: 5000 });

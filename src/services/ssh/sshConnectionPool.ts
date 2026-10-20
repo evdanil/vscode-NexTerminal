@@ -501,6 +501,7 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
   private readonly entries = new Map<string, PoolEntry>();
   private readonly retiredEntries = new Set<PoolEntry>();
   private readonly pending = new Map<string, PendingConnectionGroup>();
+  private readonly unsettledGroups = new Set<PendingConnectionGroup>();
   private readonly listeners = new Set<(event: PoolEvent) => void>();
   // Per-server invalidation counter. A connect captures the value at handshake
   // start and re-checks it once the handshake settles; a bump in between means
@@ -687,7 +688,7 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
     }
     this.entries.clear();
     this.retiredEntries.clear();
-    for (const group of this.pending.values()) {
+    for (const group of this.unsettledGroups) {
       this.abortPendingGroup(group);
     }
     this.pending.clear();
@@ -740,18 +741,23 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
           return false;
         }
         const receiver = group.owners.find((candidate) => this.isPendingOwnerActive(candidate) && candidate.context?.onAuthMessage);
-        return receiver?.context?.onAuthMessage?.(text) !== false;
+        if (!receiver?.context?.onAuthMessage) {
+          return false;
+        }
+        return receiver.context.onAuthMessage(text) !== false;
       }
     };
     group.livenessTimer = setInterval(() => {
       this.isPendingGroupActive(group);
     }, 50);
+    this.unsettledGroups.add(group);
     group.promise = this.createEntry(server, sharedContext).then((entry) => {
       group.entry = entry;
       return entry;
     }).finally(() => {
       group.settled = true;
       this.stopPendingGroupMonitoring(group);
+      this.unsettledGroups.delete(group);
       if (!group.owners.some((candidate) => this.isPendingOwnerActive(candidate))) {
         this.disposeUnclaimedEntry(group);
       }
@@ -949,6 +955,17 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
       // path in connectWithContext disposes the underlying connection as soon
       // as the last pre-invalidation lease is released.
       entry.healthy = false;
+      this.trackRetired(entry);
+      return entry;
+    }
+
+    const currentEntry = this.entries.get(server.id);
+    if (currentEntry?.healthy) {
+      // Policy-qualified handshakes can race for publication. Keep the first
+      // healthy transport current; this later result belongs only to callers
+      // already waiting on its group and remains owned until those leases leave.
+      entry.healthy = false;
+      this.trackRetired(entry);
       return entry;
     }
 
