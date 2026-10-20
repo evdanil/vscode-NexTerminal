@@ -557,9 +557,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     },
     socks5HandshakeTimeoutMs: readBoundedMs("nexus.tunnel", "socks5HandshakeTimeout", 10, 2, 60)
   });
-  // Lifecycle invalidation is installed before this runtime is visible through
-  // the provider registry or the status poll. The executor stays in the Node
-  // extension graph; the browser entry never imports these process/SSH adapters.
+  // The controller installs its source mutation observer synchronously before
+  // this runtime is visible through the provider registry or status poll. Its
+  // fresh nonce and empty in-memory maps start this host unapproved; persisted
+  // records never hydrate authority, so startup does not read or rewrite them.
+  // The executor stays in the Node extension graph; the browser entry never
+  // imports these process/SSH adapters.
   const containerlabActivation = createContainerlabActivationController({
     core,
     executor: createContainerlabExecutor({
@@ -576,7 +579,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
         "Cancel"
       )) === "Run"
   });
-  await containerlabActivation.invalidateAllSources();
   context.subscriptions.push({ dispose: () => containerlabActivation.dispose() });
   const containerlabRuntime = containerlabActivation;
   for (const provider of createBuiltInProviders({ containerlabRuntime })) {

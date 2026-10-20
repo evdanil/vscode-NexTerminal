@@ -11,6 +11,8 @@ import type {
 import { parseContainerlabConfig } from "../../src/services/inventory/providers/containerlabConfig";
 import { CONTAINERLAB_INSPECT_ARGS, CONTAINERLAB_VERSION_ARGS } from "../../src/services/inventory/providers/containerlabCommands";
 import { createContainerlabActivationController } from "../../src/services/inventory/containerlabActivation";
+import { createBuiltInProviders } from "../../src/services/inventory/builtInProviders";
+import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
 
 const LOCAL_VALUES: InventorySourceValues = {
   location: "local",
@@ -110,6 +112,11 @@ function context(source: InventorySourceConfig, intent: InventoryOperationContex
   return { intent, subject: { kind: "source", sourceId: source.id, revision: source.revision! } };
 }
 
+function requirePreparedApprovalCleanup(cleanup: (() => void) | undefined): () => void {
+  if (!cleanup) throw new Error("A successful form Test must prepare its Containerlab approval transfer.");
+  return cleanup;
+}
+
 function sshServer(id: string, host: string, proxy?: ServerConfig["proxy"]): ServerConfig {
   return {
     id,
@@ -125,6 +132,57 @@ function sshServer(id: string, host: string, proxy?: ServerConfig["proxy"]): Ser
 
 describe("Containerlab activation", () => {
   beforeEach(() => vi.clearAllMocks());
+
+  it("does not touch stale persisted approvals during construction, registration, or unapproved status", async () => {
+    const staleDocument = {
+      schema: 1,
+      sessionNonce: "previous-extension-session",
+      records: [{ scope: "source", id: "source-1", generation: "stale-generation", acceptedRevision: "stale-revision" }]
+    };
+    const emptyCore = new NexusCore(new InMemoryConfigRepository());
+    await emptyCore.initialize();
+    const emptyStore = memoryStore(staleDocument);
+    const emptyExecutor: ContainerlabExecutor = {
+      resolveDependencies: vi.fn(async () => ({ identity: identity() })),
+      preflight: vi.fn(async (_config, resolved) => ({ identity: resolved.identity, version: "0.80.0" })),
+      inspect: vi.fn(async () => ({ version: "0.80.0", stdout: "{}" }))
+    };
+    const emptyController = createContainerlabActivationController({
+      core: emptyCore,
+      executor: emptyExecutor,
+      store: emptyStore,
+      isWorkspaceTrusted: () => true,
+      confirmRun: vi.fn(async () => true)
+    });
+    expect(emptyStore.load).not.toHaveBeenCalled();
+    expect(emptyStore.save).not.toHaveBeenCalled();
+    emptyController.dispose();
+
+    const store = memoryStore(staleDocument);
+    const confirmRun = vi.fn(async () => true);
+    const harness = await makeHarness({ store, confirmRun });
+    const registry = new InventoryProviderRegistry();
+    for (const provider of createBuiltInProviders({ containerlabRuntime: harness.controller })) {
+      registry.register(provider);
+    }
+    const provider = registry.get("containerlab");
+    expect(provider?.fetchStatus).toBeDefined();
+    expect(store.load).not.toHaveBeenCalled();
+    expect(store.save).not.toHaveBeenCalled();
+
+    await expect(provider!.fetchStatus!(harness.source.config, {}, context(harness.source, "background-status")))
+      .rejects.toThrow(/Test|Sync|authoriz/i);
+    await expect(provider!.fetchStatus!(harness.source.config, {}, context(harness.source, "manual-status")))
+      .rejects.toThrow(/Test|Sync|authoriz/i);
+
+    expect(confirmRun).not.toHaveBeenCalled();
+    expect(harness.executor.resolveDependencies).not.toHaveBeenCalled();
+    expect(harness.executor.preflight).not.toHaveBeenCalled();
+    expect(harness.executor.inspect).not.toHaveBeenCalled();
+    expect(store.load).not.toHaveBeenCalled();
+    expect(store.save).not.toHaveBeenCalled();
+    harness.controller.dispose();
+  });
 
   it("requires Run before resolving metadata or running version preflight", async () => {
     const run = deferred<boolean>();
@@ -684,7 +742,7 @@ describe("Containerlab activation", () => {
     vi.mocked(harness.executor.resolveDependencies).mockClear();
     vi.mocked(harness.executor.preflight).mockClear();
     vi.mocked(harness.executor.inspect).mockClear();
-    const cleanup = harness.controller.prepareFormSourceSave(sessionId, "reused-source-id");
+    const cleanup = requirePreparedApprovalCleanup(harness.controller.prepareFormSourceSave(sessionId, "reused-source-id"));
     try {
       await harness.core.addOrUpdateInventorySource(makeSource({ baseUrl: "https://netbox.example.test" }, {
         id: "reused-source-id",
@@ -741,7 +799,7 @@ describe("Containerlab activation", () => {
       subject: { kind: "form", sessionId }
     };
     await harness.controller.inspect(harness.config, formContext);
-    const finishCreation = harness.controller.prepareFormSourceSave(sessionId, "form-created-source");
+    const finishCreation = requirePreparedApprovalCleanup(harness.controller.prepareFormSourceSave(sessionId, "form-created-source"));
     try {
       await harness.core.addOrUpdateInventorySource(makeSource(harness.source.config, { id: "form-created-source" }));
     } finally {
@@ -755,12 +813,81 @@ describe("Containerlab activation", () => {
     await expect(harness.controller.transferFormApproval(sessionId, saved)).rejects.toThrow(/transfer|consum|save/i);
   });
 
+  it("allows an untested Add save without creating approval or execution authority", async () => {
+    const harness = await makeHarness();
+    const sessionId = harness.controller.beginFormSession();
+    harness.controller.updateFormSession(sessionId, harness.source.config);
+
+    expect(harness.controller.prepareFormSourceSave(sessionId, "untested-form-source")).toBeUndefined();
+    await harness.core.addOrUpdateInventorySource(makeSource(harness.source.config, { id: "untested-form-source" }));
+    const saved = harness.core.getInventorySource("untested-form-source")!;
+
+    await expect(harness.controller.transferFormApproval(sessionId, saved)).rejects.toThrow(/transfer|save|approval/i);
+    vi.mocked(harness.executor.resolveDependencies).mockClear();
+    vi.mocked(harness.executor.preflight).mockClear();
+    vi.mocked(harness.executor.inspect).mockClear();
+    await expect(harness.controller.inspect(harness.config, context(saved, "background-status"))).rejects.toThrow(/Test|Sync|approv/i);
+    expect(harness.executor.resolveDependencies).not.toHaveBeenCalled();
+    expect(harness.executor.preflight).not.toHaveBeenCalled();
+    expect(harness.executor.inspect).not.toHaveBeenCalled();
+  });
+
+  it("keeps an unchanged Edit approval through an untested metadata-only save", async () => {
+    const harness = await makeHarness();
+    const opened = harness.core.getInventorySource(harness.source.id)!;
+    await harness.controller.inspect(harness.config, context(opened, "sync"));
+    const sessionId = harness.controller.beginFormSession({ sourceId: opened.id, revision: opened.revision! });
+    harness.controller.updateFormSession(sessionId, opened.config);
+
+    expect(harness.controller.prepareFormSourceSave(sessionId, opened.id)).toBeUndefined();
+    await harness.core.addOrUpdateInventorySource({ ...opened, name: "Renamed without Test" });
+    const saved = harness.core.getInventorySource(opened.id)!;
+
+    await harness.controller.inspect(harness.config, context(saved, "background-status"));
+    expect(harness.executor.inspect).toHaveBeenCalledTimes(2);
+  });
+
+  it("revokes source approval when an untested Edit changes Containerlab intent", async () => {
+    const harness = await makeHarness();
+    const opened = harness.core.getInventorySource(harness.source.id)!;
+    await harness.controller.inspect(harness.config, context(opened, "sync"));
+    const sessionId = harness.controller.beginFormSession({ sourceId: opened.id, revision: opened.revision! });
+    harness.controller.updateFormSession(sessionId, { ...opened.config, sudo: true });
+
+    expect(harness.controller.prepareFormSourceSave(sessionId, opened.id)).toBeUndefined();
+    await harness.core.addOrUpdateInventorySource({ ...opened, config: { ...opened.config, sudo: true } });
+    const saved = harness.core.getInventorySource(opened.id)!;
+    vi.mocked(harness.executor.resolveDependencies).mockClear();
+    vi.mocked(harness.executor.preflight).mockClear();
+    vi.mocked(harness.executor.inspect).mockClear();
+
+    await expect(harness.controller.inspect(parseContainerlabConfig(saved.config), context(saved, "background-status")))
+      .rejects.toThrow(/Test|Sync|approv/i);
+    expect(harness.executor.resolveDependencies).not.toHaveBeenCalled();
+    expect(harness.executor.preflight).not.toHaveBeenCalled();
+    expect(harness.executor.inspect).not.toHaveBeenCalled();
+  });
+
+  it("still validates live SSH dependencies for an untested form save", async () => {
+    const harness = await makeHarness({
+      beforeController: async (core) => {
+        await core.addOrUpdateServer({ ...sshServer("telnet-host", "telnet.example.test"), protocol: "telnet" });
+      }
+    });
+    const sessionId = harness.controller.beginFormSession();
+    harness.controller.updateFormSession(sessionId, { ...REMOTE_VALUES, labHostId: "telnet-host" });
+
+    expect(() => harness.controller.prepareFormSourceSave(sessionId, "invalid-route-source")).toThrow(/SSH|host|protocol/i);
+    expect(harness.core.getInventorySource("invalid-route-source")).toBeUndefined();
+    expect(harness.executor.resolveDependencies).not.toHaveBeenCalled();
+  });
+
   it("does not transfer a form approval to a forced import that reuses the prepared Add ID", async () => {
     const harness = await makeHarness();
     const sessionId = harness.controller.beginFormSession();
     harness.controller.updateFormSession(sessionId, harness.source.config);
     await harness.controller.inspect(harness.config, { intent: "test", subject: { kind: "form", sessionId } });
-    const cleanup = harness.controller.prepareFormSourceSave(sessionId, "imported-source");
+    const cleanup = requirePreparedApprovalCleanup(harness.controller.prepareFormSourceSave(sessionId, "imported-source"));
     try {
       await harness.core.addOrUpdateInventorySource(makeSource(harness.source.config, { id: "imported-source" }), {
         forceNewActivationGeneration: true
@@ -787,7 +914,7 @@ describe("Containerlab activation", () => {
     await harness.controller.inspect(harness.config, { intent: "test", subject: { kind: "form", sessionId } });
 
     expect(() => harness.controller.prepareFormSourceSave(sessionId, harness.source.id)).toThrow(/exist|Add|Edit/i);
-    const cleanup = harness.controller.prepareFormSourceSave(sessionId, "unrelated-source");
+    const cleanup = requirePreparedApprovalCleanup(harness.controller.prepareFormSourceSave(sessionId, "unrelated-source"));
     try {
       await harness.core.addOrUpdateInventorySource(makeSource({ ...harness.source.config, sudo: true }, { id: "unrelated-source" }));
     } finally {
@@ -806,7 +933,7 @@ describe("Containerlab activation", () => {
     const sessionId = harness.controller.beginFormSession({ sourceId: opened.id, revision: opened.revision! });
     harness.controller.updateFormSession(sessionId, opened.config);
     await harness.controller.inspect(harness.config, { intent: "test", subject: { kind: "form", sessionId } });
-    const cleanup = harness.controller.prepareFormSourceSave(sessionId, opened.id);
+    const cleanup = requirePreparedApprovalCleanup(harness.controller.prepareFormSourceSave(sessionId, opened.id));
     try {
       await harness.core.addOrUpdateInventorySource({ ...opened, name: "Edited Containerlab" });
     } finally {
@@ -839,7 +966,7 @@ describe("Containerlab activation", () => {
     const sessionId = harness.controller.beginFormSession({ sourceId: opened.id, revision: opened.revision! });
     harness.controller.updateFormSession(sessionId, opened.config);
     await harness.controller.inspect(harness.config, { intent: "test", subject: { kind: "form", sessionId } });
-    const cleanup = harness.controller.prepareFormSourceSave(sessionId, opened.id);
+    const cleanup = requirePreparedApprovalCleanup(harness.controller.prepareFormSourceSave(sessionId, opened.id));
     try {
       await harness.core.addOrUpdateInventorySource(opened, { forceNewActivationGeneration: true });
     } finally {
@@ -856,7 +983,7 @@ describe("Containerlab activation", () => {
     const sessionId = harness.controller.beginFormSession();
     harness.controller.updateFormSession(sessionId, harness.source.config);
     await harness.controller.inspect(harness.config, { intent: "test", subject: { kind: "form", sessionId } });
-    const cleanup = harness.controller.prepareFormSourceSave(sessionId, "replaced-source");
+    const cleanup = requirePreparedApprovalCleanup(harness.controller.prepareFormSourceSave(sessionId, "replaced-source"));
     await harness.core.addOrUpdateInventorySource(makeSource(harness.source.config, { id: "replaced-source" }));
     cleanup();
     await harness.core.addOrUpdateInventorySource(makeSource(harness.source.config, { id: "replaced-source" }), { forceNewActivationGeneration: true });
@@ -868,7 +995,7 @@ describe("Containerlab activation", () => {
     const secondSession = harness.controller.beginFormSession();
     harness.controller.updateFormSession(secondSession, harness.source.config);
     await harness.controller.inspect(harness.config, { intent: "test", subject: { kind: "form", sessionId: secondSession } });
-    const secondCleanup = harness.controller.prepareFormSourceSave(secondSession, "closed-source");
+    const secondCleanup = requirePreparedApprovalCleanup(harness.controller.prepareFormSourceSave(secondSession, "closed-source"));
     await harness.core.addOrUpdateInventorySource(makeSource(harness.source.config, { id: "closed-source" }));
     secondCleanup();
     harness.controller.endFormSession(secondSession);
@@ -885,7 +1012,7 @@ describe("Containerlab activation", () => {
       intent: "test",
       subject: { kind: "form", sessionId }
     });
-    const cleanup = harness.controller.prepareFormSourceSave(sessionId, "changed-form-source");
+    const cleanup = requirePreparedApprovalCleanup(harness.controller.prepareFormSourceSave(sessionId, "changed-form-source"));
     try {
       await harness.core.addOrUpdateInventorySource(makeSource(harness.source.config, { id: "changed-form-source" }));
     } finally {
@@ -924,7 +1051,7 @@ describe("Containerlab activation", () => {
       intent: "test",
       subject: { kind: "form", sessionId }
     });
-    const cleanup = harness.controller.prepareFormSourceSave(sessionId, "remote-form-source");
+    const cleanup = requirePreparedApprovalCleanup(harness.controller.prepareFormSourceSave(sessionId, "remote-form-source"));
     try {
       await harness.core.addOrUpdateInventorySource(makeSource(harness.source.config, { id: "remote-form-source" }));
     } finally {
@@ -950,7 +1077,7 @@ describe("Containerlab activation", () => {
     const sessionId = harness.controller.beginFormSession();
     harness.controller.updateFormSession(sessionId, harness.source.config);
     await harness.controller.inspect(harness.config, { intent: "test", subject: { kind: "form", sessionId } });
-    const cleanup = harness.controller.prepareFormSourceSave(sessionId, "held-transfer-source");
+    const cleanup = requirePreparedApprovalCleanup(harness.controller.prepareFormSourceSave(sessionId, "held-transfer-source"));
     try {
       await harness.core.addOrUpdateInventorySource(makeSource(harness.source.config, { id: "held-transfer-source" }));
     } finally {

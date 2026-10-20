@@ -25,12 +25,13 @@ describe("Containerlab inventory provider", () => {
 
   it("keeps the same metadata without a runtime and reports a clear unsupported-runtime error on execution", async () => {
     const provider = createContainerlabProvider();
+    const unavailableMessage = "Containerlab discovery requires desktop VS Code with the Containerlab runtime. Open this source in desktop VS Code, then run Test or Sync.";
     expect(provider.configFields).toEqual(createContainerlabProvider({
       inspect: async () => ({ version: "0.80.0", stdout: "{}" })
     }).configFields);
-    await expect(provider.testConnection({}, {})).rejects.toThrow(/runtime.*unavailable|unsupported.*runtime/i);
-    await expect(provider.fetchInventory({}, {})).rejects.toThrow(/runtime.*unavailable|unsupported.*runtime/i);
-    await expect(provider.fetchStatus?.({}, {})).rejects.toThrow(/runtime.*unavailable|unsupported.*runtime/i);
+    await expect(provider.testConnection({}, {})).rejects.toMatchObject({ message: unavailableMessage });
+    await expect(provider.fetchInventory({}, {})).rejects.toMatchObject({ message: unavailableMessage });
+    await expect(provider.fetchStatus?.({}, {})).rejects.toMatchObject({ message: unavailableMessage });
   });
 
   it("uses the injected runtime and strictly parses the response for Test, fetch, and status", async () => {

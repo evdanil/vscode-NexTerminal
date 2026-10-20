@@ -1527,7 +1527,7 @@ async function persistNewInventorySource(
       }
 
       const saved = core.getInventorySource(id);
-      if (input.containerlabFormSave && providerSnapshot.id === "containerlab") {
+      if (cleanupApproval && input.containerlabFormSave && providerSnapshot.id === "containerlab") {
         if (!saved) throw new Error("Containerlab source was saved but could not be re-read for approval transfer.");
         await input.containerlabFormSave.activation.transferFormApproval(input.containerlabFormSave.sessionId, saved);
       }
@@ -1739,7 +1739,7 @@ async function persistUpdatedInventorySource(
         throw new Error(`Could not save inventory source "${name}" — the update was not applied.`);
       }
       savedSource = core.getInventorySource(source.id) ?? updated;
-      if (input.containerlabFormSave && providerSnapshot.id === "containerlab") {
+      if (cleanupApproval && input.containerlabFormSave && providerSnapshot.id === "containerlab") {
         await input.containerlabFormSave.activation.transferFormApproval(input.containerlabFormSave.sessionId, savedSource);
       }
     } finally {
@@ -5623,10 +5623,111 @@ export function registerInventoryCommands(
     const truncatedSources: { id: string; name: string; revision: string | undefined; remedy: string | undefined }[] = [];
     const containerlabStatusDeclines: { id: string; name: string; revision: string }[] = [];
     const containerlabRevisionDeclines: { id: string; name: string; revision: string | undefined }[] = [];
+    const containerlabDependencyDeclines: {
+      id: string;
+      name: string;
+      revision: string | undefined;
+      remedy: "sync" | "edit";
+    }[] = [];
     const declineMissingContainerlabRevision = (source: InventorySourceConfig): void => {
       unrefreshedSourceIds.push(source.id);
       if (options?.manual === true) {
         containerlabRevisionDeclines.push({ id: source.id, name: source.name, revision: source.revision });
+      }
+    };
+    const declineChangedContainerlabDependency = (
+      source: InventorySourceConfig,
+      remedy: "sync" | "edit"
+    ): void => {
+      unrefreshedSourceIds.push(source.id);
+      if (options?.manual === true) {
+        containerlabDependencyDeclines.push({
+          id: source.id,
+          name: source.name,
+          revision: source.revision,
+          remedy
+        });
+      }
+    };
+    type ContainerlabStatusDependencies = {
+      readonly hostId: string | undefined;
+      readonly snapshot: InventorySourceDependencySnapshot | undefined;
+    };
+    const captureContainerlabStatusDependencies = (
+      source: InventorySourceConfig,
+      providerSnapshot: ProviderRegistrationSnapshot,
+      liveSnapshot: ReturnType<NexusCore["getSnapshot"]>
+    ): ContainerlabStatusDependencies => {
+      const hostId = resolveDiscoverySshHostId(providerSnapshot, source.config);
+      if (source.config.location === "ssh" && hostId === undefined) {
+        throw new Error("Containerlab SSH discovery requires a configured lab host.");
+      }
+      return {
+        hostId,
+        snapshot: hostId === undefined
+          ? undefined
+          : snapshotInventorySourceDependencies(hostId, liveSnapshot.servers, liveSnapshot.authProfiles)
+      };
+    };
+    const checkContainerlabStatusDependencies = (
+      captured: ContainerlabStatusDependencies,
+      source: InventorySourceConfig,
+      providerSnapshot: ProviderRegistrationSnapshot,
+      liveSnapshot: ReturnType<NexusCore["getSnapshot"]>
+    ): "current" | "sync" | "edit" => {
+      let currentHostId: string | undefined;
+      try {
+        currentHostId = resolveDiscoverySshHostId(providerSnapshot, source.config);
+      } catch {
+        return "edit";
+      }
+      if (source.config.location === "ssh" && currentHostId === undefined) {
+        return "edit";
+      }
+      const currentRouteIsValid = (): boolean => {
+        if (currentHostId === undefined) return false;
+        try {
+          snapshotInventorySourceDependencies(currentHostId, liveSnapshot.servers, liveSnapshot.authProfiles);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      if (currentHostId !== captured.hostId) {
+        return currentRouteIsValid() ? "sync" : "edit";
+      }
+      if (captured.snapshot === undefined) {
+        return "current";
+      }
+      try {
+        assertInventorySourceDependenciesCurrent(captured.snapshot, liveSnapshot.servers, liveSnapshot.authProfiles);
+        return "current";
+      } catch {
+        return currentRouteIsValid() ? "sync" : "edit";
+      }
+    };
+    const warnIfContainerlabDependencyDeclined = (): void => {
+      if (options?.manual !== true || containerlabDependencyDeclines.length === 0) {
+        return;
+      }
+      for (const remedy of ["sync", "edit"] as const) {
+        const liveDeclines = containerlabDependencyDeclines.filter((declined) =>
+          declined.remedy === remedy && core.getInventorySource(declined.id)?.revision === declined.revision
+        );
+        if (liveDeclines.length === 0) continue;
+        const names = liveDeclines.slice(0, 3).map((declined) => `"${declined.name}"`).join(", ");
+        const andMore = liveDeclines.length > 3 ? ` and ${liveDeclines.length - 3} more` : "";
+        const action = remedy === "sync" ? "Sync Now" : "Edit Source";
+        void Promise.resolve(vscode.window.showWarningMessage(
+          `Containerlab live status was not refreshed for ${names}${andMore} because the selected SSH discovery dependency changed or is unavailable.`,
+          action
+        )).then(async (choice) => {
+          if (choice !== action) return;
+          const command = remedy === "sync" ? "nexus.inventory.syncNow" : "nexus.inventory.editSource";
+          for (const declined of liveDeclines) {
+            await vscode.commands.executeCommand(command, declined.id);
+          }
+        }).catch(() => undefined);
       }
     };
     // TRUNCATED STATUS (follow-up 2; R3 review) — a named renderer with ONE call
@@ -5962,7 +6063,8 @@ export function registerInventoryCommands(
       // Command Center is open, so it would put a keychain round trip per source
       // per tick on the lock that every config write in the extension serializes
       // on — an ongoing cost against a window narrower than the one above.
-      const liveSource = core.getInventorySource(source.id);
+      const liveSnapshot = core.getSnapshot();
+      const liveSource = liveSnapshot.inventorySources.find((candidate) => candidate.id === source.id);
       if (liveSource === undefined || liveSource.revision !== source.revision) {
         // REPORTED, NOT REFUSED. `refusedSources` is for the trust warning,
         // whose remedy is "run Sync Inventory Now and confirm" — advice that is
@@ -5984,6 +6086,7 @@ export function registerInventoryCommands(
       if (!provider || typeof provider.fetchStatus !== "function") {
         continue; // provider gone or offers no status (e.g. NetBox)
       }
+      const providerSnapshot = registry.snapshotOf(provider);
       // P2-1(b) — capture the source's incarnation as of THIS fetch. If Edit
       // Source (or any write) changes the record while the fetch is in flight,
       // the report was produced under a config the source no longer has, so its
@@ -5993,6 +6096,22 @@ export function registerInventoryCommands(
       if (source.providerId === "containerlab" && !hasNonEmptyRevision(startRevision)) {
         declineMissingContainerlabRevision(source);
         continue;
+      }
+      let containerlabStatusDependencies: ContainerlabStatusDependencies | undefined;
+      if (source.providerId === "containerlab") {
+        try {
+          // Bind discovery configuration and its complete SSH chain to the
+          // same live core view as the record check above, before any async
+          // trust/keychain preparation begins.
+          containerlabStatusDependencies = captureContainerlabStatusDependencies(
+            liveSource,
+            providerSnapshot,
+            liveSnapshot
+          );
+        } catch {
+          declineChangedContainerlabDependency(liveSource, "edit");
+          continue;
+        }
       }
       // #84 P2 (Codex) — capture this source's MUTATION EPOCH as of the fetch
       // start. A routine syncNow that lands while this fetch is in flight changes
@@ -6013,7 +6132,7 @@ export function registerInventoryCommands(
       // `providerStillTrustedSilently`.
       let trust: SilentProviderTrust;
       try {
-        trust = await providerStillTrustedSilently(source, registry.snapshotOf(provider), vault, confirmedProviderShapes);
+        trust = await providerStillTrustedSilently(source, providerSnapshot, vault, confirmedProviderShapes);
       } catch {
         // A REJECTING VAULT READ — the only failure this call can produce, and
         // non-fatal per source exactly like the catch around the rest of the
@@ -6091,7 +6210,8 @@ export function registerInventoryCommands(
           unrefreshedSourceIds.push(source.id);
           continue;
         }
-        const currentSource = core.getInventorySource(source.id);
+        const currentSnapshot = core.getSnapshot();
+        const currentSource = currentSnapshot.inventorySources.find((candidate) => candidate.id === source.id);
         if (!currentSource) {
           unrefreshedSourceIds.push(source.id);
           continue;
@@ -6104,6 +6224,21 @@ export function registerInventoryCommands(
           }
           if (currentSource.revision !== startRevision) {
             unrefreshedSourceIds.push(source.id);
+            continue;
+          }
+          const capturedDependencies = containerlabStatusDependencies;
+          if (capturedDependencies === undefined) {
+            declineChangedContainerlabDependency(currentSource, "edit");
+            continue;
+          }
+          const dependencyState = checkContainerlabStatusDependencies(
+            capturedDependencies,
+            currentSource,
+            providerSnapshot,
+            currentSnapshot
+          );
+          if (dependencyState !== "current") {
+            declineChangedContainerlabDependency(currentSource, dependencyState);
             continue;
           }
           const operationContext: InventoryOperationContext = {
@@ -6163,12 +6298,31 @@ export function registerInventoryCommands(
           //    one poll tick. Self-healing on the next refresh or sync, and
           //    dropping is still the conservative direction, so the guard stays
           //    as it is.
-          const currentSource = core.getInventorySource(source.id);
+          const finalSnapshot = core.getSnapshot();
+          const currentSource = finalSnapshot.inventorySources.find((candidate) => candidate.id === source.id);
           if (
             holdsClaim(source.id) &&
-            currentSource?.revision === startRevision &&
+            currentSource !== undefined &&
+            currentSource.revision === startRevision &&
             core.getSourceMutationEpoch(source.id) === startEpoch
           ) {
+            if (source.providerId === "containerlab") {
+              const capturedDependencies = containerlabStatusDependencies;
+              if (capturedDependencies === undefined) {
+                declineChangedContainerlabDependency(currentSource, "edit");
+                continue;
+              }
+              const dependencyState = checkContainerlabStatusDependencies(
+                capturedDependencies,
+                currentSource,
+                providerSnapshot,
+                finalSnapshot
+              );
+              if (dependencyState !== "current") {
+                declineChangedContainerlabDependency(currentSource, dependencyState);
+                continue;
+              }
+            }
             core.applyInventoryStatus(source.id, report);
             // R4 (review) — record WHOSE apply the tree is now showing for this
             // source, for every report and not only truncated ones (see the map's
@@ -6286,6 +6440,7 @@ export function registerInventoryCommands(
     // the manual-only gate and the one-message rule live in
     // `warnIfProviderRefused` above.
     warnIfProviderRefused();
+    warnIfContainerlabDependencyDeclined();
     const liveContainerlabDeclines = containerlabStatusDeclines.filter((declined) =>
       core.getInventorySource(declined.id)?.revision === declined.revision
     );

@@ -27,7 +27,7 @@ export interface ContainerlabActivationController extends ContainerlabRuntime {
   beginFormSession(editOrigin?: { readonly sourceId: string; readonly revision: string }): string;
   updateFormSession(sessionId: string, values: InventorySourceValues): void;
   endFormSession(sessionId: string): void;
-  prepareFormSourceSave(sessionId: string, sourceId: string): () => void;
+  prepareFormSourceSave(sessionId: string, sourceId: string): (() => void) | undefined;
   invalidateSource(sourceId: string): Promise<void>;
   invalidateAllSources(): Promise<void>;
   transferFormApproval(sessionId: string, source: InventorySourceConfig): Promise<void>;
@@ -698,9 +698,10 @@ export function createContainerlabActivationController(
     prepareFormSourceSave(sessionId, sourceId) {
       if (disposed) throw new Error("Containerlab activation controller is disposed.");
       const session = formSessions.get(sessionId);
-      if (!session || !session.values || !session.approval || !isTrusted()) {
-        throw new Error("Containerlab form must have an active, tested approval before saving.");
+      if (!session || !session.values) {
+        throw new Error("Containerlab form must have an active session with current values before saving.");
       }
+      if (!isTrusted()) throw new Error("Workspace trust is required to save this Containerlab source form.");
       const snapshot = getSnapshot();
       const source = snapshot.inventorySources.find((item) => item.id === sourceId);
       if (session.editOrigin) {
@@ -711,10 +712,11 @@ export function createContainerlabActivationController(
       } else if (source) {
         throw new Error("Add approval can only be prepared for a source ID that does not already exist.");
       }
+      const currentRoute = captureDependencies(parseContainerlabConfig(session.values), snapshot);
+      if (!session.approval) return undefined;
       if (session.approval.intentKey !== intentKey("containerlab", session.values)) {
         throw new Error("Containerlab form values changed after their successful Test.");
       }
-      const currentRoute = captureDependencies(parseContainerlabConfig(session.values), snapshot);
       if (currentRoute.identity !== session.approval.dependencyIdentity) {
         throw new Error("Containerlab SSH dependencies changed after the successful Test.");
       }

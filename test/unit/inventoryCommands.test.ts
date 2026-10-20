@@ -20,6 +20,7 @@ import {
   inventorySecretKey,
   normalizeNotSyncableReasons,
   type InventoryProvider,
+  type InventoryOperationContext,
   type InventorySourceConfig,
   type InventorySourceValues,
   type InventoryTree
@@ -420,10 +421,10 @@ describe("inventoryCommands", () => {
         expect(lockDepth).toBe(1);
         events.push("prepare");
         const cleanup = originalPrepare(sessionId, sourceId);
-        return () => {
+        return cleanup ? () => {
           events.push("cleanup");
           cleanup();
-        };
+        } : undefined;
       });
       const originalTransfer = activation.transferFormApproval.bind(activation);
       vi.spyOn(activation, "transferFormApproval").mockImplementation(async (sessionId, source) => {
@@ -761,6 +762,455 @@ describe("inventoryCommands", () => {
         activation.dispose();
         lockSpy.mockRestore();
       }
+    });
+
+    it("saves untested Add and Edit forms without transferring approval, while preserving only unchanged approved edits", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      await core.addOrUpdateServer(makeServer({ id: "jump-host", name: "Jump Host", host: "jump.example" }));
+      await core.addOrUpdateServer(makeServer({
+        id: "lab-host",
+        name: "Lab Host",
+        host: "lab.example",
+        proxy: { type: "ssh", jumpHostId: "jump-host" }
+      }));
+      await core.addOrUpdateServer(makeServer({ id: "telnet-host", name: "Telnet Host", host: "telnet.example", protocol: "telnet" }));
+
+      let lockDepth = 0;
+      const originalRunExclusive = configMutationLock.runExclusive.bind(configMutationLock);
+      const lockSpy = vi.spyOn(configMutationLock, "runExclusive").mockImplementation(async (fn: () => Promise<unknown>) =>
+        originalRunExclusive(async () => {
+          lockDepth++;
+          try {
+            return await fn();
+          } finally {
+            lockDepth--;
+          }
+        })
+      );
+      const executor: ContainerlabExecutor = {
+        resolveDependencies: vi.fn(async (config, context) => ({
+          identity: {
+            executable: config.containerlabExecutable,
+            dockerExecutable: config.dockerExecutable,
+            dockerSocket: config.dockerSocket,
+            location: config.location,
+            sudo: config.sudo,
+            routeIdentity: config.location === "local" ? "local" : context.labHostRouteIdentity!
+          }
+        })),
+        preflight: vi.fn(async (_config, resolved) => ({ identity: resolved.identity, version: "0.80.0" })),
+        inspect: vi.fn(async () => ({ version: "0.80.0", stdout: "{}" }))
+      };
+      const store = { load: vi.fn(async () => undefined), save: vi.fn(async () => {}) };
+      const confirmRun = vi.fn(async () => true);
+      const activation = createContainerlabActivationController({
+        core,
+        executor,
+        store,
+        isWorkspaceTrusted: () => true,
+        confirmRun
+      });
+      const originalPrepare = activation.prepareFormSourceSave.bind(activation);
+      const prepareSpy = vi.spyOn(activation, "prepareFormSourceSave").mockImplementation((sessionId, sourceId) => {
+        expect(lockDepth).toBe(1);
+        const cleanup = originalPrepare(sessionId, sourceId);
+        return cleanup ? () => cleanup() : undefined;
+      });
+      const originalTransfer = activation.transferFormApproval.bind(activation);
+      const transferSpy = vi.spyOn(activation, "transferFormApproval").mockImplementation(async (sessionId, source) => {
+        expect(lockDepth).toBe(1);
+        await originalTransfer(sessionId, source);
+      });
+      const provider = createContainerlabProvider(activation);
+      const testConnectionSpy = vi.spyOn(provider, "testConnection");
+      const originalAddSource = core.addOrUpdateInventorySource.bind(core);
+      vi.spyOn(core, "addOrUpdateInventorySource").mockImplementation(async (source, options) => {
+        if (source.providerId === "containerlab") expect(lockDepth).toBe(1);
+        await originalAddSource(source, options);
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(provider);
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown(), activation);
+
+      const values: FormValues = {
+        name: "Untested lab",
+        targetFolder: "Labs",
+        defaultUsername: "admin",
+        prunePolicy: "delete",
+        cfg_location: "ssh",
+        cfg_labHostId: "lab-host",
+        cfg_runner: "host",
+        cfg_deviceConnection: "direct",
+        cfg_statusPollSeconds: 0,
+        cfg_addressPreference: "ipv4"
+      };
+
+      try {
+        await registeredCommands.get("nexus.inventory.addSource")!();
+        const untestedAdd = latestFormCall();
+        await untestedAdd.onSubmit(values);
+        const untestedSource = core.getSnapshot().inventorySources.find((source) => source.name === values.name)!;
+        expect(untestedSource).toBeDefined();
+        expect(prepareSpy).toHaveBeenCalledOnce();
+        expect(transferSpy).not.toHaveBeenCalled();
+        expect(testConnectionSpy).not.toHaveBeenCalled();
+        expect(executor.inspect).not.toHaveBeenCalled();
+        const untestedContext: InventoryOperationContext = {
+          intent: "background-status",
+          subject: { kind: "source", sourceId: untestedSource.id, revision: untestedSource.revision! }
+        };
+        await expect(provider.fetchStatus!(untestedSource.config, {}, untestedContext)).rejects.toThrow(/Test|Sync|approv/i);
+        expect(confirmRun).not.toHaveBeenCalled();
+        expect(executor.inspect).not.toHaveBeenCalled();
+        untestedAdd.panel.fireDispose();
+
+        await registeredCommands.get("nexus.inventory.editSource")!(untestedSource.id);
+        const untestedEdit = latestFormCall();
+        const untestedRename = { ...values, name: "Untested lab renamed" };
+        await untestedEdit.onSubmit(untestedRename);
+        const renamedUntestedSource = core.getInventorySource(untestedSource.id)!;
+        const renamedContext: InventoryOperationContext = {
+          intent: "background-status",
+          subject: { kind: "source", sourceId: renamedUntestedSource.id, revision: renamedUntestedSource.revision! }
+        };
+        await expect(provider.fetchStatus!(renamedUntestedSource.config, {}, renamedContext)).rejects.toThrow(/Test|Sync|approv/i);
+        expect(executor.inspect).not.toHaveBeenCalled();
+        untestedEdit.panel.fireDispose();
+
+        const testedValues = { ...values, name: "Approved lab" };
+        await registeredCommands.get("nexus.inventory.addSource")!();
+        const testedAdd = latestFormCall();
+        await testedAdd.onTest!(testedValues);
+        expect(testConnectionSpy.mock.calls.at(-1)?.[2]).toMatchObject({
+          intent: "test",
+          subject: { kind: "form", sessionId: expect.any(String) }
+        });
+        await testedAdd.onSubmit(testedValues);
+        const approvedSource = core.getSnapshot().inventorySources.find((source) => source.name === testedValues.name)!;
+        expect(transferSpy).toHaveBeenCalledOnce();
+        testedAdd.panel.fireDispose();
+
+        await registeredCommands.get("nexus.inventory.editSource")!(approvedSource.id);
+        const metadataEdit = latestFormCall();
+        const metadataValues = { ...testedValues, name: "Approved lab renamed" };
+        await metadataEdit.onSubmit(metadataValues);
+        const metadataSaved = core.getInventorySource(approvedSource.id)!;
+        expect(metadataSaved.name).toBe(metadataValues.name);
+        expect(transferSpy).toHaveBeenCalledOnce();
+        vi.mocked(executor.inspect).mockClear();
+        const metadataContext: InventoryOperationContext = {
+          intent: "background-status",
+          subject: { kind: "source", sourceId: metadataSaved.id, revision: metadataSaved.revision! }
+        };
+        await provider.fetchStatus!(metadataSaved.config, {}, metadataContext);
+        expect(executor.inspect).toHaveBeenCalledOnce();
+        expect(confirmRun).toHaveBeenCalledOnce();
+        metadataEdit.panel.fireDispose();
+
+        await registeredCommands.get("nexus.inventory.editSource")!(metadataSaved.id);
+        const changedIntentEdit = latestFormCall();
+        const changedIntentValues = { ...metadataValues, cfg_sudo: true };
+        await changedIntentEdit.onSubmit(changedIntentValues);
+        const changedIntentSaved = core.getInventorySource(metadataSaved.id)!;
+        vi.mocked(executor.resolveDependencies).mockClear();
+        vi.mocked(executor.preflight).mockClear();
+        vi.mocked(executor.inspect).mockClear();
+        const changedContext: InventoryOperationContext = {
+          intent: "background-status",
+          subject: { kind: "source", sourceId: changedIntentSaved.id, revision: changedIntentSaved.revision! }
+        };
+        await expect(provider.fetchStatus!(changedIntentSaved.config, {}, changedContext)).rejects.toThrow(/Test|Sync|approv/i);
+        expect(executor.resolveDependencies).not.toHaveBeenCalled();
+        expect(executor.preflight).not.toHaveBeenCalled();
+        expect(executor.inspect).not.toHaveBeenCalled();
+        expect(confirmRun).toHaveBeenCalledOnce();
+        changedIntentEdit.panel.fireDispose();
+
+        await registeredCommands.get("nexus.inventory.addSource")!();
+        const invalidHostAdd = latestFormCall();
+        await expect(invalidHostAdd.onSubmit({ ...values, name: "Invalid Telnet lab", cfg_labHostId: "telnet-host" }))
+          .rejects.toThrow(/SSH|host|route|protocol/i);
+        expect(core.getSnapshot().inventorySources.some((source) => source.name === "Invalid Telnet lab")).toBe(false);
+        expect(executor.inspect).not.toHaveBeenCalled();
+        invalidHostAdd.panel.fireDispose();
+      } finally {
+        activation.dispose();
+        lockSpy.mockRestore();
+      }
+    });
+
+    it.each(["lab host", "deep jump host", "authentication profile", "missing lab host"] as const)(
+      "does not apply a Containerlab status report when the %s changes after activation inspection returns",
+      async (changedDependency) => {
+        const core = new NexusCore(new InMemoryConfigRepository());
+        await core.initialize();
+        const profile: AuthProfile = { id: "lab-auth", name: "Lab Auth", username: "netops", authType: "agent" };
+        await core.addOrUpdateAuthProfile(profile);
+        const jumpHost = makeServer({ id: "jump-host", name: "Jump Host", host: "jump.example", authProfileId: profile.id });
+        const labHost = makeServer({
+          id: "lab-host",
+          name: "Lab Host",
+          host: "lab.example",
+          authProfileId: profile.id,
+          proxy: { type: "ssh", jumpHostId: jumpHost.id }
+        });
+        await core.addOrUpdateServer(jumpHost);
+        await core.addOrUpdateServer(labHost);
+        const config: InventorySourceValues = {
+          location: "ssh",
+          labHostId: labHost.id,
+          runner: "host",
+          containerlabExecutable: "containerlab",
+          dockerExecutable: "docker",
+          dockerSocket: "/var/run/docker.sock",
+          sudo: false,
+          deviceConnection: "direct",
+          labFilter: "",
+          addressPreference: "ipv4"
+        };
+        await core.addOrUpdateInventorySource(makeSource({
+          id: "containerlab-status-source",
+          providerId: "containerlab",
+          name: "Containerlab status",
+          targetFolder: "Labs",
+          config
+        }));
+        const source = core.getInventorySource("containerlab-status-source")!;
+        const executor: ContainerlabExecutor = {
+          resolveDependencies: vi.fn(async (currentConfig, context) => ({
+            identity: {
+              executable: currentConfig.containerlabExecutable,
+              dockerExecutable: currentConfig.dockerExecutable,
+              dockerSocket: currentConfig.dockerSocket,
+              location: currentConfig.location,
+              sudo: currentConfig.sudo,
+              routeIdentity: context.labHostRouteIdentity!
+            }
+          })),
+          preflight: vi.fn(async (_config, resolved) => ({ identity: resolved.identity, version: "0.80.0" })),
+          inspect: vi.fn(async () => ({
+            version: "0.80.0",
+            stdout: JSON.stringify({
+              "lab-a": [{
+                ID: "container-1",
+                Names: ["/clab-lab-a-r1"],
+                Image: "ghcr.io/example/router:1",
+                State: "running",
+                Status: "Up 1 minute",
+                Labels: {
+                  containerlab: "lab-a",
+                  "clab-node-name": "r1",
+                  "clab-node-kind": "linux",
+                  "clab-node-type": "linux"
+                },
+                NetworkSettings: { IPv4addr: "", IPv4pLen: 0, IPv6addr: "", IPv6pLen: 0 }
+              }]
+            })
+          }))
+        };
+        const activation = createContainerlabActivationController({
+          core,
+          executor,
+          store: { load: vi.fn(async () => undefined), save: vi.fn(async () => {}) },
+          isWorkspaceTrusted: () => true,
+          confirmRun: vi.fn(async () => true)
+        });
+        const provider = createContainerlabProvider(activation);
+        const registry = new InventoryProviderRegistry();
+        registry.register(provider);
+        registerInventoryCommands(core, registry, makeVault(), makeTeardown(), activation);
+        const sourceContext: InventoryOperationContext = {
+          intent: "sync",
+          subject: { kind: "source", sourceId: source.id, revision: source.revision! }
+        };
+        await provider.testConnection!(source.config, {}, sourceContext);
+
+        const originalInspect = activation.inspect.bind(activation);
+        let mutationCompleted = false;
+        vi.spyOn(activation, "inspect").mockImplementation(async (currentConfig, operationContext) => {
+          const inspection = await originalInspect(currentConfig, operationContext);
+          if (!mutationCompleted) {
+            if (changedDependency === "lab host") {
+              await core.addOrUpdateServer({ ...labHost, host: "lab-moved.example" });
+            } else if (changedDependency === "deep jump host") {
+              await core.addOrUpdateServer({ ...jumpHost, host: "jump-moved.example" });
+            } else if (changedDependency === "authentication profile") {
+              await core.addOrUpdateAuthProfile({ ...profile, username: "changed-user" });
+            } else {
+              await core.removeServer(labHost.id);
+            }
+            mutationCompleted = true;
+          }
+          return inspection;
+        });
+        const applySpy = vi.spyOn(core, "applyInventoryStatus");
+        const healSpy = vi.spyOn(core, "healSyncedConsolePorts");
+        mockShowWarningMessage.mockResolvedValueOnce(undefined);
+
+        const outcome = await registeredCommands.get("nexus.inventory.refreshStatus")!() as { unrefreshedSourceIds: string[] };
+
+        expect(mutationCompleted).toBe(true);
+        expect(executor.inspect).toHaveBeenCalledTimes(2);
+        expect(applySpy).not.toHaveBeenCalled();
+        expect(outcome.unrefreshedSourceIds).toEqual([source.id]);
+        expect(healSpy).not.toHaveBeenCalled();
+        expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+        if (changedDependency === "missing lab host") {
+          expect(mockShowWarningMessage).toHaveBeenCalledWith(
+            expect.stringContaining("selected SSH discovery dependency changed or is unavailable"),
+            "Edit Source"
+          );
+        } else {
+          expect(mockShowWarningMessage).toHaveBeenCalledWith(
+            expect.stringContaining("selected SSH discovery dependency changed or is unavailable"),
+            "Sync Now"
+          );
+        }
+        activation.dispose();
+      }
+    );
+
+    it("silently leaves Containerlab status unrefreshed when a background dependency changes after inspection", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const jumpHost = makeServer({ id: "jump-host", name: "Jump Host", host: "jump.example" });
+      const labHost = makeServer({
+        id: "lab-host",
+        name: "Lab Host",
+        host: "lab.example",
+        proxy: { type: "ssh", jumpHostId: jumpHost.id }
+      });
+      await core.addOrUpdateServer(jumpHost);
+      await core.addOrUpdateServer(labHost);
+      const config: InventorySourceValues = {
+        location: "ssh",
+        labHostId: labHost.id,
+        runner: "host",
+        containerlabExecutable: "containerlab",
+        dockerExecutable: "docker",
+        dockerSocket: "/var/run/docker.sock",
+        sudo: false,
+        deviceConnection: "direct",
+        labFilter: "",
+        addressPreference: "ipv4"
+      };
+      await core.addOrUpdateInventorySource(makeSource({
+        id: "containerlab-background-source",
+        providerId: "containerlab",
+        config
+      }));
+      const source = core.getInventorySource("containerlab-background-source")!;
+      const executor: ContainerlabExecutor = {
+        resolveDependencies: vi.fn(async (currentConfig, context) => ({
+          identity: {
+            executable: currentConfig.containerlabExecutable,
+            dockerExecutable: currentConfig.dockerExecutable,
+            dockerSocket: currentConfig.dockerSocket,
+            location: currentConfig.location,
+            sudo: currentConfig.sudo,
+            routeIdentity: context.labHostRouteIdentity!
+          }
+        })),
+        preflight: vi.fn(async (_config, resolved) => ({ identity: resolved.identity, version: "0.80.0" })),
+        inspect: vi.fn(async () => ({ version: "0.80.0", stdout: "{}" }))
+      };
+      const activation = createContainerlabActivationController({
+        core,
+        executor,
+        store: { load: vi.fn(async () => undefined), save: vi.fn(async () => {}) },
+        isWorkspaceTrusted: () => true,
+        confirmRun: vi.fn(async () => true)
+      });
+      const provider = createContainerlabProvider(activation);
+      const registry = new InventoryProviderRegistry();
+      registry.register(provider);
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown(), activation);
+      await provider.testConnection!(source.config, {}, {
+        intent: "sync",
+        subject: { kind: "source", sourceId: source.id, revision: source.revision! }
+      });
+      const originalInspect = activation.inspect.bind(activation);
+      let mutationCompleted = false;
+      vi.spyOn(activation, "inspect").mockImplementation(async (currentConfig, operationContext) => {
+        const inspection = await originalInspect(currentConfig, operationContext);
+        if (!mutationCompleted) {
+          await core.addOrUpdateServer({ ...jumpHost, host: "jump-moved.example" });
+          mutationCompleted = true;
+        }
+        return inspection;
+      });
+      const applySpy = vi.spyOn(core, "applyInventoryStatus");
+      const outcome = await registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: source.id, __poll: true }) as {
+        unrefreshedSourceIds: string[];
+      };
+
+      expect(mutationCompleted).toBe(true);
+      expect(applySpy).not.toHaveBeenCalled();
+      expect(outcome.unrefreshedSourceIds).toEqual([source.id]);
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+      activation.dispose();
+    });
+
+    it("applies Containerlab status when the original SSH dependency snapshot remains unchanged", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const labHost = makeServer({ id: "lab-host", name: "Lab Host", host: "lab.example" });
+      await core.addOrUpdateServer(labHost);
+      const config: InventorySourceValues = {
+        location: "ssh",
+        labHostId: labHost.id,
+        runner: "host",
+        containerlabExecutable: "containerlab",
+        dockerExecutable: "docker",
+        dockerSocket: "/var/run/docker.sock",
+        sudo: false,
+        deviceConnection: "direct",
+        labFilter: "",
+        addressPreference: "ipv4"
+      };
+      await core.addOrUpdateInventorySource(makeSource({
+        id: "containerlab-unchanged-source",
+        providerId: "containerlab",
+        config
+      }));
+      const source = core.getInventorySource("containerlab-unchanged-source")!;
+      const executor: ContainerlabExecutor = {
+        resolveDependencies: vi.fn(async (currentConfig, context) => ({
+          identity: {
+            executable: currentConfig.containerlabExecutable,
+            dockerExecutable: currentConfig.dockerExecutable,
+            dockerSocket: currentConfig.dockerSocket,
+            location: currentConfig.location,
+            sudo: currentConfig.sudo,
+            routeIdentity: context.labHostRouteIdentity!
+          }
+        })),
+        preflight: vi.fn(async (_config, resolved) => ({ identity: resolved.identity, version: "0.80.0" })),
+        inspect: vi.fn(async () => ({ version: "0.80.0", stdout: "{}" }))
+      };
+      const activation = createContainerlabActivationController({
+        core,
+        executor,
+        store: { load: vi.fn(async () => undefined), save: vi.fn(async () => {}) },
+        isWorkspaceTrusted: () => true,
+        confirmRun: vi.fn(async () => true)
+      });
+      const provider = createContainerlabProvider(activation);
+      const registry = new InventoryProviderRegistry();
+      registry.register(provider);
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown(), activation);
+      await provider.testConnection!(source.config, {}, {
+        intent: "sync",
+        subject: { kind: "source", sourceId: source.id, revision: source.revision! }
+      });
+      const applySpy = vi.spyOn(core, "applyInventoryStatus");
+      const outcome = await registeredCommands.get("nexus.inventory.refreshStatus")!() as { unrefreshedSourceIds: string[] };
+
+      expect(outcome.unrefreshedSourceIds).toEqual([]);
+      expect(executor.inspect).toHaveBeenCalledTimes(2);
+      expect(applySpy).toHaveBeenCalledOnce();
+      activation.dispose();
     });
 
     it("blocks Add Test and Save when the selected Containerlab SSH host stops being live", async () => {

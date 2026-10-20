@@ -19,6 +19,8 @@ import type { AuthProfile, ServerConfig } from "../../src/models/config";
 import { authProfileOwnedCredentials } from "../../src/models/config";
 import { formatAuthProfileLabel } from "../../src/utils/authProfileLabel";
 import { createContainerlabProvider } from "../../src/services/inventory/providers/containerlabProvider";
+import { renderFormHtml } from "../../src/ui/formHtml";
+import { openForm } from "../helpers/formScriptHarness";
 
 function keyedField(definition: FormDefinition, key: string): Extract<FormFieldDescriptor, { key: string }> {
   const field = definition.fields.find(
@@ -764,6 +766,44 @@ describe("inventorySourceFormDefinition", () => {
     }
     expect(imageField.requiredWhen).toEqual({ field: "cfg_runner", value: "disposable" });
     expect(containerField.requiredWhen).toEqual({ field: "cfg_runner", value: "existing" });
+  });
+
+  it("lets the native Save submit with a selected SSH host and empty optional picker filter across location changes", () => {
+    const provider = createContainerlabProvider();
+    const definition = inventorySourceFormDefinition(
+      provider,
+      sourceSeed({
+        providerId: "containerlab",
+        config: { location: "local", labHostId: "lab-host" }
+      }),
+      "admin",
+      [],
+      [],
+      [],
+      [sshProfile("lab-host", "Lab Host")]
+    );
+    const html = renderFormHtml(definition);
+    const filterMarkup = html.match(/<input type="text" class="custom-select-filter"[^>]*>/);
+
+    expect(html).toMatch(/data-required-when='[^']*cfg_location[^']*ssh/);
+    expect(html).toContain('<input type="hidden" name="cfg_labHostId" value="lab-host" />');
+    expect(filterMarkup).not.toBeNull();
+    expect(filterMarkup![0]).not.toContain("name=");
+
+    const form = openForm(definition);
+    expect(form.requiredState("cfg_labHostId")).toEqual({ value: false, filter: false });
+    expect(form.attemptNativeSubmit()?.cfg_labHostId).toBe("lab-host");
+
+    form.choose("cfg_location", "ssh");
+    expect(form.requiredState("cfg_labHostId")).toEqual({ value: true, filter: false });
+    const remoteValues = form.attemptNativeSubmit();
+    expect(remoteValues?.cfg_labHostId).toBe("lab-host");
+    expect(form.posted.filter((message) => message.type === "submit")).toHaveLength(2);
+
+    form.choose("cfg_location", "local");
+    expect(form.requiredState("cfg_labHostId")).toEqual({ value: false, filter: false });
+    expect(form.attemptNativeSubmit()?.cfg_labHostId).toBe("lab-host");
+    expect(form.posted.filter((message) => message.type === "submit")).toHaveLength(3);
   });
 
   it("shows a deleted Containerlab SSH profile as unresolved instead of silently selecting another host", () => {

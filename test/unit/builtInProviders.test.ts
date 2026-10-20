@@ -119,5 +119,14 @@ describe("built-in inventory providers", () => {
     it("⊘ names no individual provider factory in activate(), so adding one cannot require an edit here", () => {
       expect(source).not.toMatch(/inventoryProviderRegistry\.register\(create\w+Provider\(\)\)/);
     });
+
+    it("keeps startup independent of the approval store because a fresh controller already has no authority", () => {
+      expect(source).not.toMatch(/await containerlabActivation\.invalidateAllSources\(\)/);
+      const controllerIndex = source.indexOf("const containerlabActivation = createContainerlabActivationController({");
+      const providerLoopIndex = source.indexOf("for (const provider of createBuiltInProviders({ containerlabRuntime })) {");
+      expect(controllerIndex).toBeGreaterThanOrEqual(0);
+      expect(providerLoopIndex).toBeGreaterThanOrEqual(0);
+      expect(controllerIndex).toBeLessThan(providerLoopIndex);
+    });
   });
 });
