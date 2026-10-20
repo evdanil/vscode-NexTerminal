@@ -10,8 +10,8 @@ import type { ContainerlabExecutionIdentity } from "../../src/services/inventory
 
 function identity(location: "local" | "ssh", runner: "host" | "disposable" | "existing"): ContainerlabExecutionIdentity {
   return {
-    executable: runner === "host" ? "/usr/bin/containerlab" : "/usr/local/bin/containerlab",
-    dockerExecutable: runner === "host" ? undefined : "/usr/bin/docker",
+    executable: runner === "host" ? "/usr/bin/containerlab" : "containerlab",
+    dockerExecutable: "/usr/bin/docker",
     imageId: runner === "disposable" ? `sha256:${"a".repeat(64)}` : undefined,
     containerId: runner === "existing" ? "b".repeat(64) : undefined,
     dockerSocket: "/run/docker.sock",
@@ -61,6 +61,7 @@ describe("Containerlab command vectors", () => {
     const command = buildContainerlabInspectionCommand(config, identity(location, runner), helper);
     expect(command.cwd).toBe("/");
     expect(command.args.slice(0, 3)).toEqual(["-n", "--", "env"]);
+    expect(command.args.filter((argument) => argument === "-i")).toHaveLength(runner === "host" ? 1 : 2);
     if (runner === "host") {
       expect(command.args).toContain("DOCKER_HOST=unix:///run/docker.sock");
     } else {

@@ -6,6 +6,7 @@ export const CONTAINERLAB_INSPECT_ARGS: readonly string[] = Object.freeze([
   "--runtime", "docker", "--topo=", "--name=", "--timeout", "20s",
   "inspect", "--all", "--details", "--format", "json"
 ]);
+export const CONTAINERLAB_VERSION_ARGS: readonly string[] = Object.freeze(["version"]);
 
 const SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const CONTAINER_DOCKER_SOCKET = "/var/run/docker.sock";
@@ -45,8 +46,16 @@ function validateIdentity(config: ContainerlabConfig, identity: ContainerlabExec
   if (identity.location !== config.location || identity.dockerSocket !== config.dockerSocket) {
     return invalid("Containerlab execution identity does not match the selected location and Docker socket.");
   }
-  if (!identity.executable.startsWith("/") || /[\u0000-\u0020\u007f-\u009f]/u.test(identity.executable)) {
-    return invalid("Containerlab execution requires a resolved absolute CLI executable path.");
+  if (config.runner === "host") {
+    if (!identity.executable.startsWith("/") || /[\u0000-\u0020\u007f-\u009f]/u.test(identity.executable)) {
+      return invalid("Host Containerlab execution requires a resolved absolute CLI executable path.");
+    }
+  } else if (
+    identity.executable !== config.containerlabExecutable ||
+    identity.executable.startsWith("-") ||
+    /[\u0000-\u0020\u007f-\u009f]/u.test(identity.executable)
+  ) {
+    return invalid("Container Containerlab execution must use the configured CLI token with the fixed runner PATH.");
   }
   if (identity.sudo !== config.sudo) {
     return invalid("Containerlab execution identity does not match the configured sudo setting.");
@@ -54,6 +63,7 @@ function validateIdentity(config: ContainerlabConfig, identity: ContainerlabExec
   if (identity.routeIdentity.length === 0 || /[\u0000-\u001f\u007f-\u009f]/u.test(identity.routeIdentity)) {
     return invalid("Containerlab execution identity requires a valid route identity.");
   }
+  validateDocker(identity);
 }
 
 function validateDocker(identity: ContainerlabExecutionIdentity): string {
@@ -100,9 +110,10 @@ function validateImmutableRunner(config: ContainerlabConfig, identity: Container
   }
 }
 
-export function buildContainerlabInspectionCommand(
+function buildContainerlabRunnerCommand(
   config: ContainerlabConfig,
   identity: ContainerlabExecutionIdentity,
+  args: readonly string[],
   helper?: { readonly name: string; readonly ownershipLabel: string }
 ): ContainerlabCommand {
   validateIdentity(config, identity);
@@ -110,7 +121,7 @@ export function buildContainerlabInspectionCommand(
   const environment = containerlabCleanEnvironment(config.dockerSocket);
 
   if (config.runner === "host") {
-    const command = addSudoReset(identity.executable, CONTAINERLAB_INSPECT_ARGS, environment, config.sudo);
+    const command = addSudoReset(identity.executable, args, environment, config.sudo);
     return { ...command, env: environment, cwd: "/" };
   }
 
@@ -121,7 +132,7 @@ export function buildContainerlabInspectionCommand(
     innerArgs = [
       "exec", "--workdir", "/", identity.containerId!, "env",
       ...environmentArgs(containerlabCleanEnvironment(CONTAINER_DOCKER_SOCKET)),
-      identity.executable, ...CONTAINERLAB_INSPECT_ARGS
+      identity.executable, ...args
     ];
   } else {
     innerArgs = [
@@ -132,9 +143,26 @@ export function buildContainerlabInspectionCommand(
       "--mount", `type=bind,src=${config.dockerSocket},dst=${CONTAINER_DOCKER_SOCKET}`,
       "--workdir", "/", "--entrypoint", "env", identity.imageId!,
       ...environmentArgs(containerlabCleanEnvironment(CONTAINER_DOCKER_SOCKET)),
-      identity.executable, ...CONTAINERLAB_INSPECT_ARGS
+      identity.executable, ...args
     ];
   }
   const command = addSudoReset(docker, outerArgs.concat(innerArgs), environment, config.sudo);
   return { ...command, env: environment, cwd: "/" };
+}
+
+export function buildContainerlabInspectionCommand(
+  config: ContainerlabConfig,
+  identity: ContainerlabExecutionIdentity,
+  helper?: { readonly name: string; readonly ownershipLabel: string }
+): ContainerlabCommand {
+  return buildContainerlabRunnerCommand(config, identity, CONTAINERLAB_INSPECT_ARGS, helper);
+}
+
+/** Runs the fixed CLI version preflight inside the already-resolved runner. */
+export function buildContainerlabVersionCommand(
+  config: ContainerlabConfig,
+  identity: ContainerlabExecutionIdentity,
+  helper?: { readonly name: string; readonly ownershipLabel: string }
+): ContainerlabCommand {
+  return buildContainerlabRunnerCommand(config, identity, CONTAINERLAB_VERSION_ARGS, helper);
 }

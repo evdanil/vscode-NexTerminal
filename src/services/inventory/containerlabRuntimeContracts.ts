@@ -1,4 +1,5 @@
 import type { InventoryOperationContext } from "../../models/inventory";
+import type { ServerConfig } from "../../models/config";
 import type { ContainerlabConfig } from "./providers/containerlabConfig";
 
 /** A validated result of one bounded Containerlab inspection invocation. */
@@ -20,10 +21,69 @@ export interface ContainerlabCommand {
   readonly cwd: "/";
 }
 
-/** Dependencies resolved by the runtime preflight, never mutable names or tags. */
+/** One absolute invocation deadline and the host snapshot authorized by its caller. */
+export interface ContainerlabRunContext {
+  readonly interaction: "interactive" | "noninteractive";
+  readonly signal: AbortSignal;
+  readonly deadline: number;
+  readonly labHost?: ServerConfig;
+  /** Captured dependency-snapshot identity for the full SSH route and its auth profiles. */
+  readonly labHostRouteIdentity?: string;
+  readonly isCurrent: () => boolean;
+}
+
+export interface ResolvedContainerlabExecution {
+  readonly identity: ContainerlabExecutionIdentity;
+}
+
+export interface PreparedContainerlabExecution {
+  readonly identity: ContainerlabExecutionIdentity;
+  readonly version: string;
+}
+
+export interface ContainerlabCommandResult {
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+export interface ContainerlabCommandRunner {
+  run(command: ContainerlabCommand, context: ContainerlabRunContext): Promise<ContainerlabCommandResult>;
+}
+
+export interface ContainerlabExecutor {
+  resolveDependencies(
+    config: ContainerlabConfig,
+    context: ContainerlabRunContext,
+    expected?: ContainerlabExecutionIdentity
+  ): Promise<ResolvedContainerlabExecution>;
+  preflight(
+    config: ContainerlabConfig,
+    resolved: ResolvedContainerlabExecution,
+    context: ContainerlabRunContext
+  ): Promise<PreparedContainerlabExecution>;
+  inspect(
+    config: ContainerlabConfig,
+    prepared: PreparedContainerlabExecution,
+    context: ContainerlabRunContext
+  ): Promise<ContainerlabInspection>;
+}
+
+export interface ContainerlabExecutorDependencies {
+  readonly localRunner: ContainerlabCommandRunner;
+  readonly sshRunner: ContainerlabCommandRunner;
+  readonly now?: () => number;
+  readonly createInvocationId?: () => string;
+}
+
+/**
+ * Captures the checked host Containerlab and Docker executable paths or the
+ * container CLI token plus outer Docker path, immutable runner IDs, selected
+ * socket and SSH route. Host paths identify lookup results; they do not pin
+ * executable contents.
+ */
 export interface ContainerlabExecutionIdentity {
   readonly executable: string;
-  readonly dockerExecutable?: string;
+  readonly dockerExecutable: string;
   readonly imageId?: string;
   readonly containerId?: string;
   readonly dockerSocket: string;
