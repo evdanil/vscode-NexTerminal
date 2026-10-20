@@ -257,7 +257,7 @@ describe("VscodeConfigRepository corrupt globalState shapes", () => {
       tree: { contractVersion: 1, devices: [{ externalId: "ext", name: "Prod", endpoints: [] }] },
       currentServers: [loaded], now: 2
     });
-    expect(plan.warnings).toContain('1 device has no console address yet and remains a placeholder (e.g. "Prod").');
+    expect(plan.warnings).toContain('1 device has no console address and remains a placeholder (e.g. "Prod").');
     expect(plan.warnings.some((warning) => warning.includes("downgraded to a placeholder"))).toBe(false);
   });
 

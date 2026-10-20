@@ -2623,12 +2623,13 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       // strips `origin` (see below), so the copy would be a MANUAL addressless
       // record — an invariant violation: `addressless` exists only for synced
       // placeholders. No sync would ever upgrade it (no origin), and its connect
-      // refusal tells the user to re-sync a source it has no link to. Stripping the
-      // flag instead would leave an empty host that fails validation, so refusing is
-      // the only coherent answer.
+      // refusal directs the user to a known endpoint they can add by hand. The
+      // duplicate has no source link to sync, and stripping the flag instead would
+      // leave an empty host that fails validation, so refusing is the only coherent
+      // answer.
       if (server.addressless === true) {
         void vscode.window.showInformationMessage(
-          `"${server.name}" has no console address yet, so it can't be duplicated — it will get one when its inventory source next syncs.`
+          `"${server.name}" has no console address, so it can't be duplicated. If you know a reachable endpoint, edit its Host, Port and connection settings first.`
         );
         return;
       }
@@ -2759,7 +2760,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       if (addresslessInGroup.length > 0) {
         const count = addresslessInGroup.length;
         void vscode.window.showInformationMessage(
-          `${count} ${count === 1 ? "server has" : "servers have"} no console address yet and ${count === 1 ? "was" : "were"} skipped — ${count === 1 ? "it" : "they"} will connect once the inventory source assigns an address.`
+          `${count} ${count === 1 ? "server has" : "servers have"} no console address and ${count === 1 ? "was" : "were"} skipped. If you know a reachable endpoint, edit its profile's Host, Port and connection settings. Re-sync the source if it later reports an address.`
         );
       }
     }),

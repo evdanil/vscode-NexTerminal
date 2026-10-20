@@ -73,5 +73,5 @@ Connection details beside items in the tree: [settings.md#connectivity-hub](sett
 - [Serial Consoles](serial.md) — serial profiles
 - [Local Shells](local-shells.md) — local shell profiles
 - [Local Servers](local-servers.md) — local processes you start, stop and restart from the Hub
-- [Inventory Sync](inventory/README.md) — servers created and kept current from NetBox, EVE-NG, Proxmox or GNS3
+- [Inventory Sync](inventory/README.md) — servers created and kept current from NetBox, EVE-NG, Proxmox, GNS3 or Containerlab
 - [Port Forwarding](port-forwarding.md) — tunnels you can drop onto a server

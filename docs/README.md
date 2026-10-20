@@ -21,6 +21,7 @@ One guide per feature. New here? Start with the [Quick start](../README.md#quick
   - [EVE-NG](inventory/eve-ng.md) — lab nodes from an EVE-NG server, with live lab status.
   - [Proxmox VE](inventory/proxmox.md) — VMs and containers from a Proxmox cluster, with the guest's web console.
   - [GNS3](inventory/gns3.md) — project nodes from a GNS3 server.
+  - [Containerlab](inventory/containerlab.md) — deployed lab nodes from a local Linux extension host or an existing SSH profile.
   - [Device Templates](inventory/device-templates.md) — reusable connection settings for synced servers.
 - [Import and Export](import-export.md) — import from `~/.ssh/config`, MobaXterm, SecureCRT, or a device list; encrypted backup and share export.
 

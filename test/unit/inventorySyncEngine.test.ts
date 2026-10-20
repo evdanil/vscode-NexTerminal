@@ -250,7 +250,8 @@ describe("computeSyncPlan — adds", () => {
     const plan = computeSyncPlan({ source, tree, currentServers: [], now: 1000 });
     expect(plan.adds).toHaveLength(5);
     expect(plan.adds.every((a) => a.addressless === true)).toBe(true);
-    const note = plan.warnings.filter((w) => w.toLowerCase().includes("no console address yet"));
+    const note = plan.warnings.filter((w) => w.toLowerCase().includes("no console address"));
+    expect(note.every((warning) => !warning.includes("no console address yet"))).toBe(true);
     expect(note).toHaveLength(1);
     expect(note[0]).toContain("5");
   });
@@ -273,7 +274,8 @@ describe("computeSyncPlan — adds", () => {
     expect(plan.adds[0].addressless).toBe(true);
     // Only the NEW addressless device is named in the aggregate note (the owned
     // one is an in-place update, not a fresh placeholder).
-    const note = plan.warnings.filter((w) => w.toLowerCase().includes("no console address yet"));
+    const note = plan.warnings.filter((w) => w.toLowerCase().includes("no console address"));
+    expect(note.every((warning) => !warning.includes("no console address yet"))).toBe(true);
     expect(note).toHaveLength(1);
     expect(note[0]).toContain("unowned-noendpoint");
   });
@@ -689,10 +691,12 @@ describe("computeSyncPlan — adds", () => {
 
       /** Every warning that speaks about devices having no console address. */
       function addresslessLines(plan: InventorySyncPlan): string[] {
-        return plan.warnings.filter((w) => w.includes("no console address yet"));
+        const lines = plan.warnings.filter((w) => w.includes("no console address"));
+        expect(lines.every((line) => !line.includes("no console address yet"))).toBe(true);
+        return lines;
       }
 
-      it("ADDS ONLY — keeps today's sentence verbatim, so the common case does not regress (⊘ rewording the added-only branch churns the line every user already reads)", () => {
+      it("ADDS ONLY — reports newly-created placeholders as added without an endpoint (⊘ omitting the added outcome hides which placeholders this sync created)", () => {
         const plan = computeSyncPlan({
           source: makeSource(),
           tree: makeTree([
@@ -704,7 +708,7 @@ describe("computeSyncPlan — adds", () => {
         });
         expect(plan.adds).toHaveLength(2);
         expect(addresslessLines(plan)).toEqual([
-          '2 devices have no console address yet and were added without one (e.g. "fresh-a", "fresh-b").'
+          '2 devices have no console address and were added without one (e.g. "fresh-a", "fresh-b").'
         ]);
       });
 
@@ -716,7 +720,7 @@ describe("computeSyncPlan — adds", () => {
           now: 5000
         });
         expect(addresslessLines(plan)).toEqual([
-          '1 device has no console address yet and was added without one (e.g. "lonely").'
+          '1 device has no console address and was added without one (e.g. "lonely").'
         ]);
       });
 
@@ -734,7 +738,7 @@ describe("computeSyncPlan — adds", () => {
         });
         expect(plan.adds).toHaveLength(1);
         expect(addresslessLines(plan)).toEqual([
-          '2 devices have no console address yet — 1 was added without one and 1 was already a placeholder (e.g. "fresh-node", "core-sw-1").'
+          '2 devices have no console address — 1 was added without one and 1 was already a placeholder (e.g. "fresh-node", "core-sw-1").'
         ]);
       });
 
@@ -750,7 +754,7 @@ describe("computeSyncPlan — adds", () => {
           now: 5000
         });
         expect(addresslessLines(plan)).toEqual([
-          '3 devices have no console address yet — 1 was added without one and 2 were already placeholders (e.g. "fresh-node", "core-sw-1", "edge-sw-2").'
+          '3 devices have no console address — 1 was added without one and 2 were already placeholders (e.g. "fresh-node", "core-sw-1", "edge-sw-2").'
         ]);
       });
 
@@ -769,7 +773,7 @@ describe("computeSyncPlan — adds", () => {
         // The mirror of the case above: 2 added / 1 already, where that one is
         // 1 added / 2 already. Between them every arm of the BOTH branch is read.
         expect(addresslessLines(plan)).toEqual([
-          '3 devices have no console address yet — 2 were added without one and 1 was already a placeholder (e.g. "fresh-a", "fresh-b", "core-sw-1").'
+          '3 devices have no console address — 2 were added without one and 1 was already a placeholder (e.g. "fresh-a", "fresh-b", "core-sw-1").'
         ]);
       });
 
@@ -783,7 +787,7 @@ describe("computeSyncPlan — adds", () => {
         expect(plan.adds).toHaveLength(0);
         expect(plan.unchangedCount).toBe(1);
         expect(addresslessLines(plan)).toEqual([
-          '1 device has no console address yet and remains a placeholder (e.g. "core-sw-1").'
+          '1 device has no console address and remains a placeholder (e.g. "core-sw-1").'
         ]);
         expect(addresslessLines(plan)[0]).not.toContain("added");
       });
@@ -799,7 +803,7 @@ describe("computeSyncPlan — adds", () => {
           now: 5000
         });
         expect(addresslessLines(plan)).toEqual([
-          '2 devices have no console address yet and remain placeholders (e.g. "core-sw-1", "edge-sw-2").'
+          '2 devices have no console address and remain placeholders (e.g. "core-sw-1", "edge-sw-2").'
         ]);
       });
 
@@ -813,7 +817,7 @@ describe("computeSyncPlan — adds", () => {
         });
         expect(plan.updates).toHaveLength(1);
         expect(addresslessLines(plan)).toEqual([
-          '1 device has no console address yet and remains a placeholder (e.g. "renamed").'
+          '1 device has no console address and remains a placeholder (e.g. "renamed").'
         ]);
       });
 

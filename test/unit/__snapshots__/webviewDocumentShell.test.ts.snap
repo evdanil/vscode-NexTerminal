@@ -2221,6 +2221,31 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
             }
           }
         }
+        var requiredGroups = document.querySelectorAll("[data-required-when]");
+        for (var ri = 0; ri < requiredGroups.length; ri++) {
+          var requiredGroup = requiredGroups[ri];
+          var requiredConditions = parseVisibleWhen(requiredGroup.dataset.requiredWhen);
+          var required = true;
+          for (var rci = 0; rci < requiredConditions.length; rci++) {
+            var requiredControl = form.elements[requiredConditions[rci].field];
+            var requiredValue = requiredConditions[rci].value;
+            var requiredMatches = Array.isArray(requiredValue)
+              ? requiredValue.indexOf(requiredControl && requiredControl.value) !== -1
+              : requiredControl && requiredControl.value === requiredValue;
+            if (!requiredMatches) {
+              required = false;
+              break;
+            }
+          }
+          // A filterable select's named value lives in its hidden input; the
+          // separate nameless filter box must never stand in for that value.
+          // Hidden inputs do not participate in native validation, so the host
+          // reference is still checked by the command/controller before Save.
+          var requiredInputs = requiredGroup.querySelectorAll("input[name], select[name], textarea[name]");
+          for (var rj = 0; rj < requiredInputs.length; rj++) {
+            requiredInputs[rj].required = required;
+          }
+        }
         updateProfileManagedFields();
       }
 
@@ -2230,6 +2255,13 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
         var wfConditions = parseVisibleWhen(wfGroups[wi].dataset.visibleWhen);
         for (var fi = 0; fi < wfConditions.length; fi++) {
           watchedFields[wfConditions[fi].field] = true;
+        }
+      }
+      var requiredGroups = document.querySelectorAll("[data-required-when]");
+      for (var rg = 0; rg < requiredGroups.length; rg++) {
+        var requiredConditions = parseVisibleWhen(requiredGroups[rg].dataset.requiredWhen);
+        for (var rci = 0; rci < requiredConditions.length; rci++) {
+          watchedFields[requiredConditions[rci].field] = true;
         }
       }
       for (var fieldName in watchedFields) {
@@ -4231,6 +4263,31 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
             }
           }
         }
+        var requiredGroups = document.querySelectorAll("[data-required-when]");
+        for (var ri = 0; ri < requiredGroups.length; ri++) {
+          var requiredGroup = requiredGroups[ri];
+          var requiredConditions = parseVisibleWhen(requiredGroup.dataset.requiredWhen);
+          var required = true;
+          for (var rci = 0; rci < requiredConditions.length; rci++) {
+            var requiredControl = form.elements[requiredConditions[rci].field];
+            var requiredValue = requiredConditions[rci].value;
+            var requiredMatches = Array.isArray(requiredValue)
+              ? requiredValue.indexOf(requiredControl && requiredControl.value) !== -1
+              : requiredControl && requiredControl.value === requiredValue;
+            if (!requiredMatches) {
+              required = false;
+              break;
+            }
+          }
+          // A filterable select's named value lives in its hidden input; the
+          // separate nameless filter box must never stand in for that value.
+          // Hidden inputs do not participate in native validation, so the host
+          // reference is still checked by the command/controller before Save.
+          var requiredInputs = requiredGroup.querySelectorAll("input[name], select[name], textarea[name]");
+          for (var rj = 0; rj < requiredInputs.length; rj++) {
+            requiredInputs[rj].required = required;
+          }
+        }
         updateProfileManagedFields();
       }
 
@@ -4240,6 +4297,13 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
         var wfConditions = parseVisibleWhen(wfGroups[wi].dataset.visibleWhen);
         for (var fi = 0; fi < wfConditions.length; fi++) {
           watchedFields[wfConditions[fi].field] = true;
+        }
+      }
+      var requiredGroups = document.querySelectorAll("[data-required-when]");
+      for (var rg = 0; rg < requiredGroups.length; rg++) {
+        var requiredConditions = parseVisibleWhen(requiredGroups[rg].dataset.requiredWhen);
+        for (var rci = 0; rci < requiredConditions.length; rci++) {
+          watchedFields[requiredConditions[rci].field] = true;
         }
       }
       for (var fieldName in watchedFields) {

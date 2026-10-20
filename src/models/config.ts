@@ -652,21 +652,23 @@ export interface ServerConfig {
   port: number;
   /**
    * ADDRESSLESS (Codex P1 on #82) — a SYNCED PLACEHOLDER with no usable primary
-   * endpoint yet: a stopped EVE-NG node, a VNC/HTML5-console node, or a NetBox
-   * row with no IP. `true` here means `host` is `""` and there is nothing to
-   * connect to; the connect path refuses it with a friendly, provider-neutral
-   * "no console address yet — re-sync the source once it has an address" message
-   * instead of a raw handshake failure, and the tree renders a `" (no address)"`
+   * endpoint: a stopped EVE-NG node, a VNC/HTML5-console node, a NetBox row
+   * with no IP, or a Containerlab node without a management address. `true`
+   * here means `host` is `""` and there is nothing to connect to; Connect
+   * refuses before opening a transport and recommends editing Host, Port and
+   * connection settings. It suggests source re-sync only if a later result
+   * reports an address. The tree renders a `" (no address)"`
    * suffix.
    *
    * Written ONLY by inventory sync — a hand-created server is never addressless,
    * and `validateServerConfig` only relaxes the empty-host requirement when this
    * is exactly `true` (any other value, including a non-boolean, is treated as
-   * false and the host stays required). A later sync where the device gains a
-   * console UPGRADES the same record in place (fills `host`/`port`/`protocol`,
-   * clears this flag); losing the console again DOWNGRADES it back (no
-   * create/prune churn), under the same host/protocol ownership discipline the
-   * addressed update uses.
+   * false and the host stays required). Editing a Host clears this flag and
+   * makes that endpoint hand-owned until normal sync ownership rules say
+   * otherwise. A later sync where the device reports a console UPGRADES the
+   * same record in place (fills `host`/`port`/`protocol`, clears this flag);
+   * losing the console again DOWNGRADES it back (no create/prune churn), under
+   * the same host/protocol ownership discipline the addressed update uses.
    *
    * Optional and additive, like every field added after 1.0 — absent ≡ false, so
    * every record written before this existed round-trips untouched with no

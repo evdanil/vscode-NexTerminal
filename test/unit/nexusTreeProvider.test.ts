@@ -659,6 +659,8 @@ describe("NexusTreeProvider stable IDs", () => {
   it("ADDRESSLESS (Codex P1) — renders an addressless server with a ' (no address)' description and does not crash on the empty host (⊘ the default `user@` + empty host reads as a broken addressed server)", () => {
     const item = new ServerTreeItem(makeServer({ id: "s1", host: "", port: 0, addressless: true, origin: { sourceId: "src", externalId: "e1", syncedAt: 1 } }), false);
     expect(item.description).toContain("(no address)");
+    expect(item.tooltip).toContain("no console address");
+    expect(item.tooltip).not.toContain("no console address yet");
     // The empty host is not dangled after an "@" as though it were a real host.
     expect(item.description).not.toMatch(/@\s*\(/);
     expect(() => item.tooltip).not.toThrow();

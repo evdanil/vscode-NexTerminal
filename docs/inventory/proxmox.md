@@ -4,7 +4,7 @@ A Proxmox VE cluster is an inventory source too, and the shape is the same: **gu
 
 ## Add a Proxmox Source
 
-1. Run `Nexus: Add Inventory Source (NetBox, EVE-NG, Proxmox, GNS3…)`, choose **Proxmox**, and enter the cluster's base URL — what you open the web UI at, `https://pve.example.com:8006` shaped. Keep the port: PVE serves its API on 8006, and a URL without one sends every request to 443, where nothing answers. Omit the port only when a reverse proxy fronts the cluster on 443 — a mount path in the URL is fine and is kept. For **API Token**, enter the FULL credential as ONE string in Proxmox's own form — id, `=`, then the secret PVE shows you exactly once at creation:
+1. Run `Nexus: Add Inventory Source (NetBox, EVE-NG, Proxmox, GNS3, Containerlab…)`, choose **Proxmox**, and enter the cluster's base URL — what you open the web UI at, `https://pve.example.com:8006` shaped. Keep the port: PVE serves its API on 8006, and a URL without one sends every request to 443, where nothing answers. Omit the port only when a reverse proxy fronts the cluster on 443 — a mount path in the URL is fine and is kept. For **API Token**, enter the FULL credential as ONE string in Proxmox's own form — id, `=`, then the secret PVE shows you exactly once at creation:
 
     ```
     <user@realm>!<tokenid>=<secret>        e.g.  root@pam!nexus=8c1a4bb2-3d7f-4c22-9a51-e0f2b6c1d990

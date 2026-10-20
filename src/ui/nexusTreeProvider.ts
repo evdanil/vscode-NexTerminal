@@ -122,11 +122,11 @@ export class ServerTreeItem extends vscode.TreeItem {
     const templateSuffix = applied.length > 0
       ? `\nTemplate-applied: ${applied.map((f) => TEMPLATE_FIELD_SHORT_LABELS[f]).join(", ")} (your edits override)`
       : "";
-    // ADDRESSLESS (Codex P1) — a synced placeholder with no console address yet.
+    // ADDRESSLESS (Codex P1) — a synced placeholder with no console address.
     // Its empty host must not be dangled after an "@" as though it were a real
     // host, in the tooltip or the description.
     const addressless = server.addressless === true;
-    const hostSummary = addressless ? "no console address yet" : `${displayUsername}@${server.host}:${server.port}`;
+    const hostSummary = addressless ? "no console address" : `${displayUsername}@${server.host}:${server.port}`;
     // NODE CONTROL (Phase 4, task #28) — a status line for any
     // node-control-capable origin, so the state the Start/Stop gate reads is
     // visible on the row itself. Matches the labeled-line tooltip idiom.

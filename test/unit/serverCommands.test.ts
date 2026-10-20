@@ -1341,8 +1341,7 @@ describe("server disconnect with tunnel autoStop", () => {
   // P2-1 (Fable) — duplicating spreads the record and strips `origin`, so an
   // addressless placeholder would become a MANUAL addressless record: an invariant
   // violation (addressless exists only for synced placeholders), which no sync will
-  // ever upgrade (no origin) and whose connect refusal tells the user to "re-sync the
-  // source" it has no link to. ⊘ Minting the copy leaves that record in the store.
+  // ever upgrade (no origin). ⊘ Minting the copy leaves that record in the store.
   it("P2-1 — refuses to duplicate an addressless placeholder with a message, writing nothing", async () => {
     const { ctx, addOrUpdateServer } = setupHarness({
       profiles: [],
@@ -1354,7 +1353,12 @@ describe("server disconnect with tunnel autoStop", () => {
     await registeredCommands.get("nexus.server.duplicate")!("srv-1");
 
     expect(addOrUpdateServer).not.toHaveBeenCalled();
-    expect(vscode.window.showInformationMessage).toHaveBeenCalledWith(expect.stringContaining("can't be duplicated"));
+    const message = vi.mocked(vscode.window.showInformationMessage as any).mock.calls
+      .map((call: unknown[]) => String(call[0]))
+      .find((text: string) => text.includes("can't be duplicated"));
+    expect(message).toContain("can't be duplicated");
+    expect(message).toContain("edit its Host, Port and connection settings");
+    expect(message).not.toMatch(/will get one|next syncs/i);
   });
 
   it("P2-1 control — still duplicates an ORDINARY addressed server (⊘ an over-broad guard would block normal duplication)", async () => {
@@ -2826,7 +2830,10 @@ describe("SSH File Explorer auto-open on manual connect", () => {
       .map((c: unknown[]) => String(c[0]))
       .filter((m: string) => /no console address/i.test(m));
     expect(infoMsgs).toHaveLength(1);
-    expect(infoMsgs[0]).toContain("2");
+    expect(infoMsgs[0]).toContain("2 servers have no console address and were skipped");
+    expect(infoMsgs[0]).toContain("edit its profile's Host, Port and connection settings");
+    expect(infoMsgs[0]).toContain("Re-sync the source if it later reports an address");
+    expect(infoMsgs[0]).not.toMatch(/will connect|assigns an address|no console address yet/i);
     // Only the live server built a pty.
     expect(SshPty).toHaveBeenCalledTimes(1);
   });
@@ -5384,7 +5391,7 @@ describe("addressless connect guard", () => {
     expect(TelnetPty).not.toHaveBeenCalled();
     expect((ctx.sshFactory as any).connect).not.toHaveBeenCalled();
     expect(vscode.window.showInformationMessage).toHaveBeenCalledWith(
-      expect.stringContaining("no console address yet")
+      expect.stringContaining("no console address")
     );
   });
 
@@ -5397,7 +5404,7 @@ describe("addressless connect guard", () => {
     await registeredCommands.get("nexus.server.testConnection")!("srv-1");
 
     expect((ctx.sshFactory as any).connect).not.toHaveBeenCalled();
-    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("no console address yet"));
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("no console address"));
   });
 
   // REVIEW FINDING (P2) — a watchdog wrapper (Run Macro on Server / Connect and
@@ -5415,7 +5422,7 @@ describe("addressless connect guard", () => {
     await connectServer(ctx, "srv-1", { onConnectFailed });
 
     expect(onConnectFailed).toHaveBeenCalledTimes(1);
-    expect(onConnectFailed).toHaveBeenCalledWith(expect.stringContaining("no console address yet"));
+    expect(onConnectFailed).toHaveBeenCalledWith(expect.stringContaining("no console address"));
   });
 
   // The script wrapper (nexus.server.runWithScript → connectAndRunScript) does not
@@ -6347,7 +6354,8 @@ describe("connectServer — addressless placeholder that has a web console", () 
     await flushPromises();
 
     const infos = messagesFrom(vi.mocked(vscode.window.showInformationMessage) as never);
-    expect(infos.some((m) => /no console address yet/i.test(m) && /re-sync/i.test(m))).toBe(true);
+    expect(infos.some((m) => /no console address/i.test(m) && /Host, Port and connection settings/i.test(m))).toBe(true);
+    expect(infos.some((m) => /Re-sync the source if it later reports an address/i.test(m))).toBe(true);
     expect(infos.every((m) => !/web console/i.test(m))).toBe(true);
     // No action button either — the refusal must not carry one for a row whose
     // right-click menu has no console entry.
@@ -6362,7 +6370,7 @@ describe("connectServer — addressless placeholder that has a web console", () 
     await flushPromises();
 
     const infos = messagesFrom(vi.mocked(vscode.window.showInformationMessage) as never);
-    expect(infos.some((m) => /no console address yet/i.test(m))).toBe(true);
+    expect(infos.some((m) => /no console address/i.test(m) && /Host, Port and connection settings/i.test(m))).toBe(true);
     expect(infos.every((m) => !/web console/i.test(m))).toBe(true);
     expect(mockShowWarningMessage.mock.calls.some((call) => call.includes("Open Web Console"))).toBe(false);
     expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexus.inventory.openWebConsole", expect.anything());

@@ -6,7 +6,7 @@ For what every inventory source shares — the sync plan, removing and re-adopti
 
 ## Add a NetBox Source
 
-1. Run `Nexus: Add Inventory Source (NetBox, EVE-NG, Proxmox, GNS3…)` and choose **NetBox** — the first step is choosing a provider — or open **Settings → Inventory Sources**, which lists every configured source with inline **Sync Inventory Now**, **Edit Inventory Source**, **Edit Template Rules** and **Remove Inventory Source** icons
+1. Run `Nexus: Add Inventory Source (NetBox, EVE-NG, Proxmox, GNS3, Containerlab…)` and choose **NetBox** — the first step is choosing a provider — or open **Settings → Inventory Sources**, which lists every configured source with inline **Sync Inventory Now**, **Edit Inventory Source**, **Edit Template Rules** and **Remove Inventory Source** icons
 2. Enter your NetBox base URL and an API token with read access to DCIM (and Virtualization, if you include VMs). The token is stored in VS Code SecretStorage. **Test Connection** confirms the URL is reachable and the token is accepted — it does not check that the token can read your devices, so a token NetBox accepts but hasn't granted DCIM access will pass here and fail on the first sync
 3. Optionally narrow the sync with a device filter (e.g. `status=active&site=syd`), shape the folder layout with a template (`{site}/{rack}` by default), and set a **Target Folder** to keep synced servers under
 4. Pick an **Auth Profile** so the servers the sync creates can actually connect — choose an existing profile or create one inline without leaving the form. Its username fills the **Default SSH Username** field; with **(None)**, servers use the default username with SSH agent authentication

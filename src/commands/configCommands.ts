@@ -2271,7 +2271,8 @@ const BUILT_IN_INVENTORY_PROVIDER_IDS: ReadonlySet<string> = new Set([
   NETBOX_PROVIDER_ID,
   EVE_NG_PROVIDER_ID,
   PROXMOX_PROVIDER_ID,
-  GNS3_PROVIDER_ID
+  GNS3_PROVIDER_ID,
+  "containerlab"
 ]);
 
 /**

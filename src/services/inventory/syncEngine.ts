@@ -3936,22 +3936,22 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     const already = addresslessAlreadyPlaceholder.length;
     const examples = namedExamples([...addresslessAdded, ...addresslessAlreadyPlaceholder]);
     if (already === 0) {
-      // Added only — the common case, worded exactly as it always was so the
-      // line every user already reads does not churn.
+      // Added only — keep this as one aggregate line, with no invented
+      // distinction between sources that can and cannot report an address.
       warnings.push(
-        `${added} device${added === 1 ? "" : "s"} ${added === 1 ? "has" : "have"} no console address yet and ${added === 1 ? "was" : "were"} added without one (e.g. ${examples}).`
+        `${added} device${added === 1 ? "" : "s"} ${added === 1 ? "has" : "have"} no console address and ${added === 1 ? "was" : "were"} added without one (e.g. ${examples}).`
       );
     } else if (added === 0) {
       // Standing placeholders only — must NOT imply this sync created anything.
       warnings.push(
-        `${already} device${already === 1 ? "" : "s"} ${already === 1 ? "has" : "have"} no console address yet and ${already === 1 ? "remains a placeholder" : "remain placeholders"} (e.g. ${examples}).`
+        `${already} device${already === 1 ? "" : "s"} ${already === 1 ? "has" : "have"} no console address and ${already === 1 ? "remains a placeholder" : "remain placeholders"} (e.g. ${examples}).`
       );
     } else {
       // Both — the total first (what the user wants to know), then the split.
       // Each half carries its OWN number agreement; the total is >= 2 by
       // construction, so its own verb is unconditionally plural.
       warnings.push(
-        `${added + already} devices have no console address yet — ${added} ${added === 1 ? "was" : "were"} added without one and ${already} ${already === 1 ? "was" : "were"} already ${already === 1 ? "a placeholder" : "placeholders"} (e.g. ${examples}).`
+        `${added + already} devices have no console address — ${added} ${added === 1 ? "was" : "were"} added without one and ${already} ${already === 1 ? "was" : "were"} already ${already === 1 ? "a placeholder" : "placeholders"} (e.g. ${examples}).`
       );
     }
   }

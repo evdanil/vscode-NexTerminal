@@ -753,10 +753,6 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
           // separate nameless filter box must never stand in for that value.
           // Hidden inputs do not participate in native validation, so the host
           // reference is still checked by the command/controller before Save.
-          // A filterable select's named value lives in its hidden input; the
-          // separate nameless filter box must never stand in for that value.
-          // Hidden inputs do not participate in native validation, so the host
-          // reference is still checked by the command/controller before Save.
           var requiredInputs = requiredGroup.querySelectorAll("input[name], select[name], textarea[name]");
           for (var rj = 0; rj < requiredInputs.length; rj++) {
             requiredInputs[rj].required = required;

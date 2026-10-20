@@ -50,34 +50,33 @@ describe("addresslessUnavailableMessage", () => {
   });
 
   /**
-   * P2 (Codex review) — the guard is SHARED across providers and gets no
-   * provider identity, but an addressless server can come from an IP-less NetBox
-   * row (remedy: assign an address in NetBox), not only a stopped EVE-NG node.
-   * So the message must NOT prescribe an EVE-NG-specific remedy.
+   * The guard is shared across providers and receives no provider identity.
+   * Manual endpoint editing is available for every placeholder; resync is
+   * conditional on the source later reporting an address.
    */
-  it("is provider-NEUTRAL — it does not tell the user to start something in EVE-NG (⊘ EVE-NG-specific advice is wrong for an IP-less NetBox row)", () => {
+  it("offers a manual endpoint and conditional resync without implying an address will appear", () => {
     const message = addresslessUnavailableMessage(server({ addressless: true, host: "" }));
-    expect(message).not.toMatch(/eve-ng/i);
-    // Points at the inventory source as the general remedy.
-    expect(message?.toLowerCase()).toContain("source");
+    expect(message).toContain("no console address.");
+    expect(message).toContain("edit the profile's Host, Port and connection settings.");
+    expect(message).toContain("Re-sync the source if it later reports an address.");
+    expect(message).not.toMatch(/no console address yet|offline|hasn't assigned|re-sync the source once it has an address/i);
+    expect(message).not.toMatch(/eve-ng|netbox|containerlab/i);
   });
 });
 
 /**
  * WEB CONSOLE VARIANT — for a device whose inventory source offers a browser
- * console (a Proxmox guest with no qemu-guest-agent), the neutral message is
- * actively wrong in every clause: the address is not missing "yet", the guest is
- * not offline, and no amount of re-syncing will ever assign it one. The remedy
- * that does exist — Open Web Console, which needs only vmid + node — goes
- * unmentioned. The variant is OPT-IN on a capability the caller establishes,
- * which is what keeps the default answer provider-neutral.
+ * console (a Proxmox guest with no qemu-guest-agent), the neutral message's
+ * manual endpoint and conditional resync remedies do not open that console.
+ * Open Web Console needs only vmid + node, so the variant is OPT-IN on a
+ * capability the caller establishes and keeps the default answer provider-neutral.
  */
 describe("addresslessUnavailableMessage — web-console variant", () => {
-  it("points an addressless console-capable device at its web console instead of a re-sync (⊘ the neutral text tells the owner of an agentless guest to wait for an address that never arrives)", () => {
+  it("points an addressless console-capable device at its web console instead of profile endpoint advice", () => {
     const message = addresslessUnavailableMessage(server({ addressless: true, host: "" }), { webConsoleAvailable: true });
     expect(message).toContain("eve-r1");
     expect(message?.toLowerCase()).toContain("web console");
-    // The three misleading clauses of the neutral text must all be gone.
+    // The old temporal, availability and resync claims must stay out of this branch.
     expect(message).not.toMatch(/yet/i);
     expect(message).not.toMatch(/offline/i);
     expect(message).not.toMatch(/re-sync/i);
@@ -87,8 +86,8 @@ describe("addresslessUnavailableMessage — web-console variant", () => {
     const neutral = addresslessUnavailableMessage(server({ addressless: true, host: "" }));
     expect(addresslessUnavailableMessage(server({ addressless: true, host: "" }), {})).toBe(neutral);
     expect(addresslessUnavailableMessage(server({ addressless: true, host: "" }), { webConsoleAvailable: false })).toBe(neutral);
-    // The neutral text is the one the other five call sites keep getting.
-    expect(neutral).toMatch(/re-sync the source/i);
+    // The neutral fallback stays shared with call sites that have no console capability.
+    expect(neutral).toContain("Re-sync the source if it later reports an address.");
     expect(neutral).not.toMatch(/web console/i);
   });
 

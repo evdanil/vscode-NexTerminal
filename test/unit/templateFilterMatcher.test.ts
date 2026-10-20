@@ -270,9 +270,9 @@ describe("describeFilterConditions / unknownFilterKeys — §7.2 live feedback",
     expect(knownKeysList(["site", "ip6", "if_name", "dns.name", "sub-net"])).toBe("site, ip6, if_name, dns.name, sub-net, name");
   });
 
-  it("every built-in provider's key list renders exactly as declared (\u2298 a display rule that alters NetBox, EVE-NG, Proxmox or GNS3 keys)", () => {
+  it("every built-in provider's key list renders exactly as declared (\u2298 a display rule that alters NetBox, EVE-NG, Proxmox, GNS3 or Containerlab keys)", () => {
     const providers = createBuiltInProviders();
-    expect(providers.map((p) => p.id)).toEqual(["netbox", "eve-ng", "proxmox", "gns3"]);
+    expect(providers.map((p) => p.id)).toEqual(["netbox", "eve-ng", "proxmox", "gns3", "containerlab"]);
     for (const provider of providers) {
       expect(provider.attributeKeys, provider.id).toBeDefined();
       expect(knownKeysList(provider.attributeKeys!), provider.id).toBe(provider.attributeKeys!.join(", "));

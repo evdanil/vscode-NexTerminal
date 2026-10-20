@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.8.302] — 2026-10-20
+
+### Added
+
+- **Sync deployed Containerlab nodes into SSH profiles.** Inspect a local or remote Linux lab with Host Binary, an installed disposable image, or an existing socket-mounted container. Discovery is bounded and approval-gated; it does not pull images or control nodes.
+- **Choose an explicit direct route in Device Templates.** Template Proxy distinguishes *Not set* (leave the route unspecified) from *Direct* (choose a direct connection); source-managed **Automatic** restores the source route, while **Keep Direct** preserves a manual direct choice.
+
+### Changed
+
+- **Provider-neutral addressless refusals and summaries give actionable, accurate guidance.** They offer editing Host, Port and connection settings for a known reachable endpoint and recommend re-sync only if the source later reports an address. Duplicate and folder-connect notices no longer promise that an address or connection will appear.
+
 ## [2.8.301] — 2026-10-16
 
 ### Fixed
