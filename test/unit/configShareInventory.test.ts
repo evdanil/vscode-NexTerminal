@@ -398,6 +398,45 @@ describe("sanitizeForSharing — inventory sources", () => {
     expect(() => parseContainerlabConfig(shipped.config)).toThrow(/labHostId/i);
   });
 
+  it.each([
+    ["explicit Local", { location: "local", labHostId: "not-shared", runner: "host" }],
+    ["default Local", { labHostId: "not-shared", runner: "host" }]
+  ])("omits an unmapped inactive Containerlab host through actual %s export/import", async (_label, config) => {
+    const sender = await makeMachine();
+    await sender.core.addOrUpdateInventorySource(makeSource({
+      id: "containerlab-source", providerId: "containerlab", config
+    }));
+    const json = await exportShare(sender);
+    const [shipped] = (JSON.parse(json) as { inventorySources: InventorySourceConfig[] }).inventorySources;
+    expect(shipped.config).not.toHaveProperty("labHostId");
+    expect(JSON.stringify(shipped.config)).not.toContain("not-shared");
+
+    const recipient = await makeMachine();
+    await importShare(recipient, json);
+    const [imported] = recipient.core.getSnapshot().inventorySources;
+    expect(imported.config).not.toHaveProperty("labHostId");
+    expect(parseContainerlabConfig(imported.config).location).toBe("local");
+    const provider = createBuiltInProviders().find((candidate) => candidate.id === "containerlab")!;
+    expect(provider.discoverySshHostId?.(imported.config)).toBeUndefined();
+    expect(provider.sourceDefaultRoute?.(imported.config)).toEqual({ kind: "direct" });
+  });
+
+  it("keeps a carried Containerlab host reference remapped when its source is Local", async () => {
+    const sender = await makeMachine();
+    const host = makeServer({ id: "lab-host", name: "Lab host" });
+    await sender.core.addOrUpdateServer(host);
+    await sender.core.addOrUpdateInventorySource(makeSource({
+      id: "containerlab-source", providerId: "containerlab",
+      config: { location: "local", labHostId: host.id, runner: "host" }
+    }));
+    const json = await exportShare(sender);
+    const [shipped] = (JSON.parse(json) as { inventorySources: InventorySourceConfig[] }).inventorySources;
+    const shippedHost = (JSON.parse(json) as { servers: ServerConfig[] }).servers.find((server) => server.name === "Lab host")!;
+    expect(shipped.config.labHostId).toBe(shippedHost.id);
+    expect(shipped.config.labHostId).not.toBe(host.id);
+    expect(parseContainerlabConfig(shipped.config).location).toBe("local");
+  });
+
   it("does not treat another provider's labHostId field as a server reference", () => {
     const [shipped] = share(
       [makeSource({ providerId: "acme.cmdb", config: { location: "ssh", labHostId: "lab-host" } })],
@@ -1356,6 +1395,13 @@ describe("share import — inventory sources", () => {
     expect(imported.config.location).toBe("ssh");
     expect(imported.config.labHostId).toBe("");
     expect(() => parseContainerlabConfig(imported.config)).toThrow(/labHostId/i);
+  });
+
+  it("keeps an unmapped Containerlab host unchanged when the location itself is malformed", () => {
+    const [shipped] = sanitizeForSharing([], [], [], [], {}, [], [], [makeSource({
+      providerId: "containerlab", config: { location: "elsewhere", labHostId: "not-shared" }
+    })]).inventorySources;
+    expect(shipped.config).toMatchObject({ location: "elsewhere", labHostId: "not-shared" });
   });
 
   it("persists each source with a fresh id and a minted revision, and never the bookkeeping or trust stamp a hand-edited file carries (⊘ any of them landing)", async () => {

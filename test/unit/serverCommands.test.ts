@@ -3584,7 +3584,7 @@ describe("nexus.server.edit — origin preservation (P1)", () => {
         sourceDefaultRoute: sourceSshRoute
       });
     const first = sync(saved, 2000);
-    expect(first.warnings.join("\n")).not.toMatch(/jump host no longer exists/i);
+    expect(first.warnings.join("\n")).not.toMatch(/invalid or missing SSH host/i);
     const afterFirst = first.updates.find((update) => update.after.id === saved.id)?.after;
     expect(afterFirst).toBeDefined();
     expect(afterFirst?.proxy).toBeUndefined();

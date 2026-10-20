@@ -16,6 +16,7 @@ import {
 import type { DeviceTemplateProfile } from "../../models/deviceTemplate";
 import type { InventorySyncApplication } from "../../core/nexusCore";
 import {
+  assertInventorySourceDependenciesRemainValid,
   assertInventorySourceDependenciesSurvive,
   type InventorySourceDependencySnapshot
 } from "./inventorySourceDependencies";
@@ -1665,6 +1666,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         const templateMatrix = applyTemplateMatrix(ownedForAddressless, addresslessDesired, {
           targetServerId: ownedForAddressless.id,
           targetServerName: device.name,
+          sourceName: source.name,
           proxyTemplateName: addresslessProxyTemplateName,
           ipmiGatewayTemplateName: addresslessGatewayTemplateName
         });
@@ -1869,6 +1871,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         const addMatrix = applyTemplateMatrix(undefined, addresslessDesired, {
           targetServerId: addresslessId,
           targetServerName: device.name,
+          sourceName: source.name,
           proxyTemplateName: addresslessProxyTemplateName,
           ipmiGatewayTemplateName: addresslessGatewayTemplateName
         });
@@ -2205,6 +2208,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       const templateMatrix = applyTemplateMatrix(ownedServer, deviceDesiredNonAuth, {
         targetServerId: ownedServer.id,
         targetServerName: device.name,
+        sourceName: source.name,
         proxyTemplateName: deviceProxyTemplateName,
         // PR-T3 review FIX 2 — names the template for the IPMI-gateway self-skip.
         ipmiGatewayTemplateName: deviceCascade.provenance.ipmiGatewayServerId?.templateName
@@ -3106,6 +3110,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         const templateMatrix = applyTemplateMatrix(adopteeForMatrix, deviceDesiredNonAuth, {
           targetServerId: adoptee.id,
           targetServerName: device.name,
+          sourceName: source.name,
           proxyTemplateName: deviceProxyTemplateName,
           // PR-T3 review FIX 2 — names the template for the IPMI-gateway self-skip.
           ipmiGatewayTemplateName: deviceCascade.provenance.ipmiGatewayServerId?.templateName
@@ -3574,6 +3579,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     const addMatrix = applyTemplateMatrix(undefined, deviceDesiredNonAuth, {
       targetServerId: id,
       targetServerName: device.name,
+      sourceName: source.name,
       proxyTemplateName: deviceProxyTemplateName,
       // PR-T3 review FIX 2 — names the template for the IPMI-gateway self-skip. A
       // fresh add whose gateway rule matches its own id (a catch-all/override
@@ -4132,11 +4138,11 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   // it and fell through to part 2's destructive DROP — data loss on an override
   // MOVE (the pre-existing working proxy A was stripped) and a silent dangling
   // proxy shipped on an add (no warning, connect fails). This pass now OWNS every
-  // WRITTEN template proxy; retained proxies (row-5 carry, never written this run,
-  // not in the map) are left to part 2.
+  // WRITTEN sync-owned proxy; retained proxies (row-5 carry, never written this
+  // run, not in the map) are left to part 2.
   //
-  // For each such record whose written `after.proxy` is a template-OWNED ssh proxy
-  // (`proxyConfigsEqual(cur, stamp)`, so the sync owns it — §8.4) pointing at a
+  // For each such record whose written `after.proxy` matches its ownership receipt
+  // (`proxyConfigsEqual(cur, stamp)`, so the sync owns it — §8.4) and points at a
   // NON-survivor jump host, REJECT it as §4.3 row 5 does ("desired none → keep
   // existing"):
   //  - UPDATE: RESTORE the pre-matrix proxy `before.proxy` + before's stamp — a
@@ -4147,22 +4153,28 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
   //    path the old code shipped a dangling proxy on.
   // Self-reference never reaches here: the matrix skips a self-proxy so it is never
   // written, and a record's own id is itself a survivor. The warning names the
-  // template that ACTUALLY set THIS proxy per-record (fixes MINOR-6's
-  // mis-attribution to the baseline catch-all), deduped by `server::jumpHost`.
-  const rejectWrittenProxy = (after: ServerConfig, before: ServerConfig | undefined): string | undefined => {
+  // attempted writer for THIS proxy per-record, before rollback restores the
+  // prior receipt, deduped by `server::jumpHost`.
+  const rejectWrittenProxy = (
+    after: ServerConfig,
+    before: ServerConfig | undefined
+  ): { jumpHostId: string; writer: "source-default" | "template" } | undefined => {
     const p = after.proxy;
     const stampedProxy = ownedProxyStamp(after);
     if (
       p === undefined ||
       p.type !== "ssh" ||
       stampedProxy === undefined ||
-      !proxyConfigsEqual(p, stampedProxy) || // §8.4 — template-OWNED only; a hand proxy is left alone
+      !proxyConfigsEqual(p, stampedProxy) || // §8.4 — sync-owned only; a hand proxy is left alone
       p.jumpHostId === after.id || // self is always a survivor (owned, not a delete-prune)
       survivorIds.has(p.jumpHostId)
     ) {
-      return undefined; // not a written template proxy this pass must reject
+      return undefined; // not a written sync-owned proxy this pass must reject
     }
     const danglingJumpHostId = p.jumpHostId;
+    // Keep the attempted writer before restoring the prior route and ownership.
+    // The restored record describes what remains, not who made this rejected write.
+    const attemptedWriter = after.origin?.proxyOwnership?.owner ?? "template";
     const priorProxy = before?.proxy; // A on a row-3 override move; undefined on a row-1 write
     const priorStamp = ownedProxyStamp(before);
     const priorOwnership = before?.origin?.proxyOwnership ?? (priorStamp ? { owner: "template" as const, value: priorStamp } : undefined);
@@ -4186,18 +4198,22 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         after.origin = { ...withoutProxyOwnership, templated: templatedHasAnyStamp(templated) ? templated : undefined };
       }
     }
-    // The template's NEW proxy did not flow onto this record — strip its §3.4 line.
+    // The rejected proxy did not flow onto this record — strip any §3.4 line for it.
     dropProxyProvenance(after.id);
-    return danglingJumpHostId;
+    return { jumpHostId: danglingJumpHostId, writer: attemptedWriter };
   };
-  const warnWrittenProxy = (record: ServerConfig, jumpHostId: string): void => {
+  const warnWrittenProxy = (
+    record: ServerConfig,
+    rejected: { jumpHostId: string; writer: "source-default" | "template" }
+  ): void => {
+    const { jumpHostId, writer } = rejected;
     const warnKey = `${record.id}::${jumpHostId}`;
     if (warnedRetainedProxyKeys.has(warnKey)) {
       return;
     }
     warnedRetainedProxyKeys.add(warnKey);
-    // Names the owner that ACTUALLY wrote this proxy on this record.
-    const sourceDefault = record.origin?.proxyOwnership?.owner === "source-default";
+    // `writer` was captured before rollback; `record` now carries the prior owner.
+    const sourceDefault = writer === "source-default";
     const name = proxyTemplateNameByServerId.get(record.id) ?? "?";
     warnings.push(
       sourceDefault
@@ -4209,9 +4225,9 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     if (!proxyWrittenServerIds.has(a.id)) {
       continue; // this run wrote no proxy on this add
     }
-    const rejectedJump = rejectWrittenProxy(a, undefined);
-    if (rejectedJump !== undefined) {
-      warnWrittenProxy(a, rejectedJump);
+    const rejected = rejectWrittenProxy(a, undefined);
+    if (rejected !== undefined) {
+      warnWrittenProxy(a, rejected);
     }
   }
   // Codex round 4/6 — NO-OP COLLAPSE (keep the plan counts exact). Restoring A can
@@ -4250,9 +4266,9 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     if (!proxyWrittenServerIds.has(u.after.id)) {
       continue; // this run wrote no proxy on this update — a retained proxy is part 2's job
     }
-    const rejectedJump = rejectWrittenProxy(u.after, u.before);
-    if (rejectedJump !== undefined) {
-      warnWrittenProxy(u.after, rejectedJump);
+    const rejected = rejectWrittenProxy(u.after, u.before);
+    if (rejected !== undefined) {
+      warnWrittenProxy(u.after, rejected);
       if (!updateStillChanged(u.before, u.after)) {
         collapsedIds.add(u.before.id);
       }
@@ -4935,20 +4951,34 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
 
   if (input.discoveryDependencies !== undefined) {
     const survivingServerIds = new Set(currentServers.map((server) => server.id));
+    const removeServerIds: string[] = [];
     for (const prune of prunes) {
       if (prune.policy === "delete") {
         survivingServerIds.delete(prune.server.id);
+        removeServerIds.push(prune.server.id);
       }
     }
-    for (const server of [...adds, ...updates.map((update) => update.after)]) {
+    const upsertServers = [...adds, ...updates.map((update) => update.after)];
+    for (const server of upsertServers) {
       survivingServerIds.add(server.id);
     }
     for (const prune of prunes) {
       if (prune.policy === "orphan") {
         survivingServerIds.add(prune.after.id);
+        upsertServers.push(prune.after);
       }
     }
     assertInventorySourceDependenciesSurvive(input.discoveryDependencies, survivingServerIds);
+    const authProfiles = input.authProfilesById !== undefined
+      ? [...input.authProfilesById.values()]
+      : input.authProfile !== undefined ? [input.authProfile] : [];
+    assertInventorySourceDependenciesRemainValid(
+      input.discoveryDependencies,
+      currentServers,
+      removeServerIds,
+      upsertServers,
+      authProfiles
+    );
   }
 
   return plan;

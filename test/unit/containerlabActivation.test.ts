@@ -79,6 +79,7 @@ async function makeHarness(options: {
   preflight?: ContainerlabExecutor["preflight"];
   resolvedIdentity?: ContainerlabExecutionIdentity;
   store?: ReturnType<typeof memoryStore>;
+  now?: () => number;
   beforeController?: (core: NexusCore) => Promise<void>;
 } = {}) {
   const core = new NexusCore(new InMemoryConfigRepository());
@@ -103,7 +104,7 @@ async function makeHarness(options: {
       let next = 0;
       return () => `local-generation-${++next}`;
     })(),
-    now: () => 10_000
+    now: options.now ?? (() => 10_000)
   });
   return { core, source, config: parseContainerlabConfig(source.config), executor, controller, store };
 }
@@ -197,6 +198,91 @@ describe("Containerlab activation", () => {
     await operation;
     expect(harness.executor.resolveDependencies).toHaveBeenCalledOnce();
     expect(harness.executor.preflight).toHaveBeenCalledOnce();
+  });
+
+  it("starts a fresh bounded execution window after consent even when Run stays open over 30 seconds", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    const run = deferred<boolean>();
+    const confirmRun = vi.fn(() => run.promise);
+    const harness = await makeHarness({ confirmRun, now: () => Date.now() });
+    try {
+      const operation = harness.controller.inspect(harness.config, context(harness.source, "sync"));
+      for (let index = 0; index < 10 && confirmRun.mock.calls.length === 0; index += 1) await Promise.resolve();
+      expect(confirmRun).toHaveBeenCalledOnce();
+      expect(harness.executor.resolveDependencies).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(31_000);
+      run.resolve(true);
+      await operation;
+
+      expect(harness.executor.resolveDependencies).toHaveBeenCalledOnce();
+      const runContext = vi.mocked(harness.executor.resolveDependencies).mock.calls[0][1];
+      expect(runContext.deadline).toBe(Date.now() + 30_000);
+      expect(harness.executor.preflight).toHaveBeenCalledOnce();
+      expect(harness.executor.inspect).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+      harness.controller.dispose();
+    }
+  });
+
+  it.each(["cancelled", "stale source"] as const)("does not resolve metadata when Run consent completes after a %s", async (change) => {
+    const run = deferred<boolean>();
+    const abortController = new AbortController();
+    const confirmRun = vi.fn(() => run.promise);
+    const harness = await makeHarness({ confirmRun });
+    try {
+      const operationContext = {
+        ...context(harness.source, "sync"),
+        ...(change === "cancelled" ? { signal: abortController.signal } : {})
+      } satisfies InventoryOperationContext;
+      const operation = harness.controller.inspect(harness.config, operationContext);
+      for (let index = 0; index < 10 && confirmRun.mock.calls.length === 0; index += 1) await Promise.resolve();
+      expect(confirmRun).toHaveBeenCalledOnce();
+
+      if (change === "cancelled") abortController.abort(new Error("caller canceled while Run was open"));
+      else await harness.core.addOrUpdateInventorySource({ ...harness.source, name: "Replaced while Run was open" });
+      run.resolve(true);
+
+      await expect(operation).rejects.toThrow(/cancel|changed|current/i);
+      expect(harness.executor.resolveDependencies).not.toHaveBeenCalled();
+      expect(harness.executor.preflight).not.toHaveBeenCalled();
+      expect(harness.executor.inspect).not.toHaveBeenCalled();
+    } finally {
+      harness.controller.dispose();
+    }
+  });
+
+  it("keeps one execution deadline across resolution, preflight, approval persistence, and inspection", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    const runContexts: ContainerlabRunContext[] = [];
+    const harness = await makeHarness({
+      now: () => Date.now(),
+      preflight: vi.fn(async (_config, resolved, runContext) => {
+        runContexts.push(runContext);
+        await vi.advanceTimersByTimeAsync(16_000);
+        return { identity: resolved.identity, version: "0.80.0" };
+      })
+    });
+    vi.mocked(harness.executor.inspect).mockImplementationOnce(async (_config, _prepared, runContext) => {
+      runContexts.push(runContext);
+      await vi.advanceTimersByTimeAsync(15_000);
+      return { version: "0.80.0", stdout: "{}" };
+    });
+    try {
+      await expect(harness.controller.inspect(harness.config, context(harness.source, "sync")))
+        .rejects.toThrow(/deadline|timed out|canceled/i);
+      expect(runContexts).toHaveLength(2);
+      expect(runContexts[0]).toBe(runContexts[1]);
+      expect(harness.executor.resolveDependencies).toHaveBeenCalledOnce();
+      expect(harness.executor.preflight).toHaveBeenCalledOnce();
+      expect(harness.executor.inspect).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+      harness.controller.dispose();
+    }
   });
 
   it("does not execute or approve when Run is canceled", async () => {

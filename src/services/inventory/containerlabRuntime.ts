@@ -327,10 +327,13 @@ function parseExistingContainer(stdout: string, configuredName: string, socketPa
   const matchingMounts = mounts.map(asRecord).filter((mount) =>
     mount?.Type === "bind" && mount.Source === socketPath && mount.Destination === "/var/run/docker.sock" && mount.RW === true
   );
+  const configuredReferenceMatches = CONTAINER_ID.test(configuredName)
+    ? typeof container?.Id === "string" && container.Id.toLowerCase() === configuredName.toLowerCase()
+    : container?.Name === `/${configuredName}`;
   if (
     !container ||
     typeof container.Id !== "string" || !CONTAINER_ID.test(container.Id) ||
-    container.Name !== `/${configuredName}` || state?.Running !== true ||
+    !configuredReferenceMatches || state?.Running !== true ||
     matchingMounts.length !== 1
   ) {
     providerError("The configured Containerlab runner must be running and bind the selected Docker socket read-write at /var/run/docker.sock.", "protocol");

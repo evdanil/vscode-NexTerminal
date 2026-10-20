@@ -2372,7 +2372,14 @@ function sanitizeAndRemapSharedSourceConfig(
   if (providerId === "containerlab") {
     const sourceHostId = next.labHostId;
     if (typeof sourceHostId === "string") {
-      next.labHostId = linkServer(sourceHostId) ?? "";
+      const sharedHostId = linkServer(sourceHostId);
+      if (sharedHostId !== undefined) {
+        next.labHostId = sharedHostId;
+      } else if (next.location === "ssh") {
+        next.labHostId = "";
+      } else if (next.location === undefined || next.location === "local") {
+        delete next.labHostId;
+      }
     } else if (next.location === "ssh") {
       // Keep a remote source visibly remote and invalid when the share did not
       // carry its discovery host. Falling back to local would run on the

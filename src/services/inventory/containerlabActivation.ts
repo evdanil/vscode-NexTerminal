@@ -95,7 +95,7 @@ interface OperationCapture {
   readonly dependencies?: InventorySourceDependencySnapshot;
   readonly dependencyIdentity: string | null;
   readonly labHost?: ServerConfig;
-  readonly deadline: number;
+  deadline?: number;
   readonly signal: AbortSignal;
   readonly isCurrent: () => boolean;
 }
@@ -262,7 +262,6 @@ export function createContainerlabActivationController(
   const captureOperation = (
     config: ContainerlabConfig,
     operationContext: InventoryOperationContext | undefined,
-    deadline: number,
     signal: AbortSignal
   ): OperationCapture => {
     if (disposed) throw new Error("Containerlab activation controller is disposed.");
@@ -318,12 +317,11 @@ export function createContainerlabActivationController(
       ...(capturedDependencies.dependencies ? { dependencies: capturedDependencies.dependencies } : {}),
       dependencyIdentity: capturedDependencies.identity,
       ...(capturedDependencies.labHost ? { labHost: capturedDependencies.labHost } : {}),
-      deadline,
       signal,
       isCurrent: () => false
     };
     (capture as { isCurrent: () => boolean }).isCurrent = () => {
-      if (disposed || signal.aborted || now() >= deadline || !isTrusted()) return false;
+      if (disposed || signal.aborted || (capture.deadline !== undefined && now() >= capture.deadline) || !isTrusted()) return false;
       if (!checkDependencyCurrent(capture)) return false;
       if (capture.source) {
         if (pendingSourceMutations.has(capture.source.id)) return false;
@@ -348,7 +346,9 @@ export function createContainerlabActivationController(
       const reason = capture.signal.reason;
       throw reason instanceof Error ? reason : new Error("Containerlab inspection was canceled.");
     }
-    if (now() >= capture.deadline) throw new Error("Containerlab inspection exceeded its 30-second deadline.");
+    if (capture.deadline !== undefined && now() >= capture.deadline) {
+      throw new Error("Containerlab inspection exceeded its 30-second deadline.");
+    }
     if (!capture.isCurrent()) throw new Error("Containerlab source, form, workspace trust, or SSH route changed during inspection.");
   };
 
@@ -559,20 +559,29 @@ export function createContainerlabActivationController(
 
   const controller: ContainerlabActivationController = {
     async inspect(config, operationContext) {
-      const deadline = now() + RUN_DEADLINE_MS;
       const abortController = new AbortController();
       const externalSignal = operationContext?.signal;
       const abortFromCaller = () => abortController.abort(externalSignal?.reason ?? new Error("Containerlab inspection was canceled."));
       if (externalSignal?.aborted) abortFromCaller();
       else externalSignal?.addEventListener("abort", abortFromCaller, { once: true });
-      const timer = setTimeout(() => abortController.abort(new Error("Containerlab inspection exceeded its 30-second deadline.")), Math.max(0, deadline - now()));
-      let capture: OperationCapture;
+      let timer: ReturnType<typeof setTimeout> | undefined;
       try {
-        capture = captureOperation(config, operationContext, deadline, abortController.signal);
+        const capture = captureOperation(config, operationContext, abortController.signal);
+        const isBackground = capture.intent === "background-status" || capture.intent === "manual-status";
+        const armDeadline = (): number => {
+          if (capture.deadline !== undefined) return capture.deadline;
+          const deadline = now() + RUN_DEADLINE_MS;
+          capture.deadline = deadline;
+          timer = setTimeout(
+            () => abortController.abort(new Error("Containerlab inspection exceeded its 30-second deadline.")),
+            Math.max(0, deadline - now())
+          );
+          return deadline;
+        };
+        if (isBackground) armDeadline();
         await loadedStore();
         ensureCurrent(capture);
 
-        const isBackground = capture.intent === "background-status" || capture.intent === "manual-status";
         let approved: ApprovalRecord | undefined;
         if (isBackground) {
           if (!capture.source) throw approvalError();
@@ -594,8 +603,11 @@ export function createContainerlabActivationController(
           const allowed = await dependencies.confirmRun(runDescription(capture.config, capture.labHost));
           if (!allowed) throw new Error("Containerlab Run was canceled.");
           ensureCurrent(capture);
+          armDeadline();
         }
 
+        const deadline = capture.deadline;
+        if (deadline === undefined) throw new Error("Containerlab inspection deadline was not started.");
         const runContext: ContainerlabRunContext = {
           interaction: isBackground ? "noninteractive" : "interactive",
           signal: abortController.signal,
@@ -656,7 +668,7 @@ export function createContainerlabActivationController(
         ensureCurrent(capture);
         return result;
       } finally {
-        clearTimeout(timer);
+        if (timer !== undefined) clearTimeout(timer);
         externalSignal?.removeEventListener("abort", abortFromCaller);
       }
     },

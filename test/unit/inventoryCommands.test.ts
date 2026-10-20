@@ -342,6 +342,63 @@ describe("inventoryCommands", () => {
     mockWebviewOpen.mockImplementation(() => makeFakePanel());
   });
 
+  describe("syncNow proposed discovery chain validation", () => {
+    it("refuses an Automatic route that would make the existing discovery chain cyclic before preview, teardown, or writes", async () => {
+      const sourceId = "route-source";
+      const labHost = makeServer({
+        id: "lab-host",
+        name: "Lab host",
+        host: "10.0.0.2",
+        proxy: { type: "ssh", jumpHostId: "hop" }
+      });
+      const hop = makeServer({
+        id: "hop",
+        name: "Hop",
+        host: "10.0.0.1",
+        origin: { sourceId, externalId: "hop-device", syncedAt: 1 }
+      });
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      await core.addOrUpdateServer(labHost);
+      await core.addOrUpdateServer(hop);
+      const source = makeSource({
+        id: sourceId,
+        providerId: "route-provider",
+        prunePolicy: "keep",
+        config: { labHostId: "lab-host" }
+      });
+      await core.addOrUpdateInventorySource(source);
+
+      const provider = makeProvider({
+        id: "route-provider",
+        configFields: [{ id: "labHostId", label: "Lab Host", type: "string", required: true }],
+        sourceDefaultRoute: () => ({ kind: "ssh", jumpHostId: "lab-host" }),
+        discoverySshHostId: () => "lab-host",
+        fetchInventory: vi.fn(async () => ({
+          contractVersion: 1 as const,
+          devices: [{ externalId: "hop-device", name: "Hop", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] }]
+        }))
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(provider);
+      const teardown = makeTeardown();
+      registerInventoryCommands(core, registry, makeVault(), teardown);
+
+      const beforeServers = core.getSnapshot().servers;
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+      const writeSpy = vi.spyOn(core, "addOrUpdateServer");
+      await registeredCommands.get("nexus.inventory.syncNow")!(sourceId);
+
+      expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringMatching(/cycle|Keep Direct/i));
+      expect(mockShowInformationMessage).not.toHaveBeenCalled();
+      expect(applySpy).not.toHaveBeenCalled();
+      expect(teardown.calls).toEqual([]);
+      expect(writeSpy).not.toHaveBeenCalled();
+      expect(core.getSnapshot().servers).toEqual(beforeServers);
+    });
+  });
+
   describe("Containerlab source form command integration", () => {
     it("forwards Add/Edit Test contexts and transfers each saved approval inside the mutation lock", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
@@ -1669,6 +1726,46 @@ describe("inventoryCommands", () => {
       expect(vault.store).not.toHaveBeenCalled();
     });
 
+    it("collects a required generic ssh-profile field before provider or source writes, then accepts a live selection", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      await core.addOrUpdateServer(makeServer({ id: "live-host", name: "Live Host", host: "ssh.example" }));
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        id: "third-party-containerlab",
+        label: "Containerlab",
+        configFields: [{ id: "labHostId", label: "SSH Gateway", type: "ssh-profile", required: true }]
+      });
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { definition, onSubmit } = latestFormCall();
+      const hostField = definition.fields.find((field) => "key" in field && field.key === "cfg_labHostId");
+      expect(hostField).toMatchObject({ type: "select", required: true });
+      const sourceWrite = vi.spyOn(core, "addOrUpdateInventorySource");
+      const values: FormValues = {
+        name: "Containerlab Provider",
+        targetFolder: "Infra",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        cfg_labHostId: ""
+      };
+
+      await expect(onSubmit(values)).rejects.toThrow(/SSH Gateway is required/);
+      expect(sourceWrite).not.toHaveBeenCalled();
+      expect(core.getSnapshot().inventorySources).toHaveLength(0);
+      expect(provider.testConnection).not.toHaveBeenCalled();
+      expect(vault.store).not.toHaveBeenCalled();
+
+      await onSubmit({ ...values, cfg_labHostId: "live-host" });
+      expect(sourceWrite).toHaveBeenCalledTimes(1);
+      expect(core.getSnapshot().inventorySources[0]?.config).toEqual({ labHostId: "live-host" });
+      expect(provider.testConnection).not.toHaveBeenCalled();
+      expect(vault.store).not.toHaveBeenCalled();
+    });
+
     it("top-level target folder — declining the confirmation leaves the source unsaved; confirming with Continue saves it at the top level (kills silently skipping the confirmation)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
@@ -2039,6 +2136,20 @@ describe("inventoryCommands", () => {
       expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Reload Window"), "Reload Window");
       await Promise.resolve();
       expect(mockExecuteCommand).not.toHaveBeenCalledWith("workbench.action.reloadWindow");
+
+      const reloadError = new Error("reload failed");
+      let reloadRejectionConsumed = false;
+      const rejectedReload = {
+        then(onFulfilled: (value: void) => unknown, onRejected: (reason: unknown) => unknown) {
+          reloadRejectionConsumed = typeof onRejected === "function";
+          return Promise.reject(reloadError).then(onFulfilled, onRejected);
+        }
+      } as unknown as PromiseLike<void>;
+      mockExecuteCommand.mockReturnValueOnce(rejectedReload);
+      mockShowErrorMessage.mockResolvedValueOnce("Reload Window");
+      await edit("src-1");
+      await vi.waitFor(() => expect(mockExecuteCommand).toHaveBeenCalledWith("workbench.action.reloadWindow"));
+      await vi.waitFor(() => expect(reloadRejectionConsumed).toBe(true));
 
       getSourceSpy.mockImplementation(originalGetInventorySource);
       mockShowErrorMessage.mockClear();

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { deviceTemplateFormDefinition, serverFormDefinition } from "../../src/ui/formDefinitions";
+import { renderFormHtml } from "../../src/ui/formHtml";
 import { TEMPLATE_FIELD_SHORT_LABELS, templateAppliedFields } from "../../src/services/inventory/templateApply";
 import type { FormDefinition, FormFieldDescriptor } from "../../src/ui/formTypes";
 import type { DeviceTemplateProfile } from "../../src/models/deviceTemplate";
@@ -41,11 +42,18 @@ describe("deviceTemplateFormDefinition — tri-state wiring (§7.1)", () => {
     });
     const templateProxy = field(directTemplate, "proxyType") as Extract<FormFieldDescriptor, { type: "select" }>;
     expect(templateProxy.value).toBe("direct");
+    expect(templateProxy.options).toContainEqual({ label: "Not set (no opinion)", value: "none" });
+    expect(templateProxy.options).not.toContainEqual({ label: "None (direct connection)", value: "none" });
     expect(templateProxy.options).toContainEqual({ label: "Direct (no proxy)", value: "direct" });
+    const templateHtml = renderFormHtml(directTemplate);
+    expect(templateHtml).toContain("Not set (no opinion)");
+    expect(templateHtml).not.toContain("None (direct connection)");
 
     const server = serverFormDefinition({ id: "s1", name: "s", host: "h", port: 22, username: "u", authType: "agent" });
     const serverProxy = field(server, "proxyType") as Extract<FormFieldDescriptor, { type: "select" }>;
     expect(serverProxy.options).not.toContainEqual(expect.objectContaining({ value: "direct" }));
+    expect(serverProxy.options).toContainEqual({ label: "None (direct connection)", value: "none" });
+    expect(renderFormHtml(server)).toContain("None (direct connection)");
   });
 
   it("PR-T3 — the IPMI rows reuse the filterable selects and seed from the template fields", () => {
@@ -234,6 +242,55 @@ describe("shared short-label map (§7.3/§7.4)", () => {
     const applied = templateAppliedFields(server);
     expect(applied).toEqual(["proxy", "multiplexing"]);
     expect(applied.map((f) => TEMPLATE_FIELD_SHORT_LABELS[f])).toEqual(["Proxy", "Multiplexing"]);
+  });
+
+  it("uses canonical proxy ownership for editor hints and falls back to legacy stamps only without ownership or opt-out", () => {
+    const server = (origin: ServerConfig["origin"], proxy?: ProxyConfig): ServerConfig => ({
+      id: "s",
+      name: "n",
+      host: "h",
+      port: 22,
+      username: "u",
+      authType: "agent",
+      isHidden: false,
+      ...(proxy ? { proxy } : {}),
+      origin
+    });
+    const canonicalSsh = server({ sourceId: "src", externalId: "d", syncedAt: 1, proxyOwnership: { owner: "template", value: P } }, P);
+    const canonicalDirect = server({ sourceId: "src", externalId: "d", syncedAt: 1, proxyOwnership: { owner: "template", value: null } });
+    const legacy = server({ sourceId: "src", externalId: "d", syncedAt: 1, templated: { proxy: P } }, P);
+    const handEdited = server({
+      sourceId: "src", externalId: "d", syncedAt: 1,
+      proxyOwnership: { owner: "template", value: { type: "ssh", jumpHostId: "old-hop" } },
+      templated: { proxy: P }
+    }, P);
+    const sourceDefault = server({
+      sourceId: "src", externalId: "d", syncedAt: 1,
+      proxyOwnership: { owner: "source-default", value: P },
+      templated: { proxy: P }
+    }, P);
+    const currentCleared = server({
+      sourceId: "src", externalId: "d", syncedAt: 1,
+      proxyOwnership: { owner: "template", value: P },
+      templated: { proxy: P }
+    });
+    const optedOutLegacy = server({
+      sourceId: "src", externalId: "d", syncedAt: 1,
+      proxyOptOut: true,
+      templated: { proxy: P }
+    }, P);
+
+    expect(templateAppliedFields(canonicalSsh)).toEqual(["proxy"]);
+    expect(templateAppliedFields(canonicalDirect)).toEqual(["proxy"]);
+    expect(templateAppliedFields(legacy)).toEqual(["proxy"]);
+    for (const notApplied of [handEdited, sourceDefault, currentCleared, optedOutLegacy]) {
+      expect(templateAppliedFields(notApplied)).toEqual([]);
+    }
+
+    const hint = field(serverFormDefinition(canonicalSsh), "proxyType");
+    expect("hint" in (hint ?? {}) ? hint?.hint : undefined).toContain("applied by a device template");
+    const noHint = field(serverFormDefinition(sourceDefault), "proxyType");
+    expect("hint" in (noHint ?? {}) ? noHint?.hint : undefined).not.toContain("applied by a device template");
   });
 
   it("a hand-edited field (cur != stamp) drops out of the applied set (the 'your edits override' signal)", () => {

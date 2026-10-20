@@ -792,7 +792,7 @@ function proxyFields(
       key: "proxyType",
       label: "Proxy",
       options: [
-        { label: "None (direct connection)", value: "none" },
+        { label: includeDirect ? "Not set (no opinion)" : "None (direct connection)", value: "none" },
         ...(includeDirect ? [{ label: "Direct (no proxy)", value: "direct" }] : []),
         { label: "SSH Jump Host", value: "ssh" },
         { label: "SOCKS5 Proxy", value: "socks5" },
@@ -1493,7 +1493,8 @@ function inventoryConfigFieldDescriptor(
   field: InventoryConfigField,
   existingConfig: InventorySourceValues,
   existingSecretFieldIds: ReadonlySet<string>,
-  sshProfiles: readonly ServerConfig[] = []
+  sshProfiles: readonly ServerConfig[] = [],
+  providerId?: string
 ): FormFieldDescriptor {
   const key = inventoryConfigFieldPrefixedKey(field.id);
   if (field.type === "password") {
@@ -1569,7 +1570,10 @@ function inventoryConfigFieldDescriptor(
       options,
       value: existingValue,
       filterable: true,
-      requiredWhen: field.id === "labHostId" ? { field: inventoryConfigFieldPrefixedKey("location"), value: "ssh" } : undefined,
+      required: field.required,
+      ...(providerId === "containerlab" && field.id === "labHostId"
+        ? { requiredWhen: { field: inventoryConfigFieldPrefixedKey("location"), value: "ssh" } }
+        : {}),
       hint: field.description,
       advanced: field.advanced
     };
@@ -1603,9 +1607,9 @@ function inventoryConfigFieldDescriptor(
     };
   }
   const existing = existingConfig[field.id];
-  const requiredWhen = field.id === "runnerImage"
+  const requiredWhen = providerId === "containerlab" && field.id === "runnerImage"
     ? { field: inventoryConfigFieldPrefixedKey("runner"), value: "disposable" }
-    : field.id === "runnerContainer"
+    : providerId === "containerlab" && field.id === "runnerContainer"
       ? { field: inventoryConfigFieldPrefixedKey("runner"), value: "existing" }
       : undefined;
   return {
@@ -1854,7 +1858,7 @@ const INVENTORY_SOURCE_AUTH_PROFILE_HINT =
  * handlers parse the posted values against.
  */
 export function inventorySourceFormDefinition(
-  provider: { label: string; configFields: readonly InventoryConfigField[] },
+  provider: { id?: string; label: string; configFields: readonly InventoryConfigField[] },
   seed?: InventorySourceConfig,
   defaultUsernameSeed?: string,
   authProfiles?: AuthProfile[],
@@ -2005,8 +2009,11 @@ export function inventorySourceFormDefinition(
       // provider without one gets its config fields unchanged, byte-for-byte.
       ...provider.configFields.flatMap((field) =>
         field === filterTarget?.field
-          ? [savedFilterSelectField(savedFilters, filterTarget.label), inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds, sshProfiles)]
-          : [inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds, sshProfiles)]
+          ? [
+              savedFilterSelectField(savedFilters, filterTarget.label),
+              inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds, sshProfiles, provider.id)
+            ]
+          : [inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds, sshProfiles, provider.id)]
       )
     ]
   };

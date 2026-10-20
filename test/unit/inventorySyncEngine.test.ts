@@ -5051,6 +5051,36 @@ describe("discovery dependencies carried by a sync plan", () => {
     expect(plan.discoveryDependencies).toBe(dependencies);
     expect(planToApplication(plan, source).discoveryDependencies).toBe(dependencies);
   });
+
+  it("rejects an effective source-default cycle while allowing a valid required-hop update", () => {
+    const labHost: ServerConfig = {
+      id: "lab-host", name: "Lab host", host: "10.0.0.2", port: 22, username: "admin", authType: "agent",
+      isHidden: false, proxy: { type: "ssh", jumpHostId: "hop" }
+    };
+    const hop = makeOwnedServer({
+      id: "hop", name: "Hop", host: "10.0.0.1",
+      origin: { sourceId: "source-1", externalId: "hop-node", syncedAt: 1, syncedHost: "10.0.0.1", syncedPort: 22, syncedProtocol: "ssh" }
+    });
+    const source = makeSource({ prunePolicy: "delete" });
+    const dependencies = snapshotInventorySourceDependencies("lab-host", [labHost, hop], []);
+    const tree = makeTree([makeDevice({
+      externalId: "hop-node", name: "Hop", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }]
+    })]);
+
+    expect(() => computeSyncPlan({
+      source, tree, currentServers: [labHost, hop], now: 2, discoveryDependencies: dependencies,
+      sourceDefaultRoute: { kind: "ssh", jumpHostId: "lab-host" }
+    })).toThrow(/cycle|Keep Direct|Device Connection/i);
+
+    const benignTree = makeTree([makeDevice({
+      externalId: "hop-node", name: "Hop", endpoints: [{ kind: "ssh", host: "10.0.0.9", port: 22 }]
+    })]);
+    const benign = computeSyncPlan({
+      source, tree: benignTree, currentServers: [labHost, hop], now: 2, discoveryDependencies: dependencies,
+      sourceDefaultRoute: { kind: "direct" }
+    });
+    expect(benign.updates.find((update) => update.after.id === "hop")?.after.host).toBe("10.0.0.9");
+  });
 });
 
 describe("prunedServerIdsForSecretCleanup", () => {

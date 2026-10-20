@@ -208,7 +208,7 @@ describe("device template matrix — non-auth fields", () => {
     expect(after.origin?.proxyOwnership).toEqual({ owner: "template", value: P_A });
     expect(after.origin?.templated?.proxy).toBeUndefined();
     expect(p.warnings.some((warning) => warning.includes('Proxy ← "T"'))).toBe(true);
-    expect(p.warnings.join("\n")).not.toMatch(/jump host no longer exists/i);
+    expect(p.warnings.join("\n")).not.toMatch(/invalid or missing SSH host/i);
   });
 
   it("lets explicit template Direct beat the source default and records Direct ownership", () => {
@@ -224,7 +224,7 @@ describe("device template matrix — non-auth fields", () => {
     expect("proxy" in p.adds[0]).toBe(false);
     expect(p.adds[0].origin?.proxyOwnership).toEqual({ owner: "template", value: null });
     expect(p.warnings.some((warning) => warning.includes('Proxy ← "T"'))).toBe(true);
-    expect(p.warnings.join("\n")).not.toMatch(/jump host no longer exists/i);
+    expect(p.warnings.join("\n")).not.toMatch(/invalid or missing SSH host/i);
   });
 
   it("releases a legacy template-owned route to a capable source default and migrates its stamp", () => {
@@ -262,7 +262,18 @@ describe("device template matrix — non-auth fields", () => {
     expect(afterFor(p, optOut.id)?.proxy).toBeUndefined();
     expect(afterFor(p, optOut.id)?.origin?.proxyOptOut).toBe(true);
     expect(afterFor(p, optOut.id)?.origin?.proxyOwnership).toBeUndefined();
-    expect(p.warnings.join("\n")).not.toMatch(/jump host no longer exists/i);
+    expect(p.warnings.join("\n")).not.toMatch(/invalid or missing SSH host/i);
+  });
+
+  it("M6 — an invalid source-default SSH host emits the actual source-default warning", () => {
+    const p = plan({
+      source: makeSource(),
+      devices: [makeDevice()],
+      sourceDefaultRoute: { kind: "ssh", jumpHostId: "missing-lab-host" }
+    });
+    expect(p.warnings).toContain(
+      'The inventory source default route for "NetBox" names an invalid or missing SSH host — restore that server or change the source route.'
+    );
   });
 
   it("migrates a legacy template receipt on an unrelated write without writing a route", () => {
@@ -1108,6 +1119,20 @@ describe("§5.3 proxy reference validation — dangling / self-referential jumpH
     expect(p.adds[0].multiplexing).toBe(true); // sibling field still applied
     const selfWarnings = p.warnings.filter((w) => w.includes("through itself"));
     expect(selfWarnings.length).toBe(1);
+    expect(selfWarnings[0]).toContain('Device template "T"'); // a real template attempt keeps template attribution
+    expect(selfWarnings[0]).not.toContain("Inventory source default");
+  });
+
+  it("M5 — a source-default self-reference names the source that attempted the route", () => {
+    const p = plan({
+      source: makeSource(),
+      devices: [makeDevice()],
+      sourceDefaultRoute: { kind: "ssh", jumpHostId: SELF_ID }
+    });
+    expect(p.adds[0].proxy).toBeUndefined();
+    const selfWarning = p.warnings.find((w) => w.includes("through itself"));
+    expect(selfWarning).toContain('Inventory source default for "NetBox"');
+    expect(selfWarning).not.toContain('Device template "?"');
   });
 
   it("Fixture 30 — a catch-all override proxy with a DANGLING jumpHostId is SKIPPED, its sibling fields still apply, one dangling warning (kills 'write the dangling proxy')", () => {
@@ -1652,6 +1677,47 @@ describe("Codex round 6 — the survivor pass RESTORES the pre-matrix proxy A on
     expect(after.origin?.proxyOwnership?.value).toEqual(sshProxy(A_JUMP_ID)); // stamp follows the restored value
     expect(after.multiplexing).toBe(true); // the other template write still landed
     expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
+  });
+
+  it("M5 — a rejected source-default replacement reports its attempted writer and restores the prior template route", () => {
+    const oldTemplateRoute = sshProxy(A_JUMP_ID);
+    const s = ownedServer(
+      { name: "old-core-sw-1", proxy: oldTemplateRoute },
+      { proxyOwnership: { owner: "template", value: oldTemplateRoute } }
+    );
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete" }),
+      devices: [makeDevice({ name: "core-sw-1-renamed" })],
+      servers: [s, survivorJump(), danglingJump()],
+      sourceDefaultRoute: { kind: "ssh", jumpHostId: B_JUMP_ID }
+    });
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === B_JUMP_ID)).toBe(true);
+    const after = afterFor(p, S_ID)!;
+    expect(after.name).toBe("core-sw-1-renamed"); // keep a sibling change visible after proxy rollback
+    expect(after.proxy).toEqual(oldTemplateRoute);
+    expect(after.origin?.proxyOwnership).toEqual({ owner: "template", value: oldTemplateRoute });
+    expect(p.warnings.some((w) => w.includes('Inventory source default for "NetBox"') && w.includes("will not survive this sync"))).toBe(true);
+    expect(p.warnings.some((w) => w.includes('Device template "?"'))).toBe(false);
+    expect(p.warnings.some((w) => w.includes("Proxy ←"))).toBe(false); // rejected source route has no template provenance
+  });
+
+  it("M5 control — a rejected source-default proxy-only update still collapses after the old route is restored", () => {
+    const oldTemplateRoute = sshProxy(A_JUMP_ID);
+    const s = ownedServer(
+      { proxy: oldTemplateRoute },
+      { proxyOwnership: { owner: "template", value: oldTemplateRoute } }
+    );
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete" }),
+      devices: [makeDevice()],
+      servers: [s, survivorJump(), danglingJump()],
+      sourceDefaultRoute: { kind: "ssh", jumpHostId: B_JUMP_ID }
+    });
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === B_JUMP_ID)).toBe(true);
+    expect(afterFor(p, S_ID)).toBeUndefined();
+    expect(p.updates.some((u) => u.before.id === S_ID)).toBe(false);
+    expect(p.unchangedCount).toBe(1);
+    expect(p.warnings.some((w) => w.includes('Inventory source default for "NetBox"'))).toBe(true);
   });
 
   it("Fixture 51 — NO-OP COLLAPSE: A→B was the ONLY change; restoring A reverts it → S is removed from `updates` and counted UNCHANGED (kills leaving a now-no-op update in the plan, and kills the round-2 delete which keeps S in updates with proxy absent)", () => {

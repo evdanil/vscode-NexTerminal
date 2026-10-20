@@ -148,7 +148,7 @@ describe("Containerlab SSH command runner", () => {
       executable: process.execPath,
       args: [
         "-e",
-        "process.stdout.write(JSON.stringify({ cwd: process.cwd(), value: process.env.NEXUS_TEST_VALUE, args: process.argv.slice(1) }))",
+        "process.stdout.write(JSON.stringify({ cwd: process.cwd(), value: process.env.NEXUS_TEST_VALUE, unrelated: process.env.NEXUS_UNRELATED ?? null, args: process.argv.slice(1) }))",
         hostileArgument,
         "$(printf injected)",
         "single'quote"
@@ -168,9 +168,9 @@ describe("Containerlab SSH command runner", () => {
       expect(JSON.parse(result.stdout)).toEqual({
         cwd: "/",
         value: hostileEnvironment,
+        unrelated: null,
         args: [hostileArgument, "$(printf injected)", "single'quote"]
       });
-      expect(result.stdout).not.toContain("must-be-cleared");
       expect(existsSync(argumentMarker)).toBe(false);
       expect(existsSync(environmentMarker)).toBe(false);
     } finally {

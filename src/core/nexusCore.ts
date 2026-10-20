@@ -31,6 +31,7 @@ import {
 import { syncOwnsHost, syncOwnsPort } from "../services/inventory/syncEngine";
 import {
   assertInventorySourceDependenciesCurrent,
+  assertInventorySourceDependenciesRemainValid,
   assertInventorySourceDependenciesSurvive,
   type InventorySourceDependencySnapshot
 } from "../services/inventory/inventorySourceDependencies";
@@ -1623,6 +1624,13 @@ export class NexusCore {
         survivingServerIds.add(server.id);
       }
       assertInventorySourceDependenciesSurvive(apply.discoveryDependencies, survivingServerIds);
+      assertInventorySourceDependenciesRemainValid(
+        apply.discoveryDependencies,
+        [...this.servers.values()],
+        removeServerIds,
+        upsertServers,
+        [...this.authProfiles.values()]
+      );
     }
     // ITEM 1 — capture everything this call is about to mutate BEFORE
     // touching it, so a rejected persist below can be rolled back completely.

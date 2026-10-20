@@ -40,7 +40,13 @@ const CONFIG_FIELDS: InventoryConfigField[] = [
   { id: "containerlabExecutable", label: "Containerlab Executable", type: "string", placeholder: "containerlab" },
   { id: "dockerExecutable", label: "Docker Executable", type: "string", placeholder: "docker" },
   { id: "runnerImage", label: "Installed Runner Image", type: "string", advanced: true },
-  { id: "runnerContainer", label: "Existing Runner Container", type: "string", advanced: true },
+  {
+    id: "runnerContainer",
+    label: "Existing Runner Container",
+    type: "string",
+    description: "Enter an exact container name or its full 64-character Docker ID; abbreviated IDs are not accepted.",
+    advanced: true
+  },
   { id: "dockerSocket", label: "Docker Socket", type: "string", placeholder: "/var/run/docker.sock", advanced: true },
   { id: "sudo", label: "Use Noninteractive Sudo", type: "boolean", advanced: true },
   {

@@ -185,6 +185,8 @@ describe("parseDeviceTemplateFormValues (§7.1 tri-state → model)", () => {
   it("represents explicit Direct as a nullable proxy value and keeps legacy none as no opinion", () => {
     const direct = parseDeviceTemplateFormValues({ name: "T", mode_proxy: "override", proxyType: "direct" });
     expect(direct.fields.proxy).toEqual({ mode: "override", value: null });
+    const noOpinion = parseDeviceTemplateFormValues({ name: "T", mode_proxy: "override", proxyType: "none" });
+    expect(noOpinion.fields.proxy).toBeUndefined();
     const legacy = parseDeviceTemplateFormValues({ name: "T", mode_proxy: "none", proxyType: "none" });
     expect(legacy.fields.proxy).toBeUndefined();
     expect(parseDeviceTemplateFormValues({ name: "T", mode_proxy: "none", proxyType: "direct" }).fields.proxy).toBeUndefined();

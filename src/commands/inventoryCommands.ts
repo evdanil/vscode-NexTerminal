@@ -155,7 +155,7 @@ function showReloadWindowMessage(kind: "error" | "warning", message: string): vo
   void Promise.resolve(prompt)
     .then((choice) => {
       if (choice === "Reload Window") {
-        void vscode.commands.executeCommand("workbench.action.reloadWindow");
+        return vscode.commands.executeCommand("workbench.action.reloadWindow");
       }
     })
     .catch(() => undefined);

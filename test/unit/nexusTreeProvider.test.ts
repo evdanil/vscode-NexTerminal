@@ -672,6 +672,38 @@ describe("NexusTreeProvider stable IDs", () => {
     expect(item.description).not.toContain("(no address)");
   });
 
+  it("shows proxy template ownership from the canonical record and ignores stale legacy stamps", () => {
+    const proxy = { type: "socks5", host: "proxy.example", port: 1080 } as const;
+    const canonicalTemplate = new ServerTreeItem(makeServer({
+      id: "template-proxy",
+      proxy,
+      origin: {
+        sourceId: "src", externalId: "template-proxy", syncedAt: 1,
+        proxyOwnership: { owner: "template", value: proxy }
+      }
+    }), false);
+    const canonicalDirect = new ServerTreeItem(makeServer({
+      id: "template-direct",
+      origin: {
+        sourceId: "src", externalId: "template-direct", syncedAt: 1,
+        proxyOwnership: { owner: "template", value: null }
+      }
+    }), false);
+    const staleLegacy = new ServerTreeItem(makeServer({
+      id: "source-default-proxy",
+      proxy,
+      origin: {
+        sourceId: "src", externalId: "source-default-proxy", syncedAt: 1,
+        proxyOwnership: { owner: "source-default", value: proxy },
+        templated: { proxy }
+      }
+    }), false);
+
+    expect(canonicalTemplate.tooltip).toContain("Template-applied: Proxy");
+    expect(canonicalDirect.tooltip).toContain("Template-applied: Proxy");
+    expect(staleLegacy.tooltip).not.toContain("Template-applied:");
+  });
+
   it("ServerTreeItem shows the IPMI/BMC address on its own tooltip line, only when set (issue #48)", () => {
     // Not part of the SSH connection, so it must not be folded into the
     // `user@host:port` summary — and a server with no BMC gets no line at all.

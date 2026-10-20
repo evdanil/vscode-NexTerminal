@@ -5388,4 +5388,44 @@ describe("NexusCore.applyInventorySyncPlan discovery dependency guard", () => {
     expect(core.getServer("lab-host")?.host).toBe("new.example.test");
     expect(core.getServer("new-device")).toBeUndefined();
   });
+
+  it("rejects an unsafe future route before persistence or notification while allowing a valid endpoint update", async () => {
+    const labHost: ServerConfig = {
+      id: "lab-host", name: "Lab host", host: "10.0.0.2", port: 22, username: "admin", authType: "agent",
+      isHidden: false, proxy: { type: "ssh", jumpHostId: "hop" }
+    };
+    const hop: ServerConfig = {
+      id: "hop", name: "Hop", host: "10.0.0.1", port: 22, username: "admin", authType: "agent", isHidden: false,
+      origin: { sourceId: "source-1", externalId: "hop-node", syncedAt: 1, syncedHost: "10.0.0.1", syncedPort: 22, syncedProtocol: "ssh" }
+    };
+    const repository = new InMemoryConfigRepository([labHost, hop]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1", providerId: "containerlab" }));
+    const expectedSource = core.getInventorySource("source-1")!;
+    const dependencies = snapshotInventorySourceDependencies("lab-host", [labHost, hop], []);
+    const before = core.getSnapshot();
+    const saveServers = vi.spyOn(repository, "saveServers");
+    const saveGroups = vi.spyOn(repository, "saveGroups");
+    const listener = vi.fn();
+    core.onDidChange(listener);
+
+    await expect(configMutationLock.runExclusive(() => core.applyInventorySyncPlan({
+      sourceId: "source-1", syncedAt: 2,
+      upsertServers: [{ ...hop, proxy: { type: "ssh", jumpHostId: "lab-host" } }],
+      removeServerIds: [], folders: [], expectedSource, discoveryDependencies: dependencies
+    }))).rejects.toThrow(/cycle|Keep Direct|Device Connection/i);
+
+    expect(core.getSnapshot()).toEqual(before);
+    expect(saveServers).not.toHaveBeenCalled();
+    expect(saveGroups).not.toHaveBeenCalled();
+    expect(listener).not.toHaveBeenCalled();
+
+    await configMutationLock.runExclusive(() => core.applyInventorySyncPlan({
+      sourceId: "source-1", syncedAt: 3,
+      upsertServers: [{ ...hop, host: "10.0.0.9", origin: { ...hop.origin!, syncedHost: "10.0.0.9" } }],
+      removeServerIds: [], folders: [], expectedSource, discoveryDependencies: dependencies
+    }));
+    expect(core.getServer("hop")?.host).toBe("10.0.0.9");
+  });
 });

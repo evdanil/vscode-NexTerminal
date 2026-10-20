@@ -38,7 +38,7 @@ The source keeps the usual inventory settings too: target folder, node authentic
 
 **Disposable Docker Image** is for a Containerlab image that is already installed. Nexus uses its immutable image identity for the bounded check and inspection, mounts only the selected Docker socket, disables container networking, and removes the temporary helper when the command finishes. It does not pull the image, install Containerlab, or widen Docker permissions. If the image is missing or changes before execution, choose or install the intended image and run Test or Sync again.
 
-**Existing Docker Container** uses a named or identified container that is already running. That container must already have a read-write mount of the selected Docker socket and a compatible Containerlab CLI. Nexus checks the container's identity before it runs; it does not start, stop, reconfigure, or remove this container. If the container or mount is missing, repair it outside Nexus or select another runner.
+**Existing Docker Container** uses a container selected by its exact name or full 64-character Docker ID; abbreviated IDs are not accepted. It must already be running, have a read-write mount of the selected Docker socket, and include a compatible Containerlab CLI. Nexus checks the container's identity before it runs; it does not start, stop, reconfigure, or remove this container. If the container or mount is missing, repair it outside Nexus or select another runner.
 
 All three modes inspect the selected Docker daemon using the configured socket. A missing CLI, unavailable socket, incompatible daemon, wrong runner image/container, or insufficient socket access fails the operation; Nexus will not silently try another daemon or grant extra permissions. If the outer command needs elevated access, select **Use Noninteractive Sudo** only after configuring passwordless sudo for that command.
 
@@ -66,7 +66,7 @@ The source can include internal helper containers returned by Containerlab's all
 
 ## Approve Execution and Status Polling
 
-Before Containerlab runs its bounded preflight and inspection for the first time in the current scope, Nexus asks you to choose **Run** or cancel. The Run decision covers that inspection. Nexus requires a trusted VS Code workspace and checks the saved source or active form, lab host, runner, selected socket, and SSH dependencies before execution.
+Each explicit Test or Sync asks you to choose **Run** or cancel before Containerlab executes its bounded preflight and inspection. Approved status checks reuse the current window's session authority without prompting. Nexus requires a trusted VS Code workspace and checks the saved source or active form, lab host, runner, selected socket, and SSH dependencies before execution.
 
 Saving a source does **not** require Test or Run, and saving an untested source does not authorize commands. A Test of an exact current Add/Edit form can transfer its approval when that same form is saved. An unchanged metadata edit can keep the source's approval; changing the execution setup or route requires a new Run decision. Only the tested current form can transfer approval.
 

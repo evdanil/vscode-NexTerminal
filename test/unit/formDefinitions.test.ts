@@ -766,6 +766,135 @@ describe("inventorySourceFormDefinition", () => {
     }
     expect(imageField.requiredWhen).toEqual({ field: "cfg_runner", value: "disposable" });
     expect(containerField.requiredWhen).toEqual({ field: "cfg_runner", value: "existing" });
+
+    const form = openForm(definition);
+    expect(form.requiredState("cfg_labHostId").value).toBe(false);
+    form.choose("cfg_location", "ssh");
+    expect(form.requiredState("cfg_labHostId").value).toBe(true);
+    form.choose("cfg_labHostId", "lab-host");
+    form.choose("cfg_runner", "disposable");
+    expect(form.attemptNativeSubmit()).toBeUndefined();
+    form.type("cfg_runnerImage", "registry.example/containerlab:1");
+    expect(form.attemptNativeSubmit()?.cfg_runnerImage).toBe("registry.example/containerlab:1");
+    form.choose("cfg_runner", "existing");
+    expect(form.attemptNativeSubmit()).toBeUndefined();
+    form.type("cfg_runnerContainer", "containerlab-runner");
+    expect(form.attemptNativeSubmit()?.cfg_runnerContainer).toBe("containerlab-runner");
+  });
+
+  it("keeps Containerlab field-name collisions owned by third-party providers", () => {
+    const provider: InventoryProvider = {
+      id: "third-party-lab",
+      label: "Third-party Lab",
+      configFields: [
+        { id: "labHostId", label: "SSH Gateway", type: "ssh-profile", required: true },
+        { id: "runnerImage", label: "Image Reference", type: "string", required: true },
+        { id: "runnerContainer", label: "Container Reference", type: "string", required: true }
+      ],
+      testConnection: async () => undefined,
+      fetchInventory: async () => ({ nodes: [] }) as never
+    };
+    const definition = inventorySourceFormDefinition(
+      provider,
+      sourceSeed({
+        providerId: provider.id,
+        config: { labHostId: "deleted-host", runnerImage: "registry.example/app:1", runnerContainer: "agent-1" }
+      }),
+      "admin",
+      [],
+      [],
+      [],
+      [sshProfile("live-host", "Live Host")]
+    );
+    const hostField = keyedField(definition, "cfg_labHostId");
+    const imageField = keyedField(definition, "cfg_runnerImage");
+    const containerField = keyedField(definition, "cfg_runnerContainer");
+    if (hostField.type !== "select") throw new Error("The SSH gateway should be rendered as a select field.");
+    expect(hostField.required).toBe(true);
+    expect(hostField.requiredWhen).toBeUndefined();
+    expect(hostField.options).toEqual([
+      { label: "Select an SSH profile…", value: "" },
+      { label: "Unresolved SSH profile (deleted-host)", value: "deleted-host" },
+      { label: "Live Host", value: "live-host" }
+    ]);
+    if (imageField.type !== "text") throw new Error("The image reference should be rendered as a text field.");
+    expect(imageField.required).toBe(true);
+    expect(imageField.requiredWhen).toBeUndefined();
+    if (containerField.type !== "text") throw new Error("The container reference should be rendered as a text field.");
+    expect(containerField.required).toBe(true);
+    expect(containerField.requiredWhen).toBeUndefined();
+
+    const html = renderFormHtml(definition);
+    expect(html).not.toContain("data-required-when=");
+    expect(html).toMatch(/<input type="text" id="field-cfg_runnerImage"[^>]* required \/>/u);
+    expect(html).toMatch(/<input type="text" id="field-cfg_runnerContainer"[^>]* required \/>/u);
+    const form = openForm(definition);
+    form.type("cfg_runnerImage", "");
+    expect(form.attemptNativeSubmit()).toBeUndefined();
+    form.type("cfg_runnerImage", "registry.example/app:1");
+    expect(form.attemptNativeSubmit()?.cfg_labHostId).toBe("deleted-host");
+  });
+
+  it("keeps optional colliding fields optional when a third-party Containerlab-labeled provider has matching selectors", () => {
+    const provider: InventoryProvider = {
+      id: "third-party-containerlab",
+      label: "Containerlab",
+      configFields: [
+        { id: "location", label: "Location", type: "select", options: [
+          { label: "Local", value: "local" }, { label: "SSH", value: "ssh" }
+        ] },
+        { id: "runner", label: "Runner", type: "select", options: [
+          { label: "Disposable", value: "disposable" }, { label: "Existing", value: "existing" }
+        ] },
+        { id: "labHostId", label: "SSH Gateway", type: "ssh-profile" },
+        { id: "runnerImage", label: "Image Reference", type: "string" },
+        { id: "runnerContainer", label: "Container Reference", type: "string" }
+      ],
+      testConnection: async () => undefined,
+      fetchInventory: async () => ({ nodes: [] }) as never
+    };
+    const definition = inventorySourceFormDefinition(
+      provider,
+      sourceSeed({
+        providerId: provider.id,
+        config: { location: "local", runner: "host", labHostId: "", runnerImage: "", runnerContainer: "" }
+      }),
+      "admin",
+      [],
+      [],
+      [],
+      [sshProfile("live-host", "Live Host")]
+    );
+    const hostField = keyedField(definition, "cfg_labHostId");
+    const imageField = keyedField(definition, "cfg_runnerImage");
+    const containerField = keyedField(definition, "cfg_runnerContainer");
+    if (hostField.type !== "select") throw new Error("The SSH gateway should be rendered as a select field.");
+    expect(hostField.required).toBeUndefined();
+    expect(hostField.requiredWhen).toBeUndefined();
+    if (imageField.type !== "text") throw new Error("The image reference should be rendered as a text field.");
+    expect(imageField.required).toBeUndefined();
+    expect(imageField.requiredWhen).toBeUndefined();
+    if (containerField.type !== "text") throw new Error("The container reference should be rendered as a text field.");
+    expect(containerField.required).toBeUndefined();
+    expect(containerField.requiredWhen).toBeUndefined();
+    expect(renderFormHtml(definition)).not.toContain("data-required-when=");
+
+    const form = openForm(definition);
+    form.choose("cfg_location", "ssh");
+    form.choose("cfg_runner", "disposable");
+    expect(form.requiredState("cfg_labHostId").value).toBe(false);
+    expect(form.attemptNativeSubmit()).toMatchObject({
+      cfg_labHostId: "",
+      cfg_runnerImage: "",
+      cfg_runnerContainer: ""
+    });
+
+    form.choose("cfg_runner", "existing");
+    expect(form.attemptNativeSubmit()).toMatchObject({
+      cfg_labHostId: "",
+      cfg_runnerImage: "",
+      cfg_runnerContainer: ""
+    });
   });
 
   it("lets the native Save submit with a selected SSH host and empty optional picker filter across location changes", () => {

@@ -110,6 +110,83 @@ function metadataResponse(command: ContainerlabCommand): ContainerlabCommandResu
   throw new Error(`Unexpected runtime command: ${command.executable} ${command.args.join(" ")}`);
 }
 
+function disposableFailureScenario(options: {
+  corrupt?: "id" | "name" | "label";
+  failRemoval?: boolean;
+} = {}) {
+  const helperId = "d".repeat(64);
+  const originalAbort = new AbortController();
+  let current = true;
+  const clock = { value: 1_000 };
+  const primaryError = new Error("primary preflight failure");
+  const originalContext = context("local", {
+    interaction: "interactive",
+    signal: originalAbort.signal,
+    deadline: 31_000,
+    labHost: { ...labHost },
+    labHostRouteIdentity: "captured-route-a",
+    isCurrent: () => current
+  });
+  const cleanupContexts: ContainerlabRunContext[] = [];
+  const operationEntries: string[] = [];
+  const cleanupEntries: string[] = [];
+  const container = {
+    Id: options.corrupt === "id" ? "c".repeat(64) : helperId,
+    Name: options.corrupt === "name" ? "/wrong-helper-name" : "/nexus-inventory-run-123",
+    Config: {
+      Labels: {
+        "nexus.inventory-run": options.corrupt === "label" ? "wrong-run" : "run-123"
+      }
+    }
+  };
+  const runner: ContainerlabCommandRunner = {
+    async run(command, runContext) {
+      if (command.args.includes("version")) {
+        operationEntries.push("version");
+        originalAbort.abort(new Error("original operation canceled"));
+        current = false;
+        clock.value = 100_000;
+        throw primaryError;
+      }
+      if (command.args.includes("--quiet")) {
+        cleanupEntries.push("list");
+      } else if (command.args.includes("container") && command.args.includes("inspect") && command.args.includes("--format")) {
+        cleanupEntries.push("inspect");
+      } else if (command.args.includes("rm")) {
+        cleanupEntries.push("remove");
+      }
+      if (cleanupEntries.length > 0 && cleanupEntries.at(-1) !== undefined) {
+        cleanupContexts.push(runContext);
+        if (
+          runContext.interaction !== "noninteractive" ||
+          runContext.signal.aborted ||
+          clock.value >= runContext.deadline ||
+          !runContext.isCurrent()
+        ) {
+          throw new Error("cleanup context failed the test runner's noninteractive budget guard");
+        }
+      }
+      if (command.args.includes("--quiet")) return { stdout: `${helperId}\n`, stderr: "" };
+      if (command.args.includes("container") && command.args.includes("inspect") && command.args.includes("--format")) {
+        return { stdout: JSON.stringify(container), stderr: "" };
+      }
+      if (command.args.includes("rm")) {
+        if (options.failRemoval) throw new Error("secondary cleanup failure");
+        return { stdout: "", stderr: "" };
+      }
+      return metadataResponse(command);
+    }
+  };
+  const settings = config({ runner: "disposable", runnerImage: "ghcr.io/srl-labs/clab:0.80.0" });
+  const executor = createContainerlabExecutor({
+    localRunner: runner,
+    sshRunner: runner,
+    createInvocationId: () => "run-123",
+    now: () => clock.value
+  });
+  return { executor, settings, originalContext, originalAbort, primaryError, clock, cleanupContexts, operationEntries, cleanupEntries };
+}
+
 describe("Containerlab runtime execution", () => {
   it("rejects a missing SSH route identity before acquiring a runner", async () => {
     const remote = commandRunner(() => ({ stdout: "/usr/bin/containerlab\n", stderr: "" }));
@@ -479,6 +556,48 @@ describe("Containerlab runtime execution", () => {
     }
   });
 
+  it.each([
+    ["name", "runner", "local"],
+    ["full container ID", containerId, "local"],
+    ["name", "runner", "ssh"],
+    ["full container ID", containerId, "ssh"]
+  ] as const)("resolves and pins an existing runner configured by %s in %s mode", async (_referenceKind, reference, location) => {
+    const values = { runner: "existing", runnerContainer: reference, dockerSocket: "/run/docker.sock" };
+    const settings = location === "ssh" ? remoteConfig(values) : config(values);
+    const fake = commandRunner(metadataResponse);
+    const executor = createContainerlabExecutor({ localRunner: fake.runner, sshRunner: fake.runner });
+    const runContext = context(location);
+
+    const resolved = await executor.resolveDependencies(settings, runContext);
+    const prepared = await executor.preflight(settings, resolved, runContext);
+    await executor.inspect(settings, prepared, runContext);
+
+    expect(resolved.identity.containerId).toBe(containerId);
+    expect(resolved.identity.executable).toBe(settings.containerlabExecutable);
+    const metadata = fake.calls.find((call) => call.args.includes("container") && call.args.includes("inspect"))!;
+    expect(metadata.args.slice(-1)).toEqual([reference]);
+    const pinnedExecutions = fake.calls.filter((call) => call.args.includes("exec"));
+    expect(pinnedExecutions).toHaveLength(2);
+    for (const call of pinnedExecutions) {
+      expect(call.args).toContain(containerId);
+      expect(call.args).toContain(resolved.identity.executable);
+    }
+    expect(pinnedExecutions[0].args.slice(-1)).toEqual(["version"]);
+    expect(pinnedExecutions[1].args.slice(-11)).toEqual([
+      "--runtime", "docker", "--topo=", "--name=", "--timeout", "20s",
+      "inspect", "--all", "--details", "--format", "json"
+    ]);
+  });
+
+  it("rejects an existing-runner reference that matches neither its exact name nor full ID", async () => {
+    const fake = commandRunner(metadataResponse);
+    const executor = createContainerlabExecutor({ localRunner: fake.runner, sshRunner: fake.runner });
+
+    await expect(executor.resolveDependencies(config({ runner: "existing", runnerContainer: "c".repeat(64) }), context()))
+      .rejects.toThrow(/runner|container/i);
+    expect(fake.calls.some((call) => call.args.includes("version"))).toBe(false);
+  });
+
   it("compares the expected outer Docker path before any Docker metadata command", async () => {
     const fake = commandRunner(metadataResponse);
     const executor = createContainerlabExecutor({ localRunner: fake.runner, sshRunner: fake.runner });
@@ -658,5 +777,59 @@ describe("Containerlab runtime execution", () => {
     expect(fake.calls.find((call) => call.args.includes("container") && call.args.includes("inspect") && call.args.includes("--format"))?.args).toContain(helperId);
     expect(removal?.args).toContain(helperId);
     expect(fake.calls.some((call) => call.args.includes(`label=nexus.inventory-run=run-123`))).toBe(true);
+  });
+
+  it("M1 gives disposable cleanup its own fresh bounded context after the operation aborts and expires", async () => {
+    const scenario = disposableFailureScenario();
+    const resolved = await scenario.executor.resolveDependencies(scenario.settings, scenario.originalContext);
+    expect(resolved.identity.imageId).toBe(imageId);
+
+    await expect(scenario.executor.preflight(scenario.settings, resolved, scenario.originalContext)).rejects.toBe(scenario.primaryError);
+    expect(scenario.operationEntries).toEqual(["version"]); // failing preflight operation was entered
+    expect(scenario.originalAbort.signal.aborted).toBe(true);
+    expect(scenario.clock.value).toBeGreaterThan(scenario.originalContext.deadline);
+    expect(scenario.originalContext.isCurrent()).toBe(false);
+    expect(scenario.cleanupEntries).toEqual(["list", "inspect", "remove"]);
+    expect(scenario.cleanupContexts).toHaveLength(3);
+    const cleanup = scenario.cleanupContexts[0];
+    expect(scenario.cleanupContexts.every((captured) => captured === cleanup)).toBe(true);
+    expect(cleanup).not.toBe(scenario.originalContext);
+    expect(cleanup.signal).not.toBe(scenario.originalAbort.signal);
+    expect(cleanup.signal.aborted).toBe(false);
+    expect(cleanup.interaction).toBe("noninteractive");
+    expect(cleanup.deadline).toBe(scenario.clock.value + 5_000);
+    expect(Number.isFinite(cleanup.deadline)).toBe(true);
+    expect(cleanup.labHost).toEqual(scenario.originalContext.labHost);
+    expect(cleanup.labHostRouteIdentity).toBe("captured-route-a");
+    expect(cleanup.isCurrent()).toBe(true);
+  });
+
+  it.each([
+    ["metadata ID", "id"],
+    ["exact helper name", "name"],
+    ["ownership label", "label"]
+  ] as const)("M1 refuses removal when cleanup metadata has a changed %s", async (_label, corrupt) => {
+    const scenario = disposableFailureScenario({ corrupt });
+    const resolved = await scenario.executor.resolveDependencies(scenario.settings, scenario.originalContext);
+    expect(resolved.identity.imageId).toBe(imageId);
+
+    await expect(scenario.executor.preflight(scenario.settings, resolved, scenario.originalContext))
+      .rejects.toThrow(/primary preflight failure/);
+    expect(scenario.operationEntries).toEqual(["version"]);
+    expect(scenario.cleanupEntries).toEqual(["list", "inspect"]);
+    expect(scenario.cleanupContexts.every((captured) => captured === scenario.cleanupContexts[0])).toBe(true);
+    expect(scenario.cleanupEntries).not.toContain("remove");
+  });
+
+  it("M1 preserves both the primary operation failure and secondary cleanup failure", async () => {
+    const scenario = disposableFailureScenario({ failRemoval: true });
+    const resolved = await scenario.executor.resolveDependencies(scenario.settings, scenario.originalContext);
+    expect(resolved.identity.imageId).toBe(imageId);
+
+    await expect(scenario.executor.preflight(scenario.settings, resolved, scenario.originalContext))
+      .rejects.toThrow(/primary preflight failure.*helper cleanup also failed: secondary cleanup failure/);
+    expect(scenario.operationEntries).toEqual(["version"]);
+    expect(scenario.cleanupEntries).toEqual(["list", "inspect", "remove"]);
+    expect(scenario.cleanupContexts.every((captured) => captured === scenario.cleanupContexts[0])).toBe(true);
   });
 });

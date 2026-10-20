@@ -134,17 +134,22 @@ const NON_AUTH_TEMPLATABLE_FIELDS = [
 export function templateAppliedFields(
   server: Pick<ServerConfig, "proxy" | "multiplexing" | "legacyAlgorithms" | "logSession" | "ipmiAuthProfileId" | "ipmiGatewayServerId" | "origin">
 ): TemplatableField[] {
-  const stamps = server.origin?.templated;
-  if (stamps === undefined) {
-    return [];
-  }
+  const origin = server.origin;
+  const stamps = origin?.templated;
   const applied: TemplatableField[] = [];
+  const proxyOwnership = origin?.proxyOwnership;
+  if (proxyOwnership !== undefined) {
+    if (proxyOwnership.owner === "template" && proxyEqual(server.proxy, proxyOwnership.value ?? undefined)) {
+      applied.push("proxy");
+    }
+  } else if (origin?.proxyOptOut !== true && stamps?.proxy !== undefined && proxyEqual(server.proxy, stamps.proxy)) {
+    // Older origins have no canonical ownership record; their equality stamp
+    // remains usable unless the user explicitly opted out of template proxying.
+    applied.push("proxy");
+  }
+  if (stamps === undefined) return applied;
   for (const field of NON_AUTH_TEMPLATABLE_FIELDS) {
-    if (field === "proxy") {
-      if (stamps.proxy !== undefined && proxyEqual(server.proxy, stamps.proxy)) {
-        applied.push("proxy");
-      }
-    } else if (stamps[field] !== undefined && server[field] === stamps[field]) {
+    if (field !== "proxy" && stamps[field] !== undefined && server[field] === stamps[field]) {
       // Booleans and the two IPMI id strings alike: PRESENT stamp AND cur === stamp.
       applied.push(field);
     }
@@ -872,6 +877,7 @@ export interface TemplateMatrixResult {
 export interface ProxySelfReferenceContext {
   targetServerId: string;
   targetServerName: string;
+  sourceName: string;
   proxyTemplateName: string | undefined;
   // PR-T3 review FIX 2 — the SAME per-device self-reference judgement for the
   // IPMI gateway id (a server id, like a jump host): a gateway winner equal to
@@ -946,6 +952,10 @@ export function applyTemplateMatrix(
     //    self-proxy stays the connect-time error, untouched (§8.4).
     // The dangling check already ran once in composeDesiredFields.
     if (value !== null && value.type === "ssh" && proxyRef !== undefined && value.jumpHostId === proxyRef.targetServerId) {
+      const writer =
+        desired.proxy.owner === "source-default"
+          ? `Inventory source default for "${proxyRef.sourceName}"`
+          : `Device template "${proxyRef.proxyTemplateName ?? "?"}"`;
       const curIsOwnedSelfProxy =
         current !== undefined &&
         current.type === "ssh" &&
@@ -959,11 +969,11 @@ export function applyTemplateMatrix(
         clearProxy = true;
         proxyWritten = true;
         warnings.push(
-          `Device template "${proxyRef.proxyTemplateName ?? "?"}" routed "${proxyRef.targetServerName}" through itself — the invalid proxy was cleared.`
+          `${writer} routed "${proxyRef.targetServerName}" through itself — the invalid proxy was cleared.`
         );
       } else {
         warnings.push(
-          `Device template "${proxyRef.proxyTemplateName ?? "?"}" would route "${proxyRef.targetServerName}" through itself — the proxy field was skipped.`
+          `${writer} would route "${proxyRef.targetServerName}" through itself — the proxy field was skipped.`
         );
       }
     } else if (!protectedManualRoute) {

@@ -1,4 +1,5 @@
 import { authProfileOwnedCredentials, type AuthProfile, type ServerConfig } from "../../models/config";
+import { flattenProviderText } from "../../models/inventory";
 import { validateProxyConfig } from "../../utils/validation";
 
 export interface InventorySourceDependencySnapshot {
@@ -13,9 +14,12 @@ export class InventorySourceDependencyError extends Error {
   }
 }
 
-function dependencyError(detail: string): never {
+function dependencyError(
+  detail: string,
+  remedy = "Select or restore a valid SSH profile. If a planned route introduced the problem, edit that hop to Keep Direct, set Device Connection to Direct, or choose a different valid lab host."
+): never {
   throw new InventorySourceDependencyError(
-    `Containerlab discovery requires a valid SSH lab host and jump chain: ${detail} Select or restore a valid SSH profile, or revise pruning so every required profile survives.`
+    `Containerlab discovery requires a valid SSH lab host and jump chain: ${flattenProviderText(detail)} ${remedy}`
   );
 }
 
@@ -168,6 +172,27 @@ export function assertInventorySourceDependenciesSurvive(
 ): void {
   assertSnapshotShape(snapshot);
   if (snapshot.serverIds.some((id) => !survivingServerIds.has(id))) {
-    dependencyError("the current sync would remove the lab host or one of its SSH jump profiles.");
+    dependencyError(
+      "the current sync would remove the lab host or one of its SSH jump profiles.",
+      "Select or restore a valid SSH profile, or revise pruning so every required profile survives."
+    );
   }
+}
+
+export function assertInventorySourceDependenciesRemainValid(
+  snapshot: InventorySourceDependencySnapshot,
+  currentServers: readonly ServerConfig[],
+  removedServerIds: readonly string[],
+  upsertServers: readonly ServerConfig[],
+  authProfiles: readonly AuthProfile[]
+): void {
+  assertSnapshotShape(snapshot);
+  const effectiveServers = new Map(currentServers.map((server) => [server.id, server]));
+  for (const id of removedServerIds) {
+    effectiveServers.delete(id);
+  }
+  for (const server of upsertServers) {
+    effectiveServers.set(server.id, server);
+  }
+  snapshotInventorySourceDependencies(snapshot.serverIds[0], [...effectiveServers.values()], authProfiles);
 }
