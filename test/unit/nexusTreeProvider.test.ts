@@ -7,6 +7,7 @@ import { TUNNEL_DRAG_MIME } from "../../src/ui/dndMimeTypes";
 import type { LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile } from "../../src/models/config";
 import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
 import type { InventoryProvider } from "../../src/models/inventory";
+import { createContainerlabProvider } from "../../src/services/inventory/providers/containerlabProvider";
 import type { SessionSnapshot } from "../../src/core/contracts";
 
 // Read for the "No matches found" tooltip check: the tooltip must name a command
@@ -1610,6 +1611,35 @@ function serverItemById(provider: NexusTreeProvider, id: string): ServerTreeItem
  *     (defaults to false) → marker never reaches the item.
  */
 describe("NexusTreeProvider node-control marker — end-to-end snapshot wiring", () => {
+  it("decorates known Containerlab state without lifecycle or web-console markers", () => {
+    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
+      get: (key: string) => key === "showTreeDescriptions" ? true : undefined
+    } as any);
+    const registry = new InventoryProviderRegistry();
+    registry.register(createContainerlabProvider());
+    const hasNodeControl = (providerId: string, externalId: string): boolean => {
+      const provider = registry.get(providerId);
+      return provider !== undefined && typeof provider.controlNode === "function" && (provider.canControlNode?.(externalId) ?? true);
+    };
+    const hasWebConsole = (providerId: string, externalId: string): boolean => {
+      const provider = registry.get(providerId);
+      return provider !== undefined && provider.webConsoleUrl !== undefined && (provider.canWebConsole?.(externalId) ?? true);
+    };
+    const provider = providerWith(
+      [makeServer({ id: "clab", name: "r1", origin: { sourceId: "clab-source", externalId: '["lab-a","clab-lab-a-r1"]', syncedAt: 1 } })],
+      [{ id: "clab-source", providerId: "containerlab", name: "Containerlab labs" }],
+      new Map<string, "running" | "stopped">([["clab", "running"]]),
+      hasNodeControl,
+      hasWebConsole
+    );
+    const item = serverItemById(provider, "clab");
+
+    expect(item.contextValue).toBe("nexus.server");
+    expect(item.description).toContain(" (running)");
+    expect((item.iconPath as { id: string }).id).toBe("circle-filled");
+    expect(item.tooltip).not.toMatch(/SSH service|SSH ready|credentials verified|refresh inventory status/iu);
+  });
+
   it("resolves an eve-ng inventory source through origin.sourceId → predicate → .nodeRunning / .nodeStopped from serverStatus (⊘ a broken resolution, a typo'd 'eve-ng' literal in the fixture or predicate, or a dropped constructor arg leaves the EVE node with no node-control marker)", () => {
     const provider = providerWith(
       [

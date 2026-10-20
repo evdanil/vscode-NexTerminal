@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { startInventoryStatusPoll, type InventoryStatusPollSource } from "../../src/services/inventory/inventoryStatusPoll";
+import { statusPollSources } from "../../src/services/inventory/statusPollSources";
+import { createContainerlabProvider } from "../../src/services/inventory/providers/containerlabProvider";
 import type { VisibilityAwareView } from "../../src/services/terminal/viewVisibilityWiring";
 
 /**
@@ -120,6 +122,43 @@ describe("startInventoryStatusPoll", () => {
     feed.set([{ id: "off", intervalSeconds: 0 }, { id: "also-off", intervalSeconds: 30 }]);
     expect(firedIds(fire)).toEqual(["also-off"]);
     expect(vi.getTimerCount()).toBe(1);
+  });
+
+  it("keeps Containerlab polling off by default and arms the real scheduler only when its source interval is enabled", () => {
+    const provider = createContainerlabProvider();
+    const source = {
+      id: "clab-source",
+      providerId: provider.id,
+      name: "Containerlab labs",
+      targetFolder: "Labs",
+      prunePolicy: "orphan" as const,
+      defaultUsername: "admin",
+      config: { statusPollSeconds: 0 },
+      secretFieldIds: [],
+      revision: "clab-rev-1"
+    };
+    const view = makeView(true);
+    const feed = makeSourceFeed(statusPollSources([source]));
+    const fire = vi.fn();
+    const poll = startInventoryStatusPoll({ view, getSources: feed.getSources, onDidChangeSources: feed.onDidChangeSources, fire });
+
+    expect(firedIds(fire)).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+
+    fire.mockClear();
+    feed.set(statusPollSources([{
+      ...source,
+      config: { statusPollSeconds: 30 },
+      revision: "clab-rev-2"
+    }]));
+    expect(firedIds(fire)).toEqual(["clab-source"]);
+    expect(vi.getTimerCount()).toBe(1);
+
+    fire.mockClear();
+    vi.advanceTimersByTime(30_000);
+    expect(firedIds(fire)).toEqual(["clab-source"]);
+    poll.dispose();
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("does NOT fire while hidden, and fires every armed source immediately when the view becomes visible (⊘ hammering a lab box while the panel is closed)", () => {

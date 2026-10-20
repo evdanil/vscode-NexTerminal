@@ -15,9 +15,10 @@ import {
 import type { SavedFilterDefinition } from "../../src/models/savedFilter";
 import type { FormDefinition, FormFieldDescriptor } from "../../src/ui/formTypes";
 import type { InventoryProvider, InventorySourceConfig } from "../../src/models/inventory";
-import type { AuthProfile } from "../../src/models/config";
+import type { AuthProfile, ServerConfig } from "../../src/models/config";
 import { authProfileOwnedCredentials } from "../../src/models/config";
 import { formatAuthProfileLabel } from "../../src/utils/authProfileLabel";
+import { createContainerlabProvider } from "../../src/services/inventory/providers/containerlabProvider";
 
 function keyedField(definition: FormDefinition, key: string): Extract<FormFieldDescriptor, { key: string }> {
   const field = definition.fields.find(
@@ -724,6 +725,70 @@ describe("inventorySourceFormDefinition", () => {
       ...overrides
     };
   }
+
+  function sshProfile(id: string, name: string, overrides: Partial<ServerConfig> = {}): ServerConfig {
+    return {
+      id,
+      name,
+      protocol: "ssh",
+      host: `${id}.example.test`,
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      ...overrides
+    } as ServerConfig;
+  }
+
+  it("builds the Containerlab host picker from current addressable SSH profiles and keeps conditional requirements", () => {
+    const provider = createContainerlabProvider();
+    const profiles = [
+      sshProfile("lab-host", "Lab Host", { proxy: { type: "ssh", jumpHostId: "jump-host" } }),
+      sshProfile("jump-host", "Jump Host"),
+      sshProfile("telnet-host", "Telnet", { protocol: "telnet" }),
+      sshProfile("addressless-host", "Addressless", { addressless: true, host: "" })
+    ];
+    const definition = inventorySourceFormDefinition(provider, undefined, "admin", [], [], [], profiles);
+    const hostField = keyedField(definition, "cfg_labHostId");
+    const imageField = keyedField(definition, "cfg_runnerImage");
+    const containerField = keyedField(definition, "cfg_runnerContainer");
+
+    expect(hostField.type).toBe("select");
+    if (hostField.type === "select") {
+      expect(hostField.options).toEqual([
+        { label: "Select an SSH profile…", value: "" },
+        { label: "Lab Host", value: "lab-host" },
+        { label: "Jump Host", value: "jump-host" }
+      ]);
+      expect(hostField.value).toBe("");
+      expect(hostField.requiredWhen).toEqual({ field: "cfg_location", value: "ssh" });
+    }
+    expect(imageField.requiredWhen).toEqual({ field: "cfg_runner", value: "disposable" });
+    expect(containerField.requiredWhen).toEqual({ field: "cfg_runner", value: "existing" });
+  });
+
+  it("shows a deleted Containerlab SSH profile as unresolved instead of silently selecting another host", () => {
+    const provider = createContainerlabProvider();
+    const definition = inventorySourceFormDefinition(
+      provider,
+      sourceSeed({
+        providerId: "containerlab",
+        config: { location: "ssh", labHostId: "deleted-host" }
+      }),
+      undefined,
+      [],
+      [],
+      [],
+      [sshProfile("live-host", "Live Host")]
+    );
+    const hostField = keyedField(definition, "cfg_labHostId");
+
+    expect(hostField.type).toBe("select");
+    if (hostField.type === "select") {
+      expect(hostField.value).toBe("deleted-host");
+      expect(hostField.options).toContainEqual({ label: "Unresolved SSH profile (deleted-host)", value: "deleted-host" });
+      expect(hostField.options).toContainEqual({ label: "Live Host", value: "live-host" });
+    }
+  });
 
   it("renders the Auth Profile select outside Advanced, directly above Default SSH Username", () => {
     const definition = inventorySourceFormDefinition(fakeProvider, undefined, undefined, authProfiles);

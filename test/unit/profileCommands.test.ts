@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { FormDefinition, FormValues } from "../../src/ui/formTypes";
+import { createContainerlabProvider } from "../../src/services/inventory/providers/containerlabProvider";
 
 const mockExecuteCommand = vi.fn((..._args: unknown[]) => undefined);
 const mockShowWarningMessage = vi.fn();
@@ -401,6 +402,21 @@ describe("Profile Actions quick-pick — EVE node power (M5)", () => {
     expect(labels).not.toContain("Open Web Console");
     const nodeOnly = await labelsFor(serverItem({ hasNodeControl: true, status: "stopped" }));
     expect(nodeOnly).not.toContain("Open Web Console");
+  });
+
+  it("keeps Containerlab rows out of node lifecycle and web-console actions", async () => {
+    const containerlab = createContainerlabProvider();
+    expect(containerlab.controlNode).toBeUndefined();
+    expect(containerlab.canControlNode).toBeUndefined();
+    expect(containerlab.webConsoleUrl).toBeUndefined();
+    expect(containerlab.canWebConsole).toBeUndefined();
+
+    const item = serverItem({ status: "stopped", hasNodeControl: false, hasWebConsole: false });
+    expect(item.contextValue).toBe("nexus.server");
+    const labels = await labelsFor(item);
+    expect(labels).not.toContain("Start Node");
+    expect(labels).not.toContain("Stop Node");
+    expect(labels).not.toContain("Open Web Console");
   });
 
   // ORDER — the console is a way IN to the device, so it sits with Connect and

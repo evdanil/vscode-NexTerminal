@@ -3,6 +3,7 @@ import type { InventoryStatusPollSource } from "./inventoryStatusPoll";
 import { EVE_NG_PROVIDER_ID, readEveNgStatusPollSeconds } from "./providers/eveNgProvider";
 import { GNS3_PROVIDER_ID, readGns3StatusPollSeconds } from "./providers/gns3Provider";
 import { PROXMOX_PROVIDER_ID, readProxmoxStatusPollSeconds } from "./providers/proxmoxProvider";
+import { readContainerlabStatusPollSeconds } from "./providers/containerlabProvider";
 
 /**
  * WHO GETS POLLED — the providerId → poll-interval reader map. A provider
@@ -23,7 +24,8 @@ import { PROXMOX_PROVIDER_ID, readProxmoxStatusPollSeconds } from "./providers/p
 const STATUS_POLL_READERS: Record<string, (config: InventorySourceConfig["config"]) => number> = {
   [EVE_NG_PROVIDER_ID]: readEveNgStatusPollSeconds,
   [PROXMOX_PROVIDER_ID]: readProxmoxStatusPollSeconds,
-  [GNS3_PROVIDER_ID]: readGns3StatusPollSeconds
+  [GNS3_PROVIDER_ID]: readGns3StatusPollSeconds,
+  containerlab: readContainerlabStatusPollSeconds
 };
 
 /**

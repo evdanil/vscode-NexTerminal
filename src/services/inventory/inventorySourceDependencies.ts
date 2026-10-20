@@ -6,8 +6,15 @@ export interface InventorySourceDependencySnapshot {
   readonly identity: string;
 }
 
+export class InventorySourceDependencyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InventorySourceDependencyError";
+  }
+}
+
 function dependencyError(detail: string): never {
-  throw new Error(
+  throw new InventorySourceDependencyError(
     `Containerlab discovery requires a valid SSH lab host and jump chain: ${detail} Select or restore a valid SSH profile, or revise pruning so every required profile survives.`
   );
 }
@@ -149,7 +156,7 @@ export function assertInventorySourceDependenciesCurrent(
   assertSnapshotShape(snapshot);
   const current = snapshotInventorySourceDependencies(snapshot.serverIds[0], servers, authProfiles);
   if (current.identity !== snapshot.identity) {
-    throw new Error(
+    throw new InventorySourceDependencyError(
       "Containerlab discovery's SSH route or authentication profile changed while the sync was running. Run the sync again after selecting the intended lab host and jump profiles."
     );
   }

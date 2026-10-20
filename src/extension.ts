@@ -88,7 +88,12 @@ import { registerSavedFilterCommands } from "./commands/savedFilterCommands";
 import { registerInventoryCommands, type InventoryRuntimeTeardown } from "./commands/inventoryCommands";
 import { InventoryProviderRegistry } from "./services/inventory/providerRegistry";
 import { createBuiltInProviders } from "./services/inventory/builtInProviders";
+import { createContainerlabActivationController } from "./services/inventory/containerlabActivation";
+import { createContainerlabExecutor } from "./services/inventory/containerlabRuntime";
+import { createContainerlabProcessRunner } from "./services/inventory/containerlabProcessRunner";
+import { createContainerlabSshRunner } from "./services/inventory/containerlabSshRunner";
 import { statusPollSources } from "./services/inventory/statusPollSources";
+import { VscodeContainerlabApprovalStore } from "./storage/vscodeContainerlabApprovalStore";
 import { createNexusExtensionApi, type NexusExtensionApi } from "./services/inventory/publicApi";
 import { isTunnelStartCurrent, resolveTunnelConnectionMode, startTunnel } from "./commands/tunnelCommands";
 import { MacroTreeItem, MacroTreeProvider } from "./ui/macroTreeProvider";
@@ -399,9 +404,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // cannot ship unregistered OR unnamed. Both are failures this codebase has
   // already had. Add a provider there, never by appending a call here.
   const inventoryProviderRegistry = new InventoryProviderRegistry();
-  for (const provider of createBuiltInProviders()) {
-    inventoryProviderRegistry.register(provider);
-  }
 
   // WEB CONSOLE capability — the two-half question, asked of the capability
   // rather than of a provider id: the PROVIDER half is whether `webConsoleUrl`
@@ -555,6 +557,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     },
     socks5HandshakeTimeoutMs: readBoundedMs("nexus.tunnel", "socks5HandshakeTimeout", 10, 2, 60)
   });
+  // Lifecycle invalidation is installed before this runtime is visible through
+  // the provider registry or the status poll. The executor stays in the Node
+  // extension graph; the browser entry never imports these process/SSH adapters.
+  const containerlabActivation = createContainerlabActivationController({
+    core,
+    executor: createContainerlabExecutor({
+      localRunner: createContainerlabProcessRunner(),
+      sshRunner: createContainerlabSshRunner({ sshFactory: pool })
+    }),
+    store: new VscodeContainerlabApprovalStore(context.globalState),
+    isWorkspaceTrusted: () => vscode.workspace.isTrusted,
+    confirmRun: async (description) =>
+      (await vscode.window.showWarningMessage(
+        description,
+        { modal: true, detail: "Containerlab inventory is read-only. No topology changes will be made." },
+        "Run",
+        "Cancel"
+      )) === "Run"
+  });
+  await containerlabActivation.invalidateAllSources();
+  context.subscriptions.push({ dispose: () => containerlabActivation.dispose() });
+  const containerlabRuntime = containerlabActivation;
+  for (const provider of createBuiltInProviders({ containerlabRuntime })) {
+    inventoryProviderRegistry.register(provider);
+  }
   const extensionRoot = path.resolve(__dirname, "..");
   const sidecarPath = path.join(__dirname, "services", "serial", "serialSidecarWorker.js");
   const serialSidecar = new SerialSidecarManager(
@@ -1502,7 +1529,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   };
   // Registered BEFORE the poll is created: the poll's arm fire runs
   // `nexus.inventory.refreshStatus`, so that command must exist first.
-  const inventoryDisposables = registerInventoryCommands(core, inventoryProviderRegistry, secretVault, inventoryTeardown);
+  const inventoryDisposables = registerInventoryCommands(
+    core,
+    inventoryProviderRegistry,
+    secretVault,
+    inventoryTeardown,
+    containerlabActivation
+  );
   // LIVE STATUS — opt-in poll of lab running status, gated on the Command
   // Center being visible and on the SOURCE's own Lab Status Poll Interval field
   // being > 0. Seeds from commandCenterView.visible up front (createTreeView
@@ -1510,7 +1543,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // source is added, edited or removed, and is disposed with the extension.
   //
   // The polled providers are those that declare a poll-interval reader in
-  // statusPollSources.ts (currently EVE-NG, Proxmox and GNS3 — the built-ins
+  // statusPollSources.ts (currently EVE-NG, Proxmox, GNS3, and Containerlab — the built-ins
   // with a `fetchStatus`); the mapping itself lives there so it stays
   // unit-testable. Adding a provider with `fetchStatus` means adding it there
   // too: that map is keyed by provider id and nothing derives it, so a new

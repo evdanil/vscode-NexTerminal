@@ -10,12 +10,25 @@ import type { ContainerlabRuntime } from "../containerlabRuntimeContracts";
 import { containerlabDefaultRoute, parseContainerlabConfig } from "./containerlabConfig";
 import { parseContainerlabInspection } from "./containerlabParser";
 
+export const CONTAINERLAB_STATUS_POLL_FIELD_ID = "statusPollSeconds";
+export const CONTAINERLAB_STATUS_POLL_MIN_SECONDS = 0;
+export const CONTAINERLAB_STATUS_POLL_MAX_SECONDS = 3600;
+
+export function readContainerlabStatusPollSeconds(config: InventorySourceValues): number {
+  const raw = config[CONTAINERLAB_STATUS_POLL_FIELD_ID];
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return CONTAINERLAB_STATUS_POLL_MIN_SECONDS;
+  return Math.floor(Math.min(Math.max(raw, CONTAINERLAB_STATUS_POLL_MIN_SECONDS), CONTAINERLAB_STATUS_POLL_MAX_SECONDS));
+}
+
 const CONFIG_FIELDS: InventoryConfigField[] = [
   {
     id: "location", label: "Discovery Location", type: "select", required: true,
     options: [{ label: "Local Extension Host", value: "local" }, { label: "Remote SSH", value: "ssh" }]
   },
-  { id: "labHostId", label: "Lab Host SSH Profile", type: "ssh-profile", advanced: true },
+  {
+    id: "labHostId", label: "Lab Host SSH Profile", type: "ssh-profile", advanced: true,
+    description: "Required for remote discovery. This route also becomes the automatic SSH route for discovered devices; Direct device routing does not change where discovery runs."
+  },
   {
     id: "runner", label: "CLI Runner", type: "select", required: true,
     options: [
@@ -36,13 +49,26 @@ const CONFIG_FIELDS: InventoryConfigField[] = [
   },
   { id: "labFilter", label: "Lab Filter", type: "string", advanced: true },
   {
+    id: CONTAINERLAB_STATUS_POLL_FIELD_ID,
+    label: "Lab Status Poll Interval (seconds)",
+    type: "number",
+    min: CONTAINERLAB_STATUS_POLL_MIN_SECONDS,
+    max: CONTAINERLAB_STATUS_POLL_MAX_SECONDS,
+    integer: true,
+    placeholder: "0",
+    description: "Set to 0 to keep background status polling off. A poll uses only already-approved, noninteractive discovery."
+  },
+  {
     id: "addressPreference", label: "Address Preference", type: "select",
     options: [{ label: "IPv4 First", value: "ipv4" }, { label: "IPv6 First", value: "ipv6" }]
   }
 ];
 
 function unavailable(): InventoryProviderError {
-  return new InventoryProviderError("protocol", "Containerlab execution runtime is unavailable in this provider instance.");
+  return new InventoryProviderError(
+    "protocol",
+    "Containerlab discovery requires desktop VS Code with the Containerlab runtime. Open this source in desktop VS Code, then run Test or Sync."
+  );
 }
 
 export function createContainerlabProvider(runtime?: ContainerlabRuntime): InventoryProvider {

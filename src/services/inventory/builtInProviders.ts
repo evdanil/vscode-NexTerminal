@@ -3,6 +3,8 @@ import { createEveNgProvider } from "./providers/eveNgProvider";
 import { createGns3Provider } from "./providers/gns3Provider";
 import { createNetboxProvider } from "./providers/netboxProvider";
 import { createProxmoxProvider } from "./providers/proxmoxProvider";
+import { createContainerlabProvider } from "./providers/containerlabProvider";
+import type { ContainerlabRuntime } from "./containerlabRuntimeContracts";
 
 /**
  * THE one place a built-in inventory provider is declared. Two separate
@@ -36,6 +38,12 @@ import { createProxmoxProvider } from "./providers/proxmoxProvider";
  * the wiring itself has to stay unit-testable without dragging the extension
  * host into a test that only wants to know which providers exist.
  */
-export function createBuiltInProviders(): InventoryProvider[] {
-  return [createNetboxProvider(), createEveNgProvider(), createProxmoxProvider(), createGns3Provider()];
+export function createBuiltInProviders(options: { containerlabRuntime?: ContainerlabRuntime } = {}): InventoryProvider[] {
+  return [
+    createNetboxProvider(),
+    createEveNgProvider(),
+    createProxmoxProvider(),
+    createGns3Provider(),
+    createContainerlabProvider(options.containerlabRuntime)
+  ];
 }

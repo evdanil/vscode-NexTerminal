@@ -72,4 +72,9 @@ describe("Containerlab configuration", () => {
     expect(containerlabDefaultRoute(parseContainerlabConfig({ location: "ssh", labHostId: "profile-1", deviceConnection: "direct" })))
       .toEqual({ kind: "direct" });
   });
+
+  it("does not turn a missing SSH discovery host into Direct", () => {
+    const missingHost = { ...parseContainerlabConfig({}), location: "ssh" as const };
+    expect(() => containerlabDefaultRoute(missingHost)).toThrow(/configured lab host SSH profile/i);
+  });
 });

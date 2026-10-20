@@ -40,6 +40,8 @@ interface FormFieldCommon {
   advanced?: boolean;
   hint?: string;
   visibleWhen?: VisibleWhen;
+  /** Marks a field required only while the watched form values match. */
+  requiredWhen?: VisibleWhen;
 }
 
 export type FormFieldDescriptor =

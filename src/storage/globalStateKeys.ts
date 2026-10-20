@@ -1,5 +1,6 @@
 import { ACTIVE_SCHEME_KEY, FONT_KEY, SCHEMES_KEY } from "./vscodeColorSchemeStorage";
 import { LOCAL_SHELL_AUTOTRIGGER_WARNING_KEY } from "./noticeKeys";
+import { CONTAINERLAB_APPROVAL_STATE_KEY } from "./vscodeContainerlabApprovalStore";
 
 /**
  * Every Nexus-owned `globalState` key, sorted by what Delete All Data does with
@@ -12,6 +13,7 @@ import { LOCAL_SHELL_AUTOTRIGGER_WARNING_KEY } from "./noticeKeys";
 export const RESET_CLEARED_GLOBAL_STATE_KEYS: readonly string[] = [
   "nexus.macros.migrationNoticeShown",
   LOCAL_SHELL_AUTOTRIGGER_WARNING_KEY,
+  CONTAINERLAB_APPROVAL_STATE_KEY,
   SCHEMES_KEY,
   ACTIVE_SCHEME_KEY,
   FONT_KEY,

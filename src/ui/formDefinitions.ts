@@ -1492,7 +1492,8 @@ export function inventoryConfigFieldPrefixedKey(fieldId: string): string {
 function inventoryConfigFieldDescriptor(
   field: InventoryConfigField,
   existingConfig: InventorySourceValues,
-  existingSecretFieldIds: ReadonlySet<string>
+  existingSecretFieldIds: ReadonlySet<string>,
+  sshProfiles: readonly ServerConfig[] = []
 ): FormFieldDescriptor {
   const key = inventoryConfigFieldPrefixedKey(field.id);
   if (field.type === "password") {
@@ -1548,6 +1549,31 @@ function inventoryConfigFieldDescriptor(
       advanced: field.advanced
     };
   }
+  if (field.type === "ssh-profile") {
+    const eligible = sshProfiles.filter((profile) =>
+      resolveServerProtocol(profile) === "ssh" &&
+      profile.addressless !== true &&
+      typeof profile.host === "string" && profile.host.trim() !== "" &&
+      Number.isInteger(profile.port) && profile.port >= 1 && profile.port <= 65535
+    );
+    const existing = existingConfig[field.id];
+    const existingValue = typeof existing === "string" ? existing : "";
+    const options = [{ label: "Select an SSH profile…", value: "" }, ...eligible.map((profile) => ({ label: profile.name, value: profile.id }))];
+    if (existingValue !== "" && !options.some((option) => option.value === existingValue)) {
+      options.splice(1, 0, { label: `Unresolved SSH profile (${flattenProviderText(existingValue)})`, value: existingValue });
+    }
+    return {
+      type: "select",
+      key,
+      label: field.label,
+      options,
+      value: existingValue,
+      filterable: true,
+      requiredWhen: field.id === "labHostId" ? { field: inventoryConfigFieldPrefixedKey("location"), value: "ssh" } : undefined,
+      hint: field.description,
+      advanced: field.advanced
+    };
+  }
   if (field.type === "number") {
     const existing = existingConfig[field.id];
     return {
@@ -1577,6 +1603,11 @@ function inventoryConfigFieldDescriptor(
     };
   }
   const existing = existingConfig[field.id];
+  const requiredWhen = field.id === "runnerImage"
+    ? { field: inventoryConfigFieldPrefixedKey("runner"), value: "disposable" }
+    : field.id === "runnerContainer"
+      ? { field: inventoryConfigFieldPrefixedKey("runner"), value: "existing" }
+      : undefined;
   return {
     type: "text",
     key,
@@ -1584,6 +1615,7 @@ function inventoryConfigFieldDescriptor(
     required: field.required,
     placeholder: field.placeholder,
     value: existing !== undefined ? String(existing) : "",
+    ...(requiredWhen ? { requiredWhen } : {}),
     hint: field.description,
     advanced: field.advanced
   };
@@ -1827,7 +1859,8 @@ export function inventorySourceFormDefinition(
   defaultUsernameSeed?: string,
   authProfiles?: AuthProfile[],
   deviceTemplates?: DeviceTemplateProfile[],
-  savedFilters?: SavedFilterDefinition[]
+  savedFilters?: SavedFilterDefinition[],
+  sshProfiles?: readonly ServerConfig[]
 ): FormDefinition {
   const isEdit = Boolean(seed);
   const existingSecretFieldIds = new Set(seed?.secretFieldIds ?? []);
@@ -1972,8 +2005,8 @@ export function inventorySourceFormDefinition(
       // provider without one gets its config fields unchanged, byte-for-byte.
       ...provider.configFields.flatMap((field) =>
         field === filterTarget?.field
-          ? [savedFilterSelectField(savedFilters, filterTarget.label), inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds)]
-          : [inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds)]
+          ? [savedFilterSelectField(savedFilters, filterTarget.label), inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds, sshProfiles)]
+          : [inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds, sshProfiles)]
       )
     ]
   };
