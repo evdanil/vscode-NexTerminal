@@ -78,4 +78,14 @@ describe("createNexusExtensionApi", () => {
 
     expect(registry.snapshotOf(provider).sourceDefaultRoute?.({})).toEqual({ kind: "direct" });
   });
+
+  it("retains the independent SSH discovery-host capability in the checked provider snapshot", () => {
+    const registry = new InventoryProviderRegistry();
+    const api = createNexusExtensionApi(registry);
+    const provider = makeProvider({ discoverySshHostId: (config) => String(config.labHostId ?? "") || undefined });
+    api.registerInventoryProvider(provider);
+
+    expect(registry.snapshotOf(provider).discoverySshHostId?.({ labHostId: "lab-host" })).toBe("lab-host");
+    expect(registry.snapshotOf(provider).discoverySshHostId?.({ location: "local" })).toBeUndefined();
+  });
 });

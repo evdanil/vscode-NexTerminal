@@ -37,11 +37,22 @@ export interface HttpConnectProxy {
 
 export type ProxyConfig = SshJumpProxy | Socks5Proxy | HttpConnectProxy;
 
+/** The last automatic writer of a server's route, including an explicit Direct choice. */
+export interface InventoryProxyOwnership {
+  readonly owner: "source-default" | "template";
+  /** `null` records Direct; the server's own `proxy` field remains absent. */
+  readonly value: ProxyConfig | null;
+}
+
 /** Marks a server as materialized by an inventory sync rather than added by hand. */
 export interface ServerOrigin {
   sourceId: string; // InventorySourceConfig.id
   externalId: string; // InventoryDevice.externalId within that source
   syncedAt: number;
+  /** Canonical source/template route ownership. Legacy `templated.proxy` migrates to owner `template`. */
+  proxyOwnership?: InventoryProxyOwnership;
+  /** A manual Direct choice; it blocks automatic source and template route writes. */
+  proxyOptOut?: true;
   /**
    * REVIEW FINDING (P1, adoption instance identity) — WHICH DEPLOYMENT of the
    * source's provider the sync that last wrote this record was reading from, as
@@ -319,6 +330,7 @@ export interface ServerOrigin {
    * removeAuthProfile clearing, and the AUTH 2 clauses need no parallel twin.
    */
   templated?: {
+    /** Legacy template route stamp, read for migration and removed on the next matrix write. */
     proxy?: ProxyConfig;
     multiplexing?: boolean;
     legacyAlgorithms?: boolean;
@@ -566,6 +578,10 @@ export interface DetachedServerOrigin {
    * `cloneTemplatedStamps`.
    */
   templated?: ServerOrigin["templated"];
+  /** Preserves the route owner across Keep Servers and later adoption. */
+  proxyOwnership?: InventoryProxyOwnership;
+  /** Preserves a manual Direct choice across Keep Servers and later adoption. */
+  proxyOptOut?: true;
   detachedAt: number;
 }
 
@@ -816,10 +832,25 @@ export interface ServerConfig {
  */
 export function cloneServerOrigin(origin: ServerOrigin): ServerOrigin {
   const cloned: ServerOrigin = { ...origin };
+  if (origin.proxyOwnership !== undefined) {
+    cloned.proxyOwnership = cloneInventoryProxyOwnership(origin.proxyOwnership);
+  }
   if (origin.templated) {
     cloned.templated = cloneTemplatedStamps(origin.templated);
   }
   return cloned;
+}
+
+export function cloneInventoryProxyOwnership(ownership: InventoryProxyOwnership): InventoryProxyOwnership {
+  return { ...ownership, value: ownership.value === null ? null : { ...ownership.value } };
+}
+
+export function cloneDetachedServerOrigin(origin: DetachedServerOrigin): DetachedServerOrigin {
+  return {
+    ...origin,
+    ...(origin.proxyOwnership !== undefined ? { proxyOwnership: cloneInventoryProxyOwnership(origin.proxyOwnership) } : {}),
+    ...(origin.templated !== undefined ? { templated: cloneTemplatedStamps(origin.templated) } : {})
+  };
 }
 
 /**
@@ -847,7 +878,7 @@ export function cloneServerConfig(server: ServerConfig): ServerConfig {
     ...server,
     proxy: server.proxy ? { ...server.proxy } : server.proxy,
     origin: server.origin ? cloneServerOrigin(server.origin) : server.origin,
-    formerlySynced: server.formerlySynced ? { ...server.formerlySynced } : server.formerlySynced
+    formerlySynced: server.formerlySynced ? cloneDetachedServerOrigin(server.formerlySynced) : server.formerlySynced
   };
 }
 
@@ -910,6 +941,13 @@ export function templatedStampsEqual(a: ServerOrigin["templated"], b: ServerOrig
     ap.ipmiAuthProfileId === bp.ipmiAuthProfileId &&
     ap.ipmiGatewayServerId === bp.ipmiGatewayServerId
   );
+}
+
+export function proxyOwnershipEqual(a: InventoryProxyOwnership | undefined, b: InventoryProxyOwnership | undefined): boolean {
+  if (a === b) return true;
+  if (a === undefined || b === undefined || a.owner !== b.owner) return false;
+  if (a.value === null || b.value === null) return a.value === b.value;
+  return proxyConfigsEqual(a.value, b.value);
 }
 
 /**
@@ -999,6 +1037,8 @@ export function serverOriginStampsEqual(a: ServerOrigin | undefined, b: ServerOr
     // every later sync (its address then never followed and never healed).
     a.syncedHost === b.syncedHost &&
     a.syncedPort === b.syncedPort &&
+    proxyOwnershipEqual(a.proxyOwnership, b.proxyOwnership) &&
+    a.proxyOptOut === b.proxyOptOut &&
     // DEVICE TEMPLATES (PR-T1) — the per-field template stamps join for the
     // same reason: a template application whose value already equals the
     // record must still land in `updates` to persist the stamp (AUTH 3a's
@@ -1084,6 +1124,8 @@ function detachedOriginsEqual(a: DetachedServerOrigin | undefined, b: DetachedSe
     // forgetful one, and the adopted server's protocol would be back to looking
     // hand-flipped, which no later sync can repair.
     a.syncedProtocol === b.syncedProtocol &&
+    proxyOwnershipEqual(a.proxyOwnership, b.proxyOwnership) &&
+    a.proxyOptOut === b.proxyOptOut &&
     // DEVICE TEMPLATES (issue #48 PR-T1) — the template receipt joins for the
     // identical reason `syncedAuthProfileId` and `syncedIpmiHost` above it did:
     // a rollback that called two markers equal while one remembers the non-auth

@@ -16,6 +16,8 @@ describe("Containerlab inventory provider", () => {
     expect(provider.attributeKeys).toEqual(["lab", "kind", "image", "nodeName", "name"]);
     expect(provider.sourceDefaultRoute?.({ location: "ssh", labHostId: "profile-1" })).toEqual({ kind: "ssh", jumpHostId: "profile-1" });
     expect(provider.sourceDefaultRoute?.({ location: "local" })).toEqual({ kind: "direct" });
+    expect(provider.discoverySshHostId?.({ location: "ssh", labHostId: "profile-1", deviceConnection: "direct" })).toBe("profile-1");
+    expect(provider.discoverySshHostId?.({ location: "local", deviceConnection: "automatic" })).toBeUndefined();
     expect(provider).not.toHaveProperty("instanceKey");
     expect(provider).not.toHaveProperty("controlNode");
     expect(provider).not.toHaveProperty("webConsoleUrl");

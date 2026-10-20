@@ -1,4 +1,4 @@
-import type { AuthProfile, AuthProfileOwnedCredentials, LocalShellProfile, SerialProfile, ServerConfig, ServerProtocol, TunnelProfile, TunnelType } from "../models/config";
+import type { AuthProfile, AuthProfileOwnedCredentials, LocalShellProfile, ProxyConfig, SerialProfile, ServerConfig, ServerProtocol, TunnelProfile, TunnelType } from "../models/config";
 import { authProfileOwnedCredentials, resolveServerProtocol, resolveTunnelType } from "../models/config";
 import type { NetworkServerKind } from "../models/networkServer";
 import type { DhcpAdapterConfig, TftpAdapterConfig } from "../services/networkServers/core/index";
@@ -740,7 +740,7 @@ const TEMPLATE_PROXY_PASSWORD_HINT =
   "Proxy passwords aren't stored in templates — each server prompts for its own the first time it connects.";
 
 function proxyFields(
-  seed?: Partial<ServerConfig>,
+  seed?: Omit<Partial<ServerConfig>, "proxy"> & { proxy?: ProxyConfig | null },
   servers?: ServerListEntry[],
   vw?: VisibleWhen,
   // Device templates (PR-T1b, UX-M4/m13) — defaults to `true` so every existing
@@ -755,10 +755,11 @@ function proxyFields(
   // templates carry no secrets), so rendering the two password inputs would let a
   // user type a value that Save throws away, then hit an unexpected auth prompt at
   // connect. Omitting them, plus the per-server hint above, states the real model.
-  includePasswords = true
+  includePasswords = true,
+  includeDirect = false
 ): FormFieldDescriptor[] {
   const proxy = seed?.proxy;
-  const proxyType = proxy?.type ?? "none";
+  const proxyType = proxy === null ? "direct" : proxy?.type ?? "none";
 
   const sshJumpVw: VisibleWhenCondition = { field: "proxyType", value: "ssh" };
   const socks5Vw: VisibleWhenCondition = { field: "proxyType", value: "socks5" };
@@ -792,6 +793,7 @@ function proxyFields(
       label: "Proxy",
       options: [
         { label: "None (direct connection)", value: "none" },
+        ...(includeDirect ? [{ label: "Direct (no proxy)", value: "direct" }] : []),
         { label: "SSH Jump Host", value: "ssh" },
         { label: "SOCKS5 Proxy", value: "socks5" },
         { label: "HTTP CONNECT Proxy", value: "http" }
@@ -944,7 +946,7 @@ export function deviceTemplateFormDefinition(
       // Fix C (PR #62 Codex round 2) — `includePasswords: false`: §5.3 templates
       // carry no proxy SECRETS, and `parseDeviceTemplateFormValues` discards them,
       // so the password inputs are omitted (a per-server hint replaces them).
-      ...proxyFields({ proxy: seed?.fields.proxy?.value }, servers, proxyVw, false, false),
+      ...proxyFields({ proxy: seed?.fields.proxy?.value }, servers, proxyVw, false, false, true),
       templateOverridePreemption("proxy"),
 
       // Auth Profile — autofill OFF (no server SSH form to mirror into, m13).
@@ -1067,7 +1069,8 @@ export function serverFormDefinition(
   existingGroups?: string[],
   defaultLogSession = true,
   servers?: ServerListEntry[],
-  authProfiles?: AuthProfile[]
+  authProfiles?: AuthProfile[],
+  showInventoryProxyRouteChoice = false
 ): FormDefinition {
   const isEdit = Boolean(seed?.id);
   // Resolved the same way `authProfileSelectField` resolves the selected
@@ -1095,6 +1098,20 @@ export function serverFormDefinition(
       authProfileSelectField(authProfiles, sshOnly(), seed?.authProfileId, { displacedValues: ssh.displaced }),
       ...ssh.fields,
       ...proxyFields(seed, servers, sshOnly()),
+      ...(showInventoryProxyRouteChoice
+        ? [{
+            type: "select" as const,
+            key: "inventoryProxyRouteChoice",
+            label: "Inventory Proxy Route",
+            options: [
+              { label: "Automatic", value: "automatic" },
+              { label: "Keep Direct", value: "direct" }
+            ],
+            value: seed?.origin?.proxyOptOut === true || seed?.formerlySynced?.proxyOptOut === true || seed?.proxy !== undefined ? "direct" : "automatic",
+            hint: "When Proxy is None, choose whether inventory sync can set a route for this device. Keep Direct records your choice.",
+            visibleWhen: { field: "proxyType", value: "none" }
+          }]
+        : []),
       openFileExplorerOnFirstConnectField(seed, sshOnly()),
       ...sharedTrailingFields(seed, existingGroups, defaultLogSession)
     ])

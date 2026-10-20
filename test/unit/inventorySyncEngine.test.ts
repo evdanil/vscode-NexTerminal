@@ -16,6 +16,7 @@ import { isValidServerOrigin, validateServerConfig } from "../../src/utils/valid
 import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 import { buildConnectConfig } from "../../src/services/ssh/ssh2Connector";
 import type { InventoryDevice, InventorySourceConfig, InventoryTree } from "../../src/models/inventory";
+import { snapshotInventorySourceDependencies } from "../../src/services/inventory/inventorySourceDependencies";
 
 function makeSource(overrides: Partial<InventorySourceConfig> = {}): InventorySourceConfig {
   return {
@@ -2821,6 +2822,27 @@ describe("computeSyncPlan — prunes", () => {
   });
 });
 
+describe("computeSyncPlan — discovery dependencies survive effective pruning", () => {
+  it("rejects deletion of the remote lab host even when the source's device route is Direct", () => {
+    const labHost = makeOwnedServer({
+      id: "lab-host",
+      name: "Lab host",
+      host: "lab.example.test",
+      origin: { sourceId: "source-1", externalId: "lab-host", syncedAt: 1 }
+    });
+    const dependencies = snapshotInventorySourceDependencies("lab-host", [labHost], []);
+
+    expect(() => computeSyncPlan({
+      source: makeSource({ providerId: "containerlab", prunePolicy: "delete" }),
+      tree: makeTree([]),
+      currentServers: [labHost],
+      now: 2,
+      sourceDefaultRoute: { kind: "direct" },
+      discoveryDependencies: dependencies
+    })).toThrow(/jump|discovery|host|profile/i);
+  });
+});
+
 describe("computeSyncPlan — amendments F5/F6", () => {
   it("(F5/FIX 3) a planned add matching a manual server's host:port still adds, warns about the duplicate, and the count is exposed on the plan (not just parseable from warnings text)", () => {
     const source = makeSource();
@@ -4983,6 +5005,47 @@ describe("planToApplication (F19 — no targetFolder parameter)", () => {
     expect(application.sourceId).toBe("source-1");
     expect(application.syncedAt).toBe(1000);
     expect(application.expectedSource).toBe(expectedSource);
+  });
+});
+
+describe("discovery dependencies carried by a sync plan", () => {
+  it("rejects a prune plan that removes the lab host or one of its jump hops", () => {
+    const labHost = makeOwnedServer({
+      id: "lab-host",
+      origin: { sourceId: "source-1", externalId: "lab-host-device", syncedAt: 1 },
+      proxy: { type: "ssh", jumpHostId: "jump-one" }
+    });
+    const jump = makeOwnedServer({
+      id: "jump-one",
+      origin: { sourceId: "source-1", externalId: "jump-device", syncedAt: 1 }
+    });
+    const dependencies = snapshotInventorySourceDependencies("lab-host", [labHost, jump], []);
+
+    expect(() =>
+      computeSyncPlan({
+        source: makeSource({ prunePolicy: "delete" }),
+        tree: makeTree([]),
+        currentServers: [labHost, jump],
+        discoveryDependencies: dependencies,
+        now: 2
+      })
+    ).toThrow(/lab host|jump|discovery/i);
+  });
+
+  it("carries the same immutable dependency snapshot from the plan into its application", () => {
+    const labHost = makeManualServer({ id: "lab-host" });
+    const source = makeSource({ prunePolicy: "delete" });
+    const dependencies = snapshotInventorySourceDependencies("lab-host", [labHost], []);
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([]),
+      currentServers: [labHost],
+      discoveryDependencies: dependencies,
+      now: 2
+    });
+
+    expect(plan.discoveryDependencies).toBe(dependencies);
+    expect(planToApplication(plan, source).discoveryDependencies).toBe(dependencies);
   });
 });
 

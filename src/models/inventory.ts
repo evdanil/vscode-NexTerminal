@@ -403,6 +403,13 @@ export interface InventoryProvider {
    */
   sourceDefaultRoute?(config: InventorySourceValues): InventorySourceDefaultRoute;
   /**
+   * OPTIONAL SSH host required to discover this source. Independent of
+   * sourceDefaultRoute because devices may use Direct while discovery remains
+   * remote. A present capability must return a non-empty server id or
+   * undefined; callers fail closed on invalid results.
+   */
+  discoverySshHostId?(config: InventorySourceValues): string | undefined;
+  /**
    * DEVICE TEMPLATES (issue #48 PR-T2, §2.2 A-M4) — OPTIONAL. The filter keys
    * this provider's `InventoryDevice.attributes` can carry, so the rule-save flow
    * can warn when a filter uses a key outside this list ("Key 'sites' is not one

@@ -9013,7 +9013,7 @@ describe("backup export round-trip", () => {
    * row 7) — un-reclaimable by an override template. The falsifier: `templated` is
    * PRESENT on the marker; against the pre-fix tree it is absent.
    */
-  it("(ADOPT 1, Codex round 3) a rolled-back source's Keep-Servers marker also preserves the origin's `templated` stamps (kills the round-2 slip that dropped `templated` at this second detach site, leaving a re-adopted server's template fields hand-owned)", async () => {
+  it("(ADOPT 1, Task 4) rollback detach preserves canonical proxy ownership and manual Direct intent in its receipts", async () => {
     vi.clearAllMocks();
     registeredCommands.clear();
     configStore.clear();
@@ -9039,6 +9039,7 @@ describe("backup export round-trip", () => {
     registerConfigCommands(core, vault);
 
     const templatedProxy = { type: "socks5" as const, host: "10.9.9.9", port: 1080 };
+    const canonicalOwnership = { owner: "template" as const, value: templatedProxy };
     const secrets = { inventorySourceSecrets: { src1: { apiToken: "src1-token" } } };
     const encryptedSecrets = encrypt(JSON.stringify(secrets), "masterpass1");
     const importData = {
@@ -9050,10 +9051,14 @@ describe("backup export round-trip", () => {
           id: "srv-owned",
           name: "Owned",
           proxy: templatedProxy,
-          // The sync's own record that IT wrote this proxy via a template override —
-          // the receipt this detach path has to preserve (the fourth member, beside
-          // instance / auth / OOB) so a later adoption reads it as sync-owned (row 3).
-          origin: { sourceId: "src1", externalId: "dev-a", syncedAt: 1, templated: { proxy: templatedProxy } }
+          // The canonical receipt and an unrelated older template stamp both
+          // survive this rollback detach.
+          origin: { sourceId: "src1", externalId: "dev-a", syncedAt: 1, proxyOwnership: canonicalOwnership, templated: { logSession: true } }
+        }),
+        makeServer({
+          id: "srv-direct",
+          name: "Direct",
+          origin: { sourceId: "src1", externalId: "dev-direct", syncedAt: 1, proxyOptOut: true }
         })
       ],
       tunnels: [],
@@ -9075,11 +9080,14 @@ describe("backup export round-trip", () => {
     expect(core.getInventorySource("src1")).toBeUndefined();
     const owned = core.getServer("srv-owned")!;
     expect(owned.origin).toBeUndefined();
-    // THE ASSERTION — the marker carries the template stamps forward (deep-cloned via
-    // `cloneTemplatedStamps`, exactly as the Keep-Servers path does), so a re-adoption
-    // sees the proxy as this sync's doing and an override can reclaim it.
-    expect(owned.formerlySynced?.templated).toEqual({ proxy: { type: "socks5", host: "10.9.9.9", port: 1080 } });
+    // The canonical route receipt is deep-copied, while unrelated template
+    // provenance and manual Direct intent remain available to adoption.
+    expect(owned.formerlySynced?.proxyOwnership).toEqual(canonicalOwnership);
+    expect(owned.formerlySynced?.proxyOwnership).not.toBe(canonicalOwnership);
+    expect(owned.formerlySynced?.proxyOwnership?.value).not.toBe(templatedProxy);
+    expect(owned.formerlySynced?.templated).toEqual({ logSession: true });
     expect(isValidDetachedServerOrigin(owned.formerlySynced)).toBe(true);
+    expect(core.getServer("srv-direct")?.formerlySynced?.proxyOptOut).toBe(true);
   });
 
   /**

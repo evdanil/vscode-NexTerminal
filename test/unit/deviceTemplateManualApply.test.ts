@@ -41,7 +41,8 @@ function applyManual(server: ServerConfig, plan: ManualApplyPlan): ServerConfig 
     return server;
   }
   const next: ServerConfig = { ...server };
-  if (w.proxy !== undefined) next.proxy = w.proxy;
+  if (w.clearProxy === true) delete next.proxy;
+  else if (w.proxy !== undefined) next.proxy = w.proxy;
   if (w.multiplexing !== undefined) next.multiplexing = w.multiplexing;
   if (w.legacyAlgorithms !== undefined) next.legacyAlgorithms = w.legacyAlgorithms;
   if (w.logSession !== undefined) next.logSession = w.logSession;
@@ -50,7 +51,7 @@ function applyManual(server: ServerConfig, plan: ManualApplyPlan): ServerConfig 
   if (cleared === undefined) {
     delete next.origin;
   } else {
-    next.origin = cleared;
+    next.origin = w.clearProxy === true ? { ...cleared, proxyOptOut: true } : cleared;
   }
   return next;
 }
@@ -204,6 +205,22 @@ describe("fixture 24 — mode is honored on the manual path", () => {
     const override = runPlan(template({ proxy: { mode: "override", value: P_B } }), [server]);
     expect(override.proxy?.willSet).toBe(1);
     expect(override.serverWrites[0].proxy).toEqual(P_B);
+  });
+
+  it("manual Direct is an explicit clear that removes route ownership and records opt-out", () => {
+    const server = ownedServer(
+      { proxy: P },
+      { proxyOwnership: { owner: "source-default", value: P } }
+    );
+    const plan = runPlan(template({ proxy: { mode: "override", value: null } }), [server]);
+    expect(plan.proxy?.willSet).toBe(1);
+    expect(plan.serverWrites[0].clearProxy).toBe(true);
+    expect(plan.serverWrites[0].writtenFields).toContain("proxy");
+
+    const applied = applyManual(server, plan);
+    expect(applied.proxy).toBeUndefined();
+    expect(applied.origin?.proxyOwnership).toBeUndefined();
+    expect(applied.origin?.proxyOptOut).toBe(true);
   });
 });
 

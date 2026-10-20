@@ -182,6 +182,14 @@ describe("parseDeviceTemplateFormValues (§7.1 tri-state → model)", () => {
     expect(t.fields.logSession).toBeUndefined();
   });
 
+  it("represents explicit Direct as a nullable proxy value and keeps legacy none as no opinion", () => {
+    const direct = parseDeviceTemplateFormValues({ name: "T", mode_proxy: "override", proxyType: "direct" });
+    expect(direct.fields.proxy).toEqual({ mode: "override", value: null });
+    const legacy = parseDeviceTemplateFormValues({ name: "T", mode_proxy: "none", proxyType: "none" });
+    expect(legacy.fields.proxy).toBeUndefined();
+    expect(parseDeviceTemplateFormValues({ name: "T", mode_proxy: "none", proxyType: "direct" }).fields.proxy).toBeUndefined();
+  });
+
   it("rejects an empty name", () => {
     expect(() => parseDeviceTemplateFormValues({ name: "  " })).toThrow(/Name is required/);
   });
@@ -687,6 +695,29 @@ describe("Fix A (PR #62 Codex round 2, SECURITY) — manual apply clears the sta
     // And the new proxy did publish.
     expect(core.getServer("srv-1")!.proxy).toEqual(Y);
     expect(mockShowInformationMessage).toHaveBeenCalledWith('Applied device template "Reproxy" to 1 server.');
+  });
+
+  it("DELETES the old proxy secret before publishing explicit Direct and records a manual opt-out", async () => {
+    const core = makeCore();
+    await seedProxyServer(core);
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Direct", fields: { proxy: { mode: "override", value: null } } });
+    const key = legacyProxyPasswordSecretKey("srv-1");
+    const vault = makeVault(core, { [key]: "topsecret" });
+    registerWithVault(core, vault);
+
+    mockShowQuickPick.mockResolvedValue({ label: "Direct", template: core.getSnapshot().deviceTemplates[0] });
+    mockShowWarningMessage.mockResolvedValue("Apply");
+    mockShowInformationMessage.mockResolvedValue(undefined);
+
+    await registeredCommands.get("nexus.deviceTemplate.applyToFolder")!(new FolderTreeItem("DC", "DC"));
+
+    expect(vault._deleted).toContain(key);
+    expect(vault._proxyAtDelete.get(key)).toEqual(X);
+    const saved = core.getServer("srv-1")!;
+    expect(saved.proxy).toBeUndefined();
+    expect(saved.origin?.proxyOwnership).toBeUndefined();
+    expect(saved.origin?.templated?.proxy).toBeUndefined();
+    expect(saved.origin?.proxyOptOut).toBe(true);
   });
 
   it("fail-closed — a delete failure ABORTS the apply: nothing published, secret intact, house 'run again' message", async () => {

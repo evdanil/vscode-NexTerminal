@@ -65,7 +65,8 @@ export interface DeviceTemplateProfile {
    * like the booleans (string equality).
    */
   fields: {
-    proxy?: TemplateField<ProxyConfig>;
+    /** `null` is an explicit Direct route; an absent wrapper means no opinion. */
+    proxy?: TemplateField<ProxyConfig | null>;
     authProfileId?: TemplateField<string>; // AuthProfile.id
     multiplexing?: TemplateField<boolean>;
     legacyAlgorithms?: TemplateField<boolean>;

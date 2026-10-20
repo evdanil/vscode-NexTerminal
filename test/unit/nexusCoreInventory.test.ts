@@ -7,6 +7,7 @@ import { mergeServerConfigFields, resolveBmcWebProtocol, serverConfigsEqual, ser
 import type { ServerConfig, SerialProfile, LocalShellProfile } from "../../src/models/config";
 import { computeProviderFingerprint, sourceConfigUnchanged, type InventoryProvider, type InventorySourceConfig } from "../../src/models/inventory";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
+import { snapshotInventorySourceDependencies } from "../../src/services/inventory/inventorySourceDependencies";
 
 function makeSourceConfig(overrides: Partial<InventorySourceConfig> = {}): InventorySourceConfig {
   return {
@@ -5339,5 +5340,52 @@ describe("NexusCore.healSyncedConsolePorts (task #29 / D8)", () => {
       statuses: { "lab.unl#1": { state: "running", consolePort: 32769 } }
     });
     expect(listener).not.toHaveBeenCalled();
+  });
+});
+
+describe("NexusCore.applyInventorySyncPlan discovery dependency guard", () => {
+  it("rejects a preview whose SSH host route changed before the locked apply", async () => {
+    const before = {
+      id: "lab-host",
+      name: "Lab host",
+      host: "old.example.test",
+      port: 22,
+      username: "operator",
+      authType: "agent" as const,
+      isHidden: false
+    };
+    const current = { ...before, host: "new.example.test" };
+    const dependencies = snapshotInventorySourceDependencies("lab-host", [before], []);
+    const core = new NexusCore(new InMemoryConfigRepository([current]));
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+    const expectedSource = core.getInventorySource("source-1")!;
+
+    await expect(
+      configMutationLock.runExclusive(() =>
+        core.applyInventorySyncPlan({
+          sourceId: "source-1",
+          syncedAt: 2,
+          upsertServers: [
+            {
+              id: "new-device",
+              name: "new-device",
+              host: "10.0.0.2",
+              port: 22,
+              username: "admin",
+              authType: "agent",
+              isHidden: false
+            }
+          ],
+          removeServerIds: [],
+          folders: [],
+          expectedSource,
+          discoveryDependencies: dependencies
+        })
+      )
+    ).rejects.toThrow(/changed|identity|dependency/i);
+
+    expect(core.getServer("lab-host")?.host).toBe("new.example.test");
+    expect(core.getServer("new-device")).toBeUndefined();
   });
 });

@@ -84,8 +84,8 @@ export function parseDeviceTemplateFormValues(values: FormValues, existingId?: s
     throw new Error("Name is required");
   }
   const fields: DeviceTemplateProfile["fields"] = {};
-  const proxy = readTemplateField<ProxyConfig>(values, "proxy", () => formValuesToProxy(values));
-  if (proxy) {
+  const proxy = readTemplateField<ProxyConfig | null>(values, "proxy", () => values.proxyType === "direct" ? null : formValuesToProxy(values));
+  if (proxy !== undefined) {
     fields.proxy = proxy;
   }
   const auth = readTemplateField<string>(values, "authProfileId", () => {
@@ -585,7 +585,9 @@ export async function applyPlanWrites(ctx: CommandContext, plan: ManualApplyPlan
         writtenFields.splice(i, 1);
       }
     };
-    if (write.proxy !== undefined) {
+    if (write.clearProxy === true) {
+      delete next.proxy;
+    } else if (write.proxy !== undefined) {
       next.proxy = write.proxy;
     }
     if (write.multiplexing !== undefined) {
@@ -635,7 +637,7 @@ export async function applyPlanWrites(ctx: CommandContext, plan: ManualApplyPlan
     if (clearedOrigin === undefined) {
       delete next.origin;
     } else {
-      next.origin = clearedOrigin;
+      next.origin = write.clearProxy === true ? { ...clearedOrigin, proxyOptOut: true } : clearedOrigin;
     }
     // PR-T3 review round 9 (Codex) — a server KEPT from a removed source carries its
     // ownership receipt in `formerlySynced` (a DetachedServerOrigin), not `origin`. Clear
@@ -647,7 +649,7 @@ export async function applyPlanWrites(ctx: CommandContext, plan: ManualApplyPlan
     // straight reassign when `formerlySynced` is present and a no-op when it is absent.
     const clearedFormerly = clearDetachedTemplatedStamps(live.formerlySynced, writtenFields);
     if (clearedFormerly !== undefined) {
-      next.formerlySynced = clearedFormerly;
+      next.formerlySynced = write.clearProxy === true ? { ...clearedFormerly, proxyOptOut: true } : clearedFormerly;
     }
     await ctx.core.addOrUpdateServer(next);
     applied++;
@@ -1144,14 +1146,20 @@ export function registerDeviceTemplateCommands(ctx: CommandContext, registry: In
             const vault = ctx.secretVault;
             const proxyChanges: Array<{ before: ServerConfig; after: ServerConfig }> = [];
             for (const write of plan.serverWrites) {
-              if (write.proxy === undefined) {
+              if (write.proxy === undefined && write.clearProxy !== true) {
                 continue;
               }
               const liveServer = ctx.core.getServer(write.serverId);
               if (!liveServer) {
                 continue;
               }
-              proxyChanges.push({ before: liveServer, after: { ...liveServer, proxy: write.proxy } });
+              const after = { ...liveServer };
+              if (write.clearProxy === true) {
+                delete after.proxy;
+              } else if (write.proxy !== undefined) {
+                after.proxy = write.proxy;
+              }
+              proxyChanges.push({ before: liveServer, after });
             }
             let capturedProxySecrets: CapturedProxyPasswordSecret[] = [];
             if (vault && proxyChanges.length > 0) {

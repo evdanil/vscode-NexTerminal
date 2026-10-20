@@ -3425,6 +3425,99 @@ describe("nexus.server.edit — origin preservation (P1)", () => {
     expect(saved.origin).toEqual(origin);
   });
 
+  it("Keep Direct clears route ownership and the legacy proxy receipt when a managed server is explicitly cleared", async () => {
+    const origin = {
+      sourceId: "netbox-1",
+      externalId: "device:42",
+      syncedAt: 1000,
+      proxyOwnership: { owner: "template" as const, value: { type: "socks5" as const, host: "proxy", port: 1080 } },
+      templated: { proxy: { type: "socks5" as const, host: "proxy", port: 1080 } }
+    };
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({
+        proxy: { type: "socks5", host: "proxy", port: 1080 },
+        origin
+      })]
+    });
+
+    await submitEdit(ctx, {
+      name: "Server 1",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      proxyType: "none",
+      inventoryProxyRouteChoice: "direct"
+    });
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.proxy).toBeUndefined();
+    expect(saved.origin).toEqual({
+      sourceId: "netbox-1",
+      externalId: "device:42",
+      syncedAt: 1000,
+      proxyOptOut: true
+    });
+  });
+
+  it("an Automatic save with an already-Direct owned route preserves the route receipt", async () => {
+    const origin = {
+      sourceId: "netbox-1",
+      externalId: "device:42",
+      syncedAt: 1000,
+      proxyOwnership: { owner: "template" as const, value: null }
+    };
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ origin })]
+    });
+
+    await submitEdit(ctx, {
+      name: "Renamed Server",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      proxyType: "none",
+      inventoryProxyRouteChoice: "automatic"
+    });
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.origin?.proxyOwnership).toEqual({ owner: "template", value: null });
+    expect(saved.origin?.proxyOptOut).toBeUndefined();
+  });
+
+  it("Automatic clears a manual Direct opt-out without inventing a route owner", async () => {
+    const origin = {
+      sourceId: "netbox-1",
+      externalId: "device:42",
+      syncedAt: 1000,
+      proxyOptOut: true as const
+    };
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ origin })]
+    });
+
+    await submitEdit(ctx, {
+      name: "Renamed Server",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      proxyType: "none",
+      inventoryProxyRouteChoice: "automatic"
+    });
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.origin?.proxyOptOut).toBeUndefined();
+    expect(saved.origin?.proxyOwnership).toBeUndefined();
+  });
+
   it("leaves origin undefined when editing a manually-added (never synced) server", async () => {
     const { ctx, addOrUpdateServer } = setupHarness({
       profiles: [],

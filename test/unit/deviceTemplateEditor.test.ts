@@ -33,6 +33,21 @@ describe("deviceTemplateFormDefinition — tri-state wiring (§7.1)", () => {
     expect(field(def, "ipmiGatewayServerId")?.visibleWhen).toEqual({ field: "mode_ipmiGatewayServerId", value: ["fill", "override"] });
   });
 
+  it("offers an explicit Direct value only in templates and seeds nullable Direct without changing server Proxy None", () => {
+    const directTemplate = deviceTemplateFormDefinition({
+      id: "direct",
+      name: "Direct",
+      fields: { proxy: { mode: "override", value: null } }
+    });
+    const templateProxy = field(directTemplate, "proxyType") as Extract<FormFieldDescriptor, { type: "select" }>;
+    expect(templateProxy.value).toBe("direct");
+    expect(templateProxy.options).toContainEqual({ label: "Direct (no proxy)", value: "direct" });
+
+    const server = serverFormDefinition({ id: "s1", name: "s", host: "h", port: 22, username: "u", authType: "agent" });
+    const serverProxy = field(server, "proxyType") as Extract<FormFieldDescriptor, { type: "select" }>;
+    expect(serverProxy.options).not.toContainEqual(expect.objectContaining({ value: "direct" }));
+  });
+
   it("PR-T3 — the IPMI rows reuse the filterable selects and seed from the template fields", () => {
     const seed = {
       id: "t1",

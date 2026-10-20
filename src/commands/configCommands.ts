@@ -5,7 +5,13 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, LocalShellProfile, ProxyConfig, ServerConfig, ServerOrigin, TunnelProfile, SerialProfile } from "../models/config";
-import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials, cloneTemplatedStamps, templatedHasAnyStamp } from "../models/config";
+import {
+  authProfileNeedsServerKeyPath,
+  authProfileOwnedCredentials,
+  cloneInventoryProxyOwnership,
+  cloneTemplatedStamps,
+  templatedHasAnyStamp
+} from "../models/config";
 import type { InventorySourceConfig, InventorySourceValues, TemplateRule } from "../models/inventory";
 import { inventorySecretKey } from "../models/inventory";
 import type { DeviceTemplateProfile, TemplateField } from "../models/deviceTemplate";
@@ -1703,7 +1709,11 @@ interface SanitizedSnapshot {
  * and a hand-edited file cannot land one either. Anything that is not a proxy
  * this build knows is returned as it is, for the validators to judge.
  */
-function remapProxy(proxy: ProxyConfig | undefined, linkServer: (id: string) => string | undefined): ProxyConfig | undefined {
+function remapProxy(proxy: null, linkServer: (id: string) => string | undefined): null;
+function remapProxy(proxy: undefined, linkServer: (id: string) => string | undefined): undefined;
+function remapProxy(proxy: ProxyConfig, linkServer: (id: string) => string | undefined): ProxyConfig | undefined;
+function remapProxy(proxy: ProxyConfig | null | undefined, linkServer: (id: string) => string | undefined): ProxyConfig | null | undefined;
+function remapProxy(proxy: ProxyConfig | null | undefined, linkServer: (id: string) => string | undefined): ProxyConfig | null | undefined {
   if (typeof proxy !== "object" || proxy === null) {
     return proxy;
   }
@@ -1718,6 +1728,11 @@ function remapProxy(proxy: ProxyConfig | undefined, linkServer: (id: string) => 
     default:
       return proxy;
   }
+}
+
+function remapConcreteProxy(proxy: ProxyConfig | undefined, linkServer: (id: string) => string | undefined): ProxyConfig | undefined {
+  const remapped = remapProxy(proxy, linkServer);
+  return remapped === null ? undefined : remapped;
 }
 
 /**
@@ -1910,6 +1925,8 @@ const SHARED_ORIGIN_RULES = {
   syncedProtocol: "keep",
   syncedHost: "keep",
   syncedPort: "keep",
+  proxyOwnership: "link",
+  proxyOptOut: "keep",
   templated: "link"
 } satisfies ShareRules<ServerOrigin>;
 
@@ -2443,12 +2460,19 @@ function shareOrigin(origin: ServerOrigin, sourceId: string, lenses: ShareLenses
   return shareRecord(origin, SHARED_ORIGIN_RULES, {
     sourceId: () => sourceId,
     syncedAuthProfileId: (id) => (id === undefined || dropAuthLink ? undefined : lenses.linkProfile(id)),
+    proxyOwnership: (ownership) => {
+      if (ownership === undefined || ownership.value === null) {
+        return ownership;
+      }
+      const value = remapProxy(ownership.value, lenses.linkServer);
+      return value === undefined ? undefined : { ...ownership, value };
+    },
     templated: (stamps) => {
       if (stamps === undefined) {
         return undefined;
       }
       const shared = shareRecord(stamps, SHARED_TEMPLATED_STAMP_RULES, {
-        proxy: (proxy) => remapProxy(proxy, lenses.linkServer),
+        proxy: (proxy) => remapConcreteProxy(proxy, lenses.linkServer),
         ipmiAuthProfileId: (id) => (id === undefined ? undefined : lenses.linkProfile(id)),
         ipmiGatewayServerId: (id) => (id === undefined ? undefined : lenses.linkServer(id))
       });
@@ -2479,7 +2503,7 @@ function shareServer(
   const linkProfile = (profileId: string | undefined): string | undefined => (profileId ? lenses.linkProfile(profileId) : undefined);
   return shareRecord(server, SHARED_SERVER_RULES, {
     id: () => id,
-    proxy: (proxy) => remapProxy(proxy, lenses.linkServer),
+    proxy: (proxy) => remapConcreteProxy(proxy, lenses.linkServer),
     authProfileId: (profileId) => (dropAuthLink ? undefined : linkProfile(profileId)),
     ipmiAuthProfileId: linkProfile,
     ipmiGatewayServerId: (serverId) => (serverId ? lenses.linkServer(serverId) : undefined),
@@ -5249,6 +5273,14 @@ export function registerConfigCommands(
                       ...(rolledBackOrigin.templated !== undefined
                         ? { templated: cloneTemplatedStamps(rolledBackOrigin.templated) }
                         : {}),
+                      // The canonical route receipt is nested and follows the
+                      // origin through this rollback detach just as it does
+                      // through Remove Source → Keep Servers. Manual Direct is
+                      // separate intent and must also survive the strip.
+                      ...(rolledBackOrigin.proxyOwnership !== undefined
+                        ? { proxyOwnership: cloneInventoryProxyOwnership(rolledBackOrigin.proxyOwnership) }
+                        : {}),
+                      ...(rolledBackOrigin.proxyOptOut === true ? { proxyOptOut: true as const } : {}),
                       detachedAt
                     }
                   }

@@ -29,6 +29,11 @@ import {
 // runtime import into syncEngine; the reverse edge (syncEngine → nexusCore) is
 // type-only, so there is no runtime cycle.
 import { syncOwnsHost, syncOwnsPort } from "../services/inventory/syncEngine";
+import {
+  assertInventorySourceDependenciesCurrent,
+  assertInventorySourceDependenciesSurvive,
+  type InventorySourceDependencySnapshot
+} from "../services/inventory/inventorySourceDependencies";
 // P2-1 (review) — the heal validates its own resulting record before persisting,
 // so it can NEVER write a host/port that `validateServerConfig` would reject on
 // the next reload (the #82 record-drop class). Belt-and-suspenders behind the
@@ -137,6 +142,8 @@ export interface InventorySyncApplication {
   // never bumped and no source-record entry is written for apply.sourceId
   // (there is nothing to write it onto).
   expectedSource: InventorySourceConfig | "absent";
+  /** Remote discovery route and auth dependencies captured before fetching. */
+  discoveryDependencies?: InventorySourceDependencySnapshot;
   // FINDING 2 (removeSource review) — only consulted when expectedSource is
   // "absent". importMergeReplace imports servers BEFORE sources, so a
   // recreated owned server (or one that took over the same id under a NEW
@@ -1415,6 +1422,23 @@ export class NexusCore {
           `Cannot apply inventory sync: inventory source "${apply.sourceId}" configuration changed since the sync was computed.`
         );
       }
+    }
+    if (apply.discoveryDependencies !== undefined) {
+      // Core checks this synchronously before the first mutation/await. The
+      // command holds configMutationLock across this final validation and apply.
+      assertInventorySourceDependenciesCurrent(
+        apply.discoveryDependencies,
+        [...this.servers.values()],
+        [...this.authProfiles.values()]
+      );
+      const survivingServerIds = new Set(this.servers.keys());
+      for (const id of removeServerIds) {
+        survivingServerIds.delete(id);
+      }
+      for (const server of upsertServers) {
+        survivingServerIds.add(server.id);
+      }
+      assertInventorySourceDependenciesSurvive(apply.discoveryDependencies, survivingServerIds);
     }
     // ITEM 1 — capture everything this call is about to mutate BEFORE
     // touching it, so a rejected persist below can be rolled back completely.

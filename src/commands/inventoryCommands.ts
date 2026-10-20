@@ -2,7 +2,12 @@ import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { InventorySourceRemovalMismatchError, type NexusCore } from "../core/nexusCore";
 import type { AuthProfile, ServerConfig } from "../models/config";
-import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials, cloneTemplatedStamps } from "../models/config";
+import {
+  authProfileNeedsServerKeyPath,
+  authProfileOwnedCredentials,
+  cloneInventoryProxyOwnership,
+  cloneTemplatedStamps
+} from "../models/config";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import {
   computeProviderFingerprint,
@@ -26,6 +31,12 @@ import {
   type InventoryTree
 } from "../models/inventory";
 import type { InventoryProviderRegistry, ProviderRegistrationSnapshot } from "../services/inventory/providerRegistry";
+import { resolveDiscoverySshHostId } from "../services/inventory/providerRegistry";
+import {
+  assertInventorySourceDependenciesCurrent,
+  snapshotInventorySourceDependencies,
+  type InventorySourceDependencySnapshot
+} from "../services/inventory/inventorySourceDependencies";
 // Shared with ui/settingsTreeProvider.ts so both surfaces describe a source identically.
 import { sourceDescription } from "../services/inventory/sourceDescription";
 import {
@@ -3779,6 +3790,15 @@ export function registerInventoryCommands(
                     // alias the live origin's `templated`. Omitted rather than
                     // written as `undefined` for the reason `instanceKey` is.
                     ...(origin.templated !== undefined ? { templated: cloneTemplatedStamps(origin.templated) } : {}),
+                    // Route ownership is the proxy field's canonical receipt. It
+                    // is nested, so detach it as its own value rather than
+                    // aliasing the origin that is being removed. A manual Direct
+                    // choice is a separate receipt and must survive the strip as
+                    // well, or adoption would reopen automatic route writes.
+                    ...(origin.proxyOwnership !== undefined
+                      ? { proxyOwnership: cloneInventoryProxyOwnership(origin.proxyOwnership) }
+                      : {}),
+                    ...(origin.proxyOptOut === true ? { proxyOptOut: true as const } : {}),
                     detachedAt
                   }
                 } as ServerConfig)
@@ -3856,6 +3876,7 @@ export function registerInventoryCommands(
       void vscode.window.showErrorMessage(providerMissingMessage(source.providerId));
       return;
     }
+    const providerSnapshot = registry.snapshotOf(provider);
     // Issue #195 — the copy registration checked: the gate hashes it and the
     // required-secret loop below walks it.
     const configFields = registry.configFieldsOf(provider);
@@ -3865,6 +3886,40 @@ export function registerInventoryCommands(
     // This is the one claimant for which "syncing" is the honest word.
     inFlightSourceIds.set(source.id, "sync");
     try {
+      let sourceDefaultRoute: ReturnType<NonNullable<ProviderRegistrationSnapshot["sourceDefaultRoute"]>> | undefined;
+      let discoveryDependencies: InventorySourceDependencySnapshot | undefined;
+      try {
+        sourceDefaultRoute = providerSnapshot.sourceDefaultRoute?.(source.config);
+        const discoveryHostId = resolveDiscoverySshHostId(providerSnapshot, source.config);
+        if (discoveryHostId !== undefined) {
+          // One immutable core view binds the provider's discovery declaration
+          // to the host, every jump hop and each effective auth profile used to
+          // reach it. `sourceDefaultRoute` remains a device-route policy and is
+          // deliberately not consulted to discover this dependency chain.
+          const discoveryView = core.getSnapshot();
+          discoveryDependencies = snapshotInventorySourceDependencies(
+            discoveryHostId,
+            discoveryView.servers,
+            discoveryView.authProfiles
+          );
+        }
+      } catch (error) {
+        void vscode.window.showErrorMessage(`Inventory sync failed: ${describeInventoryError(error)}`);
+        return;
+      }
+      const discoveryPlanInputs = {
+        ...(sourceDefaultRoute !== undefined ? { sourceDefaultRoute } : {}),
+        ...(discoveryDependencies !== undefined ? { discoveryDependencies } : {})
+      };
+      const discoveryDependencyError = (servers: readonly ServerConfig[], authProfiles: readonly AuthProfile[]): Error | undefined => {
+        if (discoveryDependencies === undefined) return undefined;
+        try {
+          assertInventorySourceDependenciesCurrent(discoveryDependencies, servers, authProfiles);
+          return undefined;
+        } catch (error) {
+          return error instanceof Error ? error : new Error(String(error));
+        }
+      };
       // ITEM A (provider trust fingerprint) / F3 — strictly BEFORE any vault
       // read for this source (the required-secret presence loop right below
       // this reads real secret values from the vault). VS Code gives Nexus no
@@ -3881,7 +3936,7 @@ export function registerInventoryCommands(
       // checkProviderFingerprint is the same helper editSource's own
       // pre-open gate uses, so the two flows can't drift on wording or on
       // when this confirmation fires.
-      const fingerprintCheck = await checkProviderFingerprint(source, registry.snapshotOf(provider), confirmedProviderShapes);
+      const fingerprintCheck = await checkProviderFingerprint(source, providerSnapshot, confirmedProviderShapes);
       if (fingerprintCheck.outcome === "cancelled") {
         // Cancel (or dismiss) aborts before ANY vault.get for this source —
         // the required-secret loop and every other vault read below never run.
@@ -3929,6 +3984,12 @@ export function registerInventoryCommands(
         const fetched = await vscode.window.withProgress(
           { location: vscode.ProgressLocation.Notification, title: `Syncing inventory from "${source.name}"…` },
           () => {
+            // `withProgress` may wait before it invokes this callback. Recheck
+            // against one live core view immediately before handing control to
+            // the provider; no await may separate this validation from fetch.
+            const beforeFetch = core.getSnapshot();
+            const dependencyError = discoveryDependencyError(beforeFetch.servers, beforeFetch.authProfiles);
+            if (dependencyError) throw dependencyError;
             const cloned = cloneForProvider(source.config, secrets);
             return provider.fetchInventory(cloned.config, cloned.secrets);
           }
@@ -3940,6 +4001,9 @@ export function registerInventoryCommands(
           throw new InventoryProviderError("protocol", `Provider returned an invalid inventory tree: ${reason}`);
         }
         ({ tree, ...hostNormalization } = normalizeInventoryTreeHosts(fetched));
+        const afterFetch = core.getSnapshot();
+        const dependencyError = discoveryDependencyError(afterFetch.servers, afterFetch.authProfiles);
+        if (dependencyError) throw dependencyError;
       } catch (error) {
         void vscode.window.showErrorMessage(`Inventory sync failed: ${describeInventoryError(error)}`);
         return;
@@ -4057,16 +4121,23 @@ export function registerInventoryCommands(
       // config that plan was computed from rather than the one this run started
       // with.
       let planInstanceKey = resolveProviderInstanceKey(provider, source.config);
+      const initialPlanningView = core.getSnapshot();
+      const initialDependencyError = discoveryDependencyError(initialPlanningView.servers, initialPlanningView.authProfiles);
+      if (initialDependencyError) {
+        void vscode.window.showErrorMessage(initialDependencyError.message);
+        return;
+      }
       let plan = computeSyncPlan({
         source,
         tree,
         hostNormalization,
-        currentServers: core.getSnapshot().servers,
+        currentServers: initialPlanningView.servers,
         now: Date.now(),
         authProfile: planAuthProfile,
         providerInstanceKey: planInstanceKey,
         templatesById: resolveTemplatesById(core),
-        authProfilesById: resolveAuthProfilesById(core)
+        authProfilesById: resolveAuthProfilesById(core),
+        ...discoveryPlanInputs
       });
 
       // Nothing to do AND nothing to ask: apply an empty application to bump
@@ -4128,6 +4199,12 @@ export function registerInventoryCommands(
             );
             return { kind: "abort" };
           }
+          const fastPathView = core.getSnapshot();
+          const dependencyError = discoveryDependencyError(fastPathView.servers, fastPathView.authProfiles);
+          if (dependencyError) {
+            void vscode.window.showErrorMessage(dependencyError.message);
+            return { kind: "abort" };
+          }
           const freshAuthProfile = resolveSourceAuthProfile(core, freshSource);
           // Derived from `freshSource.config`, not the outer `source`'s — the
           // pairing rule `planAuthProfile` follows, for the same reason: this
@@ -4137,12 +4214,13 @@ export function registerInventoryCommands(
             source: freshSource,
             tree,
             hostNormalization,
-            currentServers: core.getSnapshot().servers,
+            currentServers: fastPathView.servers,
             now: Date.now(),
             authProfile: freshAuthProfile,
             providerInstanceKey: freshInstanceKey,
             templatesById: resolveTemplatesById(core),
-            authProfilesById: resolveAuthProfilesById(core)
+            authProfilesById: resolveAuthProfilesById(core),
+            ...discoveryPlanInputs
           });
           // THE SAME PREDICATE AS THE OUTER GATE, deliberately — a second gate
           // asking a narrower question is the first one's blindness moved rather
@@ -4505,6 +4583,12 @@ export function registerInventoryCommands(
           // the same `source` snapshot the initial computation used.
           planAuthProfile = resolveSourceAuthProfile(core, source);
           planInstanceKey = resolveProviderInstanceKey(provider, source.config);
+          const adoptionPlanningView = core.getSnapshot();
+          const dependencyError = discoveryDependencyError(adoptionPlanningView.servers, adoptionPlanningView.authProfiles);
+          if (dependencyError) {
+            void vscode.window.showErrorMessage(dependencyError.message);
+            return;
+          }
           // RECOMPUTED ON BOTH ANSWERS, not just on Adopt. The rule this run
           // follows from here is that the answer is threaded by name into EVERY
           // computeSyncPlan call, and the preview is the first of them: a plan
@@ -4519,12 +4603,13 @@ export function registerInventoryCommands(
             source,
             tree,
             hostNormalization,
-            currentServers: core.getSnapshot().servers,
+            currentServers: adoptionPlanningView.servers,
             now: Date.now(),
             authProfile: planAuthProfile,
             providerInstanceKey: planInstanceKey,
             templatesById: resolveTemplatesById(core),
             authProfilesById: resolveAuthProfilesById(core),
+            ...discoveryPlanInputs,
             adoptionChoice
           });
           // GUARD SITE 1 of 3 (REVIEW FINDING, P1) — this recompute is the first
@@ -4723,7 +4808,13 @@ export function registerInventoryCommands(
             return { kind: "abort" };
           }
 
-          const freshServersForRecompute = core.getSnapshot().servers;
+          const recomputeView = core.getSnapshot();
+          const dependencyError = discoveryDependencyError(recomputeView.servers, recomputeView.authProfiles);
+          if (dependencyError) {
+            void vscode.window.showErrorMessage(dependencyError.message);
+            return { kind: "abort" };
+          }
+          const freshServersForRecompute = recomputeView.servers;
           // Resolved FRESH here, inside the lock, against `freshSource` — never
           // the `planAuthProfile` the modal rendered with. That is the whole
           // point of the pairing rule: a profile renamed or deleted while the
@@ -4747,6 +4838,7 @@ export function registerInventoryCommands(
             providerInstanceKey: freshInstanceKey,
             templatesById: resolveTemplatesById(core),
             authProfilesById: resolveAuthProfilesById(core),
+            ...discoveryPlanInputs,
             // ADOPT 1 — the answer given once above governs EVERY recompute of
             // this run. Omitted here, this plan would render adds where the
             // preview rendered adoptions and drift on every pass, looping the
@@ -4859,7 +4951,13 @@ export function registerInventoryCommands(
           // applyInventorySyncPlan's expectedSource — FINDING E's synchronous
           // check inside applyInventorySyncPlan is what still catches the
           // source record itself being replaced during this window.
-          const finalServersForRecompute = core.getSnapshot().servers;
+          const finalRecomputeView = core.getSnapshot();
+          const finalDependencyError = discoveryDependencyError(finalRecomputeView.servers, finalRecomputeView.authProfiles);
+          if (finalDependencyError) {
+            void vscode.window.showErrorMessage(finalDependencyError.message);
+            return { kind: "abort" };
+          }
+          const finalServersForRecompute = finalRecomputeView.servers;
           // Resolved fresh again — the teardown loop and the FINDING D vault
           // re-read above are awaits a profile rename/delete can land inside.
           const finalAuthProfile = resolveSourceAuthProfile(core, freshSource);
@@ -4877,6 +4975,7 @@ export function registerInventoryCommands(
             providerInstanceKey: freshInstanceKey,
             templatesById: resolveTemplatesById(core),
             authProfilesById: resolveAuthProfilesById(core),
+            ...discoveryPlanInputs,
             // ADOPT 1 — same answer, same run. This is the plan that is actually
             // APPLIED, so an answer missed here would not merely loop: it would
             // apply duplicate adds against consent collected for adoptions

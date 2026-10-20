@@ -1,4 +1,4 @@
-import type { InventoryConfigField, InventoryConfigFieldType, InventoryProvider, InventorySourceDefaultRoute } from "../../models/inventory";
+import type { InventoryConfigField, InventoryConfigFieldType, InventoryProvider, InventorySourceDefaultRoute, InventorySourceValues } from "../../models/inventory";
 
 /** vscode.Disposable-shaped without importing vscode — this module runs in tests without the API. */
 export interface ProviderRegistration {
@@ -32,6 +32,7 @@ export interface ProviderRegistrationSnapshot {
   readonly label: string;
   readonly configFields: readonly InventoryConfigField[];
   readonly sourceDefaultRoute?: (config: Record<string, string | number | boolean>) => InventorySourceDefaultRoute;
+  readonly discoverySshHostId?: (config: InventorySourceValues) => string | undefined;
 }
 
 /** The checked public snapshot plus the optional template-filter keys. */
@@ -129,6 +130,10 @@ function checkProviderShape(provider: unknown): CheckedProviderData {
   if (sourceDefaultRoute !== undefined && typeof sourceDefaultRoute !== "function") {
     throw new Error("Inventory provider sourceDefaultRoute must be a function when present.");
   }
+  const discoverySshHostId = obj.discoverySshHostId;
+  if (discoverySshHostId !== undefined && typeof discoverySshHostId !== "function") {
+    throw new Error("Inventory provider discoverySshHostId must be a function when present.");
+  }
   // TEMPLATE-RULE FILTER KEYS (issue #163) — the twin of the clauses above, for
   // the one optional member that is data rather than a function. `attributeKeys`
   // is OPTIONAL (a provider that declares no list has its filters checked
@@ -151,8 +156,27 @@ function checkProviderShape(provider: unknown): CheckedProviderData {
     attributeKeys: copyAttributeKeys(obj.attributeKeys),
     ...(typeof sourceDefaultRoute === "function"
       ? { sourceDefaultRoute: sourceDefaultRoute as (config: Record<string, string | number | boolean>) => InventorySourceDefaultRoute }
+      : {}),
+    ...(typeof discoverySshHostId === "function"
+      ? { discoverySshHostId: discoverySshHostId as (config: InventorySourceValues) => string | undefined }
       : {})
   };
+}
+
+/** Resolves the registered discovery host without treating provider failure as local discovery. */
+export function resolveDiscoverySshHostId(snapshot: ProviderRegistrationSnapshot, config: InventorySourceValues): string | undefined {
+  if (!snapshot.discoverySshHostId) return undefined;
+  let hostId: unknown;
+  try {
+    hostId = snapshot.discoverySshHostId(config);
+  } catch (error) {
+    const detail = error instanceof Error ? ` ${error.message}` : "";
+    throw new Error(`Inventory provider discovery SSH host lookup failed.${detail}`);
+  }
+  if (hostId !== undefined && (typeof hostId !== "string" || hostId.length === 0)) {
+    throw new Error("Inventory provider discovery SSH host lookup returned an invalid server id.");
+  }
+  return hostId;
 }
 
 /**
@@ -406,8 +430,8 @@ export class InventoryProviderRegistry {
   }
 
   public register(provider: InventoryProvider): ProviderRegistration {
-    const { id, label, configFields, attributeKeys, sourceDefaultRoute } = checkProviderShape(provider);
-    const snapshot = Object.freeze({ id, label, configFields, ...(sourceDefaultRoute ? { sourceDefaultRoute } : {}) });
+    const { id, label, configFields, attributeKeys, sourceDefaultRoute, discoverySshHostId } = checkProviderShape(provider);
+    const snapshot = Object.freeze({ id, label, configFields, ...(sourceDefaultRoute ? { sourceDefaultRoute } : {}), ...(discoverySshHostId ? { discoverySshHostId } : {}) });
     const registration: RegisteredProvider = { provider, snapshot, attributeKeys };
     if (this.providers.has(id)) {
       throw new Error(`An inventory provider with id "${id}" is already registered.`);

@@ -94,6 +94,52 @@ describe("serverFormDefinition — addressless (P2-a)", () => {
   });
 });
 
+describe("serverFormDefinition — managed inventory route choice", () => {
+  it("offers Automatic / Keep Direct only for managed edits, visible only with Proxy None and seeded from current route ownership", () => {
+    const server = {
+      id: "s1",
+      name: "managed",
+      host: "host",
+      port: 22,
+      username: "admin",
+      authType: "agent" as const,
+      proxy: { type: "socks5" as const, host: "proxy", port: 1080 },
+      origin: { sourceId: "source", externalId: "device", syncedAt: 1 }
+    };
+    const managed = serverFormDefinition(server, [], true, [], [], true);
+    const route = keyedField(managed, "inventoryProxyRouteChoice");
+
+    if (route.type !== "select") throw new Error("managed route choice should be a select");
+    expect(route.options).toEqual([
+      { label: "Automatic", value: "automatic" },
+      { label: "Keep Direct", value: "direct" }
+    ]);
+    expect(route.value).toBe("direct");
+    expect(route.visibleWhen).toEqual({ field: "proxyType", value: "none" });
+    expect(serverFormDefinition(server).fields.some((field) => "key" in field && field.key === "inventoryProxyRouteChoice")).toBe(false);
+  });
+
+  it("seeds Automatic for an explicitly owned Direct route and Keep Direct for a saved manual opt-out", () => {
+    const base = {
+      id: "s1",
+      name: "managed",
+      host: "host",
+      port: 22,
+      username: "admin",
+      authType: "agent" as const,
+      origin: { sourceId: "source", externalId: "device", syncedAt: 1 }
+    };
+    expect(keyedField(serverFormDefinition({
+      ...base,
+      origin: { ...base.origin, proxyOwnership: { owner: "template", value: null } }
+    }, [], true, [], [], true), "inventoryProxyRouteChoice").value).toBe("automatic");
+    expect(keyedField(serverFormDefinition({
+      ...base,
+      origin: { ...base.origin, proxyOptOut: true }
+    }, [], true, [], [], true), "inventoryProxyRouteChoice").value).toBe("direct");
+  });
+});
+
 describe("formDefinitions keyPath visibility", () => {
   it("shows server keyPath field only for authType=key on an SSH server", () => {
     // TELNET (Phase 0) — the key-file control now carries the SSH-only gate as

@@ -530,18 +530,24 @@ describe("sanitizeForSharing — device templates", () => {
       name: "Via missing bastion",
       fields: { proxy: { mode: "override", value: { type: "ssh", jumpHostId: "srv-not-here" } } }
     };
+    const withDirect: DeviceTemplateProfile = {
+      id: "tpl-4",
+      name: "Direct",
+      fields: { proxy: { mode: "override", value: null } }
+    };
 
     const source = makeSource({
       templateRules: [
         { id: "rule-1", templateId: "tpl-1" },
         { id: "rule-2", templateId: "tpl-2" },
-        { id: "rule-3", templateId: "tpl-3" }
+        { id: "rule-3", templateId: "tpl-3" },
+        { id: "rule-4", templateId: "tpl-4" }
       ]
     });
 
-    const result = sanitizeForSharing([gateway], [], [], [], {}, [profile], [], [source], [withRefs, withSocks, withLostJump]);
+    const result = sanitizeForSharing([gateway], [], [], [], {}, [profile], [], [source], [withRefs, withSocks, withLostJump, withDirect]);
 
-    const [a, b, c] = result.deviceTemplates;
+    const [a, b, c, d] = result.deviceTemplates;
     expect(a.id).not.toBe("tpl-1");
     expect(a).not.toHaveProperty("revision");
     expect(a.fields).toEqual({
@@ -551,6 +557,7 @@ describe("sanitizeForSharing — device templates", () => {
     });
     expect(b.fields.proxy).toEqual({ mode: "override", value: { type: "socks5", host: "proxy.example.com", port: 1080 } });
     expect(c.fields).toEqual({});
+    expect(d.fields.proxy).toEqual({ mode: "override", value: null });
     expect(JSON.stringify(result.deviceTemplates)).not.toMatch(/ap-ssh|ap-not-here|gw-1|proxy-user|srv-not-here|rev-sender/);
   });
 });

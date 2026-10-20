@@ -2736,6 +2736,108 @@ describe("inventoryCommands", () => {
   });
 
   describe("nexus.inventory.syncNow", () => {
+    it("aborts when the full SSH discovery dependency changes while fetchInventory is running", async () => {
+      const labHost = makeServer({ id: "lab-host", name: "Lab host", host: "before.example.test", username: "operator" });
+      const core = new NexusCore(new InMemoryConfigRepository([labHost]));
+      await core.initialize();
+      const provider = makeProvider({
+        discoverySshHostId: () => "lab-host",
+        fetchInventory: vi.fn(async () => {
+          await core.addOrUpdateServer({ ...core.getServer("lab-host")!, host: "after.example.test" });
+          return {
+            contractVersion: 1 as const,
+            devices: [{ externalId: "new-device", name: "new-device", endpoints: [{ kind: "ssh" as const, host: "10.0.0.10", port: 22 }] }]
+          };
+        })
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "token" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+      mockShowInformationMessage.mockResolvedValue("Apply");
+
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringMatching(/discovery.*changed|route.*changed|run the sync again/i));
+      expect(core.getServer("new-device")).toBeUndefined();
+    });
+
+    it("revalidates every jump hop immediately before fetch after progress setup, even when device routing is Direct", async () => {
+      const labHost = makeServer({
+        id: "lab-host",
+        name: "Lab host",
+        host: "lab.example.test",
+        username: "operator",
+        proxy: { type: "ssh", jumpHostId: "jump-one" }
+      });
+      const jump = makeServer({ id: "jump-one", name: "Jump one", host: "jump-before.example.test", username: "operator" });
+      const core = new NexusCore(new InMemoryConfigRepository([labHost, jump]));
+      await core.initialize();
+      const provider = makeProvider({
+        discoverySshHostId: () => "lab-host",
+        sourceDefaultRoute: () => ({ kind: "direct" }),
+        fetchInventory: vi.fn(async () => ({
+          contractVersion: 1 as const,
+          devices: [{ externalId: "new-device", name: "new-device", endpoints: [{ kind: "ssh" as const, host: "10.0.0.10", port: 22 }] }]
+        }))
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "token" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+      mockWithProgress.mockImplementationOnce(async (_options, task) => {
+        await core.addOrUpdateServer({ ...core.getServer("jump-one")!, host: "jump-after.example.test" });
+        return task();
+      });
+
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(provider.fetchInventory).not.toHaveBeenCalled();
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringMatching(/discovery.*changed|route.*changed|run the sync again/i));
+      expect(core.getServer("new-device")).toBeUndefined();
+    });
+
+    it("aborts when an SSH jump-hop identity changes while the sync preview is open", async () => {
+      const labHost = makeServer({
+        id: "lab-host",
+        name: "Lab host",
+        host: "lab.example.test",
+        username: "operator",
+        proxy: { type: "ssh", jumpHostId: "jump-one" }
+      });
+      const jump = makeServer({ id: "jump-one", name: "Jump one", host: "jump-before.example.test", username: "operator" });
+      const core = new NexusCore(new InMemoryConfigRepository([labHost, jump]));
+      await core.initialize();
+      const provider = makeProvider({
+        discoverySshHostId: () => "lab-host",
+        sourceDefaultRoute: () => ({ kind: "direct" }),
+        fetchInventory: vi.fn(async () => ({
+          contractVersion: 1 as const,
+          devices: [{ externalId: "new-device", name: "new-device", endpoints: [{ kind: "ssh" as const, host: "10.0.0.10", port: 22 }] }]
+        }))
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "token" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+      mockShowInformationMessage.mockImplementationOnce(async () => {
+        await core.addOrUpdateServer({ ...core.getServer("jump-one")!, host: "jump-after.example.test" });
+        return "Apply";
+      });
+
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringMatching(/discovery.*changed|route.*changed|run the sync again/i));
+      expect(applySpy).not.toHaveBeenCalled();
+      expect(core.getServer("new-device")).toBeUndefined();
+    });
+
     it("prune 'delete' tears down and removes only the pruned server, applies the plan, and cleans up only its vault secrets (F1 — teardown runs before apply)", async () => {
       const survivor = makeServer({
         id: "owned-2",
@@ -7612,6 +7714,35 @@ describe("inventoryCommands", () => {
       // Only the sync's own write leaves a receipt.
       expect(core.getServer("owned-1")?.formerlySynced?.syncedIpmiHost).toBe("10.9.9.9");
       expect(core.getServer("owned-2")?.formerlySynced).not.toHaveProperty("syncedIpmiHost");
+    });
+
+    it("Keep Servers carries canonical proxy ownership and manual Direct intent into detached receipts", async () => {
+      const ownership = { owner: "template" as const, value: { type: "socks5" as const, host: "proxy.example.test", port: 1080 } };
+      const { core } = await harness({
+        servers: [
+          makeServer({
+            id: "owned-proxy",
+            name: "proxy-managed",
+            host: "10.0.0.21",
+            origin: { sourceId: "src-1", externalId: "device:proxy", syncedAt: 1, proxyOwnership: ownership }
+          }),
+          makeServer({
+            id: "owned-direct",
+            name: "direct-opt-out",
+            host: "10.0.0.22",
+            origin: { sourceId: "src-1", externalId: "device:direct", syncedAt: 1, proxyOptOut: true }
+          })
+        ]
+      });
+
+      mockShowWarningMessage.mockResolvedValueOnce("Keep Servers");
+      await registeredCommands.get("nexus.inventory.removeSource")!("src-1");
+
+      const detachedProxy = core.getServer("owned-proxy")?.formerlySynced;
+      expect(detachedProxy?.proxyOwnership).toEqual(ownership);
+      expect(detachedProxy?.proxyOwnership).not.toBe(ownership);
+      expect(detachedProxy?.proxyOwnership?.value).not.toBe(ownership.value);
+      expect(core.getServer("owned-direct")?.formerlySynced?.proxyOptOut).toBe(true);
     });
 
     it("a provider that reports no instance at all writes a receipt-only marker and adopts nothing (kills stamping an instance key the provider never supplied, and kills falling back to the provider id when it has none)", async () => {

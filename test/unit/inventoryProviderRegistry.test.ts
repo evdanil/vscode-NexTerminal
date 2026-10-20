@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { InventoryProviderRegistry, validateProviderShape } from "../../src/services/inventory/providerRegistry";
+import { InventoryProviderRegistry, resolveDiscoverySshHostId, validateProviderShape } from "../../src/services/inventory/providerRegistry";
 import { MAX_INVENTORY_INSTANCE_KEY_LENGTH, computeProviderFingerprint, resolveProviderInstanceKey } from "../../src/models/inventory";
 import type { InventoryConfigField, InventoryProvider } from "../../src/models/inventory";
 import { createNetboxProvider } from "../../src/services/inventory/providers/netboxProvider";
@@ -1144,5 +1144,29 @@ describe("InventoryProviderRegistry Containerlab contract extensions", () => {
     const capability = registry.snapshotOf(provider).sourceDefaultRoute;
     expect({ reads, capability }).toEqual({ reads: 1, capability: route });
     expect(capability?.({})).toEqual({ kind: "direct" });
+  });
+
+  it("captures the discovery SSH host capability once and fails closed on invalid results", () => {
+    const registry = new InventoryProviderRegistry();
+    const discoveryHost = (config: Record<string, string | number | boolean>) =>
+      config.location === "ssh" && typeof config.labHostId === "string" ? config.labHostId : undefined;
+    const provider = makeProvider({ discoverySshHostId: discoveryHost });
+    let reads = 0;
+    Object.defineProperty(provider, "discoverySshHostId", {
+      configurable: true,
+      get: () => (++reads <= 3 ? discoveryHost : "invalid")
+    });
+
+    registry.register(provider);
+    const snapshot = registry.snapshotOf(provider);
+    expect({ reads, capability: snapshot.discoverySshHostId }).toEqual({ reads: 1, capability: discoveryHost });
+    expect(resolveDiscoverySshHostId(snapshot, { location: "ssh", labHostId: "host-1" })).toBe("host-1");
+    expect(resolveDiscoverySshHostId(snapshot, { location: "local" })).toBeUndefined();
+    expect(() => resolveDiscoverySshHostId({ ...snapshot, discoverySshHostId: () => "" }, {})).toThrow(/discovery SSH host/i);
+    expect(() => resolveDiscoverySshHostId({ ...snapshot, discoverySshHostId: () => { throw new Error("bad config"); } }, {})).toThrow(/discovery SSH host/i);
+  });
+
+  it("rejects a non-function discovery SSH host capability", () => {
+    expect(() => validateProviderShape(makeProvider({ discoverySshHostId: "host" as never }))).toThrow(/discoverySshHostId/i);
   });
 });

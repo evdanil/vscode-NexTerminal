@@ -62,6 +62,10 @@ export function createContainerlabProvider(runtime?: ContainerlabRuntime): Inven
     })),
     attributeKeys: ["lab", "kind", "image", "nodeName", "name"],
     sourceDefaultRoute: (values) => containerlabDefaultRoute(parseContainerlabConfig(values)),
+    discoverySshHostId: (values) => {
+      const config = parseContainerlabConfig(values);
+      return config.location === "ssh" ? config.labHostId : undefined;
+    },
     async testConnection(config, _secrets, context) {
       await inspect(config, context);
     },
