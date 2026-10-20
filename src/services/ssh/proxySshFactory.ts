@@ -7,8 +7,10 @@ import type {
   ContextAwareSshFactory,
   SecretVault,
   SshConnectContext,
-  SshConnection
+  SshConnection,
+  SshInteractionPolicy
 } from "./contracts";
+import { SshInteractionRequiredError } from "./contracts";
 import { ProxiedSshConnection, jumpHostCleanup, socketCleanup, socketCloseRelay } from "./proxiedSshConnection";
 import { underlyingConnection } from "./sshConnectionPool";
 import { getSshNetworkRoute, networkEndpointIdentity, networkRouteIdentity, rememberSshNetworkRoute } from "./sshNetworkRoute";
@@ -161,16 +163,23 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     const credentialRecord = this.serverLookup(credentialSource.id) ?? null;
     const credentialEndpointSignature = this.authFactory.getCredentialEndpointSignature?.(credentialSource, this.serverLookup);
     const hasCredentialGuard = typeof this.authFactory.getCredentialEndpointSignature === "function";
+    const interaction = context?.interaction ?? "interactive";
+    const signal = context?.signal;
+    const isActive = context?.isActive || signal
+      ? () => !signal?.aborted && context?.isActive?.() !== false
+      : undefined;
     if (!server.proxy) {
       let connection: SshConnection;
-      if (!context?.onAuthMessage && !context?.isActive && !hasCredentialGuard) {
+      if (!context?.onAuthMessage && !isActive && !context?.interaction && !signal && !hasCredentialGuard) {
         connection = await this.authFactory.connect(server);
       } else {
         connection = await this.authFactory.connect(server, {
           ...(context?.onAuthMessage && { onAuthMessage: context.onAuthMessage }),
-          ...(context?.isActive && { isActive: context.isActive }),
+          ...(isActive && { isActive }),
           ...(credentialEndpointSignature !== undefined && { credentialEndpointSignature }),
-          ...(hasCredentialGuard && { credentialRecord })
+          ...(hasCredentialGuard && { credentialRecord }),
+          ...(context?.interaction && { interaction }),
+          ...(signal && { signal })
         });
       }
       rememberSshNetworkRoute(
@@ -187,7 +196,9 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       credentialEndpointSignature,
       credentialRecord,
       credentialSource,
-      context?.isActive
+      isActive,
+      interaction,
+      signal
     );
     if (server.proxy.type !== "ssh") {
       rememberSshNetworkRoute(
@@ -206,7 +217,9 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     credentialEndpointSignature?: string,
     credentialRecord?: ServerConfig | null,
     routeSource: ServerConfig = server,
-    isActive?: () => boolean
+    isActive?: () => boolean,
+    interaction: SshInteractionPolicy = "interactive",
+    signal?: AbortSignal
   ): Promise<SshConnection> {
     switch (proxy.type) {
       case "ssh":
@@ -218,12 +231,14 @@ export class ProxySshFactory implements ContextAwareSshFactory {
           credentialEndpointSignature,
           credentialRecord,
           routeSource,
-          isActive
+          isActive,
+          interaction,
+          signal
         );
       case "socks5":
-        return this.connectViaSocks5(server, proxy, onAuthMessage, credentialEndpointSignature, credentialRecord, isActive);
+        return this.connectViaSocks5(server, proxy, onAuthMessage, credentialEndpointSignature, credentialRecord, isActive, interaction, signal);
       case "http":
-        return this.connectViaHttpConnect(server, proxy, onAuthMessage, credentialEndpointSignature, credentialRecord, isActive);
+        return this.connectViaHttpConnect(server, proxy, onAuthMessage, credentialEndpointSignature, credentialRecord, isActive, interaction, signal);
     }
   }
 
@@ -235,7 +250,9 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     credentialEndpointSignature?: string,
     credentialRecord?: ServerConfig | null,
     routeSource: ServerConfig = target,
-    isActive?: () => boolean
+    isActive?: () => boolean,
+    interaction: SshInteractionPolicy = "interactive",
+    signal?: AbortSignal
   ): Promise<SshConnection> {
     const nextVisited = this.addToVisited(visited, target);
     const jumpServer = this.serverLookup(jumpHostId);
@@ -278,8 +295,11 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     // target's alternate address VIA the (working) jump host.
     let jumpConnection: SshConnection;
     try {
-      jumpConnection = await this.connectToJumpHost(jumpServer, nextVisited, onAuthMessage, isActive);
+      jumpConnection = await this.connectToJumpHost(jumpServer, nextVisited, onAuthMessage, isActive, interaction, signal);
     } catch (error) {
+      if (error instanceof SshInteractionRequiredError || signal?.aborted) {
+        throw signal?.reason ?? error;
+      }
       const detail = error instanceof Error ? error.message : String(error);
       throw new Error(`Jump host connection failed (${jumpServer.name}): ${detail}`, { cause: error });
     }
@@ -303,7 +323,9 @@ export class ProxySshFactory implements ContextAwareSshFactory {
         ...(onAuthMessage && { onAuthMessage }),
         ...(isActive && { isActive }),
         ...(credentialEndpointSignature !== undefined && { credentialEndpointSignature }),
-        ...(typeof this.authFactory.getCredentialEndpointSignature === "function" && { credentialRecord })
+        ...(typeof this.authFactory.getCredentialEndpointSignature === "function" && { credentialRecord }),
+        ...(interaction !== "interactive" && { interaction }),
+        ...(signal && { signal })
       });
     } catch (error) {
       jumpConnection.dispose();
@@ -333,9 +355,11 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     onAuthMessage?: (text: string) => void,
     credentialEndpointSignature?: string,
     credentialRecord?: ServerConfig | null,
-    isActive?: () => boolean
+    isActive?: () => boolean,
+    interaction: SshInteractionPolicy = "interactive",
+    signal?: AbortSignal
   ): Promise<SshConnection> {
-    const resolved = await this.resolveProxyPassword(target, proxy, credentialEndpointSignature, credentialRecord, isActive);
+    const resolved = await this.resolveProxyPassword(target, proxy, credentialEndpointSignature, credentialRecord, isActive, interaction, signal);
     const proxyPassword = resolved.password;
 
     // Track the most recently opened socket so the ProxiedSshConnection wrapper
@@ -399,7 +423,9 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       onAuthMessage,
       credentialEndpointSignature,
       credentialRecord,
-      isActive
+      isActive,
+      interaction,
+      signal
     );
     // lastSock is guaranteed to be defined here: a successful authFactory.connect
     // means sockFactory was called and resolved at least once.
@@ -412,9 +438,11 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     onAuthMessage?: (text: string) => void,
     credentialEndpointSignature?: string,
     credentialRecord?: ServerConfig | null,
-    isActive?: () => boolean
+    isActive?: () => boolean,
+    interaction: SshInteractionPolicy = "interactive",
+    signal?: AbortSignal
   ): Promise<SshConnection> {
-    const resolved = await this.resolveProxyPassword(target, proxy, credentialEndpointSignature, credentialRecord, isActive);
+    const resolved = await this.resolveProxyPassword(target, proxy, credentialEndpointSignature, credentialRecord, isActive, interaction, signal);
     const proxyPassword = resolved.password;
 
     // Track the most recently opened socket so the ProxiedSshConnection wrapper
@@ -457,7 +485,9 @@ export class ProxySshFactory implements ContextAwareSshFactory {
       onAuthMessage,
       credentialEndpointSignature,
       credentialRecord,
-      isActive
+      isActive,
+      interaction,
+      signal
     );
     // lastSock is guaranteed to be defined here: a successful authFactory.connect
     // means sockFactory was called and resolved at least once.
@@ -472,7 +502,9 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     onAuthMessage?: (text: string) => void,
     credentialEndpointSignature?: string,
     credentialRecord?: ServerConfig | null,
-    isActive?: () => boolean
+    isActive?: () => boolean,
+    interaction: SshInteractionPolicy = "interactive",
+    signal?: AbortSignal
   ): Promise<SshConnection> {
     let connection: SshConnection;
     try {
@@ -482,7 +514,9 @@ export class ProxySshFactory implements ContextAwareSshFactory {
         ...(onAuthMessage && { onAuthMessage }),
         ...(isActive && { isActive }),
         ...(credentialEndpointSignature !== undefined && { credentialEndpointSignature }),
-        ...(typeof this.authFactory.getCredentialEndpointSignature === "function" && { credentialRecord })
+        ...(typeof this.authFactory.getCredentialEndpointSignature === "function" && { credentialRecord }),
+        ...(interaction !== "interactive" && { interaction }),
+        ...(signal && { signal })
       });
     } catch (error) {
       // The shared answer may be what failed: the next connect asks afresh.
@@ -573,14 +607,25 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     proxy: Socks5Proxy | HttpConnectProxy,
     credentialEndpointSignature?: string,
     credentialRecord?: ServerConfig | null,
-    isActive?: () => boolean
+    isActive?: () => boolean,
+    interaction: SshInteractionPolicy = "interactive",
+    signal?: AbortSignal
   ): Promise<ResolvedProxyPassword> {
+    if (signal?.aborted || isActive?.() === false) {
+      throw signal?.reason ?? new AuthNotJudgedError("SSH connection attempt ended before authentication completed");
+    }
     if (!proxy.username) {
       return { password: undefined };
     }
     const stored = await this.vault.get(proxyPasswordSecretKey(target.id, proxy));
+    if (signal?.aborted || isActive?.() === false) {
+      throw signal?.reason ?? new AuthNotJudgedError("SSH connection attempt ended before authentication completed");
+    }
     if (stored !== undefined) {
       return { password: stored };
+    }
+    if (interaction === "noninteractive") {
+      throw new SshInteractionRequiredError("SSH proxy authentication requires a saved password.");
     }
     if (!this.promptProxyPassword) {
       return { password: undefined };
@@ -709,16 +754,35 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     jumpServer: ServerConfig,
     visited: ReadonlySet<string>,
     onAuthMessage?: (text: string) => void,
-    isActive?: () => boolean
+    isActive?: () => boolean,
+    interaction: SshInteractionPolicy = "interactive",
+    signal?: AbortSignal
   ): Promise<SshConnection> {
     if (this.jumpHostFactory) {
-      return this.jumpHostFactory.connectWithContext(jumpServer, { proxyVisited: visited, ...(onAuthMessage && { onAuthMessage }), ...(isActive && { isActive }) });
+      return this.jumpHostFactory.connectWithContext(jumpServer, {
+        proxyVisited: visited,
+        ...(onAuthMessage && { onAuthMessage }),
+        ...(isActive && { isActive }),
+        ...(interaction !== "interactive" && { interaction }),
+        ...(signal && { signal })
+      });
     }
     if (jumpServer.proxy) {
-      return this.connectWithContext(jumpServer, { proxyVisited: visited, ...(onAuthMessage && { onAuthMessage }), ...(isActive && { isActive }) });
+      return this.connectWithContext(jumpServer, {
+        proxyVisited: visited,
+        ...(onAuthMessage && { onAuthMessage }),
+        ...(isActive && { isActive }),
+        ...(interaction !== "interactive" && { interaction }),
+        ...(signal && { signal })
+      });
     }
-    return onAuthMessage || isActive
-      ? this.authFactory.connect(jumpServer, { ...(onAuthMessage && { onAuthMessage }), ...(isActive && { isActive }) })
+    return onAuthMessage || isActive || interaction !== "interactive" || signal
+      ? this.authFactory.connect(jumpServer, {
+          ...(onAuthMessage && { onAuthMessage }),
+          ...(isActive && { isActive }),
+          ...(interaction !== "interactive" && { interaction }),
+          ...(signal && { signal })
+        })
       : this.authFactory.connect(jumpServer);
   }
 

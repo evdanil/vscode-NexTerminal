@@ -182,6 +182,16 @@ describe("parseDeviceTemplateFormValues (§7.1 tri-state → model)", () => {
     expect(t.fields.logSession).toBeUndefined();
   });
 
+  it("represents explicit Direct as a nullable proxy value and keeps legacy none as no opinion", () => {
+    const direct = parseDeviceTemplateFormValues({ name: "T", mode_proxy: "override", proxyType: "direct" });
+    expect(direct.fields.proxy).toEqual({ mode: "override", value: null });
+    const noOpinion = parseDeviceTemplateFormValues({ name: "T", mode_proxy: "override", proxyType: "none" });
+    expect(noOpinion.fields.proxy).toBeUndefined();
+    const legacy = parseDeviceTemplateFormValues({ name: "T", mode_proxy: "none", proxyType: "none" });
+    expect(legacy.fields.proxy).toBeUndefined();
+    expect(parseDeviceTemplateFormValues({ name: "T", mode_proxy: "none", proxyType: "direct" }).fields.proxy).toBeUndefined();
+  });
+
   it("rejects an empty name", () => {
     expect(() => parseDeviceTemplateFormValues({ name: "  " })).toThrow(/Name is required/);
   });
@@ -212,16 +222,27 @@ describe("parseDeviceTemplateFormValues (§7.1 tri-state → model)", () => {
     ).toThrow(/IPMI Auth Profile mode is set to Fill but no value is configured/);
   });
 
-  it("P3 — a field whose mode is fill/override but has no usable value is REJECTED, not silently dropped", () => {
+  it("P3 — auth requires a value, while legacy proxy None and missing selections remain no-opinion", () => {
     // Auth mode set but left on (None)/create sentinel → reject (the pre-fix code
     // returned a template with the auth field silently dropped).
     expect(() => parseDeviceTemplateFormValues({ name: "T", mode_authProfileId: "fill", authProfileId: "" })).toThrow(
       /Auth Profile mode is set to Fill but no value is configured/
     );
-    // Override proxy with proxyType "none" → the value resolves to undefined → reject.
-    expect(() =>
-      parseDeviceTemplateFormValues({ name: "T", mode_proxy: "override", proxyType: "none" })
-    ).toThrow(/Proxy mode is set to Override but no value is configured/);
+    // Older form submissions sent proxyType="none" even if a stale Fill/Override
+    // mode remained selected. Missing proxyType is the same no-opinion state.
+    expect(parseDeviceTemplateFormValues({ name: "T", mode_proxy: "fill", proxyType: "none" }).fields.proxy).toBeUndefined();
+    expect(parseDeviceTemplateFormValues({ name: "T", mode_proxy: "override" }).fields.proxy).toBeUndefined();
+    expect(parseDeviceTemplateFormValues({ name: "T", mode_proxy: "none", proxyType: "socks5" }).fields.proxy).toBeUndefined();
+    // Explicit Direct is a real configured value; invalid concrete values and
+    // unknown proxy types still go through the strict parser.
+    expect(parseDeviceTemplateFormValues({ name: "T", mode_proxy: "fill", proxyType: "direct" }).fields.proxy).toEqual({
+      mode: "fill",
+      value: null
+    });
+    expect(() => parseDeviceTemplateFormValues({ name: "T", mode_proxy: "fill", proxyType: "ssh" })).toThrow();
+    expect(() => parseDeviceTemplateFormValues({ name: "T", mode_proxy: "override", proxyType: "socks5" })).toThrow();
+    expect(() => parseDeviceTemplateFormValues({ name: "T", mode_proxy: "fill", proxyType: "http" })).toThrow();
+    expect(() => parseDeviceTemplateFormValues({ name: "T", mode_proxy: "fill", proxyType: "unexpected" })).toThrow();
   });
 });
 
@@ -687,6 +708,29 @@ describe("Fix A (PR #62 Codex round 2, SECURITY) — manual apply clears the sta
     // And the new proxy did publish.
     expect(core.getServer("srv-1")!.proxy).toEqual(Y);
     expect(mockShowInformationMessage).toHaveBeenCalledWith('Applied device template "Reproxy" to 1 server.');
+  });
+
+  it("DELETES the old proxy secret before publishing explicit Direct and records a manual opt-out", async () => {
+    const core = makeCore();
+    await seedProxyServer(core);
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Direct", fields: { proxy: { mode: "override", value: null } } });
+    const key = legacyProxyPasswordSecretKey("srv-1");
+    const vault = makeVault(core, { [key]: "topsecret" });
+    registerWithVault(core, vault);
+
+    mockShowQuickPick.mockResolvedValue({ label: "Direct", template: core.getSnapshot().deviceTemplates[0] });
+    mockShowWarningMessage.mockResolvedValue("Apply");
+    mockShowInformationMessage.mockResolvedValue(undefined);
+
+    await registeredCommands.get("nexus.deviceTemplate.applyToFolder")!(new FolderTreeItem("DC", "DC"));
+
+    expect(vault._deleted).toContain(key);
+    expect(vault._proxyAtDelete.get(key)).toEqual(X);
+    const saved = core.getServer("srv-1")!;
+    expect(saved.proxy).toBeUndefined();
+    expect(saved.origin?.proxyOwnership).toBeUndefined();
+    expect(saved.origin?.templated?.proxy).toBeUndefined();
+    expect(saved.origin?.proxyOptOut).toBe(true);
   });
 
   it("fail-closed — a delete failure ABORTS the apply: nothing published, secret intact, house 'run again' message", async () => {

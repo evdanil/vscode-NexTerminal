@@ -2,7 +2,12 @@ import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { InventorySourceRemovalMismatchError, type NexusCore } from "../core/nexusCore";
 import type { AuthProfile, ServerConfig } from "../models/config";
-import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials, cloneTemplatedStamps } from "../models/config";
+import {
+  authProfileNeedsServerKeyPath,
+  authProfileOwnedCredentials,
+  cloneInventoryProxyOwnership,
+  cloneTemplatedStamps
+} from "../models/config";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import {
   computeProviderFingerprint,
@@ -18,6 +23,7 @@ import {
   sourceConfigUnchanged,
   validateInventoryStatusReport,
   type InventoryConfigField,
+  type InventoryOperationContext,
   type InventoryPrunePolicy,
   type InventoryProvider,
   type InventorySourceConfig,
@@ -26,6 +32,13 @@ import {
   type InventoryTree
 } from "../models/inventory";
 import type { InventoryProviderRegistry, ProviderRegistrationSnapshot } from "../services/inventory/providerRegistry";
+import { resolveDiscoverySshHostId } from "../services/inventory/providerRegistry";
+import {
+  InventorySourceDependencyError,
+  assertInventorySourceDependenciesCurrent,
+  snapshotInventorySourceDependencies,
+  type InventorySourceDependencySnapshot
+} from "../services/inventory/inventorySourceDependencies";
 // Shared with ui/settingsTreeProvider.ts so both surfaces describe a source identically.
 import { sourceDescription } from "../services/inventory/sourceDescription";
 import {
@@ -60,6 +73,7 @@ import { resolveMacroBrowserUrl } from "../utils/browserUrl";
 import { createInlineAuthProfileCreation } from "./inlineAuthProfileCreation";
 import { createInlineDeviceTemplateCreation } from "./inlineDeviceTemplateCreation";
 import { createInlineSavedFilterCreation } from "./inlineSavedFilterCreation";
+import type { ContainerlabActivationController } from "../services/inventory/containerlabActivation";
 
 /**
  * F1 — server runtime teardown, injected from extension.ts (mirrors the
@@ -128,6 +142,34 @@ export interface InventoryStatusRefreshOutcome {
 
 function providerMissingMessage(providerId: string): string {
   return `Inventory provider "${providerId}" is not available (the extension providing it may be disabled).`;
+}
+
+function hasNonEmptyRevision(revision: unknown): revision is string {
+  return typeof revision === "string" && revision.trim().length > 0;
+}
+
+function showReloadWindowMessage(kind: "error" | "warning", message: string): void {
+  const prompt = kind === "error"
+    ? vscode.window.showErrorMessage(message, "Reload Window")
+    : vscode.window.showWarningMessage(message, "Reload Window");
+  void Promise.resolve(prompt)
+    .then((choice) => {
+      if (choice === "Reload Window") {
+        return vscode.commands.executeCommand("workbench.action.reloadWindow");
+      }
+    })
+    .catch(() => undefined);
+}
+
+function missingContainerlabRevisionMessage(sourceName: string): string {
+  return `Containerlab source "${sourceName}" is missing its saved revision. Reload Window to refresh legacy source metadata, then try again.`;
+}
+
+class ContainerlabRevisionUnavailableError extends Error {
+  constructor(sourceName: string) {
+    super(missingContainerlabRevisionMessage(sourceName));
+    this.name = "ContainerlabRevisionUnavailableError";
+  }
 }
 
 /**
@@ -693,15 +735,21 @@ async function testInventoryConnection(
   name: string,
   provider: InventoryProvider,
   config: InventorySourceValues,
-  secrets: InventorySourceSecrets
+  secrets: InventorySourceSecrets,
+  operationContext?: InventoryOperationContext
 ): Promise<void> {
   try {
+    const cloned = cloneForProvider(config, secrets);
+    // Containerlab's controller captures the form/source and its complete SSH
+    // dependency snapshot synchronously at this call. Keep it before the first
+    // await (including withProgress) so no later host/profile edit can rebase
+    // the command that Test is about to authorize.
+    const testing = operationContext === undefined
+      ? provider.testConnection(cloned.config, cloned.secrets)
+      : provider.testConnection(cloned.config, cloned.secrets, operationContext);
     await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: `Testing connection to "${name}"…` },
-      () => {
-        const cloned = cloneForProvider(config, secrets);
-        return provider.testConnection(cloned.config, cloned.secrets);
-      }
+      () => testing
     );
     void vscode.window.showInformationMessage(`Connection test succeeded for "${name}".`);
   } catch (error) {
@@ -1308,6 +1356,8 @@ export interface NewInventorySourceInput {
   /** DEVICE TEMPLATES (PR-T1b) — the catch-all rule (or `[]`) the Device
    *  Template select resolved to, or `undefined` to store no rules. */
   templateRules?: TemplateRule[];
+  /** Session-bound approval transfer; meaningful only for the Containerlab provider. */
+  containerlabFormSave?: { readonly activation: ContainerlabActivationController; readonly sessionId: string };
 }
 
 /**
@@ -1451,25 +1501,40 @@ async function persistNewInventorySource(
       ...(templateRules !== undefined ? { templateRules } : {})
     };
 
+    // Prepare only the matching form approval, immediately before the ordinary
+    // core save. The controller does no network work here; the cleanup removes
+    // this one-shot association even if persistence or transfer fails.
+    const cleanupApproval = input.containerlabFormSave && providerSnapshot.id === "containerlab"
+      ? input.containerlabFormSave.activation.prepareFormSourceSave(input.containerlabFormSave.sessionId, id)
+      : undefined;
+    try {
     // FINDING 1 — if persisting the new source record fails, the vault keys
     // just written above have no source to be enumerated/cleaned up by, so
     // they'd be orphaned forever. Roll them back (best-effort — a delete
     // failure here must not mask the original persistence error) and report
     // that the source was not created.
-    try {
-      await core.addOrUpdateInventorySource(source);
-    } catch {
-      for (const fieldId of secretFieldIds) {
-        try {
-          await vault.delete(inventorySecretKey(id, fieldId));
-        } catch {
-          // best-effort rollback — ignore
+      try {
+        await core.addOrUpdateInventorySource(source);
+      } catch {
+        for (const fieldId of secretFieldIds) {
+          try {
+            await vault.delete(inventorySecretKey(id, fieldId));
+          } catch {
+            // best-effort rollback — ignore
+          }
         }
+        throw new Error(`Could not save inventory source "${name}" — the source was not created.`);
       }
-      throw new Error(`Could not save inventory source "${name}" — the source was not created.`);
-    }
 
-    return source;
+      const saved = core.getInventorySource(id);
+      if (cleanupApproval && input.containerlabFormSave && providerSnapshot.id === "containerlab") {
+        if (!saved) throw new Error("Containerlab source was saved but could not be re-read for approval transfer.");
+        await input.containerlabFormSave.activation.transferFormApproval(input.containerlabFormSave.sessionId, saved);
+      }
+      return saved ?? source;
+    } finally {
+      cleanupApproval?.();
+    }
   });
 }
 
@@ -1491,6 +1556,8 @@ export interface UpdatedInventorySourceInput {
    *  Template select resolved to, or `undefined` to KEEP the source's existing
    *  `templateRules` (fallback shown / non-representable). */
   templateRules?: TemplateRule[];
+  /** Session-bound approval transfer; meaningful only for the Containerlab provider. */
+  containerlabFormSave?: { readonly activation: ContainerlabActivationController; readonly sessionId: string };
 }
 
 /**
@@ -1649,6 +1716,14 @@ async function persistUpdatedInventorySource(
       templateRules: templateRules ?? source.templateRules
     };
 
+    // Prepare the same edit session that passed Test, while the source is
+    // still under the shared config mutation lock. No network runs here; the
+    // returned cleanup closes the one-shot association in every outcome.
+    const cleanupApproval = input.containerlabFormSave && providerSnapshot.id === "containerlab"
+      ? input.containerlabFormSave.activation.prepareFormSourceSave(input.containerlabFormSave.sessionId, source.id)
+      : undefined;
+    let savedSource: InventorySourceConfig = updated;
+    try {
     // FINDING 1 — persist BEFORE any vault cleanup. If persistence rejects,
     // the pre-existing secretFieldIds keys must be left untouched (they're
     // still the keys the last-known-good source record points at), and any
@@ -1657,11 +1732,18 @@ async function persistUpdatedInventorySource(
     // FINDING C — additionally, any re-entered field that OVERWROTE an
     // existing value gets that captured previous value restored, so the
     // vault matches the reverted (last-known-good) source record.
-    try {
-      await core.addOrUpdateInventorySource(updated);
-    } catch {
-      await rollbackThisRunsVaultWrites();
-      throw new Error(`Could not save inventory source "${name}" — the update was not applied.`);
+      try {
+        await core.addOrUpdateInventorySource(updated);
+      } catch {
+        await rollbackThisRunsVaultWrites();
+        throw new Error(`Could not save inventory source "${name}" — the update was not applied.`);
+      }
+      savedSource = core.getInventorySource(source.id) ?? updated;
+      if (cleanupApproval && input.containerlabFormSave && providerSnapshot.id === "containerlab") {
+        await input.containerlabFormSave.activation.transferFormApproval(input.containerlabFormSave.sessionId, savedSource);
+      }
+    } finally {
+      cleanupApproval?.();
     }
 
     // FINDING 3 — vault keys for ids that were in the OLD secretFieldIds but
@@ -1686,7 +1768,7 @@ async function persistUpdatedInventorySource(
       }
     }
 
-    return updated;
+    return savedSource;
   });
 }
 
@@ -2710,7 +2792,8 @@ export function registerInventoryCommands(
   core: NexusCore,
   registry: InventoryProviderRegistry,
   vault: SecretVault,
-  teardown: InventoryRuntimeTeardown
+  teardown: InventoryRuntimeTeardown,
+  containerlabActivation?: ContainerlabActivationController
 ): vscode.Disposable[] {
   // F4 — shared by all four commands: syncNow holds a source's id for its whole
   // run; editSource/removeSource hold it for their whole run too (they mutate
@@ -2899,7 +2982,8 @@ export function registerInventoryCommands(
     provider: InventoryProvider,
     configFields: readonly InventoryConfigField[],
     fallbackName: string,
-    hydrateFrom?: InventorySourceConfig
+    hydrateFrom?: InventorySourceConfig,
+    containerlabForm?: { readonly activation: ContainerlabActivationController; readonly sessionId: string }
   ): Promise<void> {
     let parsed: ProviderConfigFormResult;
     try {
@@ -2908,8 +2992,16 @@ export function registerInventoryCommands(
       void vscode.window.showWarningMessage(error instanceof Error ? error.message : String(error));
       return;
     }
+    let operationContext: InventoryOperationContext | undefined;
+    if (containerlabForm) {
+      // Capture the exact form values synchronously before any vault or UI await;
+      // the activation controller then captures the live source and complete SSH
+      // hop/auth snapshot at the synchronous provider-forward seam below.
+      containerlabForm.activation.updateFormSession(containerlabForm.sessionId, parsed.config);
+      operationContext = { intent: "test", subject: { kind: "form", sessionId: containerlabForm.sessionId } };
+    }
     const secretsForTest: InventorySourceSecrets = { ...parsed.secrets };
-    if (hydrateFrom) {
+    if (hydrateFrom && !containerlabForm) {
       // REVIEW FINDING 2 (P2) — a rejecting SecretStorage.get here (vault
       // hydration of a kept/blank secret field) must not escape this
       // function: WebviewFormPanel's "test" message handler awaits onTest
@@ -2934,7 +3026,7 @@ export function registerInventoryCommands(
       }
     }
     const name = typeof values.name === "string" && values.name.trim() ? values.name.trim() : fallbackName;
-    await testInventoryConnection(name, provider, parsed.config, secretsForTest);
+    await testInventoryConnection(name, provider, parsed.config, secretsForTest, operationContext);
   }
 
   async function addSource(): Promise<void> {
@@ -2970,8 +3062,12 @@ export function registerInventoryCommands(
       mostCommonUsername(snapshot.servers),
       snapshot.authProfiles,
       snapshot.deviceTemplates,
-      snapshot.savedFilters
+      snapshot.savedFilters,
+      snapshot.servers
     );
+    const containerlabForm = providerSnapshot.id === "containerlab" && containerlabActivation
+      ? { activation: containerlabActivation, sessionId: containerlabActivation.beginFormSession() }
+      : undefined;
     // Same controller/handler triple the server edit form uses
     // (serverCommands.ts) — the only difference is onAutofill's payload: this
     // form mirrors the profile's username into `defaultUsername`, not into
@@ -2992,9 +3088,15 @@ export function registerInventoryCommands(
     // `addSelectOption` after an inline create, both post one — and that is
     // what "rendered" means on this path.
     let renderedAuthProfile: RenderedSourceAuthProfile | undefined = undefined;
-    const panel = WebviewFormPanel.open(`inventory-source-add-${providerSnapshot.id}`, definition, {
+    let panel: ReturnType<typeof WebviewFormPanel.open>;
+    try {
+      panel = WebviewFormPanel.open(`inventory-source-add-${providerSnapshot.id}`, definition, {
       onSubmit: async (values) => {
         const parsed = await parseSourceFormValues(values, configFields);
+        if (providerSnapshot.id === "containerlab" && !containerlabForm) {
+          throw new Error("Containerlab approvals are available only in desktop VS Code.");
+        }
+        containerlabForm?.activation.updateFormSession(containerlabForm.sessionId, parsed.config);
         const created = await persistNewInventorySource(core, vault, {
           name: parsed.name,
           targetFolder: parsed.targetFolder,
@@ -3007,7 +3109,8 @@ export function registerInventoryCommands(
           secrets: parsed.secrets,
           // No existing rules on an Add — a representable submit either stores
           // one catch-all rule or none.
-          templateRules: resolveSubmittedTemplateRules(values, undefined)
+          templateRules: resolveSubmittedTemplateRules(values, undefined),
+          ...(containerlabForm ? { containerlabFormSave: containerlabForm } : {})
         });
 
         // F1 — onSubmit resolves as soon as persistence succeeds. The follow-up
@@ -3025,7 +3128,7 @@ export function registerInventoryCommands(
           }
         })();
       },
-      onTest: (values) => handleFormTest(values, provider, configFields, providerSnapshot.label),
+      onTest: (values) => handleFormTest(values, provider, configFields, providerSnapshot.label, undefined, containerlabForm),
       onCreateInline: (key, values) => {
         inlineAuthProfile.handleCreateInline(key);
         inlineDeviceTemplate.handleCreateInline(key);
@@ -3040,6 +3143,13 @@ export function registerInventoryCommands(
         renderedAuthProfile = renderedSourceAuthProfile(profile);
         return authProfileUsernameMirror(profile);
       }
+      });
+    } catch (error) {
+      if (containerlabForm) containerlabForm.activation.endFormSession(containerlabForm.sessionId);
+      throw error;
+    }
+    panel.onDidDispose(() => {
+      if (containerlabForm) containerlabForm.activation.endFormSession(containerlabForm.sessionId);
     });
     inlineAuthProfile.attachPanel(panel);
     inlineDeviceTemplate.attachPanel(panel);
@@ -3156,6 +3266,12 @@ export function registerInventoryCommands(
     const providerSnapshot = registry.snapshotOf(provider);
     const configFields = providerSnapshot.configFields;
 
+    if (providerSnapshot.id === "containerlab" && !hasNonEmptyRevision(source.revision)) {
+      releaseInFlight();
+      showReloadWindowMessage("error", missingContainerlabRevisionMessage(source.name));
+      return;
+    }
+
     // F3 — gated BEFORE the form ever opens: the Edit form's Test button
     // hydrates kept (blank) secret fields straight from the vault (see
     // handleFormTest's `hydrateFrom`), which is exactly the silent-secret-
@@ -3177,17 +3293,37 @@ export function registerInventoryCommands(
     // earlier: the list both populates the select and decides whether the
     // seeded `source.authProfileId` survives sanitization, so a stale list
     // would render a real link as `(None)` and quietly drop it on Save.
-    const authProfiles = core.getSnapshot().authProfiles;
-    const deviceTemplates = core.getSnapshot().deviceTemplates;
-    const savedFilters = core.getSnapshot().savedFilters;
+    const formSnapshot = core.getSnapshot();
+    const authProfiles = formSnapshot.authProfiles;
+    const deviceTemplates = formSnapshot.deviceTemplates;
+    const savedFilters = formSnapshot.savedFilters;
     const definition = inventorySourceFormDefinition(
       providerSnapshot,
       source,
       undefined,
       authProfiles,
       deviceTemplates,
-      savedFilters
+      savedFilters,
+      formSnapshot.servers
     );
+    let containerlabForm: { readonly activation: ContainerlabActivationController; readonly sessionId: string } | undefined;
+    if (providerSnapshot.id === "containerlab" && containerlabActivation) {
+      try {
+        if (!hasNonEmptyRevision(source.revision)) {
+          releaseInFlight();
+          showReloadWindowMessage("error", missingContainerlabRevisionMessage(source.name));
+          return;
+        }
+        containerlabForm = {
+          activation: containerlabActivation,
+          sessionId: containerlabActivation.beginFormSession({ sourceId: source.id, revision: source.revision })
+        };
+      } catch (error) {
+        releaseInFlight();
+        void vscode.window.showErrorMessage(`Could not open Containerlab Edit Source: ${describeInventoryError(error)}`);
+        return;
+      }
+    }
     // REVIEW FINDING (P2) — as addSource's, but seeded: this form opens already
     // showing the LINKED profile's username in Default SSH Username, locked
     // (`inventorySourceFormDefinition`'s render rule), so on Edit "rendered"
@@ -3232,6 +3368,10 @@ export function registerInventoryCommands(
         onSubmit: (values) => {
           const submitPromise = (async (): Promise<void> => {
             const parsed = await parseSourceFormValues(values, configFields, existingSecretFieldIds);
+            if (providerSnapshot.id === "containerlab" && !containerlabForm) {
+              throw new Error("Containerlab approvals are available only in desktop VS Code.");
+            }
+            containerlabForm?.activation.updateFormSession(containerlabForm.sessionId, parsed.config);
             const updated = await persistUpdatedInventorySource(core, vault, source, {
               name: parsed.name,
               targetFolder: parsed.targetFolder,
@@ -3245,7 +3385,8 @@ export function registerInventoryCommands(
               // Representable submit → new rule list; fallback shown → undefined
               // keeps `source.templateRules` untouched (a filtered/multi-rule set
               // the select never rendered), byte-for-byte (UX-M3).
-              templateRules: resolveSubmittedTemplateRules(values, source.templateRules)
+              templateRules: resolveSubmittedTemplateRules(values, source.templateRules),
+              ...(containerlabForm ? { containerlabFormSave: containerlabForm } : {})
             });
 
             const folderNote = updated.targetFolder !== source.targetFolder ? " Servers move to the new folder on the next sync." : "";
@@ -3303,7 +3444,7 @@ export function registerInventoryCommands(
             });
           return submitPromise;
         },
-        onTest: (values) => handleFormTest(values, provider, configFields, source.name, source),
+        onTest: (values) => handleFormTest(values, provider, configFields, source.name, source, containerlabForm),
         onCreateInline: (key, values) => {
           inlineAuthProfile.handleCreateInline(key);
           inlineDeviceTemplate.handleCreateInline(key);
@@ -3318,10 +3459,14 @@ export function registerInventoryCommands(
         }
       });
     } catch (error) {
+      if (containerlabForm) containerlabForm.activation.endFormSession(containerlabForm.sessionId);
       releaseInFlight();
       throw error;
     }
-    panel.onDidDispose(releaseInFlight);
+    panel.onDidDispose(() => {
+      if (containerlabForm) containerlabForm.activation.endFormSession(containerlabForm.sessionId);
+      return releaseInFlight();
+    });
     inlineAuthProfile.attachPanel(panel);
     inlineDeviceTemplate.attachPanel(panel);
     inlineSavedFilter.attachPanel(panel);
@@ -3779,6 +3924,15 @@ export function registerInventoryCommands(
                     // alias the live origin's `templated`. Omitted rather than
                     // written as `undefined` for the reason `instanceKey` is.
                     ...(origin.templated !== undefined ? { templated: cloneTemplatedStamps(origin.templated) } : {}),
+                    // Route ownership is the proxy field's canonical receipt. It
+                    // is nested, so detach it as its own value rather than
+                    // aliasing the origin that is being removed. A manual Direct
+                    // choice is a separate receipt and must survive the strip as
+                    // well, or adoption would reopen automatic route writes.
+                    ...(origin.proxyOwnership !== undefined
+                      ? { proxyOwnership: cloneInventoryProxyOwnership(origin.proxyOwnership) }
+                      : {}),
+                    ...(origin.proxyOptOut === true ? { proxyOptOut: true as const } : {}),
                     detachedAt
                   }
                 } as ServerConfig)
@@ -3846,6 +4000,11 @@ export function registerInventoryCommands(
       if (sourceIdArg) void vscode.window.showErrorMessage("That inventory source no longer exists.");
       return;
     }
+    const sourceRevision = source.revision;
+    if (source.providerId === "containerlab" && !hasNonEmptyRevision(sourceRevision)) {
+      showReloadWindowMessage("error", missingContainerlabRevisionMessage(source.name));
+      return;
+    }
     const syncBusyReason = inFlightSourceIds.get(source.id);
     if (syncBusyReason !== undefined) {
       void vscode.window.showWarningMessage(sourceBusyMessage(source.name, syncBusyReason, "sync"));
@@ -3856,6 +4015,7 @@ export function registerInventoryCommands(
       void vscode.window.showErrorMessage(providerMissingMessage(source.providerId));
       return;
     }
+    const providerSnapshot = registry.snapshotOf(provider);
     // Issue #195 — the copy registration checked: the gate hashes it and the
     // required-secret loop below walks it.
     const configFields = registry.configFieldsOf(provider);
@@ -3865,6 +4025,40 @@ export function registerInventoryCommands(
     // This is the one claimant for which "syncing" is the honest word.
     inFlightSourceIds.set(source.id, "sync");
     try {
+      let sourceDefaultRoute: ReturnType<NonNullable<ProviderRegistrationSnapshot["sourceDefaultRoute"]>> | undefined;
+      let discoveryDependencies: InventorySourceDependencySnapshot | undefined;
+      try {
+        sourceDefaultRoute = providerSnapshot.sourceDefaultRoute?.(source.config);
+        const discoveryHostId = resolveDiscoverySshHostId(providerSnapshot, source.config);
+        if (discoveryHostId !== undefined) {
+          // One immutable core view binds the provider's discovery declaration
+          // to the host, every jump hop and each effective auth profile used to
+          // reach it. `sourceDefaultRoute` remains a device-route policy and is
+          // deliberately not consulted to discover this dependency chain.
+          const discoveryView = core.getSnapshot();
+          discoveryDependencies = snapshotInventorySourceDependencies(
+            discoveryHostId,
+            discoveryView.servers,
+            discoveryView.authProfiles
+          );
+        }
+      } catch (error) {
+        void vscode.window.showErrorMessage(`Inventory sync failed: ${describeInventoryError(error)}`);
+        return;
+      }
+      const discoveryPlanInputs = {
+        ...(sourceDefaultRoute !== undefined ? { sourceDefaultRoute } : {}),
+        ...(discoveryDependencies !== undefined ? { discoveryDependencies } : {})
+      };
+      const discoveryDependencyError = (servers: readonly ServerConfig[], authProfiles: readonly AuthProfile[]): Error | undefined => {
+        if (discoveryDependencies === undefined) return undefined;
+        try {
+          assertInventorySourceDependenciesCurrent(discoveryDependencies, servers, authProfiles);
+          return undefined;
+        } catch (error) {
+          return error instanceof Error ? error : new Error(String(error));
+        }
+      };
       // ITEM A (provider trust fingerprint) / F3 — strictly BEFORE any vault
       // read for this source (the required-secret presence loop right below
       // this reads real secret values from the vault). VS Code gives Nexus no
@@ -3881,7 +4075,7 @@ export function registerInventoryCommands(
       // checkProviderFingerprint is the same helper editSource's own
       // pre-open gate uses, so the two flows can't drift on wording or on
       // when this confirmation fires.
-      const fingerprintCheck = await checkProviderFingerprint(source, registry.snapshotOf(provider), confirmedProviderShapes);
+      const fingerprintCheck = await checkProviderFingerprint(source, providerSnapshot, confirmedProviderShapes);
       if (fingerprintCheck.outcome === "cancelled") {
         // Cancel (or dismiss) aborts before ANY vault.get for this source —
         // the required-secret loop and every other vault read below never run.
@@ -3929,8 +4123,40 @@ export function registerInventoryCommands(
         const fetched = await vscode.window.withProgress(
           { location: vscode.ProgressLocation.Notification, title: `Syncing inventory from "${source.name}"…` },
           () => {
+            // `withProgress` may wait before it invokes this callback. Recheck
+            // against one live core view immediately before handing control to
+            // the provider; no await may separate this validation from fetch.
+            const beforeFetch = core.getSnapshot();
+            const currentSource = beforeFetch.inventorySources.find((item) => item.id === source.id);
+            if (!currentSource) {
+              throw new Error("The inventory source changed while Sync was being prepared. Run Sync again.");
+            }
+            let operationContext: InventoryOperationContext | undefined;
+            if (providerSnapshot.id === "containerlab") {
+              if (!hasNonEmptyRevision(sourceRevision) || !hasNonEmptyRevision(currentSource.revision)) {
+                throw new ContainerlabRevisionUnavailableError(source.name);
+              }
+              if (currentSource.revision !== sourceRevision) {
+                throw new Error("The inventory source changed while Sync was being prepared. Run Sync again.");
+              }
+              operationContext = {
+                intent: "sync",
+                subject: { kind: "source", sourceId: currentSource.id, revision: sourceRevision }
+              };
+            } else if (currentSource.revision !== sourceRevision) {
+              throw new Error("The inventory source changed while Sync was being prepared. Run Sync again.");
+            }
+            const dependencyError = discoveryDependencyError(beforeFetch.servers, beforeFetch.authProfiles);
+            if (dependencyError) throw dependencyError;
             const cloned = cloneForProvider(source.config, secrets);
-            return provider.fetchInventory(cloned.config, cloned.secrets);
+            // WHY THIS FORWARD IS SYNCHRONOUS: Containerlab's controller captures
+            // the saved source, form intent, and every SSH hop/auth profile before
+            // its first await. An await between the revalidation above and this
+            // provider call could authorize a later host/config than the one this
+            // Sync command just proved current.
+            return operationContext === undefined
+              ? provider.fetchInventory(cloned.config, cloned.secrets)
+              : provider.fetchInventory(cloned.config, cloned.secrets, operationContext);
           }
         );
         try {
@@ -3940,8 +4166,15 @@ export function registerInventoryCommands(
           throw new InventoryProviderError("protocol", `Provider returned an invalid inventory tree: ${reason}`);
         }
         ({ tree, ...hostNormalization } = normalizeInventoryTreeHosts(fetched));
+        const afterFetch = core.getSnapshot();
+        const dependencyError = discoveryDependencyError(afterFetch.servers, afterFetch.authProfiles);
+        if (dependencyError) throw dependencyError;
       } catch (error) {
-        void vscode.window.showErrorMessage(`Inventory sync failed: ${describeInventoryError(error)}`);
+        if (error instanceof ContainerlabRevisionUnavailableError) {
+          showReloadWindowMessage("error", error.message);
+        } else {
+          void vscode.window.showErrorMessage(`Inventory sync failed: ${describeInventoryError(error)}`);
+        }
         return;
       }
 
@@ -4057,16 +4290,23 @@ export function registerInventoryCommands(
       // config that plan was computed from rather than the one this run started
       // with.
       let planInstanceKey = resolveProviderInstanceKey(provider, source.config);
+      const initialPlanningView = core.getSnapshot();
+      const initialDependencyError = discoveryDependencyError(initialPlanningView.servers, initialPlanningView.authProfiles);
+      if (initialDependencyError) {
+        void vscode.window.showErrorMessage(initialDependencyError.message);
+        return;
+      }
       let plan = computeSyncPlan({
         source,
         tree,
         hostNormalization,
-        currentServers: core.getSnapshot().servers,
+        currentServers: initialPlanningView.servers,
         now: Date.now(),
         authProfile: planAuthProfile,
         providerInstanceKey: planInstanceKey,
         templatesById: resolveTemplatesById(core),
-        authProfilesById: resolveAuthProfilesById(core)
+        authProfilesById: resolveAuthProfilesById(core),
+        ...discoveryPlanInputs
       });
 
       // Nothing to do AND nothing to ask: apply an empty application to bump
@@ -4128,6 +4368,12 @@ export function registerInventoryCommands(
             );
             return { kind: "abort" };
           }
+          const fastPathView = core.getSnapshot();
+          const dependencyError = discoveryDependencyError(fastPathView.servers, fastPathView.authProfiles);
+          if (dependencyError) {
+            void vscode.window.showErrorMessage(dependencyError.message);
+            return { kind: "abort" };
+          }
           const freshAuthProfile = resolveSourceAuthProfile(core, freshSource);
           // Derived from `freshSource.config`, not the outer `source`'s — the
           // pairing rule `planAuthProfile` follows, for the same reason: this
@@ -4137,12 +4383,13 @@ export function registerInventoryCommands(
             source: freshSource,
             tree,
             hostNormalization,
-            currentServers: core.getSnapshot().servers,
+            currentServers: fastPathView.servers,
             now: Date.now(),
             authProfile: freshAuthProfile,
             providerInstanceKey: freshInstanceKey,
             templatesById: resolveTemplatesById(core),
-            authProfilesById: resolveAuthProfilesById(core)
+            authProfilesById: resolveAuthProfilesById(core),
+            ...discoveryPlanInputs
           });
           // THE SAME PREDICATE AS THE OUTER GATE, deliberately — a second gate
           // asking a narrower question is the first one's blindness moved rather
@@ -4505,6 +4752,12 @@ export function registerInventoryCommands(
           // the same `source` snapshot the initial computation used.
           planAuthProfile = resolveSourceAuthProfile(core, source);
           planInstanceKey = resolveProviderInstanceKey(provider, source.config);
+          const adoptionPlanningView = core.getSnapshot();
+          const dependencyError = discoveryDependencyError(adoptionPlanningView.servers, adoptionPlanningView.authProfiles);
+          if (dependencyError) {
+            void vscode.window.showErrorMessage(dependencyError.message);
+            return;
+          }
           // RECOMPUTED ON BOTH ANSWERS, not just on Adopt. The rule this run
           // follows from here is that the answer is threaded by name into EVERY
           // computeSyncPlan call, and the preview is the first of them: a plan
@@ -4519,12 +4772,13 @@ export function registerInventoryCommands(
             source,
             tree,
             hostNormalization,
-            currentServers: core.getSnapshot().servers,
+            currentServers: adoptionPlanningView.servers,
             now: Date.now(),
             authProfile: planAuthProfile,
             providerInstanceKey: planInstanceKey,
             templatesById: resolveTemplatesById(core),
             authProfilesById: resolveAuthProfilesById(core),
+            ...discoveryPlanInputs,
             adoptionChoice
           });
           // GUARD SITE 1 of 3 (REVIEW FINDING, P1) — this recompute is the first
@@ -4723,7 +4977,13 @@ export function registerInventoryCommands(
             return { kind: "abort" };
           }
 
-          const freshServersForRecompute = core.getSnapshot().servers;
+          const recomputeView = core.getSnapshot();
+          const dependencyError = discoveryDependencyError(recomputeView.servers, recomputeView.authProfiles);
+          if (dependencyError) {
+            void vscode.window.showErrorMessage(dependencyError.message);
+            return { kind: "abort" };
+          }
+          const freshServersForRecompute = recomputeView.servers;
           // Resolved FRESH here, inside the lock, against `freshSource` — never
           // the `planAuthProfile` the modal rendered with. That is the whole
           // point of the pairing rule: a profile renamed or deleted while the
@@ -4747,6 +5007,7 @@ export function registerInventoryCommands(
             providerInstanceKey: freshInstanceKey,
             templatesById: resolveTemplatesById(core),
             authProfilesById: resolveAuthProfilesById(core),
+            ...discoveryPlanInputs,
             // ADOPT 1 — the answer given once above governs EVERY recompute of
             // this run. Omitted here, this plan would render adds where the
             // preview rendered adoptions and drift on every pass, looping the
@@ -4859,7 +5120,13 @@ export function registerInventoryCommands(
           // applyInventorySyncPlan's expectedSource — FINDING E's synchronous
           // check inside applyInventorySyncPlan is what still catches the
           // source record itself being replaced during this window.
-          const finalServersForRecompute = core.getSnapshot().servers;
+          const finalRecomputeView = core.getSnapshot();
+          const finalDependencyError = discoveryDependencyError(finalRecomputeView.servers, finalRecomputeView.authProfiles);
+          if (finalDependencyError) {
+            void vscode.window.showErrorMessage(finalDependencyError.message);
+            return { kind: "abort" };
+          }
+          const finalServersForRecompute = finalRecomputeView.servers;
           // Resolved fresh again — the teardown loop and the FINDING D vault
           // re-read above are awaits a profile rename/delete can land inside.
           const finalAuthProfile = resolveSourceAuthProfile(core, freshSource);
@@ -4877,6 +5144,7 @@ export function registerInventoryCommands(
             providerInstanceKey: freshInstanceKey,
             templatesById: resolveTemplatesById(core),
             authProfilesById: resolveAuthProfilesById(core),
+            ...discoveryPlanInputs,
             // ADOPT 1 — same answer, same run. This is the plan that is actually
             // APPLIED, so an answer missed here would not merely loop: it would
             // apply duplicate adds against consent collected for adoptions
@@ -5178,6 +5446,10 @@ export function registerInventoryCommands(
         }
         return;
       }
+    } catch (error) {
+      if (!(error instanceof InventorySourceDependencyError)) throw error;
+      void vscode.window.showErrorMessage(error.message);
+      return;
     } finally {
       releaseSourceClaim(source.id);
     }
@@ -5349,6 +5621,115 @@ export function registerInventoryCommands(
     // The resolved STRING, not the provider, so a later mutation of the
     // provider object cannot reach it either.
     const truncatedSources: { id: string; name: string; revision: string | undefined; remedy: string | undefined }[] = [];
+    const containerlabStatusDeclines: { id: string; name: string; revision: string }[] = [];
+    const containerlabRevisionDeclines: { id: string; name: string; revision: string | undefined }[] = [];
+    const containerlabDependencyDeclines: {
+      id: string;
+      name: string;
+      revision: string | undefined;
+      remedy: "sync" | "edit";
+    }[] = [];
+    const declineMissingContainerlabRevision = (source: InventorySourceConfig): void => {
+      unrefreshedSourceIds.push(source.id);
+      if (options?.manual === true) {
+        containerlabRevisionDeclines.push({ id: source.id, name: source.name, revision: source.revision });
+      }
+    };
+    const declineChangedContainerlabDependency = (
+      source: InventorySourceConfig,
+      remedy: "sync" | "edit"
+    ): void => {
+      unrefreshedSourceIds.push(source.id);
+      if (options?.manual === true) {
+        containerlabDependencyDeclines.push({
+          id: source.id,
+          name: source.name,
+          revision: source.revision,
+          remedy
+        });
+      }
+    };
+    type ContainerlabStatusDependencies = {
+      readonly hostId: string | undefined;
+      readonly snapshot: InventorySourceDependencySnapshot | undefined;
+    };
+    const captureContainerlabStatusDependencies = (
+      source: InventorySourceConfig,
+      providerSnapshot: ProviderRegistrationSnapshot,
+      liveSnapshot: ReturnType<NexusCore["getSnapshot"]>
+    ): ContainerlabStatusDependencies => {
+      const hostId = resolveDiscoverySshHostId(providerSnapshot, source.config);
+      if (source.config.location === "ssh" && hostId === undefined) {
+        throw new Error("Containerlab SSH discovery requires a configured lab host.");
+      }
+      return {
+        hostId,
+        snapshot: hostId === undefined
+          ? undefined
+          : snapshotInventorySourceDependencies(hostId, liveSnapshot.servers, liveSnapshot.authProfiles)
+      };
+    };
+    const checkContainerlabStatusDependencies = (
+      captured: ContainerlabStatusDependencies,
+      source: InventorySourceConfig,
+      providerSnapshot: ProviderRegistrationSnapshot,
+      liveSnapshot: ReturnType<NexusCore["getSnapshot"]>
+    ): "current" | "sync" | "edit" => {
+      let currentHostId: string | undefined;
+      try {
+        currentHostId = resolveDiscoverySshHostId(providerSnapshot, source.config);
+      } catch {
+        return "edit";
+      }
+      if (source.config.location === "ssh" && currentHostId === undefined) {
+        return "edit";
+      }
+      const currentRouteIsValid = (): boolean => {
+        if (currentHostId === undefined) return false;
+        try {
+          snapshotInventorySourceDependencies(currentHostId, liveSnapshot.servers, liveSnapshot.authProfiles);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      if (currentHostId !== captured.hostId) {
+        return currentRouteIsValid() ? "sync" : "edit";
+      }
+      if (captured.snapshot === undefined) {
+        return "current";
+      }
+      try {
+        assertInventorySourceDependenciesCurrent(captured.snapshot, liveSnapshot.servers, liveSnapshot.authProfiles);
+        return "current";
+      } catch {
+        return currentRouteIsValid() ? "sync" : "edit";
+      }
+    };
+    const warnIfContainerlabDependencyDeclined = (): void => {
+      if (options?.manual !== true || containerlabDependencyDeclines.length === 0) {
+        return;
+      }
+      for (const remedy of ["sync", "edit"] as const) {
+        const liveDeclines = containerlabDependencyDeclines.filter((declined) =>
+          declined.remedy === remedy && core.getInventorySource(declined.id)?.revision === declined.revision
+        );
+        if (liveDeclines.length === 0) continue;
+        const names = liveDeclines.slice(0, 3).map((declined) => `"${declined.name}"`).join(", ");
+        const andMore = liveDeclines.length > 3 ? ` and ${liveDeclines.length - 3} more` : "";
+        const action = remedy === "sync" ? "Sync Now" : "Edit Source";
+        void Promise.resolve(vscode.window.showWarningMessage(
+          `Containerlab live status was not refreshed for ${names}${andMore} because the selected SSH discovery dependency changed or is unavailable.`,
+          action
+        )).then(async (choice) => {
+          if (choice !== action) return;
+          const command = remedy === "sync" ? "nexus.inventory.syncNow" : "nexus.inventory.editSource";
+          for (const declined of liveDeclines) {
+            await vscode.commands.executeCommand(command, declined.id);
+          }
+        }).catch(() => undefined);
+      }
+    };
     // TRUNCATED STATUS (follow-up 2; R3 review) — a named renderer with ONE call
     // site, at the end of the sweep. It had two while a supersede bailed out of
     // the loop mid-list; per-source supersede (review H1) skips the superseded
@@ -5682,7 +6063,8 @@ export function registerInventoryCommands(
       // Command Center is open, so it would put a keychain round trip per source
       // per tick on the lock that every config write in the extension serializes
       // on — an ongoing cost against a window narrower than the one above.
-      const liveSource = core.getInventorySource(source.id);
+      const liveSnapshot = core.getSnapshot();
+      const liveSource = liveSnapshot.inventorySources.find((candidate) => candidate.id === source.id);
       if (liveSource === undefined || liveSource.revision !== source.revision) {
         // REPORTED, NOT REFUSED. `refusedSources` is for the trust warning,
         // whose remedy is "run Sync Inventory Now and confirm" — advice that is
@@ -5704,12 +6086,33 @@ export function registerInventoryCommands(
       if (!provider || typeof provider.fetchStatus !== "function") {
         continue; // provider gone or offers no status (e.g. NetBox)
       }
+      const providerSnapshot = registry.snapshotOf(provider);
       // P2-1(b) — capture the source's incarnation as of THIS fetch. If Edit
       // Source (or any write) changes the record while the fetch is in flight,
       // the report was produced under a config the source no longer has, so its
       // apply is dropped. Complements the global generation guard, which only
       // orders sweeps against each other.
       const startRevision = source.revision;
+      if (source.providerId === "containerlab" && !hasNonEmptyRevision(startRevision)) {
+        declineMissingContainerlabRevision(source);
+        continue;
+      }
+      let containerlabStatusDependencies: ContainerlabStatusDependencies | undefined;
+      if (source.providerId === "containerlab") {
+        try {
+          // Bind discovery configuration and its complete SSH chain to the
+          // same live core view as the record check above, before any async
+          // trust/keychain preparation begins.
+          containerlabStatusDependencies = captureContainerlabStatusDependencies(
+            liveSource,
+            providerSnapshot,
+            liveSnapshot
+          );
+        } catch {
+          declineChangedContainerlabDependency(liveSource, "edit");
+          continue;
+        }
+      }
       // #84 P2 (Codex) — capture this source's MUTATION EPOCH as of the fetch
       // start. A routine syncNow that lands while this fetch is in flight changes
       // servers (e.g. a device console port) WITHOUT bumping the source revision
@@ -5729,7 +6132,7 @@ export function registerInventoryCommands(
       // `providerStillTrustedSilently`.
       let trust: SilentProviderTrust;
       try {
-        trust = await providerStillTrustedSilently(source, registry.snapshotOf(provider), vault, confirmedProviderShapes);
+        trust = await providerStillTrustedSilently(source, providerSnapshot, vault, confirmedProviderShapes);
       } catch {
         // A REJECTING VAULT READ — the only failure this call can produce, and
         // non-fatal per source exactly like the catch around the rest of the
@@ -5807,7 +6210,63 @@ export function registerInventoryCommands(
           unrefreshedSourceIds.push(source.id);
           continue;
         }
-        const report = await fetchProviderStatus(provider, source.config, secrets);
+        const currentSnapshot = core.getSnapshot();
+        const currentSource = currentSnapshot.inventorySources.find((candidate) => candidate.id === source.id);
+        if (!currentSource) {
+          unrefreshedSourceIds.push(source.id);
+          continue;
+        }
+        let report: Awaited<ReturnType<typeof fetchProviderStatus>>;
+        if (source.providerId === "containerlab") {
+          if (!hasNonEmptyRevision(startRevision) || !hasNonEmptyRevision(currentSource.revision)) {
+            declineMissingContainerlabRevision(currentSource);
+            continue;
+          }
+          if (currentSource.revision !== startRevision) {
+            unrefreshedSourceIds.push(source.id);
+            continue;
+          }
+          const capturedDependencies = containerlabStatusDependencies;
+          if (capturedDependencies === undefined) {
+            declineChangedContainerlabDependency(currentSource, "edit");
+            continue;
+          }
+          const dependencyState = checkContainerlabStatusDependencies(
+            capturedDependencies,
+            currentSource,
+            providerSnapshot,
+            currentSnapshot
+          );
+          if (dependencyState !== "current") {
+            declineChangedContainerlabDependency(currentSource, dependencyState);
+            continue;
+          }
+          const operationContext: InventoryOperationContext = {
+            intent: options?.manual === true ? "manual-status" : "background-status",
+            subject: { kind: "source", sourceId: currentSource.id, revision: startRevision }
+          };
+          // Containerlab captures the source and its complete SSH route
+          // synchronously when this wrapper forwards the provider call. Keep the
+          // revision recheck directly adjacent to forwarding, with no await gap.
+          report = await fetchProviderStatus(provider, currentSource.config, secrets, operationContext);
+        } else {
+          if (currentSource.revision !== startRevision) {
+            unrefreshedSourceIds.push(source.id);
+            continue;
+          }
+          report = await fetchProviderStatus(provider, currentSource.config, secrets);
+        }
+        if (!report && source.providerId === "containerlab") {
+          // The controller rejects unapproved, stale, or unavailable status
+          // before a report can return. Polls decline silently; a manual refresh
+          // offers the remedy: Sync Now and explicit approval of read-only inspect.
+          attempted--;
+          unrefreshedSourceIds.push(source.id);
+          if (options?.manual === true && typeof currentSource.revision === "string") {
+            containerlabStatusDeclines.push({ id: source.id, name: source.name, revision: currentSource.revision });
+          }
+          continue;
+        }
         if (report) {
           // A report (even an empty one) means the source was reachable — count
           // it as a success for the total-failure warning regardless of whether
@@ -5839,12 +6298,31 @@ export function registerInventoryCommands(
           //    one poll tick. Self-healing on the next refresh or sync, and
           //    dropping is still the conservative direction, so the guard stays
           //    as it is.
-          const currentSource = core.getInventorySource(source.id);
+          const finalSnapshot = core.getSnapshot();
+          const currentSource = finalSnapshot.inventorySources.find((candidate) => candidate.id === source.id);
           if (
             holdsClaim(source.id) &&
-            currentSource?.revision === startRevision &&
+            currentSource !== undefined &&
+            currentSource.revision === startRevision &&
             core.getSourceMutationEpoch(source.id) === startEpoch
           ) {
+            if (source.providerId === "containerlab") {
+              const capturedDependencies = containerlabStatusDependencies;
+              if (capturedDependencies === undefined) {
+                declineChangedContainerlabDependency(currentSource, "edit");
+                continue;
+              }
+              const dependencyState = checkContainerlabStatusDependencies(
+                capturedDependencies,
+                currentSource,
+                providerSnapshot,
+                finalSnapshot
+              );
+              if (dependencyState !== "current") {
+                declineChangedContainerlabDependency(currentSource, dependencyState);
+                continue;
+              }
+            }
             core.applyInventoryStatus(source.id, report);
             // R4 (review) — record WHOSE apply the tree is now showing for this
             // source, for every report and not only truncated ones (see the map's
@@ -5962,6 +6440,40 @@ export function registerInventoryCommands(
     // the manual-only gate and the one-message rule live in
     // `warnIfProviderRefused` above.
     warnIfProviderRefused();
+    warnIfContainerlabDependencyDeclined();
+    const liveContainerlabDeclines = containerlabStatusDeclines.filter((declined) =>
+      core.getInventorySource(declined.id)?.revision === declined.revision
+    );
+    if (liveContainerlabDeclines.length > 0) {
+      const names = liveContainerlabDeclines.slice(0, 3).map((declined) => `"${declined.name}"`).join(", ");
+      const andMore = liveContainerlabDeclines.length > 3 ? ` and ${liveContainerlabDeclines.length - 3} more` : "";
+      void vscode.window.showWarningMessage(
+        `Containerlab live status was not refreshed for ${names}${andMore}. Run Sync Now and choose Run to confirm read-only discovery.`,
+        "Sync Now"
+      ).then((choice) => {
+        if (choice === "Sync Now") {
+          void (async (): Promise<void> => {
+            for (const declined of liveContainerlabDeclines) {
+              await vscode.commands.executeCommand("nexus.inventory.syncNow", declined.id);
+            }
+          })().catch(() => undefined);
+        }
+      });
+    }
+    const liveContainerlabRevisionDeclines = containerlabRevisionDeclines.filter((declined) => {
+      const current = core.getInventorySource(declined.id);
+      return current !== undefined && current.revision === declined.revision;
+    });
+    if (liveContainerlabRevisionDeclines.length > 0) {
+      const names = liveContainerlabRevisionDeclines.slice(0, 3).map((declined) => `"${declined.name}"`).join(", ");
+      const andMore = liveContainerlabRevisionDeclines.length > 3
+        ? ` and ${liveContainerlabRevisionDeclines.length - 3} more`
+        : "";
+      showReloadWindowMessage(
+        "warning",
+        `Containerlab live status was not refreshed for ${names}${andMore} because saved source metadata is incomplete. Reload Window to restore the missing revision.`
+      );
+    }
     return { unrefreshedSourceIds };
   }
 

@@ -1,11 +1,26 @@
 import { describe, expect, it, vi } from "vitest";
 import { NexusCore } from "../../src/core/nexusCore";
 import type { AuthProfile, ServerConfig } from "../../src/models/config";
+import type { InventorySourceConfig } from "../../src/models/inventory";
 import { watchPoolInvalidationOnConfigMutation } from "../../src/services/ssh/poolConfigInvalidation";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 
 function server(id: string, extra: Partial<ServerConfig> = {}): ServerConfig {
   return { id, name: id, host: `${id}.example`, port: 22, username: "u", authType: "password", isHidden: false, ...extra };
+}
+
+function inventorySource(id: string, authProfileId?: string): InventorySourceConfig {
+  return {
+    id,
+    providerId: "containerlab",
+    name: id,
+    targetFolder: "",
+    prunePolicy: "orphan",
+    defaultUsername: "u",
+    config: { location: "local" },
+    secretFieldIds: [],
+    ...(authProfileId ? { authProfileId } : {})
+  };
 }
 
 /** A repository whose persistence can be held open, like a slow globalState write. */
@@ -185,6 +200,80 @@ describe("auth profile removal and edits", () => {
     const pending = core.removeAuthProfile("ap");
     expect(ids()).toEqual(new Set(["jump", "t"]));
     await settle(repo, pending);
+    stop();
+  });
+
+  it("keeps auth-profile invalidation synchronous with an active lifecycle listener when no source is affected", async () => {
+    const profile: AuthProfile = { id: "ap", name: "AP", username: "a", authType: "password" };
+    const { core, repo, ids, stop } = await setup(
+      [server("jump", { authProfileId: "ap" }), server("t", { proxy: { type: "ssh", jumpHostId: "jump" } })],
+      [profile]
+    );
+    const prepare = vi.fn();
+    const unsubscribe = core.onPrepareInventorySourceMutation(prepare);
+    const pending = core.removeAuthProfile("ap");
+
+    expect(ids()).toEqual(new Set(["jump", "t"]));
+    expect(prepare).not.toHaveBeenCalled();
+    await settle(repo, pending);
+    unsubscribe();
+    stop();
+  });
+
+  it("keeps source auth-link revisions synchronous when no lifecycle listener is registered", async () => {
+    const profile: AuthProfile = { id: "ap", name: "AP", username: "a", authType: "password" };
+    const { core, repo, stop } = await setup([server("jump", { authProfileId: "ap" })], [profile]);
+    repo.hold = false;
+    await core.addOrUpdateInventorySource(inventorySource("source", "ap"));
+    repo.hold = true;
+    const previous = core.getInventorySource("source")!;
+    const pending = core.removeAuthProfile("ap");
+
+    expect(core.getInventorySource("source")?.revision).not.toBe(previous.revision);
+    expect(core.getInventorySource("source")?.authProfileId).toBeUndefined();
+    await settle(repo, pending);
+    stop();
+  });
+
+  it("holds the source revision until active lifecycle preparation finishes, then invalidates before auth persistence", async () => {
+    const profile: AuthProfile = { id: "ap", name: "AP", username: "a", authType: "password" };
+    const { core, repo, ids, stop } = await setup([server("jump", { authProfileId: "ap" })], [profile]);
+    repo.hold = false;
+    await core.addOrUpdateInventorySource(inventorySource("source", "ap"));
+    repo.hold = true;
+    const previous = core.getInventorySource("source")!;
+
+    let enterPreparation!: () => void;
+    const preparationStarted = new Promise<void>((resolve) => { enterPreparation = resolve; });
+    let releasePreparation!: () => void;
+    const preparationGate = new Promise<void>((resolve) => { releasePreparation = resolve; });
+    let enterAuthSave!: () => void;
+    const authSaveStarted = new Promise<void>((resolve) => { enterAuthSave = resolve; });
+    const saveAuthProfiles = repo.saveAuthProfiles.bind(repo);
+    vi.spyOn(repo, "saveAuthProfiles").mockImplementation(async (profiles) => {
+      enterAuthSave();
+      await saveAuthProfiles(profiles);
+    });
+    const prepare = vi.fn(async () => {
+      enterPreparation();
+      await preparationGate;
+      return { commit: () => undefined, abort: () => undefined };
+    });
+    const unsubscribe = core.onPrepareInventorySourceMutation(prepare);
+    const pending = core.removeAuthProfile("ap");
+    await preparationStarted;
+
+    expect(core.getInventorySource("source")).toBe(previous);
+    expect(repo.release).toBeUndefined();
+    expect(ids()).toEqual(new Set());
+
+    releasePreparation();
+    await authSaveStarted;
+    expect(core.getInventorySource("source")?.revision).not.toBe(previous.revision);
+    expect(core.getInventorySource("source")?.authProfileId).toBeUndefined();
+    expect(ids()).toEqual(new Set(["jump"]));
+    await settle(repo, pending);
+    unsubscribe();
     stop();
   });
 

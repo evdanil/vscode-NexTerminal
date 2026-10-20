@@ -1,9 +1,9 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createBuiltInProviders } from "../../src/services/inventory/builtInProviders";
 import { InventoryProviderRegistry, validateProviderShape } from "../../src/services/inventory/providerRegistry";
-import { computeProviderFingerprint } from "../../src/models/inventory";
+import { computeProviderFingerprint, type InventoryOperationContext } from "../../src/models/inventory";
 
 /**
  * The guard on the two ways a built-in provider has actually failed to ship
@@ -17,7 +17,34 @@ import { computeProviderFingerprint } from "../../src/models/inventory";
  */
 describe("built-in inventory providers", () => {
   it("declares exactly the shipped providers, in add-source picker order (⊘ a set comparison would pass on a reorder, and order is what the user sees first)", () => {
-    expect(createBuiltInProviders().map((p) => p.id)).toEqual(["netbox", "eve-ng", "proxmox", "gns3"]);
+    expect(createBuiltInProviders().map((p) => p.id)).toEqual(["netbox", "eve-ng", "proxmox", "gns3", "containerlab"]);
+  });
+
+  it("registers Containerlab as an inventory-only provider and injects its runtime explicitly", async () => {
+    const context: InventoryOperationContext = {
+      intent: "test",
+      subject: { kind: "form", sessionId: "form-1" }
+    };
+    const runtime = { inspect: vi.fn(async () => ({ version: "0.80.0", stdout: "{}" })) };
+    const provider = createBuiltInProviders({ containerlabRuntime: runtime }).find((item) => item.id === "containerlab");
+
+    expect(provider).toBeDefined();
+    expect(provider?.controlNode).toBeUndefined();
+    expect(provider?.canControlNode).toBeUndefined();
+    expect(provider?.webConsoleUrl).toBeUndefined();
+    expect(provider?.canWebConsole).toBeUndefined();
+    expect(provider?.instanceKey).toBeUndefined();
+    await provider?.testConnection?.({}, {}, context);
+    expect(runtime.inspect).toHaveBeenCalledWith(
+      expect.objectContaining({ location: "local", runner: "host" }),
+      context
+    );
+  });
+
+  it("gives a restored Containerlab source an actionable browser-runtime remedy", async () => {
+    const provider = createBuiltInProviders().find((item) => item.id === "containerlab");
+
+    await expect(provider?.testConnection?.({}, {})).rejects.toThrow("desktop VS Code");
   });
 
   it("gives every provider a non-empty label, which is the ONLY string every list, row and description renders it by", () => {
@@ -64,7 +91,8 @@ describe("built-in inventory providers", () => {
       netbox: "dc9a66a54bad3a2f",
       "eve-ng": "5f83d2655fc19c02",
       proxmox: "b3dd29d387e21afd",
-      gns3: "1e603c982fd7d0bb"
+      gns3: "1e603c982fd7d0bb",
+      containerlab: "115a570be2cf9bf9"
     });
   });
 
@@ -84,12 +112,21 @@ describe("built-in inventory providers", () => {
     const source = readFileSync(path.resolve(__dirname, "..", "..", "src", "extension.ts"), "utf8");
 
     it("registers every built-in provider by iterating the shared array (⊘ importing the array without looping would satisfy a name check)", () => {
-      expect(source).toMatch(/for \(const provider of createBuiltInProviders\(\)\) \{/);
+      expect(source).toMatch(/for \(const provider of createBuiltInProviders\(\{ containerlabRuntime \}\)\) \{/);
       expect(source).toMatch(/inventoryProviderRegistry\.register\(provider\);/);
     });
 
     it("⊘ names no individual provider factory in activate(), so adding one cannot require an edit here", () => {
       expect(source).not.toMatch(/inventoryProviderRegistry\.register\(create\w+Provider\(\)\)/);
+    });
+
+    it("keeps startup independent of the approval store because a fresh controller already has no authority", () => {
+      expect(source).not.toMatch(/await containerlabActivation\.invalidateAllSources\(\)/);
+      const controllerIndex = source.indexOf("const containerlabActivation = createContainerlabActivationController({");
+      const providerLoopIndex = source.indexOf("for (const provider of createBuiltInProviders({ containerlabRuntime })) {");
+      expect(controllerIndex).toBeGreaterThanOrEqual(0);
+      expect(providerLoopIndex).toBeGreaterThanOrEqual(0);
+      expect(controllerIndex).toBeLessThan(providerLoopIndex);
     });
   });
 });

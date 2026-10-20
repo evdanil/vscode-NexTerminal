@@ -162,7 +162,9 @@ function fieldIdentical(a: DeviceTemplateProfile, b: DeviceTemplateProfile, fiel
     return false;
   }
   if (field === "proxy") {
-    return proxyConfigsEqual(a.fields.proxy!.value, b.fields.proxy!.value);
+    const av = a.fields.proxy!.value;
+    const bv = b.fields.proxy!.value;
+    return av === null || bv === null ? av === bv : proxyConfigsEqual(av, bv);
   }
   return (fa.value as unknown) === (fb.value as unknown);
 }

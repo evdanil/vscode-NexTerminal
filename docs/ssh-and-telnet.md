@@ -129,5 +129,5 @@ SSH connection, keepalive, host-key, proxy-timeout and multiplexing settings: [s
 - [File Explorer](file-explorer.md) — SFTP browsing on a connected server
 - [Terminal](terminal.md) — highlighting, tab commands, transcripts, keyboard passthrough
 - [Import and Export](import-export.md#import-from-an-ssh-config) — bring servers in from `~/.ssh/config`, MobaXterm or SecureCRT
-- [Inventory Sync](inventory/README.md) — servers created from NetBox, EVE-NG, Proxmox or GNS3, including [servers with no address yet](inventory/README.md#servers-with-no-address-yet)
+- [Inventory Sync](inventory/README.md) — servers created from NetBox, EVE-NG, Proxmox, GNS3 or Containerlab, including [servers with no address yet](inventory/README.md#servers-with-no-address-yet)
 - [Connectivity Hub](connectivity-hub.md) — folders, filter and drag and drop

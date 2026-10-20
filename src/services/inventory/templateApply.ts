@@ -1,5 +1,17 @@
-import type { AuthProfile, DetachedServerOrigin, ProxyConfig, ServerConfig, ServerOrigin } from "../../models/config";
-import { authProfileNeedsServerKeyPath, templatedHasAnyStamp } from "../../models/config";
+import type {
+  AuthProfile,
+  DetachedServerOrigin,
+  InventoryProxyOwnership,
+  ProxyConfig,
+  ServerConfig,
+  ServerOrigin
+} from "../../models/config";
+import {
+  authProfileNeedsServerKeyPath,
+  cloneInventoryProxyOwnership,
+  cloneTemplatedStamps,
+  templatedHasAnyStamp
+} from "../../models/config";
 import type { InventoryDevice, InventorySourceConfig, TemplateRule } from "../../models/inventory";
 import type { DeviceTemplateProfile, TemplateField, TemplateFieldMode } from "../../models/deviceTemplate";
 
@@ -122,17 +134,22 @@ const NON_AUTH_TEMPLATABLE_FIELDS = [
 export function templateAppliedFields(
   server: Pick<ServerConfig, "proxy" | "multiplexing" | "legacyAlgorithms" | "logSession" | "ipmiAuthProfileId" | "ipmiGatewayServerId" | "origin">
 ): TemplatableField[] {
-  const stamps = server.origin?.templated;
-  if (stamps === undefined) {
-    return [];
-  }
+  const origin = server.origin;
+  const stamps = origin?.templated;
   const applied: TemplatableField[] = [];
+  const proxyOwnership = origin?.proxyOwnership;
+  if (proxyOwnership !== undefined) {
+    if (proxyOwnership.owner === "template" && proxyEqual(server.proxy, proxyOwnership.value ?? undefined)) {
+      applied.push("proxy");
+    }
+  } else if (origin?.proxyOptOut !== true && stamps?.proxy !== undefined && proxyEqual(server.proxy, stamps.proxy)) {
+    // Older origins have no canonical ownership record; their equality stamp
+    // remains usable unless the user explicitly opted out of template proxying.
+    applied.push("proxy");
+  }
+  if (stamps === undefined) return applied;
   for (const field of NON_AUTH_TEMPLATABLE_FIELDS) {
-    if (field === "proxy") {
-      if (stamps.proxy !== undefined && proxyEqual(server.proxy, stamps.proxy)) {
-        applied.push("proxy");
-      }
-    } else if (stamps[field] !== undefined && server[field] === stamps[field]) {
+    if (field !== "proxy" && stamps[field] !== undefined && server[field] === stamps[field]) {
       // Booleans and the two IPMI id strings alike: PRESENT stamp AND cur === stamp.
       applied.push(field);
     }
@@ -442,7 +459,7 @@ export function unknownFilterKeys(parsed: ParsedFilter, attributeKeys: readonly 
 
 /** The per-field winners of the cascade — the {mode, value} each field resolves to. */
 export interface CascadeWinners {
-  proxy?: TemplateField<ProxyConfig>;
+  proxy?: TemplateField<ProxyConfig | null>;
   authProfileId?: TemplateField<string>;
   multiplexing?: TemplateField<boolean>;
   legacyAlgorithms?: TemplateField<boolean>;
@@ -453,7 +470,9 @@ export interface CascadeWinners {
 
 /** §3.4 — where one field's applied value came from, for the plan-report provenance lines. */
 export interface FieldProvenance {
-  templateName: string;
+  templateName?: string;
+  /** The route came from the provider's implicit source default. */
+  sourceDefault?: true;
   /** The winning rule's raw filter; undefined for a catch-all rule or the implicit source rule. */
   ruleFilter?: string;
 }
@@ -598,7 +617,7 @@ export function selectFieldWinners(
     return { field: winField, templateName: winner.template.name };
   };
 
-  const proxyWin = resolveField<ProxyConfig>("proxy", (t) => t.fields.proxy, proxyEqual);
+  const proxyWin = resolveField<ProxyConfig | null>("proxy", (t) => t.fields.proxy, (a, b) => proxyEqual(a ?? undefined, b ?? undefined));
   if (proxyWin !== undefined) {
     winners.proxy = proxyWin.field;
   }
@@ -655,7 +674,7 @@ export interface DesiredField<T> {
 }
 
 export interface DesiredNonAuthFields {
-  proxy?: DesiredField<ProxyConfig>;
+  proxy?: DesiredField<ProxyConfig | null> & { owner: InventoryProxyOwnership["owner"] };
   multiplexing?: DesiredField<boolean>;
   legacyAlgorithms?: DesiredField<boolean>;
   logSession?: DesiredField<boolean>;
@@ -730,13 +749,13 @@ export function composeDesiredFields(
   const warnings: string[] = [];
   if (winners.proxy !== undefined) {
     const value = winners.proxy.value;
-    if (value.type === "ssh" && proxyRef !== undefined && !proxyRef.hasServer(value.jumpHostId)) {
+    if (value !== null && value.type === "ssh" && proxyRef !== undefined && !proxyRef.hasServer(value.jumpHostId)) {
       warnings.push(
         `Device template "${proxyRef.proxyTemplateName ?? "?"}" on "${proxyRef.sourceName}" sets a jump-host proxy whose jump host no longer exists — the proxy field was skipped.`
       );
       // desired none — leave `desired.proxy` unset (NOT written undefined).
     } else {
-      desired.proxy = { value, mode: winners.proxy.mode };
+      desired.proxy = { value, mode: winners.proxy.mode, owner: "template" };
     }
   }
   if (winners.multiplexing !== undefined) {
@@ -776,8 +795,9 @@ export function composeDesiredFields(
   return { desired, warnings };
 }
 
-function proxyEqual(a: ProxyConfig | undefined, b: ProxyConfig | undefined): boolean {
+function proxyEqual(a: ProxyConfig | null | undefined, b: ProxyConfig | null | undefined): boolean {
   if (a === b) return true;
+  if (a === null || b === null) return false;
   if (!a || !b || a.type !== b.type) return false;
   if (a.type === "ssh") {
     return b.type === "ssh" && a.jumpHostId === b.jumpHostId;
@@ -827,6 +847,10 @@ export interface TemplateMatrixResult {
   values: Partial<Pick<ServerConfig, "proxy" | "multiplexing" | "legacyAlgorithms" | "logSession" | "ipmiAuthProfileId" | "ipmiGatewayServerId">>;
   /** The full new `origin.templated` record — carried-forward stamps with the written fields updated. */
   templated: ServerOrigin["templated"];
+  /** Canonical route owner after migration and this run's matrix decision. */
+  proxyOwnership: InventoryProxyOwnership | undefined;
+  /** True when this run applied an automatic route or transferred its owner. */
+  proxyWritten: boolean;
   /** §5.3 per-device self-reference skip warnings (a proxy routing the target through itself). */
   warnings: string[];
   /**
@@ -853,6 +877,7 @@ export interface TemplateMatrixResult {
 export interface ProxySelfReferenceContext {
   targetServerId: string;
   targetServerName: string;
+  sourceName: string;
   proxyTemplateName: string | undefined;
   // PR-T3 review FIX 2 — the SAME per-device self-reference judgement for the
   // IPMI gateway id (a server id, like a jump host): a gateway winner equal to
@@ -880,13 +905,35 @@ export function applyTemplateMatrix(
   const values: TemplateMatrixResult["values"] = {};
   const warnings: string[] = [];
   let clearProxy = false;
+  let proxyWritten = false;
   const carried = ownedServer?.origin?.templated;
-  const templated: NonNullable<ServerOrigin["templated"]> = carried
-    ? { ...carried, proxy: carried.proxy ? { ...carried.proxy } : carried.proxy }
-    : {};
+  const templated: NonNullable<ServerOrigin["templated"]> = carried ? cloneTemplatedStamps(carried) : {};
+  let proxyOwnership =
+    ownedServer?.origin?.proxyOwnership !== undefined
+      ? cloneInventoryProxyOwnership(ownedServer.origin.proxyOwnership)
+      : undefined;
+  // Old releases stored only a template value stamp. It is enough to preserve
+  // the old manual-edit boundary, but never enough to infer source ownership.
+  if (proxyOwnership === undefined && carried?.proxy !== undefined) {
+    proxyOwnership = { owner: "template", value: { ...carried.proxy } };
+  }
+  // `templated.proxy` is now migration input only. All matrix results use the
+  // canonical owner stamp so Direct and equal-valued source/template routes stay
+  // distinguishable.
+  if (ownedServer?.origin?.proxyOptOut === true) {
+    proxyOwnership = undefined;
+  }
 
   if (desired.proxy !== undefined) {
     const value = desired.proxy.value;
+    const current = ownedServer?.proxy;
+    const currentRoute = current ?? null;
+    const ownerMatchesCurrent =
+      proxyOwnership !== undefined && proxyEqual(current, proxyOwnership.value ?? undefined);
+    const protectedManualRoute =
+      ownedServer?.origin?.proxyOptOut === true ||
+      (current !== undefined && proxyOwnership === undefined) ||
+      (proxyOwnership !== undefined && !ownerMatchesCurrent);
     // §5.3 SELF-REFERENCE (per-device): a jump host that IS the device being
     // written routes it through itself. Two distinct dispositions here (§5.3 vs
     // survivor-cleanup philosophy):
@@ -904,36 +951,60 @@ export function applyTemplateMatrix(
     //    carried. Scoped to template-OWNED (`proxyEqual(cur, stamp)`) so a hand
     //    self-proxy stays the connect-time error, untouched (§8.4).
     // The dangling check already ran once in composeDesiredFields.
-    if (value.type === "ssh" && proxyRef !== undefined && value.jumpHostId === proxyRef.targetServerId) {
-      const cur = ownedServer?.proxy;
-      const stamp = carried?.proxy;
+    if (value !== null && value.type === "ssh" && proxyRef !== undefined && value.jumpHostId === proxyRef.targetServerId) {
+      const writer =
+        desired.proxy.owner === "source-default"
+          ? `Inventory source default for "${proxyRef.sourceName}"`
+          : `Device template "${proxyRef.proxyTemplateName ?? "?"}"`;
       const curIsOwnedSelfProxy =
-        cur !== undefined &&
-        cur.type === "ssh" &&
-        cur.jumpHostId === proxyRef.targetServerId &&
-        stamp !== undefined &&
-        proxyEqual(cur, stamp); // §8.4 — template-OWNED only; a hand self-proxy is left alone
+        current !== undefined &&
+        current.type === "ssh" &&
+        current.jumpHostId === proxyRef.targetServerId &&
+        ownerMatchesCurrent; // hand-set self-proxies remain untouched
       if (curIsOwnedSelfProxy) {
         // Repair: drop the stamp (so it is not carried) and signal the caller to
         // remove the record's `proxy` field. `values.proxy` is intentionally NOT
         // set — a self-proxy is never a value to write.
-        delete templated.proxy;
+        proxyOwnership = undefined;
         clearProxy = true;
+        proxyWritten = true;
         warnings.push(
-          `Device template "${proxyRef.proxyTemplateName ?? "?"}" routed "${proxyRef.targetServerName}" through itself — the invalid proxy was cleared.`
+          `${writer} routed "${proxyRef.targetServerName}" through itself — the invalid proxy was cleared.`
         );
       } else {
         warnings.push(
-          `Device template "${proxyRef.proxyTemplateName ?? "?"}" would route "${proxyRef.targetServerName}" through itself — the proxy field was skipped.`
+          `${writer} would route "${proxyRef.targetServerName}" through itself — the proxy field was skipped.`
         );
       }
-    } else {
-      const cur = ownedServer?.proxy;
-      const stamp = carried?.proxy;
-      const write = ownedServer === undefined ? true : matrixWrites(cur !== undefined, cur, stamp !== undefined, stamp, desired.proxy, proxyEqual);
+    } else if (!protectedManualRoute) {
+      let write = false;
+      if (desired.proxy.owner === "source-default") {
+        // Source defaults may refresh their own value and take over an unchanged
+        // template value after the explicit template rule disappears.
+        write =
+          proxyOwnership === undefined ||
+          !ownerMatchesCurrent ||
+          proxyOwnership.owner !== "source-default" ||
+          !proxyEqual(current, value ?? undefined);
+      } else if (proxyOwnership?.owner === "source-default" && ownerMatchesCurrent) {
+        // A source default is implicit. Even a template Fill deliberately
+        // supersedes it; the fill/override mode still governs template-owned data.
+        write = true;
+      } else if (ownerMatchesCurrent) {
+        write = matrixWrites(true, currentRoute, true, proxyOwnership?.value, desired.proxy, (a, b) => proxyEqual(a, b));
+      } else if (proxyOwnership === undefined && current === undefined) {
+        write = true;
+      }
       if (write) {
-        values.proxy = { ...value };
-        templated.proxy = { ...value };
+        if (value === null) {
+          if (current !== undefined) {
+            clearProxy = true;
+          }
+        } else {
+          values.proxy = { ...value };
+        }
+        proxyOwnership = { owner: desired.proxy.owner, value: value === null ? null : { ...value } };
+        proxyWritten = true;
       }
     }
   }
@@ -992,7 +1063,17 @@ export function applyTemplateMatrix(
   applyId("ipmiAuthProfileId");
   applyId("ipmiGatewayServerId");
 
-  return { values, templated: templatedHasAnyStamp(templated) ? templated : undefined, warnings, clearProxy };
+  // `templated.proxy` is accepted only as migration input. Every output carries
+  // the canonical ownership receipt, including unchanged/manual-route results.
+  delete templated.proxy;
+  return {
+    values,
+    templated: templatedHasAnyStamp(templated) ? templated : undefined,
+    proxyOwnership,
+    proxyWritten,
+    warnings,
+    clearProxy
+  };
 }
 
 /**
@@ -1201,6 +1282,8 @@ export function computeProfilesNeedingServerKey(params: {
 export interface ManualApplyServerWrite {
   serverId: string;
   proxy?: ProxyConfig;
+  /** Explicit Direct template value; delete the persisted proxy member. */
+  clearProxy?: true;
   multiplexing?: boolean;
   legacyAlgorithms?: boolean;
   logSession?: boolean;
@@ -1234,6 +1317,7 @@ export interface AuthFieldPlan {
 
 export interface ManualApplyPlan {
   serverWrites: ManualApplyServerWrite[];
+  /** Proxy field counts, including explicit Direct clears. */
   proxy?: ValueFieldPlan;
   multiplexing?: ValueFieldPlan;
   legacyAlgorithms?: ValueFieldPlan;
@@ -1298,9 +1382,9 @@ export function planManualTemplateApply(ctx: ManualApplyContext): ManualApplyPla
   // ---- Proxy ----------------------------------------------------------------
   const proxyField = template.fields.proxy;
   if (proxyField !== undefined) {
-    let proxyValue: ProxyConfig | undefined = proxyField.value;
+    let proxyValue: ProxyConfig | null | undefined = proxyField.value;
     // §5.3 dangling jump host — device-independent, checked once; drops the field.
-    if (proxyValue.type === "ssh" && !hasServer(proxyValue.jumpHostId)) {
+    if (proxyValue !== null && proxyValue !== undefined && proxyValue.type === "ssh" && !hasServer(proxyValue.jumpHostId)) {
       warnings.push(`Device template "${template.name}" sets a jump-host proxy whose jump host no longer exists — the proxy field was skipped.`);
       proxyValue = undefined;
     }
@@ -1308,7 +1392,7 @@ export function planManualTemplateApply(ctx: ManualApplyContext): ManualApplyPla
       const stats: ValueFieldPlan = { mode: proxyField.mode, willSet: 0, skipped: 0 };
       for (const server of servers) {
         // §5.3 per-device self-reference — a jump host that IS this server.
-        if (proxyValue.type === "ssh" && proxyValue.jumpHostId === server.id) {
+        if (proxyValue !== null && proxyValue.type === "ssh" && proxyValue.jumpHostId === server.id) {
           warnings.push(`Device template "${template.name}" would route "${server.name}" through itself — the proxy field was skipped.`);
           stats.skipped++;
           continue;
@@ -1316,7 +1400,11 @@ export function planManualTemplateApply(ctx: ManualApplyContext): ManualApplyPla
         const write = proxyField.mode === "override" || server.proxy === undefined;
         if (write) {
           const w = writeFor(server.id);
-          w.proxy = proxyValue;
+          if (proxyValue === null) {
+            w.clearProxy = true;
+          } else {
+            w.proxy = proxyValue;
+          }
           w.writtenFields.push("proxy");
           stats.willSet++;
         } else {
@@ -1492,12 +1580,21 @@ export function planManualTemplateApply(ctx: ManualApplyContext): ManualApplyPla
  * first and let this fill in only the cleared members — keeping each wrapper's declared
  * return type intact.
  */
-type StampBearer = { syncedAuthProfileId?: string; templated?: ServerOrigin["templated"] };
+type StampBearer = {
+  syncedAuthProfileId?: string;
+  templated?: ServerOrigin["templated"];
+  proxyOwnership?: ServerOrigin["proxyOwnership"];
+  proxyOptOut?: true;
+};
 function clearStampMembers(source: StampBearer, target: StampBearer, writtenFields: readonly TemplatableField[]): void {
   if (writtenFields.includes("authProfileId")) {
     target.syncedAuthProfileId = undefined; // the auth link's twin keys off `authProfileId`, not a `templated` member
   }
   const templated = source.templated ? { ...source.templated } : undefined;
+  if (writtenFields.includes("proxy")) {
+    delete target.proxyOwnership;
+    delete target.proxyOptOut;
+  }
   if (templated !== undefined) {
     for (const field of writtenFields) {
       if (

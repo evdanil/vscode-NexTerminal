@@ -11,8 +11,30 @@ export interface PasswordPrompt {
   prompt(server: ServerConfig, signal?: AbortSignal): Promise<PasswordPromptResult | undefined>;
 }
 
+export type SshInteractionPolicy = "interactive" | "noninteractive";
+
+export class SshInteractionRequiredError extends Error {
+  public readonly code = "interaction-required";
+
+  public constructor(message: string) {
+    super(message);
+    this.name = "SshInteractionRequiredError";
+  }
+}
+
+export interface SshCommandChannel {
+  readonly stdout: NodeJS.ReadableStream;
+  readonly stderr: NodeJS.ReadableStream;
+  readonly completion: Promise<{ readonly code: number | null; readonly signal?: string }>;
+  close(): void;
+}
+
 export interface HostKeyVerifier {
-  verify(server: ServerConfig, hostKey: Buffer): Promise<boolean>;
+  verify(
+    server: ServerConfig,
+    hostKey: Buffer,
+    context?: Pick<SshConnectContext, "interaction" | "signal">
+  ): Promise<boolean>;
 }
 
 export interface SecretVault {
@@ -44,6 +66,7 @@ export interface SshConnection {
   openDirectTcp(remoteIP: string, remotePort: number): Promise<Duplex>;
   openSftp(): Promise<SFTPWrapper>;
   exec(command: string): Promise<Duplex>;
+  execCommand?(command: string, signal?: AbortSignal): Promise<SshCommandChannel>;
   requestForwardIn(bindAddr: string, bindPort: number): Promise<number>;
   cancelForwardIn(bindAddr: string, bindPort: number): Promise<void>;
   onTcpConnection(handler: (info: TcpConnectionInfo, accept: () => Duplex, reject: () => void) => void): () => void;
@@ -55,6 +78,10 @@ export interface SshConnection {
 }
 
 export interface SshConnectContext {
+  /** Defaults to interactive for existing terminal and service callers. */
+  interaction?: SshInteractionPolicy;
+  /** Cancels acquisition, authentication, and command-channel fallback work. */
+  signal?: AbortSignal;
   proxyVisited?: ReadonlySet<string>;
   /**
    * The live config record whose credentials this connect attempt belongs to.
@@ -100,6 +127,8 @@ export interface SshConnector {
       sock?: Duplex;
       onKeyboardInteractive?: KeyboardInteractiveHandler;
       onAuthMessage?: (text: string) => boolean | void;
+      interaction?: SshInteractionPolicy;
+      signal?: AbortSignal;
     }
   ): Promise<SshConnection>;
 }

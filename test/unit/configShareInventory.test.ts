@@ -90,6 +90,7 @@ import { EVE_NG_PROVIDER_ID } from "../../src/services/inventory/providers/eveNg
 import { GNS3_PROVIDER_ID } from "../../src/services/inventory/providers/gns3Provider";
 import { PROXMOX_PROVIDER_ID } from "../../src/services/inventory/providers/proxmoxProvider";
 import { inventorySecretKey, type InventoryDevice, type InventorySourceConfig, type InventoryTree } from "../../src/models/inventory";
+import { parseContainerlabConfig } from "../../src/services/inventory/providers/containerlabConfig";
 import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, ServerOrigin, TunnelProfile } from "../../src/models/config";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 import type { DeviceTemplateProfile } from "../../src/models/deviceTemplate";
@@ -174,6 +175,25 @@ function makeSource(overrides: Partial<InventorySourceConfig> = {}): InventorySo
   };
 }
 
+const malformedSharedConfigShapes: ReadonlyArray<{ readonly label: string; readonly value?: unknown; readonly absent?: true }> = [
+  { label: "null", value: null },
+  { label: "boolean", value: true },
+  { label: "number", value: 1 },
+  { label: "array", value: [] },
+  { label: "string", value: "malformed" },
+  { label: "absent config", absent: true }
+];
+
+function sourceWithMalformedConfig(providerId: string, id: string, shape: (typeof malformedSharedConfigShapes)[number]): Record<string, unknown> {
+  const source = { ...makeSource({ id, providerId }) } as unknown as Record<string, unknown>;
+  if (shape.absent) {
+    delete source.config;
+  } else {
+    source.config = shape.value;
+  }
+  return source;
+}
+
 function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
   return {
     id: "srv-1",
@@ -227,6 +247,18 @@ beforeEach(async () => {
 describe("sanitizeForSharing — inventory sources", () => {
   const share = (sources: InventorySourceConfig[], servers: ServerConfig[] = [], profiles: AuthProfile[] = [], templates: DeviceTemplateProfile[] = []) =>
     sanitizeForSharing(servers, [], [], [], {}, profiles, [], sources, templates, []);
+
+  it.each(["containerlab", "netbox"] as const)("preserves malformed %s config shapes in the existing export contract", (providerId) => {
+    for (const [index, shape] of malformedSharedConfigShapes.entries()) {
+      const source = sourceWithMalformedConfig(providerId, `malformed-${index}`, shape);
+      const [shipped] = share([source as unknown as InventorySourceConfig]).inventorySources;
+      if (shape.absent) {
+        expect(shipped).not.toHaveProperty("config");
+      } else {
+        expect(shipped.config).toEqual(shape.value);
+      }
+    }
+  });
 
   it("ships each source with a fresh id and WITHOUT its trust stamp, sync bookkeeping or incarnation token (⊘ any of `providerFingerprint`, `revision`, `managedFolders`, `lastSyncAt` surviving the spread)", () => {
     const source = makeSource({
@@ -331,6 +363,87 @@ describe("sanitizeForSharing — inventory sources", () => {
     // A source whose every rule names a missing template ships no rules at all.
     const lone = share([makeSource({ templateRules: [{ id: "rule-2", templateId: "tpl-missing" }] })]);
     expect(lone.inventorySources[0].templateRules).toBeUndefined();
+  });
+
+  it("remaps a Containerlab discovery host and every hop in its SSH chain on export", () => {
+    const bastion = makeServer({ id: "bastion-1", name: "Bastion" });
+    const labHost = makeServer({ id: "lab-host", name: "Lab host", proxy: sshVia("bastion-1") });
+    const source = makeSource({
+      providerId: "containerlab",
+      config: { location: "ssh", labHostId: "lab-host", runner: "host", dockerSocket: "/var/run/docker.sock" }
+    });
+
+    const result = share([source], [labHost, bastion]);
+    const [shipped] = result.inventorySources;
+    const shippedHost = result.servers.find((server) => server.name === "Lab host")!;
+    const shippedBastion = result.servers.find((server) => server.name === "Bastion")!;
+
+    expect(shipped.config.labHostId).toBe(shippedHost.id);
+    expect(shipped.config.labHostId).not.toBe("lab-host");
+    expect(shipped.config.location).toBe("ssh");
+    expect(shippedHost.proxy).toMatchObject({ type: "ssh", jumpHostId: shippedBastion.id });
+    expect(source.config.labHostId).toBe("lab-host");
+  });
+
+  it("keeps an SSH Containerlab source unresolved when its lab host is omitted from export", () => {
+    const [shipped] = share([
+      makeSource({
+        providerId: "containerlab",
+        config: { location: "ssh", labHostId: "not-shared", runner: "host", dockerSocket: "/var/run/docker.sock" }
+      })
+    ]).inventorySources;
+
+    expect(shipped.config.location).toBe("ssh");
+    expect(shipped.config.labHostId).toBe("");
+    expect(() => parseContainerlabConfig(shipped.config)).toThrow(/labHostId/i);
+  });
+
+  it.each([
+    ["explicit Local", { location: "local", labHostId: "not-shared", runner: "host" }],
+    ["default Local", { labHostId: "not-shared", runner: "host" }]
+  ])("omits an unmapped inactive Containerlab host through actual %s export/import", async (_label, config) => {
+    const sender = await makeMachine();
+    await sender.core.addOrUpdateInventorySource(makeSource({
+      id: "containerlab-source", providerId: "containerlab", config
+    }));
+    const json = await exportShare(sender);
+    const [shipped] = (JSON.parse(json) as { inventorySources: InventorySourceConfig[] }).inventorySources;
+    expect(shipped.config).not.toHaveProperty("labHostId");
+    expect(JSON.stringify(shipped.config)).not.toContain("not-shared");
+
+    const recipient = await makeMachine();
+    await importShare(recipient, json);
+    const [imported] = recipient.core.getSnapshot().inventorySources;
+    expect(imported.config).not.toHaveProperty("labHostId");
+    expect(parseContainerlabConfig(imported.config).location).toBe("local");
+    const provider = createBuiltInProviders().find((candidate) => candidate.id === "containerlab")!;
+    expect(provider.discoverySshHostId?.(imported.config)).toBeUndefined();
+    expect(provider.sourceDefaultRoute?.(imported.config)).toEqual({ kind: "direct" });
+  });
+
+  it("keeps a carried Containerlab host reference remapped when its source is Local", async () => {
+    const sender = await makeMachine();
+    const host = makeServer({ id: "lab-host", name: "Lab host" });
+    await sender.core.addOrUpdateServer(host);
+    await sender.core.addOrUpdateInventorySource(makeSource({
+      id: "containerlab-source", providerId: "containerlab",
+      config: { location: "local", labHostId: host.id, runner: "host" }
+    }));
+    const json = await exportShare(sender);
+    const [shipped] = (JSON.parse(json) as { inventorySources: InventorySourceConfig[] }).inventorySources;
+    const shippedHost = (JSON.parse(json) as { servers: ServerConfig[] }).servers.find((server) => server.name === "Lab host")!;
+    expect(shipped.config.labHostId).toBe(shippedHost.id);
+    expect(shipped.config.labHostId).not.toBe(host.id);
+    expect(parseContainerlabConfig(shipped.config).location).toBe("local");
+  });
+
+  it("does not treat another provider's labHostId field as a server reference", () => {
+    const [shipped] = share(
+      [makeSource({ providerId: "acme.cmdb", config: { location: "ssh", labHostId: "lab-host" } })],
+      [makeServer({ id: "lab-host", name: "A server with the same id" })]
+    ).inventorySources;
+
+    expect(shipped.config.labHostId).toBe("lab-host");
   });
 });
 
@@ -530,18 +643,24 @@ describe("sanitizeForSharing — device templates", () => {
       name: "Via missing bastion",
       fields: { proxy: { mode: "override", value: { type: "ssh", jumpHostId: "srv-not-here" } } }
     };
+    const withDirect: DeviceTemplateProfile = {
+      id: "tpl-4",
+      name: "Direct",
+      fields: { proxy: { mode: "override", value: null } }
+    };
 
     const source = makeSource({
       templateRules: [
         { id: "rule-1", templateId: "tpl-1" },
         { id: "rule-2", templateId: "tpl-2" },
-        { id: "rule-3", templateId: "tpl-3" }
+        { id: "rule-3", templateId: "tpl-3" },
+        { id: "rule-4", templateId: "tpl-4" }
       ]
     });
 
-    const result = sanitizeForSharing([gateway], [], [], [], {}, [profile], [], [source], [withRefs, withSocks, withLostJump]);
+    const result = sanitizeForSharing([gateway], [], [], [], {}, [profile], [], [source], [withRefs, withSocks, withLostJump, withDirect]);
 
-    const [a, b, c] = result.deviceTemplates;
+    const [a, b, c, d] = result.deviceTemplates;
     expect(a.id).not.toBe("tpl-1");
     expect(a).not.toHaveProperty("revision");
     expect(a.fields).toEqual({
@@ -551,6 +670,7 @@ describe("sanitizeForSharing — device templates", () => {
     });
     expect(b.fields.proxy).toEqual({ mode: "override", value: { type: "socks5", host: "proxy.example.com", port: 1080 } });
     expect(c.fields).toEqual({});
+    expect(d.fields.proxy).toEqual({ mode: "override", value: null });
     expect(JSON.stringify(result.deviceTemplates)).not.toMatch(/ap-ssh|ap-not-here|gw-1|proxy-user|srv-not-here|rev-sender/);
   });
 });
@@ -1209,6 +1329,81 @@ describe("the same rules in both directions — a hand-edited file", () => {
 // ---------------------------------------------------------------------------
 
 describe("share import — inventory sources", () => {
+  it.each(["containerlab", "netbox"] as const)("rejects malformed %s config shapes and continues importing the valid neighbor", async (providerId) => {
+    const recipient = await makeMachine();
+    const malformed = malformedSharedConfigShapes.map((shape, index) => sourceWithMalformedConfig(providerId, `malformed-${index}`, shape));
+    const validNeighbor = makeSource({
+      id: "valid-neighbor",
+      name: "Valid neighbor",
+      providerId,
+      defaultUsername: "user",
+      config: providerId === "containerlab" ? { location: "local", runner: "host" } : { baseUrl: "https://netbox.example.com" }
+    });
+
+    await importShare(recipient, shareJson({ inventorySources: [...malformed, validNeighbor] }));
+
+    expect(recipient.core.getSnapshot().inventorySources.map((source) => source.name)).toEqual(["Valid neighbor"]);
+    expect(lastInfoMessage()).toContain("(6 skipped)");
+  });
+
+  it("remaps a Containerlab discovery host through the imported multi-hop SSH chain", async () => {
+    const recipient = await makeMachine();
+    const source = makeSource({
+      providerId: "containerlab",
+      defaultUsername: "user",
+      config: { location: "ssh", labHostId: "lab-host", runner: "host", dockerSocket: "/var/run/docker.sock" }
+    });
+
+    await importShare(
+      recipient,
+      shareJson({
+        inventorySources: [source],
+        servers: [
+          makeServer({ id: "lab-host", name: "Lab host", username: "user", proxy: sshVia("bastion-1") }),
+          makeServer({ id: "bastion-1", name: "Bastion", username: "user" })
+        ]
+      })
+    );
+
+    const snapshot = recipient.core.getSnapshot();
+    const [imported] = snapshot.inventorySources;
+    const importedHost = snapshot.servers.find((server) => server.name === "Lab host")!;
+    const importedBastion = snapshot.servers.find((server) => server.name === "Bastion")!;
+    expect(imported.config.location).toBe("ssh");
+    expect(imported.config.labHostId).toBe(importedHost.id);
+    expect(imported.config.labHostId).not.toBe("lab-host");
+    expect(importedHost.proxy).toMatchObject({ type: "ssh", jumpHostId: importedBastion.id });
+  });
+
+  it("keeps a missing Containerlab lab host unresolved on import instead of switching to local", async () => {
+    const recipient = await makeMachine();
+
+    await importShare(
+      recipient,
+      shareJson({
+        inventorySources: [
+          makeSource({
+            providerId: "containerlab",
+            defaultUsername: "user",
+            config: { location: "ssh", labHostId: "host-not-in-share", runner: "host", dockerSocket: "/var/run/docker.sock" }
+          })
+        ]
+      })
+    );
+
+    const [imported] = recipient.core.getSnapshot().inventorySources;
+    expect(imported.config.location).toBe("ssh");
+    expect(imported.config.labHostId).toBe("");
+    expect(() => parseContainerlabConfig(imported.config)).toThrow(/labHostId/i);
+  });
+
+  it("keeps an unmapped Containerlab host unchanged when the location itself is malformed", () => {
+    const [shipped] = sanitizeForSharing([], [], [], [], {}, [], [], [makeSource({
+      providerId: "containerlab", config: { location: "elsewhere", labHostId: "not-shared" }
+    })]).inventorySources;
+    expect(shipped.config).toMatchObject({ location: "elsewhere", labHostId: "not-shared" });
+  });
+
   it("persists each source with a fresh id and a minted revision, and never the bookkeeping or trust stamp a hand-edited file carries (⊘ any of them landing)", async () => {
     const recipient = await makeMachine();
 

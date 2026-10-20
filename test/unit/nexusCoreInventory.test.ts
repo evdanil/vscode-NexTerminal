@@ -7,6 +7,7 @@ import { mergeServerConfigFields, resolveBmcWebProtocol, serverConfigsEqual, ser
 import type { ServerConfig, SerialProfile, LocalShellProfile } from "../../src/models/config";
 import { computeProviderFingerprint, sourceConfigUnchanged, type InventoryProvider, type InventorySourceConfig } from "../../src/models/inventory";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
+import { snapshotInventorySourceDependencies } from "../../src/services/inventory/inventorySourceDependencies";
 
 function makeSourceConfig(overrides: Partial<InventorySourceConfig> = {}): InventorySourceConfig {
   return {
@@ -5339,5 +5340,92 @@ describe("NexusCore.healSyncedConsolePorts (task #29 / D8)", () => {
       statuses: { "lab.unl#1": { state: "running", consolePort: 32769 } }
     });
     expect(listener).not.toHaveBeenCalled();
+  });
+});
+
+describe("NexusCore.applyInventorySyncPlan discovery dependency guard", () => {
+  it("rejects a preview whose SSH host route changed before the locked apply", async () => {
+    const before = {
+      id: "lab-host",
+      name: "Lab host",
+      host: "old.example.test",
+      port: 22,
+      username: "operator",
+      authType: "agent" as const,
+      isHidden: false
+    };
+    const current = { ...before, host: "new.example.test" };
+    const dependencies = snapshotInventorySourceDependencies("lab-host", [before], []);
+    const core = new NexusCore(new InMemoryConfigRepository([current]));
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig());
+    const expectedSource = core.getInventorySource("source-1")!;
+
+    await expect(
+      configMutationLock.runExclusive(() =>
+        core.applyInventorySyncPlan({
+          sourceId: "source-1",
+          syncedAt: 2,
+          upsertServers: [
+            {
+              id: "new-device",
+              name: "new-device",
+              host: "10.0.0.2",
+              port: 22,
+              username: "admin",
+              authType: "agent",
+              isHidden: false
+            }
+          ],
+          removeServerIds: [],
+          folders: [],
+          expectedSource,
+          discoveryDependencies: dependencies
+        })
+      )
+    ).rejects.toThrow(/changed|identity|dependency/i);
+
+    expect(core.getServer("lab-host")?.host).toBe("new.example.test");
+    expect(core.getServer("new-device")).toBeUndefined();
+  });
+
+  it("rejects an unsafe future route before persistence or notification while allowing a valid endpoint update", async () => {
+    const labHost: ServerConfig = {
+      id: "lab-host", name: "Lab host", host: "10.0.0.2", port: 22, username: "admin", authType: "agent",
+      isHidden: false, proxy: { type: "ssh", jumpHostId: "hop" }
+    };
+    const hop: ServerConfig = {
+      id: "hop", name: "Hop", host: "10.0.0.1", port: 22, username: "admin", authType: "agent", isHidden: false,
+      origin: { sourceId: "source-1", externalId: "hop-node", syncedAt: 1, syncedHost: "10.0.0.1", syncedPort: 22, syncedProtocol: "ssh" }
+    };
+    const repository = new InMemoryConfigRepository([labHost, hop]);
+    const core = new NexusCore(repository);
+    await core.initialize();
+    await core.addOrUpdateInventorySource(makeSourceConfig({ id: "source-1", providerId: "containerlab" }));
+    const expectedSource = core.getInventorySource("source-1")!;
+    const dependencies = snapshotInventorySourceDependencies("lab-host", [labHost, hop], []);
+    const before = core.getSnapshot();
+    const saveServers = vi.spyOn(repository, "saveServers");
+    const saveGroups = vi.spyOn(repository, "saveGroups");
+    const listener = vi.fn();
+    core.onDidChange(listener);
+
+    await expect(configMutationLock.runExclusive(() => core.applyInventorySyncPlan({
+      sourceId: "source-1", syncedAt: 2,
+      upsertServers: [{ ...hop, proxy: { type: "ssh", jumpHostId: "lab-host" } }],
+      removeServerIds: [], folders: [], expectedSource, discoveryDependencies: dependencies
+    }))).rejects.toThrow(/cycle|Keep Direct|Device Connection/i);
+
+    expect(core.getSnapshot()).toEqual(before);
+    expect(saveServers).not.toHaveBeenCalled();
+    expect(saveGroups).not.toHaveBeenCalled();
+    expect(listener).not.toHaveBeenCalled();
+
+    await configMutationLock.runExclusive(() => core.applyInventorySyncPlan({
+      sourceId: "source-1", syncedAt: 3,
+      upsertServers: [{ ...hop, host: "10.0.0.9", origin: { ...hop.origin!, syncedHost: "10.0.0.9" } }],
+      removeServerIds: [], folders: [], expectedSource, discoveryDependencies: dependencies
+    }));
+    expect(core.getServer("hop")?.host).toBe("10.0.0.9");
   });
 });

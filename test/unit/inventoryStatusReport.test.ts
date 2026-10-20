@@ -434,6 +434,16 @@ describe("fetchProviderStatus", () => {
     expect(result).toEqual(validReport);
   });
 
+  it("preserves the two-argument provider call when operation context is omitted or undefined", async () => {
+    const fetchStatus = vi.fn(async () => validReport);
+
+    await fetchProviderStatus({ fetchStatus }, {}, {});
+    await fetchProviderStatus({ fetchStatus }, {}, {}, undefined);
+
+    expect(fetchStatus.mock.calls[0]).toHaveLength(2);
+    expect(fetchStatus.mock.calls[1]).toHaveLength(2);
+  });
+
   it("hands the provider a COPY of config, so an in-place normalization cannot mutate the caller's stored source config (⊘ passing source.config straight through mutates globalState with no revision bump)", async () => {
     const live = { baseUrl: "HTTP://EVE/" };
     const seen: unknown[] = [];

@@ -82,4 +82,27 @@ describe("mergeServerConfigFields — §1.3 rollback merge", () => {
     // The concurrent clear must survive.
     expect(merged.origin?.templated?.multiplexing).toBeUndefined();
   });
+
+  it("deep-clones the concurrent detached marker and its nested proxy receipts", () => {
+    const oldRoute = { type: "socks5" as const, host: "proxy.example.test", port: 1080 };
+    const currentMarker = {
+      sourceId: "removed-source",
+      sourceName: "Removed Source",
+      providerId: "netbox",
+      externalId: "device:1",
+      detachedAt: 10,
+      proxyOwnership: { owner: "template" as const, value: { ...oldRoute } },
+      templated: { proxy: { ...oldRoute } }
+    };
+    const prior = server({ formerlySynced: undefined });
+    const batchSnapshot = server({ formerlySynced: undefined });
+    const current = server({ formerlySynced: currentMarker });
+
+    const merged = mergeServerConfigFields(prior, batchSnapshot, current);
+    (merged.formerlySynced!.proxyOwnership!.value as typeof oldRoute).host = "changed-owner.example.test";
+    (merged.formerlySynced!.templated!.proxy as typeof oldRoute).host = "changed-stamp.example.test";
+
+    expect((current.formerlySynced!.proxyOwnership!.value as typeof oldRoute).host).toBe(oldRoute.host);
+    expect((current.formerlySynced!.templated!.proxy as typeof oldRoute).host).toBe(oldRoute.host);
+  });
 });

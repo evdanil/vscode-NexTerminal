@@ -154,6 +154,16 @@ describe("saveOverlapWarnings — possible overlap, no disjointness proof (fixtu
     expect(w).toHaveLength(0);
   });
 
+  it("treats two explicit Direct proxy values as identical and Direct versus SSH as unequal", () => {
+    const direct = template({ proxy: { mode: "override", value: null } }, "direct", "Direct");
+    const sameDirect = template({ proxy: { mode: "override", value: null } }, "same-direct", "Same Direct");
+    const directPair = new Map([["direct", direct], ["same-direct", sameDirect]]);
+    expect(saveOverlapWarnings([rule("direct", "role=switch", "r1"), rule("same-direct", "site=syd", "r2")], directPair)).toHaveLength(0);
+
+    const directAndProxy = new Map([["direct", direct], ["tb", proxyB]]);
+    expect(saveOverlapWarnings([rule("direct", "role=switch", "r1"), rule("tb", "site=syd", "r2")], directAndProxy)).toHaveLength(1);
+  });
+
   it("20d(e) — unequal specificity OR no shared field → NO warning", () => {
     // unequal specificity
     expect(saveOverlapWarnings([rule("ta", "role=switch", "r1"), rule("tb", "role=switch&site=syd", "r2")], tById)).toHaveLength(0);

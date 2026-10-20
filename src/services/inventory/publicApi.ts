@@ -51,6 +51,21 @@ import type { InventoryProviderRegistry, ProviderRegistration } from "./provider
  * a backup export, the post-import verification, and the rollback captures in
  * `removeSource`/`persistUpdatedInventorySource` handle the user's own data and
  * have no provider to distrust.
+
+ * Providers may declare `sourceDefaultRoute(config)`, a synchronous,
+ * data-only connection preference for devices from that source. Nexus captures
+ * the capability at registration and validates its result at use; it is not a
+ * connection hook. Providers that discover inventory over SSH may separately
+ * declare `discoverySshHostId(config)`, which names the saved Nexus SSH server
+ * used to reach the provider. This discovery dependency is independent of the
+ * device routes returned by the source, so a Direct device route does not make
+ * SSH-based discovery local. Nexus captures this optional function at
+ * registration, validates its result, and refuses a sync when the host, any
+ * jump hop, or effective authentication route changes during the operation.
+ * Existing providers that omit it keep their current behavior. The optional
+ * third argument to Test, inventory, and status methods carries operation
+ * intent, subject identity, and cancellation only. It contains no credentials
+ * or approval token, and older providers can ignore it.
  *
  * ONLY A STAMPED SOURCE IS GATED, which is the limit worth knowing before
  * reading the rest as a guarantee. A source saved before the field existed

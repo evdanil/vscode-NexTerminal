@@ -251,9 +251,14 @@ function readAttribute(el: StubElement, name: string): string | undefined {
 
 /** Supports exactly the selector shapes the rendered script uses. */
 function matchesSelector(el: StubElement, selector: string): boolean {
+  const negation = selector.match(/:not\(([^()]*)\)/);
+  if (negation) {
+    if (matchesSelector(el, negation[1])) return false;
+    selector = selector.replace(negation[0], "");
+  }
   const attrs: Array<{ name: string; op?: string; value?: string }> = [];
-  const rest = selector.replace(/\[([a-zA-Z-]+)(?:(\^?=)"([^"]*)")?\]/g, (_match, name: string, op: string | undefined, value: string | undefined) => {
-    attrs.push({ name, op, value });
+  const rest = selector.replace(/\[([a-zA-Z-]+)(?:(\^?=)(?:"([^"]*)"|'([^']*)'|([^\]\s]+)))?\]/g, (_match, name: string, op: string | undefined, doubleQuoted: string | undefined, singleQuoted: string | undefined, unquoted: string | undefined) => {
+    attrs.push({ name, op, value: doubleQuoted ?? singleQuoted ?? unquoted });
     return "";
   });
   const [tag, ...classNames] = rest.split(".");
@@ -287,6 +292,7 @@ interface FormDom {
   byId: Map<string, StubElement>;
   deliverMessage: (msg: ExtensionMessage) => void;
   submit: () => void;
+  submitNatively: () => boolean;
 }
 
 /** Builds the DOM `renderField` would have produced for this definition. */
@@ -304,6 +310,9 @@ function buildFormDom(definition: FormDefinition): FormDom {
       const group = form.append(new StubElement("DIV", ["form-group", "form-illustration"]));
       if (field.visibleWhen) {
         group.dataset.visibleWhen = JSON.stringify(Array.isArray(field.visibleWhen) ? field.visibleWhen : [field.visibleWhen]);
+      }
+      if (field.requiredWhen) {
+        group.dataset.requiredWhen = JSON.stringify(Array.isArray(field.requiredWhen) ? field.requiredWhen : [field.requiredWhen]);
       }
       continue;
     }
@@ -329,6 +338,9 @@ function buildFormDom(definition: FormDefinition): FormDom {
           Array.isArray(field.visibleWhen) ? field.visibleWhen : [field.visibleWhen]
         );
       }
+      if (field.requiredWhen) {
+        heading.dataset.requiredWhen = JSON.stringify(Array.isArray(field.requiredWhen) ? field.requiredWhen : [field.requiredWhen]);
+      }
       continue;
     }
 
@@ -336,10 +348,13 @@ function buildFormDom(definition: FormDefinition): FormDom {
     if (field.visibleWhen) {
       group.dataset.visibleWhen = JSON.stringify(Array.isArray(field.visibleWhen) ? field.visibleWhen : [field.visibleWhen]);
     }
+    if (field.requiredWhen) {
+      group.dataset.requiredWhen = JSON.stringify(Array.isArray(field.requiredWhen) ? field.requiredWhen : [field.requiredWhen]);
+    }
 
     switch (field.type) {
       case "select": {
-        const wrapper = group.append(new StubElement("DIV", ["custom-select"]));
+        const wrapper = group.append(new StubElement("DIV", ["custom-select", ...(field.filterable ? ["filterable"] : [])]));
         wrapper.dataset.name = field.key;
         if (field.autofill) {
           wrapper.dataset.autofill = "true";
@@ -359,6 +374,11 @@ function buildFormDom(definition: FormDefinition): FormDom {
         const text = trigger.append(new StubElement("SPAN", ["custom-select-text"]));
         text.textContent = (field.options.find((opt) => opt.value === selectedValue) ?? field.options[0])?.label ?? "";
         const dropdown = wrapper.append(new StubElement("DIV", ["custom-select-dropdown"]));
+        if (field.filterable) {
+          const filterRow = dropdown.append(new StubElement("DIV", ["custom-select-filter-row"]));
+          const filter = filterRow.append(new StubElement("INPUT", ["custom-select-filter"]));
+          filter.type = "text";
+        }
         for (const opt of field.options) {
           const option = dropdown.append(new StubElement("DIV", ["custom-select-option"]));
           option.dataset.value = opt.value;
@@ -522,6 +542,21 @@ function buildFormDom(definition: FormDefinition): FormDom {
         throw new Error("form script never registered a submit listener");
       }
       submitHandler({ preventDefault: () => {} });
+    },
+    submitNatively: (): boolean => {
+      // Model the browser's required-control gate before its submit event. A
+      // hidden input can hold the selected value but does not participate in
+      // native constraint validation; unnamed text inputs still do.
+      const valid = form.querySelectorAll("input, select, textarea").every((control) => {
+        if (!control.required || control.disabled || control.type === "hidden") return true;
+        return control.type === "checkbox" ? control.checked : control.value !== "";
+      });
+      if (!valid) return false;
+      if (!submitHandler) {
+        throw new Error("form script never registered a submit listener");
+      }
+      submitHandler({ preventDefault: () => {} });
+      return true;
     }
   };
 }
@@ -544,6 +579,8 @@ export interface FormHarness {
    * the pointer path use `clickSave`.
    */
   attemptSubmit: () => FormValues | undefined;
+  /** Runs native required validation before dispatching the emitted submit handler. */
+  attemptNativeSubmit: () => FormValues | undefined;
   /**
    * The POINTER path: a real click on the Save button.
    *
@@ -585,6 +622,8 @@ export interface FormHarness {
    * it to be inferred from a click that happened to get through.
    */
   saveNativelyDisabled: () => boolean;
+  /** Required state of a custom select's named value input and optional filter input. */
+  requiredState: (key: string) => { value: boolean; filter: boolean | undefined };
   /** The `requestId` the script stamped on its most recent `autofill` post —
    *  what an answer must echo back to release that request. */
   lastAutofillRequestId: () => number | undefined;
@@ -761,6 +800,12 @@ export function openForm(definition: FormDefinition): FormHarness {
       const last = posted[posted.length - 1];
       return posted.length > before && last?.type === "submit" ? last.values : undefined;
     },
+    attemptNativeSubmit: () => {
+      const before = posted.length;
+      if (!dom.submitNatively()) return undefined;
+      const last = posted[posted.length - 1];
+      return posted.length > before && last?.type === "submit" ? last.values : undefined;
+    },
     clickSave: () => {
       // The press is held long enough for the queue to drain before the click
       // is dispatched — legal, unbounded, and the timing the fifth review
@@ -790,6 +835,12 @@ export function openForm(definition: FormDefinition): FormHarness {
       return marked;
     },
     saveNativelyDisabled: () => dom.byId.get("save-btn")?.disabled === true,
+    requiredState: (key) => {
+      const field = dom.byId.get(`field-${key}`);
+      const valueInput = field?.querySelector('input[type="hidden"]');
+      const filterInput = field?.querySelector(".custom-select-filter");
+      return { value: valueInput?.required === true, filter: filterInput ? filterInput.required : undefined };
+    },
     lastAutofillRequestId: () => {
       const message = [...posted].reverse().find((entry) => entry.type === "autofill");
       return message?.type === "autofill" ? message.requestId : undefined;

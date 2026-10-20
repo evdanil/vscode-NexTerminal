@@ -2,7 +2,8 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { Duplex } from "node:stream";
 import type { SFTPWrapper } from "ssh2";
 import type { HttpConnectProxy, ServerConfig, Socks5Proxy } from "../../src/models/config";
-import type { PasswordPrompt, SecretVault, SshConnection, SshConnector } from "../../src/services/ssh/contracts";
+import type { ContextAwareSshFactory, PasswordPrompt, SecretVault, SshCommandChannel, SshConnection, SshConnector } from "../../src/services/ssh/contracts";
+import { SshInteractionRequiredError } from "../../src/services/ssh/contracts";
 import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 import { proxyPasswordSecretKey } from "../../src/services/ssh/proxyPasswordKeys";
 
@@ -200,6 +201,36 @@ describe("ProxiedSshConnection", () => {
     proxied.onClose(listener);
     inner.fireClose();
     expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it("forwards typed command channels and their cancellation signal through a proxy", async () => {
+    const inner = makeFakeConnection();
+    const signal = new AbortController().signal;
+    const channel: SshCommandChannel = {
+      stdout: {} as NodeJS.ReadableStream,
+      stderr: {} as NodeJS.ReadableStream,
+      completion: Promise.resolve({ code: 0 }),
+      close: vi.fn()
+    };
+    const execCommand = vi.fn(async function (this: SshConnection, command: string, receivedSignal?: AbortSignal) {
+      expect(this).toBe(inner);
+      expect(receivedSignal).toBe(signal);
+      return channel;
+    });
+    inner.execCommand = execCommand;
+    const proxied = new ProxiedSshConnection(inner, vi.fn());
+
+    await expect(proxied.execCommand?.("containerlab inspect", signal)).resolves.toBe(channel);
+
+    expect(execCommand).toHaveBeenCalledWith("containerlab inspect", signal);
+  });
+
+  it("does not synthesize typed command support from legacy exec", () => {
+    const inner = makeFakeConnection();
+    const proxied = new ProxiedSshConnection(inner, vi.fn());
+
+    expect(proxied.execCommand).toBeUndefined();
+    expect(inner.exec).not.toHaveBeenCalled();
   });
 
   it("dispose() cleans up inner connection and proxy resources", () => {
@@ -512,8 +543,14 @@ describe("ProxySshFactory", () => {
     const targetConn = makeFakeConnection();
 
     const results = [jumpConn, targetConn];
-    authFactory.connect = vi.fn(async (_server: ServerConfig, opts?: { sockFactory?: () => Promise<unknown> }) => {
+    authFactory.connect = vi.fn(async (_server: ServerConfig, opts?: {
+      sockFactory?: () => Promise<unknown>;
+      onAuthMessage?: (text: string) => void;
+    }) => {
       await opts?.sockFactory?.();
+      if (_server.id === jumpServer.id) {
+        opts?.onAuthMessage?.("Jump host banner");
+      }
       return results.shift()!;
     });
 
@@ -522,9 +559,8 @@ describe("ProxySshFactory", () => {
     await factory.connectWithContext(targetServer, { onAuthMessage });
 
     expect(authFactory.connect).toHaveBeenNthCalledWith(1, jumpServer, {
-      isActive: expect.any(Function), onAuthMessage: expect.any(Function)
+      isActive: expect.any(Function), onAuthMessage: expect.any(Function), signal: expect.any(AbortSignal)
     });
-    authFactory.connect.mock.calls[0][1].onAuthMessage("Jump host banner");
     expect(onAuthMessage).toHaveBeenCalledWith("Jump host banner");
     expect(authFactory.connect).toHaveBeenNthCalledWith(2, targetServer, {
       sockFactory: expect.any(Function),
@@ -740,11 +776,11 @@ describe("ProxySshFactory", () => {
 
     expect(authFactory.connect).toHaveBeenCalledTimes(2);
     expect(authFactory.connect).toHaveBeenNthCalledWith(1, jumpServer, {
-      isActive: expect.any(Function), onAuthMessage: expect.any(Function)
+      isActive: expect.any(Function), onAuthMessage: expect.any(Function), signal: expect.any(AbortSignal)
     });
     expect(authFactory.connect).toHaveBeenNthCalledWith(2, targetServer, {
       sockFactory: expect.any(Function), route: expect.any(Function),
-      isActive: expect.any(Function), onAuthMessage: expect.any(Function)
+      isActive: expect.any(Function), onAuthMessage: expect.any(Function), signal: expect.any(AbortSignal)
     });
     expect(jumpConn.openDirectTcp).toHaveBeenCalledWith("target.example.com", 22);
 
@@ -912,11 +948,11 @@ describe("ProxySshFactory", () => {
     expect(authFactory.connect).toHaveBeenCalledTimes(3);
     expect(authFactory.connect).toHaveBeenNthCalledWith(1, jumpServer);
     expect(authFactory.connect).toHaveBeenNthCalledWith(2, jumpServer, {
-      isActive: expect.any(Function), onAuthMessage: expect.any(Function)
+      isActive: expect.any(Function), onAuthMessage: expect.any(Function), signal: expect.any(AbortSignal)
     });
     expect(authFactory.connect).toHaveBeenNthCalledWith(3, targetServer, {
       sockFactory: expect.any(Function), route: expect.any(Function),
-      isActive: expect.any(Function), onAuthMessage: expect.any(Function)
+      isActive: expect.any(Function), onAuthMessage: expect.any(Function), signal: expect.any(AbortSignal)
     });
     expect(proxiedJumpConn.openDirectTcp).toHaveBeenCalledWith("target.example.com", 22);
 
@@ -968,11 +1004,11 @@ describe("ProxySshFactory", () => {
 
     expect(authFactory.connect).toHaveBeenCalledTimes(3);
     expect(authFactory.connect).toHaveBeenCalledWith(jumpServer, {
-      isActive: expect.any(Function), onAuthMessage: expect.any(Function)
+      isActive: expect.any(Function), onAuthMessage: expect.any(Function), signal: expect.any(AbortSignal)
     });
     expect(authFactory.connect).toHaveBeenCalledWith(targetServer, {
       sockFactory: expect.any(Function), route: expect.any(Function),
-      isActive: expect.any(Function), onAuthMessage: expect.any(Function)
+      isActive: expect.any(Function), onAuthMessage: expect.any(Function), signal: expect.any(AbortSignal)
     });
     expect(fallbackJumpConn.openDirectTcp).toHaveBeenCalledWith("target.example.com", 22);
 
@@ -1027,6 +1063,64 @@ describe("ProxySshFactory", () => {
     // authFactory.connect is called with sockFactory; the failure propagates through
     // sockFactory() when the HTTP handshake inside it fails.
     expect(authFactory.connect).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves interaction-required from a noninteractive jump hop", async () => {
+    const jump = makeServer({ id: "srv-jump", name: "bastion" });
+    const target = makeServer({ proxy: { type: "ssh", jumpHostId: jump.id } });
+    servers.set(jump.id, jump);
+    servers.set(target.id, target);
+    const factory = await createFactory();
+    const jumpFactory: ContextAwareSshFactory = {
+      connect: vi.fn(async () => makeFakeConnection()),
+      connectWithContext: vi.fn(async () => {
+        throw new SshInteractionRequiredError("jump authentication requires input");
+      })
+    };
+    factory.setJumpHostConnectionFactory(jumpFactory);
+
+    await expect(factory.connectWithContext(target, { interaction: "noninteractive" }))
+      .rejects.toMatchObject({ code: "interaction-required" });
+
+    expect(jumpFactory.connectWithContext).toHaveBeenCalledWith(jump, expect.objectContaining({ interaction: "noninteractive" }));
+    expect(authFactory.connect).not.toHaveBeenCalled();
+  });
+
+  it("carries the noninteractive policy through every nested SSH jump hop", async () => {
+    const finalJump = makeServer({ id: "srv-jump-final", name: "final bastion" });
+    const firstJump = makeServer({
+      id: "srv-jump-first",
+      name: "first bastion",
+      proxy: { type: "ssh", jumpHostId: finalJump.id }
+    });
+    const target = makeServer({ proxy: { type: "ssh", jumpHostId: firstJump.id } });
+    servers.set(finalJump.id, finalJump);
+    servers.set(firstJump.id, firstJump);
+    servers.set(target.id, target);
+    const factory = await createFactory();
+    const refusal = new SshInteractionRequiredError("final jump authentication requires input");
+    const jumpContexts: Array<{ server: ServerConfig; context?: any }> = [];
+    const jumpFactory: ContextAwareSshFactory = {
+      connect: vi.fn(async () => makeFakeConnection()),
+      connectWithContext: vi.fn(async (server: ServerConfig, context?: any) => {
+        jumpContexts.push({ server, context });
+        if (server.id === firstJump.id) {
+          return factory.connectWithContext(server, context);
+        }
+        throw refusal;
+      })
+    };
+    factory.setJumpHostConnectionFactory(jumpFactory);
+    const signal = new AbortController().signal;
+
+    await expect(factory.connectWithContext(target, { interaction: "noninteractive", signal }))
+      .rejects.toBe(refusal);
+
+    expect(jumpContexts.map(({ server }) => server.id)).toEqual([firstJump.id, finalJump.id]);
+    for (const { context } of jumpContexts) {
+      expect(context).toMatchObject({ interaction: "noninteractive", signal });
+    }
+    expect(authFactory.connect).not.toHaveBeenCalled();
   });
 
   it("pushes back trailing HTTP CONNECT data so SSH banner is preserved", async () => {
@@ -1128,6 +1222,22 @@ describe("ProxySshFactory", () => {
       prompt
     );
   }
+
+  it.each([
+    { type: "socks5" as const, host: "socks.example", port: 1080, username: "proxy-user" },
+    { type: "http" as const, host: "http.example", port: 8080, username: "proxy-user" }
+  ])("refuses an unsaved $type proxy password without opening its prompt", async (proxy) => {
+    const target = makeServer({ id: `target-${proxy.type}`, proxy });
+    servers.set(target.id, target);
+    const prompt = vi.fn(async () => ({ password: "should-not-be-requested", save: false }));
+    const factory = await createFactoryWithPrompt(prompt);
+
+    await expect(factory.connectWithContext(target, { interaction: "noninteractive" }))
+      .rejects.toMatchObject({ code: "interaction-required" });
+
+    expect(prompt).not.toHaveBeenCalled();
+    expect(authFactory.connect).not.toHaveBeenCalled();
+  });
 
   it("closes an active proxy-password prompt and releases the shared queue when its last owner ends", async () => {
     const proxied = makeServer({ id: "proxied", authType: "agent", proxy: { type: "socks5", host: "proxy.local", port: 1080, username: "puser" } });

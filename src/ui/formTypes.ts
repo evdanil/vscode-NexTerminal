@@ -40,6 +40,8 @@ interface FormFieldCommon {
   advanced?: boolean;
   hint?: string;
   visibleWhen?: VisibleWhen;
+  /** Marks a field required only while the watched form values match. */
+  requiredWhen?: VisibleWhen;
 }
 
 export type FormFieldDescriptor =
@@ -96,7 +98,7 @@ export type FormFieldDescriptor =
    * `__create__` sentinel routes to inline-create before any fill. Unlike
    * `autofill`, this never touches the auth-profile mirror/ownership machinery.
    */
-  | ({ type: "select"; key: string; label: string; options: { label: string; value: string; description?: string; fillValue?: string }[]; value?: string; filterable?: boolean; autofill?: boolean; autofillFilledKeys?: string[]; autofillDisplacedValues?: Record<string, string>; fillTarget?: string } & FormFieldCommon)
+  | ({ type: "select"; key: string; label: string; options: { label: string; value: string; description?: string; fillValue?: string }[]; value?: string; required?: boolean; filterable?: boolean; autofill?: boolean; autofillFilledKeys?: string[]; autofillDisplacedValues?: Record<string, string>; fillTarget?: string } & FormFieldCommon)
   | ({ type: "combobox"; key: string; label: string; suggestions: string[]; required?: boolean; placeholder?: string; value?: string } & FormFieldCommon)
   | ({ type: "checkbox"; key: string; label: string; value?: boolean } & FormFieldCommon)
   | ({ type: "file"; key: string; label: string; value?: string } & FormFieldCommon)

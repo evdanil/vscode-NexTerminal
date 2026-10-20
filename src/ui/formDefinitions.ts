@@ -1,4 +1,4 @@
-import type { AuthProfile, AuthProfileOwnedCredentials, LocalShellProfile, SerialProfile, ServerConfig, ServerProtocol, TunnelProfile, TunnelType } from "../models/config";
+import type { AuthProfile, AuthProfileOwnedCredentials, LocalShellProfile, ProxyConfig, SerialProfile, ServerConfig, ServerProtocol, TunnelProfile, TunnelType } from "../models/config";
 import { authProfileOwnedCredentials, resolveServerProtocol, resolveTunnelType } from "../models/config";
 import type { NetworkServerKind } from "../models/networkServer";
 import type { DhcpAdapterConfig, TftpAdapterConfig } from "../services/networkServers/core/index";
@@ -740,7 +740,7 @@ const TEMPLATE_PROXY_PASSWORD_HINT =
   "Proxy passwords aren't stored in templates — each server prompts for its own the first time it connects.";
 
 function proxyFields(
-  seed?: Partial<ServerConfig>,
+  seed?: Omit<Partial<ServerConfig>, "proxy"> & { proxy?: ProxyConfig | null },
   servers?: ServerListEntry[],
   vw?: VisibleWhen,
   // Device templates (PR-T1b, UX-M4/m13) — defaults to `true` so every existing
@@ -755,10 +755,11 @@ function proxyFields(
   // templates carry no secrets), so rendering the two password inputs would let a
   // user type a value that Save throws away, then hit an unexpected auth prompt at
   // connect. Omitting them, plus the per-server hint above, states the real model.
-  includePasswords = true
+  includePasswords = true,
+  includeDirect = false
 ): FormFieldDescriptor[] {
   const proxy = seed?.proxy;
-  const proxyType = proxy?.type ?? "none";
+  const proxyType = proxy === null ? "direct" : proxy?.type ?? "none";
 
   const sshJumpVw: VisibleWhenCondition = { field: "proxyType", value: "ssh" };
   const socks5Vw: VisibleWhenCondition = { field: "proxyType", value: "socks5" };
@@ -791,7 +792,8 @@ function proxyFields(
       key: "proxyType",
       label: "Proxy",
       options: [
-        { label: "None (direct connection)", value: "none" },
+        { label: includeDirect ? "Not set (no opinion)" : "None (direct connection)", value: "none" },
+        ...(includeDirect ? [{ label: "Direct (no proxy)", value: "direct" }] : []),
         { label: "SSH Jump Host", value: "ssh" },
         { label: "SOCKS5 Proxy", value: "socks5" },
         { label: "HTTP CONNECT Proxy", value: "http" }
@@ -944,7 +946,7 @@ export function deviceTemplateFormDefinition(
       // Fix C (PR #62 Codex round 2) — `includePasswords: false`: §5.3 templates
       // carry no proxy SECRETS, and `parseDeviceTemplateFormValues` discards them,
       // so the password inputs are omitted (a per-server hint replaces them).
-      ...proxyFields({ proxy: seed?.fields.proxy?.value }, servers, proxyVw, false, false),
+      ...proxyFields({ proxy: seed?.fields.proxy?.value }, servers, proxyVw, false, false, true),
       templateOverridePreemption("proxy"),
 
       // Auth Profile — autofill OFF (no server SSH form to mirror into, m13).
@@ -1067,7 +1069,8 @@ export function serverFormDefinition(
   existingGroups?: string[],
   defaultLogSession = true,
   servers?: ServerListEntry[],
-  authProfiles?: AuthProfile[]
+  authProfiles?: AuthProfile[],
+  showInventoryProxyRouteChoice = false
 ): FormDefinition {
   const isEdit = Boolean(seed?.id);
   // Resolved the same way `authProfileSelectField` resolves the selected
@@ -1095,6 +1098,20 @@ export function serverFormDefinition(
       authProfileSelectField(authProfiles, sshOnly(), seed?.authProfileId, { displacedValues: ssh.displaced }),
       ...ssh.fields,
       ...proxyFields(seed, servers, sshOnly()),
+      ...(showInventoryProxyRouteChoice
+        ? [{
+            type: "select" as const,
+            key: "inventoryProxyRouteChoice",
+            label: "Inventory Proxy Route",
+            options: [
+              { label: "Automatic", value: "automatic" },
+              { label: "Keep Direct", value: "direct" }
+            ],
+            value: seed?.origin?.proxyOptOut === true || seed?.formerlySynced?.proxyOptOut === true || seed?.proxy !== undefined ? "direct" : "automatic",
+            hint: "When Proxy is None, choose whether inventory sync can set a route for this device. Keep Direct records your choice.",
+            visibleWhen: { field: "proxyType", value: "none" }
+          }]
+        : []),
       openFileExplorerOnFirstConnectField(seed, sshOnly()),
       ...sharedTrailingFields(seed, existingGroups, defaultLogSession)
     ])
@@ -1475,7 +1492,9 @@ export function inventoryConfigFieldPrefixedKey(fieldId: string): string {
 function inventoryConfigFieldDescriptor(
   field: InventoryConfigField,
   existingConfig: InventorySourceValues,
-  existingSecretFieldIds: ReadonlySet<string>
+  existingSecretFieldIds: ReadonlySet<string>,
+  sshProfiles: readonly ServerConfig[] = [],
+  providerId?: string
 ): FormFieldDescriptor {
   const key = inventoryConfigFieldPrefixedKey(field.id);
   if (field.type === "password") {
@@ -1531,6 +1550,34 @@ function inventoryConfigFieldDescriptor(
       advanced: field.advanced
     };
   }
+  if (field.type === "ssh-profile") {
+    const eligible = sshProfiles.filter((profile) =>
+      resolveServerProtocol(profile) === "ssh" &&
+      profile.addressless !== true &&
+      typeof profile.host === "string" && profile.host.trim() !== "" &&
+      Number.isInteger(profile.port) && profile.port >= 1 && profile.port <= 65535
+    );
+    const existing = existingConfig[field.id];
+    const existingValue = typeof existing === "string" ? existing : "";
+    const options = [{ label: "Select an SSH profile…", value: "" }, ...eligible.map((profile) => ({ label: profile.name, value: profile.id }))];
+    if (existingValue !== "" && !options.some((option) => option.value === existingValue)) {
+      options.splice(1, 0, { label: `Unresolved SSH profile (${flattenProviderText(existingValue)})`, value: existingValue });
+    }
+    return {
+      type: "select",
+      key,
+      label: field.label,
+      options,
+      value: existingValue,
+      filterable: true,
+      required: field.required,
+      ...(providerId === "containerlab" && field.id === "labHostId"
+        ? { requiredWhen: { field: inventoryConfigFieldPrefixedKey("location"), value: "ssh" } }
+        : {}),
+      hint: field.description,
+      advanced: field.advanced
+    };
+  }
   if (field.type === "number") {
     const existing = existingConfig[field.id];
     return {
@@ -1560,6 +1607,11 @@ function inventoryConfigFieldDescriptor(
     };
   }
   const existing = existingConfig[field.id];
+  const requiredWhen = providerId === "containerlab" && field.id === "runnerImage"
+    ? { field: inventoryConfigFieldPrefixedKey("runner"), value: "disposable" }
+    : providerId === "containerlab" && field.id === "runnerContainer"
+      ? { field: inventoryConfigFieldPrefixedKey("runner"), value: "existing" }
+      : undefined;
   return {
     type: "text",
     key,
@@ -1567,6 +1619,7 @@ function inventoryConfigFieldDescriptor(
     required: field.required,
     placeholder: field.placeholder,
     value: existing !== undefined ? String(existing) : "",
+    ...(requiredWhen ? { requiredWhen } : {}),
     hint: field.description,
     advanced: field.advanced
   };
@@ -1805,12 +1858,13 @@ const INVENTORY_SOURCE_AUTH_PROFILE_HINT =
  * handlers parse the posted values against.
  */
 export function inventorySourceFormDefinition(
-  provider: { label: string; configFields: readonly InventoryConfigField[] },
+  provider: { id?: string; label: string; configFields: readonly InventoryConfigField[] },
   seed?: InventorySourceConfig,
   defaultUsernameSeed?: string,
   authProfiles?: AuthProfile[],
   deviceTemplates?: DeviceTemplateProfile[],
-  savedFilters?: SavedFilterDefinition[]
+  savedFilters?: SavedFilterDefinition[],
+  sshProfiles?: readonly ServerConfig[]
 ): FormDefinition {
   const isEdit = Boolean(seed);
   const existingSecretFieldIds = new Set(seed?.secretFieldIds ?? []);
@@ -1955,8 +2009,11 @@ export function inventorySourceFormDefinition(
       // provider without one gets its config fields unchanged, byte-for-byte.
       ...provider.configFields.flatMap((field) =>
         field === filterTarget?.field
-          ? [savedFilterSelectField(savedFilters, filterTarget.label), inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds)]
-          : [inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds)]
+          ? [
+              savedFilterSelectField(savedFilters, filterTarget.label),
+              inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds, sshProfiles, provider.id)
+            ]
+          : [inventoryConfigFieldDescriptor(field, existingConfig, existingSecretFieldIds, sshProfiles, provider.id)]
       )
     ]
   };

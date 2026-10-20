@@ -109,11 +109,33 @@ function isValidTemplatedStamps(value: unknown): boolean {
   );
 }
 
+function isValidProxyOwnership(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const obj = value as Record<string, unknown>;
+  return (
+    (obj.owner === "source-default" || obj.owner === "template") &&
+    (obj.value === null || validateProxyConfig(obj.value))
+  );
+}
+
+function hasValidProxyIntent(obj: Record<string, unknown>): boolean {
+  return (
+    (obj.proxyOwnership === undefined || isValidProxyOwnership(obj.proxyOwnership)) &&
+    (obj.proxyOptOut === undefined || obj.proxyOptOut === true) &&
+    !(obj.proxyOwnership !== undefined && obj.proxyOptOut === true)
+  );
+}
+
 export function isValidServerOrigin(value: unknown): value is ServerOrigin {
   if (typeof value !== "object" || value === null) {
     return false;
   }
   const obj = value as Record<string, unknown>;
+  if (!hasValidProxyIntent(obj)) {
+    return false;
+  }
   // DEVICE TEMPLATES (PR-T1) — `templated` is optional (absent on every server
   // synced before it existed) but shape-checked like the rest; a malformed
   // record strips the whole origin (§1.3 bookkeeping / risk 3).
@@ -254,6 +276,9 @@ export function isValidDetachedServerOrigin(value: unknown): value is DetachedSe
     return false;
   }
   const obj = value as Record<string, unknown>;
+  if (!hasValidProxyIntent(obj)) {
+    return false;
+  }
   if (obj.instanceKey !== undefined && !isNonEmptyString(obj.instanceKey)) {
     return false;
   }
@@ -602,7 +627,7 @@ export function validateDeviceTemplate(item: unknown): item is DeviceTemplatePro
     return (f.mode === "fill" || f.mode === "override") && valueOk(f.value);
   };
   return (
-    validField(fields.proxy, (v) => validateProxyConfig(v)) &&
+    validField(fields.proxy, (v) => v === null || validateProxyConfig(v)) &&
     validField(fields.authProfileId, (v) => isNonEmptyString(v)) &&
     validField(fields.multiplexing, (v) => typeof v === "boolean") &&
     validField(fields.legacyAlgorithms, (v) => typeof v === "boolean") &&

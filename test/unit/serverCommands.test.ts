@@ -1341,8 +1341,7 @@ describe("server disconnect with tunnel autoStop", () => {
   // P2-1 (Fable) — duplicating spreads the record and strips `origin`, so an
   // addressless placeholder would become a MANUAL addressless record: an invariant
   // violation (addressless exists only for synced placeholders), which no sync will
-  // ever upgrade (no origin) and whose connect refusal tells the user to "re-sync the
-  // source" it has no link to. ⊘ Minting the copy leaves that record in the store.
+  // ever upgrade (no origin). ⊘ Minting the copy leaves that record in the store.
   it("P2-1 — refuses to duplicate an addressless placeholder with a message, writing nothing", async () => {
     const { ctx, addOrUpdateServer } = setupHarness({
       profiles: [],
@@ -1354,7 +1353,12 @@ describe("server disconnect with tunnel autoStop", () => {
     await registeredCommands.get("nexus.server.duplicate")!("srv-1");
 
     expect(addOrUpdateServer).not.toHaveBeenCalled();
-    expect(vscode.window.showInformationMessage).toHaveBeenCalledWith(expect.stringContaining("can't be duplicated"));
+    const message = vi.mocked(vscode.window.showInformationMessage as any).mock.calls
+      .map((call: unknown[]) => String(call[0]))
+      .find((text: string) => text.includes("can't be duplicated"));
+    expect(message).toContain("can't be duplicated");
+    expect(message).toContain("edit its Host, Port and connection settings");
+    expect(message).not.toMatch(/will get one|next syncs/i);
   });
 
   it("P2-1 control — still duplicates an ORDINARY addressed server (⊘ an over-broad guard would block normal duplication)", async () => {
@@ -2826,7 +2830,10 @@ describe("SSH File Explorer auto-open on manual connect", () => {
       .map((c: unknown[]) => String(c[0]))
       .filter((m: string) => /no console address/i.test(m));
     expect(infoMsgs).toHaveLength(1);
-    expect(infoMsgs[0]).toContain("2");
+    expect(infoMsgs[0]).toContain("2 servers have no console address and were skipped");
+    expect(infoMsgs[0]).toContain("edit its profile's Host, Port and connection settings");
+    expect(infoMsgs[0]).toContain("Re-sync the source if it later reports an address");
+    expect(infoMsgs[0]).not.toMatch(/will connect|assigns an address|no console address yet/i);
     // Only the live server built a pty.
     expect(SshPty).toHaveBeenCalledTimes(1);
   });
@@ -3423,6 +3430,172 @@ describe("nexus.server.edit — origin preservation (P1)", () => {
     // wrong implementation that saves it verbatim would produce `undefined`
     // here rather than the exact original origin object.
     expect(saved.origin).toEqual(origin);
+  });
+
+  it("Keep Direct clears route ownership and the legacy proxy receipt when a managed server is explicitly cleared", async () => {
+    const origin = {
+      sourceId: "netbox-1",
+      externalId: "device:42",
+      syncedAt: 1000,
+      proxyOwnership: { owner: "template" as const, value: { type: "socks5" as const, host: "proxy", port: 1080 } },
+      templated: { proxy: { type: "socks5" as const, host: "proxy", port: 1080 } }
+    };
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({
+        proxy: { type: "socks5", host: "proxy", port: 1080 },
+        origin
+      })]
+    });
+
+    await submitEdit(ctx, {
+      name: "Server 1",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      proxyType: "none",
+      inventoryProxyRouteChoice: "direct"
+    });
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.proxy).toBeUndefined();
+    expect(saved.origin).toEqual({
+      sourceId: "netbox-1",
+      externalId: "device:42",
+      syncedAt: 1000,
+      proxyOptOut: true
+    });
+  });
+
+  it("an Automatic save with an already-Direct owned route preserves the route receipt", async () => {
+    const origin = {
+      sourceId: "netbox-1",
+      externalId: "device:42",
+      syncedAt: 1000,
+      proxyOwnership: { owner: "template" as const, value: null }
+    };
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ origin })]
+    });
+
+    await submitEdit(ctx, {
+      name: "Renamed Server",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      proxyType: "none",
+      inventoryProxyRouteChoice: "automatic"
+    });
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.origin?.proxyOwnership).toEqual({ owner: "template", value: null });
+    expect(saved.origin?.proxyOptOut).toBeUndefined();
+  });
+
+  it("Automatic clears a manual Direct opt-out without inventing a route owner", async () => {
+    const origin = {
+      sourceId: "netbox-1",
+      externalId: "device:42",
+      syncedAt: 1000,
+      proxyOptOut: true as const
+    };
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [makeServer({ origin })]
+    });
+
+    await submitEdit(ctx, {
+      name: "Renamed Server",
+      host: "example.com",
+      port: 22,
+      username: "dev",
+      authType: "password",
+      proxyType: "none",
+      inventoryProxyRouteChoice: "automatic"
+    });
+
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.origin?.proxyOptOut).toBeUndefined();
+    expect(saved.origin?.proxyOwnership).toBeUndefined();
+  });
+
+  it("a saved Keep Direct choice survives successive source-default SSH syncs", async () => {
+    const source = {
+      id: "netbox-1",
+      providerId: "netbox",
+      name: "NetBox",
+      targetFolder: "DC",
+      prunePolicy: "orphan" as const,
+      defaultUsername: "dev",
+      config: {},
+      secretFieldIds: []
+    };
+    const tree = {
+      contractVersion: 1 as const,
+      devices: [{ externalId: "device:42", name: "Server 1", endpoints: [{ kind: "ssh" as const, host: "example.com", port: 22 }] }]
+    };
+    const initial = computeSyncPlan({
+      source,
+      tree,
+      currentServers: [],
+      now: 1000,
+      sourceDefaultRoute: { kind: "direct" }
+    }).adds[0];
+    expect(initial.origin?.proxyOwnership).toEqual({ owner: "source-default", value: null });
+
+    const { ctx, addOrUpdateServer } = setupHarness({
+      profiles: [],
+      activeTunnels: [],
+      servers: [initial]
+    });
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.edit")!(initial.id);
+    const panel = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as {
+      onSubmit: (values: Record<string, unknown>) => Promise<void>;
+    };
+    await panel.onSubmit({
+      name: initial.name,
+      host: initial.host,
+      port: initial.port,
+      username: initial.username,
+      authType: initial.authType,
+      proxyType: "none",
+      inventoryProxyRouteChoice: "direct"
+    });
+    const saved = addOrUpdateServer.mock.calls.at(-1)![0] as ServerConfig;
+    expect(saved.proxy).toBeUndefined();
+    expect(saved.origin?.proxyOptOut).toBe(true);
+    expect(saved.origin?.proxyOwnership).toBeUndefined();
+
+    const labHost = makeServer({ id: "lab-host", name: "Lab Host", host: "lab.example.test", username: "lab", authType: "agent" });
+    const sourceSshRoute = { kind: "ssh" as const, jumpHostId: labHost.id };
+    const sync = (current: ServerConfig, now: number) =>
+      computeSyncPlan({
+        source,
+        tree,
+        currentServers: [current, labHost],
+        now,
+        sourceDefaultRoute: sourceSshRoute
+      });
+    const first = sync(saved, 2000);
+    expect(first.warnings.join("\n")).not.toMatch(/invalid or missing SSH host/i);
+    const afterFirst = first.updates.find((update) => update.after.id === saved.id)?.after;
+    expect(afterFirst).toBeDefined();
+    expect(afterFirst?.proxy).toBeUndefined();
+    expect(afterFirst?.origin?.proxyOptOut).toBe(true);
+    expect(afterFirst?.origin?.proxyOwnership).toBeUndefined();
+
+    const second = sync(afterFirst!, 3000);
+    const afterSecond = second.updates.find((update) => update.after.id === saved.id)?.after ?? afterFirst;
+    expect(afterSecond?.proxy).toBeUndefined();
+    expect(afterSecond?.origin?.proxyOptOut).toBe(true);
+    expect(afterSecond?.origin?.proxyOwnership).toBeUndefined();
   });
 
   it("leaves origin undefined when editing a manually-added (never synced) server", async () => {
@@ -5218,7 +5391,7 @@ describe("addressless connect guard", () => {
     expect(TelnetPty).not.toHaveBeenCalled();
     expect((ctx.sshFactory as any).connect).not.toHaveBeenCalled();
     expect(vscode.window.showInformationMessage).toHaveBeenCalledWith(
-      expect.stringContaining("no console address yet")
+      expect.stringContaining("no console address")
     );
   });
 
@@ -5231,7 +5404,7 @@ describe("addressless connect guard", () => {
     await registeredCommands.get("nexus.server.testConnection")!("srv-1");
 
     expect((ctx.sshFactory as any).connect).not.toHaveBeenCalled();
-    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("no console address yet"));
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("no console address"));
   });
 
   // REVIEW FINDING (P2) — a watchdog wrapper (Run Macro on Server / Connect and
@@ -5249,7 +5422,7 @@ describe("addressless connect guard", () => {
     await connectServer(ctx, "srv-1", { onConnectFailed });
 
     expect(onConnectFailed).toHaveBeenCalledTimes(1);
-    expect(onConnectFailed).toHaveBeenCalledWith(expect.stringContaining("no console address yet"));
+    expect(onConnectFailed).toHaveBeenCalledWith(expect.stringContaining("no console address"));
   });
 
   // The script wrapper (nexus.server.runWithScript → connectAndRunScript) does not
@@ -6181,7 +6354,8 @@ describe("connectServer — addressless placeholder that has a web console", () 
     await flushPromises();
 
     const infos = messagesFrom(vi.mocked(vscode.window.showInformationMessage) as never);
-    expect(infos.some((m) => /no console address yet/i.test(m) && /re-sync/i.test(m))).toBe(true);
+    expect(infos.some((m) => /no console address/i.test(m) && /Host, Port and connection settings/i.test(m))).toBe(true);
+    expect(infos.some((m) => /Re-sync the source if it later reports an address/i.test(m))).toBe(true);
     expect(infos.every((m) => !/web console/i.test(m))).toBe(true);
     // No action button either — the refusal must not carry one for a row whose
     // right-click menu has no console entry.
@@ -6196,7 +6370,7 @@ describe("connectServer — addressless placeholder that has a web console", () 
     await flushPromises();
 
     const infos = messagesFrom(vi.mocked(vscode.window.showInformationMessage) as never);
-    expect(infos.some((m) => /no console address yet/i.test(m))).toBe(true);
+    expect(infos.some((m) => /no console address/i.test(m) && /Host, Port and connection settings/i.test(m))).toBe(true);
     expect(infos.every((m) => !/web console/i.test(m))).toBe(true);
     expect(mockShowWarningMessage.mock.calls.some((call) => call.includes("Open Web Console"))).toBe(false);
     expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexus.inventory.openWebConsole", expect.anything());

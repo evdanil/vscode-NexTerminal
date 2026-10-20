@@ -7,6 +7,7 @@ import { TUNNEL_DRAG_MIME } from "../../src/ui/dndMimeTypes";
 import type { LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile } from "../../src/models/config";
 import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
 import type { InventoryProvider } from "../../src/models/inventory";
+import { createContainerlabProvider } from "../../src/services/inventory/providers/containerlabProvider";
 import type { SessionSnapshot } from "../../src/core/contracts";
 
 // Read for the "No matches found" tooltip check: the tooltip must name a command
@@ -658,6 +659,8 @@ describe("NexusTreeProvider stable IDs", () => {
   it("ADDRESSLESS (Codex P1) — renders an addressless server with a ' (no address)' description and does not crash on the empty host (⊘ the default `user@` + empty host reads as a broken addressed server)", () => {
     const item = new ServerTreeItem(makeServer({ id: "s1", host: "", port: 0, addressless: true, origin: { sourceId: "src", externalId: "e1", syncedAt: 1 } }), false);
     expect(item.description).toContain("(no address)");
+    expect(item.tooltip).toContain("no console address");
+    expect(item.tooltip).not.toContain("no console address yet");
     // The empty host is not dangled after an "@" as though it were a real host.
     expect(item.description).not.toMatch(/@\s*\(/);
     expect(() => item.tooltip).not.toThrow();
@@ -667,6 +670,38 @@ describe("NexusTreeProvider stable IDs", () => {
     const item = new ServerTreeItem(makeServer({ id: "s2", host: "10.0.0.5", origin: { sourceId: "src", externalId: "e2", syncedAt: 1 } }), false);
     expect(item.description).toContain("@10.0.0.5");
     expect(item.description).not.toContain("(no address)");
+  });
+
+  it("shows proxy template ownership from the canonical record and ignores stale legacy stamps", () => {
+    const proxy = { type: "socks5", host: "proxy.example", port: 1080 } as const;
+    const canonicalTemplate = new ServerTreeItem(makeServer({
+      id: "template-proxy",
+      proxy,
+      origin: {
+        sourceId: "src", externalId: "template-proxy", syncedAt: 1,
+        proxyOwnership: { owner: "template", value: proxy }
+      }
+    }), false);
+    const canonicalDirect = new ServerTreeItem(makeServer({
+      id: "template-direct",
+      origin: {
+        sourceId: "src", externalId: "template-direct", syncedAt: 1,
+        proxyOwnership: { owner: "template", value: null }
+      }
+    }), false);
+    const staleLegacy = new ServerTreeItem(makeServer({
+      id: "source-default-proxy",
+      proxy,
+      origin: {
+        sourceId: "src", externalId: "source-default-proxy", syncedAt: 1,
+        proxyOwnership: { owner: "source-default", value: proxy },
+        templated: { proxy }
+      }
+    }), false);
+
+    expect(canonicalTemplate.tooltip).toContain("Template-applied: Proxy");
+    expect(canonicalDirect.tooltip).toContain("Template-applied: Proxy");
+    expect(staleLegacy.tooltip).not.toContain("Template-applied:");
   });
 
   it("ServerTreeItem shows the IPMI/BMC address on its own tooltip line, only when set (issue #48)", () => {
@@ -1610,6 +1645,35 @@ function serverItemById(provider: NexusTreeProvider, id: string): ServerTreeItem
  *     (defaults to false) → marker never reaches the item.
  */
 describe("NexusTreeProvider node-control marker — end-to-end snapshot wiring", () => {
+  it("decorates known Containerlab state without lifecycle or web-console markers", () => {
+    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({
+      get: (key: string) => key === "showTreeDescriptions" ? true : undefined
+    } as any);
+    const registry = new InventoryProviderRegistry();
+    registry.register(createContainerlabProvider());
+    const hasNodeControl = (providerId: string, externalId: string): boolean => {
+      const provider = registry.get(providerId);
+      return provider !== undefined && typeof provider.controlNode === "function" && (provider.canControlNode?.(externalId) ?? true);
+    };
+    const hasWebConsole = (providerId: string, externalId: string): boolean => {
+      const provider = registry.get(providerId);
+      return provider !== undefined && provider.webConsoleUrl !== undefined && (provider.canWebConsole?.(externalId) ?? true);
+    };
+    const provider = providerWith(
+      [makeServer({ id: "clab", name: "r1", origin: { sourceId: "clab-source", externalId: '["lab-a","clab-lab-a-r1"]', syncedAt: 1 } })],
+      [{ id: "clab-source", providerId: "containerlab", name: "Containerlab labs" }],
+      new Map<string, "running" | "stopped">([["clab", "running"]]),
+      hasNodeControl,
+      hasWebConsole
+    );
+    const item = serverItemById(provider, "clab");
+
+    expect(item.contextValue).toBe("nexus.server");
+    expect(item.description).toContain(" (running)");
+    expect((item.iconPath as { id: string }).id).toBe("circle-filled");
+    expect(item.tooltip).not.toMatch(/SSH service|SSH ready|credentials verified|refresh inventory status/iu);
+  });
+
   it("resolves an eve-ng inventory source through origin.sourceId → predicate → .nodeRunning / .nodeStopped from serverStatus (⊘ a broken resolution, a typo'd 'eve-ng' literal in the fixture or predicate, or a dropped constructor arg leaves the EVE node with no node-control marker)", () => {
     const provider = providerWith(
       [

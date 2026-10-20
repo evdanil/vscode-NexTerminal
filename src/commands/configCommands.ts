@@ -5,7 +5,13 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
 import type { AuthProfile, LocalShellProfile, ProxyConfig, ServerConfig, ServerOrigin, TunnelProfile, SerialProfile } from "../models/config";
-import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials, cloneTemplatedStamps, templatedHasAnyStamp } from "../models/config";
+import {
+  authProfileNeedsServerKeyPath,
+  authProfileOwnedCredentials,
+  cloneInventoryProxyOwnership,
+  cloneTemplatedStamps,
+  templatedHasAnyStamp
+} from "../models/config";
 import type { InventorySourceConfig, InventorySourceValues, TemplateRule } from "../models/inventory";
 import { inventorySecretKey } from "../models/inventory";
 import type { DeviceTemplateProfile, TemplateField } from "../models/deviceTemplate";
@@ -1703,7 +1709,11 @@ interface SanitizedSnapshot {
  * and a hand-edited file cannot land one either. Anything that is not a proxy
  * this build knows is returned as it is, for the validators to judge.
  */
-function remapProxy(proxy: ProxyConfig | undefined, linkServer: (id: string) => string | undefined): ProxyConfig | undefined {
+function remapProxy(proxy: null, linkServer: (id: string) => string | undefined): null;
+function remapProxy(proxy: undefined, linkServer: (id: string) => string | undefined): undefined;
+function remapProxy(proxy: ProxyConfig, linkServer: (id: string) => string | undefined): ProxyConfig | undefined;
+function remapProxy(proxy: ProxyConfig | null | undefined, linkServer: (id: string) => string | undefined): ProxyConfig | null | undefined;
+function remapProxy(proxy: ProxyConfig | null | undefined, linkServer: (id: string) => string | undefined): ProxyConfig | null | undefined {
   if (typeof proxy !== "object" || proxy === null) {
     return proxy;
   }
@@ -1718,6 +1728,11 @@ function remapProxy(proxy: ProxyConfig | undefined, linkServer: (id: string) => 
     default:
       return proxy;
   }
+}
+
+function remapConcreteProxy(proxy: ProxyConfig | undefined, linkServer: (id: string) => string | undefined): ProxyConfig | undefined {
+  const remapped = remapProxy(proxy, linkServer);
+  return remapped === null ? undefined : remapped;
 }
 
 /**
@@ -1880,10 +1895,7 @@ const SHARED_SOURCE_RULES = {
   // it for the completion message) — see `importShareData`.
   prunePolicy: "link",
   defaultUsername: () => SHARED_USERNAME,
-  config: (config, source) =>
-    typeof config === "object" && config !== null && !Array.isArray(config)
-      ? sanitizeSharedSourceConfig(source.providerId, config, source.secretFieldIds)
-      : config,
+  config: "link",
   secretFieldIds: "keep",
   lastSyncAt: "drop",
   revision: "drop",
@@ -1910,6 +1922,8 @@ const SHARED_ORIGIN_RULES = {
   syncedProtocol: "keep",
   syncedHost: "keep",
   syncedPort: "keep",
+  proxyOwnership: "link",
+  proxyOptOut: "keep",
   templated: "link"
 } satisfies ShareRules<ServerOrigin>;
 
@@ -2257,7 +2271,8 @@ const BUILT_IN_INVENTORY_PROVIDER_IDS: ReadonlySet<string> = new Set([
   NETBOX_PROVIDER_ID,
   EVE_NG_PROVIDER_ID,
   PROXMOX_PROVIDER_ID,
-  GNS3_PROVIDER_ID
+  GNS3_PROVIDER_ID,
+  "containerlab"
 ]);
 
 /**
@@ -2338,6 +2353,39 @@ function sanitizeSharedSourceConfig(providerId: unknown, config: InventorySource
       delete next[fieldId];
     }
     delete next.username;
+  }
+  return next;
+}
+
+function sanitizeAndRemapSharedSourceConfig(
+  providerId: unknown,
+  config: unknown,
+  secretFieldIds: unknown,
+  linkServer: (id: string) => string | undefined
+): InventorySourceValues | undefined {
+  // Sanitization transforms a config object; it must not make a malformed
+  // payload object-shaped, or import validation would accept it after repair.
+  if (typeof config !== "object" || config === null || Array.isArray(config)) {
+    return config as InventorySourceValues | undefined;
+  }
+  const next = sanitizeSharedSourceConfig(providerId, config as InventorySourceValues, secretFieldIds);
+  if (providerId === "containerlab") {
+    const sourceHostId = next.labHostId;
+    if (typeof sourceHostId === "string") {
+      const sharedHostId = linkServer(sourceHostId);
+      if (sharedHostId !== undefined) {
+        next.labHostId = sharedHostId;
+      } else if (next.location === "ssh") {
+        next.labHostId = "";
+      } else if (next.location === undefined || next.location === "local") {
+        delete next.labHostId;
+      }
+    } else if (next.location === "ssh") {
+      // Keep a remote source visibly remote and invalid when the share did not
+      // carry its discovery host. Falling back to local would run on the
+      // recipient's extension host against a different Docker daemon.
+      next.labHostId = "";
+    }
   }
   return next;
 }
@@ -2443,12 +2491,19 @@ function shareOrigin(origin: ServerOrigin, sourceId: string, lenses: ShareLenses
   return shareRecord(origin, SHARED_ORIGIN_RULES, {
     sourceId: () => sourceId,
     syncedAuthProfileId: (id) => (id === undefined || dropAuthLink ? undefined : lenses.linkProfile(id)),
+    proxyOwnership: (ownership) => {
+      if (ownership === undefined || ownership.value === null) {
+        return ownership;
+      }
+      const value = remapProxy(ownership.value, lenses.linkServer);
+      return value === undefined ? undefined : { ...ownership, value };
+    },
     templated: (stamps) => {
       if (stamps === undefined) {
         return undefined;
       }
       const shared = shareRecord(stamps, SHARED_TEMPLATED_STAMP_RULES, {
-        proxy: (proxy) => remapProxy(proxy, lenses.linkServer),
+        proxy: (proxy) => remapConcreteProxy(proxy, lenses.linkServer),
         ipmiAuthProfileId: (id) => (id === undefined ? undefined : lenses.linkProfile(id)),
         ipmiGatewayServerId: (id) => (id === undefined ? undefined : lenses.linkServer(id))
       });
@@ -2479,7 +2534,7 @@ function shareServer(
   const linkProfile = (profileId: string | undefined): string | undefined => (profileId ? lenses.linkProfile(profileId) : undefined);
   return shareRecord(server, SHARED_SERVER_RULES, {
     id: () => id,
-    proxy: (proxy) => remapProxy(proxy, lenses.linkServer),
+    proxy: (proxy) => remapConcreteProxy(proxy, lenses.linkServer),
     authProfileId: (profileId) => (dropAuthLink ? undefined : linkProfile(profileId)),
     ipmiAuthProfileId: linkProfile,
     ipmiGatewayServerId: (serverId) => (serverId ? lenses.linkServer(serverId) : undefined),
@@ -2620,6 +2675,7 @@ export function sanitizeForSharing(
       shareRecord(source, SHARED_SOURCE_RULES, {
         id: () => sourceIdMap.get(source.id)!,
         prunePolicy: (policy) => policy,
+        config: (config) => sanitizeAndRemapSharedSourceConfig(source.providerId, config, source.secretFieldIds, lenses.linkServer),
         authProfileId: (id) => linkSyncAuthProfile(id, lenses),
         templateRules: (rules) => remapSharedTemplateRules(rules, (id) => templateIdMap.get(id))
       }) as InventorySourceConfig
@@ -3872,6 +3928,7 @@ export function registerConfigCommands(
       const remappedSource = shareRecord(source, SHARED_SOURCE_RULES, {
         id: () => newSourceId,
         prunePolicy: (policy) => (policy === "delete" ? "orphan" : policy),
+        config: (config) => sanitizeAndRemapSharedSourceConfig(source.providerId, config, source.secretFieldIds, lenses.linkServer),
         authProfileId: (id) => linkSyncAuthProfile(id, lenses),
         templateRules: (rules) => remapSharedTemplateRules(rules, (id) => validTemplates.get(id)?.id)
       }) as InventorySourceConfig;
@@ -3902,7 +3959,7 @@ export function registerConfigCommands(
     const importedSourceIds: string[] = [];
     let deletePoliciesOrphaned = 0;
     for (const { payloadId, record, deletePolicy } of landingSources) {
-      await core.addOrUpdateInventorySource(record);
+      await core.addOrUpdateInventorySource(record, { forceNewActivationGeneration: true });
       if (typeof payloadId === "string") {
         sourceIdMap.set(payloadId, record.id);
       }
@@ -4562,7 +4619,7 @@ export function registerConfigCommands(
     data.inventorySources = sanitizedInventorySources.sources;
     skipped += sanitizedInventorySources.skipped;
     const inventorySourceTally = await importPreservingIds(data.inventorySources, existingIds, validateInventorySource, (e) =>
-      core.addOrUpdateInventorySource(e)
+      core.addOrUpdateInventorySource(e, { forceNewActivationGeneration: true })
     );
     // Environment restored from the encrypted section first; see `restoreEnvFromSecrets`.
     restoreEnvFromSecrets(data.localShellProfiles, decryptedSecrets?.localShellEnv);
@@ -5249,6 +5306,14 @@ export function registerConfigCommands(
                       ...(rolledBackOrigin.templated !== undefined
                         ? { templated: cloneTemplatedStamps(rolledBackOrigin.templated) }
                         : {}),
+                      // The canonical route receipt is nested and follows the
+                      // origin through this rollback detach just as it does
+                      // through Remove Source → Keep Servers. Manual Direct is
+                      // separate intent and must also survive the strip.
+                      ...(rolledBackOrigin.proxyOwnership !== undefined
+                        ? { proxyOwnership: cloneInventoryProxyOwnership(rolledBackOrigin.proxyOwnership) }
+                        : {}),
+                      ...(rolledBackOrigin.proxyOptOut === true ? { proxyOptOut: true as const } : {}),
                       detachedAt
                     }
                   }

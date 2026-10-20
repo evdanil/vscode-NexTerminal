@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import type { AuthProfile, AuthType, ProxyConfig, ServerConfig, SessionPtyHandle } from "../models/config";
+import type { AuthProfile, AuthType, InventoryProxyOwnership, ProxyConfig, ServerConfig, ServerOrigin, SessionPtyHandle } from "../models/config";
 import {
   authProfileOwnedCredentials,
   authProfileOwnershipSignature,
@@ -683,6 +683,43 @@ export async function syncProxyPasswordSecret(ctx: CommandContext, serverId: str
 // placeholder has no console endpoint, so the port is a placeholder too; kept in
 // sync-engine and form-save so an edited placeholder round-trips to the same shape.
 const ADDRESSLESS_PORT = 0;
+
+type InventoryProxyRouteMarker = {
+  proxyOwnership?: InventoryProxyOwnership;
+  proxyOptOut?: true;
+  templated?: ServerOrigin["templated"];
+};
+
+function applyInventoryProxyRouteChoice<T extends InventoryProxyRouteMarker>(
+  marker: T | undefined,
+  choice: unknown,
+  removedConcreteRoute: boolean
+): T | undefined {
+  if (!marker || (choice !== "automatic" && choice !== "direct")) {
+    return marker;
+  }
+  if (choice === "direct" || removedConcreteRoute) {
+    const updated = { ...marker };
+    delete updated.proxyOwnership;
+    if (updated.templated !== undefined) {
+      const templated = { ...updated.templated };
+      delete templated.proxy;
+      updated.templated = Object.keys(templated).length > 0 ? templated : undefined;
+    }
+    if (choice === "direct") {
+      updated.proxyOptOut = true;
+    } else {
+      delete updated.proxyOptOut;
+    }
+    return updated;
+  }
+  if (marker.proxyOptOut === true) {
+    const updated = { ...marker };
+    delete updated.proxyOptOut;
+    return updated;
+  }
+  return marker;
+}
 
 export function formValuesToServer(
   values: FormValues,
@@ -1850,7 +1887,14 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       // TELNET (Phase 0, MAJOR-3) — the protocol rides along so the Jump Host
       // and IPMI Gateway pickers can leave telnet servers out of their options.
       const serverList = toSshInfrastructureServerList(snapshot.servers);
-      const definition = serverFormDefinition(existing, existingGroups, getDefaultSessionTranscriptsEnabled(), serverList, snapshot.authProfiles);
+      const definition = serverFormDefinition(
+        existing,
+        existingGroups,
+        getDefaultSessionTranscriptsEnabled(),
+        serverList,
+        snapshot.authProfiles,
+        existing.origin !== undefined || existing.formerlySynced !== undefined
+      );
       // Issue #48 — a caller that is sending the user here to fill in an
       // advanced field (a `${profile.ipmiHost}` refusal) says so, and the
       // section opens instead of hiding the field the error just named.
@@ -2122,10 +2166,20 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
               delete liveOrigin.syncedPort;
               delete liveOrigin.syncedProtocol;
             }
+            const routeChoice = values.proxyType === "none" ? values.inventoryProxyRouteChoice : undefined;
+            const removedConcreteRoute = values.proxyType === "none" && liveRecord?.proxy !== undefined;
+            if (liveOrigin !== undefined) {
+              liveOrigin = applyInventoryProxyRouteChoice(liveOrigin, routeChoice, removedConcreteRoute);
+            }
+            const liveFormerlySynced = applyInventoryProxyRouteChoice(
+              liveRecord?.formerlySynced,
+              routeChoice,
+              removedConcreteRoute
+            );
             const updated: ServerConfig = {
               ...preserveDormantSshConfig(liveRecord ?? existing, linked),
               ...(liveOrigin !== undefined ? { origin: liveOrigin } : {}),
-              ...(liveRecord?.formerlySynced !== undefined ? { formerlySynced: liveRecord.formerlySynced } : {})
+              ...(liveFormerlySynced !== undefined ? { formerlySynced: liveFormerlySynced } : {})
             };
             // FINDINGS 2+3 (P2, edit-rollback review) — addOrUpdateServer
             // enforces single ownership of openFileExplorerOnFirstConnect:
@@ -2569,12 +2623,13 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       // strips `origin` (see below), so the copy would be a MANUAL addressless
       // record — an invariant violation: `addressless` exists only for synced
       // placeholders. No sync would ever upgrade it (no origin), and its connect
-      // refusal tells the user to re-sync a source it has no link to. Stripping the
-      // flag instead would leave an empty host that fails validation, so refusing is
-      // the only coherent answer.
+      // refusal directs the user to a known endpoint they can add by hand. The
+      // duplicate has no source link to sync, and stripping the flag instead would
+      // leave an empty host that fails validation, so refusing is the only coherent
+      // answer.
       if (server.addressless === true) {
         void vscode.window.showInformationMessage(
-          `"${server.name}" has no console address yet, so it can't be duplicated — it will get one when its inventory source next syncs.`
+          `"${server.name}" has no console address, so it can't be duplicated. If you know a reachable endpoint, edit its Host, Port and connection settings first.`
         );
         return;
       }
@@ -2705,7 +2760,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       if (addresslessInGroup.length > 0) {
         const count = addresslessInGroup.length;
         void vscode.window.showInformationMessage(
-          `${count} ${count === 1 ? "server has" : "servers have"} no console address yet and ${count === 1 ? "was" : "were"} skipped — ${count === 1 ? "it" : "they"} will connect once the inventory source assigns an address.`
+          `${count} ${count === 1 ? "server has" : "servers have"} no console address and ${count === 1 ? "was" : "were"} skipped. If you know a reachable endpoint, edit its profile's Host, Port and connection settings. Re-sync the source if it later reports an address.`
         );
       }
     }),

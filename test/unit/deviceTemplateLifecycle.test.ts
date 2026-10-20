@@ -5,9 +5,15 @@ vi.mock("vscode", () => ({}));
 import { NexusCore } from "../../src/core/nexusCore";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { sanitizeForSharing } from "../../src/commands/configCommands";
+import { cloneServerConfig } from "../../src/models/config";
 import type { AuthProfile, ServerConfig } from "../../src/models/config";
 import type { DeviceTemplateProfile } from "../../src/models/deviceTemplate";
 import type { InventorySourceConfig } from "../../src/models/inventory";
+import {
+  isValidDetachedServerOrigin,
+  isValidServerOrigin,
+  validateDeviceTemplate
+} from "../../src/utils/validation";
 
 /**
  * DEVICE TEMPLATES (issue #48 PR-T1) — §6.2 template deletion sweep, §8.4
@@ -32,6 +38,59 @@ function source(id: string, overrides: Partial<InventorySourceConfig> = {}): Inv
 function tmpl(id: string, fields: DeviceTemplateProfile["fields"] = {}): DeviceTemplateProfile {
   return { id, name: id, fields };
 }
+
+const proxyIntentValidationCases = [
+  { name: "accepts absent proxy intent", intent: {}, expected: true },
+  { name: "accepts template Direct ownership", intent: { proxyOwnership: { owner: "template", value: null } }, expected: true },
+  { name: "accepts source-default Direct ownership", intent: { proxyOwnership: { owner: "source-default", value: null } }, expected: true },
+  {
+    name: "accepts template SSH ownership",
+    intent: { proxyOwnership: { owner: "template", value: { type: "ssh", jumpHostId: "lab-host" } } },
+    expected: true
+  },
+  {
+    name: "accepts source-default SSH ownership",
+    intent: { proxyOwnership: { owner: "source-default", value: { type: "ssh", jumpHostId: "lab-host" } } },
+    expected: true
+  },
+  { name: "accepts a manual Direct opt-out without ownership", intent: { proxyOptOut: true }, expected: true },
+  { name: "rejects null ownership", intent: { proxyOwnership: null }, expected: false },
+  { name: "rejects array ownership", intent: { proxyOwnership: [] }, expected: false },
+  { name: "rejects ownership with no owner", intent: { proxyOwnership: { value: null } }, expected: false },
+  { name: "rejects an unknown owner", intent: { proxyOwnership: { owner: "manual", value: null } }, expected: false },
+  { name: "rejects ownership with no value", intent: { proxyOwnership: { owner: "template" } }, expected: false },
+  {
+    name: "rejects malformed concrete SSH ownership",
+    intent: { proxyOwnership: { owner: "source-default", value: { type: "ssh", jumpHostId: "" } } },
+    expected: false
+  },
+  { name: "rejects false opt-out", intent: { proxyOptOut: false }, expected: false },
+  { name: "rejects string opt-out", intent: { proxyOptOut: "true" }, expected: false },
+  { name: "rejects null opt-out", intent: { proxyOptOut: null }, expected: false },
+  {
+    name: "rejects Direct ownership together with opt-out",
+    intent: { proxyOwnership: { owner: "template", value: null }, proxyOptOut: true },
+    expected: false
+  },
+  {
+    name: "rejects concrete ownership together with opt-out",
+    intent: { proxyOwnership: { owner: "source-default", value: { type: "ssh", jumpHostId: "lab-host" } }, proxyOptOut: true },
+    expected: false
+  }
+] satisfies readonly { name: string; intent: Record<string, unknown>; expected: boolean }[];
+
+const proxyIntentValidationTargets = [
+  {
+    name: "live server origin",
+    validate: isValidServerOrigin,
+    base: { sourceId: "source-1", externalId: "device:1", syncedAt: 1 }
+  },
+  {
+    name: "detached server origin",
+    validate: isValidDetachedServerOrigin,
+    base: { sourceId: "source-1", sourceName: "Source", providerId: "netbox", externalId: "device:1", detachedAt: 1 }
+  }
+] as const;
 
 describe("Fixture 25 — removeDeviceTemplate sweep (§6.2)", () => {
   it("clears the referencing rule on EVERY source and re-revisions them, leaving server values/stamps untouched", async () => {
@@ -173,6 +232,89 @@ describe("Fixture 26 — storage round-trip + share exclusion", () => {
     expect(core2.getInventorySource("s1")?.templateRules).toEqual([{ id: "r1", templateId: "T", filter: "role=switch" }]);
     // The boolean-false stamp survives the round trip (present-when-false).
     expect(core2.getServer("srv-1")?.origin?.templated?.multiplexing).toBe(false);
+  });
+
+  it("a Direct template and canonical Direct ownership receipt survive validation and reload", async () => {
+    const direct = tmpl("T", { proxy: { mode: "override", value: null } });
+    expect(validateDeviceTemplate(direct)).toBe(true);
+
+    const repo = new InMemoryConfigRepository();
+    const core = new NexusCore(repo);
+    await core.initialize();
+    await core.addOrUpdateDeviceTemplate(direct);
+    await core.addOrUpdateInventorySource(source("s1", { templateRules: [{ id: "r1", templateId: "T" }] }));
+    await core.addOrUpdateServer({
+      id: "srv-1",
+      name: "sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: {
+        sourceId: "s1",
+        externalId: "device:1",
+        syncedAt: 1,
+        proxyOwnership: { owner: "template", value: null }
+      }
+    });
+
+    const reloaded = new NexusCore(repo);
+    await reloaded.initialize();
+
+    expect(reloaded.getDeviceTemplate("T")?.fields.proxy).toEqual({ mode: "override", value: null });
+    expect(reloaded.getServer("srv-1")?.origin?.proxyOwnership).toEqual({ owner: "template", value: null });
+  });
+
+  for (const target of proxyIntentValidationTargets) {
+    describe(`${target.name} proxy intent validation`, () => {
+      it.each(proxyIntentValidationCases)("$name", ({ intent, expected }) => {
+        expect(target.validate({ ...target.base, ...intent })).toBe(expected);
+      });
+    });
+  }
+
+  it("server clones isolate nested live and detached proxy receipts", async () => {
+    const route = { type: "socks5" as const, host: "proxy.example.test", port: 1080 };
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    await core.addOrUpdateServer({
+      id: "srv-1",
+      name: "sw",
+      host: "10.0.0.1",
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      isHidden: false,
+      origin: {
+        sourceId: "s1",
+        externalId: "device:1",
+        syncedAt: 1,
+        proxyOwnership: { owner: "template", value: { ...route } },
+        templated: { proxy: { ...route } }
+      },
+      formerlySynced: {
+        sourceId: "removed-source",
+        sourceName: "Removed Source",
+        providerId: "netbox",
+        externalId: "device:old",
+        detachedAt: 1,
+        proxyOwnership: { owner: "template", value: { ...route } },
+        templated: { proxy: { ...route } }
+      }
+    });
+
+    const stored = core.getServer("srv-1")!;
+    const cloned = cloneServerConfig(stored);
+    (cloned.origin!.proxyOwnership!.value as typeof route).host = "changed-live.example.test";
+    (cloned.origin!.templated!.proxy as typeof route).host = "changed-live-stamp.example.test";
+    (cloned.formerlySynced!.proxyOwnership!.value as typeof route).host = "changed-detached.example.test";
+    (cloned.formerlySynced!.templated!.proxy as typeof route).host = "changed-detached-stamp.example.test";
+
+    expect((stored.origin!.proxyOwnership!.value as typeof route).host).toBe(route.host);
+    expect((stored.origin!.templated!.proxy as typeof route).host).toBe(route.host);
+    expect((stored.formerlySynced!.proxyOwnership!.value as typeof route).host).toBe(route.host);
+    expect((stored.formerlySynced!.templated!.proxy as typeof route).host).toBe(route.host);
   });
 
   it("the sanitized SHARE export carries device templates beside the sources whose rules name them, under fresh ids (⊘ the former A-M5 exclusion, which dropped every rule on the recipient)", () => {

@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { computeSyncPlan, type InventorySyncPlan } from "../../src/services/inventory/syncEngine";
-import { clearTemplatedStamps } from "../../src/services/inventory/templateApply";
+import { applyTemplateMatrix, clearTemplatedStamps } from "../../src/services/inventory/templateApply";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 import type { AuthProfile, ProxyConfig, ServerConfig, ServerOrigin } from "../../src/models/config";
-import type { InventoryDevice, InventorySourceConfig, InventoryTree, TemplateRule } from "../../src/models/inventory";
+import type { InventoryDevice, InventorySourceConfig, InventorySourceDefaultRoute, InventoryTree, TemplateRule } from "../../src/models/inventory";
 import type { DeviceTemplateProfile } from "../../src/models/deviceTemplate";
 
 /**
@@ -53,6 +53,17 @@ function ownedServer(overrides: Partial<ServerConfig> = {}, origin: Partial<Serv
     origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, ...origin },
     ...overrides
   };
+  // Most matrix fixtures describe current-format template ownership. Convert
+  // legacy setup shorthand here so only explicit migration fixtures exercise
+  // origin.templated.proxy on a live record.
+  if (merged.origin?.templated?.proxy !== undefined) {
+    const { proxy, ...otherStamps } = merged.origin.templated;
+    merged.origin = {
+      ...merged.origin,
+      proxyOwnership: merged.origin.proxyOwnership ?? { owner: "template", value: proxy },
+      templated: Object.keys(otherStamps).length > 0 ? otherStamps : undefined
+    };
+  }
   // PRIMARY HOST/PORT (task #29) — a real synced server OWNS its address, so seed
   // syncedHost/syncedPort to match its own host/port (when unset and addressed).
   // Without this these template fixtures would see a spurious matrix-row-5a
@@ -90,6 +101,7 @@ interface PlanOpts {
   authProfile?: AuthProfile;
   adoptionChoice?: "adopt" | "decline";
   providerInstanceKey?: string;
+  sourceDefaultRoute?: InventorySourceDefaultRoute;
 }
 
 function plan(opts: PlanOpts): InventorySyncPlan {
@@ -101,6 +113,7 @@ function plan(opts: PlanOpts): InventorySyncPlan {
     authProfile: opts.authProfile,
     adoptionChoice: opts.adoptionChoice,
     providerInstanceKey: opts.providerInstanceKey,
+    sourceDefaultRoute: opts.sourceDefaultRoute,
     templatesById: new Map((opts.templates ?? []).map((t) => [t.id, t] as const)),
     authProfilesById: new Map((opts.authProfiles ?? []).map((p) => [p.id, p] as const))
   });
@@ -143,6 +156,267 @@ function afterFor(p: InventorySyncPlan, serverId: string): ServerConfig | undefi
 // -------- Matrix rows 1–7 + mode gate (proxy) --------
 
 describe("device template matrix — non-auth fields", () => {
+  it("applies and identifies a source-default SSH route on a new server", () => {
+    const route = { type: "ssh", jumpHostId: "lab-host" } as const;
+    const p = plan({
+      source: makeSource(),
+      devices: [makeDevice()],
+      servers: [{ id: "lab-host", name: "Lab Host", host: "lab.example", port: 22, username: "lab", authType: "agent", isHidden: false }],
+      sourceDefaultRoute: { kind: "ssh", jumpHostId: "lab-host" }
+    });
+
+    expect(p.adds[0].proxy).toEqual(route);
+    expect(p.adds[0].origin?.proxyOwnership).toEqual({ owner: "source-default", value: route });
+    expect(p.warnings.some((warning) => warning.includes("inventory source default"))).toBe(true);
+  });
+
+  it("updates a still-owned source route when the source changes to Direct", () => {
+    const oldRoute = { type: "ssh", jumpHostId: "old-lab-host" } as const;
+    const server = ownedServer(
+      { proxy: oldRoute },
+      { proxyOwnership: { owner: "source-default", value: oldRoute } }
+    );
+    const p = plan({
+      source: makeSource(),
+      devices: [makeDevice()],
+      servers: [server],
+      sourceDefaultRoute: { kind: "direct" }
+    });
+
+    const after = afterFor(p, server.id)!;
+    expect(after.proxy).toBeUndefined();
+    expect("proxy" in after).toBe(false);
+    expect(after.origin?.proxyOwnership).toEqual({ owner: "source-default", value: null });
+  });
+
+  it("lets an explicit template Fill take ownership from an unchanged source default", () => {
+    const sourceRoute = { type: "ssh", jumpHostId: "lab-host" } as const;
+    const server = ownedServer(
+      { proxy: sourceRoute },
+      { proxyOwnership: { owner: "source-default", value: sourceRoute } }
+    );
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()],
+      servers: [server, { id: "lab-host", name: "Lab Host", host: "lab.example.test", port: 22, username: "lab", authType: "agent", isHidden: false }],
+      templates: [template({ proxy: { mode: "fill", value: P_A } })],
+      sourceDefaultRoute: { kind: "ssh", jumpHostId: "lab-host" }
+    });
+
+    const after = afterFor(p, server.id)!;
+    expect(after.proxy).toEqual(P_A);
+    expect(after.origin?.proxyOwnership).toEqual({ owner: "template", value: P_A });
+    expect(after.origin?.templated?.proxy).toBeUndefined();
+    expect(p.warnings.some((warning) => warning.includes('Proxy ← "T"'))).toBe(true);
+    expect(p.warnings.join("\n")).not.toMatch(/invalid or missing SSH host/i);
+  });
+
+  it("lets explicit template Direct beat the source default and records Direct ownership", () => {
+    const p = plan({
+      source: makeSource({ templateRules: [rule("tmpl-1")] }),
+      devices: [makeDevice()],
+      servers: [{ id: "lab-host", name: "Lab Host", host: "lab.example.test", port: 22, username: "lab", authType: "agent", isHidden: false }],
+      templates: [template({ proxy: { mode: "override", value: null } })],
+      sourceDefaultRoute: { kind: "ssh", jumpHostId: "lab-host" }
+    });
+
+    expect(p.adds[0].proxy).toBeUndefined();
+    expect("proxy" in p.adds[0]).toBe(false);
+    expect(p.adds[0].origin?.proxyOwnership).toEqual({ owner: "template", value: null });
+    expect(p.warnings.some((warning) => warning.includes('Proxy ← "T"'))).toBe(true);
+    expect(p.warnings.join("\n")).not.toMatch(/invalid or missing SSH host/i);
+  });
+
+  it("releases a legacy template-owned route to a capable source default and migrates its stamp", () => {
+    const oldRoute = { type: "ssh", jumpHostId: "old-template-host" } as const;
+    const server = ownedServer({ proxy: oldRoute }, { templated: { proxy: oldRoute } });
+    server.origin = { ...server.origin!, proxyOwnership: undefined, templated: { proxy: oldRoute } };
+    const p = plan({
+      source: makeSource(),
+      devices: [makeDevice()],
+      servers: [server],
+      sourceDefaultRoute: { kind: "direct" }
+    });
+
+    const after = afterFor(p, server.id)!;
+    expect(after.proxy).toBeUndefined();
+    expect(after.origin?.proxyOwnership).toEqual({ owner: "source-default", value: null });
+    expect(after.origin?.templated?.proxy).toBeUndefined();
+  });
+
+  it("protects a manual route and a recorded manual Direct opt-out from source defaults", () => {
+    const manual = ownedServer({ proxy: P_C }, { templated: undefined });
+    const optOut = ownedServer(
+      { id: "manual-direct", proxy: undefined },
+      { externalId: "manual-direct", proxyOptOut: true, templated: undefined }
+    );
+    const p = plan({
+      source: makeSource(),
+      devices: [makeDevice({ externalId: "device:1", name: "renamed-manual" }), makeDevice({ externalId: "manual-direct", name: "renamed-direct" })],
+      servers: [manual, optOut, { id: "lab-host", name: "Lab Host", host: "lab.example.test", port: 22, username: "lab", authType: "agent", isHidden: false }],
+      sourceDefaultRoute: { kind: "ssh", jumpHostId: "lab-host" }
+    });
+
+    expect(afterFor(p, manual.id)?.proxy).toEqual(P_C);
+    expect(afterFor(p, manual.id)?.origin?.proxyOwnership).toBeUndefined();
+    expect(afterFor(p, optOut.id)?.proxy).toBeUndefined();
+    expect(afterFor(p, optOut.id)?.origin?.proxyOptOut).toBe(true);
+    expect(afterFor(p, optOut.id)?.origin?.proxyOwnership).toBeUndefined();
+    expect(p.warnings.join("\n")).not.toMatch(/invalid or missing SSH host/i);
+  });
+
+  it("M6 — an invalid source-default SSH host emits the actual source-default warning", () => {
+    const p = plan({
+      source: makeSource(),
+      devices: [makeDevice()],
+      sourceDefaultRoute: { kind: "ssh", jumpHostId: "missing-lab-host" }
+    });
+    expect(p.warnings).toContain(
+      'The inventory source default route for "NetBox" names an invalid or missing SSH host — restore that server or change the source route.'
+    );
+  });
+
+  it("migrates a legacy template receipt on an unrelated write without writing a route", () => {
+    const server = ownedServer({ proxy: P_C }, { templated: undefined });
+    server.origin = { ...server.origin!, templated: { proxy: P_A } };
+
+    const matrix = applyTemplateMatrix(server, { multiplexing: { value: true, mode: "override" } });
+
+    expect(matrix.values.multiplexing).toBe(true);
+    expect(matrix.proxyWritten).toBe(false);
+    expect(matrix.values).not.toHaveProperty("proxy");
+    expect(matrix.clearProxy).toBe(false);
+    expect(matrix.proxyOwnership).toEqual({ owner: "template", value: P_A });
+    expect(matrix.templated?.proxy).toBeUndefined();
+  });
+
+  it("prefers canonical ownership over a simultaneous legacy template receipt", () => {
+    const server = ownedServer({ proxy: P_C }, { templated: undefined });
+    server.origin = {
+      ...server.origin!,
+      proxyOwnership: { owner: "source-default", value: P_C },
+      templated: { proxy: P_A }
+    };
+
+    const matrix = applyTemplateMatrix(server, {});
+
+    expect(matrix.proxyWritten).toBe(false);
+    expect(matrix.proxyOwnership).toEqual({ owner: "source-default", value: P_C });
+    expect(matrix.templated?.proxy).toBeUndefined();
+  });
+
+  it("drops a legacy receipt when manual Direct intent is present", () => {
+    const server = ownedServer({ proxy: undefined }, { proxyOptOut: true, templated: undefined });
+    server.origin = { ...server.origin!, proxyOptOut: true, templated: { proxy: P_A } };
+
+    const matrix = applyTemplateMatrix(server, {
+      proxy: { value: P_B, mode: "override", owner: "source-default" }
+    });
+
+    expect(matrix.proxyWritten).toBe(false);
+    expect(matrix.values).not.toHaveProperty("proxy");
+    expect(matrix.proxyOwnership).toBeUndefined();
+    expect(matrix.templated?.proxy).toBeUndefined();
+  });
+
+  it("keeps the old template receipt when a source default meets a manual route", () => {
+    const server = ownedServer({ proxy: P_C }, { templated: undefined });
+    server.origin = { ...server.origin!, templated: { proxy: P_A } };
+
+    const matrix = applyTemplateMatrix(server, {
+      proxy: { value: P_B, mode: "override", owner: "source-default" }
+    });
+
+    expect(matrix.proxyWritten).toBe(false);
+    expect(matrix.values).not.toHaveProperty("proxy");
+    expect(matrix.clearProxy).toBe(false);
+    expect(matrix.proxyOwnership).toEqual({ owner: "template", value: P_A });
+    expect(matrix.templated?.proxy).toBeUndefined();
+  });
+
+  it("clones carried ownership and template stamps when an unchanged matrix returns them", () => {
+    const server = ownedServer({ proxy: P_A }, { templated: undefined });
+    server.origin = {
+      ...server.origin!,
+      proxyOwnership: { owner: "template", value: { ...P_A } },
+      templated: { multiplexing: false }
+    };
+
+    const matrix = applyTemplateMatrix(server, {});
+    expect(matrix.proxyWritten).toBe(false);
+    expect(matrix.proxyOwnership).not.toBe(server.origin.proxyOwnership);
+    expect(matrix.templated).not.toBe(server.origin.templated);
+
+    (matrix.proxyOwnership!.value as typeof P_A).host = "mutated.example.test";
+    matrix.templated!.multiplexing = true;
+
+    expect((server.origin.proxyOwnership!.value as typeof P_A).host).toBe(P_A.host);
+    expect(server.origin.templated!.multiplexing).toBe(false);
+  });
+
+  it("adoption retains a cloned detached proxy receipt", () => {
+    const detachedRoute = { type: "socks5" as const, host: "detached-proxy.example.test", port: 1080 };
+    const kept = keptServer({
+      id: "kept-receipt",
+      proxy: { ...detachedRoute },
+      formerlySynced: {
+        ...keptServer().formerlySynced!,
+        proxyOwnership: { owner: "template", value: { ...detachedRoute } }
+      }
+    });
+    const p = plan({
+      source: makeSource(),
+      devices: [makeDevice()],
+      servers: [kept],
+      adoptionChoice: "adopt",
+      providerInstanceKey: DEVICE_INSTANCE
+    });
+
+    const adopted = afterFor(p, kept.id)!;
+    expect(adopted.origin?.proxyOwnership).toEqual({ owner: "template", value: detachedRoute });
+    (adopted.origin!.proxyOwnership!.value as typeof detachedRoute).host = "mutated-adoption.example.test";
+    expect((kept.formerlySynced!.proxyOwnership!.value as typeof detachedRoute).host).toBe(detachedRoute.host);
+  });
+
+  it("restores detached proxy ownership and manual Direct intent before the adoption matrix runs", () => {
+    const sourceRoute = { type: "ssh", jumpHostId: "lab-host" } as const;
+    const oldOwnedRoute = { type: "socks5", host: "proxy-before.example.test", port: 1080 } as const;
+    const owned = keptServer({
+      id: "kept-owned-route",
+      proxy: oldOwnedRoute,
+      formerlySynced: {
+        ...keptServer().formerlySynced!,
+        proxyOwnership: { owner: "source-default", value: oldOwnedRoute }
+      }
+    });
+    const direct = keptServer({
+      id: "kept-manual-direct",
+      host: "10.0.0.2",
+      proxy: undefined,
+      formerlySynced: { ...keptServer().formerlySynced!, externalId: "device:2", proxyOptOut: true }
+    });
+    const p = plan({
+      source: makeSource(),
+      devices: [
+        makeDevice({ externalId: "device:1", endpoints: [{ kind: "ssh", host: "10.0.0.1" }] }),
+        makeDevice({ externalId: "device:2", name: "core-sw-2", endpoints: [{ kind: "ssh", host: "10.0.0.2" }] })
+      ],
+      servers: [
+        { id: "lab-host", name: "Lab Host", host: "lab.example.test", port: 22, username: "lab", authType: "agent", isHidden: false },
+        owned,
+        direct
+      ],
+      adoptionChoice: "adopt",
+      providerInstanceKey: DEVICE_INSTANCE,
+      sourceDefaultRoute: { kind: "ssh", jumpHostId: "lab-host" }
+    });
+
+    expect(afterFor(p, owned.id)?.proxy).toEqual(sourceRoute);
+    expect(afterFor(p, owned.id)?.origin?.proxyOwnership).toEqual({ owner: "source-default", value: sourceRoute });
+    expect(afterFor(p, direct.id)?.proxy).toBeUndefined();
+    expect(afterFor(p, direct.id)?.origin?.proxyOptOut).toBe(true);
+  });
+
   it("Fixture 4 — row 1 fill: a fresh unset field gets the fill value written + stamped (kills 'fill never writes')", () => {
     const p = plan({
       source: makeSource({ templateRules: [rule("tmpl-1")] }),
@@ -152,7 +426,7 @@ describe("device template matrix — non-auth fields", () => {
     });
     const after = afterFor(p, ownedServer().id)!;
     expect(after.proxy).toEqual(P_A);
-    expect(after.origin?.templated?.proxy).toEqual(P_A);
+    expect(after.origin?.proxyOwnership?.value).toEqual(P_A);
   });
 
   it("Fixture 5 — row 2 opt-out: cur unset with a DIFFERENT stamp present is NOT re-applied (kills a missing opt-out clause)", () => {
@@ -177,7 +451,7 @@ describe("device template matrix — non-auth fields", () => {
     });
     const after = afterFor(p, ownedServer().id)!;
     expect(after.proxy).toEqual(P_B);
-    expect(after.origin?.templated?.proxy).toEqual(P_B);
+    expect(after.origin?.proxyOwnership?.value).toEqual(P_B);
   });
 
   it("Fixture 6b — MODE GATE: a FILL winner in row-3 position does NOT rewrite (write-once) (kills fill behaving like override)", () => {
@@ -204,7 +478,7 @@ describe("device template matrix — non-auth fields", () => {
     const after = afterFor(p, ownedServer().id)!;
     expect(after.name).toBe("renamed-sw");
     expect(after.proxy).toEqual(P_A);
-    expect(after.origin?.templated?.proxy).toEqual(P_A);
+    expect(after.origin?.proxyOwnership?.value).toEqual(P_A);
   });
 
   it("Fixture 8 — row 6: a hand-edited value (cur ≠ stamp) is kept, the old stamp carried (kills 'override beats everything')", () => {
@@ -216,7 +490,7 @@ describe("device template matrix — non-auth fields", () => {
     });
     const after = afterFor(p, ownedServer().id)!;
     expect(after.proxy).toEqual(P_C); // hand value kept
-    expect(after.origin?.templated?.proxy).toEqual(P_A); // old stamp carried
+    expect(after.origin?.proxyOwnership?.value).toEqual(P_A); // old stamp carried
   });
 
   it("Fixture 9 — row 7: a legacy hand value with NO stamp is untouched by override (kills 'absent stamp = sync owns')", () => {
@@ -228,7 +502,7 @@ describe("device template matrix — non-auth fields", () => {
     });
     const after = afterFor(p, ownedServer().id)!;
     expect(after.proxy).toEqual(P_C);
-    expect(after.origin?.templated?.proxy).toBeUndefined();
+    expect(after.origin?.proxyOwnership?.value).toBeUndefined();
   });
 
   it("Fixture 10 — a template application otherwise identical to the record still lands in `updates` (kills a forgotten `changed` clause for the value + template stamp)", () => {
@@ -254,7 +528,7 @@ describe("device template matrix — non-auth fields", () => {
     });
     const after = afterFor(p, ownedServer().id)!;
     expect(after.name).toBe("renamed-sw"); // the unrelated update did fire
-    expect(after.origin?.templated?.proxy).toEqual(P_A);
+    expect(after.origin?.proxyOwnership?.value).toEqual(P_A);
     expect(after.origin?.templated?.multiplexing).toBe(true);
   });
 
@@ -280,7 +554,7 @@ describe("device template matrix — non-auth fields", () => {
     expect(p.adds.length).toBe(1);
     expect(p.adds[0].proxy).toEqual(P_A);
     expect(p.adds[0].multiplexing).toBe(false);
-    expect(p.adds[0].origin?.templated?.proxy).toEqual(P_A);
+    expect(p.adds[0].origin?.proxyOwnership?.value).toEqual(P_A);
     expect(p.adds[0].origin?.templated?.multiplexing).toBe(false);
   });
 });
@@ -605,7 +879,7 @@ describe("device template cascade — filter, specificity, per-field ties (§3)"
     expect(add.authProfileId).toBe("B");
     expect(add.proxy).toEqual(P_A);
     expect(add.origin?.syncedAuthProfileId).toBe("B"); // stamped independently
-    expect(add.origin?.templated?.proxy).toEqual(P_A);
+    expect(add.origin?.proxyOwnership?.value).toEqual(P_A);
   });
 
   it("Fixture 16 — a later sync flips ONLY the auth winner (device gains a rack matching a narrower rule) → auth rewritten, proxy value AND stamp untouched (kills re-deciding/re-stamping all fields when one flips)", () => {
@@ -630,7 +904,7 @@ describe("device template cascade — filter, specificity, per-field ties (§3)"
     expect(after.authProfileId).toBe("C"); // auth winner flipped B → C
     expect(after.origin?.syncedAuthProfileId).toBe("C");
     expect(after.proxy).toEqual(P_A); // proxy untouched
-    expect(after.origin?.templated?.proxy).toEqual(P_A); // and its stamp intact
+    expect(after.origin?.proxyOwnership?.value).toEqual(P_A); // and its stamp intact
   });
 
   it("Fixture 17 — a one-field (auth-only) narrow rule matches while the broad (proxy) rule does NOT → auth written, proxy NOT written (kills a matched rule dragging its template's absent fields in as defaults)", () => {
@@ -845,6 +1119,20 @@ describe("§5.3 proxy reference validation — dangling / self-referential jumpH
     expect(p.adds[0].multiplexing).toBe(true); // sibling field still applied
     const selfWarnings = p.warnings.filter((w) => w.includes("through itself"));
     expect(selfWarnings.length).toBe(1);
+    expect(selfWarnings[0]).toContain('Device template "T"'); // a real template attempt keeps template attribution
+    expect(selfWarnings[0]).not.toContain("Inventory source default");
+  });
+
+  it("M5 — a source-default self-reference names the source that attempted the route", () => {
+    const p = plan({
+      source: makeSource(),
+      devices: [makeDevice()],
+      sourceDefaultRoute: { kind: "ssh", jumpHostId: SELF_ID }
+    });
+    expect(p.adds[0].proxy).toBeUndefined();
+    const selfWarning = p.warnings.find((w) => w.includes("through itself"));
+    expect(selfWarning).toContain('Inventory source default for "NetBox"');
+    expect(selfWarning).not.toContain('Device template "?"');
   });
 
   it("Fixture 30 — a catch-all override proxy with a DANGLING jumpHostId is SKIPPED, its sibling fields still apply, one dangling warning (kills 'write the dangling proxy')", () => {
@@ -892,7 +1180,7 @@ describe("§5.3 proxy reference validation — dangling / self-referential jumpH
     });
     const after = afterFor(p, server.id) ?? server;
     expect(after.proxy).toEqual(P_A); // existing proxy kept, NOT clobbered to the dangling proxy or to undefined
-    expect(after.origin?.templated?.proxy).toEqual(P_A); // stamp carried forward
+    expect(after.origin?.proxyOwnership?.value).toEqual(P_A); // stamp carried forward
   });
 });
 
@@ -938,7 +1226,7 @@ describe("§5.3 repair — a template-owned self-proxy already carried is cleare
     const after = afterFor(p, SELF_ID);
     expect(after).toBeDefined(); // promoted to an update — the repair lands
     expect(after!.proxy).toBeUndefined(); // self-proxy CLEARED, not carried
-    expect(after!.origin?.templated?.proxy).toBeUndefined(); // stamp dropped with it
+    expect(after!.origin?.proxyOwnership?.value).toBeUndefined(); // stamp dropped with it
     expect(p.warnings.filter((w) => w.includes("through itself") && w.includes("was cleared")).length).toBe(1);
     expect(p.warnings.filter((w) => w.includes("the proxy field was skipped")).length).toBe(0);
   });
@@ -966,7 +1254,7 @@ describe("§5.3 repair — a template-owned self-proxy already carried is cleare
     });
     const after = afterFor(p, "kept-1")!;
     expect(after.proxy).toBeUndefined(); // repaired at adoption
-    expect(after.origin?.templated?.proxy).toBeUndefined();
+    expect(after.origin?.proxyOwnership?.value).toBeUndefined();
     expect(p.warnings.filter((w) => w.includes("through itself") && w.includes("was cleared")).length).toBe(1);
   });
 
@@ -1027,7 +1315,7 @@ describe("FIX 1 — adoption branch consumes the template cascade (proxy / boole
     const after = afterFor(p, "kept-1")!;
     // Non-auth values applied AND stamped.
     expect(after.proxy).toEqual(sshProxy("bastion-1"));
-    expect(after.origin?.templated?.proxy).toEqual(sshProxy("bastion-1"));
+    expect(after.origin?.proxyOwnership?.value).toEqual(sshProxy("bastion-1"));
     expect(after.multiplexing).toBe(true);
     expect(after.origin?.templated?.multiplexing).toBe(true);
     // Auth link applied AND stamped (the cascade winner, restored into the origin
@@ -1052,7 +1340,7 @@ describe("FIX 1 — adoption branch consumes the template cascade (proxy / boole
     });
     const after = afterFor(p, "kept-1")!;
     expect(after.proxy).toEqual(P_A); // existing proxy kept (fill write-once)
-    expect(after.origin?.templated?.proxy).toBeUndefined(); // nothing stamped for a field left alone
+    expect(after.origin?.proxyOwnership?.value).toBeUndefined(); // nothing stamped for a field left alone
     expect(after.multiplexing).toBe(true); // unset boolean filled
     expect(after.origin?.templated?.multiplexing).toBe(true);
   });
@@ -1103,7 +1391,7 @@ describe("FIX A — `origin.templated` survives the Keep-Servers detach and is r
     // Reclaimed: the override winner rewrites the still-sync-owned proxy...
     expect(after.proxy).toEqual(P_B);
     // ...AND re-stamps it, so ownership is preserved for the next sync too.
-    expect(after.origin?.templated?.proxy).toEqual(P_B);
+    expect(after.origin?.proxyOwnership?.value).toEqual(P_B);
   });
 
   it("Fixture 42 — a HAND-EDITED field the sync never template-managed stays row 7 after adoption; an override does NOT reclaim it (guards against restoring provenance too broadly)", () => {
@@ -1133,7 +1421,7 @@ describe("FIX A — `origin.templated` survives the Keep-Servers detach and is r
     const after = afterFor(p, "kept-1")!;
     // Hand-owned proxy (no proxy stamp in the marker) is left untouched by the override.
     expect(after.proxy).toEqual(P_A);
-    expect(after.origin?.templated?.proxy).toBeUndefined();
+    expect(after.origin?.proxyOwnership?.value).toBeUndefined();
   });
 
   it("Fixture 43 — a marker carrying NO `templated` restores none: a fresh template fills an unset field (row 1) and leaves a pre-existing hand value (row 7) (guards the 'restore verbatim, never invent' rule)", () => {
@@ -1154,7 +1442,7 @@ describe("FIX A — `origin.templated` survives the Keep-Servers detach and is r
     const after = afterFor(p, "kept-1")!;
     // Hand proxy left (fill never rewrites a configured field — and nothing was restored to claim it either).
     expect(after.proxy).toEqual(P_A);
-    expect(after.origin?.templated?.proxy).toBeUndefined();
+    expect(after.origin?.proxyOwnership?.value).toBeUndefined();
     // Unset boolean filled + stamped (row 1).
     expect(after.multiplexing).toBe(true);
     expect(after.origin?.templated?.multiplexing).toBe(true);
@@ -1277,7 +1565,7 @@ describe("FIX 2 — jump-host references validated against the POST-PLAN survivo
     const added = p.adds.find((s) => s.origin?.externalId === "device:1")!;
     expect(added.proxy).toBeUndefined();
     expect("proxy" in added).toBe(false); // absent, never a written undefined
-    expect(added.origin?.templated?.proxy).toBeUndefined();
+    expect(added.origin?.proxyOwnership?.value).toBeUndefined();
     expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
   });
 
@@ -1386,9 +1674,50 @@ describe("Codex round 6 — the survivor pass RESTORES the pre-matrix proxy A on
     expect(after).toBeDefined();
     // THE FIX: the pre-matrix proxy A is restored, NOT deleted to absent.
     expect(after.proxy).toEqual(sshProxy(A_JUMP_ID));
-    expect(after.origin?.templated?.proxy).toEqual(sshProxy(A_JUMP_ID)); // stamp follows the restored value
+    expect(after.origin?.proxyOwnership?.value).toEqual(sshProxy(A_JUMP_ID)); // stamp follows the restored value
     expect(after.multiplexing).toBe(true); // the other template write still landed
     expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
+  });
+
+  it("M5 — a rejected source-default replacement reports its attempted writer and restores the prior template route", () => {
+    const oldTemplateRoute = sshProxy(A_JUMP_ID);
+    const s = ownedServer(
+      { name: "old-core-sw-1", proxy: oldTemplateRoute },
+      { proxyOwnership: { owner: "template", value: oldTemplateRoute } }
+    );
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete" }),
+      devices: [makeDevice({ name: "core-sw-1-renamed" })],
+      servers: [s, survivorJump(), danglingJump()],
+      sourceDefaultRoute: { kind: "ssh", jumpHostId: B_JUMP_ID }
+    });
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === B_JUMP_ID)).toBe(true);
+    const after = afterFor(p, S_ID)!;
+    expect(after.name).toBe("core-sw-1-renamed"); // keep a sibling change visible after proxy rollback
+    expect(after.proxy).toEqual(oldTemplateRoute);
+    expect(after.origin?.proxyOwnership).toEqual({ owner: "template", value: oldTemplateRoute });
+    expect(p.warnings.some((w) => w.includes('Inventory source default for "NetBox"') && w.includes("will not survive this sync"))).toBe(true);
+    expect(p.warnings.some((w) => w.includes('Device template "?"'))).toBe(false);
+    expect(p.warnings.some((w) => w.includes("Proxy ←"))).toBe(false); // rejected source route has no template provenance
+  });
+
+  it("M5 control — a rejected source-default proxy-only update still collapses after the old route is restored", () => {
+    const oldTemplateRoute = sshProxy(A_JUMP_ID);
+    const s = ownedServer(
+      { proxy: oldTemplateRoute },
+      { proxyOwnership: { owner: "template", value: oldTemplateRoute } }
+    );
+    const p = plan({
+      source: makeSource({ prunePolicy: "delete" }),
+      devices: [makeDevice()],
+      servers: [s, survivorJump(), danglingJump()],
+      sourceDefaultRoute: { kind: "ssh", jumpHostId: B_JUMP_ID }
+    });
+    expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === B_JUMP_ID)).toBe(true);
+    expect(afterFor(p, S_ID)).toBeUndefined();
+    expect(p.updates.some((u) => u.before.id === S_ID)).toBe(false);
+    expect(p.unchangedCount).toBe(1);
+    expect(p.warnings.some((w) => w.includes('Inventory source default for "NetBox"'))).toBe(true);
   });
 
   it("Fixture 51 — NO-OP COLLAPSE: A→B was the ONLY change; restoring A reverts it → S is removed from `updates` and counted UNCHANGED (kills leaving a now-no-op update in the plan, and kills the round-2 delete which keeps S in updates with proxy absent)", () => {
@@ -1435,7 +1764,7 @@ describe("Codex round 6 — the survivor pass RESTORES the pre-matrix proxy A on
     const added = p.adds.find((a) => a.origin?.externalId === "device:1")!;
     expect(added.proxy).toBeUndefined(); // nothing prior to restore → absent
     expect("proxy" in added).toBe(false); // never a written undefined
-    expect(added.origin?.templated?.proxy).toBeUndefined();
+    expect(added.origin?.proxyOwnership?.value).toBeUndefined();
     expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
   });
 });
@@ -1466,7 +1795,7 @@ describe("FIX B — an UNCHANGED template-owned server whose stamped jump host i
     expect(after).toBeDefined();
     expect(after!.proxy).toBeUndefined();
     expect("proxy" in after!).toBe(false); // absent, never a written undefined
-    expect(after!.origin?.templated?.proxy).toBeUndefined(); // the ownership stamp cleared with it
+    expect(after!.origin?.proxyOwnership?.value).toBeUndefined(); // the ownership stamp cleared with it
     expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
   });
 
@@ -1641,7 +1970,7 @@ describe("Codex round 7 — the survivor part-2 cleans a retained dangling templ
     expect(after!.name).toBe("renamed-sw"); // the unrelated update is preserved
     expect(after!.proxy).toBeUndefined(); // THE FIX: the retained dangling proxy is dropped IN PLACE
     expect("proxy" in after!).toBe(false); // absent, never a written undefined
-    expect(after!.origin?.templated?.proxy).toBeUndefined(); // the ownership stamp cleared with it
+    expect(after!.origin?.proxyOwnership?.value).toBeUndefined(); // the ownership stamp cleared with it
     expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
   });
 
@@ -1657,7 +1986,7 @@ describe("Codex round 7 — the survivor part-2 cleans a retained dangling templ
     expect(after).toBeDefined();
     expect(after!.host).toBe("10.9.9.9"); // endpoint change preserved
     expect(after!.proxy).toBeUndefined(); // retained dangling proxy dropped in place
-    expect(after!.origin?.templated?.proxy).toBeUndefined();
+    expect(after!.origin?.proxyOwnership?.value).toBeUndefined();
     expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
   });
 
@@ -1672,7 +2001,7 @@ describe("Codex round 7 — the survivor part-2 cleans a retained dangling templ
     const after = afterFor(p, S_ID);
     expect(after).toBeDefined(); // promoted to a new update
     expect(after!.proxy).toBeUndefined();
-    expect(after!.origin?.templated?.proxy).toBeUndefined();
+    expect(after!.origin?.proxyOwnership?.value).toBeUndefined();
     expect(p.unchangedCount).toBe(0); // counted unchanged, then decremented on promotion
     expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
   });
@@ -1713,7 +2042,7 @@ describe("Codex round 7 — the survivor part-2 cleans a retained dangling templ
     expect(after).toBeDefined();
     expect(after!.name).toBe("renamed-sw"); // the rename kept the update alive (no collapse)
     expect(after!.proxy).toEqual(sshProxy(A_JUMP_ID)); // round 6 restored A; part 2 left it (A survives)
-    expect(after!.origin?.templated?.proxy).toEqual(sshProxy(A_JUMP_ID)); // A's stamp restored, not cleared
+    expect(after!.origin?.proxyOwnership?.value).toEqual(sshProxy(A_JUMP_ID)); // A's stamp restored, not cleared
     // Only round 6's aggregate warning — part 2 must NOT add a second.
     expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
   });
@@ -1740,7 +2069,7 @@ describe("Codex round 8 — the survivor part-2 cleans a retained template-owned
     expect(after).toBeDefined(); // THE FIX: promoted to a new update instead of skipped-as-survivor
     expect(after!.proxy).toBeUndefined(); // self-proxy DROPPED
     expect("proxy" in after!).toBe(false); // absent, never a written undefined
-    expect(after!.origin?.templated?.proxy).toBeUndefined(); // stamp cleared with it
+    expect(after!.origin?.proxyOwnership?.value).toBeUndefined(); // stamp cleared with it
     expect(p.unchangedCount).toBe(0); // counted unchanged, then decremented on promotion
     expect(p.warnings.filter((w) => w.includes("points at itself")).length).toBe(1);
     // The self case is NOT a prune — the dangling wording must not appear.
@@ -1759,7 +2088,7 @@ describe("Codex round 8 — the survivor part-2 cleans a retained template-owned
     expect(after!.name).toBe("renamed-sw"); // the unrelated update is preserved
     expect(after!.proxy).toBeUndefined(); // self-proxy dropped IN PLACE
     expect("proxy" in after!).toBe(false);
-    expect(after!.origin?.templated?.proxy).toBeUndefined();
+    expect(after!.origin?.proxyOwnership?.value).toBeUndefined();
     expect(p.unchangedCount).toBe(0); // S was an update from the start, never counted unchanged
     expect(p.warnings.filter((w) => w.includes("points at itself")).length).toBe(1);
     expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(0);
@@ -1788,7 +2117,7 @@ describe("Codex round 8 — the survivor part-2 cleans a retained template-owned
     const after = afterFor(p, S_ID);
     expect(after).toBeDefined();
     expect(after!.proxy).toBeUndefined();
-    expect(after!.origin?.templated?.proxy).toBeUndefined();
+    expect(after!.origin?.proxyOwnership?.value).toBeUndefined();
     // The matrix's own repair warning, once — and NOT part 2's, which would be a double-handle.
     expect(p.warnings.filter((w) => w.includes("through itself") && w.includes("was cleared")).length).toBe(1);
     expect(p.warnings.filter((w) => w.includes("points at itself")).length).toBe(0);
@@ -1834,7 +2163,7 @@ describe("Codex round 9 — the survivor part-2 cleans a retained template-owned
     expect(after!.origin?.externalId).toBe("device:1"); // it really is the adoption update
     expect(after!.proxy).toBeUndefined(); // THE FIX: the retained dangling proxy is cleaned on the adoption update
     expect("proxy" in after!).toBe(false); // absent, never a written undefined
-    expect(after!.origin?.templated?.proxy).toBeUndefined(); // the ownership stamp cleared with it
+    expect(after!.origin?.proxyOwnership?.value).toBeUndefined(); // the ownership stamp cleared with it
     expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
   });
 
@@ -1863,7 +2192,7 @@ describe("Codex round 9 — the survivor part-2 cleans a retained template-owned
     expect(after!.origin?.externalId).toBe("device:1");
     expect(after!.proxy).toBeUndefined(); // THE FIX: the retained self-proxy is cleaned on the adoption update
     expect("proxy" in after!).toBe(false);
-    expect(after!.origin?.templated?.proxy).toBeUndefined();
+    expect(after!.origin?.proxyOwnership?.value).toBeUndefined();
     expect(p.warnings.filter((w) => w.includes("points at itself")).length).toBe(1);
     expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(0);
   });
@@ -1928,7 +2257,7 @@ describe("PR-T2 review B1 — the jump-host survivor pass owns every WRITTEN tem
     expect(p.prunes.some((pr) => pr.policy === "delete" && pr.server.id === B_JUMP_ID)).toBe(true);
     const after = afterFor(p, S_ID)!;
     expect(after.proxy).toEqual(sshProxy(A_JUMP_ID)); // RESTORED — not dropped to absent
-    expect(after.origin?.templated?.proxy).toEqual(sshProxy(A_JUMP_ID)); // stamp follows the restored value
+    expect(after.origin?.proxyOwnership?.value).toEqual(sshProxy(A_JUMP_ID)); // stamp follows the restored value
     expect(after.multiplexing).toBe(true); // the sibling write still landed
     expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
   });
@@ -1943,7 +2272,7 @@ describe("PR-T2 review B1 — the jump-host survivor pass owns every WRITTEN tem
     const added = p.adds.find((a) => a.origin?.externalId === "device:1")!;
     expect(added.proxy).toBeUndefined(); // dropped to absent
     expect("proxy" in added).toBe(false); // never a written undefined
-    expect(added.origin?.templated?.proxy).toBeUndefined(); // stamp cleared with it
+    expect(added.origin?.proxyOwnership?.value).toBeUndefined(); // stamp cleared with it
     expect(p.warnings.filter((w) => w.includes("will not survive this sync")).length).toBe(1);
   });
 

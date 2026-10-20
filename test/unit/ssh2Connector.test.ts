@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { PassThrough } from "node:stream";
 import type { ServerConfig } from "../../src/models/config";
 
 // Minimal fake for ssh2's `Client`: a bare event emitter with the handful of
@@ -28,6 +29,8 @@ vi.mock("ssh2", () => {
 });
 
 import { isAuthNotJudged } from "../../src/services/ssh/authErrors";
+import { SshInteractionRequiredError, type ContextAwareSshFactory } from "../../src/services/ssh/contracts";
+import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
 import { buildConnectConfig, LEGACY_ALGORITHMS, Ssh2Connector } from "../../src/services/ssh/ssh2Connector";
 
 function appendedAlgorithms(value: unknown): readonly string[] {
@@ -136,6 +139,246 @@ describe("Ssh2Connector.connect banner handling", () => {
     mockClients.length = 0;
   });
 
+  it("preserves a typed noninteractive host-key refusal through ssh2 error wrapping", async () => {
+    const verifier = {
+      verify: vi.fn(async () => { throw new SshInteractionRequiredError("host key requires a decision"); })
+    };
+    const connector = new Ssh2Connector(verifier);
+    const connecting = connector.connect(makeServer(), { interaction: "noninteractive" });
+    await flushMicrotasks();
+    const client = mockClients.at(-1);
+    const config = client.connect.mock.calls[0][0];
+    const verify = vi.fn();
+
+    config.hostVerifier(Buffer.from("host-key"), verify);
+    await flushMicrotasks();
+    client.emit("error", new Error("Host denied (verification failed)"));
+
+    await expect(connecting).rejects.toMatchObject({ code: "interaction-required" });
+    expect(verifier.verify).toHaveBeenCalledWith(makeServer(), Buffer.from("host-key"), { interaction: "noninteractive" });
+  });
+
+  it("returns separate stdout and stderr and waits for exit plus close", async () => {
+    const connector = new Ssh2Connector();
+    const connecting = connector.connect(makeServer(), { password: "pw" });
+    await flushMicrotasks();
+    const client = mockClients.at(-1);
+    client.emit("ready");
+    const connection = await connecting;
+    const stream = new PassThrough();
+    const stderr = new PassThrough();
+    Object.assign(stream, { stderr });
+    client.exec = vi.fn((_command: string, callback: (error: Error | undefined, channel: PassThrough) => void) => callback(undefined, stream));
+
+    const channel = await connection.execCommand?.("containerlab inspect");
+    expect(channel).toBeDefined();
+    expect(channel?.stdout).toBe(stream);
+    expect(channel?.stderr).toBe(stderr);
+    const stdoutChunks: string[] = [];
+    const stderrChunks: string[] = [];
+    channel?.stdout.on("data", (chunk: Buffer | string) => stdoutChunks.push(String(chunk)));
+    channel?.stderr.on("data", (chunk: Buffer | string) => stderrChunks.push(String(chunk)));
+    stream.write("stdout data");
+    stderr.write("stderr data");
+
+    let completed = false;
+    void channel?.completion.then(() => { completed = true; }, () => { completed = true; });
+    stream.emit("exit", 17, undefined);
+    await flushMicrotasks();
+    expect(completed).toBe(false);
+    stream.end();
+    stderr.end();
+
+    await expect(channel?.completion).resolves.toEqual({ code: 17 });
+    expect(stdoutChunks).toEqual(["stdout data"]);
+    expect(stderrChunks).toEqual(["stderr data"]);
+  });
+
+  it("observes an exit emitted synchronously inside the exec callback", async () => {
+    const connector = new Ssh2Connector();
+    const connecting = connector.connect(makeServer(), { password: "pw" });
+    await flushMicrotasks();
+    const client = mockClients.at(-1);
+    client.emit("ready");
+    const connection = await connecting;
+    const stream = new PassThrough();
+    const stderr = new PassThrough();
+    Object.assign(stream, { stderr });
+    client.exec = vi.fn((_command: string, callback: (error: Error | undefined, channel: PassThrough) => void) => {
+      callback(undefined, stream);
+      stream.emit("exit", 0, undefined);
+    });
+
+    const channel = await connection.execCommand?.("containerlab inspect");
+    const stdoutChunks: string[] = [];
+    const stderrChunks: string[] = [];
+    channel?.stdout.on("data", (chunk: Buffer | string) => stdoutChunks.push(String(chunk)));
+    channel?.stderr.on("data", (chunk: Buffer | string) => stderrChunks.push(String(chunk)));
+    stream.end("stdout");
+    stderr.end("stderr");
+    await flushMicrotasks();
+    stream.emit("close");
+
+    await expect(channel?.completion).resolves.toEqual({ code: 0 });
+    expect(stdoutChunks).toEqual(["stdout"]);
+    expect(stderrChunks).toEqual(["stderr"]);
+  });
+
+  it("waits for delayed stdout drainage after exit and channel close", async () => {
+    const connector = new Ssh2Connector();
+    const connecting = connector.connect(makeServer(), { password: "pw" });
+    await flushMicrotasks();
+    const client = mockClients.at(-1);
+    client.emit("ready");
+    const connection = await connecting;
+    const stream = new PassThrough();
+    const stderr = new PassThrough();
+    Object.assign(stream, { stderr });
+    client.exec = vi.fn((_command: string, callback: (error: Error | undefined, channel: PassThrough) => void) => callback(undefined, stream));
+
+    const channel = await connection.execCommand?.("containerlab inspect");
+    const stderrChunks: string[] = [];
+    channel?.stderr.on("data", (chunk: Buffer | string) => stderrChunks.push(String(chunk)));
+    stream.end("delayed stdout");
+    stderr.end("stderr");
+    stream.emit("exit", 0, undefined);
+    stream.emit("close");
+    await flushMicrotasks();
+
+    let completed = false;
+    void channel?.completion.then(() => { completed = true; }, () => { completed = true; });
+    await flushMicrotasks();
+    expect(completed).toBe(false);
+
+    const stdoutChunks: string[] = [];
+    channel?.stdout.on("data", (chunk: Buffer | string) => stdoutChunks.push(String(chunk)));
+    await flushMicrotasks();
+
+    await expect(channel?.completion).resolves.toEqual({ code: 0 });
+    expect(stdoutChunks).toEqual(["delayed stdout"]);
+    expect(stderrChunks).toEqual(["stderr"]);
+  });
+
+  it("waits for buffered stderr to drain after stdout and channel close", async () => {
+    const connector = new Ssh2Connector();
+    const connecting = connector.connect(makeServer(), { password: "pw" });
+    await flushMicrotasks();
+    const client = mockClients.at(-1);
+    client.emit("ready");
+    const connection = await connecting;
+    const stream = new PassThrough();
+    const stderr = new PassThrough();
+    Object.assign(stream, { stderr });
+    client.exec = vi.fn((_command: string, callback: (error: Error | undefined, channel: PassThrough) => void) => callback(undefined, stream));
+
+    const channel = await connection.execCommand?.("containerlab inspect");
+    channel?.stdout.on("data", () => {});
+    stream.end("stdout");
+    stderr.end("buffered stderr");
+    stream.emit("exit", 0, undefined);
+    stream.emit("close");
+    await flushMicrotasks();
+
+    let completed = false;
+    void channel?.completion.then(() => { completed = true; }, () => { completed = true; });
+    await flushMicrotasks();
+    expect(completed).toBe(false);
+
+    const stderrChunks: string[] = [];
+    channel?.stderr.on("data", (chunk: Buffer | string) => stderrChunks.push(String(chunk)));
+    await flushMicrotasks();
+
+    await expect(channel?.completion).resolves.toEqual({ code: 0 });
+    expect(stderrChunks).toEqual(["buffered stderr"]);
+  });
+
+  it("rejects a stderr error before readable end", async () => {
+    const connector = new Ssh2Connector();
+    const connecting = connector.connect(makeServer(), { password: "pw" });
+    await flushMicrotasks();
+    const client = mockClients.at(-1);
+    client.emit("ready");
+    const connection = await connecting;
+    const stream = new PassThrough();
+    const stderr = new PassThrough();
+    Object.assign(stream, { stderr });
+    client.exec = vi.fn((_command: string, callback: (error: Error | undefined, channel: PassThrough) => void) => callback(undefined, stream));
+
+    const channel = await connection.execCommand?.("containerlab inspect");
+    const error = new Error("stderr stream failed");
+    stderr.emit("error", error);
+
+    await expect(channel?.completion).rejects.toBe(error);
+  });
+
+  it("preserves cancellation while closing a command channel during drainage", async () => {
+    const connector = new Ssh2Connector();
+    const connecting = connector.connect(makeServer(), { password: "pw" });
+    await flushMicrotasks();
+    const client = mockClients.at(-1);
+    client.emit("ready");
+    const connection = await connecting;
+    const stream = new PassThrough();
+    const stderr = new PassThrough();
+    const teardownError = new Error("channel closed during abort");
+    const close = vi.fn(() => {
+      stream.emit("error", teardownError);
+      stream.emit("close");
+    });
+    Object.assign(stream, { stderr, close });
+    client.exec = vi.fn((_command: string, callback: (error: Error | undefined, channel: PassThrough) => void) => callback(undefined, stream));
+    const controller = new AbortController();
+    const cancellation = new Error("discovery canceled during drainage");
+
+    const channel = await connection.execCommand?.("containerlab inspect", controller.signal);
+    stream.emit("exit", 0, undefined);
+    stream.emit("close");
+    controller.abort(cancellation);
+
+    await expect(channel?.completion).rejects.toBe(cancellation);
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("rejects typed command completion when a channel closes without an exit result", async () => {
+    const connector = new Ssh2Connector();
+    const connecting = connector.connect(makeServer(), { password: "pw" });
+    await flushMicrotasks();
+    const client = mockClients.at(-1);
+    client.emit("ready");
+    const connection = await connecting;
+    const stream = new PassThrough();
+    Object.assign(stream, { stderr: new PassThrough() });
+    client.exec = vi.fn((_command: string, callback: (error: Error | undefined, channel: PassThrough) => void) => callback(undefined, stream));
+
+    const channel = await connection.execCommand?.("containerlab inspect");
+    stream.emit("close");
+
+    await expect(channel?.completion).rejects.toThrow(/without an exit result/i);
+  });
+
+  it("closes a command channel that arrives after cancellation", async () => {
+    const connector = new Ssh2Connector();
+    const connecting = connector.connect(makeServer(), { password: "pw" });
+    await flushMicrotasks();
+    const client = mockClients.at(-1);
+    client.emit("ready");
+    const connection = await connecting;
+    let completeExec: ((error: Error | undefined, channel: PassThrough) => void) | undefined;
+    client.exec = vi.fn((_command: string, callback: (error: Error | undefined, channel: PassThrough) => void) => { completeExec = callback; });
+    const controller = new AbortController();
+    const reason = new Error("discovery canceled");
+    const opening = connection.execCommand?.("containerlab inspect", controller.signal);
+
+    controller.abort(reason);
+    await expect(opening).rejects.toBe(reason);
+    const lateStream = new PassThrough();
+    Object.assign(lateStream, { stderr: new PassThrough() });
+    completeExec?.(undefined, lateStream);
+    await flushMicrotasks();
+
+    expect(lateStream.destroyed).toBe(true);
+  });
+
   it("aborts a keyboard-interactive request when the handshake times out", async () => {
     const connector = new Ssh2Connector();
     let signal: AbortSignal | undefined;
@@ -214,6 +457,38 @@ describe("Ssh2Connector.connect banner handling", () => {
     const connection = await connectPromise;
     expect(onAuthMessage).toHaveBeenCalledWith("Authorized use only");
     expect(connection.getBanner()).toBe("Authorized use only");
+  });
+
+  it("buffers a pooled banner without a live sink and does not replay one already delivered", async () => {
+    const connector = new Ssh2Connector();
+    const factory: ContextAwareSshFactory = {
+      connect: vi.fn(async () => { throw new Error("unexpected direct connect"); }),
+      connectWithContext: vi.fn((server, context) => connector.connect(server, {
+        password: "pw",
+        ...(context?.onAuthMessage && { onAuthMessage: context.onAuthMessage })
+      }))
+    };
+    const pool = new SshConnectionPool(factory, { enabled: true, idleTimeoutMs: 5000 });
+
+    const noSinkOpening = pool.connect(makeServer({ id: "no-sink" }));
+    await flushMicrotasks();
+    const noSinkClient = mockClients.at(-1);
+    noSinkClient.emit("banner", "Buffered for a later terminal");
+    noSinkClient.emit("ready");
+    const noSinkLease = await noSinkOpening;
+    expect(noSinkLease.getBanner()).toBe("Buffered for a later terminal");
+
+    const liveSink = vi.fn();
+    const liveOpening = pool.connectWithContext(makeServer({ id: "live-sink" }), { onAuthMessage: liveSink });
+    await flushMicrotasks();
+    const liveClient = mockClients.at(-1);
+    liveClient.emit("banner", "Delivered to a terminal");
+    liveClient.emit("ready");
+    const liveLease = await liveOpening;
+    expect(liveSink).toHaveBeenCalledWith("Delivered to a terminal");
+    expect(liveLease.getBanner()).toBeUndefined();
+
+    pool.dispose();
   });
 
   it("notifies a close listener registered after the SSH connection has closed", async () => {

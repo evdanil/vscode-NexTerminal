@@ -16,6 +16,7 @@ import { isValidServerOrigin, validateServerConfig } from "../../src/utils/valid
 import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 import { buildConnectConfig } from "../../src/services/ssh/ssh2Connector";
 import type { InventoryDevice, InventorySourceConfig, InventoryTree } from "../../src/models/inventory";
+import { snapshotInventorySourceDependencies } from "../../src/services/inventory/inventorySourceDependencies";
 
 function makeSource(overrides: Partial<InventorySourceConfig> = {}): InventorySourceConfig {
   return {
@@ -249,7 +250,8 @@ describe("computeSyncPlan — adds", () => {
     const plan = computeSyncPlan({ source, tree, currentServers: [], now: 1000 });
     expect(plan.adds).toHaveLength(5);
     expect(plan.adds.every((a) => a.addressless === true)).toBe(true);
-    const note = plan.warnings.filter((w) => w.toLowerCase().includes("no console address yet"));
+    const note = plan.warnings.filter((w) => w.toLowerCase().includes("no console address"));
+    expect(note.every((warning) => !warning.includes("no console address yet"))).toBe(true);
     expect(note).toHaveLength(1);
     expect(note[0]).toContain("5");
   });
@@ -272,7 +274,8 @@ describe("computeSyncPlan — adds", () => {
     expect(plan.adds[0].addressless).toBe(true);
     // Only the NEW addressless device is named in the aggregate note (the owned
     // one is an in-place update, not a fresh placeholder).
-    const note = plan.warnings.filter((w) => w.toLowerCase().includes("no console address yet"));
+    const note = plan.warnings.filter((w) => w.toLowerCase().includes("no console address"));
+    expect(note.every((warning) => !warning.includes("no console address yet"))).toBe(true);
     expect(note).toHaveLength(1);
     expect(note[0]).toContain("unowned-noendpoint");
   });
@@ -688,10 +691,12 @@ describe("computeSyncPlan — adds", () => {
 
       /** Every warning that speaks about devices having no console address. */
       function addresslessLines(plan: InventorySyncPlan): string[] {
-        return plan.warnings.filter((w) => w.includes("no console address yet"));
+        const lines = plan.warnings.filter((w) => w.includes("no console address"));
+        expect(lines.every((line) => !line.includes("no console address yet"))).toBe(true);
+        return lines;
       }
 
-      it("ADDS ONLY — keeps today's sentence verbatim, so the common case does not regress (⊘ rewording the added-only branch churns the line every user already reads)", () => {
+      it("ADDS ONLY — reports newly-created placeholders as added without an endpoint (⊘ omitting the added outcome hides which placeholders this sync created)", () => {
         const plan = computeSyncPlan({
           source: makeSource(),
           tree: makeTree([
@@ -703,7 +708,7 @@ describe("computeSyncPlan — adds", () => {
         });
         expect(plan.adds).toHaveLength(2);
         expect(addresslessLines(plan)).toEqual([
-          '2 devices have no console address yet and were added without one (e.g. "fresh-a", "fresh-b").'
+          '2 devices have no console address and were added without one (e.g. "fresh-a", "fresh-b").'
         ]);
       });
 
@@ -715,7 +720,7 @@ describe("computeSyncPlan — adds", () => {
           now: 5000
         });
         expect(addresslessLines(plan)).toEqual([
-          '1 device has no console address yet and was added without one (e.g. "lonely").'
+          '1 device has no console address and was added without one (e.g. "lonely").'
         ]);
       });
 
@@ -733,7 +738,7 @@ describe("computeSyncPlan — adds", () => {
         });
         expect(plan.adds).toHaveLength(1);
         expect(addresslessLines(plan)).toEqual([
-          '2 devices have no console address yet — 1 was added without one and 1 was already a placeholder (e.g. "fresh-node", "core-sw-1").'
+          '2 devices have no console address — 1 was added without one and 1 was already a placeholder (e.g. "fresh-node", "core-sw-1").'
         ]);
       });
 
@@ -749,7 +754,7 @@ describe("computeSyncPlan — adds", () => {
           now: 5000
         });
         expect(addresslessLines(plan)).toEqual([
-          '3 devices have no console address yet — 1 was added without one and 2 were already placeholders (e.g. "fresh-node", "core-sw-1", "edge-sw-2").'
+          '3 devices have no console address — 1 was added without one and 2 were already placeholders (e.g. "fresh-node", "core-sw-1", "edge-sw-2").'
         ]);
       });
 
@@ -768,7 +773,7 @@ describe("computeSyncPlan — adds", () => {
         // The mirror of the case above: 2 added / 1 already, where that one is
         // 1 added / 2 already. Between them every arm of the BOTH branch is read.
         expect(addresslessLines(plan)).toEqual([
-          '3 devices have no console address yet — 2 were added without one and 1 was already a placeholder (e.g. "fresh-a", "fresh-b", "core-sw-1").'
+          '3 devices have no console address — 2 were added without one and 1 was already a placeholder (e.g. "fresh-a", "fresh-b", "core-sw-1").'
         ]);
       });
 
@@ -782,7 +787,7 @@ describe("computeSyncPlan — adds", () => {
         expect(plan.adds).toHaveLength(0);
         expect(plan.unchangedCount).toBe(1);
         expect(addresslessLines(plan)).toEqual([
-          '1 device has no console address yet and remains a placeholder (e.g. "core-sw-1").'
+          '1 device has no console address and remains a placeholder (e.g. "core-sw-1").'
         ]);
         expect(addresslessLines(plan)[0]).not.toContain("added");
       });
@@ -798,7 +803,7 @@ describe("computeSyncPlan — adds", () => {
           now: 5000
         });
         expect(addresslessLines(plan)).toEqual([
-          '2 devices have no console address yet and remain placeholders (e.g. "core-sw-1", "edge-sw-2").'
+          '2 devices have no console address and remain placeholders (e.g. "core-sw-1", "edge-sw-2").'
         ]);
       });
 
@@ -812,7 +817,7 @@ describe("computeSyncPlan — adds", () => {
         });
         expect(plan.updates).toHaveLength(1);
         expect(addresslessLines(plan)).toEqual([
-          '1 device has no console address yet and remains a placeholder (e.g. "renamed").'
+          '1 device has no console address and remains a placeholder (e.g. "renamed").'
         ]);
       });
 
@@ -2818,6 +2823,27 @@ describe("computeSyncPlan — prunes", () => {
     expect(orphanFallbackWarnings).toHaveLength(1);
     expect(orphanFallbackWarnings[0]).not.toMatch(/maximum folder depth/i);
     expect(orphanFallbackWarnings[0]).toContain("2");
+  });
+});
+
+describe("computeSyncPlan — discovery dependencies survive effective pruning", () => {
+  it("rejects deletion of the remote lab host even when the source's device route is Direct", () => {
+    const labHost = makeOwnedServer({
+      id: "lab-host",
+      name: "Lab host",
+      host: "lab.example.test",
+      origin: { sourceId: "source-1", externalId: "lab-host", syncedAt: 1 }
+    });
+    const dependencies = snapshotInventorySourceDependencies("lab-host", [labHost], []);
+
+    expect(() => computeSyncPlan({
+      source: makeSource({ providerId: "containerlab", prunePolicy: "delete" }),
+      tree: makeTree([]),
+      currentServers: [labHost],
+      now: 2,
+      sourceDefaultRoute: { kind: "direct" },
+      discoveryDependencies: dependencies
+    })).toThrow(/jump|discovery|host|profile/i);
   });
 });
 
@@ -4983,6 +5009,77 @@ describe("planToApplication (F19 — no targetFolder parameter)", () => {
     expect(application.sourceId).toBe("source-1");
     expect(application.syncedAt).toBe(1000);
     expect(application.expectedSource).toBe(expectedSource);
+  });
+});
+
+describe("discovery dependencies carried by a sync plan", () => {
+  it("rejects a prune plan that removes the lab host or one of its jump hops", () => {
+    const labHost = makeOwnedServer({
+      id: "lab-host",
+      origin: { sourceId: "source-1", externalId: "lab-host-device", syncedAt: 1 },
+      proxy: { type: "ssh", jumpHostId: "jump-one" }
+    });
+    const jump = makeOwnedServer({
+      id: "jump-one",
+      origin: { sourceId: "source-1", externalId: "jump-device", syncedAt: 1 }
+    });
+    const dependencies = snapshotInventorySourceDependencies("lab-host", [labHost, jump], []);
+
+    expect(() =>
+      computeSyncPlan({
+        source: makeSource({ prunePolicy: "delete" }),
+        tree: makeTree([]),
+        currentServers: [labHost, jump],
+        discoveryDependencies: dependencies,
+        now: 2
+      })
+    ).toThrow(/lab host|jump|discovery/i);
+  });
+
+  it("carries the same immutable dependency snapshot from the plan into its application", () => {
+    const labHost = makeManualServer({ id: "lab-host" });
+    const source = makeSource({ prunePolicy: "delete" });
+    const dependencies = snapshotInventorySourceDependencies("lab-host", [labHost], []);
+    const plan = computeSyncPlan({
+      source,
+      tree: makeTree([]),
+      currentServers: [labHost],
+      discoveryDependencies: dependencies,
+      now: 2
+    });
+
+    expect(plan.discoveryDependencies).toBe(dependencies);
+    expect(planToApplication(plan, source).discoveryDependencies).toBe(dependencies);
+  });
+
+  it("rejects an effective source-default cycle while allowing a valid required-hop update", () => {
+    const labHost: ServerConfig = {
+      id: "lab-host", name: "Lab host", host: "10.0.0.2", port: 22, username: "admin", authType: "agent",
+      isHidden: false, proxy: { type: "ssh", jumpHostId: "hop" }
+    };
+    const hop = makeOwnedServer({
+      id: "hop", name: "Hop", host: "10.0.0.1",
+      origin: { sourceId: "source-1", externalId: "hop-node", syncedAt: 1, syncedHost: "10.0.0.1", syncedPort: 22, syncedProtocol: "ssh" }
+    });
+    const source = makeSource({ prunePolicy: "delete" });
+    const dependencies = snapshotInventorySourceDependencies("lab-host", [labHost, hop], []);
+    const tree = makeTree([makeDevice({
+      externalId: "hop-node", name: "Hop", endpoints: [{ kind: "ssh", host: "10.0.0.1", port: 22 }]
+    })]);
+
+    expect(() => computeSyncPlan({
+      source, tree, currentServers: [labHost, hop], now: 2, discoveryDependencies: dependencies,
+      sourceDefaultRoute: { kind: "ssh", jumpHostId: "lab-host" }
+    })).toThrow(/cycle|Keep Direct|Device Connection/i);
+
+    const benignTree = makeTree([makeDevice({
+      externalId: "hop-node", name: "Hop", endpoints: [{ kind: "ssh", host: "10.0.0.9", port: 22 }]
+    })]);
+    const benign = computeSyncPlan({
+      source, tree: benignTree, currentServers: [labHost, hop], now: 2, discoveryDependencies: dependencies,
+      sourceDefaultRoute: { kind: "direct" }
+    });
+    expect(benign.updates.find((update) => update.after.id === "hop")?.after.host).toBe("10.0.0.9");
   });
 });
 

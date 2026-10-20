@@ -49,18 +49,26 @@ function visibleWhenAttrs(field: FormFieldDescriptor): string {
   return visibleWhenDataAttr(field.visibleWhen);
 }
 
+function requiredWhenAttrs(field: FormFieldDescriptor): string {
+  return field.requiredWhen
+    ? ` data-required-when='${escapeHtml(JSON.stringify(Array.isArray(field.requiredWhen) ? field.requiredWhen : [field.requiredWhen]))}'`
+    : "";
+}
+
 function renderField(field: FormFieldDescriptor): string {
   if (field.type === "html") {
     const vw = visibleWhenAttrs(field);
-    return `<div class="form-group form-illustration"${vw}>${field.content}</div>`;
+    return `<div class="form-group form-illustration"${vw}${requiredWhenAttrs(field)}>${field.content}</div>`;
   }
   if (field.type === "section") {
-    return `<div class="form-section"${visibleWhenAttrs(field)}>${escapeHtml(field.label)}</div>`;
+    return `<div class="form-section"${visibleWhenAttrs(field)}${requiredWhenAttrs(field)}>${escapeHtml(field.label)}</div>`;
   }
   const key = escapeHtml(field.key);
   const id = `field-${key}`;
   const req = "required" in field && field.required ? " required" : "";
   const vw = visibleWhenAttrs(field);
+  const rw = requiredWhenAttrs(field);
+  const requiredLabel = ("required" in field && field.required) || field.requiredWhen ? ' <span class="req">*</span>' : "";
 
   switch (field.type) {
     case "hidden":
@@ -71,8 +79,8 @@ function renderField(field: FormFieldDescriptor): string {
       // here, so its markup is byte-for-byte what it has always been.
       const textAutofillAttr = field.autofill ? ' data-autofill="true"' : "";
       if (field.scannable) {
-        return `<div class="form-group"${vw}>
-  <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
+        return `<div class="form-group"${vw}${rw}>
+  <label for="${id}">${escapeHtml(field.label)}${requiredLabel}</label>
   <div class="file-input-row">
     <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req}${textAutofillAttr} />
     <button type="button" class="scan-btn" data-key="${key}">Scan</button>
@@ -80,8 +88,8 @@ function renderField(field: FormFieldDescriptor): string {
   <div class="field-error" id="error-${key}"></div>
 </div>`;
       }
-      return `<div class="form-group"${vw}>
-  <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
+      return `<div class="form-group"${vw}${rw}>
+  <label for="${id}">${escapeHtml(field.label)}${requiredLabel}</label>
   <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req}${textAutofillAttr} />${renderHint(field)}
   <div class="field-error" id="error-${key}"></div>
 </div>`;
@@ -96,15 +104,15 @@ function renderField(field: FormFieldDescriptor): string {
     // whose value is stored verbatim needs the leading newline — without it,
     // opening the form and pressing Save silently drops the value's first line.
     case "textarea":
-      return `<div class="form-group"${vw}>
-  <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
+      return `<div class="form-group"${vw}${rw}>
+  <label for="${id}">${escapeHtml(field.label)}${requiredLabel}</label>
   <textarea id="${id}" name="${key}" rows="${field.rows ?? 4}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req}>${escapeHtml(field.value ?? "")}</textarea>${renderHint(field)}
   <div class="field-error" id="error-${key}"></div>
 </div>`;
 
     case "password":
-      return `<div class="form-group"${vw}>
-  <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
+      return `<div class="form-group"${vw}${rw}>
+  <label for="${id}">${escapeHtml(field.label)}${requiredLabel}</label>
   <input type="password" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}" autocomplete="new-password"${req} />${renderHint(field)}
   <div class="field-error" id="error-${key}"></div>
 </div>`;
@@ -164,8 +172,8 @@ function renderField(field: FormFieldDescriptor): string {
         // only when the filter hides every real option and no create affordance
         // applies (see initCustomSelects in webviewScripts.ts).
         const filterLabel = escapeHtml(`Filter ${field.label} options`);
-        return `<div class="form-group"${vw}>
-  <label>${escapeHtml(field.label)}</label>
+        return `<div class="form-group"${vw}${rw}>
+  <label>${escapeHtml(field.label)}${requiredLabel}</label>
   <div class="custom-select filterable" id="${id}" data-name="${key}"${autofillAttr}${filledAttr}${displacedAttr}${fillTargetAttr}>
     <input type="hidden" name="${key}" value="${escapeHtml(selectedValue)}" />
     <div class="custom-select-trigger" tabindex="0">
@@ -182,8 +190,8 @@ function renderField(field: FormFieldDescriptor): string {
   <div class="field-error" id="error-${key}"></div>
 </div>`;
       }
-      return `<div class="form-group"${vw}>
-  <label>${escapeHtml(field.label)}</label>
+      return `<div class="form-group"${vw}${rw}>
+  <label>${escapeHtml(field.label)}${requiredLabel}</label>
   <div class="custom-select" id="${id}" data-name="${key}"${autofillAttr}${filledAttr}${displacedAttr}${fillTargetAttr}>
     <input type="hidden" name="${key}" value="${escapeHtml(selectedValue)}" />
     <div class="custom-select-trigger" tabindex="0">
@@ -201,8 +209,8 @@ function renderField(field: FormFieldDescriptor): string {
       const suggestionsHtml = field.suggestions.map((s) =>
         `<div class="custom-select-option" data-value="${escapeHtml(s)}">${escapeHtml(s)}</div>`
       ).join("\n      ");
-      return `<div class="form-group"${vw}>
-  <label for="${id}">${escapeHtml(field.label)}${field.required ? ' <span class="req">*</span>' : ""}</label>
+      return `<div class="form-group"${vw}${rw}>
+  <label for="${id}">${escapeHtml(field.label)}${requiredLabel}</label>
   <div class="custom-combobox">
     <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "Type or select...")}" autocomplete="off"${field.required ? " required" : ""} />
     <div class="custom-select-dropdown">
@@ -214,7 +222,7 @@ function renderField(field: FormFieldDescriptor): string {
     }
 
     case "checkbox":
-      return `<div class="form-group form-group-checkbox"${vw}>
+      return `<div class="form-group form-group-checkbox"${vw}${rw}>
   <label>
     <input type="checkbox" id="${id}" name="${key}"${field.value ? " checked" : ""} />
     ${escapeHtml(field.label)}
@@ -725,6 +733,31 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
             }
           }
         }
+        var requiredGroups = document.querySelectorAll("[data-required-when]");
+        for (var ri = 0; ri < requiredGroups.length; ri++) {
+          var requiredGroup = requiredGroups[ri];
+          var requiredConditions = parseVisibleWhen(requiredGroup.dataset.requiredWhen);
+          var required = true;
+          for (var rci = 0; rci < requiredConditions.length; rci++) {
+            var requiredControl = form.elements[requiredConditions[rci].field];
+            var requiredValue = requiredConditions[rci].value;
+            var requiredMatches = Array.isArray(requiredValue)
+              ? requiredValue.indexOf(requiredControl && requiredControl.value) !== -1
+              : requiredControl && requiredControl.value === requiredValue;
+            if (!requiredMatches) {
+              required = false;
+              break;
+            }
+          }
+          // A filterable select's named value lives in its hidden input; the
+          // separate nameless filter box must never stand in for that value.
+          // Hidden inputs do not participate in native validation, so the host
+          // reference is still checked by the command/controller before Save.
+          var requiredInputs = requiredGroup.querySelectorAll("input[name], select[name], textarea[name]");
+          for (var rj = 0; rj < requiredInputs.length; rj++) {
+            requiredInputs[rj].required = required;
+          }
+        }
         updateProfileManagedFields();
       }
 
@@ -734,6 +767,13 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
         var wfConditions = parseVisibleWhen(wfGroups[wi].dataset.visibleWhen);
         for (var fi = 0; fi < wfConditions.length; fi++) {
           watchedFields[wfConditions[fi].field] = true;
+        }
+      }
+      var requiredGroups = document.querySelectorAll("[data-required-when]");
+      for (var rg = 0; rg < requiredGroups.length; rg++) {
+        var requiredConditions = parseVisibleWhen(requiredGroups[rg].dataset.requiredWhen);
+        for (var rci = 0; rci < requiredConditions.length; rci++) {
+          watchedFields[requiredConditions[rci].field] = true;
         }
       }
       for (var fieldName in watchedFields) {

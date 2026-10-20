@@ -4,7 +4,7 @@ Point an inventory source at a GNS3 server and its projects become folders and i
 
 ## Add a GNS3 Source
 
-1. Run `Nexus: Add Inventory Source (NetBox, EVE-NG, Proxmox, GNS3…)`, choose **GNS3**, and enter the server URL. A stock GNS3 server answers on plain HTTP at port 3080, so `http://gns3.example.com:3080` is the usual shape — keep the port, and include the scheme
+1. Run `Nexus: Add Inventory Source (NetBox, EVE-NG, Proxmox, GNS3, Containerlab…)`, choose **GNS3**, and enter the server URL. A stock GNS3 server answers on plain HTTP at port 3080, so `http://gns3.example.com:3080` is the usual shape — keep the port, and include the scheme
 2. Fill in **Username** and **Password** if your server needs them. GNS3 2.2 ships with HTTP authentication **off**, so both are optional there; GNS3 3.x always requires them. Nexus works out which generation it is talking to when it connects, so there is nothing to select. The password is stored in VS Code SecretStorage; on 3.x the login token it exchanges for is kept in memory for the session only and never written to disk
 3. Narrow what comes across with **Project Filter** — a case-insensitive substring of the project name, with the same **Saved Filter** picker NetBox and EVE-NG sources have (see [Saved filters](README.md#add-a-source)). Leave it empty to import every project
 4. If the consoles are reached through NAT or a port forward, set **Console Host Override** to the address you actually connect to. Without it, Nexus uses the host from the server URL, which is right for a direct connection

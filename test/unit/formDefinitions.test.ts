@@ -15,9 +15,12 @@ import {
 import type { SavedFilterDefinition } from "../../src/models/savedFilter";
 import type { FormDefinition, FormFieldDescriptor } from "../../src/ui/formTypes";
 import type { InventoryProvider, InventorySourceConfig } from "../../src/models/inventory";
-import type { AuthProfile } from "../../src/models/config";
+import type { AuthProfile, ServerConfig } from "../../src/models/config";
 import { authProfileOwnedCredentials } from "../../src/models/config";
 import { formatAuthProfileLabel } from "../../src/utils/authProfileLabel";
+import { createContainerlabProvider } from "../../src/services/inventory/providers/containerlabProvider";
+import { renderFormHtml } from "../../src/ui/formHtml";
+import { openForm } from "../helpers/formScriptHarness";
 
 function keyedField(definition: FormDefinition, key: string): Extract<FormFieldDescriptor, { key: string }> {
   const field = definition.fields.find(
@@ -91,6 +94,52 @@ describe("serverFormDefinition — addressless (P2-a)", () => {
     expect(keyedField(telnet, "port").value).toBe(23);
     const ssh = serverFormDefinition({ id: "s1", name: "s", host: "", port: 0, username: "admin", authType: "agent", addressless: true });
     expect(keyedField(ssh, "port").value).toBe(22);
+  });
+});
+
+describe("serverFormDefinition — managed inventory route choice", () => {
+  it("offers Automatic / Keep Direct only for managed edits, visible only with Proxy None and seeded from current route ownership", () => {
+    const server = {
+      id: "s1",
+      name: "managed",
+      host: "host",
+      port: 22,
+      username: "admin",
+      authType: "agent" as const,
+      proxy: { type: "socks5" as const, host: "proxy", port: 1080 },
+      origin: { sourceId: "source", externalId: "device", syncedAt: 1 }
+    };
+    const managed = serverFormDefinition(server, [], true, [], [], true);
+    const route = keyedField(managed, "inventoryProxyRouteChoice");
+
+    if (route.type !== "select") throw new Error("managed route choice should be a select");
+    expect(route.options).toEqual([
+      { label: "Automatic", value: "automatic" },
+      { label: "Keep Direct", value: "direct" }
+    ]);
+    expect(route.value).toBe("direct");
+    expect(route.visibleWhen).toEqual({ field: "proxyType", value: "none" });
+    expect(serverFormDefinition(server).fields.some((field) => "key" in field && field.key === "inventoryProxyRouteChoice")).toBe(false);
+  });
+
+  it("seeds Automatic for an explicitly owned Direct route and Keep Direct for a saved manual opt-out", () => {
+    const base = {
+      id: "s1",
+      name: "managed",
+      host: "host",
+      port: 22,
+      username: "admin",
+      authType: "agent" as const,
+      origin: { sourceId: "source", externalId: "device", syncedAt: 1 }
+    };
+    expect(keyedField(serverFormDefinition({
+      ...base,
+      origin: { ...base.origin, proxyOwnership: { owner: "template", value: null } }
+    }, [], true, [], [], true), "inventoryProxyRouteChoice").value).toBe("automatic");
+    expect(keyedField(serverFormDefinition({
+      ...base,
+      origin: { ...base.origin, proxyOptOut: true }
+    }, [], true, [], [], true), "inventoryProxyRouteChoice").value).toBe("direct");
   });
 });
 
@@ -678,6 +727,237 @@ describe("inventorySourceFormDefinition", () => {
       ...overrides
     };
   }
+
+  function sshProfile(id: string, name: string, overrides: Partial<ServerConfig> = {}): ServerConfig {
+    return {
+      id,
+      name,
+      protocol: "ssh",
+      host: `${id}.example.test`,
+      port: 22,
+      username: "admin",
+      authType: "agent",
+      ...overrides
+    } as ServerConfig;
+  }
+
+  it("builds the Containerlab host picker from current addressable SSH profiles and keeps conditional requirements", () => {
+    const provider = createContainerlabProvider();
+    const profiles = [
+      sshProfile("lab-host", "Lab Host", { proxy: { type: "ssh", jumpHostId: "jump-host" } }),
+      sshProfile("jump-host", "Jump Host"),
+      sshProfile("telnet-host", "Telnet", { protocol: "telnet" }),
+      sshProfile("addressless-host", "Addressless", { addressless: true, host: "" })
+    ];
+    const definition = inventorySourceFormDefinition(provider, undefined, "admin", [], [], [], profiles);
+    const hostField = keyedField(definition, "cfg_labHostId");
+    const imageField = keyedField(definition, "cfg_runnerImage");
+    const containerField = keyedField(definition, "cfg_runnerContainer");
+
+    expect(hostField.type).toBe("select");
+    if (hostField.type === "select") {
+      expect(hostField.options).toEqual([
+        { label: "Select an SSH profile…", value: "" },
+        { label: "Lab Host", value: "lab-host" },
+        { label: "Jump Host", value: "jump-host" }
+      ]);
+      expect(hostField.value).toBe("");
+      expect(hostField.requiredWhen).toEqual({ field: "cfg_location", value: "ssh" });
+    }
+    expect(imageField.requiredWhen).toEqual({ field: "cfg_runner", value: "disposable" });
+    expect(containerField.requiredWhen).toEqual({ field: "cfg_runner", value: "existing" });
+
+    const form = openForm(definition);
+    expect(form.requiredState("cfg_labHostId").value).toBe(false);
+    form.choose("cfg_location", "ssh");
+    expect(form.requiredState("cfg_labHostId").value).toBe(true);
+    form.choose("cfg_labHostId", "lab-host");
+    form.choose("cfg_runner", "disposable");
+    expect(form.attemptNativeSubmit()).toBeUndefined();
+    form.type("cfg_runnerImage", "registry.example/containerlab:1");
+    expect(form.attemptNativeSubmit()?.cfg_runnerImage).toBe("registry.example/containerlab:1");
+    form.choose("cfg_runner", "existing");
+    expect(form.attemptNativeSubmit()).toBeUndefined();
+    form.type("cfg_runnerContainer", "containerlab-runner");
+    expect(form.attemptNativeSubmit()?.cfg_runnerContainer).toBe("containerlab-runner");
+  });
+
+  it("keeps Containerlab field-name collisions owned by third-party providers", () => {
+    const provider: InventoryProvider = {
+      id: "third-party-lab",
+      label: "Third-party Lab",
+      configFields: [
+        { id: "labHostId", label: "SSH Gateway", type: "ssh-profile", required: true },
+        { id: "runnerImage", label: "Image Reference", type: "string", required: true },
+        { id: "runnerContainer", label: "Container Reference", type: "string", required: true }
+      ],
+      testConnection: async () => undefined,
+      fetchInventory: async () => ({ nodes: [] }) as never
+    };
+    const definition = inventorySourceFormDefinition(
+      provider,
+      sourceSeed({
+        providerId: provider.id,
+        config: { labHostId: "deleted-host", runnerImage: "registry.example/app:1", runnerContainer: "agent-1" }
+      }),
+      "admin",
+      [],
+      [],
+      [],
+      [sshProfile("live-host", "Live Host")]
+    );
+    const hostField = keyedField(definition, "cfg_labHostId");
+    const imageField = keyedField(definition, "cfg_runnerImage");
+    const containerField = keyedField(definition, "cfg_runnerContainer");
+    if (hostField.type !== "select") throw new Error("The SSH gateway should be rendered as a select field.");
+    expect(hostField.required).toBe(true);
+    expect(hostField.requiredWhen).toBeUndefined();
+    expect(hostField.options).toEqual([
+      { label: "Select an SSH profile…", value: "" },
+      { label: "Unresolved SSH profile (deleted-host)", value: "deleted-host" },
+      { label: "Live Host", value: "live-host" }
+    ]);
+    if (imageField.type !== "text") throw new Error("The image reference should be rendered as a text field.");
+    expect(imageField.required).toBe(true);
+    expect(imageField.requiredWhen).toBeUndefined();
+    if (containerField.type !== "text") throw new Error("The container reference should be rendered as a text field.");
+    expect(containerField.required).toBe(true);
+    expect(containerField.requiredWhen).toBeUndefined();
+
+    const html = renderFormHtml(definition);
+    expect(html).not.toContain("data-required-when=");
+    expect(html).toMatch(/<input type="text" id="field-cfg_runnerImage"[^>]* required \/>/u);
+    expect(html).toMatch(/<input type="text" id="field-cfg_runnerContainer"[^>]* required \/>/u);
+    const form = openForm(definition);
+    form.type("cfg_runnerImage", "");
+    expect(form.attemptNativeSubmit()).toBeUndefined();
+    form.type("cfg_runnerImage", "registry.example/app:1");
+    expect(form.attemptNativeSubmit()?.cfg_labHostId).toBe("deleted-host");
+  });
+
+  it("keeps optional colliding fields optional when a third-party Containerlab-labeled provider has matching selectors", () => {
+    const provider: InventoryProvider = {
+      id: "third-party-containerlab",
+      label: "Containerlab",
+      configFields: [
+        { id: "location", label: "Location", type: "select", options: [
+          { label: "Local", value: "local" }, { label: "SSH", value: "ssh" }
+        ] },
+        { id: "runner", label: "Runner", type: "select", options: [
+          { label: "Disposable", value: "disposable" }, { label: "Existing", value: "existing" }
+        ] },
+        { id: "labHostId", label: "SSH Gateway", type: "ssh-profile" },
+        { id: "runnerImage", label: "Image Reference", type: "string" },
+        { id: "runnerContainer", label: "Container Reference", type: "string" }
+      ],
+      testConnection: async () => undefined,
+      fetchInventory: async () => ({ nodes: [] }) as never
+    };
+    const definition = inventorySourceFormDefinition(
+      provider,
+      sourceSeed({
+        providerId: provider.id,
+        config: { location: "local", runner: "host", labHostId: "", runnerImage: "", runnerContainer: "" }
+      }),
+      "admin",
+      [],
+      [],
+      [],
+      [sshProfile("live-host", "Live Host")]
+    );
+    const hostField = keyedField(definition, "cfg_labHostId");
+    const imageField = keyedField(definition, "cfg_runnerImage");
+    const containerField = keyedField(definition, "cfg_runnerContainer");
+    if (hostField.type !== "select") throw new Error("The SSH gateway should be rendered as a select field.");
+    expect(hostField.required).toBeUndefined();
+    expect(hostField.requiredWhen).toBeUndefined();
+    if (imageField.type !== "text") throw new Error("The image reference should be rendered as a text field.");
+    expect(imageField.required).toBeUndefined();
+    expect(imageField.requiredWhen).toBeUndefined();
+    if (containerField.type !== "text") throw new Error("The container reference should be rendered as a text field.");
+    expect(containerField.required).toBeUndefined();
+    expect(containerField.requiredWhen).toBeUndefined();
+    expect(renderFormHtml(definition)).not.toContain("data-required-when=");
+
+    const form = openForm(definition);
+    form.choose("cfg_location", "ssh");
+    form.choose("cfg_runner", "disposable");
+    expect(form.requiredState("cfg_labHostId").value).toBe(false);
+    expect(form.attemptNativeSubmit()).toMatchObject({
+      cfg_labHostId: "",
+      cfg_runnerImage: "",
+      cfg_runnerContainer: ""
+    });
+
+    form.choose("cfg_runner", "existing");
+    expect(form.attemptNativeSubmit()).toMatchObject({
+      cfg_labHostId: "",
+      cfg_runnerImage: "",
+      cfg_runnerContainer: ""
+    });
+  });
+
+  it("lets the native Save submit with a selected SSH host and empty optional picker filter across location changes", () => {
+    const provider = createContainerlabProvider();
+    const definition = inventorySourceFormDefinition(
+      provider,
+      sourceSeed({
+        providerId: "containerlab",
+        config: { location: "local", labHostId: "lab-host" }
+      }),
+      "admin",
+      [],
+      [],
+      [],
+      [sshProfile("lab-host", "Lab Host")]
+    );
+    const html = renderFormHtml(definition);
+    const filterMarkup = html.match(/<input type="text" class="custom-select-filter"[^>]*>/);
+
+    expect(html).toMatch(/data-required-when='[^']*cfg_location[^']*ssh/);
+    expect(html).toContain('<input type="hidden" name="cfg_labHostId" value="lab-host" />');
+    expect(filterMarkup).not.toBeNull();
+    expect(filterMarkup![0]).not.toContain("name=");
+
+    const form = openForm(definition);
+    expect(form.requiredState("cfg_labHostId")).toEqual({ value: false, filter: false });
+    expect(form.attemptNativeSubmit()?.cfg_labHostId).toBe("lab-host");
+
+    form.choose("cfg_location", "ssh");
+    expect(form.requiredState("cfg_labHostId")).toEqual({ value: true, filter: false });
+    const remoteValues = form.attemptNativeSubmit();
+    expect(remoteValues?.cfg_labHostId).toBe("lab-host");
+    expect(form.posted.filter((message) => message.type === "submit")).toHaveLength(2);
+
+    form.choose("cfg_location", "local");
+    expect(form.requiredState("cfg_labHostId")).toEqual({ value: false, filter: false });
+    expect(form.attemptNativeSubmit()?.cfg_labHostId).toBe("lab-host");
+    expect(form.posted.filter((message) => message.type === "submit")).toHaveLength(3);
+  });
+
+  it("shows a deleted Containerlab SSH profile as unresolved instead of silently selecting another host", () => {
+    const provider = createContainerlabProvider();
+    const definition = inventorySourceFormDefinition(
+      provider,
+      sourceSeed({
+        providerId: "containerlab",
+        config: { location: "ssh", labHostId: "deleted-host" }
+      }),
+      undefined,
+      [],
+      [],
+      [],
+      [sshProfile("live-host", "Live Host")]
+    );
+    const hostField = keyedField(definition, "cfg_labHostId");
+
+    expect(hostField.type).toBe("select");
+    if (hostField.type === "select") {
+      expect(hostField.value).toBe("deleted-host");
+      expect(hostField.options).toContainEqual({ label: "Unresolved SSH profile (deleted-host)", value: "deleted-host" });
+      expect(hostField.options).toContainEqual({ label: "Live Host", value: "live-host" });
+    }
+  });
 
   it("renders the Auth Profile select outside Advanced, directly above Default SSH Username", () => {
     const definition = inventorySourceFormDefinition(fakeProvider, undefined, undefined, authProfiles);

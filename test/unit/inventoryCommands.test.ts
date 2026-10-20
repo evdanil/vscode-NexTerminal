@@ -20,11 +20,18 @@ import {
   inventorySecretKey,
   normalizeNotSyncableReasons,
   type InventoryProvider,
+  type InventoryOperationContext,
   type InventorySourceConfig,
   type InventorySourceValues,
   type InventoryTree
 } from "../../src/models/inventory";
 import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
+import {
+  createContainerlabActivationController,
+  type ContainerlabActivationController
+} from "../../src/services/inventory/containerlabActivation";
+import type { ContainerlabExecutionIdentity, ContainerlabExecutor } from "../../src/services/inventory/containerlabRuntimeContracts";
+import { createContainerlabProvider } from "../../src/services/inventory/providers/containerlabProvider";
 import { startInventoryStatusPoll } from "../../src/services/inventory/inventoryStatusPoll";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 import { ORPHAN_FOLDER_NAME, type InventorySyncPlan } from "../../src/services/inventory/syncEngine";
@@ -333,6 +340,1005 @@ describe("inventoryCommands", () => {
     registeredCommands.clear();
     managementPanelOpens.length = 0;
     mockWebviewOpen.mockImplementation(() => makeFakePanel());
+  });
+
+  describe("syncNow proposed discovery chain validation", () => {
+    it("refuses an Automatic route that would make the existing discovery chain cyclic before preview, teardown, or writes", async () => {
+      const sourceId = "route-source";
+      const labHost = makeServer({
+        id: "lab-host",
+        name: "Lab host",
+        host: "10.0.0.2",
+        proxy: { type: "ssh", jumpHostId: "hop" }
+      });
+      const hop = makeServer({
+        id: "hop",
+        name: "Hop",
+        host: "10.0.0.1",
+        origin: { sourceId, externalId: "hop-device", syncedAt: 1 }
+      });
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      await core.addOrUpdateServer(labHost);
+      await core.addOrUpdateServer(hop);
+      const source = makeSource({
+        id: sourceId,
+        providerId: "route-provider",
+        prunePolicy: "keep",
+        config: { labHostId: "lab-host" }
+      });
+      await core.addOrUpdateInventorySource(source);
+
+      const provider = makeProvider({
+        id: "route-provider",
+        configFields: [{ id: "labHostId", label: "Lab Host", type: "string", required: true }],
+        sourceDefaultRoute: () => ({ kind: "ssh", jumpHostId: "lab-host" }),
+        discoverySshHostId: () => "lab-host",
+        fetchInventory: vi.fn(async () => ({
+          contractVersion: 1 as const,
+          devices: [{ externalId: "hop-device", name: "Hop", endpoints: [{ kind: "ssh" as const, host: "10.0.0.1", port: 22 }] }]
+        }))
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(provider);
+      const teardown = makeTeardown();
+      registerInventoryCommands(core, registry, makeVault(), teardown);
+
+      const beforeServers = core.getSnapshot().servers;
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+      const writeSpy = vi.spyOn(core, "addOrUpdateServer");
+      await registeredCommands.get("nexus.inventory.syncNow")!(sourceId);
+
+      expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringMatching(/cycle|Keep Direct/i));
+      expect(mockShowInformationMessage).not.toHaveBeenCalled();
+      expect(applySpy).not.toHaveBeenCalled();
+      expect(teardown.calls).toEqual([]);
+      expect(writeSpy).not.toHaveBeenCalled();
+      expect(core.getSnapshot().servers).toEqual(beforeServers);
+    });
+  });
+
+  describe("Containerlab source form command integration", () => {
+    it("forwards Add/Edit Test contexts and transfers each saved approval inside the mutation lock", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      await core.addOrUpdateServer(makeServer({ id: "jump-host", name: "Jump Host", host: "jump.example" }));
+      await core.addOrUpdateServer(makeServer({
+        id: "lab-host",
+        name: "Lab Host",
+        host: "lab.example",
+        proxy: { type: "ssh", jumpHostId: "jump-host" }
+      }));
+      await core.addOrUpdateServer(makeServer({
+        id: "telnet-host",
+        name: "Telnet Host",
+        host: "telnet.example",
+        protocol: "telnet"
+      }));
+      await core.addOrUpdateServer(makeServer({
+        id: "addressless-host",
+        name: "Addressless Host",
+        host: "",
+        addressless: true
+      }));
+
+      let lockDepth = 0;
+      const events: string[] = [];
+      const originalRunExclusive = configMutationLock.runExclusive.bind(configMutationLock);
+      const lockSpy = vi.spyOn(configMutationLock, "runExclusive").mockImplementation(async (fn: () => Promise<unknown>) =>
+        originalRunExclusive(async () => {
+          lockDepth++;
+          try {
+            return await fn();
+          } finally {
+            lockDepth--;
+          }
+        })
+      );
+
+      const executor: ContainerlabExecutor = {
+        resolveDependencies: vi.fn(async (config, context) => {
+          expect(lockDepth).toBe(0);
+          return {
+            identity: {
+              executable: config.containerlabExecutable,
+              dockerExecutable: config.dockerExecutable,
+              dockerSocket: config.dockerSocket,
+              location: config.location,
+              sudo: config.sudo,
+              routeIdentity: config.location === "local" ? "local" : context.labHostRouteIdentity!
+            }
+          };
+        }),
+        preflight: vi.fn(async (_config, resolved) => {
+          expect(lockDepth).toBe(0);
+          return { identity: resolved.identity, version: "0.80.0" };
+        }),
+        inspect: vi.fn(async () => {
+          expect(lockDepth).toBe(0);
+          return { version: "0.80.0", stdout: "{}" };
+        })
+      };
+      const store = { load: vi.fn(async () => undefined), save: vi.fn(async () => {}) };
+      const activation = createContainerlabActivationController({
+        core,
+        executor,
+        store,
+        isWorkspaceTrusted: () => true,
+        confirmRun: vi.fn(async () => true),
+        createId: (() => {
+          let id = 0;
+          return () => `inventory-form-${++id}`;
+        })()
+      });
+      const beginSessionSpy = vi.spyOn(activation, "beginFormSession");
+      const originalPrepare = activation.prepareFormSourceSave.bind(activation);
+      vi.spyOn(activation, "prepareFormSourceSave").mockImplementation((sessionId, sourceId) => {
+        expect(lockDepth).toBe(1);
+        events.push("prepare");
+        const cleanup = originalPrepare(sessionId, sourceId);
+        return cleanup ? () => {
+          events.push("cleanup");
+          cleanup();
+        } : undefined;
+      });
+      const originalTransfer = activation.transferFormApproval.bind(activation);
+      vi.spyOn(activation, "transferFormApproval").mockImplementation(async (sessionId, source) => {
+        expect(lockDepth).toBe(1);
+        events.push("transfer");
+        await originalTransfer(sessionId, source);
+      });
+
+      const provider = createContainerlabProvider(activation);
+      const originalTestConnection = provider.testConnection.bind(provider);
+      const testConnectionSpy = vi.spyOn(provider, "testConnection").mockImplementation(async (config, secrets, context) => {
+        expect(lockDepth).toBe(0);
+        events.push("test");
+        await originalTestConnection(config, secrets, context);
+      });
+      const originalAddSource = core.addOrUpdateInventorySource.bind(core);
+      vi.spyOn(core, "addOrUpdateInventorySource").mockImplementation(async (source, options) => {
+        if (source.providerId === "containerlab") {
+          expect(lockDepth).toBe(1);
+          events.push("core-save");
+        }
+        await originalAddSource(source, options);
+      });
+
+      const registry = new InventoryProviderRegistry();
+      registry.register(provider);
+      const teardown = makeTeardown();
+      registerInventoryCommands(core, registry, makeVault(), teardown, activation);
+
+      const values: FormValues = {
+        name: "Containerlab labs",
+        targetFolder: "Labs",
+        defaultUsername: "admin",
+        prunePolicy: "delete",
+        cfg_location: "ssh",
+        cfg_labHostId: "lab-host",
+        cfg_runner: "host",
+        cfg_deviceConnection: "direct",
+        cfg_statusPollSeconds: 0,
+        cfg_addressPreference: "ipv4"
+      };
+
+      try {
+        await registeredCommands.get("nexus.inventory.addSource")!();
+        const addForm = latestFormCall();
+        const addSessionId = beginSessionSpy.mock.results[0]?.value as string;
+        const hostField = addForm.definition.fields.find((field) => "key" in field && field.key === "cfg_labHostId");
+        expect(hostField).toMatchObject({
+          type: "select",
+          options: expect.arrayContaining([
+            { label: "Lab Host", value: "lab-host" },
+            { label: "Jump Host", value: "jump-host" }
+          ])
+        });
+        if (hostField?.type === "select") {
+          expect(hostField.options.map((option) => option.value)).not.toEqual(
+            expect.arrayContaining(["telnet-host", "addressless-host"])
+          );
+        }
+
+        await addForm.onTest!(values);
+        expect(testConnectionSpy.mock.calls[0]?.[2]).toEqual({
+          intent: "test",
+          subject: { kind: "form", sessionId: addSessionId }
+        });
+        expect(events).toEqual(["test"]);
+
+        events.length = 0;
+        await addForm.onSubmit(values);
+        const added = core.getSnapshot().inventorySources.find((source) => source.providerId === "containerlab");
+        expect(added).toBeDefined();
+        expect(added?.config).toMatchObject({ location: "ssh", labHostId: "lab-host", deviceConnection: "direct" });
+        expect(events).toEqual(["prepare", "core-save", "transfer", "cleanup"]);
+        expect(store.save).toHaveBeenCalled();
+        addForm.panel.fireDispose();
+
+        await registeredCommands.get("nexus.inventory.editSource")!(added!.id);
+        const editForm = latestFormCall();
+        const editSessionId = beginSessionSpy.mock.results[1]?.value as string;
+        expect(beginSessionSpy.mock.calls[1]?.[0]).toEqual({ sourceId: added!.id, revision: added!.revision });
+        const editValues = { ...values, name: "Containerlab labs edited" };
+        await editForm.onTest!(editValues);
+        expect(testConnectionSpy.mock.calls[1]?.[2]).toEqual({
+          intent: "test",
+          subject: { kind: "form", sessionId: editSessionId }
+        });
+
+        events.length = 0;
+        await editForm.onSubmit(editValues);
+        const edited = core.getInventorySource(added!.id)!;
+        expect(edited.name).toBe("Containerlab labs edited");
+        expect(edited.revision).not.toBe(added!.revision);
+        expect(events).toEqual(["prepare", "core-save", "transfer", "cleanup"]);
+        editForm.panel.fireDispose();
+
+        const fetchInventorySpy = vi.spyOn(provider, "fetchInventory");
+        await registeredCommands.get("nexus.inventory.syncNow")!(edited.id);
+        expect(fetchInventorySpy.mock.calls.at(-1)?.[2]).toEqual({
+          intent: "sync",
+          subject: { kind: "source", sourceId: edited.id, revision: edited.revision! }
+        });
+
+        const fetchStatusSpy = vi.spyOn(provider, "fetchStatus");
+        await registeredCommands.get("nexus.inventory.refreshStatus")!();
+        expect(fetchStatusSpy.mock.calls.at(-1)?.[2]).toEqual({
+          intent: "manual-status",
+          subject: { kind: "source", sourceId: edited.id, revision: edited.revision! }
+        });
+        await registeredCommands.get("nexus.inventory.refreshStatus")!({ __poll: true });
+        expect(fetchStatusSpy.mock.calls.at(-1)?.[2]).toEqual({
+          intent: "background-status",
+          subject: { kind: "source", sourceId: edited.id, revision: edited.revision! }
+        });
+
+        vi.mocked(executor.inspect).mockResolvedValueOnce({
+          version: "0.80.0",
+          stdout: JSON.stringify({
+            "lab-a": [
+              {
+                ID: "lab-a-r1-container",
+                Names: ["/clab-lab-a-r1"],
+                Image: "ghcr.io/example/router:1",
+                State: "running",
+                Status: "Up 2 minutes",
+                Labels: {
+                  containerlab: "lab-a",
+                  "clab-node-name": "r1",
+                  "clab-node-kind": "linux",
+                  "clab-node-type": "linux"
+                },
+                NetworkSettings: { IPv4addr: "10.0.0.11", IPv4pLen: 24, IPv6addr: "", IPv6pLen: 0 }
+              },
+              null
+            ]
+          })
+        });
+        const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+        const serversBeforeMalformedDiscovery = core.getSnapshot().servers;
+        await registeredCommands.get("nexus.inventory.syncNow")!(edited.id);
+        expect(applySpy).not.toHaveBeenCalled();
+        expect(core.getSnapshot().servers).toEqual(serversBeforeMalformedDiscovery);
+        expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Containerlab"));
+        applySpy.mockRestore();
+
+        vi.mocked(executor.inspect).mockRejectedValueOnce(new Error("Containerlab command exited with code 9"));
+        const failedCommandApplySpy = vi.spyOn(core, "applyInventorySyncPlan");
+        const serversBeforeCommandFailure = core.getSnapshot().servers;
+        await registeredCommands.get("nexus.inventory.syncNow")!(edited.id);
+        expect(failedCommandApplySpy).not.toHaveBeenCalled();
+        expect(core.getSnapshot().servers).toEqual(serversBeforeCommandFailure);
+        expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("code 9"));
+        failedCommandApplySpy.mockRestore();
+
+        vi.mocked(executor.inspect).mockResolvedValueOnce({
+          version: "0.80.0",
+          stdout: "untrusted command noise\n{}"
+        });
+        mockShowErrorMessage.mockClear();
+        const noisyInspectionApplySpy = vi.spyOn(core, "applyInventorySyncPlan");
+        const serversBeforeNoisyInspection = core.getSnapshot().servers;
+        await registeredCommands.get("nexus.inventory.syncNow")!(edited.id);
+        expect(noisyInspectionApplySpy).not.toHaveBeenCalled();
+        expect(core.getSnapshot().servers).toEqual(serversBeforeNoisyInspection);
+        expect(mockShowErrorMessage).toHaveBeenCalledWith(
+          expect.stringContaining("malformed detailed inspection JSON")
+        );
+        noisyInspectionApplySpy.mockRestore();
+
+        vi.mocked(executor.preflight).mockRejectedValueOnce(new Error("Containerlab version preflight exited with code 8"));
+        mockShowErrorMessage.mockClear();
+        const preflightFailureApplySpy = vi.spyOn(core, "applyInventorySyncPlan");
+        const inspectionsBeforeFailedPreflight = vi.mocked(executor.inspect).mock.calls.length;
+        const serversBeforeFailedPreflight = core.getSnapshot().servers;
+        await registeredCommands.get("nexus.inventory.syncNow")!(edited.id);
+        expect(preflightFailureApplySpy).not.toHaveBeenCalled();
+        expect(vi.mocked(executor.inspect)).toHaveBeenCalledTimes(inspectionsBeforeFailedPreflight);
+        expect(core.getSnapshot().servers).toEqual(serversBeforeFailedPreflight);
+        expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("preflight exited with code 8"));
+        preflightFailureApplySpy.mockRestore();
+
+        const jumpHostBeforeRouteCases = core.getServer("jump-host")!;
+        const fetchTeardownCalls = [...teardown.calls];
+        mockShowErrorMessage.mockClear();
+        const changedDuringFetchApplySpy = vi.spyOn(core, "applyInventorySyncPlan");
+        vi.mocked(executor.inspect).mockImplementationOnce(async () => {
+          expect(lockDepth).toBe(0);
+          await core.addOrUpdateServer({ ...jumpHostBeforeRouteCases, host: "jump-during-fetch.example" });
+          return { version: "0.80.0", stdout: "{}" };
+        });
+        await registeredCommands.get("nexus.inventory.syncNow")!(edited.id);
+        expect(changedDuringFetchApplySpy).not.toHaveBeenCalled();
+        expect(teardown.calls).toEqual(fetchTeardownCalls);
+        expect(mockShowErrorMessage).toHaveBeenCalledTimes(1);
+        expect(mockShowErrorMessage).toHaveBeenCalledWith(
+          "Inventory sync failed: Error: Containerlab source, form, workspace trust, or SSH route changed during inspection."
+        );
+        changedDuringFetchApplySpy.mockRestore();
+        await core.addOrUpdateServer(jumpHostBeforeRouteCases);
+
+        // A source-owned jump server is part of this source's deletion plan
+        // when absent from inspection. Planning must refuse that plan before
+        // the user can approve it or runtime teardown can begin.
+        const sourceOwnedJump = makeServer({
+          ...jumpHostBeforeRouteCases,
+          origin: { sourceId: edited.id, externalId: "jump-host-device", syncedAt: 1 }
+        });
+        await core.addOrUpdateServer(sourceOwnedJump);
+        const infoCallsBeforeUnsafePreview = mockShowInformationMessage.mock.calls.length;
+        const pruneTeardownCalls = [...teardown.calls];
+        mockShowErrorMessage.mockClear();
+        const prunedHopApplySpy = vi.spyOn(core, "applyInventorySyncPlan");
+        await registeredCommands.get("nexus.inventory.syncNow")!(edited.id);
+        expect(lockDepth).toBe(0);
+        expect(prunedHopApplySpy).not.toHaveBeenCalled();
+        expect(teardown.calls).toEqual(pruneTeardownCalls);
+        expect(core.getServer("jump-host")).toEqual(sourceOwnedJump);
+        expect(mockShowInformationMessage).toHaveBeenCalledTimes(infoCallsBeforeUnsafePreview);
+        expect(mockShowErrorMessage).toHaveBeenCalledTimes(1);
+        expect(mockShowErrorMessage).toHaveBeenCalledWith(
+          "Containerlab discovery requires a valid SSH lab host and jump chain: the current sync would remove the lab host or one of its SSH jump profiles. Select or restore a valid SSH profile, or revise pruning so every required profile survives."
+        );
+        prunedHopApplySpy.mockRestore();
+        await core.addOrUpdateServer(jumpHostBeforeRouteCases);
+        const inspectionsBeforeClaimRetry = vi.mocked(executor.inspect).mock.calls.length;
+
+        const pruneCandidate = makeServer({
+          id: "owned-clab-server",
+          name: "lab-b-r1",
+          host: "10.0.0.99",
+          username: "admin",
+          origin: {
+            sourceId: edited.id,
+            externalId: JSON.stringify(["lab-b", "clab-lab-b-r1"]),
+            syncedAt: 1
+          }
+        });
+        await core.addOrUpdateServer(pruneCandidate);
+        const beforePreviewHopChange = core.getServer("jump-host")!;
+        const beforePreviewPruneCandidate = core.getServer(pruneCandidate.id)!;
+        const teardownCallsBeforePreview = [...teardown.calls];
+        mockShowErrorMessage.mockClear();
+        mockShowInformationMessage.mockImplementationOnce(async (...args: unknown[]) => {
+          expect(args[0]).toContain("Apply inventory sync from");
+          const options = args[1] as { modal?: boolean; detail?: string };
+          expect(options.modal).toBe(true);
+          expect(options.detail).toContain("1 server will be deleted");
+
+          // The preview is bound to this jump endpoint. Moving a hop while the
+          // user is deciding must abort before teardown or applying its prune.
+          await core.addOrUpdateServer({ ...beforePreviewHopChange, host: "jump-moved.example" });
+          return "Apply";
+        });
+        const previewApplySpy = vi.spyOn(core, "applyInventorySyncPlan");
+        await registeredCommands.get("nexus.inventory.syncNow")!(edited.id);
+        expect(vi.mocked(executor.inspect)).toHaveBeenCalledTimes(inspectionsBeforeClaimRetry + 1);
+        expect(previewApplySpy).not.toHaveBeenCalled();
+        expect(teardown.calls).toEqual(teardownCallsBeforePreview);
+        expect(core.getServer(pruneCandidate.id)).toEqual(beforePreviewPruneCandidate);
+        expect(mockShowErrorMessage).toHaveBeenCalledWith(
+          "Containerlab discovery's SSH route or authentication profile changed while the sync was running. Run the sync again after selecting the intended lab host and jump profiles."
+        );
+        previewApplySpy.mockRestore();
+
+        // This change lands after the preview-to-teardown guard has passed,
+        // while teardown is awaited. The final synchronous dependency fence
+        // must still stop the plan before core application.
+        await core.addOrUpdateServer(beforePreviewHopChange);
+        const beforeFinalHopChange = core.getServer("jump-host")!;
+        const beforeFinalPruneCandidate = core.getServer(pruneCandidate.id)!;
+        const teardownCallsBeforeFinalFence = [...teardown.calls];
+        mockShowErrorMessage.mockClear();
+        mockShowInformationMessage.mockImplementationOnce(async () => "Apply");
+        const finalFenceApplySpy = vi.spyOn(core, "applyInventorySyncPlan");
+        vi.mocked(teardown.teardownServerRuntime).mockImplementationOnce(async (serverId: string) => {
+          expect(lockDepth).toBe(1);
+          teardown.calls.push(serverId);
+          await core.addOrUpdateServer({ ...beforeFinalHopChange, host: "jump-after-teardown.example" });
+        });
+        await registeredCommands.get("nexus.inventory.syncNow")!(edited.id);
+        expect(teardown.calls).toEqual([...teardownCallsBeforeFinalFence, pruneCandidate.id]);
+        expect(finalFenceApplySpy).not.toHaveBeenCalled();
+        expect(core.getServer(pruneCandidate.id)).toEqual(beforeFinalPruneCandidate);
+        expect(mockShowErrorMessage).toHaveBeenCalledWith(
+          "Containerlab discovery's SSH route or authentication profile changed while the sync was running. Run the sync again after selecting the intended lab host and jump profiles."
+        );
+        finalFenceApplySpy.mockRestore();
+        await core.addOrUpdateServer(beforeFinalHopChange);
+
+        const unknownSyncFailure = new Error("controlled unknown sync failure");
+        const teardownCallsBeforeUnknownFailure = [...teardown.calls];
+        mockShowErrorMessage.mockClear();
+        mockShowWarningMessage.mockClear();
+        mockShowInformationMessage.mockRejectedValueOnce(unknownSyncFailure);
+        await expect(registeredCommands.get("nexus.inventory.syncNow")!(edited.id)).rejects.toBe(unknownSyncFailure);
+        expect(mockShowErrorMessage).not.toHaveBeenCalled();
+        expect(teardown.calls).toEqual(teardownCallsBeforeUnknownFailure);
+
+        const sourceBeforeByteIdenticalReplace = core.getInventorySource(edited.id)!;
+        const byteIdenticalConfig = structuredClone(sourceBeforeByteIdenticalReplace.config);
+        const inspectionsBeforeByteIdenticalReplace = vi.mocked(executor.inspect).mock.calls.length;
+        mockShowErrorMessage.mockClear();
+        mockShowInformationMessage.mockClear();
+        const byteIdenticalReplaceApplySpy = vi.spyOn(core, "applyInventorySyncPlan");
+        const sourceWriteSpy = vi.spyOn(core, "addOrUpdateInventorySource");
+        const sourceWriteCallsBeforeReplacement = sourceWriteSpy.mock.calls.length;
+        let replacementCompleted = false;
+        vi.mocked(executor.inspect).mockImplementationOnce(async () => {
+          expect(lockDepth).toBe(0);
+          await configMutationLock.runExclusive(() =>
+            core.addOrUpdateInventorySource(sourceBeforeByteIdenticalReplace, { forceNewActivationGeneration: true })
+          );
+          replacementCompleted = true;
+          return { version: "0.80.0", stdout: "{}" };
+        });
+        await registeredCommands.get("nexus.inventory.syncNow")!(edited.id);
+        const replacedSource = core.getInventorySource(edited.id)!;
+        expect(vi.mocked(executor.inspect)).toHaveBeenCalledTimes(inspectionsBeforeByteIdenticalReplace + 1);
+        expect(replacementCompleted).toBe(true);
+        expect(sourceWriteSpy.mock.calls.slice(sourceWriteCallsBeforeReplacement)).toEqual([
+          [sourceBeforeByteIdenticalReplace, { forceNewActivationGeneration: true }]
+        ]);
+        expect(lockDepth).toBe(0);
+        expect(replacedSource.config).toEqual(byteIdenticalConfig);
+        expect(replacedSource.revision).not.toBe(sourceBeforeByteIdenticalReplace.revision);
+        expect(byteIdenticalReplaceApplySpy).not.toHaveBeenCalled();
+        expect(teardown.calls).toEqual(teardownCallsBeforeUnknownFailure);
+        expect(mockShowErrorMessage).toHaveBeenCalledTimes(1);
+        expect(mockShowErrorMessage).toHaveBeenCalledWith(
+          "Inventory sync failed: Error: Containerlab source, form, workspace trust, or SSH route changed during inspection."
+        );
+        expect(mockShowInformationMessage).not.toHaveBeenCalled();
+        sourceWriteSpy.mockRestore();
+        byteIdenticalReplaceApplySpy.mockRestore();
+      } finally {
+        activation.dispose();
+        lockSpy.mockRestore();
+      }
+    });
+
+    it("saves untested Add and Edit forms without transferring approval, while preserving only unchanged approved edits", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      await core.addOrUpdateServer(makeServer({ id: "jump-host", name: "Jump Host", host: "jump.example" }));
+      await core.addOrUpdateServer(makeServer({
+        id: "lab-host",
+        name: "Lab Host",
+        host: "lab.example",
+        proxy: { type: "ssh", jumpHostId: "jump-host" }
+      }));
+      await core.addOrUpdateServer(makeServer({ id: "telnet-host", name: "Telnet Host", host: "telnet.example", protocol: "telnet" }));
+
+      let lockDepth = 0;
+      const originalRunExclusive = configMutationLock.runExclusive.bind(configMutationLock);
+      const lockSpy = vi.spyOn(configMutationLock, "runExclusive").mockImplementation(async (fn: () => Promise<unknown>) =>
+        originalRunExclusive(async () => {
+          lockDepth++;
+          try {
+            return await fn();
+          } finally {
+            lockDepth--;
+          }
+        })
+      );
+      const executor: ContainerlabExecutor = {
+        resolveDependencies: vi.fn(async (config, context) => ({
+          identity: {
+            executable: config.containerlabExecutable,
+            dockerExecutable: config.dockerExecutable,
+            dockerSocket: config.dockerSocket,
+            location: config.location,
+            sudo: config.sudo,
+            routeIdentity: config.location === "local" ? "local" : context.labHostRouteIdentity!
+          }
+        })),
+        preflight: vi.fn(async (_config, resolved) => ({ identity: resolved.identity, version: "0.80.0" })),
+        inspect: vi.fn(async () => ({ version: "0.80.0", stdout: "{}" }))
+      };
+      const store = { load: vi.fn(async () => undefined), save: vi.fn(async () => {}) };
+      const confirmRun = vi.fn(async () => true);
+      const activation = createContainerlabActivationController({
+        core,
+        executor,
+        store,
+        isWorkspaceTrusted: () => true,
+        confirmRun
+      });
+      const originalPrepare = activation.prepareFormSourceSave.bind(activation);
+      const prepareSpy = vi.spyOn(activation, "prepareFormSourceSave").mockImplementation((sessionId, sourceId) => {
+        expect(lockDepth).toBe(1);
+        const cleanup = originalPrepare(sessionId, sourceId);
+        return cleanup ? () => cleanup() : undefined;
+      });
+      const originalTransfer = activation.transferFormApproval.bind(activation);
+      const transferSpy = vi.spyOn(activation, "transferFormApproval").mockImplementation(async (sessionId, source) => {
+        expect(lockDepth).toBe(1);
+        await originalTransfer(sessionId, source);
+      });
+      const provider = createContainerlabProvider(activation);
+      const testConnectionSpy = vi.spyOn(provider, "testConnection");
+      const originalAddSource = core.addOrUpdateInventorySource.bind(core);
+      vi.spyOn(core, "addOrUpdateInventorySource").mockImplementation(async (source, options) => {
+        if (source.providerId === "containerlab") expect(lockDepth).toBe(1);
+        await originalAddSource(source, options);
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(provider);
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown(), activation);
+
+      const values: FormValues = {
+        name: "Untested lab",
+        targetFolder: "Labs",
+        defaultUsername: "admin",
+        prunePolicy: "delete",
+        cfg_location: "ssh",
+        cfg_labHostId: "lab-host",
+        cfg_runner: "host",
+        cfg_deviceConnection: "direct",
+        cfg_statusPollSeconds: 0,
+        cfg_addressPreference: "ipv4"
+      };
+
+      try {
+        await registeredCommands.get("nexus.inventory.addSource")!();
+        const untestedAdd = latestFormCall();
+        await untestedAdd.onSubmit(values);
+        const untestedSource = core.getSnapshot().inventorySources.find((source) => source.name === values.name)!;
+        expect(untestedSource).toBeDefined();
+        expect(prepareSpy).toHaveBeenCalledOnce();
+        expect(transferSpy).not.toHaveBeenCalled();
+        expect(testConnectionSpy).not.toHaveBeenCalled();
+        expect(executor.inspect).not.toHaveBeenCalled();
+        const untestedContext: InventoryOperationContext = {
+          intent: "background-status",
+          subject: { kind: "source", sourceId: untestedSource.id, revision: untestedSource.revision! }
+        };
+        await expect(provider.fetchStatus!(untestedSource.config, {}, untestedContext)).rejects.toThrow(/Test|Sync|approv/i);
+        expect(confirmRun).not.toHaveBeenCalled();
+        expect(executor.inspect).not.toHaveBeenCalled();
+        untestedAdd.panel.fireDispose();
+
+        await registeredCommands.get("nexus.inventory.editSource")!(untestedSource.id);
+        const untestedEdit = latestFormCall();
+        const untestedRename = { ...values, name: "Untested lab renamed" };
+        await untestedEdit.onSubmit(untestedRename);
+        const renamedUntestedSource = core.getInventorySource(untestedSource.id)!;
+        const renamedContext: InventoryOperationContext = {
+          intent: "background-status",
+          subject: { kind: "source", sourceId: renamedUntestedSource.id, revision: renamedUntestedSource.revision! }
+        };
+        await expect(provider.fetchStatus!(renamedUntestedSource.config, {}, renamedContext)).rejects.toThrow(/Test|Sync|approv/i);
+        expect(executor.inspect).not.toHaveBeenCalled();
+        untestedEdit.panel.fireDispose();
+
+        const testedValues = { ...values, name: "Approved lab" };
+        await registeredCommands.get("nexus.inventory.addSource")!();
+        const testedAdd = latestFormCall();
+        await testedAdd.onTest!(testedValues);
+        expect(testConnectionSpy.mock.calls.at(-1)?.[2]).toMatchObject({
+          intent: "test",
+          subject: { kind: "form", sessionId: expect.any(String) }
+        });
+        await testedAdd.onSubmit(testedValues);
+        const approvedSource = core.getSnapshot().inventorySources.find((source) => source.name === testedValues.name)!;
+        expect(transferSpy).toHaveBeenCalledOnce();
+        testedAdd.panel.fireDispose();
+
+        await registeredCommands.get("nexus.inventory.editSource")!(approvedSource.id);
+        const metadataEdit = latestFormCall();
+        const metadataValues = { ...testedValues, name: "Approved lab renamed" };
+        await metadataEdit.onSubmit(metadataValues);
+        const metadataSaved = core.getInventorySource(approvedSource.id)!;
+        expect(metadataSaved.name).toBe(metadataValues.name);
+        expect(transferSpy).toHaveBeenCalledOnce();
+        vi.mocked(executor.inspect).mockClear();
+        const metadataContext: InventoryOperationContext = {
+          intent: "background-status",
+          subject: { kind: "source", sourceId: metadataSaved.id, revision: metadataSaved.revision! }
+        };
+        await provider.fetchStatus!(metadataSaved.config, {}, metadataContext);
+        expect(executor.inspect).toHaveBeenCalledOnce();
+        expect(confirmRun).toHaveBeenCalledOnce();
+        metadataEdit.panel.fireDispose();
+
+        await registeredCommands.get("nexus.inventory.editSource")!(metadataSaved.id);
+        const changedIntentEdit = latestFormCall();
+        const changedIntentValues = { ...metadataValues, cfg_sudo: true };
+        await changedIntentEdit.onSubmit(changedIntentValues);
+        const changedIntentSaved = core.getInventorySource(metadataSaved.id)!;
+        vi.mocked(executor.resolveDependencies).mockClear();
+        vi.mocked(executor.preflight).mockClear();
+        vi.mocked(executor.inspect).mockClear();
+        const changedContext: InventoryOperationContext = {
+          intent: "background-status",
+          subject: { kind: "source", sourceId: changedIntentSaved.id, revision: changedIntentSaved.revision! }
+        };
+        await expect(provider.fetchStatus!(changedIntentSaved.config, {}, changedContext)).rejects.toThrow(/Test|Sync|approv/i);
+        expect(executor.resolveDependencies).not.toHaveBeenCalled();
+        expect(executor.preflight).not.toHaveBeenCalled();
+        expect(executor.inspect).not.toHaveBeenCalled();
+        expect(confirmRun).toHaveBeenCalledOnce();
+        changedIntentEdit.panel.fireDispose();
+
+        await registeredCommands.get("nexus.inventory.addSource")!();
+        const invalidHostAdd = latestFormCall();
+        await expect(invalidHostAdd.onSubmit({ ...values, name: "Invalid Telnet lab", cfg_labHostId: "telnet-host" }))
+          .rejects.toThrow(/SSH|host|route|protocol/i);
+        expect(core.getSnapshot().inventorySources.some((source) => source.name === "Invalid Telnet lab")).toBe(false);
+        expect(executor.inspect).not.toHaveBeenCalled();
+        invalidHostAdd.panel.fireDispose();
+      } finally {
+        activation.dispose();
+        lockSpy.mockRestore();
+      }
+    });
+
+    it.each(["lab host", "deep jump host", "authentication profile", "missing lab host"] as const)(
+      "does not apply a Containerlab status report when the %s changes after activation inspection returns",
+      async (changedDependency) => {
+        const core = new NexusCore(new InMemoryConfigRepository());
+        await core.initialize();
+        const profile: AuthProfile = { id: "lab-auth", name: "Lab Auth", username: "netops", authType: "agent" };
+        await core.addOrUpdateAuthProfile(profile);
+        const jumpHost = makeServer({ id: "jump-host", name: "Jump Host", host: "jump.example", authProfileId: profile.id });
+        const labHost = makeServer({
+          id: "lab-host",
+          name: "Lab Host",
+          host: "lab.example",
+          authProfileId: profile.id,
+          proxy: { type: "ssh", jumpHostId: jumpHost.id }
+        });
+        await core.addOrUpdateServer(jumpHost);
+        await core.addOrUpdateServer(labHost);
+        const config: InventorySourceValues = {
+          location: "ssh",
+          labHostId: labHost.id,
+          runner: "host",
+          containerlabExecutable: "containerlab",
+          dockerExecutable: "docker",
+          dockerSocket: "/var/run/docker.sock",
+          sudo: false,
+          deviceConnection: "direct",
+          labFilter: "",
+          addressPreference: "ipv4"
+        };
+        await core.addOrUpdateInventorySource(makeSource({
+          id: "containerlab-status-source",
+          providerId: "containerlab",
+          name: "Containerlab status",
+          targetFolder: "Labs",
+          config
+        }));
+        const source = core.getInventorySource("containerlab-status-source")!;
+        const executor: ContainerlabExecutor = {
+          resolveDependencies: vi.fn(async (currentConfig, context) => ({
+            identity: {
+              executable: currentConfig.containerlabExecutable,
+              dockerExecutable: currentConfig.dockerExecutable,
+              dockerSocket: currentConfig.dockerSocket,
+              location: currentConfig.location,
+              sudo: currentConfig.sudo,
+              routeIdentity: context.labHostRouteIdentity!
+            }
+          })),
+          preflight: vi.fn(async (_config, resolved) => ({ identity: resolved.identity, version: "0.80.0" })),
+          inspect: vi.fn(async () => ({
+            version: "0.80.0",
+            stdout: JSON.stringify({
+              "lab-a": [{
+                ID: "container-1",
+                Names: ["/clab-lab-a-r1"],
+                Image: "ghcr.io/example/router:1",
+                State: "running",
+                Status: "Up 1 minute",
+                Labels: {
+                  containerlab: "lab-a",
+                  "clab-node-name": "r1",
+                  "clab-node-kind": "linux",
+                  "clab-node-type": "linux"
+                },
+                NetworkSettings: { IPv4addr: "", IPv4pLen: 0, IPv6addr: "", IPv6pLen: 0 }
+              }]
+            })
+          }))
+        };
+        const activation = createContainerlabActivationController({
+          core,
+          executor,
+          store: { load: vi.fn(async () => undefined), save: vi.fn(async () => {}) },
+          isWorkspaceTrusted: () => true,
+          confirmRun: vi.fn(async () => true)
+        });
+        const provider = createContainerlabProvider(activation);
+        const registry = new InventoryProviderRegistry();
+        registry.register(provider);
+        registerInventoryCommands(core, registry, makeVault(), makeTeardown(), activation);
+        const sourceContext: InventoryOperationContext = {
+          intent: "sync",
+          subject: { kind: "source", sourceId: source.id, revision: source.revision! }
+        };
+        await provider.testConnection!(source.config, {}, sourceContext);
+
+        const originalInspect = activation.inspect.bind(activation);
+        let mutationCompleted = false;
+        vi.spyOn(activation, "inspect").mockImplementation(async (currentConfig, operationContext) => {
+          const inspection = await originalInspect(currentConfig, operationContext);
+          if (!mutationCompleted) {
+            if (changedDependency === "lab host") {
+              await core.addOrUpdateServer({ ...labHost, host: "lab-moved.example" });
+            } else if (changedDependency === "deep jump host") {
+              await core.addOrUpdateServer({ ...jumpHost, host: "jump-moved.example" });
+            } else if (changedDependency === "authentication profile") {
+              await core.addOrUpdateAuthProfile({ ...profile, username: "changed-user" });
+            } else {
+              await core.removeServer(labHost.id);
+            }
+            mutationCompleted = true;
+          }
+          return inspection;
+        });
+        const applySpy = vi.spyOn(core, "applyInventoryStatus");
+        const healSpy = vi.spyOn(core, "healSyncedConsolePorts");
+        mockShowWarningMessage.mockResolvedValueOnce(undefined);
+
+        const outcome = await registeredCommands.get("nexus.inventory.refreshStatus")!() as { unrefreshedSourceIds: string[] };
+
+        expect(mutationCompleted).toBe(true);
+        expect(executor.inspect).toHaveBeenCalledTimes(2);
+        expect(applySpy).not.toHaveBeenCalled();
+        expect(outcome.unrefreshedSourceIds).toEqual([source.id]);
+        expect(healSpy).not.toHaveBeenCalled();
+        expect(mockShowWarningMessage).toHaveBeenCalledTimes(1);
+        if (changedDependency === "missing lab host") {
+          expect(mockShowWarningMessage).toHaveBeenCalledWith(
+            expect.stringContaining("selected SSH discovery dependency changed or is unavailable"),
+            "Edit Source"
+          );
+        } else {
+          expect(mockShowWarningMessage).toHaveBeenCalledWith(
+            expect.stringContaining("selected SSH discovery dependency changed or is unavailable"),
+            "Sync Now"
+          );
+        }
+        activation.dispose();
+      }
+    );
+
+    it("silently leaves Containerlab status unrefreshed when a background dependency changes after inspection", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const jumpHost = makeServer({ id: "jump-host", name: "Jump Host", host: "jump.example" });
+      const labHost = makeServer({
+        id: "lab-host",
+        name: "Lab Host",
+        host: "lab.example",
+        proxy: { type: "ssh", jumpHostId: jumpHost.id }
+      });
+      await core.addOrUpdateServer(jumpHost);
+      await core.addOrUpdateServer(labHost);
+      const config: InventorySourceValues = {
+        location: "ssh",
+        labHostId: labHost.id,
+        runner: "host",
+        containerlabExecutable: "containerlab",
+        dockerExecutable: "docker",
+        dockerSocket: "/var/run/docker.sock",
+        sudo: false,
+        deviceConnection: "direct",
+        labFilter: "",
+        addressPreference: "ipv4"
+      };
+      await core.addOrUpdateInventorySource(makeSource({
+        id: "containerlab-background-source",
+        providerId: "containerlab",
+        config
+      }));
+      const source = core.getInventorySource("containerlab-background-source")!;
+      const executor: ContainerlabExecutor = {
+        resolveDependencies: vi.fn(async (currentConfig, context) => ({
+          identity: {
+            executable: currentConfig.containerlabExecutable,
+            dockerExecutable: currentConfig.dockerExecutable,
+            dockerSocket: currentConfig.dockerSocket,
+            location: currentConfig.location,
+            sudo: currentConfig.sudo,
+            routeIdentity: context.labHostRouteIdentity!
+          }
+        })),
+        preflight: vi.fn(async (_config, resolved) => ({ identity: resolved.identity, version: "0.80.0" })),
+        inspect: vi.fn(async () => ({ version: "0.80.0", stdout: "{}" }))
+      };
+      const activation = createContainerlabActivationController({
+        core,
+        executor,
+        store: { load: vi.fn(async () => undefined), save: vi.fn(async () => {}) },
+        isWorkspaceTrusted: () => true,
+        confirmRun: vi.fn(async () => true)
+      });
+      const provider = createContainerlabProvider(activation);
+      const registry = new InventoryProviderRegistry();
+      registry.register(provider);
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown(), activation);
+      await provider.testConnection!(source.config, {}, {
+        intent: "sync",
+        subject: { kind: "source", sourceId: source.id, revision: source.revision! }
+      });
+      const originalInspect = activation.inspect.bind(activation);
+      let mutationCompleted = false;
+      vi.spyOn(activation, "inspect").mockImplementation(async (currentConfig, operationContext) => {
+        const inspection = await originalInspect(currentConfig, operationContext);
+        if (!mutationCompleted) {
+          await core.addOrUpdateServer({ ...jumpHost, host: "jump-moved.example" });
+          mutationCompleted = true;
+        }
+        return inspection;
+      });
+      const applySpy = vi.spyOn(core, "applyInventoryStatus");
+      const outcome = await registeredCommands.get("nexus.inventory.refreshStatus")!({ sourceId: source.id, __poll: true }) as {
+        unrefreshedSourceIds: string[];
+      };
+
+      expect(mutationCompleted).toBe(true);
+      expect(applySpy).not.toHaveBeenCalled();
+      expect(outcome.unrefreshedSourceIds).toEqual([source.id]);
+      expect(mockShowWarningMessage).not.toHaveBeenCalled();
+      activation.dispose();
+    });
+
+    it("applies Containerlab status when the original SSH dependency snapshot remains unchanged", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const labHost = makeServer({ id: "lab-host", name: "Lab Host", host: "lab.example" });
+      await core.addOrUpdateServer(labHost);
+      const config: InventorySourceValues = {
+        location: "ssh",
+        labHostId: labHost.id,
+        runner: "host",
+        containerlabExecutable: "containerlab",
+        dockerExecutable: "docker",
+        dockerSocket: "/var/run/docker.sock",
+        sudo: false,
+        deviceConnection: "direct",
+        labFilter: "",
+        addressPreference: "ipv4"
+      };
+      await core.addOrUpdateInventorySource(makeSource({
+        id: "containerlab-unchanged-source",
+        providerId: "containerlab",
+        config
+      }));
+      const source = core.getInventorySource("containerlab-unchanged-source")!;
+      const executor: ContainerlabExecutor = {
+        resolveDependencies: vi.fn(async (currentConfig, context) => ({
+          identity: {
+            executable: currentConfig.containerlabExecutable,
+            dockerExecutable: currentConfig.dockerExecutable,
+            dockerSocket: currentConfig.dockerSocket,
+            location: currentConfig.location,
+            sudo: currentConfig.sudo,
+            routeIdentity: context.labHostRouteIdentity!
+          }
+        })),
+        preflight: vi.fn(async (_config, resolved) => ({ identity: resolved.identity, version: "0.80.0" })),
+        inspect: vi.fn(async () => ({ version: "0.80.0", stdout: "{}" }))
+      };
+      const activation = createContainerlabActivationController({
+        core,
+        executor,
+        store: { load: vi.fn(async () => undefined), save: vi.fn(async () => {}) },
+        isWorkspaceTrusted: () => true,
+        confirmRun: vi.fn(async () => true)
+      });
+      const provider = createContainerlabProvider(activation);
+      const registry = new InventoryProviderRegistry();
+      registry.register(provider);
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown(), activation);
+      await provider.testConnection!(source.config, {}, {
+        intent: "sync",
+        subject: { kind: "source", sourceId: source.id, revision: source.revision! }
+      });
+      const applySpy = vi.spyOn(core, "applyInventoryStatus");
+      const outcome = await registeredCommands.get("nexus.inventory.refreshStatus")!() as { unrefreshedSourceIds: string[] };
+
+      expect(outcome.unrefreshedSourceIds).toEqual([]);
+      expect(executor.inspect).toHaveBeenCalledTimes(2);
+      expect(applySpy).toHaveBeenCalledOnce();
+      activation.dispose();
+    });
+
+    it("blocks Add Test and Save when the selected Containerlab SSH host stops being live", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const liveHost = makeServer({ id: "lab-host", name: "Lab Host", host: "lab.example" });
+      await core.addOrUpdateServer(liveHost);
+
+      const executor: ContainerlabExecutor = {
+        resolveDependencies: vi.fn(async (config, context) => ({
+          identity: {
+            executable: config.containerlabExecutable,
+            dockerExecutable: config.dockerExecutable,
+            dockerSocket: config.dockerSocket,
+            location: config.location,
+            sudo: config.sudo,
+            routeIdentity: config.location === "local" ? "local" : context.labHostRouteIdentity!
+          }
+        })),
+        preflight: vi.fn(async (_config, resolved) => ({ identity: resolved.identity, version: "0.80.0" })),
+        inspect: vi.fn(async () => ({ version: "0.80.0", stdout: "{}" }))
+      };
+      const activation = createContainerlabActivationController({
+        core,
+        executor,
+        store: { load: vi.fn(async () => undefined), save: vi.fn(async () => {}) },
+        isWorkspaceTrusted: () => true,
+        confirmRun: vi.fn(async () => true)
+      });
+      const provider = createContainerlabProvider(activation);
+      const registry = new InventoryProviderRegistry();
+      registry.register(provider);
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown(), activation);
+
+      const values: FormValues = {
+        name: "Containerlab labs",
+        targetFolder: "Labs",
+        defaultUsername: "admin",
+        prunePolicy: "delete",
+        cfg_location: "ssh",
+        cfg_labHostId: "lab-host",
+        cfg_runner: "host",
+        cfg_deviceConnection: "direct",
+        cfg_statusPollSeconds: 0,
+        cfg_addressPreference: "ipv4"
+      };
+
+      let form: ReturnType<typeof latestFormCall> | undefined;
+      try {
+        await registeredCommands.get("nexus.inventory.addSource")!();
+        form = latestFormCall();
+
+        await core.addOrUpdateServer({ ...liveHost, protocol: "telnet" });
+        await form.onTest!(values);
+        expect(executor.resolveDependencies).not.toHaveBeenCalled();
+        expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("valid SSH lab host"));
+        expect(core.getSnapshot().inventorySources).toHaveLength(0);
+
+        await core.addOrUpdateServer(liveHost);
+        mockShowErrorMessage.mockClear();
+        await form.onTest!(values);
+        expect(executor.resolveDependencies).toHaveBeenCalledOnce();
+
+        await core.addOrUpdateServer({ ...liveHost, protocol: "telnet" });
+        await expect(form.onSubmit(values)).rejects.toThrow(/SSH|lab host/i);
+        expect(core.getSnapshot().inventorySources).toHaveLength(0);
+      } finally {
+        form?.panel.fireDispose();
+        activation.dispose();
+      }
+    });
   });
 
   describe("nexus.inventory.addSource", () => {
@@ -720,6 +1726,46 @@ describe("inventoryCommands", () => {
       expect(vault.store).not.toHaveBeenCalled();
     });
 
+    it("collects a required generic ssh-profile field before provider or source writes, then accepts a live selection", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      await core.addOrUpdateServer(makeServer({ id: "live-host", name: "Live Host", host: "ssh.example" }));
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        id: "third-party-containerlab",
+        label: "Containerlab",
+        configFields: [{ id: "labHostId", label: "SSH Gateway", type: "ssh-profile", required: true }]
+      });
+      registry.register(provider);
+      const vault = makeVault();
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { definition, onSubmit } = latestFormCall();
+      const hostField = definition.fields.find((field) => "key" in field && field.key === "cfg_labHostId");
+      expect(hostField).toMatchObject({ type: "select", required: true });
+      const sourceWrite = vi.spyOn(core, "addOrUpdateInventorySource");
+      const values: FormValues = {
+        name: "Containerlab Provider",
+        targetFolder: "Infra",
+        defaultUsername: "admin",
+        prunePolicy: "orphan",
+        cfg_labHostId: ""
+      };
+
+      await expect(onSubmit(values)).rejects.toThrow(/SSH Gateway is required/);
+      expect(sourceWrite).not.toHaveBeenCalled();
+      expect(core.getSnapshot().inventorySources).toHaveLength(0);
+      expect(provider.testConnection).not.toHaveBeenCalled();
+      expect(vault.store).not.toHaveBeenCalled();
+
+      await onSubmit({ ...values, cfg_labHostId: "live-host" });
+      expect(sourceWrite).toHaveBeenCalledTimes(1);
+      expect(core.getSnapshot().inventorySources[0]?.config).toEqual({ labHostId: "live-host" });
+      expect(provider.testConnection).not.toHaveBeenCalled();
+      expect(vault.store).not.toHaveBeenCalled();
+    });
+
     it("top-level target folder — declining the confirmation leaves the source unsaved; confirming with Continue saves it at the top level (kills silently skipping the confirmation)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
@@ -1049,6 +2095,71 @@ describe("inventoryCommands", () => {
   });
 
   describe("nexus.inventory.editSource", () => {
+    it("refuses a Containerlab Edit without a live revision before opening a form, and releases its busy claim", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({ id: "containerlab", label: "Containerlab" });
+      registry.register(provider);
+      const vault = makeVault();
+      const activation = {
+        beginFormSession: vi.fn(() => "form-session"),
+        updateFormSession: vi.fn(),
+        endFormSession: vi.fn(),
+        prepareFormSourceSave: vi.fn(),
+        transferFormApproval: vi.fn()
+      } as unknown as ContainerlabActivationController;
+      registerInventoryCommands(core, registry, vault, makeTeardown(), activation);
+      await core.addOrUpdateInventorySource(makeSource({
+        providerId: "containerlab",
+        providerFingerprint: computeProviderFingerprint(provider)
+      }));
+
+      const originalGetInventorySource = core.getInventorySource.bind(core);
+      const getSourceSpy = vi.spyOn(core, "getInventorySource").mockImplementation((id) => {
+        const source = originalGetInventorySource(id);
+        return source ? { ...source, revision: undefined } : undefined;
+      });
+      const edit = registeredCommands.get("nexus.inventory.editSource")!;
+      mockShowErrorMessage.mockResolvedValueOnce("Reload Window");
+      await edit("src-1");
+
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Reload Window"), "Reload Window");
+      await vi.waitFor(() => expect(mockExecuteCommand).toHaveBeenCalledWith("workbench.action.reloadWindow"));
+      expect(activation.beginFormSession).not.toHaveBeenCalled();
+      expect(mockWebviewOpen).not.toHaveBeenCalled();
+      expect(provider.testConnection).not.toHaveBeenCalled();
+
+      mockExecuteCommand.mockClear();
+      mockShowErrorMessage.mockClear();
+      await edit("src-1");
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Reload Window"), "Reload Window");
+      await Promise.resolve();
+      expect(mockExecuteCommand).not.toHaveBeenCalledWith("workbench.action.reloadWindow");
+
+      const reloadError = new Error("reload failed");
+      let reloadRejectionConsumed = false;
+      const rejectedReload = {
+        then(onFulfilled: (value: void) => unknown, onRejected: (reason: unknown) => unknown) {
+          reloadRejectionConsumed = typeof onRejected === "function";
+          return Promise.reject(reloadError).then(onFulfilled, onRejected);
+        }
+      } as unknown as PromiseLike<void>;
+      mockExecuteCommand.mockReturnValueOnce(rejectedReload);
+      mockShowErrorMessage.mockResolvedValueOnce("Reload Window");
+      await edit("src-1");
+      await vi.waitFor(() => expect(mockExecuteCommand).toHaveBeenCalledWith("workbench.action.reloadWindow"));
+      await vi.waitFor(() => expect(reloadRejectionConsumed).toBe(true));
+
+      getSourceSpy.mockImplementation(originalGetInventorySource);
+      mockShowErrorMessage.mockClear();
+      await edit("src-1");
+      expect(mockShowErrorMessage).not.toHaveBeenCalled();
+      expect(activation.beginFormSession).toHaveBeenCalledTimes(1);
+      expect(mockWebviewOpen).toHaveBeenCalledTimes(1);
+      latestFormCall().panel.fireDispose();
+    });
+
     it("F7 — a blank secret field keeps the previously saved vault value on Save, AND the Test button hydrates it from the vault before calling testConnection (kills blank overwriting the token)", async () => {
       const core = new NexusCore(new InMemoryConfigRepository());
       await core.initialize();
@@ -2736,6 +3847,157 @@ describe("inventoryCommands", () => {
   });
 
   describe("nexus.inventory.syncNow", () => {
+    it("does not forward a Containerlab sync when the immediately re-read source has no revision", async () => {
+      const core = new NexusCore(new InMemoryConfigRepository());
+      await core.initialize();
+      const registry = new InventoryProviderRegistry();
+      const provider = makeProvider({
+        id: "containerlab",
+        label: "Containerlab",
+        configFields: [{ id: "value", label: "Value", type: "string", required: false }]
+      });
+      registry.register(provider);
+      registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource({ providerId: "containerlab", config: {} }));
+
+      const originalGetSnapshot = core.getSnapshot.bind(core);
+      let sourceRevisionMissing = false;
+      vi.spyOn(core, "getSnapshot").mockImplementation(() => {
+        const snapshot = originalGetSnapshot();
+        return {
+          ...snapshot,
+          inventorySources: sourceRevisionMissing
+            ? snapshot.inventorySources.map((source) =>
+                source.id === "src-1" ? { ...source, revision: undefined } : source
+              )
+            : snapshot.inventorySources
+        };
+      });
+
+      let enterProgress!: () => void;
+      const progressEntered = new Promise<void>((resolve) => { enterProgress = resolve; });
+      let releaseProgress!: () => void;
+      const progressGate = new Promise<void>((resolve) => { releaseProgress = resolve; });
+      mockWithProgress.mockImplementationOnce(async (_options, task) => {
+        enterProgress();
+        await progressGate;
+        sourceRevisionMissing = true;
+        return task();
+      });
+
+      const sync = registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+      await progressEntered;
+      mockShowErrorMessage.mockResolvedValueOnce("Reload Window");
+      releaseProgress();
+      await sync;
+
+      expect(provider.fetchInventory).not.toHaveBeenCalled();
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Reload Window"), "Reload Window");
+      await vi.waitFor(() => expect(mockExecuteCommand).toHaveBeenCalledWith("workbench.action.reloadWindow"));
+    });
+
+    it("aborts when the full SSH discovery dependency changes while fetchInventory is running", async () => {
+      const labHost = makeServer({ id: "lab-host", name: "Lab host", host: "before.example.test", username: "operator" });
+      const core = new NexusCore(new InMemoryConfigRepository([labHost]));
+      await core.initialize();
+      const provider = makeProvider({
+        discoverySshHostId: () => "lab-host",
+        fetchInventory: vi.fn(async () => {
+          await core.addOrUpdateServer({ ...core.getServer("lab-host")!, host: "after.example.test" });
+          return {
+            contractVersion: 1 as const,
+            devices: [{ externalId: "new-device", name: "new-device", endpoints: [{ kind: "ssh" as const, host: "10.0.0.10", port: 22 }] }]
+          };
+        })
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "token" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+      mockShowInformationMessage.mockResolvedValue("Apply");
+
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringMatching(/discovery.*changed|route.*changed|run the sync again/i));
+      expect(core.getServer("new-device")).toBeUndefined();
+    });
+
+    it("revalidates every jump hop immediately before fetch after progress setup, even when device routing is Direct", async () => {
+      const labHost = makeServer({
+        id: "lab-host",
+        name: "Lab host",
+        host: "lab.example.test",
+        username: "operator",
+        proxy: { type: "ssh", jumpHostId: "jump-one" }
+      });
+      const jump = makeServer({ id: "jump-one", name: "Jump one", host: "jump-before.example.test", username: "operator" });
+      const core = new NexusCore(new InMemoryConfigRepository([labHost, jump]));
+      await core.initialize();
+      const provider = makeProvider({
+        discoverySshHostId: () => "lab-host",
+        sourceDefaultRoute: () => ({ kind: "direct" }),
+        fetchInventory: vi.fn(async () => ({
+          contractVersion: 1 as const,
+          devices: [{ externalId: "new-device", name: "new-device", endpoints: [{ kind: "ssh" as const, host: "10.0.0.10", port: 22 }] }]
+        }))
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "token" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+      mockWithProgress.mockImplementationOnce(async (_options, task) => {
+        await core.addOrUpdateServer({ ...core.getServer("jump-one")!, host: "jump-after.example.test" });
+        return task();
+      });
+
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(provider.fetchInventory).not.toHaveBeenCalled();
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringMatching(/discovery.*changed|route.*changed|run the sync again/i));
+      expect(core.getServer("new-device")).toBeUndefined();
+    });
+
+    it("aborts when an SSH jump-hop identity changes while the sync preview is open", async () => {
+      const labHost = makeServer({
+        id: "lab-host",
+        name: "Lab host",
+        host: "lab.example.test",
+        username: "operator",
+        proxy: { type: "ssh", jumpHostId: "jump-one" }
+      });
+      const jump = makeServer({ id: "jump-one", name: "Jump one", host: "jump-before.example.test", username: "operator" });
+      const core = new NexusCore(new InMemoryConfigRepository([labHost, jump]));
+      await core.initialize();
+      const provider = makeProvider({
+        discoverySshHostId: () => "lab-host",
+        sourceDefaultRoute: () => ({ kind: "direct" }),
+        fetchInventory: vi.fn(async () => ({
+          contractVersion: 1 as const,
+          devices: [{ externalId: "new-device", name: "new-device", endpoints: [{ kind: "ssh" as const, host: "10.0.0.10", port: 22 }] }]
+        }))
+      });
+      const registry = new InventoryProviderRegistry();
+      registry.register(provider);
+      const vault = makeVault({ [inventorySecretKey("src-1", "apiToken")]: "token" });
+      registerInventoryCommands(core, registry, vault, makeTeardown());
+      await core.addOrUpdateInventorySource(makeSource());
+      const applySpy = vi.spyOn(core, "applyInventorySyncPlan");
+      mockShowInformationMessage.mockImplementationOnce(async () => {
+        await core.addOrUpdateServer({ ...core.getServer("jump-one")!, host: "jump-after.example.test" });
+        return "Apply";
+      });
+
+      await registeredCommands.get("nexus.inventory.syncNow")!("src-1");
+
+      expect(provider.fetchInventory).toHaveBeenCalledTimes(1);
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringMatching(/discovery.*changed|route.*changed|run the sync again/i));
+      expect(applySpy).not.toHaveBeenCalled();
+      expect(core.getServer("new-device")).toBeUndefined();
+    });
+
     it("prune 'delete' tears down and removes only the pruned server, applies the plan, and cleans up only its vault secrets (F1 — teardown runs before apply)", async () => {
       const survivor = makeServer({
         id: "owned-2",
@@ -7614,6 +8876,35 @@ describe("inventoryCommands", () => {
       expect(core.getServer("owned-2")?.formerlySynced).not.toHaveProperty("syncedIpmiHost");
     });
 
+    it("Keep Servers carries canonical proxy ownership and manual Direct intent into detached receipts", async () => {
+      const ownership = { owner: "template" as const, value: { type: "socks5" as const, host: "proxy.example.test", port: 1080 } };
+      const { core } = await harness({
+        servers: [
+          makeServer({
+            id: "owned-proxy",
+            name: "proxy-managed",
+            host: "10.0.0.21",
+            origin: { sourceId: "src-1", externalId: "device:proxy", syncedAt: 1, proxyOwnership: ownership }
+          }),
+          makeServer({
+            id: "owned-direct",
+            name: "direct-opt-out",
+            host: "10.0.0.22",
+            origin: { sourceId: "src-1", externalId: "device:direct", syncedAt: 1, proxyOptOut: true }
+          })
+        ]
+      });
+
+      mockShowWarningMessage.mockResolvedValueOnce("Keep Servers");
+      await registeredCommands.get("nexus.inventory.removeSource")!("src-1");
+
+      const detachedProxy = core.getServer("owned-proxy")?.formerlySynced;
+      expect(detachedProxy?.proxyOwnership).toEqual(ownership);
+      expect(detachedProxy?.proxyOwnership).not.toBe(ownership);
+      expect(detachedProxy?.proxyOwnership?.value).not.toBe(ownership.value);
+      expect(core.getServer("owned-direct")?.formerlySynced?.proxyOptOut).toBe(true);
+    });
+
     it("a provider that reports no instance at all writes a receipt-only marker and adopts nothing (kills stamping an instance key the provider never supplied, and kills falling back to the provider id when it has none)", async () => {
       const { core } = await harness({
         provider: { instanceKey: undefined },
@@ -9787,6 +11078,42 @@ describe("nexus.inventory.refreshStatus", () => {
   });
 
   const REPORT = { contractVersion: 1 as const, statuses: { "dev#1": { state: "running" as const } } };
+
+  it("silently declines background Containerlab status without a revision and offers Reload Window manually", async () => {
+    const core = new NexusCore(new InMemoryConfigRepository());
+    await core.initialize();
+    const registry = new InventoryProviderRegistry();
+    const fetchStatus = vi.fn(async () => REPORT);
+    registry.register(makeProvider({ id: "containerlab", label: "Containerlab", fetchStatus }));
+    registerInventoryCommands(core, registry, makeVault(), makeTeardown());
+    await core.addOrUpdateInventorySource(makeSource({ providerId: "containerlab" }));
+
+    const originalGetSnapshot = core.getSnapshot.bind(core);
+    vi.spyOn(core, "getSnapshot").mockImplementation(() => {
+      const snapshot = originalGetSnapshot();
+      return {
+        ...snapshot,
+        inventorySources: snapshot.inventorySources.map((source) =>
+          source.id === "src-1" ? { ...source, revision: undefined } : source
+        )
+      };
+    });
+    const originalGetInventorySource = core.getInventorySource.bind(core);
+    vi.spyOn(core, "getInventorySource").mockImplementation((id) => {
+      const source = originalGetInventorySource(id);
+      return source?.id === "src-1" ? { ...source, revision: undefined } : source;
+    });
+
+    const refresh = registeredCommands.get("nexus.inventory.refreshStatus")!;
+    await expect(refresh({ __poll: true })).resolves.toEqual({ unrefreshedSourceIds: ["src-1"] });
+    expect(fetchStatus).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+
+    await expect(refresh()).resolves.toEqual({ unrefreshedSourceIds: ["src-1"] });
+    expect(fetchStatus).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("Reload Window"), "Reload Window");
+    expect(mockShowWarningMessage).not.toHaveBeenCalledWith(expect.stringContaining("Run Sync Now"), expect.anything());
+  });
 
   it("applies a report from a source whose provider implements fetchStatus (⊘ never calling applyInventoryStatus leaves the tree without any live status)", async () => {
     const core = new NexusCore(new InMemoryConfigRepository());
