@@ -681,28 +681,28 @@ describe("Containerlab activation", () => {
     const sessionId = harness.controller.beginFormSession();
     harness.controller.updateFormSession(sessionId, harness.source.config);
     await harness.controller.inspect(harness.config, { intent: "test", subject: { kind: "form", sessionId } });
+    vi.mocked(harness.executor.resolveDependencies).mockClear();
+    vi.mocked(harness.executor.preflight).mockClear();
+    vi.mocked(harness.executor.inspect).mockClear();
     const cleanup = harness.controller.prepareFormSourceSave(sessionId, "reused-source-id");
     try {
       await harness.core.addOrUpdateInventorySource(makeSource({ baseUrl: "https://netbox.example.test" }, {
         id: "reused-source-id",
         providerId: "netbox"
       }));
+      await harness.core.removeInventorySource("reused-source-id");
+      await harness.core.addOrUpdateInventorySource(makeSource(LOCAL_VALUES, { id: "reused-source-id" }));
+      const replacement = harness.core.getInventorySource("reused-source-id")!;
+
+      await expect(harness.controller.transferFormApproval(sessionId, replacement)).rejects.toThrow(/save|approval|transfer/i);
+      await expect(harness.controller.inspect(harness.config, context(replacement, "background-status")))
+        .rejects.toThrow(/Test|Sync|approv/i);
+      expect(harness.executor.resolveDependencies).not.toHaveBeenCalled();
+      expect(harness.executor.preflight).not.toHaveBeenCalled();
+      expect(harness.executor.inspect).not.toHaveBeenCalled();
     } finally {
       cleanup();
     }
-    await harness.core.removeInventorySource("reused-source-id");
-    await harness.core.addOrUpdateInventorySource(makeSource(LOCAL_VALUES, { id: "reused-source-id" }));
-    const replacement = harness.core.getInventorySource("reused-source-id")!;
-
-    await expect(harness.controller.transferFormApproval(sessionId, replacement)).rejects.toThrow(/save|approval|transfer/i);
-    vi.mocked(harness.executor.resolveDependencies).mockClear();
-    vi.mocked(harness.executor.preflight).mockClear();
-    vi.mocked(harness.executor.inspect).mockClear();
-    await expect(harness.controller.inspect(harness.config, context(replacement, "background-status")))
-      .rejects.toThrow(/Test|Sync|approv/i);
-    expect(harness.executor.resolveDependencies).not.toHaveBeenCalled();
-    expect(harness.executor.preflight).not.toHaveBeenCalled();
-    expect(harness.executor.inspect).not.toHaveBeenCalled();
   });
 
   it("does not restore an approval across transitions away from and back to Containerlab", async () => {
