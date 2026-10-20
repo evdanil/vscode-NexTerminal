@@ -1126,7 +1126,8 @@ export function normalizeNotSyncableReasons(raw: unknown): Record<string, string
  * handed a `structuredClone` of the config inside the try (so an in-place
  * normalization cannot mutate the caller's stored source config, and a
  * non-cloneable config degrades to undefined rather than throwing); optional
- * operation context is forwarded unchanged; the return
+ * operation context is forwarded unchanged when present; when absent, legacy
+ * providers receive the original two-argument call shape; the return
  * is validated. A throw or a malformed report both degrade to `undefined` — "no
  * status update" — never an exception escaping into the refresh loop.
  */
@@ -1141,7 +1142,10 @@ export async function fetchProviderStatus(
   }
   let raw: unknown;
   try {
-    raw = await provider.fetchStatus(structuredClone(config), secrets, context);
+    const clonedConfig = structuredClone(config);
+    raw = context === undefined
+      ? await provider.fetchStatus(clonedConfig, secrets)
+      : await provider.fetchStatus(clonedConfig, secrets, context);
   } catch {
     return undefined;
   }
