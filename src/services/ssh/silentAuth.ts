@@ -9,8 +9,10 @@ import type {
   SecretVault,
   SshConnection,
   SshConnector,
-  SshFactory
+  SshFactory,
+  SshInteractionPolicy
 } from "./contracts";
+import { SshInteractionRequiredError } from "./contracts";
 import { AuthNotJudgedError, isAuthNotJudged } from "./authErrors";
 import {
   endpointProxyPasswordKeysOf,
@@ -369,9 +371,10 @@ export class SilentAuthSshFactory implements SshFactory {
     password?: string,
     onAuthMessage?: (text: string) => void,
     provenance?: PromptAnswerProvenance,
-    isActive?: () => boolean
+    isActive?: () => boolean,
+    interaction: SshInteractionPolicy = "interactive"
   ): KeyboardInteractiveHandler | undefined {
-    if (!this.inputPromptFn) {
+    if (!this.inputPromptFn && interaction !== "noninteractive") {
       return undefined;
     }
     const promptFn = this.inputPromptFn;
@@ -408,6 +411,12 @@ export class SilentAuthSshFactory implements SshFactory {
           if (isPasswordPrompt && password) {
             responses.push(password);
           } else {
+            if (interaction === "noninteractive") {
+              throw new SshInteractionRequiredError("SSH authentication requires an interactive response.");
+            }
+            if (!promptFn) {
+              throw new AuthNotJudgedError("Keyboard-interactive authentication is unavailable");
+            }
             const answer = await promptFn(p.prompt, !p.echo, signal);
             if (answer === undefined) {
               throw new AuthNotJudgedError("Keyboard-interactive authentication canceled");
@@ -464,8 +473,13 @@ export class SilentAuthSshFactory implements SshFactory {
       /** Exact live record captured before async connection work; null means absent at start. */
       credentialRecord?: ServerConfig | null;
       isActive?: () => boolean;
+      interaction?: SshInteractionPolicy;
+      signal?: AbortSignal;
     }
   ): Promise<SshConnection> {
+    const interaction = options?.interaction ?? "interactive";
+    const isAttemptActive = (): boolean => !options?.signal?.aborted && options?.isActive?.() !== false;
+    this.assertAttemptActive(isAttemptActive);
     const credentialEndpointSignature =
       options?.credentialEndpointSignature ?? this.getCredentialEndpointSignature(server);
     const hasCapturedCredentialRecord = options !== undefined && "credentialRecord" in options;
@@ -484,7 +498,7 @@ export class SilentAuthSshFactory implements SshFactory {
     const { resolved, passwordKey, passphraseKey, legacyServerPassphraseKey, profileScoped } = this.resolveServer(server);
 
     if (resolved.authType === "key") {
-      const handler = this.buildKeyboardInteractiveHandler(undefined, options?.onAuthMessage, promptProvenance, options?.isActive);
+      const handler = this.buildKeyboardInteractiveHandler(undefined, options?.onAuthMessage, promptProvenance, isAttemptActive, interaction);
       const savedPassphrase = await this.vault.get(passphraseKey);
       this.assertCredentialRecordCurrent(promptProvenance);
 
@@ -496,7 +510,9 @@ export class SilentAuthSshFactory implements SshFactory {
           ...(savedPassphrase && { passphrase: savedPassphrase }),
           ...(handler && { onKeyboardInteractive: handler }),
           ...(firstSock && { sock: firstSock }),
-          ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage })
+          ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage }),
+          ...(options?.interaction && { interaction: options.interaction }),
+          ...(options?.signal && { signal: options.signal })
         });
       } catch (error) {
         firstSock?.destroy();
@@ -524,6 +540,10 @@ export class SilentAuthSshFactory implements SshFactory {
 
       this.assertCredentialRecordCurrent(promptProvenance);
 
+      if (interaction === "noninteractive") {
+        throw new SshInteractionRequiredError("The SSH key passphrase is missing or expired.");
+      }
+
       // Prompt user for passphrase — or join the prompt already open for it.
       const prompted = await this.promptShared(
         passphraseKey,
@@ -535,12 +555,12 @@ export class SilentAuthSshFactory implements SshFactory {
           }, signal),
         `Passphrase entry canceled for ${server.name}`,
         promptProvenance,
-        options?.isActive
+        isAttemptActive
       );
       const { result: promptResult, settle, provenance = promptProvenance } = prompted;
 
       try {
-        this.assertAttemptActive(options?.isActive);
+        this.assertAttemptActive(isAttemptActive);
         this.assertCredentialRecordCurrent(promptProvenance);
         const secondSock = await options?.sockFactory?.();
 
@@ -556,7 +576,9 @@ export class SilentAuthSshFactory implements SshFactory {
             passphrase: promptResult.password,
             ...(handler && { onKeyboardInteractive: handler }),
             ...(secondSock && { sock: secondSock }),
-            ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage })
+            ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage }),
+            ...(options?.interaction && { interaction: options.interaction }),
+            ...(options?.signal && { signal: options.signal })
           });
         } catch (error) {
           secondSock?.destroy();
@@ -613,14 +635,16 @@ export class SilentAuthSshFactory implements SshFactory {
     }
 
     if (resolved.authType !== "password") {
-      const handler = this.buildKeyboardInteractiveHandler(undefined, options?.onAuthMessage, promptProvenance, options?.isActive);
+      const handler = this.buildKeyboardInteractiveHandler(undefined, options?.onAuthMessage, promptProvenance, isAttemptActive, interaction);
       const sock = await options?.sockFactory?.();
       try {
         this.assertCredentialRecordCurrent(promptProvenance);
         return await this.connector.connect(resolved, {
           ...(handler && { onKeyboardInteractive: handler }),
           ...(sock && { sock }),
-          ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage })
+          ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage }),
+          ...(options?.interaction && { interaction: options.interaction }),
+          ...(options?.signal && { signal: options.signal })
         });
       } catch (error) {
         sock?.destroy();
@@ -631,7 +655,7 @@ export class SilentAuthSshFactory implements SshFactory {
     const savedPassword = await this.vault.get(passwordKey);
     this.assertCredentialRecordCurrent(promptProvenance);
     if (savedPassword) {
-      const handler = this.buildKeyboardInteractiveHandler(savedPassword, options?.onAuthMessage, promptProvenance, options?.isActive);
+      const handler = this.buildKeyboardInteractiveHandler(savedPassword, options?.onAuthMessage, promptProvenance, isAttemptActive, interaction);
       const firstSock = await options?.sockFactory?.();
       try {
         this.assertCredentialRecordCurrent(promptProvenance);
@@ -639,7 +663,9 @@ export class SilentAuthSshFactory implements SshFactory {
           password: savedPassword,
           ...(handler && { onKeyboardInteractive: handler }),
           ...(firstSock && { sock: firstSock }),
-          ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage })
+          ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage }),
+          ...(options?.interaction && { interaction: options.interaction }),
+          ...(options?.signal && { signal: options.signal })
         });
       } catch (error) {
         firstSock?.destroy();
@@ -669,6 +695,10 @@ export class SilentAuthSshFactory implements SshFactory {
 
     this.assertCredentialRecordCurrent(promptProvenance);
 
+    if (interaction === "noninteractive") {
+      throw new SshInteractionRequiredError("The SSH password is missing or expired.");
+    }
+
     // Prompt user for the password — or join the prompt already open for it.
     const route = options?.route?.() ?? (resolved.proxy ? undefined : "direct");
     const typedFor =
@@ -688,14 +718,14 @@ export class SilentAuthSshFactory implements SshFactory {
       (signal) => this.prompt.prompt({ ...resolved, name: server.name }, signal),
       `Password entry canceled for ${server.name}`,
       promptProvenance,
-      options?.isActive
+      isAttemptActive
     );
     const { result: promptResult, settle, joined, provenance = promptProvenance } = prompted;
 
     try {
-      this.assertAttemptActive(options?.isActive);
+      this.assertAttemptActive(isAttemptActive);
       this.assertCredentialRecordCurrent(promptProvenance);
-      const handler = this.buildKeyboardInteractiveHandler(promptResult.password, options?.onAuthMessage, promptProvenance, options?.isActive);
+      const handler = this.buildKeyboardInteractiveHandler(promptResult.password, options?.onAuthMessage, promptProvenance, isAttemptActive, interaction);
       const secondSock = await options?.sockFactory?.();
       if (joined && options?.route && options.route() !== route) {
         // Opening the socket moved this login onto another route — a pooled
@@ -722,7 +752,9 @@ export class SilentAuthSshFactory implements SshFactory {
           password: promptResult.password,
           ...(handler && { onKeyboardInteractive: handler }),
           ...(secondSock && { sock: secondSock }),
-          ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage })
+          ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage }),
+          ...(options?.interaction && { interaction: options.interaction }),
+          ...(options?.signal && { signal: options.signal })
         });
       } catch (error) {
         secondSock?.destroy();

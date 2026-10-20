@@ -81,6 +81,92 @@ describe("SilentAuthSshFactory", () => {
     expect(prompt.prompt).not.toHaveBeenCalled();
   });
 
+  it("returns interaction-required when no password is saved for a noninteractive request", async () => {
+    const connector: SshConnector = { connect: vi.fn(async () => fakeConnection) };
+    const prompt: PasswordPrompt = { prompt: vi.fn(async () => ({ password: "entered", save: false })) };
+    const factory = new SilentAuthSshFactory(connector, createVault(), prompt);
+
+    await expect(factory.connect(baseServer, { interaction: "noninteractive" }))
+      .rejects.toMatchObject({ code: "interaction-required" });
+
+    expect(prompt.prompt).not.toHaveBeenCalled();
+    expect(connector.connect).not.toHaveBeenCalled();
+  });
+
+  it("returns interaction-required after a saved password is rejected without prompting", async () => {
+    const connector: SshConnector = {
+      connect: vi.fn(async () => { throw new Error("All configured authentication methods failed"); })
+    };
+    const prompt: PasswordPrompt = { prompt: vi.fn(async () => ({ password: "entered", save: false })) };
+    const factory = new SilentAuthSshFactory(
+      connector,
+      createVault({ [passwordSecretKey(baseServer.id)]: "expired" }),
+      prompt
+    );
+
+    await expect(factory.connect(baseServer, { interaction: "noninteractive" }))
+      .rejects.toMatchObject({ code: "interaction-required" });
+
+    expect(prompt.prompt).not.toHaveBeenCalled();
+    expect(connector.connect).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns interaction-required for an MFA challenge without opening an input prompt", async () => {
+    const connector: SshConnector = {
+      connect: vi.fn(async (_server, auth) => {
+        await auth.onKeyboardInteractive?.("Duo", "Approve the login", [{ prompt: "Verification code:", echo: false }]);
+        return fakeConnection;
+      })
+    };
+    const inputPrompt = vi.fn(async () => "123456");
+    const factory = new SilentAuthSshFactory(connector, createVault(), { prompt: vi.fn() }, inputPrompt);
+
+    await expect(factory.connect({ ...baseServer, authType: "agent" }, { interaction: "noninteractive" }))
+      .rejects.toMatchObject({ code: "interaction-required" });
+
+    expect(inputPrompt).not.toHaveBeenCalled();
+  });
+
+  it("uses a saved passphrase for noninteractive key authentication without opening a prompt", async () => {
+    const keyServer: ServerConfig = { ...baseServer, authType: "key", keyPath: "/keys/id_ed25519" };
+    const passphrase = "saved-key-passphrase";
+    const connector: SshConnector = {
+      connect: vi.fn(async () => fakeConnection)
+    };
+    const prompt: PasswordPrompt = { prompt: vi.fn(async () => ({ password: "prompted", save: false })) };
+    const factory = new SilentAuthSshFactory(
+      connector,
+      createVault({ [passphraseSecretKey(keyServer.id)]: passphrase }),
+      prompt
+    );
+
+    const connection = await factory.connect(keyServer, { interaction: "noninteractive" });
+
+    expect(connection).toBe(fakeConnection);
+    expect(connector.connect).toHaveBeenCalledWith(keyServer, expect.objectContaining({
+      passphrase,
+      interaction: "noninteractive"
+    }));
+    expect(prompt.prompt).not.toHaveBeenCalled();
+  });
+
+  it("returns interaction-required for an encrypted key with no saved passphrase", async () => {
+    const keyServer: ServerConfig = { ...baseServer, authType: "key", keyPath: "/keys/id_ed25519" };
+    const connector: SshConnector = {
+      connect: vi.fn(async () => {
+        throw new Error("Encrypted private OpenSSH key detected, but no passphrase given");
+      })
+    };
+    const prompt: PasswordPrompt = { prompt: vi.fn(async () => ({ password: "prompted", save: false })) };
+    const factory = new SilentAuthSshFactory(connector, createVault(), prompt);
+
+    await expect(factory.connect(keyServer, { interaction: "noninteractive" }))
+      .rejects.toMatchObject({ code: "interaction-required" });
+
+    expect(connector.connect).toHaveBeenCalledTimes(1);
+    expect(prompt.prompt).not.toHaveBeenCalled();
+  });
+
   it("does not read saved credentials when the server is already absent from live state", async () => {
     const connector: SshConnector = {
       connect: vi.fn(async () => fakeConnection)

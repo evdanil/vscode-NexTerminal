@@ -59,6 +59,47 @@ describe("VscodeHostKeyVerifier TOFU", () => {
     expect(vscode.window.showWarningMessage).not.toHaveBeenCalled();
   });
 
+  it("does not auto-trust an unknown host for a noninteractive request", async () => {
+    mockTrustNewHosts(true);
+    const verifier = new VscodeHostKeyVerifier(memento);
+
+    await expect(verifier.verify(makeServer(), DUMMY_KEY, { interaction: "noninteractive" }))
+      .rejects.toMatchObject({ code: "interaction-required" });
+
+    expect(vscode.window.showWarningMessage).not.toHaveBeenCalled();
+    expect(memento.get("nexus.ssh.knownHostFingerprints.v1")).toBeUndefined();
+  });
+
+  it("does not accept or replace a rotated host key noninteractively", async () => {
+    mockTrustNewHosts(true);
+    const verifier = new VscodeHostKeyVerifier(memento);
+    await verifier.verify(makeServer(), DUMMY_KEY);
+    vi.clearAllMocks();
+
+    await expect(verifier.verify(makeServer(), DIFFERENT_KEY, { interaction: "noninteractive" }))
+      .rejects.toMatchObject({ code: "interaction-required" });
+
+    expect(vscode.window.showWarningMessage).not.toHaveBeenCalled();
+    expect(memento.get<Record<string, string>>("nexus.ssh.knownHostFingerprints.v1")?.["example.com:22"]).toMatch(/^SHA256:/u);
+  });
+
+  it("accepts a saved trusted host noninteractively without rewriting trust", async () => {
+    mockTrustNewHosts(true);
+    const verifier = new VscodeHostKeyVerifier(memento);
+    const update = vi.spyOn(memento, "update");
+    await verifier.verify(makeServer(), DUMMY_KEY);
+    const trusted = memento.get<Record<string, string>>("nexus.ssh.knownHostFingerprints.v1");
+    update.mockClear();
+    vi.clearAllMocks();
+
+    await expect(verifier.verify(makeServer(), DUMMY_KEY, { interaction: "noninteractive" }))
+      .resolves.toBe(true);
+
+    expect(update).not.toHaveBeenCalled();
+    expect(vscode.window.showWarningMessage).not.toHaveBeenCalled();
+    expect(memento.get<Record<string, string>>("nexus.ssh.knownHostFingerprints.v1")).toEqual(trusted);
+  });
+
   it("stores fingerprint after silent accept", async () => {
     mockTrustNewHosts(true);
     const verifier = new VscodeHostKeyVerifier(memento);

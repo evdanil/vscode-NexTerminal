@@ -5,11 +5,13 @@ import type {
   ContextAwareSshFactory,
   PtyOptions,
   SshConnectContext,
+  SshCommandChannel,
   SshConnection,
   SshFactory,
   SshPoolControl,
   TcpConnectionInfo
 } from "./contracts";
+import { SshInteractionRequiredError } from "./contracts";
 import { hasContextAwareConnect } from "./contracts";
 import { isStaleConnectionError, shouldFallbackForChannelLimit } from "./channelErrors";
 import { AuthNotJudgedError } from "./authErrors";
@@ -33,6 +35,29 @@ interface PoolEntry {
   closeUnsubscribe: () => void;
 }
 
+interface PendingConnectionOwner {
+  context?: SshConnectContext;
+  controller: AbortController;
+  removeAbortListener?: () => void;
+  released: boolean;
+}
+
+interface PendingConnectionGroup {
+  key: string;
+  serverId: string;
+  promise: Promise<PoolEntry>;
+  owners: PendingConnectionOwner[];
+  controller: AbortController;
+  settled: boolean;
+  entry?: PoolEntry;
+  livenessTimer?: ReturnType<typeof setInterval>;
+}
+
+interface PoolAcquisition {
+  entry: PoolEntry;
+  releasePendingOwner?: () => void;
+}
+
 const MAX_IDLE_TIMEOUT_MS = 3_600_000;
 
 function waitForConnectionClose(connection: SshConnection): Promise<void> {
@@ -54,7 +79,115 @@ function waitForConnectionClose(connection: SshConnection): Promise<void> {
   });
 }
 
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new AuthNotJudgedError("SSH connection attempt was canceled");
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw abortReason(signal);
+  }
+}
+
+function awaitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal, disposeLate?: (value: T) => void): Promise<T> {
+  if (!signal) {
+    return promise;
+  }
+  if (signal.aborted) {
+    void promise.then(disposeLate, () => {});
+    return Promise.reject(abortReason(signal));
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const cleanup = (): void => signal.removeEventListener("abort", onAbort);
+    const onAbort = (): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(abortReason(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        if (settled || signal.aborted) {
+          disposeLate?.(value);
+          if (!settled) {
+            settled = true;
+            cleanup();
+            reject(abortReason(signal));
+          }
+          return;
+        }
+        settled = true;
+        cleanup();
+        resolve(value);
+      },
+      (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      }
+    );
+  });
+}
+
+function awaitWithSignals<T>(promise: Promise<T>, signals: Array<AbortSignal | undefined>): Promise<T> {
+  const activeSignals = [...new Set(signals.filter((signal): signal is AbortSignal => signal !== undefined))];
+  if (activeSignals.length === 0) {
+    return promise;
+  }
+  const alreadyAborted = activeSignals.find((signal) => signal.aborted);
+  if (alreadyAborted) {
+    return Promise.reject(abortReason(alreadyAborted));
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const listeners = new Map<AbortSignal, () => void>();
+    const cleanup = (): void => {
+      for (const [signal, listener] of listeners) {
+        signal.removeEventListener("abort", listener);
+      }
+      listeners.clear();
+    };
+    for (const signal of activeSignals) {
+      const listener = (): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(abortReason(signal));
+      };
+      listeners.set(signal, listener);
+      signal.addEventListener("abort", listener, { once: true });
+    }
+    promise.then(
+      (value) => {
+        if (settled) return;
+        const aborted = activeSignals.find((signal) => signal.aborted);
+        settled = true;
+        cleanup();
+        if (aborted) {
+          reject(abortReason(aborted));
+        } else {
+          resolve(value);
+        }
+      },
+      (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      }
+    );
+  });
+}
+
 class PooledSshConnection implements SshConnection {
+  public readonly execCommand?: NonNullable<SshConnection["execCommand"]>;
   private disposed = false;
   private readonly closeUnsubscribes: Array<() => void> = [];
   private fallbackConnection?: SshConnection;
@@ -65,11 +198,15 @@ class PooledSshConnection implements SshConnection {
   public constructor(
     private readonly inner: SshConnection,
     private readonly releasePooled: () => void,
-    private readonly createFallback?: () => Promise<SshConnection>,
+    private readonly createFallback?: (signal?: AbortSignal) => Promise<SshConnection>,
     private readonly isReused = false,
     private readonly retireEntry: () => Promise<void> = () => Promise.resolve(),
     private readonly evictDeadEntry?: () => void
-  ) {}
+  ) {
+    if (this.inner.execCommand) {
+      this.execCommand = (command, signal) => this.execCommandWithFallback(command, signal);
+    }
+  }
 
   /** See `SshConnectionPool.retire`. */
   public retireTransport(): Promise<void> {
@@ -167,6 +304,55 @@ class PooledSshConnection implements SshConnection {
     }
   }
 
+  private async execCommandWithFallback(command: string, signal?: AbortSignal): Promise<SshCommandChannel> {
+    this.assertNotDisposed();
+    throwIfAborted(signal);
+    const source = this.active;
+    const execCommand = source.execCommand;
+    if (!execCommand) {
+      throw new Error("SSH transport does not support typed command channels");
+    }
+    try {
+      const channel = await awaitWithSignal(execCommand.call(source, command, signal), signal, (late) => late.close());
+      throwIfAborted(signal);
+      this.closeChannelOnAbort(channel, signal);
+      return channel;
+    } catch (error) {
+      if (signal?.aborted) {
+        throw abortReason(signal);
+      }
+      this.evictIfStale(error, source);
+      if (this.shouldAttemptFallback(error)) {
+        const fallback = await this.tryFallback(signal);
+        this.assertNotDisposed();
+        throwIfAborted(signal);
+        if (fallback) {
+          const fallbackExec = fallback.execCommand;
+          if (!fallbackExec) {
+            throw new Error("SSH transport does not support typed command channels");
+          }
+          const channel = await awaitWithSignal(fallbackExec.call(fallback, command, signal), signal, (late) => late.close());
+          throwIfAborted(signal);
+          this.closeChannelOnAbort(channel, signal);
+          return channel;
+        }
+      }
+      this.assertNotDisposed();
+      throw error;
+    }
+  }
+
+  private closeChannelOnAbort(channel: SshCommandChannel, signal?: AbortSignal): void {
+    if (!signal) return;
+    const onAbort = (): void => channel.close();
+    signal.addEventListener("abort", onAbort, { once: true });
+    void channel.completion.then(
+      () => signal.removeEventListener("abort", onAbort),
+      () => signal.removeEventListener("abort", onAbort)
+    );
+    if (signal.aborted) onAbort();
+  }
+
   public requestForwardIn(bindAddr: string, bindPort: number): Promise<number> {
     this.assertNotDisposed();
     return this.active.requestForwardIn(bindAddr, bindPort);
@@ -250,7 +436,7 @@ class PooledSshConnection implements SshConnection {
     return this.isReused && shouldFallbackForChannelLimit(error);
   }
 
-  private tryFallback(): Promise<SshConnection | undefined> {
+  private tryFallback(signal?: AbortSignal): Promise<SshConnection | undefined> {
     if (this.fallbackUsed) {
       return Promise.resolve(this.fallbackConnection);
     }
@@ -259,26 +445,28 @@ class PooledSshConnection implements SshConnection {
     }
     // Cache the promise so concurrent callers share a single fallback attempt
     if (!this.fallbackPromise) {
-      this.fallbackPromise = this.executeFallback();
+      this.fallbackPromise = this.executeFallback(signal);
     }
-    return this.fallbackPromise;
+    return awaitWithSignal(this.fallbackPromise, signal, (late) => late?.dispose());
   }
 
-  private async executeFallback(): Promise<SshConnection | undefined> {
+  private async executeFallback(signal?: AbortSignal): Promise<SshConnection | undefined> {
     if (this.disposed) {
       // Disposed while the original channel open was in flight: dialing (and
       // possibly prompting for a password/2FA) for a closed lease is unwanted.
       this.fallbackUsed = true;
       return undefined;
     }
+    throwIfAborted(signal);
     try {
-      const fallback = await this.createFallback!();
+      const fallback = await this.createFallback!(signal);
       this.fallbackUsed = true;
-      if (this.disposed) {
+      if (this.disposed || signal?.aborted) {
         // The lease was disposed while the fallback was connecting: nobody owns
         // this connection, so close it rather than hand it to the pending call.
         // dispose() already released the pooled reference.
         fallback.dispose();
+        if (signal?.aborted) throw abortReason(signal);
         return undefined;
       }
       this.fallbackConnection = fallback;
@@ -288,8 +476,11 @@ class PooledSshConnection implements SshConnection {
       this.onRelease = () => this.fallbackConnection?.dispose();
       this.releasePooledOnce();
       return this.fallbackConnection;
-    } catch {
+    } catch (error) {
       this.fallbackUsed = true; // prevent retries
+      if (error instanceof SshInteractionRequiredError || signal?.aborted) {
+        throw signal?.aborted ? abortReason(signal) : error;
+      }
       return undefined;
     }
   }
@@ -309,10 +500,7 @@ class PooledSshConnection implements SshConnection {
 export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl {
   private readonly entries = new Map<string, PoolEntry>();
   private readonly retiredEntries = new Set<PoolEntry>();
-  private readonly pending = new Map<string, {
-    promise: Promise<PoolEntry>;
-    owners: Array<SshConnectContext | undefined>;
-  }>();
+  private readonly pending = new Map<string, PendingConnectionGroup>();
   private readonly listeners = new Set<(event: PoolEvent) => void>();
   // Per-server invalidation counter. A connect captures the value at handshake
   // start and re-checks it once the handshake settles; a bump in between means
@@ -349,6 +537,7 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
     if (this.disposed) {
       throw new Error("Connection pool is disposed");
     }
+    throwIfAborted(context?.signal);
     if (context?.isActive?.() === false) {
       throw new AuthNotJudgedError("SSH connection attempt ended before authentication completed");
     }
@@ -357,12 +546,20 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
       return this.connectInner(server, context);
     }
 
-    const entry = await this.getOrCreateEntry(server, context);
-    if (context?.isActive?.() === false) {
-      throw new AuthNotJudgedError("SSH connection attempt ended before authentication completed");
+    const acquisition = await this.getOrCreateEntry(server, context);
+    const entry = acquisition.entry;
+    try {
+      throwIfAborted(context?.signal);
+      if (context?.isActive?.() === false) {
+        throw new AuthNotJudgedError("SSH connection attempt ended before authentication completed");
+      }
+      this.cancelIdleTimer(entry);
+      entry.refCount++;
+      acquisition.releasePendingOwner?.();
+    } catch (error) {
+      acquisition.releasePendingOwner?.();
+      throw error;
     }
-    this.cancelIdleTimer(entry);
-    entry.refCount++;
 
     // Offer fallback: if a channel open fails on a multiplexed connection
     // (e.g. Cisco devices that reject additional channels) or the pooled
@@ -385,9 +582,13 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
         }
       }
     };
-    const createFallback = async (): Promise<SshConnection> => {
+    const createFallback = async (signal?: AbortSignal): Promise<SshConnection> => {
       evictDeadEntry();
-      return this.connectInner(server, context);
+      const fallbackSignal = signal ?? context?.signal;
+      const fallbackContext = context || fallbackSignal
+        ? { ...context, ...(fallbackSignal && { signal: fallbackSignal }) }
+        : undefined;
+      return this.connectInner(server, fallbackContext);
     };
 
     const isReused = entry.refCount > 1;
@@ -454,7 +655,12 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
     this.invalidationEpochs.set(serverId, this.invalidationEpoch(serverId) + 1);
     // Drop the in-flight connect from the join point so callers arriving from
     // now on start a fresh handshake instead of joining the stale one.
-    this.pending.delete(serverId);
+    const keyPrefix = `${serverId}\u0000`;
+    for (const key of this.pending.keys()) {
+      if (key.startsWith(keyPrefix)) {
+        this.pending.delete(key);
+      }
+    }
 
     const entry = this.entries.get(serverId);
     if (!entry) {
@@ -481,6 +687,9 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
     }
     this.entries.clear();
     this.retiredEntries.clear();
+    for (const group of this.pending.values()) {
+      this.abortPendingGroup(group);
+    }
     this.pending.clear();
     this.invalidationEpochs.clear();
     this.listeners.clear();
@@ -489,42 +698,195 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
   private async getOrCreateEntry(
     server: ServerConfig,
     context?: SshConnectContext
-  ): Promise<PoolEntry> {
+  ): Promise<PoolAcquisition> {
     const existing = this.entries.get(server.id);
     if (existing && existing.healthy) {
-      return existing;
+      return { entry: existing };
     }
     if (existing && !existing.healthy) {
       this.entries.delete(server.id);
       this.cancelIdleTimer(existing);
     }
 
-    const pending = this.pending.get(server.id);
-    if (pending) {
-      pending.owners.push(context);
-      return pending.promise;
+    const interaction = context?.interaction ?? "interactive";
+    const pendingKey = `${server.id}\u0000${interaction}`;
+    const pending = this.pending.get(pendingKey);
+    if (pending && !pending.settled && !pending.controller.signal.aborted) {
+      const owner = this.addPendingOwner(pending, context);
+      return this.waitForPendingOwner(pending, owner);
+    }
+    if (pending && this.pending.get(pendingKey) === pending) {
+      this.pending.delete(pendingKey);
     }
 
-    const owners: Array<SshConnectContext | undefined> = [context];
-    // The first terminal may close while another caller awaits the same
-    // handshake. Keep its queued prompt only while at least one owner is live.
+    const group: PendingConnectionGroup = {
+      key: pendingKey,
+      serverId: server.id,
+      promise: Promise.resolve(undefined as never),
+      owners: [],
+      controller: new AbortController(),
+      settled: false
+    };
+    const owner = this.addPendingOwner(group, context);
     const sharedContext: SshConnectContext = {
       ...context,
-      isActive: () => owners.some((owner) => owner?.isActive?.() !== false),
+      // A caller owns its wait, but the shared transport attempt belongs to
+      // the whole policy group. Never let the first caller's signal cancel
+      // authentication while another same-policy owner is still live.
+      signal: group.controller.signal,
+      isActive: () => this.isPendingGroupActive(group),
       onAuthMessage: (text: string) => {
-        const receiver = owners.find((owner) => owner?.isActive?.() !== false && owner?.onAuthMessage);
-        return receiver ? receiver.onAuthMessage!(text) !== false : false;
+        if (!this.isPendingGroupActive(group)) {
+          return false;
+        }
+        const receiver = group.owners.find((candidate) => this.isPendingOwnerActive(candidate) && candidate.context?.onAuthMessage);
+        return receiver?.context?.onAuthMessage?.(text) !== false;
       }
     };
-    const promise: Promise<PoolEntry> = this.createEntry(server, sharedContext).finally(() => {
+    group.livenessTimer = setInterval(() => {
+      this.isPendingGroupActive(group);
+    }, 50);
+    group.promise = this.createEntry(server, sharedContext).then((entry) => {
+      group.entry = entry;
+      return entry;
+    }).finally(() => {
+      group.settled = true;
+      this.stopPendingGroupMonitoring(group);
+      if (!group.owners.some((candidate) => this.isPendingOwnerActive(candidate))) {
+        this.disposeUnclaimedEntry(group);
+      }
       // Only clear the slot if it is still ours: invalidate() may have dropped
       // this connect from `pending` and a newer handshake may already hold it.
-      if (this.pending.get(server.id)?.promise === promise) {
-        this.pending.delete(server.id);
+      if (this.pending.get(pendingKey) === group) {
+        this.pending.delete(pendingKey);
       }
     });
-    this.pending.set(server.id, { promise, owners });
-    return promise;
+    this.pending.set(pendingKey, group);
+    return this.waitForPendingOwner(group, owner);
+  }
+
+  private addPendingOwner(group: PendingConnectionGroup, context?: SshConnectContext): PendingConnectionOwner {
+    const owner: PendingConnectionOwner = { context, controller: new AbortController(), released: false };
+    if (context?.signal) {
+      const onAbort = (): void => {
+        this.refreshPendingOwners(group);
+      };
+      context.signal.addEventListener("abort", onAbort, { once: true });
+      owner.removeAbortListener = () => context.signal?.removeEventListener("abort", onAbort);
+    }
+    group.owners.push(owner);
+    this.refreshPendingOwners(group);
+    return owner;
+  }
+
+  private isPendingOwnerActive(owner: PendingConnectionOwner): boolean {
+    return !owner.released && !owner.controller.signal.aborted &&
+      owner.context?.signal?.aborted !== true && owner.context?.isActive?.() !== false;
+  }
+
+  private refreshPendingOwners(group: PendingConnectionGroup): boolean {
+    for (const owner of group.owners) {
+      if (owner.released || owner.controller.signal.aborted) {
+        continue;
+      }
+      if (owner.context?.signal?.aborted) {
+        owner.controller.abort(abortReason(owner.context.signal));
+      } else if (owner.context?.isActive?.() === false) {
+        owner.controller.abort(new AuthNotJudgedError("SSH connection attempt ended before authentication completed"));
+      }
+    }
+    const hasActiveOwner = group.owners.some((owner) => this.isPendingOwnerActive(owner));
+    if (!hasActiveOwner && !group.settled) {
+      this.abortPendingGroup(group);
+    }
+    return hasActiveOwner && !group.controller.signal.aborted;
+  }
+
+  private isPendingGroupActive(group: PendingConnectionGroup): boolean {
+    return this.refreshPendingOwners(group);
+  }
+
+  private async waitForPendingOwner(
+    group: PendingConnectionGroup,
+    owner: PendingConnectionOwner
+  ): Promise<PoolAcquisition> {
+    try {
+      const entry = await awaitWithSignals(group.promise, [owner.controller.signal, group.controller.signal]);
+      if (!this.isPendingOwnerActive(owner)) {
+        throw owner.controller.signal.aborted
+          ? abortReason(owner.controller.signal)
+          : new AuthNotJudgedError("SSH connection attempt ended before authentication completed");
+      }
+      return {
+        entry,
+        releasePendingOwner: () => this.releasePendingOwner(group, owner)
+      };
+    } catch (error) {
+      this.releasePendingOwner(group, owner);
+      throw error;
+    }
+  }
+
+  private releasePendingOwner(group: PendingConnectionGroup, owner: PendingConnectionOwner): void {
+    if (owner.released) {
+      return;
+    }
+    owner.released = true;
+    owner.removeAbortListener?.();
+    const index = group.owners.indexOf(owner);
+    if (index >= 0) {
+      group.owners.splice(index, 1);
+    }
+    if (!group.settled && !group.owners.some((candidate) => this.isPendingOwnerActive(candidate))) {
+      this.abortPendingGroup(group);
+    }
+    if (group.settled && !group.owners.some((candidate) => this.isPendingOwnerActive(candidate))) {
+      this.disposeUnclaimedEntry(group);
+    }
+    if (group.owners.length === 0) {
+      this.stopPendingGroupMonitoring(group);
+    }
+  }
+
+  private abortPendingGroup(group: PendingConnectionGroup): void {
+    if (!group.controller.signal.aborted) {
+      const canceledOwner = group.owners.find((owner) => owner.context?.signal?.aborted);
+      const reason = canceledOwner?.context?.signal
+        ? abortReason(canceledOwner.context.signal)
+        : new AuthNotJudgedError("SSH connection attempt ended before authentication completed");
+      group.controller.abort(reason);
+    }
+    if (this.pending.get(group.key) === group) {
+      this.pending.delete(group.key);
+    }
+    if (group.owners.length === 0) {
+      this.stopPendingGroupMonitoring(group);
+    }
+  }
+
+  private disposeUnclaimedEntry(group: PendingConnectionGroup): void {
+    const entry = group.entry;
+    if (!entry || entry.refCount > 0) {
+      return;
+    }
+    if (this.entries.get(group.serverId) === entry) {
+      this.entries.delete(group.serverId);
+      entry.healthy = false;
+      this.cancelIdleTimer(entry);
+      this.emit({ type: "disconnected", serverId: group.serverId });
+    }
+    entry.connection.dispose();
+  }
+
+  private stopPendingGroupMonitoring(group: PendingConnectionGroup): void {
+    if (group.livenessTimer !== undefined) {
+      clearInterval(group.livenessTimer);
+      group.livenessTimer = undefined;
+    }
+    for (const owner of group.owners) {
+      owner.removeAbortListener?.();
+      owner.removeAbortListener = undefined;
+    }
   }
 
   private invalidationEpoch(serverId: string): number {
@@ -535,9 +897,9 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
     const epochAtStart = this.invalidationEpoch(server.id);
     const connection = await this.connectInner(server, context);
 
-    if (context?.isActive?.() === false) {
+    if (context?.signal?.aborted || context?.isActive?.() === false) {
       connection.dispose();
-      throw new AuthNotJudgedError("SSH connection attempt ended before authentication completed");
+      throw context.signal?.aborted ? abortReason(context.signal) : new AuthNotJudgedError("SSH connection attempt ended before authentication completed");
     }
     if (this.disposed) {
       connection.dispose();
@@ -650,6 +1012,9 @@ export class SshConnectionPool implements ContextAwareSshFactory, SshPoolControl
   }
 
   private connectInner(server: ServerConfig, context?: SshConnectContext): Promise<SshConnection> {
+    if (context?.interaction === "noninteractive" && !hasContextAwareConnect(this.innerFactory)) {
+      return Promise.reject(new SshInteractionRequiredError("SSH transport cannot guarantee noninteractive acquisition."));
+    }
     if (hasContextAwareConnect(this.innerFactory)) {
       return this.innerFactory.connectWithContext(server, context);
     }

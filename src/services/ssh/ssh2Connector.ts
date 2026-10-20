@@ -21,11 +21,63 @@ import type {
   HostKeyVerifier,
   KeyboardInteractiveHandler,
   PtyOptions,
+  SshCommandChannel,
   SshConnection,
   SshConnector,
   TcpConnectionInfo
 } from "./contracts";
 import { AuthNotJudgedError } from "./authErrors";
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new AuthNotJudgedError("SSH operation was canceled");
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortReason(signal);
+}
+
+function awaitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal, disposeLate?: (value: T) => void): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    void promise.then(disposeLate, () => {});
+    return Promise.reject(abortReason(signal));
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const cleanup = (): void => signal.removeEventListener("abort", onAbort);
+    const onAbort = (): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(abortReason(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        if (settled || signal.aborted) {
+          disposeLate?.(value);
+          if (!settled) {
+            settled = true;
+            cleanup();
+            reject(abortReason(signal));
+          }
+          return;
+        }
+        settled = true;
+        cleanup();
+        resolve(value);
+      },
+      (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      }
+    );
+  });
+}
 
 /**
  * Legacy SSH algorithms appended as fallbacks when `ServerConfig.legacyAlgorithms`
@@ -148,6 +200,77 @@ class Ssh2Connection implements SshConnection {
         resolve(stream);
       });
     });
+  }
+
+  public async execCommand(command: string, signal?: AbortSignal): Promise<SshCommandChannel> {
+    throwIfAborted(signal);
+    const stream = await awaitWithSignal(this.exec(command), signal, (late) => late.destroy());
+    throwIfAborted(signal);
+    const commandStream = stream as Duplex & {
+      stderr?: NodeJS.ReadableStream;
+      close?: () => void;
+    };
+    const stderr = commandStream.stderr;
+    if (!stderr) {
+      stream.destroy();
+      throw new Error("SSH command channel did not expose stderr");
+    }
+
+    let exit: { readonly code: number | null; readonly signal?: string } | undefined;
+    let settled = false;
+    let rejectCompletion!: (error: Error) => void;
+    let resolveCompletion!: (result: { readonly code: number | null; readonly signal?: string }) => void;
+    const completion = new Promise<{ readonly code: number | null; readonly signal?: string }>((resolve, reject) => {
+      resolveCompletion = resolve;
+      rejectCompletion = reject;
+    });
+    const closeStream = (): void => {
+      if (commandStream.close) {
+        commandStream.close.call(stream);
+      } else {
+        stream.destroy();
+      }
+    };
+    const cleanup = (): void => {
+      stream.removeListener("exit", onExit);
+      stream.removeListener("close", onClose);
+      stream.removeListener("error", onError);
+      stderr.removeListener("error", onError);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      rejectCompletion(error);
+    };
+    const onExit = (code: number | null, exitSignal?: string): void => {
+      exit = { code: code ?? null, ...(exitSignal && { signal: exitSignal }) };
+    };
+    const onClose = (): void => {
+      if (!exit) {
+        fail(new Error("SSH command channel closed without an exit result"));
+        return;
+      }
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolveCompletion(exit);
+    };
+    const onError = (error: Error): void => fail(error);
+    const onAbort = (): void => {
+      closeStream();
+      fail(abortReason(signal!));
+    };
+
+    stream.on("exit", onExit);
+    stream.on("close", onClose);
+    stream.on("error", onError);
+    stderr.on("error", onError);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+
+    return { stdout: stream, stderr, completion, close: closeStream };
   }
 
   public async requestForwardIn(bindAddr: string, bindPort: number): Promise<number> {
@@ -285,15 +408,25 @@ export class Ssh2Connector implements SshConnector {
       sock?: Duplex;
       onKeyboardInteractive?: KeyboardInteractiveHandler;
       onAuthMessage?: (text: string) => boolean | void;
+      interaction?: "interactive" | "noninteractive";
+      signal?: AbortSignal;
     }
   ): Promise<SshConnection> {
     const config = await buildConnectConfig(server, auth.password, auth.passphrase, auth.sock, this.connectionOptions);
+    throwIfAborted(auth.signal);
+    let hostKeyError: unknown;
     if (this.hostKeyVerifier) {
       config.hostVerifier = (hostKey: Buffer | string, verify: VerifyCallback): void => {
         const rawHostKey = Buffer.isBuffer(hostKey) ? hostKey : Buffer.from(hostKey, "hex");
-        void this.hostKeyVerifier!.verify(server, rawHostKey).then(
+        void this.hostKeyVerifier!.verify(server, rawHostKey, {
+          ...(auth.interaction && { interaction: auth.interaction }),
+          ...(auth.signal && { signal: auth.signal })
+        }).then(
           (allowed) => verify(allowed),
-          () => verify(false)
+          (error: unknown) => {
+            hostKeyError = error;
+            verify(false);
+          }
         );
       };
     }
@@ -301,6 +434,20 @@ export class Ssh2Connector implements SshConnector {
     return new Promise((resolve, reject) => {
       let settled = false;
       const authAbort = new AbortController();
+      const onExternalAbort = (): void => {
+        authAbort.abort();
+        client.end();
+        if (!settled) {
+          settled = true;
+          reject(auth.signal ? abortReason(auth.signal) : new AuthNotJudgedError("SSH connection attempt was canceled"));
+        }
+      };
+      auth.signal?.addEventListener("abort", onExternalAbort, { once: true });
+      const removeExternalAbort = (): void => auth.signal?.removeEventListener("abort", onExternalAbort);
+      if (auth.signal?.aborted) {
+        onExternalAbort();
+        return;
+      }
       let banner: string | undefined;
       client.on("banner", (message: string) => {
         // A live sink handles banners immediately, so getBanner() must stay
@@ -348,17 +495,21 @@ export class Ssh2Connector implements SshConnector {
       });
       const label = `${server.name} (${server.host})`;
       client.on("ready", () => {
+        if (settled) return;
         authAbort.abort();
+        removeExternalAbort();
         settled = true;
         resolve(new Ssh2Connection(client, banner, label, this.diagnostics));
       });
       client.on("error", (error: Error) => {
         authAbort.abort();
+        removeExternalAbort();
         if (!settled) {
+          settled = true;
           // Pre-ready errors are the caller's to handle and MUST stay a plain
           // rejection — the connect flow (auth retry, host-key prompts) reads
           // them. Nothing is logged here on purpose.
-          reject(error);
+          reject(hostKeyError instanceof Error ? hostKeyError : error);
           return;
         }
         // Post-ready these used to be dropped on the floor, which is why a
@@ -373,7 +524,11 @@ export class Ssh2Connector implements SshConnector {
       });
       client.on("close", () => {
         authAbort.abort();
-        if (!settled) reject(new AuthNotJudgedError("SSH connection closed before authentication completed"));
+        removeExternalAbort();
+        if (!settled) {
+          settled = true;
+          reject(hostKeyError instanceof Error ? hostKeyError : new AuthNotJudgedError("SSH connection closed before authentication completed"));
+        }
       });
       client.connect(config);
     });

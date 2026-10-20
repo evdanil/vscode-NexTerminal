@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { PassThrough } from "node:stream";
 import type { ServerConfig } from "../../src/models/config";
 
 // Minimal fake for ssh2's `Client`: a bare event emitter with the handful of
@@ -28,6 +29,7 @@ vi.mock("ssh2", () => {
 });
 
 import { isAuthNotJudged } from "../../src/services/ssh/authErrors";
+import { SshInteractionRequiredError } from "../../src/services/ssh/contracts";
 import { buildConnectConfig, LEGACY_ALGORITHMS, Ssh2Connector } from "../../src/services/ssh/ssh2Connector";
 
 function appendedAlgorithms(value: unknown): readonly string[] {
@@ -134,6 +136,100 @@ function flushMicrotasks(): Promise<void> {
 describe("Ssh2Connector.connect banner handling", () => {
   beforeEach(() => {
     mockClients.length = 0;
+  });
+
+  it("preserves a typed noninteractive host-key refusal through ssh2 error wrapping", async () => {
+    const verifier = {
+      verify: vi.fn(async () => { throw new SshInteractionRequiredError("host key requires a decision"); })
+    };
+    const connector = new Ssh2Connector(verifier);
+    const connecting = connector.connect(makeServer(), { interaction: "noninteractive" });
+    await flushMicrotasks();
+    const client = mockClients.at(-1);
+    const config = client.connect.mock.calls[0][0];
+    const verify = vi.fn();
+
+    config.hostVerifier(Buffer.from("host-key"), verify);
+    await flushMicrotasks();
+    client.emit("error", new Error("Host denied (verification failed)"));
+
+    await expect(connecting).rejects.toMatchObject({ code: "interaction-required" });
+    expect(verifier.verify).toHaveBeenCalledWith(makeServer(), Buffer.from("host-key"), { interaction: "noninteractive" });
+  });
+
+  it("returns separate stdout and stderr and waits for exit plus close", async () => {
+    const connector = new Ssh2Connector();
+    const connecting = connector.connect(makeServer(), { password: "pw" });
+    await flushMicrotasks();
+    const client = mockClients.at(-1);
+    client.emit("ready");
+    const connection = await connecting;
+    const stream = new PassThrough();
+    const stderr = new PassThrough();
+    Object.assign(stream, { stderr });
+    client.exec = vi.fn((_command: string, callback: (error: Error | undefined, channel: PassThrough) => void) => callback(undefined, stream));
+
+    const channel = await connection.execCommand?.("containerlab inspect");
+    expect(channel).toBeDefined();
+    expect(channel?.stdout).toBe(stream);
+    expect(channel?.stderr).toBe(stderr);
+    const stdoutChunks: string[] = [];
+    const stderrChunks: string[] = [];
+    channel?.stdout.on("data", (chunk: Buffer | string) => stdoutChunks.push(String(chunk)));
+    channel?.stderr.on("data", (chunk: Buffer | string) => stderrChunks.push(String(chunk)));
+    stream.write("stdout data");
+    stderr.write("stderr data");
+
+    let completed = false;
+    void channel?.completion.then(() => { completed = true; }, () => { completed = true; });
+    stream.emit("exit", 17, undefined);
+    await flushMicrotasks();
+    expect(completed).toBe(false);
+    stream.emit("close");
+
+    await expect(channel?.completion).resolves.toEqual({ code: 17 });
+    expect(stdoutChunks).toEqual(["stdout data"]);
+    expect(stderrChunks).toEqual(["stderr data"]);
+  });
+
+  it("rejects typed command completion when a channel closes without an exit result", async () => {
+    const connector = new Ssh2Connector();
+    const connecting = connector.connect(makeServer(), { password: "pw" });
+    await flushMicrotasks();
+    const client = mockClients.at(-1);
+    client.emit("ready");
+    const connection = await connecting;
+    const stream = new PassThrough();
+    Object.assign(stream, { stderr: new PassThrough() });
+    client.exec = vi.fn((_command: string, callback: (error: Error | undefined, channel: PassThrough) => void) => callback(undefined, stream));
+
+    const channel = await connection.execCommand?.("containerlab inspect");
+    stream.emit("close");
+
+    await expect(channel?.completion).rejects.toThrow(/without an exit result/i);
+  });
+
+  it("closes a command channel that arrives after cancellation", async () => {
+    const connector = new Ssh2Connector();
+    const connecting = connector.connect(makeServer(), { password: "pw" });
+    await flushMicrotasks();
+    const client = mockClients.at(-1);
+    client.emit("ready");
+    const connection = await connecting;
+    let completeExec: ((error: Error | undefined, channel: PassThrough) => void) | undefined;
+    client.exec = vi.fn((_command: string, callback: (error: Error | undefined, channel: PassThrough) => void) => { completeExec = callback; });
+    const controller = new AbortController();
+    const reason = new Error("discovery canceled");
+    const opening = connection.execCommand?.("containerlab inspect", controller.signal);
+
+    controller.abort(reason);
+    await expect(opening).rejects.toBe(reason);
+    const lateStream = new PassThrough();
+    Object.assign(lateStream, { stderr: new PassThrough() });
+    completeExec?.(undefined, lateStream);
+    await flushMicrotasks();
+
+    expect(lateStream.destroyed).toBe(true);
   });
 
   it("aborts a keyboard-interactive request when the handshake times out", async () => {

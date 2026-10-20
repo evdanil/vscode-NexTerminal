@@ -6,6 +6,7 @@ import type { Socket } from "node:net";
 type CloseRelay = (listener: () => void) => () => void;
 
 export class ProxiedSshConnection implements SshConnection {
+  public readonly execCommand?: NonNullable<SshConnection["execCommand"]>;
   private readonly closeListeners = new Set<() => void>();
   private innerCloseUnsubscribe?: () => void;
   private readonly proxyCloseUnsubscribe?: () => void;
@@ -17,6 +18,10 @@ export class ProxiedSshConnection implements SshConnection {
     private readonly proxyCleanup: () => void,
     proxyOnClose?: CloseRelay
   ) {
+    const execCommand = this.inner.execCommand;
+    if (execCommand) {
+      this.execCommand = (command, signal) => execCommand.call(this.inner, command, signal);
+    }
     this.innerCloseUnsubscribe = this.inner.onClose(() => {
       this.emitClose();
     });

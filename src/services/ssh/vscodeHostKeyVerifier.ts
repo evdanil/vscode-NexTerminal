@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import * as vscode from "vscode";
 import type { ServerConfig } from "../../models/config";
-import type { HostKeyVerifier } from "./contracts";
+import { SshInteractionRequiredError, type HostKeyVerifier, type SshConnectContext } from "./contracts";
+import { AuthNotJudgedError } from "./authErrors";
 
 /**
  * The trusted-host store: `hostIdentity` → `toFingerprint`, one flat object in
@@ -130,25 +131,48 @@ export class VscodeHostKeyVerifier implements HostKeyVerifier {
 
   public constructor(private readonly state: vscode.Memento) {}
 
-  public async verify(server: ServerConfig, hostKey: Buffer): Promise<boolean> {
+  public async verify(
+    server: ServerConfig,
+    hostKey: Buffer,
+    context?: Pick<SshConnectContext, "interaction" | "signal">
+  ): Promise<boolean> {
     const identity = hostIdentity(server);
-    const existing = this.pendingByHost.get(identity);
+    const interaction = context?.interaction ?? "interactive";
+    const pendingKey = `${identity}\u0000${interaction}`;
+    const existing = this.pendingByHost.get(pendingKey);
     if (existing) {
       return existing;
     }
-    const task = this.verifyInternal(server, hostKey).finally(() => {
-      this.pendingByHost.delete(identity);
+    const task = this.verifyInternal(server, hostKey, context).finally(() => {
+      this.pendingByHost.delete(pendingKey);
     });
-    this.pendingByHost.set(identity, task);
+    this.pendingByHost.set(pendingKey, task);
     return task;
   }
 
-  private async verifyInternal(server: ServerConfig, hostKey: Buffer): Promise<boolean> {
+  private async verifyInternal(
+    server: ServerConfig,
+    hostKey: Buffer,
+    context?: Pick<SshConnectContext, "interaction" | "signal">
+  ): Promise<boolean> {
     const identity = hostIdentity(server);
     const fingerprint = toFingerprint(hostKey);
     const knownHosts = this.readKnownHosts();
     const knownFingerprint = knownHosts[identity];
 
+    if (context?.signal?.aborted) {
+      throw context.signal.reason ?? new AuthNotJudgedError("SSH host-key verification was canceled");
+    }
+
+    // A background connection may use a previously trusted identity, but it
+    // cannot learn or replace trust, even when the interactive auto-trust
+    // setting is enabled. This check precedes every trust write and prompt.
+    if (knownFingerprint === fingerprint) {
+      return true;
+    }
+    if (context?.interaction === "noninteractive") {
+      throw new SshInteractionRequiredError("SSH host-key verification requires an interactive decision.");
+    }
     if (!knownFingerprint) {
       const trustNewHosts = vscode.workspace.getConfiguration("nexus.ssh").get<boolean>("trustNewHosts", true);
       if (trustNewHosts) {
@@ -163,6 +187,9 @@ export class VscodeHostKeyVerifier implements HostKeyVerifier {
       if (choice !== TRUST_NEW_LABEL) {
         return false;
       }
+    if (context?.signal?.aborted) {
+      throw context.signal.reason ?? new AuthNotJudgedError("SSH host-key verification was canceled");
+    }
       await this.trust(identity, fingerprint);
       return true;
     }
@@ -183,6 +210,10 @@ export class VscodeHostKeyVerifier implements HostKeyVerifier {
     );
     if (choice !== TRUST_REPLACE_LABEL) {
       return false;
+    }
+
+    if (context?.signal?.aborted) {
+      throw context.signal.reason ?? new AuthNotJudgedError("SSH host-key verification was canceled");
     }
 
     await this.trust(identity, fingerprint);
