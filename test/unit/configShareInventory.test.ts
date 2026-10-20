@@ -90,6 +90,7 @@ import { EVE_NG_PROVIDER_ID } from "../../src/services/inventory/providers/eveNg
 import { GNS3_PROVIDER_ID } from "../../src/services/inventory/providers/gns3Provider";
 import { PROXMOX_PROVIDER_ID } from "../../src/services/inventory/providers/proxmoxProvider";
 import { inventorySecretKey, type InventoryDevice, type InventorySourceConfig, type InventoryTree } from "../../src/models/inventory";
+import { parseContainerlabConfig } from "../../src/services/inventory/providers/containerlabConfig";
 import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, ServerOrigin, TunnelProfile } from "../../src/models/config";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 import type { DeviceTemplateProfile } from "../../src/models/deviceTemplate";
@@ -331,6 +332,48 @@ describe("sanitizeForSharing — inventory sources", () => {
     // A source whose every rule names a missing template ships no rules at all.
     const lone = share([makeSource({ templateRules: [{ id: "rule-2", templateId: "tpl-missing" }] })]);
     expect(lone.inventorySources[0].templateRules).toBeUndefined();
+  });
+
+  it("remaps a Containerlab discovery host and every hop in its SSH chain on export", () => {
+    const bastion = makeServer({ id: "bastion-1", name: "Bastion" });
+    const labHost = makeServer({ id: "lab-host", name: "Lab host", proxy: sshVia("bastion-1") });
+    const source = makeSource({
+      providerId: "containerlab",
+      config: { location: "ssh", labHostId: "lab-host", runner: "host", dockerSocket: "/var/run/docker.sock" }
+    });
+
+    const result = share([source], [labHost, bastion]);
+    const [shipped] = result.inventorySources;
+    const shippedHost = result.servers.find((server) => server.name === "Lab host")!;
+    const shippedBastion = result.servers.find((server) => server.name === "Bastion")!;
+
+    expect(shipped.config.labHostId).toBe(shippedHost.id);
+    expect(shipped.config.labHostId).not.toBe("lab-host");
+    expect(shipped.config.location).toBe("ssh");
+    expect(shippedHost.proxy).toMatchObject({ type: "ssh", jumpHostId: shippedBastion.id });
+    expect(source.config.labHostId).toBe("lab-host");
+  });
+
+  it("keeps an SSH Containerlab source unresolved when its lab host is omitted from export", () => {
+    const [shipped] = share([
+      makeSource({
+        providerId: "containerlab",
+        config: { location: "ssh", labHostId: "not-shared", runner: "host", dockerSocket: "/var/run/docker.sock" }
+      })
+    ]).inventorySources;
+
+    expect(shipped.config.location).toBe("ssh");
+    expect(shipped.config.labHostId).toBe("");
+    expect(() => parseContainerlabConfig(shipped.config)).toThrow(/labHostId/i);
+  });
+
+  it("does not treat another provider's labHostId field as a server reference", () => {
+    const [shipped] = share(
+      [makeSource({ providerId: "acme.cmdb", config: { location: "ssh", labHostId: "lab-host" } })],
+      [makeServer({ id: "lab-host", name: "A server with the same id" })]
+    ).inventorySources;
+
+    expect(shipped.config.labHostId).toBe("lab-host");
   });
 });
 
@@ -1216,6 +1259,57 @@ describe("the same rules in both directions — a hand-edited file", () => {
 // ---------------------------------------------------------------------------
 
 describe("share import — inventory sources", () => {
+  it("remaps a Containerlab discovery host through the imported multi-hop SSH chain", async () => {
+    const recipient = await makeMachine();
+    const source = makeSource({
+      providerId: "containerlab",
+      defaultUsername: "user",
+      config: { location: "ssh", labHostId: "lab-host", runner: "host", dockerSocket: "/var/run/docker.sock" }
+    });
+
+    await importShare(
+      recipient,
+      shareJson({
+        inventorySources: [source],
+        servers: [
+          makeServer({ id: "lab-host", name: "Lab host", username: "user", proxy: sshVia("bastion-1") }),
+          makeServer({ id: "bastion-1", name: "Bastion", username: "user" })
+        ]
+      })
+    );
+
+    const snapshot = recipient.core.getSnapshot();
+    const [imported] = snapshot.inventorySources;
+    const importedHost = snapshot.servers.find((server) => server.name === "Lab host")!;
+    const importedBastion = snapshot.servers.find((server) => server.name === "Bastion")!;
+    expect(imported.config.location).toBe("ssh");
+    expect(imported.config.labHostId).toBe(importedHost.id);
+    expect(imported.config.labHostId).not.toBe("lab-host");
+    expect(importedHost.proxy).toMatchObject({ type: "ssh", jumpHostId: importedBastion.id });
+  });
+
+  it("keeps a missing Containerlab lab host unresolved on import instead of switching to local", async () => {
+    const recipient = await makeMachine();
+
+    await importShare(
+      recipient,
+      shareJson({
+        inventorySources: [
+          makeSource({
+            providerId: "containerlab",
+            defaultUsername: "user",
+            config: { location: "ssh", labHostId: "host-not-in-share", runner: "host", dockerSocket: "/var/run/docker.sock" }
+          })
+        ]
+      })
+    );
+
+    const [imported] = recipient.core.getSnapshot().inventorySources;
+    expect(imported.config.location).toBe("ssh");
+    expect(imported.config.labHostId).toBe("");
+    expect(() => parseContainerlabConfig(imported.config)).toThrow(/labHostId/i);
+  });
+
   it("persists each source with a fresh id and a minted revision, and never the bookkeeping or trust stamp a hand-edited file carries (⊘ any of them landing)", async () => {
     const recipient = await makeMachine();
 

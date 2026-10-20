@@ -68,6 +68,31 @@ import { normalizeFolderPath, isDescendantOrSelf, parentPath, folderDisplayName,
 type NexusListener = (snapshot: SessionSnapshot) => void;
 type ServerRemovalListener = (serverId: string) => void;
 
+export type InventorySourceMutationKind = "create" | "metadata" | "update" | "replace" | "delete";
+
+export interface InventorySourceMutation {
+  readonly kind: InventorySourceMutationKind;
+  readonly sourceId: string;
+  /** Import/restore boundary; form approvals must never transfer through it, including creates. */
+  readonly forceNewActivationGeneration?: boolean;
+  readonly previous?: InventorySourceConfig;
+  readonly next?: InventorySourceConfig;
+}
+
+export interface InventorySourceMutationPreparation {
+  commit(): void;
+  abort(): void;
+}
+
+type InventorySourceMutationListener = (
+  mutation: InventorySourceMutation
+) => Promise<InventorySourceMutationPreparation | void> | InventorySourceMutationPreparation | void;
+
+export interface InventorySourceMutationOptions {
+  /** Imports/restores replace authority even when they contain byte-identical records. */
+  readonly forceNewActivationGeneration?: boolean;
+}
+
 /**
  * A synchronous notification of one in-memory change to a server or auth
  * profile record, fired immediately after the assignment and before any
@@ -197,6 +222,7 @@ export class FolderCascadeSaveError extends Error {
 
 export class NexusCore {
   private readonly listeners = new Set<NexusListener>();
+  private readonly inventorySourceMutationListeners = new Set<InventorySourceMutationListener>();
   private readonly serverRemovalListeners = new Set<ServerRemovalListener>();
   private serverBatchDepth = 0;
   private readonly serverBatchEndListeners = new Set<() => void>();
@@ -415,6 +441,73 @@ export class NexusCore {
   }
 
   /**
+   * Lets machine-local activation state revoke or advance authority before a
+   * source revision becomes visible. Preparation remains pending through the
+   * source persistence result; core commits or aborts it synchronously after.
+   */
+  public onPrepareInventorySourceMutation(listener: InventorySourceMutationListener): () => void {
+    this.inventorySourceMutationListeners.add(listener);
+    return () => this.inventorySourceMutationListeners.delete(listener);
+  }
+
+  private async prepareInventorySourceMutation(
+    mutation: InventorySourceMutation
+  ): Promise<InventorySourceMutationPreparation[]> {
+    const prepared: InventorySourceMutationPreparation[] = [];
+    try {
+      for (const listener of this.inventorySourceMutationListeners) {
+        const result = await listener(mutation);
+        if (result) prepared.push(result);
+      }
+      return prepared;
+    } catch (error) {
+      this.finishInventorySourceMutation(prepared, false);
+      throw error;
+    }
+  }
+
+  private async prepareInventorySourceMutationForUpdates(
+    updates: readonly { readonly previous: InventorySourceConfig; readonly next: InventorySourceConfig }[]
+  ): Promise<InventorySourceMutationPreparation[]> {
+    const results = await Promise.allSettled(
+      updates.map(({ previous, next }) =>
+        this.prepareInventorySourceMutation({ kind: "metadata", sourceId: previous.id, previous, next })
+      )
+    );
+    const prepared: InventorySourceMutationPreparation[] = [];
+    let failure: unknown;
+    for (const result of results) {
+      if (result.status === "fulfilled") prepared.push(...result.value);
+      else if (failure === undefined) failure = result.reason;
+    }
+    if (failure !== undefined) {
+      this.finishInventorySourceMutation(prepared, false);
+      throw failure;
+    }
+    return prepared;
+  }
+
+  private finishInventorySourceMutation(
+    prepared: readonly InventorySourceMutationPreparation[],
+    committed: boolean
+  ): void {
+    for (const item of prepared) {
+      try {
+        if (committed) item.commit();
+        else item.abort();
+      } catch (error) {
+        console.error("[Nexus] Inventory source mutation finalizer threw:", error);
+      }
+    }
+  }
+
+  private assertInventorySourceIncarnation(id: string, expected: InventorySourceConfig | undefined): void {
+    if (this.inventorySources.get(id) !== expected) {
+      throw new Error(`Inventory source "${id}" changed while its lifecycle update was being prepared.`);
+    }
+  }
+
+  /**
    * Observes a server row leaving live in-memory state. `removeServer` and
    * folder deletion fire this synchronously before their fallible persistence;
    * those mutations are not rolled back when a repository write rejects.
@@ -622,223 +715,246 @@ export class NexusCore {
    * the deletion genuinely did not happen.
    */
   public async removeAuthProfile(profileId: string): Promise<void> {
-    this.authProfiles.delete(profileId);
-    let serversChanged = false;
-    for (const [id, server] of this.servers.entries()) {
-      // Either link is enough to make this server a reference-holder: a server
-      // can name this profile as its SSH credentials, as its BMC credentials
-      // (`ipmiAuthProfileId`, issue #48 Phase 3), or as both, and a deletion
-      // that only swept the first would leave `${profile.ipmiUsername}` and the
-      // credential injection resolving against a profile that no longer exists —
-      // silently, on every run, with the server form showing an empty select.
-      if (server.authProfileId === profileId || server.ipmiAuthProfileId === profileId) {
-        const cleared: ServerConfig = { ...server };
-        if (server.authProfileId === profileId) {
-          cleared.authProfileId = undefined;
-        }
-        if (server.ipmiAuthProfileId === profileId) {
-          cleared.ipmiAuthProfileId = undefined;
-        }
-        // The inventory sync's record that IT linked this profile goes with the
-        // link. Without this, deleting a profile an inventory source applied
-        // would leave every server it owned looking permanently opted OUT (no
-        // `authProfileId`, but a stamp naming a profile) — so re-pointing the
-        // source at a replacement profile would silently skip exactly the
-        // servers the sync itself had configured, which nobody ever hand-edited.
-        // This clear is the system's doing, not a user decision, so the stamp
-        // must not outlive the link it describes.
-        //
-        // Scoped to the servers whose `authProfileId` is being cleared here: a
-        // server whose link the USER already cleared (stamp names this profile,
-        // `authProfileId` already undefined) is not touched, so its opt-out
-        // survives the profile's deletion — which is the whole point of it.
-        //
-        // The `authProfileId === profileId` term is what keeps that scoping true
-        // now that this loop can also be entered through `ipmiAuthProfileId`:
-        // the stamp records an SSH link, so a server reached here only by its
-        // BMC link has had no SSH link cleared and must keep its stamp.
-        if (server.authProfileId === profileId && server.origin?.syncedAuthProfileId === profileId) {
-          cleared.origin = { ...server.origin, syncedAuthProfileId: undefined };
-        }
-        // REVIEW FINDING (P1, adoption auth provenance) — the DETACHED form of
-        // the same stamp, on a server kept from a removed source
-        // (`DetachedServerOrigin.syncedAuthProfileId`). Adoption restores it into
-        // a real origin, so a stamp left standing here would name a deleted
-        // profile from the moment that server is reclaimed — the permanent
-        // opt-out this clear exists to prevent, merely deferred until the marker
-        // is cashed in. Scoped identically: only where the link being cleared is
-        // the one the stamp names, so a user's own divergence survives.
-        if (server.authProfileId === profileId && server.formerlySynced?.syncedAuthProfileId === profileId) {
-          cleared.formerlySynced = { ...server.formerlySynced, syncedAuthProfileId: undefined };
-        }
-        // BMC VALUE STAMP (issue #48 PR-T3, `origin.templated.ipmiAuthProfileId`)
-        // — the sync's receipt that IT wrote the BMC credential link on this
-        // server, cleared for the SAME reason as the SSH `syncedAuthProfileId`
-        // stamp above: left standing after its link is gone it reads as a
-        // per-server opt-out (value undefined, stamp still naming a profile), and
-        // `matrixWrites` would lock the field out of even a later override
-        // template — the carry-forward trap the PR-T3 value stamps otherwise
-        // spring on deletion.
-        //
-        // GATE ASYMMETRY vs the SSH stamp clears above: those gate on
-        // `authProfileId === profileId` because `syncedAuthProfileId` records the
-        // SSH link. THIS stamp records the BMC link, so it gates on
-        // `ipmiAuthProfileId === profileId`. A server reached here only through
-        // its SSH link has had no BMC link cleared and must keep its BMC stamp;
-        // and a server whose BMC value the USER already hand-cleared (value
-        // undefined, stamp still naming this profile, reached here only via its
-        // SSH link) keeps it too — that opt-out is deliberate.
-        //
-        // SINGLE-MEMBER CLEAR — mirrors the sync engine's `dropTemplateProxy` /
-        // `clearTemplatedStamps`: rebuild the `templated` bag without the member
-        // and collapse it to `undefined` when nothing else is stamped
-        // (`templatedHasAnyStamp`). Chained off `cleared.origin` so a server that
-        // named this profile on BOTH links loses the SSH stamp AND the BMC stamp.
-        if (
-          server.ipmiAuthProfileId === profileId &&
-          (cleared.origin ?? server.origin)?.templated?.ipmiAuthProfileId === profileId
-        ) {
-          const baseOrigin = cleared.origin ?? server.origin!;
-          const templated = { ...baseOrigin.templated };
-          delete templated.ipmiAuthProfileId;
-          cleared.origin = { ...baseOrigin, templated: templatedHasAnyStamp(templated) ? templated : undefined };
-        }
-        // The detached twin (`formerlySynced.templated.ipmiAuthProfileId`) — swept
-        // for the reason the SSH `formerlySynced.syncedAuthProfileId` above is:
-        // adoption restores the marker into a live origin, so a stamp left naming
-        // a deleted profile would be the permanent opt-out this clear prevents,
-        // merely deferred until the record is reclaimed. Same BMC-link gate, same
-        // single-member mechanics.
-        if (
-          server.ipmiAuthProfileId === profileId &&
-          (cleared.formerlySynced ?? server.formerlySynced)?.templated?.ipmiAuthProfileId === profileId
-        ) {
-          const baseFormerly = cleared.formerlySynced ?? server.formerlySynced!;
-          const templated = { ...baseFormerly.templated };
-          delete templated.ipmiAuthProfileId;
-          cleared.formerlySynced = {
-            ...baseFormerly,
-            templated: templatedHasAnyStamp(templated) ? templated : undefined
-          };
-        }
-        this.servers.set(id, cleared);
-        serversChanged = true;
-      }
-    }
-    const previousSources = new Map<string, InventorySourceConfig>();
-    for (const [id, source] of this.inventorySources.entries()) {
-      if (source.authProfileId === profileId) {
-        previousSources.set(id, source);
-        this.inventorySources.set(id, { ...source, authProfileId: undefined, revision: randomUUID() });
-      }
-    }
-    // DEVICE TEMPLATES (PR-T1, §8.4) — a template's `fields.authProfileId` names
-    // this same AuthProfile store, so a deletion must clear it there too: a link
-    // naming a profile that no longer exists resolves to nothing on every sync,
-    // with nothing on screen to say why. The template is re-revisioned like the
-    // sources — but note what that does and does NOT buy in T1. The full mid-sync
-    // template-revision drift fast-fail (capturing each referenced template's
-    // revision at fetch time and comparing it before apply) is DEFERRED TO T1b,
-    // and NOT because no T1 path mutates a template: THIS method re-revisions
-    // every template that links the deleted profile, and `removeDeviceTemplate`
-    // re-revisions the sources that reference the deleted template — both are
-    // reachable in T1. It is deferred because (i) the window is narrow (a
-    // `removeAuthProfile` landing mid-apply of an already-in-flight plan),
-    // (ii) the worst outcome is a dangling `authProfileId` that degrades to SSH
-    // agent auth at connect time — not data loss or a security hole — and
-    // (iii) the fuller guard belongs with T1b's template-authoring UI, which is
-    // when templates first become user-mutable at all (in T1 they arrive only by
-    // import). KNOWN RESIDUAL the T1b guard closes: when a profile is referenced
-    // ONLY by a template (never by a `source.authProfileId`), deleting it
-    // re-revisions the template but NOT any source, so the shipped
-    // `sourceConfigUnchanged` pre-apply guard does not catch it, and it does not
-    // self-heal — the profile is not in `profilesNeedingServerKey`, so no AUTH 2b
-    // rollback fires; only an override rule or a manual edit reclaims the link.
-    // The server-side stamp (`syncedAuthProfileId`) is already handled above via
-    // the shared stamp; this is the SOURCE of the link, not the record of it.
-    const previousTemplates = new Map<string, DeviceTemplateProfile>();
-    for (const [id, template] of this.deviceTemplates.entries()) {
-      // A template can name this profile as its SSH `authProfileId`, as its BMC
-      // `ipmiAuthProfileId` (issue #48 PR-T3), or as BOTH — each is an
-      // independent link into this same AuthProfile store, so each is swept on
-      // its own terms and a template naming the profile in both fields loses
-      // both. Destructured out (never written `undefined`) exactly like the SSH
-      // field, with the same single rollback capture/restore and re-revision.
-      const sshLinkMatch = template.fields.authProfileId?.value === profileId;
-      const bmcLinkMatch = template.fields.ipmiAuthProfileId?.value === profileId;
-      if (sshLinkMatch || bmcLinkMatch) {
-        previousTemplates.set(id, template);
-        let restFields = template.fields;
-        if (sshLinkMatch) {
-          const { authProfileId: _authProfileId, ...rest } = restFields;
-          restFields = rest;
-        }
-        if (bmcLinkMatch) {
-          const { ipmiAuthProfileId: _ipmiAuthProfileId, ...rest } = restFields;
-          restFields = rest;
-        }
-        this.deviceTemplates.set(id, { ...template, fields: restFields, revision: randomUUID() });
-      }
-    }
-    // The emission is in a `finally`, not on the success path: by the time any
-    // of these saves can reject, the profile is already gone from this.authProfiles
-    // and the server references are already cleared in memory (and, past the
-    // first await, on disk). Returning through a rejection without emitting
-    // would leave every observer rendering a profile that no longer exists and
-    // links that no longer resolve, until some unrelated change happened to fire
-    // an emission. Whatever the in-memory state ends up being — fully applied,
-    // or with the inventory-source clears rolled back below — observers are told
-    // about it exactly once.
-    // The single fact the restore below is gated on: has the profile record
-    // itself left disk yet? Set between the save and the next await, so nothing
-    // can observe it out of step with what has been persisted.
-    let deletionCommitted = false;
+    const previousAuthProfile = this.authProfiles.get(profileId);
+    const sourceChanges = [...this.inventorySources.values()]
+      .filter((source) => source.authProfileId === profileId)
+      .map((previous) => ({
+        previous,
+        next: { ...previous, authProfileId: undefined, revision: randomUUID() } satisfies InventorySourceConfig
+      }));
+    const preparedSourceChanges =
+      sourceChanges.length > 0 && this.inventorySourceMutationListeners.size > 0
+        ? await this.prepareInventorySourceMutationForUpdates(sourceChanges)
+        : [];
+    let sourceChangesCommitted = false;
     try {
-      try {
-        await this.repository.saveAuthProfiles([...this.authProfiles.values()]);
-        deletionCommitted = true;
-        if (serversChanged) {
-          await this.persistServers([...this.servers.values()]);
-        }
-        if (previousSources.size > 0) {
-          await this.repository.saveInventorySources([...this.inventorySources.values()]);
-        }
-        // DEVICE TEMPLATES (PR-T1, §8.4) — last in the ordered persist chain
-        // (authProfiles gate -> servers -> inventorySources -> deviceTemplates),
-        // written only when it actually changed, on the same "the profile record
-        // must leave disk before its references do" argument the sources follow.
-        if (previousTemplates.size > 0) {
-          await this.repository.saveDeviceTemplates([...this.deviceTemplates.values()]);
-        }
-      } catch (error) {
-        // FINDING A / FINDING 2 — restore the sources for a rejection that
-        // happened BEFORE the profile record left disk, then rethrow. A no-op
-        // when nothing was cleared (`previousSources` empty), so it needs no
-        // guard of its own. This catch is nested inside the emitting try/finally
-        // rather than wrapping it, so the restore is complete before the
-        // emission fires.
-        //
-        // REVIEW FINDING (P2) — once `deletionCommitted` is true the restore is
-        // SKIPPED: re-linking a source to a profile that no longer exists (and
-        // can no longer be deleted again) is worse than leaving the link
-        // cleared. See the two-halves rule in the doc comment above.
-        if (!deletionCommitted) {
-          for (const [id, source] of previousSources) {
-            this.inventorySources.set(id, source);
-          }
-          // DEVICE TEMPLATES (PR-T1, §8.4) — restored on the same pre-commit
-          // terms as the sources, and skipped once the deletion has committed
-          // for the same reason (re-linking a template to a profile that no
-          // longer exists, and can no longer be deleted, is worse than leaving
-          // the field cleared).
-          for (const [id, template] of previousTemplates) {
-            this.deviceTemplates.set(id, template);
-          }
-        }
-        throw error;
+      if (this.authProfiles.get(profileId) !== previousAuthProfile) {
+        throw new Error(`Auth profile "${profileId}" changed while its references were being prepared for removal.`);
       }
+      for (const { previous } of sourceChanges) this.assertInventorySourceIncarnation(previous.id, previous);
+      const currentReferences = [...this.inventorySources.values()].filter((source) => source.authProfileId === profileId);
+      if (currentReferences.length !== sourceChanges.length) {
+        throw new Error(`Inventory source references to auth profile "${profileId}" changed during removal.`);
+      }
+      this.authProfiles.delete(profileId);
+      let serversChanged = false;
+      for (const [id, server] of this.servers.entries()) {
+        // Either link is enough to make this server a reference-holder: a server
+        // can name this profile as its SSH credentials, as its BMC credentials
+        // (`ipmiAuthProfileId`, issue #48 Phase 3), or as both, and a deletion
+        // that only swept the first would leave `${profile.ipmiUsername}` and the
+        // credential injection resolving against a profile that no longer exists —
+        // silently, on every run, with the server form showing an empty select.
+        if (server.authProfileId === profileId || server.ipmiAuthProfileId === profileId) {
+          const cleared: ServerConfig = { ...server };
+          if (server.authProfileId === profileId) {
+            cleared.authProfileId = undefined;
+          }
+          if (server.ipmiAuthProfileId === profileId) {
+            cleared.ipmiAuthProfileId = undefined;
+          }
+          // The inventory sync's record that IT linked this profile goes with the
+          // link. Without this, deleting a profile an inventory source applied
+          // would leave every server it owned looking permanently opted OUT (no
+          // `authProfileId`, but a stamp naming a profile) — so re-pointing the
+          // source at a replacement profile would silently skip exactly the
+          // servers the sync itself had configured, which nobody ever hand-edited.
+          // This clear is the system's doing, not a user decision, so the stamp
+          // must not outlive the link it describes.
+          //
+          // Scoped to the servers whose `authProfileId` is being cleared here: a
+          // server whose link the USER already cleared (stamp names this profile,
+          // `authProfileId` already undefined) is not touched, so its opt-out
+          // survives the profile's deletion — which is the whole point of it.
+          //
+          // The `authProfileId === profileId` term is what keeps that scoping true
+          // now that this loop can also be entered through `ipmiAuthProfileId`:
+          // the stamp records an SSH link, so a server reached here only by its
+          // BMC link has had no SSH link cleared and must keep its stamp.
+          if (server.authProfileId === profileId && server.origin?.syncedAuthProfileId === profileId) {
+            cleared.origin = { ...server.origin, syncedAuthProfileId: undefined };
+          }
+          // REVIEW FINDING (P1, adoption auth provenance) — the DETACHED form of
+          // the same stamp, on a server kept from a removed source
+          // (`DetachedServerOrigin.syncedAuthProfileId`). Adoption restores it into
+          // a real origin, so a stamp left standing here would name a deleted
+          // profile from the moment that server is reclaimed — the permanent
+          // opt-out this clear exists to prevent, merely deferred until the marker
+          // is cashed in. Scoped identically: only where the link being cleared is
+          // the one the stamp names, so a user's own divergence survives.
+          if (server.authProfileId === profileId && server.formerlySynced?.syncedAuthProfileId === profileId) {
+            cleared.formerlySynced = { ...server.formerlySynced, syncedAuthProfileId: undefined };
+          }
+          // BMC VALUE STAMP (issue #48 PR-T3, `origin.templated.ipmiAuthProfileId`)
+          // — the sync's receipt that IT wrote the BMC credential link on this
+          // server, cleared for the SAME reason as the SSH `syncedAuthProfileId`
+          // stamp above: left standing after its link is gone it reads as a
+          // per-server opt-out (value undefined, stamp still naming a profile), and
+          // `matrixWrites` would lock the field out of even a later override
+          // template — the carry-forward trap the PR-T3 value stamps otherwise
+          // spring on deletion.
+          //
+          // GATE ASYMMETRY vs the SSH stamp clears above: those gate on
+          // `authProfileId === profileId` because `syncedAuthProfileId` records the
+          // SSH link. THIS stamp records the BMC link, so it gates on
+          // `ipmiAuthProfileId === profileId`. A server reached here only through
+          // its SSH link has had no BMC link cleared and must keep its BMC stamp;
+          // and a server whose BMC value the USER already hand-cleared (value
+          // undefined, stamp still naming this profile, reached here only via its
+          // SSH link) keeps it too — that opt-out is deliberate.
+          //
+          // SINGLE-MEMBER CLEAR — mirrors the sync engine's `dropTemplateProxy` /
+          // `clearTemplatedStamps`: rebuild the `templated` bag without the member
+          // and collapse it to `undefined` when nothing else is stamped
+          // (`templatedHasAnyStamp`). Chained off `cleared.origin` so a server that
+          // named this profile on BOTH links loses the SSH stamp AND the BMC stamp.
+          if (
+            server.ipmiAuthProfileId === profileId &&
+            (cleared.origin ?? server.origin)?.templated?.ipmiAuthProfileId === profileId
+          ) {
+            const baseOrigin = cleared.origin ?? server.origin!;
+            const templated = { ...baseOrigin.templated };
+            delete templated.ipmiAuthProfileId;
+            cleared.origin = { ...baseOrigin, templated: templatedHasAnyStamp(templated) ? templated : undefined };
+          }
+          // The detached twin (`formerlySynced.templated.ipmiAuthProfileId`) — swept
+          // for the reason the SSH `formerlySynced.syncedAuthProfileId` above is:
+          // adoption restores the marker into a live origin, so a stamp left naming
+          // a deleted profile would be the permanent opt-out this clear prevents,
+          // merely deferred until the record is reclaimed. Same BMC-link gate, same
+          // single-member mechanics.
+          if (
+            server.ipmiAuthProfileId === profileId &&
+            (cleared.formerlySynced ?? server.formerlySynced)?.templated?.ipmiAuthProfileId === profileId
+          ) {
+            const baseFormerly = cleared.formerlySynced ?? server.formerlySynced!;
+            const templated = { ...baseFormerly.templated };
+            delete templated.ipmiAuthProfileId;
+            cleared.formerlySynced = {
+              ...baseFormerly,
+              templated: templatedHasAnyStamp(templated) ? templated : undefined
+            };
+          }
+          this.servers.set(id, cleared);
+          serversChanged = true;
+        }
+      }
+      const previousSources = new Map<string, InventorySourceConfig>();
+      for (const { previous, next } of sourceChanges) {
+        previousSources.set(previous.id, previous);
+        this.inventorySources.set(previous.id, next);
+      }
+      // DEVICE TEMPLATES (PR-T1, §8.4) — a template's `fields.authProfileId` names
+      // this same AuthProfile store, so a deletion must clear it there too: a link
+      // naming a profile that no longer exists resolves to nothing on every sync,
+      // with nothing on screen to say why. The template is re-revisioned like the
+      // sources — but note what that does and does NOT buy in T1. The full mid-sync
+      // template-revision drift fast-fail (capturing each referenced template's
+      // revision at fetch time and comparing it before apply) is DEFERRED TO T1b,
+      // and NOT because no T1 path mutates a template: THIS method re-revisions
+      // every template that links the deleted profile, and `removeDeviceTemplate`
+      // re-revisions the sources that reference the deleted template — both are
+      // reachable in T1. It is deferred because (i) the window is narrow (a
+      // `removeAuthProfile` landing mid-apply of an already-in-flight plan),
+      // (ii) the worst outcome is a dangling `authProfileId` that degrades to SSH
+      // agent auth at connect time — not data loss or a security hole — and
+      // (iii) the fuller guard belongs with T1b's template-authoring UI, which is
+      // when templates first become user-mutable at all (in T1 they arrive only by
+      // import). KNOWN RESIDUAL the T1b guard closes: when a profile is referenced
+      // ONLY by a template (never by a `source.authProfileId`), deleting it
+      // re-revisions the template but NOT any source, so the shipped
+      // `sourceConfigUnchanged` pre-apply guard does not catch it, and it does not
+      // self-heal — the profile is not in `profilesNeedingServerKey`, so no AUTH 2b
+      // rollback fires; only an override rule or a manual edit reclaims the link.
+      // The server-side stamp (`syncedAuthProfileId`) is already handled above via
+      // the shared stamp; this is the SOURCE of the link, not the record of it.
+      const previousTemplates = new Map<string, DeviceTemplateProfile>();
+      for (const [id, template] of this.deviceTemplates.entries()) {
+        // A template can name this profile as its SSH `authProfileId`, as its BMC
+        // `ipmiAuthProfileId` (issue #48 PR-T3), or as BOTH — each is an
+        // independent link into this same AuthProfile store, so each is swept on
+        // its own terms and a template naming the profile in both fields loses
+        // both. Destructured out (never written `undefined`) exactly like the SSH
+        // field, with the same single rollback capture/restore and re-revision.
+        const sshLinkMatch = template.fields.authProfileId?.value === profileId;
+        const bmcLinkMatch = template.fields.ipmiAuthProfileId?.value === profileId;
+        if (sshLinkMatch || bmcLinkMatch) {
+          previousTemplates.set(id, template);
+          let restFields = template.fields;
+          if (sshLinkMatch) {
+            const { authProfileId: _authProfileId, ...rest } = restFields;
+            restFields = rest;
+          }
+          if (bmcLinkMatch) {
+            const { ipmiAuthProfileId: _ipmiAuthProfileId, ...rest } = restFields;
+            restFields = rest;
+          }
+          this.deviceTemplates.set(id, { ...template, fields: restFields, revision: randomUUID() });
+        }
+      }
+      // The emission is in a `finally`, not on the success path: by the time any
+      // of these saves can reject, the profile is already gone from this.authProfiles
+      // and the server references are already cleared in memory (and, past the
+      // first await, on disk). Returning through a rejection without emitting
+      // would leave every observer rendering a profile that no longer exists and
+      // links that no longer resolve, until some unrelated change happened to fire
+      // an emission. Whatever the in-memory state ends up being — fully applied,
+      // or with the inventory-source clears rolled back below — observers are told
+      // about it exactly once.
+      // The single fact the restore below is gated on: has the profile record
+      // itself left disk yet? Set between the save and the next await, so nothing
+      // can observe it out of step with what has been persisted.
+      let deletionCommitted = false;
+      try {
+        try {
+          await this.repository.saveAuthProfiles([...this.authProfiles.values()]);
+          deletionCommitted = true;
+          if (serversChanged) {
+            await this.persistServers([...this.servers.values()]);
+          }
+          if (previousSources.size > 0) {
+            await this.repository.saveInventorySources([...this.inventorySources.values()]);
+          }
+          // DEVICE TEMPLATES (PR-T1, §8.4) — last in the ordered persist chain
+          // (authProfiles gate -> servers -> inventorySources -> deviceTemplates),
+          // written only when it actually changed, on the same "the profile record
+          // must leave disk before its references do" argument the sources follow.
+          if (previousTemplates.size > 0) {
+            await this.repository.saveDeviceTemplates([...this.deviceTemplates.values()]);
+          }
+        } catch (error) {
+          // FINDING A / FINDING 2 — restore the sources for a rejection that
+          // happened BEFORE the profile record left disk, then rethrow. A no-op
+          // when nothing was cleared (`previousSources` empty), so it needs no
+          // guard of its own. This catch is nested inside the emitting try/finally
+          // rather than wrapping it, so the restore is complete before the
+          // emission fires.
+          //
+          // REVIEW FINDING (P2) — once `deletionCommitted` is true the restore is
+          // SKIPPED: re-linking a source to a profile that no longer exists (and
+          // can no longer be deleted again) is worse than leaving the link
+          // cleared. See the two-halves rule in the doc comment above.
+          if (!deletionCommitted) {
+            for (const [id, source] of previousSources) {
+              this.inventorySources.set(id, source);
+            }
+            // DEVICE TEMPLATES (PR-T1, §8.4) — restored on the same pre-commit
+            // terms as the sources, and skipped once the deletion has committed
+            // for the same reason (re-linking a template to a profile that no
+            // longer exists, and can no longer be deleted, is worse than leaving
+            // the field cleared).
+            for (const [id, template] of previousTemplates) {
+              this.deviceTemplates.set(id, template);
+            }
+          }
+          throw error;
+        }
+      } finally {
+        this.emitChanged();
+      }
+      sourceChangesCommitted = true;
     } finally {
-      this.emitChanged();
+      this.finishInventorySourceMutation(preparedSourceChanges, sourceChangesCommitted);
     }
   }
 
@@ -866,9 +982,12 @@ export class NexusCore {
    * bump below intentionally preserves whatever revision the record already
    * has, since that is not a new incarnation, just a routine sync stamp.
    */
-  public async addOrUpdateInventorySource(source: InventorySourceConfig): Promise<void> {
-    const hadPrevious = this.inventorySources.has(source.id);
+  public async addOrUpdateInventorySource(
+    source: InventorySourceConfig,
+    options: InventorySourceMutationOptions = {}
+  ): Promise<void> {
     const previous = this.inventorySources.get(source.id);
+    const hadPrevious = previous !== undefined;
     // LIVE STATUS (Phase 2) — a change to the PROVIDER CONFIG (baseUrl,
     // rootFolder, filter, …) invalidates any runtime status: the report was
     // fetched under the old config, so nodes the new config excludes — or the
@@ -877,22 +996,45 @@ export class NexusCore {
     // rename) does not needlessly clear. Cleared AFTER the persist succeeds.
     const configChanged = hadPrevious && previous !== undefined && !inventorySourceValuesEqual(previous.config, source.config);
     const withRevision: InventorySourceConfig = { ...source, revision: randomUUID() };
-    this.inventorySources.set(source.id, withRevision);
+    const kind: InventorySourceMutationKind = !previous
+      ? "create"
+      : options.forceNewActivationGeneration
+        ? "replace"
+        : previous.providerId !== source.providerId || !inventorySourceValuesEqual(previous.config, source.config)
+          ? "update"
+          : "metadata";
+    const prepared =
+      this.inventorySourceMutationListeners.size > 0
+        ? await this.prepareInventorySourceMutation({
+            kind,
+            sourceId: source.id,
+            ...(options.forceNewActivationGeneration === true ? { forceNewActivationGeneration: true } : {}),
+            ...(previous ? { previous } : {}),
+            next: withRevision
+          })
+        : [];
     try {
-      await this.repository.saveInventorySources([...this.inventorySources.values()]);
-    } catch (error) {
-      if (hadPrevious) {
-        this.inventorySources.set(source.id, previous!);
-      } else {
-        this.inventorySources.delete(source.id);
+      this.assertInventorySourceIncarnation(source.id, previous);
+      this.inventorySources.set(source.id, withRevision);
+      try {
+        await this.repository.saveInventorySources([...this.inventorySources.values()]);
+      } catch (error) {
+        if (this.inventorySources.get(source.id) === withRevision) {
+          if (hadPrevious) this.inventorySources.set(source.id, previous!);
+          else this.inventorySources.delete(source.id);
+        }
+        throw error;
       }
+      if (configChanged) {
+        // No separate emit — the emitChanged() below covers the status drop too.
+        this.dropInventoryStatusForSource(source.id);
+      }
+      this.finishInventorySourceMutation(prepared, true);
+      this.emitChanged();
+    } catch (error) {
+      this.finishInventorySourceMutation(prepared, false);
       throw error;
     }
-    if (configChanged) {
-      // No separate emit — the emitChanged() below covers the status drop too.
-      this.dropInventoryStatusForSource(source.id);
-    }
-    this.emitChanged();
   }
 
   /**
@@ -931,23 +1073,39 @@ export class NexusCore {
         throw new InventorySourceRemovalMismatchError(id);
       }
     }
-    const hadPrevious = this.inventorySources.has(id);
     const previous = this.inventorySources.get(id);
-    this.inventorySources.delete(id);
-    try {
+    if (!previous) {
       await this.repository.saveInventorySources([...this.inventorySources.values()]);
-    } catch (error) {
-      if (hadPrevious) {
-        this.inventorySources.set(id, previous!);
+      return;
+    }
+    const prepared =
+      this.inventorySourceMutationListeners.size > 0
+        ? await this.prepareInventorySourceMutation({ kind: "delete", sourceId: id, previous })
+        : [];
+    try {
+      this.assertInventorySourceIncarnation(id, previous);
+      if (expected) {
+        const current = this.inventorySources.get(id);
+        if (!current || !sourceConfigUnchanged(current, expected) || current.name !== expected.name) {
+          throw new InventorySourceRemovalMismatchError(id);
+        }
       }
+      this.inventorySources.delete(id);
+      try {
+        await this.repository.saveInventorySources([...this.inventorySources.values()]);
+      } catch (error) {
+        if (!this.inventorySources.has(id)) this.inventorySources.set(id, previous);
+        throw error;
+      }
+      // LIVE STATUS (Phase 2) — the source is gone; drop any runtime status it
+      // owned so a removed source leaves no lingering running/stopped highlight.
+      this.dropInventoryStatusForSource(id);
+      this.finishInventorySourceMutation(prepared, true);
+      this.emitChanged();
+    } catch (error) {
+      this.finishInventorySourceMutation(prepared, false);
       throw error;
     }
-    // LIVE STATUS (Phase 2) — the source is gone; drop any runtime status it
-    // owned so a removed source leaves no lingering running/stopped highlight.
-    // Shares clearInventoryStatus's loop; no extra emit since emitChanged()
-    // fires below regardless.
-    this.dropInventoryStatusForSource(id);
-    this.emitChanged();
   }
 
   public getDeviceTemplate(id: string): DeviceTemplateProfile | undefined {
@@ -1000,41 +1158,67 @@ export class NexusCore {
    * `finally`, once.
    */
   public async removeDeviceTemplate(id: string): Promise<void> {
-    const hadPrevious = this.deviceTemplates.has(id);
     const previousTemplate = this.deviceTemplates.get(id);
-    this.deviceTemplates.delete(id);
-    const previousSources = new Map<string, InventorySourceConfig>();
-    for (const [sourceId, source] of this.inventorySources.entries()) {
-      const rules = source.templateRules;
-      if (rules && rules.some((rule) => rule.templateId === id)) {
-        previousSources.set(sourceId, source);
-        const remaining = rules.filter((rule) => rule.templateId !== id);
-        this.inventorySources.set(sourceId, { ...source, templateRules: remaining, revision: randomUUID() });
-      }
-    }
-    let deletionCommitted = false;
+    const sourceChanges = [...this.inventorySources.values()]
+      .filter((source) => source.templateRules?.some((rule) => rule.templateId === id))
+      .map((previous) => ({
+        previous,
+        next: {
+          ...previous,
+          templateRules: previous.templateRules!.filter((rule) => rule.templateId !== id),
+          revision: randomUUID()
+        } satisfies InventorySourceConfig
+      }));
+    const preparedSourceChanges =
+      sourceChanges.length > 0 && this.inventorySourceMutationListeners.size > 0
+        ? await this.prepareInventorySourceMutationForUpdates(sourceChanges)
+        : [];
+    let sourceChangesCommitted = false;
     try {
-      try {
-        if (hadPrevious) {
-          await this.repository.saveDeviceTemplates([...this.deviceTemplates.values()]);
-        }
-        deletionCommitted = true;
-        if (previousSources.size > 0) {
-          await this.repository.saveInventorySources([...this.inventorySources.values()]);
-        }
-      } catch (error) {
-        if (!deletionCommitted) {
-          if (hadPrevious && previousTemplate !== undefined) {
-            this.deviceTemplates.set(id, previousTemplate);
-          }
-          for (const [sourceId, source] of previousSources) {
-            this.inventorySources.set(sourceId, source);
-          }
-        }
-        throw error;
+      if (this.deviceTemplates.get(id) !== previousTemplate) {
+        throw new Error(`Device template "${id}" changed while its source references were being prepared for removal.`);
       }
+      for (const { previous } of sourceChanges) this.assertInventorySourceIncarnation(previous.id, previous);
+      const currentReferences = [...this.inventorySources.values()].filter((source) =>
+        source.templateRules?.some((rule) => rule.templateId === id)
+      );
+      if (currentReferences.length !== sourceChanges.length) {
+        throw new Error(`Inventory source references to device template "${id}" changed during removal.`);
+      }
+      const hadPrevious = previousTemplate !== undefined;
+      this.deviceTemplates.delete(id);
+      const previousSources = new Map<string, InventorySourceConfig>();
+      for (const { previous, next } of sourceChanges) {
+        previousSources.set(previous.id, previous);
+        this.inventorySources.set(previous.id, next);
+      }
+      let deletionCommitted = false;
+      try {
+        try {
+          if (hadPrevious) {
+            await this.repository.saveDeviceTemplates([...this.deviceTemplates.values()]);
+          }
+          deletionCommitted = true;
+          if (previousSources.size > 0) {
+            await this.repository.saveInventorySources([...this.inventorySources.values()]);
+          }
+        } catch (error) {
+          if (!deletionCommitted) {
+            if (hadPrevious && previousTemplate !== undefined) {
+              this.deviceTemplates.set(id, previousTemplate);
+            }
+            for (const [sourceId, source] of previousSources) {
+              this.inventorySources.set(sourceId, source);
+            }
+          }
+          throw error;
+        }
+      } finally {
+        this.emitChanged();
+      }
+      sourceChangesCommitted = true;
     } finally {
-      this.emitChanged();
+      this.finishInventorySourceMutation(preparedSourceChanges, sourceChangesCommitted);
     }
   }
 

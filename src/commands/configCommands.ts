@@ -1895,10 +1895,7 @@ const SHARED_SOURCE_RULES = {
   // it for the completion message) — see `importShareData`.
   prunePolicy: "link",
   defaultUsername: () => SHARED_USERNAME,
-  config: (config, source) =>
-    typeof config === "object" && config !== null && !Array.isArray(config)
-      ? sanitizeSharedSourceConfig(source.providerId, config, source.secretFieldIds)
-      : config,
+  config: "link",
   secretFieldIds: "keep",
   lastSyncAt: "drop",
   revision: "drop",
@@ -2359,6 +2356,27 @@ function sanitizeSharedSourceConfig(providerId: unknown, config: InventorySource
   return next;
 }
 
+function sanitizeAndRemapSharedSourceConfig(
+  providerId: unknown,
+  config: InventorySourceValues,
+  secretFieldIds: unknown,
+  linkServer: (id: string) => string | undefined
+): InventorySourceValues {
+  const next = sanitizeSharedSourceConfig(providerId, config, secretFieldIds);
+  if (providerId === "containerlab") {
+    const sourceHostId = next.labHostId;
+    if (typeof sourceHostId === "string") {
+      next.labHostId = linkServer(sourceHostId) ?? "";
+    } else if (next.location === "ssh") {
+      // Keep a remote source visibly remote and invalid when the share did not
+      // carry its discovery host. Falling back to local would run on the
+      // recipient's extension host against a different Docker daemon.
+      next.labHostId = "";
+    }
+  }
+  return next;
+}
+
 /**
  * The template ids the sources' `templateRules` name — the only device
  * templates a share carries, in either direction: the export asks it of the
@@ -2644,6 +2662,7 @@ export function sanitizeForSharing(
       shareRecord(source, SHARED_SOURCE_RULES, {
         id: () => sourceIdMap.get(source.id)!,
         prunePolicy: (policy) => policy,
+        config: (config) => sanitizeAndRemapSharedSourceConfig(source.providerId, config, source.secretFieldIds, lenses.linkServer),
         authProfileId: (id) => linkSyncAuthProfile(id, lenses),
         templateRules: (rules) => remapSharedTemplateRules(rules, (id) => templateIdMap.get(id))
       }) as InventorySourceConfig
@@ -3896,6 +3915,7 @@ export function registerConfigCommands(
       const remappedSource = shareRecord(source, SHARED_SOURCE_RULES, {
         id: () => newSourceId,
         prunePolicy: (policy) => (policy === "delete" ? "orphan" : policy),
+        config: (config) => sanitizeAndRemapSharedSourceConfig(source.providerId, config, source.secretFieldIds, lenses.linkServer),
         authProfileId: (id) => linkSyncAuthProfile(id, lenses),
         templateRules: (rules) => remapSharedTemplateRules(rules, (id) => validTemplates.get(id)?.id)
       }) as InventorySourceConfig;
@@ -3926,7 +3946,7 @@ export function registerConfigCommands(
     const importedSourceIds: string[] = [];
     let deletePoliciesOrphaned = 0;
     for (const { payloadId, record, deletePolicy } of landingSources) {
-      await core.addOrUpdateInventorySource(record);
+      await core.addOrUpdateInventorySource(record, { forceNewActivationGeneration: true });
       if (typeof payloadId === "string") {
         sourceIdMap.set(payloadId, record.id);
       }
@@ -4586,7 +4606,7 @@ export function registerConfigCommands(
     data.inventorySources = sanitizedInventorySources.sources;
     skipped += sanitizedInventorySources.skipped;
     const inventorySourceTally = await importPreservingIds(data.inventorySources, existingIds, validateInventorySource, (e) =>
-      core.addOrUpdateInventorySource(e)
+      core.addOrUpdateInventorySource(e, { forceNewActivationGeneration: true })
     );
     // Environment restored from the encrypted section first; see `restoreEnvFromSecrets`.
     restoreEnvFromSecrets(data.localShellProfiles, decryptedSecrets?.localShellEnv);
