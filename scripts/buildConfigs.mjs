@@ -100,7 +100,10 @@ export function createBuildConfigs({ production }) {
 
     // Serial sidecar worker — runs as a bare child process (spawned by
     // SerialSidecarManager), needs serialport at runtime. serialport has
-    // native addons loaded via node-gyp-build and must stay in node_modules.
+    // native addons loaded via node-gyp-build and must stay in node_modules;
+    // like every `external` a bundle cannot run without, it must also ship
+    // in the VSIX, which test/unit/vsixPackaging.test.ts enforces against
+    // .vscodeignore.
     // Out-of-host exactly like the daemon below: no extension host, no
     // injected `vscode` loader, so it gets the same guard. The plugin's
     // /^vscode$/ resolve filter does not touch the "serialport" external.

@@ -2,6 +2,14 @@
 
 ## [2.8.303] — 2026-10-20
 
+### Security
+
+- **Dependency updates close one advisory in the SSH proxy path and one in the Local Shell sidecar.** `ip-address` (10.7.2 → 10.7.4) fixes a moderate denial of service in which one long string made `Address6` match a zone identifier in quadratic time (GHSA-rxp7-6hxx-x8q5). It is compiled into the extension through `socks`, which handles SOCKS proxying for SSH connections. `socks` gives `Address6` either an address Node has already accepted as IPv6 or one built from the 16 raw bytes of the proxy's reply, and neither can be the kind of string that triggers it, so the slow path was not reachable from a proxy or target address; the extension now carries the fixed copy all the same. `anyhow` (1.0.102 → 1.0.103), a Rust library in the Local Shell sidecar, fixes an unsoundness in `Error::downcast_mut` (RUSTSEC-2026-0190), which the sidecar never calls. `npm audit --omit=dev`, which covers every JavaScript dependency the extension ships, now reports no vulnerabilities.
+
+### Changed
+
+- **The installed extension is smaller: it no longer packages files it never reads.** Every JavaScript library the extension uses is compiled into its bundled files, except `serialport`, which the serial port sidecar loads from disk together with the libraries it needs. Separate copies of the SOCKS, DHCP, XML and JSONC libraries, the TypeScript type definitions of every packaged library, a build-time patch file and a search-tool configuration file were still packaged next to the bundles although nothing read them. They are gone: 197 fewer files, about 1.4 MB less on disk once installed and about 0.4 MB less to download. None of the extension's own code changed, and everything documented for scripts (`nexus.*`, `nexus.include()`, Node built-ins) works as before. The one visible effect is on scripts that import one of the removed libraries by its bare package name, such as `await import("jsonc-parser")`: that only ever worked because those copies happened to be packaged, was never documented, and now fails with a module-not-found error (`ERR_MODULE_NOT_FOUND`). A bare `import()` never looks in the scripts folder, so a script that needs a library should keep a self-contained copy (a single `.js` file) there and load it with `nexus.include()`.
+
 ## [2.8.302] — 2026-10-20
 
 ### Added

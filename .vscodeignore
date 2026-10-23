@@ -17,6 +17,12 @@ coverage/**
 .gitignore
 package-lock.json
 
+# Build-time inputs, never read at run time: patch-package applies patches/
+# to node_modules during npm ci, before esbuild compiles the patched code
+# into the bundles, and .ignore is a ripgrep rule for searching the repository.
+patches/**
+.ignore
+
 # IDE and tooling
 **/.git/**
 **/.vscode/**
@@ -33,10 +39,29 @@ CLAUDE.md
 # Media file
 media/demo-jump-host.gif
 
-# Node modules — only serialport (native) is needed at runtime; everything else is bundled
+# Node modules
+#
+# The extension is bundled by esbuild (esbuild.mjs, scripts/buildConfigs.mjs).
+# The only thing a bundle loads from node_modules at run time is serialport
+# (the serial sidecar's `external`) plus its own dependency closure. Every
+# other production dependency is compiled into dist/*.js, or left out on
+# purpose because ssh2 runs without it (cpu-features, ssh2's optional native
+# accelerator, and the native-build helpers nan and buildcheck). Shipping
+# their files is dead weight: nothing loads them, yet VSIX scanners report
+# them. (npm audit --omit=dev still covers them through package-lock.json.)
+#
+# How vsce reads this file: a file is dropped when ANY ignore line matches it
+# and NO `!` line does. Line order plays no part and a `!` line beats every
+# ignore line, so never add a `!node_modules/...` line: a former
+# `!node_modules/**/*.d.ts` kept the type definitions of excluded packages
+# (tweetnacl/nacl.d.ts among them) in the VSIX.
+#
+# Adding a production dependency? If esbuild bundles it, add
+# `node_modules/<name>/**` below. If a bundle loads it from disk (an
+# `external` in scripts/buildConfigs.mjs) it must NOT be listed.
+# test/unit/vsixPackaging.test.ts derives both facts from package-lock.json
+# and fails either way.
 node_modules/.package-lock.json
-
-# Exclude all node_modules EXCEPT serialport and its native dependencies
 node_modules/ssh2/**
 node_modules/asn1/**
 node_modules/bcrypt-pbkdf/**
@@ -48,6 +73,20 @@ node_modules/buildcheck/**
 node_modules/esbuild/**
 node_modules/@rollup/**
 node_modules/rollup/**
+node_modules/@nodable/entities/**
+node_modules/anynum/**
+node_modules/dhcp/**
+node_modules/fast-xml-builder/**
+node_modules/fast-xml-parser/**
+node_modules/ip-address/**
+node_modules/is-unsafe/**
+node_modules/jsonc-parser/**
+node_modules/minimist/**
+node_modules/path-expression-matcher/**
+node_modules/smart-buffer/**
+node_modules/socks/**
+node_modules/strnum/**
+node_modules/xml-naming/**
 
 # Strip non-essential files from remaining node_modules
 node_modules/**/test/**
@@ -62,7 +101,6 @@ node_modules/**/.eslintignore
 node_modules/**/.prettierrc*
 node_modules/**/tsconfig.json
 node_modules/**/*.ts
-!node_modules/**/*.d.ts
 node_modules/**/*.map
 node_modules/**/*.mjs
 node_modules/**/*.md

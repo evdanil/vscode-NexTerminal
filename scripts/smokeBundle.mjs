@@ -10,13 +10,18 @@
  * instead of on a user's machine. Asserts the bundle loads and exports
  * activate()/deactivate().
  *
+ * The bundle is loaded from inside the repository, where node_modules is
+ * installed, so a bare `require("some-package")` that esbuild left in it would
+ * quietly resolve here and pass, then fail in the installed extension, whose
+ * VSIX carries only what the serial sidecar loads from node_modules. The
+ * loader hook below therefore refuses every bare request that is neither a
+ * Node builtin nor one of the stubs, as Node would with nothing installed.
+ *
  * Run AFTER `node esbuild.mjs --production`. Exits non-zero on any failure so a
  * CI build fails before publish. This is the gate unit tests + a green esbuild
- * build do NOT provide: they exercise SOURCE (node_modules resolves), never the
- * packaged bundle with no node_modules alongside it.
+ * build do NOT provide: they exercise SOURCE, where node_modules resolves.
  */
-import { createRequire } from "node:module";
-import Module from "node:module";
+import Module, { createRequire, isBuiltin } from "node:module";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
@@ -29,15 +34,15 @@ if (!existsSync(bundlePath)) {
   process.exit(1);
 }
 
-// Modules the MAIN extension bundle keeps external (see esbuild.mjs:
+// Modules the MAIN extension bundle keeps external (see scripts/buildConfigs.mjs:
 // external: ["vscode", "cpu-features"]). They are NOT in the bundle, so a bare
 // require() of them resolves against node_modules / the host: `vscode` is
 // provided by the extension host (absent here), and `cpu-features` is ssh2's
 // optional native accel (ssh2 try/catches it). Stub both so module-level
 // evaluation doesn't fail for an unrelated reason and mask — or falsely trip —
-// the bundle-integrity check. NOTE: serialport is NOT external in the main
-// bundle (it's inlined; external only in the sidecar-worker build), so it needs
-// no stub here — any load-time problem in its inlined code SHOULD surface.
+// the bundle-integrity check. NOTE: serialport is not in the main bundle at
+// all: only the serial sidecar worker (a separate bundle, not loaded here)
+// requires it, from node_modules.
 const EXTERNAL_STUBS = new Map([
   ["vscode", makeVscodeStub()],
   ["cpu-features", {}],
@@ -46,6 +51,18 @@ const EXTERNAL_STUBS = new Map([
 const realLoad = Module._load;
 Module._load = function (request, parent, isMain) {
   if (EXTERNAL_STUBS.has(request)) return EXTERNAL_STUBS.get(request);
+  const relativeOrAbsolute = request.startsWith("./") || request.startsWith("../") || path.isAbsolute(request);
+  if (!isBuiltin(request) && !relativeOrAbsolute) {
+    // Shaped like Node's own failure, so code that try/catches an optional
+    // require (as ssh2 does for cpu-features) sees what a user's machine shows.
+    const err = new Error(
+      `Cannot find module '${request}': the bundle requires it from node_modules at load time, and the ` +
+        `packaged extension does not provide it. Let esbuild bundle it; if it truly must load from disk, ` +
+        `declare it external in scripts/buildConfigs.mjs and add it to EXTERNAL_STUBS here.`
+    );
+    err.code = "MODULE_NOT_FOUND";
+    throw err;
+  }
   return realLoad.call(this, request, parent, isMain);
 };
 
