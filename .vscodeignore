@@ -17,6 +17,12 @@ coverage/**
 .gitignore
 package-lock.json
 
+# Build-time inputs, never read at run time: patch-package applies patches/
+# to node_modules during npm ci, before esbuild compiles the patched code
+# into the bundles, and .ignore is a ripgrep rule for searching the repository.
+patches/**
+.ignore
+
 # IDE and tooling
 **/.git/**
 **/.vscode/**

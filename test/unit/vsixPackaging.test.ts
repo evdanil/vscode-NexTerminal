@@ -197,3 +197,13 @@ describe("the VSIX ships exactly the node_modules the bundles load from disk", (
     ).toEqual([]);
   });
 });
+
+describe("the VSIX leaves out build-time inputs", () => {
+  // patch-package applies patches/ to node_modules during npm ci, before
+  // esbuild compiles the patched code into the bundles, and .ignore is a
+  // ripgrep rule for searching the repository. Nothing reads either at run time.
+  it("ships no patch file and no .ignore", () => {
+    const buildInputs = [...readdirSync(path.join(ROOT, "patches")).map((name) => `patches/${name}`), ".ignore"];
+    expect(buildInputs.filter(wouldShip)).toEqual([]);
+  });
+});
