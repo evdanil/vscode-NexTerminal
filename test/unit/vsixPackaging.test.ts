@@ -231,6 +231,9 @@ describe("the VSIX leaves out local tooling", () => {
       ".specify/memory.md",
       ".worktrees/issue-1/package.json",
       ".demo-lab/record.sh",
+      // vsce's own default `.github` gets no `/**` appended, so it drops only a
+      // file named `.github`: the workflows stay out only through `.*/**`.
+      ".github/workflows/release.yml",
       // Made up: a tool adopted after this test was written.
       ".newtool.json",
       ".some-new-tool/cache/state.db"

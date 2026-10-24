@@ -35,7 +35,8 @@ patches/**
 # with no wildcard in its last segment). Both match the top level only.
 .*
 .*/**
-# The same folders at any depth, as a dependency can carry them too.
+# Three of them at any depth too (.git, .vscode, .idea), as a dependency can
+# carry them.
 **/.git/**
 **/.vscode/**
 **/.idea/**
