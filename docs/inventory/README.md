@@ -91,6 +91,15 @@ A source whose **Removed-Device Policy** was **Delete** arrives set to move remo
 
 If you already have a source for the same NetBox, EVE-NG server, Proxmox cluster, GNS3 server or Containerlab lab host, the import adds a second one beside it rather than merging the two, so every device appears once for each source. Remove the one you don't want, choosing **Delete Servers** to take its copies with it.
 
+## VS Code's Node.js and Compressed Responses (CVE-2026-111497)
+
+Every request Nexus sends to a NetBox, EVE-NG, Proxmox VE or GNS3 source — a sync, a status refresh, Test Connection, Start or Stop Node, and for Proxmox VE the guest lookup behind Open Web Console — reads the server's response through the Node.js that VS Code runs it on. CVE-2026-111497, disclosed in October 2026, is a memory-corruption flaw in that runtime's Brotli decompressor which a crafted compressed response can trigger. Whether you are affected depends on your VS Code, not on Nexus — **VS Code 1.143.1 or later is fixed everywhere**:
+
+- **Desktop VS Code 1.123 or later is fixed.** Its Node.js is built against Chromium's copy of Brotli, which carries the fix from Chromium 148 on, so **Help → About** (**Code → About Visual Studio Code** on macOS) can show a Node.js version older than Node.js's own fixed releases (22.23.4, 24.22.1, 26.12.1) while the decompressor is fixed. The **Chromium** line there — 148 or later — is the one that tells. Desktop VS Code 1.122 or earlier is affected.
+- **In a Remote window** (SSH, WSL, Dev Containers, Codespaces), Nexus runs on the VS Code Server, which uses Node.js's own Brotli: the server from VS Code 1.143.1 (Node.js 24.22.1) is fixed, and 1.143.0 or earlier is affected. Updating VS Code updates the server it installs on the remote; a Codespace opened in the browser runs the server GitHub provides.
+
+On an affected version, the server a source points at can send such a response — and so can anything on the network path to it, for a source whose Base URL starts with `http:`; prefer `https:` sources with certificate verification on. A source with **Allow a Self-Signed or Mismatched Certificate** on is not affected by this flaw: that connection asks for an uncompressed response and refuses a compressed one instead of decompressing it (its own exposure, no certificate check, is unchanged). A Containerlab source makes no HTTP requests and is not affected.
+
 ## Upgrade notes
 
 **Why a pruned device is still at the source (2.8.221).** Until 2.8.221 a server whose device stopped syncing and one whose device genuinely vanished read identically in the sync confirmation.
