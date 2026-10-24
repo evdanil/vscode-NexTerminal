@@ -431,6 +431,11 @@ describe("SETTINGS_KEYS", () => {
     expect(policyKeys).toEqual(knownKeys);
     expect(SHARE_SETTINGS_POLICY["nexus.settings.futurePreference"]).toBeUndefined();
   });
+
+  it("never shares the SSH agent choice (⊘ a shared configuration that sets nexus.ssh.agentPath would redirect the recipient's key signing)", () => {
+    expect(SHARE_SETTINGS_POLICY["nexus.ssh.agent"]).toBe("local");
+    expect(SHARE_SETTINGS_POLICY["nexus.ssh.agentPath"]).toBe("local");
+  });
 });
 
 describe("config import command (legacy)", () => {

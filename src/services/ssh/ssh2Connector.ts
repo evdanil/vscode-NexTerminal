@@ -7,7 +7,7 @@ import type { Duplex } from "node:stream";
 // See sshDhGroupCompat.ts for the full story.
 import { uninstallSshDhGroupCompat } from "./sshDhGroupCompat";
 
-import { Client, type Algorithms, type ConnectConfig, type SFTPWrapper, type VerifyCallback } from "ssh2";
+import { Client, createAgent, type Algorithms, type ConnectConfig, type SFTPWrapper, type VerifyCallback } from "ssh2";
 
 // ssh2 captured the shim-wrapped function in its own module closure during the
 // import above, so the wrapper keeps serving our connections — restore the
@@ -26,7 +26,15 @@ import type {
   SshConnector,
   TcpConnectionInfo
 } from "./contracts";
-import { AuthNotJudgedError } from "./authErrors";
+import { AuthNotJudgedError, SshAgentUnavailableError } from "./authErrors";
+import {
+  hostSshAgentLookup,
+  resolveSshAgent,
+  SSH_AGENT_SOURCE_LABELS,
+  sshAgentHoldsNoKeysMessage,
+  sshAgentUnusableMessage,
+  type SshAgentChoice
+} from "./sshAgentLocator";
 
 function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error
@@ -447,7 +455,20 @@ function normalizeConnectionOptions(options?: SshConnectionOptions): Required<Ss
   };
 }
 
-export async function buildConnectConfig(server: ServerConfig, password?: string, passphrase?: string, sock?: Duplex, options?: SshConnectionOptions): Promise<ConnectConfig> {
+/**
+ * `agent` is the socket or pipe `Ssh2Connector` resolved for an SSH Agent
+ * login (`sshAgentLocator.ts`); undefined dials without one. The environment
+ * is not read here: on Windows `SSH_AUTH_SOCK` is normally unset, and passing
+ * it through is what left agent logins with no agent at all.
+ */
+export async function buildConnectConfig(
+  server: ServerConfig,
+  password?: string,
+  passphrase?: string,
+  sock?: Duplex,
+  options?: SshConnectionOptions,
+  agent?: string
+): Promise<ConnectConfig> {
   const normalized = normalizeConnectionOptions(options);
   const base: ConnectConfig = {
     host: server.host,
@@ -471,7 +492,7 @@ export async function buildConnectConfig(server: ServerConfig, password?: string
   if (server.authType === "agent") {
     return {
       ...base,
-      agent: process.env.SSH_AUTH_SOCK
+      agent
     };
   }
 
@@ -487,19 +508,173 @@ export async function buildConnectConfig(server: ServerConfig, password?: string
   };
 }
 
+/** The agent an SSH Agent login dials with — or none, and what to say if the server then refuses. */
+type AgentForLogin =
+  | { readonly path: string; readonly ifRefused?: undefined }
+  | {
+      readonly path?: undefined;
+      /** Why the agent offered no key, as the user is told it. */
+      readonly ifRefused: SshAgentUnavailableError;
+      /** The same, as a short clause for a refusal that was about something else. */
+      readonly unoffered: string;
+    };
+
+/**
+ * An SSH Agent login that went ahead with no agent key ends, if the server
+ * refuses everything else, in ssh2's "All configured authentication methods
+ * failed" — which names neither the agent nor a fix. While the server has
+ * judged nothing the user typed, the agent is the whole story and its own
+ * explanation replaces that failure. Once a keyboard-interactive answer went
+ * in (a device's "Password:" prompt), the same failure means that answer was
+ * refused — an `auth` failure exactly as it was before agent discovery — so it
+ * is kept, with the missing agent added as context in words no classifier
+ * branch reads as anything else. Any other failure (network, host key, a
+ * cancelled prompt) is not the agent's doing and passes through as it is.
+ */
+function explainAgentShortfall(agent: AgentForLogin | undefined, error: Error, answeredKeyboardInteractive: boolean): Error {
+  if (!agent?.ifRefused || !/all configured authentication methods failed/i.test(error.message)) {
+    return error;
+  }
+  if (answeredKeyboardInteractive) {
+    return Object.assign(new Error(`${error.message} (no SSH agent key was offered: ${agent.unoffered})`, { cause: error }), {
+      level: (error as { level?: unknown }).level
+    });
+  }
+  return new SshAgentUnavailableError(agent.ifRefused.message, { cause: error });
+}
+
+const AGENT_KEY_CHECK_TIMEOUT_MS = 5_000;
+
+/** ssh2's OpenSSHAgent reports every failure before its socket connects as exactly this. */
+const SSH2_AGENT_CONNECT_FAILURE = "Failed to connect to agent";
+
+/**
+ * How many keys the agent at `path` offers. Asked before dialling, so a
+ * missing, hung or empty agent is reported as itself rather than as a failed
+ * login. The timeout keeps a hung agent from hanging the connect, and the
+ * connect's own cancellation stops it at once.
+ *
+ * ssh2 opens the agent's socket through the agent's `getStream` (OpenSSHAgent,
+ * and CygwinAgent, which inherits it), so that is wrapped to keep the socket:
+ * a check that gives up closes it instead of leaving one open per connect to
+ * a hung agent. A socket still connecting when the check gives up is not yet
+ * handed over and is left to fail or close on its own.
+ */
+export function countAgentKeys(path: string, signal?: AbortSignal, timeoutMs = AGENT_KEY_CHECK_TIMEOUT_MS): Promise<number> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortReason(signal));
+      return;
+    }
+    const agent = createAgent(path);
+    let stream: Duplex | undefined;
+    const getStream = agent.getStream?.bind(agent);
+    if (getStream) {
+      agent.getStream = (cb) =>
+        getStream((error, opened) => {
+          stream = opened;
+          cb(error, opened);
+        });
+    }
+    let settled = false;
+    const settle = (outcome: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      outcome();
+    };
+    const giveUp = (reason: Error): void =>
+      settle(() => {
+        stream?.destroy();
+        reject(reason);
+      });
+    const onAbort = (): void => giveUp(abortReason(signal!));
+    const timer = setTimeout(() => giveUp(new Error(`it did not answer within ${timeoutMs / 1000} seconds`)), timeoutMs);
+    timer.unref?.();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    agent.getIdentities((error, keys) => settle(() => (error ? reject(error) : resolve(keys?.length ?? 0))));
+  });
+}
+
+/** How an SSH Agent login finds its agent; both read on every connect. */
+export interface SshAgentAccess {
+  /** Throws `SshAgentUnavailableError` with the remedy as its message. */
+  resolve(): SshAgentChoice;
+  countKeys(path: string, signal?: AbortSignal): Promise<number>;
+}
+
 export class Ssh2Connector implements SshConnector {
   private connectionOptions: Required<SshConnectionOptions>;
+  private readonly agentAccess: SshAgentAccess;
 
   public constructor(
     private readonly hostKeyVerifier?: HostKeyVerifier,
     connectionOptions?: SshConnectionOptions,
-    private readonly diagnostics?: (line: string) => void
+    private readonly diagnostics?: (line: string) => void,
+    agentAccess?: Partial<SshAgentAccess>
   ) {
     this.connectionOptions = normalizeConnectionOptions(connectionOptions);
+    this.agentAccess = {
+      resolve: agentAccess?.resolve ?? (() => resolveSshAgent(hostSshAgentLookup({ mode: "auto", customPath: "" }))),
+      countKeys: agentAccess?.countKeys ?? countAgentKeys
+    };
   }
 
   public updateConnectionOptions(connectionOptions: SshConnectionOptions): void {
     this.connectionOptions = normalizeConnectionOptions(connectionOptions);
+  }
+
+  /**
+   * Resolved on every connect — pooled, jump-host and tunnel connections
+   * included — so a change to `nexus.ssh.agent`, or Pageant starting, applies
+   * at the next login. A pooled connection already open is reused without
+   * one, so it keeps the agent it logged in with until it closes (idle
+   * timeout or Reload Window). A choice that cannot be honoured is refused here,
+   * before anything is dialled. "No agent key to offer" (nothing found in auto
+   * mode, or an empty agent) is not: those logins always went on to the
+   * server's other methods, typically a keyboard-interactive password prompt,
+   * and still do.
+   */
+  private async agentForLogin(label: string, signal?: AbortSignal): Promise<AgentForLogin> {
+    let choice: SshAgentChoice;
+    try {
+      choice = this.agentAccess.resolve();
+    } catch (error) {
+      if (error instanceof SshAgentUnavailableError && error.proceedWithoutAgent) {
+        this.diagnostics?.(`[agent] ${label}: none found, trying the server's other login methods — ${error.message}`);
+        return { ifRefused: error, unoffered: "no agent was found" };
+      }
+      this.diagnostics?.(`[agent] ${label}: ${error instanceof Error ? error.message : String(error)}`);
+      throw error;
+    }
+    const where = `${SSH_AGENT_SOURCE_LABELS[choice.source]} at ${choice.agent} (${choice.note})`;
+    let keys: number;
+    try {
+      keys = await this.agentAccess.countKeys(choice.agent, signal);
+    } catch (error) {
+      // A cancel is the user's, not the agent's: it must stay a cancel.
+      throwIfAborted(signal);
+      const detail = error instanceof Error ? error.message : String(error);
+      if (choice.ifUnreachable && detail === SSH2_AGENT_CONNECT_FAILURE) {
+        this.diagnostics?.(
+          `[agent] ${label}: nothing answers at ${where}, so no agent was found; trying the server's other login methods`
+        );
+        return { ifRefused: choice.ifUnreachable, unoffered: "no agent was found" };
+      }
+      this.diagnostics?.(`[agent] ${label}: ${where} cannot be used — ${detail}`);
+      // The agent came from this machine's lookup, so this is its platform.
+      throw new SshAgentUnavailableError(sshAgentUnusableMessage(choice, error, process.platform), { cause: error });
+    }
+    if (keys === 0) {
+      this.diagnostics?.(`[agent] ${label}: ${where} holds no keys, trying the server's other login methods`);
+      return {
+        ifRefused: new SshAgentUnavailableError(sshAgentHoldsNoKeysMessage(choice), { proceedWithoutAgent: true }),
+        unoffered: "the agent holds no keys"
+      };
+    }
+    this.diagnostics?.(`[agent] ${label}: ${where} — ${keys} ${keys === 1 ? "key" : "keys"}`);
+    return { path: choice.agent };
   }
 
   public async connect(
@@ -514,7 +689,10 @@ export class Ssh2Connector implements SshConnector {
       signal?: AbortSignal;
     }
   ): Promise<SshConnection> {
-    const config = await buildConnectConfig(server, auth.password, auth.passphrase, auth.sock, this.connectionOptions);
+    const label = `${server.name} (${server.host})`;
+    throwIfAborted(auth.signal);
+    const agent = server.authType === "agent" ? await this.agentForLogin(label, auth.signal) : undefined;
+    const config = await buildConnectConfig(server, auth.password, auth.passphrase, auth.sock, this.connectionOptions, agent?.path);
     throwIfAborted(auth.signal);
     let hostKeyError: unknown;
     if (this.hostKeyVerifier) {
@@ -551,6 +729,16 @@ export class Ssh2Connector implements SshConnector {
         return;
       }
       let banner: string | undefined;
+      // Whether the server has been sent anything typed for it to judge — see
+      // explainAgentShortfall: after that, a refusal is the answer's, not the
+      // missing agent's.
+      let answeredKeyboardInteractive = false;
+      const answer = (finish: (responses: string[]) => void, responses: string[]): void => {
+        if (responses.some((response) => response !== "")) {
+          answeredKeyboardInteractive = true;
+        }
+        finish(responses);
+      };
       client.on("banner", (message: string) => {
         // A live sink handles banners immediately, so getBanner() must stay
         // empty and sshPty.ts will not print them a second time. A pooled
@@ -578,7 +766,7 @@ export class Ssh2Connector implements SshConnector {
           }));
           auth.onKeyboardInteractive(name, instructions, mapped, authAbort.signal).then(
             (responses) => {
-              if (!authAbort.signal.aborted) finish(responses);
+              if (!authAbort.signal.aborted) answer(finish, responses);
             },
             (error) => {
               if (authAbort.signal.aborted) return;
@@ -590,12 +778,11 @@ export class Ssh2Connector implements SshConnector {
         }
         // Legacy fallback: auto-fill password for all prompts
         if (auth.password) {
-          finish(prompts.map(() => auth.password!));
+          answer(finish, prompts.map(() => auth.password!));
           return;
         }
         finish([]);
       });
-      const label = `${server.name} (${server.host})`;
       client.on("ready", () => {
         if (settled) return;
         authAbort.abort();
@@ -611,7 +798,7 @@ export class Ssh2Connector implements SshConnector {
           // Pre-ready errors are the caller's to handle and MUST stay a plain
           // rejection — the connect flow (auth retry, host-key prompts) reads
           // them. Nothing is logged here on purpose.
-          reject(hostKeyError instanceof Error ? hostKeyError : error);
+          reject(hostKeyError instanceof Error ? hostKeyError : explainAgentShortfall(agent, error, answeredKeyboardInteractive));
           return;
         }
         // Post-ready these used to be dropped on the floor, which is why a

@@ -112,7 +112,14 @@ export type FormFieldDescriptor =
    * plain rule-and-label, so every form's groups read alike and the label is
    * escaped rather than trusted as markup.
    */
-  | ({ type: "section"; label: string } & FormFieldCommon);
+  | ({ type: "section"; label: string } & FormFieldCommon)
+  /**
+   * A line of explanatory text between fields, e.g. one shown only for a
+   * particular choice. Like `section` it carries no `key` and its text is
+   * escaped; unlike `html` it is not an illustration card, so it neither gets
+   * that border nor widens the form (`body:has(.form-illustration)`).
+   */
+  | ({ type: "note"; text: string } & FormFieldCommon);
 
 export interface FormDefinition {
   title: string;

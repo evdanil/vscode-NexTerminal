@@ -14,7 +14,7 @@ import {
   proxyPasswordSecretKey,
   legacyProxyPasswordSecretKey
 } from "../../src/services/ssh/silentAuth";
-import { AuthNotJudgedError } from "../../src/services/ssh/authErrors";
+import { AuthNotJudgedError, SshAgentUnavailableError } from "../../src/services/ssh/authErrors";
 import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 import { PassThrough } from "node:stream";
@@ -312,6 +312,27 @@ describe("SilentAuthSshFactory", () => {
       await expect(factory.connect(baseServer)).rejects.toThrow("canceled");
 
       expect(vault.delete).not.toHaveBeenCalled();
+      expect(prompt.prompt).not.toHaveBeenCalled();
+    });
+
+    it("an SSH agent failure — by its type alone, even worded like a server rejection (⊘ an agent error that is not AuthNotJudged would delete the password)", async () => {
+      // Worded on purpose with the exact text isAuthError matches, so only the
+      // error's type stands between it and the vault. (The real agent messages
+      // never use that wording either — pinned in sshAgentLocator.test.ts.)
+      const exhausted = Object.assign(new Error("All configured authentication methods failed"), { level: "client-authentication" });
+      const connector: SshConnector = {
+        connect: vi.fn(async () => {
+          throw new SshAgentUnavailableError("All configured authentication methods failed", { cause: exhausted });
+        })
+      };
+      const vault = createVault({ [savedKey]: "good-secret" });
+      const prompt: PasswordPrompt = { prompt: vi.fn() };
+      const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, undefined, lookup);
+
+      await expect(factory.connect(baseServer)).rejects.toBeInstanceOf(SshAgentUnavailableError);
+
+      expect(vault.delete).not.toHaveBeenCalled();
+      expect(await vault.get(savedKey)).toBe("good-secret");
       expect(prompt.prompt).not.toHaveBeenCalled();
     });
 

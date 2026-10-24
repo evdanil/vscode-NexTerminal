@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AuthNotJudgedError } from "../../src/services/ssh/authErrors";
+import { AuthNotJudgedError, SshAgentUnavailableError } from "../../src/services/ssh/authErrors";
 import { classifySshConnectionError } from "../../src/services/ssh/connectionDiagnostics";
 
 describe("classifySshConnectionError", () => {
@@ -188,6 +188,61 @@ describe("classifySshConnectionError", () => {
   it("still classifies a bare 'socks5 authentication failed' as proxy via the broad keyword", () => {
     const result = classifySshConnectionError(new Error("socks5 authentication failed"));
     expect(result.stage).toBe("proxy");
+  });
+
+  describe("agent stage", () => {
+    const NO_AGENT =
+      "No SSH agent found. Start Pageant (PuTTY 0.75 or newer) or the OpenSSH Authentication Agent service, or set nexus.ssh.agent to custom and enter the agent's pipe.";
+
+    it("classifies an agent refusal as `agent`, carrying its remedy as the detail (⊘ the auth branch would read 'Authentication Agent' as a rejected login)", () => {
+      const result = classifySshConnectionError(new SshAgentUnavailableError(NO_AGENT));
+      expect(result).toMatchObject({ ok: false, stage: "agent", title: "SSH agent could not be used", detail: NO_AGENT });
+    });
+
+    it("keeps the agent stage whatever the agent's path contains (⊘ a keyword branch would read a path through 'proxy' or 'timeout' as a network failure and retry the alternate host)", () => {
+      const message =
+        "Could not use the SSH agent at /run/socks-proxy/timeout/agent.sock (nexus.ssh.agentPath): Failed to connect to agent. Check nexus.ssh.agentPath and that the agent is running, then connect again.";
+      expect(classifySshConnectionError(new SshAgentUnavailableError(message)).stage).toBe("agent");
+    });
+
+    it("finds an agent refusal wrapped as another error's cause", () => {
+      const wrapped = new Error("SSH connect failed", { cause: new SshAgentUnavailableError(NO_AGENT) });
+      expect(classifySshConnectionError(wrapped)).toMatchObject({ stage: "agent", detail: NO_AGENT });
+    });
+
+    for (const ssh2Message of ["Failed to connect to agent", "Failed to retrieve identities from agent"]) {
+      it(`classifies ssh2's "${ssh2Message}" as agent, not auth`, () => {
+        const result = classifySshConnectionError(Object.assign(new Error(ssh2Message), { level: "agent" }));
+        expect(result.stage).toBe("agent");
+        expect(result.title).toBe("SSH agent could not be used");
+      });
+    }
+
+    it("leaves a jump host whose agent failed as `proxy` — the hop is what failed (⊘ checking for the agent before the jump-host phrase)", () => {
+      const jumpText = classifySshConnectionError(new Error("Jump host connection failed (Bastion): Failed to connect to agent"));
+      expect(jumpText.stage).toBe("proxy");
+      const jumpTyped = classifySshConnectionError(
+        new Error(`Jump host connection failed (Bastion): ${NO_AGENT}`, { cause: new SshAgentUnavailableError(NO_AGENT) })
+      );
+      expect(jumpTyped.stage).toBe("proxy");
+    });
+
+    it("keeps a jump host's agent failure `proxy` but carries the agent's remedy as the detail (⊘ the generic proxy text hides what to fix)", () => {
+      const result = classifySshConnectionError(
+        new Error(`Jump host connection failed (Bastion): ${NO_AGENT}`, { cause: new SshAgentUnavailableError(NO_AGENT) })
+      );
+      expect(result.stage).toBe("proxy");
+      expect(result.detail).toBe(`The jump host's SSH agent could not be used. ${NO_AGENT}`);
+      // Any other jump-host failure keeps the generic proxy detail.
+      expect(classifySshConnectionError(new Error("Jump host connection failed (Bastion): connect ECONNREFUSED")).detail).toBe(
+        "Nexus could not complete the configured proxy or jump-host connection."
+      );
+    });
+
+    it("does not claim other agent-free failures", () => {
+      expect(classifySshConnectionError(new Error("All configured authentication methods failed")).stage).toBe("auth");
+      expect(classifySshConnectionError(new Error("user agent string rejected")).stage).not.toBe("agent");
+    });
   });
 
   it("falls back to an unknown failure without including raw secret-looking text", () => {

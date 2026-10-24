@@ -30,6 +30,14 @@ export interface SettingMeta {
   visibleWhen?: { setting: string; value: unknown };
 }
 
+/**
+ * Shown beside the SSH Agent authentication choice in the server form and the
+ * auth profile editor: the agent is one setting for the machine, not a
+ * per-server field, so the form says where it lives.
+ */
+export const SSH_AGENT_FORM_NOTE =
+  "Uses the agent chosen in Settings → SSH → SSH Agent — by default SSH_AUTH_SOCK, or on Windows Pageant or the OpenSSH agent. One choice for every server on this machine.";
+
 export const SETTINGS_META: SettingMeta[] = [
   // --- Logging ---
   {
@@ -103,6 +111,46 @@ export const SETTINGS_META: SettingMeta[] = [
     max: 3600,
     unit: "seconds",
     badge: "Requires reload"
+  },
+  // --- SSH > SSH Agent ---
+  // No "Requires reload" badge: every connect reads both (sshAgentSettings.ts).
+  {
+    key: "agent",
+    section: "nexus.ssh",
+    label: "SSH Agent",
+    type: "enum",
+    category: "ssh",
+    subgroup: "SSH Agent",
+    description:
+      "Which agent answers SSH Agent logins on this machine, for terminals, SFTP, tunnels and jump hosts. A workspace cannot change it. Applies at the next login; an open shared connection keeps its login.",
+    default: "auto",
+    enumOptions: [
+      {
+        label: "Automatic",
+        value: "auto",
+        description: "SSH_AUTH_SOCK when set; otherwise on Windows Pageant (0.75 or newer), then the OpenSSH agent",
+        recommended: true
+      },
+      { label: "Pageant (Windows)", value: "pageant", description: "PuTTY's Pageant 0.75 or newer, found by its named pipe" },
+      {
+        label: "OpenSSH Agent (Windows)",
+        value: "openssh",
+        description: "The OpenSSH Authentication Agent service, or another agent on its pipe (e.g. 1Password)"
+      },
+      { label: "Custom socket or pipe", value: "custom", description: "The path in Agent Socket or Pipe" }
+    ]
+  },
+  {
+    key: "agentPath",
+    section: "nexus.ssh",
+    label: "Agent Socket or Pipe",
+    type: "string",
+    category: "ssh",
+    subgroup: "SSH Agent",
+    description:
+      "Full path of the agent's socket (Linux, macOS) or named pipe (Windows, \\\\.\\pipe\\…). For PuTTY's Unix Pageant, run pageant --symlink <fixed path> and enter that path.",
+    default: "",
+    visibleWhen: { setting: "nexus.ssh.agent", value: "custom" }
   },
   {
     key: "trustNewHosts",
@@ -875,7 +923,7 @@ export const CATEGORY_ICONS: Record<string, string> = {
 
 export const CATEGORY_DESCRIPTIONS: Record<string, string> = {
   logging: "Control session transcripts, log locations, and rotation limits.",
-  ssh: "Tune SSH connection sharing, timeouts, keepalives, proxy handshakes, and terminal identity.",
+  ssh: "Tune SSH connection sharing, the SSH agent, timeouts, keepalives, proxy handshakes, and terminal identity.",
   securityData: "Review host trust, credentials, backups, exports, imports, resets, and data deletion.",
   tunnels: "Set defaults for shared or isolated tunnel connections and bind behavior.",
   terminal: "Choose terminal placement, keyboard passthrough, highlighting, and macro trigger behavior.",

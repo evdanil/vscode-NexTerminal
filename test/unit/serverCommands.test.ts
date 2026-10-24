@@ -20,6 +20,7 @@ import { defaultSshDir, deployPublicKeyToRemote, findLocalKeyPairs, generateKeyP
 import { SilentAuthSshFactory, passphraseSecretKey, passwordSecretKey, legacyProxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
 import { currentProxyPasswordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/proxyPasswordKeys";
 import { SshPty } from "../../src/services/ssh/sshPty";
+import { SshAgentUnavailableError } from "../../src/services/ssh/authErrors";
 import { TelnetPty } from "../../src/services/telnet/telnetPty";
 import { AsyncMutex, configMutationLock } from "../../src/services/configMutationLock";
 import { validateServerConfig } from "../../src/utils/validation";
@@ -1451,6 +1452,53 @@ describe("server test connection command", () => {
     expect(copied).toContain("Authentication failed");
     expect(copied).not.toContain("hunter2");
     expect(copied).not.toContain("password hunter2");
+  });
+
+  describe("an SSH agent failure", () => {
+    const NO_AGENT =
+      "No SSH agent found. Start Pageant (PuTTY 0.75 or newer) or the OpenSSH Authentication Agent service, or set nexus.ssh.agent to custom and enter the agent's pipe.";
+
+    async function testAgentServer(choice: string | undefined): Promise<void> {
+      const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [makeServer({ authType: "agent" })] });
+      (ctx.sshFactory as any).connect = vi.fn(async () => {
+        throw new SshAgentUnavailableError(NO_AGENT);
+      });
+      mockShowErrorMessage.mockResolvedValueOnce(choice);
+      registerServerCommands(ctx);
+      await registeredCommands.get("nexus.server.testConnection")!("srv-1");
+    }
+
+    it("shows the agent's own remedy and offers Open Agent Settings beside Copy Details", async () => {
+      await testAgentServer(undefined);
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(`SSH agent could not be used: ${NO_AGENT}`, "Open Agent Settings", "Copy Details");
+    });
+
+    it("Open Agent Settings opens the Nexus settings at the SSH category, and copies nothing", async () => {
+      await testAgentServer("Open Agent Settings");
+      expect(vscode.commands.executeCommand).toHaveBeenCalledWith("nexus.settings.openPanel", "ssh");
+      expect(vscode.env.clipboard.writeText).not.toHaveBeenCalled();
+    });
+
+    it("a jump host's agent failure stays a proxy failure but shows the agent's remedy and offers Open Agent Settings", async () => {
+      const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [makeServer()] });
+      (ctx.sshFactory as any).connect = vi.fn(async () => {
+        throw new Error(`Jump host connection failed (Bastion): ${NO_AGENT}`, { cause: new SshAgentUnavailableError(NO_AGENT) });
+      });
+      mockShowErrorMessage.mockResolvedValueOnce(undefined);
+      registerServerCommands(ctx);
+      await registeredCommands.get("nexus.server.testConnection")!("srv-1");
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(
+        `Proxy connection failed: The jump host's SSH agent could not be used. ${NO_AGENT}`,
+        "Open Agent Settings",
+        "Copy Details"
+      );
+    });
+
+    it("Copy Details still copies, naming the agent stage", async () => {
+      await testAgentServer("Copy Details");
+      expect(vi.mocked(vscode.env.clipboard.writeText).mock.calls[0][0]).toContain("Stage: agent");
+      expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexus.settings.openPanel", "ssh");
+    });
   });
 
   it("falls back to a server QuickPick when no server tree item is supplied", async () => {

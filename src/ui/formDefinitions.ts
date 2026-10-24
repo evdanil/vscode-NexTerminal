@@ -25,6 +25,7 @@ import { formatAuthProfileLabel } from "../utils/authProfileLabel";
 import { randomUUID } from "node:crypto";
 import type { FormDefinition, FormFieldDescriptor, FormValues, VisibleWhen, VisibleWhenCondition } from "./formTypes";
 import { tunnelIllustrationSvgs } from "./tunnelIllustrations";
+import { SSH_AGENT_FORM_NOTE } from "./settingsMetadata";
 
 /** Default placement/wording of the shared Auth Profile select — the profile
  *  and serial/SSH profile forms treat it as a power-user shortcut tucked into
@@ -430,6 +431,9 @@ function sshFields(seed?: Partial<ServerConfig>, vw?: VisibleWhen, authProfiles?
       visibleWhen: sshVw
     },
     { type: "file", key: "keyPath", label: "Private Key File", value: seed?.keyPath, hint: "Private key used when Authentication is Private Key.", visibleWhen: andVisibleWhen(sshVw, { field: "authType", value: "key" }) },
+    // The agent is a machine setting, not a field of this server — so SSH Agent
+    // has nothing to fill in here, only where to look.
+    { type: "note", text: SSH_AGENT_FORM_NOTE, visibleWhen: andVisibleWhen(sshVw, { field: "authType", value: "agent" }) },
     // Not part of the SSH connection at all — it is the out-of-band address
     // `${profile.ipmiHost}` resolves to when a macro is run against this
     // profile (services/profileTokens.ts). Advanced, because a server that has

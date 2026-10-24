@@ -1,4 +1,4 @@
-import { isAuthNotJudged } from "./authErrors";
+import { findSshAgentUnavailable, isAuthNotJudged } from "./authErrors";
 
 export type ConnectionDiagnosticStage =
   | "dns"
@@ -7,6 +7,7 @@ export type ConnectionDiagnosticStage =
   | "host-key"
   | "key"
   | "proxy"
+  | "agent"
   | "unknown";
 
 export interface ConnectionDiagnosticResult {
@@ -38,12 +39,35 @@ export function classifySshConnectionError(error: unknown): ConnectionDiagnostic
   // falls through to the concrete DNS/TCP signatures below and keeps its
   // connect-fallback. The broad keyword match runs LAST (just before `auth`).
   if (/jump host connection failed|proxy connection failed/.test(message)) {
+    // A hop whose own agent failed stays `proxy` (that keeps the alternate-host
+    // retry off, as for any failed hop) but says what to fix there.
+    const hopAgent = findSshAgentUnavailable(error);
     return {
       ok: false,
       stage: "proxy",
       title: "Proxy connection failed",
-      detail: "Nexus could not complete the configured proxy or jump-host connection.",
+      detail: hopAgent
+        ? `The jump host's SSH agent could not be used. ${hopAgent.message}`
+        : "Nexus could not complete the configured proxy or jump-host connection.",
       suggestion: "Check the proxy server, credentials, and jump-host settings before retrying."
+    };
+  }
+
+  // SSH AGENT — matched by identity (`SshAgentUnavailableError`, whose message
+  // is Nexus's own remedy) and by ssh2's two agent errors, never by a keyword:
+  // the message names the agent's path, and a path through "proxy" or
+  // "timeout" must not reach the network branches below — a `tcp` stage would
+  // send SshPty to the alternate host, which has the same missing agent. It
+  // runs after the jump-host phrase so a hop whose agent failed stays `proxy`,
+  // and before `auth`, which would read "Authentication Agent" as a rejection.
+  const agentError = findSshAgentUnavailable(error);
+  if (agentError || /^failed to (connect to|retrieve identities from) agent$/.test(message)) {
+    return {
+      ok: false,
+      stage: "agent",
+      title: "SSH agent could not be used",
+      detail: agentError?.message ?? "Nexus could not reach the SSH agent, or it stopped answering during login.",
+      suggestion: "Start the agent, choose another in Settings → SSH → SSH Agent, or edit the server to use another authentication method."
     };
   }
 

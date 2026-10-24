@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "Full SSH + serial + telnet + port-forwarding client inside VS Code — no 300MB Remote-SSH agent on the box. Built for network and infra engineers: SSH, serial and telnet consoles, jump-host chains, SFTP, tunnels, expect/send macros with prompted variables, and a JS scripting engine, all in one sidebar. Bulk-import devices from CSV or a plain host list, save root-owned files over SFTP with sudo, import from MobaXterm/SecureCRT/SSH Config, NetBox, EVE-NG, Proxmox, GNS3 and Containerlab inventory sync with auth profiles and device templates, IPv6/IPv4 dual-address connect-fallback, 2FA, legacy KEX for old Cisco gear.",
-  "version": "2.8.303",
+  "version": "2.8.304",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -4210,6 +4210,32 @@
           "maximum": 200,
           "order": 24,
           "markdownDescription": "Maximum size (in MB) of a single file Nexus will hold in memory. Applies to opening a remote file in the editor, and to transferring a file whose reported size is `0` (pseudo-files and appliances that mis-report size have to be read to the end to find out how big they are). Ordinary uploads and downloads stream and are not limited by this."
+        },
+        "nexus.ssh.agent": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "pageant",
+            "openssh",
+            "custom"
+          ],
+          "default": "auto",
+          "scope": "machine",
+          "order": 5.35,
+          "markdownDescription": "Which SSH agent answers **SSH Agent** logins — servers and auth profiles set to SSH Agent, including servers synced from an inventory source without an auth profile — for terminals, SFTP, tunnels and jump hosts alike. Machine-specific: a workspace cannot set it, so a repository can never redirect your key signing. Takes effect at the next login; a connection that is already open (multiplexing keeps one open for a while after its last terminal closes) keeps the login it has.",
+          "enumDescriptions": [
+            "Use `SSH_AUTH_SOCK` when it is set. Otherwise, on Windows, Pageant's named pipe when Pageant (0.75 or newer) is running, then the Windows OpenSSH Authentication Agent. On Linux and macOS, `SSH_AUTH_SOCK` only.",
+            "Windows only: PuTTY's Pageant 0.75 or newer, found by its named pipe. Fails if Pageant is not running.",
+            "Windows only: the OpenSSH agent pipe (`\\\\.\\pipe\\openssh-ssh-agent`), served by the OpenSSH Authentication Agent service or another agent that provides it (e.g. 1Password).",
+            "The socket or pipe in `#nexus.ssh.agentPath#`."
+          ]
+        },
+        "nexus.ssh.agentPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "order": 5.36,
+          "markdownDescription": "Full path of the SSH agent's socket (Linux, macOS) or named pipe (Windows, `\\\\.\\pipe\\…`), used when `#nexus.ssh.agent#` is `custom`. On Linux, set this when VS Code was started from a desktop launcher and did not inherit `SSH_AUTH_SOCK`. For PuTTY's Unix Pageant, run `pageant --symlink <fixed path>` and enter that path."
         },
         "nexus.ssh.connectionTimeout": {
           "type": "number",

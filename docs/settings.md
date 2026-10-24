@@ -23,6 +23,8 @@ Guide: [SSH and Telnet](ssh-and-telnet.md).
 | `nexus.ssh.multiplexing.enabled` | `true` | Share one SSH connection per server across terminals, tunnels (shared mode) and SFTP. Requires a window reload |
 | `nexus.ssh.multiplexing.idleTimeout` | `300` | Seconds to keep an idle multiplexed connection alive after all channels close (`0` = until the window closes, max `3600`). Requires a window reload |
 | `nexus.ssh.trustNewHosts` | `true` | Auto-trust host keys on first connection (TOFU); prompt only on key change |
+| `nexus.ssh.agent` | `auto` | Which SSH agent answers SSH Agent logins: `auto` (`SSH_AUTH_SOCK`, then on Windows Pageant 0.75+ and the OpenSSH agent), `pageant` or `openssh` (Windows only), or `custom`. Machine-specific — a workspace cannot set it. See [SSH agents](ssh-and-telnet.md#ssh-agents-pageant-and-openssh) |
+| `nexus.ssh.agentPath` | `""` | The agent's socket path (Linux, macOS) or named pipe (Windows), used when `nexus.ssh.agent` is `custom`. Machine-specific |
 | `nexus.ssh.connectionTimeout` | `60` | SSH connection timeout in seconds |
 | `nexus.ssh.keepaliveInterval` | `10` | Interval between SSH keepalive packets in seconds (`0` disables keepalives) |
 | `nexus.ssh.keepaliveCountMax` | `3` | Missed keepalive responses before the connection is treated as dead |

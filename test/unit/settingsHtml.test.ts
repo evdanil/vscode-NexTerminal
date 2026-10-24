@@ -124,6 +124,59 @@ describe("renderSettingsHtml", () => {
     expect(html).toContain("nexus.terminal.keyboardPassthrough");
   });
 
+  /**
+   * The SSH agent path is the first setting gated on an ENUM rather than a
+   * checkbox. An enum's `[data-section][data-key]` element is the
+   * `.custom-select` wrapper — a <div>, whose `.value` is undefined — so the
+   * gate read nothing and the path field could never appear.
+   */
+  describe("visibility gated on an enum setting", () => {
+    function extractFunction(html: string, signature: string): string {
+      const start = html.indexOf(signature);
+      expect(start).toBeGreaterThan(-1);
+      let depth = 0;
+      for (let i = html.indexOf("{", start); i < html.length; i++) {
+        if (html[i] === "{") depth++;
+        if (html[i] === "}" && --depth === 0) return html.slice(start, i + 1);
+      }
+      throw new Error(`unterminated ${signature}`);
+    }
+
+    function runUpdateVisibility(agentMode: string): boolean {
+      const html = renderWithDefaults();
+      expect(html).toContain('data-visible-when-setting="nexus.ssh.agent" data-visible-when-value="custom"');
+      const visible = new Set<string>();
+      const gated = {
+        dataset: { visibleWhenSetting: "nexus.ssh.agent", visibleWhenValue: "custom" },
+        classList: { toggle: (name: string, on: boolean) => (on ? visible.add(name) : visible.delete(name)), remove: (name: string) => visible.delete(name) }
+      };
+      const hidden = { type: "hidden", value: agentMode };
+      const enumWrapper = {
+        classList: { contains: (name: string) => name === "custom-select" },
+        querySelector: (selector: string) => (selector === 'input[type="hidden"]' ? hidden : null)
+      };
+      const document = {
+        querySelectorAll: (selector: string) => (selector === "[data-visible-when-setting]" ? [gated] : []),
+        querySelector: (selector: string) => (selector === '[data-section="nexus.ssh"][data-key="agent"]' ? enumWrapper : null)
+      };
+      const source = extractFunction(html, "function updateVisibility()");
+      (new Function("document", `${source}\nupdateVisibility();`) as (doc: unknown) => void)(document);
+      return visible.has("field-visible");
+    }
+
+    it("shows the agent path when nexus.ssh.agent is custom, and only then", () => {
+      expect(runUpdateVisibility("custom")).toBe(true);
+      expect(runUpdateVisibility("auto")).toBe(false);
+      expect(runUpdateVisibility("pageant")).toBe(false);
+    });
+
+    it("re-evaluates visibility when an enum changes (⊘ the path would stay hidden until the panel reloads)", () => {
+      expect(renderWithDefaults()).toMatch(
+        /hidden\.addEventListener\("change", function\(\) \{\s*saveSetting\(wrapper\.dataset\.section, wrapper\.dataset\.key, hidden\.value\);\s*updateVisibility\(\);/
+      );
+    });
+  });
+
   it("includes save indicator elements", () => {
     const html = renderWithDefaults();
     expect(html).toContain("save-indicator");

@@ -27,6 +27,57 @@ describe("renderAuthProfileEditorHtml", () => {
     expect(saved).toContain("setTimeout(hideSaveFlag");
   });
 
+  describe("SSH Agent note", () => {
+    const AGENT_NOTE = /<div class="form-group conditional-field( visible)?" id="agent-note">/;
+
+    function noteVisibleAfterSelecting(authType: string): boolean {
+      const html = render();
+      const start = html.indexOf("function updateConditionalFields()");
+      expect(start).toBeGreaterThan(-1);
+      let depth = 0;
+      let end = -1;
+      for (let i = html.indexOf("{", start); i < html.length; i++) {
+        if (html[i] === "{") depth++;
+        if (html[i] === "}" && --depth === 0) {
+          end = i;
+          break;
+        }
+      }
+      const classes = (): { add: (c: string) => void; remove: (c: string) => void; has: (c: string) => boolean } => {
+        const set = new Set<string>();
+        return { add: (c) => set.add(c), remove: (c) => set.delete(c), has: (c) => set.has(c) };
+      };
+      const elements: Record<string, { value?: string; classList: ReturnType<typeof classes> }> = {
+        "authtype-select-value": { value: authType, classList: classes() },
+        "password-field": { classList: classes() },
+        "keypath-field": { classList: classes() },
+        "agent-note": { classList: classes() }
+      };
+      const document = { getElementById: (id: string) => elements[id] };
+      (new Function("document", `${html.slice(start, end + 1)}\nupdateConditionalFields();`) as (doc: unknown) => void)(document);
+      return elements["agent-note"].classList.has("visible");
+    }
+
+    it("is rendered visible only for an SSH Agent profile", () => {
+      const agent = render([{ id: "a", name: "Fleet", username: "admin", authType: "agent" }], "a");
+      expect(agent.match(AGENT_NOTE)?.[1]).toBe(" visible");
+      const password = render([{ id: "p", name: "Pw", username: "admin", authType: "password" }], "p");
+      expect(password).toMatch(AGENT_NOTE);
+      expect(password.match(AGENT_NOTE)?.[1]).toBeUndefined();
+    });
+
+    it("follows the Authentication select (⊘ a note that stays as rendered when the type changes)", () => {
+      expect(noteVisibleAfterSelecting("agent")).toBe(true);
+      expect(noteVisibleAfterSelecting("key")).toBe(false);
+      expect(noteVisibleAfterSelecting("password")).toBe(false);
+    });
+
+    it("says the same as the server form's note", () => {
+      expect(render()).toContain("Uses the agent chosen in Settings → SSH → SSH Agent");
+      expect(render()).toContain("One choice for every server on this machine.");
+    });
+  });
+
   it("renders auth type options", () => {
     const html = render();
     expect(html).toContain('data-value="password"');

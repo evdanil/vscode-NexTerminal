@@ -24,6 +24,28 @@ When several SSH logins need input at once, server password, proxy password, key
 
 If the last connection waiting on an open server-password, proxy-password, or key-passphrase dialog closes, Nexus dismisses that dialog so another connection can prompt. A shared dialog stays open while another connection still needs it.
 
+### SSH agents: Pageant and OpenSSH
+
+A server or auth profile set to **SSH Agent** signs in with a key held by an SSH agent — and so does a server synced from an inventory source without an auth profile. Which agent is one choice for the machine, not a field of each server: **SSH Agent** in the Nexus Settings panel's SSH section (`nexus.ssh.agent`). It applies to terminals, SFTP, tunnels and jump hosts alike, and a change takes effect at the next login. A connection that is already open keeps the login it has — including one [connection multiplexing](#connection-multiplexing) keeps open for a while after its last terminal closes (`nexus.ssh.multiplexing.idleTimeout`) — so run **Reload Window**, or wait out that idle time, to make the next connect log in afresh.
+
+With **Automatic** (the default), Nexus looks for the agent on every connection, in this order:
+
+1. `SSH_AUTH_SOCK`, when VS Code was started with it — on any operating system.
+2. On Windows, PuTTY's **Pageant** (0.75 or newer), found by the named pipe it opens for your Windows user. The pipe's name can change when Windows restarts, which is why Nexus finds it each time instead of asking you to enter it.
+3. On Windows, the OpenSSH agent pipe (`\\.\pipe\openssh-ssh-agent`) — the **OpenSSH Authentication Agent** service, or another agent that provides that pipe, such as 1Password.
+
+Nexus only uses a Pageant pipe named for your Windows user name. For some domain, Microsoft and Entra accounts Pageant names its pipe after another form of your name; Nexus then does not use it and names the pipe it found — in the error, or, when it uses the OpenSSH agent pipe instead, in the **Nexus SSH** output channel. If that Pageant is yours, choose **Custom socket or pipe** and enter that pipe (its name can change when Windows restarts).
+
+When both Windows agents are running, Pageant is used; choose **OpenSSH Agent (Windows)** to use the other one. **Pageant (Windows)** and **OpenSSH Agent (Windows)** use only that agent and never fall back to another — they also ignore `SSH_AUTH_SOCK`. **Custom socket or pipe** uses the path in **Agent Socket or Pipe** (`nexus.ssh.agentPath`).
+
+On Windows `SSH_AUTH_SOCK` is often set for the whole user, for example to `\\.\pipe\openssh-ssh-agent`. If the agent it points to is not running, Automatic stops there rather than quietly using another agent: start that agent, choose the agent to use instead (such as **Pageant (Windows)**), or remove `SSH_AUTH_SOCK` from the Windows environment and fully restart VS Code so Automatic can find Pageant or the OpenSSH agent itself.
+
+On Linux and macOS, Automatic uses `SSH_AUTH_SOCK` only. VS Code started from a desktop launcher often does not have it: start VS Code from a shell where your agent runs, or choose Custom and enter the agent's full socket path. PuTTY's Pageant on Linux opens a differently named socket each time it starts; run it as `pageant --symlink <fixed path>` and enter that fixed path.
+
+Before connecting, Nexus asks the agent which keys it holds. If the agent cannot be reached, or does not answer within 5 seconds, the connection stops there with the agent's path and what to do. If no agent is found, or the agent holds no keys (or is locked), the login carries on with whatever else the server offers — on many network devices a keyboard-interactive password prompt, exactly as before. If the server then refuses the login before you have typed anything, the error names the missing agent and the fix; a password or code you typed that the server refuses is reported as a rejected login, as it always was, with a note that no agent key was offered. A terminal's error offers **Open Agent Settings** and **Edit Server**, and Test Connection offers **Open Agent Settings**. The agent each login used, and why, is written to the **Nexus SSH** output channel.
+
+Both settings are machine-specific: a workspace's `.vscode/settings.json` cannot set them and Export for Sharing leaves them out, so neither a repository you open nor a file someone sends you can redirect your key signing to another agent.
+
 ### Deploy an SSH Key
 
 Right-click any server and select "Deploy SSH Key" to automate key-based authentication setup. Discovers existing local keys or generates new ed25519 key pairs, deploys the public key to the remote `authorized_keys`, and optionally converts the server profile to key auth. Cross-platform (Windows, macOS, Linux).
@@ -121,7 +143,7 @@ Everything the terminal layer gives an SSH tab it gives a telnet tab too: [highl
 
 ## Related settings
 
-SSH connection, keepalive, host-key, proxy-timeout and multiplexing settings: [settings.md#ssh](settings.md#ssh).
+SSH connection, SSH agent, keepalive, host-key, proxy-timeout and multiplexing settings: [settings.md#ssh](settings.md#ssh).
 
 ## See also
 

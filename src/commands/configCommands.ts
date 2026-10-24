@@ -418,6 +418,11 @@ export const SHARE_SETTINGS_POLICY: Readonly<Record<string, "share" | "local">> 
   "nexus.ssh.multiplexing.enabled": "local",
   "nexus.ssh.multiplexing.idleTimeout": "local",
   "nexus.ssh.trustNewHosts": "local",
+  // Which agent signs this machine's logins, and where it listens — a shared
+  // file must never redirect a recipient's key signing (both settings are
+  // machine-scoped for the same reason).
+  "nexus.ssh.agent": "local",
+  "nexus.ssh.agentPath": "local",
   "nexus.ssh.connectionTimeout": "share",
   "nexus.ssh.keepaliveInterval": "share",
   "nexus.ssh.keepaliveCountMax": "share",

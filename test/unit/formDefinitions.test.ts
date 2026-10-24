@@ -143,6 +143,71 @@ describe("serverFormDefinition — managed inventory route choice", () => {
   });
 });
 
+describe("SSH Agent note", () => {
+  function agentNotes(definition: FormDefinition): Array<Extract<FormFieldDescriptor, { type: "note" }>> {
+    return definition.fields.filter(
+      (field): field is Extract<FormFieldDescriptor, { type: "note" }> =>
+        field.type === "note" && field.text.includes("Settings → SSH → SSH Agent")
+    );
+  }
+
+  /**
+   * An `html` field renders as `.form-illustration`, and
+   * `body:has(.form-illustration)` widens the whole form from 700px to
+   * 1000px — present in the DOM is enough, hidden or not. The agent note is
+   * on every SSH server form, so as an `html` field it widened every Edit
+   * Server form for every protocol and authentication type.
+   */
+  it("is a plain note that leaves the Edit Server form at its normal width (⊘ an html field widens every server form)", () => {
+    const seed: Partial<ServerConfig> = { id: "s1", name: "prod", host: "h", port: 22, username: "u", authType: "password" };
+    const definition = serverFormDefinition(seed);
+    expect(definition.fields.some((field) => field.type === "html")).toBe(false);
+    const html = renderFormHtml(definition, "nonce");
+    expect(html).not.toContain('class="form-group form-illustration"');
+    expect(html).toMatch(
+      /<div class="form-group form-note" data-visible-when='[^']*&quot;authType&quot;,&quot;value&quot;:&quot;agent&quot;[^']*'>Uses the agent chosen in Settings → SSH → SSH Agent/
+    );
+  });
+
+  it("renders a note's text escaped, never as markup", () => {
+    const html = renderFormHtml({ title: "t", fields: [{ type: "note", text: "<b>bold</b> & more" }] }, "nonce");
+    expect(html).toContain('<div class="form-group form-note">&lt;b&gt;bold&lt;/b&gt; &amp; more</div>');
+  });
+
+  it("server form: one note, shown only for SSH Agent on an SSH server (⊘ an always-visible note talks about agents to password users)", () => {
+    const notes = agentNotes(serverFormDefinition());
+    expect(notes).toHaveLength(1);
+    expect(notes[0].visibleWhen).toEqual([
+      { field: "protocol", value: "ssh" },
+      { field: "authType", value: "agent" }
+    ]);
+  });
+
+  it("unified add form: the same note, also gated on the SSH profile type", () => {
+    const notes = agentNotes(unifiedProfileFormDefinition());
+    expect(notes).toHaveLength(1);
+    expect(notes[0].visibleWhen).toEqual([
+      { field: "profileType", value: "ssh" },
+      { field: "protocol", value: "ssh" },
+      { field: "authType", value: "agent" }
+    ]);
+  });
+
+  it("says where the agent is chosen, what auto finds, and that the choice is the machine's, not the server's", () => {
+    const [note] = agentNotes(serverFormDefinition());
+    expect(note.text).toContain("SSH_AUTH_SOCK");
+    expect(note.text).toContain("Pageant");
+    expect(note.text).toContain("OpenSSH agent");
+    expect(note.text).toContain("One choice for every server on this machine.");
+  });
+
+  it("keeps the option label SSH Agent", () => {
+    const authType = keyedField(serverFormDefinition(), "authType");
+    if (authType.type !== "select") throw new Error("authType should be a select");
+    expect(authType.options).toContainEqual({ label: "SSH Agent", value: "agent" });
+  });
+});
+
 describe("formDefinitions keyPath visibility", () => {
   it("shows server keyPath field only for authType=key on an SSH server", () => {
     // TELNET (Phase 0) — the key-file control now carries the SSH-only gate as

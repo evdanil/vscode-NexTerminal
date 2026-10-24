@@ -63,6 +63,10 @@ function renderField(field: FormFieldDescriptor): string {
   if (field.type === "section") {
     return `<div class="form-section"${visibleWhenAttrs(field)}${requiredWhenAttrs(field)}>${escapeHtml(field.label)}</div>`;
   }
+  if (field.type === "note") {
+    // A .form-group so the shared visibleWhen show/hide rules apply to it.
+    return `<div class="form-group form-note"${visibleWhenAttrs(field)}${requiredWhenAttrs(field)}>${escapeHtml(field.text)}</div>`;
+  }
   const key = escapeHtml(field.key);
   const id = `field-${key}`;
   const req = "required" in field && field.required ? " required" : "";
@@ -296,6 +300,11 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
     }
     .form-section:first-child {
       margin-top: 4px;
+    }
+    .form-note {
+      color: var(--vscode-descriptionForeground);
+      font-size: 12px;
+      line-height: 1.5;
     }
     .actions button[data-visible-when] {
       display: none;
