@@ -398,6 +398,33 @@ describe("package contributions", () => {
     expect(palette?.when).toBe("false");
   });
 
+  /**
+   * OPEN WEB CONSOLE'S SIGN-IN CLAIM (issue #297). The prose used to promise
+   * that a first open "may land on PVE's login page" — it never did: PVE's
+   * bare console page shows no login and dead-ends on a 401 without a session.
+   * The command now opens the full web UI on the guest's Console tab, which
+   * signs in first when needed, and every place that explained the old route
+   * has to say so — including the WHY comment a maintainer reads before
+   * touching the URL.
+   */
+  it("describes Open Web Console as PVE's web UI opening on the guest's Console tab, signing in first if needed, with the old login-page promise gone everywhere (⊘ a doc still promising a login on the bare console page sends the next reader back to the URL that dead-ended)", () => {
+    const proxmoxSource = readDoc("src/services/inventory/providers/proxmoxProvider.ts");
+    const retired = [/first open may (land on|show) PVE's login page/i, /intended handshake/i, /the console is right there/i];
+    for (const [name, doc] of [...userDocs, ["docs/functional-documentation.md", functionalDocs] as const, ["proxmoxProvider.ts", proxmoxSource] as const]) {
+      for (const claim of retired) {
+        expect(doc, name).not.toMatch(claim);
+      }
+    }
+    // The bare console page's query shapes are gone from the reference too.
+    expect(functionalDocs).not.toContain("?console=kvm&novnc=1");
+    expect(functionalDocs).not.toContain("?console=lxc&xtermjs=1");
+    expect(functionalDocs).toContain("#v1:0:=qemu%2F{vmid}:4:::::8::");
+    expect(functionalDocs).toContain("#v1:0:=lxc%2F{vmid}:4::::::=consolejs:");
+    const proxmoxGuide = userDoc("docs/inventory/proxmox.md");
+    expect(proxmoxGuide).toMatch(/\*\*Console\*\* tab/);
+    expect(proxmoxGuide).toMatch(/OpenID/);
+  });
+
   it("contributes settings.openPanel command", () => {
     const commands = packageJson.contributes.commands.map((item) => item.command);
     expect(commands).toContain("nexus.settings.openPanel");
