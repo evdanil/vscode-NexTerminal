@@ -2145,25 +2145,22 @@ function isProxmoxNodeExternalId(externalId: string): boolean {
 }
 
 /**
- * FRESH vmid → {node, kind, name} resolution over `/cluster/resources?type=vm`.
+ * FRESH vmid → {node, kind, template} resolution over `/cluster/resources?type=vm`.
  *
  * ONE DEFINITION, TWO CALLERS (`controlNodeImpl`, `webConsoleUrlImpl`), because
- * both need the same facts for the same reason: a bare vmid externalId
- * does not name the node it runs on, and a guest can migrate between syncs — so
- * the last synced tree is never the source of this answer. Sharing it also
- * keeps the not-found contract (name the guest, name the way out) in one place;
- * two copies would drift and one of the two commands would stop saying "re-sync".
- *
- * `name` is best-effort: PVE omits it on a guest that has never been named, and
- * an unnamed guest is still resolvable — only the callers that render a label
- * care, and "" renders as an empty label rather than a failure.
+ * both need facts a bare vmid externalId does not carry — whether it is a VM or
+ * a container, and (for control) the node it runs on, which can change between
+ * syncs — so the last synced tree is never the source of this answer. Sharing
+ * it also keeps the not-found contract (name the guest, name the way out) in
+ * one place; two copies would drift and one of the two commands would stop
+ * saying "re-sync".
  */
 async function resolveGuestRow(
   transport: ProxmoxTransport,
   baseUrl: string,
   token: string,
   externalId: string
-): Promise<{ node: string; kind: "qemu" | "lxc"; name: string; template: boolean }> {
+): Promise<{ node: string; kind: "qemu" | "lxc"; template: boolean }> {
   const lookupUrl = new URL(`${baseUrl}${PROXMOX_API_BASE}/cluster/resources?type=vm`);
   const lookupRaw = await rawGet(transport, lookupUrl, token, FETCH_TIMEOUT_MS);
   if (lookupRaw.status < 200 || lookupRaw.status >= 300) {
@@ -2191,7 +2188,7 @@ async function resolveGuestRow(
       // this live row can report — nothing about template-ness survives the sync
       // onto a server record — and one caller must refuse a template outright.
       // PVE reports it as the number 1; anything else (absent, 0) is a guest.
-      return { node: row.node as string, kind: row.type, name: str(row.name), template: row.template === 1 };
+      return { node: row.node as string, kind: row.type, template: row.template === 1 };
     }
   }
   throw new InventoryProviderError(
@@ -2323,34 +2320,98 @@ async function controlNodeImpl(
 }
 
 /**
- * WEB CONSOLE (§Spec) — PVE's own console page for ONE guest, as a URL for the
- * USER'S BROWSER (noVNC for a VM, xterm.js for a container — see the two shapes
- * below). Nexus never fetches it.
+ * PVE's `#v1` UI-state hash selecting ONE guest and its Console tab, written
+ * exactly as PVE's own `PVE.StateProvider.encodeHToken` writes that state,
+ * because PVE's `decodeHToken` is what reads it (www/manager6/StateProvider.js;
+ * the same in this respect on PVE 7, 8 and master).
+ *
+ * The token is `v1` and then ten `:`-separated fields IN THIS ORDER: view, rid,
+ * ltab, nodetab, storagetab, sdntab, pooltab, kvmtab, lxctab, dctab. A string
+ * is written as `=` + encodeURIComponent(value), and a value in PVE's
+ * `compDict` as its number. `view` and `ltab` carry their defaults, `server`
+ * (0) and `tasks` (4), rather than being left empty, because that is how
+ * `encodeHToken` writes this state: the hash is byte-identical to the one PVE
+ * itself writes. (Empty would also work — the view selector and the log panel
+ * ignore an empty value.)
+ *
+ * THE TWO CONSOLE TABS HAVE DIFFERENT NAMES. A VM's Console tab is itemId
+ * `console` (compDict 8) under `kvmtab`; a container's is itemId `consolejs`,
+ * which has no compDict number, so it goes in as a string under `lxctab`. PVE's
+ * config panel falls back to the FIRST tab (Summary) for a name it does not
+ * have, so a container given `8` opens on Summary without any error.
+ *
+ * VS Code's opener does not deliver this byte for byte: `URI.parse` decodes
+ * the fragment's `%2F` and the opener writes the fragment back raw, so the
+ * browser gets `=qemu/107`. PVE decodes that to the same rid, because the
+ * decoder splits on `:` only and decodeURIComponent leaves a `/` alone. The
+ * vmid is not re-checked here: it is the externalId that `resolveGuestRow`
+ * matched as `String(row.vmid)` against the live row, and PVE's vmids are
+ * integers — so in practice it holds only digits, which no decoding step can
+ * turn into a `:`.
+ */
+function pveGuestConsoleHash(kind: "qemu" | "lxc", vmid: string): string {
+  const fields = [
+    "0", // view: server
+    `=${encodeURIComponent(`${kind}/${vmid}`)}`, // rid
+    "4", // ltab: tasks
+    "", // nodetab
+    "", // storagetab
+    "", // sdntab
+    "", // pooltab
+    kind === "qemu" ? "8" : "", // kvmtab: console
+    kind === "lxc" ? "=consolejs" : "", // lxctab: consolejs
+    "" // dctab
+  ];
+  return `#v1:${fields.join(":")}`;
+}
+
+/**
+ * WEB CONSOLE (§Spec) — the PVE web UI itself, deep-linked to ONE guest's
+ * Console tab, as a URL for the USER'S BROWSER. Nexus never fetches it.
  *
  * WHY THIS IS THE FEATURE. A guest with no reachable address — no
  * qemu-guest-agent, no lease, never booted — has nothing to SSH to and is a
  * dead end in the tree. The console needs no address at all, so it is the one
  * way into exactly the guests Nexus otherwise cannot offer anything for. Which
- * is also why there is NO running/stopped gate here: a stopped guest's noVNC
- * page is PVE's own "not running" answer, in PVE's voice, in the browser — a
- * truthful answer that Nexus second-guessing from a possibly-unpolled status
- * would only replace with a worse one.
+ * is also why there is NO running/stopped gate here: whatever PVE's console
+ * shows for a stopped guest is PVE's own answer, in PVE's voice, in the
+ * browser — and Nexus second-guessing it from a possibly-unpolled status would
+ * only replace it with a worse one.
+ *
+ * WHY THE FULL UI, NOT PVE'S BARE CONSOLE PAGE (#297). The bare page
+ * (`/?console=kvm&novnc=1&…`) never shows a login: without a PVE session its
+ * vncproxy/termproxy call answers 401 and the tab dead-ends, with nothing on it
+ * to sign in from. The full UI shows its own login dialog when there is no
+ * session — and its state provider reads the `#v1` hash on page load, BEFORE
+ * that dialog, so once the user signs in the resource tree selects the guest
+ * the hash names and its config panel opens the tab the hash names. With a
+ * session it lands on that tab straight away. The Console tab embeds that same
+ * console page in an iframe (noVNC for a VM, xterm.js for a container), now
+ * inside the signed-in UI. Verified against pve-manager's StateProvider.js,
+ * Workspace.js, tree/ResourceTree.js, panel/ConfigPanel.js, VNCConsole.js and
+ * {qemu,lxc}/Config.js on stable-7, stable-8 and master.
  *
  * THE BROWSER'S PVE SESSION IS THE CREDENTIAL (its PVEAuthCookie), not the API
  * token. The token is used for the RESOLUTION lookup below and MUST NOT be
  * appended to the returned URL: PVE's ticket endpoint is `allowtoken: 0`, so it
  * would not authenticate the console anyway, and a URL handed to an external
- * browser lands in history and in whatever the OS handler logs. First open may
- * show PVE's login page; that is the intended handshake.
+ * browser lands in history and in whatever the OS handler logs.
  *
- * FRESH RESOLUTION, for the same reason `controlNodeImpl` does it: the node in
- * the URL must be the node running the guest NOW, not the one the last sync saw.
+ * FRESH RESOLUTION, because the externalId is a bare vmid: it does not say
+ * whether the guest is a VM or a container (the hash's rid AND its tab field
+ * depend on that), nor whether it is a template, nor whether PVE still lists it.
+ *
+ * NO NAME, NO NODE. The deep link needs neither: the rid `<type>/<vmid>` is
+ * what PVE's own resource tree keys a guest by, and the tree finds it on
+ * whichever node runs it now — so a migrated guest needs nothing from us. That
+ * also keeps provider text — the guest-controlled name above all — out of a URL
+ * handed to the OS.
  *
  * THE MOUNT PATH SURVIVES. `normalizeBaseUrl` keeps a reverse-proxy prefix and
  * strips its trailing slash, so the slash is put back before serializing —
- * `https://gateway.example/pve` must open `…/pve/?console=…`, which is where
- * that deployment's UI lives; an origin-only URL reaches the proxy's root.
- * A bare origin already has pathname "/" and is left alone.
+ * `https://gateway.example/pve` must open `…/pve/#v1:…`, which is where that
+ * deployment's UI lives; an origin-only URL reaches the proxy's root. A bare
+ * origin already has pathname "/" and is left alone.
  */
 async function webConsoleUrlImpl(
   transports: ProxmoxTransports,
@@ -2396,43 +2457,7 @@ async function webConsoleUrlImpl(
   if (url.pathname !== "/") {
     url.pathname = `${url.pathname}/`;
   }
-  // `URLSearchParams`, not concatenation: `vmname` is guest-controlled text, so
-  // a name carrying "&" or "=" would otherwise forge parameters or truncate the
-  // query — and the result is a blank console with no error anywhere.
-  //
-  // TWO SHAPES, ONE PER GUEST TYPE, each built the way PVE's own web UI builds
-  // it rather than by swapping a flag in a shared parameter set:
-  //
-  //   VM (qemu)      ?console=kvm&novnc=1&vmid&vmname&node&resize=off&cmd=
-  //   container (lxc) ?console=lxc&xtermjs=1&vmid&vmname&node&cmd=
-  //
-  // `resize` is a noVNC scaling option and has no meaning to the xterm.js page,
-  // which is why the container shape drops it and does not merely rename a flag.
-  //
-  // WHY xterm.js FOR A CONTAINER: it is what PVE's own Console button opens for
-  // a container when the datacenter console option is unset — its per-type
-  // default. Not because noVNC is unavailable for containers: a container node
-  // exposes vncproxy and vncwebsocket just as a VM does, and `console=lxc&novnc=1`
-  // opens a working console. This is about opening the SAME console PVE would,
-  // so the two routes to a container's shell do not differ in frontend.
-  //
-  // WHY NOT PVE'S DEFAULT FOR A VM: there the per-type default is `vv` — a
-  // downloaded .vv handed to a native SPICE client, which is not a browser
-  // handoff at all. noVNC is the in-browser console for a VM, so that is what
-  // this returns.
-  const isVm = target.kind === "qemu";
-  url.searchParams.set("console", isVm ? "kvm" : "lxc");
-  url.searchParams.set(isVm ? "novnc" : "xtermjs", "1");
-  url.searchParams.set("vmid", externalId);
-  url.searchParams.set("vmname", target.name);
-  url.searchParams.set("node", target.node);
-  if (isVm) {
-    url.searchParams.set("resize", "off");
-  }
-  // Empty-valued on purpose — PVE's console page expects the parameter present
-  // and blank (it means "no command to run"), so it serializes as `cmd=`. Both
-  // shapes carry it.
-  url.searchParams.set("cmd", "");
+  url.hash = pveGuestConsoleHash(target.kind, externalId);
   return url.toString();
 }
 

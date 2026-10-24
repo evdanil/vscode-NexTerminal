@@ -176,7 +176,7 @@ export class ServerTreeItem extends vscode.TreeItem {
     // anchored and spells the groups in this order, so a marker in any other
     // slot matches none of them and the row loses every context action (#83).
     // CAPABILITY ONLY — no status term: the console is what makes an addressless
-    // or unpolled guest manageable at all, and a stopped guest's console page is
+    // or unpolled guest manageable at all, and a stopped guest's console is
     // the hypervisor's own honest answer.
     const webConsoleMarker = hasWebConsole ? ".webConsole" : "";
     this.contextValue = `${connected ? "nexus.serverConnected" : "nexus.server"}${hasIpmi ? ".ipmi" : ""}${nodeMarker}${webConsoleMarker}`;

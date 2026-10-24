@@ -10905,8 +10905,10 @@ describe("nexus.inventory.openWebConsole", () => {
     mockWebviewOpen.mockImplementation(() => makeFakePanel());
   });
 
-  const CONSOLE_URL =
-    "https://pve.example.com:8006/?console=kvm&novnc=1&vmid=107&vmname=build-vm&node=pve&resize=off&cmd=";
+  // The shape Proxmox's webConsoleUrl returns today (#297): the full web UI
+  // with a `#v1` deep link — so "opens exactly that URL" also proves the
+  // fragment survives the http(s) check on the way to openExternal.
+  const CONSOLE_URL = "https://pve.example.com:8006/#v1:0:=qemu%2F107:4:::::8::";
 
   async function setup(
     opts: {

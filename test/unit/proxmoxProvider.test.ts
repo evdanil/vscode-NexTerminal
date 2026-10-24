@@ -2605,13 +2605,17 @@ describe("createProxmoxProvider", () => {
   /**
    * WEB CONSOLE (§Spec) — the one provider member that makes NO request on
    * behalf of what it returns: the URL goes to the user's browser, where the
-   * PVE web session is the credential. Every assertion here defends a piece of
-   * the URL PVE actually serves, because a wrong one fails as a blank noVNC
-   * page with no diagnostic anywhere in Nexus.
+   * PVE web session is the credential. It is the full PVE web UI deep-linked to
+   * the guest's Console tab (issue #297), so every assertion here defends a
+   * piece of the `#v1` state hash PVE restores: a wrong field fails SILENTLY in
+   * the browser — the UI opens on some other guest or tab, with nothing in Nexus
+   * to diagnose.
    */
   describe("webConsoleUrl", () => {
     const BASE = "https://pve.example.com:8006";
     const SECRETS = { apiToken: "root@pam!test=secret" };
+    const VM_HASH = "#v1:0:=qemu%2F107:4:::::8::";
+    const CT_HASH = "#v1:0:=lxc%2F114:4::::::=consolejs:";
 
     function lookupFetch(rows: unknown[], status = 200) {
       const calls: Array<{ url: string; method: string; headers?: Record<string, string> }> = [];
@@ -2622,58 +2626,110 @@ describe("createProxmoxProvider", () => {
       return { calls, fetchImpl: impl as unknown as typeof fetch };
     }
 
-    it("builds PVE's noVNC URL for a qemu guest with the FULL query, including the empty-valued cmd= PVE expects (kills a hand-concatenated query that drops or mis-orders a member — the console opens blank with nothing to diagnose)", async () => {
-      const { fetchImpl } = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build-vm" }]);
-      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
-      await expect(provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107")).resolves.toBe(
-        `${BASE}/?console=kvm&novnc=1&vmid=107&vmname=build-vm&node=pve&resize=off&cmd=`
+    async function consoleUrlFor(row: Record<string, unknown>, baseUrl = BASE): Promise<string> {
+      const { fetchImpl } = lookupFetch([row]);
+      return createProxmoxProvider(fetchImpl, fetchImpl).webConsoleUrl!({ baseUrl }, SECRETS, String(row.vmid));
+    }
+
+    /**
+     * A REPLICA of the two steps between the returned string and the guest PVE
+     * selects — written from the sources it names, not copied from them (PVE's
+     * code is never vendored here):
+     *
+     * 1. VS Code. `openWebConsole` calls `openExternal(Uri.parse(url))`.
+     *    `URI.parse` percent-decodes the fragment (`percentDecode`, uri.ts), and
+     *    the opener sends `encodeURI(uri.toString(true))` (`_doOpenExternal`,
+     *    openerService.ts), whose `toString(true)` writes the fragment back
+     *    raw. So `%2F` reaches the browser as `/`.
+     * 2. PVE. `PVE.StateProvider.decodeHToken` (www/manager6/StateProvider.js,
+     *    the same on stable-7, stable-8 and master) splits the token on `:`,
+     *    requires the `v1` prefix, strips a leading `=` and decodeURIComponent()s
+     *    the rest, and maps a number back through `compDict` (a SUBSET here — a
+     *    number outside it stays a digit string, which fails any check that
+     *    expects a tab name).
+     */
+    const PVE_HASH_FIELDS = ["view", "rid", "ltab", "nodetab", "storagetab", "sdntab", "pooltab", "kvmtab", "lxctab", "dctab"] as const;
+    const PVE_COMP_DICT: Record<string, string> = { "0": "server", "4": "tasks", "5": "summary", "7": "hardware", "8": "console" };
+    function viaVsCodeOpener(url: string): string {
+      const at = url.indexOf("#");
+      const fragment = url.slice(at + 1).replace(/(%[0-9A-Za-z][0-9A-Za-z])+/g, (m) => decodeURIComponent(m));
+      return encodeURI(`${url.slice(0, at)}#${fragment}`);
+    }
+    function decodePveState(href: string): Record<string, string | undefined> | undefined {
+      // The history token is everything after the "#".
+      const [prefix, ...items] = href.slice(href.indexOf("#") + 1).split(":");
+      if (prefix !== "v1") {
+        return undefined;
+      }
+      const state: Record<string, string | undefined> = {};
+      for (const name of PVE_HASH_FIELDS) {
+        let value = items.shift();
+        if (value) {
+          if (value.startsWith("=")) {
+            value = decodeURIComponent(value.slice(1));
+          }
+          value = PVE_COMP_DICT[value] ?? value;
+        }
+        state[name] = value;
+      }
+      return state;
+    }
+
+    it("opens the FULL PVE web UI on a VM's Console tab — PVE's own #v1 encoding of {view: server, rid: qemu/<vmid>, ltab: tasks, kvmtab: console}, on the base URL with no query (kills the bare ?console=kvm page, which never shows a login and dead-ends on 401 without a session; and kills a wrong field order or tab code, which opens some other tab or guest)", async () => {
+      const resolved = await consoleUrlFor({ vmid: 107, node: "pve", type: "qemu", name: "build-vm" });
+      expect(resolved).toBe(`${BASE}/${VM_HASH}`);
+      // The bare console page this replaces must not come back in any form.
+      expect(resolved).not.toContain("?");
+      expect(resolved).not.toMatch(/console=|novnc|xtermjs/);
+    });
+
+    it("opens a CONTAINER on ITS Console tab, whose itemId is consolejs — a string value in the lxctab field, never compDict 8 (kills reusing the VM's 8 for a container: PVE's lxc config panel has no 'console' tab, so it falls back to Summary, silently)", async () => {
+      const resolved = await consoleUrlFor({ vmid: 114, node: "pve", type: "lxc", name: "dns-ct" });
+      expect(resolved).toBe(`${BASE}/${CT_HASH}`);
+      const fields = new URL(resolved).hash.slice(1).split(":");
+      // [v1, view, rid, ltab, nodetab, storagetab, sdntab, pooltab, kvmtab, lxctab, dctab]
+      expect(fields).toHaveLength(11);
+      expect(fields[9]).toBe("=consolejs");
+      expect(fields[9]).not.toBe("8");
+      expect(fields[8]).toBe("");
+    });
+
+    it("survives VS Code's opener and decodes in PVE to the guest's rid and Console tab, each type in ITS OWN field (kills qemu and lxc swapped in the rid, and the VM's tab written into lxctab or the container's into kvmtab)", async () => {
+      const blank = { nodetab: "", storagetab: "", sdntab: "", pooltab: "", dctab: "" };
+      const vm = await consoleUrlFor({ vmid: 107, node: "pve", type: "qemu", name: "build-vm" });
+      expect(viaVsCodeOpener(vm)).toBe(`${BASE}/#v1:0:=qemu/107:4:::::8::`);
+      expect(decodePveState(viaVsCodeOpener(vm))).toEqual({
+        view: "server", rid: "qemu/107", ltab: "tasks", ...blank, kvmtab: "console", lxctab: ""
+      });
+      const ct = await consoleUrlFor({ vmid: 114, node: "pve", type: "lxc", name: "dns-ct" });
+      expect(viaVsCodeOpener(ct)).toBe(`${BASE}/#v1:0:=lxc/114:4::::::=consolejs:`);
+      expect(decodePveState(viaVsCodeOpener(ct))).toEqual({
+        view: "server", rid: "lxc/114", ltab: "tasks", ...blank, kvmtab: "", lxctab: "consolejs"
+      });
+    });
+
+    it("PRESERVES a reverse-proxy mount path from the base URL, with the slash before the hash (kills a builder that keeps only the origin — https://gateway.example/#v1… is not where that deployment's UI lives — and one that glues the hash onto /pve without the slash)", async () => {
+      await expect(consoleUrlFor({ vmid: 107, node: "pve", type: "qemu", name: "build-vm" }, "https://gateway.example/pve")).resolves.toBe(
+        `https://gateway.example/pve/${VM_HASH}`
+      );
+      await expect(consoleUrlFor({ vmid: 114, node: "pve", type: "lxc", name: "dns-ct" }, "https://gateway.example/pve")).resolves.toBe(
+        `https://gateway.example/pve/${CT_HASH}`
       );
     });
 
-    it("builds PVE's xterm.js URL for a container with ITS full query — console=lxc, xtermjs=1 and NO resize (kills a builder that swaps one flag and keeps the noVNC shape, and kills a qemu-only builder: each type's complete query is pinned, so flags cannot be traded between them unnoticed)", async () => {
-      const { fetchImpl } = lookupFetch([{ vmid: 114, node: "pve", type: "lxc", name: "dns-ct" }]);
-      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
-      await expect(provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "114")).resolves.toBe(
-        `${BASE}/?console=lxc&xtermjs=1&vmid=114&vmname=dns-ct&node=pve&cmd=`
-      );
+    it("carries NO provider text — neither the guest's name nor its node reaches the URL (⊘ the deep link needs neither, and a guest-controlled name carrying ':' or '#' would shift the hash fields PVE splits on)", async () => {
+      const resolved = await consoleUrlFor({ vmid: 107, node: "node-zz9", type: "qemu", name: "evil:name#=x&vmname=y" });
+      expect(resolved).toBe(`${BASE}/${VM_HASH}`);
+      expect(resolved).not.toContain("evil");
+      expect(resolved).not.toContain("node-zz9");
+      expect(resolved).not.toMatch(/vmname|node=/);
     });
 
-    it("keeps the two shapes apart: a container URL carries no novnc and no resize, a VM URL carries no xtermjs (\u2298 one shared parameter set for both types hands PVE a viewer flag the other type's page does not read)", async () => {
-      const ct = lookupFetch([{ vmid: 114, node: "pve", type: "lxc", name: "dns-ct" }]);
-      const ctUrl = new URL(await createProxmoxProvider(ct.fetchImpl, ct.fetchImpl).webConsoleUrl!({ baseUrl: BASE }, SECRETS, "114"));
-      expect(ctUrl.searchParams.get("xtermjs")).toBe("1");
-      expect(ctUrl.searchParams.has("novnc")).toBe(false);
-      expect(ctUrl.searchParams.has("resize")).toBe(false);
-      const vm = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build-vm" }]);
-      const vmUrl = new URL(await createProxmoxProvider(vm.fetchImpl, vm.fetchImpl).webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107"));
-      expect(vmUrl.searchParams.get("novnc")).toBe("1");
-      expect(vmUrl.searchParams.get("resize")).toBe("off");
-      expect(vmUrl.searchParams.has("xtermjs")).toBe(false);
-    });
-
-    it("PRESERVES a reverse-proxy mount path from the base URL (kills a builder that keeps only the origin — https://gateway.example/?console=… is not where that deployment's UI lives)", async () => {
-      const { fetchImpl } = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build-vm" }]);
-      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
-      await expect(provider.webConsoleUrl!({ baseUrl: "https://gateway.example/pve" }, SECRETS, "107")).resolves.toBe(
-        "https://gateway.example/pve/?console=kvm&novnc=1&vmid=107&vmname=build-vm&node=pve&resize=off&cmd="
-      );
-    });
-
-    it("QUERY-ENCODES the guest name — it is guest-controlled text (kills raw interpolation, where a space or an & truncates the query and the remaining parameters are silently lost)", async () => {
-      const { fetchImpl } = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build vm&novnc=0" }]);
+    it("takes the guest TYPE from a FRESH ?type=vm lookup — one GET, before anything is built (kills a builder that assumes qemu: a container's link would carry a qemu/<vmid> rid that matches no tree node, so PVE selects nothing)", async () => {
+      const { calls, fetchImpl } = lookupFetch([{ vmid: 107, node: "pve-2", type: "lxc", name: "was-a-vm" }]);
       const provider = createProxmoxProvider(fetchImpl, fetchImpl);
       const resolved = await provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107");
-      const parsed = new URL(resolved);
-      expect(parsed.searchParams.get("vmname")).toBe("build vm&novnc=0");
-      // The injected `novnc=0` must not survive as a parameter of its own.
-      expect(parsed.searchParams.getAll("novnc")).toEqual(["1"]);
-    });
-
-    it("resolves node/type/name FRESH from ?type=vm before building anything, and reflects a node the guest has since migrated to (kills a URL built from the last sync's node — the console would open on a host that no longer runs the guest)", async () => {
-      const { calls, fetchImpl } = lookupFetch([{ vmid: 107, node: "pve-2", type: "qemu", name: "build-vm" }]);
-      const provider = createProxmoxProvider(fetchImpl, fetchImpl);
-      const resolved = await provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107");
-      expect(new URL(resolved).searchParams.get("node")).toBe("pve-2");
+      expect(resolved).toBe(`${BASE}/#v1:0:=lxc%2F107:4::::::=consolejs:`);
       expect(calls.map((c) => `${c.method} ${c.url}`)).toEqual([`GET ${BASE}/api2/json/cluster/resources?type=vm`]);
     });
 
@@ -2708,9 +2764,7 @@ describe("createProxmoxProvider", () => {
     it("still builds the URL for an ordinary guest whose row carries template: 0 (\u2298 a truthiness slip on the template member refuses every guest PVE reports it for, killing the feature outright)", async () => {
       const { fetchImpl } = lookupFetch([{ vmid: 107, node: "pve", type: "qemu", name: "build-vm", template: 0 }]);
       const provider = createProxmoxProvider(fetchImpl, fetchImpl);
-      await expect(provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107")).resolves.toBe(
-        `${BASE}/?console=kvm&novnc=1&vmid=107&vmname=build-vm&node=pve&resize=off&cmd=`
-      );
+      await expect(provider.webConsoleUrl!({ baseUrl: BASE }, SECRETS, "107")).resolves.toBe(`${BASE}/${VM_HASH}`);
     });
 
     it("rejects with a re-sync hint when the vmid is no longer in the cluster listing (kills an error that names neither the guest nor the way out — same contract as controlNode's)", async () => {

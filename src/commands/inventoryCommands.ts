@@ -6762,8 +6762,8 @@ export function registerInventoryCommands(
    * manageable: a stopped VM, or one whose guest agent never reported an IP,
    * imports as a placeholder with nothing to SSH to, and its hypervisor's own
    * console is the only way in — so the entry is deliberately NOT gated on
-   * running/stopped state (a stopped guest's console page is the hypervisor's
-   * own honest "not running", rendered in the hypervisor's voice).
+   * running/stopped state (whatever a stopped guest's console shows is the
+   * hypervisor's own answer, in the hypervisor's voice).
    *
    * The browser's existing session with the hypervisor is the CONSOLE's
    * credential, and no token or password of ours rides the URL — which is why
