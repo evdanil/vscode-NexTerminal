@@ -2353,7 +2353,7 @@ describe("createProxmoxProvider", () => {
       expect(calls[2].url).not.toContain("UPID:pve");
     });
 
-    it("REJECTS with the task's own message when it finished with a non-OK exitstatus — the POST's HTTP 200 said nothing (verified live: task `exitstatus: 'VM 105 already running'`; kills swallowing a failed task because the transport answered 200)", async () => {
+    it("REJECTS with the task's own message when it finished with an error exitstatus (neither OK nor WARNINGS) — the POST's HTTP 200 said nothing (verified live: task `exitstatus: 'VM 105 already running'`; kills swallowing a failed task because the transport answered 200)", async () => {
       const { fetchImpl } = controlFetch({
         "/api2/json/cluster/resources": { body: { data: [qemuRow()] } },
         "/api2/json/nodes/pve/qemu/105/status/start": { body: { data: UPID } },
@@ -2364,6 +2364,83 @@ describe("createProxmoxProvider", () => {
       expect(err).toBeInstanceOf(InventoryProviderError);
       expect((err as InventoryProviderError).kind).toBe("protocol");
       expect((err as Error).message).toContain("VM 105 already running");
+    });
+
+    // -----------------------------------------------------------------------------
+    // ISSUE #298 — a finished PVE task's `exitstatus` has THREE forms, not two:
+    // "OK"; "WARNINGS: <n>", a task that COMPLETED and logged n warnings (PVE's
+    // own task list paints it yellow, not red); and anything else, which is the
+    // error message. proxmox-widget-toolkit's `parse_task_status` makes the same
+    // split. The OK-only check reported a running guest as "Failed to start".
+    // -----------------------------------------------------------------------------
+
+    /** The lookup → POST → one stopped task, for `action` on guest 105 living on `node`. */
+    const finishedTask = (exitstatus: string, action: "start" | "stop" = "start", node = "pve"): RouteMap => {
+      const nodePath = `/api2/json/nodes/${encodeURIComponent(node)}`;
+      return {
+        "/api2/json/cluster/resources": { body: { data: [qemuRow({ node })] } },
+        [`${nodePath}/qemu/105/status/${action}`]: { body: { data: UPID } },
+        [`${nodePath}/tasks/${UPID_ENC}/status`]: { body: { data: { status: "stopped", exitstatus } } }
+      };
+    };
+
+    /**
+     * Drives one control through its first 2 s poll beat on the fake clock and
+     * returns how it SETTLED — a loop over many exit statuses would otherwise
+     * spend two real seconds per status.
+     */
+    async function settleControl(routes: RouteMap, action: "start" | "stop" = "start"): Promise<{ value?: unknown; error?: unknown }> {
+      vi.useFakeTimers();
+      try {
+        const { fetchImpl } = controlFetch(routes);
+        const provider = createProxmoxProvider(fetchImpl, fetchImpl);
+        const settled = provider.controlNode!({ baseUrl: BASE }, SECRETS, "105", action).then(
+          (value: unknown) => ({ value }),
+          (error: unknown) => ({ error })
+        );
+        await vi.advanceTimersByTimeAsync(2_000);
+        return await settled;
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+
+    it("RESOLVES a start whose task finished 'WARNINGS: 1', with a notice naming the count and the node whose task log holds them (issue #298 — the guest was running and Nexus said it failed; ⊘ the OK-only check, which threw on every non-OK status, and ⊘ a fix that resolves silently, so the user never learns there is a log to read)", async () => {
+      const outcome = await settleControl(finishedTask("WARNINGS: 1"));
+      expect(outcome.error).toBeUndefined();
+      expect(outcome.value).toEqual({ notice: "Proxmox reported 1 warning; see the task log on node pve." });
+    });
+
+    it("RESOLVES a stop whose task finished 'WARNINGS: 3', pluralised, naming the node the live lookup found (⊘ a hard-coded '1 warning' or 'warnings' that ignores the count, and ⊘ a node read from anywhere but the fresh lookup)", async () => {
+      const outcome = await settleControl(finishedTask("WARNINGS: 3", "stop", "pve2"), "stop");
+      expect(outcome.error).toBeUndefined();
+      expect(outcome.value).toEqual({ notice: "Proxmox reported 3 warnings; see the task log on node pve2." });
+    });
+
+    it("FLATTENS the node name where it enters the notice — the node comes off the PVE API, and a line break or bidi control in it would forge text in a sentence Nexus composed (⊘ interpolating the node name raw)", async () => {
+      const outcome = await settleControl(finishedTask("WARNINGS: 1", "start", "pve‮\n1"));
+      expect(outcome.value).toEqual({ notice: "Proxmox reported 1 warning; see the task log on node pve 1." });
+    });
+
+    it("still REJECTS, carrying the task's text verbatim, every exit status that is not exactly 'WARNINGS: <digits>' — PVE's own message, an error that merely mentions warnings, a lowercase or unanchored variant (⊘ includes/startsWith('WARNINGS'), ⊘ a regex missing either anchor, ⊘ the i or m flag, ⊘ treating every stopped task as success)", async () => {
+      for (const exitstatus of [
+        "VM 105 already running",
+        "failed: WARNINGS: 1 then error",
+        "WARNINGS: 1 then error",
+        "TASK WARNINGS: 1",
+        "warnings: 1",
+        "Warnings: 2",
+        "WARNINGS:1",
+        "WARNINGS: ",
+        "WARNINGS: one",
+        "WARNINGS: 1\nTASK ERROR: start failed"
+      ]) {
+        const outcome = await settleControl(finishedTask(exitstatus));
+        expect(outcome.value, exitstatus).toBeUndefined();
+        expect(outcome.error, exitstatus).toBeInstanceOf(InventoryProviderError);
+        expect((outcome.error as InventoryProviderError).kind).toBe("protocol");
+        expect((outcome.error as Error).message).toBe(`Proxmox start of guest 105 failed: ${exitstatus}.`);
+      }
     });
 
     it("gives up at the deadline when the task is still running and STOPS polling — the task continues server-side, so the error points at the PVE task log (kills an unbounded poll that never reports)", async () => {
