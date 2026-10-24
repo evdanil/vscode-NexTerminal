@@ -331,7 +331,10 @@ describe("agent messages", () => {
     for (const source of ["env", "pageant", "openssh", "custom"] as const) {
       const choice = { agent: "/tmp/agent", source, note: "" };
       messages.push(sshAgentHoldsNoKeysMessage(choice));
-      messages.push(sshAgentUnusableMessage(choice, new Error("Failed to connect to agent")));
+      messages.push(sshAgentUnusableMessage(choice, new Error("Failed to connect to agent"), "linux"));
+    }
+    for (const agent of ["\\\\.\\pipe\\openssh-ssh-agent", "/tmp/ssh-XXXX/agent.1"]) {
+      messages.push(sshAgentUnusableMessage({ agent, source: "env", note: "" }, new Error("Failed to connect to agent"), "win32"));
     }
     const guess = resolveSshAgent(
       lookup({
@@ -341,7 +344,7 @@ describe("agent messages", () => {
       })
     );
     messages.push(guess.ifUnreachable!.message);
-    expect(messages).toHaveLength(19);
+    expect(messages).toHaveLength(21);
     for (const message of messages) {
       expect(message).not.toMatch(SERVER_REJECTION_WORDING);
     }
@@ -355,16 +358,56 @@ describe("agent messages", () => {
 
   it("give each source a remedy that can actually fix it when the agent cannot be used", () => {
     const failure = new Error("Failed to connect to agent");
-    expect(sshAgentUnusableMessage({ agent: "/tmp/stale", source: "env", note: "" }, failure)).toBe(
+    expect(sshAgentUnusableMessage({ agent: "/tmp/stale", source: "env", note: "" }, failure, "linux")).toBe(
       "Could not use the SSH agent at /tmp/stale (SSH_AUTH_SOCK): Failed to connect to agent. Start VS Code from a shell where your agent runs, or set nexus.ssh.agent to custom and enter the agent's socket path."
     );
-    expect(sshAgentUnusableMessage({ agent: "p", source: "pageant", note: "" }, failure)).toMatch(/Restart Pageant and connect again\.$/);
-    expect(sshAgentUnusableMessage({ agent: "p", source: "openssh", note: "" }, failure)).toMatch(
-      /\(OpenSSH Authentication Agent\).*Restart the OpenSSH Authentication Agent service, or the other agent that provides this pipe \(e\.g\. 1Password\), and connect again\.$/
+    expect(sshAgentUnusableMessage({ agent: "/tmp/stale", source: "env", note: "" }, failure, "darwin")).toMatch(
+      /Start VS Code from a shell where your agent runs/
     );
-    expect(sshAgentUnusableMessage({ agent: "p", source: "custom", note: "" }, failure)).toMatch(
-      /\(nexus\.ssh\.agentPath\).*Check nexus\.ssh\.agentPath and that the agent is running, then connect again\.$/
-    );
+    for (const platform of ["win32", "linux"] as const) {
+      expect(sshAgentUnusableMessage({ agent: "p", source: "pageant", note: "" }, failure, platform)).toMatch(/Restart Pageant and connect again\.$/);
+      expect(sshAgentUnusableMessage({ agent: "p", source: "openssh", note: "" }, failure, platform)).toMatch(
+        /\(OpenSSH Authentication Agent\).*Restart the OpenSSH Authentication Agent service, or the other agent that provides this pipe \(e\.g\. 1Password\), and connect again\.$/
+      );
+      expect(sshAgentUnusableMessage({ agent: "p", source: "custom", note: "" }, failure, platform)).toMatch(
+        /\(nexus\.ssh\.agentPath\).*Check nexus\.ssh\.agentPath and that the agent is running, then connect again\.$/
+      );
+    }
+  });
+
+  /**
+   * On Windows SSH_AUTH_SOCK is usually set for the whole user or system, so
+   * starting VS Code from another shell changes nothing — a refusal naming
+   * that remedy names one that cannot happen (found on a real Windows machine
+   * with a global SSH_AUTH_SOCK at the OpenSSH pipe and only Pageant running).
+   */
+  describe("SSH_AUTH_SOCK that cannot be reached, on Windows", () => {
+    const failure = new Error("Failed to connect to agent");
+
+    it("names the agent behind the OpenSSH pipe, the setting that picks another agent, and removing the variable (⊘ 'Start VS Code from a shell', which a global variable ignores)", () => {
+      const message = sshAgentUnusableMessage({ agent: "\\\\.\\pipe\\openssh-ssh-agent", source: "env", note: "" }, failure, "win32");
+      expect(message).toBe(
+        "Could not use the SSH agent at \\\\.\\pipe\\openssh-ssh-agent (SSH_AUTH_SOCK): Failed to connect to agent. Start the agent SSH_AUTH_SOCK points to (the OpenSSH Authentication Agent service, or another agent that provides this pipe, e.g. 1Password), or set nexus.ssh.agent to the agent Nexus should use instead, such as pageant. Or remove SSH_AUTH_SOCK from the Windows environment and fully restart VS Code, so Automatic finds Pageant or the OpenSSH agent itself."
+      );
+      expect(message).not.toContain("Start VS Code from a shell");
+    });
+
+    it("recognises the OpenSSH pipe however it is spelled (ssh2 accepts either slash, Windows any case)", () => {
+      for (const agent of ["//./pipe/openssh-ssh-agent", "\\\\.\\pipe\\OpenSSH-SSH-Agent"]) {
+        expect(sshAgentUnusableMessage({ agent, source: "env", note: "" }, failure, "win32")).toContain(
+          "(the OpenSSH Authentication Agent service, or another agent that provides this pipe, e.g. 1Password)"
+        );
+      }
+    });
+
+    it("for any other agent behind SSH_AUTH_SOCK, names starting it, the setting and removing the variable — never a service it is not", () => {
+      const message = sshAgentUnusableMessage({ agent: "/tmp/ssh-XXXX/agent.1234", source: "env", note: "" }, failure, "win32");
+      expect(message).toBe(
+        "Could not use the SSH agent at /tmp/ssh-XXXX/agent.1234 (SSH_AUTH_SOCK): Failed to connect to agent. Start the agent SSH_AUTH_SOCK points to, or set nexus.ssh.agent to the agent Nexus should use instead, such as pageant. Or remove SSH_AUTH_SOCK from the Windows environment and fully restart VS Code, so Automatic finds Pageant or the OpenSSH agent itself."
+      );
+      expect(message).not.toContain("Start VS Code from a shell");
+      expect(message).not.toContain("OpenSSH Authentication Agent service");
+    });
   });
 });
 

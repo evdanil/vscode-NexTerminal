@@ -36,7 +36,9 @@ With **Automatic** (the default), Nexus looks for the agent on every connection,
 
 Nexus only uses a Pageant pipe named for your Windows user name. For some domain, Microsoft and Entra accounts Pageant names its pipe after another form of your name; Nexus then does not use it and names the pipe it found — in the error, or, when it uses the OpenSSH agent pipe instead, in the **Nexus SSH** output channel. If that Pageant is yours, choose **Custom socket or pipe** and enter that pipe (its name can change when Windows restarts).
 
-When both Windows agents are running, Pageant is used; choose **OpenSSH Agent (Windows)** to use the other one. **Pageant (Windows)** and **OpenSSH Agent (Windows)** use only that agent and never fall back to another. **Custom socket or pipe** uses the path in **Agent Socket or Pipe** (`nexus.ssh.agentPath`).
+When both Windows agents are running, Pageant is used; choose **OpenSSH Agent (Windows)** to use the other one. **Pageant (Windows)** and **OpenSSH Agent (Windows)** use only that agent and never fall back to another — they also ignore `SSH_AUTH_SOCK`. **Custom socket or pipe** uses the path in **Agent Socket or Pipe** (`nexus.ssh.agentPath`).
+
+On Windows `SSH_AUTH_SOCK` is often set for the whole user, for example to `\\.\pipe\openssh-ssh-agent`. If the agent it points to is not running, Automatic stops there rather than quietly using another agent: start that agent, choose the agent to use instead (such as **Pageant (Windows)**), or remove `SSH_AUTH_SOCK` from the Windows environment and fully restart VS Code so Automatic can find Pageant or the OpenSSH agent itself.
 
 On Linux and macOS, Automatic uses `SSH_AUTH_SOCK` only. VS Code started from a desktop launcher often does not have it: start VS Code from a shell where your agent runs, or choose Custom and enter the agent's full socket path. PuTTY's Pageant on Linux opens a differently named socket each time it starts; run it as `pageant --symlink <fixed path>` and enter that fixed path.
 

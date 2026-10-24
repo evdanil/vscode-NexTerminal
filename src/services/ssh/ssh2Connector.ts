@@ -661,7 +661,8 @@ export class Ssh2Connector implements SshConnector {
         return { ifRefused: choice.ifUnreachable, unoffered: "no agent was found" };
       }
       this.diagnostics?.(`[agent] ${label}: ${where} cannot be used — ${detail}`);
-      throw new SshAgentUnavailableError(sshAgentUnusableMessage(choice, error), { cause: error });
+      // The agent came from this machine's lookup, so this is its platform.
+      throw new SshAgentUnavailableError(sshAgentUnusableMessage(choice, error, process.platform), { cause: error });
     }
     if (keys === 0) {
       this.diagnostics?.(`[agent] ${label}: ${where} holds no keys, trying the server's other login methods`);

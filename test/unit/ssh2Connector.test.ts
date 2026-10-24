@@ -720,6 +720,26 @@ describe("Ssh2Connector — SSH agent logins", () => {
     expect(mockClients).toHaveLength(0);
   });
 
+  it("words the refusal for the platform it runs on — a Windows SSH_AUTH_SOCK gets the Windows remedies (⊘ 'Start VS Code from a shell' for a variable set system-wide)", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+    try {
+      const connector = new Ssh2Connector(undefined, undefined, undefined, {
+        resolve: () => ({ agent: "\\\\.\\pipe\\openssh-ssh-agent", source: "env", note: "auto; from SSH_AUTH_SOCK" }),
+        countKeys: async () => {
+          throw new Error("Failed to connect to agent");
+        }
+      });
+      const error = await connector.connect(agentServer(), {}).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(SshAgentUnavailableError);
+      expect((error as Error).message).toContain("or set nexus.ssh.agent to the agent Nexus should use instead, such as pageant");
+      expect((error as Error).message).not.toContain("Start VS Code from a shell");
+      expect(mockClients).toHaveLength(0);
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+    }
+  });
+
   it("an agent holding no keys does not block the server's other login methods (⊘ refusing here locks out keyboard-interactive logins that worked before)", async () => {
     const connector = new Ssh2Connector(undefined, undefined, undefined, { resolve: () => PAGEANT, countKeys: async () => 0 });
 

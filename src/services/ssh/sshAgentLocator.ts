@@ -86,8 +86,9 @@ const CUSTOM_PATH_PAGEANT =
   'nexus.ssh.agentPath is "pageant", which Nexus cannot use. To use Pageant, set nexus.ssh.agent to pageant.';
 
 const UNUSABLE_REMEDIES: Readonly<Record<SshAgentSource, string>> = {
-  // Restarting an agent usually gives it a new socket, which VS Code's
-  // environment will not see — so the remedy is the environment itself.
+  // Linux and macOS (Windows: windowsEnvRemedy). Restarting an agent usually
+  // gives it a new socket, which VS Code's environment will not see — so the
+  // remedy is the environment itself.
   env: "Start VS Code from a shell where your agent runs, or set nexus.ssh.agent to custom and enter the agent's socket path.",
   pageant: "Restart Pageant and connect again.",
   openssh: "Restart the OpenSSH Authentication Agent service, or the other agent that provides this pipe (e.g. 1Password), and connect again.",
@@ -113,9 +114,27 @@ export function hostSshAgentLookup(settings: { mode: SshAgentMode; customPath: s
   return { ...settings, platform: process.platform, env: process.env, username, listPipes: listWindowsPipes };
 }
 
-export function sshAgentUnusableMessage(choice: SshAgentChoice, failure: unknown): string {
+/**
+ * `platform` is where the lookup ran. It matters for SSH_AUTH_SOCK alone: on
+ * Windows the variable is usually set for the whole user or system, so
+ * starting VS Code from another shell changes nothing. There the remedies
+ * that work are starting the agent it points to, choosing the agent Nexus
+ * should use instead (an explicit mode ignores SSH_AUTH_SOCK), or removing
+ * the variable — which VS Code only sees after a full restart.
+ */
+export function sshAgentUnusableMessage(choice: SshAgentChoice, failure: unknown, platform: NodeJS.Platform): string {
   const detail = failure instanceof Error ? failure.message : String(failure);
-  return `Could not use the SSH agent at ${choice.agent} (${SSH_AGENT_SOURCE_LABELS[choice.source]}): ${detail}. ${UNUSABLE_REMEDIES[choice.source]}`;
+  const remedy = choice.source === "env" && platform === "win32" ? windowsEnvRemedy(choice.agent) : UNUSABLE_REMEDIES[choice.source];
+  return `Could not use the SSH agent at ${choice.agent} (${SSH_AGENT_SOURCE_LABELS[choice.source]}): ${detail}. ${remedy}`;
+}
+
+function windowsEnvRemedy(agent: string): string {
+  // ssh2 accepts either slash in a pipe path, and Windows ignores case.
+  const isOpenSshPipe = agent.replace(/\//g, "\\").toLowerCase() === OPENSSH_AGENT_PIPE.toLowerCase();
+  const which = isOpenSshPipe
+    ? " (the OpenSSH Authentication Agent service, or another agent that provides this pipe, e.g. 1Password)"
+    : "";
+  return `Start the agent SSH_AUTH_SOCK points to${which}, or set nexus.ssh.agent to the agent Nexus should use instead, such as pageant. Or remove SSH_AUTH_SOCK from the Windows environment and fully restart VS Code, so Automatic finds Pageant or the OpenSSH agent itself.`;
 }
 
 export function sshAgentHoldsNoKeysMessage(choice: SshAgentChoice): string {
