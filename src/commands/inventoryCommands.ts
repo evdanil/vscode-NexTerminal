@@ -6518,7 +6518,9 @@ export function registerInventoryCommands(
    * failure — surfaced here as an error naming the node — unlike the swallowing
    * status refresh. On success it fires a best-effort `refreshStatus` for the
    * source WITHOUT awaiting: the node boots over seconds, so the status will lag
-   * a beat, which is expected and fine.
+   * a beat, which is expected and fine. A success the provider qualified (a
+   * Proxmox task that completed with warnings) is still a success: same toast
+   * with the provider's sentence appended, same refreshes.
    */
   async function controlNode(arg: unknown, action: "start" | "stop"): Promise<void> {
     const server = resolveServerArg(arg);
@@ -6589,6 +6591,10 @@ export function registerInventoryCommands(
     const startRevision = source.revision;
     inFlightSourceIds.set(source.id, "control");
     let dispatched = false;
+    // What the provider had to add about a success, already made inert by
+    // `controlProviderNode` (issue #298: a Proxmox task that completed with
+    // warnings). Absent for a plain success.
+    let providerNotice: string | undefined;
     try {
       // PROVIDER TRUST FINGERPRINT — the same Continue/Cancel gate `syncNow`,
       // `editSource` and `openWebConsole` put in front of THEIR vault reads, and
@@ -6685,7 +6691,7 @@ export function registerInventoryCommands(
         { location: vscode.ProgressLocation.Notification, title: `${verb} "${server.name}"…` },
         async () => {
           try {
-            await controlProviderNode(provider, captured.config, captured.secrets, origin.externalId, action);
+            providerNotice = await controlProviderNode(provider, captured.config, captured.secrets, origin.externalId, action);
             return true;
           } catch (err) {
             void vscode.window.showErrorMessage(`Failed to ${action} "${server.name}": ${describeInventoryError(err)}`);
@@ -6723,13 +6729,18 @@ export function registerInventoryCommands(
     // `fetchStatus`. Promising a re-check there would be the same empty promise
     // wearing new words — so that case says what WILL update the row, and nothing
     // is fired or armed, since neither refresh could do anything for it.
+    //
+    // A provider's notice (a Proxmox task that completed with warnings) is
+    // APPENDED, never a replacement: the action happened, so every promise above
+    // still holds and the same refreshes fire below. A synced server's name is
+    // provider text, so it is flattened here, where it enters the sentence.
     const reportsStatus = typeof provider.fetchStatus === "function";
     const sent = action === "start" ? "Start" : "Stop";
-    void vscode.window.showInformationMessage(
-      reportsStatus
-        ? `${sent} sent to "${server.name}" — it takes a few seconds to take effect, and Nexus re-checks the status after that.`
-        : `${sent} sent to "${server.name}" — it takes a few seconds to take effect. This source reports node state only when it syncs, so the row updates on its next sync.`
-    );
+    const name = flattenProviderText(server.name);
+    const notice = reportsStatus
+      ? `${sent} sent to "${name}" — it takes a few seconds to take effect, and Nexus re-checks the status after that.`
+      : `${sent} sent to "${name}" — it takes a few seconds to take effect. This source reports node state only when it syncs, so the row updates on its next sync.`;
+    void vscode.window.showInformationMessage(providerNotice ? `${notice} ${providerNotice}` : notice);
     if (!reportsStatus) {
       return;
     }

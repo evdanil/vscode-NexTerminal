@@ -4,7 +4,9 @@ import { certificateFailureMessage, redirectNotFollowedMessage, type Certificate
 import { createInsecureHttpsFetch } from "../insecureFetch";
 import {
   InventoryProviderError,
+  flattenProviderText,
   type InventoryConfigField,
+  type InventoryControlResult,
   type InventoryDevice,
   type InventoryDeviceStatus,
   type InventoryProvider,
@@ -2208,11 +2210,14 @@ async function resolveGuestRow(
  * so a fresh `?type=vm` lookup resolves them (a guest can migrate between
  * syncs — the last tree is never trusted); the POST answers HTTP 200
  * IMMEDIATELY with `{"data":"UPID:…"}`, and the task's verdict is visible ONLY
- * by polling the task endpoint — a POST 200 says nothing about success ("VM 105
- * already running" travels as a stopped task with a non-OK `exitstatus`, and a
- * success task carries `exitstatus: "OK"`). Nodes (`"node/<name>"` externalIds)
- * are refused before any HTTP call: PVE nodes are not start/stop targets from
- * Nexus. A deadline expiry reports honestly — the task continues server-side.
+ * by polling the task endpoint — a POST 200 says nothing about success. A
+ * stopped task's `exitstatus` takes one of THREE forms: `"OK"` resolves;
+ * `"WARNINGS: <n>"` — the task completed and logged n warnings — also
+ * resolves, with a notice naming the count and the node whose task log holds
+ * them; anything else is PVE's error message ("VM 105 already running") and is
+ * thrown verbatim. Nodes (`"node/<name>"` externalIds) are refused before any
+ * HTTP call: PVE nodes are not start/stop targets from Nexus. A deadline
+ * expiry reports honestly — the task continues server-side.
  */
 async function controlNodeImpl(
   transports: ProxmoxTransports,
@@ -2220,7 +2225,7 @@ async function controlNodeImpl(
   secrets: InventorySourceSecrets,
   externalId: string,
   action: "start" | "stop"
-): Promise<void> {
+): Promise<void | InventoryControlResult> {
   if (isProxmoxNodeExternalId(externalId)) {
     throw new InventoryProviderError(
       "protocol",
@@ -2287,6 +2292,19 @@ async function controlNodeImpl(
     if (t.status === "stopped") {
       if (t.exitstatus === "OK") {
         return;
+      }
+      // "WARNINGS: <n>" is a task that COMPLETED and logged n warnings — PVE's
+      // own UI (proxmox-widget-toolkit's `parse_task_status`) shows it as a
+      // warning, not an error. The action happened, so it resolves; the notice
+      // says where the warnings are, since only that node's task log holds
+      // them. Anchored at both ends and case-sensitive: every other status is
+      // an error MESSAGE, and one may merely mention warnings.
+      const warnings = /^WARNINGS: (\d+)$/.exec(str(t.exitstatus));
+      if (warnings) {
+        const count = warnings[1];
+        return {
+          notice: `Proxmox reported ${count} ${count === "1" ? "warning" : "warnings"}; see the task log on node ${flattenProviderText(target.node)}.`
+        };
       }
       // The task's own message is the only truthful explanation available —
       // carry it verbatim (verified live: "VM 105 already running").
@@ -2493,7 +2511,7 @@ export function createProxmoxProvider(
       secrets: InventorySourceSecrets,
       externalId: string,
       action: "start" | "stop"
-    ): Promise<void> {
+    ): Promise<void | InventoryControlResult> {
       return controlNodeImpl(transports, config, secrets, externalId, action);
     },
     // The device-aware control gate (§Control, P2 review fix) — bare vmids

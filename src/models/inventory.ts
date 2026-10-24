@@ -370,6 +370,25 @@ export type InventorySourceDefaultRoute =
   | { readonly kind: "direct" }
   | { readonly kind: "ssh"; readonly jumpHostId: string };
 
+/**
+ * NODE CONTROL — what a `controlNode` that SUCCEEDED may add to the success
+ * notice. Optional in every sense: a provider that resolves with nothing keeps
+ * the plain notice.
+ *
+ * WHY THE PROVIDER OWNS THE SENTENCE, as it does `statusTruncationRemedy`: the
+ * notice the command shows is provider-neutral, and what is worth adding is in
+ * one provider's vocabulary. The case it exists for is Proxmox, whose task can
+ * complete while logging warnings ("WARNINGS: 1") — a success the user should
+ * still hear about, along with which node's task log holds them.
+ *
+ * Read only through `controlProviderNode`, which makes the text inert and
+ * bounds it, and drops anything that is not a string.
+ */
+export interface InventoryControlResult {
+  /** One sentence, appended after the success notice's own. */
+  readonly notice?: string;
+}
+
 export interface InventoryProvider {
   /** Unique registry key, read once at registration; later edits do not move this registration or its sources. */
   id: string; // e.g. "netbox"
@@ -521,13 +540,18 @@ export interface InventoryProvider {
    * no-op: a start/stop the user issued that did not happen must surface as an
    * error, not vanish. A provider that does not implement it offers no node
    * control (NetBox); the Start/Stop commands guard on it and stay hidden.
+   *
+   * Resolving means the action HAPPENED. A provider may resolve with an
+   * `InventoryControlResult` to say something more about a success — see that
+   * type; resolving with nothing, as every provider written before it does,
+   * keeps the plain success notice.
    */
   controlNode?(
     config: InventorySourceValues,
     secrets: InventorySourceSecrets,
     externalId: string,
     action: "start" | "stop"
-  ): Promise<void>;
+  ): Promise<void | InventoryControlResult>;
   /**
    * DEVICE-AWARE CONTROL GATE (P2 review fix) — OPTIONAL. Which of this
    * provider's synced devices `controlNode` can actually act on, keyed by the
@@ -1184,6 +1208,9 @@ export function resolveStatusTruncationRemedy(
   return text.length > 0 ? text : undefined;
 }
 
+/** See `controlProviderNode` — two clauses naming a count and a place, with room to spare; still a notification. */
+const CONTROL_NOTICE_MAX_LENGTH = 240;
+
 /**
  * NODE CONTROL (Phase 4) — the ONE sanctioned way to invoke
  * `InventoryProvider.controlNode`, the MUTATING twin of `fetchProviderStatus`.
@@ -1200,6 +1227,14 @@ export function resolveStatusTruncationRemedy(
  * config so an in-place normalization cannot mutate the caller's stored source
  * config — but the clone is OUTSIDE any try, matching the propagate-everything
  * stance: a non-cloneable config surfaces rather than masquerading as success.
+ *
+ * Resolves with the provider's `InventoryControlResult.notice`, flattened and
+ * capped like `resolveStatusTruncationRemedy`'s text and for the same reason:
+ * it is interpolated into a sentence Nexus composed. Anything else a provider
+ * resolves with — nothing, a non-object, a non-string or blank notice —
+ * resolves to `undefined` and is never a throw: by the time the result is
+ * read the action has HAPPENED, and reporting a start that took place as a
+ * failure is the bug this field was added to fix.
  */
 export async function controlProviderNode(
   provider: Pick<InventoryProvider, "controlNode">,
@@ -1207,11 +1242,17 @@ export async function controlProviderNode(
   secrets: InventorySourceSecrets,
   externalId: string,
   action: "start" | "stop"
-): Promise<void> {
+): Promise<string | undefined> {
   if (typeof provider.controlNode !== "function") {
     throw new Error("This inventory source does not support node control.");
   }
-  await provider.controlNode(structuredClone(config), secrets, externalId, action);
+  const result: unknown = await provider.controlNode(structuredClone(config), secrets, externalId, action);
+  const notice = typeof result === "object" && result !== null ? (result as { notice?: unknown }).notice : undefined;
+  if (typeof notice !== "string") {
+    return undefined;
+  }
+  const text = capProviderText(flattenProviderText(notice), CONTROL_NOTICE_MAX_LENGTH);
+  return text.length > 0 ? text : undefined;
 }
 
 export type InventoryErrorKind = "auth" | "network" | "protocol";
