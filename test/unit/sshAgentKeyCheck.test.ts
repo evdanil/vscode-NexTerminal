@@ -31,17 +31,34 @@ function socketPath(): string {
   return path.join(dir, "agent.sock");
 }
 
+/**
+ * The keys the fake agent offers: fixed, made once with the system ssh-keygen,
+ * and parsed once here. Do not go back to generating them per run with ssh2's
+ * own ed25519 key-pair generator: ssh2 1.17.0 drops a leading zero byte of
+ * the 32-byte public key, so about one key in 256 is encoded 31 bytes
+ * long and its own `parseKey` rejects it ("Malformed OpenSSH public key") —
+ * measured at 17 and 22 failures in 5000 — which made this file fail on its
+ * own in roughly one run in a hundred. Both keys here are 32 bytes with a
+ * non-zero first byte. (The extension itself generates keys with ssh-keygen,
+ * never ssh2, so only this fixture was exposed.)
+ */
+const AGENT_KEYS = [
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICO6B89vdm2MgqPXpYEB5NA4Y++30/ZJm9sDJaUcTtvO nexus-agent-test-1",
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH6beyC54pPGux3RsiNZBugJt+DvmDGBetpmyPAy9s2a nexus-agent-test-2"
+].map((line) => {
+  const parsed = utils.parseKey(line);
+  if (parsed instanceof Error) throw parsed;
+  return parsed;
+});
+
 /** Resolves once every connection the fake agent accepted has closed. */
 let agentConnectionsClosed: () => Promise<void> = async () => {};
 
 async function fakeAgent(behaviour: Behaviour): Promise<string> {
-  const publicKeys = behaviour === "silent"
-    ? []
-    : Array.from({ length: behaviour.keys }, () => {
-        const parsed = utils.parseKey(utils.generateKeyPairSync("ed25519").public);
-        if (parsed instanceof Error) throw parsed;
-        return parsed;
-      });
+  if (behaviour !== "silent" && behaviour.keys > AGENT_KEYS.length) {
+    throw new Error(`the fake agent holds at most ${AGENT_KEYS.length} keys`);
+  }
+  const publicKeys = behaviour === "silent" ? [] : AGENT_KEYS.slice(0, behaviour.keys);
   const sockets = new Set<Socket>();
   const closed: Array<Promise<void>> = [];
   agentConnectionsClosed = () => Promise.all(closed).then(() => undefined);
