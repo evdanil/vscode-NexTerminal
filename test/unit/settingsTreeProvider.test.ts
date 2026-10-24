@@ -264,11 +264,25 @@ describe("SettingsTreeProvider", () => {
       expect(children.some((child) => (typeof child.label === "string" ? child.label : child.label?.label)?.includes("Terminal Output Trace"))).toBe(true);
     });
 
-    it("returns 7 children for ssh category after host trust moves to Security & Data", () => {
+    it("returns 8 children for ssh category after host trust moves to Security & Data — the agent mode, but not its path, while the agent is not custom", () => {
       const provider = createProvider();
       const category = new SettingsCategoryItem("ssh");
       const children = provider.getChildren(category);
-      expect(children).toHaveLength(7);
+      expect(children).toHaveLength(8);
+      expect(children.map((child) => String(child.label))).toEqual(
+        expect.arrayContaining([expect.stringContaining("SSH Agent")])
+      );
+      expect(children.map((child) => String(child.label)).some((label) => label.includes("Agent Socket or Pipe"))).toBe(false);
+    });
+
+    it("shows the agent socket or pipe once nexus.ssh.agent is custom (visibleWhen on an enum)", () => {
+      mockGetConfiguration.mockImplementation(() => ({
+        get: (key: string) => (key === "agent" ? "custom" : undefined)
+      }));
+      const provider = createProvider();
+      const children = provider.getChildren(new SettingsCategoryItem("ssh"));
+      expect(children).toHaveLength(9);
+      expect(children.map((child) => String(child.label)).some((label) => label.includes("Agent Socket or Pipe"))).toBe(true);
     });
 
     it("returns Trust New Hosts and Data Management under Security & Data", () => {

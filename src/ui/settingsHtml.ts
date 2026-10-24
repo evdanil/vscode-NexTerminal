@@ -561,6 +561,7 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
           var hidden = wrapper.querySelector('input[type="hidden"]');
           hidden.addEventListener("change", function() {
             saveSetting(wrapper.dataset.section, wrapper.dataset.key, hidden.value);
+            updateVisibility();
           });
         })(selects[si]);
       }
@@ -686,6 +687,11 @@ export function renderSettingsHtml(values: SettingValues, nonce: string, categor
           var currentValue;
           if (ctrl.type === "checkbox") {
             currentValue = String(ctrl.checked);
+          } else if (ctrl.classList && ctrl.classList.contains("custom-select")) {
+            // An enum's [data-section] element is its wrapper <div>; the value
+            // lives in the hidden input inside it.
+            var enumValue = ctrl.querySelector('input[type="hidden"]');
+            currentValue = enumValue ? enumValue.value : "";
           } else {
             currentValue = ctrl.value;
           }

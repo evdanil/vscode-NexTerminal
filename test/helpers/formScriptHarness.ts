@@ -306,8 +306,8 @@ function buildFormDom(definition: FormDefinition): FormDom {
   };
 
   for (const field of definition.fields) {
-    if (field.type === "html") {
-      const group = form.append(new StubElement("DIV", ["form-group", "form-illustration"]));
+    if (field.type === "html" || field.type === "note") {
+      const group = form.append(new StubElement("DIV", ["form-group", field.type === "html" ? "form-illustration" : "form-note"]));
       if (field.visibleWhen) {
         group.dataset.visibleWhen = JSON.stringify(Array.isArray(field.visibleWhen) ? field.visibleWhen : [field.visibleWhen]);
       }

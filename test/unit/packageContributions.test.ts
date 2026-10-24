@@ -2276,3 +2276,57 @@ describe("#153 — setting descriptions name everything the setting governs", ()
     expect(timeout).not.toContain("waitFor / expect / waitAny when");
   });
 });
+
+/**
+ * SSH AGENT — the agent every SSH Agent login uses is chosen per machine.
+ * `scope: "machine"` is the security property, not a nicety: VS Code ignores a
+ * machine-scoped setting in workspace and folder settings, so a repository the
+ * user opens can never point their key signing at an agent of its choosing.
+ */
+describe("SSH agent settings (nexus.ssh.agent, nexus.ssh.agentPath)", () => {
+  const props = packageJson.contributes.configuration?.properties ?? {};
+
+  it("contributes nexus.ssh.agent as a machine-scoped enum defaulting to auto (⊘ a window-scoped setting lets a workspace redirect key signing)", () => {
+    const agent = props["nexus.ssh.agent"];
+    expect(agent).toMatchObject({ type: "string", default: "auto", scope: "machine" });
+    expect(agent.enum).toEqual(["auto", "pageant", "openssh", "custom"]);
+    expect(agent.enumDescriptions).toHaveLength(4);
+    expect(agent.markdownDescription).toMatch(/workspace cannot set it/i);
+  });
+
+  it("contributes nexus.ssh.agentPath as a machine-scoped string defaulting to empty, pointing at the mode that uses it", () => {
+    const agentPath = props["nexus.ssh.agentPath"];
+    expect(agentPath).toMatchObject({ type: "string", default: "", scope: "machine" });
+    expect(agentPath.markdownDescription).toContain("#nexus.ssh.agent#");
+    expect(agentPath.markdownDescription).toContain("pageant --symlink");
+  });
+
+  it("orders both among the other nexus.ssh settings, the path right after the mode", () => {
+    const sshOrders = Object.entries(props)
+      .filter(([key]) => key.startsWith("nexus.ssh.") && !key.startsWith("nexus.ssh.agent"))
+      .map(([, value]) => value.order as number);
+    const agentOrder = props["nexus.ssh.agent"].order as number;
+    expect(agentOrder).toBeGreaterThan(Math.min(...sshOrders));
+    expect(agentOrder).toBeLessThan(Math.max(...sshOrders));
+    expect(props["nexus.ssh.agentPath"].order).toBeGreaterThan(agentOrder);
+    expect(Object.values(props).filter((value) => value.order === agentOrder)).toHaveLength(1);
+  });
+
+  it("mirrors both into the Settings panel: the same modes, auto recommended, the path shown only for custom, and no reload badge (each connect reads them)", async () => {
+    const { SETTINGS_META } = await import("../../src/ui/settingsMetadata");
+    const agent = SETTINGS_META.find((item) => item.section === "nexus.ssh" && item.key === "agent");
+    const agentPath = SETTINGS_META.find((item) => item.section === "nexus.ssh" && item.key === "agentPath");
+    expect(agent).toMatchObject({ type: "enum", category: "ssh", subgroup: "SSH Agent", default: "auto" });
+    expect(agent?.enumOptions?.map((option) => option.value)).toEqual(props["nexus.ssh.agent"].enum);
+    expect(agent?.enumOptions?.filter((option) => option.recommended).map((option) => option.value)).toEqual(["auto"]);
+    expect(agentPath).toMatchObject({
+      type: "string",
+      category: "ssh",
+      subgroup: "SSH Agent",
+      default: "",
+      visibleWhen: { setting: "nexus.ssh.agent", value: "custom" }
+    });
+    expect(agent?.badge).toBeUndefined();
+    expect(agentPath?.badge).toBeUndefined();
+  });
+});

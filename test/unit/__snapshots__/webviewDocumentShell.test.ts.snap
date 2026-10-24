@@ -562,6 +562,10 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
     </div>
   </div>
 
+  <div class="form-group conditional-field" id="agent-note">
+    <div class="hint">Uses the agent chosen in Settings → SSH → SSH Agent — by default SSH_AUTH_SOCK, or on Windows Pageant or the OpenSSH agent. One choice for every server on this machine.</div>
+  </div>
+
   <div class="bottom-actions">
     <button type="button" class="btn-primary" id="save-btn">Save</button>
     <span class="save-indicator" id="save-flag" role="status" aria-live="polite">✓ Saved</span>
@@ -897,6 +901,7 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
         var authType = document.getElementById("authtype-select-value").value;
         var pwField = document.getElementById("password-field");
         var keyField = document.getElementById("keypath-field");
+        var agentNote = document.getElementById("agent-note");
         if (authType === "password") {
           pwField.classList.add("visible");
           keyField.classList.remove("visible");
@@ -906,6 +911,11 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
         } else {
           pwField.classList.remove("visible");
           keyField.classList.remove("visible");
+        }
+        if (authType === "agent") {
+          agentNote.classList.add("visible");
+        } else {
+          agentNote.classList.remove("visible");
         }
       }
 
@@ -1491,6 +1501,11 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
     }
     .form-section:first-child {
       margin-top: 4px;
+    }
+    .form-note {
+      color: var(--vscode-descriptionForeground);
+      font-size: 12px;
+      line-height: 1.5;
     }
     .actions button[data-visible-when] {
       display: none;
@@ -3533,6 +3548,11 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
     }
     .form-section:first-child {
       margin-top: 4px;
+    }
+    .form-note {
+      color: var(--vscode-descriptionForeground);
+      font-size: 12px;
+      line-height: 1.5;
     }
     .actions button[data-visible-when] {
       display: none;
@@ -10791,6 +10811,30 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
   <span class="validation-error" data-for="nexus.ssh.multiplexing.idleTimeout"></span>
   <span class="save-indicator" aria-live="polite" data-for="nexus.ssh.multiplexing.idleTimeout"></span>
 </div>
+  <h4 class="settings-subgroup">SSH Agent</h4>
+  <div class="form-group">
+  <label id="setting-nexus-ssh-agent-label">SSH Agent</label>
+  <div class="setting-desc">Which agent answers SSH Agent logins on this machine, for terminals, SFTP, tunnels and jump hosts. A workspace cannot change it. Applies at the next connection.</div>
+  <div class="custom-select" data-section="nexus.ssh" data-key="agent">
+    <input type="hidden" id="setting-nexus-ssh-agent" value="auto" />
+    <div class="custom-select-trigger" tabindex="0" role="combobox" aria-haspopup="listbox" aria-labelledby="setting-nexus-ssh-agent-label" aria-expanded="false">
+      <span class="custom-select-text">Automatic</span>
+    </div>
+    <div class="custom-select-dropdown" role="listbox" aria-labelledby="setting-nexus-ssh-agent-label">
+      <div class="custom-select-option selected" data-value="auto" role="option" aria-selected="true">Automatic <span class="recommended-badge">recommended</span></div>
+        <div class="custom-select-option" data-value="pageant" role="option" aria-selected="false">Pageant (Windows)</div>
+        <div class="custom-select-option" data-value="openssh" role="option" aria-selected="false">OpenSSH Agent (Windows)</div>
+        <div class="custom-select-option" data-value="custom" role="option" aria-selected="false">Custom socket or pipe</div>
+    </div>
+  </div>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.ssh.agent"></span>
+</div>
+  <div class="form-group" data-visible-when-setting="nexus.ssh.agent" data-visible-when-value="custom">
+  <label for="setting-nexus-ssh-agentPath">Agent Socket or Pipe</label>
+  <div class="setting-desc">Full path of the agent&#39;s socket (Linux, macOS) or named pipe (Windows, \\\\.\\pipe\\…). For PuTTY&#39;s Unix Pageant, run pageant --symlink &lt;fixed path&gt; and enter that path.</div>
+  <input type="text" id="setting-nexus-ssh-agentPath" data-section="nexus.ssh" data-key="agentPath" value="" />
+  <span class="save-indicator" aria-live="polite" data-for="nexus.ssh.agentPath"></span>
+</div>
   <h4 class="settings-subgroup">Advanced</h4>
   <div class="form-group">
   <label for="setting-nexus-ssh-connectionTimeout">Connection Timeout</label>
@@ -11845,6 +11889,7 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
           var hidden = wrapper.querySelector('input[type="hidden"]');
           hidden.addEventListener("change", function() {
             saveSetting(wrapper.dataset.section, wrapper.dataset.key, hidden.value);
+            updateVisibility();
           });
         })(selects[si]);
       }
@@ -11970,6 +12015,11 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
           var currentValue;
           if (ctrl.type === "checkbox") {
             currentValue = String(ctrl.checked);
+          } else if (ctrl.classList && ctrl.classList.contains("custom-select")) {
+            // An enum's [data-section] element is its wrapper <div>; the value
+            // lives in the hidden input inside it.
+            var enumValue = ctrl.querySelector('input[type="hidden"]');
+            currentValue = enumValue ? enumValue.value : "";
           } else {
             currentValue = ctrl.value;
           }
@@ -12656,7 +12706,7 @@ exports[`webview document shell (byte-identity guard) > settings (single categor
   </div>
   <header class="settings-panel-header">
     <h2>Nexus: SSH</h2>
-    <p>Tune SSH connection sharing, timeouts, keepalives, proxy handshakes, and terminal identity.</p>
+    <p>Tune SSH connection sharing, the SSH agent, timeouts, keepalives, proxy handshakes, and terminal identity.</p>
   </header>  <h4 class="settings-subgroup">Connection</h4>
   <div class="settings-card"><div class="form-group form-group-checkbox">
   <label for="setting-nexus-ssh-multiplexing-enabled">
@@ -12677,6 +12727,30 @@ exports[`webview document shell (byte-identity guard) > settings (single categor
   </div>
   <span class="validation-error" data-for="nexus.ssh.multiplexing.idleTimeout"></span>
   <span class="save-indicator" aria-live="polite" data-for="nexus.ssh.multiplexing.idleTimeout"></span>
+</div></div>
+  <h4 class="settings-subgroup">SSH Agent</h4>
+  <div class="settings-card"><div class="form-group">
+  <label id="setting-nexus-ssh-agent-label">SSH Agent</label>
+  <div class="setting-desc">Which agent answers SSH Agent logins on this machine, for terminals, SFTP, tunnels and jump hosts. A workspace cannot change it. Applies at the next connection.</div>
+  <div class="custom-select" data-section="nexus.ssh" data-key="agent">
+    <input type="hidden" id="setting-nexus-ssh-agent" value="auto" />
+    <div class="custom-select-trigger" tabindex="0" role="combobox" aria-haspopup="listbox" aria-labelledby="setting-nexus-ssh-agent-label" aria-expanded="false">
+      <span class="custom-select-text">Automatic</span>
+    </div>
+    <div class="custom-select-dropdown" role="listbox" aria-labelledby="setting-nexus-ssh-agent-label">
+      <div class="custom-select-option selected" data-value="auto" role="option" aria-selected="true">Automatic <span class="recommended-badge">recommended</span></div>
+        <div class="custom-select-option" data-value="pageant" role="option" aria-selected="false">Pageant (Windows)</div>
+        <div class="custom-select-option" data-value="openssh" role="option" aria-selected="false">OpenSSH Agent (Windows)</div>
+        <div class="custom-select-option" data-value="custom" role="option" aria-selected="false">Custom socket or pipe</div>
+    </div>
+  </div>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.ssh.agent"></span>
+</div></div>
+  <div class="settings-card"><div class="form-group" data-visible-when-setting="nexus.ssh.agent" data-visible-when-value="custom">
+  <label for="setting-nexus-ssh-agentPath">Agent Socket or Pipe</label>
+  <div class="setting-desc">Full path of the agent&#39;s socket (Linux, macOS) or named pipe (Windows, \\\\.\\pipe\\…). For PuTTY&#39;s Unix Pageant, run pageant --symlink &lt;fixed path&gt; and enter that path.</div>
+  <input type="text" id="setting-nexus-ssh-agentPath" data-section="nexus.ssh" data-key="agentPath" value="" />
+  <span class="save-indicator" aria-live="polite" data-for="nexus.ssh.agentPath"></span>
 </div></div>
   <h4 class="settings-subgroup">Advanced</h4>
   <div class="settings-card"><div class="form-group">
@@ -13115,6 +13189,7 @@ exports[`webview document shell (byte-identity guard) > settings (single categor
           var hidden = wrapper.querySelector('input[type="hidden"]');
           hidden.addEventListener("change", function() {
             saveSetting(wrapper.dataset.section, wrapper.dataset.key, hidden.value);
+            updateVisibility();
           });
         })(selects[si]);
       }
@@ -13240,6 +13315,11 @@ exports[`webview document shell (byte-identity guard) > settings (single categor
           var currentValue;
           if (ctrl.type === "checkbox") {
             currentValue = String(ctrl.checked);
+          } else if (ctrl.classList && ctrl.classList.contains("custom-select")) {
+            // An enum's [data-section] element is its wrapper <div>; the value
+            // lives in the hidden input inside it.
+            var enumValue = ctrl.querySelector('input[type="hidden"]');
+            currentValue = enumValue ? enumValue.value : "";
           } else {
             currentValue = ctrl.value;
           }

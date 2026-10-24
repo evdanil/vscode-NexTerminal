@@ -3,6 +3,7 @@ import { escapeHtml } from "./shared/escapeHtml";
 import { baseWebviewCss } from "./shared/webviewStyles";
 import { baseWebviewJs } from "./shared/webviewScripts";
 import { renderWebviewDocument } from "./shared/webviewDocument";
+import { SSH_AGENT_FORM_NOTE } from "./settingsMetadata";
 
 export function renderAuthProfileEditorHtml(
   profiles: AuthProfile[],
@@ -151,6 +152,10 @@ export function renderAuthProfileEditorHtml(
     </div>
   </div>
 
+  <div class="form-group conditional-field${authTypeValue === "agent" ? " visible" : ""}" id="agent-note">
+    <div class="hint">${escapeHtml(SSH_AGENT_FORM_NOTE)}</div>
+  </div>
+
   <div class="bottom-actions">
     <button type="button" class="btn-primary" id="save-btn">${escapeHtml(saveLabel)}</button>
     <span class="save-indicator${justSavedName ? " visible" : ""}" id="save-flag" role="status" aria-live="polite">✓ Saved</span>
@@ -196,6 +201,7 @@ export function renderAuthProfileEditorHtml(
         var authType = document.getElementById("authtype-select-value").value;
         var pwField = document.getElementById("password-field");
         var keyField = document.getElementById("keypath-field");
+        var agentNote = document.getElementById("agent-note");
         if (authType === "password") {
           pwField.classList.add("visible");
           keyField.classList.remove("visible");
@@ -205,6 +211,11 @@ export function renderAuthProfileEditorHtml(
         } else {
           pwField.classList.remove("visible");
           keyField.classList.remove("visible");
+        }
+        if (authType === "agent") {
+          agentNote.classList.add("visible");
+        } else {
+          agentNote.classList.remove("visible");
         }
       }
 
