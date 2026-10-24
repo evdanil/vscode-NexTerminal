@@ -10268,9 +10268,13 @@ describe("inventoryCommands", () => {
     });
 
     it("refuses a manual (non-synced) server with no origin (⊘ start/stop on a server with no inventory node has nothing to control)", async () => {
-      const { start, controlSpy, server } = await setup({ noOrigin: true });
+      const { start, controlSpy, server } = await setup({ noOrigin: true, serverName: "R1\n‮forged" });
       await start({ server });
       expect(mockShowErrorMessage).toHaveBeenCalled();
+      // The refusal quotes the same flattened name as every other message here.
+      expect(String(mockShowErrorMessage.mock.calls[0]?.[0])).toBe(
+        '"R1 forged" is not synced from an inventory source that supports node control.'
+      );
       expect(controlSpy).not.toHaveBeenCalled();
     });
 
@@ -10367,6 +10371,22 @@ describe("inventoryCommands", () => {
       expect(info).toBe(
         'Start sent to "R1 forged" — it takes a few seconds to take effect, and Nexus re-checks the status after that. Proxmox reported 2 warnings; see the task log on node pve1.'
       );
+    });
+
+    it("the guest name enters the progress title and the failure toast FLATTENED as well — one value, one treatment across the handler (⊘ flattening only the success toast, leaving the title and the failure toast to remember)", async () => {
+      const { start, server } = await setup({
+        serverName: "R1\n‮forged",
+        controlNode: vi.fn(async () => {
+          throw new Error("refused");
+        })
+      });
+      await start({ server });
+      const title = String((mockWithProgress.mock.calls[0]?.[0] as { title?: string } | undefined)?.title);
+      expect(title).toBe('Starting "R1 forged"…');
+      const msg = String(mockShowErrorMessage.mock.calls[0]?.[0]);
+      expect(msg).toContain('Failed to start "R1 forged": ');
+      expect(msg).not.toContain("\n");
+      expect(msg).not.toContain("‮");
     });
 
     it("P3-4 — wraps the dispatch in withProgress so the '{Starting|Stopping} \"name\"…' title shows DURING the ~60s call, then still dispatches and refreshes (⊘ no withProgress leaves the user staring at a silent UI for the whole login→detect→action sequence)", async () => {

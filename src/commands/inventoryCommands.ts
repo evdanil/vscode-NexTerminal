@@ -6530,12 +6530,15 @@ export function registerInventoryCommands(
       void vscode.window.showErrorMessage(`Select a synced node to ${action} it.`);
       return;
     }
+    // A synced server's name is provider text: flattened once, where it enters
+    // this handler, so every message it composes shares one treatment.
+    const name = flattenProviderText(server.name);
     const origin = server.origin;
     const source = origin ? core.getInventorySource(origin.sourceId) : undefined;
     const provider = source ? registry.get(source.providerId) : undefined;
     if (!origin || !source || !provider || typeof provider.controlNode !== "function") {
       void vscode.window.showErrorMessage(
-        `"${server.name}" is not synced from an inventory source that supports node control.`
+        `"${name}" is not synced from an inventory source that supports node control.`
       );
       return;
     }
@@ -6688,13 +6691,13 @@ export function registerInventoryCommands(
       // inventory failure toast, rather than a bare err.message.
       const verb = action === "start" ? "Starting" : "Stopping";
       dispatched = await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: `${verb} "${server.name}"…` },
+        { location: vscode.ProgressLocation.Notification, title: `${verb} "${name}"…` },
         async () => {
           try {
             providerNotice = await controlProviderNode(provider, captured.config, captured.secrets, origin.externalId, action);
             return true;
           } catch (err) {
-            void vscode.window.showErrorMessage(`Failed to ${action} "${server.name}": ${describeInventoryError(err)}`);
+            void vscode.window.showErrorMessage(`Failed to ${action} "${name}": ${describeInventoryError(err)}`);
             return false;
           }
         }
@@ -6732,11 +6735,9 @@ export function registerInventoryCommands(
     //
     // A provider's notice (a Proxmox task that completed with warnings) is
     // APPENDED, never a replacement: the action happened, so every promise above
-    // still holds and the same refreshes fire below. A synced server's name is
-    // provider text, so it is flattened here, where it enters the sentence.
+    // still holds and the same refreshes fire below.
     const reportsStatus = typeof provider.fetchStatus === "function";
     const sent = action === "start" ? "Start" : "Stop";
-    const name = flattenProviderText(server.name);
     const notice = reportsStatus
       ? `${sent} sent to "${name}" — it takes a few seconds to take effect, and Nexus re-checks the status after that.`
       : `${sent} sent to "${name}" — it takes a few seconds to take effect. This source reports node state only when it syncs, so the row updates on its next sync.`;
