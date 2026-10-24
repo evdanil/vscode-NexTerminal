@@ -628,7 +628,9 @@ export class Ssh2Connector implements SshConnector {
   /**
    * Resolved on every connect — pooled, jump-host and tunnel connections
    * included — so a change to `nexus.ssh.agent`, or Pageant starting, applies
-   * at the next connection. A choice that cannot be honoured is refused here,
+   * at the next login. A pooled connection already open is reused without
+   * one, so it keeps the agent it logged in with until it closes (idle
+   * timeout or Reload Window). A choice that cannot be honoured is refused here,
    * before anything is dialled. "No agent key to offer" (nothing found in auto
    * mode, or an empty agent) is not: those logins always went on to the
    * server's other methods, typically a keyboard-interactive password prompt,

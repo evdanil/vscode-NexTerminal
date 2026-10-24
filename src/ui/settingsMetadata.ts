@@ -122,7 +122,7 @@ export const SETTINGS_META: SettingMeta[] = [
     category: "ssh",
     subgroup: "SSH Agent",
     description:
-      "Which agent answers SSH Agent logins on this machine, for terminals, SFTP, tunnels and jump hosts. A workspace cannot change it. Applies at the next connection.",
+      "Which agent answers SSH Agent logins on this machine, for terminals, SFTP, tunnels and jump hosts. A workspace cannot change it. Applies at the next login; an open shared connection keeps its login.",
     default: "auto",
     enumOptions: [
       {

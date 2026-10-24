@@ -2341,6 +2341,27 @@ describe("SSH agent settings (nexus.ssh.agent, nexus.ssh.agentPath)", () => {
     expect(functionalDocs).toContain("| `nexus.ssh.agentPath` | string |");
   });
 
+  /**
+   * Found on Windows: Pageant quit, yet Connect still succeeded — the shared
+   * connection multiplexing keeps open after the last terminal closes was
+   * still logged in, so no new login (and no agent lookup) happened. Correct,
+   * but "takes effect at the next connection" promised otherwise.
+   */
+  it("says an agent change applies at the next login, not to a shared connection already open (⊘ 'at the next connection', which an open multiplexed connection contradicts)", async () => {
+    const { SETTINGS_META } = await import("../../src/ui/settingsMetadata");
+    const panel = SETTINGS_META.find((item) => item.section === "nexus.ssh" && item.key === "agent")?.description ?? "";
+    const setting: string = props["nexus.ssh.agent"].markdownDescription;
+    const guide = userDoc("docs/ssh-and-telnet.md");
+    for (const [where, text] of [["package.json", setting], ["settings panel", panel], ["SSH guide", guide]] as const) {
+      expect(text, where).not.toMatch(/(takes effect|applies) at the next connection/i);
+      expect(text, where).toMatch(/at the next login/);
+    }
+    expect(setting).toContain("keeps the login it has");
+    expect(panel).toContain("an open shared connection keeps its login");
+    expect(guide).toContain("`nexus.ssh.multiplexing.idleTimeout`");
+    expect(guide).toContain("**Reload Window**");
+  });
+
   it("no longer documents agent auth as a bare SSH_AUTH_SOCK pass-through (⊘ the claim that hid Windows having no agent at all)", () => {
     expect(functionalDocs).not.toContain("delegates to the system SSH agent via `SSH_AUTH_SOCK`");
     expect(functionalDocs).toContain("`buildConnectConfig` no longer reads `SSH_AUTH_SOCK`");

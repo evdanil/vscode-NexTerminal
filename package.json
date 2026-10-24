@@ -4222,7 +4222,7 @@
           "default": "auto",
           "scope": "machine",
           "order": 5.35,
-          "markdownDescription": "Which SSH agent answers **SSH Agent** logins — servers and auth profiles set to SSH Agent, including servers synced from an inventory source without an auth profile — for terminals, SFTP, tunnels and jump hosts alike. Machine-specific: a workspace cannot set it, so a repository can never redirect your key signing. Takes effect at the next connection.",
+          "markdownDescription": "Which SSH agent answers **SSH Agent** logins — servers and auth profiles set to SSH Agent, including servers synced from an inventory source without an auth profile — for terminals, SFTP, tunnels and jump hosts alike. Machine-specific: a workspace cannot set it, so a repository can never redirect your key signing. Takes effect at the next login; a connection that is already open (multiplexing keeps one open for a while after its last terminal closes) keeps the login it has.",
           "enumDescriptions": [
             "Use `SSH_AUTH_SOCK` when it is set. Otherwise, on Windows, Pageant's named pipe when Pageant (0.75 or newer) is running, then the Windows OpenSSH Authentication Agent. On Linux and macOS, `SSH_AUTH_SOCK` only.",
             "Windows only: PuTTY's Pageant 0.75 or newer, found by its named pipe. Fails if Pageant is not running.",

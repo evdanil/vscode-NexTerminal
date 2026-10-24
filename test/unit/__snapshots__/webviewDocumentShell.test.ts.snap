@@ -10814,7 +10814,7 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
   <h4 class="settings-subgroup">SSH Agent</h4>
   <div class="form-group">
   <label id="setting-nexus-ssh-agent-label">SSH Agent</label>
-  <div class="setting-desc">Which agent answers SSH Agent logins on this machine, for terminals, SFTP, tunnels and jump hosts. A workspace cannot change it. Applies at the next connection.</div>
+  <div class="setting-desc">Which agent answers SSH Agent logins on this machine, for terminals, SFTP, tunnels and jump hosts. A workspace cannot change it. Applies at the next login; an open shared connection keeps its login.</div>
   <div class="custom-select" data-section="nexus.ssh" data-key="agent">
     <input type="hidden" id="setting-nexus-ssh-agent" value="auto" />
     <div class="custom-select-trigger" tabindex="0" role="combobox" aria-haspopup="listbox" aria-labelledby="setting-nexus-ssh-agent-label" aria-expanded="false">
@@ -12731,7 +12731,7 @@ exports[`webview document shell (byte-identity guard) > settings (single categor
   <h4 class="settings-subgroup">SSH Agent</h4>
   <div class="settings-card"><div class="form-group">
   <label id="setting-nexus-ssh-agent-label">SSH Agent</label>
-  <div class="setting-desc">Which agent answers SSH Agent logins on this machine, for terminals, SFTP, tunnels and jump hosts. A workspace cannot change it. Applies at the next connection.</div>
+  <div class="setting-desc">Which agent answers SSH Agent logins on this machine, for terminals, SFTP, tunnels and jump hosts. A workspace cannot change it. Applies at the next login; an open shared connection keeps its login.</div>
   <div class="custom-select" data-section="nexus.ssh" data-key="agent">
     <input type="hidden" id="setting-nexus-ssh-agent" value="auto" />
     <div class="custom-select-trigger" tabindex="0" role="combobox" aria-haspopup="listbox" aria-labelledby="setting-nexus-ssh-agent-label" aria-expanded="false">

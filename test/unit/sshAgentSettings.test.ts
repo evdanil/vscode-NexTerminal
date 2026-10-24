@@ -28,7 +28,7 @@ describe("sshAgentResolver", () => {
     getConfiguration.mockClear();
   });
 
-  it("reads nexus.ssh.agent and nexus.ssh.agentPath on every call (⊘ reading them once would need a reload for a change the setting says applies at the next connection)", () => {
+  it("reads nexus.ssh.agent and nexus.ssh.agentPath on every call (⊘ reading them once would need a reload for a change the setting says applies at the next login)", () => {
     const resolve = sshAgentResolver();
     settings.set("nexus.ssh.agent", "custom");
     settings.set("nexus.ssh.agentPath", "/run/first.sock");
