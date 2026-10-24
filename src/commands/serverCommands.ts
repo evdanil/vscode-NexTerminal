@@ -21,6 +21,8 @@ import { flattenProviderText } from "../models/inventory";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SshPty } from "../services/ssh/sshPty";
+import { OPEN_AGENT_SETTINGS, openAgentSettings } from "../services/ssh/sshAgentSettings";
+import { findSshAgentUnavailable } from "../services/ssh/authErrors";
 import { TelnetPty } from "../services/telnet/telnetPty";
 import type { PtyOutputObserver } from "../services/macroAutoTrigger";
 import { Osc7Parser } from "../services/terminal/osc7Parser";
@@ -1660,11 +1662,13 @@ async function testServerConnection(ctx: CommandContext, arg?: unknown): Promise
     void vscode.window.showInformationMessage(`Connection test succeeded for ${server.name}.`);
   } catch (error) {
     const diagnostic = classifySshConnectionError(error);
-    const choice = await vscode.window.showErrorMessage(
-      `${diagnostic.title}: ${diagnostic.detail}`,
-      "Copy Details"
-    );
-    if (choice === "Copy Details") {
+    // A jump host's agent failure stays `proxy`, but the agent setting is still the fix.
+    const agentInvolved = diagnostic.stage === "agent" || findSshAgentUnavailable(error) !== undefined;
+    const actions = agentInvolved ? [OPEN_AGENT_SETTINGS, "Copy Details"] : ["Copy Details"];
+    const choice = await vscode.window.showErrorMessage(`${diagnostic.title}: ${diagnostic.detail}`, ...actions);
+    if (choice === OPEN_AGENT_SETTINGS) {
+      await openAgentSettings();
+    } else if (choice === "Copy Details") {
       await vscode.env.clipboard.writeText(formatSshDiagnosticDetails(server, diagnostic));
     }
   }

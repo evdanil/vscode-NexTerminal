@@ -8,6 +8,8 @@ import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
 import type { SshConnection, SshFactory } from "./contracts";
 import { hasContextAwareConnect } from "./contracts";
 import { classifySshConnectionError } from "./connectionDiagnostics";
+import { findSshAgentUnavailable } from "./authErrors";
+import { OPEN_AGENT_SETTINGS, openAgentSettings } from "./sshAgentSettings";
 import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
 import { CLEAR_VISIBLE_SCREEN, RESET_INTERACTIVE_MODES } from "../terminal/terminalEscapes";
@@ -22,6 +24,8 @@ import { createAnsiRegex } from "../../utils/ansi";
 // malicious banner can't manipulate terminal state or spoof the prompt.
 const AUTH_MESSAGE_ANSI_RE = createAnsiRegex();
 const AUTH_MESSAGE_CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
+
+const EDIT_SERVER = "Edit Server";
 
 export interface SshPtyCallbacks {
   onSessionOpened(sessionId: string): void;
@@ -490,7 +494,29 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       this.writeEmitter.fire(`\r\n[Nexus SSH] Connection failed: ${message}\r\n`);
       this.writeEmitter.fire("\r\n[Nexus SSH] Press any key to close this terminal.\r\n");
       this.callbacks.onConnectFailed?.(this.sessionId, message);
-      void vscode.window.showErrorMessage(`Nexus SSH connection failed for ${this.serverConfig.name}: ${message}`);
+      const notice = `Nexus SSH connection failed for ${this.serverConfig.name}: ${message}`;
+      if (classifySshConnectionError(error).stage === "agent") {
+        void this.offerAgentRemedies(notice, [OPEN_AGENT_SETTINGS, EDIT_SERVER]);
+      } else if (findSshAgentUnavailable(error)) {
+        // The jump host's agent failed: editing this server would not help.
+        void this.offerAgentRemedies(notice, [OPEN_AGENT_SETTINGS]);
+      } else {
+        void vscode.window.showErrorMessage(notice);
+      }
+    }
+  }
+
+  /**
+   * An agent failure's message already says what to do — start the agent,
+   * pick another in the agent setting, or give this server another
+   * authentication method. The buttons take the user to the last two.
+   */
+  private async offerAgentRemedies(notice: string, actions: string[]): Promise<void> {
+    const choice = await vscode.window.showErrorMessage(notice, ...actions);
+    if (choice === OPEN_AGENT_SETTINGS) {
+      await openAgentSettings();
+    } else if (choice === EDIT_SERVER) {
+      await vscode.commands.executeCommand("nexus.server.edit", this.serverConfig.id);
     }
   }
 }

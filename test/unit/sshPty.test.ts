@@ -1,13 +1,15 @@
 import { PassThrough } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ServerConfig } from "../../src/models/config";
+import { SshAgentUnavailableError } from "../../src/services/ssh/authErrors";
 import { SshPty } from "../../src/services/ssh/sshPty";
 import { CLEAR_VISIBLE_SCREEN, RESET_INTERACTIVE_MODES as RESET_TERMINAL_MODES } from "../../src/services/terminal/terminalEscapes";
 
 const KITTY_KEYBOARD_MODE_ENABLE = "\x1b[>1u";
 
-const { mockShowErrorMessage } = vi.hoisted(() => ({
-  mockShowErrorMessage: vi.fn()
+const { mockShowErrorMessage, mockExecuteCommand } = vi.hoisted(() => ({
+  mockShowErrorMessage: vi.fn(),
+  mockExecuteCommand: vi.fn()
 }));
 
 vi.mock("vscode", () => ({
@@ -45,6 +47,9 @@ vi.mock("vscode", () => ({
   },
   window: {
     showErrorMessage: (...args: unknown[]) => mockShowErrorMessage(...args)
+  },
+  commands: {
+    executeCommand: (...args: unknown[]) => mockExecuteCommand(...args)
   }
 }));
 
@@ -1267,6 +1272,59 @@ describe("SshPty", () => {
     expect(mockShowErrorMessage).toHaveBeenCalledTimes(1);
   });
 
+  describe("a connect that failed for want of an SSH agent", () => {
+    const NO_AGENT =
+      "No SSH agent found. Start Pageant (PuTTY 0.75 or newer) or the OpenSSH Authentication Agent service, or set nexus.ssh.agent to custom and enter the agent's pipe.";
+
+    async function failWith(error: Error, choice: string | undefined): Promise<void> {
+      mockShowErrorMessage.mockResolvedValueOnce(choice);
+      const sshFactory = { connect: vi.fn(async () => { throw error; }) };
+      const pty = new SshPty(makeServer({ id: "srv-agent", authType: "agent" }), sshFactory as any, {
+        onSessionOpened: vi.fn(),
+        onSessionClosed: vi.fn()
+      }, { log: vi.fn(), close: vi.fn() } as any);
+      pty.open();
+      await flushAsync();
+      await flushAsync();
+      pty.dispose();
+    }
+
+    it("offers the two remedies the message names: the agent setting and the server's authentication", async () => {
+      await failWith(new SshAgentUnavailableError(NO_AGENT), undefined);
+
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(
+        `Nexus SSH connection failed for Server 1: ${NO_AGENT}`,
+        "Open Agent Settings",
+        "Edit Server"
+      );
+      expect(mockExecuteCommand).not.toHaveBeenCalled();
+    });
+
+    it("Open Agent Settings opens the Nexus settings at the SSH category", async () => {
+      await failWith(new SshAgentUnavailableError(NO_AGENT), "Open Agent Settings");
+      expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.settings.openPanel", "ssh");
+    });
+
+    it("Edit Server opens this server's form by id", async () => {
+      await failWith(new SshAgentUnavailableError(NO_AGENT), "Edit Server");
+      expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.server.edit", "srv-agent");
+    });
+
+    it("offers only Open Agent Settings when the jump host's agent failed — editing this server would not help", async () => {
+      const wrapped = new Error(`Jump host connection failed (Bastion): ${NO_AGENT}`, { cause: new SshAgentUnavailableError(NO_AGENT) });
+      await failWith(wrapped, "Open Agent Settings");
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(`Nexus SSH connection failed for Server 1: ${wrapped.message}`, "Open Agent Settings");
+      expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.settings.openPanel", "ssh");
+    });
+
+    it("keeps a plain notification, without agent buttons, for every other failure (⊘ offering agent settings for a refused password)", async () => {
+      await failWith(new Error("All configured authentication methods failed"), undefined);
+      expect(mockShowErrorMessage).toHaveBeenCalledWith(
+        "Nexus SSH connection failed for Server 1: All configured authentication methods failed"
+      );
+    });
+  });
+
   /**
    * ALTERNATE HOST (issue #48) — the connect-fallback. A CONNECTION-LEVEL
    * failure (TCP/DNS) against the primary `host` retries once against `altHost`;
@@ -1464,6 +1522,29 @@ describe("SshPty", () => {
       expect(callbacks.onSessionOpened).not.toHaveBeenCalled();
       expect(callbacks.onConnectFailed).toHaveBeenCalledTimes(1);
       expect(mockShowErrorMessage).toHaveBeenCalledTimes(1);
+
+      pty.dispose();
+    });
+
+    it("does NOT fall back on an SSH agent failure — the alternate address has the same missing agent", async () => {
+      const connect = vi.fn(async () => {
+        throw new SshAgentUnavailableError(
+          "Could not use the SSH agent at /run/agent.sock (SSH_AUTH_SOCK): it did not answer within 5 seconds. Start VS Code from a shell where your agent runs, or set nexus.ssh.agent to custom and enter the agent's socket path."
+        );
+      });
+      const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn(), onConnectFailed: vi.fn() };
+      const pty = new SshPty(
+        makeServer({ host: "primary.example.com", altHost: "2001:db8::1", authType: "agent" }),
+        { connect } as any,
+        callbacks,
+        { log: vi.fn(), close: vi.fn() } as any
+      );
+
+      pty.open();
+      await flushAsync();
+
+      expect(connect).toHaveBeenCalledTimes(1);
+      expect(callbacks.onConnectFailed).toHaveBeenCalledTimes(1);
 
       pty.dispose();
     });

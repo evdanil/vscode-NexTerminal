@@ -46,6 +46,7 @@ import { KeySerializedSecretVault } from "./services/ssh/keySerializedSecretVaul
 import { migrateLegacyProxyPasswords } from "./services/ssh/proxyPasswordKeys";
 import { watchPoolInvalidationOnConfigMutation } from "./services/ssh/poolConfigInvalidation";
 import { Ssh2Connector } from "./services/ssh/ssh2Connector";
+import { sshAgentResolver } from "./services/ssh/sshAgentSettings";
 import { VscodeHostKeyVerifier } from "./services/ssh/vscodeHostKeyVerifier";
 import { VscodePasswordPrompt } from "./services/ssh/vscodePasswordPrompt";
 import { VscodeSecretVault } from "./services/ssh/vscodeSecretVault";
@@ -488,7 +489,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   };
 
   const hostKeyVerifier = new VscodeHostKeyVerifier(context.globalState);
-  const sshConnector = new Ssh2Connector(hostKeyVerifier, readSshConnectionOptions(), sshDiagnostics);
+  const sshConnector = new Ssh2Connector(hostKeyVerifier, readSshConnectionOptions(), sshDiagnostics, {
+    resolve: sshAgentResolver()
+  });
   const sshFactory = new SilentAuthSshFactory(
     sshConnector,
     secretVault,

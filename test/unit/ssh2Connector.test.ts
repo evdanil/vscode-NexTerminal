@@ -28,7 +28,9 @@ vi.mock("ssh2", () => {
   return { Client: MockClient };
 });
 
-import { isAuthNotJudged } from "../../src/services/ssh/authErrors";
+import { isAuthNotJudged, SshAgentUnavailableError } from "../../src/services/ssh/authErrors";
+import type { SshAgentChoice } from "../../src/services/ssh/sshAgentLocator";
+import { classifySshConnectionError } from "../../src/services/ssh/connectionDiagnostics";
 import { SshInteractionRequiredError, type ContextAwareSshFactory } from "../../src/services/ssh/contracts";
 import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
 import { buildConnectConfig, LEGACY_ALGORITHMS, Ssh2Connector } from "../../src/services/ssh/ssh2Connector";
@@ -107,6 +109,25 @@ describe("buildConnectConfig", () => {
     expect(config.readyTimeout).toBe(5_000);
     expect(config.keepaliveInterval).toBe(0);
     expect(config.keepaliveCountMax).toBe(30);
+  });
+
+  it("puts the resolved agent in an agent login's config and never reads SSH_AUTH_SOCK itself (⊘ the old pass-through, which offered Windows no agent at all)", async () => {
+    const saved = process.env.SSH_AUTH_SOCK;
+    process.env.SSH_AUTH_SOCK = "/tmp/from-environment";
+    try {
+      const agentServer = makeServer({ authType: "agent" });
+      const resolved = await buildConnectConfig(agentServer, undefined, undefined, undefined, undefined, "\\\\.\\pipe\\openssh-ssh-agent");
+      expect(resolved.agent).toBe("\\\\.\\pipe\\openssh-ssh-agent");
+      expect((await buildConnectConfig(agentServer)).agent).toBeUndefined();
+      // A password login carries no agent even when one is passed.
+      expect((await buildConnectConfig(makeServer(), "pw", undefined, undefined, undefined, "/tmp/x")).agent).toBeUndefined();
+    } finally {
+      if (saved === undefined) {
+        delete process.env.SSH_AUTH_SOCK;
+      } else {
+        process.env.SSH_AUTH_SOCK = saved;
+      }
+    }
   });
 
   it("LEGACY_ALGORITHMS contains expected algorithm families", () => {
@@ -623,5 +644,275 @@ describe("Ssh2Connector.connect banner handling", () => {
 
     expect(onAuthMessage).toHaveBeenCalledWith("Authorized use only");
     expect(connection).toBeDefined();
+  });
+});
+
+describe("Ssh2Connector — SSH agent logins", () => {
+  const PAGEANT: SshAgentChoice = {
+    agent: "\\\\.\\pipe\\pageant.alice.abc123",
+    source: "pageant",
+    note: "auto; SSH_AUTH_SOCK unset"
+  };
+  const EXHAUSTED = (): Error =>
+    Object.assign(new Error("All configured authentication methods failed"), { level: "client-authentication" });
+
+  const agentServer = (): ServerConfig => makeServer({ authType: "agent" });
+
+  // The agent lookup and key check are awaited before `new Client()`, so give
+  // them a few turns of the event loop rather than one.
+  async function settle(): Promise<void> {
+    for (let i = 0; i < 3; i++) {
+      await flushMicrotasks();
+    }
+  }
+
+  beforeEach(() => {
+    mockClients.length = 0;
+  });
+
+  it("dials with the agent the resolver chose, and logs which agent answered and why", async () => {
+    const sink = vi.fn();
+    const countKeys = vi.fn(async () => 2);
+    const connector = new Ssh2Connector(undefined, undefined, sink, { resolve: () => PAGEANT, countKeys });
+
+    const connecting = connector.connect(agentServer(), {});
+    await settle();
+    const client = mockClients.at(-1);
+    expect(client.connect.mock.calls[0][0].agent).toBe(PAGEANT.agent);
+    expect(countKeys).toHaveBeenCalledWith(PAGEANT.agent, undefined);
+    const logged = sink.mock.calls.map((args) => String(args[0])).join("\n");
+    expect(logged).toContain("[agent] Test Server (example.com): Pageant at \\\\.\\pipe\\pageant.alice.abc123");
+    expect(logged).toContain("auto; SSH_AUTH_SOCK unset");
+    expect(logged).toContain("2 keys");
+
+    client.emit("ready");
+    await expect(connecting).resolves.toBeDefined();
+  });
+
+  it("refuses before dialling when no agent can be chosen (⊘ a doomed dial that ends in ssh2's misleading auth failure)", async () => {
+    const refusal = new SshAgentUnavailableError("Pageant is not running, or it is older than 0.75 and has no named pipe.");
+    const countKeys = vi.fn(async () => 1);
+    const connector = new Ssh2Connector(undefined, undefined, undefined, {
+      resolve: () => {
+        throw refusal;
+      },
+      countKeys
+    });
+
+    await expect(connector.connect(agentServer(), {})).rejects.toBe(refusal);
+    expect(mockClients).toHaveLength(0);
+    expect(countKeys).not.toHaveBeenCalled();
+  });
+
+  it("refuses before dialling when the chosen agent does not answer the key check, naming where it looked", async () => {
+    const connector = new Ssh2Connector(undefined, undefined, undefined, {
+      resolve: () => PAGEANT,
+      countKeys: async () => {
+        throw new Error("it did not answer within 5 seconds");
+      }
+    });
+
+    const error = await connector.connect(agentServer(), {}).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(SshAgentUnavailableError);
+    expect((error as Error).message).toBe(
+      "Could not use the SSH agent at \\\\.\\pipe\\pageant.alice.abc123 (Pageant): it did not answer within 5 seconds. Restart Pageant and connect again."
+    );
+    expect(mockClients).toHaveLength(0);
+  });
+
+  it("an agent holding no keys does not block the server's other login methods (⊘ refusing here locks out keyboard-interactive logins that worked before)", async () => {
+    const connector = new Ssh2Connector(undefined, undefined, undefined, { resolve: () => PAGEANT, countKeys: async () => 0 });
+
+    const connecting = connector.connect(agentServer(), {});
+    await settle();
+    const client = mockClients.at(-1);
+    expect(client.connect).toHaveBeenCalledTimes(1);
+    expect(client.connect.mock.calls[0][0].agent).toBeUndefined();
+    client.emit("ready");
+    await expect(connecting).resolves.toBeDefined();
+  });
+
+  it("...and explains itself if the server refuses everything else (⊘ leaving ssh2's 'All configured authentication methods failed')", async () => {
+    const connector = new Ssh2Connector(undefined, undefined, undefined, { resolve: () => PAGEANT, countKeys: async () => 0 });
+
+    const connecting = connector.connect(agentServer(), {});
+    await settle();
+    const exhausted = EXHAUSTED();
+    mockClients.at(-1).emit("error", exhausted);
+
+    const error = await connecting.catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(SshAgentUnavailableError);
+    expect((error as Error).message).toBe(
+      "The SSH agent at \\\\.\\pipe\\pageant.alice.abc123 (Pageant) holds no keys. Add your key in Pageant (Add Key) or with ssh-add, or unlock the agent (ssh-add -X), then connect again."
+    );
+    expect((error as Error).cause).toBe(exhausted);
+    expect(isAuthNotJudged(error)).toBe(true);
+  });
+
+  it("with no agent found in auto mode, dials without one exactly as before — and replaces ONLY the exhausted-methods failure", async () => {
+    const nothingFound = new SshAgentUnavailableError("No SSH agent found. Start Pageant (PuTTY 0.75 or newer)…", {
+      proceedWithoutAgent: true
+    });
+    const countKeys = vi.fn(async () => 1);
+    const connector = new Ssh2Connector(undefined, undefined, undefined, {
+      resolve: () => {
+        throw nothingFound;
+      },
+      countKeys
+    });
+
+    // A transport failure is not the agent's doing: it passes through untouched.
+    const refused = connector.connect(agentServer(), {});
+    await settle();
+    expect(mockClients.at(-1).connect.mock.calls[0][0].agent).toBeUndefined();
+    const transport = new Error("connect ECONNREFUSED 203.0.113.10:22");
+    mockClients.at(-1).emit("error", transport);
+    await expect(refused).rejects.toBe(transport);
+
+    const exhaustedLogin = connector.connect(agentServer(), {});
+    await settle();
+    mockClients.at(-1).emit("error", EXHAUSTED());
+    await expect(exhaustedLogin).rejects.toThrow(/^No SSH agent found\./);
+    expect(countKeys).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The soft path's replacement is only true while the server has judged
+   * nothing the user typed. Once a keyboard-interactive answer went in — a
+   * device's "Password:" prompt — "All configured authentication methods
+   * failed" means that answer was refused: the same `auth` failure it was
+   * before agent discovery, with the missing agent as context, not the cause.
+   */
+  describe("when the server asked keyboard-interactive questions", () => {
+    async function keyboardInteractiveLogin(answers: string[], resolve: () => SshAgentChoice, countKeys = async () => 0) {
+      const connector = new Ssh2Connector(undefined, undefined, undefined, { resolve, countKeys });
+      const connecting = connector.connect(agentServer(), { onKeyboardInteractive: vi.fn(async () => answers) });
+      await settle();
+      const client = mockClients.at(-1);
+      const finish = vi.fn();
+      client.emit("keyboard-interactive", "", "", "", answers.map(() => ({ prompt: "Password: ", echo: false })), finish);
+      await settle();
+      const exhausted = EXHAUSTED();
+      client.emit("error", exhausted);
+      return { error: await connecting.catch((caught: unknown) => caught), exhausted, finish };
+    }
+
+    it("keeps a refused typed answer an auth failure (⊘ blaming the missing agent for a mistyped password)", async () => {
+      const { error, exhausted, finish } = await keyboardInteractiveLogin(["typo"], () => PAGEANT);
+      expect(finish).toHaveBeenCalledWith(["typo"]);
+      expect(error).not.toBeInstanceOf(SshAgentUnavailableError);
+      expect((error as Error).message).toBe(
+        "All configured authentication methods failed (no SSH agent key was offered: the agent holds no keys)"
+      );
+      expect((error as Error).cause).toBe(exhausted);
+      expect((error as { level?: unknown }).level).toBe("client-authentication");
+      expect(classifySshConnectionError(error)).toMatchObject({ stage: "auth", title: "Authentication failed" });
+    });
+
+    it("says no agent was found, as context, when the resolver found none", async () => {
+      const { error } = await keyboardInteractiveLogin(["typo"], () => {
+        throw new SshAgentUnavailableError("No SSH agent found.", { proceedWithoutAgent: true });
+      });
+      expect((error as Error).message).toBe(
+        "All configured authentication methods failed (no SSH agent key was offered: no agent was found)"
+      );
+      expect(classifySshConnectionError(error).stage).toBe("auth");
+    });
+
+    it("still explains the agent when nothing was typed — an empty answer is no answer", async () => {
+      const { error } = await keyboardInteractiveLogin([""], () => PAGEANT);
+      expect(error).toBeInstanceOf(SshAgentUnavailableError);
+      expect(classifySshConnectionError(error).stage).toBe("agent");
+    });
+  });
+
+  it("treats nothing listening at a GUESSED pipe as no agent found (the pipe list could not be read), not a broken agent", async () => {
+    const guess: SshAgentChoice = {
+      agent: "\\\\.\\pipe\\openssh-ssh-agent",
+      source: "openssh",
+      note: "auto; the named-pipe list could not be read (ENOTDIR)",
+      ifUnreachable: new SshAgentUnavailableError("No SSH agent found. (guess)", { proceedWithoutAgent: true })
+    };
+    const connector = new Ssh2Connector(undefined, undefined, undefined, {
+      resolve: () => guess,
+      countKeys: async () => {
+        throw new Error("Failed to connect to agent");
+      }
+    });
+
+    const connecting = connector.connect(agentServer(), {});
+    await settle();
+    // ⊘ a hard refusal here removes a keyboard-interactive login that works today.
+    expect(mockClients.at(-1).connect.mock.calls[0][0].agent).toBeUndefined();
+    mockClients.at(-1).emit("error", EXHAUSTED());
+    await expect(connecting).rejects.toThrow("No SSH agent found. (guess)");
+  });
+
+  it("still refuses a guessed pipe where something answers but hangs, and any agent the user chose that cannot be reached", async () => {
+    const guess: SshAgentChoice = {
+      agent: "\\\\.\\pipe\\openssh-ssh-agent",
+      source: "openssh",
+      note: "auto; guess",
+      ifUnreachable: new SshAgentUnavailableError("No SSH agent found.", { proceedWithoutAgent: true })
+    };
+    const hung = new Ssh2Connector(undefined, undefined, undefined, {
+      resolve: () => guess,
+      countKeys: async () => {
+        throw new Error("it did not answer within 5 seconds");
+      }
+    });
+    await expect(hung.connect(agentServer(), {})).rejects.toThrow(/^Could not use the SSH agent at .*did not answer/);
+
+    const chosen = new Ssh2Connector(undefined, undefined, undefined, {
+      resolve: () => ({ ...guess, ifUnreachable: undefined, note: "nexus.ssh.agent is openssh" }),
+      countKeys: async () => {
+        throw new Error("Failed to connect to agent");
+      }
+    });
+    await expect(chosen.connect(agentServer(), {})).rejects.toThrow(/^Could not use the SSH agent at .*Failed to connect to agent/);
+    expect(mockClients).toHaveLength(0);
+  });
+
+  it("does not look up or probe an agent for a connect that was already cancelled (⊘ a cancelled connect waiting out the 5-second key check)", async () => {
+    const resolve = vi.fn(() => PAGEANT);
+    const countKeys = vi.fn(async () => 1);
+    const connector = new Ssh2Connector(undefined, undefined, undefined, { resolve, countKeys });
+    const controller = new AbortController();
+    const reason = new Error("terminal closed");
+    controller.abort(reason);
+
+    await expect(connector.connect(agentServer(), { signal: controller.signal })).rejects.toBe(reason);
+    expect(resolve).not.toHaveBeenCalled();
+    expect(countKeys).not.toHaveBeenCalled();
+    expect(mockClients).toHaveLength(0);
+  });
+
+  it("hands the connect's cancellation to the key check, and a cancel during it stays a cancel (not an agent failure)", async () => {
+    const controller = new AbortController();
+    const reason = new Error("terminal closed");
+    const countKeys = vi.fn((_path: string, signal?: AbortSignal) => {
+      controller.abort(reason);
+      return Promise.reject(signal?.reason);
+    });
+    const connector = new Ssh2Connector(undefined, undefined, undefined, { resolve: () => PAGEANT, countKeys });
+
+    await expect(connector.connect(agentServer(), { signal: controller.signal })).rejects.toBe(reason);
+    expect(countKeys).toHaveBeenCalledWith(PAGEANT.agent, controller.signal);
+    expect(mockClients).toHaveLength(0);
+  });
+
+  it("never looks up an agent for a password or key login", async () => {
+    const resolve = vi.fn(() => PAGEANT);
+    const connector = new Ssh2Connector(undefined, undefined, undefined, { resolve, countKeys: async () => 1 });
+
+    const connecting = connector.connect(makeServer(), { password: "pw" });
+    await settle();
+    const client = mockClients.at(-1);
+    expect(client.connect.mock.calls[0][0].agent).toBeUndefined();
+    client.emit("error", EXHAUSTED());
+    // A password login's rejection stays ssh2's own: silentAuth reads it to
+    // decide whether the saved password was wrong.
+    await expect(connecting).rejects.toThrow("All configured authentication methods failed");
+    expect(resolve).not.toHaveBeenCalled();
   });
 });
