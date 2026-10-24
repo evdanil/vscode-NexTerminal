@@ -14,27 +14,39 @@ esbuild.mjs
 # Dev/build artifacts
 coverage/**
 *.vsix
-.gitignore
 package-lock.json
 
 # Build-time inputs, never read at run time: patch-package applies patches/
 # to node_modules during npm ci, before esbuild compiles the patched code
-# into the bundles, and .ignore is a ripgrep rule for searching the repository.
+# into the bundles.
 patches/**
-.ignore
 
-# IDE and tooling
+# Local tooling
+#
+# vsce reads only this file and its own defaults, never .gitignore, so
+# whatever a local checkout holds that git ignores (a code-graph index, an
+# assistant's session memory, an MCP config that can carry tokens) ships in a
+# locally packaged VSIX unless a line here drops it. CI packages a fresh
+# checkout, so a release build never shows the gap.
+#
+# No top-level dot-file or dot-folder is part of the extension, so these two
+# lines drop them all, including a tool nobody has listed yet: `.*` the files,
+# `.*/**` everything under the folders (vsce appends `/**` only to a line
+# with no wildcard in its last segment). Both match the top level only.
+.*
+.*/**
+# The same folders at any depth, as a dependency can carry them too.
 **/.git/**
 **/.vscode/**
 **/.idea/**
-.github/**
-.claude/**
-.codex
+# A non-dot tool has to be named: the extension's own top-level content is
+# non-dot too, and keeping it while dropping unknown names would take `!`
+# lines (see "How vsce reads this file" below).
+graft/**
+opencode.json
 AGENTS.md
-.specify/**
-specs/**
-.worktrees/**
 CLAUDE.md
+specs/**
 
 # Media file
 media/demo-jump-host.gif
@@ -165,6 +177,3 @@ tmp/
 # Design source SVGs (inlined into src/ui/tunnelIllustrations.ts)
 media/*-type-forward.svg
 media/*-type-forward-l.svg
-
-# Local-only demo recording lab
-.demo-lab/**
