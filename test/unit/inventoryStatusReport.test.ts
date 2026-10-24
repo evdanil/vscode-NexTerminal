@@ -530,4 +530,46 @@ describe("controlProviderNode", () => {
       controlProviderNode({ controlNode: async () => undefined }, {}, {}, "lab.unl#1", "stop")
     ).resolves.toBeUndefined();
   });
+
+  /**
+   * ISSUE #298 — a control can succeed with something worth saying (Proxmox: the
+   * task completed but logged warnings). The provider's sentence is appended to
+   * a notice Nexus composed, and a third-party provider registers through the
+   * public API, so this boundary is where it enters: flattened to one inert
+   * line, capped, and dropped rather than thrown on when it is not a sentence —
+   * the mutation has already happened by the time the result is read.
+   */
+  it("returns the provider's success notice FLATTENED to one inert line (⊘ passing the notice through raw lets a line break or bidi control forge text in the success toast)", async () => {
+    await expect(
+      controlProviderNode(
+        { controlNode: async () => ({ notice: "Proxmox reported 1 warning;\nsee the task log‮ on node pve1." }) },
+        {},
+        {},
+        "105",
+        "start"
+      )
+    ).resolves.toBe("Proxmox reported 1 warning; see the task log on node pve1.");
+  });
+
+  it("caps a long notice at a word boundary with an ellipsis (⊘ an uncapped notice turns the toast into a wall of text)", async () => {
+    const notice = await controlProviderNode(
+      { controlNode: async () => ({ notice: "warning ".repeat(200) }) },
+      {},
+      {},
+      "105",
+      "start"
+    );
+    expect(notice).toBeDefined();
+    expect(notice!.length).toBeLessThanOrEqual(240);
+    expect(notice!.endsWith("warning…")).toBe(true);
+  });
+
+  it("resolves to undefined, never throws, for a result that carries no usable notice (⊘ reading `.notice` off null throws AFTER the node was started, and the user is told a start that happened failed; ⊘ a non-string or invisible notice appended as-is)", async () => {
+    for (const result of [null, 42, "a bare string", {}, { notice: 42 }, { notice: "" }, { notice: " \n​‮ " }]) {
+      await expect(
+        controlProviderNode({ controlNode: async () => result as never }, {}, {}, "105", "start"),
+        JSON.stringify(result)
+      ).resolves.toBeUndefined();
+    }
+  });
 });

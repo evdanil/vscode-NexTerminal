@@ -112,7 +112,9 @@ beforeAll(async () => {
   // and a file is dropped when ANY ignore pattern matches it and NO `!`
   // pattern does — line order plays no part. vsce's built-in default ignores
   // are left out: inside node_modules they only drop things like .git,
-  // .DS_Store and *.vsix, which no package needs to run.
+  // .DS_Store and *.vsix, which no package needs to run. At the top level they
+  // also drop CONTRIBUTING.md, .gitattributes and the like, and vsce always
+  // keeps package.json and README.md; no test here asks about any of those.
   const lines = readFileSync(path.join(ROOT, ".vscodeignore"), "utf8")
     .split(/[\n\r]/)
     .map((line) => line.trim())
@@ -205,5 +207,44 @@ describe("the VSIX leaves out build-time inputs", () => {
   it("ships no patch file and no .ignore", () => {
     const buildInputs = [...readdirSync(path.join(ROOT, "patches")).map((name) => `patches/${name}`), ".ignore"];
     expect(buildInputs.filter(wouldShip)).toEqual([]);
+  });
+});
+
+/**
+ * vsce reads .vscodeignore and its own defaults, never .gitignore, so a file
+ * git ignores still ships in a VSIX packaged from a maintainer's checkout
+ * unless .vscodeignore drops it. CI packages a fresh checkout, which has none
+ * of these, so a release build cannot catch a gap here; only this test can.
+ */
+describe("the VSIX leaves out local tooling", () => {
+  it("ships no top-level dot-file or dot-folder, including one no line names", () => {
+    const dotEntries = [
+      // Tool state a maintainer's checkout holds or .gitignore names: assistant
+      // session memory, MCP server configuration (it can carry tokens),
+      // worktrees, and working folders.
+      ".remember/now.md",
+      ".superpowers/state.json",
+      ".agents/notes.md",
+      ".mcp.json",
+      ".claude/settings.local.json",
+      ".codex",
+      ".specify/memory.md",
+      ".worktrees/issue-1/package.json",
+      ".demo-lab/record.sh",
+      // vsce's own default `.github` gets no `/**` appended, so it drops only a
+      // file named `.github`: the workflows stay out only through `.*/**`.
+      ".github/workflows/release.yml",
+      // Made up: a tool adopted after this test was written.
+      ".newtool.json",
+      ".some-new-tool/cache/state.db"
+    ];
+    expect(dotEntries.filter(wouldShip)).toEqual([]);
+  });
+
+  it("ships none of the non-dot tool entries", () => {
+    // Unlike dot-entries, a non-dot top-level name can be the extension's own
+    // (dist/, media/, LICENSE), so these have to be named one by one.
+    const toolEntries = ["graft/INDEX.md", "graft/nodes/src/extension.md", "opencode.json"];
+    expect(toolEntries.filter(wouldShip)).toEqual([]);
   });
 });

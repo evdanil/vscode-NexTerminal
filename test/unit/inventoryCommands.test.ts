@@ -32,6 +32,7 @@ import {
 } from "../../src/services/inventory/containerlabActivation";
 import type { ContainerlabExecutionIdentity, ContainerlabExecutor } from "../../src/services/inventory/containerlabRuntimeContracts";
 import { createContainerlabProvider } from "../../src/services/inventory/providers/containerlabProvider";
+import { createProxmoxProvider } from "../../src/services/inventory/providers/proxmoxProvider";
 import { startInventoryStatusPoll } from "../../src/services/inventory/inventoryStatusPoll";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
 import { ORPHAN_FOLDER_NAME, type InventorySyncPlan } from "../../src/services/inventory/syncEngine";
@@ -10159,6 +10160,7 @@ describe("inventoryCommands", () => {
         secrets?: Record<string, string>;
         providerFingerprint?: string;
         withStatus?: boolean;
+        serverName?: string;
       } = {}
     ) {
       const withControl = opts.withControl ?? true;
@@ -10169,7 +10171,7 @@ describe("inventoryCommands", () => {
       const withStatus = opts.withStatus ?? true;
       const server = makeServer({
         id: "eve-1",
-        name: "R1",
+        name: opts.serverName ?? "R1",
         ...(opts.noOrigin
           ? {}
           : { origin: { sourceId: "src-1", externalId: opts.externalId ?? "/Lab.unl#3", syncedAt: 1 } })
@@ -10266,9 +10268,13 @@ describe("inventoryCommands", () => {
     });
 
     it("refuses a manual (non-synced) server with no origin (⊘ start/stop on a server with no inventory node has nothing to control)", async () => {
-      const { start, controlSpy, server } = await setup({ noOrigin: true });
+      const { start, controlSpy, server } = await setup({ noOrigin: true, serverName: "R1\n‮forged" });
       await start({ server });
       expect(mockShowErrorMessage).toHaveBeenCalled();
+      // The refusal quotes the same flattened name as every other message here.
+      expect(String(mockShowErrorMessage.mock.calls[0]?.[0])).toBe(
+        '"R1 forged" is not synced from an inventory source that supports node control.'
+      );
       expect(controlSpy).not.toHaveBeenCalled();
     });
 
@@ -10284,6 +10290,103 @@ describe("inventoryCommands", () => {
       expect(msg).toContain("EVE-NG refused the start");
       expect(mockShowInformationMessage).not.toHaveBeenCalled();
       expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.inventory.refreshStatus", expect.anything());
+    });
+
+    /**
+     * ISSUE #298, end to end through the REAL Proxmox provider: a PVE task that
+     * finished `WARNINGS: <n>` completed — the guest is running — and the user
+     * must be told so, with the count and where to read the warnings. The
+     * provider is the shipped one, fed PVE's wire shapes, so the test exercises
+     * the same parse the user hit rather than a stub that returns the answer.
+     */
+    function proxmoxGuestControl(exitstatus: string): InventoryProvider["controlNode"] {
+      const BASE = "https://pve.example.com:8006";
+      const UPID = "UPID:pve1:00123D:00000000:68C00000:qmstart:112:root@pam:";
+      const routes: Record<string, unknown> = {
+        "/api2/json/cluster/resources": { data: [{ vmid: 112, node: "pve1", type: "qemu", name: "web" }] },
+        "/api2/json/nodes/pve1/qemu/112/status/start": { data: UPID },
+        [`/api2/json/nodes/pve1/tasks/${encodeURIComponent(UPID)}/status`]: { data: { status: "stopped", exitstatus } }
+      };
+      const fetchImpl = (async (input: string | URL) => {
+        const body = routes[new URL(String(input)).pathname];
+        return body === undefined
+          ? { status: 404, text: async () => "" }
+          : { status: 200, text: async () => JSON.stringify(body) };
+      }) as unknown as typeof fetch;
+      const proxmox = createProxmoxProvider(fetchImpl, fetchImpl);
+      return (_config, _secrets, externalId, action) => proxmox.controlNode!({ baseUrl: BASE }, { apiToken: "u@pam!t=s" }, externalId, action);
+    }
+
+    /** Runs Start through the provider's first 2 s task-poll beat on the fake clock. */
+    async function startThroughFirstPoll(start: (...args: unknown[]) => unknown, server: unknown): Promise<void> {
+      const run = start({ server });
+      await vi.advanceTimersByTimeAsync(2_000);
+      await run;
+    }
+
+    it("issue #298 — a Proxmox start whose task finished 'WARNINGS: 1' is a SUCCESS: the toast names the count and the node's task log, and the status is refreshed and re-checked exactly as after OK (⊘ the OK-only check: 'Failed to start \"R1\": … failed: WARNINGS: 1.' for a running guest, and no refresh, so the row kept showing it stopped; ⊘ a fix that drops the provider's notice, so the warnings go unmentioned)", async () => {
+      vi.useFakeTimers();
+      try {
+        const { start, server } = await setup({ externalId: "112", controlNode: proxmoxGuestControl("WARNINGS: 1") });
+        await startThroughFirstPoll(start, server);
+        expect(mockShowErrorMessage).not.toHaveBeenCalled();
+        const info = mockShowInformationMessage.mock.calls.map((c) => String(c[0])).join("\n");
+        expect(info).toBe(
+          'Start sent to "R1" — it takes a few seconds to take effect, and Nexus re-checks the status after that. Proxmox reported 1 warning; see the task log on node pve1.'
+        );
+        expect(info).not.toContain("Failed");
+        expect(info).not.toMatch(/fail/i);
+        // The same two refreshes an OK result fires: one now, one re-check later.
+        expect(statusRefreshArgs()).toEqual(["src-1"]);
+        await vi.advanceTimersByTimeAsync(NODE_CONTROL_STATUS_RECHECK_MS);
+        expect(statusRefreshArgs()).toEqual(["src-1", { sourceId: "src-1", __poll: true }]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("issue #298 — a Proxmox task that finished with a REAL error still fails, carrying PVE's message verbatim, and fires no refresh (⊘ widening the success test to every stopped task, which reports 'VM 112 already running' as a start)", async () => {
+      vi.useFakeTimers();
+      try {
+        const { start, server } = await setup({ externalId: "112", controlNode: proxmoxGuestControl("VM 112 already running") });
+        await startThroughFirstPoll(start, server);
+        expect(mockShowErrorMessage.mock.calls.map((c) => String(c[0]))).toEqual([
+          'Failed to start "R1": Unexpected response: Proxmox start of guest 112 failed: VM 112 already running.'
+        ]);
+        expect(mockShowInformationMessage).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(NODE_CONTROL_STATUS_RECHECK_MS * 2);
+        expect(statusRefreshArgs()).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("the guest name and the provider's notice enter the success toast FLATTENED — both are provider text, and a line break or bidi control in either would forge a line of a message Nexus composed (⊘ interpolating server.name raw; ⊘ appending the notice raw)", async () => {
+      const { start, server } = await setup({
+        serverName: "R1\n‮forged",
+        controlNode: vi.fn(async () => ({ notice: "Proxmox reported 2 warnings;\nsee the task log on node pve1." }))
+      });
+      await start({ server });
+      const info = mockShowInformationMessage.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(info).toBe(
+        'Start sent to "R1 forged" — it takes a few seconds to take effect, and Nexus re-checks the status after that. Proxmox reported 2 warnings; see the task log on node pve1.'
+      );
+    });
+
+    it("the guest name enters the progress title and the failure toast FLATTENED as well — one value, one treatment across the handler (⊘ flattening only the success toast, leaving the title and the failure toast to remember)", async () => {
+      const { start, server } = await setup({
+        serverName: "R1\n‮forged",
+        controlNode: vi.fn(async () => {
+          throw new Error("refused");
+        })
+      });
+      await start({ server });
+      const title = String((mockWithProgress.mock.calls[0]?.[0] as { title?: string } | undefined)?.title);
+      expect(title).toBe('Starting "R1 forged"…');
+      const msg = String(mockShowErrorMessage.mock.calls[0]?.[0]);
+      expect(msg).toContain('Failed to start "R1 forged": ');
+      expect(msg).not.toContain("\n");
+      expect(msg).not.toContain("‮");
     });
 
     it("P3-4 — wraps the dispatch in withProgress so the '{Starting|Stopping} \"name\"…' title shows DURING the ~60s call, then still dispatches and refreshes (⊘ no withProgress leaves the user staring at a silent UI for the whole login→detect→action sequence)", async () => {

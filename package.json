@@ -4678,13 +4678,13 @@
     "@types/node": "^22.13.10",
     "@types/ssh2": "^1.15.5",
     "@types/vscode": "^1.105.0",
-    "@vitest/coverage-v8": "^4.1.9",
+    "@vitest/coverage-v8": "^4.1.12",
     "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.28.1",
     "ovsx": "^1.0.2",
     "patch-package": "8.0.1",
     "rimraf": "^6.0.1",
     "typescript": "^5.8.2",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.12"
   }
 }
