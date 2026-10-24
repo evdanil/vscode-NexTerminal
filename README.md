@@ -50,7 +50,7 @@ Then open the **Nexus** sidebar (activity bar icon).
 
 ### Connect
 
-- **SSH sessions** — password, private key, SSH agent, and 2FA keyboard-interactive auth, with silent re-auth from VS Code SecretStorage. → [Authentication](docs/ssh-and-telnet.md#authentication)
+- **SSH sessions** — password, private key, SSH agent (on Windows, Pageant or the OpenSSH agent is found automatically), and 2FA keyboard-interactive auth, with silent re-auth from VS Code SecretStorage. → [Authentication](docs/ssh-and-telnet.md#authentication)
 - **Legacy devices** — a per-server legacy-algorithm toggle for older gear, including devices that only speak 1024-bit `diffie-hellman-group1-sha1`. → [Legacy Devices](docs/ssh-and-telnet.md#legacy-devices)
 - **Alternate host** — a second SSH address for a server (e.g. the IPv6 to its IPv4), retried once when the primary can't be reached at the connection level; NetBox and Proxmox syncs fill it from the device's other address family. → [Alternate Host](docs/ssh-and-telnet.md#alternate-host)
 - **SSH key deployment** — right-click a server → **Deploy SSH Key** to find or generate a key and install it in the remote `authorized_keys`. → [Deploy an SSH Key](docs/ssh-and-telnet.md#deploy-an-ssh-key)

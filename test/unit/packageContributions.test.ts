@@ -2329,4 +2329,20 @@ describe("SSH agent settings (nexus.ssh.agent, nexus.ssh.agentPath)", () => {
     expect(agent?.badge).toBeUndefined();
     expect(agentPath?.badge).toBeUndefined();
   });
+
+  it("documents both settings, and the guide section the settings table links to exists", () => {
+    const settingsDoc = userDoc("docs/settings.md");
+    expect(settingsDoc).toContain("| `nexus.ssh.agent` | `auto` |");
+    expect(settingsDoc).toContain("| `nexus.ssh.agentPath` | `\"\"` |");
+    expect(settingsDoc).toContain("(ssh-and-telnet.md#ssh-agents-pageant-and-openssh)");
+    // GitHub's slug for this heading is the anchor above.
+    expect(userDoc("docs/ssh-and-telnet.md")).toContain("\n### SSH agents: Pageant and OpenSSH\n");
+    expect(functionalDocs).toContain("| `nexus.ssh.agent` | enum | `auto` |");
+    expect(functionalDocs).toContain("| `nexus.ssh.agentPath` | string |");
+  });
+
+  it("no longer documents agent auth as a bare SSH_AUTH_SOCK pass-through (⊘ the claim that hid Windows having no agent at all)", () => {
+    expect(functionalDocs).not.toContain("delegates to the system SSH agent via `SSH_AUTH_SOCK`");
+    expect(functionalDocs).toContain("`buildConnectConfig` no longer reads `SSH_AUTH_SOCK`");
+  });
 });

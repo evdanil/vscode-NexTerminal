@@ -4,7 +4,7 @@ One guide per feature. New here? Start with the [Quick start](../README.md#quick
 
 ## Connect
 
-- [SSH and Telnet](ssh-and-telnet.md) — add a server, authentication and SSH keys, auth profiles, jump hosts and proxies, the alternate host, legacy devices, multiplexing, and telnet.
+- [SSH and Telnet](ssh-and-telnet.md) — add a server, authentication, SSH agents (Pageant and OpenSSH) and SSH keys, auth profiles, jump hosts and proxies, the alternate host, legacy devices, multiplexing, and telnet.
 - [Serial Consoles](serial.md) — add a serial device, and keep a session through Windows COM-port renumbering with Smart Follow.
 - [Local Shells](local-shells.md) — save local terminal profiles and open several sessions from each.
 

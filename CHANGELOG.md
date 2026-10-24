@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.8.304] — 2026-10-24
+
+### Added
+
+- **SSH Agent logins find the agent themselves — including PuTTY's Pageant and the OpenSSH agent on Windows.** A server or auth profile set to SSH Agent used only `SSH_AUTH_SOCK`, which Windows does not set, so on Windows it had no agent at all. Nexus now looks on every connection: `SSH_AUTH_SOCK` when VS Code has it, then on Windows Pageant 0.75 or newer — found by the named pipe it opens for your user, whose name can change at every restart — and then the Windows OpenSSH agent pipe, served by the OpenSSH Authentication Agent service or another agent that provides it, such as 1Password. Only a Pageant pipe named for your Windows user name is used; if Pageant is running under another form of your name, as it can be for domain, Microsoft and Entra accounts, Nexus names its pipe — in the error, or in the **Nexus SSH** output channel when it uses the OpenSSH agent pipe instead — so you can enter it as a custom pipe. The new **SSH Agent** setting (`nexus.ssh.agent`) chooses Automatic, Pageant, OpenSSH Agent or a custom socket or pipe (`nexus.ssh.agentPath`) — on Linux, for example, when VS Code was started from a desktop launcher without `SSH_AUTH_SOCK`, or for PuTTY's Pageant run as `pageant --symlink`. It covers terminals, SFTP, tunnels and jump hosts, and the servers an inventory sync creates without an auth profile. Both settings are machine-specific: a workspace cannot set them and Export for Sharing leaves them out, so neither a repository nor a shared file can redirect your key signing. With SSH Agent selected, the server form and the auth profile editor say where the agent is chosen.
+
+### Fixed
+
+- **An SSH Agent login without a usable agent says so, and what to do, instead of "All configured authentication methods failed".** Nexus asks the agent for its keys before connecting: an agent that cannot be reached or does not answer within 5 seconds, or a Pageant or OpenSSH agent you chose that is not running, stops the connection with the agent's path and the fix. When no agent is found, or the agent holds no keys, the login still goes on to whatever else the server offers — on many network devices a keyboard-interactive password prompt, exactly as before. If the server then refuses the login before you have typed anything, the error explains the missing agent; a password or code you typed that the server refuses is still reported as a rejected login, with a note that no agent key was offered. A terminal's error offers **Open Agent Settings** and **Edit Server**, Test Connection offers **Open Agent Settings**, and the agent each login used is recorded in the **Nexus SSH** output channel.
+
 ## [2.8.303] — 2026-10-20
 
 ### Security
