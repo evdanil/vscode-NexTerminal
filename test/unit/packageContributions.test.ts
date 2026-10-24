@@ -399,20 +399,35 @@ describe("package contributions", () => {
   });
 
   /**
-   * OPEN WEB CONSOLE'S SIGN-IN CLAIM (issue #297). The prose used to promise
-   * that a first open "may land on PVE's login page" — it never did: PVE's
-   * bare console page shows no login and dead-ends on a 401 without a session.
-   * The command now opens the full web UI on the guest's Console tab, which
-   * signs in first when needed, and every place that explained the old route
-   * has to say so — including the WHY comment a maintainer reads before
-   * touching the URL.
+   * OPEN WEB CONSOLE'S RETRACTED CLAIMS (issue #297). The prose promised that
+   * a first open "may land on PVE's login page" — it never did: PVE's bare
+   * console page shows no login and dead-ends on a 401 without a session. It
+   * also promised that a stopped guest opens PVE's own "not running" page,
+   * which nobody has confirmed for the Console tab the command now opens. Both
+   * are swept from every user doc, the reference, and the WHY comments a
+   * maintainer reads before touching the URL or the missing status gate.
+   *
+   * The patterns are deliberately broad ("login page" anywhere): none of these
+   * files has another reason to say it, and a narrow regex is beaten by the
+   * first rewording ("the PVE login page").
    */
-  it("describes Open Web Console as PVE's web UI opening on the guest's Console tab, signing in first if needed, with the old login-page promise gone everywhere (⊘ a doc still promising a login on the bare console page sends the next reader back to the URL that dead-ended)", () => {
-    const proxmoxSource = readDoc("src/services/inventory/providers/proxmoxProvider.ts");
-    const retired = [/first open may (land on|show) PVE's login page/i, /intended handshake/i, /the console is right there/i];
-    for (const [name, doc] of [...userDocs, ["docs/functional-documentation.md", functionalDocs] as const, ["proxmoxProvider.ts", proxmoxSource] as const]) {
+  it("describes Open Web Console as PVE's web UI opening on the guest's Console tab, signing in first if needed, with the retracted login-page and \"not running\" promises gone everywhere (\u2298 a doc still promising a login on the bare console page sends the next reader back to the URL that dead-ended)", () => {
+    const sources = [
+      "src/services/inventory/providers/proxmoxProvider.ts",
+      "src/commands/inventoryCommands.ts",
+      "src/ui/nexusTreeProvider.ts"
+    ].map((file) => [file, readDoc(file)] as const);
+    const retired = [
+      /login page/i,
+      /intended handshake/i,
+      /the console is right there/i,
+      /own (honest )?"not running"/i,
+      /"not running" (console )?page/i,
+      /stopped guest's (noVNC |console )page/i
+    ];
+    for (const [name, doc] of [...userDocs, ["docs/functional-documentation.md", functionalDocs] as const, ...sources]) {
       for (const claim of retired) {
-        expect(doc, name).not.toMatch(claim);
+        expect(doc, `${name} ${claim}`).not.toMatch(claim);
       }
     }
     // The bare console page's query shapes are gone from the reference too.
@@ -422,7 +437,12 @@ describe("package contributions", () => {
     expect(functionalDocs).toContain("#v1:0:=lxc%2F{vmid}:4::::::=consolejs:");
     const proxmoxGuide = userDoc("docs/inventory/proxmox.md");
     expect(proxmoxGuide).toMatch(/\*\*Console\*\* tab/);
-    expect(proxmoxGuide).toMatch(/OpenID/);
+    // The OpenID limit names the release that lifted it (fix #7337), not "PVE
+    // 7 or 8": every PVE 9 before pve-manager 9.1.7 drops the hash as well.
+    for (const doc of [proxmoxGuide, functionalDocs]) {
+      expect(doc).toMatch(/OpenID[^\n]*pve-manager 9\.1\.7/);
+      expect(doc).not.toMatch(/OpenID realm on PVE 7 or 8|on PVE 7 and 8 the OpenID/);
+    }
   });
 
   it("contributes settings.openPanel command", () => {

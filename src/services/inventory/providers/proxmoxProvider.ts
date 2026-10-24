@@ -2310,10 +2310,11 @@ async function controlNodeImpl(
  * The token is `v1` and then ten `:`-separated fields IN THIS ORDER: view, rid,
  * ltab, nodetab, storagetab, sdntab, pooltab, kvmtab, lxctab, dctab. A string
  * is written as `=` + encodeURIComponent(value), and a value in PVE's
- * `compDict` as its number. `view` and `ltab` are spelled out rather than left
- * empty: once a hash is present, an empty field decodes to '' rather than to
- * the default — harmless for a tab field, whose default IS '', but not for
- * the view selector or the log panel.
+ * `compDict` as its number. `view` and `ltab` carry their defaults, `server`
+ * (0) and `tasks` (4), rather than being left empty, because that is how
+ * `encodeHToken` writes this state: the hash is byte-identical to the one PVE
+ * itself writes. (Empty would also work — the view selector and the log panel
+ * ignore an empty value.)
  *
  * THE TWO CONSOLE TABS HAVE DIFFERENT NAMES. A VM's Console tab is itemId
  * `console` (compDict 8) under `kvmtab`; a container's is itemId `consolejs`,
@@ -2324,8 +2325,11 @@ async function controlNodeImpl(
  * VS Code's opener does not deliver this byte for byte: `URI.parse` decodes
  * the fragment's `%2F` and the opener writes the fragment back raw, so the
  * browser gets `=qemu/107`. PVE decodes that to the same rid, because the
- * decoder splits on `:` only and decodeURIComponent leaves a `/` alone. Nothing
- * in the rid can decode to a `:` — the vmid matched the integer PVE reports.
+ * decoder splits on `:` only and decodeURIComponent leaves a `/` alone. The
+ * vmid is not re-checked here: it is the externalId that `resolveGuestRow`
+ * matched as `String(row.vmid)` against the live row, and PVE's vmids are
+ * integers — so in practice it holds only digits, which no decoding step can
+ * turn into a `:`.
  */
 function pveGuestConsoleHash(kind: "qemu" | "lxc", vmid: string): string {
   const fields = [
