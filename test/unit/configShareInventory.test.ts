@@ -1505,7 +1505,7 @@ describe("share import — inventory sources", () => {
     expect(lastInfoMessage()).not.toContain("Removed-Device Policy");
   });
 
-  it("clears a source's and a template's links to a profile the import rejected, remaps the ones that landed, and prunes template rules to templates that landed (⊘ a dangling reference persisting; ⊘ a file id surviving; ⊘ a malformed template revision costing the template)", async () => {
+  it("clears unsupported BMC links, remaps valid SSH links, and prunes template rules to templates that landed (⊘ a dangling reference persisting; ⊘ a file id surviving; ⊘ a malformed template revision costing the template)", async () => {
     const recipient = await makeMachine();
 
     await importShare(
@@ -1524,7 +1524,7 @@ describe("share import — inventory sources", () => {
         inventorySources: [
           makeSource({
             defaultUsername: "user",
-            authProfileId: "ap-bad",
+            authProfileId: "ap-good",
             templateRules: [
               { id: "r-ok", templateId: "tpl-ok" },
               { id: "r-bad", templateId: "tpl-bad" },
@@ -1543,7 +1543,7 @@ describe("share import — inventory sources", () => {
       authProfileId: { mode: "fill", value: snapshot.authProfiles[0].id }
     });
     const [source] = snapshot.inventorySources;
-    expect(source.authProfileId).toBeUndefined();
+    expect(source.authProfileId).toBe(snapshot.authProfiles[0].id);
     expect(source.templateRules).toEqual([{ id: "r-ok", templateId: snapshot.deviceTemplates[0].id }]);
   });
 

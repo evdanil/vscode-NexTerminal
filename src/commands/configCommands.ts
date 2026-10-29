@@ -227,6 +227,8 @@ interface NexusConfigExport {
  * hooks must resolve; failed connection teardown is reported to the user.
  */
 export interface ConfigRuntimeHooks {
+  /** Synchronous authority fence before import writes; omitted ids revoke the whole session. */
+  revokeExternalCredentialApprovals?(profileIds?: readonly string[]): void;
   /**
    * Stop one Local Server — its process, any pending auto-restart, its
    * terminals — BEFORE its profile is removed (`stopLocalServerForRemoval`).
@@ -1080,6 +1082,54 @@ export function isValidExport(data: unknown): data is NexusConfigExport {
   return (obj.version === 1 || obj.version === 2) && hasProfileArrays;
 }
 
+/** Validate every raw candidate, including duplicates, before a sanitizer can erase source intent. */
+export function validateExternalAuthProfileImport(records: readonly unknown[]): { ok: true } | { ok: false; invalidIds: readonly string[] } {
+  const invalidIds = new Set<string>();
+  const seen = new Map<string, boolean>();
+  let invalid = false;
+  for (const record of records) {
+    if (!isRecordValue(record)) continue;
+    const candidate = record.authType === "external" || Object.hasOwn(record, "external");
+    const id = typeof record.id === "string" ? record.id : undefined;
+    const duplicate = id !== undefined && seen.has(id) && (candidate || seen.get(id));
+    if ((candidate && !validateAuthProfile(record)) || duplicate) {
+      invalid = true;
+      // These ids are for internal matching only; imported text never enters the refusal message.
+      if (id !== undefined && /^[a-zA-Z0-9_-]{1,128}$/.test(id)) invalidIds.add(id);
+    }
+    if (id !== undefined) seen.set(id, candidate || seen.get(id) === true);
+  }
+  return invalid ? { ok: false, invalidIds: [...invalidIds] } : { ok: true };
+}
+
+/** Model the importer’s id policy before it can delete records or strip a missing SSH link. */
+function hasValidProjectedAuthLinks(data: NexusConfigExport, snapshot: ReturnType<NexusCore["getSnapshot"]>, mode: "merge" | "replace" | "share"): boolean {
+  const existingIds = mode === "merge" ? new Set([
+    ...snapshot.servers, ...snapshot.tunnels, ...snapshot.serialProfiles, ...snapshot.localShellProfiles,
+    ...snapshot.authProfiles, ...snapshot.inventorySources, ...snapshot.deviceTemplates, ...snapshot.savedFilters,
+    ...snapshot.localServers, ...snapshot.tftpProfiles, ...snapshot.dhcpProfiles
+  ].map(record => record.id)) : new Set<string>();
+  const profiles = new Map(mode === "merge" ? snapshot.authProfiles.map(profile => [profile.id, profile] as const) : []);
+  for (const raw of data.authProfiles ?? []) {
+    // An id minted later by ensureId cannot satisfy a reference from the file.
+    if (!isRecordValue(raw) || typeof raw.id !== "string" || !raw.id.trim() || existingIds.has(raw.id)) continue;
+    const profile = mode === "share"
+      ? shareRecord(raw as unknown as AuthProfile, SHARED_AUTH_PROFILE_RULES, { id: () => raw.id as string })
+      : raw;
+    if (validateAuthProfile(profile)) profiles.set(profile.id, profile);
+  }
+  const resolves = (id: unknown): boolean => id === undefined || id === "" || (typeof id === "string" && profiles.has(id));
+  const projected = <T extends { id: string }>(incoming: readonly T[] | undefined, current: readonly T[]): T[] => [
+    ...(mode === "merge" ? current : []),
+    ...(incoming ?? []).filter(record => isRecordValue(record) && !existingIds.has(record.id))
+  ];
+  // Shares cannot safely remap an auth id reused by a server: the shared id map is common to both.
+  if (mode === "share" && (data.servers ?? []).some(server => isRecordValue(server) && profiles.has(server.id))) return false;
+  return projected(data.servers, snapshot.servers).every(server => resolves(server.authProfileId)) &&
+    projected(data.inventorySources, snapshot.inventorySources).every(source => resolves(source.authProfileId)) &&
+    projected(data.deviceTemplates, snapshot.deviceTemplates).every(template => resolves(template.fields?.authProfileId?.value));
+}
+
 function ensureId(item: Record<string, unknown>): void {
   if (!item.id || typeof item.id !== "string" || (item.id as string).trim() === "") {
     item.id = randomUUID();
@@ -1883,14 +1933,18 @@ function syncAuthLinkArrivesNeedingServerKey(server: Pick<ServerConfig, "authPro
  * and `keyPath` never travels — which is also why every key profile arrives
  * with no key file (`linkSyncAuthProfile`). A member the model does not declare
  * (a stored `token`, a field a later build adds) is copied in neither
- * direction.
+ * direction. External profiles keep their version and method, with no static
+ * username and no invocation: the recipient must configure their own program.
  */
 const SHARED_AUTH_PROFILE_RULES = {
   id: "link",
   name: "keep",
-  username: () => SHARED_USERNAME,
+  username: (_value: unknown, profile: AuthProfile) => isExternalAuthProfile(profile) ? undefined : SHARED_USERNAME,
   authType: "keep",
-  keyPath: "drop"
+  keyPath: "drop",
+  external: (_value: unknown, profile: AuthProfile) => isExternalAuthProfile(profile)
+    ? { version: profile.external.version, method: profile.external.method }
+    : undefined
 } satisfies ShareRules<AuthProfile>;
 
 const SHARED_SOURCE_RULES = {
@@ -3252,6 +3306,7 @@ export async function captureBackupStateForExport(
     const authProfilePasswords: Record<string, string> = {};
     const authProfilePassphrases: Record<string, string> = {};
     for (const profile of authProfiles) {
+      if (isExternalAuthProfile(profile)) continue;
       const pw = await vault.get(authProfilePasswordSecretKey(profile.id));
       if (pw) authProfilePasswords[profile.id] = pw;
       const pp = await vault.get(authProfilePassphraseSecretKey(profile.id));
@@ -3586,6 +3641,10 @@ export function registerConfigCommands(
       return;
     }
 
+    if (!validateExternalAuthProfileImport(data.authProfiles ?? []).ok) {
+      void vscode.window.showErrorMessage("Nothing was imported: an external auth profile is invalid or conflicts with another row. Repair the export or use a supported Nexus version.");
+      return;
+    }
     const exportType = data.exportType;
 
     // For share exports, always merge with fresh IDs
@@ -3727,7 +3786,16 @@ export function registerConfigCommands(
     await applyNexusExportText(Buffer.from(raw).toString("utf8"));
   }
 
+  function preflightAuthImport(data: NexusConfigExport, mode: "merge" | "replace" | "share"): boolean {
+    if (!validateExternalAuthProfileImport(data.authProfiles ?? []).ok || !hasValidProjectedAuthLinks(data, core.getSnapshot(), mode)) {
+      void vscode.window.showErrorMessage("Nothing was imported: an auth profile is invalid, conflicting, or missing for an SSH link. Repair the export or use a supported Nexus version.");
+      return false;
+    }
+    return true;
+  }
+
   async function importShareData(data: NexusConfigExport): Promise<void> {
+    if (!preflightAuthImport(data, "share")) return;
     // Generate fresh IDs to prevent duplicates on re-import
     const idMap = new Map<string, string>();
     let imported = 0;
@@ -3780,26 +3848,8 @@ export function registerConfigCommands(
       else skipped++;
     };
 
-    // REVIEW FINDING (P2) — the profiles that actually LANDED, by id, which is
-    // NOT the auth-profile half of `idMap`. `idMap` is filled in the first pass,
-    // before a single record has been validated, so a profile rejected by
-    // `validateAuthProfile` still holds a fresh id there — and a server remapped
-    // through `idMap` alone arrives linked to a profile that was never imported.
-    // Nothing downstream notices: the server persists with a link that resolves to
-    // nothing, `SilentAuthSshFactory` finds no profile and silently falls back to
-    // the server's own credentials, and no message anywhere says the link is dead.
-    // A reachable shape is an `authType` this build does not know; nothing about
-    // this is specific to it.
-    //
-    // WHY AT CONSTRUCTION rather than a post-import sweep like the backup path's:
-    // both reach the same end state — no record left pointing at a profile that
-    // does not exist — and each expresses that one rule where its own path can. The
-    // backup path preserves ids on BOTH sides, so it has no remap to build and the
-    // post-import snapshot is the only place a dangle becomes visible; it also has
-    // to inspect records it did not write, because merge mode keeps a local record
-    // in preference to the payload's. The share path builds every link value itself
-    // from a map it owns, so the check belongs there — and keeping it there means a
-    // share import still never rewrites a local record the payload never mentioned.
+    // Preflight establishes that SSH links resolve; the landed map also prevents
+    // non-SSH references from accidentally resolving through the server id map.
     const importedProfiles = new Map<string, AuthProfile>();
 
     // Each profile is rebuilt by the export's own rules (`SHARED_AUTH_PROFILE_RULES`)
@@ -4422,6 +4472,7 @@ export function registerConfigCommands(
     awaitingVerdict: Map<string, ProxyConfig | undefined>,
     removed: RemovedProfileIds
   ): Promise<void> {
+    if (!preflightAuthImport(data, mode)) return;
     const snapshot = core.getSnapshot();
 
     // Prepared BEFORE the replace-mode wipe so the guard below judges each
@@ -4442,6 +4493,10 @@ export function registerConfigCommands(
     }
 
     if (mode === "replace") {
+      // Import is an authority boundary even when the replacement is byte-identical,
+      // and must fence pending work before the first dependent or vault write can fail.
+      const externalIds = snapshot.authProfiles.filter(isExternalAuthProfile).map(profile => profile.id);
+      if (externalIds.length) runtime?.revokeExternalCredentialApprovals?.(externalIds);
       removed.tunnelProfiles.push(...snapshot.tunnels.map(({ id }) => id));
       removed.activeTunnels.push(...snapshot.activeTunnels.map(({ id, profileId, serverId }) => ({ id, profileId, serverId })));
       for (const server of snapshot.servers) {
@@ -4463,13 +4518,6 @@ export function registerConfigCommands(
         removed.localShell.push(profile.id);
         await core.removeLocalShellProfile(profile.id);
       }
-      for (const profile of snapshot.authProfiles) {
-        if (vault) {
-          await vault.delete(authProfilePasswordSecretKey(profile.id));
-          await vault.delete(authProfilePassphraseSecretKey(profile.id));
-        }
-        await core.removeAuthProfile(profile.id);
-      }
       for (const group of snapshot.explicitGroups) {
         await core.removeExplicitGroup(group);
       }
@@ -4487,6 +4535,14 @@ export function registerConfigCommands(
       // immaterial since every source is being removed anyway.
       for (const template of snapshot.deviceTemplates) {
         await core.removeDeviceTemplate(template.id);
+      }
+      // External profiles refuse removal until every dependent record is gone.
+      for (const profile of snapshot.authProfiles) {
+        if (vault) {
+          await vault.delete(authProfilePasswordSecretKey(profile.id));
+          await vault.delete(authProfilePassphraseSecretKey(profile.id));
+        }
+        await core.removeAuthProfile(profile.id);
       }
       // SAVED FILTER DEFINITIONS (PR-E) — no secrets, no references, so a plain
       // record drop; deletion here does NOT sweep any source's stored filter
@@ -4671,18 +4727,12 @@ export function registerConfigCommands(
       skipped += tally.skipped;
     }
 
-    // Clear dangling authProfileId references
+    // SSH links were preflighted; never clear them into dormant static authentication.
+    // Independently sweep unsupported BMC/gateway references.
     const postImportSnapshot = core.getSnapshot();
     const knownProfileIds = new Set(postImportSnapshot.authProfiles.map((p) => p.id));
     const knownServerIds = new Set(postImportSnapshot.servers.map((s) => s.id));
     for (const server of postImportSnapshot.servers) {
-      // Captured as a local so the stamp comparisons below keep narrowing
-      // `origin`/`formerlySynced`: `x?.stamp === <string>` proves the container
-      // is present, which `x?.stamp === server.authProfileId` (type
-      // `string | undefined`) does not.
-      const danglingSshProfileId =
-        server.authProfileId && !knownProfileIds.has(server.authProfileId) ? server.authProfileId : undefined;
-      const sshDangles = danglingSshProfileId !== undefined;
       // The BMC credential link dangles independently of the SSH one — a server
       // can carry either, both, or two different profiles — so it is swept on
       // its own terms rather than as a rider on the SSH clear.
@@ -4698,35 +4748,10 @@ export function registerConfigCommands(
       const danglingGatewayServerId =
         server.ipmiGatewayServerId && !knownServerIds.has(server.ipmiGatewayServerId) ? server.ipmiGatewayServerId : undefined;
       const gatewayDangles = danglingGatewayServerId !== undefined;
-      if (sshDangles || ipmiDangles || gatewayDangles) {
+      if (ipmiDangles || gatewayDangles) {
         const cleared: ServerConfig = { ...server };
-        if (sshDangles) cleared.authProfileId = undefined;
         if (ipmiDangles) cleared.ipmiAuthProfileId = undefined;
         if (gatewayDangles) cleared.ipmiGatewayServerId = undefined;
-        // Same rule as NexusCore.removeAuthProfile: the inventory sync's record
-        // that IT applied this profile (origin.syncedAuthProfileId) dies with the
-        // link it describes. Left behind, it would read as a per-server opt-out —
-        // no `authProfileId`, but a stamp naming a profile — and lock a server
-        // nobody hand-configured out of retro-apply for good. Only the stamp
-        // naming the very profile being cleared is dropped; a stamp the user has
-        // already diverged from is their decision and is left alone.
-        //
-        // Gated on `sshDangles`: the stamp records an SSH link, so a server
-        // reached here only by a dangling BMC link still has a live, resolving
-        // `authProfileId` — and clearing its stamp would drop the sync's record
-        // of a link that is perfectly intact.
-        if (danglingSshProfileId !== undefined && server.origin?.syncedAuthProfileId === danglingSshProfileId) {
-          cleared.origin = { ...server.origin, syncedAuthProfileId: undefined };
-        }
-        // REVIEW FINDING (P1, adoption auth provenance) — and the detached form
-        // of that stamp, for the reason NexusCore.removeAuthProfile gives: a
-        // kept server's marker carries the removed source's own link record, and
-        // adoption restores it into a live origin. Left naming a profile this
-        // import has just established does not exist, it would lock the record
-        // out of retro-apply the moment it is reclaimed.
-        if (danglingSshProfileId !== undefined && server.formerlySynced?.syncedAuthProfileId === danglingSshProfileId) {
-          cleared.formerlySynced = { ...server.formerlySynced, syncedAuthProfileId: undefined };
-        }
         // BMC VALUE STAMP (issue #48 PR-T3, `origin.templated.ipmiAuthProfileId`)
         // — mirrors NexusCore.removeAuthProfile's BMC stamp clear: the sync's
         // receipt that IT wrote the BMC credential link dies with the link, or it
@@ -4775,56 +4800,16 @@ export function registerConfigCommands(
         await core.addOrUpdateServer(cleared);
       }
     }
-    // Same clear for inventory sources, whose `authProfileId` links their synced
-    // servers to a profile the same way. Backup import preserves ids on BOTH sides
-    // (importPreservingIds above), so a surviving reference needs no remap — but it
-    // can still dangle: a payload can carry a source whose profile was never exported
-    // (or was skipped/rejected on import), and merge mode may keep a local profile-less
-    // record while importing nothing to satisfy it. Resolution is checked against the
-    // POST-import snapshot, not the payload, so a source that links to a profile this
-    // machine already has keeps its link. A dangling id left in place would survive
-    // every later resolution attempt as a permanent no-op — the sync engine degrades to
-    // the default username + SSH agent and warns on every run — so it is cleared here
-    // exactly as the server refs above are. `addOrUpdateInventorySource` re-revisions,
-    // which is correct: this is a new incarnation of the record.
-    for (const source of postImportSnapshot.inventorySources) {
-      if (source.authProfileId && !knownProfileIds.has(source.authProfileId)) {
-        await core.addOrUpdateInventorySource({ ...source, authProfileId: undefined });
-      }
-    }
-    // DEVICE TEMPLATES (PR-T1, §8.2) — post-import dangling sweeps. Read a FRESH
-    // snapshot: the source-authProfileId sweep just above may have re-written
-    // sources, so the stale `postImportSnapshot` would resurrect a link it just
-    // cleared. Checked against post-import state (a reference this machine
-    // already satisfies is kept). (a) a template's `fields.authProfileId` naming
-    // a profile that was never brought along is cleared, exactly like the source
-    // and server links above. (b) a source's `templateRules` entry naming a
-    // template that does not exist is removed, so the sync engine never receives
-    // a rule it cannot resolve.
+    // Template BMC references and source template rules retain their existing cleanup.
+    // SSH links are never rewritten by these sweeps.
     const sweepSnapshot = core.getSnapshot();
     const knownTemplateIds = new Set(sweepSnapshot.deviceTemplates.map((t) => t.id));
     for (const template of sweepSnapshot.deviceTemplates) {
-      // A template's SSH `authProfileId` and BMC `ipmiAuthProfileId` (issue #48
-      // PR-T3) are independent links into the AuthProfile store — each is swept
-      // on its own terms against the same `knownProfileIds` set, and a template
-      // dangling in both loses both. No `fields.ipmiGatewayServerId` sweep: that
-      // template->server reference is skip-and-warn at sync time, not a dangling
-      // import to rewrite here (same rationale as the deletion-path omission).
-      const linkedProfileId = template.fields.authProfileId?.value;
-      const sshDangles = linkedProfileId !== undefined && !knownProfileIds.has(linkedProfileId);
+      // SSH references retain source intent; only dangling BMC links are cleaned up.
       const linkedIpmiProfileId = template.fields.ipmiAuthProfileId?.value;
-      const ipmiDangles = linkedIpmiProfileId !== undefined && !knownProfileIds.has(linkedIpmiProfileId);
-      if (sshDangles || ipmiDangles) {
-        let restFields = template.fields;
-        if (sshDangles) {
-          const { authProfileId: _authProfileId, ...rest } = restFields;
-          restFields = rest;
-        }
-        if (ipmiDangles) {
-          const { ipmiAuthProfileId: _ipmiAuthProfileId, ...rest } = restFields;
-          restFields = rest;
-        }
-        await core.addOrUpdateDeviceTemplate({ ...template, fields: restFields });
+      if (linkedIpmiProfileId !== undefined && !knownProfileIds.has(linkedIpmiProfileId)) {
+        const { ipmiAuthProfileId: _ipmiAuthProfileId, ...fields } = template.fields;
+        await core.addOrUpdateDeviceTemplate({ ...template, fields });
       }
     }
     for (const source of sweepSnapshot.inventorySources) {
@@ -5106,8 +5091,8 @@ export function registerConfigCommands(
           importedServerIds
         );
       }
-      await restoreSecrets(decryptedSecrets.authProfilePasswords as Record<string, string> | undefined, authProfilePasswordSecretKey, vault, importedAuthProfileIds);
-      await restoreSecrets(decryptedSecrets.authProfilePassphrases as Record<string, string> | undefined, authProfilePassphraseSecretKey, vault, importedAuthProfileIds);
+      await restoreSecrets(decryptedSecrets.authProfilePasswords as Record<string, string> | undefined, (id) => isExternalAuthProfile(core.getAuthProfile(id)) ? undefined : authProfilePasswordSecretKey(id), vault, importedAuthProfileIds);
+      await restoreSecrets(decryptedSecrets.authProfilePassphrases as Record<string, string> | undefined, (id) => isExternalAuthProfile(core.getAuthProfile(id)) ? undefined : authProfilePassphraseSecretKey(id), vault, importedAuthProfileIds);
       // Nested (sourceId -> fieldId -> secret) shape, unlike the flat id->secret buckets
       // above, so it gets its own loop rather than restoreSecrets()'s single-level keyFn.
       const inventorySourceSecrets = decryptedSecrets.inventorySourceSecrets as Record<string, Record<string, string>> | undefined;
@@ -5500,6 +5485,7 @@ export function registerConfigCommands(
     // inventoryCommands' critical sections.
     const removed = emptyRemovedProfileIds();
     const resetMutation = async (): Promise<void> => {
+      runtime?.revokeExternalCredentialApprovals?.();
       const snapshot = core.getSnapshot();
       const unvalidatedOwners = context
         ? collectUnvalidatedSecretOwners(context.globalState, {
@@ -5539,13 +5525,6 @@ export function registerConfigCommands(
         await core.removeLocalShellProfile(profile.id);
       }
 
-      // Remove all auth profiles
-      for (const profile of snapshot.authProfiles) {
-        await vault.delete(authProfilePasswordSecretKey(profile.id));
-        await vault.delete(authProfilePassphraseSecretKey(profile.id));
-        await core.removeAuthProfile(profile.id);
-      }
-
       // Remove all groups
       for (const group of snapshot.explicitGroups) {
         await core.removeExplicitGroup(group);
@@ -5565,6 +5544,14 @@ export function registerConfigCommands(
       for (const template of snapshot.deviceTemplates) {
         await core.removeDeviceTemplate(template.id);
       }
+
+      // Remove all auth profiles
+      for (const profile of snapshot.authProfiles) {
+        await vault.delete(authProfilePasswordSecretKey(profile.id));
+        await vault.delete(authProfilePassphraseSecretKey(profile.id));
+        await core.removeAuthProfile(profile.id);
+      }
+
       for (const filter of snapshot.savedFilters) {
         await core.removeSavedFilter(filter.id);
       }
