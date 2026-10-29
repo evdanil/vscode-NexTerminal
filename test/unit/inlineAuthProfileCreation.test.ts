@@ -1,3 +1,4 @@
+vi.mock("vscode", () => ({ window: { showWarningMessage: vi.fn() } }));
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AuthProfile } from "../../src/models/config";
 import { createInlineAuthProfileCreation } from "../../src/commands/inlineAuthProfileCreation";
@@ -109,4 +110,12 @@ describe("inlineAuthProfileCreation", () => {
     core.addProfile({ id: "ap1", name: "Late", username: "root", authType: "password" });
     expect(panel.addSelectOption).not.toHaveBeenCalled();
   });
+});
+
+it("rejects an external profile created from IPMI without appending or changing the prior selection", () => {
+  const core = makeCore(); const panel = makePanel();
+  const controller = createInlineAuthProfileCreation({ core } as unknown as Parameters<typeof createInlineAuthProfileCreation>[0]);
+  controller.attachPanel(panel as unknown as Parameters<typeof controller.attachPanel>[0]); controller.handleCreateInline("ipmiAuthProfileId");
+  core.addProfile({ id: "e", name: "External", authType: "external", external: { version: 1, method: "password" } });
+  expect(panel.addSelectOption).not.toHaveBeenCalled(); expect(core.listenerCount()).toBe(0);
 });

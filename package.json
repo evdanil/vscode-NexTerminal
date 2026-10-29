@@ -260,6 +260,24 @@
         "icon": "$(key)"
       },
       {
+        "command": "nexus.authProfile.revokeExternalApprovals",
+        "title": "Revoke All External Credential Approvals",
+        "category": "Nexus",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "nexus.authProfile.continueExternalApproval",
+        "title": "Continue External Credential Approval",
+        "category": "Nexus",
+        "icon": "$(check)"
+      },
+      {
+        "command": "nexus.authProfile.cancelExternalApproval",
+        "title": "Cancel External Credential Approval",
+        "category": "Nexus",
+        "icon": "$(close)"
+      },
+      {
         "command": "nexus.authProfile.manage",
         "title": "Manage Auth Profiles",
         "category": "Nexus",
@@ -1162,6 +1180,7 @@
       }
     ],
     "menus": {
+      "editor/title": [{"command": "nexus.authProfile.continueExternalApproval", "when": "resourceScheme == nexus-credential-invocation", "group": "navigation"}, {"command": "nexus.authProfile.cancelExternalApproval", "when": "resourceScheme == nexus-credential-invocation", "group": "navigation"}],
       "view/title": [
         {
           "command": "nexus.refresh",
@@ -2137,6 +2156,9 @@
         }
       ],
       "commandPalette": [
+        {"command": "nexus.authProfile.revokeExternalApprovals"},
+        {"command": "nexus.authProfile.continueExternalApproval", "when": "resourceScheme == nexus-credential-invocation"},
+        {"command": "nexus.authProfile.cancelExternalApproval", "when": "resourceScheme == nexus-credential-invocation"},
         {
           "command": "nexus.refresh",
           "when": "true"

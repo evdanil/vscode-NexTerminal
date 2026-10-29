@@ -1076,6 +1076,15 @@ describe("NexusTreeProvider description visibility", () => {
     expect(server!.tooltip).toContain("[auth: Production Auth]");
   });
 
+  it("shows external source without dormant username in tree description or tooltip", () => {
+    vi.mocked(vscode.workspace.getConfiguration).mockReturnValue({ get: () => true } as never);
+    const provider = new NexusTreeProvider(noopCallbacks);
+    setTestSnapshot(provider, { servers: [makeServer({ authProfileId: "external", username: "dormant-secret-name" })], authProfiles: [{ id: "external", name: "Program", authType: "external", external: { version: 1, method: "password" } }] });
+    const item = (getTestChildren(provider, undefined) as ServerTreeItem[]).find((item) => item instanceof ServerTreeItem)!;
+    expect(item.description).toContain("External Program"); expect(item.tooltip).toContain("Needs configuration");
+    expect(item.description).not.toContain("dormant-secret-name"); expect(item.tooltip).not.toContain("dormant-secret-name");
+  });
+
   // REVIEW FINDING (P2) — the sidebar reads a linked profile's username through
   // the shared ownership rule, so it names the account a connection will
   // actually use. Reading `authProfile.username` directly rendered an imported

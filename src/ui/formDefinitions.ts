@@ -1,5 +1,5 @@
 import type { AuthProfile, AuthProfileOwnedCredentials, LocalShellProfile, ProxyConfig, SerialProfile, ServerConfig, ServerProtocol, TunnelProfile, TunnelType } from "../models/config";
-import { authProfileOwnedCredentials, resolveServerProtocol, resolveTunnelType } from "../models/config";
+import { authProfileFieldOwnership, isExternalAuthProfile, authProfileOwnedCredentials, resolveServerProtocol, resolveTunnelType } from "../models/config";
 import type { NetworkServerKind } from "../models/networkServer";
 import type { DhcpAdapterConfig, TftpAdapterConfig } from "../services/networkServers/core/index";
 import { DEFAULTS as DHCP_DEFAULTS } from "../services/networkServers/dhcp/engine/dhcpConstants";
@@ -32,7 +32,7 @@ import { SSH_AGENT_FORM_NOTE } from "./settingsMetadata";
  *  Advanced. The inventory source form overrides both (see
  *  `INVENTORY_SOURCE_AUTH_PROFILE_HINT`): there the profile IS the answer to
  *  "how will these servers authenticate", sibling to a basic field. */
-const AUTH_PROFILE_HINT = "Reuse saved SSH credentials instead of entering them here.";
+const AUTH_PROFILE_HINT = "Use an auth profile to supply SSH credentials at sign-in.";
 
 interface AuthProfileSelectOptions {
   /** Defaults to `true` — keep the shared select inside Advanced. */
@@ -82,13 +82,10 @@ interface AuthProfileSelectOptions {
  * whether the linked profile put them there; it has to be told, and only this
  * side knows the profile.
  *
- * Derived from THE ONE RULE (`authProfileOwnedCredentials`, models/config.ts),
- * the same one the connect path and the save path read, so the three can never
- * drift apart again. The runtime mirrors this seed stands in for until the
- * first autofill answers \u2014 `authProfileCredentialMirror` (serverCommands.ts)
- * and `authProfileUsernameMirror` (inventoryCommands.ts) \u2014 send exactly the
- * owned keys, so the webview's own record (`filledKeysFromValues`, which
- * independently drops blanks) rebuilds this same set.
+ * Derived from `authProfileFieldOwnership`, shared with the save boundary.
+ * Stored profiles mirror their supplied values. External profiles instead send
+ * ownership metadata: they own these controls without supplying static values,
+ * so dormant defaults stay untouched and are restored on explicit unlink.
  *
  * `defaultUsername` is the inventory source form's name for the username the
  * profile supplies; the server and unified profile forms call it `username`.
@@ -98,18 +95,18 @@ interface AuthProfileSelectOptions {
  * two read together.
  */
 function authProfileFilledKeys(profile: AuthProfile | undefined): string[] {
-  const owned = authProfileOwnedCredentials(profile);
+  const owned = authProfileFieldOwnership(profile);
   const keys: string[] = [];
-  if (owned.username !== undefined) {
+  if (owned.username) {
     keys.push("username");
   }
-  if (owned.authType !== undefined) {
+  if (owned.authType) {
     keys.push("authType");
   }
-  if (owned.keyPath !== undefined) {
+  if (owned.keyPath) {
     keys.push("keyPath");
   }
-  if (owned.username !== undefined) {
+  if (owned.username) {
     keys.push("defaultUsername");
   }
   return keys;
@@ -207,6 +204,13 @@ function applyLinkedAuthProfileValues(
   return { fields: applied, displaced };
 }
 
+function profileOptions(profiles: AuthProfile[] | undefined, selectedId?: string, ipmi = false): { label: string; value: string }[] {
+  const options = (profiles ?? []).filter((profile) => !ipmi || !isExternalAuthProfile(profile) || profile.id === selectedId)
+    .map((profile) => ({ label: ipmi && isExternalAuthProfile(profile) ? `${profile.name} — Unavailable for IPMI` : formatAuthProfileLabel(profile), value: profile.id }));
+  if (selectedId && !options.some((option) => option.value === selectedId)) options.push({ label: "Missing auth profile — Needs configuration", value: selectedId });
+  return options;
+}
+
 function authProfileSelectField(
   authProfiles?: AuthProfile[],
   vw?: VisibleWhen,
@@ -215,7 +219,7 @@ function authProfileSelectField(
 ): FormFieldDescriptor {
   const options = [
     { label: "(None)", value: "" },
-    ...(authProfiles ?? []).map((p) => ({ label: formatAuthProfileLabel(p), value: p.id })),
+    ...profileOptions(authProfiles, selectedId, opts?.key === "ipmiAuthProfileId"),
     // P2 \u2014 suppressed in the device-template editor, whose auth select has no
     // inline-create handler wired (choosing it would silently drop the field).
     ...(opts?.suppressCreate ? [] : [{ label: "Create new auth profile\u2026", value: "__create__authProfile" }])
@@ -239,6 +243,7 @@ function authProfileSelectField(
     // server SSH form to mirror INTO, so the template editor turns it OFF and,
     // with it, the render-time filled-keys/displaced seeds it feeds.
     autofill,
+    autofillExternalProfile: autofill && isExternalAuthProfile(selectedProfile) ? selectedProfile.name : undefined,
     autofillFilledKeys: autofill ? authProfileFilledKeys(selectedProfile) : undefined,
     autofillDisplacedValues: autofill ? opts?.displacedValues : undefined,
     visibleWhen: vw
@@ -254,9 +259,8 @@ function authProfileSelectField(
  *     auth type / key path into the form's own controls and locks them; this one
  *     must never touch them, because the BMC account and the SSH account are two
  *     different logins on two different interfaces of the same appliance.
- *   - Only `username` and the stored password are ever read from the profile it
- *     names, so `authType`/`keyPath` are ignored on this link and the hint says
- *     so — a `key` or `agent` profile is accepted and simply supplies a username.
+ *   - Only stored profiles can supply this link. External profiles are excluded
+ *     from new choices; an existing external link remains visible as unavailable.
  */
 function ipmiAuthProfileSelectField(
   authProfiles?: AuthProfile[],
@@ -272,7 +276,7 @@ function ipmiAuthProfileSelectField(
     filterable: true,
     options: [
       { label: "(None)", value: "" },
-      ...(authProfiles ?? []).map((p) => ({ label: formatAuthProfileLabel(p), value: p.id })),
+      ...profileOptions(authProfiles, selectedId, true),
       // C2 — same inline-create escape hatch as the SSH select above, so an empty
       // list is not a dead end. NO `autofill` on this field (see the header), so
       // the created profile is appended and selected without mirroring anything
@@ -284,7 +288,7 @@ function ipmiAuthProfileSelectField(
       "The BMC's own login — separate from the SSH credentials above. Its username fills ${profile.ipmiUsername}, " +
       "and its saved password is handed to ipmitool through the environment (never the command line) by macros you tick " +
       '"Provide IPMI credentials" on, and by Connect BMC Serial Console. Only the username and password are used; ' +
-      "the profile's authentication type and key file are ignored here.",
+      "a stored profile's authentication type and key file are ignored. External programs support SSH only.",
     advanced: true,
     visibleWhen: vw
   };
@@ -1875,20 +1879,8 @@ export function inventorySourceFormDefinition(
   const existingConfig = seed?.config ?? {};
   const filterTarget = savedFilterTarget(provider.configFields);
 
-  // A seeded id whose profile is gone must seed as `(None)`, not merely LOOK
-  // like it. `renderField`'s select case resolves the displayed LABEL by
-  // falling back to `options[0]` when nothing matches, but writes
-  // `field.value` verbatim into the hidden input — so an unsanitized dangling
-  // id displays "(None)" while submitting the dead id, and a plain Save would
-  // silently rewrite the source with a reference that resolves nowhere.
-  const seededAuthProfileId = seed?.authProfileId;
-  const sanitizedAuthProfileId =
-    seededAuthProfileId !== undefined && (authProfiles ?? []).some((profile) => profile.id === seededAuthProfileId)
-      ? seededAuthProfileId
-      : undefined;
-  // Resolved from the SAME list the select's options and the sanitizer above
-  // are built from, so what the form renders, what it locks and what it offers
-  // are one lookup — never a second, later one that could disagree.
+  // Preserve source intent: missing links stay selected until the user explicitly repairs them.
+  const sanitizedAuthProfileId = seed?.authProfileId;
   const linkedProfile =
     sanitizedAuthProfileId !== undefined
       ? (authProfiles ?? []).find((profile) => profile.id === sanitizedAuthProfileId)

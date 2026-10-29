@@ -1,3 +1,4 @@
+import { parseExternalArgumentsText } from "./externalCredentialForm";
 import type { AuthProfile } from "../models/config";
 import { escapeHtml } from "./shared/escapeHtml";
 import { baseWebviewCss } from "./shared/webviewStyles";
@@ -30,6 +31,7 @@ export function renderAuthProfileEditorHtml(
   const usernameValue = profile?.username ?? "";
   const authTypeValue = profile?.authType ?? "password";
   const keyPathValue = profile?.keyPath ?? "";
+  const external = profile?.authType === "external" ? profile.external : undefined;
   const isNew = selectedId === null;
   const saveLabel = isNew ? "Create" : "Save";
   const deleteDisabled = isNew ? " disabled" : "";
@@ -37,7 +39,8 @@ export function renderAuthProfileEditorHtml(
   const authTypeOptions = [
     { label: "Password", value: "password" },
     { label: "Private Key", value: "key" },
-    { label: "SSH Agent", value: "agent" }
+    { label: "SSH Agent", value: "agent" },
+    { label: "External Program", value: "external" }
   ];
   const authTypeOptionsHtml = authTypeOptions
     .map(
@@ -45,7 +48,7 @@ export function renderAuthProfileEditorHtml(
         `<div class="custom-select-option${o.value === authTypeValue ? " selected" : ""}" data-value="${o.value}">${escapeHtml(o.label)}</div>`
     )
     .join("\n          ");
-  const authTypeTriggerLabel = authTypeOptions.find((o) => o.value === authTypeValue)?.label ?? "Password";
+  const authTypeTriggerLabel = authTypeOptions.find((o) => o.value === authTypeValue)?.label ?? "Unknown authentication";
 
   return renderWebviewDocument({
     nonce,
@@ -119,7 +122,7 @@ export function renderAuthProfileEditorHtml(
     <div class="field-error" id="error-name"></div>
   </div>
 
-  <div class="form-group">
+  <div class="form-group conditional-field${authTypeValue !== "external" ? " visible" : ""}" id="username-field">
     <label for="profile-username">Username</label>
     <input type="text" id="profile-username" value="${escapeHtml(usernameValue)}" placeholder="root" />
     <div class="field-error" id="error-username"></div>
@@ -136,6 +139,38 @@ export function renderAuthProfileEditorHtml(
         ${authTypeOptionsHtml}
       </div>
     </div>
+  </div>
+
+  <div class="conditional-field${authTypeValue === "external" ? " visible" : ""}" id="external-field">
+    <p class="hint">The program supplies the username and credentials when a new SSH connection signs in.</p>
+    <div class="form-group">
+      <label id="external-method-label">Authentication Method</label>
+      <div class="custom-select" id="external-method-selector">
+        <input type="hidden" id="external-method" value="${external?.method ?? "password"}" />
+        <div class="custom-select-trigger" tabindex="0" aria-labelledby="external-method-label" aria-describedby="external-method-hint"><span class="custom-select-text">${external?.method === "key" ? "Private Key" : "Password"}</span></div>
+        <div class="custom-select-dropdown">
+          <div class="custom-select-option${external?.method !== "key" ? " selected" : ""}" data-value="password">Password</div>
+          <div class="custom-select-option${external?.method === "key" ? " selected" : ""}" data-value="key">Private Key</div>
+        </div>
+      </div>
+      <div class="hint" id="external-method-hint">Nexus adds <span id="external-method-flag">${external?.method === "key" ? "--pkey" : "--pass"}</span>. Private keys supplied by the program must be unencrypted.</div>
+    </div>
+    <div class="form-group">
+      <label for="external-executable">Executable</label>
+      <div class="browse-row">
+        <input type="text" id="external-executable" value="${escapeHtml(external?.invocation?.executable ?? "")}" aria-describedby="external-executable-hint error-external-executable" />
+        <button type="button" class="btn-secondary" id="external-browse-btn">Browse</button>
+      </div>
+      <div class="hint" id="external-executable-hint">Absolute path on the extension host, which may be remote, in a container or WSL. For scripts, select the interpreter and put the script path in Arguments.</div>
+      <div class="field-error" id="error-external-executable" aria-live="polite"></div>
+    </div>
+    <div class="form-group">
+      <label for="external-arguments">Arguments</label>
+      <textarea id="external-arguments" rows="4" aria-describedby="external-arguments-hint error-external-arguments">${escapeHtml(external?.invocation?.args.join("\n") ?? "")}</textarea>
+      <div class="hint" id="external-arguments-hint">One argument per line. Spaces inside an argument are preserved. Do not add shell quotes or put passwords/tokens here; arguments are saved in configuration. Nexus adds --pass or --pkey for the selected method. Tilde, environment and template expansion are unavailable.</div>
+      <div class="field-error" id="error-external-arguments" aria-live="polite"></div>
+    </div>
+    <p class="hint">Saving does not run the program or grant approval. Interactive Connect asks you to review the complete invocation before approving it for this extension-host session.</p>
   </div>
 
   <div class="form-group conditional-field${authTypeValue === "password" ? " visible" : ""}" id="password-field">
@@ -163,10 +198,18 @@ export function renderAuthProfileEditorHtml(
     <button type="button" class="btn-secondary" id="new-btn">New Profile</button>
     <button type="button" class="btn-secondary" id="delete-btn"${deleteDisabled}>Delete</button>
   </div>
+  <section id="session-approvals" aria-labelledby="session-approvals-heading">
+    <h3 id="session-approvals-heading">Session Approvals</h3>
+    <p class="hint">Applies to all external credential profiles in this extension-host session, including profiles other than the one selected.</p>
+    <button type="button" class="btn-secondary" id="revoke-external-btn">Revoke All External Credential Approvals</button>
+    <div id="session-approvals-status" role="status" aria-live="polite"></div>
+  </section>
+  <div id="action-error" class="field-error" role="status" aria-live="polite"></div>
 `,
     script: `    ${baseWebviewJs()}
     (function() {
       var vscode = acquireVsCodeApi();
+      var parseExternalArgumentsText = ${parseExternalArgumentsText.toString()};
       var dirty = false;
       var currentId = ${selectedId !== null ? JSON.stringify(selectedId) : "null"};
       var saveFlag = document.getElementById("save-flag");
@@ -199,6 +242,10 @@ export function renderAuthProfileEditorHtml(
 
       function updateConditionalFields() {
         var authType = document.getElementById("authtype-select-value").value;
+        var externalField = document.getElementById("external-field");
+        var usernameField = document.getElementById("username-field");
+        if (externalField) externalField.classList[authType === "external" ? "add" : "remove"]("visible");
+        if (usernameField) usernameField.classList[authType !== "external" ? "add" : "remove"]("visible");
         var pwField = document.getElementById("password-field");
         var keyField = document.getElementById("keypath-field");
         var agentNote = document.getElementById("agent-note");
@@ -219,6 +266,22 @@ export function renderAuthProfileEditorHtml(
         }
       }
 
+      function updateExternalControls() {
+        updateConditionalFields();
+        var mode = document.getElementById("authtype-select-value").value;
+        ["username-field", "password-field", "keypath-field", "external-field"].forEach(function(id) {
+          var group = document.getElementById(id);
+          var active = group.classList.contains("visible");
+          group.querySelectorAll("input, textarea, button").forEach(function(control) { control.disabled = !active; });
+          group.querySelectorAll(".custom-select-trigger").forEach(function(control) { control.tabIndex = active ? 0 : -1; });
+        });
+        document.getElementById("external-method-flag").textContent = document.getElementById("external-method").value === "key" ? "--pkey" : "--pass";
+      }
+      updateExternalControls();
+      document.getElementById("authtype-selector").addEventListener("click", updateExternalControls);
+      document.getElementById("authtype-selector").addEventListener("keydown", function() { setTimeout(updateExternalControls, 0); });
+      ["external-executable", "external-arguments"].forEach(function(id) { document.getElementById(id).addEventListener("input", markDirty); });
+
       // Track changes
       document.getElementById("profile-name").addEventListener("input", markDirty);
       document.getElementById("profile-username").addEventListener("input", markDirty);
@@ -236,6 +299,9 @@ export function renderAuthProfileEditorHtml(
           }
           wrapper.classList.remove("open");
           return;
+        }
+        if (wrapper.id === "external-method-selector") {
+          selectCustomOption(wrapper, value); markDirty(); updateExternalControls();
         }
         if (wrapper.id === "authtype-selector") {
           selectCustomOption(wrapper, value);
@@ -260,13 +326,34 @@ export function renderAuthProfileEditorHtml(
         } else {
           document.getElementById("error-name").textContent = "";
         }
-        if (!username) {
+        if (authType !== "external" && !username) {
           document.getElementById("error-username").textContent = "Username cannot be empty";
           valid = false;
         } else {
           document.getElementById("error-username").textContent = "";
         }
-        if (!valid) return;
+        var firstInvalid;
+        function error(id, message) {
+          document.getElementById("error-" + id).textContent = message;
+          var field = document.getElementById(id);
+          field.setAttribute("aria-invalid", message ? "true" : "false");
+          if (message && !firstInvalid) firstInvalid = field;
+          if (message) valid = false;
+        }
+        if (!name) firstInvalid = document.getElementById("profile-name");
+        if (!username && authType !== "external" && !firstInvalid) firstInvalid = document.getElementById("profile-username");
+        if (["password", "key", "agent", "external"].indexOf(authType) === -1) { document.getElementById("action-error").textContent = "Choose a supported Authentication type."; return; }
+        if (authType === "external") {
+          var executable = document.getElementById("external-executable").value;
+          var args = [];
+          error("external-executable", executable && (executable[0] === "/" || /^[A-Za-z]:[\\\\/]/.test(executable) || /^\\\\\\\\/.test(executable)) && !/[\\u0000-\\u001f\\u007f-\\u009f\\u061c\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069]/.test(executable) ? "" : "Choose an absolute executable path without control characters.");
+          try { args = parseExternalArgumentsText(document.getElementById("external-arguments").value); error("external-arguments", ""); }
+          catch (e) { error("external-arguments", e.message); }
+          if (!valid) { if (firstInvalid) firstInvalid.focus(); return; }
+          vscode.postMessage({ type: "save", id: currentId, name: name, authType: "external", external: { version: 1, method: document.getElementById("external-method").value, invocation: { executable: executable, args: args } } });
+          return;
+        }
+        if (!valid) { if (firstInvalid) firstInvalid.focus(); return; }
 
         vscode.postMessage({
           type: "save",
@@ -274,8 +361,8 @@ export function renderAuthProfileEditorHtml(
           name: name,
           username: username,
           authType: authType,
-          password: password,
-          keyPath: keyPath
+          password: authType === "password" ? password : undefined,
+          keyPath: authType === "key" ? keyPath : undefined
         });
       });
 
@@ -299,9 +386,15 @@ export function renderAuthProfileEditorHtml(
         vscode.postMessage({ type: "browse" });
       });
 
+      document.getElementById("external-browse-btn").addEventListener("click", function() { vscode.postMessage({ type: "externalExecutable" }); });
+      document.getElementById("revoke-external-btn").addEventListener("click", function() { vscode.postMessage({ type: "revokeExternalApprovals" }); });
+
       // Messages from host
       window.addEventListener("message", function(event) {
         var msg = event.data;
+        if (msg.type === "externalExecutableResult" && typeof msg.path === "string") { document.getElementById("external-executable").value = msg.path; markDirty(); }
+        if (msg.type === "externalApprovalsStatus") document.getElementById("session-approvals-status").textContent = msg.message;
+        if (msg.type === "actionError") document.getElementById("action-error").textContent = msg.message;
         if (msg.type === "saved") {
           clearDirty();
         }

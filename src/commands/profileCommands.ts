@@ -1,3 +1,5 @@
+import { externalServerFormValues } from "../ui/externalCredentialForm";
+import { isExternalAuthProfile, authProfileConnectionIdentity } from "../models/authProfile";
 import * as vscode from "vscode";
 import type { UnifiedProfileSeed } from "../ui/formDefinitions";
 import { unifiedProfileFormDefinition, unifiedProfileFormId , toSshInfrastructureServerList } from "../ui/formDefinitions";
@@ -91,6 +93,7 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
     definition.testableWhen = { field: "profileType", value: ["ssh", "serial"] };
   }
   const inlineAuthProfile = createInlineAuthProfileCreation(ctx);
+  let renderedExternalIdentity: { id: string; identity: string } | undefined;
   const panel = WebviewFormPanel.open(unifiedProfileFormId(seed), definition, {
     onSubmit: async (values: FormValues) => {
       if (normalizeOptionalFolderPath(values.group) === null) {
@@ -131,7 +134,8 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
         // Same reasoning, and the same create-only shape, as the serial branch above.
         await configMutationLock.runExclusive(() => ctx.core.addOrUpdateLocalServerConfig(config));
       } else {
-        const builtServer = formValuesToServer(values);
+        const selectedProfile = typeof values.authProfileId === "string" ? ctx.core.getAuthProfile(values.authProfileId) : undefined;
+        const builtServer = formValuesToServer(externalServerFormValues(values, selectedProfile));
         if (!builtServer) {
           return;
         }
@@ -162,32 +166,15 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
           // on purpose: nothing has been written yet, so there is nothing to
           // roll back.
           //
-          // WHY ONLY THE MISSING CASE, and not the server EDIT form's full
-          // `serverAuthProfileRejection` (commands/serverCommands.ts). That
-          // guard has two halves, and only one of them has a counterpart here.
-          // Its ownership-signature half exists solely because
-          // `preserveLinkedServerCredentials` reads the LIVE profile to decide
-          // which submitted credential fields are the user's own input and
-          // which come back from the STORED record — a decision made about a
-          // form nobody rendered if the profile's shape moved underneath it,
-          // which silently discards a field the user typed or writes the
-          // profile's own mirrored value over the record's. That helper does
-          // not run on this path at all: it returns `next` untouched without an
-          // `existing`, and there is no stored record to put anything back
-          // from. This path writes the submission verbatim, so a new server
-          // linked here ALWAYS stores the profile's mirrored credentials as its
-          // own — that is the intended value underneath the link, not a
-          // corruption, and a drifted shape only makes it one profile edit
-          // stale. That is the same state the record would be in had the user
-          // pressed Save a moment earlier, and it is what the link itself
-          // means: the live profile decides at connect time regardless. Same
-          // reasoning `inventoryAuthProfileRejection` uses to omit the server
-          // form's comparand — compare what this save actually READS from the
-          // profile, which here is the id and nothing else.
-          //
-          // The missing half has no such excuse: an id that resolves to nothing
-          // is not one edit stale, it is a reference to a record that does not
-          // exist, and it is the one outcome no save may leave behind.
+          // Stored-profile Add keeps its existing mirrored-value policy. External
+          // profiles own hidden fields dynamically, so they must still match the
+          // invocation rendered by this form before accepting host-owned defaults.
+          const linkedProfile = server.authProfileId ? ctx.core.getAuthProfile(server.authProfileId) : undefined;
+          if (isExternalAuthProfile(linkedProfile) || renderedExternalIdentity?.id === server.authProfileId && renderedExternalIdentity !== undefined) {
+            if (renderedExternalIdentity?.id !== server.authProfileId || renderedExternalIdentity?.identity !== JSON.stringify(authProfileConnectionIdentity(linkedProfile))) {
+              throw new Error("The external auth profile changed while this form was open. Re-select it in Auth Profile, then save again.");
+            }
+          }
           if (server.authProfileId !== undefined && ctx.core.getAuthProfile(server.authProfileId) === undefined) {
             throw new Error(MISSING_AUTH_PROFILE_MESSAGE);
           }
@@ -334,7 +321,11 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
     onBrowse: browseForKey,
     onScan: () => scanForPort(ctx),
     onCreateInline: inlineAuthProfile.handleCreateInline,
-    onAutofill: async (_key, value) => authProfileCredentialMirror(ctx.core.getAuthProfile(value)),
+    onAutofill: async (_key, value) => {
+      const profile = ctx.core.getAuthProfile(value);
+      renderedExternalIdentity = isExternalAuthProfile(profile) ? { id: profile.id, identity: JSON.stringify(authProfileConnectionIdentity(profile)) } : undefined;
+      return authProfileCredentialMirror(profile);
+    },
     onTest: async (values: FormValues) => {
       if (values.profileType === "serial") {
         const draft = formValuesToSerial(values);

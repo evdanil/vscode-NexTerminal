@@ -10,6 +10,7 @@ const panelDispose = vi.fn(() => {
 const panelReveal = vi.fn();
 const postMessage = vi.fn(async () => true);
 const showErrorMessage = vi.fn();
+const executeCommand = vi.fn();
 
 vi.mock("../../src/ui/formHtml", () => ({
   renderFormHtml: vi.fn(() => "<html></html>")
@@ -35,6 +36,7 @@ vi.mock("vscode", () => ({
       reveal: panelReveal
     }))
   },
+  commands: { executeCommand: (...args: unknown[]) => executeCommand(...args) },
   ViewColumn: { Active: 1 }
 }));
 
@@ -345,4 +347,11 @@ describe("WebviewFormPanel submit handling", () => {
     expect(listenerA).not.toHaveBeenCalled();
     expect(listenerB).toHaveBeenCalledTimes(1);
   });
+});
+
+it("repairs the specific linked auth profile without saving or closing the form", async () => {
+  const onSubmit = vi.fn(); WebviewFormPanel.open("profile-repair", { title: "Test", fields: [] }, { onSubmit });
+  const before = panelDispose.mock.calls.length;
+  await messageHandler!({ type: "manageAuthProfile", id: "unconfigured-external" });
+  expect(executeCommand).toHaveBeenCalledWith("nexus.authProfile.manage", "unconfigured-external"); expect(onSubmit).not.toHaveBeenCalled(); expect(panelDispose.mock.calls.length).toBe(before);
 });

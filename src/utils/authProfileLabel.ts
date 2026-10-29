@@ -22,6 +22,9 @@ export function formatKeyPathDisplayName(keyPath: string): string {
 }
 
 export function formatAuthProfileLabel(profile: AuthProfile): string {
+  if (profile.authType === "external") {
+    return `${profile.name} — External Program · ${profile.external.method === "password" ? "Password" : "Private Key"}${profile.external.invocation ? "" : " · Needs configuration"}`;
+  }
   const parts = [profile.name, profile.authType, profile.username];
   if (profile.authType === "key" && profile.keyPath) {
     parts.push(formatKeyPathDisplayName(profile.keyPath));

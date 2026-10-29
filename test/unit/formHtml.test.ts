@@ -587,7 +587,7 @@ describe("renderFormHtml", () => {
       const factory = new Function(
         "document",
         "profileFilledKeys",
-        `${source}\nreturn updateProfileManagedFields;`
+        `var externalProfileName; ${source}\nreturn updateProfileManagedFields;`
       ) as (doc: unknown, filledKeys: Record<string, boolean>) => () => void;
       return (doc, filledKeys) => factory(doc, filledKeys)();
     }
@@ -652,6 +652,7 @@ describe("renderFormHtml", () => {
         style: {}
       };
       const group = {
+        style: {}, dataset: {},
         querySelectorAll: (selector: string): StubElement[] =>
           selector === "input, textarea" ? [field] : selector === "button" ? [button] : [],
         querySelector: (): unknown => null
@@ -661,6 +662,7 @@ describe("renderFormHtml", () => {
         querySelector: (): unknown => ({ value: opts.linkedProfileId })
       };
       const document = {
+        querySelectorAll: () => [],
         getElementById: (id: string): unknown => {
           if (id === "field-authProfileId") return profileWrapper;
           if (id === "field-defaultUsername") return field;
@@ -1085,7 +1087,7 @@ describe("renderFormHtml", () => {
     expect(html).not.toContain("data-autofill-displaced='");
   });
 
-  it("renders a dangling seeded auth profile id as an empty hidden value, not just an empty label", () => {
+  it("renders a dangling auth profile as selected and needing repair", () => {
     const definition = inventorySourceFormDefinition(
       {
         label: "Fake Provider",
@@ -1106,10 +1108,9 @@ describe("renderFormHtml", () => {
       [{ id: "p1", name: "Lab credentials", username: "labuser", authType: "password" }]
     );
     const html = renderFormHtml(definition);
-    // Display and submit must agree. An unsanitized seed renders the (None)
-    // label (options[0] fallback) but keeps "ghost" as the posted value.
-    expect(html).toContain('<input type="hidden" name="authProfileId" value="" />');
-    expect(html).not.toContain("ghost");
+    expect(html).toContain('<input type="hidden" name="authProfileId" value="ghost" />');
+    expect(html).toContain("Missing auth profile — Needs configuration");
+    expect(html).toContain("Manage Auth Profiles");
   });
 
   it("guards visibleWhen JSON parsing to avoid script breakage", () => {

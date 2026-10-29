@@ -117,11 +117,13 @@ async function linkProfileToServers(
 export function registerAuthProfileCommands(ctx: CommandContext): vscode.Disposable[] {
   return [
     vscode.commands.registerCommand("nexus.authProfile.add", () => {
-      AuthProfileEditorPanel.openNew(ctx.core, ctx.secretVault);
+      if (ctx.externalCredentialResolver) AuthProfileEditorPanel.openNew(ctx.core, ctx.secretVault, ctx.externalCredentialResolver);
+      else AuthProfileEditorPanel.openNew(ctx.core, ctx.secretVault);
     }),
 
-    vscode.commands.registerCommand("nexus.authProfile.manage", () => {
-      AuthProfileEditorPanel.open(ctx.core, ctx.secretVault);
+    vscode.commands.registerCommand("nexus.authProfile.manage", (profileId?: unknown) => {
+      if (ctx.externalCredentialResolver || typeof profileId === "string") AuthProfileEditorPanel.open(ctx.core, ctx.secretVault, typeof profileId === "string" ? profileId : undefined, ctx.externalCredentialResolver);
+      else AuthProfileEditorPanel.open(ctx.core, ctx.secretVault);
     }),
 
     vscode.commands.registerCommand("nexus.authProfile.applyToFolder", async (arg?: unknown) => {

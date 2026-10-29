@@ -1,3 +1,5 @@
+import { externalServerFormValues } from "../ui/externalCredentialForm";
+import { isExternalAuthProfile } from "../models/authProfile";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import * as os from "node:os";
@@ -904,6 +906,9 @@ export function preserveLinkedServerCredentials(
   next: ServerConfig,
   profile: AuthProfile | undefined
 ): ServerConfig {
+  if (!existing && next.authProfileId && isExternalAuthProfile(profile)) {
+    return { ...next, username: "root", authType: "password", keyPath: undefined };
+  }
   if (!existing || !next.authProfileId) {
     return next;
   }
@@ -1024,6 +1029,7 @@ export function authProfileCredentialMirror(profile: AuthProfile | undefined): R
   if (!profile) {
     return undefined;
   }
+  if (isExternalAuthProfile(profile)) return { __externalAuthProfile: profile.name };
   const owned = authProfileOwnedCredentials(profile);
   const values: Record<string, string> = {};
   if (owned.username !== undefined) {
@@ -1927,7 +1933,8 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           if (normalizeOptionalFolderPath(values.group) === null) {
             throw new Error(INVALID_FOLDER_PATH_MESSAGE);
           }
-          const candidate = formValuesToServer(values, existing.id, existing.isHidden, existing.addressless === true);
+          const selectedProfile = typeof values.authProfileId === "string" ? ctx.core.getAuthProfile(values.authProfileId) : undefined;
+          const candidate = formValuesToServer(externalServerFormValues(values, selectedProfile, existing), existing.id, existing.isHidden, existing.addressless === true);
           if (!candidate) {
             return;
           }

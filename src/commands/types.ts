@@ -66,6 +66,7 @@ export interface CommandContext {
   fileSystemProvider?: NexusFileSystemProvider;
   elevationBroker?: ElevationBroker;
   secretVault?: SecretVault;
+  externalCredentialResolver?: Pick<import("../services/credentials/contracts").ExternalCredentialResolver, "revoke">;
   registrySync?: TunnelRegistrySync;
   focusedTerminal?: vscode.Terminal;
   activityIndicators: Map<string, { setActivityIndicator(active: boolean): void }>;

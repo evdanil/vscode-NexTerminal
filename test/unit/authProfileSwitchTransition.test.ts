@@ -1,3 +1,5 @@
+import { externalServerFormValues } from "../../src/ui/externalCredentialForm";
+import { validateServerConfig } from "../../src/utils/validation";
 import { describe, expect, it, vi } from "vitest";
 import { inventorySourceFormDefinition, serverFormDefinition } from "../../src/ui/formDefinitions";
 import type { FormValues } from "../../src/ui/formTypes";
@@ -922,5 +924,37 @@ describe("an auth-profile switch hands back the values the previous profile disp
       harness.choose("authProfileId", "");
       expect(harness.value("defaultUsername")).toBe("typed-by-hand");
     });
+  });
+});
+
+
+describe("external profile dynamic ownership", () => {
+  const external: AuthProfile = { id: "external", name: "Vault", authType: "external", external: { version: 1, method: "key", invocation: { executable: "/provider", args: [] } } };
+  const server: ServerConfig = { id: "s", name: "Server", host: "host.test", port: 22, isHidden: false, username: "dormant", authType: "key", keyPath: "/dormant" };
+  it("hides and omits dormant fields while preserving them on explicit unlink", () => {
+    const h = openForm(serverFormDefinition({ ...server, authProfileId: external.id }, undefined, true, undefined, [external]));
+    expect(h.locked("username")).toBe(true); expect(h.locked("authType")).toBe(true);
+    const values = h.submit(); expect(values).not.toHaveProperty("username"); expect(values).not.toHaveProperty("authType"); expect(values).not.toHaveProperty("keyPath");
+    h.choose("authProfileId", ""); expect(h.value("username")).toBe("dormant"); expect(h.value("keyPath")).toBe("/dormant");
+    expect(h.submit().username).toBe("dormant");
+  });
+  it("switches into dynamic ownership without fake values and restores the typed draft", () => {
+    const h = openForm(serverFormDefinition(server, undefined, true, undefined, [external]));
+    h.type("username", "draft"); pickProfile(h, [external], external.id);
+    expect(h.value("username")).toBe("draft"); expect(h.locked("username")).toBe(true); expect(h.submit()).not.toHaveProperty("username");
+    h.choose("authProfileId", ""); expect(h.value("username")).toBe("draft"); expect(h.submit().username).toBe("draft");
+  });
+  it("creates an external-linked server in an empty form with host-owned dormant defaults and reveals them on unlink", () => {
+    const h = openForm(serverFormDefinition(undefined, undefined, true, undefined, [external]));
+    h.type("name", "New"); h.type("host", "host.test"); pickProfile(h, [external], external.id);
+    const values = h.submit(); expect(values).not.toHaveProperty("username");
+    const created = formValuesToServer(externalServerFormValues(values, external))!;
+    expect(created.username).toBe("root"); expect(created.authType).toBe("password"); expect(validateServerConfig(created)).toBe(true);
+    const reopened = openForm(serverFormDefinition(created, undefined, true, undefined, [external])); reopened.choose("authProfileId", "");
+    expect(reopened.value("username")).toBe("root"); expect(reopened.value("authType")).toBe("password");
+  });
+  it("never persists crafted dormant values for an externally owned existing server", () => {
+    const next = preserveLinkedServerCredentials(server, { ...server, authProfileId: external.id, username: "forged", authType: "password", keyPath: "/forged" }, external);
+    expect(next.username).toBe("dormant"); expect(next.authType).toBe("key"); expect(next.keyPath).toBe("/dormant");
   });
 });

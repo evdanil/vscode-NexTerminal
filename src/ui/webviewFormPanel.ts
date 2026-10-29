@@ -53,6 +53,10 @@ export class WebviewFormPanel {
         }
         return;
       }
+      if (message.type === "manageAuthProfile" && typeof message.id === "string") {
+        void vscode.commands.executeCommand("nexus.authProfile.manage", message.id);
+        return;
+      }
       if (message.type === "cancel") {
         this.onCancel();
         this.dispose();

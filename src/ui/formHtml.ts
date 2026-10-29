@@ -141,6 +141,8 @@ function renderField(field: FormFieldDescriptor): string {
       // The initial ownership record: which keys the ALREADY SELECTED option's
       // autofill fills. Omitted when it fills nothing, which the script reads
       // as the same empty set.
+      const externalAttr = field.autofillExternalProfile !== undefined ? ` data-external-profile="${escapeHtml(field.autofillExternalProfile)}"` : "";
+      const profileHelp = field.key === "authProfileId" ? '<div id="auth-profile-source-note" class="hint" role="status" aria-live="polite"></div><button type="button" class="btn-secondary" id="auth-profile-repair">Manage Auth Profiles</button>' : "";
       const filledAttr = field.autofillFilledKeys && field.autofillFilledKeys.length > 0
         ? ` data-autofill-filled='${escapeHtml(JSON.stringify(field.autofillFilledKeys))}'`
         : "";
@@ -178,7 +180,7 @@ function renderField(field: FormFieldDescriptor): string {
         const filterLabel = escapeHtml(`Filter ${field.label} options`);
         return `<div class="form-group"${vw}${rw}>
   <label>${escapeHtml(field.label)}${requiredLabel}</label>
-  <div class="custom-select filterable" id="${id}" data-name="${key}"${autofillAttr}${filledAttr}${displacedAttr}${fillTargetAttr}>
+  <div class="custom-select filterable" id="${id}" data-name="${key}"${autofillAttr}${filledAttr}${displacedAttr}${fillTargetAttr}${externalAttr}>
     <input type="hidden" name="${key}" value="${escapeHtml(selectedValue)}" />
     <div class="custom-select-trigger" tabindex="0">
       <span class="custom-select-text">${escapeHtml(selectedLabel)}</span>
@@ -190,13 +192,13 @@ function renderField(field: FormFieldDescriptor): string {
       ${optionsHtml}
       <div class="custom-select-no-matches" style="display: none;" role="status" aria-live="polite">No matches</div>
     </div>
-  </div>${renderHint(field)}
+  </div>${renderHint(field)}${profileHelp}
   <div class="field-error" id="error-${key}"></div>
 </div>`;
       }
       return `<div class="form-group"${vw}${rw}>
   <label>${escapeHtml(field.label)}${requiredLabel}</label>
-  <div class="custom-select" id="${id}" data-name="${key}"${autofillAttr}${filledAttr}${displacedAttr}${fillTargetAttr}>
+  <div class="custom-select" id="${id}" data-name="${key}"${autofillAttr}${filledAttr}${displacedAttr}${fillTargetAttr}${externalAttr}>
     <input type="hidden" name="${key}" value="${escapeHtml(selectedValue)}" />
     <div class="custom-select-trigger" tabindex="0">
       <span class="custom-select-text">${escapeHtml(selectedLabel)}</span>
@@ -204,7 +206,7 @@ function renderField(field: FormFieldDescriptor): string {
     <div class="custom-select-dropdown">
       ${optionsHtml}
     </div>
-  </div>${renderHint(field)}
+  </div>${renderHint(field)}${profileHelp}
   <div class="field-error" id="error-${key}"></div>
 </div>`;
     }
@@ -359,6 +361,8 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
       // data-autofill-filled attribute and replaced on every later transition
       // — emptied the moment a different profile is chosen (it has supplied
       // nothing yet), then rebuilt when that choice's fillFields answer lands.
+      var profileSeed = document.getElementById("field-authProfileId");
+      var externalProfileName = profileSeed && profileSeed.dataset ? profileSeed.dataset.externalProfile : undefined;
       var profileFilledKeys = seededProfileFilledKeys();
 
       // ── WHAT THE PREVIOUS PROFILE DISPLACED ────────────────────────────
@@ -464,6 +468,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
        * ever answers.
        */
       function filledKeysFromValues(values) {
+        if (typeof values.__externalAuthProfile === "string") return { username: true, authType: true, keyPath: true, defaultUsername: true };
         var filled = {};
         for (var key in values) {
           var value = values[key];
@@ -562,6 +567,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
        * profile's values behind in fields the user is now free to save.
        */
       function releaseProfileOwnedFields() {
+        externalProfileName = undefined;
         for (var key in profileDisplacedValues) {
           setFieldValue(key, profileDisplacedValues[key]);
         }
@@ -602,6 +608,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
         }
         var fillValues = msg.values;
         var isProfileFill = msg.key === "authProfileId";
+        if (isProfileFill) externalProfileName = typeof fillValues.__externalAuthProfile === "string" ? fillValues.__externalAuthProfile : undefined;
         var nextFilledKeys = isProfileFill ? filledKeysFromValues(fillValues) : null;
         // Read once, not per key: collecting inside the loop would compare the
         // later keys against a form this very loop has already been writing to.
@@ -611,6 +618,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
         // over below covers exactly those and not the ones it was refused.
         var writtenKeys = [];
         for (var fk in fillValues) {
+          if (fk === "__externalAuthProfile") continue;
           if (!isProfileFill && requestSnapshot && !mayFillOver(fk, msg.requestId, liveValues, requestSnapshot)) {
             // Either hand-edited since this request went out — the host decided
             // what it was allowed to overwrite from the snapshot above, so its
@@ -1316,6 +1324,15 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
         var profileInput = profileWrapper.querySelector('input[name="authProfileId"]');
         if (!profileInput) return;
         var isLinked = profileInput.value && profileInput.value !== "";
+        var dynamic = !!isLinked && externalProfileName !== undefined;
+        var sourceNote = document.getElementById("auth-profile-source-note");
+        if (sourceNote) sourceNote.textContent = dynamic ? "Provided by " + externalProfileName + " at sign-in. Edit it in Settings → Auth Profiles." : "";
+        var repair = document.getElementById("auth-profile-repair");
+        if (repair) { repair.style.display = isLinked ? "" : "none"; repair.disabled = !isLinked; }
+        document.querySelectorAll(".form-note").forEach(function(note) {
+          var conditions = parseVisibleWhen(note.dataset.visibleWhen);
+          if (conditions.some(function(condition) { return condition.field === "authType" && condition.value === "agent"; })) note.style.display = dynamic ? "none" : "";
+        });
         // One list, shared by every form that renders an authProfileId select.
         // The server/unified profile forms render username/authType/keyPath;
         // the inventory source form renders defaultUsername. The loop below
@@ -1346,6 +1363,14 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
           // each entry point: initial render, selection (pre-fill), the
           // fillFields answer, and an injected inline-created option.
           var locked = !!isLinked && profileFilledKeys[managedKeys[mi]] === true;
+          group.style.display = dynamic ? "none" : "";
+          group.querySelectorAll("input, textarea, select").forEach(function(control) {
+            if (dynamic) { control.dataset.externalDisabled = "true"; control.disabled = true; }
+            else if (control.dataset.externalDisabled === "true") {
+              control.disabled = !!group.dataset.visibleWhen && !group.classList.contains("field-visible");
+              delete control.dataset.externalDisabled;
+            }
+          });
           var inputs = group.querySelectorAll("input, textarea");
           for (var ii = 0; ii < inputs.length; ii++) {
             var input = inputs[ii];
@@ -1440,6 +1465,11 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
           // gets no second chance to put anything back.
           releaseProfileOwnedFields();
         }
+      });
+      var repairProfileButton = document.getElementById("auth-profile-repair");
+      if (repairProfileButton) repairProfileButton.addEventListener("click", function() {
+        var selected = form.elements.authProfileId;
+        if (selected && selected.value) vscode.postMessage({ type: "manageAuthProfile", id: selected.value });
       });
       initCustomComboboxes();
       updateProfileManagedFields();

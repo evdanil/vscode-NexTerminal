@@ -1,4 +1,4 @@
-import { authProfileOwnedCredentials, isExternalAuthProfile, authProfileConnectionIdentity } from "./authProfile";
+import { authProfileFieldOwnership, authProfileOwnedCredentials, isExternalAuthProfile, authProfileConnectionIdentity } from "./authProfile";
 import type { AuthProfile } from "./authProfile";
 import type { PtyOutputObserver } from "../services/macroAutoTrigger";
 import type * as vscode from "vscode";
@@ -1572,7 +1572,7 @@ export function formOfferedServerCredentials(
   submitted: Pick<ServerConfig, "authType">,
   profile: AuthProfile | undefined
 ): FormOfferedServerCredentials {
-  const owned = authProfileOwnedCredentials(profile);
+  const owned = authProfileFieldOwnership(profile);
   return {
     // Rendered whenever the form is showing SSH controls at all; from there,
     // only profile ownership can take it away.
@@ -1586,13 +1586,13 @@ export function formOfferedServerCredentials(
     // `preserveDormantSshConfig` (commands/serverCommands.ts), which restores
     // the stored SSH config wholesale rather than field by field. Teaching this
     // function about the protocol would split one decision across two places.
-    username: owned.username === undefined,
+    username: !owned.username,
     // A closed enum is always owned, so this is `true` only where nothing
     // resolved — no link, or an id that names no profile, which is the same
     // state the form renders the record's own value unlocked for.
-    authType: owned.authType === undefined,
+    authType: !owned.authType,
     // The one field that can be taken away twice over.
-    keyPath: owned.keyPath === undefined && submitted.authType === "key"
+    keyPath: !owned.keyPath && submitted.authType === "key"
   };
 }
 

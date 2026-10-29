@@ -4,7 +4,14 @@ import type { ExternalCredentialRequest } from "../../src/services/credentials/c
 import { createExternalCredentialApproval } from "../../src/services/credentials/externalCredentialApproval";
 import { createVscodeExternalCredentialApproval } from "../../src/services/credentials/vscodeExternalCredentialApproval";
 
-vi.mock("vscode", () => ({ workspace: { isTrusted: true }, env: { remoteName: "ssh-remote" }, window: { showWarningMessage: vi.fn() } }));
+vi.mock("vscode", () => ({
+  workspace: { isTrusted: true, registerTextDocumentContentProvider: vi.fn(() => ({ dispose: vi.fn() })), openTextDocument: vi.fn(async (uri) => ({ uri })) },
+  env: { remoteName: "ssh-remote" },
+  window: { showWarningMessage: vi.fn(), showInformationMessage: vi.fn(), activeTextEditor: undefined, showTextDocument: vi.fn(async (document) => { (vscode.window as unknown as { activeTextEditor: unknown }).activeTextEditor = { document }; }) },
+  commands: { registerCommand: vi.fn(() => ({ dispose: vi.fn() })) },
+  Uri: { parse: (uri: string) => ({ toString: () => uri }) },
+  EventEmitter: class { event = vi.fn(); fire = vi.fn(); dispose = vi.fn(); }
+}));
 import * as vscode from "vscode";
 
 const profile = (): ExternalAuthProfile => ({ id: "provider", name: "Vault", authType: "external", external: { version: 1, method: "password", invocation: { executable: "/provider", args: ["vault item"] } } });
@@ -92,10 +99,16 @@ describe("native approval disclosure", () => {
     const approval = createVscodeExternalCredentialApproval(); approvals.push(approval);
     const p = profile(); p.name = "Name\n\u202eSpoof";
     p.external.invocation!.args = ['quote"slash\\\t\b\f\u0001\u0085\u2028\u2029\u202eend', ...Array.from({ length: 31 }, () => "x".repeat(4096))];
-    await approval.authorize(request(p));
+    const pending = approval.authorize(request(p));
+    await vi.waitFor(() => expect(vscode.window.showTextDocument).toHaveBeenCalled());
+    expect(vscode.window.showWarningMessage).not.toHaveBeenCalled();
+    const provider = vi.mocked(vscode.workspace.registerTextDocumentContentProvider).mock.calls[0][1];
+    const detail = await provider.provideTextDocumentContent(vscode.window.activeTextEditor!.document.uri, {} as vscode.CancellationToken) as string;
+    const callback = vi.mocked(vscode.commands.registerCommand).mock.calls.find(([id]) => id === "nexus.authProfile.continueExternalApproval")![1];
+    await callback(); await pending;
     const [message, options] = vi.mocked(vscode.window.showWarningMessage).mock.calls[0];
     expect(message).not.toContain("\n"); expect(message).not.toContain("\u202e");
-    const detail = (options as { detail: string }).detail;
+    expect((options as { detail: string }).detail).toContain("read-only document just reviewed");
     expect(detail).toContain('Executable: "/provider"');
     p.external.invocation!.args.forEach((arg, index) => { const line = detail.split("\n").find((l) => l.startsWith(`argv[${index}]: `)); expect(JSON.parse(line!.slice(line!.indexOf(": ") + 2))).toBe(arg); });
     expect(detail).toContain('argv[32]: "--pass"'); expect(detail).toContain("ssh-remote");
@@ -106,7 +119,10 @@ describe("native approval disclosure", () => {
   it("ignores a native answer after cancellation", async () => {
     const answer = deferred<vscode.MessageItem | undefined>(); vi.mocked(vscode.window.showWarningMessage).mockReturnValue(answer.promise);
     const approval = createVscodeExternalCredentialApproval(); approvals.push(approval); const c = new AbortController();
-    const pending = approval.authorize(request(profile(), c)).catch((e: unknown) => e); await Promise.resolve(); c.abort(); answer.resolve({ title: "Allow for This Session" });
+    const pending = approval.authorize(request(profile(), c)).catch((e: unknown) => e);
+    await vi.waitFor(() => expect(vscode.window.showTextDocument).toHaveBeenCalled());
+    const callback = vi.mocked(vscode.commands.registerCommand).mock.calls.find(([id]) => id === "nexus.authProfile.continueExternalApproval")![1];
+    const modal = callback(); c.abort(); answer.resolve({ title: "Allow for This Session" }); await modal;
     expect(await pending).toMatchObject({ code: "cancelled" });
     await expect(approval.authorize({ ...request(), interaction: "noninteractive" })).rejects.toMatchObject({ code: "approval-required" });
   });
