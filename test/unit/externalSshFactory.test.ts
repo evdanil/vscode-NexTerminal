@@ -112,8 +112,12 @@ describe("external SSH factory", () => {
   it("authenticates jump and target once each, preserving noninteractive policy", async () => {
     const h = setup(); h.servers.set("jump", server("jump"));
     h.servers.set("target", server("target", { proxy: { type: "ssh", jumpHostId: "jump" } }));
-    await h.pool.connect(h.servers.get("target")!);
+    const approved = h.resolver.begin({ profile: profile(), interaction: "interactive", signal: new AbortController().signal, isCurrent: () => true });
+    await approved.resolve(); approved.dispose(); h.run.mockClear(); h.confirm.mockClear();
+    await h.pool.connectWithContext(h.servers.get("target")!, { interaction: "noninteractive" });
     expect(h.run).toHaveBeenCalledTimes(2); expect(h.connect.mock.calls.map(([s]) => s.id)).toEqual(["jump", "target"]);
+    expect(h.connect.mock.calls.map(([, auth]) => auth.interaction)).toEqual(["noninteractive", "noninteractive"]);
+    expect(h.confirm).not.toHaveBeenCalled();
     expect(h.connect.mock.calls[1][1].sock).toBeDefined(); h.noLegacy();
   });
 

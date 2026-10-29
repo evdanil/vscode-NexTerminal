@@ -10,6 +10,7 @@ import type { parseExternalCredentialResponse } from "./externalCredentialProtoc
 interface PendingAttempt {
   profileId: string;
   cancel(code: CredentialProviderErrorCode): void;
+  recheck(): void;
 }
 interface QueuedJob {
   start(): void;
@@ -102,7 +103,7 @@ export function createExternalCredentialResolver(deps: {
         if (code) throw new CredentialProviderError(code);
       };
       const onAbort = (): void => cancel("cancelled");
-      const lease: PendingAttempt = { profileId: request.profile.id, cancel };
+      const lease: PendingAttempt = { profileId: request.profile.id, cancel, recheck: () => { check(); } };
       pending.add(lease);
       request.signal.addEventListener("abort", onAbort, { once: true });
       timer = setInterval(() => { check(); }, EXTERNAL_CREDENTIAL_LIVENESS_INTERVAL_MS);
@@ -211,6 +212,9 @@ export function createExternalCredentialResolver(deps: {
           releaseResult();
         }
       };
+    },
+    recheckPending() {
+      for (const attempt of [...pending]) attempt.recheck();
     },
     revoke: (ids) => deps.approvals.revoke(ids),
     onDidRevoke(listener) { listeners.add(listener); return () => { listeners.delete(listener); }; },

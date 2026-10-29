@@ -44,6 +44,12 @@ export interface ExternalCredentialAttempt {
 
 export interface ExternalCredentialResolver {
   begin(request: ExternalCredentialRequest): ExternalCredentialAttempt;
+  /**
+   * Synchronously cancel stale pending attempts after live configuration changes,
+   * before another SSH packet can be handled. Does not revoke grants or affect
+   * committed sessions; the interval is only a fallback for predicate-only owners.
+   */
+  recheckPending(): void;
   revoke(profileIds?: readonly string[]): void;
   onDidRevoke(listener: (profileIds: readonly string[] | undefined) => void): () => void;
   dispose(): void;

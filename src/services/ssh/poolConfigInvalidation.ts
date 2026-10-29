@@ -61,7 +61,7 @@ export function watchPoolInvalidationOnConfigMutation(
     deleteEndpoint(serverId: string, proxy: PasswordBearingProxy, stillUnused: () => boolean): Promise<boolean>;
   },
   /** Owns both mutation revocation and revoke-only retirement; do not install a second mutation revoker. */
-  externalCredentials?: Pick<ExternalCredentialResolver, "revoke" | "onDidRevoke">
+  externalCredentials?: Pick<ExternalCredentialResolver, "revoke" | "onDidRevoke" | "recheckPending">
 ): () => void {
   /** serverId -> password-bearing endpoints the server left since the last persist. */
   const leftEndpoints = new Map<string, PasswordBearingProxy[]>();
@@ -182,6 +182,10 @@ export function watchPoolInvalidationOnConfigMutation(
   const unsubscribeBatchEnd = proxySecrets ? core.onDidEndServerBatch(settle) : undefined;
 
   const unsubscribeMutations = core.onDidMutateConnectionConfig((mutation) => {
+    // ObservedMap installs the replacement before this callback. Abort stale
+    // external handshakes now: the next host-verifier/PK_OK continuation can
+    // send credentials before a polling tick, even if ready is later refused.
+    externalCredentials?.recheckPending();
     const invalidated = new Set<string>();
     if (mutation.kind === "server") {
       indexServer(mutation.id, mutation.next);

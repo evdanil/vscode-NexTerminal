@@ -18,6 +18,22 @@ function setup(run: ExternalCredentialProcessRunner = vi.fn(async () => output()
 afterEach(() => { resolvers.splice(0).forEach((r) => r.dispose()); vi.useRealTimers(); });
 
 describe("external credential attempt", () => {
+  it("synchronous provenance rechecks cancel only stale pending attempts, preserving grants and committed sessions", async () => {
+    vi.useFakeTimers(); const { resolver, approvals, confirm } = setup();
+    let current = true;
+    const established = resolver.begin(request()); await established.resolve(); expect(established.commit()).toBe(true);
+    const stale = resolver.begin({ ...request(), isCurrent: () => current }); const borrowed = await stale.resolve();
+    const live = resolver.begin(request()); await live.resolve();
+    const generation = approvals.generation("provider"); current = false; resolver.recheckPending();
+    expect(stale.signal.aborted).toBe(true); expect(borrowed).toMatchObject({ username: "", password: "" });
+    expect(established.signal.aborted).toBe(false); expect(live.signal.aborted).toBe(false);
+    expect(approvals.generation("provider")).toBe(generation);
+    const approved = resolver.begin({ ...request(), interaction: "noninteractive" }); await approved.resolve();
+    expect(confirm).toHaveBeenCalledTimes(1); expect(live.commit()).toBe(true);
+    for (const attempt of [established, stale, live, approved]) attempt.dispose();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("shares consent but calls runner anew for every login, including approved noninteractive logins", async () => {
     let n = 0; const run = vi.fn(async () => output(`SECRET-${++n}`)); const { resolver, confirm } = setup(run);
     const a = resolver.begin(request()); const b = resolver.begin(request()); const [one, two] = await Promise.all([a.resolve(), b.resolve()]);
