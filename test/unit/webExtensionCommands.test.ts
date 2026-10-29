@@ -1,6 +1,15 @@
 import { readFileSync } from "node:fs";
 import * as path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import * as vscode from "vscode";
+import { activate } from "../../src/webExtension";
+
+const web = vi.hoisted(() => ({ commands: new Map<string, () => void>(), warning: vi.fn(), execute: vi.fn() }));
+vi.mock("vscode", () => ({
+  EventEmitter: class { event = vi.fn(); dispose = vi.fn(); },
+  window: { createTreeView: vi.fn(() => ({ dispose: vi.fn() })), showWarningMessage: web.warning },
+  commands: { registerCommand: vi.fn((id: string, run: () => void) => { web.commands.set(id, run); return { dispose: () => web.commands.delete(id) }; }), executeCommand: web.execute }
+}));
 
 const packageJsonPath = path.resolve(__dirname, "..", "..", "package.json");
 const webExtensionPath = path.resolve(__dirname, "..", "..", "src", "webExtension.ts");
@@ -43,4 +52,20 @@ describe("web extension fallback command coverage", () => {
     expect(source).toContain('registerCommand("nexus.macro.openDocs"');
     expect(source).toContain("openExternal");
   });
+});
+
+
+it("external credential commands are explicit unavailable handlers in the browser host", () => {
+  const subscriptions: Array<{ dispose(): void }> = [];
+  activate({ subscriptions } as unknown as vscode.ExtensionContext);
+  for (const command of ["revokeExternalApprovals", "continueExternalApproval", "cancelExternalApproval"]) {
+    web.warning.mockClear();
+    const handler = web.commands.get(`nexus.authProfile.${command}`);
+    expect(handler).toBeDefined();
+    handler!();
+    expect(web.warning).toHaveBeenCalledWith("Nexus runtime features are unavailable in the web extension host. Use desktop VS Code.");
+  }
+  expect(web.execute).not.toHaveBeenCalled();
+  subscriptions.forEach((subscription) => subscription.dispose());
+  expect(web.commands.size).toBe(0);
 });

@@ -1,3 +1,4 @@
+import { CredentialProviderError } from "../../src/services/credentials/credentialProviderError";
 import { beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import * as vscode from "vscode";
 import type { CommandContext } from "../../src/commands/types";
@@ -1403,6 +1404,16 @@ describe("server test connection command", () => {
     registeredCommands.clear();
     (vscode.window as any).activeTerminal = undefined;
     vi.mocked(vscode.window.withProgress as any).mockImplementation(async (_options: unknown, task: () => Promise<unknown>) => task());
+  });
+
+  it("offers external-profile repair when Test Connection cannot retrieve credentials", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [] });
+    ctx.sshFactory.connect = vi.fn(async () => { throw new CredentialProviderError("unconfigured"); });
+    mockShowErrorMessage.mockResolvedValueOnce("Manage Auth Profiles");
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.testConnection")!("srv-1");
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(new CredentialProviderError("unconfigured").message, "Manage Auth Profiles");
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("nexus.authProfile.manage");
   });
 
   it("connects, disposes the probe connection, and reports success", async () => {

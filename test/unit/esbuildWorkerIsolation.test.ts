@@ -89,3 +89,10 @@ describe("out-of-host bundles are isolated from the vscode module", () => {
     });
   }
 });
+
+
+it("the real browser bundle contains no credential process, parser, resolver or native SSH dependency", async () => {
+  const result = await esbuild.build({ ...await configFor("dist/webExtension.js"), write: false, metafile: true, logLevel: "silent" });
+  const inputs = Object.keys(result.metafile!.inputs).join("\n");
+  expect(inputs).not.toMatch(/externalCredential(?:Process|Protocol|Resolver)|sshCredentialRuntime|node_modules\/ssh2\//);
+});

@@ -1,3 +1,4 @@
+import { showExternalCredentialError } from "../services/credentials/externalCredentialUi";
 import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as vscode from "vscode";
@@ -312,6 +313,7 @@ export async function startTunnel(
           connection.dispose();
           return true;
         } catch (error) {
+          if (await showExternalCredentialError(error, server.id)) return false;
           const message = error instanceof Error ? error.message : "unknown SSH error";
           if (message.toLowerCase().includes("password entry canceled")) {
             void vscode.window.showInformationMessage(`Tunnel "${profile.name}" start canceled.`);
@@ -376,6 +378,7 @@ export async function startTunnel(
     if (error instanceof TunnelStoppedError || error instanceof TunnelStartCancelledError) {
       return;
     }
+    if (await showExternalCredentialError(error, server.id)) return;
     throw error;
   }
   } finally {

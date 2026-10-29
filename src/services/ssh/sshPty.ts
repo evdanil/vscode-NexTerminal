@@ -1,3 +1,5 @@
+import { findCredentialProviderError } from "../credentials/credentialProviderError";
+import { showExternalCredentialError } from "../credentials/externalCredentialUi";
 import { randomUUID } from "node:crypto";
 import type { Duplex } from "node:stream";
 import * as vscode from "vscode";
@@ -484,7 +486,8 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       if (this.disposed || this.shuttingDown) {
         return;
       }
-      const message = error instanceof Error ? error.message : "unknown SSH error";
+      const providerError = findCredentialProviderError(error);
+      const message = providerError?.message ?? (error instanceof Error ? error.message : "unknown SSH error");
       this.logger.log(`connect failed ${message}`);
       if (this.reconnecting) {
         this.writeEmitter.fire(`[Nexus SSH] Reconnection failed: ${message}\r\n`);
@@ -495,7 +498,9 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       this.writeEmitter.fire("\r\n[Nexus SSH] Press any key to close this terminal.\r\n");
       this.callbacks.onConnectFailed?.(this.sessionId, message);
       const notice = `Nexus SSH connection failed for ${this.serverConfig.name}: ${message}`;
-      if (classifySshConnectionError(error).stage === "agent") {
+      if (providerError) {
+        void showExternalCredentialError(providerError, this.serverConfig.id);
+      } else if (classifySshConnectionError(error).stage === "agent") {
         void this.offerAgentRemedies(notice, [OPEN_AGENT_SETTINGS, EDIT_SERVER]);
       } else if (findSshAgentUnavailable(error)) {
         // The jump host's agent failed: editing this server would not help.

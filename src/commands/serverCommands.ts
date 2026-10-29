@@ -1,3 +1,4 @@
+import { showExternalCredentialError } from "../services/credentials/externalCredentialUi";
 import { externalServerFormValues } from "../ui/externalCredentialForm";
 import { authProfileConnectionIdentity, externalAuthProfileUnsupportedReason, isExternalAuthProfile, keyDeploymentUnavailableReason } from "../models/authProfile";
 import { randomUUID } from "node:crypto";
@@ -1674,6 +1675,7 @@ async function testServerConnection(ctx: CommandContext, arg?: unknown): Promise
     connection.dispose();
     void vscode.window.showInformationMessage(`Connection test succeeded for ${server.name}.`);
   } catch (error) {
+    if (await showExternalCredentialError(error, server.id)) return;
     const diagnostic = classifySshConnectionError(error);
     // A jump host's agent failure stays `proxy`, but the agent setting is still the fix.
     const agentInvolved = diagnostic.stage === "agent" || findSshAgentUnavailable(error) !== undefined;

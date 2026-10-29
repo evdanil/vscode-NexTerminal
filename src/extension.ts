@@ -40,11 +40,11 @@ import { NexusFileSystemProvider, NEXTERM_SCHEME } from "./services/sftp/nexusFi
 import { registerEditAsRootHint } from "./services/sftp/editAsRootHint";
 import { SftpService } from "./services/sftp/sftpService";
 import { SudoElevationBroker } from "./services/sftp/sudoElevationBroker";
-import { SilentAuthSshFactory, proxyPasswordSecretKey } from "./services/ssh/silentAuth";
-import { createSshTransportStack } from "./services/ssh/sshTransportStack";
+import { proxyPasswordSecretKey } from "./services/ssh/silentAuth";
+import { createSshCredentialRuntime } from "./services/ssh/sshCredentialRuntime";
+import { registerExternalCredentialCommands } from "./commands/externalCredentialCommands";
 import { KeySerializedSecretVault } from "./services/ssh/keySerializedSecretVault";
 import { migrateLegacyProxyPasswords } from "./services/ssh/proxyPasswordKeys";
-import { watchPoolInvalidationOnConfigMutation } from "./services/ssh/poolConfigInvalidation";
 import { Ssh2Connector } from "./services/ssh/ssh2Connector";
 import { sshAgentResolver } from "./services/ssh/sshAgentSettings";
 import { VscodeHostKeyVerifier } from "./services/ssh/vscodeHostKeyVerifier";
@@ -492,11 +492,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const sshConnector = new Ssh2Connector(hostKeyVerifier, readSshConnectionOptions(), sshDiagnostics, {
     resolve: sshAgentResolver()
   });
-  const sshFactory = new SilentAuthSshFactory(
-    sshConnector,
-    secretVault,
-    new VscodePasswordPrompt(),
-    async (message, isPassword, signal) => {
+  const multiplexingConfig = vscode.workspace.getConfiguration("nexus.ssh.multiplexing");
+  const sshCredentialRuntime = createSshCredentialRuntime({
+    core,
+    vault: secretVault,
+    connector: sshConnector,
+    passwordPrompt: new VscodePasswordPrompt(),
+    inputPrompt: async (message, isPassword, signal) => {
       const cancellation = new vscode.CancellationTokenSource();
       const abort = (): void => cancellation.cancel();
       signal?.addEventListener("abort", abort, { once: true });
@@ -513,53 +515,56 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
         cancellation.dispose();
       }
     },
-    (id) => core.getAuthProfile(id),
-    (id) => core.getServer(id)
-  );
-  const multiplexingConfig = vscode.workspace.getConfiguration("nexus.ssh.multiplexing");
-  const { proxiedFactory, pool, tunnelManager } = createSshTransportStack(sshFactory, {
-    serverLookup: (id) => core.getServer(id),
-    vault: secretVault,
-    proxyTimeoutMs: readBoundedMs("nexus.ssh", "proxyTimeout", 60, 5, 300),
-    // Per-connect proxy-password prompt (design doc §5.3; §11 OQ2) — realizes the
-    // prompt §5.3 assumed for a template's authenticated socks5/http proxy, which
-    // carries no secret. Fired by ProxySshFactory only for a username-bearing proxy
-    // with no saved password for that endpoint (`proxyPasswordSecretKey(id, proxy)`). Masked, never logged (matching the
-    // VscodePasswordPrompt discipline); a chosen save is deferred until proxy and
-    // SSH authentication succeed. Returning undefined on cancel makes
-    // ProxySshFactory abort every connect sharing that prompt before a handshake.
-    // Owner cancellation closes the input box when no connection still needs it.
-    promptProxyPassword: async (server, proxy, signal) => {
-      const label = proxy.type === "socks5" ? "SOCKS5" : "HTTP";
-      const endpoint = proxy.username
-        ? `${proxy.username}@${proxy.host}:${proxy.port}`
-        : `${proxy.host}:${proxy.port}`;
-      const cancellation = new vscode.CancellationTokenSource();
-      const abort = (): void => cancellation.cancel();
-      signal.addEventListener("abort", abort, { once: true });
-      if (signal.aborted) abort();
-      try {
-        const password = await vscode.window.showInputBox({
-          title: `Nexus ${label} Proxy Password`,
-          prompt: `Enter password for ${label} proxy ${endpoint}`,
-          password: true,
-          ignoreFocusOut: true
-        }, cancellation.token);
-        if (password === undefined) {
-          return undefined;
+    proxySecrets: {
+      deleteEndpoint: (serverId, proxy, stillUnused) =>
+        secretVault.deleteIf(proxyPasswordSecretKey(serverId, proxy), stillUnused)
+    },
+    transport: {
+      proxyTimeoutMs: readBoundedMs("nexus.ssh", "proxyTimeout", 60, 5, 300),
+      // Per-connect proxy-password prompt (design doc §5.3; §11 OQ2) — realizes the
+      // prompt §5.3 assumed for a template's authenticated socks5/http proxy, which
+      // carries no secret. Fired by ProxySshFactory only for a username-bearing proxy
+      // with no saved password for that endpoint (`proxyPasswordSecretKey(id, proxy)`). Masked, never logged (matching the
+      // VscodePasswordPrompt discipline); a chosen save is deferred until proxy and
+      // SSH authentication succeed. Returning undefined on cancel makes
+      // ProxySshFactory abort every connect sharing that prompt before a handshake.
+      // Owner cancellation closes the input box when no connection still needs it.
+      promptProxyPassword: async (server, proxy, signal) => {
+        const label = proxy.type === "socks5" ? "SOCKS5" : "HTTP";
+        const endpoint = proxy.username
+          ? `${proxy.username}@${proxy.host}:${proxy.port}`
+          : `${proxy.host}:${proxy.port}`;
+        const cancellation = new vscode.CancellationTokenSource();
+        const abort = (): void => cancellation.cancel();
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) abort();
+        try {
+          const password = await vscode.window.showInputBox({
+            title: `Nexus ${label} Proxy Password`,
+            prompt: `Enter password for ${label} proxy ${endpoint}`,
+            password: true,
+            ignoreFocusOut: true
+          }, cancellation.token);
+          if (password === undefined) {
+            return undefined;
+          }
+          return { password, save: true };
+        } finally {
+          signal.removeEventListener("abort", abort);
+          cancellation.dispose();
         }
-        return { password, save: true };
-      } finally {
-        signal.removeEventListener("abort", abort);
-        cancellation.dispose();
-      }
-    },
-    pool: {
-      enabled: multiplexingConfig.get<boolean>("enabled", true),
-      idleTimeoutMs: readBoundedMs("nexus.ssh.multiplexing", "idleTimeout", 300, 0, 3600)
-    },
-    socks5HandshakeTimeoutMs: readBoundedMs("nexus.tunnel", "socks5HandshakeTimeout", 10, 2, 60)
+      },
+      pool: {
+        enabled: multiplexingConfig.get<boolean>("enabled", true),
+        idleTimeoutMs: readBoundedMs("nexus.ssh.multiplexing", "idleTimeout", 300, 0, 3600)
+      },
+      socks5HandshakeTimeoutMs: readBoundedMs("nexus.tunnel", "socks5HandshakeTimeout", 10, 2, 60)
+    }
   });
+  // Own pending processes/disclosure immediately; the transport keeps its existing
+  // ordered shutdown below (tunnels and registry first, then pool).
+  context.subscriptions.push(sshCredentialRuntime);
+  const { proxiedFactory, pool, tunnelManager, externalCredentialResolver } = sshCredentialRuntime;
   // The controller installs its source mutation observer synchronously before
   // this runtime is visible through the provider registry or status poll. Its
   // fresh nonce and empty in-memory maps start this host unapproved; persisted
@@ -849,6 +854,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     fileSystemProvider,
     elevationBroker,
     secretVault,
+    externalCredentialResolver,
     registrySync,
     focusedTerminal: vscode.window.activeTerminal ?? undefined,
     activityIndicators: new Map(),
@@ -1323,18 +1329,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const unsubscribeProviderRegistry = inventoryProviderRegistry.onDidChange(() => {
     syncViews();
   });
-  // The ONE source of pooled-connection invalidation: synchronous with each
-  // in-memory server / auth-profile mutation (initialize() included), ahead of
-  // persistence. Nothing invalidates the pool again on the change event below, on
-  // purpose (see poolConfigInvalidation.ts).
-  // Also housekeeping for endpoint-keyed proxy passwords: once a proxy change is
-  // persisted, the password saved for the endpoint the server left is deleted.
-  // Safety does not depend on it: a password is read only for the endpoint it was
-  // entered for (proxyPasswordKeys.ts).
-  const unsubscribeSyncPoolInvalidation = watchPoolInvalidationOnConfigMutation(core, pool, {
-    deleteEndpoint: (serverId, proxy, stillUnused) =>
-      secretVault.deleteIf(proxyPasswordSecretKey(serverId, proxy), stillUnused)
-  });
   const unsubscribeCore = core.onDidChange(() => {
     syncViews();
   });
@@ -1526,6 +1520,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const profileDisposables = registerProfileCommands(localServerCtx);
   const settingsDisposables = registerSettingsCommands(() => ctx.sessionLogDir);
   const authProfileDisposables = registerAuthProfileCommands(ctx);
+  const externalCredentialDisposables = registerExternalCredentialCommands(ctx);
   const deviceTemplateDisposables = registerDeviceTemplateCommands(ctx, inventoryProviderRegistry);
   const savedFilterDisposables = registerSavedFilterCommands(ctx, inventoryProviderRegistry);
   // F1 — same objects nexus.server.remove tears down with (ctx carries core/tunnelManager/sshPool).
@@ -1539,7 +1534,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     inventoryProviderRegistry,
     secretVault,
     inventoryTeardown,
-    containerlabActivation
+    containerlabActivation,
+    externalCredentialResolver
   );
   // LIVE STATUS — opt-in poll of lab running status, gated on the Command
   // Center being visible and on the SOURCE's own Lab Status Poll Interval field
@@ -1598,6 +1594,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     { provider: macroTreeProvider, persistence: macroCollapsedFolderStatePersistence }
   ];
   const configDisposables = registerConfigCommands(core, secretVault, context, {
+    revokeExternalCredentialApprovals: sshCredentialRuntime.revokeExternalCredentialApprovals,
     stopLocalServer: (configId) => stopLocalServerForRemoval(localServerCtx, configId),
     stopNetworkServices: () => stopRunningNetworkServices(core, networkServerManager),
     teardownServerRuntime: (serverId, shouldAbort) => teardownServerRuntime(ctx, serverId, shouldAbort),
@@ -1723,6 +1720,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     ...profileDisposables,
     ...settingsDisposables,
     ...authProfileDisposables,
+    ...externalCredentialDisposables,
     ...deviceTemplateDisposables,
     ...savedFilterDisposables,
     ...inventoryDisposables,
@@ -1746,7 +1744,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     },
     {
       dispose: () => {
-        unsubscribeSyncPoolInvalidation();
         unsubscribeCore();
         unsubscribeProviderRegistry();
         const shutdownReason = "Nexus extension is shutting down. This session has been closed.";

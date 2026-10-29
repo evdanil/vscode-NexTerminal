@@ -1,3 +1,4 @@
+import * as vscode from "vscode";
 import { PassThrough } from "node:stream";
 import { utils } from "ssh2";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -210,6 +211,7 @@ describe("external SSH factory", () => {
   });
 
   it.each(["tcp", "dns", "provider", "auth"])("terminal alternate-address behavior preserves %s provenance and retrieval counts", async (failure) => {
+    vi.mocked(vscode.window.showErrorMessage).mockClear();
     const h = setup({
       run: async () => { if (failure === "provider") throw new CredentialProviderError("timed-out"); return output(); },
       connect: async (target) => {
@@ -230,6 +232,9 @@ describe("external SSH factory", () => {
       expect(callbacks.onConnectFailed).toHaveBeenCalledTimes(1); expect(h.run).toHaveBeenCalledTimes(1);
       expect(h.connect).toHaveBeenCalledTimes(failure === "provider" ? 0 : 1);
       expect(writes.join("")).not.toContain("trying alternate host");
+    }
+    if (failure === "provider") {
+      expect(vscode.window.showErrorMessage).toHaveBeenCalledWith(new CredentialProviderError("timed-out").message, "Manage Auth Profiles");
     }
     expect(writes.join("")).not.toContain("PROVIDER-CANARY"); h.noLegacy();
   });

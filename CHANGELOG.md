@@ -2,6 +2,14 @@
 
 ## [2.8.305] — 2026-10-25
 
+### Added
+
+- **External Program auth profiles retrieve a username and password or unencrypted private key for each new SSH authentication.** Configure the executable and literal arguments in Auth Profiles, review its exact invocation and allow it for the current extension-host session. Terminals, SFTP, tunnels and jump hosts share bounded execution and cancellation; results are never saved in SecretStorage. Inventory sources and device templates can assign the profile without running it. Revoke approvals from the editor or command palette; established sessions continue. Sharing preserves external links but removes invocation details for recipient configuration. External-profile exports require Nexus 2.8.305 or later; older readers are unsafe.
+
+### Changed
+
+- **SSH profile links that no longer resolve now require repair or explicit unlinking.** They no longer silently fall back to dormant server credentials. Imports and sharing refuse unresolved SSH links; malformed external-profile imports fail before changing configuration. External authentication does not support Deploy SSH Key, IPMI credentials, dynamic username macro/URL tokens or arbitrary keyboard-interactive MFA.
+
 ## [2.8.304] — 2026-10-24
 
 ### Added

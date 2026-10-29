@@ -44,3 +44,13 @@ export class CredentialProviderError extends Error {
     if (safeExitCode !== undefined) this.exitCode = safeExitCode;
   }
 }
+
+/** Follow only Error causes; wrapper text must never become provider diagnostics. */
+export function findCredentialProviderError(error: unknown): CredentialProviderError | undefined {
+  const seen = new Set<Error>();
+  for (let cause = error; cause instanceof Error && !seen.has(cause); cause = cause.cause) {
+    seen.add(cause);
+    if (cause instanceof CredentialProviderError) return new CredentialProviderError(cause.code, cause.exitCode);
+  }
+  return undefined;
+}

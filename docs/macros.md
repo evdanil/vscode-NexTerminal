@@ -285,9 +285,11 @@ do not retype what Nexus already knows. Write them as `${profile.<field>}`:
 | `${profile.name}` | the profile's name |
 | `${profile.host}` | its SSH host |
 | `${profile.port}` | its SSH port |
-| `${profile.username}` | the username it connects as — the linked **auth profile**'s where one supplies it, the server's own otherwise |
+| `${profile.username}` | the static username from a stored **auth profile**, or the server's own otherwise; unavailable with External Program authentication |
 | `${profile.ipmiHost}` | its **IPMI / BMC Host** (Advanced section of the server form — filled in automatically on servers synced from a NetBox device that carries an out-of-band IP) |
-| `${profile.ipmiUsername}` | the username of its **IPMI Auth Profile** (Advanced section of the server form). The BMC's own account, separate from the SSH one; only the profile's username and saved password are used, never its authentication type or key file |
+| `${profile.ipmiUsername}` | the username of its **IPMI Auth Profile** (Advanced section of the server form). The BMC's own account, separate from the SSH one; only a supported stored profile's username and saved password are used, never its key file; external profiles are refused |
+
+External Program usernames are retrieved only during SSH authentication. A macro or browser URL containing `${profile.username}` refuses before execution when the server uses an external profile; it never runs the credential program or substitutes dormant/cached identity, even for an already connected session. Other tokens remain available. External profiles also cannot supply IPMI credentials: choose a stored IPMI auth profile before running a macro that requests them.
 
 Nothing else is exposed — key paths, ids and inventory bookkeeping are
 deliberately not addressable.

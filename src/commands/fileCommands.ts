@@ -1,3 +1,4 @@
+import { showExternalCredentialError } from "../services/credentials/externalCredentialUi";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import type { ServerConfig } from "../models/config";
@@ -513,6 +514,7 @@ export async function browseServerFiles(ctx: CommandContext, server: ServerConfi
     );
     await vscode.commands.executeCommand("nexusFileExplorer.focus");
   } catch (error) {
+    if (await showExternalCredentialError(error, server.id)) return;
     const message = error instanceof Error ? error.message : String(error);
     vscode.window.showErrorMessage(`Failed to browse files on ${server.name}: ${message}`);
   }
