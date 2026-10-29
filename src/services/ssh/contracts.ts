@@ -1,3 +1,4 @@
+import type { ResolvedExternalCredential } from "../credentials/contracts";
 import type { Duplex } from "node:stream";
 import type { SFTPWrapper } from "ssh2";
 import type { ServerConfig } from "../../models/config";
@@ -122,6 +123,7 @@ export interface SshConnector {
   connect(
     server: ServerConfig,
     auth: {
+      externalCredential?: ResolvedExternalCredential;
       password?: string;
       passphrase?: string;
       sock?: Duplex;

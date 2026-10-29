@@ -30,7 +30,12 @@ export interface ExternalCredentialRequest {
 export interface ExternalCredentialAttempt {
   readonly signal: AbortSignal;
   isCurrent(): boolean;
-  /** May be called once per attempt; results are never shared or cached. */
+  /**
+   * May be called once per attempt; results are never shared or cached. The
+   * returned value is borrowed until dispose/cancellation: cancellation clears
+   * its fields and zeros key bytes synchronously, before notifying abort listeners.
+   * Consumers needing bytes beyond that boundary must own and dispose a copy.
+   */
   resolve(): Promise<ResolvedExternalCredential>;
   /** Synchronously fences connection delivery against revocation and stale configuration. */
   commit(): boolean;

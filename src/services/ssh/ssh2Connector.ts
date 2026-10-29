@@ -15,6 +15,8 @@ import { Client, createAgent, type Algorithms, type ConnectConfig, type SFTPWrap
 // are not left with a permanent monkey-patch on node:crypto.
 uninstallSshDhGroupCompat();
 
+import { createExternalSshAuthentication, type ExternalSshAuthentication } from "./externalSshAuthentication";
+import type { ResolvedExternalCredential } from "../credentials/contracts";
 import type { ServerConfig } from "../../models/config";
 import { normalizeBoundedNumber as normalizeTimeout } from "../../utils/helpers";
 import type {
@@ -26,6 +28,7 @@ import type {
   SshConnector,
   TcpConnectionInfo
 } from "./contracts";
+import { SshInteractionRequiredError } from "./contracts";
 import { AuthNotJudgedError, SshAgentUnavailableError } from "./authErrors";
 import {
   hostSshAgentLookup,
@@ -467,7 +470,8 @@ export async function buildConnectConfig(
   passphrase?: string,
   sock?: Duplex,
   options?: SshConnectionOptions,
-  agent?: string
+  agent?: string,
+  externalOptions?: ExternalSshAuthentication["connectOptions"]
 ): Promise<ConnectConfig> {
   const normalized = normalizeConnectionOptions(options);
   const base: ConnectConfig = {
@@ -481,6 +485,8 @@ export async function buildConnectConfig(
     ...(sock && { sock }),
     ...(server.legacyAlgorithms && { algorithms: LEGACY_ALGORITHMS })
   };
+
+  if (externalOptions) return { ...base, ...externalOptions };
 
   if (server.authType === "password") {
     return {
@@ -679,7 +685,8 @@ export class Ssh2Connector implements SshConnector {
 
   public async connect(
     server: ServerConfig,
-    auth: {
+    { externalCredential, password, passphrase, sock, onKeyboardInteractive, onAuthMessage, interaction, signal }: {
+      externalCredential?: ResolvedExternalCredential;
       password?: string;
       passphrase?: string;
       sock?: Duplex;
@@ -690,17 +697,33 @@ export class Ssh2Connector implements SshConnector {
     }
   ): Promise<SshConnection> {
     const label = `${server.name} (${server.host})`;
-    throwIfAborted(auth.signal);
-    const agent = server.authType === "agent" ? await this.agentForLogin(label, auth.signal) : undefined;
-    const config = await buildConnectConfig(server, auth.password, auth.passphrase, auth.sock, this.connectionOptions, agent?.path);
-    throwIfAborted(auth.signal);
+    throwIfAborted(signal);
+    if (externalCredential && (password !== undefined || passphrase !== undefined)) {
+      throw new Error("External credentials cannot be combined with password or passphrase authentication.");
+    }
+    let failInteraction: (() => void) | undefined;
+    let external = externalCredential ? createExternalSshAuthentication(externalCredential, {
+      onInteractionRequired: () => failInteraction?.()
+    }) : undefined;
+    externalCredential = undefined;
+    let config: ConnectConfig | undefined;
+    let agent: AgentForLogin | undefined;
+    try {
+      agent = !external && server.authType === "agent" ? await this.agentForLogin(label, signal) : undefined;
+      config = await buildConnectConfig(server, password, passphrase, sock, this.connectionOptions, agent?.path, external?.connectOptions);
+      passphrase = undefined;
+      throwIfAborted(signal);
+    } catch (error) {
+      external?.dispose();
+      throw error;
+    }
     let hostKeyError: unknown;
     if (this.hostKeyVerifier) {
       config.hostVerifier = (hostKey: Buffer | string, verify: VerifyCallback): void => {
         const rawHostKey = Buffer.isBuffer(hostKey) ? hostKey : Buffer.from(hostKey, "hex");
         void this.hostKeyVerifier!.verify(server, rawHostKey, {
-          ...(auth.interaction && { interaction: auth.interaction }),
-          ...(auth.signal && { signal: auth.signal })
+          ...(interaction && { interaction }),
+          ...(signal && { signal })
         }).then(
           (allowed) => verify(allowed),
           (error: unknown) => {
@@ -715,19 +738,14 @@ export class Ssh2Connector implements SshConnector {
       let settled = false;
       const authAbort = new AbortController();
       const onExternalAbort = (): void => {
-        authAbort.abort();
-        client.end();
         if (!settled) {
           settled = true;
-          reject(auth.signal ? abortReason(auth.signal) : new AuthNotJudgedError("SSH connection attempt was canceled"));
+          reject(signal ? abortReason(signal) : new AuthNotJudgedError("SSH connection attempt was canceled"));
         }
+        cleanupAuthentication();
+        client.end();
       };
-      auth.signal?.addEventListener("abort", onExternalAbort, { once: true });
-      const removeExternalAbort = (): void => auth.signal?.removeEventListener("abort", onExternalAbort);
-      if (auth.signal?.aborted) {
-        onExternalAbort();
-        return;
-      }
+      const removeExternalAbort = (): void => signal?.removeEventListener("abort", onExternalAbort);
       let banner: string | undefined;
       // Whether the server has been sent anything typed for it to judge — see
       // explainAgentShortfall: after that, a refusal is the answer's, not the
@@ -739,17 +757,17 @@ export class Ssh2Connector implements SshConnector {
         }
         finish(responses);
       };
-      client.on("banner", (message: string) => {
+      const onBanner = (message: string): void => {
         // A live sink handles banners immediately, so getBanner() must stay
         // empty and sshPty.ts will not print them a second time. A pooled
         // handshake may begin without a terminal and gain one while pending;
         // its router returns false until a sink joins, preserving the banner.
-        if (auth.onAuthMessage) {
+        if (onAuthMessage) {
           // Legacy getBanner() consumers still see blank banners (unchanged
           // buffering below); the live sink only wants non-blank messages.
           if (!message.trim()) return;
           try {
-            if (auth.onAuthMessage(message) !== false) return;
+            if (onAuthMessage(message) !== false) return;
           } catch {
             // Display is best-effort — a throwing sink must not unwind
             // ssh2's protocol handler mid-handshake or abort auth.
@@ -757,42 +775,54 @@ export class Ssh2Connector implements SshConnector {
           }
         }
         banner = message;
-      });
-      client.on("keyboard-interactive", (name, instructions, _lang, prompts, finish) => {
-        if (auth.onKeyboardInteractive) {
+      };
+      const handleKeyboard = (name: string, instructions: string, _lang: string, prompts: import("ssh2").Prompt[], finish: (responses: string[]) => void): void => {
+        if (onKeyboardInteractive) {
           const mapped = prompts.map((p) => ({
             prompt: p.prompt,
             echo: p.echo ?? false
           }));
-          auth.onKeyboardInteractive(name, instructions, mapped, authAbort.signal).then(
+          onKeyboardInteractive(name, instructions, mapped, authAbort.signal).then(
             (responses) => {
               if (!authAbort.signal.aborted) answer(finish, responses);
             },
             (error) => {
               if (authAbort.signal.aborted) return;
-              if (!settled) reject(error);
+              if (!settled) { settled = true; reject(error); }
+              cleanupAuthentication();
               client.end();
             }
           );
           return;
         }
         // Legacy fallback: auto-fill password for all prompts
-        if (auth.password) {
-          answer(finish, prompts.map(() => auth.password!));
+        if (password) {
+          answer(finish, prompts.map(() => password!));
           return;
         }
         finish([]);
-      });
-      client.on("ready", () => {
-        if (settled) return;
+      };
+      const cleanupAuthentication = (): void => {
         authAbort.abort();
         removeExternalAbort();
+        external?.dispose();
+        external = undefined;
+        password = undefined;
+        onKeyboardInteractive = undefined;
+        failInteraction = undefined;
+        config = undefined;
+        client.removeListener("keyboard-interactive", handleKeyboard);
+        client.removeListener("banner", onBanner);
+        client.removeListener("ready", onReady);
+      };
+      const onReady = (): void => {
+        if (settled) return;
+        cleanupAuthentication();
         settled = true;
         resolve(new Ssh2Connection(client, banner, label, this.diagnostics));
-      });
+      };
       client.on("error", (error: Error) => {
-        authAbort.abort();
-        removeExternalAbort();
+        cleanupAuthentication();
         if (!settled) {
           settled = true;
           // Pre-ready errors are the caller's to handle and MUST stay a plain
@@ -812,14 +842,32 @@ export class Ssh2Connector implements SshConnector {
         );
       });
       client.on("close", () => {
-        authAbort.abort();
-        removeExternalAbort();
+        cleanupAuthentication();
         if (!settled) {
           settled = true;
           reject(hostKeyError instanceof Error ? hostKeyError : new AuthNotJudgedError("SSH connection closed before authentication completed"));
         }
       });
-      client.connect(config);
+      failInteraction = (): void => {
+        if (settled) return;
+        settled = true;
+        reject(new SshInteractionRequiredError("External SSH authentication requires an unsupported interactive response."));
+        cleanupAuthentication();
+        client.end();
+      };
+      client.on("banner", onBanner);
+      if (!external) client.on("keyboard-interactive", handleKeyboard);
+      client.on("ready", onReady);
+      signal?.addEventListener("abort", onExternalAbort, { once: true });
+      if (signal?.aborted) { onExternalAbort(); return; }
+      try {
+        client.connect(config!);
+      } catch (error) {
+        cleanupAuthentication();
+        settled = true;
+        reject(error);
+        client.end();
+      }
     });
   }
 }
