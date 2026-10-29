@@ -321,3 +321,59 @@ it("does not let an invented preflight id turn a share SSH link into static auth
   await importData(m, json({ exportType: "share", authProfiles: [{ name: "No id", authType: "password", username: "user" }], servers: [{ ...server(), authProfileId: "preflight" }] }));
   expect(mockShowErrorMessage).toHaveBeenCalled(); expect(m.core.getSnapshot().servers).toHaveLength(0); expect(m.core.getSnapshot().authProfiles).toHaveLength(0);
 });
+
+
+async function repositoryWithRejectedExternalProfile(kind: "server" | "source" | "template") {
+  const state = new Map<string, unknown>([
+    ["nexus.authProfiles", [malformed[0]]],
+    ["nexus.servers", kind === "server" ? [server()] : []],
+    ["nexus.inventorySources", kind === "server" ? [] : [{ ...source(), ...(kind === "template" ? { authProfileId: undefined } : {}) }]],
+    ["nexus.deviceTemplates", kind === "template" ? [template()] : []]
+  ]);
+  const context = { globalState: { get: (key: string) => state.get(key), update: async (key: string, value: unknown) => { state.set(key, value); } } } as unknown as vscode.ExtensionContext;
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const core = new NexusCore(new VscodeConfigRepository(context));
+    await core.initialize();
+    expect(core.getSnapshot().authProfiles).toHaveLength(0);
+    return core;
+  } finally { warn.mockRestore(); }
+}
+
+it.each(["server", "source", "template"] as const)("share export refuses an unresolved %s SSH link after repository profile rejection", async kind => {
+  const core = await repositoryWithRejectedExternalProfile(kind);
+  const snapshot = core.getSnapshot();
+  const link = kind === "server" ? snapshot.servers[0].authProfileId
+    : kind === "source" ? snapshot.inventorySources[0].authProfileId : snapshot.deviceTemplates[0].fields.authProfileId?.value;
+  expect(link).toBe("ext");
+  const m = await machine(); registerConfigCommands(core, m.vault);
+  mockShowSaveDialog.mockResolvedValueOnce({ fsPath: "/fake/share.json", scheme: "file" });
+  await registeredCommands.get("nexus.config.export")!();
+  expect(mockWriteFile.mock.calls.length).toBe(0);
+  expect(mockShowSaveDialog).not.toHaveBeenCalled();
+  expect(mockShowErrorMessage).toHaveBeenCalledWith("Nothing was exported: an SSH auth profile link cannot be resolved. Repair the linked Auth Profile in Settings, or explicitly choose another profile or unlink it, then export again.");
+  expect(core.getSnapshot()).toEqual(snapshot);
+});
+
+it("share export excludes unused templates before checking their unresolved SSH links", async () => {
+  const m = await machine(); await m.core.addOrUpdateAuthProfile(external()); await m.core.addOrUpdateServer(server());
+  await m.core.addOrUpdateDeviceTemplate({ ...template(), fields: { authProfileId: { mode: "override", value: "missing" } } });
+  registerConfigCommands(m.core, m.vault); mockShowSaveDialog.mockResolvedValueOnce({ fsPath: "/fake/share.json", scheme: "file" });
+  await registeredCommands.get("nexus.config.export")!();
+  expect(mockShowErrorMessage).not.toHaveBeenCalled(); expect(mockWriteFile).toHaveBeenCalledTimes(1);
+  const payload = JSON.parse(Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8"));
+  expect(payload.deviceTemplates).toBeUndefined();
+  expect(payload.authProfiles[0].authType).toBe("external");
+  expect(payload.servers[0].authProfileId).toBe(payload.authProfiles[0].id);
+});
+
+it("backup export preserves unresolved SSH source intent for repair without applying the share refusal", async () => {
+  const core = await repositoryWithRejectedExternalProfile("server");
+  const m = await machine(); registerConfigCommands(core, m.vault);
+  mockShowInputBox.mockResolvedValueOnce(password).mockResolvedValueOnce(password);
+  mockShowSaveDialog.mockResolvedValueOnce({ fsPath: "/fake/backup.json", scheme: "file" });
+  await registeredCommands.get("nexus.config.export.backup")!();
+  expect(mockShowErrorMessage).not.toHaveBeenCalled(); expect(mockWriteFile).toHaveBeenCalledTimes(1);
+  const payload = JSON.parse(Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8"));
+  expect(payload.exportType).toBe("backup"); expect(payload.servers[0].authProfileId).toBe("ext");
+});

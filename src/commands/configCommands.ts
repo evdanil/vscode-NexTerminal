@@ -3540,6 +3540,22 @@ export function registerConfigCommands(
 
   async function exportShare(): Promise<void> {
     const snapshot = core.getSnapshot();
+    const knownProfileIds = new Set(snapshot.authProfiles.filter(validateAuthProfile).map(profile => profile.id));
+    const resolves = (id: string | undefined): boolean => !id || knownProfileIds.has(id);
+    const sourceIds = new Set(snapshot.inventorySources.map(source => source.id));
+    const includedTemplateIds = templateIdsNamedBySources(snapshot.inventorySources);
+    // Validate source intent before sharing strips/remaps references. Repository
+    // rejection leaves dangling SSH links deliberately; clearing one here would
+    // let the recipient authenticate with the server's dormant static settings.
+    // Match the sanitizer's exclusions: unused templates and addressless rows
+    // without their source are not carried by this export.
+    if (snapshot.servers.some(server =>
+      (server.addressless !== true || (server.origin !== undefined && sourceIds.has(server.origin.sourceId))) && !resolves(server.authProfileId)) ||
+      snapshot.inventorySources.some(source => !resolves(source.authProfileId)) ||
+      snapshot.deviceTemplates.some(template => includedTemplateIds.has(template.id) && !resolves(template.fields.authProfileId?.value))) {
+      void vscode.window.showErrorMessage("Nothing was exported: an SSH auth profile link cannot be resolved. Repair the linked Auth Profile in Settings, or explicitly choose another profile or unlink it, then export again.");
+      return;
+    }
     const settings = readSettings();
     const allMacros = getMacros();
 
