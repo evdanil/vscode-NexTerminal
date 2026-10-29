@@ -101,7 +101,9 @@ function transportDescriptor(
     // the authentication boundary refuses unresolved sources before fallback.
     rawServer.authProfileId || null,
     profile !== undefined,
-    authProfileConnectionIdentity(profile),
+    // Stored profiles are already projected above, including keyPath only for
+    // key auth; adding their entire identity would make dormant paths relevant.
+    isExternalAuthProfile(profile) ? authProfileConnectionIdentity(profile) : null,
     Boolean(server.legacyAlgorithms),
     proxyDescriptor(server.proxy, inputs, chain)
   ];
