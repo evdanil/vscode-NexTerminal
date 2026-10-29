@@ -59,13 +59,20 @@ vi.mock("vscode", () => ({
 
 // The server-resolution helpers are exercised by serverCommands.test.ts; mocking
 // them here keeps this file about macro dispatch and off the SSH/keygen imports.
+function seedResolvedServer(core: { getServer?: (id: string) => ServerConfig | undefined; getSnapshot: () => { servers: ServerConfig[] } }, target: ServerConfig | undefined): ServerConfig | undefined {
+  // Older dispatch fixtures supplied only a resolved argument. Give their mock
+  // repository a live lookup; race cases supply their own authoritative getter.
+  if (target && !core.getServer) core.getServer = (id) => core.getSnapshot().servers.find((s) => s.id === id) ?? (id === target.id ? target : undefined);
+  return target;
+}
+
 const pickServer = vi.fn();
 const connectServer = vi.fn(async (_ctx: unknown, _id: unknown, _options?: { onConnectFailed?: (message: string) => void }) => {});
 vi.mock("../../src/commands/serverCommands", () => ({
-  pickServer: (...args: unknown[]) => pickServer(...args),
+  pickServer: async (core: Parameters<typeof seedResolvedServer>[0]) => seedResolvedServer(core, await pickServer(core)),
   connectServer: (ctx: unknown, id: unknown, options?: { onConnectFailed?: (message: string) => void }) => connectServer(ctx, id, options),
-  toServerFromArg: (_core: unknown, arg: unknown) =>
-    arg && typeof arg === "object" && "server" in arg ? (arg as { server: ServerConfig }).server : undefined
+  toServerFromArg: (core: Parameters<typeof seedResolvedServer>[0], arg: unknown) =>
+    seedResolvedServer(core, arg && typeof arg === "object" && "server" in arg ? (arg as { server: ServerConfig }).server : undefined)
 }));
 
 import { collectIncomingMacros, sanitizeForSharing } from "../../src/commands/configCommands";
@@ -2205,7 +2212,6 @@ describe("external credential macro consumers", () => {
     const ctx = contextWithAuthProfiles([external]); const get = vi.fn();
     const gateway = server({ id: "gateway", name: "Gateway" });
     const sendText = vi.fn(); const terminal = { name: "Gateway", sendText, show: vi.fn() };
-    (ctx.core as unknown as { getServer: (id: string) => ServerConfig }).getServer = () => gateway;
     vi.spyOn(ctx.core, "getSnapshot").mockReturnValue({ activeSessions: [{ id: "session", serverId: gateway.id }], servers: [gateway] } as ReturnType<CommandContext["core"]["getSnapshot"]>);
     ctx.sessionTerminals.set("session", terminal as unknown as Parameters<typeof ctx.sessionTerminals.set>[1]);
     openTerminals = [terminal];
@@ -2229,4 +2235,32 @@ it("browser IPMI username refuses before opening a URL or invoking a provider", 
   await runMacroOnServer(ctx, { server: server({ ipmiHost: "192.0.2.1", ipmiAuthProfileId: external.id }) });
   expect(resolve).not.toHaveBeenCalled(); expect(openExternal).not.toHaveBeenCalled(); expect(createdTerminals).toHaveLength(0);
   expect(showErrorMessage).toHaveBeenCalledWith(expect.stringContaining("SSH only"), "Manage Auth Profiles");
+});
+
+
+describe("macro picker credential relink races", () => {
+  it.each(["ssh", "ipmi"] as const)("refuses a %s link changed from stored to external while the picker is open", async (consumer) => {
+    const stored = authProfile({ id: "stored", username: "old-account" });
+    const external: AuthProfile = { id: "external", name: "Program", authType: "external", external: { version: 1, method: "password" } };
+    const target = server({ authProfileId: stored.id, ipmiAuthProfileId: stored.id, ipmiHost: "192.0.2.2" });
+    let live = target;
+    const ctx = contextWithAuthProfiles([stored, external]);
+    (ctx.core as unknown as { getServer: (id: string) => ServerConfig }).getServer = () => live;
+    const get = vi.fn(); const resolve = vi.fn();
+    ctx.secretVault = { get } as unknown as CommandContext["secretVault"];
+    ctx.externalCredentialResolver = { resolve } as unknown as CommandContext["externalCredentialResolver"];
+    await setMacros([{ id: "race", name: "Profile URL", text: consumer === "ssh" ? "https://${profile.host}/${profile.username}" : "https://${profile.ipmiHost}/${profile.ipmiUsername}", runIn: "browser" }]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => {
+      live = { ...target, ...(consumer === "ssh" ? { authProfileId: external.id } : { ipmiAuthProfileId: external.id }) };
+      return items[0];
+    });
+    await runMacroOnServer(ctx, { server: target });
+    expect(openExternal).not.toHaveBeenCalled();
+    expect(createdTerminals).toHaveLength(0);
+    expect(connectServer).not.toHaveBeenCalled();
+    expect(showInputBox).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalled();
+    expect(resolve).not.toHaveBeenCalled();
+    expect(showErrorMessage.mock.calls[0][0]).toContain("changed");
+  });
 });

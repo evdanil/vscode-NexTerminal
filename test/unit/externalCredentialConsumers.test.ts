@@ -53,3 +53,25 @@ describe("external credential consumer boundaries", () => {
     expect(plan.warnings.join(" ")).not.toContain("key path");
   });
 });
+
+
+describe("IPMI vault await capability races", () => {
+  it.each(["external", "missing"] as const)("does not prompt when the profile becomes %s during an empty or failed vault read", async (kind) => {
+    for (const failedRead of [false, true]) {
+      showErrorMessage.mockReset(); showInputBox.mockReset();
+      showInputBox.mockResolvedValue("must-not-be-requested");
+      let profile: AuthProfile | undefined = { id: external.id, name: "Stored", authType: "password", username: "bmc" };
+      const get = vi.fn(async () => {
+        profile = kind === "external" ? external : undefined;
+        if (failedRead) throw new Error("vault unavailable");
+        return "";
+      });
+      const resolve = vi.fn();
+      const ctx = { core: { getAuthProfile: () => profile }, secretVault: { get }, externalCredentialResolver: { resolve } } as unknown as CommandContext;
+      expect(await resolveIpmiTerminalEnv(ctx, server)).toEqual({ kind: "cancelled" });
+      expect(showInputBox).not.toHaveBeenCalled();
+      expect(get).toHaveBeenCalledTimes(1);
+      expect(resolve).not.toHaveBeenCalled();
+    }
+  });
+});

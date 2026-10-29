@@ -2219,6 +2219,30 @@ describe("deploy key command", () => {
     expect(vscode.window.showInputBox).not.toHaveBeenCalled();
   });
 
+  it.each(["external", "deleted", "username", "keyPath"])("refuses a destination key profile changed to %s while its picker is open", async (change) => {
+    const destination = makeAuthProfile({ id: "destination", authType: "key", username: "stored-user", keyPath: "/keys/id" });
+    let liveDestination: AuthProfile | undefined = destination;
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [makeServer({ username: "stored-user" })], authProfiles: [destination] });
+    vi.mocked(ctx.core.getAuthProfile).mockImplementation((id) => id === destination.id ? liveDestination : undefined);
+    (ctx.sshFactory as any).connect = vi.fn(async () => ({ dispose: vi.fn() }));
+    vi.mocked(readFile).mockResolvedValue("ssh-ed25519 AAAA");
+    vi.mocked(vscode.window.showInformationMessage as any).mockResolvedValueOnce("Use key auth profile");
+    vi.mocked(vscode.window.showQuickPick as any)
+      .mockResolvedValueOnce({ keyPair: { name: "id", publicKeyPath: "/keys/id.pub", privateKeyPath: "/keys/id" } })
+      .mockImplementationOnce(async () => {
+        liveDestination = change === "deleted" ? undefined : change === "external"
+          ? { id: destination.id, name: "Program", authType: "external", external: { version: 1, method: "password" } }
+          : { ...destination, ...(change === "username" ? { username: "other-account" } : { keyPath: "/other/key" }) };
+        return { profile: destination };
+      });
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.deployKey")!("srv-1");
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+    expect(ctx.core.addOrUpdateAuthProfile).not.toHaveBeenCalled();
+    expect(ctx.core.getServer("srv-1")?.authProfileId).toBeUndefined();
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("selected key auth profile changed"));
+  });
+
   it("deploys selected key and converts a linked password-profile server to standalone key auth", async () => {
     const passwordProfile = makeAuthProfile({ id: "ap-pass", username: "profile-user", authType: "password" });
     const { ctx, addOrUpdateServer, secretDelete } = setupHarness({

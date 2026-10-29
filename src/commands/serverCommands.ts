@@ -528,16 +528,14 @@ function findMatchingKeyAuthProfiles(
   username: string,
   privateKeyPath: string
 ): AuthProfile[] {
+  return core.getSnapshot().authProfiles.filter((profile) => keyAuthProfileMatches(profile, username, privateKeyPath));
+}
+
+function keyAuthProfileMatches(profile: AuthProfile | undefined, username: string, privateKeyPath: string): boolean {
   const normalizedKeyPath = normalizeKeyPathForComparison(privateKeyPath);
-  return core.getSnapshot().authProfiles.filter((profile) => {
-    const owned = authProfileOwnedCredentials(profile);
-    return (
-      owned.authType === "key" &&
-      owned.username === username &&
-      owned.keyPath !== undefined &&
-      normalizeKeyPathForComparison(owned.keyPath) === normalizedKeyPath
-    );
-  });
+  const owned = authProfileOwnedCredentials(profile);
+  return owned.authType === "key" && owned.username === username && owned.keyPath !== undefined &&
+    normalizeKeyPathForComparison(owned.keyPath) === normalizedKeyPath;
 }
 
 function getDefaultKeyAuthProfileName(username: string, privateKeyPath: string): string {
@@ -2930,7 +2928,14 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             );
             return;
           }
-          await ctx.core.addOrUpdateServer(buildProfileLinkedKeyServer(live, deployedEffectiveUsername, privateKeyPath, profile.id));
+          // The destination picker carries an id, not authority to reuse its
+          // stale credentials. Resolve and match it inside the same write lock.
+          const currentDestination = ctx.core.getAuthProfile(profile.id);
+          if (!currentDestination || !keyAuthProfileMatches(currentDestination, deployedEffectiveUsername, privateKeyPath)) {
+            void vscode.window.showWarningMessage("The selected key auth profile changed or was removed. Nothing was switched. Re-run Deploy SSH Key to choose a matching stored key profile.");
+            return;
+          }
+          await ctx.core.addOrUpdateServer(buildProfileLinkedKeyServer(live, deployedEffectiveUsername, privateKeyPath, currentDestination.id));
           converted = true;
         });
         if (converted) {

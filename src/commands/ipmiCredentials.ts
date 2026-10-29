@@ -144,6 +144,9 @@ export async function resolveIpmiTerminalEnv(
     }
   }
 
+  // Even an empty/failed read yielded to other config writers. Refuse before
+  // asking for a fallback secret if the linked source is no longer supported.
+  if (await refuseUnsupportedIpmiProfile(ctx, server)) return { kind: "cancelled" };
   if (!password) {
     const profileName = ipmiAuthProfile(ctx, server)?.name;
     password = await vscode.window.showInputBox({
