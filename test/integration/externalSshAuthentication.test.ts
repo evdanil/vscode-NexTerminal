@@ -1,10 +1,15 @@
 import { generateKeyPairSync } from "node:crypto";
 import { once } from "node:events";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Client, Server, utils, type AuthContext, type Connection, type PublicKeyAuthMethod } from "ssh2";
 import { Ssh2Connector } from "../../src/services/ssh/ssh2Connector";
 import { createExternalSshAuthentication } from "../../src/services/ssh/externalSshAuthentication";
-import type { ServerConfig } from "../../src/models/config";
+import type { ExternalAuthProfile, ServerConfig } from "../../src/models/config";
+import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
+import { createExternalCredentialApproval } from "../../src/services/credentials/externalCredentialApproval";
+import { createExternalCredentialResolver } from "../../src/services/credentials/externalCredentialResolver";
+import { parseExternalCredentialResponse } from "../../src/services/credentials/externalCredentialProtocol";
+import type { HostKeyVerifier } from "../../src/services/ssh/contracts";
 
 const hostKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ format: "pem", type: "pkcs1" });
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -174,5 +179,73 @@ describe("external credentials with installed ssh2", () => {
     const encrypted = utils.generateKeyPairSync("ed25519", { cipher: "aes256-ctr", passphrase: "test-passphrase", rounds: 1 }).private;
     await expect(new Ssh2Connector().connect(server, { externalCredential: { method: "key", username: "provider-user", privateKey: Buffer.from(encrypted) } })).rejects.toThrow("invalid response");
     expect(attempts).toBe(0);
+  });
+});
+
+function fullFactory(target: ServerConfig, method: "password" | "key" = "password", verifier?: HostKeyVerifier) {
+  const profile: ExternalAuthProfile = { id: "provider", name: "Provider", authType: "external", external: { version: 1, method, invocation: { executable: "/provider", args: [] } } };
+  const linked = { ...target, authProfileId: profile.id };
+  const vault = { get: vi.fn(async () => "dormant"), store: vi.fn(async () => {}), delete: vi.fn(async () => {}) };
+  const prompt = { prompt: vi.fn(async () => ({ password: "dormant", save: true })) };
+  const run = vi.fn(async () => Buffer.from(JSON.stringify({ version: 1, username: "runtime-user", ...(method === "password" ? { password: "PROVIDER-CANARY" } : { private_key: String(hostKey) }) })));
+  const resolver = createExternalCredentialResolver({ approvals: createExternalCredentialApproval({ isWorkspaceTrusted: () => true, confirm: async () => true }), run, parse: parseExternalCredentialResponse });
+  cleanups.push(() => resolver.dispose());
+  const factory = new SilentAuthSshFactory(new Ssh2Connector(verifier), vault, prompt, undefined, () => profile, () => linked, resolver);
+  const noLegacy = () => { expect(vault.get).not.toHaveBeenCalled(); expect(vault.store).not.toHaveBeenCalled(); expect(vault.delete).not.toHaveBeenCalled(); expect(prompt.prompt).not.toHaveBeenCalled(); };
+  return { factory, linked, resolver, run, noLegacy };
+}
+
+describe("common external factory through installed ssh2", () => {
+  it.each(["password", "otp", "multiple", "echo", "key"])("answers only the supported password challenge (%s)", async (challenge) => {
+    const methods: string[] = [];
+    const answers: string[][] = [];
+    const target = await listen((ctx) => {
+      methods.push(ctx.method);
+      if (ctx.method !== "keyboard-interactive") { ctx.reject(["keyboard-interactive"]); return; }
+      const prompts = challenge === "multiple" ? [{ prompt: "Password:", echo: false }, { prompt: "OTP:", echo: false }] : [{ prompt: challenge === "otp" ? "OTP:" : "Password:", echo: challenge === "echo" }];
+      ctx.prompt(prompts, (responses) => { answers.push(responses); if (challenge === "password" && responses[0] === "PROVIDER-CANARY") ctx.accept(); else ctx.reject(); });
+    });
+    const h = fullFactory(target, challenge === "key" ? "key" : "password");
+    const messages: string[] = [];
+    const pending = h.factory.connect(h.linked, { onAuthMessage: (text) => { messages.push(text); } });
+    if (challenge === "password") {
+      const connection = await pending; cleanups.push(() => connection.dispose());
+      expect(answers).toEqual([["PROVIDER-CANARY"]]);
+    } else if (challenge === "key") {
+      await expect(pending).rejects.toThrow("authentication");
+      expect(methods).toEqual(["publickey"]); expect(answers).toEqual([]);
+    } else {
+      await expect(pending).rejects.toMatchObject({ code: "interaction-required" });
+      expect(answers.flat()).not.toContain("PROVIDER-CANARY");
+    }
+    expect(messages.join("")).not.toContain("PROVIDER-CANARY"); expect(h.run).toHaveBeenCalledTimes(1); h.noLegacy();
+  });
+
+  it("revoke during real host verification stops authentication even when the verifier later accepts", async () => {
+    let entered!: () => void;
+    const verifying = new Promise<void>((resolve) => { entered = resolve; });
+    let allow!: (value: boolean) => void;
+    const decision = new Promise<boolean>((resolve) => { allow = resolve; });
+    const authenticate = vi.fn((ctx: AuthContext) => ctx.accept());
+    const target = await listen(authenticate);
+    let signal: AbortSignal | undefined;
+    const h = fullFactory(target, "password", { verify: async (_server, _key, context) => { signal = context?.signal; entered(); return decision; } });
+    const pending = h.factory.connect(h.linked).catch((error: unknown) => error);
+    await verifying; h.resolver.revoke();
+    expect(signal?.aborted).toBe(true); expect(await pending).toMatchObject({ code: "cancelled" });
+    allow(true); await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(authenticate).not.toHaveBeenCalled(); h.noLegacy();
+  });
+
+  it("revoke while real SSH authentication awaits readiness cancels delivery", async () => {
+    let entered!: () => void;
+    const authenticating = new Promise<void>((resolve) => { entered = resolve; });
+    let accept!: () => void;
+    const target = await listen((ctx) => { accept = () => ctx.accept(); entered(); });
+    const h = fullFactory(target);
+    const pending = h.factory.connect(h.linked).catch((error: unknown) => error);
+    await authenticating; h.resolver.revoke();
+    expect(await pending).toMatchObject({ code: "cancelled" });
+    accept(); await new Promise<void>((resolve) => setImmediate(resolve)); h.noLegacy();
   });
 });

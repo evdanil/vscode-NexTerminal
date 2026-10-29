@@ -20,6 +20,7 @@ import { isSameAuthenticatedEndpoint } from "../inventory/proxySecretHygiene";
 import { configMutationLock } from "../configMutationLock";
 import { addresslessUnavailableMessage, telnetUnsupportedMessage } from "../../utils/protocolGuards";
 import { AuthNotJudgedError } from "./authErrors";
+import { CredentialProviderError } from "../credentials/credentialProviderError";
 
 const MAX_HTTP_RESPONSE_SIZE = 65536; // 64KB — more than enough for CONNECT headers
 
@@ -297,6 +298,9 @@ export class ProxySshFactory implements ContextAwareSshFactory {
     try {
       jumpConnection = await this.connectToJumpHost(jumpServer, nextVisited, onAuthMessage, isActive, interaction, signal);
     } catch (error) {
+      // Resolver cancellation is controlled; do not replace it with an arbitrary
+      // caller reason or turn provider failures into target transport failures.
+      if (error instanceof CredentialProviderError) throw error;
       if (error instanceof SshInteractionRequiredError || signal?.aborted) {
         throw signal?.reason ?? error;
       }
