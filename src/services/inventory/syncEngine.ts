@@ -1,3 +1,4 @@
+import { externalAuthProfileUnsupportedReason } from "../../models/authProfile";
 import type { AuthProfile, DetachedServerOrigin, ProxyConfig, ServerConfig, ServerOrigin, ServerProtocol } from "../../models/config";
 import { authProfileNeedsServerKeyPath, proxyConfigsEqual, serverOriginStampsEqual, templatedHasAnyStamp } from "../../models/config";
 import type {
@@ -1139,6 +1140,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     // against the per-device path and are the sole surface when zero devices sync.
     {
       hasAuthProfile: (pid) => resolveAuthProfileById(pid) !== undefined,
+      authProfileUnsupportedReason: (pid) => externalAuthProfileUnsupportedReason(resolveAuthProfileById(pid), "ipmi"),
       hasServer: (sid) => liveServerIds.has(sid),
       ipmiAuthProfileTemplateName: baselineCascade.provenance.ipmiAuthProfileId?.templateName,
       ipmiGatewayServerTemplateName: baselineCascade.provenance.ipmiGatewayServerId?.templateName,
@@ -1568,6 +1570,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         },
         {
           hasAuthProfile: (pid) => resolveAuthProfileById(pid) !== undefined,
+          authProfileUnsupportedReason: (pid) => externalAuthProfileUnsupportedReason(resolveAuthProfileById(pid), "ipmi"),
           hasServer: (sid) => liveServerIds.has(sid),
           ipmiAuthProfileTemplateName: addresslessCascade.provenance.ipmiAuthProfileId?.templateName,
           ipmiGatewayServerTemplateName: addresslessCascade.provenance.ipmiGatewayServerId?.templateName,
@@ -1997,6 +2000,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
       // id drops the field to none + a deduped warning naming the template.
       {
         hasAuthProfile: (pid) => resolveAuthProfileById(pid) !== undefined,
+        authProfileUnsupportedReason: (pid) => externalAuthProfileUnsupportedReason(resolveAuthProfileById(pid), "ipmi"),
         hasServer: (sid) => liveServerIds.has(sid),
         ipmiAuthProfileTemplateName: deviceCascade.provenance.ipmiAuthProfileId?.templateName,
         ipmiGatewayServerTemplateName: deviceCascade.provenance.ipmiGatewayServerId?.templateName,

@@ -51,6 +51,8 @@ export interface ProfileTokenFacts {
   ipmiHost?: string;
   /** The linked IPMI auth profile's username; see `ServerConfig.ipmiAuthProfileId`. */
   ipmiUsername?: string;
+  /** Host-owned explanations for facts unavailable from a linked credential source. */
+  unavailableTokenReasons?: Partial<Record<ProfileTokenName, string>>;
 }
 
 /** Display names used in error text — what the user sees on the server form. */
@@ -1022,7 +1024,9 @@ export function resolveProfileTokens(
 
     const value = rawTokenValue(match.token, server);
     if (value === "") {
-      return { refuse: missingError(match.token, serverName) };
+      const error = missingError(match.token, serverName);
+      error.message = server.unavailableTokenReasons?.[match.token] ?? error.message;
+      return { refuse: error };
     }
     if (!validateTokenValue(match.token, value)) {
       return { refuse: invalidError(match.token, serverName, value) };

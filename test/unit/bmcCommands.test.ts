@@ -550,3 +550,19 @@ describe("registerBmcCommands", () => {
     expect(createdTerminals).toHaveLength(1);
   });
 });
+
+
+describe("external IPMI consumers", () => {
+  const external: AuthProfile = { id: "ap-bmc", name: "Program", authType: "external", external: { version: 1, method: "password" } };
+  it("refuses SOL before reading a stale password, prompting or spawning a terminal", async () => {
+    const ctx = context(VAULTED, [external]); const get = vi.fn(async () => "stale");
+    ctx.secretVault = { get } as unknown as CommandContext["secretVault"];
+    await connectBmcSol(ctx, { server: server() });
+    expect(get).not.toHaveBeenCalled(); expect(showInputBox).not.toHaveBeenCalled(); expect(createdTerminals).toHaveLength(0);
+    expect(showErrorMessage).toHaveBeenCalledWith(expect.stringContaining("SSH only"), "Manage Auth Profiles");
+  });
+  it("still opens a BMC URL requiring only its address", async () => {
+    await openBmcWebConsole(context(VAULTED, [external]), { server: server() });
+    expect(openExternal).toHaveBeenCalledTimes(1); expect(showInputBox).not.toHaveBeenCalled();
+  });
+});

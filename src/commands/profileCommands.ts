@@ -1,3 +1,4 @@
+import { externalAuthProfileUnsupportedReason } from "../models/authProfile";
 import { externalServerFormValues } from "../ui/externalCredentialForm";
 import { isExternalAuthProfile, authProfileConnectionIdentity } from "../models/authProfile";
 import * as vscode from "vscode";
@@ -186,7 +187,9 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
           // case above and not the server EDIT form's full signature check: the
           // IPMI link mirrors no credentials into this form, it only supplies
           // `${profile.ipmiUsername}` at macro-run time (resolved live then), so
-          // an id that resolves to nothing is the one and only thing to catch.
+          // the linked profile must exist and support IPMI.
+          const ipmiUnsupported = externalAuthProfileUnsupportedReason(server.ipmiAuthProfileId ? ctx.core.getAuthProfile(server.ipmiAuthProfileId) : undefined, "ipmi");
+          if (ipmiUnsupported) throw new Error(ipmiUnsupported);
           if (server.ipmiAuthProfileId !== undefined && ctx.core.getAuthProfile(server.ipmiAuthProfileId) === undefined) {
             throw new Error(MISSING_IPMI_AUTH_PROFILE_MESSAGE);
           }
@@ -591,6 +594,8 @@ export function registerProfileCommands(ctx: ProfileCommandContext): vscode.Disp
           ? [{ label: "Browse Files", command: "nexus.files.browse" }]
           : []),
         { label: "Connect and Run Script", command: "nexus.server.runWithScript" },
+        ...(!markers.includes("noKeyDeployment") && arg.server.protocol !== "telnet" && !arg.server.addressless
+          ? [{ label: "Deploy SSH Key", command: "nexus.server.deployKey" }] : []),
         { label: "Run Macro on Server…", command: "nexus.server.runMacro" },
         { label: "Edit", command: "nexus.server.edit" },
         { label: "Duplicate", command: "nexus.server.duplicate" },

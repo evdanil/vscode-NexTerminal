@@ -1,3 +1,4 @@
+import { keyDeploymentUnavailableReason } from "../models/authProfile";
 import * as vscode from "vscode";
 import type { SessionSnapshot } from "../core/contracts";
 import type { ActiveLocalServerSession, LocalServerConfig, LocalServerStatus } from "../models/localServer";
@@ -98,7 +99,8 @@ export class ServerTreeItem extends vscode.TreeItem {
     // below, which — unlike the node-state marker — requires NO known status:
     // an addressless, unpolled guest is the row the console exists for.
     hasWebConsole = false,
-    authProfileSource?: string
+    authProfileSource?: string,
+    keyDeploymentUnavailable = false
   ) {
     super(server.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
     this.id = `server:${server.id}`;
@@ -171,7 +173,7 @@ export class ServerTreeItem extends vscode.TreeItem {
     // for any provider implementing `controlNode`, so it reads correctly on an
     // EVE-NG lab node and on a Proxmox guest alike.
     const nodeMarker = hasNodeControl && status ? (status === "running" ? ".nodeRunning" : ".nodeStopped") : "";
-    // WEB CONSOLE — LAST in the fixed order
+    // WEB CONSOLE — after the node marker in the fixed order
     // `nexus.server[Connected][.ipmi][.nodeRunning|.nodeStopped][.webConsole]`.
     // Position is load-bearing, not cosmetic: every server-menu `when` regex is
     // anchored and spells the groups in this order, so a marker in any other
@@ -180,7 +182,9 @@ export class ServerTreeItem extends vscode.TreeItem {
     // or unpolled guest manageable at all, and a stopped guest's console is
     // the hypervisor's own honest answer.
     const webConsoleMarker = hasWebConsole ? ".webConsole" : "";
-    this.contextValue = `${connected ? "nexus.serverConnected" : "nexus.server"}${hasIpmi ? ".ipmi" : ""}${nodeMarker}${webConsoleMarker}`;
+    // Unsupported SSH sources suppress key deployment while all other menus
+    // tolerate this final marker; the command independently rechecks live state.
+    this.contextValue = `${connected ? "nexus.serverConnected" : "nexus.server"}${hasIpmi ? ".ipmi" : ""}${nodeMarker}${webConsoleMarker}${keyDeploymentUnavailable ? ".noKeyDeployment" : ""}`;
     // LIVE STATUS (Phase 2) — the icon. A CONNECTED server always keeps its
     // connected (plug) icon: the connected affordance must not be lost (P3-6),
     // and the running state is still conveyed by the " (running)" description
@@ -1011,7 +1015,8 @@ export class NexusTreeProvider
       status,
       hasNodeControl,
       hasWebConsole,
-      isExternalAuthProfile(authProfile) ? `External Program${authProfile.external.invocation ? "" : " · Needs configuration"}` : server.authProfileId && !authProfile ? "Missing auth profile" : undefined
+      isExternalAuthProfile(authProfile) ? `External Program${authProfile.external.invocation ? "" : " · Needs configuration"}` : server.authProfileId && !authProfile ? "Missing auth profile" : undefined,
+      keyDeploymentUnavailableReason(server, authProfile) !== undefined
     );
     // LIVE STATUS (Phase 2) — the resourceUri the decoration provider matches on
     // to paint the ▶ badge for a running server.

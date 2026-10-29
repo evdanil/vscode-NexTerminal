@@ -1,3 +1,4 @@
+import { externalAuthProfileUnsupportedReason } from "../models/authProfile";
 import * as vscode from "vscode";
 import { randomUUID } from "node:crypto";
 import type { ProxyConfig, ServerConfig } from "../models/config";
@@ -256,6 +257,8 @@ function openDeviceTemplateEditor(ctx: CommandContext, seed?: DeviceTemplateProf
               'Choose another IPMI auth profile, or set the IPMI Auth Profile field\'s mode to "Not set".'
           );
         }
+        const unsupportedIpmi = externalAuthProfileUnsupportedReason(linkedIpmiAuthProfileId ? ctx.core.getAuthProfile(linkedIpmiAuthProfileId) : undefined, "ipmi");
+        if (unsupportedIpmi) throw new Error(unsupportedIpmi);
         await ctx.core.addOrUpdateDeviceTemplate(template);
       });
       // U1 (§6.1 UX-S8) — the VERBATIM save toast (single "saved." wording, not a
@@ -612,7 +615,8 @@ export async function applyPlanWrites(ctx: CommandContext, plan: ManualApplyPlan
       }
     }
     if (write.ipmiAuthProfileId !== undefined) {
-      if (ctx.core.getAuthProfile(write.ipmiAuthProfileId) !== undefined) {
+      if (ctx.core.getAuthProfile(write.ipmiAuthProfileId) !== undefined &&
+        externalAuthProfileUnsupportedReason(ctx.core.getAuthProfile(write.ipmiAuthProfileId), "ipmi") === undefined) {
         next.ipmiAuthProfileId = write.ipmiAuthProfileId;
       } else {
         dropWritten("ipmiAuthProfileId");

@@ -15,7 +15,7 @@ import { bindingToDisplayLabel } from "../macroBindings";
 import { sanitizeMacroGroup } from "../services/macroFolders";
 import { formatProfileTokenErrorForCommand, hasProfileTokens, profileTokenLabel, profileTokensUsed, resolveProfileTokens } from "../services/profileTokens";
 import type { ProfileTokenError, ProfileTokenErrorCommandSubject, ProfileTokenForm } from "../services/profileTokens";
-import { profileTokenServer, resolveIpmiTerminalEnv, type ProfileTokenServer } from "./ipmiCredentials";
+import { profileTokenServer, refuseUnsupportedIpmiProfile, resolveIpmiTerminalEnv, type ProfileTokenServer } from "./ipmiCredentials";
 import { VARIABLE_MARKER } from "../ui/macroVariableMarker";
 import { resolveMacroBrowserUrl } from "../utils/browserUrl";
 import { textRunsIpmitool } from "../utils/ipmitoolCommand";
@@ -805,10 +805,16 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
   // the two cannot answer differently for the same macro.
   const runTarget = resolveMacroRunTarget(macro);
 
+  // Rebuild after the picker: a profile may have been edited while it was open.
+  const ipmiTokens = profileTokensUsed(macro.text);
+  if ((macroProvidesIpmiCredentials(macro) || ipmiTokens.includes("ipmiUsername") ||
+    (runTarget !== "browser" && ipmiTokens.includes("ipmiHost"))) &&
+    await refuseUnsupportedIpmiProfile(ctx, server)) return;
+
   // Profile tokens are resolved FIRST and synchronously: a macro that cannot be
   // resolved against this server must fail before anything is connected, any
   // terminal is created, and any prompt is shown.
-  const resolution = resolveProfileTokens(macro.text, tokenServer, { form: profileTokenForm(macro) });
+  const resolution = resolveProfileTokens(macro.text, profileTokenServer(ctx, server), { form: profileTokenForm(macro) });
   if (!resolution.ok) {
     await reportProfileTokenError(resolution.error, server);
     return;

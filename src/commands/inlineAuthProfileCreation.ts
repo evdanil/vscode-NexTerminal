@@ -59,7 +59,7 @@ export function createInlineAuthProfileCreation(
           return;
         }
         if (key === "ipmiAuthProfileId" && isExternalAuthProfile(added)) {
-          void vscode.window.showWarningMessage("This external auth profile supports SSH only. The IPMI Auth Profile selection has not changed.");
+          void vscode.window.showWarningMessage("This external auth profile supports SSH only. Choose or create a stored profile for IPMI. The IPMI Auth Profile selection has not changed.");
           clearWatcher(); return;
         }
         panel?.addSelectOption(key, added.id, authProfileOptionLabel(added));

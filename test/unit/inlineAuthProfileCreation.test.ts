@@ -119,3 +119,12 @@ it("rejects an external profile created from IPMI without appending or changing 
   core.addProfile({ id: "e", name: "External", authType: "external", external: { version: 1, method: "password" } });
   expect(panel.addSelectOption).not.toHaveBeenCalled(); expect(core.listenerCount()).toBe(0);
 });
+
+it("appends and selects an external profile created from SSH", () => {
+  const core = makeCore(); const panel = makePanel();
+  const controller = createInlineAuthProfileCreation({ core } as unknown as Parameters<typeof createInlineAuthProfileCreation>[0]);
+  controller.attachPanel(panel as unknown as Parameters<typeof controller.attachPanel>[0]); controller.handleCreateInline("authProfileId");
+  core.addProfile({ id: "e", name: "External", authType: "external", external: { version: 1, method: "password" } });
+  expect(panel.addSelectOption).toHaveBeenCalledWith("authProfileId", "e", expect.stringContaining("External Program"));
+  expect(core.listenerCount()).toBe(0);
+});

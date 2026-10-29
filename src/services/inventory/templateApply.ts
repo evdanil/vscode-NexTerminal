@@ -1,3 +1,4 @@
+import { externalAuthProfileUnsupportedReason } from "../../models/authProfile";
 import type {
   AuthProfile,
   DetachedServerOrigin,
@@ -686,13 +687,15 @@ export interface DesiredNonAuthFields {
  * §5.3 / §14 (PR-T3) reference-validation context for the two IPMI id fields,
  * the SAME skip-and-warn posture as the jump-host / auth-profile references.
  * `hasAuthProfile` resolves `ipmiAuthProfileId` against the live profile store
- * (dangling → dropped); `hasServer` resolves `ipmiGatewayServerId` against the
+ * (dangling → dropped); `authProfileUnsupportedReason` also excludes SSH-only
+ * credential sources. `hasServer` resolves `ipmiGatewayServerId` against the
  * set of servers live after this sync (reusing the proxy jump-host predicate).
  * The template names name the disposition in the house style. Absent ⇒ no IPMI
  * reference validation (legacy/test callers), matching `proxyRef`'s optionality.
  */
 export interface IpmiReferenceContext {
   hasAuthProfile: (profileId: string) => boolean;
+  authProfileUnsupportedReason?: (profileId: string) => string | undefined;
   hasServer: (serverId: string) => boolean;
   ipmiAuthProfileTemplateName: string | undefined;
   ipmiGatewayServerTemplateName: string | undefined;
@@ -774,7 +777,10 @@ export function composeDesiredFields(
   // jump-host / auth-profile skip-and-warn verbatim in spirit.
   if (winners.ipmiAuthProfileId !== undefined) {
     const value = winners.ipmiAuthProfileId.value;
-    if (ipmiRef !== undefined && !ipmiRef.hasAuthProfile(value)) {
+    const unsupported = ipmiRef?.authProfileUnsupportedReason?.(value);
+    if (unsupported) {
+      warnings.push(`Device template "${ipmiRef?.ipmiAuthProfileTemplateName ?? "?"}" — ${unsupported} The IPMI Auth Profile field was skipped.`);
+    } else if (ipmiRef !== undefined && !ipmiRef.hasAuthProfile(value)) {
       warnings.push(
         `Device template "${ipmiRef.ipmiAuthProfileTemplateName ?? "?"}" on "${ipmiRef.sourceName}" links an IPMI auth profile that no longer exists — the IPMI Auth Profile field was skipped.`
       );
@@ -1482,10 +1488,14 @@ export function planManualTemplateApply(ctx: ManualApplyContext): ManualApplyPla
     }
     return stats;
   };
+  const ipmiProfile = template.fields.ipmiAuthProfileId ? authProfile(template.fields.ipmiAuthProfileId.value) : undefined;
+  const ipmiUnsupported = externalAuthProfileUnsupportedReason(ipmiProfile, "ipmi");
   plan.ipmiAuthProfileId = applyIdField(
     "ipmiAuthProfileId",
-    (id) => authProfile(id) !== undefined,
-    `Device template "${template.name}" links an IPMI auth profile that no longer exists — the IPMI Auth Profile field was skipped.`
+    (id) => authProfile(id) !== undefined && externalAuthProfileUnsupportedReason(authProfile(id), "ipmi") === undefined,
+    ipmiUnsupported
+      ? `Device template "${template.name}" — ${ipmiUnsupported} The IPMI Auth Profile field was skipped.`
+      : `Device template "${template.name}" links an IPMI auth profile that no longer exists — the IPMI Auth Profile field was skipped.`
   );
   plan.ipmiGatewayServerId = applyIdField(
     "ipmiGatewayServerId",

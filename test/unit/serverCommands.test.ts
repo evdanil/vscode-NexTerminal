@@ -2179,6 +2179,46 @@ describe("deploy key command", () => {
     vi.mocked(vscode.window.withProgress as any).mockImplementation(async (_options: unknown, task: () => Promise<unknown>) => task());
   });
 
+  it.each(["external", "missing"])("refuses %s credentials before key filesystem and SSH side effects", async (kind) => {
+    const profile: AuthProfile = { id: "ap", name: "Program", authType: "external", external: { version: 1, method: "password" } };
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [makeServer({ authProfileId: "ap", username: "dormant" })], authProfiles: kind === "external" ? [profile] : [] });
+    const connect = vi.fn(); (ctx.sshFactory as any).connect = connect;
+    registerServerCommands(ctx); await registeredCommands.get("nexus.server.deployKey")!("srv-1");
+    expect(findLocalKeyPairs).not.toHaveBeenCalled(); expect(readFile).not.toHaveBeenCalled(); expect(generateKeyPair).not.toHaveBeenCalled();
+    expect(connect).not.toHaveBeenCalled(); expect(deployPublicKeyToRemote).not.toHaveBeenCalled(); expect(addOrUpdateServer).not.toHaveBeenCalled();
+  });
+
+  it.each(["existing", "generate"])("rechecks the source after the key picker before %s key side effects", async (selection) => {
+    const profile = makeAuthProfile({ id: "ap", authType: "password", username: "stored" });
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [makeServer({ authProfileId: "ap" })], authProfiles: [profile] });
+    const connect = vi.fn(); (ctx.sshFactory as any).connect = connect;
+    const keyPair = { name: "id_ed25519", publicKeyPath: "/keys/id.pub", privateKeyPath: "/keys/id" };
+    vi.mocked(findLocalKeyPairs).mockResolvedValue([keyPair]);
+    vi.mocked(vscode.window.showQuickPick as any).mockImplementationOnce(async () => {
+      await ctx.core.addOrUpdateAuthProfile({ id: "ap", name: "Program", authType: "external", external: { version: 1, method: "password" } });
+      return selection === "generate" ? { generate: true } : { keyPair };
+    });
+    registerServerCommands(ctx); await registeredCommands.get("nexus.server.deployKey")!("srv-1");
+    expect(readFile).not.toHaveBeenCalled(); expect(generateKeyPair).not.toHaveBeenCalled(); expect(connect).not.toHaveBeenCalled();
+    expect(addOrUpdateServer).not.toHaveBeenCalled(); expect(deployPublicKeyToRemote).not.toHaveBeenCalled();
+  });
+
+  it("rechecks after conversion confirmation before creating a key auth profile", async () => {
+    const profile = makeAuthProfile({ id: "ap", authType: "password", username: "stored" });
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers: [makeServer({ authProfileId: "ap" })], authProfiles: [profile] });
+    (ctx.sshFactory as any).connect = vi.fn(async () => ({ dispose: vi.fn() }));
+    vi.mocked(vscode.window.showQuickPick as any).mockResolvedValueOnce({ keyPair: { name: "key", publicKeyPath: "/keys/id.pub", privateKeyPath: "/keys/id" } });
+    vi.mocked(readFile).mockResolvedValue("ssh-ed25519 AAAA");
+    vi.mocked(vscode.window.showInformationMessage as any).mockImplementationOnce(async () => {
+      await ctx.core.addOrUpdateAuthProfile({ id: "ap", name: "Program", authType: "external", external: { version: 1, method: "password" } });
+      return "Use key auth profile";
+    });
+    const before = ctx.core.getSnapshot().authProfiles.length;
+    registerServerCommands(ctx); await registeredCommands.get("nexus.server.deployKey")!("srv-1");
+    expect(addOrUpdateServer).not.toHaveBeenCalled(); expect(ctx.core.getSnapshot().authProfiles).toHaveLength(before);
+    expect(vscode.window.showInputBox).not.toHaveBeenCalled();
+  });
+
   it("deploys selected key and converts a linked password-profile server to standalone key auth", async () => {
     const passwordProfile = makeAuthProfile({ id: "ap-pass", username: "profile-user", authType: "password" });
     const { ctx, addOrUpdateServer, secretDelete } = setupHarness({

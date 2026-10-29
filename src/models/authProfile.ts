@@ -32,6 +32,24 @@ export function isExternalAuthProfile(profile: AuthProfile | undefined): profile
   return profile?.authType === "external";
 }
 
+/** Fixed copy: unsupported consumers must never retrieve or guess an identity. */
+export function externalAuthProfileUnsupportedReason(
+  profile: AuthProfile | undefined,
+  consumer: "ipmi" | "key-deployment"
+): string | undefined {
+  if (!isExternalAuthProfile(profile)) return undefined;
+  return consumer === "ipmi"
+    ? "External programs support SSH only. Choose a stored IPMI auth profile, or unlink the IPMI Auth Profile."
+    : "Deploy SSH Key is unavailable with an External Program auth profile. Choose stored SSH credentials before deploying a key.";
+}
+
+export function keyDeploymentUnavailableReason(server: ServerConfig, profile: AuthProfile | undefined): string | undefined {
+  if (server.authProfileId && !profile) {
+    return "Deploy SSH Key is unavailable because the linked auth profile no longer exists. Choose an existing SSH auth profile, or unlink it before deploying a key.";
+  }
+  return externalAuthProfileUnsupportedReason(profile, "key-deployment");
+}
+
 export type AuthProfileOwnedCredentials = Partial<Pick<ServerConfig, "username" | "authType" | "keyPath">>;
 
 /** Static supplied values only. Dynamic ownership is a separate question. */

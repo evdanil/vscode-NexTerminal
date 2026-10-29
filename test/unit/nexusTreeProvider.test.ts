@@ -2115,3 +2115,22 @@ describe("NexusTreeProvider — the inline sync action on a source's target fold
     expect(folders.get("Lab")!.contextValue).toBe("nexus.folderWithServers");
   });
 });
+
+
+describe("external credential deployment menu availability", () => {
+  it.each(["external", "missing"])("keeps supported actions but excludes key deploy for %s SSH profiles", (kind) => {
+    const profile = { id: "auth", name: "Program", authType: "external", external: { version: 1, method: "password" } };
+    const provider = new NexusTreeProvider(noopCallbacks, () => true, () => true);
+    setTestSnapshot(provider, { ...emptySnapshot(), servers: [makeServer({ id: "server", authProfileId: "auth", ipmiHost: "192.0.2.2", origin: { sourceId: "inventory", externalId: "node", syncedAt: 1 } })], authProfiles: kind === "external" ? [profile] : [], inventorySources: [{ id: "inventory", providerId: "provider" }], serverStatus: new Map([["server", "stopped"]]) } as any);
+    const item = serverItemById(provider, "server");
+    expect(item.contextValue).toContain("noKeyDeployment");
+    const menu = packageJson.contributes.menus["view/item/context"] as Array<{ command: string; when: string }>;
+    for (const command of ["nexus.server.connect", "nexus.server.edit", "nexus.inventory.openWebConsole", "nexus.inventory.startNode"]) {
+      const entry = menu.find((m) => m.command === command && m.when.includes("viewItem =~"));
+      const pattern = entry?.when.match(/viewItem =~ \/(.*?)\//)?.[1];
+      expect(pattern, command).toBeDefined(); expect(new RegExp(pattern!).test(item.contextValue!)).toBe(true);
+    }
+    const deploy = menu.find((m) => m.command === "nexus.server.deployKey")!;
+    expect(new RegExp(deploy.when.match(/viewItem =~ \/(.*?)\//)![1]).test(item.contextValue!)).toBe(false);
+  });
+});

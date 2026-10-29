@@ -713,7 +713,7 @@ describe("nexus.server.runMacro — ${profile.username} and linked auth profiles
     expect(createdTerminals[0].sent).toEqual(["ipmitool -U admin sol activate\n"]);
   });
 
-  it("falls back to the server's username when the link resolves to no profile at all", async () => {
+  it("refuses a missing linked profile instead of falling back to the dormant server username", async () => {
     await setMacros([USERNAME_MACRO]);
     showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
 
@@ -721,7 +721,9 @@ describe("nexus.server.runMacro — ${profile.username} and linked auth profiles
       server: server({ username: "admin", authProfileId: "ap-gone" })
     });
 
-    expect(createdTerminals[0].sent).toEqual(["ipmitool -U admin sol activate\n"]);
+    expect(createdTerminals).toHaveLength(0);
+    expect(showErrorMessage.mock.calls[0][0]).toContain("no longer exists");
+    expect(showErrorMessage.mock.calls[0][0]).not.toContain("Add it in the server form");
   });
 
   it("checks the PROFILE's username against the charset, and refuses the run", async () => {
@@ -2175,4 +2177,56 @@ describe("nexus.server.runMacro — jump-host IPMI routing (issue #48 PR-C)", ()
       expect(IPMI_GATEWAY_INERT_CREDENTIALS_HINT).toContain("when authentication is enabled");
     });
   });
+});
+
+
+describe("external credential macro consumers", () => {
+  const external: AuthProfile = { id: "external", name: "Program", authType: "external", external: { version: 1, method: "password" } };
+  it.each(["localTerminal", "browser"] as const)("refuses an external username before %s dispatch", async (runTarget) => {
+    const ctx = contextWithAuthProfiles([external]);
+    const get = vi.fn(); ctx.secretVault = { get } as unknown as CommandContext["secretVault"];
+    await setMacros([{ id: "external-test", name: "Dynamic identity", text: runTarget === "browser" ? "https://${profile.host}/${profile.username}" : "echo ${profile.username}", runIn: runTarget }]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+    await runMacroOnServer(ctx, { server: server({ authProfileId: external.id, username: "dormant" }) });
+    expect(createdTerminals).toHaveLength(0); expect(openExternal).not.toHaveBeenCalled();
+    expect(connectServer).not.toHaveBeenCalled(); expect(get).not.toHaveBeenCalled(); expect(showInputBox).not.toHaveBeenCalled();
+    expect(showErrorMessage.mock.calls[0][0]).toContain("unavailable");
+    expect(showErrorMessage.mock.calls[0][0]).not.toContain("Add it in the server form");
+  });
+  it.each(["echo ${profile.host}", "echo $${profile.username}", "echo profile.username"])("allows static and literal text: %s", async (text) => {
+    await setMacros([{ id: "external-test", name: "Static facts", text, runIn: "localTerminal" }]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+    await runMacroOnServer(contextWithAuthProfiles([external]), { server: server({ authProfileId: external.id, username: "dormant" }) });
+    expect(createdTerminals).toHaveLength(1);
+    expect(createdTerminals[0].sent.join("")).not.toContain("dormant");
+    expect(createdTerminals[0].sent.join("")).toContain(text === "echo ${profile.host}" ? "10.1.2.3" : text.replace("$${", "${"));
+  });
+  it.each(["local", "ipmiGateway"] as const)("refuses external IPMI before %s macro side effects even without username tokens", async (route) => {
+    const ctx = contextWithAuthProfiles([external]); const get = vi.fn();
+    const gateway = server({ id: "gateway", name: "Gateway" });
+    const sendText = vi.fn(); const terminal = { name: "Gateway", sendText, show: vi.fn() };
+    (ctx.core as unknown as { getServer: (id: string) => ServerConfig }).getServer = () => gateway;
+    vi.spyOn(ctx.core, "getSnapshot").mockReturnValue({ activeSessions: [{ id: "session", serverId: gateway.id }], servers: [gateway] } as ReturnType<CommandContext["core"]["getSnapshot"]>);
+    ctx.sessionTerminals.set("session", terminal as unknown as Parameters<typeof ctx.sessionTerminals.set>[1]);
+    openTerminals = [terminal];
+    ctx.secretVault = { get } as unknown as CommandContext["secretVault"];
+    await setMacros([{ id: "external-test", name: "IPMI", text: "ipmitool -H ${profile.ipmiHost} power status", runIn: "localTerminal", route, provideIpmiCredentials: true }]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+    await runMacroOnServer(ctx, { server: server({ ipmiHost: "10.0.0.9", ipmiAuthProfileId: external.id, ...(route === "ipmiGateway" ? { ipmiGatewayServerId: gateway.id } : {}) }) });
+    expect(sendText).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalled(); expect(showInputBox).not.toHaveBeenCalled();
+    expect(createdTerminals).toHaveLength(0); expect(connectServer).not.toHaveBeenCalled(); expect(openExternal).not.toHaveBeenCalled();
+    expect(showErrorMessage).toHaveBeenCalledWith(expect.stringContaining("SSH only"), "Manage Auth Profiles");
+  });
+});
+
+it("browser IPMI username refuses before opening a URL or invoking a provider", async () => {
+  const external: AuthProfile = { id: "external", name: "Program", authType: "external", external: { version: 1, method: "password" } };
+  const ctx = contextWithAuthProfiles([external]); const resolve = vi.fn();
+  ctx.externalCredentialResolver = { resolve } as unknown as CommandContext["externalCredentialResolver"];
+  await setMacros([{ id: "browser", name: "BMC username", text: "https://${profile.ipmiHost}/${profile.ipmiUsername}", runIn: "browser" }]);
+  showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+  await runMacroOnServer(ctx, { server: server({ ipmiHost: "192.0.2.1", ipmiAuthProfileId: external.id }) });
+  expect(resolve).not.toHaveBeenCalled(); expect(openExternal).not.toHaveBeenCalled(); expect(createdTerminals).toHaveLength(0);
+  expect(showErrorMessage).toHaveBeenCalledWith(expect.stringContaining("SSH only"), "Manage Auth Profiles");
 });

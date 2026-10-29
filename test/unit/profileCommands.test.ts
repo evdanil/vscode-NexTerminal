@@ -349,6 +349,13 @@ describe("Profile Actions quick-pick — EVE node power (M5)", () => {
     return (mockShowQuickPick.mock.calls[0][0] as Array<{ label: string }>).map((p) => p.label);
   }
 
+  it("offers Deploy SSH Key only when the row has a supported static credential source", async () => {
+    expect(await labelsFor(serverItem({}))).toContain("Deploy SSH Key");
+    mockShowQuickPick.mockClear();
+    const external = serverItem({}); external.contextValue += ".noKeyDeployment";
+    expect(await labelsFor(external)).not.toContain("Deploy SSH Key");
+  });
+
   it("offers Start Node (not Stop) for a STOPPED EVE node (⊘ omitting Start leaves the click path showing only futile Connect/Test on a down node)", async () => {
     const labels = await labelsFor(serverItem({ hasNodeControl: true, status: "stopped" }));
     expect(labels).toContain("Start Node");

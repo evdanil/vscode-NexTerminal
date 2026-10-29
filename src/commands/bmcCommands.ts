@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import type { ServerConfig } from "../models/config";
 import { resolveBmcWebProtocol } from "../models/config";
 import { resolveProfileTokens } from "../services/profileTokens";
-import { profileTokenServer, resolveIpmiTerminalEnv } from "./ipmiCredentials";
+import { profileTokenServer, refuseUnsupportedIpmiProfile, resolveIpmiTerminalEnv } from "./ipmiCredentials";
 import {
   ipmiGatewayUnavailableMessage,
   openServerAdvancedEdit,
@@ -101,6 +101,7 @@ export async function connectBmcSol(ctx: CommandContext, arg?: unknown): Promise
   if (!server) {
     return;
   }
+  if (await refuseUnsupportedIpmiProfile(ctx, server)) return;
 
   // JUMP-HOST IPMI ROUTING (issue #48 PR-C, §3.6). When the target names a
   // reachable IPMI gateway, this command honors it exactly as a

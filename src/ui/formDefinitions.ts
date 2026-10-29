@@ -1000,7 +1000,7 @@ export function deviceTemplateFormDefinition(
         // PR-T3 review FIX 7 — the empty-list pointer: with `suppressCreate: true`
         // this select offers only "(None)" when no auth profiles exist, so Fill/
         // Override then guarantees the submit error with no route to the fix.
-        hint: "The saved credentials this template links as each server's BMC (IPMI) login — separate from the SSH auth profile above. Create profiles with Manage Auth Profiles."
+        hint: "The saved credentials this template links as each server's BMC (IPMI) login — separate from the SSH auth profile above. External programs support SSH only. Create stored profiles with Manage Auth Profiles."
       }),
       templateOverridePreemption("ipmiAuthProfileId"),
 
