@@ -1,3 +1,4 @@
+import { isExternalAuthProfile } from "../models/authProfile";
 import { randomUUID } from "node:crypto";
 import {
   cloneServerConfig,
@@ -622,6 +623,9 @@ export class NexusCore {
   }
 
   /**
+   * Refuses referenced external profiles before any mutation: their links must
+   * be explicitly removed/replaced so deletion cannot activate dormant auth.
+   * Stored profiles retain the reference-clearing behavior described below.
    * Deletes the profile and clears every reference to it, so nothing is left
    * pointing at an id that no longer resolves. Two kinds of holder:
    *
@@ -717,6 +721,14 @@ export class NexusCore {
    */
   public async removeAuthProfile(profileId: string): Promise<void> {
     const previousAuthProfile = this.authProfiles.get(profileId);
+    // Removing a dynamic source must never silently activate dormant credentials.
+    if (isExternalAuthProfile(previousAuthProfile) && (
+      [...this.servers.values()].some((server) => server.authProfileId === profileId || server.ipmiAuthProfileId === profileId) ||
+      [...this.inventorySources.values()].some((source) => source.authProfileId === profileId) ||
+      [...this.deviceTemplates.values()].some((template) => template.fields.authProfileId?.value === profileId || template.fields.ipmiAuthProfileId?.value === profileId)
+    )) {
+      throw new Error("This external auth profile is still referenced. Explicitly unlink or change its server, inventory source and device template references before deleting it.");
+    }
     const sourceChanges = [...this.inventorySources.values()]
       .filter((source) => source.authProfileId === profileId)
       .map((previous) => ({

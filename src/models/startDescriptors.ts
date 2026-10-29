@@ -1,3 +1,4 @@
+import { authProfileConnectionIdentity, isExternalAuthProfile } from "./authProfile";
 import type { AuthProfile, ProxyConfig, ResolvedTunnelConnectionMode, ServerConfig, TunnelProfile } from "./config";
 import {
   applyAuthProfile,
@@ -91,19 +92,16 @@ function transportDescriptor(
     server.port,
     server.addressless ?? false,
     resolveServerProtocol(server),
-    server.username,
-    server.authType,
+    isExternalAuthProfile(profile) ? null : server.username,
+    isExternalAuthProfile(profile) ? "external" : server.authType,
     // The key file is read only by a key login, judged on the EFFECTIVE auth type.
-    server.authType === "key" ? server.keyPath || null : null,
-    // The link itself, so switching profiles cancels; the profile's supplied
-    // fields are already folded into the values above. And which credential scope
-    // is actually selected, mirroring SilentAuthSshFactory.resolveServer: the
-    // profile-scoped password/passphrase key only when the link is set AND the
-    // profile was found, the server-scoped key otherwise. A profile that vanishes
-    // (another window between removeAuthProfile's two saves) can leave every
-    // effective field equal to the server's own yet switch the credential source.
+    !isExternalAuthProfile(profile) && server.authType === "key" ? server.keyPath || null : null,
+    // Preserve source intent even if its record disappears. External invocation
+    // changes cancel starts without exposing dormant fields or response values;
+    // the authentication boundary refuses unresolved sources before fallback.
     rawServer.authProfileId || null,
     profile !== undefined,
+    authProfileConnectionIdentity(profile),
     Boolean(server.legacyAlgorithms),
     proxyDescriptor(server.proxy, inputs, chain)
   ];

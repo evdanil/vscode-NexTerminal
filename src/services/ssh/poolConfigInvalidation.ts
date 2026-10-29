@@ -1,5 +1,5 @@
 import type { NexusCore } from "../../core/nexusCore";
-import { authProfileOwnedCredentials, proxyConfigsEqual, type AuthProfile, type ProxyConfig } from "../../models/config";
+import { authProfileConnectionIdentity, proxyConfigsEqual, type AuthProfile, type ProxyConfig } from "../../models/config";
 import { pooledConnectionParamsChanged, ridersFromIndex } from "./pooledConnectionParams";
 import { isPasswordBearingProxy, type PasswordBearingProxy } from "./proxyPasswordKeys";
 
@@ -8,7 +8,7 @@ function authProfileConnectionChanged(prev: AuthProfile | undefined, next: AuthP
   if (!prev || !next) {
     return prev !== next;
   }
-  return JSON.stringify(authProfileOwnedCredentials(prev)) !== JSON.stringify(authProfileOwnedCredentials(next));
+  return JSON.stringify(authProfileConnectionIdentity(prev)) !== JSON.stringify(authProfileConnectionIdentity(next));
 }
 
 /**

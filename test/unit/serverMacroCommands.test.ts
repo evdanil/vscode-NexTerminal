@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { AuthProfile, ServerConfig } from "../../src/models/config";
+import type { StoredAuthProfile, AuthProfile, ServerConfig } from "../../src/models/config";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 import type { CommandContext } from "../../src/commands/types";
 
@@ -119,7 +119,7 @@ function contextWithAuthProfiles(profiles: AuthProfile[]): CommandContext {
   } as unknown as Partial<CommandContext>);
 }
 
-function authProfile(overrides: Partial<AuthProfile> = {}): AuthProfile {
+function authProfile(overrides: Partial<StoredAuthProfile> = {}): StoredAuthProfile {
   return { id: "ap-1", name: "BMC accounts", username: "bmc-operator", authType: "password", ...overrides };
 }
 

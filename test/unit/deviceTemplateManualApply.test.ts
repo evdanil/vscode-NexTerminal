@@ -6,7 +6,7 @@ import {
   type ManualApplyPlan
 } from "../../src/services/inventory/templateApply";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
-import type { AuthProfile, ProxyConfig, ServerConfig, ServerOrigin } from "../../src/models/config";
+import type { StoredAuthProfile, AuthProfile, ProxyConfig, ServerConfig, ServerOrigin } from "../../src/models/config";
 import type { InventoryDevice, InventorySourceConfig, InventoryTree, TemplateRule } from "../../src/models/inventory";
 import type { DeviceTemplateProfile } from "../../src/models/deviceTemplate";
 
@@ -27,7 +27,7 @@ function template(fields: DeviceTemplateProfile["fields"], id = "tmpl-1", name =
   return { id, name, fields };
 }
 
-function authProfile(id: string, overrides: Partial<AuthProfile> = {}): AuthProfile {
+function authProfile(id: string, overrides: Partial<StoredAuthProfile> = {}): StoredAuthProfile {
   return { id, name: id.toUpperCase(), username: "svc", authType: "agent", ...overrides };
 }
 

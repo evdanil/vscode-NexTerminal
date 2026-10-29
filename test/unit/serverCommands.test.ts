@@ -12,7 +12,7 @@ import {
   syncProxyPasswordSecret,
   teardownServerRuntime
 } from "../../src/commands/serverCommands";
-import type { AuthProfile, ServerConfig, TunnelProfile } from "../../src/models/config";
+import type { StoredAuthProfile, AuthProfile, ServerConfig, TunnelProfile } from "../../src/models/config";
 import { authProfileOwnershipSignature } from "../../src/models/config";
 import { FolderTreeItem, ServerTreeItem } from "../../src/ui/nexusTreeProvider";
 import { readFile } from "node:fs/promises";
@@ -455,7 +455,7 @@ describe("connectServer — auto-start sweep compares the connect attempt's capt
     });
     return {
       ...c,
-      harnessProfile: (patch: Partial<AuthProfile>) =>
+      harnessProfile: (patch: Partial<StoredAuthProfile>) =>
         c.addOrUpdateAuthProfile({ id: "ap1", name: "AP", username: "ops", authType: "password", ...patch })
     };
   }
@@ -595,7 +595,7 @@ function makeTunnel(overrides: Partial<TunnelProfile> = {}): TunnelProfile {
   };
 }
 
-function makeAuthProfile(overrides: Partial<AuthProfile> = {}): AuthProfile {
+function makeAuthProfile(overrides: Partial<StoredAuthProfile> = {}): StoredAuthProfile {
   return {
     id: "ap1",
     name: "Prod Auth",

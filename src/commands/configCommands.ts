@@ -1,3 +1,4 @@
+import { authProfileConnectionIdentity, isExternalAuthProfile } from "../models/authProfile";
 import { createHash, randomUUID } from "node:crypto";
 import { isIP } from "node:net";
 import { chmod } from "node:fs/promises";
@@ -1600,6 +1601,7 @@ function sameProxy(a: ProxyConfig | null | undefined, b: ProxyConfig | null | un
 
 function effectiveSshAuthIdentity(server: ServerConfig, profiles: ReadonlyMap<string, AuthProfile>): string {
   const profile = server.authProfileId ? profiles.get(server.authProfileId) : undefined;
+  if (isExternalAuthProfile(profile)) return JSON.stringify(authProfileConnectionIdentity(profile));
   const owned = authProfileOwnedCredentials(profile);
   const authType = owned.authType ?? server.authType;
   return JSON.stringify([

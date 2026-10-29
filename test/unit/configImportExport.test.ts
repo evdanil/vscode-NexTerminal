@@ -170,7 +170,7 @@ import { INVALID_FOLDER_PATH_MESSAGE } from "../../src/utils/folderPaths";
 import { getAssignedBinding } from "../../src/macroBindingHelpers";
 import { isValidDetachedServerOrigin, validateServerConfig } from "../../src/utils/validation";
 import type { SecretVault } from "../../src/services/ssh/contracts";
-import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
+import type { StoredAuthProfile, AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 import { inventorySecretKey, type InventorySourceConfig } from "../../src/models/inventory";
 import { EVE_NG_PROVIDER_ID, EVE_NG_STATUS_POLL_FIELD_ID } from "../../src/services/inventory/providers/eveNgProvider";
@@ -244,7 +244,7 @@ function makeLocalShellProfile(overrides: Partial<LocalShellProfile> = {}): Loca
   };
 }
 
-function makeAuthProfile(overrides: Partial<AuthProfile> = {}): AuthProfile {
+function makeAuthProfile(overrides: Partial<StoredAuthProfile> = {}): StoredAuthProfile {
   return {
     id: "ap1",
     name: "Prod Auth",

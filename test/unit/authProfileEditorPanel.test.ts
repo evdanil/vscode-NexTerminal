@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { NexusCore } from "../../src/core/nexusCore";
-import type { AuthProfile } from "../../src/models/config";
+import type { StoredAuthProfile, AuthProfile } from "../../src/models/config";
 import type { InventorySourceConfig } from "../../src/models/inventory";
 import { authProfilePassphraseSecretKey, authProfilePasswordSecretKey } from "../../src/services/ssh/silentAuth";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
@@ -62,7 +62,7 @@ function makeVault(initialSecrets: Record<string, string> = {}) {
   };
 }
 
-function makeAuthProfile(overrides: Partial<AuthProfile> = {}): AuthProfile {
+function makeAuthProfile(overrides: Partial<StoredAuthProfile> = {}): StoredAuthProfile {
   return {
     id: "ap1",
     name: "Prod Auth",

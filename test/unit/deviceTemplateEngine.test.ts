@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { computeSyncPlan, type InventorySyncPlan } from "../../src/services/inventory/syncEngine";
 import { applyTemplateMatrix, clearTemplatedStamps } from "../../src/services/inventory/templateApply";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
-import type { AuthProfile, ProxyConfig, ServerConfig, ServerOrigin } from "../../src/models/config";
+import type { StoredAuthProfile, AuthProfile, ProxyConfig, ServerConfig, ServerOrigin } from "../../src/models/config";
 import type { InventoryDevice, InventorySourceConfig, InventorySourceDefaultRoute, InventoryTree, TemplateRule } from "../../src/models/inventory";
 import type { DeviceTemplateProfile } from "../../src/models/deviceTemplate";
 
@@ -88,7 +88,7 @@ function rule(templateId: string, overrides: Partial<TemplateRule> = {}): Templa
   return { id: `rule-${templateId}`, templateId, ...overrides };
 }
 
-function authProfile(id: string, overrides: Partial<AuthProfile> = {}): AuthProfile {
+function authProfile(id: string, overrides: Partial<StoredAuthProfile> = {}): StoredAuthProfile {
   return { id, name: id.toUpperCase(), username: "svc", authType: "agent", ...overrides };
 }
 

@@ -1,3 +1,4 @@
+import { isExternalAuthProfile } from "../../models/authProfile";
 import type { Duplex } from "node:stream";
 import type { AuthProfile, ProxyConfig, ServerConfig } from "../../models/config";
 import { applyAuthProfile } from "../../models/config";
@@ -327,7 +328,7 @@ export class SilentAuthSshFactory implements SshFactory {
     legacyServerPassphraseKey?: string;
     profileScoped: boolean;
   } {
-    if (!server.authProfileId || !this.authProfileLookup) {
+    if (!server.authProfileId) {
       return {
         resolved: server,
         passwordKey: passwordSecretKey(server.id),
@@ -335,14 +336,14 @@ export class SilentAuthSshFactory implements SshFactory {
         profileScoped: false
       };
     }
-    const profile = this.authProfileLookup(server.authProfileId);
+    const profile = this.authProfileLookup?.(server.authProfileId);
     if (!profile) {
-      return {
-        resolved: server,
-        passwordKey: passwordSecretKey(server.id),
-        passphraseKey: passphraseSecretKey(server.id),
-        profileScoped: false
-      };
+      throw new Error("The linked auth profile is unavailable. Open Settings → Auth Profiles to configure it, or explicitly unlink it before connecting.");
+    }
+    // Until the external runtime is wired, never interpret absent static values
+    // as permission to read dormant server/profile secrets or use its SSH agent.
+    if (isExternalAuthProfile(profile)) {
+      throw new Error("External credential authentication is unavailable in this build. Open Settings → Auth Profiles to choose a supported source.");
     }
     // REVIEW FINDING (P2) — only the fields the profile actually SUPPLIES are
     // taken over (authProfileOwnedCredentials, models/config.ts); the server

@@ -1,3 +1,4 @@
+import { isPlainCredentialConfig, validateExternalCredentialInvocation } from "../models/authProfile";
 import type {
   AuthProfile,
   DetachedServerOrigin,
@@ -888,6 +889,17 @@ export function validateAuthProfile(item: unknown): item is AuthProfile {
     return false;
   }
   const obj = item as Record<string, unknown>;
+  if (obj.authType === "external") {
+    if (!isPlainCredentialConfig(obj) || Object.keys(obj).some((key) => !["id", "name", "authType", "external"].includes(key)) ||
+      !isNonEmptyString(obj.id) || !isNonEmptyString(obj.name) ||
+      "username" in obj || "keyPath" in obj || !isPlainCredentialConfig(obj.external)) return false;
+    const external = obj.external;
+    return Object.keys(external).every((key) => ["version", "method", "invocation"].includes(key)) &&
+      external.version === 1 && (external.method === "password" || external.method === "key") &&
+      (!Object.hasOwn(external, "invocation") || validateExternalCredentialInvocation(external.invocation));
+  }
+  // An external payload must never be reinterpreted as a legacy credential source.
+  if ("external" in obj) return false;
   if (
     !(
       isNonEmptyString(obj.id) &&

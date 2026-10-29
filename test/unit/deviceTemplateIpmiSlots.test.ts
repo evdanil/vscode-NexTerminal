@@ -9,7 +9,7 @@ import {
   type TemplatableField
 } from "../../src/services/inventory/templateApply";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
-import {
+import { type StoredAuthProfile,
   templatedStampsEqual,
   cloneServerConfig,
   type AuthProfile,
@@ -90,7 +90,7 @@ function rule(templateId: string, overrides: Partial<TemplateRule> = {}): Templa
   return { id: `rule-${templateId}`, templateId, ...overrides };
 }
 
-function authProfile(id: string, overrides: Partial<AuthProfile> = {}): AuthProfile {
+function authProfile(id: string, overrides: Partial<StoredAuthProfile> = {}): StoredAuthProfile {
   return { id, name: id.toUpperCase(), username: "svc", authType: "agent", ...overrides };
 }
 

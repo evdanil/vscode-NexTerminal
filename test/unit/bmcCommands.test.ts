@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { AuthProfile, ServerConfig } from "../../src/models/config";
+import type { StoredAuthProfile, AuthProfile, ServerConfig } from "../../src/models/config";
 import type { CommandContext } from "../../src/commands/types";
 
 /**
@@ -90,7 +90,7 @@ function server(overrides: Partial<ServerConfig> = {}): ServerConfig {
   };
 }
 
-function authProfile(overrides: Partial<AuthProfile> = {}): AuthProfile {
+function authProfile(overrides: Partial<StoredAuthProfile> = {}): StoredAuthProfile {
   return { id: "ap-bmc", name: "BMC accounts", username: "bmc-operator", authType: "password", ...overrides };
 }
 
