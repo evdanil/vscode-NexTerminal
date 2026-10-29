@@ -3,7 +3,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const [mode, control] = process.argv.slice(2);
 fs.appendFileSync(control, `${process.pid}\n`);
-const valid = () => process.stdout.write(JSON.stringify({ version: 1, username: "fixture", password: "synthetic-value" }));
+const valid = (done) => process.stdout.write(JSON.stringify({ version: 1, username: "fixture", password: "synthetic-value" }), done);
 switch (mode) {
   case "valid": valid(); break;
   case "malformed": process.stdout.write("{invalid"); break;
@@ -16,10 +16,16 @@ switch (mode) {
   case "inherited":
   case "escaped": {
     const descendant = spawn(process.execPath, [path.join(__dirname, "descendant.cjs"), control], {
-      stdio: ["ignore", "inherit", "inherit"], detached: mode === "escaped", windowsHide: true
+      stdio: ["ignore", "inherit", "inherit", "ipc"],
+      // Windows libuv kills non-detached children when their parent exits. Detach
+      // this fixture there so it actually retains pipes; POSIX keeps its owned group.
+      detached: mode === "escaped" || (mode === "inherited" && process.platform === "win32"), windowsHide: true
+    });
+    descendant.once("message", () => {
+      descendant.disconnect();
+      if (mode !== "waiting") { descendant.unref(); valid(() => process.exit(0)); }
     });
     if (mode === "waiting") setInterval(() => {}, 1000);
-    else { descendant.unref(); valid(); setTimeout(() => process.exit(0), 100); }
     break;
   }
   default: process.exitCode = 2;

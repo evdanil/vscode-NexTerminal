@@ -1,20 +1,32 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { createExternalCredentialProcessRunner } from "../../src/services/credentials/externalCredentialProcess";
 
-async function fixture(mode: string, check: (result: Buffer | Error, pids: number[]) => void | Promise<void>, timeoutMs = 1500) {
+async function fixture(mode: string, check: (result: Buffer | Error, pids: number[], observation: { parentExited: boolean; pipesOpenAtExit: boolean }) => void | Promise<void>, timeoutMs = 1500) {
   const directory = mkdtempSync(join(tmpdir(), "nexus-credential-test-"));
   const control = join(directory, "pids");
   try {
-    const runner = createExternalCredentialProcessRunner({ limits: { timeoutMs } });
+    const observation = { parentExited: false, pipesOpenAtExit: false };
+    let providerSpawned = false;
+    const runner = createExternalCredentialProcessRunner({ limits: { timeoutMs }, spawn: (executable, args, options) => {
+      const child = spawn(executable, args, options);
+      if (!providerSpawned) {
+        providerSpawned = true;
+        child.once("exit", () => {
+          observation.parentExited = true;
+          observation.pipesOpenAtExit = !!child.stdout && !child.stdout.destroyed && !child.stdout.readableEnded;
+        });
+      }
+      return child;
+    } });
     const result = await runner({ executable: process.execPath, args: [resolve(__dirname, "../fixtures/externalCredentials/provider.cjs"), mode, control] }, "password",
       { signal: new AbortController().signal, isCurrent: () => true }).catch((error: Error) => error);
     try {
       const pids = readFileSync(control, "utf8").trim().split("\n").map(Number);
-      await check(result, pids);
+      await check(result, pids, observation);
     } finally { if (Buffer.isBuffer(result)) result.fill(0); }
   } finally {
     // Fixture control files contain only synthetic PIDs, never credentials.
@@ -53,7 +65,18 @@ describe("real external credential process", () => {
       expect(pids.filter(alive)).toEqual([]);
     }, 1500);
   });
-  it.each(["inherited", "escaped"])("rejects %s pipes after parent exit without accepting partial output", async mode => { await fixture(mode, result => expect(result).toMatchObject({ code: "exited" })); });
+  it.each(["inherited", "escaped"])("rejects %s pipes after parent exit without accepting partial output", async mode => {
+    await fixture(mode, (result, pids, observation) => {
+      expect(pids).toHaveLength(2);
+      expect(observation).toEqual({ parentExited: true, pipesOpenAtExit: true });
+      expect(result).toMatchObject({ code: "exited" });
+      if (process.platform === "win32") {
+        // The runner must leave the exited parent's PID alone; fixture cleanup owns the survivor.
+        expect(() => process.kill(pids[0], 0)).toThrow();
+        expect(() => process.kill(pids[1], 0)).not.toThrow();
+      }
+    });
+  });
   it.skipIf(process.platform === "win32")("rejects headerless text without executing its shell side effect", async () => {
     const directory = mkdtempSync(join(tmpdir(), "nexus-credential-header-"));
     const executable = join(directory, "provider"); const marker = join(directory, "executed");
