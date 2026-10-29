@@ -45,7 +45,7 @@ export function renderAuthProfileEditorHtml(
   const authTypeOptionsHtml = authTypeOptions
     .map(
       (o) =>
-        `<div class="custom-select-option${o.value === authTypeValue ? " selected" : ""}" data-value="${o.value}">${escapeHtml(o.label)}</div>`
+        `<div class="custom-select-option${o.value === authTypeValue ? " selected" : ""}" data-value="${o.value}" id="authtype-option-${o.value}" role="option" aria-selected="${o.value === authTypeValue ? "true" : "false"}">${escapeHtml(o.label)}</div>`
     )
     .join("\n          ");
   const authTypeTriggerLabel = authTypeOptions.find((o) => o.value === authTypeValue)?.label ?? "Unknown authentication";
@@ -129,13 +129,13 @@ export function renderAuthProfileEditorHtml(
   </div>
 
   <div class="form-group">
-    <label>Authentication</label>
-    <div class="custom-select" id="authtype-selector">
+    <label id="authtype-label">Authentication</label>
+    <div class="custom-select" id="authtype-selector" data-select-only="true">
       <input type="hidden" id="authtype-select-value" value="${escapeHtml(authTypeValue)}" />
-      <div class="custom-select-trigger" tabindex="0">
-        <span class="custom-select-text">${escapeHtml(authTypeTriggerLabel)}</span>
+      <div class="custom-select-trigger" tabindex="0" role="combobox" aria-haspopup="listbox" aria-expanded="false" aria-controls="authtype-listbox" aria-labelledby="authtype-label authtype-value">
+        <span class="custom-select-text" id="authtype-value">${escapeHtml(authTypeTriggerLabel)}</span>
       </div>
-      <div class="custom-select-dropdown">
+      <div class="custom-select-dropdown" id="authtype-listbox" role="listbox" aria-labelledby="authtype-label">
         ${authTypeOptionsHtml}
       </div>
     </div>
@@ -145,12 +145,12 @@ export function renderAuthProfileEditorHtml(
     <p class="hint">The program supplies the username and credentials when a new SSH connection signs in.</p>
     <div class="form-group">
       <label id="external-method-label">Authentication Method</label>
-      <div class="custom-select" id="external-method-selector">
+      <div class="custom-select" id="external-method-selector" data-select-only="true">
         <input type="hidden" id="external-method" value="${external?.method ?? "password"}" />
-        <div class="custom-select-trigger" tabindex="0" aria-labelledby="external-method-label" aria-describedby="external-method-hint"><span class="custom-select-text">${external?.method === "key" ? "Private Key" : "Password"}</span></div>
-        <div class="custom-select-dropdown">
-          <div class="custom-select-option${external?.method !== "key" ? " selected" : ""}" data-value="password">Password</div>
-          <div class="custom-select-option${external?.method === "key" ? " selected" : ""}" data-value="key">Private Key</div>
+        <div class="custom-select-trigger" tabindex="0" role="combobox" aria-haspopup="listbox" aria-expanded="false" aria-controls="external-method-listbox" aria-labelledby="external-method-label external-method-value" aria-describedby="external-method-hint"><span class="custom-select-text" id="external-method-value">${external?.method === "key" ? "Private Key" : "Password"}</span></div>
+        <div class="custom-select-dropdown" id="external-method-listbox" role="listbox" aria-labelledby="external-method-label">
+          <div class="custom-select-option${external?.method !== "key" ? " selected" : ""}" data-value="password" id="external-method-option-password" role="option" aria-selected="${external?.method !== "key" ? "true" : "false"}">Password</div>
+          <div class="custom-select-option${external?.method === "key" ? " selected" : ""}" data-value="key" id="external-method-option-key" role="option" aria-selected="${external?.method === "key" ? "true" : "false"}">Private Key</div>
         </div>
       </div>
       <div class="hint" id="external-method-hint">Nexus adds <span id="external-method-flag">${external?.method === "key" ? "--pkey" : "--pass"}</span>. Private keys supplied by the program must be unencrypted.</div>
@@ -273,7 +273,7 @@ export function renderAuthProfileEditorHtml(
           var group = document.getElementById(id);
           var active = group.classList.contains("visible");
           group.querySelectorAll("input, textarea, button").forEach(function(control) { control.disabled = !active; });
-          group.querySelectorAll(".custom-select-trigger").forEach(function(control) { control.tabIndex = active ? 0 : -1; });
+          group.querySelectorAll(".custom-select-trigger").forEach(function(control) { control.tabIndex = active ? 0 : -1; control.setAttribute("aria-disabled", active ? "false" : "true"); });
         });
         document.getElementById("external-method-flag").textContent = document.getElementById("external-method").value === "key" ? "--pkey" : "--pass";
       }
@@ -392,6 +392,10 @@ export function renderAuthProfileEditorHtml(
       // Messages from host
       window.addEventListener("message", function(event) {
         var msg = event.data;
+        if (msg.type === "requestProfileSwitch" && typeof msg.targetValue === "string") {
+          if (dirty) vscode.postMessage({ type: "confirmSwitch", targetValue: msg.targetValue });
+          else vscode.postMessage({ type: "selectProfile", value: msg.targetValue });
+        }
         if (msg.type === "externalExecutableResult" && typeof msg.path === "string") { document.getElementById("external-executable").value = msg.path; markDirty(); }
         if (msg.type === "externalApprovalsStatus") document.getElementById("session-approvals-status").textContent = msg.message;
         if (msg.type === "actionError") document.getElementById("action-error").textContent = msg.message;

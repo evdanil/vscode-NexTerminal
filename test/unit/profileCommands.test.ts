@@ -190,6 +190,27 @@ describe("openUnifiedForm test action", () => {
     })).rejects.toThrow(/required local shell fields/i);
   });
 
+  it("tests an external-linked omitted-field payload and refuses changed invocation identity", async () => {
+    const ctx = makeCtx();
+    const external = { id: "external", name: "Program", authType: "external", external: { version: 1, method: "password", invocation: { executable: "/provider", args: [] } } };
+    ctx.core.getAuthProfile.mockReturnValue(external);
+    openUnifiedForm(ctx);
+    const handlers = mockWebviewOpen.mock.calls.at(-1)![2] as { onAutofill(key: string, value: string): Promise<unknown>; onTest(values: FormValues): Promise<void> };
+    await handlers.onAutofill("authProfileId", external.id);
+    const { formValuesToServer } = await vi.importActual<typeof import("../../src/commands/serverCommands")>("../../src/commands/serverCommands");
+    mockFormValuesToServer.mockImplementationOnce(formValuesToServer);
+    const payload = { profileType: "ssh", name: "Server", host: "example.com", port: 22, authProfileId: external.id };
+    await handlers.onTest(payload);
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.server.testConnection", { server: expect.objectContaining({ authProfileId: external.id, username: "root", authType: "password" }) });
+    expect(mockShowWarningMessage).not.toHaveBeenCalled();
+    mockExecuteCommand.mockClear();
+    ctx.core.getAuthProfile.mockReturnValue({ ...external, external: { ...external.external, invocation: { executable: "/changed", args: [] } } });
+    await handlers.onTest(payload);
+    expect(mockExecuteCommand).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenLastCalledWith(expect.stringContaining("Re-select"));
+    expect(mockShowWarningMessage.mock.calls.flat().join(" ")).not.toContain("Username");
+  });
+
   it("preserves SSH and Serial test actions from the generic form", async () => {
     openUnifiedForm(makeCtx());
     const { onTest } = latestFormOptions();

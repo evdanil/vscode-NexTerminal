@@ -38,6 +38,10 @@ export function baseWebviewJs(): string {
       wrapper.classList.toggle('open', !!open);
       var trigger = wrapper.querySelector('.custom-select-trigger');
       if (trigger) trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (!open && wrapper.dataset.selectOnly === 'true') {
+        trigger.removeAttribute('aria-activedescendant');
+        wrapper.querySelectorAll('.custom-select-option').forEach(function(opt) { opt.classList.remove('highlighted'); });
+      }
     }
 
     document.addEventListener('click', function(e) {
@@ -66,6 +70,18 @@ export function baseWebviewJs(): string {
           // wrapper into type-to-filter mode, so the two paths never diverge on
           // which is which.
           var filterInput = wrapper.querySelector('.custom-select-filter');
+          // Opt-in select-only comboboxes retain DOM focus on the trigger while
+          // aria-activedescendant exposes the highlighted, not yet committed option.
+          var selectOnly = wrapper.dataset.selectOnly === 'true';
+          var activeOption;
+          function activateOption(opt) {
+            if (!opt) return;
+            wrapper.querySelectorAll('.custom-select-option').forEach(function(item) { item.classList.remove('highlighted'); });
+            activeOption = opt;
+            opt.classList.add('highlighted');
+            trigger.setAttribute('aria-activedescendant', opt.id);
+            if (opt.scrollIntoView) opt.scrollIntoView({ block: 'nearest' });
+          }
 
           function chooseOption(opt) {
             if (onOptionClick) {
@@ -84,6 +100,7 @@ export function baseWebviewJs(): string {
               if (openSelects[j] !== wrapper) setCustomSelectOpen(openSelects[j], false);
             }
             setCustomSelectOpen(wrapper, open);
+            if (open && selectOnly) activateOption(wrapper.querySelector('.custom-select-option.selected') || wrapper.querySelector('.custom-select-option'));
             if (open && filterInput) {
               resetFilter();
               filterInput.focus();
@@ -95,6 +112,26 @@ export function baseWebviewJs(): string {
             openSelect(!wrapper.classList.contains('open'));
           });
           trigger.addEventListener('keydown', function(e) {
+            if (selectOnly) {
+              var isOpen = wrapper.classList.contains('open');
+              var opts = Array.from(wrapper.querySelectorAll('.custom-select-option'));
+              if (e.key === 'Escape') { e.preventDefault(); setCustomSelectOpen(wrapper, false); }
+              else if (e.key === 'Tab') { if (isOpen && activeOption) chooseOption(activeOption); }
+              else if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                if (isOpen && activeOption) chooseOption(activeOption); else openSelect(true);
+              } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].indexOf(e.key) !== -1) {
+                e.preventDefault();
+                if (!isOpen) openSelect(true);
+                if (e.key === 'Home') activateOption(opts[0]);
+                else if (e.key === 'End') activateOption(opts[opts.length - 1]);
+                else if (isOpen) activateOption(opts[Math.max(0, Math.min(opts.length - 1, opts.indexOf(activeOption) + (e.key === 'ArrowDown' ? 1 : -1)))]);
+              } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                var match = opts.find(function(opt) { return opt.textContent.trim().toLowerCase().startsWith(e.key.toLowerCase()); });
+                if (match) { e.preventDefault(); if (!isOpen) openSelect(true); activateOption(match); }
+              }
+              return;
+            }
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault();
               openSelect(!wrapper.classList.contains('open'));

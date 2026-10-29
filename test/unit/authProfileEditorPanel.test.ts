@@ -110,6 +110,28 @@ describe("AuthProfileEditorPanel", () => {
     vi.resetModules();
   });
 
+  it("preserves same-id repair drafts and asks the webview before a different-id switch", async () => {
+    const core = await makeCore([makeAuthProfile(), makeAuthProfile({ id: "ap2", name: "Second" })]);
+    const { AuthProfileEditorPanel } = await import("../../src/ui/authProfileEditorPanel");
+    AuthProfileEditorPanel.open(core, undefined, "ap1");
+    const vscode = await import("vscode");
+    const panel = vi.mocked(vscode.window.createWebviewPanel).mock.results.at(-1)!.value;
+    panel.webview.html = "dirty draft sentinel";
+    AuthProfileEditorPanel.open(core, undefined, "ap1");
+    expect(panel.webview.html).toBe("dirty draft sentinel");
+    expect(mockPostMessage).not.toHaveBeenCalled();
+    AuthProfileEditorPanel.open(core, undefined, "ap2");
+    expect(mockPostMessage).toHaveBeenLastCalledWith({ type: "requestProfileSwitch", targetValue: "ap2" });
+    expect(panel.webview.html).toBe("dirty draft sentinel");
+    mockShowWarningMessage.mockResolvedValueOnce(undefined);
+    await onDidReceiveMessageHandler!({ type: "confirmSwitch", targetValue: "ap2" });
+    expect(panel.webview.html).toBe("dirty draft sentinel");
+    mockShowWarningMessage.mockResolvedValueOnce("Discard");
+    await onDidReceiveMessageHandler!({ type: "confirmSwitch", targetValue: "ap2" });
+    expect(panel.webview.html).toContain('value="ap2"');
+    expect(panel.webview.html).not.toBe("dirty draft sentinel");
+  });
+
   async function openPanel(
     authProfiles: AuthProfile[] = [],
     secrets: Record<string, string> = {},

@@ -101,9 +101,8 @@ export class AuthProfileEditorPanel {
     const id = profileId !== undefined && !missing ? profileId : null;
     if (AuthProfileEditorPanel.instance) {
       AuthProfileEditorPanel.instance.panel.reveal();
-      if (id !== null || missing) {
-        AuthProfileEditorPanel.instance.selectedId = id;
-        AuthProfileEditorPanel.instance.render();
+      if ((id !== null || missing) && AuthProfileEditorPanel.instance.selectedId !== id) {
+        void AuthProfileEditorPanel.instance.panel.webview.postMessage({ type: "requestProfileSwitch", targetValue: id ?? "__new__" });
       }
       return;
     }

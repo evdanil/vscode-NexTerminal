@@ -30,6 +30,15 @@ function editor() {
 }
 
 describe("external auth editor actual script", () => {
+  it("routes repair navigation through the existing dirty-switch decision", () => {
+    const h = editor();
+    h.deliver({ type: "requestProfileSwitch", targetValue: "ap2" });
+    expect(h.posted.pop()).toEqual({ type: "selectProfile", value: "ap2" });
+    h.field("profile-name").value = "Unsaved"; h.field("profile-name").dispatch("input");
+    h.deliver({ type: "requestProfileSwitch", targetValue: "ap3" });
+    expect(h.posted.pop()).toEqual({ type: "confirmSwitch", targetValue: "ap3" });
+    expect(h.field("profile-name").value).toBe("Unsaved");
+  });
   it("submits only active external fields and preserves exact argument bytes", () => {
     const h = editor(); h.field("profile-name").value = "Program"; h.field("profile-username").value = "dormant"; h.field("profile-password").value = "secret";
     h.choose("authtype-selector", "external"); h.field("external-executable").value = "/provider"; h.field("external-arguments").value = 'a "quote"\nC:\\path';

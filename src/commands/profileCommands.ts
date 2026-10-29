@@ -337,7 +337,18 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
       } else if (values.profileType === "localShell" || values.profileType === "localServer") {
         return;
       } else {
-        const draft = formValuesToServer(values);
+        const linkedProfile = typeof values.authProfileId === "string" ? ctx.core.getAuthProfile(values.authProfileId) : undefined;
+        if (isExternalAuthProfile(linkedProfile) || renderedExternalIdentity?.id === values.authProfileId && renderedExternalIdentity !== undefined) {
+          if (renderedExternalIdentity?.id !== values.authProfileId || renderedExternalIdentity?.identity !== JSON.stringify(authProfileConnectionIdentity(linkedProfile))) {
+            void vscode.window.showWarningMessage("The external auth profile changed while this form was open. Re-select it in Auth Profile, then test again.");
+            return;
+          }
+        }
+        if (values.authProfileId && !linkedProfile) {
+          void vscode.window.showWarningMessage(MISSING_AUTH_PROFILE_MESSAGE);
+          return;
+        }
+        const draft = formValuesToServer(externalServerFormValues(values, linkedProfile));
         if (!draft) {
           void vscode.window.showWarningMessage("Fill in the required fields (Name, Host, Username) before testing.");
           return;
