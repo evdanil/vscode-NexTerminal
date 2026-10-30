@@ -68,6 +68,8 @@ Manage profiles from a dedicated editor panel accessible via the Settings tree o
 
 ## External Program Credentials
 
+For a worked vault integration, see [1Password settings and provider script](1password.md).
+
 Choose **Settings → Auth Profiles → New Profile → Authentication: External Program**, then **Authentication Method: Password** or **Private Key**. Enter an absolute **Executable** path and optional **Arguments**, one argument per line. Select that profile on the server under **Advanced → Auth Profile**, or apply it to a folder, inventory source, or device template. Saving, selecting, importing, previewing and syncing these links do not retrieve credentials or grant execution approval.
 
 Use **SSH Agent** when your vault already provides an agent: signing stays with the agent. Use **External Program** when a noninteractive program must return a username plus a password or private key for each new SSH authentication. Nexus does not integrate a particular vault CLI; your wrapper selects the vault item and converts its response to the protocol below. Unlock/sign in to the vault outside this protocol first.
