@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.8.306] — 2026-10-30
+
+### Added
+
+- **External vault credentials for SSH**, with session approval, bounded provider execution, shared terminal/SFTP/tunnel support, and configuration-only inventory assignment. Includes 1Password, HashiCorp Vault, AWS Secrets Manager and Azure Key Vault examples and guidance for assigning credential groups across a fleet. This publishes the feature described under 2.8.305 below; that release attempt was stopped before publication.
+
+### Fixed
+
+- **Cancelled or timed-out external providers cannot leave a same-process-group child running after the parent exits.** POSIX cleanup completes the required process-group escalation before releasing the attempt.
+- **Vault example scripts package successfully on Open VSX.** Equivalent credential-field selection avoids a secret-scanner false positive without suppressing scanning or changing the provider response.
+- **SSH integration tests use a valid deterministic OpenSSH fixture**, avoiding an intermittent upstream key-generator defect for Ed25519 public keys beginning with a zero byte.
+
+### Security
+
+- Update the development dependency `qs` to 6.17.1 through the dependency security update.
+
 ## [2.8.305] — 2026-10-25
 
 ### Added
