@@ -32,6 +32,11 @@ export function isExternalAuthProfile(profile: AuthProfile | undefined): profile
   return profile?.authType === "external";
 }
 
+/** Display only: dynamic or unresolved sources must never expose dormant accounts. */
+export function serverAccountPrefixForDisplay(server: ServerConfig, profile: AuthProfile | undefined): string {
+  return isExternalAuthProfile(profile) || (server.authProfileId && !profile) ? "" : `${server.username}@`;
+}
+
 /** Fixed copy: unsupported consumers must never retrieve or guess an identity. */
 export function externalAuthProfileUnsupportedReason(
   profile: AuthProfile | undefined,

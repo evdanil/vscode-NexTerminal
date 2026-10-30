@@ -314,6 +314,46 @@ describe("Containerlab activation", () => {
     expect(harness.executor.inspect).not.toHaveBeenCalled();
   });
 
+  it("invalidates background approval after an external provider invocation changes", async () => {
+    const profile = { id: "external", name: "Provider", authType: "external" as const,
+      external: { version: 1 as const, method: "password" as const, invocation: { executable: "/provider", args: ["a"] } } };
+    const harness = await makeHarness({ beforeController: async (core) => {
+      await core.addOrUpdateAuthProfile(profile);
+      await core.addOrUpdateServer({ ...sshServer("lab-host", "lab.example.test"), authProfileId: profile.id });
+      await core.addOrUpdateInventorySource(makeSource(REMOTE_VALUES));
+    } });
+    await harness.controller.inspect(harness.config, context(harness.source, "sync"));
+    await harness.core.addOrUpdateAuthProfile({ ...profile, external: { ...profile.external, invocation: { executable: "/provider", args: ["b"] } } });
+    vi.mocked(harness.executor.inspect).mockClear();
+    await expect(harness.controller.inspect(harness.config, context(harness.source, "background-status")))
+      .rejects.toThrow(/Test|Sync|changed|approval|authoriz/i);
+    expect(harness.executor.inspect).not.toHaveBeenCalled();
+  });
+
+  it("rejects already acquired discovery results when the external provider changes", async () => {
+    const profile = { id: "external", name: "Provider", authType: "external" as const,
+      external: { version: 1 as const, method: "password" as const, invocation: { executable: "/provider", args: ["a"] } } };
+    const harness = await makeHarness({ beforeController: async (core) => {
+      await core.addOrUpdateAuthProfile(profile);
+      await core.addOrUpdateServer({ ...sshServer("lab-host", "lab.example.test"), authProfileId: profile.id });
+      await core.addOrUpdateInventorySource(makeSource(REMOTE_VALUES));
+    } });
+    const entered = deferred<ContainerlabRunContext>();
+    const finish = deferred<void>();
+    vi.mocked(harness.executor.inspect).mockImplementationOnce(async (_config, prepared, runContext) => {
+      entered.resolve(runContext);
+      await finish.promise;
+      return { version: prepared.version, stdout: "{}" };
+    });
+    const operation = harness.controller.inspect(harness.config, context(harness.source, "sync"));
+    const runContext = await entered.promise;
+    await harness.core.addOrUpdateAuthProfile({ ...profile, external: { ...profile.external, invocation: { executable: "/other", args: ["a"] } } });
+    const current = runContext.isCurrent();
+    finish.resolve();
+    await expect(operation).rejects.toThrow(/changed|current|route/i);
+    expect(current).toBe(false);
+  });
+
   it("uses a successful explicit approval for an unchanged background inspection", async () => {
     const harness = await makeHarness();
     await harness.controller.inspect(harness.config, context(harness.source, "sync"));

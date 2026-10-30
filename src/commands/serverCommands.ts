@@ -1,6 +1,6 @@
 import { showExternalCredentialError } from "../services/credentials/externalCredentialUi";
 import { externalServerFormValues } from "../ui/externalCredentialForm";
-import { authProfileConnectionIdentity, externalAuthProfileUnsupportedReason, isExternalAuthProfile, keyDeploymentUnavailableReason } from "../models/authProfile";
+import { serverAccountPrefixForDisplay, authProfileConnectionIdentity, externalAuthProfileUnsupportedReason, isExternalAuthProfile, keyDeploymentUnavailableReason } from "../models/authProfile";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import * as os from "node:os";
@@ -70,7 +70,7 @@ export async function pickServer(core: import("../core/nexusCore").NexusCore): P
         label: server.name,
         // P3-2 (Fable) — an addressless placeholder has no endpoint, so show
         // "(no address)" rather than the nonsense "user@:0".
-        description: server.addressless === true ? "(no address)" : `${server.username}@${server.host}:${server.port}`,
+        description: server.addressless === true ? "(no address)" : `${serverAccountPrefixForDisplay(server, server.authProfileId ? core.getAuthProfile(server.authProfileId) : undefined)}${server.host}:${server.port}`,
         server
       })),
     { title: "Select Nexus Server" }
@@ -2615,7 +2615,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       // VALUE, not the protocol, so a blank username reads the same whatever put
       // it there.
       const account = typeof server.username === "string" && server.username.trim() !== ""
-        ? `${server.username}@`
+        ? serverAccountPrefixForDisplay(server, server.authProfileId ? ctx.core.getAuthProfile(server.authProfileId) : undefined)
         : "";
       // P3-2 (Fable) — an addressless placeholder has no console address, so the
       // `host:port` half renders the nonsense ":0". Head with "(no console address)"

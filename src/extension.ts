@@ -810,7 +810,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const colorSchemeStorage = new VscodeColorSchemeStorage(context);
   const colorSchemeService = new ColorSchemeService(colorSchemeStorage, createResetGenerationGuard(context.globalState));
   const sftpService = new SftpService(pool, readSftpServiceConfig(), sshDiagnostics);
-  const elevationBroker = new SudoElevationBroker(sftpService, (id) => core.getServer(id));
+  const elevationBroker = new SudoElevationBroker(sftpService, (id) => core.getServer(id), (id) => core.getAuthProfile(id));
   const fileSystemProvider = new NexusFileSystemProvider(sftpService, elevationBroker);
   const fsRegistration = vscode.workspace.registerFileSystemProvider(NEXTERM_SCHEME, fileSystemProvider, { isCaseSensitive: true });
   // Password cache and elevated-URI state are per-server and must not survive a
@@ -828,7 +828,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
 
   // Keep nexterm:// labels in POSIX style on Windows.
   tryRegisterResourceLabelFormatter(vscode.workspace, NEXTERM_SCHEME);
-  const fileExplorerProvider = new FileExplorerTreeProvider(sftpService, sshDiagnostics);
+  const fileExplorerProvider = new FileExplorerTreeProvider(sftpService, sshDiagnostics, (id) => core.getServer(id), (id) => core.getAuthProfile(id));
   const defaultSessionLogDir = path.join(context.globalStorageUri.fsPath, "session-logs");
 
   const ctx: CommandContext = {

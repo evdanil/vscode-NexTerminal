@@ -29,6 +29,44 @@ function chain(): ServerConfig[] {
 }
 
 describe("inventory source SSH dependencies", () => {
+  const external: AuthProfile = {
+    id: "external", name: "Provider", authType: "external",
+    external: { version: 1, method: "password", invocation: { executable: "/provider", args: ["provider-a"] } }
+  };
+
+  it.each([
+    { version: 1 as const, method: "password" as const, invocation: { executable: "/provider", args: ["provider-b"] } },
+    { version: 1 as const, method: "password" as const, invocation: { executable: "/other", args: ["provider-a"] } },
+    { version: 1 as const, method: "key" as const, invocation: { executable: "/provider", args: ["provider-a"] } },
+    { version: 1 as const, method: "password" as const }
+  ])("invalidates external discovery when provider configuration changes: %j", (changed) => {
+    const servers = [makeServer("lab-host", { authProfileId: external.id })];
+    const captured = snapshotInventorySourceDependencies("lab-host", servers, [external]);
+    expect(() => assertInventorySourceDependenciesCurrent(captured, servers, [{ ...external, external: changed }]))
+      .toThrow(/changed/);
+  });
+
+  it("ignores dormant static credentials for external discovery and permits a dynamic username", () => {
+    const servers = [makeServer("lab-host", { authProfileId: external.id })];
+    const captured = snapshotInventorySourceDependencies("lab-host", servers, [external]);
+    const changed = [{ ...servers[0], username: "", authType: "key" as const, keyPath: "/dormant" }];
+    expect(() => assertInventorySourceDependenciesCurrent(captured, changed, [external])).not.toThrow();
+    expect(captured.identity).not.toContain("lab-host-user");
+  });
+
+  it("refuses a missing linked auth profile rather than capturing dormant credentials", () => {
+    expect(() => snapshotInventorySourceDependencies("lab-host", [makeServer("lab-host", { authProfileId: "missing" })], []))
+      .toThrow(/authentication profile.*missing|authentication profile.*exist/i);
+  });
+
+  it("preserves the stored dependency identity format", () => {
+    const server = makeServer("lab-host", { authProfileId: "stored" });
+    const profile: AuthProfile = { id: "stored", name: "Stored", username: "operator", authType: "key", keyPath: "/key" };
+    expect(snapshotInventorySourceDependencies("lab-host", [server], [profile]).identity).toBe(JSON.stringify([
+      ["lab-host", "lab-host.example.test", 22, "ssh", null, ["stored", true, "operator", "key", "/key"], null]
+    ]));
+  });
+
   it("captures the lab host and every SSH jump hop in route order", () => {
     const snapshot = snapshotInventorySourceDependencies("lab-host", chain(), []);
 

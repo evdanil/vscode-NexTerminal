@@ -4,6 +4,7 @@ import * as vscode from "vscode";
 import type { CommandContext } from "../../src/commands/types";
 import {
   registerServerCommands,
+  pickServer,
   connectServer,
   authProfileCredentialMirror,
   formValuesToServer,
@@ -6020,6 +6021,21 @@ describe("nexus.server.copyInfo — telnet servers (MINOR-4)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     registeredCommands.clear();
+  });
+
+  it.each(["external", "missing"])("hides dormant usernames in %s server picks and copied connection info", async (kind) => {
+    const server = makeServer({ username: "dormant-root", authProfileId: "profile", host: "example.com" });
+    const profile: AuthProfile = { id: "profile", name: "Provider", authType: "external",
+      external: { version: 1, method: "password", invocation: { executable: "/never-run", args: [] } } };
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server], authProfiles: kind === "external" ? [profile] : [] });
+    registerServerCommands(ctx);
+    await pickServer(ctx.core);
+    const choices = await vi.mocked(vscode.window.showQuickPick).mock.calls.at(-1)?.[0];
+    expect(choices?.[0].description).toBe("example.com:22");
+    expect(choices?.[0].description).not.toContain("dormant-root");
+    await registeredCommands.get("nexus.server.copyInfo")!("srv-1");
+    expect(vscode.env.clipboard.writeText).toHaveBeenCalledWith("example.com:22");
+    expect(vi.mocked(vscode.env.clipboard.writeText).mock.calls.at(-1)?.[0]).not.toContain("dormant-root");
   });
 
   // ⊘ A telnet server has no username, so the old template produced a leading

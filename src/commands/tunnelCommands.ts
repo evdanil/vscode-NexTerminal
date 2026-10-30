@@ -1,3 +1,4 @@
+import { serverAccountPrefixForDisplay } from "../models/authProfile";
 import { showExternalCredentialError } from "../services/credentials/externalCredentialUi";
 import { randomUUID } from "node:crypto";
 import * as os from "node:os";
@@ -130,7 +131,7 @@ export async function resolveServerForTunnel(
   const pick = await vscode.window.showQuickPick(
     servers.map((server) => ({
       label: server.name,
-      description: `${server.username}@${server.host}${server.isHidden ? " (hidden)" : ""}`,
+      description: `${serverAccountPrefixForDisplay(server, server.authProfileId ? core.getAuthProfile(server.authProfileId) : undefined)}${server.host}${server.isHidden ? " (hidden)" : ""}`,
       server
     })),
     { title: `Start tunnel "${profile.name}" on which server?` }

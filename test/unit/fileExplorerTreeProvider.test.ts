@@ -1540,3 +1540,35 @@ describe("FileExplorerTreeProvider", () => {
     });
   });
 });
+
+
+describe("external credential explorer labels", () => {
+  it("uses live source links when rendering an already-open explorer without connecting again", async () => {
+    const sftp = createMockSftpService();
+    vi.mocked(sftp.readDirectory).mockResolvedValue([]);
+    let server = { ...testServer };
+    let profile: import("../../src/models/config").AuthProfile | undefined = {
+      id: "profile", name: "Stored", authType: "password", username: "other-stored-user"
+    };
+    const provider = new FileExplorerTreeProvider(sftp, undefined, () => server, () => profile);
+    provider.setActiveServer(testServer, "/home/dev");
+    expect((await provider.getChildren())[0].label).toBe("Test Server (dev@example.com)");
+    server = { ...server, authProfileId: "profile" };
+    expect((await provider.getChildren())[0].label).toBe("Test Server (dev@example.com)");
+    profile = { id: "profile", name: "External", authType: "external", external: { version: 1, method: "password" } };
+    expect((await provider.getChildren())[0].label).toBe("Test Server (example.com)");
+    expect((await provider.getChildren())[0].label).not.toContain("dev@");
+    profile = undefined;
+    expect((await provider.getChildren())[0].label).toBe("Test Server (example.com)");
+    expect(sftp.connect).not.toHaveBeenCalled();
+    provider.dispose();
+  });
+
+  it.each(["external", "missing"])("does not display dormant credentials for a %s link", (kind) => {
+    const profile = kind === "external" ? { id: "profile", name: "Provider", authType: "external" as const,
+      external: { version: 1 as const, method: "password" as const } } : undefined;
+    const item = new FileExplorerServerItem({ ...testServer, username: "dormant-root", authProfileId: "profile" }, profile);
+    expect(item.label).toBe(`${testServer.name} (${testServer.host})`);
+    expect(item.label).not.toContain("dormant-root");
+  });
+});
