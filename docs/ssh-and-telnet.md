@@ -68,7 +68,7 @@ Manage profiles from a dedicated editor panel accessible via the Settings tree o
 
 ## External Program Credentials
 
-For a worked vault integration, see [1Password settings and provider script](1password.md).
+For worked integrations, see [1Password](1password.md) and [HashiCorp Vault, AWS Secrets Manager and Azure Key Vault](vault-providers.md).
 
 Choose **Settings → Auth Profiles → New Profile → Authentication: External Program**, then **Authentication Method: Password** or **Private Key**. Enter an absolute **Executable** path and optional **Arguments**, one argument per line. Select that profile on the server under **Advanced → Auth Profile**, or apply it to a folder, inventory source, or device template. Saving, selecting, importing, previewing and syncing these links do not retrieve credentials or grant execution approval.
 

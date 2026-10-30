@@ -4,6 +4,8 @@ Use an **External Program** auth profile to read a username and password or priv
 
 This is a credential-provider program launched by Nexus, not a script to run from the Nexus Scripts view. For the general contract and supported consumers, see [External Program credentials](ssh-and-telnet.md#external-program-credentials).
 
+For other services, see [HashiCorp Vault, AWS Secrets Manager and Azure Key Vault examples](vault-providers.md).
+
 ## Prepare the extension host
 
 1. Install Node.js 20 or 22 and 1Password CLI on the machine running the Nexus extension host. Find their absolute executable paths with `command -v node` and `command -v op` on macOS/Linux, or `(Get-Command node.exe).Source` and `(Get-Command op.exe).Source` in PowerShell.
