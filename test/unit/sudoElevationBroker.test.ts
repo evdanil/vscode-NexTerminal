@@ -71,6 +71,22 @@ describe("SudoElevationBroker", () => {
     vi.useRealTimers();
   });
 
+  it.each(["external", "missing"])("never names dormant credentials in %s sudo prompts or refusals", async (kind) => {
+    const server = { ...testServer, username: "dormant-root", authProfileId: "profile" };
+    const profile = kind === "external" ? { id: "profile", name: "Provider", authType: "external" as const,
+      external: { version: 1 as const, method: "password" as const, invocation: { executable: "/never-run", args: [] } } } : undefined;
+    broker = new SudoElevationBroker(sftp as any, () => server, () => profile);
+    sftp.writeFileElevated.mockRejectedValueOnce(new SudoPasswordRequiredError());
+    mockShowInputBox.mockResolvedValueOnce(undefined);
+    await broker.saveElevated(server.id, "/etc/hosts", Buffer.from("data"));
+    expect(mockShowInputBox.mock.calls.at(-1)?.[0].prompt).toContain("for example.com");
+    expect(mockShowInputBox.mock.calls.at(-1)?.[0].prompt).not.toContain("dormant-root");
+    sftp.writeFileElevated.mockRejectedValueOnce(new SudoNotPermittedError("denied"));
+    await broker.saveElevated(server.id, "/etc/hosts", Buffer.from("data"));
+    expect(mockShowErrorMessage.mock.calls.at(-1)?.[0]).toContain("example.com is not permitted");
+    expect(mockShowErrorMessage.mock.calls.at(-1)?.[0]).not.toContain("dormant-root");
+  });
+
   describe("confirmElevation", () => {
     it("shows a modal warning and resolves true only when 'Save as Root' is chosen", async () => {
       mockShowWarningMessage.mockResolvedValue("Save as Root");

@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { ServerConfig } from "../models/config";
 import { resolveServerProtocol } from "../models/config";
+import { authProfileConnectionIdentity } from "../models/authProfile";
 import type { TerminalMacro } from "../models/terminalMacro";
 import {
   IPMI_GATEWAY_INERT_CREDENTIALS_HINT,
@@ -15,7 +16,7 @@ import { bindingToDisplayLabel } from "../macroBindings";
 import { sanitizeMacroGroup } from "../services/macroFolders";
 import { formatProfileTokenErrorForCommand, hasProfileTokens, profileTokenLabel, profileTokensUsed, resolveProfileTokens } from "../services/profileTokens";
 import type { ProfileTokenError, ProfileTokenErrorCommandSubject, ProfileTokenForm } from "../services/profileTokens";
-import { profileTokenServer, resolveIpmiTerminalEnv, type ProfileTokenServer } from "./ipmiCredentials";
+import { profileTokenServer, refuseUnsupportedIpmiProfile, resolveIpmiTerminalEnv, type ProfileTokenServer } from "./ipmiCredentials";
 import { VARIABLE_MARKER } from "../ui/macroVariableMarker";
 import { resolveMacroBrowserUrl } from "../utils/browserUrl";
 import { textRunsIpmitool } from "../utils/ipmitoolCommand";
@@ -759,11 +760,22 @@ function preselectedMacro(arg: unknown, macros: readonly TerminalMacro[]): Termi
   return typeof candidate?.name === "string" && typeof candidate?.text === "string" ? candidate : undefined;
 }
 
+function macroInvocationIdentity(ctx: CommandContext, server: ServerConfig): string {
+  return JSON.stringify([
+    server.host, server.port, server.name, server.username, server.authType, server.keyPath,
+    resolveServerProtocol(server), server.addressless, server.proxy,
+    server.authProfileId, server.ipmiHost, server.ipmiAuthProfileId, server.ipmiGatewayServerId,
+    authProfileConnectionIdentity(server.authProfileId ? ctx.core.getAuthProfile(server.authProfileId) : undefined),
+    authProfileConnectionIdentity(server.ipmiAuthProfileId ? ctx.core.getAuthProfile(server.ipmiAuthProfileId) : undefined)
+  ]);
+}
+
 export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Promise<void> {
-  const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
+  let server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
   if (!server) {
     return;
   }
+  const capturedIdentity = macroInvocationIdentity(ctx, server);
 
   const macros = getMacros();
   if (macros.length === 0) {
@@ -799,16 +811,31 @@ export async function runMacroOnServer(ctx: CommandContext, arg?: unknown): Prom
     macro = picked.macro;
   }
 
+  // A picker outlives its server snapshot. Revalidate both links and profile
+  // identities before resolving tokens or reaching any credential/dispatch path.
+  const live = ctx.core.getServer(server.id);
+  if (!live || macroInvocationIdentity(ctx, live) !== capturedIdentity) {
+    await vscode.window.showErrorMessage("The server or its credential source changed while choosing the macro. Run the macro again to review the current details. Nothing was sent.");
+    return;
+  }
+  server = live;
+
   // Read BEFORE the tokens resolve, because it decides how they resolve: a
   // browser macro's text is a URL, and an address token is written in URL form
   // there. `profileTokenForm` is the same function the picker's flag used, so
   // the two cannot answer differently for the same macro.
   const runTarget = resolveMacroRunTarget(macro);
 
+  // Rebuild after the picker: a profile may have been edited while it was open.
+  const ipmiTokens = profileTokensUsed(macro.text);
+  if ((macroProvidesIpmiCredentials(macro) || ipmiTokens.includes("ipmiUsername") ||
+    (runTarget !== "browser" && ipmiTokens.includes("ipmiHost"))) &&
+    await refuseUnsupportedIpmiProfile(ctx, server)) return;
+
   // Profile tokens are resolved FIRST and synchronously: a macro that cannot be
   // resolved against this server must fail before anything is connected, any
   // terminal is created, and any prompt is shown.
-  const resolution = resolveProfileTokens(macro.text, tokenServer, { form: profileTokenForm(macro) });
+  const resolution = resolveProfileTokens(macro.text, profileTokenServer(ctx, server), { form: profileTokenForm(macro) });
   if (!resolution.ok) {
     await reportProfileTokenError(resolution.error, server);
     return;

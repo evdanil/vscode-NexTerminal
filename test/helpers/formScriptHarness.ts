@@ -359,6 +359,7 @@ function buildFormDom(definition: FormDefinition): FormDom {
         if (field.autofill) {
           wrapper.dataset.autofill = "true";
         }
+        if (field.autofillExternalProfile !== undefined) wrapper.dataset.externalProfile = field.autofillExternalProfile;
         if (field.autofillFilledKeys && field.autofillFilledKeys.length > 0) {
           wrapper.dataset.autofillFilled = JSON.stringify(field.autofillFilledKeys);
         }

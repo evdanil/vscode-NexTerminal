@@ -91,7 +91,7 @@ import { GNS3_PROVIDER_ID } from "../../src/services/inventory/providers/gns3Pro
 import { PROXMOX_PROVIDER_ID } from "../../src/services/inventory/providers/proxmoxProvider";
 import { inventorySecretKey, type InventoryDevice, type InventorySourceConfig, type InventoryTree } from "../../src/models/inventory";
 import { parseContainerlabConfig } from "../../src/services/inventory/providers/containerlabConfig";
-import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, ServerOrigin, TunnelProfile } from "../../src/models/config";
+import type { StoredAuthProfile, AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, ServerOrigin, TunnelProfile } from "../../src/models/config";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 import type { DeviceTemplateProfile } from "../../src/models/deviceTemplate";
 import type { SecretVault } from "../../src/services/ssh/contracts";
@@ -207,7 +207,7 @@ function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
   };
 }
 
-function makeProfile(overrides: Partial<AuthProfile> = {}): AuthProfile {
+function makeProfile(overrides: Partial<StoredAuthProfile> = {}): StoredAuthProfile {
   return { id: "ap-1", name: "Lab login", username: "netops", authType: "password", ...overrides };
 }
 
@@ -1505,7 +1505,7 @@ describe("share import — inventory sources", () => {
     expect(lastInfoMessage()).not.toContain("Removed-Device Policy");
   });
 
-  it("clears a source's and a template's links to a profile the import rejected, remaps the ones that landed, and prunes template rules to templates that landed (⊘ a dangling reference persisting; ⊘ a file id surviving; ⊘ a malformed template revision costing the template)", async () => {
+  it("clears unsupported BMC links, remaps valid SSH links, and prunes template rules to templates that landed (⊘ a dangling reference persisting; ⊘ a file id surviving; ⊘ a malformed template revision costing the template)", async () => {
     const recipient = await makeMachine();
 
     await importShare(
@@ -1524,7 +1524,7 @@ describe("share import — inventory sources", () => {
         inventorySources: [
           makeSource({
             defaultUsername: "user",
-            authProfileId: "ap-bad",
+            authProfileId: "ap-good",
             templateRules: [
               { id: "r-ok", templateId: "tpl-ok" },
               { id: "r-bad", templateId: "tpl-bad" },
@@ -1543,7 +1543,7 @@ describe("share import — inventory sources", () => {
       authProfileId: { mode: "fill", value: snapshot.authProfiles[0].id }
     });
     const [source] = snapshot.inventorySources;
-    expect(source.authProfileId).toBeUndefined();
+    expect(source.authProfileId).toBe(snapshot.authProfiles[0].id);
     expect(source.templateRules).toEqual([{ id: "r-ok", templateId: snapshot.deviceTemplates[0].id }]);
   });
 
@@ -2429,6 +2429,7 @@ describe("share round trip — the recipient's first sync adopts the cached tree
     const { recipient, sourceId } = await roundTrip(undefined, { profile: KEY_PROFILE, via: "source" });
     const { core } = recipient;
     const shipped = core.getSnapshot().authProfiles.find((p) => p.name === "Lab key")!;
+    if (shipped.authType === "external") throw new Error("Expected a stored key profile");
     await core.addOrUpdateAuthProfile({ ...shipped, username: "alice", keyPath: "/home/alice/.ssh/id_ed25519" });
     // What the Edit Source form does: link the profile, mirror its username into the default.
     await core.addOrUpdateInventorySource({ ...core.getInventorySource(sourceId)!, authProfileId: shipped.id, defaultUsername: "alice" });

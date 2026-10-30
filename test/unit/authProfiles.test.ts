@@ -1,12 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { NexusCore } from "../../src/core/nexusCore";
-import type { AuthProfile } from "../../src/models/config";
+import type { StoredAuthProfile, AuthProfile } from "../../src/models/config";
 import { authProfileNeedsServerKeyPath, authProfileOwnedCredentials } from "../../src/models/config";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { validateAuthProfile } from "../../src/utils/validation";
 import { authProfilePassphraseSecretKey, authProfilePasswordSecretKey } from "../../src/services/ssh/silentAuth";
 
-function makeAuthProfile(overrides?: Partial<AuthProfile>): AuthProfile {
+function makeAuthProfile(overrides?: Partial<StoredAuthProfile>): StoredAuthProfile {
   return {
     id: "ap1",
     name: "Production",

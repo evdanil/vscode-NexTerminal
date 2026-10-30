@@ -199,6 +199,18 @@ describe("SettingsTreeProvider", () => {
       expect(links.map((link) => link.label)).toEqual(["Macros", "Auth Profiles", "Device Templates"]);
     });
 
+    it("keeps settings categories followed by the existing management links without a vault root", () => {
+      const roots = createProvider().getChildren();
+      const index = roots.findIndex((root) => root.label === "Macros");
+      expect(roots.slice(0, index).every((root) => root instanceof SettingsCategoryItem)).toBe(true);
+      expect(roots.slice(index).map((root) => root.label)).toEqual(["Macros", "Auth Profiles", "Device Templates", "Inventory Sources"]);
+      const profile = roots[index + 1];
+      expect(profile.id).toBe("settings-link:nexus.authProfile.manage");
+      expect(profile.command).toEqual({ command: "nexus.authProfile.manage", title: "Auth Profiles" });
+      expect(profile.iconPath).toEqual({ id: "key" });
+      expect(roots.map((root) => root.label).join(" ")).not.toMatch(/External Credentials|Vault/);
+    });
+
     // §7 UX-M6 — the Auth Profiles row description no longer says "template" so
     // the word means exactly one thing (the device template) in the product.
     it("describes Auth Profiles as reusable SSH credentials (not a template)", () => {

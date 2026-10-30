@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
-import type { ServerConfig } from "../../models/config";
+import { serverAccountPrefixForDisplay } from "../../models/authProfile";
+import type { AuthProfile, ServerConfig } from "../../models/config";
 import type { SftpService } from "./sftpService";
 import { ElevatedInstallFailedError, SudoNotPermittedError, SudoPasswordRequiredError } from "./elevatedWrite";
 import type { ElevationBroker } from "./nexusFileSystemProvider";
@@ -47,7 +48,8 @@ export class SudoElevationBroker implements ElevationBroker {
 
   public constructor(
     private readonly sftp: SftpService,
-    private readonly getServer: (serverId: string) => ServerConfig | undefined
+    private readonly getServer: (serverId: string) => ServerConfig | undefined,
+    private readonly getAuthProfile?: (profileId: string) => AuthProfile | undefined
   ) {}
 
   public async confirmElevation(serverId: string, remotePath: string): Promise<boolean> {
@@ -215,7 +217,7 @@ export class SudoElevationBroker implements ElevationBroker {
   private reportFailure(serverId: string, error: unknown): void {
     const server = this.getServer(serverId);
     if (error instanceof SudoNotPermittedError) {
-      const target = server ? `${server.username}@${server.host}` : serverId;
+      const target = server ? `${serverAccountPrefixForDisplay(server, server.authProfileId ? this.getAuthProfile?.(server.authProfileId) : undefined)}${server.host}` : serverId;
       const host = server ? server.name : serverId;
       vscode.window.showErrorMessage(
         `${target} is not permitted to run sudo for this file on ${host}. Check the remote sudoers policy — ` +
@@ -232,7 +234,7 @@ export class SudoElevationBroker implements ElevationBroker {
 
   private async promptPassword(serverId: string, retry = false): Promise<string | undefined> {
     const server = this.getServer(serverId);
-    const target = server ? `${server.username}@${server.host}` : serverId;
+    const target = server ? `${serverAccountPrefixForDisplay(server, server.authProfileId ? this.getAuthProfile?.(server.authProfileId) : undefined)}${server.host}` : serverId;
     const title = `Sudo Password: ${server ? server.name : serverId}`;
     // The rootpw/targetpw hint belongs on the retry prompt only: it's a plausible
     // explanation for a *rejected* password, but would be noise (and misleadingly

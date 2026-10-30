@@ -1,3 +1,4 @@
+import { isPlainCredentialConfig, validateExternalCredentialInvocation } from "../models/authProfile";
 import type {
   AuthProfile,
   DetachedServerOrigin,
@@ -888,6 +889,17 @@ export function validateAuthProfile(item: unknown): item is AuthProfile {
     return false;
   }
   const obj = item as Record<string, unknown>;
+  if (obj.authType === "external") {
+    if (!isPlainCredentialConfig(obj) || Object.keys(obj).some((key) => !["id", "name", "authType", "external"].includes(key)) ||
+      !isNonEmptyString(obj.id) || !isNonEmptyString(obj.name) ||
+      "username" in obj || "keyPath" in obj || !isPlainCredentialConfig(obj.external)) return false;
+    const external = obj.external;
+    return Object.keys(external).every((key) => ["version", "method", "invocation"].includes(key)) &&
+      external.version === 1 && (external.method === "password" || external.method === "key") &&
+      (!Object.hasOwn(external, "invocation") || validateExternalCredentialInvocation(external.invocation));
+  }
+  // An external payload must never be reinterpreted as a legacy credential source.
+  if ("external" in obj) return false;
   if (
     !(
       isNonEmptyString(obj.id) &&
@@ -920,15 +932,10 @@ export function validateAuthProfile(item: unknown): item is AuthProfile {
   //   * No version of Nexus has ever WRITTEN a non-string here
   //     (`authProfileEditorPanel.ts` stores `string | undefined`), so nothing
   //     a user legitimately holds can be rejected by this line. That matters
-  //     because rejection is destructive in a way a shape check on a
-  //     bookkeeping field is not: a rejected profile is skipped by the import
-  //     (counted, but not named), its vault password/passphrase are not
-  //     restored — `restoreSecrets` is scoped to the ids actually imported —
-  //     and the post-import dangling-reference sweep then strips the link from
-  //     every server and inventory source that pointed at it. In REPLACE mode
-  //     the local copy is already gone by the time this runs. Rejecting only
-  //     values no writer of ours can produce keeps that blast radius aimed
-  //     exclusively at records that are already broken.
+  //     because rejected records must not silently switch a linked server to
+  //     its dormant credentials. Import preflight refuses unresolved SSH links
+  //     before any writes; repository loading retains those links for the
+  //     runtime refusal. Only values no writer of ours can produce are rejected.
   //
   // The rule itself stays defensive too (see `authProfileOwnedCredentials`):
   // this boundary is what should stop such a value existing, not the only

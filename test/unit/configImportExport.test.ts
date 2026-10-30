@@ -110,9 +110,9 @@ vi.mock("vscode", () => ({
     }))
   },
   Uri: {
-    file: (path: string) => ({ fsPath: path, scheme: "file" }),
+    file: (filePath: string) => ({ fsPath: path.normalize(filePath), scheme: "file" }),
     joinPath: (base: { fsPath: string; scheme: string }, ...parts: string[]) => ({
-      fsPath: [base.fsPath, ...parts].join("/").replace(/\/+/g, "/"),
+      fsPath: path.join(base.fsPath, ...parts),
       scheme: base.scheme
     })
   },
@@ -170,7 +170,7 @@ import { INVALID_FOLDER_PATH_MESSAGE } from "../../src/utils/folderPaths";
 import { getAssignedBinding } from "../../src/macroBindingHelpers";
 import { isValidDetachedServerOrigin, validateServerConfig } from "../../src/utils/validation";
 import type { SecretVault } from "../../src/services/ssh/contracts";
-import type { AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
+import type { StoredAuthProfile, AuthProfile, LocalShellProfile, ServerConfig, TunnelProfile, SerialProfile } from "../../src/models/config";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 import { inventorySecretKey, type InventorySourceConfig } from "../../src/models/inventory";
 import { EVE_NG_PROVIDER_ID, EVE_NG_STATUS_POLL_FIELD_ID } from "../../src/services/inventory/providers/eveNgProvider";
@@ -244,7 +244,7 @@ function makeLocalShellProfile(overrides: Partial<LocalShellProfile> = {}): Loca
   };
 }
 
-function makeAuthProfile(overrides: Partial<AuthProfile> = {}): AuthProfile {
+function makeAuthProfile(overrides: Partial<StoredAuthProfile> = {}): StoredAuthProfile {
   return {
     id: "ap1",
     name: "Prod Auth",
@@ -285,6 +285,9 @@ function makeExportData(overrides: Record<string, unknown> = {}) {
 // initialized before any test that triggers exportBackup or importMergeReplace,
 // both of which call getMacros()/saveMacros().
 beforeEach(async () => {
+  // Clearing call history leaves unused one-shot answers queued for the next test.
+  for (const prompt of [mockShowInformationMessage, mockShowErrorMessage, mockShowWarningMessage,
+    mockShowQuickPick, mockShowSaveDialog, mockShowOpenDialog, mockShowInputBox]) prompt.mockReset();
   configDefaults.clear();
   configWorkspaceStore.clear();
   const store = new InMemoryMacroStore();
@@ -2251,7 +2254,7 @@ describe("backup export command", () => {
 
   it("exports the user .ssh folder and resolved scripts folder inside encrypted secrets", async () => {
     const sshDir = path.join(os.homedir(), ".ssh");
-    const scriptsDir = "/workspace/.nexus/scripts";
+    const scriptsDir = path.normalize("/workspace/.nexus/scripts");
     const fakeContext = {
       globalStorageUri: { fsPath: "/global-storage", scheme: "file", path: "/global-storage" }
     } as unknown as import("vscode").ExtensionContext;
@@ -2262,7 +2265,7 @@ describe("backup export command", () => {
 
     mockStat.mockImplementation(async (uri: { fsPath: string }) => {
       if ([sshDir, scriptsDir].includes(uri.fsPath)) return { type: 2 };
-      if ([path.join(sshDir, "config"), path.join(sshDir, "keys"), path.join(sshDir, "keys/id_ed25519"), `${scriptsDir}/hello.js`].includes(uri.fsPath)) {
+      if ([path.join(sshDir, "config"), path.join(sshDir, "keys"), path.join(sshDir, "keys/id_ed25519"), path.join(scriptsDir, "hello.js")].includes(uri.fsPath)) {
         return { type: uri.fsPath.endsWith("keys") ? 2 : 1 };
       }
       throw new Error(`ENOENT: ${uri.fsPath}`);
@@ -2276,7 +2279,7 @@ describe("backup export command", () => {
     mockReadFile.mockImplementation(async (uri: { fsPath: string }) => {
       if (uri.fsPath === path.join(sshDir, "config")) return Buffer.from("Host lab\n");
       if (uri.fsPath === path.join(sshDir, "keys/id_ed25519")) return Buffer.from("PRIVATE KEY");
-      if (uri.fsPath === `${scriptsDir}/hello.js`) return Buffer.from("/** @nexus-script */\n");
+      if (uri.fsPath === path.join(scriptsDir, "hello.js")) return Buffer.from("/** @nexus-script */\n");
       throw new Error(`ENOENT: ${uri.fsPath}`);
     });
 
@@ -3789,7 +3792,7 @@ describe("backup import", () => {
     await importCmd();
 
     expect(configStore.get("nexus.scripts.path")).toBe("/tmp/redirected-scripts");
-    expect((mockWriteFile.mock.calls[0][0] as { fsPath: string }).fsPath).toBe("/workspace/.nexus/scripts/hello.js");
+    expect((mockWriteFile.mock.calls[0][0] as { fsPath: string }).fsPath).toBe(path.normalize("/workspace/.nexus/scripts/hello.js"));
   });
 
   it("merge-mode import does not overwrite a retained server's vault password with the backup's; a newly-imported server's password still restores; replace mode restores everything (kills restoreSecrets()'s pre-fix unconditional write)", async () => {
@@ -4164,23 +4167,8 @@ describe("share import", () => {
     expect(snapshot.servers.some((s) => s.id === target.ipmiGatewayServerId)).toBe(true);
   });
 
-  /**
-   * REVIEW FINDING (P2) — the share path's half of "a rejected record must not
-   * leave references pointing at nothing". `importShareData` assigns every auth
-   * profile a fresh id in its FIRST pass, before anything is validated, then remaps
-   * each server's `authProfileId` through that map — so a profile rejected on
-   * import (a non-string `keyPath` is the reachable shape, and the one
-   * `validateAuthProfile` was taught to reject) still hands the server a fresh id
-   * naming a profile that was never persisted. The server then silently falls back
-   * to its own credentials with nothing anywhere saying the link is dead. The
-   * backup path has swept for exactly this since before the feature; the share path
-   * had no equivalent.
-   *
-   * BOTH links are asserted in one test on purpose. Either half alone is passed by
-   * a wrong implementation: today's code passes "the good link is remapped", and a
-   * blanket `authProfileId: undefined` passes "the dead link is cleared".
-   */
-  it("share import clears a server's link to a profile it REJECTED while keeping the link to one it imported (kills remapping through the id map alone, which hands the server a fresh id for a profile that was never persisted)", async () => {
+  // Reject unresolved SSH source intent before importing any part of the share.
+  it("share import refuses the whole file when an SSH link names a rejected profile", async () => {
     const exportData = makeExportData({
       exportType: "share",
       servers: [
@@ -4204,26 +4192,9 @@ describe("share import", () => {
     mockShowQuickPick.mockResolvedValueOnce({ value: "nexusExport" }); // chooser: Nexus Export File…
     await registeredCommands.get("nexus.config.import")!();
 
-    const snapshot = core.getSnapshot();
-    // The premise, proven rather than assumed: one profile really was rejected.
-    expect(snapshot.authProfiles.map((p) => p.name)).toEqual(["Kept"]);
-    // …and neither server was dropped along with it. An import never deletes a
-    // credential record the user still holds.
-    expect(snapshot.servers).toHaveLength(2);
-
-    const knownProfileIds = new Set(snapshot.authProfiles.map((p) => p.id));
-    const dead = snapshot.servers.find((s) => s.name === "Dead Link")!;
-    const live = snapshot.servers.find((s) => s.name === "Live Link")!;
-
-    // THE ASSERTION — as the invariant, not as a value: no imported server may hold
-    // an `authProfileId` that resolves to nothing. Under the wrong implementation
-    // this one holds a fresh UUID for the profile that was thrown away.
-    expect(dead.authProfileId).toBeUndefined();
-    expect(live.authProfileId).toBeDefined();
-    expect(knownProfileIds.has(live.authProfileId!)).toBe(true);
-    // Still the share path's fresh id, not the payload's — the clearing must not
-    // have been bought by abandoning the remap.
-    expect(live.authProfileId).not.toBe("ap-ok");
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Nothing was imported"));
+    expect(core.getSnapshot().authProfiles).toHaveLength(0);
+    expect(core.getSnapshot().servers).toHaveLength(0);
   });
 
   /**
@@ -4233,10 +4204,10 @@ describe("share import", () => {
    * kept the EXPORTING machine's id: a reference that resolves to nothing by
    * construction. Left there it reads exactly as a per-server opt-out (no link, but
    * a stamp naming a profile), which is the state that locks a server out of
-   * retro-apply for good — which is why the backup path's sweep drops the stamp
-   * together with the link it describes.
+   * retro-apply for good. Valid links and their stamps must be remapped together;
+   * unresolved SSH links now reject the entire import during preflight.
    */
-  it("share import remaps the sync's auth-profile stamp with the link it describes, clears it when that profile was rejected, and invents one for nobody (kills carrying `origin.syncedAuthProfileId` across unremapped)", async () => {
+  it("share import remaps the sync's valid auth-profile stamp and invents one for nobody", async () => {
     const remoteOrigin = (syncedAuthProfileId?: string) => ({
       sourceId: "src-on-the-other-machine",
       externalId: "device:1",
@@ -4250,7 +4221,6 @@ describe("share import", () => {
       inventorySources: [remoteSource()],
       servers: [
         makeServer({ id: "share-s-live", name: "Live Link", authProfileId: "ap-ok", origin: remoteOrigin("ap-ok") }),
-        makeServer({ id: "share-s-dead", name: "Dead Link", authProfileId: "ap-rejected", origin: remoteOrigin("ap-rejected") }),
         makeServer({ id: "share-s-none", name: "No Stamp", origin: remoteOrigin() })
       ],
       tunnels: [],
@@ -4269,7 +4239,6 @@ describe("share import", () => {
 
     const snapshot = core.getSnapshot();
     const live = snapshot.servers.find((s) => s.name === "Live Link")!;
-    const dead = snapshot.servers.find((s) => s.name === "Dead Link")!;
     const none = snapshot.servers.find((s) => s.name === "No Stamp")!;
 
     // The premise: the origins survived import at all (a malformed one is stripped
@@ -4283,11 +4252,6 @@ describe("share import", () => {
     expect(live.origin?.syncedAuthProfileId).toBe(live.authProfileId);
     expect(live.origin?.syncedAuthProfileId).not.toBe("ap-ok");
     expect(new Set(snapshot.authProfiles.map((p) => p.id)).has(live.origin!.syncedAuthProfileId!)).toBe(true);
-
-    // Cleared with the link, for the same reason the backup path clears it: a stamp
-    // naming a profile that is not here is an opt-out nobody chose.
-    expect(dead.authProfileId).toBeUndefined();
-    expect(dead.origin?.syncedAuthProfileId).toBeUndefined();
 
     // And a server that never carried a stamp does not acquire one, nor lose the
     // rest of its origin. (Its username stamp is kept — as "user", with the
@@ -5184,17 +5148,19 @@ describe("import from SSH config command (nexus.config.import.sshConfig)", () =>
 
   /** Serve one file (plus optional extra paths) through the mocked workspace.fs. */
   function serveFiles(files: Record<string, string>, dirs: Record<string, string[]> = {}): void {
+    files = Object.fromEntries(Object.entries(files).map(([name, content]) => [path.resolve(name), content]));
+    dirs = Object.fromEntries(Object.entries(dirs).map(([name, entries]) => [path.resolve(name), entries]));
     mockStat.mockImplementation(async (uri: { fsPath: string }) => {
-      if (uri.fsPath in files) return { type: 1, size: Buffer.byteLength(files[uri.fsPath], "utf8") };
-      if (uri.fsPath in dirs) return { type: 2, size: 0 };
+      if (path.resolve(uri.fsPath) in files) return { type: 1, size: Buffer.byteLength(files[path.resolve(uri.fsPath)], "utf8") };
+      if (path.resolve(uri.fsPath) in dirs) return { type: 2, size: 0 };
       throw new Error(`ENOENT: ${uri.fsPath}`);
     });
     mockReadFile.mockImplementation(async (uri: { fsPath: string }) => {
-      if (uri.fsPath in files) return Buffer.from(files[uri.fsPath], "utf8");
+      if (path.resolve(uri.fsPath) in files) return Buffer.from(files[path.resolve(uri.fsPath)], "utf8");
       throw new Error(`ENOENT: ${uri.fsPath}`);
     });
     mockReadDirectory.mockImplementation(async (uri: { fsPath: string }) =>
-      (dirs[uri.fsPath] ?? []).map((name) => [name, 1] as [string, number])
+      (dirs[path.resolve(uri.fsPath)] ?? []).map((name) => [name, 1] as [string, number])
     );
   }
 
@@ -5371,8 +5337,13 @@ describe("import from SSH config command (nexus.config.import.sshConfig)", () =>
       return "Import";
     });
 
-    await registeredCommands.get("nexus.config.import.sshConfig")!();
-    await holderDone;
+    try {
+      await registeredCommands.get("nexus.config.import.sshConfig")!();
+    } finally {
+      // A failed preflight never opens the modal that normally releases this holder.
+      releaseHolder();
+      await holderDone;
+    }
 
     const matching = core.getSnapshot().servers.filter((server) => server.host === "web1.example.com");
     expect(matching).toHaveLength(1);
@@ -6061,20 +6032,20 @@ describe("import from SecureCRT command", () => {
     mockShowInformationMessage.mockResolvedValueOnce("Import");
 
     mockReadDirectory.mockImplementation(async (uri: { fsPath: string }) => {
-      switch (uri.fsPath) {
-        case "/fake/Sessions":
+      switch (path.resolve(uri.fsPath)) {
+        case path.resolve("/fake/Sessions"):
           return [
             ["Prod", 2], // Directory
             ["RootSession.INI", 1], // File
             ["Telnet.ini", 1], // File (non-SSH)
             ["notes.txt", 1] // File (ignored by extension)
           ];
-        case "/fake/Sessions/Prod":
+        case path.resolve("/fake/Sessions/Prod"):
           return [
             ["App.ini", 1], // File
             ["Nested", 2] // Directory
           ];
-        case "/fake/Sessions/Prod/Nested":
+        case path.resolve("/fake/Sessions/Prod/Nested"):
           return [
             ["Db.iNi", 1] // File
           ];
@@ -6090,7 +6061,8 @@ describe("import from SecureCRT command", () => {
         "/fake/Sessions/Prod/App.ini": `S:"Protocol Name"=SSH2\nS:"Hostname"=app.example.com\nD:"[SSH2] Port"=000008AE\nS:"Username"=deploy`,
         "/fake/Sessions/Prod/Nested/Db.iNi": `S:"Protocol Name"=SSH2\nS:"Hostname"=db.example.com\nD:"[SSH2] Port"=00011170\nS:"Username"=`
       };
-      return Buffer.from(byPath[uri.fsPath] ?? "", "utf8");
+      const entry = Object.entries(byPath).find(([name]) => path.resolve(name) === path.resolve(uri.fsPath));
+      return Buffer.from(entry?.[1] ?? "", "utf8");
     });
 
     const cmd = registeredCommands.get("nexus.config.import.securecrt")!;
@@ -7772,7 +7744,7 @@ describe("backup export round-trip", () => {
     expect(snapshot.inventorySources[0].authProfileId).toBe("ap1");
   });
 
-  it("import clears dangling authProfileId when profile not imported", async () => {
+  it("import refuses a dangling SSH authProfileId before creating a server", async () => {
     vi.clearAllMocks();
     registeredCommands.clear();
     configStore.clear();
@@ -7802,12 +7774,11 @@ describe("backup export round-trip", () => {
     const importCmd = registeredCommands.get("nexus.config.import")!;
     await importCmd();
 
-    const snapshot = core.getSnapshot();
-    expect(snapshot.servers).toHaveLength(1);
-    expect(snapshot.servers[0].authProfileId).toBeUndefined();
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Nothing was imported"));
+    expect(core.getSnapshot().servers).toHaveLength(0);
   });
 
-  it("import clearing a dangling authProfileId also drops the inventory stamp that recorded it, but leaves a stamp the user has already diverged from", async () => {
+  it("import refuses dangling SSH links even when inventory stamps differ", async () => {
     vi.clearAllMocks();
     registeredCommands.clear();
     configStore.clear();
@@ -7824,17 +7795,15 @@ describe("backup export round-trip", () => {
       exportedAt: new Date().toISOString(),
       servers: [
         // Synced and linked by the sync itself: link and stamp agree, and the
-        // profile is nowhere to be found after the import. Clearing the link
-        // while leaving the stamp would make this server read as a per-server
-        // opt-out nobody chose, and the next sync would skip it for good.
+        // profile is nowhere to be found. The whole import must be refused,
+        // preserving source intent instead of converting the row to static auth.
         makeServer({
           id: "s1",
           authProfileId: "nonexistent-profile",
           origin: { sourceId: "src-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "dev", syncedAuthProfileId: "nonexistent-profile" }
         }),
-        // Opted out and then hand-linked elsewhere: the dangling link being
-        // cleared is NOT the one the stamp names, so the stamp — the user's own
-        // decision — must survive.
+        // A different historical stamp does not make the unresolved current
+        // link safe to import either.
         makeServer({
           id: "s2",
           authProfileId: "another-missing-profile",
@@ -7853,16 +7822,8 @@ describe("backup export round-trip", () => {
 
     await registeredCommands.get("nexus.config.import")!();
 
-    const s1 = core.getServer("s1");
-    expect(s1?.authProfileId).toBeUndefined();
-    expect(s1?.origin?.syncedAuthProfileId).toBeUndefined();
-    // The rest of the ownership marker survives — the sweep clears a link, not
-    // a server's sync ownership.
-    expect(s1?.origin?.externalId).toBe("device:1");
-
-    const s2 = core.getServer("s2");
-    expect(s2?.authProfileId).toBeUndefined();
-    expect(s2?.origin?.syncedAuthProfileId).toBe("p-sync");
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Nothing was imported"));
+    expect(core.getSnapshot().servers).toHaveLength(0);
   });
 
   it("import clears a dangling ipmiAuthProfileId — including when the SSH link is perfectly fine (issue #48 PR-B)", async () => {
@@ -8042,7 +8003,7 @@ describe("backup export round-trip", () => {
     expect(snapshot.servers.some((s) => s.id === "local-gw")).toBe(true);
   });
 
-  it("import clears a dangling authProfileId on an inventory source when the profile is not imported", async () => {
+  it("import refuses an inventory source with an unresolved SSH auth profile", async () => {
     vi.clearAllMocks();
     registeredCommands.clear();
     configStore.clear();
@@ -8054,8 +8015,8 @@ describe("backup export round-trip", () => {
     registerConfigCommands(core, vault);
 
     // The source arrives linked to a profile that exists neither in the payload nor
-    // locally: the ref is non-undefined coming in, so a no-op import is visibly
-    // different from a correct clear.
+    // locally: importing it would silently change credential source if its link
+    // were erased, so the complete import must be refused.
     const importData = {
       version: 2,
       exportType: "backup",
@@ -8074,11 +8035,8 @@ describe("backup export round-trip", () => {
 
     await registeredCommands.get("nexus.config.import")!();
 
-    // Assert the source actually landed FIRST: if validation had rejected it outright,
-    // `getInventorySource("src1")?.authProfileId` would also read `undefined` and the
-    // clear assertion below would pass vacuously.
-    expect(core.getInventorySource("src1")?.name).toBe("NetBox");
-    expect(core.getInventorySource("src1")?.authProfileId).toBeUndefined();
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Nothing was imported"));
+    expect(core.getSnapshot().inventorySources).toHaveLength(0);
   });
 
   it("import keeps an inventory source's authProfileId when the profile exists locally but not in the payload", async () => {

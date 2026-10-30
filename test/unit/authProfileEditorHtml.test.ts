@@ -126,3 +126,15 @@ describe("renderAuthProfileEditorHtml", () => {
     expect(html).toMatch(/keypath-field[^>]*visible/);
   });
 });
+
+
+describe("external credential form", () => {
+  it("places External Program fourth and invocation controls before the unchanged footer and session action", () => {
+    const html = render([{ id: "e", name: "External <name>", authType: "external", external: { version: 1, method: "key", invocation: { executable: "/a&b", args: ['a "quote"', "C:\\path"] } } }], "e");
+    const order = ['data-value="agent"', 'data-value="external"', 'id="external-field"', 'id="external-method-selector"', 'id="external-executable"', 'id="external-arguments"', 'id="save-btn"', 'id="new-btn"', 'id="delete-btn"', 'id="session-approvals"'];
+    for (let i = 1; i < order.length; i++) expect(html.indexOf(order[i])).toBeGreaterThan(html.indexOf(order[i - 1]));
+    expect(html).toContain("/a&amp;b"); expect(html).toContain("a &quot;quote&quot;");
+    expect(html).toContain('aria-describedby="external-arguments-hint error-external-arguments"');
+    expect(html).toContain("Revoke All External Credential Approvals");
+  });
+});

@@ -1,10 +1,12 @@
+import * as vscode from "vscode";
+import { isExternalAuthProfile } from "../models/authProfile";
 import type { AuthProfile } from "../models/config";
 import { AuthProfileEditorPanel } from "../ui/authProfileEditorPanel";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { formatAuthProfileLabel } from "../utils/authProfileLabel";
 import type { CommandContext } from "./types";
 
-type InlineAuthProfileContext = Pick<CommandContext, "core" | "secretVault">;
+type InlineAuthProfileContext = Pick<CommandContext, "core" | "secretVault" | "externalCredentialResolver">;
 
 function authProfileOptionLabel(profile: AuthProfile): string {
   return formatAuthProfileLabel(profile);
@@ -46,7 +48,8 @@ export function createInlineAuthProfileCreation(
         return;
       }
 
-      AuthProfileEditorPanel.openNew(ctx.core, ctx.secretVault);
+      if (ctx.externalCredentialResolver) AuthProfileEditorPanel.openNew(ctx.core, ctx.secretVault, ctx.externalCredentialResolver);
+      else AuthProfileEditorPanel.openNew(ctx.core, ctx.secretVault);
       clearWatcher();
 
       const knownIds = new Set(ctx.core.getSnapshot().authProfiles.map((profile) => profile.id));
@@ -54,6 +57,10 @@ export function createInlineAuthProfileCreation(
         const added = ctx.core.getSnapshot().authProfiles.find((profile) => !knownIds.has(profile.id));
         if (!added) {
           return;
+        }
+        if (key === "ipmiAuthProfileId" && isExternalAuthProfile(added)) {
+          void vscode.window.showWarningMessage("This external auth profile supports SSH only. Choose or create a stored profile for IPMI. The IPMI Auth Profile selection has not changed.");
+          clearWatcher(); return;
         }
         panel?.addSelectOption(key, added.id, authProfileOptionLabel(added));
         clearWatcher();

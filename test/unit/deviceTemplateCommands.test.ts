@@ -1902,3 +1902,25 @@ describe("applyPlanWrites — skip a target whose only field was revalidated awa
     expect(core.getServer("R")?.origin?.templated).toBeUndefined();
   });
 });
+
+
+describe("external template IPMI runtime guards", () => {
+  it("refuses save of an external IPMI link but allows its SSH field", async () => {
+    const core = makeCore();
+    await core.addOrUpdateAuthProfile({ id: "external", name: "Program", authType: "external", external: { version: 1, method: "key" } });
+    register(core); await registeredCommands.get("nexus.deviceTemplate.add")!();
+    await expect(formPanelOpens[0].options.onSubmit({ name: "T", mode_ipmiAuthProfileId: "fill", ipmiAuthProfileId: "external" })).rejects.toThrow("SSH only");
+    expect(core.getSnapshot().deviceTemplates).toHaveLength(0);
+    await formPanelOpens[0].options.onSubmit({ name: "T", mode_authProfileId: "fill", authProfileId: "external" });
+    expect(core.getSnapshot().deviceTemplates[0].fields.authProfileId?.value).toBe("external");
+  });
+  it("rechecks IPMI capability at apply time after a profile changed while confirmation was open", async () => {
+    const core = makeCore();
+    await core.addOrUpdateAuthProfile({ id: "external", name: "Program", authType: "external", external: { version: 1, method: "password" } });
+    const server: ServerConfig = { id: "s", name: "S", host: "192.0.2.1", port: 22, username: "admin", authType: "agent", isHidden: false };
+    await core.addOrUpdateServer(server);
+    await applyPlanWrites(ctxFor(core), { serverWrites: [{ serverId: server.id, ipmiAuthProfileId: "external", authProfileId: "external", writtenFields: ["authProfileId", "ipmiAuthProfileId"] }], warnings: [] });
+    expect(core.getServer(server.id)?.ipmiAuthProfileId).toBeUndefined();
+    expect(core.getServer(server.id)?.authProfileId).toBe("external");
+  });
+});

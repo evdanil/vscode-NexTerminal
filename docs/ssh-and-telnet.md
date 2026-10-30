@@ -7,18 +7,18 @@ Connect to remote servers over SSH from the Connectivity Hub, or set a server to
 ## Add a Server
 
 1. Click `+` (**Add Profile**) in the Connectivity Hub title bar and keep **Network Device Profile** as the profile type, or run `Nexus: Add Network Device Profile (SSH / Telnet)` from the command palette
-2. Enter host, port, username, and authentication details (password, private key, or SSH agent)
+2. Enter host, port, username, and authentication details (password, private key, or SSH agent), or select an External Program auth profile under Advanced
 3. Optionally configure a proxy (SSH jump host, SOCKS5, or HTTP CONNECT) under the Proxy section — see [Jump Hosts and Proxies](#jump-hosts-and-proxies)
 4. Right-click the server and select **Connect** to open a terminal session
 5. To set up key-based auth: right-click the server → **Deploy SSH Key** → select or generate a key → the public key is deployed automatically — see [Deploy an SSH Key](#deploy-an-ssh-key)
 
 ## Authentication
 
-Connect to remote servers with password, private key, or SSH agent authentication.
+Connect with a stored password, private key file, SSH agent, or an [External Program auth profile](#external-program-credentials).
 
-Two-factor authentication (keyboard-interactive) is fully supported — passwords auto-fill while verification codes are prompted separately.
+Stored password, private key file, and SSH agent authentication support keyboard-interactive two-factor challenges: password prompts can auto-fill while verification codes are prompted separately. External Program has the narrower challenge policy described below.
 
-Credentials are cached securely via VS Code SecretStorage with silent re-auth.
+Stored passwords and key passphrases use VS Code SecretStorage for silent re-auth. External Program responses are never saved there.
 
 When several SSH logins need input at once, server password, proxy password, key passphrase, and verification-code prompts appear one at a time. Logins that need the same credential can share one answer; prompts for different credentials wait their turn. Canceling a shared proxy-password prompt stops every waiting login before the proxy handshake; a later connection asks again. A queued prompt is discarded if its server changes before it opens or its terminal closes; a prompt shared with another open terminal remains available to that terminal. A timed-out connection drops its queued verification prompt. If a saved password or passphrase fails, Nexus clears it only if the saved value is still the one that failed, so a newer saved answer is kept. A saved password is cleared only when the server rejects it, and a saved key passphrase only when it fails to decrypt the key (the server never sees it). A login that ends without either verdict — a connection that closed mid-login, a terminal closed or reconnected while connecting, or a dismissed verification-code prompt — keeps both.
 
@@ -48,7 +48,7 @@ Both settings are machine-specific: a workspace's `.vscode/settings.json` cannot
 
 ### Deploy an SSH Key
 
-Right-click any server and select "Deploy SSH Key" to automate key-based authentication setup. Discovers existing local keys or generates new ed25519 key pairs, deploys the public key to the remote `authorized_keys`, and optionally converts the server profile to key auth. Cross-platform (Windows, macOS, Linux).
+Right-click an SSH server using stored credentials and select "Deploy SSH Key" to automate key-based authentication setup. Discovers existing local keys or generates new ed25519 key pairs, deploys the public key to the remote `authorized_keys`, and optionally converts the server profile to key auth. Cross-platform (Windows, macOS, Linux). Servers linked to external or missing auth profiles cannot deploy keys; select a stored auth profile first.
 
 ### Host Key Verification
 
@@ -56,15 +56,121 @@ Trust-on-first-use (TOFU) model stores host keys on first connection and alerts 
 
 ## Auth Profiles
 
-Define reusable credential sets (password, private key, or SSH agent) and apply them to individual servers or entire folders in bulk.
+Define reusable credential sources (password, private key, SSH agent, or External Program) and apply them to individual servers or entire folders in bulk.
 
 A NetBox or Proxmox [inventory source](inventory/README.md) can carry a profile too, so every SSH server it syncs connects with those credentials from the start. (The field is on every source's form, but EVE-NG and GNS3 nodes sync as [telnet](#telnet) consoles, which have no login for it to fill.)
 
 The link is a reference, not a copy — edit the profile once and every server using it picks up the change, no re-sync needed.
 
-A failed login on one linked server never erases the profile's saved credential — one broken device can't lock the rest of the fleet out of silent re-auth; the stored credential is only replaced when a device actually signs in with a new one.
+For stored authentication, a failed login on one linked server never erases the profile's saved credential — one broken device can't lock the rest of the fleet out of silent re-auth; the stored credential is only replaced when a device actually signs in with a new one.
 
 Manage profiles from a dedicated editor panel accessible via the Settings tree or context menu.
+
+## External Program Credentials
+
+For worked integrations, see [1Password](1password.md) and [HashiCorp Vault, AWS Secrets Manager and Azure Key Vault](vault-providers.md).
+
+Choose **Settings → Auth Profiles → New Profile → Authentication: External Program**, then **Authentication Method: Password** or **Private Key**. Enter an absolute **Executable** path and optional **Arguments**, one argument per line. Select that profile on the server under **Advanced → Auth Profile**, or apply it to a folder, inventory source, or device template. Saving, selecting, importing, previewing and syncing these links do not retrieve credentials or grant execution approval.
+
+Use **SSH Agent** when your vault already provides an agent: signing stays with the agent. Use **External Program** when a noninteractive program must return a username plus a password or private key for each new SSH authentication. Nexus does not integrate a particular vault CLI; your wrapper selects the vault item and converts its response to the protocol below. Unlock/sign in to the vault outside this protocol first.
+
+### Execution location and approval
+
+The executable runs on the **VS Code extension host**: the desktop for a local window, or the remote machine, container or WSL environment when the extension runs there. Browse selects a file on that host where supported; otherwise enter its absolute host path manually. It does not run on the SSH target. The browser-only extension cannot execute programs or approve them.
+
+A trusted workspace is required. On the first interactive connection for an external profile in each extension-host session, Nexus opens a read-only **External Credential Invocation** document. Review the execution machine, executable, indexed literal arguments and appended method flag. **Continue External Credential Approval** (editor title or command palette) opens a native confirmation with **Allow for This Session**, **Cancel**, and **Back to Invocation**. Only Allow authorizes execution. Closing a dialog, a webview message, or merely opening the document cannot approve it. Cancel or an expired connection clears the review; a stale document cannot grant permission.
+
+Approval is for that profile and exact invocation in this host session. Concurrent logins can share the approval question, but each new authentication obtains its own response. Restart/reload requires new approval. Edits/deletion, replacement imports (even with identical configuration), reset, or **Nexus: Revoke All External Credential Approvals** revoke authority. The editor's **Session Approvals** action revokes all external approvals in this host too. Revocation cancels pending programs and authentication, and retires pooled connections for future acquisitions; established terminals, transfers and tunnels continue until their owners close them.
+
+Background work never opens approval or credential dialogs. If approval is missing, start an interactive **Connect** to review the invocation, then repeat the background operation. Program/configuration failures offer **Manage Auth Profiles** on terminal, Test Connection, SFTP browse and tunnel-start surfaces. These provider failures do not automatically rerun the credential program. A provider failure does not trigger the alternate-host network fallback.
+
+Programs inherit the extension host's environment and run with its user's file/network privileges. The working directory is that host's OS temporary directory, not your workspace or the script's folder. Nexus adds no target hostname, profile name, username, password or vault token to arguments or environment. One invocation therefore represents one credential set. Store only nonsecret item identifiers in arguments: paths and arguments are ordinary configuration, visible in backups. Neither the executable nor its dependencies are cryptographically pinned; approving a mutable program trusts subsequent changes at that path.
+
+### Program contract (version 1)
+
+Nexus invokes the executable directly with `shell: false`, configured arguments in order, then exactly one additional argument: **`--pass`** for Password or **`--pkey`** for Private Key. Do not include that final flag yourself. No shell expansion, `~`, environment substitution, token interpolation, file-association launch or interactive stdin is provided. Stdin is closed. The program must finish its child work and exit successfully with all output streams closed.
+
+The executable must be an absolute regular executable file on the host. On Linux it needs an ELF header or an explicit `#!` shebang; on macOS, a supported Mach-O/fat header or shebang. Headerless text is rejected to prevent an implicit shell fallback. Windows requires a native MZ executable; choose an explicit interpreter for `.ps1`, `.js`, `.py`, `.bat` or `.cmd` scripts. Batch files cannot be the executable themselves. No execution-policy bypass is added.
+
+Arguments are at most 32 entries, each at most 4096 UTF-8 bytes. A completely empty Arguments field means no entries. Blank lines, a trailing blank line, leading/trailing whitespace, NUL and embedded CR/LF in an entry are rejected; values are never silently trimmed or dropped. Interior spaces, quotes and backslashes are literal. A path containing spaces occupies one line, without shell quotes. Executable paths containing control or bidirectional-formatting characters are rejected.
+
+Stdout must be exactly one UTF-8 JSON object, with optional surrounding whitespace and no banner or additional JSON. Password response:
+
+```json
+{"version":1,"username":"example-user","password":"synthetic-example-only"}
+```
+
+Private Key response (replace the placeholder with the full unencrypted OpenSSH or PEM private-key text, JSON-escaped):
+
+```json
+{"version":1,"username":"example-user","private_key":"-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----\n"}
+```
+
+`version` must be the number `1`. `username` is nonempty, at most 1024 UTF-8 bytes, with no NUL, CR or LF. `password` is nonempty and at most 64 KiB UTF-8; it is not trimmed or normalized. `private_key` is nonempty, at most 192 KiB UTF-8, and must parse as an OpenSSH private key or traditional PEM RSA/DSA/EC private key without a passphrase. PKCS#8 `BEGIN PRIVATE KEY` and other formats are not accepted. Encrypted keys, a `passphrase` field, mismatched credential fields, extra fields, invalid UTF-8, arrays, null and plaintext output are refused. Nexus does not create temporary private-key files.
+
+| Bound | Limit |
+|---|---|
+| Program execution | 30 seconds from spawn |
+| Stdout / stderr | 256 KiB / 64 KiB; the combined stdout response bound also limits key responses |
+| Concurrent work per extension host | 4 running programs, 32 queued requests; queue overflow fails immediately |
+| Queue wait | 30 seconds; approval review time is outside queue and program limits |
+| Termination escalation / cleanup | 250 ms / 1000 ms; stream-drain grace after parent exit is 250 ms |
+
+Stderr is counted and discarded, never shown. Errors name a finite failure category and sometimes a numeric exit code; they never include stdout, stderr or parser exception text. Debug your wrapper independently with synthetic data. If an owned parent cannot be stopped within the cleanup bound, further external requests are refused until the extension host restarts.
+
+### Synthetic wrapper examples
+
+These examples exercise Password mode only; replace the synthetic response with your vault lookup. Never hard-code a real secret. A POSIX executable script at `/home/example/bin/nexus-credentials` could contain:
+
+```javascript
+#!/usr/bin/env node
+if (process.argv.at(-1) !== "--pass") process.exit(2);
+process.stdout.write(JSON.stringify({
+  version: 1, username: "example-user", password: "synthetic-example-only"
+}));
+```
+
+Mark it executable, select its absolute path as **Executable**, and leave **Arguments** empty. The shebang requires `node` in the extension host's inherited PATH. Alternatively choose the absolute Node interpreter as Executable and the absolute script path as its one argument.
+
+On Windows, select the installed absolute Node executable, for example `C:\Program Files\nodejs\node.exe`, and use one Arguments line `C:\Example\nexus-credentials.js` containing the same JavaScript (the shebang is optional for explicit Node invocation).
+
+For PowerShell, choose its installed absolute executable, for example `C:\Program Files\PowerShell\7\pwsh.exe`, and enter these four Arguments lines:
+
+```text
+-NoProfile
+-NonInteractive
+-File
+C:\Example\nexus-credentials.ps1
+```
+
+A synthetic script accepting the appended literal flag:
+
+```powershell
+if ($args.Count -ne 1 -or $args[0] -ne '--pass') { exit 2 }
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$response = @{ version = 1; username = 'example-user'; password = 'synthetic-example-only' }
+[Console]::Write(($response | ConvertTo-Json -Compress))
+```
+
+### Supported surfaces and retained state
+
+| Surface | External Program behavior |
+|---|---|
+| SSH terminals, Test Connection, SFTP, tunnels, SSH jump hosts | Supported through the shared authentication factory; every new authentication retrieves independently |
+| Existing pooled SSH transport | Reuses its established login; opening another channel is not a new authentication and does not run the program |
+| Inventory source / device-template SSH profile assignment | Carries the link without retrieving; External Private Key does not need a static key file |
+| Inventory API tokens/passwords and SOCKS5/HTTP proxy passwords | Independent existing credential sources; External Program does not supply them |
+| Deploy SSH Key | Unavailable for external or unresolved SSH profiles; choose a stored profile/source first |
+| IPMI credentials, including macro credential injection | External profiles are unavailable; choose a supported stored profile |
+| Macros and browser URLs using `${profile.username}` | Refused before execution; the dynamic username is not available as a static token, even after connecting; other tokens still work |
+| Password keyboard-interactive | Only the recognized password challenge can use the response; arbitrary MFA/OTP challenges are refused without prompting |
+| Private Key keyboard-interactive | No fallback; authentication rejection never falls through to stored passwords, agent keys or prompts |
+
+Linked forms and tree tooltips show **External Program**, not a stored username presented as the sign-in identity. Server/tunnel pickers, copied connection info, the File Explorer header and sudo prompts omit the account when the profile is external or missing; they never run the program just to display a label. Containerlab discovery and its background approval are invalidated when a linked external program, arguments or authentication method changes. Existing dormant server/source username, auth type and key path remain stored for an explicit unlink; new external servers use dormant `root`/password defaults, and new inventory sources use the existing fleet username seed or `root` when none exists. These are never sent as external identity. Explicitly unlinking reveals the retained fields and applies normal validation. Missing or unconfigured profile links fail closed and remain visible for repair, instead of falling back to dormant credentials.
+
+Switching a stored auth profile to External Program saves the external configuration and removes that profile's password/passphrase slots. Cleanup failure is reported accurately and those slots remain unused; retry Save to clean them. Switching back clears those slots before enabling stored mode, so a failed cleanup cannot resurrect an old secret. This does not erase unrelated server-scoped secrets. An external profile cannot be deleted while servers, sources or templates still reference it; unlink/change those references first. See [external-profile portability](import-export.md#external-program-profile-portability) for backups, sharing and older readers.
+
+Nexus does not persist provider results in configuration, SecretStorage, webviews, logs, telemetry, backups, command history or pool keys, and does not cache or share them across authentications. It releases extension-owned references and wipes owned key/output buffers. JavaScript strings, SSH-library copies, OS buffers and crash dumps cannot be guaranteed erased; dependency-owned parsed key material may remain until connection disposal. Process groups and Windows process-tree termination bound cooperative cleanup, but cannot contain malicious detached descendants. This is trusted local execution, not a sandbox.
 
 ## Jump Hosts and Proxies
 

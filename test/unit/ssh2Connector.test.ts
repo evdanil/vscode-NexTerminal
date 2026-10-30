@@ -1,21 +1,28 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { PassThrough } from "node:stream";
+import { generateKeyPairSync } from "node:crypto";
 import type { ServerConfig } from "../../src/models/config";
 
 // Minimal fake for ssh2's `Client`: a bare event emitter with the handful of
 // methods Ssh2Connector.connect() calls (`connect`, `end`). Real ssh2 would
 // require a live TCP handshake, so we swap the module for this test file.
-const { mockClients } = vi.hoisted(() => ({ mockClients: [] as any[] }));
+const { mockClients, mockBehavior } = vi.hoisted(() => ({ mockClients: [] as any[], mockBehavior: { connectError: undefined as Error | undefined } }));
 
-vi.mock("ssh2", () => {
+vi.mock("ssh2", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("ssh2")>();
   class MockClient {
     private handlers: Record<string, Array<(...args: any[]) => void>> = {};
-    public connect = vi.fn();
+    public connect = vi.fn(() => { if (mockBehavior.connectError) throw mockBehavior.connectError; });
     public end = vi.fn();
     public on(event: string, cb: (...args: any[]) => void): this {
       (this.handlers[event] ??= []).push(cb);
       return this;
     }
+    public removeListener(event: string, cb: (...args: any[]) => void): this {
+      this.handlers[event] = (this.handlers[event] ?? []).filter((handler) => handler !== cb);
+      return this;
+    }
+    public listenerCount(event: string): number { return (this.handlers[event] ?? []).length; }
     public emit(event: string, ...args: any[]): void {
       for (const cb of this.handlers[event] ?? []) {
         cb(...args);
@@ -25,7 +32,7 @@ vi.mock("ssh2", () => {
       mockClients.push(this);
     }
   }
-  return { Client: MockClient };
+  return { ...actual, utils: actual.utils, Client: MockClient };
 });
 
 import { isAuthNotJudged, SshAgentUnavailableError } from "../../src/services/ssh/authErrors";
@@ -934,5 +941,73 @@ describe("Ssh2Connector — SSH agent logins", () => {
     // decide whether the saved password was wrong.
     await expect(connecting).rejects.toThrow("All configured authentication methods failed");
     expect(resolve).not.toHaveBeenCalled();
+  });
+});
+
+
+describe("Ssh2Connector external credentials", () => {
+  beforeEach(() => { mockClients.length = 0; mockBehavior.connectError = undefined; });
+  it.each([
+    ["password", "password"], ["key", "password"], ["agent", "password"],
+    ["password", "key"], ["key", "key"], ["agent", "key"]
+  ] as const)("uses the provider username and never reads dormant keyPath or agent for %s with external %s", async (authType, method) => {
+    const externalCredential = method === "password"
+      ? { method, username: "provider-user", password: "provider-password" }
+      : { method, username: "provider-user", privateKey: Buffer.from(generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs1", format: "pem" })) };
+    const resolve = vi.fn(() => { throw new Error("agent fallback"); });
+    const connecting = new Ssh2Connector(undefined, undefined, undefined, { resolve }).connect(
+      makeServer({ authType, username: "dormant", keyPath: "/missing/external-must-not-read" }),
+      { externalCredential }
+    );
+    // Observe rejection immediately so a bad readFile implementation cannot leak an unhandled rejection.
+    let connectFailure: unknown;
+    void connecting.catch((error) => { connectFailure = error; });
+    await flushMicrotasks();
+    expect(connectFailure).toBeUndefined();
+    const client = mockClients.at(-1);
+    expect(client).toBeDefined();
+    const config = client.connect.mock.calls[0][0];
+    expect(config.username).toBe("provider-user");
+    for (const field of ["password", "privateKey", "passphrase", "agent"]) expect(config).not.toHaveProperty(field);
+    expect(resolve).not.toHaveBeenCalled();
+    const handler = config.authHandler;
+    const offered = handler(null, null, vi.fn());
+    expect(offered).toMatchObject({ type: method === "key" ? "publickey" : "password", username: "provider-user" });
+    if (method === "password") expect(offered.password).toBe("provider-password");
+    else expect(offered.key).toEqual(externalCredential.privateKey);
+    client.emit("ready");
+    await connecting;
+    expect(handler(null, null, vi.fn())).toBe(false);
+    if (method === "key") expect((offered.key as Buffer).every((byte) => byte === 0)).toBe(true);
+    expect(client.listenerCount("keyboard-interactive")).toBe(0);
+    expect(client.listenerCount("banner")).toBe(0);
+  });
+
+  it.each(["password", "passphrase"] as const)("rejects mixed external and %s authentication before connecting", async (field) => {
+    await expect(new Ssh2Connector().connect(makeServer(), {
+      externalCredential: { method: "password", username: "user", password: "secret" }, [field]: ""
+    })).rejects.toThrow("External credentials cannot be combined");
+    expect(mockClients).toHaveLength(0);
+  });
+
+  it.each(["error", "close", "abort", "throw"])("disposes external authentication on %s", async (failure) => {
+    const controller = new AbortController();
+    if (failure === "throw") mockBehavior.connectError = new Error("connect threw");
+    const connecting = new Ssh2Connector().connect(makeServer(), {
+      signal: controller.signal, externalCredential: { method: "password", username: "user", password: "secret" }
+    });
+    const rejected = expect(connecting).rejects.toBeInstanceOf(Error);
+    await flushMicrotasks();
+    const client = mockClients.at(-1);
+    const handler = client.connect.mock.calls[0][0].authHandler;
+    if (failure === "abort") {
+      client.end.mockImplementation(() => client.emit("close"));
+      controller.abort(new Error("external cancellation"));
+    }
+    else if (failure !== "throw") client.emit(failure, new Error("failed"));
+    await rejected;
+    if (failure === "abort") await expect(connecting).rejects.toThrow("external cancellation");
+    expect(handler(null, null, vi.fn())).toBe(false);
+    expect(client.listenerCount("keyboard-interactive")).toBe(0);
   });
 });

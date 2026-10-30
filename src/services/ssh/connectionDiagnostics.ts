@@ -1,4 +1,5 @@
 import { findSshAgentUnavailable, isAuthNotJudged } from "./authErrors";
+import { CredentialProviderError } from "../credentials/credentialProviderError";
 
 export type ConnectionDiagnosticStage =
   | "dns"
@@ -8,6 +9,7 @@ export type ConnectionDiagnosticStage =
   | "key"
   | "proxy"
   | "agent"
+  | "credential-provider"
   | "unknown";
 
 export interface ConnectionDiagnosticResult {
@@ -26,6 +28,20 @@ function errorMessage(error: unknown): string {
 }
 
 export function classifySshConnectionError(error: unknown): ConnectionDiagnosticResult {
+  // Identity wins over wrapper text (including a jump failure or provider timeout).
+  const visited = new Set<Error>();
+  for (let cause = error; cause instanceof Error && !visited.has(cause); cause = cause.cause) {
+    visited.add(cause);
+    if (cause instanceof CredentialProviderError) {
+      return {
+        ok: false,
+        stage: "credential-provider",
+        title: "External credentials could not be obtained",
+        detail: new CredentialProviderError(cause.code, cause.exitCode).message,
+        suggestion: "Manage Auth Profiles to check the program settings. Approval requires an interactive SSH connection."
+      };
+    }
+  }
   const message = errorMessage(error).toLowerCase();
 
   // STRUCTURED proxy / jump-host failure FIRST (issue #48, PR #67 Codex round 3 P2a).

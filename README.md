@@ -50,12 +50,12 @@ Then open the **Nexus** sidebar (activity bar icon).
 
 ### Connect
 
-- **SSH sessions** — password, private key, SSH agent (on Windows, Pageant or the OpenSSH agent is found automatically), and 2FA keyboard-interactive auth, with silent re-auth from VS Code SecretStorage. → [Authentication](docs/ssh-and-telnet.md#authentication)
+- **SSH sessions** — stored password/key/SSH agent authentication with keyboard-interactive 2FA, or External Program credentials retrieved per authentication with session approval. Windows agents include Pageant and OpenSSH. → [Authentication](docs/ssh-and-telnet.md#authentication)
 - **Legacy devices** — a per-server legacy-algorithm toggle for older gear, including devices that only speak 1024-bit `diffie-hellman-group1-sha1`. → [Legacy Devices](docs/ssh-and-telnet.md#legacy-devices)
 - **Alternate host** — a second SSH address for a server (e.g. the IPv6 to its IPv4), retried once when the primary can't be reached at the connection level; NetBox and Proxmox syncs fill it from the device's other address family. → [Alternate Host](docs/ssh-and-telnet.md#alternate-host)
 - **SSH key deployment** — right-click a server → **Deploy SSH Key** to find or generate a key and install it in the remote `authorized_keys`. → [Deploy an SSH Key](docs/ssh-and-telnet.md#deploy-an-ssh-key)
 - **Host key verification** — trust-on-first-use, with an alert when a host key changes. → [Host Key Verification](docs/ssh-and-telnet.md#host-key-verification)
-- **Auth profiles** — reusable credential sets applied to single servers or whole folders; edit one and every linked server follows. → [Auth Profiles](docs/ssh-and-telnet.md#auth-profiles)
+- **Auth profiles** — reusable credential sets applied to single servers or whole folders; edit one and every linked server follows. → [Auth Profiles](docs/ssh-and-telnet.md#auth-profiles) · [1Password](docs/1password.md) · [HashiCorp Vault, AWS and Azure examples](docs/vault-providers.md)
 - **Jump hosts and proxies** — SSH jump-host chains, SOCKS5, and HTTP CONNECT, set per server. → [Jump Hosts and Proxies](docs/ssh-and-telnet.md#jump-hosts-and-proxies)
 - **Connection multiplexing** — terminals, tunnels, and SFTP to one server share an SSH connection, with a per-server opt-out. → [Connection Multiplexing](docs/ssh-and-telnet.md#connection-multiplexing)
 - **Dropped-session diagnostics** — faults after a session is up are recorded in the **Nexus SSH** output channel, so a dropped terminal leaves a cause behind. → [When a Session Drops](docs/ssh-and-telnet.md#when-a-session-drops)

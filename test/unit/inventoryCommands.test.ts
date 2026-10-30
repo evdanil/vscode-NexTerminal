@@ -6770,6 +6770,28 @@ describe("inventoryCommands", () => {
      * linked through the form no matter what the persist helper would have
      * done with it.
      */
+    it("creates an external-linked source with a host-owned dormant root in an empty fleet", async () => {
+      const external: AuthProfile = { id: "external", name: "Program", authType: "external", external: { version: 1, method: "key", invocation: { executable: "/provider", args: [] } } };
+      const { core } = await makeHarness({ profiles: [external] });
+      await registeredCommands.get("nexus.inventory.addSource")!();
+      const { definition, onAutofill, onSubmit } = latestFormCall(); const form = openForm(definition);
+      form.type("name", "External source"); form.type("targetFolder", "Infra"); form.type("cfg_host", "source.test"); form.type("cfg_apiToken", "fixture-token");
+      form.choose("authProfileId", "external"); const values = await onAutofill!("authProfileId", "external");
+      form.deliver({ type: "fillFields", key: "authProfileId", value: "external", values: values!, requestId: form.lastAutofillRequestId() });
+      const submitted = form.submit(); expect(submitted).not.toHaveProperty("defaultUsername"); await onSubmit(submitted);
+      const source = core.getSnapshot().inventorySources[0]; expect(source.authProfileId).toBe("external"); expect(source.defaultUsername).toBe("root");
+    });
+
+    it("preserves dormant inventory username and rejects changed external invocation identity", async () => {
+      const external: AuthProfile = { id: "external", name: "Program", authType: "external", external: { version: 1, method: "password", invocation: { executable: "/provider", args: [] } } };
+      const { core } = await makeHarness({ profiles: [external], source: { authProfileId: "external", defaultUsername: "dormant" } });
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { onSubmit } = latestFormCall();
+      await core.addOrUpdateAuthProfile({ ...external, external: { ...external.external, invocation: { executable: "/changed", args: [] } } });
+      await expect(onSubmit({ name: "External source", targetFolder: "Infra", authProfileId: "external", defaultUsername: "forged", prunePolicy: "orphan", cfg_host: "source.test" })).rejects.toThrow(/external auth profile.*changed/);
+      expect(core.getInventorySource("src-1")?.defaultUsername).toBe("dormant");
+    });
+
     async function selectProfileThenSubmit(values: FormValues, profileId: string): Promise<void> {
       const { onAutofill, onSubmit } = latestFormCall();
       const mirrored = await onAutofill!("authProfileId", profileId);

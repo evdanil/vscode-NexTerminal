@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CommandContext } from "../../src/commands/types";
 import { NexusCore } from "../../src/core/nexusCore";
-import type { AuthProfile, ServerConfig } from "../../src/models/config";
+import type { StoredAuthProfile, AuthProfile, ServerConfig } from "../../src/models/config";
 import { authProfilePasswordSecretKey, passwordSecretKey } from "../../src/services/ssh/silentAuth";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import { registerAuthProfileCommands } from "../../src/commands/authProfileCommands";
@@ -79,7 +79,7 @@ function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
   };
 }
 
-function makeAuthProfile(overrides: Partial<AuthProfile> = {}): AuthProfile {
+function makeAuthProfile(overrides: Partial<StoredAuthProfile> = {}): StoredAuthProfile {
   return {
     id: "ap1",
     name: "Prod Auth",

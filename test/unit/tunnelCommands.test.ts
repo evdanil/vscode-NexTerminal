@@ -1437,3 +1437,21 @@ describe("Tunnels toolbar vs tunnel row — the toolbar Start/Stop ignore the fo
     expect(stop).not.toHaveBeenCalled();
   });
 });
+
+
+describe("external credential tunnel labels", () => {
+  it.each(["external", "missing"])("hides dormant usernames in %s server choices", async (kind) => {
+    vi.clearAllMocks();
+    mockShowQuickPick.mockResolvedValue(undefined);
+    const ctx = await setupContext([makeTunnel()]);
+    if (kind === "external") await ctx.core.addOrUpdateAuthProfile({ id: "profile", name: "Provider", authType: "external",
+      external: { version: 1, method: "password", invocation: { executable: "/never-run", args: [] } } });
+    for (const id of ["a", "b"]) await ctx.core.addOrUpdateServer({ id, name: id, host: "example.com", port: 22,
+      username: "dormant-root", authType: "password", authProfileId: "profile", isHidden: false });
+    registerTunnelCommands(ctx);
+    await registeredCommands.get("nexus.tunnel.start")!({ profile: makeTunnel() });
+    const choices = mockShowQuickPick.mock.calls.at(-1)?.[0] as Array<{ description: string }>;
+    expect(choices.map((choice) => choice.description)).toEqual(["example.com", "example.com"]);
+    expect(JSON.stringify(choices.map((choice) => choice.description))).not.toContain("dormant-root");
+  });
+});

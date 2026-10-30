@@ -1,3 +1,6 @@
+import { authProfileConnectionIdentity, isExternalAuthProfile, type ExternalAuthProfile } from "../../models/authProfile";
+import type { ExternalCredentialResolver } from "../credentials/contracts";
+import { CredentialProviderError } from "../credentials/credentialProviderError";
 import type { Duplex } from "node:stream";
 import type { AuthProfile, ProxyConfig, ServerConfig } from "../../models/config";
 import { applyAuthProfile } from "../../models/config";
@@ -176,6 +179,27 @@ interface SharedPromptAnswer {
   cancellationError?: Error;
 }
 
+/** Cancellation may win while a socket/connector ignores its signal; its eventual result still has an owner. */
+function awaitExternalResource<T>(pending: Promise<T>, signal: AbortSignal, release: (resource: T) => void): Promise<T> {
+  return new Promise((resolve, reject) => {
+    let cancelled = false;
+    const abort = (): void => {
+      cancelled = true;
+      reject(new CredentialProviderError("cancelled"));
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+    void pending.then((resource) => {
+      signal.removeEventListener("abort", abort);
+      if (cancelled) release(resource);
+      else resolve(resource);
+    }, (error: unknown) => {
+      signal.removeEventListener("abort", abort);
+      if (!cancelled) reject(error);
+    });
+  });
+}
+
 export class SilentAuthSshFactory implements SshFactory {
   /**
    * Per vault key: the prompted answer shared by every login that reaches the
@@ -207,6 +231,9 @@ export class SilentAuthSshFactory implements SshFactory {
   // A shared answer avoids duplicate questions; this queue also keeps distinct
   // credentials, proxy passwords and keyboard-interactive challenges from hiding one another.
   private promptTail: Promise<void> = Promise.resolve();
+  // A byte-identical profile replacement still withdraws the old attempt's authority.
+  private readonly externalProfileRecords = new WeakMap<ExternalAuthProfile, number>();
+  private nextExternalProfileRecord = 0;
 
   public constructor(
     private readonly connector: SshConnector,
@@ -214,7 +241,8 @@ export class SilentAuthSshFactory implements SshFactory {
     private readonly prompt: PasswordPrompt,
     private readonly inputPromptFn?: InputPromptFn,
     private readonly authProfileLookup?: (id: string) => AuthProfile | undefined,
-    private readonly liveServerLookup?: (id: string) => ServerConfig | undefined
+    private readonly liveServerLookup?: (id: string) => ServerConfig | undefined,
+    private readonly externalResolver?: ExternalCredentialResolver
   ) {}
 
   /**
@@ -235,7 +263,16 @@ export class SilentAuthSshFactory implements SshFactory {
     const nextVisited = new Set(visited);
     nextVisited.add(server.id);
 
-    const { resolved, passwordKey, passphraseKey, legacyServerPassphraseKey, profileScoped } = this.resolveServer(server);
+    const { resolved, passwordKey, passphraseKey, legacyServerPassphraseKey, profileScoped, externalProfile } = this.resolveServer(server);
+    let externalIdentity: unknown = null;
+    if (externalProfile) {
+      let record = this.externalProfileRecords.get(externalProfile);
+      if (record === undefined) {
+        record = ++this.nextExternalProfileRecord;
+        this.externalProfileRecords.set(externalProfile, record);
+      }
+      externalIdentity = [authProfileConnectionIdentity(externalProfile), record];
+    }
     let route: unknown = null;
     if (server.proxy?.type === "ssh") {
       const jump = serverLookup?.(server.proxy.jumpHostId);
@@ -260,7 +297,8 @@ export class SilentAuthSshFactory implements SshFactory {
       passphraseKey,
       legacyServerPassphraseKey ?? null,
       profileScoped,
-      route
+      route,
+      externalIdentity
     ]);
   }
 
@@ -326,8 +364,9 @@ export class SilentAuthSshFactory implements SshFactory {
     passphraseKey: string;
     legacyServerPassphraseKey?: string;
     profileScoped: boolean;
+    externalProfile?: ExternalAuthProfile;
   } {
-    if (!server.authProfileId || !this.authProfileLookup) {
+    if (!server.authProfileId) {
       return {
         resolved: server,
         passwordKey: passwordSecretKey(server.id),
@@ -335,14 +374,12 @@ export class SilentAuthSshFactory implements SshFactory {
         profileScoped: false
       };
     }
-    const profile = this.authProfileLookup(server.authProfileId);
+    const profile = this.authProfileLookup?.(server.authProfileId);
     if (!profile) {
-      return {
-        resolved: server,
-        passwordKey: passwordSecretKey(server.id),
-        passphraseKey: passphraseSecretKey(server.id),
-        profileScoped: false
-      };
+      throw new Error("The linked auth profile is unavailable. Open Settings → Auth Profiles to configure it, or explicitly unlink it before connecting.");
+    }
+    if (isExternalAuthProfile(profile)) {
+      return { resolved: server, passwordKey: "", passphraseKey: "", profileScoped: true, externalProfile: profile };
     }
     // REVIEW FINDING (P2) — only the fields the profile actually SUPPLIES are
     // taken over (authProfileOwnedCredentials, models/config.ts); the server
@@ -494,8 +531,63 @@ export class SilentAuthSshFactory implements SshFactory {
       endpointSignature: credentialEndpointSignature,
       recordIdentityAvailable: this.liveServerLookup !== undefined || hasCapturedCredentialRecord
     };
+    const { resolved, passwordKey, passphraseKey, legacyServerPassphraseKey, profileScoped, externalProfile } = this.resolveServer(server);
+
+    // External results belong to one authentication only. This branch must precede
+    // every legacy vault, prompt and shared-answer path, including on rejection.
+    if (externalProfile) {
+      if (!this.externalResolver) throw new CredentialProviderError("unsupported-consumer");
+      const route = options?.route?.();
+      const profileIdentity = JSON.stringify(authProfileConnectionIdentity(externalProfile));
+      const isCurrent = (): boolean => {
+        try {
+          return isAttemptActive() && this.isCredentialRecordCurrent(promptProvenance) &&
+            this.authProfileLookup?.(externalProfile.id) === externalProfile &&
+            JSON.stringify(authProfileConnectionIdentity(externalProfile)) === profileIdentity &&
+            options?.route?.() === route;
+        } catch { return false; }
+      };
+      // Snapshot invocation bytes before consent; neither a mutable caller nor a
+      // later profile replacement may change what this attempt is authorized to run.
+      const profile: ExternalAuthProfile = {
+        ...externalProfile,
+        external: { ...externalProfile.external, ...(externalProfile.external.invocation && {
+          invocation: { ...externalProfile.external.invocation, args: [...externalProfile.external.invocation.args] }
+        }) }
+      };
+      const attempt = this.externalResolver.begin({ profile, signal: options?.signal ?? new AbortController().signal, interaction, isCurrent });
+      const assertCurrent = (): void => {
+        if (!attempt.isCurrent()) throw new CredentialProviderError(options?.signal?.aborted ? "cancelled" : "configuration-changed");
+      };
+      let sock: Duplex | undefined;
+      let connection: SshConnection | undefined;
+      try {
+        const credential = await attempt.resolve();
+        assertCurrent();
+        if (options?.sockFactory) {
+          sock = await awaitExternalResource(options.sockFactory(), attempt.signal, (late) => late.destroy());
+        }
+        assertCurrent();
+        connection = await awaitExternalResource(this.connector.connect(resolved, {
+          externalCredential: credential,
+          ...(sock && { sock }),
+          ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage }),
+          interaction,
+          signal: attempt.signal
+        }), attempt.signal, (late) => late.dispose());
+        if (!attempt.commit()) throw new CredentialProviderError("configuration-changed");
+        return connection;
+      } catch (error) {
+        connection?.dispose();
+        sock?.destroy();
+        // Provider failures are already controlled. Transport and SSH rejection
+        // keep their own provenance so only actual TCP/DNS failures can retry an address.
+        throw error;
+      } finally {
+        attempt.dispose();
+      }
+    }
     this.assertCredentialRecordCurrent(promptProvenance);
-    const { resolved, passwordKey, passphraseKey, legacyServerPassphraseKey, profileScoped } = this.resolveServer(server);
 
     if (resolved.authType === "key") {
       const handler = this.buildKeyboardInteractiveHandler(undefined, options?.onAuthMessage, promptProvenance, isAttemptActive, interaction);

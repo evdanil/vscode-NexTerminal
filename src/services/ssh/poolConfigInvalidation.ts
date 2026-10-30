@@ -1,14 +1,16 @@
 import type { NexusCore } from "../../core/nexusCore";
-import { authProfileOwnedCredentials, proxyConfigsEqual, type AuthProfile, type ProxyConfig } from "../../models/config";
+import { authProfileConnectionIdentity, proxyConfigsEqual, type AuthProfile, type ProxyConfig } from "../../models/config";
 import { pooledConnectionParamsChanged, ridersFromIndex } from "./pooledConnectionParams";
 import { isPasswordBearingProxy, type PasswordBearingProxy } from "./proxyPasswordKeys";
+import { isExternalAuthProfile } from "../../models/authProfile";
+import type { ExternalCredentialResolver } from "../credentials/contracts";
 
-/** What a linked profile contributes to a connection; a rename or an equal reload contributes nothing. */
+/** Connection fields only; external replacement also withdraws approval independently of these values. */
 function authProfileConnectionChanged(prev: AuthProfile | undefined, next: AuthProfile | undefined): boolean {
   if (!prev || !next) {
     return prev !== next;
   }
-  return JSON.stringify(authProfileOwnedCredentials(prev)) !== JSON.stringify(authProfileOwnedCredentials(next));
+  return JSON.stringify(authProfileConnectionIdentity(prev)) !== JSON.stringify(authProfileConnectionIdentity(next));
 }
 
 /**
@@ -57,7 +59,9 @@ export function watchPoolInvalidationOnConfigMutation(
      * it), and the delete must then be skipped. Resolves true if deleted, false if skipped.
      */
     deleteEndpoint(serverId: string, proxy: PasswordBearingProxy, stillUnused: () => boolean): Promise<boolean>;
-  }
+  },
+  /** Owns both mutation revocation and revoke-only retirement; do not install a second mutation revoker. */
+  externalCredentials?: Pick<ExternalCredentialResolver, "revoke" | "onDidRevoke" | "recheckPending">
 ): () => void {
   /** serverId -> password-bearing endpoints the server left since the last persist. */
   const leftEndpoints = new Map<string, PasswordBearingProxy[]>();
@@ -105,6 +109,21 @@ export function watchPoolInvalidationOnConfigMutation(
   for (const server of core.getSnapshot().servers) {
     indexServer(server.id, server);
   }
+
+  const invalidateWithRiders = (invalidated: Set<string>): void => {
+    for (const id of invalidated) pool.invalidate(id);
+    for (const id of ridersFromIndex(ridersOf, invalidated)) pool.invalidate(id);
+  };
+  // Mutation revokes synchronously too; fold its event into that same invalidation
+  // so an epoch is never bumped twice for one profile edit.
+  let mutationRevocation = false;
+  const unsubscribeRevocation = externalCredentials?.onDidRevoke((profileIds) => {
+    if (mutationRevocation) return;
+    const ids = profileIds ?? core.getSnapshot().authProfiles.filter(isExternalAuthProfile).map((profile) => profile.id);
+    const invalidated = new Set<string>();
+    for (const id of ids) for (const serverId of linkedTo.get(id) ?? []) invalidated.add(serverId);
+    invalidateWithRiders(invalidated);
+  });
 
   // Cleanup of the saved password of an endpoint a server left (see the settle rules
   // below): a save that fails settles nothing, and a rolled-back edit finds its
@@ -163,6 +182,10 @@ export function watchPoolInvalidationOnConfigMutation(
   const unsubscribeBatchEnd = proxySecrets ? core.onDidEndServerBatch(settle) : undefined;
 
   const unsubscribeMutations = core.onDidMutateConnectionConfig((mutation) => {
+    // ObservedMap installs the replacement before this callback. Abort stale
+    // external handshakes now: the next host-verifier/PK_OK continuation can
+    // send credentials before a polling tick, even if ready is later refused.
+    externalCredentials?.recheckPending();
     const invalidated = new Set<string>();
     if (mutation.kind === "server") {
       indexServer(mutation.id, mutation.next);
@@ -180,24 +203,26 @@ export function watchPoolInvalidationOnConfigMutation(
       if (mutation.next === undefined || (mutation.prev && pooledConnectionParamsChanged(mutation.prev, mutation.next))) {
         invalidated.add(mutation.id);
       }
-    } else if (authProfileConnectionChanged(mutation.prev, mutation.next)) {
-      for (const serverId of linkedTo.get(mutation.id) ?? []) {
-        invalidated.add(serverId);
+    } else {
+      const revokeExternal = externalCredentials !== undefined && isExternalAuthProfile(mutation.prev);
+      if (revokeExternal) {
+        mutationRevocation = true;
+        try { externalCredentials.revoke([mutation.id]); }
+        finally { mutationRevocation = false; }
+      }
+      if (revokeExternal || authProfileConnectionChanged(mutation.prev, mutation.next)) {
+        for (const serverId of linkedTo.get(mutation.id) ?? []) invalidated.add(serverId);
       }
     }
     if (invalidated.size === 0) {
       return;
     }
-    for (const id of invalidated) {
-      pool.invalidate(id);
-    }
-    for (const dependentId of ridersFromIndex(ridersOf, invalidated)) {
-      pool.invalidate(dependentId);
-    }
+    invalidateWithRiders(invalidated);
   });
   return () => {
     unsubscribeMutations();
     unsubscribePersisted?.();
     unsubscribeBatchEnd?.();
+    unsubscribeRevocation?.();
   };
 }

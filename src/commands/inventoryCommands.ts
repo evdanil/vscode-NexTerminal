@@ -1,3 +1,6 @@
+import { externalSourceFormValues } from "../ui/externalCredentialForm";
+import type { ExternalCredentialResolver } from "../services/credentials/contracts";
+import { isExternalAuthProfile, authProfileConnectionIdentity } from "../models/authProfile";
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { InventorySourceRemovalMismatchError, type NexusCore } from "../core/nexusCore";
@@ -1042,11 +1045,11 @@ export interface RenderedSourceAuthProfile {
    * user's own value, unlocked.
    *
    * The value itself rather than the hashed shape the server form compares
-   * (`authProfileOwnershipSignature`): there is exactly ONE profile fact a
-   * source save reads, so `===` over `string | undefined` states it exactly,
-   * with nothing to encode and nothing to collide.
+   * (`authProfileOwnershipSignature`): stored profiles contribute just this
+   * value. External profiles separately retain their invocation identity below.
    */
   username: string | undefined;
+  externalIdentity?: string;
 }
 
 /**
@@ -1058,12 +1061,11 @@ export interface RenderedSourceAuthProfile {
  * `undefined` for an id that resolves to no profile — the state in which the
  * form is showing NO profile's username: the mirror answers nothing (so
  * WebviewFormPanel suppresses the fillFields round trip entirely) and the Edit
- * render sanitizes such a seed down to `(None)` (`inventorySourceFormDefinition`,
- * ui/formDefinitions.ts). A Save that still carries that id is refused as
- * missing, one check earlier.
+ * render retains the selected missing-id sentinel with a repair action. A Save
+ * that still carries that id is refused as missing, one check earlier.
  */
 function renderedSourceAuthProfile(profile: AuthProfile | undefined): RenderedSourceAuthProfile | undefined {
-  return profile ? { id: profile.id, username: authProfileOwnedCredentials(profile).username } : undefined;
+  return profile ? { id: profile.id, username: authProfileOwnedCredentials(profile).username, externalIdentity: isExternalAuthProfile(profile) ? JSON.stringify(authProfileConnectionIdentity(profile)) : undefined } : undefined;
 }
 
 /**
@@ -1077,6 +1079,7 @@ function renderedSourceAuthProfile(profile: AuthProfile | undefined): RenderedSo
  * single action in THIS form.
  */
 function changedAuthProfileUsernameMessage(profile: AuthProfile): string {
+  if (isExternalAuthProfile(profile)) return `The external auth profile "${profile.name}" changed while this form was open. Re-select it in Auth Profile, then save again.`;
   return `The auth profile "${profile.name}" changed the username it supplies while this form was open, so Default SSH Username on screen is not the one a save would store. Re-select it in the Auth Profile list to pick up its current username, then save again.`;
 }
 
@@ -1106,7 +1109,9 @@ function changedAuthProfileUsernameMessage(profile: AuthProfile): string {
  * syncs is stamped with, and the one `SilentAuthSshFactory` falls back to for
  * all of them if the profile is ever removed.
  *
- * THE COMPARAND IS THE USERNAME, AND ONLY THE USERNAME. The server form
+ * FOR STORED PROFILES THE COMPARAND IS THE USERNAME. External profiles instead
+ * compare invocation identity before this rule: dynamically hidden controls
+ * must correspond to the source the user actually selected. The server form
  * compares `authProfileOwnershipSignature`, which deliberately EXCLUDES the
  * profile's values: a linked server stores neither the profile's username nor
  * its key path, so a value that moves under an open server form changes nothing
@@ -1177,7 +1182,8 @@ function inventoryAuthProfileRejection(
     // land the user back on this same refusal.
     return keylessKeyAuthProfileMessage(profile);
   }
-  if (rendered?.id === authProfileId && rendered.username !== authProfileOwnedCredentials(profile).username) {
+  if (isExternalAuthProfile(profile) && rendered?.id !== authProfileId) return changedAuthProfileUsernameMessage(profile);
+  if (rendered?.id === authProfileId && (rendered.username !== authProfileOwnedCredentials(profile).username || rendered.externalIdentity !== (isExternalAuthProfile(profile) ? JSON.stringify(authProfileConnectionIdentity(profile)) : undefined))) {
     return changedAuthProfileUsernameMessage(profile);
   }
   return undefined;
@@ -1324,6 +1330,7 @@ function authProfileUsernameMirror(profile: AuthProfile | undefined): Record<str
   if (!profile) {
     return undefined;
   }
+  if (isExternalAuthProfile(profile)) return { __externalAuthProfile: profile.name };
   const username = authProfileOwnedCredentials(profile).username;
   return username !== undefined ? { defaultUsername: username } : {};
 }
@@ -1704,7 +1711,7 @@ async function persistUpdatedInventorySource(
       // REVIEW FINDING (P2) — the profile's username, not the posted one; see
       // fallbackUsernameForSource for the invariant and why the form's mirror
       // cannot be trusted to have landed before Save.
-      defaultUsername: fallbackUsernameForSource(linkedProfile, defaultUsername),
+      defaultUsername: isExternalAuthProfile(linkedProfile) ? source.defaultUsername : fallbackUsernameForSource(linkedProfile, defaultUsername),
       config,
       secretFieldIds: newSecretFieldIds,
       providerFingerprint: computeProviderFingerprint(providerSnapshot),
@@ -2793,7 +2800,8 @@ export function registerInventoryCommands(
   registry: InventoryProviderRegistry,
   vault: SecretVault,
   teardown: InventoryRuntimeTeardown,
-  containerlabActivation?: ContainerlabActivationController
+  containerlabActivation?: ContainerlabActivationController,
+  externalCredentialResolver?: Pick<ExternalCredentialResolver, "revoke">
 ): vscode.Disposable[] {
   // F4 — shared by all four commands: syncNow holds a source's id for its whole
   // run; editSource/removeSource hold it for their whole run too (they mutate
@@ -3072,7 +3080,7 @@ export function registerInventoryCommands(
     // (serverCommands.ts) — the only difference is onAutofill's payload: this
     // form mirrors the profile's username into `defaultUsername`, not into
     // `username`/`authType`/`keyPath` (fields it doesn't have).
-    const inlineAuthProfile = createInlineAuthProfileCreation({ core, secretVault: vault });
+    const inlineAuthProfile = createInlineAuthProfileCreation({ core, secretVault: vault, externalCredentialResolver });
     // DEVICE TEMPLATES (PR-T1b) — the source form's "Create new device template…"
     // affordance, routed to whichever `onCreateInline` key fired.
     const inlineDeviceTemplate = createInlineDeviceTemplateCreation({ core });
@@ -3092,7 +3100,8 @@ export function registerInventoryCommands(
     try {
       panel = WebviewFormPanel.open(`inventory-source-add-${providerSnapshot.id}`, definition, {
       onSubmit: async (values) => {
-        const parsed = await parseSourceFormValues(values, configFields);
+        const profile = typeof values.authProfileId === "string" ? core.getAuthProfile(values.authProfileId) : undefined;
+        const parsed = await parseSourceFormValues(externalSourceFormValues(values, profile, mostCommonUsername(snapshot.servers)), configFields);
         if (providerSnapshot.id === "containerlab" && !containerlabForm) {
           throw new Error("Containerlab approvals are available only in desktop VS Code.");
         }
@@ -3340,7 +3349,7 @@ export function registerInventoryCommands(
     // correct and deliberate: creating a profile never touches the source
     // record, so nothing this controller does can race the edit it is nested
     // in. The marker machinery below is untouched by this wiring.
-    const inlineAuthProfile = createInlineAuthProfileCreation({ core, secretVault: vault });
+    const inlineAuthProfile = createInlineAuthProfileCreation({ core, secretVault: vault, externalCredentialResolver });
     const inlineDeviceTemplate = createInlineDeviceTemplateCreation({ core });
     const inlineSavedFilter = createInlineSavedFilterCreation({ core, configFields });
     let panel: ReturnType<typeof WebviewFormPanel.open>;
@@ -3367,7 +3376,8 @@ export function registerInventoryCommands(
         // control to WebviewFormPanel — closing that gap.
         onSubmit: (values) => {
           const submitPromise = (async (): Promise<void> => {
-            const parsed = await parseSourceFormValues(values, configFields, existingSecretFieldIds);
+            const profile = typeof values.authProfileId === "string" ? core.getAuthProfile(values.authProfileId) : undefined;
+            const parsed = await parseSourceFormValues(externalSourceFormValues(values, profile, source.defaultUsername), configFields, existingSecretFieldIds);
             if (providerSnapshot.id === "containerlab" && !containerlabForm) {
               throw new Error("Containerlab approvals are available only in desktop VS Code.");
             }

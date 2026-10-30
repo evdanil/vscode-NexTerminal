@@ -527,25 +527,58 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
     <div class="field-error" id="error-name"></div>
   </div>
 
-  <div class="form-group">
+  <div class="form-group conditional-field visible" id="username-field">
     <label for="profile-username">Username</label>
     <input type="text" id="profile-username" value="root" placeholder="root" />
     <div class="field-error" id="error-username"></div>
   </div>
 
   <div class="form-group">
-    <label>Authentication</label>
-    <div class="custom-select" id="authtype-selector">
+    <label id="authtype-label">Authentication</label>
+    <div class="custom-select" id="authtype-selector" data-select-only="true">
       <input type="hidden" id="authtype-select-value" value="password" />
-      <div class="custom-select-trigger" tabindex="0">
-        <span class="custom-select-text">Password</span>
+      <div class="custom-select-trigger" tabindex="0" role="combobox" aria-haspopup="listbox" aria-expanded="false" aria-controls="authtype-listbox" aria-labelledby="authtype-label authtype-value">
+        <span class="custom-select-text" id="authtype-value">Password</span>
       </div>
-      <div class="custom-select-dropdown">
-        <div class="custom-select-option selected" data-value="password">Password</div>
-          <div class="custom-select-option" data-value="key">Private Key</div>
-          <div class="custom-select-option" data-value="agent">SSH Agent</div>
+      <div class="custom-select-dropdown" id="authtype-listbox" role="listbox" aria-labelledby="authtype-label">
+        <div class="custom-select-option selected" data-value="password" id="authtype-option-password" role="option" aria-selected="true">Password</div>
+          <div class="custom-select-option" data-value="key" id="authtype-option-key" role="option" aria-selected="false">Private Key</div>
+          <div class="custom-select-option" data-value="agent" id="authtype-option-agent" role="option" aria-selected="false">SSH Agent</div>
+          <div class="custom-select-option" data-value="external" id="authtype-option-external" role="option" aria-selected="false">External Program</div>
       </div>
     </div>
+  </div>
+
+  <div class="conditional-field" id="external-field">
+    <p class="hint">The program supplies the username and credentials when a new SSH connection signs in.</p>
+    <div class="form-group">
+      <label id="external-method-label">Authentication Method</label>
+      <div class="custom-select" id="external-method-selector" data-select-only="true">
+        <input type="hidden" id="external-method" value="password" />
+        <div class="custom-select-trigger" tabindex="0" role="combobox" aria-haspopup="listbox" aria-expanded="false" aria-controls="external-method-listbox" aria-labelledby="external-method-label external-method-value" aria-describedby="external-method-hint"><span class="custom-select-text" id="external-method-value">Password</span></div>
+        <div class="custom-select-dropdown" id="external-method-listbox" role="listbox" aria-labelledby="external-method-label">
+          <div class="custom-select-option selected" data-value="password" id="external-method-option-password" role="option" aria-selected="true">Password</div>
+          <div class="custom-select-option" data-value="key" id="external-method-option-key" role="option" aria-selected="false">Private Key</div>
+        </div>
+      </div>
+      <div class="hint" id="external-method-hint">Nexus adds <span id="external-method-flag">--pass</span>. Private keys supplied by the program must be unencrypted.</div>
+    </div>
+    <div class="form-group">
+      <label for="external-executable">Executable</label>
+      <div class="browse-row">
+        <input type="text" id="external-executable" value="" aria-describedby="external-executable-hint error-external-executable" />
+        <button type="button" class="btn-secondary" id="external-browse-btn">Browse</button>
+      </div>
+      <div class="hint" id="external-executable-hint">Absolute path on the extension host, which may be remote, in a container or WSL. For scripts, select the interpreter and put the script path in Arguments.</div>
+      <div class="field-error" id="error-external-executable" aria-live="polite"></div>
+    </div>
+    <div class="form-group">
+      <label for="external-arguments">Arguments</label>
+      <textarea id="external-arguments" rows="4" aria-describedby="external-arguments-hint error-external-arguments"></textarea>
+      <div class="hint" id="external-arguments-hint">One argument per line. Spaces inside an argument are preserved. Do not add shell quotes or put passwords/tokens here; arguments are saved in configuration. Nexus adds --pass or --pkey for the selected method. Tilde, environment and template expansion are unavailable.</div>
+      <div class="field-error" id="error-external-arguments" aria-live="polite"></div>
+    </div>
+    <p class="hint">Saving does not run the program or grant approval. Interactive Connect asks you to review the complete invocation before approving it for this extension-host session.</p>
   </div>
 
   <div class="form-group conditional-field visible" id="password-field">
@@ -573,6 +606,13 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
     <button type="button" class="btn-secondary" id="new-btn">New Profile</button>
     <button type="button" class="btn-secondary" id="delete-btn">Delete</button>
   </div>
+  <section id="session-approvals" aria-labelledby="session-approvals-heading">
+    <h3 id="session-approvals-heading">Session Approvals</h3>
+    <p class="hint">Applies to all external credential profiles in this extension-host session, including profiles other than the one selected.</p>
+    <button type="button" class="btn-secondary" id="revoke-external-btn">Revoke All External Credential Approvals</button>
+    <div id="session-approvals-status" role="status" aria-live="polite"></div>
+  </section>
+  <div id="action-error" class="field-error" role="status" aria-live="polite"></div>
 
   <script nonce="VERIFY_NONCE">
     
@@ -606,6 +646,10 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
       wrapper.classList.toggle('open', !!open);
       var trigger = wrapper.querySelector('.custom-select-trigger');
       if (trigger) trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (!open && wrapper.dataset.selectOnly === 'true') {
+        trigger.removeAttribute('aria-activedescendant');
+        wrapper.querySelectorAll('.custom-select-option').forEach(function(opt) { opt.classList.remove('highlighted'); });
+      }
     }
 
     document.addEventListener('click', function(e) {
@@ -634,6 +678,18 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
           // wrapper into type-to-filter mode, so the two paths never diverge on
           // which is which.
           var filterInput = wrapper.querySelector('.custom-select-filter');
+          // Opt-in select-only comboboxes retain DOM focus on the trigger while
+          // aria-activedescendant exposes the highlighted, not yet committed option.
+          var selectOnly = wrapper.dataset.selectOnly === 'true';
+          var activeOption;
+          function activateOption(opt) {
+            if (!opt) return;
+            wrapper.querySelectorAll('.custom-select-option').forEach(function(item) { item.classList.remove('highlighted'); });
+            activeOption = opt;
+            opt.classList.add('highlighted');
+            trigger.setAttribute('aria-activedescendant', opt.id);
+            if (opt.scrollIntoView) opt.scrollIntoView({ block: 'nearest' });
+          }
 
           function chooseOption(opt) {
             if (onOptionClick) {
@@ -652,6 +708,7 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
               if (openSelects[j] !== wrapper) setCustomSelectOpen(openSelects[j], false);
             }
             setCustomSelectOpen(wrapper, open);
+            if (open && selectOnly) activateOption(wrapper.querySelector('.custom-select-option.selected') || wrapper.querySelector('.custom-select-option'));
             if (open && filterInput) {
               resetFilter();
               filterInput.focus();
@@ -663,6 +720,26 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
             openSelect(!wrapper.classList.contains('open'));
           });
           trigger.addEventListener('keydown', function(e) {
+            if (selectOnly) {
+              var isOpen = wrapper.classList.contains('open');
+              var opts = Array.from(wrapper.querySelectorAll('.custom-select-option'));
+              if (e.key === 'Escape') { e.preventDefault(); setCustomSelectOpen(wrapper, false); }
+              else if (e.key === 'Tab') { if (isOpen && activeOption) chooseOption(activeOption); }
+              else if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                if (isOpen && activeOption) chooseOption(activeOption); else openSelect(true);
+              } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].indexOf(e.key) !== -1) {
+                e.preventDefault();
+                if (!isOpen) openSelect(true);
+                if (e.key === 'Home') activateOption(opts[0]);
+                else if (e.key === 'End') activateOption(opts[opts.length - 1]);
+                else if (isOpen) activateOption(opts[Math.max(0, Math.min(opts.length - 1, opts.indexOf(activeOption) + (e.key === 'ArrowDown' ? 1 : -1)))]);
+              } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                var match = opts.find(function(opt) { return opt.textContent.trim().toLowerCase().startsWith(e.key.toLowerCase()); });
+                if (match) { e.preventDefault(); if (!isOpen) openSelect(true); activateOption(match); }
+              }
+              return;
+            }
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault();
               openSelect(!wrapper.classList.contains('open'));
@@ -867,6 +944,13 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
     }
     (function() {
       var vscode = acquireVsCodeApi();
+      var parseExternalArgumentsText = function parseExternalArgumentsText(text) {
+	const args = text === "" ? [] : text.split("\\n");
+	if (args.length > 32 || args.some((arg) => arg.length === 0 || arg !== arg.trim() || /[\\0\\r\\n]/u.test(arg) || new TextEncoder().encode(arg).byteLength > 4096)) {
+		throw new Error("Use at most 32 nonempty lines, each at most 4096 UTF-8 bytes, with no leading/trailing whitespace or control line breaks.");
+	};
+	return args;
+};
       var dirty = false;
       var currentId = "p1";
       var saveFlag = document.getElementById("save-flag");
@@ -899,6 +983,10 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
 
       function updateConditionalFields() {
         var authType = document.getElementById("authtype-select-value").value;
+        var externalField = document.getElementById("external-field");
+        var usernameField = document.getElementById("username-field");
+        if (externalField) externalField.classList[authType === "external" ? "add" : "remove"]("visible");
+        if (usernameField) usernameField.classList[authType !== "external" ? "add" : "remove"]("visible");
         var pwField = document.getElementById("password-field");
         var keyField = document.getElementById("keypath-field");
         var agentNote = document.getElementById("agent-note");
@@ -919,6 +1007,22 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
         }
       }
 
+      function updateExternalControls() {
+        updateConditionalFields();
+        var mode = document.getElementById("authtype-select-value").value;
+        ["username-field", "password-field", "keypath-field", "external-field"].forEach(function(id) {
+          var group = document.getElementById(id);
+          var active = group.classList.contains("visible");
+          group.querySelectorAll("input, textarea, button").forEach(function(control) { control.disabled = !active; });
+          group.querySelectorAll(".custom-select-trigger").forEach(function(control) { control.tabIndex = active ? 0 : -1; control.setAttribute("aria-disabled", active ? "false" : "true"); });
+        });
+        document.getElementById("external-method-flag").textContent = document.getElementById("external-method").value === "key" ? "--pkey" : "--pass";
+      }
+      updateExternalControls();
+      document.getElementById("authtype-selector").addEventListener("click", updateExternalControls);
+      document.getElementById("authtype-selector").addEventListener("keydown", function() { setTimeout(updateExternalControls, 0); });
+      ["external-executable", "external-arguments"].forEach(function(id) { document.getElementById(id).addEventListener("input", markDirty); });
+
       // Track changes
       document.getElementById("profile-name").addEventListener("input", markDirty);
       document.getElementById("profile-username").addEventListener("input", markDirty);
@@ -936,6 +1040,9 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
           }
           wrapper.classList.remove("open");
           return;
+        }
+        if (wrapper.id === "external-method-selector") {
+          selectCustomOption(wrapper, value); markDirty(); updateExternalControls();
         }
         if (wrapper.id === "authtype-selector") {
           selectCustomOption(wrapper, value);
@@ -960,13 +1067,34 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
         } else {
           document.getElementById("error-name").textContent = "";
         }
-        if (!username) {
+        if (authType !== "external" && !username) {
           document.getElementById("error-username").textContent = "Username cannot be empty";
           valid = false;
         } else {
           document.getElementById("error-username").textContent = "";
         }
-        if (!valid) return;
+        var firstInvalid;
+        function error(id, message) {
+          document.getElementById("error-" + id).textContent = message;
+          var field = document.getElementById(id);
+          field.setAttribute("aria-invalid", message ? "true" : "false");
+          if (message && !firstInvalid) firstInvalid = field;
+          if (message) valid = false;
+        }
+        if (!name) firstInvalid = document.getElementById("profile-name");
+        if (!username && authType !== "external" && !firstInvalid) firstInvalid = document.getElementById("profile-username");
+        if (["password", "key", "agent", "external"].indexOf(authType) === -1) { document.getElementById("action-error").textContent = "Choose a supported Authentication type."; return; }
+        if (authType === "external") {
+          var executable = document.getElementById("external-executable").value;
+          var args = [];
+          error("external-executable", executable && (executable[0] === "/" || /^[A-Za-z]:[\\\\/]/.test(executable) || /^\\\\\\\\/.test(executable)) && !/[\\u0000-\\u001f\\u007f-\\u009f\\u061c\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069]/.test(executable) ? "" : "Choose an absolute executable path without control characters.");
+          try { args = parseExternalArgumentsText(document.getElementById("external-arguments").value); error("external-arguments", ""); }
+          catch (e) { error("external-arguments", e.message); }
+          if (!valid) { if (firstInvalid) firstInvalid.focus(); return; }
+          vscode.postMessage({ type: "save", id: currentId, name: name, authType: "external", external: { version: 1, method: document.getElementById("external-method").value, invocation: { executable: executable, args: args } } });
+          return;
+        }
+        if (!valid) { if (firstInvalid) firstInvalid.focus(); return; }
 
         vscode.postMessage({
           type: "save",
@@ -974,8 +1102,8 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
           name: name,
           username: username,
           authType: authType,
-          password: password,
-          keyPath: keyPath
+          password: authType === "password" ? password : undefined,
+          keyPath: authType === "key" ? keyPath : undefined
         });
       });
 
@@ -999,9 +1127,19 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
         vscode.postMessage({ type: "browse" });
       });
 
+      document.getElementById("external-browse-btn").addEventListener("click", function() { vscode.postMessage({ type: "externalExecutable" }); });
+      document.getElementById("revoke-external-btn").addEventListener("click", function() { vscode.postMessage({ type: "revokeExternalApprovals" }); });
+
       // Messages from host
       window.addEventListener("message", function(event) {
         var msg = event.data;
+        if (msg.type === "requestProfileSwitch" && typeof msg.targetValue === "string") {
+          if (dirty) vscode.postMessage({ type: "confirmSwitch", targetValue: msg.targetValue });
+          else vscode.postMessage({ type: "selectProfile", value: msg.targetValue });
+        }
+        if (msg.type === "externalExecutableResult" && typeof msg.path === "string") { document.getElementById("external-executable").value = msg.path; markDirty(); }
+        if (msg.type === "externalApprovalsStatus") document.getElementById("session-approvals-status").textContent = msg.message;
+        if (msg.type === "actionError") document.getElementById("action-error").textContent = msg.message;
         if (msg.type === "saved") {
           clearDirty();
         }
@@ -1573,6 +1711,10 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
       wrapper.classList.toggle('open', !!open);
       var trigger = wrapper.querySelector('.custom-select-trigger');
       if (trigger) trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (!open && wrapper.dataset.selectOnly === 'true') {
+        trigger.removeAttribute('aria-activedescendant');
+        wrapper.querySelectorAll('.custom-select-option').forEach(function(opt) { opt.classList.remove('highlighted'); });
+      }
     }
 
     document.addEventListener('click', function(e) {
@@ -1601,6 +1743,18 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
           // wrapper into type-to-filter mode, so the two paths never diverge on
           // which is which.
           var filterInput = wrapper.querySelector('.custom-select-filter');
+          // Opt-in select-only comboboxes retain DOM focus on the trigger while
+          // aria-activedescendant exposes the highlighted, not yet committed option.
+          var selectOnly = wrapper.dataset.selectOnly === 'true';
+          var activeOption;
+          function activateOption(opt) {
+            if (!opt) return;
+            wrapper.querySelectorAll('.custom-select-option').forEach(function(item) { item.classList.remove('highlighted'); });
+            activeOption = opt;
+            opt.classList.add('highlighted');
+            trigger.setAttribute('aria-activedescendant', opt.id);
+            if (opt.scrollIntoView) opt.scrollIntoView({ block: 'nearest' });
+          }
 
           function chooseOption(opt) {
             if (onOptionClick) {
@@ -1619,6 +1773,7 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
               if (openSelects[j] !== wrapper) setCustomSelectOpen(openSelects[j], false);
             }
             setCustomSelectOpen(wrapper, open);
+            if (open && selectOnly) activateOption(wrapper.querySelector('.custom-select-option.selected') || wrapper.querySelector('.custom-select-option'));
             if (open && filterInput) {
               resetFilter();
               filterInput.focus();
@@ -1630,6 +1785,26 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
             openSelect(!wrapper.classList.contains('open'));
           });
           trigger.addEventListener('keydown', function(e) {
+            if (selectOnly) {
+              var isOpen = wrapper.classList.contains('open');
+              var opts = Array.from(wrapper.querySelectorAll('.custom-select-option'));
+              if (e.key === 'Escape') { e.preventDefault(); setCustomSelectOpen(wrapper, false); }
+              else if (e.key === 'Tab') { if (isOpen && activeOption) chooseOption(activeOption); }
+              else if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                if (isOpen && activeOption) chooseOption(activeOption); else openSelect(true);
+              } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].indexOf(e.key) !== -1) {
+                e.preventDefault();
+                if (!isOpen) openSelect(true);
+                if (e.key === 'Home') activateOption(opts[0]);
+                else if (e.key === 'End') activateOption(opts[opts.length - 1]);
+                else if (isOpen) activateOption(opts[Math.max(0, Math.min(opts.length - 1, opts.indexOf(activeOption) + (e.key === 'ArrowDown' ? 1 : -1)))]);
+              } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                var match = opts.find(function(opt) { return opt.textContent.trim().toLowerCase().startsWith(e.key.toLowerCase()); });
+                if (match) { e.preventDefault(); if (!isOpen) openSelect(true); activateOption(match); }
+              }
+              return;
+            }
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault();
               openSelect(!wrapper.classList.contains('open'));
@@ -1853,6 +2028,8 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
       // data-autofill-filled attribute and replaced on every later transition
       // — emptied the moment a different profile is chosen (it has supplied
       // nothing yet), then rebuilt when that choice's fillFields answer lands.
+      var profileSeed = document.getElementById("field-authProfileId");
+      var externalProfileName = profileSeed && profileSeed.dataset ? profileSeed.dataset.externalProfile : undefined;
       var profileFilledKeys = seededProfileFilledKeys();
 
       // ── WHAT THE PREVIOUS PROFILE DISPLACED ────────────────────────────
@@ -1958,6 +2135,7 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
        * ever answers.
        */
       function filledKeysFromValues(values) {
+        if (typeof values.__externalAuthProfile === "string") return { username: true, authType: true, keyPath: true, defaultUsername: true };
         var filled = {};
         for (var key in values) {
           var value = values[key];
@@ -2056,6 +2234,7 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
        * profile's values behind in fields the user is now free to save.
        */
       function releaseProfileOwnedFields() {
+        externalProfileName = undefined;
         for (var key in profileDisplacedValues) {
           setFieldValue(key, profileDisplacedValues[key]);
         }
@@ -2096,6 +2275,7 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
         }
         var fillValues = msg.values;
         var isProfileFill = msg.key === "authProfileId";
+        if (isProfileFill) externalProfileName = typeof fillValues.__externalAuthProfile === "string" ? fillValues.__externalAuthProfile : undefined;
         var nextFilledKeys = isProfileFill ? filledKeysFromValues(fillValues) : null;
         // Read once, not per key: collecting inside the loop would compare the
         // later keys against a form this very loop has already been writing to.
@@ -2105,6 +2285,7 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
         // over below covers exactly those and not the ones it was refused.
         var writtenKeys = [];
         for (var fk in fillValues) {
+          if (fk === "__externalAuthProfile") continue;
           if (!isProfileFill && requestSnapshot && !mayFillOver(fk, msg.requestId, liveValues, requestSnapshot)) {
             // Either hand-edited since this request went out — the host decided
             // what it was allowed to overwrite from the snapshot above, so its
@@ -2810,6 +2991,15 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
         var profileInput = profileWrapper.querySelector('input[name="authProfileId"]');
         if (!profileInput) return;
         var isLinked = profileInput.value && profileInput.value !== "";
+        var dynamic = !!isLinked && externalProfileName !== undefined;
+        var sourceNote = document.getElementById("auth-profile-source-note");
+        if (sourceNote) sourceNote.textContent = dynamic ? "Provided by " + externalProfileName + " at sign-in. Edit it in Settings → Auth Profiles." : "";
+        var repair = document.getElementById("auth-profile-repair");
+        if (repair) { repair.style.display = isLinked ? "" : "none"; repair.disabled = !isLinked; }
+        document.querySelectorAll(".form-note").forEach(function(note) {
+          var conditions = parseVisibleWhen(note.dataset.visibleWhen);
+          if (conditions.some(function(condition) { return condition.field === "authType" && condition.value === "agent"; })) note.style.display = dynamic ? "none" : "";
+        });
         // One list, shared by every form that renders an authProfileId select.
         // The server/unified profile forms render username/authType/keyPath;
         // the inventory source form renders defaultUsername. The loop below
@@ -2840,6 +3030,14 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
           // each entry point: initial render, selection (pre-fill), the
           // fillFields answer, and an injected inline-created option.
           var locked = !!isLinked && profileFilledKeys[managedKeys[mi]] === true;
+          group.style.display = dynamic ? "none" : "";
+          group.querySelectorAll("input, textarea, select").forEach(function(control) {
+            if (dynamic) { control.dataset.externalDisabled = "true"; control.disabled = true; }
+            else if (control.dataset.externalDisabled === "true") {
+              control.disabled = !!group.dataset.visibleWhen && !group.classList.contains("field-visible");
+              delete control.dataset.externalDisabled;
+            }
+          });
           var inputs = group.querySelectorAll("input, textarea");
           for (var ii = 0; ii < inputs.length; ii++) {
             var input = inputs[ii];
@@ -2934,6 +3132,11 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
           // gets no second chance to put anything back.
           releaseProfileOwnedFields();
         }
+      });
+      var repairProfileButton = document.getElementById("auth-profile-repair");
+      if (repairProfileButton) repairProfileButton.addEventListener("click", function() {
+        var selected = form.elements.authProfileId;
+        if (selected && selected.value) vscode.postMessage({ type: "manageAuthProfile", id: selected.value });
       });
       initCustomComboboxes();
       updateProfileManagedFields();
@@ -3620,6 +3823,10 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
       wrapper.classList.toggle('open', !!open);
       var trigger = wrapper.querySelector('.custom-select-trigger');
       if (trigger) trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (!open && wrapper.dataset.selectOnly === 'true') {
+        trigger.removeAttribute('aria-activedescendant');
+        wrapper.querySelectorAll('.custom-select-option').forEach(function(opt) { opt.classList.remove('highlighted'); });
+      }
     }
 
     document.addEventListener('click', function(e) {
@@ -3648,6 +3855,18 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
           // wrapper into type-to-filter mode, so the two paths never diverge on
           // which is which.
           var filterInput = wrapper.querySelector('.custom-select-filter');
+          // Opt-in select-only comboboxes retain DOM focus on the trigger while
+          // aria-activedescendant exposes the highlighted, not yet committed option.
+          var selectOnly = wrapper.dataset.selectOnly === 'true';
+          var activeOption;
+          function activateOption(opt) {
+            if (!opt) return;
+            wrapper.querySelectorAll('.custom-select-option').forEach(function(item) { item.classList.remove('highlighted'); });
+            activeOption = opt;
+            opt.classList.add('highlighted');
+            trigger.setAttribute('aria-activedescendant', opt.id);
+            if (opt.scrollIntoView) opt.scrollIntoView({ block: 'nearest' });
+          }
 
           function chooseOption(opt) {
             if (onOptionClick) {
@@ -3666,6 +3885,7 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
               if (openSelects[j] !== wrapper) setCustomSelectOpen(openSelects[j], false);
             }
             setCustomSelectOpen(wrapper, open);
+            if (open && selectOnly) activateOption(wrapper.querySelector('.custom-select-option.selected') || wrapper.querySelector('.custom-select-option'));
             if (open && filterInput) {
               resetFilter();
               filterInput.focus();
@@ -3677,6 +3897,26 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
             openSelect(!wrapper.classList.contains('open'));
           });
           trigger.addEventListener('keydown', function(e) {
+            if (selectOnly) {
+              var isOpen = wrapper.classList.contains('open');
+              var opts = Array.from(wrapper.querySelectorAll('.custom-select-option'));
+              if (e.key === 'Escape') { e.preventDefault(); setCustomSelectOpen(wrapper, false); }
+              else if (e.key === 'Tab') { if (isOpen && activeOption) chooseOption(activeOption); }
+              else if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                if (isOpen && activeOption) chooseOption(activeOption); else openSelect(true);
+              } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].indexOf(e.key) !== -1) {
+                e.preventDefault();
+                if (!isOpen) openSelect(true);
+                if (e.key === 'Home') activateOption(opts[0]);
+                else if (e.key === 'End') activateOption(opts[opts.length - 1]);
+                else if (isOpen) activateOption(opts[Math.max(0, Math.min(opts.length - 1, opts.indexOf(activeOption) + (e.key === 'ArrowDown' ? 1 : -1)))]);
+              } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                var match = opts.find(function(opt) { return opt.textContent.trim().toLowerCase().startsWith(e.key.toLowerCase()); });
+                if (match) { e.preventDefault(); if (!isOpen) openSelect(true); activateOption(match); }
+              }
+              return;
+            }
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault();
               openSelect(!wrapper.classList.contains('open'));
@@ -3900,6 +4140,8 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
       // data-autofill-filled attribute and replaced on every later transition
       // — emptied the moment a different profile is chosen (it has supplied
       // nothing yet), then rebuilt when that choice's fillFields answer lands.
+      var profileSeed = document.getElementById("field-authProfileId");
+      var externalProfileName = profileSeed && profileSeed.dataset ? profileSeed.dataset.externalProfile : undefined;
       var profileFilledKeys = seededProfileFilledKeys();
 
       // ── WHAT THE PREVIOUS PROFILE DISPLACED ────────────────────────────
@@ -4005,6 +4247,7 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
        * ever answers.
        */
       function filledKeysFromValues(values) {
+        if (typeof values.__externalAuthProfile === "string") return { username: true, authType: true, keyPath: true, defaultUsername: true };
         var filled = {};
         for (var key in values) {
           var value = values[key];
@@ -4103,6 +4346,7 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
        * profile's values behind in fields the user is now free to save.
        */
       function releaseProfileOwnedFields() {
+        externalProfileName = undefined;
         for (var key in profileDisplacedValues) {
           setFieldValue(key, profileDisplacedValues[key]);
         }
@@ -4143,6 +4387,7 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
         }
         var fillValues = msg.values;
         var isProfileFill = msg.key === "authProfileId";
+        if (isProfileFill) externalProfileName = typeof fillValues.__externalAuthProfile === "string" ? fillValues.__externalAuthProfile : undefined;
         var nextFilledKeys = isProfileFill ? filledKeysFromValues(fillValues) : null;
         // Read once, not per key: collecting inside the loop would compare the
         // later keys against a form this very loop has already been writing to.
@@ -4152,6 +4397,7 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
         // over below covers exactly those and not the ones it was refused.
         var writtenKeys = [];
         for (var fk in fillValues) {
+          if (fk === "__externalAuthProfile") continue;
           if (!isProfileFill && requestSnapshot && !mayFillOver(fk, msg.requestId, liveValues, requestSnapshot)) {
             // Either hand-edited since this request went out — the host decided
             // what it was allowed to overwrite from the snapshot above, so its
@@ -4857,6 +5103,15 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
         var profileInput = profileWrapper.querySelector('input[name="authProfileId"]');
         if (!profileInput) return;
         var isLinked = profileInput.value && profileInput.value !== "";
+        var dynamic = !!isLinked && externalProfileName !== undefined;
+        var sourceNote = document.getElementById("auth-profile-source-note");
+        if (sourceNote) sourceNote.textContent = dynamic ? "Provided by " + externalProfileName + " at sign-in. Edit it in Settings → Auth Profiles." : "";
+        var repair = document.getElementById("auth-profile-repair");
+        if (repair) { repair.style.display = isLinked ? "" : "none"; repair.disabled = !isLinked; }
+        document.querySelectorAll(".form-note").forEach(function(note) {
+          var conditions = parseVisibleWhen(note.dataset.visibleWhen);
+          if (conditions.some(function(condition) { return condition.field === "authType" && condition.value === "agent"; })) note.style.display = dynamic ? "none" : "";
+        });
         // One list, shared by every form that renders an authProfileId select.
         // The server/unified profile forms render username/authType/keyPath;
         // the inventory source form renders defaultUsername. The loop below
@@ -4887,6 +5142,14 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
           // each entry point: initial render, selection (pre-fill), the
           // fillFields answer, and an injected inline-created option.
           var locked = !!isLinked && profileFilledKeys[managedKeys[mi]] === true;
+          group.style.display = dynamic ? "none" : "";
+          group.querySelectorAll("input, textarea, select").forEach(function(control) {
+            if (dynamic) { control.dataset.externalDisabled = "true"; control.disabled = true; }
+            else if (control.dataset.externalDisabled === "true") {
+              control.disabled = !!group.dataset.visibleWhen && !group.classList.contains("field-visible");
+              delete control.dataset.externalDisabled;
+            }
+          });
           var inputs = group.querySelectorAll("input, textarea");
           for (var ii = 0; ii < inputs.length; ii++) {
             var input = inputs[ii];
@@ -4981,6 +5244,11 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
           // gets no second chance to put anything back.
           releaseProfileOwnedFields();
         }
+      });
+      var repairProfileButton = document.getElementById("auth-profile-repair");
+      if (repairProfileButton) repairProfileButton.addEventListener("click", function() {
+        var selected = form.elements.authProfileId;
+        if (selected && selected.value) vscode.postMessage({ type: "manageAuthProfile", id: selected.value });
       });
       initCustomComboboxes();
       updateProfileManagedFields();
@@ -5819,6 +6087,10 @@ DEBUG: packet sent 1024 bytes</div>
       wrapper.classList.toggle('open', !!open);
       var trigger = wrapper.querySelector('.custom-select-trigger');
       if (trigger) trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (!open && wrapper.dataset.selectOnly === 'true') {
+        trigger.removeAttribute('aria-activedescendant');
+        wrapper.querySelectorAll('.custom-select-option').forEach(function(opt) { opt.classList.remove('highlighted'); });
+      }
     }
 
     document.addEventListener('click', function(e) {
@@ -5847,6 +6119,18 @@ DEBUG: packet sent 1024 bytes</div>
           // wrapper into type-to-filter mode, so the two paths never diverge on
           // which is which.
           var filterInput = wrapper.querySelector('.custom-select-filter');
+          // Opt-in select-only comboboxes retain DOM focus on the trigger while
+          // aria-activedescendant exposes the highlighted, not yet committed option.
+          var selectOnly = wrapper.dataset.selectOnly === 'true';
+          var activeOption;
+          function activateOption(opt) {
+            if (!opt) return;
+            wrapper.querySelectorAll('.custom-select-option').forEach(function(item) { item.classList.remove('highlighted'); });
+            activeOption = opt;
+            opt.classList.add('highlighted');
+            trigger.setAttribute('aria-activedescendant', opt.id);
+            if (opt.scrollIntoView) opt.scrollIntoView({ block: 'nearest' });
+          }
 
           function chooseOption(opt) {
             if (onOptionClick) {
@@ -5865,6 +6149,7 @@ DEBUG: packet sent 1024 bytes</div>
               if (openSelects[j] !== wrapper) setCustomSelectOpen(openSelects[j], false);
             }
             setCustomSelectOpen(wrapper, open);
+            if (open && selectOnly) activateOption(wrapper.querySelector('.custom-select-option.selected') || wrapper.querySelector('.custom-select-option'));
             if (open && filterInput) {
               resetFilter();
               filterInput.focus();
@@ -5876,6 +6161,26 @@ DEBUG: packet sent 1024 bytes</div>
             openSelect(!wrapper.classList.contains('open'));
           });
           trigger.addEventListener('keydown', function(e) {
+            if (selectOnly) {
+              var isOpen = wrapper.classList.contains('open');
+              var opts = Array.from(wrapper.querySelectorAll('.custom-select-option'));
+              if (e.key === 'Escape') { e.preventDefault(); setCustomSelectOpen(wrapper, false); }
+              else if (e.key === 'Tab') { if (isOpen && activeOption) chooseOption(activeOption); }
+              else if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                if (isOpen && activeOption) chooseOption(activeOption); else openSelect(true);
+              } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].indexOf(e.key) !== -1) {
+                e.preventDefault();
+                if (!isOpen) openSelect(true);
+                if (e.key === 'Home') activateOption(opts[0]);
+                else if (e.key === 'End') activateOption(opts[opts.length - 1]);
+                else if (isOpen) activateOption(opts[Math.max(0, Math.min(opts.length - 1, opts.indexOf(activeOption) + (e.key === 'ArrowDown' ? 1 : -1)))]);
+              } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                var match = opts.find(function(opt) { return opt.textContent.trim().toLowerCase().startsWith(e.key.toLowerCase()); });
+                if (match) { e.preventDefault(); if (!isOpen) openSelect(true); activateOption(match); }
+              }
+              return;
+            }
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault();
               openSelect(!wrapper.classList.contains('open'));
@@ -7327,6 +7632,10 @@ echo hi</textarea>
       wrapper.classList.toggle('open', !!open);
       var trigger = wrapper.querySelector('.custom-select-trigger');
       if (trigger) trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (!open && wrapper.dataset.selectOnly === 'true') {
+        trigger.removeAttribute('aria-activedescendant');
+        wrapper.querySelectorAll('.custom-select-option').forEach(function(opt) { opt.classList.remove('highlighted'); });
+      }
     }
 
     document.addEventListener('click', function(e) {
@@ -7355,6 +7664,18 @@ echo hi</textarea>
           // wrapper into type-to-filter mode, so the two paths never diverge on
           // which is which.
           var filterInput = wrapper.querySelector('.custom-select-filter');
+          // Opt-in select-only comboboxes retain DOM focus on the trigger while
+          // aria-activedescendant exposes the highlighted, not yet committed option.
+          var selectOnly = wrapper.dataset.selectOnly === 'true';
+          var activeOption;
+          function activateOption(opt) {
+            if (!opt) return;
+            wrapper.querySelectorAll('.custom-select-option').forEach(function(item) { item.classList.remove('highlighted'); });
+            activeOption = opt;
+            opt.classList.add('highlighted');
+            trigger.setAttribute('aria-activedescendant', opt.id);
+            if (opt.scrollIntoView) opt.scrollIntoView({ block: 'nearest' });
+          }
 
           function chooseOption(opt) {
             if (onOptionClick) {
@@ -7373,6 +7694,7 @@ echo hi</textarea>
               if (openSelects[j] !== wrapper) setCustomSelectOpen(openSelects[j], false);
             }
             setCustomSelectOpen(wrapper, open);
+            if (open && selectOnly) activateOption(wrapper.querySelector('.custom-select-option.selected') || wrapper.querySelector('.custom-select-option'));
             if (open && filterInput) {
               resetFilter();
               filterInput.focus();
@@ -7384,6 +7706,26 @@ echo hi</textarea>
             openSelect(!wrapper.classList.contains('open'));
           });
           trigger.addEventListener('keydown', function(e) {
+            if (selectOnly) {
+              var isOpen = wrapper.classList.contains('open');
+              var opts = Array.from(wrapper.querySelectorAll('.custom-select-option'));
+              if (e.key === 'Escape') { e.preventDefault(); setCustomSelectOpen(wrapper, false); }
+              else if (e.key === 'Tab') { if (isOpen && activeOption) chooseOption(activeOption); }
+              else if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                if (isOpen && activeOption) chooseOption(activeOption); else openSelect(true);
+              } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].indexOf(e.key) !== -1) {
+                e.preventDefault();
+                if (!isOpen) openSelect(true);
+                if (e.key === 'Home') activateOption(opts[0]);
+                else if (e.key === 'End') activateOption(opts[opts.length - 1]);
+                else if (isOpen) activateOption(opts[Math.max(0, Math.min(opts.length - 1, opts.indexOf(activeOption) + (e.key === 'ArrowDown' ? 1 : -1)))]);
+              } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                var match = opts.find(function(opt) { return opt.textContent.trim().toLowerCase().startsWith(e.key.toLowerCase()); });
+                if (match) { e.preventDefault(); if (!isOpen) openSelect(true); activateOption(match); }
+              }
+              return;
+            }
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault();
               openSelect(!wrapper.classList.contains('open'));
@@ -11551,6 +11893,10 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
       wrapper.classList.toggle('open', !!open);
       var trigger = wrapper.querySelector('.custom-select-trigger');
       if (trigger) trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (!open && wrapper.dataset.selectOnly === 'true') {
+        trigger.removeAttribute('aria-activedescendant');
+        wrapper.querySelectorAll('.custom-select-option').forEach(function(opt) { opt.classList.remove('highlighted'); });
+      }
     }
 
     document.addEventListener('click', function(e) {
@@ -11579,6 +11925,18 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
           // wrapper into type-to-filter mode, so the two paths never diverge on
           // which is which.
           var filterInput = wrapper.querySelector('.custom-select-filter');
+          // Opt-in select-only comboboxes retain DOM focus on the trigger while
+          // aria-activedescendant exposes the highlighted, not yet committed option.
+          var selectOnly = wrapper.dataset.selectOnly === 'true';
+          var activeOption;
+          function activateOption(opt) {
+            if (!opt) return;
+            wrapper.querySelectorAll('.custom-select-option').forEach(function(item) { item.classList.remove('highlighted'); });
+            activeOption = opt;
+            opt.classList.add('highlighted');
+            trigger.setAttribute('aria-activedescendant', opt.id);
+            if (opt.scrollIntoView) opt.scrollIntoView({ block: 'nearest' });
+          }
 
           function chooseOption(opt) {
             if (onOptionClick) {
@@ -11597,6 +11955,7 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
               if (openSelects[j] !== wrapper) setCustomSelectOpen(openSelects[j], false);
             }
             setCustomSelectOpen(wrapper, open);
+            if (open && selectOnly) activateOption(wrapper.querySelector('.custom-select-option.selected') || wrapper.querySelector('.custom-select-option'));
             if (open && filterInput) {
               resetFilter();
               filterInput.focus();
@@ -11608,6 +11967,26 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
             openSelect(!wrapper.classList.contains('open'));
           });
           trigger.addEventListener('keydown', function(e) {
+            if (selectOnly) {
+              var isOpen = wrapper.classList.contains('open');
+              var opts = Array.from(wrapper.querySelectorAll('.custom-select-option'));
+              if (e.key === 'Escape') { e.preventDefault(); setCustomSelectOpen(wrapper, false); }
+              else if (e.key === 'Tab') { if (isOpen && activeOption) chooseOption(activeOption); }
+              else if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                if (isOpen && activeOption) chooseOption(activeOption); else openSelect(true);
+              } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].indexOf(e.key) !== -1) {
+                e.preventDefault();
+                if (!isOpen) openSelect(true);
+                if (e.key === 'Home') activateOption(opts[0]);
+                else if (e.key === 'End') activateOption(opts[opts.length - 1]);
+                else if (isOpen) activateOption(opts[Math.max(0, Math.min(opts.length - 1, opts.indexOf(activeOption) + (e.key === 'ArrowDown' ? 1 : -1)))]);
+              } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                var match = opts.find(function(opt) { return opt.textContent.trim().toLowerCase().startsWith(e.key.toLowerCase()); });
+                if (match) { e.preventDefault(); if (!isOpen) openSelect(true); activateOption(match); }
+              }
+              return;
+            }
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault();
               openSelect(!wrapper.classList.contains('open'));
@@ -12851,6 +13230,10 @@ exports[`webview document shell (byte-identity guard) > settings (single categor
       wrapper.classList.toggle('open', !!open);
       var trigger = wrapper.querySelector('.custom-select-trigger');
       if (trigger) trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (!open && wrapper.dataset.selectOnly === 'true') {
+        trigger.removeAttribute('aria-activedescendant');
+        wrapper.querySelectorAll('.custom-select-option').forEach(function(opt) { opt.classList.remove('highlighted'); });
+      }
     }
 
     document.addEventListener('click', function(e) {
@@ -12879,6 +13262,18 @@ exports[`webview document shell (byte-identity guard) > settings (single categor
           // wrapper into type-to-filter mode, so the two paths never diverge on
           // which is which.
           var filterInput = wrapper.querySelector('.custom-select-filter');
+          // Opt-in select-only comboboxes retain DOM focus on the trigger while
+          // aria-activedescendant exposes the highlighted, not yet committed option.
+          var selectOnly = wrapper.dataset.selectOnly === 'true';
+          var activeOption;
+          function activateOption(opt) {
+            if (!opt) return;
+            wrapper.querySelectorAll('.custom-select-option').forEach(function(item) { item.classList.remove('highlighted'); });
+            activeOption = opt;
+            opt.classList.add('highlighted');
+            trigger.setAttribute('aria-activedescendant', opt.id);
+            if (opt.scrollIntoView) opt.scrollIntoView({ block: 'nearest' });
+          }
 
           function chooseOption(opt) {
             if (onOptionClick) {
@@ -12897,6 +13292,7 @@ exports[`webview document shell (byte-identity guard) > settings (single categor
               if (openSelects[j] !== wrapper) setCustomSelectOpen(openSelects[j], false);
             }
             setCustomSelectOpen(wrapper, open);
+            if (open && selectOnly) activateOption(wrapper.querySelector('.custom-select-option.selected') || wrapper.querySelector('.custom-select-option'));
             if (open && filterInput) {
               resetFilter();
               filterInput.focus();
@@ -12908,6 +13304,26 @@ exports[`webview document shell (byte-identity guard) > settings (single categor
             openSelect(!wrapper.classList.contains('open'));
           });
           trigger.addEventListener('keydown', function(e) {
+            if (selectOnly) {
+              var isOpen = wrapper.classList.contains('open');
+              var opts = Array.from(wrapper.querySelectorAll('.custom-select-option'));
+              if (e.key === 'Escape') { e.preventDefault(); setCustomSelectOpen(wrapper, false); }
+              else if (e.key === 'Tab') { if (isOpen && activeOption) chooseOption(activeOption); }
+              else if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                if (isOpen && activeOption) chooseOption(activeOption); else openSelect(true);
+              } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].indexOf(e.key) !== -1) {
+                e.preventDefault();
+                if (!isOpen) openSelect(true);
+                if (e.key === 'Home') activateOption(opts[0]);
+                else if (e.key === 'End') activateOption(opts[opts.length - 1]);
+                else if (isOpen) activateOption(opts[Math.max(0, Math.min(opts.length - 1, opts.indexOf(activeOption) + (e.key === 'ArrowDown' ? 1 : -1)))]);
+              } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                var match = opts.find(function(opt) { return opt.textContent.trim().toLowerCase().startsWith(e.key.toLowerCase()); });
+                if (match) { e.preventDefault(); if (!isOpen) openSelect(true); activateOption(match); }
+              }
+              return;
+            }
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault();
               openSelect(!wrapper.classList.contains('open'));
@@ -14105,6 +14521,10 @@ exports[`webview document shell (byte-identity guard) > terminal appearance 1`] 
       wrapper.classList.toggle('open', !!open);
       var trigger = wrapper.querySelector('.custom-select-trigger');
       if (trigger) trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (!open && wrapper.dataset.selectOnly === 'true') {
+        trigger.removeAttribute('aria-activedescendant');
+        wrapper.querySelectorAll('.custom-select-option').forEach(function(opt) { opt.classList.remove('highlighted'); });
+      }
     }
 
     document.addEventListener('click', function(e) {
@@ -14133,6 +14553,18 @@ exports[`webview document shell (byte-identity guard) > terminal appearance 1`] 
           // wrapper into type-to-filter mode, so the two paths never diverge on
           // which is which.
           var filterInput = wrapper.querySelector('.custom-select-filter');
+          // Opt-in select-only comboboxes retain DOM focus on the trigger while
+          // aria-activedescendant exposes the highlighted, not yet committed option.
+          var selectOnly = wrapper.dataset.selectOnly === 'true';
+          var activeOption;
+          function activateOption(opt) {
+            if (!opt) return;
+            wrapper.querySelectorAll('.custom-select-option').forEach(function(item) { item.classList.remove('highlighted'); });
+            activeOption = opt;
+            opt.classList.add('highlighted');
+            trigger.setAttribute('aria-activedescendant', opt.id);
+            if (opt.scrollIntoView) opt.scrollIntoView({ block: 'nearest' });
+          }
 
           function chooseOption(opt) {
             if (onOptionClick) {
@@ -14151,6 +14583,7 @@ exports[`webview document shell (byte-identity guard) > terminal appearance 1`] 
               if (openSelects[j] !== wrapper) setCustomSelectOpen(openSelects[j], false);
             }
             setCustomSelectOpen(wrapper, open);
+            if (open && selectOnly) activateOption(wrapper.querySelector('.custom-select-option.selected') || wrapper.querySelector('.custom-select-option'));
             if (open && filterInput) {
               resetFilter();
               filterInput.focus();
@@ -14162,6 +14595,26 @@ exports[`webview document shell (byte-identity guard) > terminal appearance 1`] 
             openSelect(!wrapper.classList.contains('open'));
           });
           trigger.addEventListener('keydown', function(e) {
+            if (selectOnly) {
+              var isOpen = wrapper.classList.contains('open');
+              var opts = Array.from(wrapper.querySelectorAll('.custom-select-option'));
+              if (e.key === 'Escape') { e.preventDefault(); setCustomSelectOpen(wrapper, false); }
+              else if (e.key === 'Tab') { if (isOpen && activeOption) chooseOption(activeOption); }
+              else if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                if (isOpen && activeOption) chooseOption(activeOption); else openSelect(true);
+              } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].indexOf(e.key) !== -1) {
+                e.preventDefault();
+                if (!isOpen) openSelect(true);
+                if (e.key === 'Home') activateOption(opts[0]);
+                else if (e.key === 'End') activateOption(opts[opts.length - 1]);
+                else if (isOpen) activateOption(opts[Math.max(0, Math.min(opts.length - 1, opts.indexOf(activeOption) + (e.key === 'ArrowDown' ? 1 : -1)))]);
+              } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                var match = opts.find(function(opt) { return opt.textContent.trim().toLowerCase().startsWith(e.key.toLowerCase()); });
+                if (match) { e.preventDefault(); if (!isOpen) openSelect(true); activateOption(match); }
+              }
+              return;
+            }
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault();
               openSelect(!wrapper.classList.contains('open'));

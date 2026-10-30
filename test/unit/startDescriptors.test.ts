@@ -155,6 +155,22 @@ describe("start descriptors — keyPath and telnet", () => {
     expect(tunnelStartDescriptor(tunnel, moved, tinputs)).toBe(tunnelStartDescriptor(tunnel, server, tinputs));
   });
 
+  it.each(["password", "agent"] as const)("ignores a linked %s profile's unused keyPath when starting a connection", (authType) => {
+    const linked = { ...server, authProfileId: "stored" };
+    const before: AuthProfile = { id: "stored", name: "Stored", username: "u", authType, keyPath: "/old" };
+    const after: AuthProfile = { ...before, keyPath: "/new" };
+    expect(connectDescriptor(linked, { ...inputs, authProfileLookup: () => after }))
+      .toBe(connectDescriptor(linked, { ...inputs, authProfileLookup: () => before }));
+  });
+
+  it.each(["password", "agent"] as const)("ignores a linked %s profile's unused keyPath when starting a tunnel", (authType) => {
+    const linked = { ...server, authProfileId: "stored" };
+    const before: AuthProfile = { id: "stored", name: "Stored", username: "u", authType, keyPath: "/old" };
+    const after: AuthProfile = { ...before, keyPath: "/new" };
+    expect(tunnelStartDescriptor(tunnel, linked, { ...tinputs, authProfileLookup: () => after }))
+      .toBe(tunnelStartDescriptor(tunnel, linked, { ...tinputs, authProfileLookup: () => before }));
+  });
+
   it("keyPath counts only for a key login", () => {
     expect(connectDescriptor({ ...server, keyPath: "/k" }, inputs)).toBe(connectDescriptor(server, inputs));
     const keyServer: ServerConfig = { ...server, authType: "key" };

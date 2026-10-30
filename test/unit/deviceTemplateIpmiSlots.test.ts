@@ -1,3 +1,5 @@
+import { deviceTemplateFormDefinition } from "../../src/ui/formDefinitions";
+import { openForm } from "../helpers/formScriptHarness";
 import { describe, expect, it } from "vitest";
 import { computeSyncPlan, type InventorySyncPlan } from "../../src/services/inventory/syncEngine";
 import {
@@ -9,7 +11,7 @@ import {
   type TemplatableField
 } from "../../src/services/inventory/templateApply";
 import { deterministicServerId } from "../../src/services/inventory/deterministicId";
-import {
+import { type StoredAuthProfile,
   templatedStampsEqual,
   cloneServerConfig,
   type AuthProfile,
@@ -90,7 +92,7 @@ function rule(templateId: string, overrides: Partial<TemplateRule> = {}): Templa
   return { id: `rule-${templateId}`, templateId, ...overrides };
 }
 
-function authProfile(id: string, overrides: Partial<AuthProfile> = {}): AuthProfile {
+function authProfile(id: string, overrides: Partial<StoredAuthProfile> = {}): StoredAuthProfile {
   return { id, name: id.toUpperCase(), username: "svc", authType: "agent", ...overrides };
 }
 
@@ -986,4 +988,46 @@ describe("PR-T3 IPMI slots — round 4 retained same-sync-pruned gateway cleanup
     expect(s.ipmiGatewayServerId).toBe(sId);
     expect(s.origin?.templated?.ipmiGatewayServerId).toBe(sId);
   });
+});
+
+
+describe("external profiles in device template IPMI slots", () => {
+  const external: AuthProfile = { id: "external", name: "Program", authType: "external", external: { version: 1, method: "key" } };
+  it.each([true, false])("sync accepts external SSH links (configured=%s) while rejecting the IPMI field", (configured) => {
+    const profile: AuthProfile = { ...external, external: { ...external.external, ...(configured ? { invocation: { executable: "/example/provider", args: [] } } : {}) } };
+    const t = template({ authProfileId: { mode: "override", value: profile.id }, ipmiAuthProfileId: { mode: "override", value: profile.id } });
+    const result = plan({ source: makeSource({ defaultUsername: "inventory-metadata", templateRules: [rule(t.id)] }), devices: [makeDevice()], templates: [t], authProfiles: [profile] });
+    const added = addFor(result);
+    expect(added.authProfileId).toBe(profile.id); expect(added.username).toBe("inventory-metadata");
+    expect(added.ipmiAuthProfileId).toBeUndefined(); expect(added.origin?.templated?.ipmiAuthProfileId).toBeUndefined();
+    expect(result.warnings.join(" ")).toContain("SSH only"); expect(result.warnings.join(" ")).not.toContain("no key path");
+  });
+  it("manual apply accepts an external SSH link and skips the unsupported IPMI field", () => {
+    const t = template({ authProfileId: { mode: "override", value: external.id }, ipmiAuthProfileId: { mode: "override", value: external.id } });
+    const result = planManualTemplateApply({ template: t, servers: [ownedServer()], sourceDefaultUsername: () => "admin", authProfile: () => external, hasServer: () => false });
+    expect(result.serverWrites[0]?.authProfileId).toBe(external.id);
+    expect(result.serverWrites[0]?.ipmiAuthProfileId).toBeUndefined();
+    expect(result.warnings.join(" ")).toContain("SSH only");
+  });
+});
+
+
+it("device template round trip keeps an unavailable external IPMI selection until explicitly unlinked", () => {
+  const external: AuthProfile = { id: "external", name: "Program", authType: "external", external: { version: 1, method: "password" } };
+  const seeded = template({ ipmiAuthProfileId: { mode: "override", value: external.id } });
+  const definition = deviceTemplateFormDefinition(seeded, [], [external, PA1]);
+  const fresh = deviceTemplateFormDefinition(undefined, [], [external, PA1]);
+  const field = definition.fields.find((f) => "key" in f && f.key === "ipmiAuthProfileId");
+  const freshField = fresh.fields.find((f) => "key" in f && f.key === "ipmiAuthProfileId");
+  if (field?.type !== "select" || freshField?.type !== "select") throw new Error("missing selector");
+  expect(freshField.options.some((o) => o.value === external.id)).toBe(false);
+  expect(field.value).toBe(external.id); expect(field.options.find((o) => o.value === external.id)?.label).toContain("Unavailable for IPMI");
+  expect(field.hint).toContain("SSH only");
+  const form = openForm(definition);
+  expect(form.attemptNativeSubmit()).toMatchObject({ ipmiAuthProfileId: external.id });
+  form.choose("ipmiAuthProfileId", "");
+  form.choose("mode_ipmiAuthProfileId", "none");
+  const unlinked = form.attemptNativeSubmit();
+  expect(unlinked).toMatchObject({ mode_ipmiAuthProfileId: "none" });
+  expect(unlinked?.ipmiAuthProfileId).toBeUndefined();
 });

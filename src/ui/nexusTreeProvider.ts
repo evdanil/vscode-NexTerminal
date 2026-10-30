@@ -1,7 +1,8 @@
+import { keyDeploymentUnavailableReason } from "../models/authProfile";
 import * as vscode from "vscode";
 import type { SessionSnapshot } from "../core/contracts";
 import type { ActiveLocalServerSession, LocalServerConfig, LocalServerStatus } from "../models/localServer";
-import { authProfileOwnedCredentials, resolveSerialProfileMode, type ActiveLocalShellSession, type ActiveSerialSession, type ActiveSession, type AuthProfile, type LocalShellProfile, type ProxyConfig, type SerialProfile, type SerialSessionStatus, type ServerConfig } from "../models/config";
+import { isExternalAuthProfile, authProfileOwnedCredentials, resolveSerialProfileMode, type ActiveLocalShellSession, type ActiveSerialSession, type ActiveSession, type AuthProfile, type LocalShellProfile, type ProxyConfig, type SerialProfile, type SerialSessionStatus, type ServerConfig } from "../models/config";
 import { getAncestorPaths, folderDisplayName, isDescendantOrSelf, parentPath as folderParentPath } from "../utils/folderPaths";
 import { templateAppliedFields, TEMPLATE_FIELD_SHORT_LABELS } from "../services/inventory/templateApply";
 import { toParityCode } from "../utils/helpers";
@@ -97,7 +98,9 @@ export class ServerTreeItem extends vscode.TreeItem {
     // same layering reason as `hasNodeControl`. Gates the `.webConsole` marker
     // below, which — unlike the node-state marker — requires NO known status:
     // an addressless, unpolled guest is the row the console exists for.
-    hasWebConsole = false
+    hasWebConsole = false,
+    authProfileSource?: string,
+    keyDeploymentUnavailable = false
   ) {
     super(server.name, connected ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None);
     this.id = `server:${server.id}`;
@@ -126,7 +129,7 @@ export class ServerTreeItem extends vscode.TreeItem {
     // Its empty host must not be dangled after an "@" as though it were a real
     // host, in the tooltip or the description.
     const addressless = server.addressless === true;
-    const hostSummary = addressless ? "no console address" : `${displayUsername}@${server.host}:${server.port}`;
+    const hostSummary = addressless ? "no console address" : authProfileSource ? `${server.host}:${server.port} · ${authProfileSource}` : `${displayUsername}@${server.host}:${server.port}`;
     // NODE CONTROL (Phase 4, task #28) — a status line for any
     // node-control-capable origin, so the state the Start/Stop gate reads is
     // visible on the row itself. Matches the labeled-line tooltip idiom.
@@ -153,7 +156,7 @@ export class ServerTreeItem extends vscode.TreeItem {
     // now gets an explicit " (stopped)" mirroring " (running)"; a non-status
     // server still gets nothing at all.
     const statusDesc = status === "running" ? " (running)" : status === "stopped" ? " (stopped)" : "";
-    const descHead = addressless ? displayUsername : `${displayUsername}@${server.host}`;
+    const descHead = authProfileSource ? `${addressless ? "" : server.host + " · "}${authProfileSource}` : addressless ? displayUsername : `${displayUsername}@${server.host}`;
     this.description = showDescription ? `${descHead}${authDesc}${syncedDesc}${addresslessDesc}${statusDesc}` : undefined;
     // BMC-menu gating (task #27) — a server with an ipmiHost (same truthiness as
     // the tooltip's ipmiSuffix above) gets an `.ipmi` marker APPENDED so the two
@@ -170,7 +173,7 @@ export class ServerTreeItem extends vscode.TreeItem {
     // for any provider implementing `controlNode`, so it reads correctly on an
     // EVE-NG lab node and on a Proxmox guest alike.
     const nodeMarker = hasNodeControl && status ? (status === "running" ? ".nodeRunning" : ".nodeStopped") : "";
-    // WEB CONSOLE — LAST in the fixed order
+    // WEB CONSOLE — after the node marker in the fixed order
     // `nexus.server[Connected][.ipmi][.nodeRunning|.nodeStopped][.webConsole]`.
     // Position is load-bearing, not cosmetic: every server-menu `when` regex is
     // anchored and spells the groups in this order, so a marker in any other
@@ -179,7 +182,9 @@ export class ServerTreeItem extends vscode.TreeItem {
     // or unpolled guest manageable at all, and a stopped guest's console is
     // the hypervisor's own honest answer.
     const webConsoleMarker = hasWebConsole ? ".webConsole" : "";
-    this.contextValue = `${connected ? "nexus.serverConnected" : "nexus.server"}${hasIpmi ? ".ipmi" : ""}${nodeMarker}${webConsoleMarker}`;
+    // Unsupported SSH sources suppress key deployment while all other menus
+    // tolerate this final marker; the command independently rechecks live state.
+    this.contextValue = `${connected ? "nexus.serverConnected" : "nexus.server"}${hasIpmi ? ".ipmi" : ""}${nodeMarker}${webConsoleMarker}${keyDeploymentUnavailable ? ".noKeyDeployment" : ""}`;
     // LIVE STATUS (Phase 2) — the icon. A CONNECTED server always keeps its
     // connected (plug) icon: the connected affordance must not be lost (P3-6),
     // and the running state is still conveyed by the " (running)" description
@@ -1009,7 +1014,9 @@ export class NexusTreeProvider
       ipmiAuthProfile?.name,
       status,
       hasNodeControl,
-      hasWebConsole
+      hasWebConsole,
+      isExternalAuthProfile(authProfile) ? `External Program${authProfile.external.invocation ? "" : " · Needs configuration"}` : server.authProfileId && !authProfile ? "Missing auth profile" : undefined,
+      keyDeploymentUnavailableReason(server, authProfile) !== undefined
     );
     // LIVE STATUS (Phase 2) — the resourceUri the decoration provider matches on
     // to paint the ▶ badge for a running server.

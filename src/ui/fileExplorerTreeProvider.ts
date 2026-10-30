@@ -1,7 +1,8 @@
 import * as path from "node:path";
 import { promises as fsp, type Dirent, type Stats } from "node:fs";
 import * as vscode from "vscode";
-import type { ServerConfig } from "../models/config";
+import { serverAccountPrefixForDisplay } from "../models/authProfile";
+import type { AuthProfile, ServerConfig } from "../models/config";
 import type { DirectoryEntry } from "../services/sftp/sftpService";
 import type { SftpService } from "../services/sftp/sftpService";
 import { buildUri } from "../services/sftp/nexusFileSystemProvider";
@@ -111,8 +112,8 @@ function parseUriList(raw: string): { uris: vscode.Uri[]; malformedCount: number
 }
 
 export class FileExplorerServerItem extends vscode.TreeItem {
-  public constructor(server: ServerConfig) {
-    super(`${server.name} (${server.username}@${server.host})`, vscode.TreeItemCollapsibleState.None);
+  public constructor(server: ServerConfig, profile?: AuthProfile) {
+    super(`${server.name} (${serverAccountPrefixForDisplay(server, profile)}${server.host})`, vscode.TreeItemCollapsibleState.None);
     this.contextValue = "nexus.fileExplorer.server";
     this.iconPath = new vscode.ThemeIcon("remote-explorer");
   }
@@ -205,7 +206,9 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
 
   public constructor(
     private readonly sftp: SftpService,
-    private readonly diagnostics?: (line: string) => void
+    private readonly diagnostics?: (line: string) => void,
+    private readonly getServer?: (serverId: string) => ServerConfig | undefined,
+    private readonly getAuthProfile?: (profileId: string) => AuthProfile | undefined
   ) {}
 
   public getActiveServerId(): string | undefined {
@@ -386,7 +389,9 @@ export class FileExplorerTreeProvider implements vscode.TreeDataProvider<FileExp
     }
 
     if (!element) {
-      const serverItem = new FileExplorerServerItem(this.activeServerConfig);
+      // The active snapshot can predate a switch to an external credential source.
+      const server = this.getServer?.(this.activeServerId) ?? this.activeServerConfig;
+      const serverItem = new FileExplorerServerItem(server, server.authProfileId ? this.getAuthProfile?.(server.authProfileId) : undefined);
       const items: FileExplorerItem[] = [serverItem];
       if (this.currentRootPath !== "/") {
         items.push(new ParentDirItem(path.posix.dirname(this.currentRootPath)));

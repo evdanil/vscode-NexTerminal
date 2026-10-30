@@ -1,4 +1,4 @@
-import { authProfileOwnedCredentials, type AuthProfile, type ServerConfig } from "../../models/config";
+import { authProfileConnectionIdentity, isExternalAuthProfile, authProfileOwnedCredentials, type AuthProfile, type ServerConfig } from "../../models/config";
 import { flattenProviderText } from "../../models/inventory";
 import { validateProxyConfig } from "../../utils/validation";
 
@@ -53,10 +53,14 @@ function profileMapFor(authProfiles: readonly AuthProfile[]): Map<string, AuthPr
 
 function connectionIdentity(server: ServerConfig, authProfilesById: ReadonlyMap<string, AuthProfile>): readonly unknown[] {
   const profile = server.authProfileId ? authProfilesById.get(server.authProfileId) : undefined;
+  if (server.authProfileId && !profile) {
+    dependencyError(`SSH profile "${server.name}" links to an authentication profile that no longer exists.`);
+  }
+  const external = isExternalAuthProfile(profile);
   const owned = authProfileOwnedCredentials(profile);
   const authType = owned.authType ?? server.authType;
   const username = owned.username ?? server.username;
-  if (typeof username !== "string" || username.trim() === "") {
+  if (!external && (typeof username !== "string" || username.trim() === "")) {
     dependencyError(`SSH profile "${server.name}" has no usable authentication username.`);
   }
 
@@ -80,7 +84,9 @@ function connectionIdentity(server: ServerConfig, authProfilesById: ReadonlyMap<
     server.port,
     server.protocol ?? "ssh",
     server.altHost ?? null,
-    [server.authProfileId ?? null, profile !== undefined, username, authType, authType === "key" ? owned.keyPath ?? server.keyPath ?? null : null],
+    external
+      ? authProfileConnectionIdentity(profile)
+      : [server.authProfileId ?? null, profile !== undefined, username, authType, authType === "key" ? owned.keyPath ?? server.keyPath ?? null : null],
     proxy
   ];
 }

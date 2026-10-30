@@ -40,8 +40,8 @@ const SCHEME: ColorScheme = {
 
 /**
  * These snapshots lock the full rendered HTML of every panel builder so the
- * `renderWebviewDocument` consolidation stays byte-identical. They were
- * generated from the pre-refactor templates; any structural drift fails here.
+ * shared document structure stays stable across panel builders. Intentional
+ * UI changes require reviewing and updating their complete rendered output.
  */
 describe("webview document shell (byte-identity guard)", () => {
   it("highlight rule editor", () => {

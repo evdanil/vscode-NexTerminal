@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import type { AuthProfile, ServerConfig } from "../models/config";
+import { externalAuthProfileUnsupportedReason, isExternalAuthProfile } from "../models/authProfile";
 import { authProfileOwnedCredentials, effectiveServerUsername } from "../models/config";
 import { authProfilePasswordSecretKey } from "../services/ssh/silentAuth";
 import type { ProfileTokenFacts } from "../services/profileTokens";
@@ -50,6 +51,8 @@ export function ipmiAuthProfile(ctx: CommandContext, server: ServerConfig): Auth
  * connect path (`SilentAuthSshFactory.resolveServer`) logs in as the PROFILE's
  * where the profile supplies one, so reading `server.username` here would
  * resolve `${profile.username}` to an account the session is not using. The
+ * External and unresolved links expose no static username; a dormant server
+ * username must never stand in for credentials that are not available. Stored
  * precedence is not re-derived: `effectiveServerUsername` is the same rule the
  * connect path decides by.
  *
@@ -63,16 +66,40 @@ export function ipmiAuthProfile(ctx: CommandContext, server: ServerConfig): Auth
  * a refusal hands to `nexus.server.edit` — the record the user can actually
  * edit.
  */
-export type ProfileTokenServer = ServerConfig & Pick<ProfileTokenFacts, "ipmiUsername">;
+export type ProfileTokenServer = ServerConfig & Pick<ProfileTokenFacts, "ipmiUsername" | "unavailableTokenReasons">;
 
 export function profileTokenServer(ctx: CommandContext, server: ServerConfig): ProfileTokenServer {
   const profile = server.authProfileId ? ctx.core.getAuthProfile(server.authProfileId) : undefined;
-  const username = effectiveServerUsername(server, profile);
+  const username = server.authProfileId && !profile ? "" : effectiveServerUsername(server, profile);
   const ipmiUsername = authProfileOwnedCredentials(ipmiAuthProfile(ctx, server)).username;
-  if (username === server.username && ipmiUsername === undefined) {
+  const unavailableTokenReasons: ProfileTokenFacts["unavailableTokenReasons"] = {};
+  if (isExternalAuthProfile(profile)) {
+    unavailableTokenReasons.username = "${profile.username} is unavailable with External Program credentials because the username is supplied only at SSH sign-in. Remove this token or use $${profile.username} for literal text. Nothing was sent.";
+  } else if (server.authProfileId && !profile) {
+    unavailableTokenReasons.username = "${profile.username} is unavailable because the linked auth profile no longer exists. Choose an existing SSH auth profile or unlink it. Nothing was sent.";
+  }
+  if (isExternalAuthProfile(ipmiAuthProfile(ctx, server))) {
+    unavailableTokenReasons.ipmiUsername = "${profile.ipmiUsername} is unavailable because External Program credentials support SSH only. Choose a stored IPMI auth profile or unlink the IPMI Auth Profile. Nothing was sent.";
+  }
+  if (username === server.username && ipmiUsername === undefined && Object.keys(unavailableTokenReasons).length === 0) {
     return server;
   }
-  return { ...server, username, ipmiUsername };
+  return { ...server, username, ipmiUsername, unavailableTokenReasons };
+}
+
+/** Guard before prompts, vault reads and local or gateway dispatch. */
+export async function refuseUnsupportedIpmiProfile(ctx: CommandContext, server: ServerConfig): Promise<boolean> {
+  const profile = ipmiAuthProfile(ctx, server);
+  const reason = externalAuthProfileUnsupportedReason(profile, "ipmi") ??
+    (server.ipmiAuthProfileId && !profile
+      ? "The linked IPMI auth profile no longer exists. Choose a stored IPMI auth profile or unlink the IPMI Auth Profile."
+      : undefined);
+  if (!reason) return false;
+  const action = await vscode.window.showErrorMessage(reason, "Manage Auth Profiles");
+  if (action === "Manage Auth Profiles") {
+    await vscode.commands.executeCommand("nexus.authProfile.manage", server.ipmiAuthProfileId);
+  }
+  return true;
 }
 
 /**
@@ -95,7 +122,8 @@ export type IpmiCredentialOutcome =
  *
  * The stored secret is preferred; the masked prompt is the fallback for a server
  * with no IPMI profile linked, a profile with no stored password, or a vault
- * that is unavailable. The answer is never remembered and never persisted
+ * that is unavailable. External and dangling profile links refuse instead of
+ * falling back to a password prompt. The answer is never remembered and never persisted
  * (`macroVariablePrompt.ts`'s discipline for secret variables).
  */
 export async function resolveIpmiTerminalEnv(
@@ -103,6 +131,7 @@ export async function resolveIpmiTerminalEnv(
   server: ServerConfig,
   options: { purpose: string } = { purpose: "IPMI" }
 ): Promise<IpmiCredentialOutcome> {
+  if (await refuseUnsupportedIpmiProfile(ctx, server)) return { kind: "cancelled" };
   let password: string | undefined;
   const profileId = server.ipmiAuthProfileId;
   if (profileId && ctx.secretVault) {
@@ -115,6 +144,9 @@ export async function resolveIpmiTerminalEnv(
     }
   }
 
+  // Even an empty/failed read yielded to other config writers. Refuse before
+  // asking for a fallback secret if the linked source is no longer supported.
+  if (await refuseUnsupportedIpmiProfile(ctx, server)) return { kind: "cancelled" };
   if (!password) {
     const profileName = ipmiAuthProfile(ctx, server)?.name;
     password = await vscode.window.showInputBox({
@@ -132,6 +164,8 @@ export async function resolveIpmiTerminalEnv(
     }
   }
 
+  // A profile can be edited or removed while the vault/prompt is pending.
+  if (await refuseUnsupportedIpmiProfile(ctx, server)) return { kind: "cancelled" };
   const env: Record<string, string> = {};
   for (const name of IPMI_PASSWORD_ENV_VARS) {
     env[name] = password;

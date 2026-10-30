@@ -1,3 +1,6 @@
+import { showExternalCredentialError } from "../services/credentials/externalCredentialUi";
+import { externalServerFormValues } from "../ui/externalCredentialForm";
+import { serverAccountPrefixForDisplay, authProfileConnectionIdentity, externalAuthProfileUnsupportedReason, isExternalAuthProfile, keyDeploymentUnavailableReason } from "../models/authProfile";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import * as os from "node:os";
@@ -67,7 +70,7 @@ export async function pickServer(core: import("../core/nexusCore").NexusCore): P
         label: server.name,
         // P3-2 (Fable) — an addressless placeholder has no endpoint, so show
         // "(no address)" rather than the nonsense "user@:0".
-        description: server.addressless === true ? "(no address)" : `${server.username}@${server.host}:${server.port}`,
+        description: server.addressless === true ? "(no address)" : `${serverAccountPrefixForDisplay(server, server.authProfileId ? core.getAuthProfile(server.authProfileId) : undefined)}${server.host}:${server.port}`,
         server
       })),
     { title: "Select Nexus Server" }
@@ -294,10 +297,11 @@ async function pickPassphraseForGeneratedKey(): Promise<string | undefined> {
   return passphrase;
 }
 
-async function pickDeployKeyName(sshDir: string): Promise<string | undefined> {
+async function pickDeployKeyName(sshDir: string, stillSupported: () => boolean): Promise<string | undefined> {
   let keyName = DEPLOY_DEFAULT_KEY_NAME;
   try {
     await readFile(path.join(sshDir, `${DEPLOY_DEFAULT_KEY_NAME}.pub`));
+    if (!stillSupported()) return undefined;
     const custom = await vscode.window.showInputBox({
       title: "Key Name",
       prompt: `${DEPLOY_DEFAULT_KEY_NAME} already exists. Enter a name for the new key`,
@@ -314,8 +318,9 @@ async function pickDeployKeyName(sshDir: string): Promise<string | undefined> {
   return keyName;
 }
 
-async function pickKeyForDeployment(sshDir: string): Promise<SelectedDeployKey | undefined> {
+async function pickKeyForDeployment(sshDir: string, stillSupported: () => boolean): Promise<SelectedDeployKey | undefined> {
   const keyPairs = await findLocalKeyPairs(sshDir);
+  if (!stillSupported()) return undefined;
 
   type KeyPickItem = vscode.QuickPickItem & { keyPair?: KeyPairInfo; generate?: boolean };
   const items: KeyPickItem[] = keyPairs.map((keyPair) => ({
@@ -329,7 +334,7 @@ async function pickKeyForDeployment(sshDir: string): Promise<SelectedDeployKey |
     title: "Deploy SSH Key",
     placeHolder: "Select an existing key or generate a new one"
   });
-  if (!pick) {
+  if (!pick || !stillSupported()) {
     return undefined;
   }
   if (!pick.generate) {
@@ -342,19 +347,20 @@ async function pickKeyForDeployment(sshDir: string): Promise<SelectedDeployKey |
     };
   }
 
-  const keyName = await pickDeployKeyName(sshDir);
-  if (!keyName) {
+  const keyName = await pickDeployKeyName(sshDir, stillSupported);
+  if (!keyName || !stillSupported()) {
     return undefined;
   }
   const passphrase = await pickPassphraseForGeneratedKey();
-  if (passphrase === undefined) {
+  if (passphrase === undefined || !stillSupported()) {
     return undefined;
   }
 
   const generated = await vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title: "Generating SSH key..." },
-    () => generateKeyPair({ sshDir, name: keyName, passphrase })
+    async () => stillSupported() ? generateKeyPair({ sshDir, name: keyName, passphrase }) : undefined
   );
+  if (!generated) return undefined;
   return { publicKeyPath: generated.publicKeyPath, privateKeyPath: generated.privateKeyPath };
 }
 
@@ -419,6 +425,7 @@ function isSameKeyDeployTarget(
   deployedEffectiveUsername: string
 ): boolean {
   return (
+    keyDeploymentUnavailableReason(live, live.authProfileId ? core.getAuthProfile(live.authProfileId) : undefined) === undefined &&
     sameConnectionIdentity(live, captured) &&
     resolveEffectiveUsername(core, live) === deployedEffectiveUsername
   );
@@ -522,16 +529,14 @@ function findMatchingKeyAuthProfiles(
   username: string,
   privateKeyPath: string
 ): AuthProfile[] {
+  return core.getSnapshot().authProfiles.filter((profile) => keyAuthProfileMatches(profile, username, privateKeyPath));
+}
+
+function keyAuthProfileMatches(profile: AuthProfile | undefined, username: string, privateKeyPath: string): boolean {
   const normalizedKeyPath = normalizeKeyPathForComparison(privateKeyPath);
-  return core.getSnapshot().authProfiles.filter((profile) => {
-    const owned = authProfileOwnedCredentials(profile);
-    return (
-      owned.authType === "key" &&
-      owned.username === username &&
-      owned.keyPath !== undefined &&
-      normalizeKeyPathForComparison(owned.keyPath) === normalizedKeyPath
-    );
-  });
+  const owned = authProfileOwnedCredentials(profile);
+  return owned.authType === "key" && owned.username === username && owned.keyPath !== undefined &&
+    normalizeKeyPathForComparison(owned.keyPath) === normalizedKeyPath;
 }
 
 function getDefaultKeyAuthProfileName(username: string, privateKeyPath: string): string {
@@ -551,10 +556,11 @@ async function promptForKeyAuthProfileName(username: string, privateKeyPath: str
 async function createKeyAuthProfile(
   ctx: CommandContext,
   username: string,
-  privateKeyPath: string
+  privateKeyPath: string,
+  stillSupported: () => boolean
 ): Promise<AuthProfile | undefined> {
   const name = await promptForKeyAuthProfileName(username, privateKeyPath);
-  if (!name) {
+  if (!name || !stillSupported()) {
     return undefined;
   }
   const profile: AuthProfile = {
@@ -564,18 +570,22 @@ async function createKeyAuthProfile(
     authType: "key",
     keyPath: privateKeyPath
   };
-  await ctx.core.addOrUpdateAuthProfile(profile);
-  return profile;
+  return configMutationLock.runExclusive(async () => {
+    if (!stillSupported()) return undefined;
+    await ctx.core.addOrUpdateAuthProfile(profile);
+    return profile;
+  });
 }
 
 async function pickOrCreateKeyAuthProfile(
   ctx: CommandContext,
   username: string,
-  privateKeyPath: string
+  privateKeyPath: string,
+  stillSupported: () => boolean
 ): Promise<AuthProfile | undefined> {
   const matches = findMatchingKeyAuthProfiles(ctx.core, username, privateKeyPath);
   if (matches.length === 0) {
-    return createKeyAuthProfile(ctx, username, privateKeyPath);
+    return createKeyAuthProfile(ctx, username, privateKeyPath, stillSupported);
   }
 
   type ProfilePickItem = vscode.QuickPickItem & { profile?: AuthProfile; createNew?: boolean };
@@ -597,11 +607,11 @@ async function pickOrCreateKeyAuthProfile(
       placeHolder: "Choose an existing matching key auth profile or create a new one"
     }
   );
-  if (!pick) {
+  if (!pick || !stillSupported()) {
     return undefined;
   }
   if (pick.createNew) {
-    return createKeyAuthProfile(ctx, username, privateKeyPath);
+    return createKeyAuthProfile(ctx, username, privateKeyPath, stillSupported);
   }
   return pick.profile;
 }
@@ -904,6 +914,9 @@ export function preserveLinkedServerCredentials(
   next: ServerConfig,
   profile: AuthProfile | undefined
 ): ServerConfig {
+  if (!existing && next.authProfileId && isExternalAuthProfile(profile)) {
+    return { ...next, username: "root", authType: "password", keyPath: undefined };
+  }
   if (!existing || !next.authProfileId) {
     return next;
   }
@@ -1024,6 +1037,7 @@ export function authProfileCredentialMirror(profile: AuthProfile | undefined): R
   if (!profile) {
     return undefined;
   }
+  if (isExternalAuthProfile(profile)) return { __externalAuthProfile: profile.name };
   const owned = authProfileOwnedCredentials(profile);
   const values: Record<string, string> = {};
   if (owned.username !== undefined) {
@@ -1661,6 +1675,7 @@ async function testServerConnection(ctx: CommandContext, arg?: unknown): Promise
     connection.dispose();
     void vscode.window.showInformationMessage(`Connection test succeeded for ${server.name}.`);
   } catch (error) {
+    if (await showExternalCredentialError(error, server.id)) return;
     const diagnostic = classifySshConnectionError(error);
     // A jump host's agent failure stays `proxy`, but the agent setting is still the fix.
     const agentInvolved = diagnostic.stage === "agent" || findSshAgentUnavailable(error) !== undefined;
@@ -1927,7 +1942,8 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           if (normalizeOptionalFolderPath(values.group) === null) {
             throw new Error(INVALID_FOLDER_PATH_MESSAGE);
           }
-          const candidate = formValuesToServer(values, existing.id, existing.isHidden, existing.addressless === true);
+          const selectedProfile = typeof values.authProfileId === "string" ? ctx.core.getAuthProfile(values.authProfileId) : undefined;
+          const candidate = formValuesToServer(externalServerFormValues(values, selectedProfile, existing), existing.id, existing.isHidden, existing.addressless === true);
           if (!candidate) {
             return;
           }
@@ -2024,17 +2040,10 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             // written, so the profile cannot vanish between this check and the
             // write.
             //
-            // EXISTENCE ONLY — deliberately NOT the SSH link's full
-            // `serverAuthProfileRejection` signature machinery. That guard's
-            // ownership-signature half exists solely because
-            // `preserveLinkedServerCredentials` mirrors an SSH profile's
-            // credentials into read-only server fields and must catch a shape
-            // that moved underneath them. The IPMI link mirrors NOTHING into
-            // this form: it only supplies `${profile.ipmiUsername}` at
-            // macro-run time, resolved live then. So the one and only hazard is
-            // a link whose profile no longer exists — an existence check is
-            // sufficient and correct, and there is no rendered credential to
-            // compare a signature against. Do not "upgrade" it.
+            // IPMI has no mirrored fields, but its linked profile must still
+            // exist and support a static BMC login when this form is saved.
+            const ipmiUnsupported = externalAuthProfileUnsupportedReason(candidate.ipmiAuthProfileId ? ctx.core.getAuthProfile(candidate.ipmiAuthProfileId) : undefined, "ipmi");
+            if (ipmiUnsupported) throw new Error(ipmiUnsupported);
             if (candidate.ipmiAuthProfileId !== undefined && ctx.core.getAuthProfile(candidate.ipmiAuthProfileId) === undefined) {
               throw new Error(MISSING_IPMI_AUTH_PROFILE_MESSAGE);
             }
@@ -2606,7 +2615,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       // VALUE, not the protocol, so a blank username reads the same whatever put
       // it there.
       const account = typeof server.username === "string" && server.username.trim() !== ""
-        ? `${server.username}@`
+        ? serverAccountPrefixForDisplay(server, server.authProfileId ? ctx.core.getAuthProfile(server.authProfileId) : undefined)
         : "";
       // P3-2 (Fable) — an addressless placeholder has no console address, so the
       // `host:port` half renders the nonsense ":0". Head with "(no console address)"
@@ -2800,16 +2809,32 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         return;
       }
 
+      const captured = cloneServerConfig(server);
+      const sourceIdentity = JSON.stringify(authProfileConnectionIdentity(server.authProfileId ? ctx.core.getAuthProfile(server.authProfileId) : undefined));
+      const stillSupported = (): boolean => {
+        const live = ctx.core.getServer(captured.id);
+        const profile = live?.authProfileId ? ctx.core.getAuthProfile(live.authProfileId) : undefined;
+        const reason = live ? keyDeploymentUnavailableReason(live, profile) : "The server no longer exists. Nothing was deployed.";
+        if (reason) { void vscode.window.showWarningMessage(reason); return false; }
+        if (!live || live.authProfileId !== captured.authProfileId || !sameConnectionIdentity(live, captured) ||
+          JSON.stringify(authProfileConnectionIdentity(profile)) !== sourceIdentity) {
+          void vscode.window.showWarningMessage("The SSH credential source or connection target changed. Re-run Deploy SSH Key to review the current details.");
+          return false;
+        }
+        return true;
+      };
+      if (!stillSupported()) return;
+
       const sshDir = defaultSshDir();
       let selectedKey: SelectedDeployKey | undefined;
       try {
-        selectedKey = await pickKeyForDeployment(sshDir);
+        selectedKey = await pickKeyForDeployment(sshDir, stillSupported);
       } catch (error: any) {
         const message = error instanceof Error ? error.message : String(error);
         void vscode.window.showErrorMessage(`Key selection failed: ${message}`);
         return;
       }
-      if (!selectedKey) {
+      if (!selectedKey || !stillSupported()) {
         return;
       }
       const { publicKeyPath, privateKeyPath } = selectedKey;
@@ -2822,6 +2847,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         void vscode.window.showErrorMessage(`Cannot read public key: ${message}`);
         return;
       }
+      if (!stillSupported()) return;
 
       // #84 P2-2 (Codex) — the EFFECTIVE username the key was authorized for, as
       // of THIS connection: for a profile-linked server it comes from the linked
@@ -2841,7 +2867,9 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             cancellable: false,
           },
           async () => {
+            if (!stillSupported()) throw new Error("The SSH credential source changed before deployment.");
             connection = await ctx.sshFactory.connect(server);
+            if (!stillSupported()) throw new Error("The SSH credential source changed before deployment.");
             return deployPublicKeyToRemote(connection, pubKeyContent);
           },
         );
@@ -2850,6 +2878,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         if (!conversionMode) {
           return;
         }
+        if (!stillSupported()) return;
 
         // #84 P1/P2 (Codex, serialization audit) — `server` was captured BEFORE
         // the key deployment (a withProgress connect) and the conversion prompt,
@@ -2873,7 +2902,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           let converted = false;
           await configMutationLock.runExclusive(async () => {
             const live = ctx.core.getServer(server.id);
-            if (!live || !isSameKeyDeployTarget(ctx.core, live, server, deployedEffectiveUsername)) {
+            if (!stillSupported() || !live || !isSameKeyDeployTarget(ctx.core, live, server, deployedEffectiveUsername)) {
               void vscode.window.showWarningMessage(
                 `${server.name}'s connection target changed during key deployment; not switching to key authentication — re-run Deploy SSH Key.`
               );
@@ -2888,20 +2917,27 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
           return;
         }
 
-        const profile = await pickOrCreateKeyAuthProfile(ctx, deployedEffectiveUsername, privateKeyPath);
+        const profile = await pickOrCreateKeyAuthProfile(ctx, deployedEffectiveUsername, privateKeyPath, stillSupported);
         if (!profile) {
           return;
         }
         let converted = false;
         await configMutationLock.runExclusive(async () => {
           const live = ctx.core.getServer(server.id);
-          if (!live || !isSameKeyDeployTarget(ctx.core, live, server, deployedEffectiveUsername)) {
+          if (!stillSupported() || !live || !isSameKeyDeployTarget(ctx.core, live, server, deployedEffectiveUsername)) {
             void vscode.window.showWarningMessage(
               `${server.name}'s connection target changed during key deployment; not switching to key authentication — re-run Deploy SSH Key.`
             );
             return;
           }
-          await ctx.core.addOrUpdateServer(buildProfileLinkedKeyServer(live, deployedEffectiveUsername, privateKeyPath, profile.id));
+          // The destination picker carries an id, not authority to reuse its
+          // stale credentials. Resolve and match it inside the same write lock.
+          const currentDestination = ctx.core.getAuthProfile(profile.id);
+          if (!currentDestination || !keyAuthProfileMatches(currentDestination, deployedEffectiveUsername, privateKeyPath)) {
+            void vscode.window.showWarningMessage("The selected key auth profile changed or was removed. Nothing was switched. Re-run Deploy SSH Key to choose a matching stored key profile.");
+            return;
+          }
+          await ctx.core.addOrUpdateServer(buildProfileLinkedKeyServer(live, deployedEffectiveUsername, privateKeyPath, currentDestination.id));
           converted = true;
         });
         if (converted) {

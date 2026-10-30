@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { NexusCore } from "../../src/core/nexusCore";
-import type { AuthProfile } from "../../src/models/config";
+import type { StoredAuthProfile, AuthProfile } from "../../src/models/config";
 import type { InventorySourceConfig } from "../../src/models/inventory";
 import { authProfilePassphraseSecretKey, authProfilePasswordSecretKey } from "../../src/services/ssh/silentAuth";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
@@ -37,6 +37,7 @@ vi.mock("vscode", () => ({
     showInformationMessage: (...args: unknown[]) => mockShowInformationMessage(...args),
     showOpenDialog: (...args: unknown[]) => mockShowOpenDialog(...args)
   },
+  env: {}, workspace: {},
   ViewColumn: { Active: 1 },
   Uri: { file: (p: string) => ({ fsPath: p }) },
   EventEmitter: class {
@@ -62,7 +63,7 @@ function makeVault(initialSecrets: Record<string, string> = {}) {
   };
 }
 
-function makeAuthProfile(overrides: Partial<AuthProfile> = {}): AuthProfile {
+function makeAuthProfile(overrides: Partial<StoredAuthProfile> = {}): StoredAuthProfile {
   return {
     id: "ap1",
     name: "Prod Auth",
@@ -102,29 +103,148 @@ async function settle(): Promise<void> {
 describe("AuthProfileEditorPanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockShowOpenDialog.mockReset();
     onDidReceiveMessageHandler = undefined;
     onDidDisposeHandler = undefined;
     // Reset the singleton between tests
     vi.resetModules();
   });
 
+  it("preserves same-id repair drafts and asks the webview before a different-id switch", async () => {
+    const core = await makeCore([makeAuthProfile(), makeAuthProfile({ id: "ap2", name: "Second" })]);
+    const { AuthProfileEditorPanel } = await import("../../src/ui/authProfileEditorPanel");
+    AuthProfileEditorPanel.open(core, undefined, "ap1");
+    const vscode = await import("vscode");
+    const panel = vi.mocked(vscode.window.createWebviewPanel).mock.results.at(-1)!.value;
+    panel.webview.html = "dirty draft sentinel";
+    AuthProfileEditorPanel.open(core, undefined, "ap1");
+    expect(panel.webview.html).toBe("dirty draft sentinel");
+    expect(mockPostMessage).not.toHaveBeenCalled();
+    AuthProfileEditorPanel.open(core, undefined, "ap2");
+    expect(mockPostMessage).toHaveBeenLastCalledWith({ type: "requestProfileSwitch", targetValue: "ap2" });
+    expect(panel.webview.html).toBe("dirty draft sentinel");
+    mockShowWarningMessage.mockResolvedValueOnce(undefined);
+    await onDidReceiveMessageHandler!({ type: "confirmSwitch", targetValue: "ap2" });
+    expect(panel.webview.html).toBe("dirty draft sentinel");
+    mockShowWarningMessage.mockResolvedValueOnce("Discard");
+    await onDidReceiveMessageHandler!({ type: "confirmSwitch", targetValue: "ap2" });
+    expect(panel.webview.html).toContain('value="ap2"');
+    expect(panel.webview.html).not.toBe("dirty draft sentinel");
+  });
+
   async function openPanel(
     authProfiles: AuthProfile[] = [],
     secrets: Record<string, string> = {},
     openNew = false,
-    repository?: InMemoryConfigRepository
+    repository?: InMemoryConfigRepository,
+    externalCredentials?: { revoke: (ids?: readonly string[]) => void }
   ) {
     const core = await makeCore(authProfiles, repository);
     const vault = makeVault(secrets);
     // Fresh import to get clean singleton state
     const { AuthProfileEditorPanel } = await import("../../src/ui/authProfileEditorPanel");
     if (openNew) {
-      AuthProfileEditorPanel.openNew(core, vault);
+      AuthProfileEditorPanel.openNew(core, vault, externalCredentials);
     } else {
-      AuthProfileEditorPanel.open(core, vault);
+      AuthProfileEditorPanel.open(core, vault, undefined, externalCredentials);
     }
     return { core, vault, sendMessage: onDidReceiveMessageHandler! };
   }
+
+  it("persists only external config and clears both stored secret slots", async () => {
+    const { core, vault, sendMessage } = await openPanel([makeAuthProfile()]);
+    const external = { version: 1, method: "password", invocation: { executable: "/provider", args: ['exact "quote"', "inside space"] } };
+    await sendMessage({ type: "save", id: "ap1", name: "External", authType: "external", external, username: "forged", password: "ignored", keyPath: "/ignored" });
+    expect(core.getAuthProfile("ap1")).toEqual({ id: "ap1", name: "External", authType: "external", external });
+    expect(vault.delete).toHaveBeenCalledWith(authProfilePasswordSecretKey("ap1"));
+    expect(vault.delete).toHaveBeenCalledWith(authProfilePassphraseSecretKey("ap1"));
+    expect(vault.store).not.toHaveBeenCalled();
+  });
+
+  it("refuses external to stored switching if either cleanup fails, retaining external mode", async () => {
+    const external: AuthProfile = { id: "ap1", name: "External", authType: "external", external: { version: 1, method: "password", invocation: { executable: "/provider", args: [] } } };
+    const { core, vault, sendMessage } = await openPanel([external]);
+    vault.delete.mockRejectedValueOnce(new Error("cleanup failed"));
+    await sendMessage({ type: "save", id: "ap1", name: "Stored", authType: "password", username: "new", password: "replacement" });
+    expect(core.getAuthProfile("ap1")).toEqual(external); expect(vault.store).not.toHaveBeenCalled();
+    expect(mockShowInformationMessage).not.toHaveBeenCalled();
+  });
+
+  it("rejects unknown authentication and malformed external arguments without defaulting", async () => {
+    const { core, sendMessage } = await openPanel([], {}, true);
+    for (const authType of ["unknown", "external"]) await sendMessage({ type: "save", id: null, name: "No", username: "legacy", authType, external: { version: 1, method: "password", invocation: { executable: "/provider", args: [" leading"] } } });
+    expect(core.getSnapshot().authProfiles).toEqual([]); expect(mockShowInformationMessage).not.toHaveBeenCalled();
+  });
+
+  it("external executable browse uses a separate response and refuses unsupported schemes", async () => {
+    const { sendMessage } = await openPanel();
+    mockShowOpenDialog.mockResolvedValueOnce([{ scheme: "file", fsPath: "/provider" }]);
+    await sendMessage({ type: "externalExecutable" });
+    expect(mockPostMessage).toHaveBeenCalledWith({ type: "externalExecutableResult", path: "/provider" });
+    mockPostMessage.mockClear(); mockShowOpenDialog.mockResolvedValueOnce([{ scheme: "https", fsPath: "/bad" }]);
+    await sendMessage({ type: "externalExecutable" }); expect(mockPostMessage).not.toHaveBeenCalled();
+    mockShowOpenDialog.mockResolvedValueOnce(undefined); await sendMessage({ type: "externalExecutable" }); expect(mockPostMessage).not.toHaveBeenCalled();
+  });
+
+  it("confirms IPMI loss before switching and rechecks the affected set under the mutation lock", async () => {
+    const { core, vault, sendMessage } = await openPanel([makeAuthProfile()]);
+    await core.addOrUpdateServer({ id: "s", name: "S", host: "host.test", port: 22, username: "root", authType: "password", isHidden: false, ipmiAuthProfileId: "ap1" });
+    const message = { type: "save", id: "ap1", name: "External", authType: "external", external: { version: 1, method: "password", invocation: { executable: "/provider", args: [] } } };
+    mockShowWarningMessage.mockResolvedValueOnce(undefined); await sendMessage(message);
+    expect(core.getAuthProfile("ap1")?.authType).toBe("password"); expect(vault.delete).not.toHaveBeenCalled();
+    mockShowWarningMessage.mockImplementationOnce(async () => {
+      await core.addOrUpdateServer({ ...core.getServer("s")!, ipmiAuthProfileId: undefined }); return "Switch";
+    });
+    await sendMessage(message); expect(core.getAuthProfile("ap1")?.authType).toBe("password"); expect(vault.delete).not.toHaveBeenCalled();
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("linked IPMI uses changed"));
+  });
+
+  it("keeps external mode when stored cleanup fails and accurately reports stored to external cleanup failure", async () => {
+    const { core, vault, sendMessage } = await openPanel([makeAuthProfile()]);
+    vault.delete.mockRejectedValueOnce(new Error("unavailable"));
+    await sendMessage({ type: "save", id: "ap1", name: "External", authType: "external", external: { version: 1, method: "password", invocation: { executable: "/provider", args: [] } } });
+    expect(core.getAuthProfile("ap1")?.authType).toBe("external"); expect(mockShowInformationMessage).not.toHaveBeenCalled();
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("External configuration was saved, but old stored secrets could not be removed"));
+  });
+
+  it("holds source switching through deferred secret deletes so a later password save survives", async () => {
+    const { core, vault, sendMessage } = await openPanel([makeAuthProfile()]);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    vault.delete.mockImplementationOnce(async () => gate);
+    const externalSave = sendMessage({ type: "save", id: "ap1", name: "External", authType: "external", external: { version: 1, method: "password", invocation: { executable: "/provider", args: [] } } });
+    await settle(); expect(core.getAuthProfile("ap1")?.authType).toBe("external");
+    const storedSave = sendMessage({ type: "save", id: "ap1", name: "Stored", authType: "password", username: "new", password: "replacement" });
+    await settle(); expect(vault.store).not.toHaveBeenCalled(); release(); await externalSave; await storedSave;
+    expect(core.getAuthProfile("ap1")?.authType).toBe("password"); expect(await vault.get(authProfilePasswordSecretKey("ap1"))).toBe("replacement");
+  });
+
+  it("revoke posts session feedback without changing draft HTML and source saves do not duplicate the mutation watcher revoke", async () => {
+    const revoke = vi.fn(); const { core, sendMessage } = await openPanel([makeAuthProfile()], {}, false, undefined, { revoke });
+    const vscode = await import("vscode");
+    const panel = vi.mocked(vscode.window.createWebviewPanel).mock.results.at(-1)!.value;
+    const before = panel.webview.html;
+    await sendMessage({ type: "revokeExternalApprovals" });
+    expect(revoke).toHaveBeenCalledWith(); expect(panel.webview.html).toBe(before);
+    expect(mockPostMessage).toHaveBeenCalledWith({ type: "externalApprovalsStatus", message: expect.stringContaining("Existing connections remain open") });
+    revoke.mockClear();
+    await sendMessage({ type: "save", id: "ap1", name: "External", authType: "external", external: { version: 1, method: "password", invocation: { executable: "/provider", args: [] } } });
+    expect(core.getAuthProfile("ap1")?.authType).toBe("external"); expect(revoke).not.toHaveBeenCalled();
+  });
+
+  it("remote Browse rejects a desktop path and a different remote authority", async () => {
+    const { sendMessage } = await openPanel(); const vscode = await import("vscode");
+    Object.assign(vscode.env, { remoteName: "ssh-remote" });
+    Object.assign(vscode.workspace, { workspaceFolders: [{ uri: { scheme: "vscode-remote", authority: "ssh-remote+fixture", with: () => ({ scheme: "vscode-remote" }) } }] });
+    try {
+      for (const uri of [{ scheme: "file", fsPath: "/desktop" }, { scheme: "vscode-remote", authority: "ssh-remote+other", fsPath: "/other" }]) {
+        mockShowOpenDialog.mockResolvedValueOnce([uri]); await sendMessage({ type: "externalExecutable" });
+      }
+      expect(mockPostMessage).not.toHaveBeenCalled();
+      mockShowOpenDialog.mockResolvedValueOnce([{ scheme: "vscode-remote", authority: "ssh-remote+fixture", fsPath: "/provider" }]);
+      await sendMessage({ type: "externalExecutable" }); expect(mockPostMessage).toHaveBeenCalledWith({ type: "externalExecutableResult", path: "/provider" });
+    } finally { Object.assign(vscode.env, { remoteName: undefined }); Object.assign(vscode.workspace, { workspaceFolders: undefined }); }
+  });
 
   it("save new profile creates auth profile and stores password", async () => {
     const { core, vault, sendMessage } = await openPanel([], {}, true);

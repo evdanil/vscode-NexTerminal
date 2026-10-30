@@ -1067,15 +1067,15 @@ describe("inventorySourceFormDefinition", () => {
     );
   });
 
-  it("leaves the server and unified profile forms' Auth Profile select advanced with its original hint", () => {
+  it("leaves the server and unified profile forms' Auth Profile select advanced with source-neutral guidance", () => {
     for (const definition of [serverFormDefinition(), unifiedProfileFormDefinition()]) {
       const field = keyedField(definition, "authProfileId");
       expect(field.advanced).toBe(true);
-      expect(field.hint).toBe("Reuse saved SSH credentials instead of entering them here.");
+      expect(field.hint).toBe("Use an auth profile to supply SSH credentials at sign-in.");
     }
   });
 
-  it("sanitizes a dangling seeded auth profile id to the (None) value so the form cannot submit a dead id", () => {
+  it("retains a dangling auth link with an explicit repair label until the user chooses None", () => {
     const definition = inventorySourceFormDefinition(
       fakeProvider,
       sourceSeed({ authProfileId: "ghost" }),
@@ -1085,12 +1085,8 @@ describe("inventorySourceFormDefinition", () => {
     const field = keyedField(definition, "authProfileId");
     expect(field.type).toBe("select");
     if (field.type === "select") {
-      // Passing "ghost" straight through would render the (None) LABEL (the
-      // select renderer falls back to options[0] for the label) while the
-      // hidden input still carries "ghost" as its VALUE — displaying one thing
-      // and submitting another.
-      expect(field.value).toBe("");
-      expect(field.options.some((option) => option.value === "ghost")).toBe(false);
+      expect(field.value).toBe("ghost");
+      expect(field.options.find((option) => option.value === "ghost")?.label).toContain("Needs configuration");
     }
   });
 
@@ -1563,5 +1559,19 @@ describe("localServerFormDefinition — environment variables placeholder", () =
     const field = keyedField(localServerFormDefinition(), "env") as { hint: string };
     expect(field.hint).toMatch(/KEY=null/);
     expect(field.hint).toMatch(/empty string/i);
+  });
+});
+
+
+describe("external profile selectors", () => {
+  const external: AuthProfile = { id: "external", name: "Program", authType: "external", external: { version: 1, method: "key" } };
+  it("labels unconfigured SSH sources and excludes them from new IPMI choices while retaining existing unavailable links", () => {
+    const fresh = serverFormDefinition(undefined, [], true, [], [external]);
+    const linked = serverFormDefinition({ ipmiAuthProfileId: external.id }, [], true, [], [external]);
+    const ssh = keyedField(fresh, "authProfileId"); const ipmi = keyedField(fresh, "ipmiAuthProfileId"); const unavailable = keyedField(linked, "ipmiAuthProfileId");
+    if (ssh.type !== "select" || ipmi.type !== "select" || unavailable.type !== "select") throw new Error("select missing");
+    expect(ssh.advanced).toBe(true); expect(ssh.options.find((option) => option.value === "external")?.label).toBe("Program — External Program · Private Key · Needs configuration");
+    expect(ipmi.options.some((option) => option.value === "external")).toBe(false);
+    expect(unavailable.value).toBe("external"); expect(unavailable.options.find((option) => option.value === "external")?.label).toContain("Unavailable for IPMI");
   });
 });

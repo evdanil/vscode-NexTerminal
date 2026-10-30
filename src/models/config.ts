@@ -1,3 +1,5 @@
+import { authProfileFieldOwnership, authProfileOwnedCredentials, isExternalAuthProfile, authProfileConnectionIdentity } from "./authProfile";
+import type { AuthProfile } from "./authProfile";
 import type { PtyOutputObserver } from "../services/macroAutoTrigger";
 import type * as vscode from "vscode";
 
@@ -1423,121 +1425,28 @@ export interface TunnelRegistryEntry extends TunnelRouteInfo {
   };
 }
 
-export interface AuthProfile {
-  id: string;       // UUID
-  name: string;     // e.g. "Production Servers"
-  username: string;
-  authType: AuthType;
-  keyPath?: string;  // only for authType === "key"
-  // Password stored in SecretVault under "auth-profile-password-{id}"
-  // Key passphrase stored in SecretVault under "auth-profile-passphrase-{id}"
-}
+export type { AuthProfile, StoredAuthProfile, ExternalAuthProfile, ExternalCredentialInvocation, AuthProfileOwnedCredentials } from "./authProfile";
+export { authProfileOwnedCredentials, authProfileFieldOwnership, authProfileConnectionIdentity, isExternalAuthProfile } from "./authProfile";
 
 /**
- * The credential fields a linked auth profile can take over on a server —
- * every key present is one the profile SUPPLIES, carrying the exact value it
- * supplies. A key that is absent is one the server keeps for itself.
- */
-export type AuthProfileOwnedCredentials = Partial<Pick<ServerConfig, "username" | "authType" | "keyPath">>;
-
-/**
- * REVIEW FINDING (P2) — THE ONE RULE for "which credential fields does this
- * auth profile actually own?", shared verbatim by all three layers that had
- * each been answering it their own way:
- *
- *   * the CONNECT path — `SilentAuthSshFactory.resolveServer` spreads this
- *     over the server, so an unowned field keeps the server's own value
- *     instead of being blanked by the profile;
- *   * the SAVE path — `preserveLinkedServerCredentials` (serverCommands.ts)
- *     restores ONLY the owned keys from the stored record, so an edit the form
- *     legitimately permitted survives Save;
- *   * the FORM path — `authProfileFilledKeys` (ui/formDefinitions.ts) seeds the
- *     webview's `profileFilledKeys` from this, and the two `onAutofill` mirrors
- *     (`authProfileCredentialMirror` in serverCommands.ts,
- *     `authProfileUsernameMirror` in inventoryCommands.ts) send exactly these
- *     keys, so the webview's own runtime record (`filledKeysFromValues`, which
- *     independently drops blanks) lands on the same set by construction.
- *
- * THE RULE: a profile owns a field only when it supplies a USABLE value for
- * it. Blank and whitespace-only are not usable values — a whitespace username
- * is reachable through an imported backup (`validateAuthProfile` only checks
- * length; the profile editor trims and refuses blanks), and a `key` profile
- * with no `keyPath` is reachable through the editor itself. Owning such a
- * field means overwriting a working credential with one no SSH login can use,
- * locking the form control that could repair it, and reverting the repair if
- * the control was unlocked anyway. `authType` is a closed enum that is never
- * blank, so it is always owned.
- *
- * Values are returned TRIMMED, matching what the profile editor stores and
- * what `authProfileUsernameMirror`/`fallbackUsernameForSource` already showed
- * and saved — so what a form displays is bit-identical to what a connection
- * uses. An `undefined` profile (no link, or an id that resolves to nothing)
- * owns nothing; the caller's own value stands everywhere.
- *
- * REVIEW FINDING (P2) — both string fields are TYPE-CHECKED, not merely
- * defaulted, before they are trimmed. `AuthProfile.keyPath` is declared
- * `string | undefined` and `validateAuthProfile` (utils/validation.ts) now
- * enforces exactly that at both boundaries a foreign record can enter through
- * (an imported backup and a globalState load), so a non-string reaching here
- * should be impossible. It is guarded anyway because this rule is called from
- * RENDERING paths — the tree's server tooltips, every form that carries the
- * Auth Profile select, the sync plan — where an exception is not a rejected
- * record but a blank sidebar or a form that never opens. A bare
- * `(profile.keyPath ?? "").trim()` throws on the one value it exists to
- * reject; this lands it in the same bucket blank already occupies, "supplies
- * no usable key path", which is both survivable and semantically right. Cheap
- * insurance against a profile built in-process, a future writer, or a boundary
- * someone adds later without this check.
- */
-export function authProfileOwnedCredentials(profile: AuthProfile | undefined): AuthProfileOwnedCredentials {
-  if (!profile) {
-    return {};
-  }
-  const owned: AuthProfileOwnedCredentials = { authType: profile.authType };
-  const username = typeof profile.username === "string" ? profile.username.trim() : "";
-  if (username !== "") {
-    owned.username = username;
-  }
-  const keyPath = typeof profile.keyPath === "string" ? profile.keyPath.trim() : "";
-  if (keyPath !== "") {
-    owned.keyPath = keyPath;
-  }
-  return owned;
-}
-
-/**
- * The server as a connection actually sees it: the linked auth profile's
- * supplied credential fields applied over the server's own (a missing profile,
- * for example one deleted while the server is still linked, leaves the server
- * as it is). Shared by SilentAuthSshFactory.resolveServer and the start
- * descriptors so the two cannot disagree about the effective username, auth
- * type and key path.
+ * Static credential projection for stored profiles. External/missing profiles
+ * supply nothing here: authentication must resolve/refuse those sources before
+ * connecting, rather than treating this projection as fallback authorization.
  */
 export function applyAuthProfile(server: ServerConfig, profile: AuthProfile | undefined): ServerConfig {
   return profile ? { ...server, ...authProfileOwnedCredentials(profile) } : server;
 }
 
 /**
- * The username a connection to `server` will ACTUALLY log in as, given the auth
- * profile it links to (`undefined` for no link, or a link that resolves to
- * nothing). One line, but it is the one line the CONNECT path decides by —
- * `SilentAuthSshFactory.resolveServer` spreads `authProfileOwnedCredentials`
- * over the server, so an owned username replaces the server's and an unowned one
- * leaves it standing — and a linked server keeps its own `username` stored
- * UNDERNEATH the link, so `server.username` and this can legitimately differ.
- *
- * REVIEW FINDING (P2) — anything that tells the user, or a command line, which
- * account is in play must ask THIS rather than read `server.username`, or it
- * describes a login that will not happen. Callers: the deploy-key flow
- * (`resolveEffectiveUsername`, commands/serverCommands.ts) and `${profile.username}`
- * (commands/serverMacroCommands.ts), whose whole contract is "resolves to what
- * this server connects with".
+ * Static username for display/token consumers. A linked external profile owns
+ * the username dynamically, so dormant server.username is never its identity.
+ * Missing-profile authentication is refused separately at the runtime boundary.
  */
 export function effectiveServerUsername(
   server: Pick<ServerConfig, "username">,
   profile: AuthProfile | undefined
 ): string {
-  return authProfileOwnedCredentials(profile).username ?? server.username;
+  return isExternalAuthProfile(profile) ? "" : authProfileOwnedCredentials(profile).username ?? server.username;
 }
 
 /**
@@ -1663,7 +1572,7 @@ export function formOfferedServerCredentials(
   submitted: Pick<ServerConfig, "authType">,
   profile: AuthProfile | undefined
 ): FormOfferedServerCredentials {
-  const owned = authProfileOwnedCredentials(profile);
+  const owned = authProfileFieldOwnership(profile);
   return {
     // Rendered whenever the form is showing SSH controls at all; from there,
     // only profile ownership can take it away.
@@ -1677,13 +1586,13 @@ export function formOfferedServerCredentials(
     // `preserveDormantSshConfig` (commands/serverCommands.ts), which restores
     // the stored SSH config wholesale rather than field by field. Teaching this
     // function about the protocol would split one decision across two places.
-    username: owned.username === undefined,
+    username: !owned.username,
     // A closed enum is always owned, so this is `true` only where nothing
     // resolved — no link, or an id that names no profile, which is the same
     // state the form renders the record's own value unlocked for.
-    authType: owned.authType === undefined,
+    authType: !owned.authType,
     // The one field that can be taken away twice over.
-    keyPath: owned.keyPath === undefined && submitted.authType === "key"
+    keyPath: !owned.keyPath && submitted.authType === "key"
   };
 }
 
@@ -1706,18 +1615,22 @@ export function formOfferedServerCredentials(
  *   * changing `authType` changes which credential control the form rendered at
  *     all.
  *
- * A profile's VALUES are excluded on purpose. A linked server never stores the
+ * Stored-profile VALUES are excluded on purpose. A linked server never stores the
  * profile's username or key path — it keeps its own underneath the link — so a
  * value that changes while the form sits open changes nothing this submission
  * writes, and the link means the profile decides at connect time regardless of
  * whether this Save happens. Rejecting on that would refuse saves that are
  * correct.
  *
+ * External invocation identity is included because dynamic ownership must not
+ * let a form save against a provider configuration it never presented.
+ *
  * A string so the comparison is `===` and cannot itself drift; `undefined`
  * (no profile) has its own signature, so "the profile was deleted" never reads
  * as equal to any live shape.
  */
 export function authProfileOwnershipSignature(profile: AuthProfile | undefined): string {
+  if (isExternalAuthProfile(profile)) return JSON.stringify(authProfileConnectionIdentity(profile));
   const owned = authProfileOwnedCredentials(profile);
   return [
     owned.authType ?? "no-profile",

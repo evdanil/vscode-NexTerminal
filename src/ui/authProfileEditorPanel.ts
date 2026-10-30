@@ -1,8 +1,13 @@
 import { randomUUID } from "node:crypto";
+import { isAbsolute } from "node:path";
+import { isExternalAuthProfile } from "../models/authProfile";
+import { validateAuthProfile } from "../utils/validation";
+import type { ExternalCredentialResolver } from "../services/credentials/contracts";
+import { revokeExternalApprovals } from "../services/credentials/externalCredentialSessionActions";
 import * as os from "node:os";
 import * as vscode from "vscode";
 import type { NexusCore } from "../core/nexusCore";
-import type { AuthProfile, AuthType, ServerConfig } from "../models/config";
+import type { AuthProfile, ServerConfig } from "../models/config";
 import type { InventorySourceConfig } from "../models/inventory";
 import { configMutationLock } from "../services/configMutationLock";
 import { authProfilePassphraseSecretKey, authProfilePasswordSecretKey } from "../services/ssh/silentAuth";
@@ -15,13 +20,8 @@ interface SecretVault {
   delete(key: string): Promise<void>;
 }
 
-const VALID_AUTH_TYPES = new Set<string>(["password", "key", "agent"]);
-function isAuthType(value: unknown): value is AuthType {
-  return typeof value === "string" && VALID_AUTH_TYPES.has(value);
-}
-
 function profileSignature(profiles: AuthProfile[]): string {
-  return profiles.map((p) => `${p.id}:${p.name}:${p.username}:${p.authType}:${p.keyPath ?? ""}`).join("|");
+  return JSON.stringify(profiles);
 }
 
 /**
@@ -68,7 +68,7 @@ export class AuthProfileEditorPanel {
   private unsubscribe: () => void = () => {};
   private lastProfileSignature: string;
 
-  private constructor(core: NexusCore, secretVault: SecretVault | undefined, initialId: string | null) {
+  private constructor(core: NexusCore, secretVault: SecretVault | undefined, initialId: string | null, private readonly externalCredentials?: Pick<ExternalCredentialResolver, "revoke">) {
     this.core = core;
     this.secretVault = secretVault;
     this.selectedId = initialId;
@@ -95,27 +95,32 @@ export class AuthProfileEditorPanel {
     });
   }
 
-  public static open(core: NexusCore, secretVault?: SecretVault, profileId?: string): void {
-    const id = profileId !== undefined ? profileId : null;
+  public static open(core: NexusCore, secretVault?: SecretVault, profileId?: string, externalCredentials?: Pick<ExternalCredentialResolver, "revoke">): void {
+    const missing = profileId !== undefined && !core.getAuthProfile(profileId);
+    if (missing) void vscode.window.showWarningMessage("This auth profile no longer exists. Create a profile here, then explicitly select it in the referring Auth Profile field.");
+    const id = profileId !== undefined && !missing ? profileId : null;
     if (AuthProfileEditorPanel.instance) {
       AuthProfileEditorPanel.instance.panel.reveal();
-      if (id !== null) {
-        AuthProfileEditorPanel.instance.selectedId = id;
-        AuthProfileEditorPanel.instance.render();
+      if ((id !== null || missing) && AuthProfileEditorPanel.instance.selectedId !== id) {
+        void AuthProfileEditorPanel.instance.panel.webview.postMessage({ type: "requestProfileSwitch", targetValue: id ?? "__new__" });
       }
       return;
     }
-    AuthProfileEditorPanel.instance = new AuthProfileEditorPanel(core, secretVault, id);
+    AuthProfileEditorPanel.instance = new AuthProfileEditorPanel(core, secretVault, id, externalCredentials);
   }
 
-  public static openNew(core: NexusCore, secretVault?: SecretVault): void {
+  public static openNew(core: NexusCore, secretVault?: SecretVault, externalCredentials?: Pick<ExternalCredentialResolver, "revoke">): void {
     if (AuthProfileEditorPanel.instance) {
       AuthProfileEditorPanel.instance.panel.reveal();
       AuthProfileEditorPanel.instance.selectedId = null;
       AuthProfileEditorPanel.instance.render();
       return;
     }
-    AuthProfileEditorPanel.instance = new AuthProfileEditorPanel(core, secretVault, null);
+    AuthProfileEditorPanel.instance = new AuthProfileEditorPanel(core, secretVault, null, externalCredentials);
+  }
+
+  public static notifyExternalApprovals(message: string): void {
+    void AuthProfileEditorPanel.instance?.panel.webview.postMessage({ type: "externalApprovalsStatus", message });
   }
 
   private render(justSavedName?: string): void {
@@ -161,115 +166,76 @@ export class AuthProfileEditorPanel {
           }
           break;
         }
+        case "revokeExternalApprovals": {
+          AuthProfileEditorPanel.notifyExternalApprovals(revokeExternalApprovals(this.externalCredentials));
+          break;
+        }
         case "save": {
           const name = typeof msg.name === "string" ? msg.name.trim() : "";
-          const username = typeof msg.username === "string" ? msg.username.trim() : "";
-          if (!name || !username) {
-            break;
-          }
-          const authType: AuthType = isAuthType(msg.authType) ? msg.authType : "password";
-          const password = typeof msg.password === "string" ? msg.password : "";
-          const keyPath = typeof msg.keyPath === "string" && msg.keyPath.trim() ? msg.keyPath.trim() : undefined;
           const requestedId = typeof msg.id === "string" ? msg.id : null;
-
-          // CONFIG MUTATION LOCK (REVIEW FINDING, P2 — save vs. deletion).
-          // The delete handler below pauses inside this lock across two awaited
-          // vault deletes before calling removeAuthProfile. A lock-free save
-          // lands squarely in that pause and breaks it both ways: the record it
-          // writes (a rename, an auth-type change, a new key path) is removed by
-          // a deletion that already revalidated and will not look again, and a
-          // save queued the other way round resurrects — under the very id the
-          // deletion just cleared off every server and inventory source — a
-          // profile built from a form snapshot taken before the delete. Both
-          // operations then report success. Serializing the record write and its
-          // secret writes into the same critical section is what makes one of
-          // them see the other's result.
-          //
-          // NO PROMPT INSIDE: everything below is a core write plus vault I/O.
-          // The re-render and the "saved" post are webview writes, not UI the
-          // user has to answer, and they are kept outside the section anyway.
-          //
-          // DEADLOCK CHECK (AsyncMutex is not re-entrant). The only way into
-          // this branch is `panel.webview.onDidReceiveMessage` -> handleMessage;
-          // handleMessage is private and called from nowhere else, and the two
-          // constructors of this panel (authProfileCommands' two commands and
-          // inlineAuthProfileCreation's openNew) only create/reveal it — neither
-          // holds the lock, and neither awaits a message handler. Nothing that
-          // runs inside a held section can therefore be sitting above this frame.
-          // The core write's synchronous `emitChanged()` reaches tree/panel
-          // observers, none of which acquires this lock. The lock stays OUT of
-          // NexusCore.addOrUpdateAuthProfile for the same reason it stays out of
-          // removeAuthProfile: configCommands' importMergeReplaceLocked and
-          // completeReset both call it from inside a held section.
-          let savedId: string | undefined;
-          let refusal: string | undefined;
-          await configMutationLock.runExclusive(async () => {
-            // Re-read INSIDE the lock. The pre-lock read this replaced could be
-            // taken while a deletion was already inside the section and merely
-            // awaiting its vault deletes.
-            const previousProfile = requestedId !== null ? this.core.getAuthProfile(requestedId) : undefined;
-            if (requestedId !== null && previousProfile === undefined) {
-              // ABORT, NOT RESURRECT — the same call the delete handler makes
-              // when its disclosure goes stale. The pre-lock code fell through to
-              // `existingId = null` here and created a NEW profile under a fresh
-              // id: a duplicate of the record the user thought they were editing,
-              // carrying its password under a key nothing else references, while
-              // every server and source the deletion unlinked stays unlinked.
-              // Saying so and keeping the form's contents is the conservative
-              // answer for a save whose subject no longer exists.
-              refusal = `Auth profile "${name}" was deleted while you were editing it — nothing was saved. Create it again if you still need it.`;
-              return;
-            }
-            const existingId = previousProfile ? requestedId : null;
-
-            const profile: AuthProfile = {
-              id: existingId ?? randomUUID(),
-              name,
-              username,
-              authType,
-              keyPath: authType === "key" ? keyPath : undefined
-            };
-
-            await this.core.addOrUpdateAuthProfile(profile);
-
-            // Handle password in SecretVault
-            if (this.secretVault) {
-              const passwordKey = authProfilePasswordSecretKey(profile.id);
-              const passphraseKey = authProfilePassphraseSecretKey(profile.id);
-              if (authType !== "password") {
-                // Switching away from password auth — remove stored password
-                await this.secretVault.delete(passwordKey);
-              } else if (password) {
-                // New or updated password
-                await this.secretVault.store(passwordKey, password);
-              } else if (existingId !== null && previousProfile && previousProfile.authType !== "password") {
-                // Switching to password auth with no password should not retain stale secret.
-                await this.secretVault.delete(passwordKey);
-              }
-
-              if (authType !== "key") {
-                await this.secretVault.delete(passphraseKey);
-              }
-            }
-
-            savedId = profile.id;
-          });
-          if (refusal !== undefined) {
-            // Deferred out of the section for the same reason the delete
-            // handler's refusal is: nothing may show UI while the lock is held.
-            // No "saved" post either — the editor must not report a write it did
-            // not make. The panel has already re-rendered off the deletion's own
-            // emission (the onDidChange signature watcher), so nothing is
-            // re-rendered here.
-            void vscode.window.showErrorMessage(refusal);
+          const password = typeof msg.password === "string" ? msg.password : "";
+          const candidate: unknown = msg.authType === "external"
+            ? { id: requestedId ?? randomUUID(), name, authType: "external", external: msg.external }
+            : { id: requestedId ?? randomUUID(), name, username: typeof msg.username === "string" ? msg.username.trim() : "",
+                authType: msg.authType, keyPath: msg.authType === "key" && typeof msg.keyPath === "string" && msg.keyPath.trim() ? msg.keyPath.trim() : undefined };
+          if (!validateAuthProfile(candidate)) {
+            void this.panel.webview.postMessage({ type: "actionError", message: "Check the authentication fields. External programs require a supported method, absolute path and valid arguments." });
             break;
           }
-
-          this.selectedId = savedId ?? this.selectedId;
-          // Keep the panel open (a persistent multi-record editor) but signal the
-          // save clearly: an in-panel "✓ Saved" indicator baked into this render,
-          // plus a host toast. Before this, save re-rendered to an identical clean
-          // form with no confirmation — indistinguishable from "nothing happened".
+          const profile = candidate;
+          const previous = requestedId ? this.core.getAuthProfile(requestedId) : undefined;
+          const previousSignature = JSON.stringify(previous);
+          const affected = (): string[] => {
+            const snapshot = this.core.getSnapshot();
+            return [
+              ...snapshot.servers.filter((server) => server.ipmiAuthProfileId === requestedId).map((server) => "server:" + server.id),
+              ...snapshot.deviceTemplates.filter((template) => template.fields.ipmiAuthProfileId?.value === requestedId).map((template) => "template:" + template.id)
+            ].sort();
+          };
+          const switchingToExternal = requestedId && previous && !isExternalAuthProfile(previous) && isExternalAuthProfile(profile);
+          const affectedIds = switchingToExternal ? affected() : [];
+          if (affectedIds.length && await vscode.window.showWarningMessage(
+            `Switch this profile to External Program? ${affectedIds.length} linked IPMI use(s) will become unavailable. External programs support SSH only. Change those IPMI Auth Profile links to restore access.`,
+            { modal: true }, "Switch"
+          ) !== "Switch") break;
+          let refusal: string | undefined;
+          // Lock order is configuration, then the shared per-secret queue. No modal or process runs here.
+          await configMutationLock.runExclusive(async () => {
+            const live = requestedId ? this.core.getAuthProfile(requestedId) : undefined;
+            if (requestedId && !live) { refusal = `Auth profile "${name}" was deleted while you were editing it — nothing was saved. Create it again if you still need it.`; return; }
+            if (JSON.stringify(live) !== previousSignature || (switchingToExternal && JSON.stringify(affected()) !== JSON.stringify(affectedIds))) {
+              refusal = "The auth profile or its linked IPMI uses changed while saving. Review the profile and save again."; return;
+            }
+            const externalBefore = isExternalAuthProfile(live);
+            const externalAfter = isExternalAuthProfile(profile);
+            const passwordKey = authProfilePasswordSecretKey(profile.id);
+            const passphraseKey = authProfilePassphraseSecretKey(profile.id);
+            // The synchronous core mutation hook owns revocation and pool invalidation.
+            // Failed earlier cleanup must never resurrect a dormant secret when stored auth is enabled.
+            if (externalBefore && !externalAfter) {
+              if (!this.secretVault) throw new Error("Secret storage is unavailable; the profile remains external.");
+              await this.secretVault.delete(passwordKey);
+              await this.secretVault.delete(passphraseKey);
+            }
+            await this.core.addOrUpdateAuthProfile(profile);
+            if (this.secretVault) {
+              if (externalAfter) {
+                try { await this.secretVault.delete(passwordKey); await this.secretVault.delete(passphraseKey); }
+                catch { throw new Error("External configuration was saved, but old stored secrets could not be removed. They are not used by external authentication. Save again to retry cleanup."); }
+              } else if (externalBefore) {
+                if (profile.authType === "password" && password) await this.secretVault.store(passwordKey, password);
+              } else {
+                if (profile.authType !== "password") await this.secretVault.delete(passwordKey);
+                else if (password) await this.secretVault.store(passwordKey, password);
+                else if (live && live.authType !== "password") await this.secretVault.delete(passwordKey);
+                if (profile.authType !== "key" || live?.authType === "key" && live.keyPath !== profile.keyPath) await this.secretVault.delete(passphraseKey);
+              }
+            } else if (externalAfter && live && !externalBefore) {
+              throw new Error("External configuration was saved, but secret storage is unavailable for removing old stored secrets. They are not used by external authentication.");
+            }
+          });
+          if (refusal) { void vscode.window.showErrorMessage(refusal); void this.panel.webview.postMessage({ type: "actionError", message: refusal }); break; }
+          this.selectedId = profile.id;
           this.render(name);
           void vscode.window.showInformationMessage(`Auth profile "${name}" saved.`);
           break;
@@ -283,6 +249,12 @@ export class AuthProfileEditorPanel {
           if (!profile) break;
 
           const snapshot = this.core.getSnapshot();
+          if (isExternalAuthProfile(profile)) {
+            const count = snapshot.servers.filter((server) => server.authProfileId === id || server.ipmiAuthProfileId === id).length
+              + snapshot.inventorySources.filter((source) => source.authProfileId === id).length
+              + snapshot.deviceTemplates.filter((template) => template.fields.authProfileId?.value === id || template.fields.ipmiAuthProfileId?.value === id).length;
+            if (count) { void vscode.window.showErrorMessage(`This external auth profile has ${count} linked record(s). Change or unlink those Auth Profile fields before deleting it.`); break; }
+          }
           const shownDetail = describeDeleteDetail(profile, snapshot.servers, snapshot.inventorySources);
           const confirm = await vscode.window.showWarningMessage(
             shownDetail,
@@ -361,6 +333,14 @@ export class AuthProfileEditorPanel {
               return;
             }
 
+            if (isExternalAuthProfile(currentProfile)) {
+              if (current.servers.some((server) => server.authProfileId === id || server.ipmiAuthProfileId === id) ||
+                current.inventorySources.some((source) => source.authProfileId === id) ||
+                current.deviceTemplates.some((template) => template.fields.authProfileId?.value === id || template.fields.ipmiAuthProfileId?.value === id)) {
+                refusal = "This external auth profile gained linked records. Change or unlink their Auth Profile fields before deleting it."; return;
+              }
+
+            }
             if (this.secretVault) {
               await this.secretVault.delete(authProfilePasswordSecretKey(id));
               await this.secretVault.delete(authProfilePassphraseSecretKey(id));
@@ -375,6 +355,23 @@ export class AuthProfileEditorPanel {
           const profiles = this.core.getSnapshot().authProfiles;
           this.selectedId = profiles.length > 0 ? profiles[0].id : null;
           this.render();
+          break;
+        }
+        case "externalExecutable": {
+          const remoteRoot = vscode.workspace?.workspaceFolders?.find((folder) => folder.uri.scheme === "vscode-remote")?.uri;
+          const uris = await vscode.window.showOpenDialog({ canSelectFiles: true, canSelectMany: false,
+            title: "Select External Credential Executable on the Extension Host", openLabel: "Select Executable",
+            defaultUri: remoteRoot ? remoteRoot.with({ path: os.homedir() }) : vscode.Uri.file(os.homedir()), filters: { "All Files": ["*"] } });
+          if (!uris?.length) break;
+          const uri = uris[0];
+          // Remote hosts must use their own chooser authority, never a desktop file URI.
+          const remote = vscode.env?.remoteName;
+          const expectedAuthority = remoteRoot?.authority;
+          const supported = remote ? uri.scheme === "vscode-remote" && !!expectedAuthority && uri.authority === expectedAuthority : uri.scheme === "file";
+          if (!supported || !isAbsolute(uri.fsPath)) {
+            void vscode.window.showErrorMessage("Choose an absolute executable path on this extension host. For remote hosts without a matching file chooser, enter the remote path in Executable."); break;
+          }
+          void this.panel.webview.postMessage({ type: "externalExecutableResult", path: uri.fsPath });
           break;
         }
         case "browse": {
@@ -395,6 +392,7 @@ export class AuthProfileEditorPanel {
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       void vscode.window.showErrorMessage(`Auth profile action failed: ${detail}`);
+      void this.panel.webview.postMessage({ type: "actionError", message: `Auth profile action failed: ${detail}` });
     }
   }
 }
