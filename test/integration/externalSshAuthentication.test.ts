@@ -1,6 +1,8 @@
 import { generateKeyPairSync } from "node:crypto";
 import { once } from "node:events";
+import { readFileSync } from "node:fs";
 import { connect as connectTcp } from "node:net";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Client, Server, utils, type AuthContext, type Connection, type PublicKeyAuthMethod } from "ssh2";
 import { Ssh2Connector } from "../../src/services/ssh/ssh2Connector";
@@ -18,6 +20,9 @@ import { ProxySshFactory } from "../../src/services/ssh/proxySshFactory";
 import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
 
 const hostKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ format: "pem", type: "pkcs1" });
+// ssh2's generator strips leading zero public-key bytes from Ed25519 keys.
+// This ssh-keygen fixture preserves that boundary and avoids random invalid keys.
+const opensshKey = readFileSync(join(__dirname, "../fixtures/externalCredentials/openssh-ed25519-leading-zero.key"));
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); vi.useRealTimers(); });
 
@@ -47,7 +52,7 @@ async function listen(authenticate: (ctx: AuthContext, peer: Connection) => void
 
 describe("external credentials with installed ssh2", () => {
   it.each(["password", "pem", "openssh"])("authenticates returned %s credentials and opens a channel after connector disposal", async (method) => {
-    const privateKey = Buffer.from(method === "openssh" ? utils.generateKeyPairSync("ed25519").private : hostKey);
+    const privateKey = Buffer.from(method === "openssh" ? opensshKey : hostKey);
     const parsed = utils.parseKey(privateKey);
     if (parsed instanceof Error || Array.isArray(parsed)) throw new Error("Invalid test key");
     const methods: string[] = [];
@@ -73,9 +78,14 @@ describe("external credentials with installed ssh2", () => {
   });
 
   it.each(["pem", "openssh"] as const)("signs %s after both raw copies are wiped before PK_OK, then rekeys and opens a channel", async (format) => {
-    const raw = Buffer.from(format === "pem" ? hostKey : utils.generateKeyPairSync("ed25519").private);
+    const raw = Buffer.from(format === "pem" ? hostKey : opensshKey);
     const parsed = utils.parseKey(raw);
     if (parsed instanceof Error || Array.isArray(parsed)) throw new Error("Invalid test key");
+    if (format === "openssh") {
+      // Keep the valid zero-prefixed public key covered through real signing.
+      expect(parsed.getPublicSSH().subarray(19)).toHaveLength(32);
+      expect(parsed.getPublicSSH()[19]).toBe(0);
+    }
     const adapter = createExternalSshAuthentication({ method: "key", username: "provider-user", privateKey: raw });
     cleanups.push(() => adapter.dispose());
     const originalHandler = adapter.connectOptions.authHandler as (methods: string[] | null, partial: boolean) => PublicKeyAuthMethod | false;

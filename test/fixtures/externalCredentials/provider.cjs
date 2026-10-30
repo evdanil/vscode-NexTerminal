@@ -13,6 +13,15 @@ switch (mode) {
   case "delayed": setTimeout(valid, 150); break;
   case "cancel-ready": process.stderr.write("ready"); setInterval(() => {}, 1000); break;
   case "hang": setInterval(() => {}, 1000); break;
+  case "stubborn-descendant": {
+    process.on("SIGTERM", () => process.exit(0));
+    const descendant = spawn(process.execPath, [path.join(__dirname, "descendant.cjs"), control, "ignore-term"], {
+      detached: false, stdio: ["ignore", "inherit", "inherit", "ipc"]
+    });
+    descendant.once("message", () => { descendant.disconnect(); process.stderr.write("ready"); });
+    setInterval(() => {}, 1000);
+    break;
+  }
   case "waiting":
   case "inherited":
   case "escaped": {

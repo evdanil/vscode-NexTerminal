@@ -27,7 +27,7 @@ try {
   const username = read(usernameReference);
   if (/[\0\r\n]/u.test(username)) throw new Error();
   const credential = read(credentialReference);
-  const field = method === "--pass" ? "password" : "private_key";
+  const field = method === "--pkey" ? "private_key" : "password";
   // Write only once, after BOTH reads succeed. Nexus validates the response.
   process.stdout.write(JSON.stringify({ version: 1, username, [field]: credential }));
 } catch {

@@ -30,6 +30,22 @@ function setup(platform: NodeJS.Platform = "linux") {
 afterEach(() => vi.useRealTimers());
 
 describe("credential process runner", () => {
+  it("escalates owned group cleanup before settling after parent close", async () => {
+    const s = setup(); let settled = false;
+    const settledAtEscalation: boolean[] = [];
+    const result = s.start().catch(error => { settled = true; return error; });
+    s.controller.abort();
+    s.killGroup.mockImplementation((_pid, signal) => {
+      if (signal === "SIGKILL") settledAtEscalation.push(settled);
+    });
+    s.close();
+    expect(await result).toMatchObject({ code: "cancelled" });
+    expect(s.killGroup.mock.calls).toEqual([[123, "SIGTERM"], [123, "SIGKILL"]]);
+    expect(settledAtEscalation).toEqual([false]);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(s.killGroup).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(0);
+  });
   it.each([["password", "--pass"], ["key", "--pkey"]] as const)("spawns literal %s argv and transfers successful bytes", async (method, flag) => {
     const s = setup(); const promise = s.start(method);
     expect(s.spawn).toHaveBeenCalledWith("/usr/bin/provider", ["a b", "x\"y", "a\\b", flag], {

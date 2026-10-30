@@ -35,7 +35,7 @@ try {
   const value = provider === "vault-kv1" ? response.data :
     provider === "vault-kv2" ? response.data?.data :
     JSON.parse(provider === "aws" ? response.SecretString : response.value);
-  const field = method === "--pass" ? "password" : "private_key";
+  const field = method === "--pkey" ? "private_key" : "password";
   if (!value || typeof value.username !== "string" || !value.username ||
       /[\0\r\n]/u.test(value.username) || typeof value[field] !== "string" || !value[field]) throw new Error();
   // Project only the selected credential. Never forward CLI envelopes or metadata.

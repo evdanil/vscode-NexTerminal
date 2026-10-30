@@ -88,6 +88,7 @@ export function createExternalCredentialProcessRunner(overrides: Dependencies = 
     let failure: CredentialProviderError | undefined;
     let exited = false;
     let closed = false;
+    let groupEscalationPending = false;
     let exitCode: number | null = null;
     let exitSignal: NodeJS.Signals | null = null;
     let stdoutBytes = 0;
@@ -131,6 +132,7 @@ export function createExternalCredentialProcessRunner(overrides: Dependencies = 
     const signalOwned = (signal: NodeJS.Signals): void => {
       if (!hasPid() || (exited && closed)) return;
       if (deps.platform !== "win32") {
+        if (signal === "SIGKILL") groupEscalationPending = false;
         try { deps.killGroup(child.pid!, signal); } catch { /* Cleanup status comes from observed exit, never kill's return. */ }
         return;
       }
@@ -157,6 +159,7 @@ export function createExternalCredentialProcessRunner(overrides: Dependencies = 
       if (failure || settled) return;
       failure = new CredentialProviderError(code, numericExit);
       wipe();
+      groupEscalationPending = deps.platform !== "win32" && hasPid() && !(exited && closed);
       // Signal before destroying pipes: pipe ownership still proves the group is ours after parent exit.
       signalOwned("SIGTERM"); destroyPipes();
       if (!hasPid() || (exited && closed)) { finish(failure); return; }
@@ -183,6 +186,10 @@ export function createExternalCredentialProcessRunner(overrides: Dependencies = 
       schedule(() => { if (!closed) fail("exited"); }, deps.limits.drainGraceMs);
     };
     const onClose = (): void => {
+      // Destroyed pipes can close as soon as the parent exits while same-group
+      // descendants still ignore SIGTERM. Complete escalation before releasing
+      // admission, without retaining a numeric group ID after observed close.
+      if (groupEscalationPending) signalOwned("SIGKILL");
       closed = true;
       if (failure) { finish(failure); return; }
       const changed = stale();

@@ -47,6 +47,21 @@ async function fixture(mode: string, check: (result: Buffer | Error, pids: numbe
 }
 
 describe("real external credential process", () => {
+  it.skipIf(process.platform === "win32").each([false, true])("kills an owned TERM-resistant descendant after parent exit (cancel=%s)", async cancel => {
+    await fixture("stubborn-descendant", async (result, pids, observation) => {
+      expect(result).toMatchObject({ code: cancel ? "cancelled" : "timed-out" });
+      expect(pids).toHaveLength(2);
+      expect(observation.parentExited).toBe(true);
+      const alive = (pid: number): boolean => {
+        try {
+          process.kill(pid, 0);
+          return process.platform !== "linux" || !/\) Z /.test(readFileSync(`/proc/${pid}/stat`, "utf8"));
+        } catch { return false; }
+      };
+      for (let i = 0; i < 25 && pids.some(alive); i++) await new Promise(resolve => setTimeout(resolve, 20));
+      expect(pids.filter(alive)).toEqual([]);
+    }, 1500, cancel);
+  });
   it.each(["valid", "delayed"])("returns %s output with ownership transferred", async mode => {
     await fixture(mode, result => { expect(Buffer.isBuffer(result)).toBe(true); expect(result.toString()).toBe('{"version":1,"username":"fixture","password":"synthetic-value"}'); });
   });
