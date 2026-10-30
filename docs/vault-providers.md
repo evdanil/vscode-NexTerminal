@@ -26,6 +26,34 @@ For key authentication store `private_key` instead of `password`, containing the
 
 Each argument line is literal: no shell quotes, environment-variable expansion or `~`. Do not add `--pass` or `--pkey`; Nexus appends the selected method. Arguments hold paths/identifiers only, never passwords, tokens or private keys. Identifiers remain visible in saved configuration and backups. Select the saved auth profile on your SSH server under **Advanced → Auth Profile**. The provider supplies the username; it receives no target hostname, so use separate profiles for different secrets.
 
+## Example: 100 servers with different credential groups
+
+Choose the secret through the server's **assigned auth profile**, not by writing a script for each server. All profiles can use the same provider script with different arguments.
+
+| Servers | Assigned auth profile | Vault secret path |
+| --- | --- | --- |
+| 60 Linux production servers | `Linux production` | `network/linux-production` |
+| 25 network devices | `Network devices` | `network/network-devices` |
+| 15 lab servers | `Lab credentials` | `network/lab` |
+
+Create three External Program profiles, each pointing to the same Node executable and `vault-provider.cjs`. For the **Linux production** profile, choose **Password** and use:
+
+```text
+/home/alex/.config/nexus/vault-provider.cjs
+vault-kv2
+/usr/local/bin/vault
+secret
+network/linux-production
+```
+
+For **Network devices**, change only the last line to `network/network-devices`; for **Lab credentials**, use `network/lab`. Each secret contains the username and password for that group. If a group uses a private key instead, select **Private Key** in that group's auth profile and store `username` plus `private_key` at its secret path.
+
+Assign each profile under the corresponding server's **Advanced → Auth Profile**, or use the existing folder action to apply an auth profile to a group of servers. These are explicit server/profile assignments; folder organization alone does not make the script choose a secret. Inventory sources and device templates can also apply auth profiles during provisioning.
+
+The same approach works with AWS secret IDs, Azure secret names, and [1Password field references](1password.md): keep the script, change the profile's arguments.
+
+**No destination context is passed to the provider.** It receives the configured arguments plus `--pass` or `--pkey`, not the target server's hostname or ID. Three shared credential sets therefore need three profiles, even with 100 servers. If all 100 servers have unique credentials, typically create 100 auth profiles with distinct secret references, still using just one script. A single profile that automatically selects a secret from the destination hostname would require a future server-context feature; it is not supported by this version.
+
 ## HashiCorp Vault (KV v2 or KV v1)
 
 Use a KV secret at mount `secret`, path `network/lab-router`, with `username` and `password` (or `private_key`) fields. Configure access in Vault's UI or your existing secret-management workflow. This is a **KV read** example, not Vault's SSH secrets engine, dynamic credentials or signed SSH certificates.

@@ -59,6 +59,8 @@ On macOS use the discovered Node and `op` paths, which may differ from Linux. Th
 
 Edit your SSH server and choose **Advanced → Auth Profile → 1Password — Lab Router**. Nexus gets the login username from the provider, so no separate static username/password is needed for this profile. One profile can be linked to multiple servers that share those credentials. Nexus does not pass the target hostname to the script; create separate profiles/references for different credentials.
 
+For a concrete 100-server setup with several credential groups, see [mapping servers to auth profiles](vault-providers.md#example-100-servers-with-different-credential-groups). The same mapping applies to 1Password: each profile supplies its own username and credential references to the shared script.
+
 ## Private-key example
 
 Store/import the SSH private key in a 1Password **SSH Key** item, for example **Lab SSH Key**. Add a text field named `username` with the target account, or reference the username in a separate Login item. An SSH Key item does not inherently specify the target server's login username. Install the matching public key on the server separately.

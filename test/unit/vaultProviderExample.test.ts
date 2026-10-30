@@ -32,7 +32,7 @@ describe.each(providers)("%s provider example", (provider) => {
     expect(args[2]).toMatchObject({ shell: false, timeout: 20000, maxBuffer: 256 * 1024, stdio: ["ignore", "pipe", "ignore"] });
   });
   it("returns a private key accepted by Nexus", () => {
-    const key = generateKeyPairSync("rsa", { modulusLength: 1024 }).privateKey.export({ type: "pkcs1", format: "pem" }).toString();
+    const key = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs1", format: "pem" }).toString();
     const result = run(provider, envelope(provider, { username: "operator", private_key: key }), "--pkey");
     expect(result.code).toBe(0);
     const parsed = parseExternalCredentialResponse(Buffer.from(result.output), "key");

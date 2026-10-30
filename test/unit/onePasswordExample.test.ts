@@ -32,7 +32,7 @@ describe("1Password provider example", () => {
       .toEqual({ method: "password", username: "operator", password: secret });
   });
   it("returns a key accepted by the real provider parser", () => {
-    const key = generateKeyPairSync("rsa", { modulusLength: 1024 }).privateKey.export({ type: "pkcs1", format: "pem" }).toString();
+    const key = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs1", format: "pem" }).toString();
     const result = run(key, "--pkey"); expect(result.status).toBe(0);
     const parsed = parseExternalCredentialResponse(Buffer.from(result.stdout), "key");
     expect(parsed.method).toBe("key");
