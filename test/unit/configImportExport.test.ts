@@ -110,9 +110,9 @@ vi.mock("vscode", () => ({
     }))
   },
   Uri: {
-    file: (path: string) => ({ fsPath: path, scheme: "file" }),
+    file: (filePath: string) => ({ fsPath: path.normalize(filePath), scheme: "file" }),
     joinPath: (base: { fsPath: string; scheme: string }, ...parts: string[]) => ({
-      fsPath: [base.fsPath, ...parts].join("/").replace(/\/+/g, "/"),
+      fsPath: path.join(base.fsPath, ...parts),
       scheme: base.scheme
     })
   },
@@ -285,6 +285,9 @@ function makeExportData(overrides: Record<string, unknown> = {}) {
 // initialized before any test that triggers exportBackup or importMergeReplace,
 // both of which call getMacros()/saveMacros().
 beforeEach(async () => {
+  // Clearing call history leaves unused one-shot answers queued for the next test.
+  for (const prompt of [mockShowInformationMessage, mockShowErrorMessage, mockShowWarningMessage,
+    mockShowQuickPick, mockShowSaveDialog, mockShowOpenDialog, mockShowInputBox]) prompt.mockReset();
   configDefaults.clear();
   configWorkspaceStore.clear();
   const store = new InMemoryMacroStore();
@@ -2251,7 +2254,7 @@ describe("backup export command", () => {
 
   it("exports the user .ssh folder and resolved scripts folder inside encrypted secrets", async () => {
     const sshDir = path.join(os.homedir(), ".ssh");
-    const scriptsDir = "/workspace/.nexus/scripts";
+    const scriptsDir = path.normalize("/workspace/.nexus/scripts");
     const fakeContext = {
       globalStorageUri: { fsPath: "/global-storage", scheme: "file", path: "/global-storage" }
     } as unknown as import("vscode").ExtensionContext;
@@ -2262,7 +2265,7 @@ describe("backup export command", () => {
 
     mockStat.mockImplementation(async (uri: { fsPath: string }) => {
       if ([sshDir, scriptsDir].includes(uri.fsPath)) return { type: 2 };
-      if ([path.join(sshDir, "config"), path.join(sshDir, "keys"), path.join(sshDir, "keys/id_ed25519"), `${scriptsDir}/hello.js`].includes(uri.fsPath)) {
+      if ([path.join(sshDir, "config"), path.join(sshDir, "keys"), path.join(sshDir, "keys/id_ed25519"), path.join(scriptsDir, "hello.js")].includes(uri.fsPath)) {
         return { type: uri.fsPath.endsWith("keys") ? 2 : 1 };
       }
       throw new Error(`ENOENT: ${uri.fsPath}`);
@@ -2276,7 +2279,7 @@ describe("backup export command", () => {
     mockReadFile.mockImplementation(async (uri: { fsPath: string }) => {
       if (uri.fsPath === path.join(sshDir, "config")) return Buffer.from("Host lab\n");
       if (uri.fsPath === path.join(sshDir, "keys/id_ed25519")) return Buffer.from("PRIVATE KEY");
-      if (uri.fsPath === `${scriptsDir}/hello.js`) return Buffer.from("/** @nexus-script */\n");
+      if (uri.fsPath === path.join(scriptsDir, "hello.js")) return Buffer.from("/** @nexus-script */\n");
       throw new Error(`ENOENT: ${uri.fsPath}`);
     });
 
@@ -3789,7 +3792,7 @@ describe("backup import", () => {
     await importCmd();
 
     expect(configStore.get("nexus.scripts.path")).toBe("/tmp/redirected-scripts");
-    expect((mockWriteFile.mock.calls[0][0] as { fsPath: string }).fsPath).toBe("/workspace/.nexus/scripts/hello.js");
+    expect((mockWriteFile.mock.calls[0][0] as { fsPath: string }).fsPath).toBe(path.normalize("/workspace/.nexus/scripts/hello.js"));
   });
 
   it("merge-mode import does not overwrite a retained server's vault password with the backup's; a newly-imported server's password still restores; replace mode restores everything (kills restoreSecrets()'s pre-fix unconditional write)", async () => {
@@ -5145,17 +5148,19 @@ describe("import from SSH config command (nexus.config.import.sshConfig)", () =>
 
   /** Serve one file (plus optional extra paths) through the mocked workspace.fs. */
   function serveFiles(files: Record<string, string>, dirs: Record<string, string[]> = {}): void {
+    files = Object.fromEntries(Object.entries(files).map(([name, content]) => [path.resolve(name), content]));
+    dirs = Object.fromEntries(Object.entries(dirs).map(([name, entries]) => [path.resolve(name), entries]));
     mockStat.mockImplementation(async (uri: { fsPath: string }) => {
-      if (uri.fsPath in files) return { type: 1, size: Buffer.byteLength(files[uri.fsPath], "utf8") };
-      if (uri.fsPath in dirs) return { type: 2, size: 0 };
+      if (path.resolve(uri.fsPath) in files) return { type: 1, size: Buffer.byteLength(files[path.resolve(uri.fsPath)], "utf8") };
+      if (path.resolve(uri.fsPath) in dirs) return { type: 2, size: 0 };
       throw new Error(`ENOENT: ${uri.fsPath}`);
     });
     mockReadFile.mockImplementation(async (uri: { fsPath: string }) => {
-      if (uri.fsPath in files) return Buffer.from(files[uri.fsPath], "utf8");
+      if (path.resolve(uri.fsPath) in files) return Buffer.from(files[path.resolve(uri.fsPath)], "utf8");
       throw new Error(`ENOENT: ${uri.fsPath}`);
     });
     mockReadDirectory.mockImplementation(async (uri: { fsPath: string }) =>
-      (dirs[uri.fsPath] ?? []).map((name) => [name, 1] as [string, number])
+      (dirs[path.resolve(uri.fsPath)] ?? []).map((name) => [name, 1] as [string, number])
     );
   }
 
@@ -5332,8 +5337,13 @@ describe("import from SSH config command (nexus.config.import.sshConfig)", () =>
       return "Import";
     });
 
-    await registeredCommands.get("nexus.config.import.sshConfig")!();
-    await holderDone;
+    try {
+      await registeredCommands.get("nexus.config.import.sshConfig")!();
+    } finally {
+      // A failed preflight never opens the modal that normally releases this holder.
+      releaseHolder();
+      await holderDone;
+    }
 
     const matching = core.getSnapshot().servers.filter((server) => server.host === "web1.example.com");
     expect(matching).toHaveLength(1);
@@ -6022,20 +6032,20 @@ describe("import from SecureCRT command", () => {
     mockShowInformationMessage.mockResolvedValueOnce("Import");
 
     mockReadDirectory.mockImplementation(async (uri: { fsPath: string }) => {
-      switch (uri.fsPath) {
-        case "/fake/Sessions":
+      switch (path.resolve(uri.fsPath)) {
+        case path.resolve("/fake/Sessions"):
           return [
             ["Prod", 2], // Directory
             ["RootSession.INI", 1], // File
             ["Telnet.ini", 1], // File (non-SSH)
             ["notes.txt", 1] // File (ignored by extension)
           ];
-        case "/fake/Sessions/Prod":
+        case path.resolve("/fake/Sessions/Prod"):
           return [
             ["App.ini", 1], // File
             ["Nested", 2] // Directory
           ];
-        case "/fake/Sessions/Prod/Nested":
+        case path.resolve("/fake/Sessions/Prod/Nested"):
           return [
             ["Db.iNi", 1] // File
           ];
@@ -6051,7 +6061,8 @@ describe("import from SecureCRT command", () => {
         "/fake/Sessions/Prod/App.ini": `S:"Protocol Name"=SSH2\nS:"Hostname"=app.example.com\nD:"[SSH2] Port"=000008AE\nS:"Username"=deploy`,
         "/fake/Sessions/Prod/Nested/Db.iNi": `S:"Protocol Name"=SSH2\nS:"Hostname"=db.example.com\nD:"[SSH2] Port"=00011170\nS:"Username"=`
       };
-      return Buffer.from(byPath[uri.fsPath] ?? "", "utf8");
+      const entry = Object.entries(byPath).find(([name]) => path.resolve(name) === path.resolve(uri.fsPath));
+      return Buffer.from(entry?.[1] ?? "", "utf8");
     });
 
     const cmd = registeredCommands.get("nexus.config.import.securecrt")!;

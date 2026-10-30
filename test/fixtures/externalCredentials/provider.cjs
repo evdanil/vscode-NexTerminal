@@ -11,6 +11,7 @@ switch (mode) {
   case "large-stderr": process.stderr.write(Buffer.alloc(65537, 65)); break;
   case "nonzero": process.stderr.write("SECRET_CANARY"); process.exitCode = 7; break;
   case "delayed": setTimeout(valid, 150); break;
+  case "cancel-ready": process.stderr.write("ready"); setInterval(() => {}, 1000); break;
   case "hang": setInterval(() => {}, 1000); break;
   case "waiting":
   case "inherited":

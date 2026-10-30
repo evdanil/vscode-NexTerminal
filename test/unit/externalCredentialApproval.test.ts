@@ -58,6 +58,37 @@ describe("session approval", () => {
     const a = approval.authorize(request(profile(), c)).catch((e: unknown) => e); c.abort(); answer.resolve(true); await a; await Promise.resolve();
     await expect(approval.authorize({ ...request(), interaction: "noninteractive" })).rejects.toMatchObject({ code: "approval-required" });
   });
+  it("keeps a replacement question alive after both owners cancel an opened question and its old Allow arrives", async () => {
+    const oldAnswer = deferred<boolean>();
+    const newAnswer = deferred<boolean>();
+    const confirm = vi.fn<(profile: ExternalAuthProfile, signal: AbortSignal) => Promise<boolean>>()
+      .mockReturnValueOnce(oldAnswer.promise).mockReturnValueOnce(newAnswer.promise);
+    const { approval } = setup(confirm);
+    const first = new AbortController(); const second = new AbortController();
+    const a = approval.authorize(request(profile(), first)).catch((error: unknown) => error);
+    const b = approval.authorize(request(profile(), second)).catch((error: unknown) => error);
+    await vi.waitFor(() => expect(confirm).toHaveBeenCalledTimes(1));
+    first.abort(); second.abort();
+    expect(await a).toMatchObject({ code: "cancelled" });
+    expect(await b).toMatchObject({ code: "cancelled" });
+    expect(confirm.mock.calls[0][1].aborted).toBe(true);
+    let replacementSettled = false;
+    const replacement = approval.authorize(request()).then(() => { replacementSettled = true; });
+    await vi.waitFor(() => expect(confirm).toHaveBeenCalledTimes(2));
+    oldAnswer.resolve(true);
+    // Flush the old confirmation's completion before inspecting replacement authority.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(replacementSettled).toBe(false);
+    expect(confirm.mock.calls[1][1].aborted).toBe(false);
+    await expect(approval.authorize({ ...request(), interaction: "noninteractive" })).rejects.toMatchObject({ code: "approval-required" });
+    const joiningReplacement = approval.authorize(request()).catch((error: unknown) => error);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(confirm).toHaveBeenCalledTimes(2);
+    newAnswer.resolve(true); await replacement;
+    expect(await joiningReplacement).toBeUndefined();
+    await expect(approval.authorize({ ...request(), interaction: "noninteractive" })).resolves.toBeUndefined();
+    expect(confirm).toHaveBeenCalledTimes(2);
+  });
   it("revocation advances generation, removes grants and synchronously notifies subscribers", async () => {
     const { approval } = setup(); await approval.authorize(request()); const before = approval.generation("provider");
     const listener = vi.fn(); const off = approval.onDidRevoke(listener); approval.revoke(["provider"]);

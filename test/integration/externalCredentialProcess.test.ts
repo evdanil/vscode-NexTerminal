@@ -5,16 +5,19 @@ import { execFileSync, spawn } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { createExternalCredentialProcessRunner } from "../../src/services/credentials/externalCredentialProcess";
 
-async function fixture(mode: string, check: (result: Buffer | Error, pids: number[], observation: { parentExited: boolean; pipesOpenAtExit: boolean }) => void | Promise<void>, timeoutMs = 1500) {
+async function fixture(mode: string, check: (result: Buffer | Error, pids: number[], observation: { parentExited: boolean; pipesOpenAtExit: boolean }) => void | Promise<void>, timeoutMs = 1500, cancelWhenReady = false) {
   const directory = mkdtempSync(join(tmpdir(), "nexus-credential-test-"));
   const control = join(directory, "pids");
   try {
     const observation = { parentExited: false, pipesOpenAtExit: false };
     let providerSpawned = false;
+    const controller = new AbortController();
     const runner = createExternalCredentialProcessRunner({ limits: { timeoutMs }, spawn: (executable, args, options) => {
       const child = spawn(executable, args, options);
       if (!providerSpawned) {
         providerSpawned = true;
+        // Fixture readiness proves cancellation happens after a real child starts.
+        if (cancelWhenReady) child.stderr!.once("data", () => controller.abort());
         child.once("exit", () => {
           observation.parentExited = true;
           observation.pipesOpenAtExit = !!child.stdout && !child.stdout.destroyed && !child.stdout.readableEnded;
@@ -23,7 +26,7 @@ async function fixture(mode: string, check: (result: Buffer | Error, pids: numbe
       return child;
     } });
     const result = await runner({ executable: process.execPath, args: [resolve(__dirname, "../fixtures/externalCredentials/provider.cjs"), mode, control] }, "password",
-      { signal: new AbortController().signal, isCurrent: () => true }).catch((error: Error) => error);
+      { signal: controller.signal, isCurrent: () => true }).catch((error: Error) => error);
     try {
       const pids = readFileSync(control, "utf8").trim().split("\n").map(Number);
       await check(result, pids, observation);
@@ -64,6 +67,14 @@ describe("real external credential process", () => {
       for (let i = 0; i < 25 && pids.some(alive); i++) await new Promise(resolve => setTimeout(resolve, 20));
       expect(pids.filter(alive)).toEqual([]);
     }, 1500);
+  });
+  it("cancels a running real child and observes its termination", async () => {
+    await fixture("cancel-ready", (result, pids, observation) => {
+      expect(result).toMatchObject({ code: "cancelled" });
+      expect(pids).toHaveLength(1);
+      expect(observation.parentExited).toBe(true);
+      expect(() => process.kill(pids[0], 0)).toThrow();
+    }, 1500, true);
   });
   it.each(["inherited", "escaped"])("rejects %s pipes after parent exit without accepting partial output", async mode => {
     await fixture(mode, (result, pids, observation) => {

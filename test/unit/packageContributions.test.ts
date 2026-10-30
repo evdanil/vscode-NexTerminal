@@ -285,9 +285,9 @@ describe("package contributions", () => {
     // BMC gating (Phase 2) broadened the connected-server menus to also match the
     // .ipmi variant; node control (Phase 4) broadened them again to tolerate the
     // optional .nodeRunning/.nodeStopped group, and Open Web Console broadened
-    // them once more with the optional .webConsole marker — the assertion follows
-    // the current form, which is the whole point of pinning it as a literal.
-    expect(menuItems.some((item) => item.when?.includes("/^nexus\\.serverConnected(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?$/"))).toBe(true);
+    // them once more with .webConsole. External/missing credential links add
+    // .noKeyDeployment; ordinary connection actions must still match these rows.
+    expect(menuItems.some((item) => item.when?.includes("/^nexus\\.serverConnected(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/"))).toBe(true);
     expect(menuItems.some((item) => item.when?.includes("viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/"))).toBe(true);
   });
 
@@ -325,12 +325,12 @@ describe("package contributions", () => {
     expect(menuItems).toEqual(expect.arrayContaining([
       expect.objectContaining({
         command: "nexus.server.testConnection",
-        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?$/",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
         group: "inline@2"
       }),
       expect.objectContaining({
         command: "nexus.server.testConnection",
-        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?$/",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
         group: "0_connect@4"
       }),
       expect.objectContaining({

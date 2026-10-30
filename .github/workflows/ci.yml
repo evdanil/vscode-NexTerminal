@@ -52,6 +52,28 @@ jobs:
       - name: Test
         run: npm test
 
+  external-credentials:
+    name: External credentials (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - name: Build all extension and worker bundles
+        run: npm run build
+      - name: Real provider processes and SSH authentication
+        run: npx vitest run --project integration test/integration/externalCredentialProcess.test.ts test/integration/externalSshAuthentication.test.ts
+      - name: Approval and import/export regressions
+        run: npx vitest run --project unit test/unit/externalCredentialApproval.test.ts test/unit/externalCredentialImportExport.test.ts test/unit/configImportExport.test.ts
+
   changes:
     name: Detect changed paths
     runs-on: ubuntu-latest

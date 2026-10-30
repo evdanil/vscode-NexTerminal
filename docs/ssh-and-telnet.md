@@ -48,7 +48,7 @@ Both settings are machine-specific: a workspace's `.vscode/settings.json` cannot
 
 ### Deploy an SSH Key
 
-Right-click any server and select "Deploy SSH Key" to automate key-based authentication setup. Discovers existing local keys or generates new ed25519 key pairs, deploys the public key to the remote `authorized_keys`, and optionally converts the server profile to key auth. Cross-platform (Windows, macOS, Linux).
+Right-click an SSH server using stored credentials and select "Deploy SSH Key" to automate key-based authentication setup. Discovers existing local keys or generates new ed25519 key pairs, deploys the public key to the remote `authorized_keys`, and optionally converts the server profile to key auth. Cross-platform (Windows, macOS, Linux). Servers linked to external or missing auth profiles cannot deploy keys; select a stored auth profile first.
 
 ### Host Key Verification
 
