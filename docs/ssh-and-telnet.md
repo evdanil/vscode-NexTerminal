@@ -111,7 +111,7 @@ Write `$${host}` to pass the literal `${host}` when expansion is on. Unrecognize
 
 Context values can contain untrusted input. Validate and map them to the secret identifiers your program is allowed to use; keeping argument boundaries does not make a vault path safe. Hostnames may change on an alternate-host retry, so use a stable session name if your vault naming requires it. See the [100-server example](vault-providers.md#example-100-servers-with-different-credential-groups).
 
-**Before enabling:** update every Nexus installation that can access this configuration and export a backup from the newer version. Older clients cannot read enabled profiles and may remove them when saving auth profiles; backups exported by an older client may omit them. Export a backup from the newer version before downgrading. This warning reduces but cannot eliminate version-skew risk.
+**Before enabling:** update every Nexus installation that can access this configuration and export a backup from the newer version. Older clients cannot read enabled profiles and may remove them when saving auth profiles; backups exported by an older client may omit them. Before downgrading, disable expansion on enabled profiles, save the auth profiles in the newer version, and export a backup there. Disabled templates are passed literally. A profile written by another tool may explicitly contain `argumentExpansion: false`: newer Nexus normalizes that value when reading, but does not rewrite saved configuration until an auth-profile save; an older client cannot read the explicit false field either. This warning reduces but cannot eliminate version-skew risk.
 
 ### Provider response
 

@@ -54,7 +54,7 @@ The same approach works with AWS secret IDs, Azure secret names, and [1Password 
 
 ### One profile for 100 distinct secrets
 
-Alternatively, enable **Expand connection variables in arguments** in a single External Program profile and assign that profile to all 100 servers. Before enabling it, update all Nexus installations that access this configuration and export a backup with the newer version. Older clients cannot read enabled profiles, may erase them when saving auth profiles, and may omit them from backups. Export a newer-version backup before downgrading too.
+Alternatively, enable **Expand connection variables in arguments** in a single External Program profile and assign that profile to all 100 servers. Before enabling it, update all Nexus installations that access this configuration and export a backup with the newer version. Older clients cannot read enabled profiles, may erase them when saving auth profiles, and may omit them from backups. Before downgrading, disable expansion, save auth profiles in the newer version and export a backup there; see the [downgrade details](import-export.md#external-program-profile-portability), including the explicit-false case.
 
 For a concrete Vault KV v2 example, suppose the servers are named `server-001` through `server-100`, with hosts such as `server-001.example.net`. Their server Username fields hold lookup hints such as `netadmin`; Vault stores a separate JSON secret at `secret` mount path `network/server-001/netadmin`, containing, for example:
 
