@@ -915,7 +915,7 @@ export function preserveLinkedServerCredentials(
   profile: AuthProfile | undefined
 ): ServerConfig {
   if (!existing && next.authProfileId && isExternalAuthProfile(profile)) {
-    return { ...next, username: "root", authType: "password", keyPath: undefined };
+    return { ...next, authType: "password", keyPath: undefined };
   }
   if (!existing || !next.authProfileId) {
     return next;

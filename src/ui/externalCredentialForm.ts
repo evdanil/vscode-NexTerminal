@@ -11,12 +11,9 @@ export function parseExternalArgumentsText(text: string): string[] {
   return args;
 }
 
-/** Hidden dynamic controls cannot overwrite dormant configuration through crafted webview values. */
+/** External profiles leave lookup usernames editable but own the hidden credential controls. */
 export function externalServerFormValues(values: FormValues, profile: AuthProfile | undefined, existing?: Pick<ServerConfig, "username" | "authType" | "keyPath">): FormValues {
   if (!isExternalAuthProfile(profile)) return values;
-  return { ...values, username: existing?.username ?? "root", authType: existing?.authType ?? "password", keyPath: existing?.keyPath };
+  return { ...values, authType: existing?.authType ?? "password", keyPath: existing?.keyPath };
 }
 
-export function externalSourceFormValues(values: FormValues, profile: AuthProfile | undefined, dormantUsername: string): FormValues {
-  return isExternalAuthProfile(profile) ? { ...values, defaultUsername: dormantUsername || "root" } : values;
-}

@@ -1061,6 +1061,22 @@ describe("computeSyncPlan — updates", () => {
     expect(followed.origin?.syncedPort).toBe(2200);
   });
 
+  it("uses a changed external lookup default for new servers without overwriting existing or edited usernames", () => {
+    const external: AuthProfile = { id: "external", name: "Vault", authType: "external", external: { version: 1, method: "password", invocation: { executable: "/provider", args: [] } } };
+    const source = makeSource({ authProfileId: external.id, defaultUsername: "new-default" });
+    const before = makeOwnedServer({ username: "old-default", authProfileId: external.id, origin: { sourceId: "source-1", externalId: "device:1", syncedAt: 1000, syncedUsername: "old-default" } });
+    const edited = makeOwnedServer({ id: deterministicServerId("source-1", "device:2"), username: "hand-edited", authProfileId: external.id, origin: { sourceId: "source-1", externalId: "device:2", syncedAt: 1000, syncedUsername: "old-default" } });
+    const tree = makeTree([
+      makeDevice({ externalId: "device:1", name: "renamed-one" }),
+      makeDevice({ externalId: "device:2", name: "renamed-two" }),
+      makeDevice({ externalId: "device:3", name: "new-three" })
+    ]);
+    const plan = computeSyncPlan({ source, tree, currentServers: [before, edited], now: 2000, authProfile: external });
+    expect(plan.updates.find((update) => update.before.id === before.id)?.after.username).toBe("old-default");
+    expect(plan.updates.find((update) => update.before.id === edited.id)?.after.username).toBe("hand-edited");
+    expect(plan.adds[0].username).toBe("new-default");
+  });
+
   it("username ownership: an endpoint username overrides; its absence keeps the existing username (never falls back to defaultUsername)", () => {
     const source = makeSource({ defaultUsername: "admin" });
 

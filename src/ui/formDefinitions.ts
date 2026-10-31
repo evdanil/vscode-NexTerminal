@@ -1927,7 +1927,7 @@ export function inventorySourceFormDefinition(
         // value the profile supplied, and the one synced servers fall back
         // to if that profile is ever deleted (silentAuth reads the record's
         // own username once the profile stops resolving).
-        hint: "Used when the inventory source doesn't provide a username. With an auth profile selected it comes from that profile, and is the fallback if the profile is ever removed."
+        hint: "Used when the inventory source does not provide a username for a new server. Changes do not update existing servers. A stored auth profile supplies this value; with an external program it remains a lookup value."
       }
     ],
     linkedProfile
