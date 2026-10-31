@@ -1344,7 +1344,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
         if (sourceNote) sourceNote.textContent = dynamic ? "Credentials and the SSH login username are provided by " + externalProfileName + " at sign-in. Manage it in Settings → Auth Profiles." : "";
         ["username", "defaultUsername"].forEach(function(key) {
           var hint = document.getElementById("external-lookup-hint-" + key);
-          if (hint) hint.textContent = dynamic ? "Used as a lookup value in external program arguments. The program returns the username used to sign in." : "";
+          if (hint) hint.textContent = dynamic ? "Sent to the external program only when argument expansion is enabled and its arguments contain \${username}. The program returns the username used to sign in." : "";
         });
         var repair = document.getElementById("auth-profile-repair");
         if (repair) { repair.style.display = isLinked ? "" : "none"; repair.disabled = !isLinked; }

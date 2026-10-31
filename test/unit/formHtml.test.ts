@@ -592,6 +592,37 @@ describe("renderFormHtml", () => {
       return (doc, filledKeys) => factory(doc, filledKeys)();
     }
 
+    it("explains when the device or source username is sent to the external program", () => {
+      const definition: FormDefinition = { title: "Lookup", fields: [
+        { type: "text", key: "username", label: "Username" },
+        { type: "text", key: "defaultUsername", label: "Default SSH Username" }
+      ] };
+      const html = renderFormHtml(definition);
+      for (const key of ["username", "defaultUsername"]) {
+        expect(html).toContain(`aria-describedby="external-lookup-hint-${key}"`);
+        expect(html).toContain(`id="external-lookup-hint-${key}"`);
+      }
+      const hints = { username: { textContent: "" }, defaultUsername: { textContent: "" } };
+      const doc = {
+        getElementById(id: string) {
+          if (id === "field-authProfileId") return { querySelector: () => ({ value: "external" }) };
+          if (id === "external-lookup-hint-username") return hints.username;
+          if (id === "external-lookup-hint-defaultUsername") return hints.defaultUsername;
+          return undefined;
+        },
+        querySelectorAll: () => []
+      };
+      const source = extractFunctionSource(html, "function updateProfileManagedFields()");
+      const update = new Function("document", "profileFilledKeys", `var externalProfileName = "Vault"; ${source}; return updateProfileManagedFields;`)(doc, {});
+      update();
+      for (const hint of Object.values(hints)) {
+        expect(hint.textContent).toContain("only when argument expansion is enabled");
+        expect(hint.textContent).toContain("${username}");
+        expect(hint.textContent).toContain("program returns the username used to sign in");
+        expect(hint.textContent).not.toContain("Used as a lookup value in external program arguments.");
+      }
+    });
+
     function extractSeededProfileFilledKeys(html: string): (doc: unknown) => Record<string, boolean> {
       const source = extractFunctionSource(html, "function seededProfileFilledKeys()");
       const factory = new Function("document", `${source}\nreturn seededProfileFilledKeys;`) as (
