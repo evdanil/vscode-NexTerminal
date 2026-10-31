@@ -126,7 +126,7 @@ Macros come back without their **Provide IPMI credentials** and **Run on** setti
 
 ## External Program Profile Portability
 
-**External Program backups and shares require Nexus 2.8.305 or later, with External Program support. Do not import them into older releases.** The export envelope remains version 2; older readers can drop an unknown external profile and clear its link, incorrectly falling back to dormant server authentication. There is no safe downgrade encoding or minimum-reader field that prevents this in an old installation.
+**External Program backups and shares require Nexus 2.8.306 or later, with External Program support. Do not import them into older releases.** The export envelope remains version 2; older readers can drop an unknown external profile and clear its link, incorrectly falling back to dormant server authentication. There is no safe downgrade encoding or minimum-reader field that prevents this in an old installation.
 
 Profiles with **Expand connection variables in arguments** enabled additionally require Nexus 2.8.307 or later. Update all installations accessing the configuration and export a backup from the newer version before enabling the option or downgrading. Older clients cannot read enabled profiles, may erase them when saving auth profiles, and may omit them from backups. This can lose configuration even without importing a file; new-version backups with enabled profiles cannot safely be imported by older clients.
 

@@ -1,6 +1,6 @@
 # External vault provider examples
 
-Nexus Terminal 2.8.305 adds **External Program** SSH authentication. These examples read credentials from HashiCorp Vault, AWS Secrets Manager and Azure Key Vault. For a desktop password manager, see the separate [1Password guide](1password.md).
+Nexus Terminal 2.8.306 adds **External Program** SSH authentication. These examples read credentials from HashiCorp Vault, AWS Secrets Manager and Azure Key Vault. For a desktop password manager, see the separate [1Password guide](1password.md).
 
 Download [vault-provider.cjs](../examples/external-credentials/vault-provider.cjs) to a stable directory you control. It uses Node.js built-ins and the selected vendor's CLI; no npm install is needed. Protect the script and CLI from modification by other users. These are external credential providers, not Nexus Scripts-view automation.
 

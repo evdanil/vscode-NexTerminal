@@ -1,6 +1,6 @@
 # SSH credentials from 1Password
 
-Use an **External Program** auth profile to read a username and password or private key from 1Password for each new SSH authentication. This example uses the [1Password CLI](https://developer.1password.com/docs/cli/) and a small [Node.js provider script](../examples/external-credentials/1password.cjs), with no npm dependencies. It requires the External Program feature introduced in Nexus Terminal 2.8.305.
+Use an **External Program** auth profile to read a username and password or private key from 1Password for each new SSH authentication. This example uses the [1Password CLI](https://developer.1password.com/docs/cli/) and a small [Node.js provider script](../examples/external-credentials/1password.cjs), with no npm dependencies. It requires the External Program feature introduced in Nexus Terminal 2.8.306.
 
 This is a credential-provider program launched by Nexus, not a script to run from the Nexus Scripts view. For the general contract and supported consumers, see [External Program credentials](ssh-and-telnet.md#external-program-credentials).
 
