@@ -2,6 +2,10 @@
 
 ## [2.8.308] — 2026-10-31
 
+### Fixed
+
+- **Reveal in Explorer View no longer silently does nothing for scripts outside the workspace.** It explains the Explorer limitation and offers to open the containing folder in a new VS Code window, or open the script file. Scripts and folders inside the workspace are revealed as before.
+
 ## [2.8.307] — 2026-10-31
 
 ### Added
