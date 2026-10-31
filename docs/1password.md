@@ -57,9 +57,9 @@ op://Infrastructure/Lab Router/password
 
 On macOS use the discovered Node and `op` paths, which may differ from Linux. This explicit Node interpreter works across platforms; Windows `.cmd` and `.bat` wrappers are not supported as the configured executable.
 
-Edit your SSH server and choose **Advanced → Auth Profile → 1Password — Lab Router**. Nexus gets the login username from the provider, so no separate static username/password is needed for this profile. One profile can be linked to multiple servers that share those credentials. Nexus does not pass the target hostname to the script; create separate profiles/references for different credentials.
+Edit your SSH server and choose **Advanced → Auth Profile → 1Password — Lab Router**. Nexus gets the SSH login username from the provider. The server Username remains required and can serve as a lookup hint; with these literal arguments it is not passed to the script. One profile can be linked to multiple servers sharing those credentials. For per-server lookups, enable connection-variable expansion and use references appropriate for each server; see the safety guidance below.
 
-For a concrete 100-server setup with several credential groups, see [mapping servers to auth profiles](vault-providers.md#example-100-servers-with-different-credential-groups). The same mapping applies to 1Password: each profile supplies its own username and credential references to the shared script.
+For example, if each 1Password item is named after the server, enabling **Expand connection variables in arguments** allows references such as `op://Infrastructure/${SessionName}/username` and `op://Infrastructure/${SessionName}/password`. Use only trusted item names conforming to your own naming rules: the example script passes references through to `op` and does not validate substituted path components. A wrapper should validate or map untrusted server values before constructing a reference. The [100-server example](vault-providers.md#example-100-servers-with-different-credential-groups) shows a validating wrapper and explains alternate hosts, approval and version compatibility.
 
 ## Private-key example
 

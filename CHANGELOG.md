@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.307] — 2026-10-31
+
+### Added
+
+- **External credential programs can select a vault entry for each connection.** Opt in to connection variables in an auth profile's arguments and use the server's username as a lookup hint. Session approval covers the template and future values; older Nexus versions cannot safely read enabled profiles, so update installations and back up before enabling or downgrading.
+
 ## [2.8.306] — 2026-10-30
 
 ### Added

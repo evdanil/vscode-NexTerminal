@@ -24,7 +24,7 @@ Every backend stores a username and the chosen credential as string fields:
 
 For key authentication store `private_key` instead of `password`, containing the full **unencrypted** OpenSSH or traditional PEM key text with actual line breaks. Use a JSON-aware editor/serializer to escape those line breaks inside JSON. Install the matching public key on the server separately. No passphrase, certificate-signing, OTP or dynamic-lease handling is implemented by these examples.
 
-Each argument line is literal: no shell quotes, environment-variable expansion or `~`. Do not add `--pass` or `--pkey`; Nexus appends the selected method. Arguments hold paths/identifiers only, never passwords, tokens or private keys. Identifiers remain visible in saved configuration and backups. Select the saved auth profile on your SSH server under **Advanced → Auth Profile**. The provider supplies the username; it receives no target hostname, so use separate profiles for different secrets.
+Each argument line is literal by default: no shell quotes, environment-variable expansion or `~`. The opt-in connection-variable expansion described below is limited to the documented tokens. Do not add `--pass` or `--pkey`; Nexus appends the selected method. Arguments hold paths/identifiers only, never passwords, tokens or private keys. Identifiers remain visible in saved configuration and backups. Select the saved auth profile on your SSH server under **Advanced → Auth Profile**. The provider supplies the SSH login username; the server username is a lookup hint when explicitly included in expanded arguments.
 
 ## Example: 100 servers with different credential groups
 
@@ -52,7 +52,58 @@ Assign each profile under the corresponding server's **Advanced → Auth Profile
 
 The same approach works with AWS secret IDs, Azure secret names, and [1Password field references](1password.md): keep the script, change the profile's arguments.
 
-**No destination context is passed to the provider.** It receives the configured arguments plus `--pass` or `--pkey`, not the target server's hostname or ID. Three shared credential sets therefore need three profiles, even with 100 servers. If all 100 servers have unique credentials, typically create 100 auth profiles with distinct secret references, still using just one script. A single profile that automatically selects a secret from the destination hostname would require a future server-context feature; it is not supported by this version.
+### One profile for 100 distinct secrets
+
+Alternatively, enable **Expand connection variables in arguments** in a single External Program profile and assign that profile to all 100 servers. Before enabling it, update all Nexus installations that access this configuration and export a backup with the newer version. Older clients cannot read enabled profiles, may erase them when saving auth profiles, and may omit them from backups. Export a newer-version backup before downgrading too.
+
+For a concrete Vault KV v2 example, suppose the servers are named `server-001` through `server-100`, with hosts such as `server-001.example.net`. Their server Username fields hold lookup hints such as `netadmin`; Vault stores a separate JSON secret at `secret` mount path `network/server-001/netadmin`, containing, for example:
+
+```json
+{"username":"actual-login","password":"EXAMPLE-ONLY"}
+```
+
+Put the following wrapper in `/home/alex/.config/nexus/fleet-vault.cjs`, alongside the downloaded `vault-provider.cjs`. Replace the paths and naming policy with ones appropriate for your environment. Its allowlist makes each substituted value a single safe path component and binds the host to the expected server name; adjust the policy for your fleet rather than blindly accepting inventory text.
+
+```js
+"use strict";
+const { spawnSync } = require("node:child_process");
+
+try {
+  const [host, session, user, method, ...extra] = process.argv.slice(2);
+  const match = /^server-(\d{3})$/.exec(session || "");
+  const number = match ? Number(match[1]) : 0;
+  if (!match || number < 1 || number > 100 ||
+      host !== `${session}.example.net` ||
+      !/^[a-z][a-z0-9_-]{0,31}$/.test(user || "") ||
+      !["--pass", "--pkey"].includes(method) || extra.length) throw new Error();
+
+  const result = spawnSync(process.execPath, [
+    "/home/alex/.config/nexus/vault-provider.cjs",
+    "vault-kv2", "/usr/local/bin/vault", "secret",
+    `network/${session}/${user}`, method
+  ], { shell: false, stdio: ["ignore", "pipe", "ignore"], timeout: 25000, maxBuffer: 256 * 1024 });
+  if (result.error || result.status !== 0 || !result.stdout.length) throw new Error();
+  process.stdout.write(result.stdout);
+} catch {
+  process.stderr.write("Fleet credential retrieval failed.\n");
+  process.exitCode = 1;
+}
+```
+
+Set **Executable** to `/usr/bin/node` (your actual absolute Node path), choose **Password**, check **Expand connection variables in arguments**, and enter these four separate argument lines:
+
+```text
+/home/alex/.config/nexus/fleet-vault.cjs
+${host}
+${SessionName}
+${username}
+```
+
+Nexus appends `--pass`; the wrapper validates the context and calls the existing provider with separate arguments and no shell. The value stored at the selected path supplies the actual SSH username and password; the server Username is only a lookup hint. For key authentication select **Private Key** and store `private_key` instead. Restrict the vault identity to the appropriate secrets as well as validating input: argument separation alone does not authorize a vault path. The wrapper example has no live vault test; validate your own policy and setup.
+
+The approval document shows the template and one resolved example; **Allow for This Session** authorizes that template for later connections whose values may differ. Context in process arguments may be visible in process listings. `${host}` is the actual dial target, including an alternate host. The strict host/name check above deliberately rejects alternate addresses unless you add an explicit allowed mapping; using `${SessionName}` for the secret path keeps the lookup stable across addresses. Jump hosts receive their own server's context. Inventory source default usernames seed new synced servers; changing the default does not replace existing usernames unless the provider supplies one.
+
+The complete token list, escaping (`$${host}` for a literal `${host}`), validation and compatibility details are in [Connection variables in arguments](ssh-and-telnet.md#connection-variables-in-arguments). Expansion is off by default, so the earlier three-profile example remains literal and works unchanged.
 
 ## HashiCorp Vault (KV v2 or KV v1)
 
