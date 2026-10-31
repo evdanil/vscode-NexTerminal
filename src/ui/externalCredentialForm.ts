@@ -16,4 +16,3 @@ export function externalServerFormValues(values: FormValues, profile: AuthProfil
   if (!isExternalAuthProfile(profile)) return values;
   return { ...values, authType: existing?.authType ?? "password", keyPath: existing?.keyPath };
 }
-
