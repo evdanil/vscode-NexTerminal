@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ExternalAuthProfile } from "../../src/models/authProfile";
+import type { ExternalAuthProfile, ExternalCredentialInvocation } from "../../src/models/authProfile";
 import type { ExternalCredentialProcessRunner, ExternalCredentialRequest } from "../../src/services/credentials/contracts";
 import { CredentialProviderError } from "../../src/services/credentials/credentialProviderError";
 import { createExternalCredentialApproval } from "../../src/services/credentials/externalCredentialApproval";
@@ -11,13 +11,75 @@ const output = (password = "SECRET") => Buffer.from(JSON.stringify({ version: 1,
 const deferred = <T>() => { let resolve!: (value: T) => void; let reject!: (error: unknown) => void; const promise = new Promise<T>((r, j) => { resolve = r; reject = j; }); return { promise, resolve, reject }; };
 const flush = async () => { for (let n = 0; n < 15; n++) await Promise.resolve(); };
 const resolvers: ReturnType<typeof createExternalCredentialResolver>[] = [];
-function setup(run: ExternalCredentialProcessRunner = vi.fn(async () => output()), confirm = vi.fn(async () => true), parse = parseExternalCredentialResponse) {
+function setup<T extends (profile: ExternalAuthProfile, signal: AbortSignal, example?: ExternalCredentialInvocation) => Promise<boolean>>(
+  run: ExternalCredentialProcessRunner = vi.fn(async () => output()), confirm: T = vi.fn(async () => true) as unknown as T, parse = parseExternalCredentialResponse
+) {
   const approvals = createExternalCredentialApproval({ isWorkspaceTrusted: () => true, confirm });
   const resolver = createExternalCredentialResolver({ approvals, run, parse }); resolvers.push(resolver); return { approvals, resolver, run, confirm };
 }
 afterEach(() => { resolvers.splice(0).forEach((r) => r.dispose()); vi.useRealTimers(); });
 
 describe("external credential attempt", () => {
+  it("freezes the template and context before waiting for approval and runs the disclosed example", async () => {
+    const answer = deferred<boolean>();
+    const run = vi.fn<ExternalCredentialProcessRunner>(async () => output());
+    const confirm = vi.fn((_profile: ExternalAuthProfile, _signal: AbortSignal, _example?: unknown) => answer.promise);
+    const { resolver } = setup(run, confirm);
+    const req = request();
+    req.profile.external.invocation = { executable: "/provider", args: ["${host}", "${username}"], argumentExpansion: true };
+    req.argumentContext = { host: "host one", port: 22, SessionName: "A", username: "hint", profile: "Vault", protocol: "ssh" };
+    const attempt = resolver.begin(req);
+    const pending = attempt.resolve(); await flush();
+    req.argumentContext.host = "forged"; req.profile.external.invocation.args = ["forged"];
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(confirm.mock.calls[0][0].external.invocation?.args).toEqual(["${host}", "${username}"]);
+    expect(confirm.mock.calls[0][2]).toMatchObject({ executable: "/provider", args: ["host one", "hint"] });
+    answer.resolve(true); await pending;
+    expect(run.mock.calls[0][0]).toMatchObject({ executable: "/provider", args: ["host one", "hint"] });
+  });
+  it("shares a template-wide grant while each concurrent owner runs its own context", async () => {
+    const answer = deferred<boolean>();
+    const confirm = vi.fn((_profile: ExternalAuthProfile, _signal: AbortSignal, _example?: unknown) => answer.promise);
+    const run = vi.fn<ExternalCredentialProcessRunner>(async () => output()); const { resolver } = setup(run, confirm);
+    const make = (host: string, signal = new AbortController()) => {
+      const req = request(signal); req.profile.external.invocation = { executable: "/provider", args: ["${host}"], argumentExpansion: true };
+      req.argumentContext = { host, port: 22, SessionName: "S", username: "u", profile: "Vault", protocol: "ssh" }; return req;
+    };
+    const c = new AbortController(); const a = resolver.begin(make("host-a", c)).resolve().catch((e: unknown) => e);
+    const b = resolver.begin(make("host-b")).resolve(); await flush();
+    expect(confirm).toHaveBeenCalledTimes(1); c.abort(); expect(await a).toMatchObject({ code: "cancelled" });
+    answer.resolve(true); await b;
+    expect(run).toHaveBeenCalledTimes(1); expect(run.mock.calls[0][0].args).toEqual(["host-b"]);
+    await resolver.begin({ ...make("host-c"), interaction: "noninteractive" }).resolve();
+    expect(run.mock.calls[1][0].args).toEqual(["host-c"]); expect(confirm).toHaveBeenCalledTimes(1);
+  });
+  it("rejects invalid or missing context before consent and preserves literal legacy arguments", async () => {
+    const run = vi.fn<ExternalCredentialProcessRunner>(async () => output()); const { resolver, confirm } = setup(run);
+    const bad = request(); bad.profile.external.invocation = { executable: "/provider", args: ["${host}"], argumentExpansion: true };
+    await expect(resolver.begin(bad).resolve()).rejects.toMatchObject({ code: "invalid-template" });
+    expect(confirm).not.toHaveBeenCalled(); expect(run).not.toHaveBeenCalled();
+    bad.argumentContext = { host: "h", port: 22, SessionName: "S", username: "u", profile: "Vault", protocol: "ssh" };
+    bad.profile.external.invocation!.args = ["${unknown}"];
+    await expect(resolver.begin(bad).resolve()).rejects.toMatchObject({ code: "invalid-template" });
+    expect(confirm).not.toHaveBeenCalled(); expect(run).not.toHaveBeenCalled();
+    const legacy = request(); legacy.profile.external.invocation!.args = ["${host}"];
+    await resolver.begin(legacy).resolve(); expect(run.mock.calls[0][0].args).toEqual(["${host}"]);
+  });
+  it("cancels the original owner even if its request object is later replaced", async () => {
+    const answer = deferred<boolean>(); const { resolver, run } = setup(undefined, vi.fn(() => answer.promise));
+    const c = new AbortController(); const req = request(c); const pending = resolver.begin(req).resolve().catch((e: unknown) => e);
+    await flush(); req.signal = new AbortController().signal; req.isCurrent = () => true;
+    c.abort(); expect(await pending).toMatchObject({ code: "cancelled" }); answer.resolve(true); await flush();
+    expect(run).not.toHaveBeenCalled();
+  });
+  it("keeps the original currentness predicate if a caller replaces it", async () => {
+    const answer = deferred<boolean>(); const { resolver, run } = setup(undefined, vi.fn(() => answer.promise));
+    let current = true; const req = { ...request(), isCurrent: () => current };
+    const attempt = resolver.begin(req); const pending = attempt.resolve().catch((e: unknown) => e);
+    await flush(); req.isCurrent = () => true; current = false; resolver.recheckPending();
+    expect(await pending).toMatchObject({ code: "configuration-changed" }); answer.resolve(true); await flush();
+    expect(run).not.toHaveBeenCalled();
+  });
   it("synchronous provenance rechecks cancel only stale pending attempts, preserving grants and committed sessions", async () => {
     vi.useFakeTimers(); const { resolver, approvals, confirm } = setup();
     let current = true;

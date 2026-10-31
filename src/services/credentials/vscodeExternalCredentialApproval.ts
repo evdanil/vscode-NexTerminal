@@ -28,7 +28,7 @@ export function createVscodeExternalCredentialApproval(facade?: ExternalCredenti
   });
   const approval = createExternalCredentialApproval({
     isWorkspaceTrusted: () => vscode.workspace.isTrusted,
-    confirm: (profile, signal) => disclosure.confirm(profile, signal)
+    confirm: (profile, signal, example) => disclosure.confirm(profile, signal, example)
   });
   return { ...approval, dispose() { approval.dispose(); disclosure.dispose(); changes?.dispose(); } };
 }

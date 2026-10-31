@@ -1,4 +1,4 @@
-import { authProfileConnectionIdentity, validateExternalCredentialInvocation, type ExternalAuthProfile } from "../../models/authProfile";
+import { authProfileConnectionIdentity, validateExternalCredentialInvocation, type ExternalAuthProfile, type ExternalCredentialInvocation } from "../../models/authProfile";
 import type { ExternalCredentialRequest } from "./contracts";
 import { CredentialProviderError, type CredentialProviderErrorCode } from "./credentialProviderError";
 
@@ -24,7 +24,7 @@ interface Question {
 
 export function createExternalCredentialApproval(deps: {
   isWorkspaceTrusted(): boolean;
-  confirm(profile: ExternalAuthProfile, signal: AbortSignal): Promise<boolean>;
+  confirm(profile: ExternalAuthProfile, signal: AbortSignal, example?: ExternalCredentialInvocation): Promise<boolean>;
 }): ExternalCredentialApproval {
   const grants = new Map<string, string>();
   const generations = new Map<string, number>();
@@ -82,6 +82,13 @@ export function createExternalCredentialApproval(deps: {
       const { profile } = request;
       if (profile.external.version !== 1 || !["password", "key"].includes(profile.external.method) ||
         !validateExternalCredentialInvocation(profile.external.invocation)) throw new CredentialProviderError("unconfigured");
+      if (profile.external.invocation.argumentExpansion === true) {
+        const example = request.resolvedInvocation;
+        if (!validateExternalCredentialInvocation(example) || example.executable !== profile.external.invocation.executable ||
+          example.args.length !== profile.external.invocation.args.length || example.argumentExpansion === true) {
+          throw new CredentialProviderError("invalid-template");
+        }
+      }
       const key = JSON.stringify(authProfileConnectionIdentity(profile));
       const epoch = generation(profile.id);
       if (grants.has(key)) return;
@@ -110,7 +117,7 @@ export function createExternalCredentialApproval(deps: {
       });
       if (start) {
         // Joiners register synchronously before the native dialog is opened.
-        void Promise.resolve().then(() => shared.controller.signal.aborted ? false : deps.confirm(profile, shared.controller.signal))
+        void Promise.resolve().then(() => shared.controller.signal.aborted ? false : deps.confirm(profile, shared.controller.signal, request.resolvedInvocation))
           .then((allowed) => finishQuestion(key, shared, allowed), () => finishQuestion(key, shared, false, "approval-required"));
       }
       return promise;
