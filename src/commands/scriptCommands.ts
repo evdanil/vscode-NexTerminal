@@ -798,7 +798,31 @@ export function registerScriptCommands(
     vscode.commands.registerCommand("nexus.script.revealInExplorer", async (arg?: unknown) => {
       const uri = toScriptUri(arg);
       if (!uri) return;
-      await vscode.commands.executeCommand("revealInExplorer", uri);
+      try {
+        if (vscode.workspace.getWorkspaceFolder(uri)) {
+          await vscode.commands.executeCommand("revealInExplorer", uri);
+          return;
+        }
+        // VS Code's reveal command silently skips files outside workspace roots.
+        // Offer a separate window instead of changing the user's current workspace.
+        const kind = typeof arg === "object" && arg !== null && "kind" in arg ? arg.kind : undefined;
+        const isFolder = kind === "folder" || (kind !== "script" &&
+          ((await vscode.workspace.fs.stat(uri)).type & vscode.FileType.Directory) !== 0);
+        const openFolder = isFolder ? "Open Folder in New Window" : "Open Containing Folder in New Window";
+        const answer = await vscode.window.showInformationMessage(
+          "This item is outside the open workspace. VS Code's Explorer can reveal only items in workspace folders.",
+          ...[openFolder, ...(!isFolder ? ["Open File"] : [])]
+        );
+        if (answer === openFolder) {
+          const folder = isFolder ? uri : vscode.Uri.joinPath(uri, "..");
+          await vscode.commands.executeCommand("vscode.openFolder", folder, { forceNewWindow: true });
+        } else if (!isFolder && answer === "Open File") {
+          await vscode.commands.executeCommand("vscode.open", uri);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        void vscode.window.showErrorMessage(`Could not reveal script item: ${message}`);
+      }
     }),
 
     vscode.commands.registerCommand("nexus.script.edit", async (arg?: unknown) => {

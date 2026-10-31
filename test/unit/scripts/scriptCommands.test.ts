@@ -9,6 +9,7 @@ const state = {
   quickPickOptions: undefined as unknown,
   quickPickReturn: undefined as unknown,
   warningReturn: undefined as string | undefined,
+  informationReturn: undefined as string | undefined,
   // Answers for successive warning dialogs, taken in order; once empty,
   // every dialog answers `warningReturn`.
   warningAnswers: [] as Array<string | undefined>,
@@ -42,7 +43,7 @@ vi.mock("vscode", () => ({
     },
     showInformationMessage: (...args: unknown[]) => {
       state.mockShowInformationMessage(...args);
-      return Promise.resolve(undefined);
+      return Promise.resolve(state.informationReturn);
     },
     showErrorMessage: (...args: unknown[]) => {
       state.mockShowErrorMessage(...args);
@@ -62,6 +63,7 @@ vi.mock("vscode", () => ({
     workspaceFolders: [
       { uri: { fsPath: "/ws", scheme: "file", path: "/ws" }, name: "ws", index: 0 }
     ],
+    getWorkspaceFolder: vi.fn((uri: { fsPath: string }) => uri.fsPath.startsWith("/ws/") ? { uri: { fsPath: "/ws" } } : undefined),
     getConfiguration: vi.fn(() => ({
       get: vi.fn((_k: string, d?: unknown) => d)
     })),
@@ -82,14 +84,18 @@ vi.mock("vscode", () => ({
     remoteName: undefined as string | undefined,
     openExternal: (...args: unknown[]) => state.mockOpenExternal(...args)
   },
+  FileType: { File: 1, Directory: 2 },
   Uri: {
     file: (p: string) => ({ fsPath: p, scheme: "file", path: p, toString: () => p }),
-    joinPath: (base: { fsPath: string }, ...parts: string[]) => ({
-      fsPath: [base.fsPath, ...parts].join("/"),
-      scheme: "file",
-      path: [base.fsPath, ...parts].join("/"),
-      toString: () => [base.fsPath, ...parts].join("/")
-    }),
+    joinPath: (base: { fsPath: string; scheme?: string; authority?: string }, ...parts: string[]) => {
+      const segments: string[] = [];
+      for (const segment of [base.fsPath, ...parts].join("/").split("/")) {
+        if (segment === "..") segments.pop();
+        else if (segment && segment !== ".") segments.push(segment);
+      }
+      const joined = "/" + segments.join("/");
+      return { fsPath: joined, scheme: base.scheme ?? "file", authority: base.authority, path: joined, toString: () => joined };
+    },
     parse: (s: string) => ({ fsPath: s, scheme: "https", toString: () => s })
   }
 }));
@@ -156,6 +162,8 @@ describe("scriptCommands", () => {
     state.quickPickOptions = undefined;
     state.quickPickReturn = undefined;
     state.warningReturn = undefined;
+    state.informationReturn = undefined;
+    vi.mocked(vscode.workspace.getWorkspaceFolder).mockClear();
     state.warningAnswers = [];
     (vscode.env as { remoteName: string | undefined }).remoteName = undefined;
     state.mockShowWarningMessage.mockClear();
@@ -757,6 +765,75 @@ describe("scriptCommands", () => {
       expect(mgr.runScript).toHaveBeenCalledWith(innerUri, "sess-a");
 
       mockWindow.activeTerminal = undefined;
+    });
+  });
+
+  describe("Reveal in Explorer View", () => {
+    async function reveal(target: unknown): Promise<void> {
+      registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+      await state.registeredCommands.get("nexus.script.revealInExplorer")!(target);
+    }
+
+    it("reveals a workspace script using VS Code's Explorer", async () => {
+      const uri = vscode.Uri.file("/ws/.nexus/scripts/test.js");
+      await reveal({ kind: "script", uri });
+      expect(vscode.commands.executeCommand).toHaveBeenCalledWith("revealInExplorer", uri);
+      expect(state.mockShowInformationMessage).not.toHaveBeenCalled();
+    });
+
+    it("explains outside-workspace scripts and opens the file when requested", async () => {
+      const uri = vscode.Uri.file("/outside/scripts/test.js");
+      state.informationReturn = "Open File";
+      await reveal({ kind: "script", uri });
+      expect(state.mockShowInformationMessage).toHaveBeenCalledWith(
+        expect.stringContaining("outside the open workspace"),
+        "Open Containing Folder in New Window", "Open File");
+      expect(vscode.commands.executeCommand).toHaveBeenCalledWith("vscode.open", uri);
+      expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("revealInExplorer", uri);
+    });
+
+    it("does not change the workspace or open anything when the outside prompt is dismissed", async () => {
+      await reveal({ kind: "script", uri: vscode.Uri.file("/outside/test.js") });
+      expect(state.mockShowInformationMessage).toHaveBeenCalled();
+      expect(vscode.commands.executeCommand).not.toHaveBeenCalled();
+    });
+
+    it("opens an outside script's containing folder in a new window only after selection", async () => {
+      state.informationReturn = "Open Containing Folder in New Window";
+      await reveal({ kind: "script", uri: vscode.Uri.file("/outside/scripts/test.js") });
+      const call = vi.mocked(vscode.commands.executeCommand).mock.calls.find(([id]) => id === "vscode.openFolder");
+      expect(call).toBeDefined();
+      expect((call![1] as { fsPath: string }).fsPath).toBe("/outside/scripts");
+      expect(call![2]).toEqual({ forceNewWindow: true });
+    });
+
+    it("opens an outside folder itself rather than its parent", async () => {
+      const uri = vscode.Uri.file("/outside/scripts/subfolder");
+      state.informationReturn = "Open Folder in New Window";
+      await reveal({ kind: "folder", uri });
+      expect(state.mockShowInformationMessage).toHaveBeenCalledWith(
+        expect.stringContaining("outside the open workspace"), "Open Folder in New Window");
+      expect(vscode.commands.executeCommand).toHaveBeenCalledWith("vscode.openFolder", uri, { forceNewWindow: true });
+    });
+
+    it("preserves a remote script's URI when opening its containing folder", async () => {
+      state.informationReturn = "Open Containing Folder in New Window";
+      const uri = { fsPath: "/opt/scripts/test.js", path: "/opt/scripts/test.js", scheme: "vscode-remote", authority: "ssh-remote+example", toString: () => "vscode-remote://ssh-remote+example/opt/scripts/test.js" };
+      await reveal({ kind: "script", uri });
+      const call = vi.mocked(vscode.commands.executeCommand).mock.calls.find(([id]) => id === "vscode.openFolder");
+      expect(call![1]).toMatchObject({ scheme: "vscode-remote", authority: "ssh-remote+example", path: "/opt/scripts" });
+    });
+
+    it("accepts a direct URI and reports a missing outside target", async () => {
+      await reveal(vscode.Uri.file("/outside/deleted.js"));
+      expect(state.mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Could not reveal"));
+      expect(vscode.commands.executeCommand).not.toHaveBeenCalled();
+    });
+
+    it("reports a failed reveal instead of rejecting without a useful message", async () => {
+      vi.mocked(vscode.commands.executeCommand).mockRejectedValueOnce(new Error("Explorer failed"));
+      await expect(reveal({ kind: "script", uri: vscode.Uri.file("/ws/test.js") })).resolves.toBeUndefined();
+      expect(state.mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Could not reveal"));
     });
   });
 

@@ -815,9 +815,13 @@ empty folder stays until you remove it.
 - **New Folder** — the view's title bar button, or a folder's right-click
   menu for a nested folder — creates a real directory. It shows up
   immediately, even before you put anything in it.
-- A folder's right-click menu also has **Reveal in Explorer View**, which reveals
-  that directory in VS Code's own Explorer view (not your OS file manager —
-  use **Open Scripts Folder**, below, for that).
+- Scripts and folders offer **Reveal in Explorer View** in their right-click
+  menus. Items inside an open workspace folder are selected in VS Code's
+  Explorer. For an item outside the workspace (including the no-workspace
+  scripts directory), Nexus explains the limitation and offers to open its
+  containing folder in a new VS Code window; scripts also offer **Open File**.
+  The current workspace is not changed. For your OS file manager, use
+  **Open Scripts Folder**, below.
 - Path segments are validated the same way folders are validated everywhere
   else in Nexus: `.` and `..` are rejected, depth is capped at 10 levels, and
   a `\` is rejected outright with a message telling you to use `/` instead —
