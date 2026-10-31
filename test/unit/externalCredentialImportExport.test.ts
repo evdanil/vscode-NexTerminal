@@ -157,6 +157,44 @@ it("preserves expansion in a backup and strips it with invocation from shares", 
   expect(JSON.stringify(shared)).not.toContain("${host}");
 });
 
+it("restores enabled, disabled and legacy argument settings through a backup", async () => {
+  const origin = await machine();
+  const enabled = external(); enabled.external.invocation = { ...enabled.external.invocation!, argumentExpansion: true, args: ["${host}"] };
+  const disabled = external(); disabled.id = "disabled"; disabled.external.invocation = { ...disabled.external.invocation!, argumentExpansion: false, args: ["${host}"] };
+  const legacy = external(); legacy.id = "legacy"; legacy.external.invocation = { ...legacy.external.invocation!, args: ["${host}"] };
+  for (const profile of [enabled, disabled, legacy]) await origin.core.addOrUpdateAuthProfile(profile);
+  const backup = await captureBackupStateForExport(origin.core, origin.vault);
+  const restored = await machine();
+  await importData(restored, json({ authProfiles: backup.authProfiles }));
+  expect(mockShowErrorMessage).not.toHaveBeenCalled();
+  const reopened = new NexusCore(restored.repo); await reopened.initialize();
+  expect(reopened.getSnapshot().authProfiles).toEqual([enabled, disabled, legacy]);
+});
+
+it("older profile loading drops expansion fields and an unrelated save removes those rows", async () => {
+  const enabled = external(); enabled.external.invocation = { ...enabled.external.invocation!, argumentExpansion: true };
+  const disabled = external(); disabled.id = "disabled"; disabled.external.invocation = { ...disabled.external.invocation!, argumentExpansion: false };
+  const legacy = external(); legacy.id = "legacy";
+  const state = new Map<string, unknown>([["nexus.authProfiles", [enabled, disabled, legacy]], ["nexus.servers", [server()]]]);
+  const context = { globalState: { get: (key: string) => state.get(key), update: async (key: string, value: unknown) => { state.set(key, value); } } } as unknown as vscode.ExtensionContext;
+  // v2.8.306's invocation validator rejects every key except executable and args.
+  // Other validation and the full-list load/save are exercised by the real repository/core.
+  class OlderRepository extends VscodeConfigRepository {
+    override async getAuthProfiles() {
+      return (await super.getAuthProfiles()).filter(profile => profile.authType !== "external" || !profile.external.invocation ||
+        Object.keys(profile.external.invocation).every(key => key === "executable" || key === "args"));
+    }
+  }
+  const core = new NexusCore(new OlderRepository(context)); await core.initialize();
+  expect(core.getSnapshot().authProfiles).toEqual([legacy]);
+  const local = await machine(); const connect = vi.fn(); const prompt = { prompt: vi.fn() };
+  const factory = new SilentAuthSshFactory({ connect }, local.vault, prompt, undefined, id => core.getAuthProfile(id), id => core.getServer(id));
+  await expect(factory.connect(core.getServer("server")!)).rejects.toThrow("linked auth profile is unavailable");
+  expect(connect).not.toHaveBeenCalled(); expect(local.vault.get).not.toHaveBeenCalled(); expect(prompt.prompt).not.toHaveBeenCalled();
+  await core.addOrUpdateAuthProfile({ id: "other", name: "Other", authType: "password", username: "user" });
+  expect(state.get("nexus.authProfiles")).toEqual([legacy, { id: "other", name: "Other", authType: "password", username: "user" }]);
+});
+
 it("shares preserve external type, method and all SSH links but strip invocation", async () => {
   const shared = sanitizeForSharing([server()], [], [], [], {}, [external()], [], [source()], [template()]);
   expect(shared.authProfiles[0]).toEqual({ id: expect.any(String), name: "External", authType: "external", external: { version: 1, method: "key" } });

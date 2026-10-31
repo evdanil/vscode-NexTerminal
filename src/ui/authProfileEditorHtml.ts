@@ -171,9 +171,10 @@ export function renderAuthProfileEditorHtml(
       <div class="field-error" id="error-external-arguments" aria-live="polite"></div>
     </div>
     <div class="form-group form-group-checkbox">
-      <label for="external-argument-expansion"><input type="checkbox" id="external-argument-expansion" aria-describedby="external-argument-expansion-hint"${external?.invocation?.argumentExpansion === true ? " checked" : ""} /> Expand connection variables in arguments</label>
+      <label for="external-argument-expansion"><input type="checkbox" id="external-argument-expansion" aria-describedby="external-argument-expansion-hint external-argument-expansion-compatibility"${external?.invocation?.argumentExpansion === true ? " checked" : ""} /> Expand connection variables in arguments</label>
       <div class="hint" id="external-argument-expansion-hint">Optional. Use \${host}, \${port}, \${SessionName}, \${username}, \${profile}, or \${protocol}; write $\${host} for a literal \${host}. The server username is a lookup hint; the program supplies the SSH login. Session approval covers this template and values may differ for future connections.</div>
     </div>
+    <div class="hint" id="external-argument-expansion-compatibility">Older NexTerminal versions cannot read profiles with argument expansion enabled; editing auth profiles in an older version can remove them from saved configuration. Back up your configuration and update all installations accessing this state first. Backups exported by older versions may omit these profiles.</div>
     <p class="hint">Saving does not run the program or grant approval. Interactive Connect asks you to review the complete invocation before approving it for this extension-host session.</p>
   </div>
 
