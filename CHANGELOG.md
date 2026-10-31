@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.309] — 2026-11-01
+
+### Changed
+
+- Shortened the Marketplace description so it displays in full.
+
 ## [2.8.308] — 2026-10-31
 
 ### Fixed
