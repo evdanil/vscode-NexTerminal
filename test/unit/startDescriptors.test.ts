@@ -32,6 +32,24 @@ const profile: AuthProfile = { id: "key-profile", name: "P", username: "pu", aut
 const inputs = { multiplexingDefault: true };
 const tinputs = { mode: "isolated" as const, multiplexingDefault: true };
 
+describe("external argument context in start descriptors", () => {
+  const external: AuthProfile = { id: "ext", name: "Vault", authType: "external", external: {
+    version: 1, method: "password", invocation: { executable: "/provider", args: ["${SessionName}"], argumentExpansion: true }
+  } };
+  const linked: ServerConfig = { ...server, authProfileId: "ext" };
+  const descriptor = (s: ServerConfig, p: AuthProfile) => connectDescriptor(s, { authProfileLookup: () => p });
+
+  it("changes for expanded server and profile context but preserves literal-mode identity", () => {
+    for (const changed of [{ ...linked, name: "other" }, { ...linked, username: "other" }]) {
+      expect(descriptor(changed, external)).not.toBe(descriptor(linked, external));
+    }
+    expect(descriptor(linked, { ...external, name: "other" })).not.toBe(descriptor(linked, external));
+    const literal = { ...external, external: { ...external.external, invocation: { ...external.external.invocation!, argumentExpansion: false } } };
+    expect(descriptor({ ...linked, name: "other", username: "other" }, literal)).toBe(descriptor(linked, literal));
+    expect(descriptor(linked, { ...literal, name: "other" })).toBe(descriptor(linked, literal));
+  });
+});
+
 describe("start descriptors — every field is classified", () => {
   it.each(Object.entries(SERVER_FIELDS))("server.%s", (key, { use, alt }) => {
     // keyPath is read only by a key login, so it is judged on a key server.

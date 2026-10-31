@@ -69,6 +69,59 @@ function setup(options: { run?: ExternalCredentialProcessRunner; confirm?: () =>
 }
 
 describe("external SSH factory", () => {
+  it("snapshots each authenticating hop's context for the provider", async () => {
+    const h = setup();
+    const configured = profile();
+    h.profiles.set("external", { ...configured, external: { ...configured.external,
+      invocation: { ...configured.external.invocation!, argumentExpansion: true } } });
+    h.servers.set("jump", server("jump", { name: "Jump", host: "jump.example", port: 2222, username: "jump-user" }));
+    h.servers.set("target", server("target", { name: "Target", port: 2200, username: "target-user", proxy: { type: "ssh", jumpHostId: "jump" } }));
+    const begin = vi.spyOn(h.resolver, "begin");
+    const lease = await h.pool.connect(h.servers.get("target")!);
+    expect(begin.mock.calls.map(([request]) => request.argumentContext)).toEqual([
+      { host: "jump.example", port: 2222, SessionName: "Jump", username: "jump-user", profile: "Provider", protocol: "ssh" },
+      { host: "target.example", port: 2200, SessionName: "Target", username: "target-user", profile: "Provider", protocol: "ssh" }
+    ]);
+    expect(begin.mock.calls.every(([request]) => Object.isFrozen(request.argumentContext))).toBe(true);
+    expect(h.delivered.map((result) => result.username)).toEqual(["runtime-user", "runtime-user"]);
+    lease.dispose(); h.noLegacy();
+  });
+
+  it("does not pass connection context to literal external profiles", async () => {
+    const h = setup(); const begin = vi.spyOn(h.resolver, "begin");
+    await h.factory.connect(h.servers.get("target")!);
+    expect(begin.mock.calls[0][0]).not.toHaveProperty("argumentContext"); h.noLegacy();
+  });
+
+  it("uses the alternate dial host while checking the original live record", async () => {
+    const h = setup({ connect: async (s) => { if (s.host === "target.example") throw new Error("connect ECONNREFUSED"); return connection(); } });
+    const configured = profile(); h.profiles.set("external", { ...configured, external: { ...configured.external,
+      invocation: { ...configured.external.invocation!, argumentExpansion: true } } });
+    const target = server("target", { altHost: "alternate.example" }); h.servers.set(target.id, target);
+    const begin = vi.spyOn(h.resolver, "begin");
+    const callbacks = { onSessionOpened: vi.fn(), onSessionClosed: vi.fn(), onConnectFailed: vi.fn() };
+    const logger = { log: vi.fn(), close: vi.fn() } as unknown as ConstructorParameters<typeof SshPty>[3];
+    const pty = new SshPty(target, h.pool, callbacks, logger); cleanup.push(() => pty.dispose());
+    pty.open(); await flush(); await flush();
+    expect(callbacks.onSessionOpened).toHaveBeenCalledTimes(1);
+    expect(begin.mock.calls.map(([request]) => request.argumentContext?.host)).toEqual(["target.example", "alternate.example"]);
+  });
+
+  it.each(["server name", "username", "profile name"])("fences an in-place %s change before SSH delivery", async (field) => {
+    const answer = deferred<boolean>(); const h = setup({ confirm: () => answer.promise });
+    const configured = profile(); const expanded: ExternalAuthProfile = { ...configured, external: { ...configured.external,
+      invocation: { ...configured.external.invocation!, argumentExpansion: true } } };
+    h.profiles.set("external", expanded);
+    const target = h.servers.get("target")!;
+    const pending = h.factory.connect(target).catch((error: unknown) => error); await flush();
+    if (field === "server name") target.name = "changed";
+    if (field === "username") target.username = "changed";
+    if (field === "profile name") expanded.name = "changed";
+    answer.resolve(true);
+    expect(await pending).toMatchObject({ code: "configuration-changed" });
+    expect(h.connect).not.toHaveBeenCalled(); h.noLegacy();
+  });
+
   it("retrieves independently, passes only external auth and releases the borrowed result at ready", async () => {
     const h = setup(); const target = h.servers.get("target")!;
     await h.factory.connect(target); await h.factory.connect(target, { interaction: "noninteractive" });
@@ -253,6 +306,31 @@ describe("external SSH factory", () => {
 });
 
 describe("external revocation pool wiring", () => {
+  it("synchronously cancels an old lookup and retires its pool on rename without closing the live lease", async () => {
+    const configured = profile(); const expanded: ExternalAuthProfile = { ...configured, external: { ...configured.external,
+      invocation: { ...configured.external.invocation!, argumentExpansion: true } } };
+    const core = new NexusCore(new InMemoryConfigRepository([server()], [], [], [], [expanded])); await core.initialize();
+    const stalled = deferred<Buffer>(); let runningSignal: AbortSignal | undefined; let calls = 0;
+    const run: ExternalCredentialProcessRunner = async (_invocation, _method, ctx) => {
+      calls++; if (calls === 2) { runningSignal = ctx.signal; return stalled.promise; } return output();
+    };
+    const resolver = createExternalCredentialResolver({ approvals: createExternalCredentialApproval({ isWorkspaceTrusted: () => true, confirm: async () => true }), run, parse: parseExternalCredentialResponse });
+    const connect = vi.fn(async () => connection());
+    const vault = { get: vi.fn(async () => undefined), store: vi.fn(async () => {}), delete: vi.fn(async () => {}) };
+    const factory = new SilentAuthSshFactory({ connect }, vault, { prompt: vi.fn() }, undefined, (id) => core.getAuthProfile(id), (id) => core.getServer(id), resolver);
+    const pool = new SshConnectionPool(new ProxySshFactory(factory, (id) => core.getServer(id), vault), { enabled: true, idleTimeoutMs: 0 });
+    cleanup.push(() => resolver.dispose(), () => pool.dispose(), watchPoolInvalidationOnConfigMutation(core, pool, undefined, resolver));
+    const first = await pool.connect(core.getServer("target")!); const transport = await connect.mock.results[0].value;
+    const pending = factory.connect(core.getServer("target")!).catch((error: unknown) => error); await flush();
+    expect(runningSignal?.aborted).toBe(false);
+    const update = core.addOrUpdateServer({ ...core.getServer("target")!, name: "renamed" });
+    expect(runningSignal?.aborted).toBe(true);
+    expect(transport.dispose).not.toHaveBeenCalled(); await first.openShell();
+    await update; expect(await pending).toMatchObject({ code: "configuration-changed" });
+    stalled.resolve(output()); const second = await pool.connect(core.getServer("target")!);
+    expect(calls).toBe(3); first.dispose(); second.dispose();
+  });
+
   it("revoke-only retires an established pool entry while its lease remains usable", async () => {
     const h = setup(); const target = h.servers.get("target")!;
     const core = new NexusCore(new InMemoryConfigRepository([target], [], [], [], [profile()])); await core.initialize();

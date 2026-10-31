@@ -54,6 +54,19 @@ describe("inventory source SSH dependencies", () => {
     expect(captured.identity).not.toContain("lab-host-user");
   });
 
+  it("tracks expanded lookup context for every lab host and jump hop", () => {
+    if (external.authType !== "external") throw new Error("bad fixture");
+    const expanded: AuthProfile = { ...external, external: { ...external.external,
+      invocation: { ...external.external.invocation!, argumentExpansion: true } } };
+    const servers = chain().map((s) => ({ ...s, authProfileId: expanded.id }));
+    const before = snapshotInventorySourceDependencies("lab-host", servers, [expanded]);
+    for (const changed of [
+      servers.map((s) => s.id === "lab-host" ? { ...s, username: "different" } : s),
+      servers.map((s) => s.id === "jump-two" ? { ...s, name: "different" } : s)
+    ]) expect(() => assertInventorySourceDependenciesCurrent(before, changed, [expanded])).toThrow(/changed/);
+    expect(() => assertInventorySourceDependenciesCurrent(before, servers, [{ ...expanded, name: "renamed" }])).toThrow(/changed/);
+  });
+
   it("refuses a missing linked auth profile rather than capturing dormant credentials", () => {
     expect(() => snapshotInventorySourceDependencies("lab-host", [makeServer("lab-host", { authProfileId: "missing" })], []))
       .toThrow(/authentication profile.*missing|authentication profile.*exist/i);

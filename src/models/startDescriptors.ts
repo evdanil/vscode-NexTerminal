@@ -104,6 +104,8 @@ function transportDescriptor(
     // Stored profiles are already projected above, including keyPath only for
     // key auth; adding their entire identity would make dormant paths relevant.
     isExternalAuthProfile(profile) ? authProfileConnectionIdentity(profile) : null,
+    isExternalAuthProfile(profile) && profile.external.invocation?.argumentExpansion === true
+      ? [rawServer.name, rawServer.username] : null,
     Boolean(server.legacyAlgorithms),
     proxyDescriptor(server.proxy, inputs, chain)
   ];
