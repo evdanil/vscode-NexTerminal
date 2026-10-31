@@ -1,3 +1,4 @@
+import { validateExternalArgumentTemplates } from "../models/externalCredentialArgumentSyntax";
 import { parseExternalArgumentsText } from "./externalCredentialForm";
 import type { AuthProfile } from "../models/config";
 import { escapeHtml } from "./shared/escapeHtml";
@@ -223,6 +224,7 @@ export function renderAuthProfileEditorHtml(
     (function() {
       var vscode = acquireVsCodeApi();
       var parseExternalArgumentsText = ${parseExternalArgumentsText.toString()};
+      var validateExternalArgumentTemplates = ${validateExternalArgumentTemplates.toString()};
       var dirty = false;
       var currentId = ${selectedId !== null ? JSON.stringify(selectedId) : "null"};
       var saveFlag = document.getElementById("save-flag");
@@ -361,8 +363,11 @@ export function renderAuthProfileEditorHtml(
           var executable = document.getElementById("external-executable").value;
           var args = [];
           error("external-executable", executable && (executable[0] === "/" || /^[A-Za-z]:[\\\\/]/.test(executable) || /^\\\\\\\\/.test(executable)) && !/[\\u0000-\\u001f\\u007f-\\u009f\\u061c\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069]/.test(executable) ? "" : "Choose an absolute executable path without control characters.");
-          try { args = parseExternalArgumentsText(document.getElementById("external-arguments").value); error("external-arguments", ""); }
-          catch (e) { error("external-arguments", e.message); }
+          try {
+            args = parseExternalArgumentsText(document.getElementById("external-arguments").value);
+            var expansion = document.getElementById("external-argument-expansion").checked;
+            error("external-arguments", expansion && !validateExternalArgumentTemplates(args) ? "Use supported placeholders and close every placeholder. Escape literal placeholders with $\${...}." : "");
+          } catch (e) { error("external-arguments", e.message); }
           if (!valid) { if (firstInvalid) firstInvalid.focus(); return; }
           var invocation = { executable: executable, args: args };
           if (document.getElementById("external-argument-expansion").checked) invocation.argumentExpansion = true;

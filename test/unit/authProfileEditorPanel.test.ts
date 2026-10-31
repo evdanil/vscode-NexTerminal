@@ -184,6 +184,19 @@ describe("AuthProfileEditorPanel", () => {
     expect(core.getSnapshot().authProfiles).toEqual([]); expect(mockShowInformationMessage).not.toHaveBeenCalled();
   });
 
+  it("refuses crafted invalid enabled templates while accepting literal and escaped arguments", async () => {
+    const { core, sendMessage } = await openPanel([makeAuthProfile()]);
+    const save = (args: string[], argumentExpansion: boolean) => sendMessage({ type: "save", id: "ap1", name: "External", authType: "external", external: { version: 1, method: "password", invocation: { executable: "/provider", args, argumentExpansion } } });
+    await save(["${unknown}"], true);
+    expect(core.getAuthProfile("ap1")?.authType).toBe("password");
+    expect(mockPostMessage).toHaveBeenCalledWith({ type: "actionError", message: expect.stringContaining("placeholder") });
+    await save(["$${anything-at-all}", "${host}"], true);
+    expect(core.getAuthProfile("ap1")).toMatchObject({ authType: "external", external: { invocation: { args: ["$${anything-at-all}", "${host}"] } } });
+    await save(["${unknown"], false);
+    expect(core.getAuthProfile("ap1")).toMatchObject({ external: { invocation: { args: ["${unknown"] } } });
+    expect((core.getAuthProfile("ap1") as Extract<AuthProfile, { authType: "external" }>).external.invocation?.argumentExpansion).toBeUndefined();
+  });
+
   it("external executable browse uses a separate response and refuses unsupported schemes", async () => {
     const { sendMessage } = await openPanel();
     mockShowOpenDialog.mockResolvedValueOnce([{ scheme: "file", fsPath: "/provider" }]);

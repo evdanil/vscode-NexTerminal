@@ -1,3 +1,4 @@
+import { validateExternalArgumentTemplates } from "../../models/externalCredentialArgumentSyntax";
 import { validateExternalCredentialInvocation } from "../../models/authProfile";
 import { CredentialProviderError } from "./credentialProviderError";
 
@@ -26,7 +27,7 @@ export function expandExternalCredentialArguments(
     const value: unknown = context?.[name];
     return typeof value === "string" && value.trim() !== "" ? value : invalid();
   };
-  if (!Array.isArray(args) || args.length > 32) return invalid();
+  if (!Array.isArray(args) || args.length > 32 || !validateExternalArgumentTemplates(args)) return invalid();
   const expanded = Array.from(args, (arg) => {
     if (typeof arg !== "string") return invalid();
     let output = "";

@@ -190,7 +190,7 @@ describe("openUnifiedForm test action", () => {
     })).rejects.toThrow(/required local shell fields/i);
   });
 
-  it("tests an external-linked omitted-field payload and refuses changed invocation identity", async () => {
+  it("tests an external-linked payload with the chosen lookup username and refuses changed invocation identity", async () => {
     const ctx = makeCtx();
     const external = { id: "external", name: "Program", authType: "external", external: { version: 1, method: "password", invocation: { executable: "/provider", args: [] } } };
     ctx.core.getAuthProfile.mockReturnValue(external);
@@ -199,9 +199,9 @@ describe("openUnifiedForm test action", () => {
     await handlers.onAutofill("authProfileId", external.id);
     const { formValuesToServer } = await vi.importActual<typeof import("../../src/commands/serverCommands")>("../../src/commands/serverCommands");
     mockFormValuesToServer.mockImplementationOnce(formValuesToServer);
-    const payload = { profileType: "ssh", name: "Server", host: "example.com", port: 22, authProfileId: external.id };
+    const payload = { profileType: "ssh", name: "Server", host: "example.com", port: 22, username: "lookup-user", authProfileId: external.id };
     await handlers.onTest(payload);
-    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.server.testConnection", { server: expect.objectContaining({ authProfileId: external.id, username: "root", authType: "password" }) });
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.server.testConnection", { server: expect.objectContaining({ authProfileId: external.id, username: "lookup-user", authType: "password" }) });
     expect(mockShowWarningMessage).not.toHaveBeenCalled();
     mockExecuteCommand.mockClear();
     ctx.core.getAuthProfile.mockReturnValue({ ...external, external: { ...external.external, invocation: { executable: "/changed", args: [] } } });

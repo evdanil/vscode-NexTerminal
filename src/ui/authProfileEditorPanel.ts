@@ -1,3 +1,4 @@
+import { validateExternalArgumentTemplates } from "../models/externalCredentialArgumentSyntax";
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import { isExternalAuthProfile } from "../models/authProfile";
@@ -183,6 +184,10 @@ export class AuthProfileEditorPanel {
             break;
           }
           const profile = candidate;
+          if (isExternalAuthProfile(profile) && profile.external.invocation?.argumentExpansion === true && !validateExternalArgumentTemplates(profile.external.invocation.args)) {
+            void this.panel.webview.postMessage({ type: "actionError", message: "Check Arguments: use supported placeholders and close every placeholder. Escape literal placeholders with $${...}." });
+            break;
+          }
           const previous = requestedId ? this.core.getAuthProfile(requestedId) : undefined;
           const previousSignature = JSON.stringify(previous);
           const affected = (): string[] => {

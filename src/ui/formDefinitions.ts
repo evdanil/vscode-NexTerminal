@@ -968,7 +968,7 @@ export function deviceTemplateFormDefinition(
         suppressCreate: true,
         // P8 (UX polish 5) — rung-3 cascade vocabulary leak: nothing in T1b
         // "matches" (catch-all only), so name what actually happens.
-        hint: "The saved SSH credentials this template links onto the servers it applies to."
+        hint: "The auth profile this template links onto the servers it applies to for SSH authentication."
       }),
       templateOverridePreemption("authProfileId"),
 

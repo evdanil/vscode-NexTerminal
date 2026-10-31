@@ -1,3 +1,4 @@
+import { validateExternalArgumentTemplates } from "../../src/models/externalCredentialArgumentSyntax";
 import { describe, expect, it } from "vitest";
 import { CredentialProviderError } from "../../src/services/credentials/credentialProviderError";
 import { expandExternalCredentialArguments } from "../../src/services/credentials/externalCredentialArguments";
@@ -54,6 +55,15 @@ describe("external credential argument expansion", () => {
       }
     }
   );
+
+  it.each([
+    ["${host}", true], ["${username}", true], ["$${any-value}", true], ["$${${host}}", true],
+    ["${host-name}", false], ["${unknown}", false], ["${}", false], ["${host", false], ["$${open", false]
+  ])("uses the same syntax at save and invocation for %s", (arg, valid) => {
+    expect(validateExternalArgumentTemplates([arg as string])).toBe(valid);
+    if (valid) expect(() => expandExternalCredentialArguments([arg as string], context)).not.toThrow();
+    else expect(() => expandExternalCredentialArguments([arg as string], context)).toThrow(CredentialProviderError);
+  });
 
   it("requires values only when their placeholder is referenced", () => {
     const missing = { ...context, username: "" };

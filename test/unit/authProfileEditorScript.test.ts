@@ -66,6 +66,20 @@ describe("external auth editor actual script", () => {
     h.field("save-btn").dispatch("click");
     expect((h.posted.at(-1)?.external as { invocation: Record<string, unknown> }).invocation.argumentExpansion).toBeUndefined();
   });
+  it.each(["${unknown}", "${host", "${}", "${host-name}", "$${unclosed"])("rejects invalid enabled template %s before posting save", (arg) => {
+    const h = editor(); h.field("profile-name").value = "Program"; h.choose("authtype-selector", "external");
+    h.field("external-executable").value = "/provider"; h.field("external-arguments").value = arg; h.field("external-argument-expansion").checked = true;
+    h.field("save-btn").dispatch("click");
+    expect(h.posted).toEqual([]); expect(h.field("external-arguments").getAttribute("aria-invalid")).toBe("true");
+    expect(h.field("error-external-arguments").textContent).toContain("placeholder");
+  });
+  it("accepts escaped arbitrary placeholders and leaves disabled templates literal", () => {
+    const h = editor(); h.field("profile-name").value = "Program"; h.choose("authtype-selector", "external"); h.field("external-executable").value = "/provider";
+    h.field("external-arguments").value = "$${arbitrary-token}\n${host}"; h.field("external-argument-expansion").checked = true; h.field("save-btn").dispatch("click");
+    expect(h.posted.at(-1)).toMatchObject({ external: { invocation: { argumentExpansion: true, args: ["$${arbitrary-token}", "${host}"] } } });
+    h.field("external-arguments").value = "${unknown"; h.field("external-argument-expansion").checked = false; h.field("save-btn").dispatch("click");
+    expect(h.posted.at(-1)).toMatchObject({ external: { invocation: { args: ["${unknown"] } } });
+  });
   it("rejects invalid lines inline with aria-invalid and keeps the draft across revoke feedback", () => {
     const h = editor(); h.field("profile-name").value = "Unsaved"; h.choose("authtype-selector", "external"); h.field("external-executable").value = "/provider"; h.field("external-arguments").value = "a\n";
     h.field("save-btn").dispatch("click"); expect(h.posted).toEqual([]); expect(h.field("external-arguments").getAttribute("aria-invalid")).toBe("true");
