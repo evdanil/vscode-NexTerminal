@@ -33,6 +33,13 @@ export function isExternalAuthProfile(profile: AuthProfile | undefined): profile
   return profile?.authType === "external";
 }
 
+/** Literal mode has the legacy representation, so older clients can read it. */
+export function normalizeAuthProfile(profile: AuthProfile): AuthProfile {
+  if (!isExternalAuthProfile(profile) || profile.external?.invocation?.argumentExpansion !== false) return profile;
+  const { argumentExpansion: _disabled, ...invocation } = profile.external.invocation;
+  return { ...profile, external: { ...profile.external, invocation } };
+}
+
 /** Display only: dynamic or unresolved sources must never expose dormant accounts. */
 export function serverAccountPrefixForDisplay(server: ServerConfig, profile: AuthProfile | undefined): string {
   return isExternalAuthProfile(profile) || (server.authProfileId && !profile) ? "" : `${server.username}@`;

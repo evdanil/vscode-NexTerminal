@@ -163,12 +163,30 @@ it("restores enabled, disabled and legacy argument settings through a backup", a
   const disabled = external(); disabled.id = "disabled"; disabled.external.invocation = { ...disabled.external.invocation!, argumentExpansion: false, args: ["${host}"] };
   const legacy = external(); legacy.id = "legacy"; legacy.external.invocation = { ...legacy.external.invocation!, args: ["${host}"] };
   for (const profile of [enabled, disabled, legacy]) await origin.core.addOrUpdateAuthProfile(profile);
+  const canonicalDisabled = { ...disabled, external: { ...disabled.external, invocation: { executable: disabled.external.invocation!.executable, args: disabled.external.invocation!.args } } };
+  expect(origin.core.getAuthProfile("disabled")).toEqual(canonicalDisabled);
+  expect(disabled.external.invocation?.argumentExpansion).toBe(false);
   const backup = await captureBackupStateForExport(origin.core, origin.vault);
   const restored = await machine();
-  await importData(restored, json({ authProfiles: backup.authProfiles }));
+  expect(backup.authProfiles).toEqual([enabled, canonicalDisabled, legacy]);
+  await importData(restored, json({ authProfiles: [enabled, disabled, legacy] }));
   expect(mockShowErrorMessage).not.toHaveBeenCalled();
   const reopened = new NexusCore(restored.repo); await reopened.initialize();
-  expect(reopened.getSnapshot().authProfiles).toEqual([enabled, disabled, legacy]);
+  expect(reopened.getSnapshot().authProfiles).toEqual([enabled, canonicalDisabled, legacy]);
+});
+
+it("normalizes disabled expansion on repository reads and writes for old readers", async () => {
+  const disabled = external(); disabled.external.invocation = { ...disabled.external.invocation!, argumentExpansion: false, args: ["${host}"] };
+  const expected = external(); expected.external.invocation = { ...expected.external.invocation!, args: ["${host}"] };
+  const state = new Map<string, unknown>([["nexus.authProfiles", [disabled]]]);
+  const context = { globalState: { get: (key: string) => state.get(key), update: async (key: string, value: unknown) => { state.set(key, value); } } } as unknown as vscode.ExtensionContext;
+  const repository = new VscodeConfigRepository(context);
+  expect(await repository.getAuthProfiles()).toEqual([expected]);
+  await repository.saveAuthProfiles([disabled]);
+  expect(state.get("nexus.authProfiles")).toEqual([expected]);
+  const invocation = (state.get("nexus.authProfiles") as ExternalAuthProfile[])[0].external.invocation!;
+  expect(Object.keys(invocation).every(key => key === "executable" || key === "args")).toBe(true);
+  expect(disabled.external.invocation?.argumentExpansion).toBe(false);
 });
 
 it("older profile loading drops expansion fields and an unrelated save removes those rows", async () => {
@@ -181,7 +199,7 @@ it("older profile loading drops expansion fields and an unrelated save removes t
   // Other validation and the full-list load/save are exercised by the real repository/core.
   class OlderRepository extends VscodeConfigRepository {
     override async getAuthProfiles() {
-      return (await super.getAuthProfiles()).filter(profile => profile.authType !== "external" || !profile.external.invocation ||
+      return (state.get("nexus.authProfiles") as ExternalAuthProfile[]).filter(profile => profile.authType !== "external" || !profile.external.invocation ||
         Object.keys(profile.external.invocation).every(key => key === "executable" || key === "args"));
     }
   }
