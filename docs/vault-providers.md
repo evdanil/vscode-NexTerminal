@@ -52,6 +52,23 @@ Assign each profile under the corresponding server's **Advanced → Auth Profile
 
 The same approach works with AWS secret IDs, Azure secret names, and [1Password field references](1password.md): keep the script, change the profile's arguments.
 
+### Available connection variables
+
+When **Expand connection variables in arguments** is enabled in an External Program profile, each argument can use these case-sensitive variables:
+
+| Variable | Value |
+| --- | --- |
+| `${host}` | Host being dialed, including an alternate-host retry |
+| `${port}` | SSH port |
+| `${SessionName}` | Server name |
+| `${username}` | Server username configured as a lookup hint |
+| `${profile}` | External auth profile name |
+| `${protocol}` | `ssh` (external credential programs currently support SSH) |
+
+For example, separate argument lines `--profile=${profile}` and `--protocol=${protocol}` pass those values to your program. They do not configure the program or vault by themselves; the program must accept those arguments. A profile name containing spaces remains part of one argument. The program's returned username is used for SSH login.
+
+Expansion is off by default. To pass a literal `${profile}` with expansion enabled, write `$${profile}`. See [Connection variables in arguments](ssh-and-telnet.md#connection-variables-in-arguments) for validation, approval and security details.
+
 ### One profile for 100 distinct secrets
 
 Alternatively, enable **Expand connection variables in arguments** in a single External Program profile and assign that profile to all 100 servers. Before enabling it, update all Nexus installations that access this configuration and export a backup with the newer version. Older clients cannot read enabled profiles, may erase them when saving auth profiles, and may omit them from backups. Before downgrading, disable expansion, save auth profiles in the newer version and export a backup there; see the [downgrade details](import-export.md#external-program-profile-portability), including the explicit-false case.
