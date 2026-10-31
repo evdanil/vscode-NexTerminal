@@ -160,6 +160,14 @@ describe("AuthProfileEditorPanel", () => {
     expect(vault.delete).toHaveBeenCalledWith(authProfilePassphraseSecretKey("ap1"));
     expect(vault.store).not.toHaveBeenCalled();
   });
+  it("persists opt-in expansion and rejects a non-boolean value", async () => {
+    const { core, sendMessage } = await openPanel([makeAuthProfile()]);
+    const invocation = { executable: "/provider", args: ["${host}"], argumentExpansion: true };
+    await sendMessage({ type: "save", id: "ap1", name: "External", authType: "external", external: { version: 1, method: "password", invocation } });
+    expect(core.getAuthProfile("ap1")).toMatchObject({ external: { invocation } });
+    await sendMessage({ type: "save", id: "ap1", name: "External", authType: "external", external: { version: 1, method: "password", invocation: { ...invocation, argumentExpansion: "true" } } });
+    expect(core.getAuthProfile("ap1")).toMatchObject({ external: { invocation } });
+  });
 
   it("refuses external to stored switching if either cleanup fails, retaining external mode", async () => {
     const external: AuthProfile = { id: "ap1", name: "External", authType: "external", external: { version: 1, method: "password", invocation: { executable: "/provider", args: [] } } };

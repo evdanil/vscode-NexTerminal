@@ -2,17 +2,18 @@ import { describe, expect, it } from "vitest";
 import { renderAuthProfileEditorHtml } from "../../src/ui/authProfileEditorHtml";
 import { StubElement } from "../helpers/formScriptHarness";
 
-function editor() {
-  const html = renderAuthProfileEditorHtml([], null, "nonce");
+function editor(profiles: Parameters<typeof renderAuthProfileEditorHtml>[0] = [], selectedId: string | null = null) {
+  const html = renderAuthProfileEditorHtml(profiles, selectedId, "nonce");
   const elements = new Map<string, StubElement>();
   for (const match of html.matchAll(/<([a-z]+)[^>]*\bid="([^"]+)"[^>]*>/g)) {
     const el = new StubElement(match[1].toUpperCase(), /class="([^"]*)"/.exec(match[0])?.[1].split(" ") ?? []);
-    el.value = /\bvalue="([^"]*)"/.exec(match[0])?.[1] ?? ""; elements.set(match[2], el);
+    el.value = /\bvalue="([^"]*)"/.exec(match[0])?.[1] ?? "";
+    el.checked = /\schecked(?:\s|\/?>)/.test(match[0]); elements.set(match[2], el);
   }
   const field = (id: string) => { const el = elements.get(id); if (!el) throw new Error(id); return el; };
   const groups: Record<string, string[]> = {
     "username-field": ["profile-username"], "password-field": ["profile-password"], "keypath-field": ["profile-keypath", "browse-btn"],
-    "external-field": ["external-method", "external-executable", "external-arguments", "external-browse-btn"]
+    "external-field": ["external-method", "external-executable", "external-arguments", "external-argument-expansion", "external-browse-btn"]
   };
   for (const [group, ids] of Object.entries(groups)) for (const id of ids) field(group).append(field(id));
   const posted: Record<string, unknown>[] = []; let message!: (event: { data: unknown }) => void;
@@ -46,6 +47,24 @@ describe("external auth editor actual script", () => {
     expect(h.posted.at(-1)).toEqual({ type: "save", id: null, name: "Program", authType: "external", external: { version: 1, method: "password", invocation: { executable: "/provider", args: ['a "quote"', "C:\\path"] } } });
     expect(h.field("profile-username").disabled).toBe(true); expect(h.field("profile-password").disabled).toBe(true);
     h.choose("authtype-selector", "password"); expect(h.field("profile-username").value).toBe("dormant"); expect(h.field("profile-password").value).toBe("secret");
+  });
+  it("saves enabled argument expansion and marks changing it dirty", () => {
+    const h = editor();
+    h.field("profile-name").value = "Program"; h.choose("authtype-selector", "external");
+    h.field("external-executable").value = "/provider"; h.field("external-arguments").value = "${host}";
+    h.field("external-argument-expansion").checked = true; h.field("external-argument-expansion").dispatch("change");
+    expect(h.field("dirty-flag").classList.contains("visible")).toBe(true);
+    h.field("save-btn").dispatch("click");
+    expect(h.posted.at(-1)).toMatchObject({ external: { invocation: { args: ["${host}"], argumentExpansion: true } } });
+  });
+  it("reopens enabled expansion and saves literal mode when disabled", () => {
+    const profile = { id: "e", name: "Program", authType: "external" as const, external: { version: 1 as const, method: "password" as const, invocation: { executable: "/provider", args: [], argumentExpansion: true } } };
+    const h = editor([profile], "e");
+    expect(h.field("external-argument-expansion").checked).toBe(true);
+    h.field("external-argument-expansion").checked = false;
+    h.field("external-argument-expansion").dispatch("change");
+    h.field("save-btn").dispatch("click");
+    expect((h.posted.at(-1)?.external as { invocation: Record<string, unknown> }).invocation.argumentExpansion).toBeUndefined();
   });
   it("rejects invalid lines inline with aria-invalid and keeps the draft across revoke feedback", () => {
     const h = editor(); h.field("profile-name").value = "Unsaved"; h.choose("authtype-selector", "external"); h.field("external-executable").value = "/provider"; h.field("external-arguments").value = "a\n";

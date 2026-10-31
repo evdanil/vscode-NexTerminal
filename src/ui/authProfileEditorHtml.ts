@@ -167,8 +167,12 @@ export function renderAuthProfileEditorHtml(
     <div class="form-group">
       <label for="external-arguments">Arguments</label>
       <textarea id="external-arguments" rows="4" aria-describedby="external-arguments-hint error-external-arguments">${escapeHtml(external?.invocation?.args.join("\n") ?? "")}</textarea>
-      <div class="hint" id="external-arguments-hint">One argument per line. Spaces inside an argument are preserved. Do not add shell quotes or put passwords/tokens here; arguments are saved in configuration. Nexus adds --pass or --pkey for the selected method. Tilde, environment and template expansion are unavailable.</div>
+      <div class="hint" id="external-arguments-hint">One argument per line. Spaces inside an argument are preserved. Do not add shell quotes or put passwords/tokens here; arguments are saved in configuration. Nexus adds --pass or --pkey for the selected method. Tilde and environment expansion are unavailable.</div>
       <div class="field-error" id="error-external-arguments" aria-live="polite"></div>
+    </div>
+    <div class="form-group form-group-checkbox">
+      <label for="external-argument-expansion"><input type="checkbox" id="external-argument-expansion" aria-describedby="external-argument-expansion-hint"${external?.invocation?.argumentExpansion === true ? " checked" : ""} /> Expand connection variables in arguments</label>
+      <div class="hint" id="external-argument-expansion-hint">Optional. Use \${host}, \${port}, \${SessionName}, \${username}, \${profile}, or \${protocol}; write $\${host} for a literal \${host}. The server username is a lookup hint; the program supplies the SSH login. Session approval covers this template and values may differ for future connections.</div>
     </div>
     <p class="hint">Saving does not run the program or grant approval. Interactive Connect asks you to review the complete invocation before approving it for this extension-host session.</p>
   </div>
@@ -281,6 +285,7 @@ export function renderAuthProfileEditorHtml(
       document.getElementById("authtype-selector").addEventListener("click", updateExternalControls);
       document.getElementById("authtype-selector").addEventListener("keydown", function() { setTimeout(updateExternalControls, 0); });
       ["external-executable", "external-arguments"].forEach(function(id) { document.getElementById(id).addEventListener("input", markDirty); });
+      document.getElementById("external-argument-expansion").addEventListener("change", markDirty);
 
       // Track changes
       document.getElementById("profile-name").addEventListener("input", markDirty);
@@ -350,7 +355,9 @@ export function renderAuthProfileEditorHtml(
           try { args = parseExternalArgumentsText(document.getElementById("external-arguments").value); error("external-arguments", ""); }
           catch (e) { error("external-arguments", e.message); }
           if (!valid) { if (firstInvalid) firstInvalid.focus(); return; }
-          vscode.postMessage({ type: "save", id: currentId, name: name, authType: "external", external: { version: 1, method: document.getElementById("external-method").value, invocation: { executable: executable, args: args } } });
+          var invocation = { executable: executable, args: args };
+          if (document.getElementById("external-argument-expansion").checked) invocation.argumentExpansion = true;
+          vscode.postMessage({ type: "save", id: currentId, name: name, authType: "external", external: { version: 1, method: document.getElementById("external-method").value, invocation: invocation } });
           return;
         }
         if (!valid) { if (firstInvalid) firstInvalid.focus(); return; }

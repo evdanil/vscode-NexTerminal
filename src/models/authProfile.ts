@@ -11,6 +11,7 @@ export interface StoredAuthProfile {
 export interface ExternalCredentialInvocation {
   executable: string;
   args: readonly string[];
+  argumentExpansion?: boolean;
 }
 
 export interface ExternalAuthProfile {
@@ -68,20 +69,21 @@ export function authProfileOwnedCredentials(profile: AuthProfile | undefined): A
   return owned;
 }
 
-/** External credentials arrive at sign-in, so all dormant server fields stay owned. */
+/** External credentials supply the login, while the server username is a lookup hint. */
 export function authProfileFieldOwnership(profile: AuthProfile | undefined): { username: boolean; authType: boolean; keyPath: boolean } {
-  if (isExternalAuthProfile(profile)) return { username: true, authType: true, keyPath: true };
+  if (isExternalAuthProfile(profile)) return { username: false, authType: true, keyPath: true };
   const owned = authProfileOwnedCredentials(profile);
   return { username: owned.username !== undefined, authType: owned.authType !== undefined, keyPath: owned.keyPath !== undefined };
 }
 
-/** No secrets, retrieved values or display name enter connection/approval identity. */
+/** No secrets or retrieved values enter connection/approval identity. */
 export function authProfileConnectionIdentity(profile: AuthProfile | undefined): readonly unknown[] {
   if (!profile) return ["missing"];
   if (isExternalAuthProfile(profile)) {
     const { version, method, invocation } = profile.external;
     return [profile.id, "external", version, method,
-      invocation ? [invocation.executable, [...invocation.args]] : null];
+      invocation ? [invocation.executable, [...invocation.args]] : null,
+      ...(invocation?.argumentExpansion === true ? [true, profile.name] : [])];
   }
   const owned = authProfileOwnedCredentials(profile);
   return ["stored", owned.authType, owned.username ?? null, owned.keyPath ?? null];
@@ -95,8 +97,9 @@ export function isPlainCredentialConfig(value: unknown): value is Record<string,
 
 /** Pure and portable: host filesystem checks belong to the Node runner. */
 export function validateExternalCredentialInvocation(value: unknown): value is ExternalCredentialInvocation {
-  if (!isPlainCredentialConfig(value) || Object.keys(value).some((key) => key !== "executable" && key !== "args")) return false;
-  const { executable, args } = value;
+  if (!isPlainCredentialConfig(value) || Object.keys(value).some((key) => key !== "executable" && key !== "args" && key !== "argumentExpansion")) return false;
+  const { executable, args, argumentExpansion } = value;
+  if ("argumentExpansion" in value && typeof argumentExpansion !== "boolean") return false;
   if (typeof executable !== "string" || /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u.test(executable)) return false;
   // Accept foreign-host paths in backups, without expanding variables or normalizing bytes.
   const absolute = executable.startsWith("/") || /^[A-Za-z]:[\\/]/u.test(executable) || /^\\\\[^\\/]+[\\/][^\\/]+[\\/]/u.test(executable);

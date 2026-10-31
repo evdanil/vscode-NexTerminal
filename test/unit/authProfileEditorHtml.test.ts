@@ -129,6 +129,18 @@ describe("renderAuthProfileEditorHtml", () => {
 
 
 describe("external credential form", () => {
+  it("renders an accessible opt-in checkbox and restores its checked state", () => {
+    const profile = { id: "e", name: "External", authType: "external" as const, external: { version: 1 as const, method: "password" as const, invocation: { executable: "/provider", args: ["${host}"], argumentExpansion: true } } };
+    const enabled = render([profile], "e");
+    expect(enabled).toMatch(/<input[^>]*id="external-argument-expansion"[^>]*checked/);
+    expect(enabled).toContain('for="external-argument-expansion"');
+    expect(enabled).toContain('aria-describedby="external-argument-expansion-hint"');
+    expect(enabled).toContain("${SessionName}");
+    expect(enabled).toContain("$${host}");
+    expect(enabled).toContain("future connections");
+    const legacy = render([{ ...profile, external: { ...profile.external, invocation: { executable: "/provider", args: ["${host}"] } } }], "e");
+    expect(legacy).not.toMatch(/<input[^>]*id="external-argument-expansion"[^>]*checked/);
+  });
   it("places External Program fourth and invocation controls before the unchanged footer and session action", () => {
     const html = render([{ id: "e", name: "External <name>", authType: "external", external: { version: 1, method: "key", invocation: { executable: "/a&b", args: ['a "quote"', "C:\\path"] } } }], "e");
     const order = ['data-value="agent"', 'data-value="external"', 'id="external-field"', 'id="external-method-selector"', 'id="external-executable"', 'id="external-arguments"', 'id="save-btn"', 'id="new-btn"', 'id="delete-btn"', 'id="session-approvals"'];

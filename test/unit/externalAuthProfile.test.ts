@@ -81,12 +81,21 @@ describe("external auth profile validation", () => {
     expect(validateAuthProfile(invocation("/bin/helper", args))).toBe(true);
     expect(validateAuthProfile(invocation("/bin/helper", Array(32).fill("x")))).toBe(true);
   });
+  it("accepts only boolean opt-in and keeps legacy profiles valid", () => {
+    for (const flag of [true, false]) {
+      expect(validateAuthProfile(candidate({ external: { version: 1, method: "password", invocation: { executable: "/provider", args: ["${host}"], argumentExpansion: flag } } }))).toBe(true);
+    }
+    for (const flag of [null, "true", 1, {}, []]) {
+      expect(validateAuthProfile(candidate({ external: { version: 1, method: "password", invocation: { executable: "/provider", args: [], argumentExpansion: flag } } }))).toBe(false);
+    }
+    expect(validateAuthProfile(invocation("/provider", ["${host}"]))).toBe(true);
+  });
 });
 
 describe("external auth static values and dynamic ownership", () => {
-  it("owns all credential fields without supplying dormant/static values", () => {
+  it("leaves the server username editable without supplying static credentials", () => {
     expect(authProfileOwnedCredentials(external())).toEqual({});
-    expect(authProfileFieldOwnership(external())).toEqual({ username: true, authType: true, keyPath: true });
+    expect(authProfileFieldOwnership(external())).toEqual({ username: false, authType: true, keyPath: true });
     expect(effectiveServerUsername({ username: "dormant" }, external())).toBe("");
     expect(authProfileNeedsServerKeyPath(external("key"))).toBe(false);
     expect(isExternalAuthProfile(external())).toBe(true);
@@ -108,6 +117,14 @@ const identityChanges: Array<[string, (p: ExternalAuthProfile) => AuthProfile]> 
   ["unconfigured", (p) => ({ ...p, external: { ...p.external, invocation: undefined } })]
 ];
 describe("external auth connection identity", () => {
+  it("distinguishes enabled expansion and profile renames only when expansion is enabled", () => {
+    const before = external();
+    const withMode = (mode: boolean) => ({ ...before, external: { ...before.external, invocation: { ...before.external.invocation!, argumentExpansion: mode } } });
+    expect(authProfileConnectionIdentity(withMode(false))).toEqual(authProfileConnectionIdentity(before));
+    expect(authProfileConnectionIdentity(withMode(true))).not.toEqual(authProfileConnectionIdentity(before));
+    expect(authProfileConnectionIdentity({ ...withMode(true), name: "New name" })).not.toEqual(authProfileConnectionIdentity(withMode(true)));
+    expect(authProfileConnectionIdentity({ ...withMode(false), name: "New name" })).toEqual(authProfileConnectionIdentity(withMode(false)));
+  });
   it.each(identityChanges)("%s changes pure identity", (_label, change) => {
     const before = external();
     expect(authProfileConnectionIdentity(change(before))).not.toEqual(authProfileConnectionIdentity(before));

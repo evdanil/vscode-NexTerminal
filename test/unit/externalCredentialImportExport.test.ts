@@ -145,6 +145,18 @@ it("backs up external configuration without reading either profile secret slot",
   expect(JSON.stringify(result)).not.toContain("SECRET-CANARY");
 });
 
+it("preserves expansion in a backup and strips it with invocation from shares", async () => {
+  const m = await machine();
+  const profile = external();
+  profile.external.invocation = { ...profile.external.invocation!, argumentExpansion: true, args: ["${host}"] };
+  await m.core.addOrUpdateAuthProfile(profile);
+  expect((await captureBackupStateForExport(m.core, m.vault)).authProfiles).toEqual([profile]);
+  const shared = sanitizeForSharing([server()], [], [], [], {}, [profile], [], [], []);
+  expect(shared.authProfiles[0]).toMatchObject({ external: { version: 1, method: "key" } });
+  expect(JSON.stringify(shared)).not.toContain("argumentExpansion");
+  expect(JSON.stringify(shared)).not.toContain("${host}");
+});
+
 it("shares preserve external type, method and all SSH links but strip invocation", async () => {
   const shared = sanitizeForSharing([server()], [], [], [], {}, [external()], [], [source()], [template()]);
   expect(shared.authProfiles[0]).toEqual({ id: expect.any(String), name: "External", authType: "external", external: { version: 1, method: "key" } });
