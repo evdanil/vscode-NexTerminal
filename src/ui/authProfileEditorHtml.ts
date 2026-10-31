@@ -58,6 +58,14 @@ export function renderAuthProfileEditorHtml(
       color: var(--vscode-descriptionForeground, var(--vscode-foreground));
       margin-top: 4px;
     }
+    .compatibility-warning {
+      margin-top: 8px;
+      padding: 8px 10px;
+      border-left: 3px solid var(--vscode-inputValidation-warningBorder, var(--vscode-editorWarning-foreground, #cca700));
+      background: var(--vscode-inputValidation-warningBackground, rgba(200, 150, 0, 0.15));
+      color: var(--vscode-foreground);
+      font-size: 12px;
+    }
     .bottom-actions {
       display: flex;
       gap: 8px;
@@ -174,7 +182,7 @@ export function renderAuthProfileEditorHtml(
       <label for="external-argument-expansion"><input type="checkbox" id="external-argument-expansion" aria-describedby="external-argument-expansion-hint external-argument-expansion-compatibility"${external?.invocation?.argumentExpansion === true ? " checked" : ""} /> Expand connection variables in arguments</label>
       <div class="hint" id="external-argument-expansion-hint">Optional. Use \${host}, \${port}, \${SessionName}, \${username}, \${profile}, or \${protocol}; write $\${host} for a literal \${host}. The server username is a lookup hint; the program supplies the SSH login. Session approval covers this template and values may differ for future connections.</div>
     </div>
-    <div class="hint" id="external-argument-expansion-compatibility">Older NexTerminal versions cannot read profiles with argument expansion enabled; editing auth profiles in an older version can remove them from saved configuration. Back up your configuration and update all installations accessing this state first. Backups exported by older versions may omit these profiles.</div>
+    <div class="compatibility-warning" id="external-argument-expansion-compatibility" role="note">Compatibility warning: Older NexTerminal versions cannot read profiles with argument expansion enabled; editing auth profiles in an older version can remove them from saved configuration. Back up your configuration and update all installations accessing this state first. Backups exported by older versions may omit these profiles.</div>
     <p class="hint">Saving does not run the program or grant approval. Interactive Connect asks you to review the complete invocation before approving it for this extension-host session.</p>
   </div>
 

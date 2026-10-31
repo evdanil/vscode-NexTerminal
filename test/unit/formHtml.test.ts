@@ -21,6 +21,13 @@ describe("renderFormHtml", () => {
     expect(html).toContain("required");
   });
 
+  it("describes source auth profiles without assuming credentials are stored", () => {
+    const provider = { id: "test", label: "Test", configFields: [] } as never;
+    const html = renderFormHtml(inventorySourceFormDefinition(provider));
+    expect(html).toContain("Servers synced from this source use this auth profile for SSH authentication.");
+    expect(html).not.toContain("this profile's saved credentials");
+  });
+
   it("renders select fields with options", () => {
     const definition: FormDefinition = {
       title: "Test",
@@ -595,13 +602,15 @@ describe("renderFormHtml", () => {
     it("explains when the device or source username is sent to the external program", () => {
       const definition: FormDefinition = { title: "Lookup", fields: [
         { type: "text", key: "username", label: "Username" },
-        { type: "text", key: "defaultUsername", label: "Default SSH Username" }
+        { type: "text", key: "defaultUsername", label: "Default SSH Username", hint: "Ordinary source hint" }
       ] };
       const html = renderFormHtml(definition);
       for (const key of ["username", "defaultUsername"]) {
-        expect(html).toContain(`aria-describedby="external-lookup-hint-${key}"`);
+        const expectedDescription = key === "defaultUsername" ? "field-hint-defaultUsername external-lookup-hint-defaultUsername" : "external-lookup-hint-username";
+        expect(html).toContain(`aria-describedby="${expectedDescription}"`);
         expect(html).toContain(`id="external-lookup-hint-${key}"`);
       }
+      expect(html).toContain('id="field-hint-defaultUsername">Ordinary source hint</div>');
       const hints = { username: { textContent: "" }, defaultUsername: { textContent: "" } };
       const doc = {
         getElementById(id: string) {

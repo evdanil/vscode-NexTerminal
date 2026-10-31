@@ -30,11 +30,11 @@ export function sortFilterableOptions(options: SelectOption[]): SelectOption[] {
   return [...topPinned, ...rest, ...bottomPinned];
 }
 
-function renderHint(field: FormFieldDescriptor): string {
+function renderHint(field: FormFieldDescriptor, id?: string): string {
   if (!("hint" in field) || !field.hint) {
     return "";
   }
-  return `\n  <div class="field-hint">${escapeHtml(field.hint)}</div>`;
+  return `\n  <div class="field-hint"${id ? ` id="${id}"` : ""}>${escapeHtml(field.hint)}</div>`;
 }
 
 function visibleWhenDataAttr(visibleWhen?: VisibleWhen): string {
@@ -83,7 +83,8 @@ function renderField(field: FormFieldDescriptor): string {
       // here, so its markup is byte-for-byte what it has always been.
       const textAutofillAttr = field.autofill ? ' data-autofill="true"' : "";
       const lookupHint = field.key === "username" || field.key === "defaultUsername";
-      const lookupAttrs = lookupHint ? ` aria-describedby="external-lookup-hint-${key}"` : "";
+      const ordinaryHintId = lookupHint && field.hint ? `field-hint-${key}` : undefined;
+      const lookupAttrs = lookupHint ? ` aria-describedby="${ordinaryHintId ? ordinaryHintId + " " : ""}external-lookup-hint-${key}"` : "";
       const lookupMarkup = lookupHint ? `<div class="field-hint" id="external-lookup-hint-${key}"></div>` : "";
       if (field.scannable) {
         return `<div class="form-group"${vw}${rw}>
@@ -97,7 +98,7 @@ function renderField(field: FormFieldDescriptor): string {
       }
       return `<div class="form-group"${vw}${rw}>
   <label for="${id}">${escapeHtml(field.label)}${requiredLabel}</label>
-  <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req}${textAutofillAttr}${lookupAttrs} />${renderHint(field)}${lookupMarkup}
+  <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req}${textAutofillAttr}${lookupAttrs} />${renderHint(field, ordinaryHintId)}${lookupMarkup}
   <div class="field-error" id="error-${key}"></div>
 </div>`;
     }

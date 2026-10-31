@@ -1843,7 +1843,7 @@ export function resolveSubmittedTemplateRules(
 /** UX §6, verbatim. Explains both halves of the select in one breath: what a
  *  linked profile does, and what `(None)` leaves in place. */
 const INVENTORY_SOURCE_AUTH_PROFILE_HINT =
-  "Servers synced from this source connect with this profile's saved credentials. (None) uses the default username with SSH agent authentication.";
+  "Servers synced from this source use this auth profile for SSH authentication. (None) uses the default username with SSH agent authentication.";
 
 /**
  * Add/Edit Inventory Source form. Collection-only — every persistence

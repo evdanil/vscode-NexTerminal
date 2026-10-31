@@ -145,6 +145,9 @@ describe("external credential form", () => {
     const html = render([], null);
     const warning = html.match(/<div[^>]*id="external-argument-expansion-compatibility"[^>]*>([^<]*)<\/div>/)?.[1];
     expect(warning).toBeDefined();
+    expect(html).toMatch(/<div class="compatibility-warning" id="external-argument-expansion-compatibility" role="note">Compatibility warning:/);
+    expect(html).toContain("var(--vscode-inputValidation-warningBackground");
+    expect(html).toContain("var(--vscode-inputValidation-warningBorder");
     expect(warning).toContain("Older NexTerminal versions cannot read profiles with argument expansion enabled");
     expect(warning).toContain("editing auth profiles in an older version can remove them from saved configuration");
     expect(warning).toContain("Back up your configuration and update all installations accessing this state first");
