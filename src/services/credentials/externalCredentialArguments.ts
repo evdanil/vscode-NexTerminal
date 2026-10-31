@@ -14,7 +14,7 @@ export interface ExternalCredentialArgumentContext {
 export function expandExternalCredentialArguments(
   args: readonly string[], context: ExternalCredentialArgumentContext
 ): string[] {
-  const invalid = (): never => { throw new CredentialProviderError("spawn-failed"); };
+  const invalid = (): never => { throw new CredentialProviderError("invalid-template"); };
   const valueFor = (name: string): string => {
     if (name === "port") {
       return Number.isInteger(context?.port) && context.port >= 1 && context.port <= 65535
@@ -37,7 +37,7 @@ export function expandExternalCredentialArguments(
         const end = arg.indexOf("}", start);
         if (end < 0) return invalid();
         const name = arg.slice(start, end);
-        if (!/^[A-Za-z][A-Za-z0-9]*$/u.test(name)) return invalid();
+        if (!escaped && !/^[A-Za-z][A-Za-z0-9]*$/u.test(name)) return invalid();
         output += escaped ? "${" + name + "}" : valueFor(name);
         i = end + 1;
       } else {

@@ -23,6 +23,26 @@ describe("external credential argument expansion", () => {
       { ...context, host: "${username}" })).toEqual(["${host}", "${unknown}", "${username}"]);
   });
 
+  it("escapes arbitrary text between braces without interpreting its contents", () => {
+    expect(expandExternalCredentialArguments(["$${AWS_SECRET_KEY}", "$${foo-bar}", "$${}", "$${${host}}"], context))
+      .toEqual(["${AWS_SECRET_KEY}", "${foo-bar}", "${}", "${${host}}"]);
+  });
+
+  it("reports a safe, actionable template error without revealing arguments or context", () => {
+    const canary = "private-value-do-not-display";
+    try {
+      expandExternalCredentialArguments([canary + "=${unknown}"], { ...context, username: canary });
+      throw new Error("Expected rejection");
+    } catch (error) {
+      expect(error).toBeInstanceOf(CredentialProviderError);
+      expect(error).toMatchObject({ code: "invalid-template" });
+      expect(String(error)).toMatch(/Auth Profile/i);
+      expect(String(error)).toMatch(/placeholder/i);
+      expect(String(error)).toMatch(/username/i);
+      expect(String(error)).not.toContain(canary);
+    }
+  });
+
   it.each(["${unknown}", "${}", "${host", "$${host", "${host${username}}"])(
     "rejects unsupported or malformed placeholder %s with a safe error", (value) => {
       try {
