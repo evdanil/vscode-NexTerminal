@@ -1,6 +1,7 @@
 import { generateKeyPairSync } from "node:crypto";
 import { once } from "node:events";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { connect as connectTcp } from "node:net";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -11,6 +12,7 @@ import type { ExternalAuthProfile, ServerConfig } from "../../src/models/config"
 import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 import { createExternalCredentialApproval } from "../../src/services/credentials/externalCredentialApproval";
 import { createExternalCredentialResolver } from "../../src/services/credentials/externalCredentialResolver";
+import { createExternalCredentialProcessRunner } from "../../src/services/credentials/externalCredentialProcess";
 import { parseExternalCredentialResponse } from "../../src/services/credentials/externalCredentialProtocol";
 import type { HostKeyVerifier } from "../../src/services/ssh/contracts";
 import { NexusCore } from "../../src/core/nexusCore";
@@ -237,6 +239,48 @@ async function listenJump(): Promise<ServerConfig> {
 }
 
 describe("common external factory through installed ssh2", () => {
+  it.each(["direct", "jump", "alternate"] as const)("uses %s connection context to select credentials in a real provider and SSH server", async (route) => {
+    const directory = mkdtempSync(join(tmpdir(), "nexus-context-ssh-"));
+    const observation = join(directory, "argv.jsonl");
+    cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+    const authenticate = (name: "target" | "jump") => (ctx: AuthContext) => {
+      if (ctx.method === "password" && ctx.username === `${name}-login` && ctx.password === `${name}-password`) ctx.accept();
+      else ctx.reject(["password"]);
+    };
+    const target = { ...await listen(authenticate("target")), name: "target", username: "target-hint" };
+    const jump = route === "jump" ? { ...await listen(authenticate("jump"), (peer) => {
+      peer.on("tcpip", (accept, reject, info) => {
+        const socket = connectTcp(info.destPort, info.destIP, () => { const stream = accept(); stream.pipe(socket).pipe(stream); });
+        socket.on("error", () => { reject(); socket.destroy(); }); peer.once("close", () => socket.destroy());
+      });
+    }), id: "jump", name: "jump", username: "jump-hint" } : undefined;
+    const profile: ExternalAuthProfile = { id: "provider", name: "Fleet", authType: "external", external: { version: 1, method: "password", invocation: {
+      executable: process.execPath, argumentExpansion: true,
+      args: [join(__dirname, "../fixtures/externalCredentials/context-provider.cjs"), observation, "unused", "choose", "${SessionName}", "${username}", "${host}", "${port}"]
+    } } };
+    const storedTarget = { ...target, ...(route === "alternate" && { host: "unreachable.invalid", altHost: target.host }), authProfileId: profile.id,
+      ...(jump && { proxy: { type: "ssh" as const, jumpHostId: jump.id } }) };
+    const repo = new InMemoryConfigRepository([storedTarget, ...(jump ? [{ ...jump, authProfileId: profile.id }] : [])], [], [], [], [profile]);
+    const core = new NexusCore(repo); await core.initialize();
+    const vault = { get: vi.fn(async () => undefined), store: vi.fn(async () => {}), delete: vi.fn(async () => {}) };
+    const prompt = { prompt: vi.fn(async () => undefined) };
+    const approvals = createExternalCredentialApproval({ isWorkspaceTrusted: () => true, confirm: async () => true });
+    const resolver = createExternalCredentialResolver({ approvals, run: createExternalCredentialProcessRunner(), parse: parseExternalCredentialResponse });
+    cleanups.push(() => resolver.dispose());
+    const auth = new SilentAuthSshFactory(new Ssh2Connector(), vault, prompt, undefined, id => core.getAuthProfile(id), id => core.getServer(id), resolver);
+    const proxy = new ProxySshFactory(auth, id => core.getServer(id), vault);
+    const pool = new SshConnectionPool(proxy, { enabled: true, idleTimeoutMs: 0 });
+    proxy.setJumpHostConnectionFactory(pool); cleanups.push(() => pool.dispose());
+    const source = core.getServer(target.id)!;
+    const connection = route === "alternate"
+      ? await proxy.connectWithContext({ ...source, host: target.host }, { credentialSource: source })
+      : await proxy.connect(source);
+    cleanups.push(() => connection.dispose());
+    const received = readFileSync(observation, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const expectedTarget = ["choose", "target", "target-hint", "127.0.0.1", String(target.port), "--pass"];
+    expect(received).toEqual(jump ? [["choose", "jump", "jump-hint", "127.0.0.1", String(jump.port), "--pass"], expectedTarget] : [expectedTarget]);
+    expect(vault.get).not.toHaveBeenCalled(); expect(prompt.prompt).not.toHaveBeenCalled();
+  });
   it.each([
     { change: "target", pooled: false }, { change: "target", pooled: true }, { change: "route", pooled: true }
   ])("$change replacement before a held polling tick sends no password after host verification (pooled=$pooled)", async ({ change, pooled }) => {
