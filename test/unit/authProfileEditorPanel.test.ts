@@ -160,6 +160,14 @@ describe("AuthProfileEditorPanel", () => {
     expect(vault.delete).toHaveBeenCalledWith(authProfilePassphraseSecretKey("ap1"));
     expect(vault.store).not.toHaveBeenCalled();
   });
+  it("persists opt-in expansion and rejects a non-boolean value", async () => {
+    const { core, sendMessage } = await openPanel([makeAuthProfile()]);
+    const invocation = { executable: "/provider", args: ["${host}"], argumentExpansion: true };
+    await sendMessage({ type: "save", id: "ap1", name: "External", authType: "external", external: { version: 1, method: "password", invocation } });
+    expect(core.getAuthProfile("ap1")).toMatchObject({ external: { invocation } });
+    await sendMessage({ type: "save", id: "ap1", name: "External", authType: "external", external: { version: 1, method: "password", invocation: { ...invocation, argumentExpansion: "true" } } });
+    expect(core.getAuthProfile("ap1")).toMatchObject({ external: { invocation } });
+  });
 
   it("refuses external to stored switching if either cleanup fails, retaining external mode", async () => {
     const external: AuthProfile = { id: "ap1", name: "External", authType: "external", external: { version: 1, method: "password", invocation: { executable: "/provider", args: [] } } };
@@ -174,6 +182,19 @@ describe("AuthProfileEditorPanel", () => {
     const { core, sendMessage } = await openPanel([], {}, true);
     for (const authType of ["unknown", "external"]) await sendMessage({ type: "save", id: null, name: "No", username: "legacy", authType, external: { version: 1, method: "password", invocation: { executable: "/provider", args: [" leading"] } } });
     expect(core.getSnapshot().authProfiles).toEqual([]); expect(mockShowInformationMessage).not.toHaveBeenCalled();
+  });
+
+  it("refuses crafted invalid enabled templates while accepting literal and escaped arguments", async () => {
+    const { core, sendMessage } = await openPanel([makeAuthProfile()]);
+    const save = (args: string[], argumentExpansion: boolean) => sendMessage({ type: "save", id: "ap1", name: "External", authType: "external", external: { version: 1, method: "password", invocation: { executable: "/provider", args, argumentExpansion } } });
+    await save(["${unknown}"], true);
+    expect(core.getAuthProfile("ap1")?.authType).toBe("password");
+    expect(mockPostMessage).toHaveBeenCalledWith({ type: "actionError", message: expect.stringContaining("placeholder") });
+    await save(["$${anything-at-all}", "${host}"], true);
+    expect(core.getAuthProfile("ap1")).toMatchObject({ authType: "external", external: { invocation: { args: ["$${anything-at-all}", "${host}"] } } });
+    await save(["${unknown"], false);
+    expect(core.getAuthProfile("ap1")).toMatchObject({ external: { invocation: { args: ["${unknown"] } } });
+    expect((core.getAuthProfile("ap1") as Extract<AuthProfile, { authType: "external" }>).external.invocation?.argumentExpansion).toBeUndefined();
   });
 
   it("external executable browse uses a separate response and refuses unsupported schemes", async () => {

@@ -968,7 +968,7 @@ export function deviceTemplateFormDefinition(
         suppressCreate: true,
         // P8 (UX polish 5) — rung-3 cascade vocabulary leak: nothing in T1b
         // "matches" (catch-all only), so name what actually happens.
-        hint: "The saved SSH credentials this template links onto the servers it applies to."
+        hint: "The auth profile this template links onto the servers it applies to for SSH authentication."
       }),
       templateOverridePreemption("authProfileId"),
 
@@ -1843,7 +1843,7 @@ export function resolveSubmittedTemplateRules(
 /** UX §6, verbatim. Explains both halves of the select in one breath: what a
  *  linked profile does, and what `(None)` leaves in place. */
 const INVENTORY_SOURCE_AUTH_PROFILE_HINT =
-  "Servers synced from this source connect with this profile's saved credentials. (None) uses the default username with SSH agent authentication.";
+  "Servers synced from this source use this auth profile for SSH authentication. (None) uses the default username with SSH agent authentication.";
 
 /**
  * Add/Edit Inventory Source form. Collection-only — every persistence
@@ -1927,7 +1927,7 @@ export function inventorySourceFormDefinition(
         // value the profile supplied, and the one synced servers fall back
         // to if that profile is ever deleted (silentAuth reads the record's
         // own username once the profile stops resolving).
-        hint: "Used when the inventory source doesn't provide a username. With an auth profile selected it comes from that profile, and is the fallback if the profile is ever removed."
+        hint: "Used when the inventory source does not provide a username for a new server. Changes do not update existing servers. A stored auth profile supplies this value; with an external program it remains a lookup value."
       }
     ],
     linkedProfile

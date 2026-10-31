@@ -1041,7 +1041,7 @@ describe("inventorySourceFormDefinition", () => {
     expect(field.advanced).toBeFalsy();
     expect(field.type).toBe("select");
     expect(field.hint).toBe(
-      "Servers synced from this source connect with this profile's saved credentials. (None) uses the default username with SSH agent authentication."
+      "Servers synced from this source use this auth profile for SSH authentication. (None) uses the default username with SSH agent authentication."
     );
     if (field.type === "select") {
       expect(field.autofill).toBe(true);
@@ -1055,7 +1055,7 @@ describe("inventorySourceFormDefinition", () => {
     }
   });
 
-  it("the Default SSH Username hint explains why the field stays visible but locked while a profile is selected", () => {
+  it("the Default SSH Username hint explains defaults and stored versus external profiles", () => {
     const definition = inventorySourceFormDefinition(fakeProvider, undefined, undefined, authProfiles);
     const field = keyedField(definition, "defaultUsername");
     // Selecting a profile mirrors its username in here and makes the field
@@ -1063,7 +1063,7 @@ describe("inventorySourceFormDefinition", () => {
     // user staring at a locked field with no explanation of where its value
     // came from or why it is still worth having.
     expect(field.hint).toBe(
-      "Used when the inventory source doesn't provide a username. With an auth profile selected it comes from that profile, and is the fallback if the profile is ever removed."
+      "Used when the inventory source does not provide a username for a new server. Changes do not update existing servers. A stored auth profile supplies this value; with an external program it remains a lookup value."
     );
   });
 

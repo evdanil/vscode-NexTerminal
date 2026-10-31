@@ -1,4 +1,3 @@
-import { externalSourceFormValues } from "../ui/externalCredentialForm";
 import type { ExternalCredentialResolver } from "../services/credentials/contracts";
 import { isExternalAuthProfile, authProfileConnectionIdentity } from "../models/authProfile";
 import { randomUUID } from "node:crypto";
@@ -1711,7 +1710,7 @@ async function persistUpdatedInventorySource(
       // REVIEW FINDING (P2) — the profile's username, not the posted one; see
       // fallbackUsernameForSource for the invariant and why the form's mirror
       // cannot be trusted to have landed before Save.
-      defaultUsername: isExternalAuthProfile(linkedProfile) ? source.defaultUsername : fallbackUsernameForSource(linkedProfile, defaultUsername),
+      defaultUsername: fallbackUsernameForSource(linkedProfile, defaultUsername),
       config,
       secretFieldIds: newSecretFieldIds,
       providerFingerprint: computeProviderFingerprint(providerSnapshot),
@@ -3100,8 +3099,7 @@ export function registerInventoryCommands(
     try {
       panel = WebviewFormPanel.open(`inventory-source-add-${providerSnapshot.id}`, definition, {
       onSubmit: async (values) => {
-        const profile = typeof values.authProfileId === "string" ? core.getAuthProfile(values.authProfileId) : undefined;
-        const parsed = await parseSourceFormValues(externalSourceFormValues(values, profile, mostCommonUsername(snapshot.servers)), configFields);
+        const parsed = await parseSourceFormValues(values, configFields);
         if (providerSnapshot.id === "containerlab" && !containerlabForm) {
           throw new Error("Containerlab approvals are available only in desktop VS Code.");
         }
@@ -3376,8 +3374,7 @@ export function registerInventoryCommands(
         // control to WebviewFormPanel — closing that gap.
         onSubmit: (values) => {
           const submitPromise = (async (): Promise<void> => {
-            const profile = typeof values.authProfileId === "string" ? core.getAuthProfile(values.authProfileId) : undefined;
-            const parsed = await parseSourceFormValues(externalSourceFormValues(values, profile, source.defaultUsername), configFields, existingSecretFieldIds);
+            const parsed = await parseSourceFormValues(values, configFields, existingSecretFieldIds);
             if (providerSnapshot.id === "containerlab" && !containerlabForm) {
               throw new Error("Containerlab approvals are available only in desktop VS Code.");
             }

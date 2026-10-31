@@ -87,6 +87,7 @@ function connectionIdentity(server: ServerConfig, authProfilesById: ReadonlyMap<
     external
       ? authProfileConnectionIdentity(profile)
       : [server.authProfileId ?? null, profile !== undefined, username, authType, authType === "key" ? owned.keyPath ?? server.keyPath ?? null : null],
+    ...(external && profile.external.invocation?.argumentExpansion === true ? [[server.name, server.username]] : []),
     proxy
   ];
 }

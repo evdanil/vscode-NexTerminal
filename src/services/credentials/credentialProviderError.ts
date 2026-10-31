@@ -7,6 +7,7 @@ export type CredentialProviderErrorCode =
   | "queue-full"
   | "queue-timeout"
   | "spawn-failed"
+  | "invalid-template"
   | "timed-out"
   | "cleanup-failed"
   | "output-too-large"
@@ -23,6 +24,7 @@ const messages: Record<CredentialProviderErrorCode, string> = {
   "queue-full": "External credential request queue is full. Try again after another request finishes.",
   "queue-timeout": "External credential request timed out while queued.",
   "spawn-failed": "External credential program could not start. Check the executable and arguments in the Auth Profile.",
+  "invalid-template": "External credential arguments could not be expanded. Check the Auth Profile argument placeholders and the server lookup username.",
   "timed-out": "External credential program timed out.",
   "cleanup-failed": "External credential program could not be stopped. Restart the extension host before trying again.",
   "output-too-large": "External credential program exceeded its output limit.",

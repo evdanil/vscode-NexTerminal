@@ -1,4 +1,5 @@
 import type { ConfigRepository } from "../core/contracts";
+import { normalizeAuthProfile } from "../models/authProfile";
 import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile } from "../models/config";
 import { ensureInventorySourceRevision, type InventorySourceConfig } from "../models/inventory";
 import { ensureDeviceTemplateRevision, type DeviceTemplateProfile } from "../models/deviceTemplate";
@@ -87,11 +88,11 @@ export class InMemoryConfigRepository implements ConfigRepository {
   }
 
   public async getAuthProfiles(): Promise<AuthProfile[]> {
-    return [...this.authProfiles];
+    return this.authProfiles.map(normalizeAuthProfile);
   }
 
   public async saveAuthProfiles(profiles: AuthProfile[]): Promise<void> {
-    this.authProfiles = [...profiles];
+    this.authProfiles = profiles.map(normalizeAuthProfile);
   }
 
   public async getInventorySources(): Promise<InventorySourceConfig[]> {

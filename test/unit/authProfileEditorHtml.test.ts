@@ -129,6 +129,30 @@ describe("renderAuthProfileEditorHtml", () => {
 
 
 describe("external credential form", () => {
+  it("renders an accessible opt-in checkbox and restores its checked state", () => {
+    const profile = { id: "e", name: "External", authType: "external" as const, external: { version: 1 as const, method: "password" as const, invocation: { executable: "/provider", args: ["${host}"], argumentExpansion: true } } };
+    const enabled = render([profile], "e");
+    expect(enabled).toMatch(/<input[^>]*id="external-argument-expansion"[^>]*checked/);
+    expect(enabled).toContain('for="external-argument-expansion"');
+    expect(enabled).toContain('aria-describedby="external-argument-expansion-hint external-argument-expansion-compatibility"');
+    expect(enabled).toContain("${SessionName}");
+    expect(enabled).toContain("$${host}");
+    expect(enabled).toContain("future connections");
+    const legacy = render([{ ...profile, external: { ...profile.external, invocation: { executable: "/provider", args: ["${host}"] } } }], "e");
+    expect(legacy).not.toMatch(/<input[^>]*id="external-argument-expansion"[^>]*checked/);
+  });
+  it("warns about older versions before the expansion option is enabled", () => {
+    const html = render([], null);
+    const warning = html.match(/<div[^>]*id="external-argument-expansion-compatibility"[^>]*>([^<]*)<\/div>/)?.[1];
+    expect(warning).toBeDefined();
+    expect(html).toMatch(/<div class="compatibility-warning" id="external-argument-expansion-compatibility" role="note">Compatibility warning:/);
+    expect(html).toContain("var(--vscode-inputValidation-warningBackground");
+    expect(html).toContain("var(--vscode-inputValidation-warningBorder");
+    expect(warning).toContain("Older NexTerminal versions cannot read profiles with argument expansion enabled");
+    expect(warning).toContain("editing auth profiles in an older version can remove them from saved configuration");
+    expect(warning).toContain("Back up your configuration and update all installations accessing this state first");
+    expect(warning).toContain("Backups exported by older versions may omit these profiles");
+  });
   it("places External Program fourth and invocation controls before the unchanged footer and session action", () => {
     const html = render([{ id: "e", name: "External <name>", authType: "external", external: { version: 1, method: "key", invocation: { executable: "/a&b", args: ['a "quote"', "C:\\path"] } } }], "e");
     const order = ['data-value="agent"', 'data-value="external"', 'id="external-field"', 'id="external-method-selector"', 'id="external-executable"', 'id="external-arguments"', 'id="save-btn"', 'id="new-btn"', 'id="delete-btn"', 'id="session-approvals"'];

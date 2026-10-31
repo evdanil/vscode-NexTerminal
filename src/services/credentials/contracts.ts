@@ -1,5 +1,6 @@
 import type { ExternalAuthProfile, ExternalCredentialInvocation } from "../../models/authProfile";
 import type { SshInteractionPolicy } from "../ssh/contracts";
+import type { ExternalCredentialArgumentContext } from "./externalCredentialArguments";
 
 export const EXTERNAL_CREDENTIAL_PROCESS_TIMEOUT_MS = 30_000;
 export const EXTERNAL_CREDENTIAL_STDOUT_MAX_BYTES = 256 * 1024;
@@ -22,6 +23,10 @@ export type ResolvedExternalCredential =
 export interface ExternalCredentialRequest {
   /** Immutable configuration snapshot, never a provider response. */
   profile: ExternalAuthProfile;
+  /** Per-hop source values, copied when the attempt begins. */
+  argumentContext?: ExternalCredentialArgumentContext;
+  /** Internal snapshot presented as the first resolved example for template consent. */
+  resolvedInvocation?: ExternalCredentialInvocation;
   signal: AbortSignal;
   interaction: SshInteractionPolicy;
   isCurrent(): boolean;

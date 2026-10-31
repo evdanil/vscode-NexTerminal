@@ -2,8 +2,12 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createExternalCredentialProcessRunner } from "../../src/services/credentials/externalCredentialProcess";
+import { createExternalCredentialApproval } from "../../src/services/credentials/externalCredentialApproval";
+import { createExternalCredentialResolver } from "../../src/services/credentials/externalCredentialResolver";
+import { parseExternalCredentialResponse } from "../../src/services/credentials/externalCredentialProtocol";
+import type { ExternalAuthProfile } from "../../src/models/authProfile";
 
 async function fixture(mode: string, check: (result: Buffer | Error, pids: number[], observation: { parentExited: boolean; pipesOpenAtExit: boolean }) => void | Promise<void>, timeoutMs = 1500, cancelWhenReady = false) {
   const directory = mkdtempSync(join(tmpdir(), "nexus-credential-test-"));
@@ -47,6 +51,69 @@ async function fixture(mode: string, check: (result: Buffer | Error, pids: numbe
 }
 
 describe("real external credential process", () => {
+  it.each(["password", "key"] as const)("passes the reviewed expanded %s arguments unchanged to a real child", async (method) => {
+    const directory = mkdtempSync(join(tmpdir(), "nexus-credential-argv-"));
+    const observation = join(directory, "argv.json");
+    const fixturePath = resolve(__dirname, "../fixtures/externalCredentials/context-provider.cjs");
+    const keyPath = resolve(__dirname, "../fixtures/externalCredentials/openssh-ed25519-leading-zero.key");
+    const profile: ExternalAuthProfile = { id: "dynamic", name: "Fleet", authType: "external", external: {
+      version: 1, method, invocation: { executable: process.execPath, argumentExpansion: true,
+        args: [fixturePath, observation, keyPath, "${host}", "prefix ${SessionName} suffix", "${username}", "${port}", "$${host}"] }
+    } };
+    let reviewed: readonly string[] | undefined;
+    const approvals = createExternalCredentialApproval({ isWorkspaceTrusted: () => true,
+      confirm: async (_profile, _signal, example) => { reviewed = example?.args; return true; } });
+    const resolver = createExternalCredentialResolver({ approvals, run: createExternalCredentialProcessRunner(), parse: parseExternalCredentialResponse });
+    const attempt = resolver.begin({ profile, signal: new AbortController().signal, interaction: "interactive", isCurrent: () => true,
+      argumentContext: { host: "a host;$(printf BAD) ${username}", port: 2201, SessionName: "東京 ✓", username: "hint", profile: "Fleet", protocol: "ssh" } });
+    try {
+      const result = await attempt.resolve();
+      const expected = [fixturePath, observation, keyPath, "a host;$(printf BAD) ${username}", "prefix 東京 ✓ suffix", "hint", "2201", "${host}"];
+      expect(reviewed).toEqual(expected);
+      expect(JSON.parse(readFileSync(observation, "utf8"))).toEqual([...expected.slice(3), method === "password" ? "--pass" : "--pkey"]);
+      expect(result.username).toBe("provider-user");
+      expect(result.method).toBe(method);
+    } finally { attempt.dispose(); resolver.dispose(); rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it("preserves template-looking arguments literally when expansion is absent", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "nexus-credential-literal-"));
+    const observation = join(directory, "argv.json");
+    const profile: ExternalAuthProfile = { id: "literal", name: "Literal", authType: "external", external: { version: 1, method: "password", invocation: {
+      executable: process.execPath, args: [resolve(__dirname, "../fixtures/externalCredentials/context-provider.cjs"), observation, "unused", "${host}", "$${username}"]
+    } } };
+    const resolver = createExternalCredentialResolver({ approvals: createExternalCredentialApproval({ isWorkspaceTrusted: () => true, confirm: async () => true }),
+      run: createExternalCredentialProcessRunner(), parse: parseExternalCredentialResponse });
+    const attempt = resolver.begin({ profile, signal: new AbortController().signal, interaction: "interactive", isCurrent: () => true,
+      argumentContext: { host: "different", port: 22, SessionName: "example", username: "user", profile: "Literal", protocol: "ssh" } });
+    try { await attempt.resolve(); expect(JSON.parse(readFileSync(observation, "utf8"))).toEqual(["${host}", "$${username}", "--pass"]); }
+    finally { attempt.dispose(); resolver.dispose(); rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it("keeps a concurrent current owner's own context when the first approval owner becomes stale", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "nexus-credential-owners-"));
+    const observation = join(directory, "argv.json");
+    let allow!: (value: boolean) => void;
+    const answer = new Promise<boolean>(resolve => { allow = resolve; });
+    let questions = 0;
+    const approvals = createExternalCredentialApproval({ isWorkspaceTrusted: () => true, confirm: async () => { questions++; return answer; } });
+    const resolver = createExternalCredentialResolver({ approvals, run: createExternalCredentialProcessRunner(), parse: parseExternalCredentialResponse });
+    const profile: ExternalAuthProfile = { id: "fleet", name: "Fleet", authType: "external", external: { version: 1, method: "password", invocation: {
+      executable: process.execPath, args: [resolve(__dirname, "../fixtures/externalCredentials/context-provider.cjs"), observation, "unused", "${host}"], argumentExpansion: true
+    } } };
+    let current = true;
+    const begin = (host: string, isCurrent: () => boolean) => resolver.begin({ profile, signal: new AbortController().signal, interaction: "interactive", isCurrent,
+      argumentContext: { host, port: 22, SessionName: "example", username: "user", profile: "Fleet", protocol: "ssh" } });
+    const first = begin("first", () => current), second = begin("second", () => true);
+    try {
+      const a = first.resolve().catch((error: unknown) => error); const b = second.resolve();
+      await vi.waitFor(() => expect(questions).toBe(1));
+      current = false; allow(true);
+      expect(await a).toMatchObject({ code: "configuration-changed" });
+      expect((await b).username).toBe("provider-user");
+      expect(JSON.parse(readFileSync(observation, "utf8"))).toEqual(["second", "--pass"]);
+    } finally { first.dispose(); second.dispose(); resolver.dispose(); rmSync(directory, { recursive: true, force: true }); }
+  });
   it.skipIf(process.platform === "win32").each([false, true])("kills an owned TERM-resistant descendant after parent exit (cancel=%s)", async cancel => {
     await fixture("stubborn-descendant", async (result, pids, observation) => {
       expect(result).toMatchObject({ code: cancel ? "cancelled" : "timed-out" });

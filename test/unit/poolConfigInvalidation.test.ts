@@ -95,6 +95,26 @@ describe("pool invalidation is synchronous with the in-memory mutation", () => {
     stop();
   });
 
+  it("a context-enabled jump rename retires the jump and riders before persistence", async () => {
+    const profile: AuthProfile = { id: "ap", name: "Vault", authType: "external", external: { version: 1, method: "password",
+      invocation: { executable: "/provider", args: ["${SessionName}"], argumentExpansion: true } } };
+    const { core, repo, ids, stop } = await setup([
+      server("jump", { authProfileId: "ap" }), server("mid", { proxy: { type: "ssh", jumpHostId: "jump" } }),
+      server("far", { proxy: { type: "ssh", jumpHostId: "mid" } }), server("x")
+    ], [profile]);
+    const pending = core.addOrUpdateServer({ ...core.getServer("jump")!, name: "renamed" });
+    expect(ids()).toEqual(new Set(["jump", "mid", "far"]));
+    await settle(repo, pending); stop();
+  });
+
+  it("a literal external profile keeps server rename cosmetic", async () => {
+    const profile: AuthProfile = { id: "ap", name: "Vault", authType: "external", external: { version: 1, method: "password",
+      invocation: { executable: "/provider", args: ["${SessionName}"] } } };
+    const { core, repo, ids, stop } = await setup([server("a", { authProfileId: "ap" })], [profile]);
+    const pending = core.addOrUpdateServer({ ...core.getServer("a")!, name: "renamed" });
+    expect(ids().size).toBe(0); await settle(repo, pending); stop();
+  });
+
   it("a linked auth profile edit invalidates the linked servers and their riders before persistence resolves", async () => {
     const profile: AuthProfile = { id: "ap", name: "AP", username: "a", authType: "password" };
     const { core, repo, ids, stop } = await setup(

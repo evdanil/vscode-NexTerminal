@@ -1,4 +1,4 @@
-import { isExternalAuthProfile } from "../models/authProfile";
+import { isExternalAuthProfile, normalizeAuthProfile } from "../models/authProfile";
 import { randomUUID } from "node:crypto";
 import {
   cloneServerConfig,
@@ -364,7 +364,7 @@ export class NexusCore {
       this.explicitGroups.add(group);
     }
     for (const profile of authProfiles) {
-      this.authProfiles.set(profile.id, profile);
+      this.authProfiles.set(profile.id, normalizeAuthProfile(profile));
     }
     for (const source of inventorySources) {
       this.inventorySources.set(source.id, source);
@@ -617,7 +617,7 @@ export class NexusCore {
   }
 
   public async addOrUpdateAuthProfile(profile: AuthProfile): Promise<void> {
-    this.authProfiles.set(profile.id, profile);
+    this.authProfiles.set(profile.id, normalizeAuthProfile(profile));
     await this.repository.saveAuthProfiles([...this.authProfiles.values()]);
     this.emitChanged();
   }

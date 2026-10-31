@@ -45,6 +45,26 @@ describe("session approval", () => {
     expect(confirm).toHaveBeenCalledTimes(5);
     await expect(setup().approval.authorize({ ...request(), interaction: "noninteractive" })).rejects.toMatchObject({ code: "approval-required" });
   });
+  it("requires a new grant when template mode or its profile name changes", async () => {
+    const { approval, confirm } = setup();
+    await approval.authorize(request());
+    const dynamic = profile(); dynamic.external.invocation = { executable: "/provider", args: ["${profile}"], argumentExpansion: true };
+    const resolvedInvocation = { executable: "/provider", args: ["Vault"] };
+    await approval.authorize({ ...request(dynamic), resolvedInvocation });
+    const renamed = { ...dynamic, name: "Renamed" };
+    await expect(approval.authorize({ ...request(renamed), resolvedInvocation, interaction: "noninteractive" })).rejects.toMatchObject({ code: "approval-required" });
+    expect(confirm).toHaveBeenCalledTimes(2);
+  });
+  it("refuses a dynamic review whose example changes the executable or argument count", async () => {
+    const { approval, confirm } = setup(); const dynamic = profile();
+    dynamic.external.invocation = { executable: "/provider", args: ["${host}"], argumentExpansion: true };
+    for (const resolvedInvocation of [
+      { executable: "/other", args: ["host"] }, { executable: "/provider", args: ["host", "extra"] }
+    ]) {
+      await expect(approval.authorize({ ...request(dynamic), resolvedInvocation })).rejects.toMatchObject({ code: "invalid-template" });
+    }
+    expect(confirm).not.toHaveBeenCalled();
+  });
   it("shares only the question and cancelling one owner preserves the other", async () => {
     const answer = deferred<boolean>(); const confirm = vi.fn((_profile: ExternalAuthProfile, _signal: AbortSignal) => answer.promise); const { approval } = setup(confirm);
     const first = new AbortController(); const a = approval.authorize(request(profile(), first)).catch((e: unknown) => e);

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ExternalAuthProfile } from "../../models/authProfile";
+import type { ExternalAuthProfile, ExternalCredentialInvocation } from "../../models/authProfile";
 import { EXTERNAL_CREDENTIAL_MAX_QUEUED } from "./contracts";
 import { CredentialProviderError } from "./credentialProviderError";
 
@@ -37,7 +37,7 @@ interface Pending {
 }
 
 export function createExternalCredentialDisclosure(host: ExternalCredentialDisclosureHost): {
-  confirm(profile: ExternalAuthProfile, signal: AbortSignal): Promise<boolean>;
+  confirm(profile: ExternalAuthProfile, signal: AbortSignal, example?: ExternalCredentialInvocation): Promise<boolean>;
   dispose(): void;
 } {
   const pending = new Map<string, Pending>();
@@ -68,8 +68,10 @@ export function createExternalCredentialDisclosure(host: ExternalCredentialDiscl
     host.registerCommand(CANCEL_EXTERNAL_APPROVAL, () => { active()?.[1].finish(false); })
   ];
   return {
-    async confirm(profile, signal) {
+    async confirm(profile, signal, example) {
       if (disposed || signal.aborted || !profile.external.invocation) return false;
+      const dynamic = profile.external.invocation.argumentExpansion === true;
+      if (dynamic && !example) return false;
       // Admission for review is separate from process admission: no unbounded history or eviction.
       if (pending.size >= EXTERNAL_CREDENTIAL_MAX_QUEUED) throw new CredentialProviderError("queue-full");
       const reference = randomUUID();
@@ -81,6 +83,7 @@ export function createExternalCredentialDisclosure(host: ExternalCredentialDiscl
       const consequences = [
         "This program runs with the extension-host user's privileges. It inherits the environment and can access files and the network on that machine.",
         "Approval covers this mutable program path and its dependencies; their contents are not cryptographically pinned.",
+        ...(dynamic ? ["Approval covers this argument template for the session. Values can differ for future connections, including other servers."] : []),
         "Do not put secrets in arguments: they are saved in configuration. Approval lasts only for this extension-host session."
       ].join("\n");
       const text = [
@@ -89,14 +92,17 @@ export function createExternalCredentialDisclosure(host: ExternalCredentialDiscl
         "To stop, run Nexus: Cancel External Credential Approval. Closing this tab does not grant permission.",
         "", `Profile: ${name}`, `Review reference: ${reference}`, `Execution machine: ${hostLabel}`,
         `Executable: ${quoteExternalInvocation(executable)}`, `Argument count: ${argv.length} (including the Nexus authentication flag)`,
-        ...argv.map((arg, index) => `argv[${index}]: ${quoteExternalInvocation(arg)}`), "", consequences
+        ...argv.map((arg, index) => `argv[${index}]: ${quoteExternalInvocation(arg)}`),
+        ...(dynamic && example ? ["", "Example resolved invocation for this connection:",
+          ...[...example.args, profile.external.method === "password" ? "--pass" : "--pkey"].map((arg, index) => `example argv[${index}]: ${quoteExternalInvocation(arg)}`)] : []),
+        "", consequences
       ].join("\n");
       return new Promise<boolean>((resolve) => {
         const abort = (): void => review.finish(false);
         const review: Pending = {
           text,
           message: `Allow external credential program for ${name}?`,
-          detail: `Review reference: ${reference}\nExecution machine: ${hostLabel}\nArgument count: ${argv.length}\nThe exact invocation is in the read-only document just reviewed.\n\n${consequences}`,
+          detail: `Review reference: ${reference}\nExecution machine: ${hostLabel}\nArgument count: ${argv.length}\n${dynamic ? "The template and one resolved example are in the read-only document just reviewed." : "The exact invocation is in the read-only document just reviewed."}\n\n${consequences}`,
           finish(allowed) {
             if (pending.get(uri) !== review) return;
             pending.delete(uri);

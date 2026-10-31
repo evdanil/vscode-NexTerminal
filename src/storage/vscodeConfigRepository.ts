@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { normalizeAuthProfile } from "../models/authProfile";
 import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile } from "../models/config";
 import { ensureInventorySourceRevision, type InventorySourceConfig } from "../models/inventory";
 import { ensureDeviceTemplateRevision, type DeviceTemplateProfile } from "../models/deviceTemplate";
@@ -452,11 +453,11 @@ export class VscodeConfigRepository implements ConfigRepository {
       }
       console.warn("[Nexus] Skipping invalid auth profile entry:", JSON.stringify(item));
       return false;
-    });
+    }).map(normalizeAuthProfile);
   }
 
   public async saveAuthProfiles(profiles: AuthProfile[]): Promise<void> {
-    await this.guardedUpdate(AUTH_PROFILES_KEY, "auth profiles", profiles);
+    await this.guardedUpdate(AUTH_PROFILES_KEY, "auth profiles", profiles.map(normalizeAuthProfile));
   }
 
   public async getInventorySources(): Promise<InventorySourceConfig[]> {

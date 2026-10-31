@@ -6770,7 +6770,7 @@ describe("inventoryCommands", () => {
      * linked through the form no matter what the persist helper would have
      * done with it.
      */
-    it("creates an external-linked source with a host-owned dormant root in an empty fleet", async () => {
+    it("creates an external-linked source with the chosen lookup username", async () => {
       const external: AuthProfile = { id: "external", name: "Program", authType: "external", external: { version: 1, method: "key", invocation: { executable: "/provider", args: [] } } };
       const { core } = await makeHarness({ profiles: [external] });
       await registeredCommands.get("nexus.inventory.addSource")!();
@@ -6778,8 +6778,20 @@ describe("inventoryCommands", () => {
       form.type("name", "External source"); form.type("targetFolder", "Infra"); form.type("cfg_host", "source.test"); form.type("cfg_apiToken", "fixture-token");
       form.choose("authProfileId", "external"); const values = await onAutofill!("authProfileId", "external");
       form.deliver({ type: "fillFields", key: "authProfileId", value: "external", values: values!, requestId: form.lastAutofillRequestId() });
-      const submitted = form.submit(); expect(submitted).not.toHaveProperty("defaultUsername"); await onSubmit(submitted);
-      const source = core.getSnapshot().inventorySources[0]; expect(source.authProfileId).toBe("external"); expect(source.defaultUsername).toBe("root");
+      form.type("defaultUsername", "lookup-user");
+      const submitted = form.submit(); expect(submitted.defaultUsername).toBe("lookup-user"); await onSubmit(submitted);
+      const source = core.getSnapshot().inventorySources[0]; expect(source.authProfileId).toBe("external"); expect(source.defaultUsername).toBe("lookup-user");
+    });
+
+    it("persists a changed lookup username while editing an external source", async () => {
+      const external: AuthProfile = { id: "external", name: "Program", authType: "external", external: { version: 1, method: "password", invocation: { executable: "/provider", args: [] } } };
+      const { core } = await makeHarness({ profiles: [external], source: { authProfileId: "external", defaultUsername: "old-user" } });
+      await registeredCommands.get("nexus.inventory.editSource")!();
+      const { definition, onSubmit } = latestFormCall();
+      const form = openForm(definition);
+      form.type("defaultUsername", "new-user");
+      await onSubmit(form.submit());
+      expect(core.getInventorySource("src-1")?.defaultUsername).toBe("new-user");
     });
 
     it("preserves dormant inventory username and rejects changed external invocation identity", async () => {

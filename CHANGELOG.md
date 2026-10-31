@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.8.307] — 2026-10-31
+
+### Added
+
+- **External credential programs can select a vault entry for each connection.** Opt in to connection variables in an auth profile's arguments and use the server's username as a lookup hint. Session approval covers the template and future values; older Nexus versions cannot safely read enabled profiles, so update installations and back up before enabling or downgrading.
+
+### Changed
+
+- **Additional details about behavior already shipped in 2.8.306:** SSH profile links that no longer resolve require repair or explicit unlinking; they do not fall back to dormant server credentials. Imports and sharing refuse unresolved links, and malformed external-profile imports fail before changing configuration. External Program profiles retrieve a username and password or unencrypted private key for each new authentication, including jump hosts; responses are not saved in SecretStorage. Inventory sources and device templates can assign them without running the program. Account labels omit dormant usernames, and Containerlab discovery and approval track external provider changes. Revoking session approval leaves established sessions open. Sharing retains external links but removes invocation details; recipients must configure them, and external-profile exports require Nexus 2.8.306 or later, or 2.8.307 or later when argument expansion is enabled. External authentication does not support Deploy SSH Key, IPMI credentials, dynamic username macro/URL tokens or arbitrary keyboard-interactive MFA.
+
+
 ## [2.8.306] — 2026-10-30
 
 ### Added

@@ -1,3 +1,4 @@
+import { validateExternalArgumentTemplates } from "../models/externalCredentialArgumentSyntax";
 import { parseExternalArgumentsText } from "./externalCredentialForm";
 import type { AuthProfile } from "../models/config";
 import { escapeHtml } from "./shared/escapeHtml";
@@ -57,6 +58,14 @@ export function renderAuthProfileEditorHtml(
       font-size: 11px;
       color: var(--vscode-descriptionForeground, var(--vscode-foreground));
       margin-top: 4px;
+    }
+    .compatibility-warning {
+      margin-top: 8px;
+      padding: 8px 10px;
+      border-left: 3px solid var(--vscode-inputValidation-warningBorder, var(--vscode-editorWarning-foreground, #cca700));
+      background: var(--vscode-inputValidation-warningBackground, rgba(200, 150, 0, 0.15));
+      color: var(--vscode-foreground);
+      font-size: 12px;
     }
     .bottom-actions {
       display: flex;
@@ -167,9 +176,14 @@ export function renderAuthProfileEditorHtml(
     <div class="form-group">
       <label for="external-arguments">Arguments</label>
       <textarea id="external-arguments" rows="4" aria-describedby="external-arguments-hint error-external-arguments">${escapeHtml(external?.invocation?.args.join("\n") ?? "")}</textarea>
-      <div class="hint" id="external-arguments-hint">One argument per line. Spaces inside an argument are preserved. Do not add shell quotes or put passwords/tokens here; arguments are saved in configuration. Nexus adds --pass or --pkey for the selected method. Tilde, environment and template expansion are unavailable.</div>
+      <div class="hint" id="external-arguments-hint">One argument per line. Spaces inside an argument are preserved. Do not add shell quotes or put passwords/tokens here; arguments are saved in configuration. Nexus adds --pass or --pkey for the selected method. Tilde and environment expansion are unavailable.</div>
       <div class="field-error" id="error-external-arguments" aria-live="polite"></div>
     </div>
+    <div class="form-group form-group-checkbox">
+      <label for="external-argument-expansion"><input type="checkbox" id="external-argument-expansion" aria-describedby="external-argument-expansion-hint external-argument-expansion-compatibility"${external?.invocation?.argumentExpansion === true ? " checked" : ""} /> Expand connection variables in arguments</label>
+      <div class="hint" id="external-argument-expansion-hint">Optional. Use \${host}, \${port}, \${SessionName}, \${username}, \${profile}, or \${protocol}; write $\${host} for a literal \${host}. The server username is a lookup hint; the program supplies the SSH login. Session approval covers this template and values may differ for future connections.</div>
+    </div>
+    <div class="compatibility-warning" id="external-argument-expansion-compatibility" role="note">Compatibility warning: Older NexTerminal versions cannot read profiles with argument expansion enabled; editing auth profiles in an older version can remove them from saved configuration. Back up your configuration and update all installations accessing this state first. Backups exported by older versions may omit these profiles.</div>
     <p class="hint">Saving does not run the program or grant approval. Interactive Connect asks you to review the complete invocation before approving it for this extension-host session.</p>
   </div>
 
@@ -210,6 +224,7 @@ export function renderAuthProfileEditorHtml(
     (function() {
       var vscode = acquireVsCodeApi();
       var parseExternalArgumentsText = ${parseExternalArgumentsText.toString()};
+      var validateExternalArgumentTemplates = ${validateExternalArgumentTemplates.toString()};
       var dirty = false;
       var currentId = ${selectedId !== null ? JSON.stringify(selectedId) : "null"};
       var saveFlag = document.getElementById("save-flag");
@@ -281,6 +296,7 @@ export function renderAuthProfileEditorHtml(
       document.getElementById("authtype-selector").addEventListener("click", updateExternalControls);
       document.getElementById("authtype-selector").addEventListener("keydown", function() { setTimeout(updateExternalControls, 0); });
       ["external-executable", "external-arguments"].forEach(function(id) { document.getElementById(id).addEventListener("input", markDirty); });
+      document.getElementById("external-argument-expansion").addEventListener("change", markDirty);
 
       // Track changes
       document.getElementById("profile-name").addEventListener("input", markDirty);
@@ -347,10 +363,15 @@ export function renderAuthProfileEditorHtml(
           var executable = document.getElementById("external-executable").value;
           var args = [];
           error("external-executable", executable && (executable[0] === "/" || /^[A-Za-z]:[\\\\/]/.test(executable) || /^\\\\\\\\/.test(executable)) && !/[\\u0000-\\u001f\\u007f-\\u009f\\u061c\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069]/.test(executable) ? "" : "Choose an absolute executable path without control characters.");
-          try { args = parseExternalArgumentsText(document.getElementById("external-arguments").value); error("external-arguments", ""); }
-          catch (e) { error("external-arguments", e.message); }
+          try {
+            args = parseExternalArgumentsText(document.getElementById("external-arguments").value);
+            var expansion = document.getElementById("external-argument-expansion").checked;
+            error("external-arguments", expansion && !validateExternalArgumentTemplates(args) ? "Use supported placeholders and close every placeholder. Escape literal placeholders with $\${...}." : "");
+          } catch (e) { error("external-arguments", e.message); }
           if (!valid) { if (firstInvalid) firstInvalid.focus(); return; }
-          vscode.postMessage({ type: "save", id: currentId, name: name, authType: "external", external: { version: 1, method: document.getElementById("external-method").value, invocation: { executable: executable, args: args } } });
+          var invocation = { executable: executable, args: args };
+          if (document.getElementById("external-argument-expansion").checked) invocation.argumentExpansion = true;
+          vscode.postMessage({ type: "save", id: currentId, name: name, authType: "external", external: { version: 1, method: document.getElementById("external-method").value, invocation: invocation } });
           return;
         }
         if (!valid) { if (firstInvalid) firstInvalid.focus(); return; }

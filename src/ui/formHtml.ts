@@ -30,11 +30,11 @@ export function sortFilterableOptions(options: SelectOption[]): SelectOption[] {
   return [...topPinned, ...rest, ...bottomPinned];
 }
 
-function renderHint(field: FormFieldDescriptor): string {
+function renderHint(field: FormFieldDescriptor, id?: string): string {
   if (!("hint" in field) || !field.hint) {
     return "";
   }
-  return `\n  <div class="field-hint">${escapeHtml(field.hint)}</div>`;
+  return `\n  <div class="field-hint"${id ? ` id="${id}"` : ""}>${escapeHtml(field.hint)}</div>`;
 }
 
 function visibleWhenDataAttr(visibleWhen?: VisibleWhen): string {
@@ -82,6 +82,10 @@ function renderField(field: FormFieldDescriptor): string {
       // Opt-in only: a field that declares no `autofill` emits the empty string
       // here, so its markup is byte-for-byte what it has always been.
       const textAutofillAttr = field.autofill ? ' data-autofill="true"' : "";
+      const lookupHint = field.key === "username" || field.key === "defaultUsername";
+      const ordinaryHintId = lookupHint && field.hint ? `field-hint-${key}` : undefined;
+      const lookupAttrs = lookupHint ? ` aria-describedby="${ordinaryHintId ? ordinaryHintId + " " : ""}external-lookup-hint-${key}"` : "";
+      const lookupMarkup = lookupHint ? `<div class="field-hint" id="external-lookup-hint-${key}"></div>` : "";
       if (field.scannable) {
         return `<div class="form-group"${vw}${rw}>
   <label for="${id}">${escapeHtml(field.label)}${requiredLabel}</label>
@@ -94,7 +98,7 @@ function renderField(field: FormFieldDescriptor): string {
       }
       return `<div class="form-group"${vw}${rw}>
   <label for="${id}">${escapeHtml(field.label)}${requiredLabel}</label>
-  <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req}${textAutofillAttr} />${renderHint(field)}
+  <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req}${textAutofillAttr}${lookupAttrs} />${renderHint(field, ordinaryHintId)}${lookupMarkup}
   <div class="field-error" id="error-${key}"></div>
 </div>`;
     }
@@ -363,6 +367,11 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
       // nothing yet), then rebuilt when that choice's fillFields answer lands.
       var profileSeed = document.getElementById("field-authProfileId");
       var externalProfileName = profileSeed && profileSeed.dataset ? profileSeed.dataset.externalProfile : undefined;
+      var lookupEdited = {};
+      ["username", "defaultUsername"].forEach(function(key) {
+        var input = form.elements[key];
+        if (input) input.addEventListener("input", function() { lookupEdited[key] = true; });
+      });
       var profileFilledKeys = seededProfileFilledKeys();
 
       // ── WHAT THE PREVIOUS PROFILE DISPLACED ────────────────────────────
@@ -468,7 +477,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
        * ever answers.
        */
       function filledKeysFromValues(values) {
-        if (typeof values.__externalAuthProfile === "string") return { username: true, authType: true, keyPath: true, defaultUsername: true };
+        if (typeof values.__externalAuthProfile === "string") return { authType: true, keyPath: true };
         var filled = {};
         for (var key in values) {
           var value = values[key];
@@ -644,6 +653,13 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
         }
         if (isProfileFill) {
           profileFilledKeys = nextFilledKeys;
+          // New external-linked records previously used root as their hidden
+          // fallback. Show that default so the lookup value is reviewable.
+          if (externalProfileName !== undefined) {
+            ["username", "defaultUsername"].forEach(function(key) {
+              if (!lookupEdited[key] && fieldValue(key) === "") setFieldValue(key, "root");
+            });
+          }
         }
         updateVisibility();
         updateProfileManagedFields();
@@ -1326,7 +1342,11 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
         var isLinked = profileInput.value && profileInput.value !== "";
         var dynamic = !!isLinked && externalProfileName !== undefined;
         var sourceNote = document.getElementById("auth-profile-source-note");
-        if (sourceNote) sourceNote.textContent = dynamic ? "Provided by " + externalProfileName + " at sign-in. Edit it in Settings → Auth Profiles." : "";
+        if (sourceNote) sourceNote.textContent = dynamic ? "Credentials and the SSH login username are provided by " + externalProfileName + " at sign-in. Manage it in Settings → Auth Profiles." : "";
+        ["username", "defaultUsername"].forEach(function(key) {
+          var hint = document.getElementById("external-lookup-hint-" + key);
+          if (hint) hint.textContent = dynamic ? "Sent to the external program only when argument expansion is enabled and its arguments contain \${username}. The program returns the username used to sign in." : "";
+        });
         var repair = document.getElementById("auth-profile-repair");
         if (repair) { repair.style.display = isLinked ? "" : "none"; repair.disabled = !isLinked; }
         document.querySelectorAll(".form-note").forEach(function(note) {
@@ -1363,9 +1383,10 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
           // each entry point: initial render, selection (pre-fill), the
           // fillFields answer, and an injected inline-created option.
           var locked = !!isLinked && profileFilledKeys[managedKeys[mi]] === true;
-          group.style.display = dynamic ? "none" : "";
+          var hideDynamicField = dynamic && managedKeys[mi] !== "username" && managedKeys[mi] !== "defaultUsername";
+          group.style.display = hideDynamicField ? "none" : "";
           group.querySelectorAll("input, textarea, select").forEach(function(control) {
-            if (dynamic) { control.dataset.externalDisabled = "true"; control.disabled = true; }
+            if (hideDynamicField) { control.dataset.externalDisabled = "true"; control.disabled = true; }
             else if (control.dataset.externalDisabled === "true") {
               control.disabled = !!group.dataset.visibleWhen && !group.classList.contains("field-visible");
               delete control.dataset.externalDisabled;

@@ -460,6 +460,14 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
       color: var(--vscode-descriptionForeground, var(--vscode-foreground));
       margin-top: 4px;
     }
+    .compatibility-warning {
+      margin-top: 8px;
+      padding: 8px 10px;
+      border-left: 3px solid var(--vscode-inputValidation-warningBorder, var(--vscode-editorWarning-foreground, #cca700));
+      background: var(--vscode-inputValidation-warningBackground, rgba(200, 150, 0, 0.15));
+      color: var(--vscode-foreground);
+      font-size: 12px;
+    }
     .bottom-actions {
       display: flex;
       gap: 8px;
@@ -575,9 +583,14 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
     <div class="form-group">
       <label for="external-arguments">Arguments</label>
       <textarea id="external-arguments" rows="4" aria-describedby="external-arguments-hint error-external-arguments"></textarea>
-      <div class="hint" id="external-arguments-hint">One argument per line. Spaces inside an argument are preserved. Do not add shell quotes or put passwords/tokens here; arguments are saved in configuration. Nexus adds --pass or --pkey for the selected method. Tilde, environment and template expansion are unavailable.</div>
+      <div class="hint" id="external-arguments-hint">One argument per line. Spaces inside an argument are preserved. Do not add shell quotes or put passwords/tokens here; arguments are saved in configuration. Nexus adds --pass or --pkey for the selected method. Tilde and environment expansion are unavailable.</div>
       <div class="field-error" id="error-external-arguments" aria-live="polite"></div>
     </div>
+    <div class="form-group form-group-checkbox">
+      <label for="external-argument-expansion"><input type="checkbox" id="external-argument-expansion" aria-describedby="external-argument-expansion-hint external-argument-expansion-compatibility" /> Expand connection variables in arguments</label>
+      <div class="hint" id="external-argument-expansion-hint">Optional. Use \${host}, \${port}, \${SessionName}, \${username}, \${profile}, or \${protocol}; write $\${host} for a literal \${host}. The server username is a lookup hint; the program supplies the SSH login. Session approval covers this template and values may differ for future connections.</div>
+    </div>
+    <div class="compatibility-warning" id="external-argument-expansion-compatibility" role="note">Compatibility warning: Older NexTerminal versions cannot read profiles with argument expansion enabled; editing auth profiles in an older version can remove them from saved configuration. Back up your configuration and update all installations accessing this state first. Backups exported by older versions may omit these profiles.</div>
     <p class="hint">Saving does not run the program or grant approval. Interactive Connect asks you to review the complete invocation before approving it for this extension-host session.</p>
   </div>
 
@@ -951,6 +964,31 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
 	};
 	return args;
 };
+      var validateExternalArgumentTemplates = function validateExternalArgumentTemplates(args) {
+	if (!Array.isArray(args)) return false;
+	for (const arg of args) {
+		if (typeof arg !== "string") return false;
+		for (let i = 0; i < arg.length;) {
+			const escaped = arg.startsWith("$\${", i);
+			if (escaped || arg.startsWith("\${", i)) {
+				const start = i + (escaped ? 3 : 2);
+				const end = arg.indexOf("}", start);
+				if (end < 0) return false;
+				const name = arg.slice(start, end);
+				if (!escaped && ![
+					"host",
+					"port",
+					"SessionName",
+					"username",
+					"profile",
+					"protocol"
+				].includes(name)) return false;
+				i = end + 1;
+			} else i++;
+		}
+	};
+	return true;
+};
       var dirty = false;
       var currentId = "p1";
       var saveFlag = document.getElementById("save-flag");
@@ -1022,6 +1060,7 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
       document.getElementById("authtype-selector").addEventListener("click", updateExternalControls);
       document.getElementById("authtype-selector").addEventListener("keydown", function() { setTimeout(updateExternalControls, 0); });
       ["external-executable", "external-arguments"].forEach(function(id) { document.getElementById(id).addEventListener("input", markDirty); });
+      document.getElementById("external-argument-expansion").addEventListener("change", markDirty);
 
       // Track changes
       document.getElementById("profile-name").addEventListener("input", markDirty);
@@ -1088,10 +1127,15 @@ exports[`webview document shell (byte-identity guard) > auth profile editor 1`] 
           var executable = document.getElementById("external-executable").value;
           var args = [];
           error("external-executable", executable && (executable[0] === "/" || /^[A-Za-z]:[\\\\/]/.test(executable) || /^\\\\\\\\/.test(executable)) && !/[\\u0000-\\u001f\\u007f-\\u009f\\u061c\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069]/.test(executable) ? "" : "Choose an absolute executable path without control characters.");
-          try { args = parseExternalArgumentsText(document.getElementById("external-arguments").value); error("external-arguments", ""); }
-          catch (e) { error("external-arguments", e.message); }
+          try {
+            args = parseExternalArgumentsText(document.getElementById("external-arguments").value);
+            var expansion = document.getElementById("external-argument-expansion").checked;
+            error("external-arguments", expansion && !validateExternalArgumentTemplates(args) ? "Use supported placeholders and close every placeholder. Escape literal placeholders with $\${...}." : "");
+          } catch (e) { error("external-arguments", e.message); }
           if (!valid) { if (firstInvalid) firstInvalid.focus(); return; }
-          vscode.postMessage({ type: "save", id: currentId, name: name, authType: "external", external: { version: 1, method: document.getElementById("external-method").value, invocation: { executable: executable, args: args } } });
+          var invocation = { executable: executable, args: args };
+          if (document.getElementById("external-argument-expansion").checked) invocation.argumentExpansion = true;
+          vscode.postMessage({ type: "save", id: currentId, name: name, authType: "external", external: { version: 1, method: document.getElementById("external-method").value, invocation: invocation } });
           return;
         }
         if (!valid) { if (firstInvalid) firstInvalid.focus(); return; }
@@ -2030,6 +2074,11 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
       // nothing yet), then rebuilt when that choice's fillFields answer lands.
       var profileSeed = document.getElementById("field-authProfileId");
       var externalProfileName = profileSeed && profileSeed.dataset ? profileSeed.dataset.externalProfile : undefined;
+      var lookupEdited = {};
+      ["username", "defaultUsername"].forEach(function(key) {
+        var input = form.elements[key];
+        if (input) input.addEventListener("input", function() { lookupEdited[key] = true; });
+      });
       var profileFilledKeys = seededProfileFilledKeys();
 
       // ── WHAT THE PREVIOUS PROFILE DISPLACED ────────────────────────────
@@ -2135,7 +2184,7 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
        * ever answers.
        */
       function filledKeysFromValues(values) {
-        if (typeof values.__externalAuthProfile === "string") return { username: true, authType: true, keyPath: true, defaultUsername: true };
+        if (typeof values.__externalAuthProfile === "string") return { authType: true, keyPath: true };
         var filled = {};
         for (var key in values) {
           var value = values[key];
@@ -2311,6 +2360,13 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
         }
         if (isProfileFill) {
           profileFilledKeys = nextFilledKeys;
+          // New external-linked records previously used root as their hidden
+          // fallback. Show that default so the lookup value is reviewable.
+          if (externalProfileName !== undefined) {
+            ["username", "defaultUsername"].forEach(function(key) {
+              if (!lookupEdited[key] && fieldValue(key) === "") setFieldValue(key, "root");
+            });
+          }
         }
         updateVisibility();
         updateProfileManagedFields();
@@ -2993,7 +3049,11 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
         var isLinked = profileInput.value && profileInput.value !== "";
         var dynamic = !!isLinked && externalProfileName !== undefined;
         var sourceNote = document.getElementById("auth-profile-source-note");
-        if (sourceNote) sourceNote.textContent = dynamic ? "Provided by " + externalProfileName + " at sign-in. Edit it in Settings → Auth Profiles." : "";
+        if (sourceNote) sourceNote.textContent = dynamic ? "Credentials and the SSH login username are provided by " + externalProfileName + " at sign-in. Manage it in Settings → Auth Profiles." : "";
+        ["username", "defaultUsername"].forEach(function(key) {
+          var hint = document.getElementById("external-lookup-hint-" + key);
+          if (hint) hint.textContent = dynamic ? "Sent to the external program only when argument expansion is enabled and its arguments contain \${username}. The program returns the username used to sign in." : "";
+        });
         var repair = document.getElementById("auth-profile-repair");
         if (repair) { repair.style.display = isLinked ? "" : "none"; repair.disabled = !isLinked; }
         document.querySelectorAll(".form-note").forEach(function(note) {
@@ -3030,9 +3090,10 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
           // each entry point: initial render, selection (pre-fill), the
           // fillFields answer, and an injected inline-created option.
           var locked = !!isLinked && profileFilledKeys[managedKeys[mi]] === true;
-          group.style.display = dynamic ? "none" : "";
+          var hideDynamicField = dynamic && managedKeys[mi] !== "username" && managedKeys[mi] !== "defaultUsername";
+          group.style.display = hideDynamicField ? "none" : "";
           group.querySelectorAll("input, textarea, select").forEach(function(control) {
-            if (dynamic) { control.dataset.externalDisabled = "true"; control.disabled = true; }
+            if (hideDynamicField) { control.dataset.externalDisabled = "true"; control.disabled = true; }
             else if (control.dataset.externalDisabled === "true") {
               control.disabled = !!group.dataset.visibleWhen && !group.classList.contains("field-visible");
               delete control.dataset.externalDisabled;
@@ -4142,6 +4203,11 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
       // nothing yet), then rebuilt when that choice's fillFields answer lands.
       var profileSeed = document.getElementById("field-authProfileId");
       var externalProfileName = profileSeed && profileSeed.dataset ? profileSeed.dataset.externalProfile : undefined;
+      var lookupEdited = {};
+      ["username", "defaultUsername"].forEach(function(key) {
+        var input = form.elements[key];
+        if (input) input.addEventListener("input", function() { lookupEdited[key] = true; });
+      });
       var profileFilledKeys = seededProfileFilledKeys();
 
       // ── WHAT THE PREVIOUS PROFILE DISPLACED ────────────────────────────
@@ -4247,7 +4313,7 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
        * ever answers.
        */
       function filledKeysFromValues(values) {
-        if (typeof values.__externalAuthProfile === "string") return { username: true, authType: true, keyPath: true, defaultUsername: true };
+        if (typeof values.__externalAuthProfile === "string") return { authType: true, keyPath: true };
         var filled = {};
         for (var key in values) {
           var value = values[key];
@@ -4423,6 +4489,13 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
         }
         if (isProfileFill) {
           profileFilledKeys = nextFilledKeys;
+          // New external-linked records previously used root as their hidden
+          // fallback. Show that default so the lookup value is reviewable.
+          if (externalProfileName !== undefined) {
+            ["username", "defaultUsername"].forEach(function(key) {
+              if (!lookupEdited[key] && fieldValue(key) === "") setFieldValue(key, "root");
+            });
+          }
         }
         updateVisibility();
         updateProfileManagedFields();
@@ -5105,7 +5178,11 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
         var isLinked = profileInput.value && profileInput.value !== "";
         var dynamic = !!isLinked && externalProfileName !== undefined;
         var sourceNote = document.getElementById("auth-profile-source-note");
-        if (sourceNote) sourceNote.textContent = dynamic ? "Provided by " + externalProfileName + " at sign-in. Edit it in Settings → Auth Profiles." : "";
+        if (sourceNote) sourceNote.textContent = dynamic ? "Credentials and the SSH login username are provided by " + externalProfileName + " at sign-in. Manage it in Settings → Auth Profiles." : "";
+        ["username", "defaultUsername"].forEach(function(key) {
+          var hint = document.getElementById("external-lookup-hint-" + key);
+          if (hint) hint.textContent = dynamic ? "Sent to the external program only when argument expansion is enabled and its arguments contain \${username}. The program returns the username used to sign in." : "";
+        });
         var repair = document.getElementById("auth-profile-repair");
         if (repair) { repair.style.display = isLinked ? "" : "none"; repair.disabled = !isLinked; }
         document.querySelectorAll(".form-note").forEach(function(note) {
@@ -5142,9 +5219,10 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
           // each entry point: initial render, selection (pre-fill), the
           // fillFields answer, and an injected inline-created option.
           var locked = !!isLinked && profileFilledKeys[managedKeys[mi]] === true;
-          group.style.display = dynamic ? "none" : "";
+          var hideDynamicField = dynamic && managedKeys[mi] !== "username" && managedKeys[mi] !== "defaultUsername";
+          group.style.display = hideDynamicField ? "none" : "";
           group.querySelectorAll("input, textarea, select").forEach(function(control) {
-            if (dynamic) { control.dataset.externalDisabled = "true"; control.disabled = true; }
+            if (hideDynamicField) { control.dataset.externalDisabled = "true"; control.disabled = true; }
             else if (control.dataset.externalDisabled === "true") {
               control.disabled = !!group.dataset.visibleWhen && !group.classList.contains("field-visible");
               delete control.dataset.externalDisabled;

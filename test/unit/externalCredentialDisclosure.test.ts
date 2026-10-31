@@ -24,6 +24,17 @@ const continueId = "nexus.authProfile.continueExternalApproval";
 const cancelId = "nexus.authProfile.cancelExternalApproval";
 
 describe("immutable external invocation disclosure", () => {
+  it("shows the template and one escaped example while warning future values differ", async () => {
+    const h = harness(); const p = profile();
+    p.external.invocation = { executable: "/provider", args: ["--host", "${host}"], argumentExpansion: true };
+    const answer = h.controller.confirm(p, new AbortController().signal, { executable: "/provider", args: ["--host", "example\u202ehost"] });
+    const text = h.read(h.active());
+    expect(text).toContain('${host}'); expect(text).toContain('example\\u202ehost'); expect(text).not.toContain("example\u202ehost");
+    expect(text).toMatch(/future connection/i); expect(text).toMatch(/example/i);
+    vi.mocked(h.host.confirm).mockResolvedValue("Allow for This Session");
+    await h.commands.get(continueId)!(); expect(await answer).toBe(true);
+    expect(String(vi.mocked(h.host.confirm).mock.calls[0][1])).toMatch(/future connection/i);
+  });
   it("opens complete reversible text without consent; only native Allow grants", async () => {
     const h = harness(); const p = profile(); const signal = new AbortController();
     p.external.invocation!.args = [...p.external.invocation!.args, ...Array.from({ length: 30 }, (_, i) => "x".repeat(4088) + `END${i}`)];

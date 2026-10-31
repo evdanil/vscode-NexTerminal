@@ -153,7 +153,7 @@ describe("external credential protocol", () => {
 
 const codes: CredentialProviderErrorCode[] = [
   "unconfigured", "untrusted-workspace", "approval-required", "cancelled", "configuration-changed", "queue-full",
-  "queue-timeout", "spawn-failed", "timed-out", "cleanup-failed", "output-too-large", "exited", "invalid-response", "unsupported-consumer"
+  "queue-timeout", "spawn-failed", "invalid-template", "timed-out", "cleanup-failed", "output-too-large", "exited", "invalid-response", "unsupported-consumer"
 ];
 describe("credential provider errors", () => {
   it.each(codes)("derives a controlled message for %s", (code) => {

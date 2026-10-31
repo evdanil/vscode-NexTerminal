@@ -6,6 +6,8 @@ import {
 import { CredentialProviderError, type CredentialProviderErrorCode } from "./credentialProviderError";
 import type { ExternalCredentialApproval } from "./externalCredentialApproval";
 import type { parseExternalCredentialResponse } from "./externalCredentialProtocol";
+import { expandExternalCredentialArguments } from "./externalCredentialArguments";
+import { validateExternalCredentialInvocation, type ExternalAuthProfile, type ExternalCredentialInvocation } from "../../models/authProfile";
 
 interface PendingAttempt {
   profileId: string;
@@ -61,8 +63,23 @@ export function createExternalCredentialResolver(deps: {
     begin(request): ExternalCredentialAttempt {
       const unavailable = admissionFailure();
       if (unavailable) throw new CredentialProviderError(unavailable);
+      const source = request.profile;
+      const sourceInvocation = source.external.invocation;
+      // Own both snapshots: caller mutations during consent must never change what runs.
+      const profile: ExternalAuthProfile = {
+        ...source, external: { ...source.external, ...(sourceInvocation && {
+          invocation: { ...sourceInvocation, args: Array.isArray(sourceInvocation.args) ? [...sourceInvocation.args] : sourceInvocation.args }
+        }) }
+      };
+      const argumentContext = request.argumentContext ? { ...request.argumentContext } : undefined;
+      if (profile.external.invocation && Array.isArray(profile.external.invocation.args)) Object.freeze(profile.external.invocation.args);
+      if (profile.external.invocation) Object.freeze(profile.external.invocation);
+      Object.freeze(profile.external); Object.freeze(profile);
+      const ownerSignal = request.signal;
+      const interaction = request.interaction;
+      const isOwnerCurrent = request.isCurrent;
       const controller = new AbortController();
-      const epoch = deps.approvals.generation(request.profile.id);
+      const epoch = deps.approvals.generation(profile.id);
       let state: "pending" | "committed" | "disposed" = "pending";
       let failure: CredentialProviderErrorCode | undefined;
       let called = false;
@@ -70,7 +87,7 @@ export function createExternalCredentialResolver(deps: {
       let result: ResolvedExternalCredential | undefined;
       let timer: ReturnType<typeof setInterval> | undefined;
       const ownerCurrent = (): boolean => {
-        try { return request.isCurrent(); } catch { return false; }
+        try { return isOwnerCurrent(); } catch { return false; }
       };
       const releaseResult = (): void => {
         if (result) release(result);
@@ -80,7 +97,7 @@ export function createExternalCredentialResolver(deps: {
         pending.delete(lease);
         if (timer !== undefined) clearInterval(timer);
         timer = undefined;
-        request.signal.removeEventListener("abort", onAbort);
+        ownerSignal.removeEventListener("abort", onAbort);
       };
       const cancel = (code: CredentialProviderErrorCode): void => {
         if (state !== "pending" || failure) return;
@@ -93,8 +110,8 @@ export function createExternalCredentialResolver(deps: {
         if (failure) return failure;
         if (state === "disposed") return "cancelled";
         if (state === "committed") return undefined;
-        const code = admissionFailure() ?? (request.signal.aborted ? "cancelled" :
-          deps.approvals.generation(request.profile.id) !== epoch || !ownerCurrent() ? "configuration-changed" : undefined);
+        const code = admissionFailure() ?? (ownerSignal.aborted ? "cancelled" :
+          deps.approvals.generation(profile.id) !== epoch || !ownerCurrent() ? "configuration-changed" : undefined);
         if (code) cancel(code);
         return code;
       };
@@ -103,13 +120,13 @@ export function createExternalCredentialResolver(deps: {
         if (code) throw new CredentialProviderError(code);
       };
       const onAbort = (): void => cancel("cancelled");
-      const lease: PendingAttempt = { profileId: request.profile.id, cancel, recheck: () => { check(); } };
+      const lease: PendingAttempt = { profileId: profile.id, cancel, recheck: () => { check(); } };
       pending.add(lease);
-      request.signal.addEventListener("abort", onAbort, { once: true });
+      ownerSignal.addEventListener("abort", onAbort, { once: true });
       timer = setInterval(() => { check(); }, EXTERNAL_CREDENTIAL_LIVENESS_INTERVAL_MS);
       timer.unref?.();
       check();
-      const approvedRequest: ExternalCredentialRequest = { ...request, signal: controller.signal, isCurrent: () => !check() };
+      let invocation: ExternalCredentialInvocation | undefined;
 
       const retrieve = (): Promise<ResolvedExternalCredential> => new Promise((resolve, reject) => {
         let settled = false;
@@ -141,11 +158,11 @@ export function createExternalCredentialResolver(deps: {
               let stage: CredentialProviderErrorCode = "spawn-failed";
               try {
                 assertCurrent();
-                bytes = await deps.run(request.profile.external.invocation!, request.profile.external.method,
+                bytes = await deps.run(invocation!, profile.external.method,
                   { signal: controller.signal, isCurrent: () => !check() });
                 assertCurrent();
                 stage = "invalid-response";
-                value = deps.parse(bytes, request.profile.external.method);
+                value = deps.parse(bytes, profile.external.method);
                 assertCurrent();
                 finish(undefined, value);
                 value = undefined;
@@ -183,6 +200,14 @@ export function createExternalCredentialResolver(deps: {
           called = true;
           try {
             assertCurrent();
+            const configured = profile.external.invocation;
+            if (!validateExternalCredentialInvocation(configured)) throw new CredentialProviderError("unconfigured");
+            if (configured.argumentExpansion === true) {
+              if (!argumentContext) throw new CredentialProviderError("invalid-template");
+              invocation = Object.freeze({ executable: configured.executable, args: Object.freeze(expandExternalCredentialArguments(configured.args, argumentContext)) });
+            } else invocation = configured;
+            const approvedRequest: ExternalCredentialRequest = { profile, signal: controller.signal, interaction,
+              isCurrent: () => !check(), ...(configured.argumentExpansion === true && { resolvedInvocation: invocation }) };
             await deps.approvals.authorize(approvedRequest);
             assertCurrent();
             const value = await retrieve();

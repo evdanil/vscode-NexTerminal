@@ -21,6 +21,13 @@ describe("renderFormHtml", () => {
     expect(html).toContain("required");
   });
 
+  it("describes source auth profiles without assuming credentials are stored", () => {
+    const provider = { id: "test", label: "Test", configFields: [] } as never;
+    const html = renderFormHtml(inventorySourceFormDefinition(provider));
+    expect(html).toContain("Servers synced from this source use this auth profile for SSH authentication.");
+    expect(html).not.toContain("this profile's saved credentials");
+  });
+
   it("renders select fields with options", () => {
     const definition: FormDefinition = {
       title: "Test",
@@ -591,6 +598,39 @@ describe("renderFormHtml", () => {
       ) as (doc: unknown, filledKeys: Record<string, boolean>) => () => void;
       return (doc, filledKeys) => factory(doc, filledKeys)();
     }
+
+    it("explains when the device or source username is sent to the external program", () => {
+      const definition: FormDefinition = { title: "Lookup", fields: [
+        { type: "text", key: "username", label: "Username" },
+        { type: "text", key: "defaultUsername", label: "Default SSH Username", hint: "Ordinary source hint" }
+      ] };
+      const html = renderFormHtml(definition);
+      for (const key of ["username", "defaultUsername"]) {
+        const expectedDescription = key === "defaultUsername" ? "field-hint-defaultUsername external-lookup-hint-defaultUsername" : "external-lookup-hint-username";
+        expect(html).toContain(`aria-describedby="${expectedDescription}"`);
+        expect(html).toContain(`id="external-lookup-hint-${key}"`);
+      }
+      expect(html).toContain('id="field-hint-defaultUsername">Ordinary source hint</div>');
+      const hints = { username: { textContent: "" }, defaultUsername: { textContent: "" } };
+      const doc = {
+        getElementById(id: string) {
+          if (id === "field-authProfileId") return { querySelector: () => ({ value: "external" }) };
+          if (id === "external-lookup-hint-username") return hints.username;
+          if (id === "external-lookup-hint-defaultUsername") return hints.defaultUsername;
+          return undefined;
+        },
+        querySelectorAll: () => []
+      };
+      const source = extractFunctionSource(html, "function updateProfileManagedFields()");
+      const update = new Function("document", "profileFilledKeys", `var externalProfileName = "Vault"; ${source}; return updateProfileManagedFields;`)(doc, {});
+      update();
+      for (const hint of Object.values(hints)) {
+        expect(hint.textContent).toContain("only when argument expansion is enabled");
+        expect(hint.textContent).toContain("${username}");
+        expect(hint.textContent).toContain("program returns the username used to sign in");
+        expect(hint.textContent).not.toContain("Used as a lookup value in external program arguments.");
+      }
+    });
 
     function extractSeededProfileFilledKeys(html: string): (doc: unknown) => Record<string, boolean> {
       const source = extractFunctionSource(html, "function seededProfileFilledKeys()");

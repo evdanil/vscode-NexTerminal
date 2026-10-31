@@ -182,6 +182,14 @@ describe("builder parameter extensions (UX-M4/m13)", () => {
     expect(serverAuth.options.some((o) => o.value === "__create__authProfile")).toBe(true);
   });
 
+  it("describes the auth profile without assuming SSH credentials are stored", () => {
+    const editor = deviceTemplateFormDefinition();
+    const editorAuth = field(editor, "authProfileId") as Extract<FormFieldDescriptor, { type: "select" }>;
+    expect(editorAuth.hint).toContain("auth profile");
+    expect(editorAuth.hint).toContain("SSH authentication");
+    expect(editorAuth.hint).not.toContain("saved SSH credentials");
+  });
+
   it("P8 — the auth-select hint drops the rung-3 'matching' cascade leak", () => {
     const editor = deviceTemplateFormDefinition();
     const editorAuth = field(editor, "authProfileId") as Extract<FormFieldDescriptor, { type: "select" }>;

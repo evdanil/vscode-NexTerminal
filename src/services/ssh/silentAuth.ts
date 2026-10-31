@@ -298,7 +298,8 @@ export class SilentAuthSshFactory implements SshFactory {
       legacyServerPassphraseKey ?? null,
       profileScoped,
       route,
-      externalIdentity
+      externalIdentity,
+      externalProfile?.external.invocation?.argumentExpansion === true ? server.name : null
     ]);
   }
 
@@ -555,7 +556,13 @@ export class SilentAuthSshFactory implements SshFactory {
           invocation: { ...externalProfile.external.invocation, args: [...externalProfile.external.invocation.args] }
         }) }
       };
-      const attempt = this.externalResolver.begin({ profile, signal: options?.signal ?? new AbortController().signal, interaction, isCurrent });
+      // The dial target may be an alternate-address clone; provenance above
+      // still tracks the original live record captured by ProxySshFactory.
+      const argumentContext = profile.external.invocation?.argumentExpansion === true ? Object.freeze({
+        host: server.host, port: server.port, SessionName: server.name,
+        username: server.username, profile: profile.name, protocol: "ssh"
+      }) : undefined;
+      const attempt = this.externalResolver.begin({ profile, ...(argumentContext && { argumentContext }), signal: options?.signal ?? new AbortController().signal, interaction, isCurrent });
       const assertCurrent = (): void => {
         if (!attempt.isCurrent()) throw new CredentialProviderError(options?.signal?.aborted ? "cancelled" : "configuration-changed");
       };

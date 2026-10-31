@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseExternalArgumentsText, externalServerFormValues, externalSourceFormValues } from "../../src/ui/externalCredentialForm";
+import { parseExternalArgumentsText, externalServerFormValues } from "../../src/ui/externalCredentialForm";
 describe("external arguments textarea bytes", () => {
   it("preserves interior spaces, quotes and backslashes with empty meaning zero arguments", () => {
     expect(parseExternalArgumentsText("")).toEqual([]);
@@ -11,11 +11,8 @@ describe("external arguments textarea bytes", () => {
 });
 
 
-it("uses only host-owned dormant defaults for new external records; stored and missing links still need normal fields", () => {
+it("retains the submitted lookup username while protecting hidden external credential fields", () => {
   const external = { id: "e", name: "Program", authType: "external" as const, external: { version: 1 as const, method: "password" as const } };
-  expect(externalServerFormValues({ username: "forged", authType: "key", keyPath: "/forged" }, external)).toEqual({ username: "root", authType: "password", keyPath: undefined });
-  expect(externalSourceFormValues({ defaultUsername: "forged" }, external, "")).toEqual({ defaultUsername: "root" });
-  expect(externalSourceFormValues({}, external, "seeded")).toEqual({ defaultUsername: "seeded" });
+  expect(externalServerFormValues({ username: "alice", authType: "key", keyPath: "/forged" }, external, { username: "old", authType: "password" })).toEqual({ username: "alice", authType: "password", keyPath: undefined });
   expect(externalServerFormValues({}, undefined)).toEqual({});
-  expect(externalSourceFormValues({}, { id: "p", name: "Stored", authType: "password", username: "admin" }, "")).toEqual({});
 });

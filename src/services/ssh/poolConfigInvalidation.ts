@@ -200,7 +200,11 @@ export function watchPoolInvalidationOnConfigMutation(
         }
         leftEndpoints.set(mutation.id, list);
       }
-      if (mutation.next === undefined || (mutation.prev && pooledConnectionParamsChanged(mutation.prev, mutation.next))) {
+      const renamed = mutation.prev && mutation.next && mutation.prev.name !== mutation.next.name;
+      const linkedProfile = renamed && mutation.next?.authProfileId
+        ? core.getSnapshot().authProfiles.find((profile) => profile.id === mutation.next!.authProfileId) : undefined;
+      const changedContextName = renamed && isExternalAuthProfile(linkedProfile) && linkedProfile.external.invocation?.argumentExpansion === true;
+      if (mutation.next === undefined || (mutation.prev && pooledConnectionParamsChanged(mutation.prev, mutation.next)) || changedContextName) {
         invalidated.add(mutation.id);
       }
     } else {

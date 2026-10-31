@@ -928,33 +928,56 @@ describe("an auth-profile switch hands back the values the previous profile disp
 });
 
 
-describe("external profile dynamic ownership", () => {
+describe("external profile lookup username", () => {
   const external: AuthProfile = { id: "external", name: "Vault", authType: "external", external: { version: 1, method: "key", invocation: { executable: "/provider", args: [] } } };
-  const server: ServerConfig = { id: "s", name: "Server", host: "host.test", port: 22, isHidden: false, username: "dormant", authType: "key", keyPath: "/dormant" };
-  it("hides and omits dormant fields while preserving them on explicit unlink", () => {
-    const h = openForm(serverFormDefinition({ ...server, authProfileId: external.id }, undefined, true, undefined, [external]));
-    expect(h.locked("username")).toBe(true); expect(h.locked("authType")).toBe(true);
-    const values = h.submit(); expect(values).not.toHaveProperty("username"); expect(values).not.toHaveProperty("authType"); expect(values).not.toHaveProperty("keyPath");
-    h.choose("authProfileId", ""); expect(h.value("username")).toBe("dormant"); expect(h.value("keyPath")).toBe("/dormant");
-    expect(h.submit().username).toBe("dormant");
+  const server: ServerConfig = { id: "s", name: "Server", host: "host.test", port: 22, isHidden: false, username: "existing", authType: "key", keyPath: "/dormant" };
+  it("renders an editable lookup username and preserves it on save while keeping hidden credentials", () => {
+    const linked = { ...server, authProfileId: external.id };
+    const h = openForm(serverFormDefinition(linked, undefined, true, undefined, [external]));
+    expect(h.locked("username")).toBe(false);
+    h.type("username", "alice");
+    const values = h.submit();
+    expect(values.username).toBe("alice");
+    expect(values).not.toHaveProperty("authType");
+    expect(values).not.toHaveProperty("keyPath");
+    const next = formValuesToServer(externalServerFormValues(values, external, linked), linked.id)!;
+    const saved = preserveLinkedServerCredentials(linked, next, external);
+    expect(saved.username).toBe("alice");
+    expect(saved.authType).toBe("key");
+    expect(saved.keyPath).toBe("/dormant");
+    expect(openForm(serverFormDefinition(saved, undefined, true, undefined, [external])).value("username")).toBe("alice");
   });
-  it("switches into dynamic ownership without fake values and restores the typed draft", () => {
+  it("keeps a typed lookup username while switching into and away from an external profile", () => {
     const h = openForm(serverFormDefinition(server, undefined, true, undefined, [external]));
     h.type("username", "draft"); pickProfile(h, [external], external.id);
-    expect(h.value("username")).toBe("draft"); expect(h.locked("username")).toBe(true); expect(h.submit()).not.toHaveProperty("username");
-    h.choose("authProfileId", ""); expect(h.value("username")).toBe("draft"); expect(h.submit().username).toBe("draft");
+    expect(h.locked("username")).toBe(false); expect(h.submit().username).toBe("draft");
+    h.type("username", "changed"); h.choose("authProfileId", "");
+    expect(h.value("username")).toBe("changed"); expect(h.submit().username).toBe("changed");
   });
-  it("creates an external-linked server in an empty form with host-owned dormant defaults and reveals them on unlink", () => {
+  it("does not replace a deliberately cleared username when selecting an external profile", () => {
+    const h = openForm(serverFormDefinition(server, undefined, true, undefined, [external]));
+    h.type("username", ""); pickProfile(h, [external], external.id);
+    expect(h.value("username")).toBe("");
+  });
+  it("shows the existing root default when an empty new server selects an external profile", () => {
     const h = openForm(serverFormDefinition(undefined, undefined, true, undefined, [external]));
     h.type("name", "New"); h.type("host", "host.test"); pickProfile(h, [external], external.id);
-    const values = h.submit(); expect(values).not.toHaveProperty("username");
-    const created = formValuesToServer(externalServerFormValues(values, external))!;
-    expect(created.username).toBe("root"); expect(created.authType).toBe("password"); expect(validateServerConfig(created)).toBe(true);
-    const reopened = openForm(serverFormDefinition(created, undefined, true, undefined, [external])); reopened.choose("authProfileId", "");
-    expect(reopened.value("username")).toBe("root"); expect(reopened.value("authType")).toBe("password");
+    expect(h.value("username")).toBe("root");
+    expect(h.submit().username).toBe("root");
   });
-  it("never persists crafted dormant values for an externally owned existing server", () => {
-    const next = preserveLinkedServerCredentials(server, { ...server, authProfileId: external.id, username: "forged", authType: "password", keyPath: "/forged" }, external);
-    expect(next.username).toBe("dormant"); expect(next.authType).toBe("key"); expect(next.keyPath).toBe("/dormant");
+  it("saves a typed lookup username when creating an external-linked server", () => {
+    const h = openForm(serverFormDefinition(undefined, undefined, true, undefined, [external]));
+    h.type("name", "New"); h.type("host", "host.test"); pickProfile(h, [external], external.id); h.type("username", "new-user");
+    const created = formValuesToServer(externalServerFormValues(h.submit(), external))!;
+    const saved = preserveLinkedServerCredentials(undefined, created, external);
+    expect(saved.username).toBe("new-user"); expect(saved.authType).toBe("password"); expect(validateServerConfig(saved)).toBe(true);
+  });
+  it("lets a source edit its external default username", () => {
+    const provider: InventoryProvider = { id: "fake", label: "Fake", configFields: [], testConnection: async () => undefined, fetchInventory: async () => ({ nodes: [] }) as never };
+    const h = openForm(inventorySourceFormDefinition(provider, undefined, "initial", [external]));
+    h.choose("authProfileId", external.id);
+    h.deliver({type:"fillFields", key:"authProfileId", value:external.id, values:{__externalAuthProfile:external.name}, requestId:h.lastAutofillRequestId()});
+    expect(h.locked("defaultUsername")).toBe(false);
+    h.type("defaultUsername", "source-user"); expect(h.submit().defaultUsername).toBe("source-user");
   });
 });
