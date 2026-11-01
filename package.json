@@ -1095,6 +1095,11 @@
         "category": "Nexus"
       },
       {
+        "command": "nexus.script.revealInFileManager",
+        "title": "Reveal in Windows File Explorer",
+        "category": "Nexus"
+      },
+      {
         "command": "nexus.terminal.reset",
         "title": "Reset Terminal",
         "category": "Nexus",
@@ -2040,6 +2045,11 @@
           "group": "1_manage@1"
         },
         {
+          "command": "nexus.script.revealInFileManager",
+          "when": "view == nexusScripts && viewItem =~ /^nexus\\.script\\.(file|running)$/ && isWindows && !remoteName && resourceScheme == file",
+          "group": "1_manage@2"
+        },
+        {
           "command": "nexus.script.delete",
           "when": "view == nexusScripts && viewItem =~ /^nexus\\.script\\.(file|running)$/",
           "group": "3_destructive"
@@ -2721,6 +2731,10 @@
         },
         {
           "command": "nexus.script.revealInExplorer",
+          "when": "false"
+        },
+        {
+          "command": "nexus.script.revealInFileManager",
           "when": "false"
         },
         {

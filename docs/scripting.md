@@ -820,8 +820,9 @@ empty folder stays until you remove it.
   Explorer. For an item outside the workspace (including the no-workspace
   scripts directory), Nexus explains the limitation and offers to open its
   containing folder in a new VS Code window; scripts also offer **Open File**.
-  The current workspace is not changed. For your OS file manager, use
-  **Open Scripts Folder**, below.
+  The current workspace is not changed. On Windows, a local script also offers **Reveal in Windows File Explorer**,
+  which opens the system file manager at the script, even when no workspace is
+  open. For the scripts root, use **Open Scripts Folder**, below.
 - Path segments are validated the same way folders are validated everywhere
   else in Nexus: `.` and `..` are rejected, depth is capped at 10 levels, and
   a `\` is rejected outright with a message telling you to use `/` instead —

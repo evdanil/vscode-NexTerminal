@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+const windowsReveal = vi.hoisted(() => vi.fn());
+vi.mock("../../../src/services/scripts/revealInWindowsExplorer", () => ({ revealInWindowsExplorer: windowsReveal }));
+
 const state = {
   registeredCommands: new Map<string, (...args: unknown[]) => unknown>(),
   writtenFiles: new Map<string, string>(),
@@ -154,6 +157,8 @@ function opensAtLoginPrompt(template: (typeof SCRIPT_TEMPLATES)[number]): boolea
 
 describe("scriptCommands", () => {
   beforeEach(() => {
+    mockWorkspace.workspaceFolders = [{ uri: vscode.Uri.file("/ws"), name: "ws", index: 0 }];
+    windowsReveal.mockReset();
     state.registeredCommands.clear();
     state.writtenFiles.clear();
     state.inputBoxValidator = undefined;
@@ -833,6 +838,62 @@ describe("scriptCommands", () => {
     it("reports a failed reveal instead of rejecting without a useful message", async () => {
       vi.mocked(vscode.commands.executeCommand).mockRejectedValueOnce(new Error("Explorer failed"));
       await expect(reveal({ kind: "script", uri: vscode.Uri.file("/ws/test.js") })).resolves.toBeUndefined();
+      expect(state.mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Could not reveal"));
+    });
+  });
+
+  describe("Reveal in Windows File Explorer", () => {
+    async function reveal(target: unknown, platform = "win32"): Promise<void> {
+      const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+      try {
+        Object.defineProperty(process, "platform", { ...original, value: platform });
+        registerScriptCommands(makeManager(), outputChannel, "/tmp/fake-gs");
+        await state.registeredCommands.get("nexus.script.revealInFileManager")!(target);
+      } finally {
+        Object.defineProperty(process, "platform", original);
+      }
+    }
+
+    it("reveals the actual script without a workspace or an intermediate prompt", async () => {
+      mockWorkspace.workspaceFolders = undefined;
+      state.mockFsStatThrows = false;
+      windowsReveal.mockResolvedValueOnce(undefined);
+      await reveal({ kind: "script", uri: vscode.Uri.file("C:\\scripts\\test.js") });
+      expect(windowsReveal).toHaveBeenCalledExactlyOnceWith("C:\\scripts\\test.js");
+      expect(vscode.commands.executeCommand).not.toHaveBeenCalled();
+      expect(state.mockShowInformationMessage).not.toHaveBeenCalled();
+    });
+
+    it("also reveals a local running script in a workspace", async () => {
+      state.mockFsStatThrows = false;
+      windowsReveal.mockResolvedValueOnce(undefined);
+      await reveal({ kind: "script", uri: vscode.Uri.file("C:\\scripts\\test.js"), running: true });
+      expect(windowsReveal).toHaveBeenCalledExactlyOnceWith("C:\\scripts\\test.js");
+    });
+
+    it("refuses remote windows without revealing a local path", async () => {
+      (vscode.env as { remoteName: string | undefined }).remoteName = "ssh-remote";
+      await reveal({ kind: "script", uri: vscode.Uri.file("C:\\scripts\\test.js") });
+      expect(windowsReveal).not.toHaveBeenCalled();
+      expect(state.mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("local"));
+    });
+
+    it("refuses non-file URIs and non-Windows hosts", async () => {
+      const uri = { scheme: "vscode-remote", fsPath: "/scripts/test.js", path: "/scripts/test.js", toString: () => "vscode-remote://host/scripts/test.js" };
+      await reveal({ kind: "script", uri });
+      await reveal({ kind: "script", uri: vscode.Uri.file("/scripts/test.js") }, "linux");
+      expect(windowsReveal).not.toHaveBeenCalled();
+      expect(state.mockShowErrorMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it("reports a missing script or a failed Explorer launch", async () => {
+      const uri = vscode.Uri.file("C:\\scripts\\test.js");
+      await reveal({ kind: "script", uri });
+      expect(windowsReveal).not.toHaveBeenCalled();
+      state.mockFsStatThrows = false;
+      windowsReveal.mockRejectedValueOnce(new Error("OS failure"));
+      await reveal({ kind: "script", uri });
+      expect(state.mockShowErrorMessage).toHaveBeenCalledTimes(2);
       expect(state.mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("Could not reveal"));
     });
   });

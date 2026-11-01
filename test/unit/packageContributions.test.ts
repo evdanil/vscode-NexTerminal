@@ -765,6 +765,12 @@ describe("package contributions", () => {
       expect(commands).toContain("nexus.script.run");
       expect(commands).toContain("nexus.script.stop");
       expect(commands).toContain("nexus.script.revealInExplorer");
+      const openContaining = scriptItems.find((i) => i.command === "nexus.script.revealInFileManager");
+      expect(openContaining?.when).toContain("!remoteName");
+      expect(openContaining?.when).toContain("resourceScheme == file");
+      expect(openContaining?.when).toContain("isWindows");
+      expect(openContaining?.when).toContain("file|running");
+      expect(openContaining?.group).toBe("1_manage@2");
       expect(commands).toContain("nexus.script.delete");
 
       // Inline ▶ run is bound to runQuick so it auto-picks the focused terminal;
