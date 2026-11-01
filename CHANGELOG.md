@@ -2,6 +2,10 @@
 
 ## [2.8.309] — 2026-11-01
 
+### Added
+
+- Reveal a local script directly in Windows File Explorer from its context menu, including when no workspace is open.
+
 ### Changed
 
 - Shortened the Marketplace description so it displays in full.

@@ -169,6 +169,7 @@ const unsupportedCommands = [
   "nexus.script.edit",
   "nexus.script.openScriptsFolder",
   "nexus.script.revealInExplorer",
+  "nexus.script.revealInFileManager",
   "nexus.server.runWithScript",
   "nexus.server.runMacro",
   // Both need a local shell (ipmitool) or a desktop browser handoff, neither of

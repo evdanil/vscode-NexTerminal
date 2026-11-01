@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import type { ScriptRuntimeManager } from "../services/scripts/scriptRuntimeManager";
+import { revealInWindowsExplorer } from "../services/scripts/revealInWindowsExplorer";
 import { parseScriptHeader } from "../services/scripts/scriptHeader";
 import { resolveScriptsDir } from "../services/scripts/resolveScriptsDir";
 import { findHiddenScriptFolderSegment } from "../services/scripts/scriptScanner";
@@ -822,6 +823,21 @@ export function registerScriptCommands(
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         void vscode.window.showErrorMessage(`Could not reveal script item: ${message}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("nexus.script.revealInFileManager", async (arg?: unknown) => {
+      const uri = toScriptUri(arg);
+      if (!uri) return;
+      if (process.platform !== "win32" || vscode.env.remoteName || uri.scheme !== "file") {
+        void vscode.window.showErrorMessage("Reveal in File Explorer is available for local Windows scripts.");
+        return;
+      }
+      try {
+        await vscode.workspace.fs.stat(uri);
+        await revealInWindowsExplorer(uri.fsPath);
+      } catch {
+        void vscode.window.showErrorMessage("Could not reveal the script in Windows File Explorer. Check that the file still exists.");
       }
     }),
 
