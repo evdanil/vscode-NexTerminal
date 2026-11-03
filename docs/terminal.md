@@ -12,6 +12,8 @@ The IPv6 and UUID rules ship **disabled** — those two patterns cost more than 
 
 Open **Nexus: Edit Highlighting Rules** to manage named highlight profiles. Create, rename, duplicate or delete a profile and choose the global default. Each profile has its own ordered rules, with live preview, staged Apply/Cancel, custom SGR foreground codes, regex safety checks, and reset to the built-in rules. Existing highlighting rules remain available as the default profile.
 
+Use **Create empty**, **Create from defaults**, or **Duplicate** first, then type over the automatically selected name. The name field always edits the selected profile. **Rename** focuses and selects that name; Enter or clicking away accepts the edit, and Escape restores the last accepted name. **Apply** includes a name you are still typing and saves all profile changes. Blank or duplicate names show an error beside the field.
+
 Use **Stage Rule** or the rule editor's **Cancel** before switching profiles or taking an action that would discard the unfinished rule. **Delete Rule** discards the unfinished edit and stages deletion of the rule. If settings change elsewhere while you have a draft, record the changes you want to keep, close the Highlight Profiles tab (discarding that draft), and run **Nexus: Edit Highlighting Rules** again to load the current settings.
 
 If saving fails, the manager shows available error details. Some settings may already have changed; preserve any draft changes you need before closing the tab and reopening the manager. Remove private paths or other sensitive details before sharing an error message.

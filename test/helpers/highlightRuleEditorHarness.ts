@@ -86,16 +86,24 @@ function buildDom(): {
   window: { addEventListener: (type: string, handler: (event: { data: unknown }) => void) => void };
   byId: Map<string, StubElement>;
   deliverMessage: (msg: unknown) => void;
+  profileNameSelection: () => [number, number];
+  focusedElement: () => StubElement | undefined;
 } {
   const byId = new Map<string, StubElement>();
+  let focused: StubElement | undefined;
   const set = (id: string, el: StubElement): StubElement => {
+    el.focus = () => { focused = el; };
     byId.set(id, el);
     return el;
   };
 
   set("profile-select", new StubElement("SELECT"));
   set("profile-default", new StubElement("SELECT"));
-  set("profile-name", textInput());
+  const profileName = set("profile-name", textInput());
+  let nameSelection: [number, number] = [0, 0];
+  Object.assign(profileName, { select: () => { nameSelection = [0, profileName.value.length]; } });
+  set("profile-name-error", new StubElement("DIV"));
+  set("profile-name-help", new StubElement("DIV"));
   set("profile-create", new StubElement("BUTTON"));
   set("profile-create-defaults", new StubElement("BUTTON"));
   set("profile-rename", new StubElement("BUTTON"));
@@ -155,6 +163,8 @@ function buildDom(): {
     document,
     window: windowStub,
     byId,
+    profileNameSelection: () => nameSelection,
+    focusedElement: () => focused,
     deliverMessage: (msg: unknown): void => {
       if (!messageHandler) {
         throw new Error("highlight rule editor script never registered a message listener");
@@ -169,6 +179,13 @@ export interface HighlightRuleEditorHarness {
   selectProfile: (id: string) => void;
   selectedProfile: () => string;
   setProfileName: (name: string) => void;
+  profileName: () => string;
+  blurProfileName: () => void;
+  profileNameKey: (key: string) => void;
+  profileNameError: () => string;
+  profileNameFocused: () => boolean;
+  profileNameSelection: () => [number, number];
+  profileNames: () => string[];
   createProfile: () => void;
   createFromDefaults: () => void;
   saveError: () => string;
@@ -283,7 +300,14 @@ export function openHighlightRuleEditor(rules: HighlightRule[], manager?: Highli
     posted,
     selectProfile: (id) => { field("profile-select").value = id; field("profile-select").bubble("change"); },
     selectedProfile: () => field("profile-select").value,
-    setProfileName: (name) => { field("profile-name").value = name; },
+    setProfileName: (name) => { field("profile-name").value = name; field("profile-name").bubble("input"); },
+    profileName: () => field("profile-name").value,
+    blurProfileName: () => field("profile-name").dispatch("blur"),
+    profileNameKey: (key) => field("profile-name").dispatchKey("keydown", key),
+    profileNameError: () => field("profile-name-error").textContent,
+    profileNameFocused: () => dom.focusedElement() === field("profile-name"),
+    profileNameSelection: () => dom.profileNameSelection(),
+    profileNames: () => field("profile-select").children.map((option) => option.textContent),
     createProfile: () => field("profile-create").bubble("click"),
     createFromDefaults: () => field("profile-create-defaults").bubble("click"),
     saveError: () => field("save-error").textContent,

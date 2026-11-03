@@ -10,6 +10,124 @@ const state: HighlightEditorState = {
 };
 
 describe("highlight profile manager", () => {
+  it("includes a typed profile name in Apply without a separate Rename click", () => {
+    const editor = openHighlightRuleEditor([], state);
+    editor.setProfileName("Cisco");
+    expect(editor.isDirty()).toBe(true);
+    editor.clickApply();
+    const save = editor.posted.find((message) => message.type === "saveCatalog");
+    if (save?.type !== "saveCatalog") throw new Error("missing save");
+    expect(save.profiles[0]).toEqual({ id: "one", name: "Cisco", rules: [{ pattern: "ONE", color: "red" }] });
+  });
+
+  it.each(["blur", "Enter"])("finishes a rename on %s and retains it when changing profiles", (action) => {
+    const editor = openHighlightRuleEditor([], state);
+    editor.setProfileName(" Cisco ");
+    if (action === "blur") editor.blurProfileName(); else editor.profileNameKey(action);
+    expect(editor.profileName()).toBe("Cisco");
+    expect(editor.profileNames()).toEqual(["Cisco", "Two"]);
+    editor.selectProfile("two"); editor.selectProfile("one");
+    expect(editor.profileName()).toBe("Cisco");
+  });
+
+  it("focuses and selects the existing name when Rename is clicked", () => {
+    const editor = openHighlightRuleEditor([], state);
+    editor.renameProfile();
+    expect(editor.profileNameFocused()).toBe(true);
+    expect(editor.profileNameSelection()).toEqual([0, 3]);
+    expect(editor.isDirty()).toBe(false);
+  });
+
+  it("Escape restores the last finished name without discarding rule changes", () => {
+    const editor = openHighlightRuleEditor([], state);
+    editor.clickEdit(0); editor.setPattern("EDITED"); editor.stageRule();
+    editor.setProfileName("Cisco"); editor.blurProfileName();
+    editor.setProfileName("Temporary"); editor.profileNameKey("Escape");
+    expect(editor.profileName()).toBe("Cisco");
+    expect(editor.rowLabel(0)).toBe("EDITED");
+  });
+
+  it.each(["", "two", "X".repeat(101)])("keeps an invalid name visible and blocks Apply: %j", (name) => {
+    const editor = openHighlightRuleEditor([], state);
+    editor.setProfileName(name); editor.blurProfileName(); editor.clickApply();
+    expect(editor.profileName()).toBe(name);
+    expect(editor.profileNameError()).not.toBe("");
+    expect(editor.profileNames()).toEqual(["One", "Two"]);
+    expect(editor.posted.some((message) => message.type === "saveCatalog")).toBe(false);
+    editor.clickCancel();
+    expect(editor.profileName()).toBe("One");
+    expect(editor.profileNameError()).toBe("");
+    expect(editor.isDirty()).toBe(false);
+  });
+
+  it("retains a pending profile name when external settings arrive", () => {
+    const editor = openHighlightRuleEditor([], state);
+    editor.setProfileName("Cisco");
+    editor.deliver({ type: "catalogUpdated", state: { ...state, revision: "remote" } });
+    expect(editor.profileName()).toBe("Cisco");
+    expect(editor.saveError()).toContain("changed elsewhere");
+  });
+
+  it("finishes a pending rename before switching profiles without a blur event", () => {
+    const editor = openHighlightRuleEditor([], state);
+    editor.setProfileName("Cisco"); editor.selectProfile("two"); editor.selectProfile("one");
+    expect(editor.profileName()).toBe("Cisco");
+  });
+
+  it.each(["switch", "create", "defaults", "duplicate", "reset", "copy"])("does not discard an invalid name on %s", (action) => {
+    const editor = openHighlightRuleEditor([], { ...state, workspaceLegacyRules: [{ pattern: "WORKSPACE", color: "green" }] });
+    editor.setProfileName("Two");
+    if (action === "switch") editor.selectProfile("two");
+    if (action === "create") editor.createProfile();
+    if (action === "defaults") editor.createFromDefaults();
+    if (action === "duplicate") editor.duplicateProfile();
+    if (action === "reset") editor.resetRules();
+    if (action === "copy") editor.copyWorkspaceRules();
+    expect(editor.selectedProfile()).toBe("one");
+    expect(editor.profileName()).toBe("Two");
+    expect(editor.profileNames()).toEqual(["One", "Two"]);
+    expect(editor.profileNameError()).toContain("already");
+    expect(editor.rowLabel(0)).toBe("ONE");
+  });
+
+  it("preserves a name typed while a save is pending and includes it in the next Apply", () => {
+    const editor = openHighlightRuleEditor([], state);
+    editor.setProfileName("Cisco"); editor.clickApply();
+    editor.setProfileName("Cisco lab");
+    editor.deliver({ type: "catalogSaveResult", ok: true, revision: "rev-2" });
+    expect(editor.profileName()).toBe("Cisco lab");
+    expect(editor.isDirty()).toBe(true);
+    editor.clickApply();
+    const saves = editor.posted.filter((message) => message.type === "saveCatalog");
+    expect(saves).toHaveLength(2);
+    if (saves[1].type !== "saveCatalog") throw new Error("missing save");
+    expect(saves[1].profiles[0].name).toBe("Cisco lab");
+    expect(saves[1].revision).toBe("rev-2");
+  });
+
+  it("can rename a profile while preserving an unfinished rule edit", () => {
+    const editor = openHighlightRuleEditor([], state);
+    editor.clickEdit(0); editor.setPattern("UNFINISHED");
+    editor.setProfileName("Cisco"); editor.blurProfileName(); editor.renameProfile();
+    expect(editor.editorVisible()).toBe(true);
+    expect(editor.patternValue()).toBe("UNFINISHED");
+    expect(editor.profileNames()[0]).toBe("Cisco");
+  });
+
+  it.each(["create", "defaults", "duplicate"])("selects the new profile name after %s", (action) => {
+    const editor = openHighlightRuleEditor([], state);
+    if (action === "create") editor.createProfile();
+    if (action === "defaults") editor.createFromDefaults();
+    if (action === "duplicate") editor.duplicateProfile();
+    expect(editor.profileNameFocused()).toBe(true);
+    expect(editor.profileNameSelection()).toEqual([0, editor.profileName().length]);
+    editor.setProfileName("Cisco"); editor.clickApply();
+    const save = editor.posted.find((message) => message.type === "saveCatalog");
+    if (save?.type !== "saveCatalog") throw new Error("missing save");
+    expect(save.profiles[0].name).toBe("One");
+    expect(save.profiles[2].name).toBe("Cisco");
+  });
+
   it("deletes the rule being edited after a reorder and stages the deletion", () => {
     const editor = openHighlightRuleEditor([], { ...state, catalog: { ...state.catalog, profiles: [
       { id: "one", name: "One", rules: [{ pattern: "FIRST", color: "red" }, { pattern: "SECOND", color: "blue" }] }
@@ -104,8 +222,9 @@ describe("highlight profile manager", () => {
   it("gives immediate feedback for explicitly chosen duplicate names", () => {
     const editor = openHighlightRuleEditor([], state);
     editor.setProfileName("Two"); editor.createProfile();
-    expect(editor.saveError()).toContain("already");
-    expect(editor.isDirty()).toBe(false);
+    expect(editor.profileNameError()).toContain("already");
+    expect(editor.profileNames()).toEqual(["One", "Two"]);
+    expect(editor.isDirty()).toBe(true);
     expect(editor.posted.some((message) => message.type === "saveCatalog")).toBe(false);
   });
 
@@ -170,7 +289,7 @@ describe("highlight profile manager", () => {
   it("stages profile rename, duplication, default change, and independent rule edits", () => {
     const editor = openHighlightRuleEditor([], state);
     expect(editor.rowLabel(0)).toBe("ONE");
-    editor.setProfileName("Copied"); editor.duplicateProfile();
+    editor.duplicateProfile(); editor.setProfileName("Copied"); editor.blurProfileName();
     editor.clickEdit(0); editor.setPattern("COPY"); editor.stageRule();
     editor.selectProfile("one"); expect(editor.rowLabel(0)).toBe("ONE");
     editor.setProfileName("Renamed"); editor.renameProfile();
@@ -221,7 +340,7 @@ describe("highlight profile manager", () => {
 
   it("creates from shipped rules and keeps failed saves editable", () => {
     const editor = openHighlightRuleEditor([], { ...state, shippedRules: [{ pattern: "SHIPPED", color: "red" }] });
-    editor.setProfileName("Defaults copy"); editor.createFromDefaults();
+    editor.createFromDefaults(); editor.setProfileName("Defaults copy"); editor.blurProfileName();
     expect(editor.rowLabel(0)).toBe("SHIPPED");
     editor.clickApply(); editor.deliver({ type: "catalogSaveResult", ok: false, message: "Cannot save now" });
     expect(editor.isDirty()).toBe(true);
