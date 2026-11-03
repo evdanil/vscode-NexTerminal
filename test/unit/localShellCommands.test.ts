@@ -14,6 +14,7 @@ const mockGetConfiguration = vi.fn();
 const closeTerminalListeners: Array<(terminal: unknown) => void> = [];
 const openTerminalListeners: Array<(terminal: unknown) => void> = [];
 const mockTerminals: unknown[] = [];
+let mockActiveTerminal: unknown;
 let mockWorkspaceFolders: Array<{ uri: { fsPath: string } }> | undefined;
 
 function normalizeMockPath(value: string): string {
@@ -86,6 +87,7 @@ vi.mock("vscode", () => ({
     executeCommand: (...args: unknown[]) => mockExecuteCommand(...args)
   },
   window: {
+    get activeTerminal() { return mockActiveTerminal; },
     get terminals() {
       return mockTerminals;
     },
@@ -448,6 +450,28 @@ describe("registerLocalShellCommands", () => {
         return fallback;
       })
     }));
+  });
+
+  it("keeps Local Shell macro eligibility after editor focus changes", async () => {
+    const ctx = makeCtx();
+    let isActive!: () => boolean;
+    let activeBeforeTerminal: boolean | undefined;
+    mockActiveTerminal = undefined;
+    ctx.macroAutoTrigger.createObserver.mockImplementation((_send: unknown, active: () => boolean) => {
+      isActive = active;
+      activeBeforeTerminal = isActive();
+      return { onOutput: vi.fn(), pauseIntervalMacros: vi.fn(), dispose: vi.fn() };
+    });
+    registerLocalShellCommands(ctx);
+    await registeredCommands.get("nexus.localShell.connect")!("local-1");
+    const terminal = ctx.focusedTerminal;
+    expect(terminal).toBeDefined();
+    ctx.focusedTerminal = undefined;
+    for (const [selected, expected] of [[terminal, true], [{ name: "other" }, false], [undefined, false]] as const) {
+      mockActiveTerminal = selected;
+      expect(isActive()).toBe(expected);
+    }
+    expect(activeBeforeTerminal).toBe(false);
   });
 
   it("opens a custom local shell with an extension-owned PTY", async () => {

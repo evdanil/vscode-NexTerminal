@@ -773,9 +773,15 @@ responses, choose **Active terminal only** or **Matching profile only** instead.
 
 **Active terminal only**
 
-The macro only matches the terminal that is currently active. This is safer for
-passwords and prompts because it reduces the chance that a background session
-receives input.
+The macro only matches VS Code's selected terminal: the terminal that has focus
+or most recently had focus. Opening the Macro Editor or another editor does not
+pause these triggers, and returning to the same terminal needs no tab switch.
+Other terminal sessions cannot start a match while a different terminal is selected.
+
+For passwords and other sensitive responses, use a narrowly targeted pattern;
+choose **Matching profile only** when responses must be restricted to one profile.
+Pause the macro before editing if the selected terminal must not receive automatic
+responses while you work in the editor.
 
 **Matching profile only**
 

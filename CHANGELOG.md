@@ -6,6 +6,10 @@
 
 - Shortened the Marketplace description so it displays in full.
 
+### Fixed
+
+- **Active-terminal-only macro triggers keep working after editing macros and returning to the same terminal**, without switching terminal tabs. SSH, Telnet, Serial, and Local Shell now use VS Code's selected terminal consistently; opening an editor does not pause these triggers.
+
 ## [2.8.308] — 2026-10-31
 
 ### Fixed
