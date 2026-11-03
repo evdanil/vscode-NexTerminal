@@ -365,6 +365,13 @@ export function formValuesToSerial(values: FormValues, existing?: Partial<Serial
   if (normalizedGroup === null) {
     return undefined;
   }
+  const rawBaud = values.baudRate === "custom" ? values.customBaudRate : values.baudRate;
+  const baudText = typeof rawBaud === "string" ? rawBaud.trim() : "";
+  const baudRate = Number(baudText);
+  // The native serial binding converts this value to a signed 32-bit integer.
+  if (!/^\d+$/.test(baudText) || !Number.isInteger(baudRate) || baudRate < 1 || baudRate > 2147483647) {
+    throw new Error("Baud rate must be a whole number between 1 and 2147483647.");
+  }
   const dataBits = typeof values.dataBits === "string" ? Number(values.dataBits) : 8;
   const stopBits = typeof values.stopBits === "string" ? Number(values.stopBits) : 1;
   const parity = typeof values.parity === "string" ? values.parity : "none";
@@ -373,7 +380,7 @@ export function formValuesToSerial(values: FormValues, existing?: Partial<Serial
     id: existing?.id ?? randomUUID(),
     name,
     path: portPath,
-    baudRate: typeof values.baudRate === "string" ? Number(values.baudRate) : 115200,
+    baudRate,
     dataBits: VALID_DATA_BITS.has(dataBits) ? (dataBits as SerialDataBits) : 8,
     stopBits: VALID_STOP_BITS.has(stopBits) ? (stopBits as SerialStopBits) : 1,
     parity: VALID_PARITY.has(parity) ? (parity as SerialParity) : "none",

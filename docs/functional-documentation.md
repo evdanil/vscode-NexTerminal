@@ -215,6 +215,7 @@ Reverse-bind reservations are separate files in `globalStorageUri`, outside the 
 
 ### 4.6 Serial Sidecar
 1. Create a serial profile with `Nexus: Add Serial Profile` (name + group + line settings).
+   The baud-rate field offers common speeds and accepts custom whole numbers from 1 to 2,147,483,647. The operating system, driver, and device determine whether a speed works; Test Connection does not validate it.
 2. Select `Standard` or `Smart Follow` connection mode.
 3. Profiles appear in **Connectivity Hub** and support right-click connect/edit/remove/duplicate/rename.
 4. Run `Nexus: Connect Serial Port` (or item context action) to open an interactive serial terminal.

@@ -2,6 +2,10 @@
 
 ## [2.8.309] — 2026-11-01
 
+### Added
+
+- **Serial profiles accept custom baud rates** alongside the common speed suggestions. Supported speeds depend on the adapter and driver.
+
 ### Changed
 
 - Shortened the Marketplace description so it displays in full.

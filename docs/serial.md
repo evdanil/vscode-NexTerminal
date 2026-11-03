@@ -11,6 +11,8 @@ Built for embedded and firmware developers on serial consoles — Smart Follow r
 3. Choose **Standard** or [**Smart Follow**](#smart-follow) connection mode, then configure baud rate, data bits, parity, and stop bits
 4. Right-click the profile and select **Connect**
 
+For **Baud Rate**, choose a suggested speed or select **Custom…** and enter a whole number from 1 to 2,147,483,647. Whether a speed works depends on the serial adapter, operating system, and device; a driver may reject it or use an approximate speed. **Test Connection** checks port availability, not baud-rate compatibility.
+
 ## Smart Follow
 
 **Smart Follow** mode is for Windows COM-port renumbering: it retries the preferred port, silently reconnects only to the previously approved device when metadata matches, prompts before switching to unfamiliar replacement ports, updates the saved preferred port after a successful move, and keeps the terminal open while waiting or stopped instead of tearing the tab down on serial errors.

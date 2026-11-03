@@ -53,6 +53,45 @@ function keyPathVisibleWhen(definition: ReturnType<typeof serverFormDefinition>)
   return keyPathField!.visibleWhen;
 }
 
+describe("serial baud rate form", () => {
+  it("requires a custom rate after other selection and profile type changes", () => {
+    const form = openForm(unifiedProfileFormDefinition());
+    form.type("name", "Console");
+    form.choose("profileType", "serial");
+    form.type("path", "COM3");
+    form.choose("baudRate", "9600");
+    form.choose("profileType", "ssh");
+    form.choose("profileType", "serial");
+    form.choose("baudRate", "custom");
+    expect(form.attemptNativeSubmit()).toBeUndefined();
+    form.type("customBaudRate", "31250");
+    expect(form.attemptNativeSubmit()).toMatchObject({ baudRate: "custom", customBaudRate: "31250" });
+  });
+
+  it("allows a custom rate on creation and retains an existing custom rate on edit", () => {
+    const createDefinition = unifiedProfileFormDefinition({ addMode: "serial", profileType: "serial" });
+    const create = openForm(createDefinition);
+    expect(create.value("baudRate")).toBe("115200");
+    create.type("name", "Console");
+    create.type("path", "COM3");
+    expect(create.attemptNativeSubmit()?.baudRate).toBe("115200");
+    create.choose("baudRate", "custom");
+    expect(create.attemptNativeSubmit()).toBeUndefined();
+    create.type("customBaudRate", "31250");
+    expect(create.attemptNativeSubmit()).toMatchObject({ baudRate: "custom", customBaudRate: "31250" });
+    create.choose("baudRate", "9600");
+    expect(create.attemptNativeSubmit()).toMatchObject({ baudRate: "9600" });
+    create.choose("baudRate", "custom");
+    expect(create.value("customBaudRate")).toBe("31250");
+
+    const editDefinition = serialFormDefinition({ name: "Console", path: "COM3", baudRate: 31250 });
+    const edit = openForm(editDefinition);
+    expect(edit.value("baudRate")).toBe("custom");
+    expect(edit.value("customBaudRate")).toBe("31250");
+    expect(edit.submit()).toMatchObject({ baudRate: "custom", customBaudRate: "31250" });
+  });
+});
+
 describe("networkServerFormDefinition — DHCP lease duration", () => {
   // ⊘ Restoring the former clamping claim misstates the form contract: invalid
   // submissions are rejected and invalid persisted settings default to 24h.

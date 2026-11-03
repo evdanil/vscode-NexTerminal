@@ -100,10 +100,24 @@ describe("formValuesToSerial", () => {
     registeredCommands.clear();
   });
 
+  it("preserves custom and preset baud rates as numbers", () => {
+    expect(formValuesToSerial({ name: "Console", path: "COM3", baudRate: "custom", customBaudRate: "31250" })?.baudRate).toBe(31250);
+    expect(formValuesToSerial({ name: "Console", path: "COM3", baudRate: "115200" })?.baudRate).toBe(115200);
+    expect(formValuesToSerial({ name: "Console", path: "COM3", baudRate: "custom", customBaudRate: "2147483647" })?.baudRate).toBe(2147483647);
+  });
+
+  it.each(["", " ", "0", "-1", "1.5", "NaN", "1e3", "2147483648"])(
+    "refuses invalid baud rate %j instead of saving it",
+    (baudRate) => {
+      expect(() => formValuesToSerial({ name: "Console", path: "COM3", baudRate: "custom", customBaudRate: baudRate })).toThrow(/baud rate.*whole number/i);
+    }
+  );
+
   it("normalizes valid group values", () => {
     const serial = formValuesToSerial({
       name: "USB Console",
       path: "COM3",
+      baudRate: "115200",
       group: "  Lab / Rack  "
     });
     expect(serial).toBeDefined();
@@ -122,7 +136,8 @@ describe("formValuesToSerial", () => {
   it("defaults connection mode to standard", () => {
     const serial = formValuesToSerial({
       name: "USB Console",
-      path: "COM3"
+      path: "COM3",
+      baudRate: "115200"
     });
     expect(serial?.mode).toBe("standard");
   });
@@ -132,6 +147,7 @@ describe("formValuesToSerial", () => {
       {
         name: "USB Console",
         path: "COM9",
+        baudRate: "115200",
         mode: "smartFollow"
       },
       {
@@ -956,6 +972,16 @@ describe("nexus.serial.remove — the disclosure is re-checked under the lock (R
       const options = call![2] as { onSubmit: (values: FormValues) => Promise<void> };
       return options.onSubmit;
     }
+
+    it("saves a custom rate and leaves it unchanged when an invalid rate is submitted", async () => {
+      const { core } = await fixture([makeSerialProfile()]);
+      const onSubmit = await editSerial("sp1");
+      const values = { name: "USB Console", path: "COM3", baudRate: "custom", customBaudRate: "31250" };
+      await onSubmit(values);
+      expect(core.getSerialProfile("sp1")?.baudRate).toBe(31250);
+      await expect(onSubmit({ ...values, customBaudRate: "0" })).rejects.toThrow(/baud rate.*whole number/i);
+      expect(core.getSerialProfile("sp1")?.baudRate).toBe(31250);
+    });
 
     it("does not revert a deviceHint set concurrently while the form was open (kills writing the pre-form snapshot's deviceHint)", async () => {
       // formValuesToSerial has no form field for deviceHint — it always carries
