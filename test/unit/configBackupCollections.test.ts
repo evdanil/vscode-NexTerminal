@@ -29,6 +29,7 @@ const mockStat = vi.fn();
 const mockCreateDirectory = vi.fn();
 const mockExecuteCommand = vi.fn();
 const mockConfigUpdate = vi.fn();
+const configValues = new Map<string, unknown>();
 const allMocks = [
   mockShowInformationMessage,
   mockShowErrorMessage,
@@ -76,9 +77,13 @@ vi.mock("vscode", () => ({
     },
     workspaceFolders: [{ uri: { fsPath: "/workspace", scheme: "file", path: "/workspace" }, name: "workspace", index: 0 }],
     getConfiguration: (section: string) => ({
-      get: (_key: string, fallback?: unknown) => fallback,
-      inspect: () => ({ defaultValue: undefined, globalValue: undefined, workspaceValue: undefined }),
-      update: (key: string, value: unknown) => mockConfigUpdate(section, key, value)
+      get: (key: string, fallback?: unknown) => configValues.has(`${section}.${key}`) ? configValues.get(`${section}.${key}`) : fallback,
+      inspect: (key: string) => ({ defaultValue: undefined, globalValue: configValues.get(`${section}.${key}`), workspaceValue: undefined }),
+      update: async (key: string, value: unknown) => {
+        await mockConfigUpdate(section, key, value);
+        if (value === undefined) configValues.delete(`${section}.${key}`);
+        else configValues.set(`${section}.${key}`, JSON.parse(JSON.stringify(value)));
+      }
     })
   },
   Uri: {
@@ -418,6 +423,7 @@ const START_COMMANDS = [
 ];
 
 beforeEach(async () => {
+  configValues.clear();
   for (const mock of allMocks) mock.mockReset();
   mockConfigUpdate.mockResolvedValue(undefined);
   mockExecuteCommand.mockResolvedValue(undefined);
@@ -518,7 +524,7 @@ describe("Encrypted Backup — Local Shell environment variables", () => {
 
     expect(dest.core.getSnapshot().localShellProfiles).toEqual([
       makeLocalShell({ id: "sh-1", name: "Local", env: { FROM: "local" } }),
-      makeLocalShell({ id: "sh-2", name: "New", env: { TOKEN: "new-shell-token" } })
+      makeLocalShell({ id: "sh-2", name: "New", env: { TOKEN: "new-shell-token" }, highlightProfileId: "default" })
     ]);
   });
 
@@ -655,7 +661,7 @@ describe("Encrypted Backup import — Local Servers and TFTP/DHCP profiles", () 
     const snapshot = dest.core.getSnapshot();
     expect(snapshot.localServers).toEqual([
       makeLocalServer({ id: "ls-1", name: "Local", env: { FROM: "local" } }),
-      makeLocalServer({ id: "ls-2", name: "New", env: { TOKEN: "new-token" } })
+      makeLocalServer({ id: "ls-2", name: "New", env: { TOKEN: "new-token" }, highlightProfileId: "default" })
     ]);
     expect(snapshot.tftpProfiles.map((p) => [p.id, p.name])).toEqual([["tftp-1", "Local"], ["tftp-2", "New TFTP"]]);
     expect(snapshot.dhcpProfiles.map((p) => [p.id, p.name])).toEqual([["dhcp-1", "Local"], ["dhcp-2", "New DHCP"]]);

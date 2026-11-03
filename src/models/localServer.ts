@@ -46,6 +46,8 @@ export interface LocalServerEnvVar {
 }
 
 export interface LocalServerConfig {
+  /** Undefined inherits the global default; null disables highlighting. */
+  highlightProfileId?: string | null;
   id: string;
   name: string;
   group?: string;
@@ -143,6 +145,7 @@ export function localServerConfigsEqual(a: LocalServerConfig, b: LocalServerConf
   if (a.autoRestart !== b.autoRestart) return false;
   if (a.maxAutoRestarts !== b.maxAutoRestarts) return false;
   if (a.description !== b.description) return false;
+  if (a.highlightProfileId !== b.highlightProfileId) return false;
   const aArgs = a.args ?? [];
   const bArgs = b.args ?? [];
   if (aArgs.length !== bArgs.length) return false;

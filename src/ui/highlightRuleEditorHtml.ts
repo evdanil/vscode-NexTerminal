@@ -5,6 +5,7 @@ import { serializeForInlineScript } from "./shared/inlineScriptData";
 import { renderWebviewDocument } from "./shared/webviewDocument";
 import { regexSafetyWebviewJs } from "../utils/regexSafety";
 import type { HighlightRule } from "../utils/highlightRuleValidation";
+import { HIGHLIGHT_CONFLICT_RECOVERY, HIGHLIGHT_SETTINGS_REPAIR } from "./highlightProfileForm";
 
 const COLOR_NAMES = [
   "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
@@ -31,14 +32,36 @@ function renderColorOptions(selected: string): string {
   return options.join("\n        ");
 }
 
-export function renderHighlightRuleEditorHtml(rules: HighlightRule[], nonce: string): string {
+export function renderHighlightRuleEditorHtml(rules: HighlightRule[], nonce: string, manager?: import("./highlightProfileEditorStore").HighlightEditorState): string {
   const colorsJson = serializeForInlineScript(COLOR_NAMES);
   const colorCssJson = serializeForInlineScript(COLOR_CSS);
   const rulesJson = serializeForInlineScript(rules);
+  const managerJson = serializeForInlineScript(manager ?? null);
+  const recoveryJson = serializeForInlineScript(HIGHLIGHT_SETTINGS_REPAIR);
+  const conflictRecoveryJson = serializeForInlineScript(HIGHLIGHT_CONFLICT_RECOVERY);
 
   return renderWebviewDocument({
     nonce,
     css: `    ${baseWebviewCss()}
+    #profile-repair-actions[hidden] {
+      display: none;
+    }
+    #profile-manager { min-width: 0; }
+    #profile-manager select {
+      display: block;
+      box-sizing: border-box;
+      width: 100%;
+      max-width: 100%;
+      min-width: 0;
+      padding: 5px 8px;
+      background: var(--vscode-input-background);
+      color: var(--vscode-input-foreground);
+      border: 1px solid var(--vscode-input-border, transparent);
+      font: inherit;
+    }
+    #profile-manager select:focus { outline: 1px solid var(--vscode-focusBorder); }
+    #profile-manager .button-row { flex-wrap: wrap; }
+    #profile-manager button { max-width: 100%; white-space: normal; }
     .rule-row {
       display: flex;
       align-items: center;
@@ -172,6 +195,33 @@ export function renderHighlightRuleEditorHtml(rules: HighlightRule[], nonce: str
       font-size: 12px;
     }`,
     body: `  <h3>Highlighting Rules</h3>
+  <section id="profile-manager"${manager ? "" : " hidden"}>
+    <div aria-live="polite"><div id="profile-highlighting-disabled" class="info-banner" hidden>
+      Highlighting is off in the current settings. Enable nexus.terminal.highlighting.enabled in the applicable Settings scope for profiles to take effect.
+      <button type="button" class="btn-secondary" id="profile-open-highlighting-settings">Open Highlighting Settings</button>
+    </div></div>
+    <label for="profile-select">Highlight profile</label>
+    <select id="profile-select"></select>
+    <label for="profile-name">Profile name</label>
+    <input id="profile-name" type="text" maxlength="100" />
+    <div class="button-row">
+      <button type="button" class="btn-secondary" id="profile-create">Create empty</button>
+      <button type="button" class="btn-secondary" id="profile-create-defaults">Create from defaults</button>
+      <button type="button" class="btn-secondary" id="profile-rename">Rename</button>
+      <button type="button" class="btn-secondary" id="profile-duplicate">Duplicate</button>
+      <button type="button" class="btn-secondary" id="profile-delete">Delete</button>
+    </div>
+    <label for="profile-default">Global default</label>
+    <select id="profile-default"></select>
+    <div id="profile-workspace-override" class="setting-desc" hidden>Workspace settings override the global profile catalog or default. Changes here are saved globally and may not affect this workspace until its override is changed.</div>
+    <div id="profile-workspace-note" class="setting-desc" hidden>Workspace legacy rules differ from global rules. Copy them explicitly to edit and save them globally.</div>
+    <button type="button" class="btn-secondary" id="profile-workspace-copy" hidden>Copy workspace rules to selected profile</button>
+    <div id="profile-validation-error" class="editor-error" aria-live="polite"></div>
+    <div id="profile-repair-actions" class="button-row" hidden>
+      <button type="button" class="btn-secondary" id="profile-repair-user">Open User Settings (JSON)</button>
+      <button type="button" class="btn-secondary" id="profile-repair-workspace">Open Workspace Settings (JSON)</button>
+    </div>
+  </section>
   <div class="setting-desc">Rules use first-match precedence. Move specific rules above broader rules. Untick a rule to keep it but stop applying it.</div>
 
   <div id="rules-list"></div>
@@ -238,7 +288,7 @@ DEBUG: packet sent 1024 bytes</div>
     <div class="button-row" style="margin-top: 12px;">
       <button type="button" class="btn-primary" id="save-rule-btn">Stage Rule</button>
       <button type="button" class="btn-secondary" id="cancel-edit-btn">Cancel</button>
-      <button type="button" class="btn-danger" id="delete-rule-btn" style="margin-left: auto; display: none;">Delete</button>
+      <button type="button" class="btn-danger" id="delete-rule-btn" title="Delete this rule and discard its unfinished edit" style="margin-left: auto; display: none;">Delete Rule</button>
     </div>
   </div>
 `,
@@ -250,13 +300,26 @@ DEBUG: packet sent 1024 bytes</div>
       var SAMPLE_TEXT = "eth0: <BROADCAST,MULTICAST,UP> state UP\\nERROR: connection refused on port 443\\nWARNING: disk usage at 90%\\nINFO: session started for user admin\\n192.168.1.100 - ESTABLISHED\\nsshd: ACCEPTED publickey for root\\n5 input errors, 0 CRC, 0 frame, 3 overruns, 0 ignored";
       ${regexSafetyWebviewJs()}
 
-      var rules = ${rulesJson};
+      var manager = ${managerJson};
+      var recoveryInstructions = ${recoveryJson};
+      var conflictRecovery = ${conflictRecoveryJson};
+      var profiles = manager ? JSON.parse(JSON.stringify(manager.catalog.profiles)) : null;
+      var originalProfiles = profiles ? JSON.parse(JSON.stringify(profiles)) : null;
+      var defaultProfileId = manager ? manager.catalog.defaultProfileId : null;
+      var originalDefaultProfileId = defaultProfileId;
+      var selectedProfileId = profiles && profiles.length ? (profiles.some(function(p) { return p.id === defaultProfileId; }) ? defaultProfileId : profiles[0].id) : null;
+      var revision = manager ? manager.revision : null;
+      var pendingSnapshot = null;
+      var rules = manager ? ((profiles.find(function(p) { return p.id === selectedProfileId; }) || {}).rules || []) : ${rulesJson};
       var originalRules = JSON.parse(JSON.stringify(rules));
       var editingIndex = -1;
+      var ruleGuardMessage = "Stage Rule to keep this rule edit, or use Cancel in the rule editor to discard it before continuing.";
+      var priorRuleGuardError = "";
       var previewTimer = null;
       var regexCache = {};
 
       initCustomSelects();
+      if (manager) initProfileManager();
       renderRulesList();
       setDirty(false);
 
@@ -264,7 +327,7 @@ DEBUG: packet sent 1024 bytes</div>
         var indicator = document.getElementById("rules-dirty-indicator");
         var applyBtn = document.getElementById("apply-rules-btn");
         indicator.classList.toggle("visible", !!value);
-        applyBtn.disabled = !value;
+        applyBtn.disabled = !value || !!pendingSnapshot;
       }
 
       // Dirty is derived from actual content, not "something happened" — so
@@ -301,8 +364,121 @@ DEBUG: packet sent 1024 bytes</div>
       }
 
       function recomputeDirty() {
-        var changed = JSON.stringify(normalizeRulesForCompare(rules)) !== JSON.stringify(normalizeRulesForCompare(originalRules));
+        var changed = manager
+          ? JSON.stringify(normalizeProfilesForCompare(profiles)) !== JSON.stringify(normalizeProfilesForCompare(originalProfiles)) || defaultProfileId !== originalDefaultProfileId
+          : JSON.stringify(normalizeRulesForCompare(rules)) !== JSON.stringify(normalizeRulesForCompare(originalRules));
         setDirty(changed);
+      }
+
+      function normalizeProfilesForCompare(list) {
+        return list.map(function(profile) { return { id: profile.id, name: profile.name, rules: normalizeRulesForCompare(profile.rules) }; });
+      }
+
+      function currentProfile() { return profiles.find(function(p) { return p.id === selectedProfileId; }); }
+      function finishRuleFirst() {
+        if (!manager || !document.getElementById("editor-section").classList.contains("visible")) return true;
+        var error = document.getElementById("save-error");
+        if (error.textContent !== ruleGuardMessage) priorRuleGuardError = error.textContent;
+        error.textContent = ruleGuardMessage;
+        return false;
+      }
+      function selectProfile(id) {
+        selectedProfileId = id;
+        var profile = currentProfile();
+        rules = profile ? profile.rules : [];
+        document.getElementById("add-rule-btn").disabled = !profile;
+        document.getElementById("reset-defaults-btn").disabled = !profile;
+        document.getElementById("profile-name").value = profile ? profile.name : "";
+        closeEditor();
+        renderRulesList();
+      }
+      function refreshProfileSelectors() {
+        var selector = document.getElementById("profile-select");
+        var defaults = document.getElementById("profile-default");
+        selector.innerHTML = ""; defaults.innerHTML = "";
+        var none = document.createElement("option"); none.value = ""; none.textContent = "None"; defaults.appendChild(none);
+        profiles.forEach(function(profile) {
+          var opt = document.createElement("option"); opt.value = profile.id; opt.textContent = profile.name; selector.appendChild(opt);
+          var def = document.createElement("option"); def.value = profile.id; def.textContent = profile.name; defaults.appendChild(def);
+        });
+        if (defaultProfileId && !profiles.some(function(profile) { return profile.id === defaultProfileId; })) {
+          var missing = document.createElement("option"); missing.value = defaultProfileId; missing.textContent = "Missing profile: " + defaultProfileId; defaults.appendChild(missing);
+        }
+        selector.value = selectedProfileId || "";
+        defaults.value = defaultProfileId || "";
+      }
+      function profileName() {
+        var name = document.getElementById("profile-name").value.trim();
+        if (!name || name.length > 100) { document.getElementById("save-error").textContent = "Enter a profile name of 1–100 characters."; return null; }
+        return name;
+      }
+      function freshId() {
+        var id;
+        do { id = "profile-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2); }
+        while (profiles.some(function(profile) { return profile.id === id; }));
+        return id;
+      }
+      function uniqueProfileName(base) {
+        var name = base.slice(0, 100), suffix = 2;
+        while (profiles.some(function(p) { return p.name.toLowerCase() === name.toLowerCase(); })) {
+          var ending = " (" + suffix++ + ")";
+          name = base.slice(0, 100 - ending.length) + ending;
+        }
+        return name;
+      }
+      function addProfile(sourceRules, duplicate) {
+        if (!finishRuleFirst()) return;
+        var current = currentProfile();
+        var input = document.getElementById("profile-name").value.trim();
+        var name = !input || (current && input === current.name)
+          ? uniqueProfileName(duplicate && current ? current.name.slice(0, 93) + " (copy)" : "New profile")
+          : profileName();
+        if (!name) return;
+        if (profiles.some(function(p) { return p.name.toLowerCase() === name.toLowerCase(); })) {
+          document.getElementById("save-error").textContent = "A profile with that name already exists. Choose a different name.";
+          return;
+        }
+        if (profiles.length >= 100) { document.getElementById("save-error").textContent = "Maximum of 100 profiles reached."; return; }
+        var profile = { id: freshId(), name: name, rules: JSON.parse(JSON.stringify(sourceRules)) };
+        profiles.push(profile); selectedProfileId = profile.id;
+        refreshProfileSelectors(); selectProfile(profile.id); recomputeDirty();
+      }
+      function updateScopeWarnings() {
+        document.getElementById("profile-workspace-override").hidden = !manager.workspaceCatalogOverrides;
+        document.getElementById("profile-workspace-note").hidden = !manager.workspaceLegacyRules;
+        document.getElementById("profile-workspace-copy").hidden = !manager.workspaceLegacyRules;
+      }
+      function updateRecovery(state) {
+        var errors = [];
+        if (state.catalog.validationError) errors.push(state.catalog.validationError);
+        if (state.effectiveValidationError && errors.indexOf(state.effectiveValidationError) < 0) errors.push(state.effectiveValidationError);
+        if (state.effectiveMissingDefaultId) errors.push("Default highlight profile is missing: " + state.effectiveMissingDefaultId + ".");
+        document.getElementById("profile-validation-error").textContent = errors.length ? errors.join(" ") + " " + recoveryInstructions : "";
+        document.getElementById("profile-repair-actions").hidden = errors.length === 0;
+      }
+      function updateHighlightingEnabled(state) {
+        document.getElementById("profile-highlighting-disabled").hidden = state.effectiveEnabled !== false;
+      }
+      function initProfileManager() {
+        updateScopeWarnings();
+        updateRecovery(manager);
+        updateHighlightingEnabled(manager);
+        refreshProfileSelectors(); selectProfile(selectedProfileId);
+        if (manager.workspaceLegacyRules) {
+          document.getElementById("profile-workspace-note").hidden = false;
+          document.getElementById("profile-workspace-copy").hidden = false;
+        }
+        document.getElementById("profile-repair-user").addEventListener("click", function() { vscode.postMessage({ type: "openHighlightSettingsJson", scope: "user" }); });
+        document.getElementById("profile-open-highlighting-settings").addEventListener("click", function() { vscode.postMessage({ type: "openHighlightingSettings" }); });
+        document.getElementById("profile-repair-workspace").addEventListener("click", function() { vscode.postMessage({ type: "openHighlightSettingsJson", scope: "workspace" }); });
+        document.getElementById("profile-select").addEventListener("change", function(e) { if (!finishRuleFirst()) { e.target.value = selectedProfileId || ""; return; } selectProfile(e.target.value); });
+        document.getElementById("profile-default").addEventListener("change", function(e) { defaultProfileId = e.target.value || null; recomputeDirty(); });
+        document.getElementById("profile-create").addEventListener("click", function() { addProfile([]); });
+        document.getElementById("profile-create-defaults").addEventListener("click", function() { addProfile(manager.shippedRules || []); });
+        document.getElementById("profile-rename").addEventListener("click", function() { var p = currentProfile(); var name = profileName(); if (!p || !name) return; p.name = name; refreshProfileSelectors(); recomputeDirty(); });
+        document.getElementById("profile-duplicate").addEventListener("click", function() { var p = currentProfile(); if (p) addProfile(p.rules, true); });
+        document.getElementById("profile-delete").addEventListener("click", function() { if (!finishRuleFirst()) return; if (currentProfile()) vscode.postMessage({ type: "confirmDeleteProfile", profileId: selectedProfileId, profileName: currentProfile().name }); });
+        document.getElementById("profile-workspace-copy").addEventListener("click", function() { if (!finishRuleFirst()) return; var p = currentProfile(); if (!p || !manager.workspaceLegacyRules) return; p.rules = JSON.parse(JSON.stringify(manager.workspaceLegacyRules)); selectProfile(p.id); recomputeDirty(); });
       }
 
       function renderRulesList() {
@@ -412,12 +588,14 @@ DEBUG: packet sent 1024 bytes</div>
         }
         var editBtn = e.target.closest(".rule-edit-btn");
         if (editBtn) {
+          if (!finishRuleFirst()) return;
           openEditor(parseInt(editBtn.dataset.index, 10));
           return;
         }
         var delBtn = e.target.closest(".rule-delete-btn");
         if (delBtn) {
           var idx = parseInt(delBtn.dataset.index, 10);
+          if (editingIndex === idx && !finishRuleFirst()) return;
           rules.splice(idx, 1);
           renderRulesList();
           recomputeDirty();
@@ -459,6 +637,7 @@ DEBUG: packet sent 1024 bytes</div>
       });
 
       document.getElementById("add-rule-btn").addEventListener("click", function() {
+        if (!finishRuleFirst()) return;
         openEditor(-1);
       });
 
@@ -528,11 +707,18 @@ DEBUG: packet sent 1024 bytes</div>
       });
 
       document.getElementById("apply-rules-btn").addEventListener("click", function() {
+        if (!finishRuleFirst()) return;
         saveRules();
       });
 
       document.getElementById("cancel-rules-btn").addEventListener("click", function() {
-        rules = JSON.parse(JSON.stringify(originalRules));
+        if (!finishRuleFirst()) return;
+        if (manager) {
+          vscode.postMessage({ type: "cancelCatalogDraft" });
+          profiles = JSON.parse(JSON.stringify(originalProfiles)); defaultProfileId = originalDefaultProfileId;
+          if (!currentProfile()) selectedProfileId = profiles.length ? profiles[0].id : null;
+          refreshProfileSelectors(); selectProfile(selectedProfileId);
+        } else { rules = JSON.parse(JSON.stringify(originalRules)); }
         renderRulesList();
         setDirty(false);
         closeEditor();
@@ -540,7 +726,11 @@ DEBUG: packet sent 1024 bytes</div>
       });
 
       document.getElementById("reset-defaults-btn").addEventListener("click", function() {
-        vscode.postMessage({ type: "resetDefaults" });
+        if (!finishRuleFirst()) return;
+        if (manager) {
+          var profile = currentProfile(); if (!profile) return;
+          profile.rules = JSON.parse(JSON.stringify(manager.shippedRules || [])); selectProfile(profile.id); recomputeDirty();
+        } else { vscode.postMessage({ type: "resetDefaults" }); }
       });
 
       var patternInput = document.getElementById("edit-pattern");
@@ -682,15 +872,47 @@ DEBUG: packet sent 1024 bytes</div>
       function closeEditor() {
         editingIndex = -1;
         document.getElementById("editor-section").classList.remove("visible");
+        var error = document.getElementById("save-error");
+        if (error.textContent === ruleGuardMessage) error.textContent = priorRuleGuardError;
+        priorRuleGuardError = "";
       }
 
       function saveRules() {
         document.getElementById("save-error").textContent = "";
-        vscode.postMessage({ type: "saveRules", rules: rules });
+        if (manager) {
+          if (pendingSnapshot) return;
+          pendingSnapshot = { profiles: JSON.parse(JSON.stringify(profiles)), defaultProfileId: defaultProfileId };
+          setDirty(true);
+          vscode.postMessage({ type: "saveCatalog", profiles: pendingSnapshot.profiles, defaultProfileId: pendingSnapshot.defaultProfileId, revision: revision });
+        } else { vscode.postMessage({ type: "saveRules", rules: rules }); }
       }
 
       window.addEventListener("message", function(event) {
         var msg = event.data;
+        if (manager && msg.type === "confirmDeleteProfileResult" && msg.profileId === selectedProfileId && msg.confirmed) {
+          if (!finishRuleFirst()) return;
+          profiles = profiles.filter(function(p) { return p.id !== msg.profileId; });
+          if (defaultProfileId === msg.profileId) defaultProfileId = null;
+          selectedProfileId = profiles.length ? profiles[0].id : null;
+          refreshProfileSelectors(); selectProfile(selectedProfileId); recomputeDirty();
+        }
+        if (manager && msg.type === "catalogUpdated") {
+          updateRecovery(msg.state);
+          updateHighlightingEnabled(msg.state);
+          if (document.getElementById("apply-rules-btn").disabled && !pendingSnapshot && !document.getElementById("editor-section").classList.contains("visible")) {
+            manager = msg.state; profiles = JSON.parse(JSON.stringify(manager.catalog.profiles)); originalProfiles = JSON.parse(JSON.stringify(profiles));
+            defaultProfileId = manager.catalog.defaultProfileId; originalDefaultProfileId = defaultProfileId; revision = manager.revision;
+            if (!currentProfile()) selectedProfileId = profiles.length ? profiles[0].id : null;
+            updateScopeWarnings(); refreshProfileSelectors(); selectProfile(selectedProfileId); setDirty(false);
+          } else if (!pendingSnapshot && msg.state.revision !== revision) { document.getElementById("save-error").textContent = "Highlight settings changed elsewhere. " + conflictRecovery; }
+        }
+        if (manager && msg.type === "catalogSaveResult") {
+          if (msg.ok && pendingSnapshot) {
+            originalProfiles = pendingSnapshot.profiles; originalDefaultProfileId = pendingSnapshot.defaultProfileId;
+            revision = msg.revision; pendingSnapshot = null; recomputeDirty();
+            document.getElementById("save-error").textContent = "";
+          } else { pendingSnapshot = null; recomputeDirty(); document.getElementById("save-error").textContent = msg.message || "Could not save highlight profiles."; }
+        }
         if (msg.type === "rulesUpdated") {
           rules = msg.rules;
           originalRules = JSON.parse(JSON.stringify(rules));

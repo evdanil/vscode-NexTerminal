@@ -70,10 +70,9 @@ describe("resetSettings", () => {
 });
 
 /**
- * `nexus.terminal.highlighting.rules` is deliberately absent from SETTINGS_META
- * (it has its own editor, not a row in the settings panel), which meant
- * "Reset all Nexus settings to their defaults" never cleared it. The extra-key
- * list closes that gap without putting the array into SETTINGS_META.
+ * Highlight rules, the profile catalog and its default are edited outside
+ * SETTINGS_META. Reset must clear all three overrides so the shipped default
+ * profile is restored, rather than leaving a custom catalog active or empty.
  */
 describe("resetSettings — extra (non-SETTINGS_META) keys", () => {
   beforeEach(() => {
@@ -81,19 +80,25 @@ describe("resetSettings — extra (non-SETTINGS_META) keys", () => {
     getConfigurationMock.mockClear();
   });
 
-  it("exposes the highlighting rules array as a terminal-category extra key", () => {
+  it("exposes legacy rules, the catalog and its default as terminal-category extra keys", () => {
     expect(RESET_EXTRA_KEYS).toEqual([
-      { section: "nexus.terminal.highlighting", key: "rules", category: "terminal" }
+      { section: "nexus.terminal.highlighting", key: "rules", category: "terminal" },
+      { section: "nexus.terminal.highlighting", key: "profiles", category: "terminal" },
+      { section: "nexus.terminal.highlighting", key: "defaultProfile", category: "terminal" }
     ]);
   });
 
-  it("filters extras by category — terminal gets the rules, other categories get nothing", () => {
-    expect(resetExtraKeysForCategory("terminal")).toHaveLength(1);
+  it("filters extras by category — terminal gets all highlight settings, other categories get nothing", () => {
+    expect(resetExtraKeysForCategory("terminal").map((extra) => extra.key)).toEqual(["rules", "profiles", "defaultProfile"]);
     expect(resetExtraKeysForCategory("ssh")).toEqual([]);
   });
 
-  it("resetAllExtraKeys is the Reset-All list", () => {
-    expect(resetAllExtraKeys()).toEqual(RESET_EXTRA_KEYS);
+  it("Reset All includes the entire highlighting configuration", () => {
+    expect(resetAllExtraKeys().map((extra) => `${extra.section}.${extra.key}`)).toEqual([
+      "nexus.terminal.highlighting.rules",
+      "nexus.terminal.highlighting.profiles",
+      "nexus.terminal.highlighting.defaultProfile"
+    ]);
   });
 
   // ⊘ The category arrives from a webview message (`msg.category as string`),
@@ -108,9 +113,18 @@ describe("resetSettings — extra (non-SETTINGS_META) keys", () => {
   it("clears each extra key at global scope after the metas", async () => {
     await resetSettings([meta("nexus.ssh", "trustNewHosts")], RESET_EXTRA_KEYS);
 
-    expect(getConfigurationMock).toHaveBeenNthCalledWith(2, "nexus.terminal.highlighting");
-    expect(updateMock).toHaveBeenNthCalledWith(2, "rules", undefined, 1);
-    expect(updateMock).toHaveBeenCalledTimes(2);
+    expect(getConfigurationMock.mock.calls).toEqual([
+      ["nexus.ssh"],
+      ["nexus.terminal.highlighting"],
+      ["nexus.terminal.highlighting"],
+      ["nexus.terminal.highlighting"]
+    ]);
+    expect(updateMock.mock.calls).toEqual([
+      ["trustNewHosts", undefined, 1],
+      ["rules", undefined, 1],
+      ["profiles", undefined, 1],
+      ["defaultProfile", undefined, 1]
+    ]);
   });
 
   it("clears nothing extra when no extras are passed", async () => {

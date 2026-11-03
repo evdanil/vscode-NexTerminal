@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import type { SessionLogger } from "../../logging/terminalLogger";
 import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
-import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
+import type { TerminalOutputHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
 import { CLEAR_VISIBLE_SCREEN, RESET_INTERACTIVE_MODES, isTerminalGeneratedReport } from "../terminal/terminalEscapes";
 import { PtyObserverHub } from "../terminal/ptyObserverHub";
@@ -56,7 +56,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     private readonly callbacks: SerialPtyCallbacks,
     private readonly logger: SessionLogger,
     private readonly transcript?: SessionTranscript,
-    private readonly highlighter?: TerminalHighlighter,
+    private readonly highlighter?: TerminalOutputHighlighter,
     outputObserver?: PtyOutputObserver
   ) {
     this.highlighterStream =

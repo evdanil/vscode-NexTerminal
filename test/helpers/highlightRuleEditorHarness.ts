@@ -1,6 +1,7 @@
 import { StubElement } from "./formScriptHarness";
 import { renderHighlightRuleEditorHtml } from "../../src/ui/highlightRuleEditorHtml";
 import type { HighlightRule } from "../../src/utils/highlightRuleValidation";
+import type { HighlightEditorState } from "../../src/ui/highlightProfileEditorStore";
 
 /* ────────────────────────────────────────────────────────────────────────
  * Executes the REAL rendered highlight-rule-editor script against a stub
@@ -21,7 +22,11 @@ import type { HighlightRule } from "../../src/utils/highlightRuleValidation";
 
 export type PostedRuleEditorMessage =
   | { type: "saveRules"; rules: HighlightRule[] }
-  | { type: "resetDefaults" };
+  | { type: "openHighlightingSettings" }
+  | { type: "openHighlightSettingsJson"; scope: "user" | "workspace" }
+  | { type: "resetDefaults" }
+  | { type: "saveCatalog"; profiles: Array<{ id: string; name: string; rules: HighlightRule[] }>; defaultProfileId: string | null; revision: string }
+  | { type: "confirmDeleteProfile"; profileId: string };
 
 function escapeHtmlStub(str: string): string {
   return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
@@ -88,6 +93,23 @@ function buildDom(): {
     return el;
   };
 
+  set("profile-select", new StubElement("SELECT"));
+  set("profile-default", new StubElement("SELECT"));
+  set("profile-name", textInput());
+  set("profile-create", new StubElement("BUTTON"));
+  set("profile-create-defaults", new StubElement("BUTTON"));
+  set("profile-rename", new StubElement("BUTTON"));
+  set("profile-duplicate", new StubElement("BUTTON"));
+  set("profile-delete", new StubElement("BUTTON"));
+  set("profile-workspace-copy", new StubElement("BUTTON"));
+  set("profile-workspace-note", new StubElement("DIV"));
+  set("profile-workspace-override", Object.assign(new StubElement("DIV"), { hidden: true }));
+  set("profile-highlighting-disabled", Object.assign(new StubElement("DIV"), { hidden: true }));
+  set("profile-open-highlighting-settings", new StubElement("BUTTON"));
+  set("profile-validation-error", new StubElement("DIV"));
+  set("profile-repair-actions", Object.assign(new StubElement("DIV"), { hidden: true }));
+  set("profile-repair-user", new StubElement("BUTTON"));
+  set("profile-repair-workspace", new StubElement("BUTTON"));
   set("rules-list", new StubElement("DIV"));
   set("rules-empty-state", new StubElement("DIV"));
   set("add-rule-btn", new StubElement("BUTTON"));
@@ -144,6 +166,24 @@ function buildDom(): {
 
 export interface HighlightRuleEditorHarness {
   posted: PostedRuleEditorMessage[];
+  selectProfile: (id: string) => void;
+  selectedProfile: () => string;
+  setProfileName: (name: string) => void;
+  createProfile: () => void;
+  createFromDefaults: () => void;
+  saveError: () => string;
+  workspaceOverrideVisible: () => boolean;
+  highlightingDisabledVisible: () => boolean;
+  openHighlightingSettings: () => void;
+  recoveryMessage: () => string;
+  recoveryVisible: () => boolean;
+  openUserSettings: () => void;
+  openWorkspaceSettings: () => void;
+  renameProfile: () => void;
+  duplicateProfile: () => void;
+  deleteProfile: () => void;
+  setDefault: (id: string) => void;
+  copyWorkspaceRules: () => void;
   rowCount: () => number;
   /** The `.rule-pattern` span's own text: the label when present, else the pattern. */
   rowLabel: (index: number) => string;
@@ -157,6 +197,7 @@ export interface HighlightRuleEditorHarness {
   clickDown: (index: number) => void;
   clickEdit: (index: number) => void;
   clickDelete: (index: number) => void;
+  deleteEditedRule: () => void;
   clickAdd: () => void;
   setLabel: (value: string) => void;
   setDescription: (value: string) => void;
@@ -165,15 +206,18 @@ export interface HighlightRuleEditorHarness {
   descriptionValue: () => string;
   patternValue: () => string;
   stageRule: () => void;
+  cancelRuleEdit: () => void;
+  resetRules: () => void;
   clickApply: () => void;
+  clickCancel: () => void;
   editorVisible: () => boolean;
   isDirty: () => boolean;
   deliver: (msg: unknown) => void;
 }
 
 /** Executes the rendered highlight-rule-editor script (the panel IIFE) against the stub DOM. */
-export function openHighlightRuleEditor(rules: HighlightRule[]): HighlightRuleEditorHarness {
-  const html = renderHighlightRuleEditorHtml(rules, "nonce");
+export function openHighlightRuleEditor(rules: HighlightRule[], manager?: HighlightEditorState): HighlightRuleEditorHarness {
+  const html = renderHighlightRuleEditorHtml(rules, "nonce", manager);
   const start = html.indexOf("(function() {");
   const end = html.indexOf("</script>");
   if (start < 0 || end < start) {
@@ -237,6 +281,24 @@ export function openHighlightRuleEditor(rules: HighlightRule[]): HighlightRuleEd
 
   return {
     posted,
+    selectProfile: (id) => { field("profile-select").value = id; field("profile-select").bubble("change"); },
+    selectedProfile: () => field("profile-select").value,
+    setProfileName: (name) => { field("profile-name").value = name; },
+    createProfile: () => field("profile-create").bubble("click"),
+    createFromDefaults: () => field("profile-create-defaults").bubble("click"),
+    saveError: () => field("save-error").textContent,
+    workspaceOverrideVisible: () => !(field("profile-workspace-override") as StubElement & { hidden: boolean }).hidden,
+    highlightingDisabledVisible: () => !(field("profile-highlighting-disabled") as StubElement & { hidden: boolean }).hidden,
+    openHighlightingSettings: () => field("profile-open-highlighting-settings").bubble("click"),
+    recoveryMessage: () => field("profile-validation-error").textContent,
+    recoveryVisible: () => !(field("profile-repair-actions") as StubElement & { hidden: boolean }).hidden,
+    openUserSettings: () => field("profile-repair-user").bubble("click"),
+    openWorkspaceSettings: () => field("profile-repair-workspace").bubble("click"),
+    renameProfile: () => field("profile-rename").bubble("click"),
+    duplicateProfile: () => field("profile-duplicate").bubble("click"),
+    deleteProfile: () => field("profile-delete").bubble("click"),
+    setDefault: (id) => { field("profile-default").value = id; field("profile-default").bubble("change"); },
+    copyWorkspaceRules: () => field("profile-workspace-copy").bubble("click"),
     rowCount: () => dom.byId.get("rules-list")!.children.length,
     rowLabel: (index) => row(index).querySelector(".rule-pattern")?.textContent ?? "",
     rowPatternSecondary: (index) => row(index).querySelector(".rule-pattern-secondary")?.textContent,
@@ -251,6 +313,7 @@ export function openHighlightRuleEditor(rules: HighlightRule[]): HighlightRuleEd
     clickDown: (index) => rowButton(index, ".rule-down-btn").bubble("click"),
     clickEdit: (index) => rowButton(index, ".rule-edit-btn").bubble("click"),
     clickDelete: (index) => rowButton(index, ".rule-delete-btn").bubble("click"),
+    deleteEditedRule: () => field("delete-rule-btn").bubble("click"),
     clickAdd: () => field("add-rule-btn").bubble("click"),
     setLabel: (value) => { field("edit-label").value = value; },
     setDescription: (value) => { field("edit-description").value = value; },
@@ -259,7 +322,10 @@ export function openHighlightRuleEditor(rules: HighlightRule[]): HighlightRuleEd
     descriptionValue: () => field("edit-description").value,
     patternValue: () => field("edit-pattern").value,
     stageRule: () => field("save-rule-btn").bubble("click"),
+    cancelRuleEdit: () => field("cancel-edit-btn").bubble("click"),
+    resetRules: () => field("reset-defaults-btn").bubble("click"),
     clickApply: () => field("apply-rules-btn").bubble("click"),
+    clickCancel: () => field("cancel-rules-btn").bubble("click"),
     editorVisible: () => field("editor-section").classList.contains("visible"),
     isDirty: () => !field("apply-rules-btn").disabled,
     deliver: (msg) => dom.deliverMessage(msg)

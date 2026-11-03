@@ -5,7 +5,7 @@ import * as vscode from "vscode";
 import type { ServerConfig } from "../../models/config";
 import type { SessionLogger } from "../../logging/terminalLogger";
 import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
-import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
+import type { TerminalOutputHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
 import { CLEAR_VISIBLE_SCREEN, RESET_INTERACTIVE_MODES, isTerminalGeneratedReport } from "../terminal/terminalEscapes";
 import { PtyObserverHub } from "../terminal/ptyObserverHub";
@@ -44,7 +44,7 @@ export interface TelnetPtyCallbacks {
 
 export interface TelnetPtyOptions {
   transcript?: SessionTranscript;
-  highlighter?: TerminalHighlighter;
+  highlighter?: TerminalOutputHighlighter;
   outputObserver?: PtyOutputObserver;
   /** Answered to a TERMINAL-TYPE subnegotiation. Defaults to `xterm-256color`. */
   terminalType?: string;

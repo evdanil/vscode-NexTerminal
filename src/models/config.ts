@@ -647,6 +647,8 @@ export function resolveSessionProtocol(
 }
 
 export interface ServerConfig {
+  /** Undefined inherits the global default; null disables highlighting. */
+  highlightProfileId?: string | null;
   id: string;
   name: string;
   group?: string;
@@ -1183,6 +1185,7 @@ export function serverConfigsEqual(a: ServerConfig, b: ServerConfig): boolean {
     a.ipmiGatewayServerId === b.ipmiGatewayServerId &&
     a.openFileExplorerOnFirstConnect === b.openFileExplorerOnFirstConnect &&
     a.authProfileId === b.authProfileId &&
+    a.highlightProfileId === b.highlightProfileId &&
     proxyConfigsEqual(a.proxy, b.proxy) &&
     serverOriginsEqual(a.origin, b.origin) &&
     detachedOriginsEqual(a.formerlySynced, b.formerlySynced)
@@ -1238,6 +1241,7 @@ export function mergeServerConfigFields(prior: ServerConfig, batchSnapshot: Serv
     merged.openFileExplorerOnFirstConnect = current.openFileExplorerOnFirstConnect;
   }
   if (current.authProfileId !== batchSnapshot.authProfileId) merged.authProfileId = current.authProfileId;
+  if (current.highlightProfileId !== batchSnapshot.highlightProfileId) merged.highlightProfileId = current.highlightProfileId;
   if (!proxyConfigsEqual(current.proxy, batchSnapshot.proxy)) {
     merged.proxy = current.proxy ? { ...current.proxy } : current.proxy;
   }
@@ -1291,6 +1295,8 @@ export interface SerialDeviceHint {
 }
 
 export interface SerialProfile {
+  /** Undefined inherits the global default; null disables highlighting. */
+  highlightProfileId?: string | null;
   id: string;
   name: string;
   group?: string;
@@ -1306,6 +1312,8 @@ export interface SerialProfile {
 }
 
 export interface LocalShellProfile {
+  /** Undefined inherits the global default; null disables highlighting. */
+  highlightProfileId?: string | null;
   id: string;
   name: string;
   group?: string;

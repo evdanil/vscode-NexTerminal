@@ -2,6 +2,7 @@ import { externalAuthProfileUnsupportedReason } from "../models/authProfile";
 import { externalServerFormValues } from "../ui/externalCredentialForm";
 import { isExternalAuthProfile, authProfileConnectionIdentity } from "../models/authProfile";
 import * as vscode from "vscode";
+import { readHighlightCatalog } from "../services/terminal/highlightProfileSettings";
 import type { UnifiedProfileSeed } from "../ui/formDefinitions";
 import { unifiedProfileFormDefinition, unifiedProfileFormId , toSshInfrastructureServerList } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
@@ -87,7 +88,7 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
   const serverList = toSshInfrastructureServerList(snapshot.servers);
   const definition = unifiedProfileFormDefinition(seed, existingGroups, defaultLogSession, serverList, snapshot.authProfiles, {
     vscodeTerminalProfileNames: getConfiguredVscodeTerminalProfileNames()
-  });
+  }, readHighlightCatalog());
   const addMode = seed?.addMode ?? "profile";
   definition.testable = addMode !== "localShell" && addMode !== "localServer";
   if (addMode === "profile") {

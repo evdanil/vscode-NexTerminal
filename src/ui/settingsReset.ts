@@ -15,16 +15,17 @@ export interface ResetExtraKey {
 /**
  * Keys reset by "Reset All" that are NOT contributed through SETTINGS_META.
  *
- * `nexus.terminal.highlighting.rules` is edited through its own webview rather
- * than a settings row, so it was deliberately kept out of SETTINGS_META (see
- * the EXTRA_IMPORT_KEYS note in `configCommands.ts`). The side effect was that
- * "Reset all Nexus settings to their defaults" left the one array most likely
- * to be shadowing the shipped defaults untouched — a user who reset because
- * highlighting looked wrong got no change at all. The `category` field keeps a
- * per-category reset honest: only the Terminal category clears this key.
+ * Highlight rules, the profile catalog and its default are edited through
+ * their own webview rather than settings rows. All three overrides must be
+ * removed together to restore the shipped highlight defaults. Clearing only
+ * the legacy rules leaves a named catalog active; writing an empty catalog
+ * explicitly selects no profiles. Only the Terminal category clears these
+ * keys during a per-category reset.
  */
 export const RESET_EXTRA_KEYS: ResetExtraKey[] = [
-  { section: "nexus.terminal.highlighting", key: "rules", category: "terminal" }
+  { section: "nexus.terminal.highlighting", key: "rules", category: "terminal" },
+  { section: "nexus.terminal.highlighting", key: "profiles", category: "terminal" },
+  { section: "nexus.terminal.highlighting", key: "defaultProfile", category: "terminal" }
 ];
 
 /**

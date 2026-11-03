@@ -19,6 +19,7 @@ import * as path from "node:path";
 import type { LocalServerConfig } from "../../src/models/localServer";
 import { LocalServerError } from "../../src/models/localServer";
 import { LocalServerManager } from "../../src/services/local/localServerManager";
+import { HighlightProfileService } from "../../src/services/terminal/highlightProfileService";
 import { LocalShellPty } from "../../src/services/local/localShellPty";
 
 function normalizeMockPath(value: string): string {
@@ -188,6 +189,31 @@ function baseConfig(partial: Partial<LocalServerConfig> = {}): LocalServerConfig
     ...partial
   };
 }
+
+describe("LocalServerManager highlight profile wiring", () => {
+  beforeEach(() => {
+    mockConfig.clear();
+    mockConfig.set("isTrusted", true);
+    vi.mocked(LocalShellPty).mockClear();
+  });
+
+  it("passes the saved Local Server profile and tracks changes in the correct namespace", async () => {
+    const service = new HighlightProfileService(() => ({ enabled: true, legacy: false, defaultProfileId: "red", profiles: [
+      { id: "red", name: "Red", rules: [{ pattern: "ERROR", color: "red" }] },
+      { id: "blue", name: "Blue", rules: [{ pattern: "WARN", color: "blue" }] }
+    ] }));
+    const registry = { register: vi.fn((..._args: unknown[]) => {}) };
+    const manager = fakeManager({ highlightProfileService: service, terminalRegistry: registry as never });
+    await manager.start(baseConfig({ highlightProfileId: "blue" }));
+    const handle = registry.register.mock.calls[0][2] as ReturnType<HighlightProfileService["createSession"]>;
+    const ptyOptions = vi.mocked(LocalShellPty).mock.calls[0][0];
+    expect(ptyOptions.highlighter).toBe(handle);
+    expect(handle.apply("ERROR WARN")).toBe("ERROR \x1b[34mWARN\x1b[39m");
+    service.updateSavedSelections({ servers: [], serialProfiles: [], localShellProfiles: [{ id: "cfg-1", highlightProfileId: "blue" }], localServers: [{ id: "cfg-1", highlightProfileId: "red" }] });
+    expect(handle.apply("ERROR WARN")).toBe("\x1b[31mERROR\x1b[39m WARN");
+    manager.dispose(); handle.dispose();
+  });
+});
 
 describe("LocalServerManager — workspace trust gating", () => {
   beforeEach(() => {

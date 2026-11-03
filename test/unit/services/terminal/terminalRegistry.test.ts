@@ -48,6 +48,7 @@ vi.mock("vscode", () => ({
   }
 }));
 
+import { HighlightProfileService } from "../../../../src/services/terminal/highlightProfileService";
 import { TerminalRegistry } from "../../../../src/services/terminal/terminalRegistry";
 import type { SessionPtyHandle } from "../../../../src/models/config";
 
@@ -140,6 +141,20 @@ describe("TerminalRegistry", () => {
     const hits = state.setContextCalls.filter((c) => c.key === key);
     return hits.length === 0 ? undefined : hits[hits.length - 1].value;
   }
+
+  it("exposes the tab's highlight handle and disposes it when the tab closes", () => {
+    const service = new HighlightProfileService(() => ({ profiles: [], defaultProfileId: null, enabled: true, legacy: false }));
+    const handle = service.createSession();
+    const dispose = vi.spyOn(handle, "dispose");
+    const reg = new TerminalRegistry(makeCore());
+    const terminal = {} as Parameters<TerminalRegistry["register"]>[0];
+    reg.register(terminal, makePty(), handle);
+    expect(reg.get(terminal)?.highlight).toBe(handle);
+    state.closeTerminalListeners.forEach(listener => listener(terminal));
+    expect(reg.get(terminal)).toBeUndefined();
+    expect(dispose).toHaveBeenCalledOnce();
+    reg.dispose();
+  });
 
   it("seeds both context keys to false at construction time (cold-start defense)", () => {
     const reg = new TerminalRegistry(makeCore());

@@ -15,6 +15,7 @@ vi.mock("vscode", () => ({
 }));
 
 import { TerminalHighlighter, TerminalHighlighterStream } from "../../src/services/terminalHighlighter";
+import { FORMER_DEFAULT_PATTERNS } from "../../src/utils/highlightRuleUpgrade";
 import { PtyObserverHub } from "../../src/services/terminal/ptyObserverHub";
 
 function setConfig(enabled: boolean, rules: Array<Record<string, unknown>>): void {
@@ -28,6 +29,18 @@ describe("TerminalHighlighter", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it("renders an explicit profile's rule exactly as supplied", () => {
+    const pattern = Object.keys(FORMER_DEFAULT_PATTERNS)[0];
+    const h = new TerminalHighlighter({ enabled: true, rules: [{ pattern, color: "red" }] });
+    expect(h.apply("fe80::b3ff:fe1e:8329")).toBe("\x1b[31mfe80::b3ff\x1b[39m:fe1e:8329");
+  });
+
+  it("uses an explicit ruleset instead of the global setting", () => {
+    setConfig(true, [{ pattern: "OTHER", color: "blue" }]);
+    const h = new TerminalHighlighter({ enabled: true, rules: [{ pattern: "ERROR", color: "red" }] });
+    expect(h.apply("ERROR OTHER")).toBe("\x1b[31mERROR\x1b[39m OTHER");
   });
 
   it("highlights ERROR in plain text with red bold", () => {

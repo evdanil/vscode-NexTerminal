@@ -21,6 +21,7 @@ import { readFile } from "node:fs/promises";
 import { defaultSshDir, deployPublicKeyToRemote, findLocalKeyPairs, generateKeyPair } from "../../src/services/ssh/deploySshKey";
 import { SilentAuthSshFactory, passphraseSecretKey, passwordSecretKey, legacyProxyPasswordSecretKey } from "../../src/services/ssh/silentAuth";
 import { currentProxyPasswordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/proxyPasswordKeys";
+import { HighlightProfileService } from "../../src/services/terminal/highlightProfileService";
 import { SshPty } from "../../src/services/ssh/sshPty";
 import { SshAgentUnavailableError } from "../../src/services/ssh/authErrors";
 import { TelnetPty } from "../../src/services/telnet/telnetPty";
@@ -1643,6 +1644,36 @@ describe("formValuesToProxy", () => {
       proxyHttpHost: "proxy.example.com",
       proxyHttpPort: 70000
     })).toBeUndefined();
+  });
+});
+
+describe("formValuesToServer — highlight profile", () => {
+  it("round-trips tri-state and missing selections for both network protocols", () => {
+    for (const protocol of ["ssh", "telnet"]) {
+      const values = { name: "Device", host: "example.test", username: "user", protocol, altHost: "alternate.test" };
+      expect(formValuesToServer({ ...values, highlightProfileId: "__none__" })?.highlightProfileId).toBeNull();
+      expect(formValuesToServer({ ...values, highlightProfileId: "" }, "id", false, false, "saved")?.highlightProfileId).toBeUndefined();
+      expect(formValuesToServer({ ...values, highlightProfileId: "profile:deleted" })?.highlightProfileId).toBe("deleted");
+      expect(formValuesToServer(values, "id", false, false, "saved")).toMatchObject({ highlightProfileId: "saved", altHost: "alternate.test" });
+    }
+  });
+
+  it("server edit preserves the live highlight selection when an older form omits it", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewFormPanelOpen.mockReturnValue({ dispose: vi.fn(), onDidDispose: vi.fn() });
+    const server = makeServer({ protocol: "telnet", highlightProfileId: "old" });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.edit")!(server.id);
+    const options = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as {
+      onSubmit: (values: Record<string, unknown>) => Promise<void>;
+    };
+    await ctx.core.addOrUpdateServer({ ...server, highlightProfileId: "live" });
+    await options.onSubmit({ name: server.name, host: server.host, port: server.port, protocol: "telnet" });
+    expect(ctx.core.getServer(server.id)?.highlightProfileId).toBe("live");
+    await options.onSubmit({ name: server.name, host: server.host, port: server.port, protocol: "telnet", highlightProfileId: "" });
+    expect(ctx.core.getServer(server.id)?.highlightProfileId).toBeUndefined();
   });
 });
 
@@ -5592,6 +5623,29 @@ describe("telnet connect path", () => {
     registerServerCommands(ctx);
     return { ctx, server, run: () => registeredCommands.get("nexus.server.connect")!("srv-1") };
   }
+
+  it.each(["ssh", "telnet"] as const)("passes the selected profile to the %s terminal", async (protocol) => {
+    const server = makeServer({ protocol, highlightProfileId: "blue" });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    const service = new HighlightProfileService(() => ({ enabled: true, legacy: false, defaultProfileId: "red", profiles: [
+      { id: "red", name: "Red", rules: [{ pattern: "ERROR", color: "red" }] },
+      { id: "blue", name: "Blue", rules: [{ pattern: "WARN", color: "blue" }] }
+    ] }));
+    const registry = { register: vi.fn((..._args: unknown[]) => {}) };
+    ctx.highlightProfileService = service;
+    ctx.terminalRegistry = registry as never;
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.connect")!(server.id);
+    const handle = registry.register.mock.calls[0][2] as unknown as ReturnType<HighlightProfileService["createSession"]>;
+    const passed = protocol === "ssh"
+      ? vi.mocked(SshPty).mock.calls[0][5]
+      : vi.mocked(TelnetPty).mock.calls[0][3]?.highlighter;
+    expect(passed).toBe(handle);
+    expect(handle.apply("ERROR WARN")).toBe("ERROR \x1b[34mWARN\x1b[39m");
+    service.updateSavedSelections({ servers: [{ id: server.id, highlightProfileId: "red" }], serialProfiles: [], localShellProfiles: [], localServers: [] });
+    expect(handle.apply("ERROR WARN")).toBe("\x1b[31mERROR\x1b[39m WARN");
+    handle.dispose();
+  });
 
   // ⊘ THE POINT OF THE BRANCH. A connect path that still built an SshPty for a
   // telnet server would prompt for a password, touch the vault, and then hand

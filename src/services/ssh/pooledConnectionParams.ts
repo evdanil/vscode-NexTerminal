@@ -33,6 +33,7 @@ export const POOLED_CONNECTION_FIELDS: Record<keyof ServerConfig, boolean> = {
   keyPath: true,
   isHidden: false,
   logSession: false,
+  highlightProfileId: false,
   multiplexing: true,
   legacyAlgorithms: true,
   ipmiHost: false,

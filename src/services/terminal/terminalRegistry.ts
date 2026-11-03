@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import type { ActiveLocalShellSession, ActiveSerialSession, ActiveSession, SessionPtyHandle } from "../../models/config";
 import type { ActiveLocalServerSession } from "../../models/localServer";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
+import type { SessionHighlightHandle } from "./highlightProfileService";
 import { TerminalCaptureBuffer } from "./terminalCaptureBuffer";
 
 export const CONTEXT_KEY_IS_NEXUS = "nexus.isNexusTerminal";
@@ -11,6 +12,7 @@ export interface RegistryEntry {
   terminal: vscode.Terminal;
   pty: SessionPtyHandle;
   buffer: TerminalCaptureBuffer;
+  highlight?: SessionHighlightHandle;
 }
 
 interface InternalEntry extends RegistryEntry {
@@ -48,8 +50,11 @@ export class TerminalRegistry implements vscode.Disposable {
     this.refreshContextKeys();
   }
 
-  public register(terminal: vscode.Terminal, pty: SessionPtyHandle): void {
-    if (this.disposed || this.entries.has(terminal)) return;
+  public register(terminal: vscode.Terminal, pty: SessionPtyHandle, highlight?: SessionHighlightHandle): void {
+    if (this.disposed || this.entries.has(terminal)) {
+      highlight?.dispose();
+      return;
+    }
     const buffer = new TerminalCaptureBuffer();
     const observer: PtyOutputObserver = {
       onOutput: (text) => buffer.append(text),
@@ -58,7 +63,7 @@ export class TerminalRegistry implements vscode.Disposable {
       dispose: () => {}
     };
     const observerDisposable = pty.addOutputObserver(observer);
-    this.entries.set(terminal, { terminal, pty, buffer, observerDisposable });
+    this.entries.set(terminal, { terminal, pty, buffer, observerDisposable, highlight });
     this.refreshContextKeys();
   }
 
@@ -73,6 +78,7 @@ export class TerminalRegistry implements vscode.Disposable {
     try {
       entry.observerDisposable.dispose();
       entry.buffer.dispose();
+      entry.highlight?.dispose();
     } finally {
       this.entries.delete(terminal);
       this.refreshContextKeys();
@@ -138,6 +144,7 @@ export class TerminalRegistry implements vscode.Disposable {
     for (const entry of this.entries.values()) {
       entry.observerDisposable.dispose();
       entry.buffer.dispose();
+      entry.highlight?.dispose();
     }
     this.entries.clear();
     for (const sub of this.subscriptions) {

@@ -3,6 +3,7 @@ import { showExternalCredentialError } from "../services/credentials/externalCre
 import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as vscode from "vscode";
+import { readHighlightCatalog } from "../services/terminal/highlightProfileSettings";
 import type { NexusCore } from "../core/nexusCore";
 import type {
   ResolvedTunnelConnectionMode,
@@ -616,7 +617,7 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
         onCreateInline: (key) => {
           if (key === "defaultServerId") {
             const existingGroups = collectGroups(ctx);
-            const serverDef = serverFormDefinition(undefined, existingGroups, getDefaultSessionTranscriptsEnabled());
+            const serverDef = serverFormDefinition(undefined, existingGroups, getDefaultSessionTranscriptsEnabled(), undefined, undefined, false, readHighlightCatalog());
             WebviewFormPanel.open("tunnel-add-server", serverDef, {
               onSubmit: async (serverValues) => {
                 const server = formValuesToServer(serverValues);
@@ -692,7 +693,7 @@ export function registerTunnelCommands(ctx: CommandContext): vscode.Disposable[]
         onCreateInline: (key) => {
           if (key === "defaultServerId") {
             const existingGroups = collectGroups(ctx);
-            const serverDef = serverFormDefinition(undefined, existingGroups, getDefaultSessionTranscriptsEnabled());
+            const serverDef = serverFormDefinition(undefined, existingGroups, getDefaultSessionTranscriptsEnabled(), undefined, undefined, false, readHighlightCatalog());
             WebviewFormPanel.open("tunnel-edit-server", serverDef, {
               onSubmit: async (serverValues) => {
                 const server = formValuesToServer(serverValues);

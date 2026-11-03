@@ -6,6 +6,9 @@ import { readFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
+import type { HighlightProfileSelection } from "../models/highlightProfile";
+import { readHighlightCatalog } from "../services/terminal/highlightProfileSettings";
+import { parseHighlightProfileFormValue } from "../ui/highlightProfileForm";
 import type { AuthProfile, AuthType, InventoryProxyOwnership, ProxyConfig, ServerConfig, ServerOrigin, SessionPtyHandle } from "../models/config";
 import {
   authProfileOwnedCredentials,
@@ -737,7 +740,8 @@ export function formValuesToServer(
   values: FormValues,
   existingId?: string,
   preserveIsHidden = false,
-  existingAddressless = false
+  existingAddressless = false,
+  existingHighlightProfileId?: HighlightProfileSelection
 ): ServerConfig | undefined {
   const name = typeof values.name === "string" ? values.name.trim() : "";
   const host = typeof values.host === "string" ? values.host.trim() : "";
@@ -792,6 +796,7 @@ export function formValuesToServer(
     group: normalizedGroup,
     isHidden: preserveIsHidden,
     logSession: typeof values.logSession === "boolean" ? values.logSession : getDefaultSessionTranscriptsEnabled(),
+    highlightProfileId: parseHighlightProfileFormValue(values.highlightProfileId, existingHighlightProfileId),
     multiplexing: typeof values.multiplexing === "boolean" ? values.multiplexing : undefined,
     legacyAlgorithms: typeof values.legacyAlgorithms === "boolean" ? values.legacyAlgorithms : undefined,
     openFileExplorerOnFirstConnect: values.openFileExplorerOnFirstConnect === true ? true : undefined,
@@ -1245,6 +1250,7 @@ async function connectTelnetServer(
       const terminalType = vscode.workspace
         .getConfiguration("nexus.ssh")
         .get<string>("terminalType", "xterm-256color");
+      const highlight = ctx.highlightProfileService?.createSession({ kind: "server", id: server.id }, server.highlightProfileId);
       const pty = new TelnetPty(
         server,
         {
@@ -1304,22 +1310,28 @@ async function connectTelnetServer(
             server.logSession ?? getDefaultSessionTranscriptsEnabled(),
             getTranscriptRotationOptions(ctx)
           ),
-          highlighter: ctx.highlighter,
+          highlighter: highlight ?? ctx.highlighter,
           outputObserver: triggerObserver,
           terminalType
         }
       );
       ptyRef = pty;
       const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
-      const terminal = vscode.window.createTerminal({
-        name: terminalName,
-        pty,
-        iconPath: new vscode.ThemeIcon("server"),
-        color: new vscode.ThemeColor("terminal.ansiCyan"),
-        location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
-      });
+      let terminal: vscode.Terminal;
+      try {
+        terminal = vscode.window.createTerminal({
+          name: terminalName,
+          pty,
+          iconPath: new vscode.ThemeIcon("server"),
+          color: new vscode.ThemeColor("terminal.ansiCyan"),
+          location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
+        });
+      } catch (error) {
+        highlight?.dispose();
+        throw error;
+      }
       terminalRef = terminal;
-      ctx.terminalRegistry?.register(terminal, pty);
+      ctx.terminalRegistry?.register(terminal, pty, highlight);
       addTerminal(server.id, terminal, ctx.terminalsByServer);
       ctx.focusedTerminal = terminal;
       terminal.show();
@@ -1441,6 +1453,7 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
       );
       const osc7Observer = createOsc7Observer(ctx, server.id);
       const terminalType = vscode.workspace.getConfiguration("nexus.ssh").get<string>("terminalType", "xterm-256color");
+      const highlight = ctx.highlightProfileService?.createSession({ kind: "server", id: server.id }, server.highlightProfileId);
       const pty = new SshPty(
         server,
         ctx.sshFactory,
@@ -1603,22 +1616,28 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
           server.logSession ?? getDefaultSessionTranscriptsEnabled(),
           getTranscriptRotationOptions(ctx)
         ),
-        ctx.highlighter,
+        highlight ?? ctx.highlighter,
         triggerObserver,
         terminalType
       );
       ptyRef = pty;
       pty.addOutputObserver(osc7Observer);
       const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
-      const terminal = vscode.window.createTerminal({
-        name: terminalName,
-        pty,
-        iconPath: new vscode.ThemeIcon("server"),
-        color: new vscode.ThemeColor("terminal.ansiCyan"),
-        location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
-      });
+      let terminal: vscode.Terminal;
+      try {
+        terminal = vscode.window.createTerminal({
+          name: terminalName,
+          pty,
+          iconPath: new vscode.ThemeIcon("server"),
+          color: new vscode.ThemeColor("terminal.ansiCyan"),
+          location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
+        });
+      } catch (error) {
+        highlight?.dispose();
+        throw error;
+      }
       terminalRef = terminal;
-      ctx.terminalRegistry?.register(terminal, pty);
+      ctx.terminalRegistry?.register(terminal, pty, highlight);
       addTerminal(server.id, terminal, ctx.terminalsByServer);
       ctx.focusedTerminal = terminal;
       terminal.show();
@@ -1912,7 +1931,8 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         getDefaultSessionTranscriptsEnabled(),
         serverList,
         snapshot.authProfiles,
-        existing.origin !== undefined || existing.formerlySynced !== undefined
+        existing.origin !== undefined || existing.formerlySynced !== undefined,
+        readHighlightCatalog()
       );
       // Issue #48 — a caller that is sending the user here to fill in an
       // advanced field (a `${profile.ipmiHost}` refusal) says so, and the
@@ -2191,6 +2211,9 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
             );
             const updated: ServerConfig = {
               ...preserveDormantSshConfig(liveRecord ?? existing, linked),
+              // An older open form may omit the new control; absence expresses
+              // no preference and must preserve the live record's selection.
+              highlightProfileId: parseHighlightProfileFormValue(values.highlightProfileId, liveRecord?.highlightProfileId),
               ...(liveOrigin !== undefined ? { origin: liveOrigin } : {}),
               ...(liveFormerlySynced !== undefined ? { formerlySynced: liveFormerlySynced } : {})
             };

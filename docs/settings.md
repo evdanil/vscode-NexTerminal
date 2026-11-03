@@ -50,7 +50,7 @@ Guide: [Terminal](terminal.md).
 | `nexus.terminal.openLocation` | `editor` | Where to open terminals: `panel` or `editor` tab |
 | `nexus.terminal.keyboardPassthrough` | `true` | Pass Ctrl+ key combinations to the terminal |
 | `nexus.terminal.passthroughKeys` | `[b,e,g,j,k,n,o,p,q,r,w]` | Which Ctrl+ keys to pass through when enabled |
-| `nexus.terminal.highlighting.enabled` | `true` | Enable regex-based terminal highlighting; rules are edited in the Highlighting Rules editor. The IPv6 and UUID rules ship disabled — switch either on with its per-rule checkbox in the editor |
+| `nexus.terminal.highlighting.enabled` | `true` | Enable regex-based terminal highlighting; manage named profiles and rules in the Highlighting Rules editor. The IPv6 and UUID rules ship disabled — switch either on with its per-rule checkbox in the editor |
 | `nexus.settingsGuard.enabled` | `true` | Restore the `terminal.integrated.commandsToSkipShell` entries macro shortcuts need when an external program strips them — see [Settings Guard](connectivity-hub.md#settings-guard). External changes are still logged when this is off |
 
 ## Macros

@@ -90,11 +90,22 @@ import type { CommandContext } from "../../src/commands/types";
 import { NexusCore } from "../../src/core/nexusCore";
 import type { SerialProfile } from "../../src/models/config";
 import { configMutationLock } from "../../src/services/configMutationLock";
+import { HighlightProfileService } from "../../src/services/terminal/highlightProfileService";
+import { SmartSerialPty } from "../../src/services/serial/smartSerialPty";
 import { SerialPty } from "../../src/services/serial/serialPty";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import type { FormValues } from "../../src/ui/formTypes";
 
 describe("formValuesToSerial", () => {
+  it("round-trips highlight inherit, none, named and omitted selections without losing Smart Follow metadata", () => {
+    const values = { name: "Console", path: "COM3", baudRate: "31250" };
+    const existing = { id: "serial", highlightProfileId: "saved", mode: "smartFollow" as const, deviceHint: { serialNumber: "device" } };
+    expect(formValuesToSerial({ ...values, highlightProfileId: "__none__" }, existing)?.highlightProfileId).toBeNull();
+    expect(formValuesToSerial({ ...values, highlightProfileId: "" }, existing)?.highlightProfileId).toBeUndefined();
+    expect(formValuesToSerial({ ...values, highlightProfileId: "profile:deleted" }, existing)?.highlightProfileId).toBe("deleted");
+    expect(formValuesToSerial(values, existing)).toMatchObject({ highlightProfileId: "saved", baudRate: 31250, mode: "smartFollow", deviceHint: { serialNumber: "device" } });
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     registeredCommands.clear();
@@ -462,6 +473,27 @@ describe("serial terminal tab visual differentiation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     registeredCommands.clear();
+  });
+
+  it.each(["standard", "smartFollow"] as const)("passes the saved profile to the %s serial terminal", async (mode) => {
+    const ctx = makeSerialCtx();
+    ctx.core.getSerialProfile = vi.fn(() => ({ ...baseProfile, mode, highlightProfileId: "blue" }));
+    const service = new HighlightProfileService(() => ({ enabled: true, legacy: false, defaultProfileId: "red", profiles: [
+      { id: "red", name: "Red", rules: [{ pattern: "ERROR", color: "red" }] },
+      { id: "blue", name: "Blue", rules: [{ pattern: "WARN", color: "blue" }] }
+    ] }));
+    const registry = { register: vi.fn((..._args: unknown[]) => {}) };
+    ctx.highlightProfileService = service;
+    ctx.terminalRegistry = registry;
+    registerSerialCommands(ctx);
+    await registeredCommands.get("nexus.serial.connect")!("sp1");
+    const handle = registry.register.mock.calls[0][2] as unknown as ReturnType<HighlightProfileService["createSession"]>;
+    const passed = mode === "standard" ? vi.mocked(SerialPty).mock.calls[0][5] : vi.mocked(SmartSerialPty).mock.calls[0][5];
+    expect(passed).toBe(handle);
+    expect(handle.apply("ERROR WARN")).toBe("ERROR \x1b[34mWARN\x1b[39m");
+    service.updateSavedSelections({ servers: [], serialProfiles: [{ id: "sp1", highlightProfileId: "red" }], localShellProfiles: [], localServers: [] });
+    expect(handle.apply("ERROR WARN")).toBe("\x1b[31mERROR\x1b[39m WARN");
+    handle.dispose();
   });
 
   it.each(["standard", "smartFollow"])("keeps %s macro eligibility after editor focus changes", async (mode) => {
@@ -972,6 +1004,19 @@ describe("nexus.serial.remove — the disclosure is re-checked under the lock (R
       const options = call![2] as { onSubmit: (values: FormValues) => Promise<void> };
       return options.onSubmit;
     }
+
+    it("explains that highlight selection updates live output while connection settings need reconnect", async () => {
+      const { core } = await fixture([makeSerialProfile()]);
+      vi.spyOn(core, "isSerialProfileConnected").mockReturnValue(true);
+      const onSubmit = await editSerial("sp1");
+      await onSubmit({ name: "USB Console", path: "COM3", baudRate: "9600", highlightProfileId: "__none__" });
+      expect(core.getSerialProfile("sp1")?.highlightProfileId).toBeNull();
+      const notice = String(vi.mocked(vscode.window.showInformationMessage).mock.calls.at(-1)?.[0]);
+      expect(notice).toContain("Highlight profile changes apply to future output");
+      expect(notice).toContain("terminal has its own override");
+      expect(notice).toContain("Other settings apply after reconnect");
+      expect(notice).not.toContain("Existing sessions keep current settings until reconnect");
+    });
 
     it("saves a custom rate and leaves it unchanged when an invalid rate is submitted", async () => {
       const { core } = await fixture([makeSerialProfile()]);

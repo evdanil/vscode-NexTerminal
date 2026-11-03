@@ -21,7 +21,8 @@ import {
   validateSavedFilter,
   isValidServerOrigin,
   isValidDetachedServerOrigin,
-  stripAddresslessOriginAddressStamps
+  stripAddresslessOriginAddressStamps,
+  sanitizeHighlightProfileSelection
 } from "../utils/validation";
 import { asArray } from "../utils/helpers";
 
@@ -280,7 +281,7 @@ export class VscodeConfigRepository implements ConfigRepository {
   }
 
   public async getServers(): Promise<ServerConfig[]> {
-    const raw = asArray<ServerConfig>(this.readRaw(SERVERS_KEY));
+    const raw = asArray<unknown>(this.readRaw(SERVERS_KEY)).map(sanitizeHighlightProfileSelection);
     const result: ServerConfig[] = [];
     for (const item of raw) {
       if (!validateServerConfig(item)) {
@@ -361,8 +362,8 @@ export class VscodeConfigRepository implements ConfigRepository {
   }
 
   public async getSerialProfiles(): Promise<SerialProfile[]> {
-    const raw = asArray<SerialProfile>(this.readRaw(SERIAL_PROFILES_KEY));
-    return raw.filter((item) => {
+    const raw = asArray<unknown>(this.readRaw(SERIAL_PROFILES_KEY)).map(sanitizeHighlightProfileSelection);
+    return raw.filter((item): item is SerialProfile => {
       if (validateSerialProfile(item)) {
         return true;
       }
@@ -376,8 +377,8 @@ export class VscodeConfigRepository implements ConfigRepository {
   }
 
   public async getLocalShellProfiles(): Promise<LocalShellProfile[]> {
-    const raw = asArray<LocalShellProfile>(this.readRaw(LOCAL_SHELL_PROFILES_KEY));
-    return raw.filter((item) => {
+    const raw = asArray<unknown>(this.readRaw(LOCAL_SHELL_PROFILES_KEY)).map(sanitizeHighlightProfileSelection);
+    return raw.filter((item): item is LocalShellProfile => {
       if (validateLocalShellProfile(item)) {
         return true;
       }
@@ -421,8 +422,8 @@ export class VscodeConfigRepository implements ConfigRepository {
   }
 
   public async getLocalServers(): Promise<LocalServerConfig[]> {
-    const raw = asArray<LocalServerConfig>(this.readRaw(LOCAL_SERVERS_KEY));
-    return raw.filter((item) => {
+    const raw = asArray<unknown>(this.readRaw(LOCAL_SERVERS_KEY)).map(sanitizeHighlightProfileSelection);
+    return raw.filter((item): item is LocalServerConfig => {
       if (validateLocalServerConfig(item)) {
         return true;
       }

@@ -48,6 +48,8 @@
 
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
+import { readHighlightCatalog } from "../services/terminal/highlightProfileSettings";
+import { parseHighlightProfileFormValue } from "../ui/highlightProfileForm";
 import { configMutationLock } from "../services/configMutationLock";
 import {
   LocalServerManager,
@@ -163,6 +165,7 @@ export function formValuesToLocalServer(values: FormValues, existing?: Partial<L
     // the exact opposite of the request.
     maxAutoRestarts: maxAutoRestarts ?? undefined,
     description: description || undefined,
+    highlightProfileId: parseHighlightProfileFormValue(values.highlightProfileId, existing?.highlightProfileId),
     group: normalizedGroup
   };
 }
@@ -552,7 +555,7 @@ export function registerLocalServerCommands(
       const editedId = existing.id;
       const editedName = existing.name;
       const groupWhenFormOpened = existing.group;
-      WebviewFormPanel.open("local-server-edit", localServerFormDefinition(existing, collectGroups(ctx)), {
+      WebviewFormPanel.open("local-server-edit", localServerFormDefinition(existing, collectGroups(ctx), readHighlightCatalog()), {
         onSubmit: async (values) => {
           if (normalizeOptionalFolderPath(values.group) === null) {
             throw new Error(INVALID_FOLDER_PATH_MESSAGE);

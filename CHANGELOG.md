@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.310] — 2026-11-03
+
+### Added
+
+- **Named highlight profiles** let you maintain separate ordered rule sets, choose a global default, assign a profile or no highlighting to a saved connection, and change an individual running terminal's selection. Existing rules remain available, and profile settings travel with backups and shares.
+
 ## [2.8.309] — 2026-11-01
 
 ### Added

@@ -69,7 +69,8 @@ import {
   validateSavedFilter,
   isValidServerOrigin,
   isValidDetachedServerOrigin,
-  stripAddresslessOriginAddressStamps
+  stripAddresslessOriginAddressStamps,
+  sanitizeHighlightProfileSelection
 } from "../utils/validation";
 import { isValidBinding } from "../macroBindings";
 import {
@@ -94,6 +95,8 @@ import { validateSettingUpdate } from "../ui/settingsValidation";
 import { SETTINGS_META } from "../ui/settingsMetadata";
 import { recordNexusConfigWrite } from "../services/terminal/settingsWriteRegistry";
 import { validateAndSanitizeHighlightRules } from "../utils/highlightRuleValidation";
+import { isHighlightProfileSelection, validateHighlightProfiles } from "../utils/highlightProfileValidation";
+import { readGlobalHighlightCatalogForEditing } from "../services/terminal/highlightProfileSettings";
 import { upgradeHighlightRules } from "../utils/highlightRuleUpgrade";
 import { validateRegexSafety } from "../utils/regexSafety";
 import { MAX_SCRIPT_RUNTIME_MS } from "../services/scripts/maxRuntime";
@@ -227,6 +230,8 @@ interface NexusConfigExport {
  * hooks must resolve; failed connection teardown is reported to the user.
  */
 export interface ConfigRuntimeHooks {
+  /** IDs used by live highlight sessions, including missing selections. */
+  getReferencedHighlightProfileIds?(): ReadonlySet<string>;
   /** Synchronous authority fence before import writes; omitted ids revoke the whole session. */
   revokeExternalCredentialApprovals?(profileIds?: readonly string[]): void;
   /**
@@ -380,6 +385,8 @@ const EXTRA_IMPORT_KEYS: Array<{ section: string; key: string }> = [
 // each gets a shape validator in SPECIAL_SETTING_VALIDATORS below — without one,
 // validateSettingUpdate would reject them on import as "Unknown Nexus setting".
 const FORM_EDITED_SETTING_KEYS: Array<{ section: string; key: string }> = [
+  { section: "nexus.terminal.highlighting", key: "profiles" },
+  { section: "nexus.terminal.highlighting", key: "defaultProfile" },
   { section: "nexus.networkServers", key: "dhcp.dns" },
   { section: "nexus.networkServers", key: "dhcp.tftpServerAddresses" },
   { section: "nexus.networkServers", key: "dhcp.vendorSpecificOptions" },
@@ -461,6 +468,8 @@ export const SHARE_SETTINGS_POLICY: Readonly<Record<string, "share" | "local">> 
   // Highlighting rules are portable user preferences. Macro activation,
   // cooldown, and prompt context are local automation safeguards.
   "nexus.terminal.highlighting.enabled": "share",
+  "nexus.terminal.highlighting.profiles": "share",
+  "nexus.terminal.highlighting.defaultProfile": "share",
   "nexus.terminal.macros.autoTrigger": "local",
   "nexus.terminal.macros.defaultCooldown": "local",
   "nexus.terminal.macros.bufferLength": "local",
@@ -629,6 +638,12 @@ function validStaticReservations(value: unknown): boolean {
 // Per-key validators applied before the generic validateSettingUpdate fallback in applySettings.
 // Keeping them in a lookup map keeps the apply loop flat (no special-case if/else ladder).
 const SPECIAL_SETTING_VALIDATORS: Record<string, (value: unknown) => SettingValidation> = {
+  "nexus.terminal.highlighting.profiles": (value) => {
+    const result = validateHighlightProfiles(value);
+    return result.ok ? { ok: true, value: result.profiles } : { ok: false };
+  },
+  "nexus.terminal.highlighting.defaultProfile": (value) =>
+    value !== undefined && isHighlightProfileSelection(value) ? { ok: true, value } : { ok: false },
   "nexus.terminal.highlighting.rules": (value) => {
     // Upgrade as well as validate. Import is the one path that carries a rule
     // array in from ANOTHER machine — usually an older install, which is
@@ -695,6 +710,13 @@ function readSettings(): Record<string, unknown> {
       }
     }
   }
+  // Sparse settings alone cannot describe a fresh install's virtual Default
+  // profile. Capture the effective catalog context so explicit and inherited
+  // selections still name the same rules on the receiving machine.
+  const highlighting = vscode.workspace.getConfiguration("nexus.terminal.highlighting");
+  result["nexus.terminal.highlighting.profiles"] = highlighting.get<unknown>("profiles", null);
+  result["nexus.terminal.highlighting.defaultProfile"] = highlighting.get<unknown>("defaultProfile", "default");
+  result["nexus.terminal.highlighting.rules"] = highlighting.get<unknown>("rules", []);
   return result;
 }
 
@@ -1148,6 +1170,188 @@ interface ImportTally {
    *  restore so a merge-mode skip of a retained local record isn't undone by an
    *  unconditional secret write — read this instead of re-deriving it from `existingIds`. */
   importedIds: string[];
+}
+
+/** Reconcile the catalog before importing records, while the file is still untrusted. */
+function prepareHighlightImport(data: NexusConfigExport, mode: "merge" | "replace", referencedIds: ReadonlySet<string>): string | undefined {
+  const prefix = "nexus.terminal.highlighting.";
+  const profilesKey = `${prefix}profiles`;
+  const defaultKey = `${prefix}defaultProfile`;
+  const rulesKey = `${prefix}rules`;
+  const settings = data.settings;
+  const has = (key: string): boolean => !!settings && Object.prototype.hasOwnProperty.call(settings, key);
+  const carriesCatalog = has(profilesKey) || has(rulesKey) || has(defaultKey);
+  const remapped = new Map<string, string>();
+  const unavailable = new Map<string, string>();
+  const currentCatalog = readGlobalHighlightCatalogForEditing();
+  let destinationIds = new Set(currentCatalog.profiles.map((profile) => profile.id));
+  const reservedDanglingIds = new Set([...referencedIds].filter((id) => !destinationIds.has(id)));
+  if (currentCatalog.defaultProfileId && !destinationIds.has(currentCatalog.defaultProfileId)) reservedDanglingIds.add(currentCatalog.defaultProfileId);
+  const occupiedIds = new Set([...destinationIds, ...reservedDanglingIds, "default"]);
+  const incomingProfiles = settings?.[profilesKey];
+  if (Array.isArray(incomingProfiles)) {
+    for (const profile of incomingProfiles) if (isRecordValue(profile) && typeof profile.id === "string") occupiedIds.add(profile.id);
+  }
+  if (typeof settings?.[defaultKey] === "string") occupiedIds.add(settings[defaultKey] as string);
+  for (const key of ["servers", "serialProfiles", "localShellProfiles", "localServers"] as const) {
+    const rows = data[key];
+    if (Array.isArray(rows)) for (const row of rows as unknown[]) {
+      if (isRecordValue(row) && typeof row.highlightProfileId === "string") occupiedIds.add(row.highlightProfileId);
+    }
+  }
+  const missingReference = (id: string): string => {
+    const previous = unavailable.get(id);
+    if (previous) return previous;
+    // A dangling source ID must not accidentally resolve to a recipient's
+    // unrelated profile. Retain the original ID whenever it is safe to do so.
+    let safeId = id;
+    if (destinationIds.has(id)) {
+      do { safeId = `missing-${randomUUID()}`; } while (occupiedIds.has(safeId));
+    }
+    occupiedIds.add(safeId);
+    destinationIds.add(safeId);
+    unavailable.set(id, safeId);
+    return safeId;
+  };
+  let importedDefault: string | null = "default";
+  const incomingRepair = "Correct the highlight settings at the source and export again, or use another file";
+
+  if (has(defaultKey)) {
+    const value = settings![defaultKey];
+    if (value === undefined || !isHighlightProfileSelection(value)) return `the export file has an invalid default highlight profile. ${incomingRepair}`;
+    importedDefault = value as string | null;
+  }
+
+  if (carriesCatalog) {
+    const checked = validateHighlightProfiles(has(profilesKey) ? settings![profilesKey] : null);
+    if (!checked.ok) return `the export file has an invalid highlight catalog: ${checked.message} ${incomingRepair}`;
+    const legacy = checked.profiles === null;
+    const defaultRules = vscode.workspace.getConfiguration("nexus.terminal.highlighting").inspect<unknown>("rules")?.defaultValue ?? [];
+    const legacyRules = legacy ? validateAndSanitizeHighlightRules(has(rulesKey) ? settings![rulesKey] : defaultRules) : [];
+    if (legacy && !legacyRules) return `the export file has invalid legacy highlight rules. ${incomingRepair}`;
+    const incoming = checked.profiles ?? [{ id: "default", name: "Default", rules: upgradeHighlightRules(legacyRules!).rules }];
+    for (const profile of incoming) occupiedIds.add(profile.id);
+    const freshId = (): string => {
+      let id: string;
+      do { id = randomUUID(); } while (occupiedIds.has(id));
+      occupiedIds.add(id);
+      return id;
+    };
+
+    if (mode === "replace") {
+      const remappedIncoming = incoming.map((profile) => {
+        const id = reservedDanglingIds.has(profile.id) ? freshId() : profile.id;
+        remapped.set(profile.id, id);
+        return { ...profile, id };
+      });
+      destinationIds = new Set(remappedIncoming.map((profile) => profile.id));
+      const remappedDefault = importedDefault === null ? null : remapped.get(importedDefault) ?? importedDefault;
+      settings![defaultKey] = remappedDefault;
+      if (legacy && remapped.get("default") === "default") {
+        settings![profilesKey] = null;
+      } else {
+        settings![profilesKey] = remappedIncoming;
+      }
+      if (legacy && !has(rulesKey)) settings![rulesKey] = legacyRules;
+    } else {
+      const existing = readGlobalHighlightCatalogForEditing();
+      if (existing.validationError) return `existing global highlight settings are invalid: ${existing.validationError} Open Preferences: Open User Settings (JSON) or Open Remote Settings (JSON), as applicable, and correct or remove nexus.terminal.highlighting.profiles and nexus.terminal.highlighting.defaultProfile`;
+      const merged = [...existing.profiles];
+      const names = new Set(merged.map((profile) => profile.name.toLowerCase()));
+      for (const profile of incoming) {
+        const sameId = merged.find((item) => item.id === profile.id);
+        if (sameId && JSON.stringify(sameId) === JSON.stringify(profile)) {
+          remapped.set(profile.id, profile.id);
+          continue;
+        }
+        const id = sameId || reservedDanglingIds.has(profile.id) ? freshId() : profile.id;
+        let name = profile.name;
+        let suffix = 2;
+        while (names.has(name.toLowerCase())) {
+          const ending = ` (${suffix++})`;
+          name = `${profile.name.slice(0, 100 - ending.length)}${ending}`;
+        }
+        names.add(name.toLowerCase());
+        merged.push({ ...profile, id, name });
+        remapped.set(profile.id, id);
+      }
+      const mergedValidation = validateHighlightProfiles(merged);
+      if (!mergedValidation.ok) return `cannot merge highlight profiles: ${mergedValidation.message}`;
+      settings![profilesKey] = mergedValidation.profiles;
+      destinationIds = new Set(merged.map((profile) => profile.id));
+      // Merge must not replace the recipient's default or legacy rules.
+      delete settings![defaultKey];
+      delete settings![rulesKey];
+    }
+  } else if (mode === "merge" && settings) {
+    delete settings[defaultKey];
+  }
+
+  for (const key of ["servers", "serialProfiles", "localShellProfiles", "localServers"] as const) {
+    const rows = data[key];
+    if (!Array.isArray(rows)) continue;
+    for (const raw of rows as unknown[]) {
+      if (!isRecordValue(raw)) continue;
+      Object.assign(raw, sanitizeHighlightProfileSelection(raw));
+      const selection = raw.highlightProfileId;
+      if (typeof selection === "string") {
+        raw.highlightProfileId = (carriesCatalog ? remapped.get(selection) : undefined) ?? missingReference(selection);
+      } else if (selection === undefined && mode === "merge" && carriesCatalog) {
+        raw.highlightProfileId = importedDefault === null ? null : remapped.get(importedDefault) ?? missingReference(importedDefault);
+      }
+    }
+  }
+  return undefined;
+}
+
+/** Write settings needed by imported references before publishing their records.
+ * VS Code has no compare-and-swap for settings; rollback is conditional on the
+ * current value still being the one this operation wrote, so it does not
+ * knowingly overwrite another writer. */
+async function commitHighlightImportSettings(settings: Record<string, unknown> | undefined): Promise<boolean> {
+  if (!settings) return true;
+  const section = "nexus.terminal.highlighting";
+  const keys = ["rules", "profiles", "defaultProfile"].filter((key) => Object.prototype.hasOwnProperty.call(settings, `${section}.${key}`));
+  if (keys.length === 0) return true;
+  const config = vscode.workspace.getConfiguration(section);
+  const original = new Map(keys.map((key) => [key, config.inspect<unknown>(key)?.globalValue]));
+  const attempted = new Map<string, unknown>();
+  const equal = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+  try {
+    for (const key of keys) {
+      const fullKey = `${section}.${key}`;
+      const value = settings[fullKey];
+      const validation = SPECIAL_SETTING_VALIDATORS[fullKey]?.(value);
+      if (!validation?.ok) throw new Error("Invalid highlight settings");
+      if (!equal(config.inspect<unknown>(key)?.globalValue, original.get(key))) throw new Error("Highlight settings changed during import");
+      attempted.set(key, validation.value);
+      recordNexusConfigWrite(fullKey, validation.value, Date.now());
+      await config.update(key, validation.value, vscode.ConfigurationTarget.Global);
+      if (!equal(config.inspect<unknown>(key)?.globalValue, validation.value)) throw new Error("Highlight settings changed during import");
+    }
+    for (const [key, value] of attempted) {
+      if (!equal(config.inspect<unknown>(key)?.globalValue, value)) throw new Error("Highlight settings changed during import");
+    }
+    for (const key of keys) delete settings[`${section}.${key}`];
+    return true;
+  } catch {
+    let rollbackFailed = false;
+    for (const [key, value] of [...attempted].reverse()) {
+      const current = config.inspect<unknown>(key)?.globalValue;
+      if (equal(current, original.get(key))) continue;
+      if (!equal(current, value)) { rollbackFailed = true; continue; }
+      try {
+        const previous = original.get(key);
+        recordNexusConfigWrite(`${section}.${key}`, previous, Date.now());
+        await config.update(key, previous, vscode.ConfigurationTarget.Global);
+        if (!equal(config.inspect<unknown>(key)?.globalValue, previous)) rollbackFailed = true;
+      } catch { rollbackFailed = true; }
+    }
+    void vscode.window.showErrorMessage(rollbackFailed
+      ? "Nothing was imported: highlight settings could not be saved or fully restored. Review the highlight settings before trying again."
+      : "Nothing was imported: highlight settings could not be saved. Check your settings permissions and try again.");
+    return false;
+  }
 }
 
 /**
@@ -2057,6 +2261,7 @@ const SHARED_SERVER_RULES = {
   keyPath: () => "",
   isHidden: "keep",
   logSession: "keep",
+  highlightProfileId: "keep",
   multiplexing: "keep",
   legacyAlgorithms: "keep",
   ipmiHost: "keep",
@@ -2226,6 +2431,7 @@ const SHARED_SERIAL_PROFILE_RULES = {
   parity: "keep",
   rtscts: "keep",
   logSession: "keep",
+  highlightProfileId: "keep",
   mode: "keep",
   deviceHint: "drop"
 } satisfies ShareRules<SerialProfile>;
@@ -2258,6 +2464,7 @@ const SHARED_LOCAL_SHELL_PROFILE_RULES = {
   shellArgs: "drop",
   cwd: "drop",
   env: "drop",
+  highlightProfileId: "keep",
   startupCommand: "drop"
 } satisfies ShareRules<LocalShellProfile>;
 
@@ -3810,8 +4017,23 @@ export function registerConfigCommands(
     return true;
   }
 
+  function highlightReferences(): ReadonlySet<string> {
+    const snapshot = core.getSnapshot();
+    const referenced = new Set(runtime?.getReferencedHighlightProfileIds?.() ?? []);
+    for (const row of [...snapshot.servers, ...snapshot.serialProfiles, ...snapshot.localShellProfiles, ...snapshot.localServers]) {
+      if (typeof row.highlightProfileId === "string") referenced.add(row.highlightProfileId);
+    }
+    return referenced;
+  }
+
   async function importShareData(data: NexusConfigExport): Promise<void> {
     if (!preflightAuthImport(data, "share")) return;
+    const highlightError = prepareHighlightImport(data, "merge", highlightReferences());
+    if (highlightError) {
+      void vscode.window.showErrorMessage(`Nothing was imported: ${highlightError}.`);
+      return;
+    }
+    if (!(await commitHighlightImportSettings(data.settings))) return;
     // Generate fresh IDs to prevent duplicates on re-import
     const idMap = new Map<string, string>();
     let imported = 0;
@@ -4489,6 +4711,11 @@ export function registerConfigCommands(
     removed: RemovedProfileIds
   ): Promise<void> {
     if (!preflightAuthImport(data, mode)) return;
+    const highlightError = prepareHighlightImport(data, mode, highlightReferences());
+    if (highlightError) {
+      void vscode.window.showErrorMessage(`Nothing was imported: ${highlightError}.`);
+      return;
+    }
     const snapshot = core.getSnapshot();
 
     // Prepared BEFORE the replace-mode wipe so the guard below judges each
@@ -4507,6 +4734,8 @@ export function registerConfigCommands(
         return;
       }
     }
+
+    if (!(await commitHighlightImportSettings(data.settings))) return;
 
     if (mode === "replace") {
       // Import is an authority boundary even when the replacement is byte-identical,

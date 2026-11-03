@@ -1,6 +1,7 @@
 import { generateKeyPairSync } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { join } from "node:path";
 import { runInNewContext } from "node:vm";
 import { utils } from "ssh2";
 import { describe, expect, it, vi } from "vitest";
@@ -8,7 +9,12 @@ import { CredentialProviderError, type CredentialProviderErrorCode } from "../..
 import { parseExternalCredentialResponse } from "../../src/services/credentials/externalCredentialProtocol";
 
 const canary = "SECRET_CANARY";
-const openSsh = utils.generateKeyPairSync("ed25519", { comment: "synthetic-test-only" });
+// ssh2's Ed25519 generator can drop a leading public-key zero, producing a
+// malformed key. Reuse the ssh-keygen fixture that exercises that boundary.
+const openSshPrivate = readFileSync(join(__dirname, "../fixtures/externalCredentials/openssh-ed25519-leading-zero.key"), "utf8");
+const parsedFixture = utils.parseKey(openSshPrivate);
+if (parsedFixture instanceof Error || Array.isArray(parsedFixture)) throw new Error("Invalid synthetic OpenSSH fixture");
+const openSsh = { private: openSshPrivate, public: `ssh-ed25519 ${parsedFixture.getPublicSSH().toString("base64")}` };
 const encryptedOpenSsh = utils.generateKeyPairSync("ed25519", {
   passphrase: "synthetic-test-only", cipher: "aes256-cbc", rounds: 1
 }).private;
@@ -39,6 +45,17 @@ describe("external credential protocol", () => {
     const before = Buffer.from(bytes);
     expect(parseExternalCredentialResponse(bytes, "password")).toEqual({ method: "password", username: " operator ", password });
     expect(bytes).toEqual(before);
+  });
+
+  it("uses the valid zero-prefixed synthetic OpenSSH fixture for both private and public key checks", () => {
+    const privateKey = utils.parseKey(openSsh.private);
+    const publicKey = utils.parseKey(openSsh.public);
+    if (privateKey instanceof Error || publicKey instanceof Error || Array.isArray(privateKey) || Array.isArray(publicKey)) throw new Error("Invalid fixture");
+    expect(privateKey.isPrivateKey()).toBe(true);
+    expect(publicKey.isPrivateKey()).toBe(false);
+    expect(privateKey.getPublicSSH()).toEqual(publicKey.getPublicSSH());
+    expect(privateKey.getPublicSSH().subarray(19)).toHaveLength(32);
+    expect(privateKey.getPublicSSH()[19]).toBe(0);
   });
 
   it.each([openSsh.private, pem])("returns independently owned usable unencrypted private-key bytes", (private_key) => {

@@ -853,6 +853,17 @@ describe("package contributions", () => {
     const bodyMenu = packageJson.contributes.menus["terminal/context"] ?? [];
     const editorTitleMenu = packageJson.contributes.menus["editor/title/context"] ?? [];
 
+    it("offers the live highlight selector from terminal tabs, session rows and the palette", () => {
+      const id = "nexus.terminal.selectHighlightProfile";
+      expect(packageJson.contributes.commands.find(c => c.command === id)).toBeDefined();
+      expect(titleMenu.find(m => m.command === id)).toBeDefined();
+      expect(editorTitleMenu.find(m => m.command === id)?.when).toBe("resourceScheme == 'vscode-terminal'");
+      expect(paletteMenu.find(m => m.command === id)?.when).toBe("nexus.isNexusTerminal");
+      const row = (packageJson.contributes.menus["view/item/context"] ?? []).find(m => m.command === id);
+      for (const kind of ["nexus.sessionNode", "nexus.serialSessionNode", "nexus.localShellSessionNode", "nexus.localServerSessionNode"]) expect(row?.when).toContain(kind);
+      expect(row?.when).not.toContain("nexus.serialProfile");
+    });
+
     it("bumps extension version to at least 2.8.9", () => {
       const parts = ((packageJson as unknown as { version: string }).version ?? "0.0.0")
         .split(".")

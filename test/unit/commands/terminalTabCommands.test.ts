@@ -7,8 +7,16 @@ const state = {
   showWarning: vi.fn(),
   showInfo: vi.fn(),
   showError: vi.fn(),
-  clipboardWrite: vi.fn(async (_text: string) => {})
+  clipboardWrite: vi.fn(async (_text: string) => {}),
+  pick: vi.fn(),
+  catalog: { enabled: true, legacy: false, defaultProfileId: "red" as string | null, profiles: [
+    { id: "red", name: "Red", rules: [{ pattern: "ERROR", color: "red" }] },
+    { id: "blue", name: "Blue", rules: [{ pattern: "WARN", color: "blue" }] }
+  ] }
+
 };
+
+vi.mock("../../../src/services/terminal/highlightProfileSettings", () => ({ readHighlightCatalog: () => state.catalog }));
 
 vi.mock("vscode", () => ({
   commands: {
@@ -24,6 +32,7 @@ vi.mock("vscode", () => ({
     get activeTerminal() {
       return state.activeTerminal;
     },
+    showQuickPick: (...args: unknown[]) => state.pick(...args),
     showWarningMessage: (...args: unknown[]) => {
       state.showWarning(...args);
       return Promise.resolve(undefined);
@@ -44,6 +53,7 @@ vi.mock("vscode", () => ({
   }
 }));
 
+import { HighlightProfileService } from "../../../src/services/terminal/highlightProfileService";
 import { registerTerminalTabCommands, type TerminalTabCommandsDeps } from "../../../src/commands/terminalTabCommands";
 import type { RegistryEntry } from "../../../src/services/terminal/terminalRegistry";
 
@@ -91,10 +101,98 @@ describe("terminalTabCommands", () => {
     state.showInfo.mockClear();
     state.showError.mockClear();
     state.clipboardWrite.mockClear();
+    state.pick.mockReset();
+    state.catalog = { enabled: true, legacy: false, defaultProfileId: "red", profiles: [
+      { id: "red", name: "Red", rules: [{ pattern: "ERROR", color: "red" }] },
+      { id: "blue", name: "Blue", rules: [{ pattern: "WARN", color: "blue" }] }
+    ] };
     state.clipboardWrite.mockImplementation(async () => {});
   });
 
   const context = { subscriptions: [] as { dispose: () => void }[] };
+
+  describe("nexus.terminal.selectHighlightProfile", () => {
+    function setup() {
+      const service = new HighlightProfileService(() => state.catalog);
+      const a = fakeTerminal() as never;
+      const b = fakeTerminal() as never;
+      const ha = service.createSession({ kind: "server", id: "server" }, "red");
+      const hb = service.createSession({ kind: "server", id: "server" }, "red");
+      const entries = new Map<unknown, RegistryEntry>([
+        [a, { terminal: a, pty: fakePty() as never, buffer: fakeBuffer("") as never, highlight: ha }],
+        [b, { terminal: b, pty: fakePty() as never, buffer: fakeBuffer("") as never, highlight: hb }]
+      ]);
+      state.activeTerminal = b;
+      registerTerminalTabCommands(context as never, fakeDeps(entries, new Set()) as never);
+      return { a, b, ha, hb, entries, service, handler: state.registeredCommands.get("nexus.terminal.selectHighlightProfile")! };
+    }
+
+    it("updates the clicked tab, independently of the active tab", async () => {
+      const { a, ha, hb, handler } = setup();
+      state.pick.mockImplementation((items: Array<{ label: string }>) => Promise.resolve(items.find(i => i.label === "Blue")));
+      await handler(a);
+      expect(ha.apply("ERROR WARN")).toBe("ERROR \x1b[34mWARN\x1b[39m");
+      expect(hb.apply("ERROR WARN")).toBe("\x1b[31mERROR\x1b[39m WARN");
+    });
+
+    it("supports none, global inheritance, and restoring the saved preference", async () => {
+      const { hb, handler, service } = setup();
+      state.catalog = { ...state.catalog, defaultProfileId: "blue" };
+      service.reload();
+      for (const [label, expected] of [["None", "ERROR WARN"], ["Use global default", "ERROR \x1b[34mWARN\x1b[39m"], ["Use saved connection setting", "\x1b[31mERROR\x1b[39m WARN"]] as const) {
+        state.pick.mockImplementation((items: Array<{ label: string }>) => Promise.resolve(items.find(i => i.label === label)));
+        await handler();
+        expect(hb.apply("ERROR WARN")).toBe(expected);
+      }
+    });
+
+    it("resolves the clicked session row and offers the profile manager", async () => {
+      const { a, ha, handler } = setup();
+      const deps = fakeDeps(new Map([[a, { terminal: a, pty: fakePty() as never, buffer: fakeBuffer("") as never, highlight: ha }]]), new Set());
+      deps.sessionTerminals.set("session-a", a);
+      registerTerminalTabCommands(context as never, deps);
+      const treeHandler = state.registeredCommands.get("nexus.terminal.selectHighlightProfile")!;
+      state.pick.mockImplementation((items: Array<{ label: string }>) => Promise.resolve(items.find(i => i.label === "Blue")));
+      await treeHandler({ session: { id: "session-a" } });
+      expect(ha.apply("WARN")).toBe("\x1b[34mWARN\x1b[39m");
+      state.pick.mockImplementation((items: Array<{ label: string }>) => Promise.resolve(items.find(i => i.label === "Manage Highlight Profiles…")));
+      await handler(a);
+      expect(state.executeCommandCalls).toContainEqual({ cmd: "nexus.openHighlightRuleEditor", args: [] });
+    });
+
+    it("does not target the active terminal for a stale explicit tree or tab argument", async () => {
+      const { hb, handler } = setup();
+      await handler({ session: { id: "gone" } });
+      await handler(fakeTerminal());
+      expect(state.pick).not.toHaveBeenCalled();
+      expect(hb.apply("ERROR")).toBe("\x1b[31mERROR\x1b[39m");
+    });
+
+    it("does not apply a choice after its terminal closes", async () => {
+      const { a, ha, entries, handler } = setup();
+      let choose!: (item: unknown) => void;
+      let choices!: Array<{ label: string }>;
+      state.pick.mockImplementation((items: Array<{ label: string }>) => { choices = items; return new Promise(resolve => { choose = resolve; }); });
+      const pending = handler(a) as Promise<void>;
+      entries.delete(a);
+      choose(choices.find(i => i.label === "Blue"));
+      await pending;
+      expect(ha.apply("ERROR")).toBe("\x1b[31mERROR\x1b[39m");
+    });
+
+    it("does not select a profile deleted while the picker is open", async () => {
+      const { a, ha, handler } = setup();
+      let choose!: (item: unknown) => void;
+      let choices!: Array<{ label: string }>;
+      state.pick.mockImplementation((items: Array<{ label: string }>) => { choices = items; return new Promise(resolve => { choose = resolve; }); });
+      const pending = handler(a) as Promise<void>;
+      state.catalog = { ...state.catalog, profiles: state.catalog.profiles.filter(p => p.id !== "blue") };
+      choose(choices.find(i => i.label === "Blue"));
+      await pending;
+      expect(ha.apply("ERROR")).toBe("\x1b[31mERROR\x1b[39m");
+      expect(state.showWarning).toHaveBeenCalled();
+    });
+  });
 
   describe("nexus.terminal.reset", () => {
     it("menu path: calls pty.resetTerminal on the supplied terminal", () => {

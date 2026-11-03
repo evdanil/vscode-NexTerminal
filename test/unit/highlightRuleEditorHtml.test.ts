@@ -4,6 +4,15 @@ import { openHighlightRuleEditor } from "../helpers/highlightRuleEditorHarness";
 import type { HighlightRule } from "../../src/utils/highlightRuleValidation";
 
 describe("renderHighlightRuleEditorHtml", () => {
+  it("constrains profile controls and wraps themed actions in narrow panels", () => {
+    const html = renderHighlightRuleEditorHtml([], "nonce");
+    expect(html).toMatch(/#profile-manager select\s*\{[^}]*width:\s*100%[^}]*max-width:\s*100%/);
+    expect(html).toMatch(/#profile-manager \.button-row\s*\{[^}]*flex-wrap:\s*wrap/);
+    for (const id of ["profile-create", "profile-create-defaults", "profile-rename", "profile-duplicate", "profile-delete", "profile-repair-user", "profile-repair-workspace"]) {
+      expect(html).toContain(`class="btn-secondary" id="${id}"`);
+    }
+  });
+
   it("renders numeric SGR colors without coercing them to red", () => {
     const html = renderHighlightRuleEditorHtml([{ pattern: "x", color: "91" }], "nonce");
     expect(html).toContain('"color":"91"');

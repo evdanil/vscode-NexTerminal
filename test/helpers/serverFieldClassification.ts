@@ -22,6 +22,7 @@ export const SERVER_FIELDS: Record<keyof ServerConfig, { use: Use; why: string; 
   keyPath: { use: "connect+tunnel", why: "login key (key auth, or any server linked to an auth profile that may switch to key)", alt: "/k" },
   isHidden: { use: "ignored", why: "tree visibility", alt: true },
   logSession: { use: "ignored", why: "transcript preference; editor writes the global default on every Save", alt: true },
+  highlightProfileId: { use: "ignored", why: "terminal rendering preference does not affect SSH transport", alt: "profile-1" },
   multiplexing: { use: "connect", why: "pool use; tunnels only when shared (covered separately)", alt: false },
   legacyAlgorithms: { use: "connect+tunnel", why: "handshake algorithms", alt: true },
   ipmiHost: { use: "ignored", why: "BMC tooling, not the SSH path", alt: "10.9.9.9" },

@@ -1,115 +1,104 @@
 import * as vscode from "vscode";
+import { flattenProviderText } from "../models/inventory";
+import { isHighlightProfileSelection } from "../utils/highlightProfileValidation";
 import { renderHighlightRuleEditorHtml } from "./highlightRuleEditorHtml";
 import { createWebviewNonce } from "./shared/webviewNonce";
-import {
-  validateAndSanitizeHighlightRules,
-  validateAndSanitizeHighlightRulesWithError,
-  type HighlightRule
-} from "../utils/highlightRuleValidation";
-import { upgradeHighlightRules } from "../utils/highlightRuleUpgrade";
-import { recordNexusConfigWrite } from "../services/terminal/settingsWriteRegistry";
+import { readHighlightEditorState, saveHighlightEditorCatalog } from "./highlightProfileEditorStore";
 
 export class HighlightRuleEditorPanel {
   private static instance: HighlightRuleEditorPanel | undefined;
   private readonly panel: vscode.WebviewPanel;
   private disposed = false;
   private readonly configListener: vscode.Disposable;
+  private readonly confirmedDeletions = new Map<string, { saved: number; live: number; revision: string }>();
 
-  private constructor() {
+  private constructor(private readonly countReferences: (id: string) => { saved: number; live: number }) {
     this.panel = vscode.window.createWebviewPanel(
-      "nexus.highlightRuleEditor",
-      "Highlighting Rules",
-      vscode.ViewColumn.Active,
+      "nexus.highlightRuleEditor", "Highlight Profiles", vscode.ViewColumn.Active,
       { enableScripts: true, retainContextWhenHidden: true }
     );
     this.render();
     this.panel.webview.onDidReceiveMessage((msg) => this.handleMessage(msg));
+    this.configListener = vscode.workspace.onDidChangeConfiguration((event) => {
+      if (!this.disposed && event.affectsConfiguration("nexus.terminal.highlighting")) {
+        void this.panel.webview.postMessage({ type: "catalogUpdated", state: readHighlightEditorState() });
+      }
+    });
     this.panel.onDidDispose(() => {
       this.disposed = true;
       this.configListener.dispose();
       HighlightRuleEditorPanel.instance = undefined;
     });
-
-    this.configListener = vscode.workspace.onDidChangeConfiguration((event) => {
-      if (this.disposed) return;
-      if (event.affectsConfiguration("nexus.terminal.highlighting.rules")) {
-        this.pushRulesUpdate();
-      }
-    });
   }
 
-  public static open(): void {
+  public static open(countReferences: (id: string) => { saved: number; live: number } = () => ({ saved: 0, live: 0 })): void {
     if (HighlightRuleEditorPanel.instance) {
       HighlightRuleEditorPanel.instance.panel.reveal();
       return;
     }
-    HighlightRuleEditorPanel.instance = new HighlightRuleEditorPanel();
+    HighlightRuleEditorPanel.instance = new HighlightRuleEditorPanel(countReferences);
   }
 
   private render(): void {
-    const nonce = createWebviewNonce();
-    const rules = this.readRules();
-    this.panel.webview.html = renderHighlightRuleEditorHtml(rules, nonce);
+    const state = readHighlightEditorState();
+    this.panel.webview.html = renderHighlightRuleEditorHtml([], createWebviewNonce(), state);
   }
 
-  private readRules(): HighlightRule[] {
-    const config = vscode.workspace.getConfiguration("nexus.terminal.highlighting");
-    const validated = validateAndSanitizeHighlightRules(config.get<unknown>("rules", [])) ?? [];
-    // Upgrade at READ time, not just at the activation migration: the array may
-    // come from a workspace/folder scope the migration deliberately leaves
-    // alone, and the editor should still show the rule's shipped name and the
-    // fixed pattern. A subsequent Save then persists the upgraded form.
-    return upgradeHighlightRules(validated).rules;
-  }
-
-  private pushRulesUpdate(): void {
-    if (this.disposed) return;
-    void this.panel.webview.postMessage({
-      type: "rulesUpdated",
-      rules: this.readRules()
-    });
-  }
-
-  private async handleMessage(msg: Record<string, unknown>): Promise<void> {
-    switch (msg.type) {
-      case "saveRules": {
-        const validation = validateAndSanitizeHighlightRulesWithError(msg.rules);
-        if (!validation.ok) {
-          void this.panel.webview.postMessage({
-            type: "saveResult",
-            ok: false,
-            message: validation.message
-          });
-          return;
+  private async handleMessage(msg: unknown): Promise<void> {
+    if (typeof msg !== "object" || msg === null || Array.isArray(msg)) return;
+    const request = msg as Record<string, unknown>;
+    if (request.type === "openHighlightingSettings") {
+      await vscode.commands.executeCommand("workbench.action.openSettings", "@id:nexus.terminal.highlighting.enabled");
+    } else if (request.type === "openHighlightSettingsJson") {
+      const command = request.scope === "user" ? "workbench.action.openSettingsJson"
+        : request.scope === "workspace" ? "workbench.action.openWorkspaceSettingsFile" : undefined;
+      if (command) await vscode.commands.executeCommand(command);
+    } else if (request.type === "cancelCatalogDraft") {
+      this.confirmedDeletions.clear();
+    } else if (request.type === "saveCatalog") {
+      const state = readHighlightEditorState();
+      if (state.revision === request.revision && Array.isArray(request.profiles)) {
+        const retained = new Set(request.profiles.flatMap((item: unknown) => typeof item === "object" && item !== null && typeof (item as { id?: unknown }).id === "string" ? [(item as { id: string }).id] : []));
+        for (const profile of state.catalog.profiles) {
+          if (retained.has(profile.id)) continue;
+          const approved = this.confirmedDeletions.get(profile.id);
+          if (!approved || approved.revision !== state.revision) {
+            void this.panel.webview.postMessage({ type: "catalogSaveResult", ok: false, message: "Please confirm each profile deletion before saving." });
+            return;
+          }
+          const counts = this.countReferences(profile.id);
+          if (counts.saved !== approved.saved || counts.live !== approved.live) {
+            const name = flattenProviderText(profile.name).slice(0, 100);
+            const confirm = await vscode.window.showWarningMessage(
+              `References to "${name}" changed: ${counts.saved} saved connections and ${counts.live} live sessions. Delete this profile?`,
+              { modal: true }, "Delete"
+            );
+            if (confirm !== "Delete") {
+              void this.panel.webview.postMessage({ type: "catalogSaveResult", ok: false, message: "Deletion was not confirmed. Your draft is unchanged." });
+              return;
+            }
+          }
         }
-        try {
-          const config = vscode.workspace.getConfiguration("nexus.terminal.highlighting");
-          recordNexusConfigWrite("nexus.terminal.highlighting.rules", validation.rules, Date.now());
-          await config.update("rules", validation.rules, vscode.ConfigurationTarget.Global);
-          void this.panel.webview.postMessage({ type: "saveResult", ok: true });
-        } catch {
-          void this.panel.webview.postMessage({
-            type: "saveResult",
-            ok: false,
-            message: "Could not save highlighting rules."
-          });
-        }
-        break;
       }
-      case "resetDefaults": {
-        const confirm = await vscode.window.showWarningMessage(
-          "Reset highlighting rules to defaults?",
-          { modal: true },
-          "Reset"
-        );
-        if (confirm === "Reset") {
-          const config = vscode.workspace.getConfiguration("nexus.terminal.highlighting");
-          recordNexusConfigWrite("nexus.terminal.highlighting.rules", undefined, Date.now());
-          await config.update("rules", undefined, vscode.ConfigurationTarget.Global);
-          this.render();
-        }
-        break;
-      }
+      const result = await saveHighlightEditorCatalog(request.profiles, request.defaultProfileId, request.revision);
+      if (this.disposed) return;
+      if (result.ok) this.confirmedDeletions.clear();
+      void this.panel.webview.postMessage(result.ok
+        ? { type: "catalogSaveResult", ok: true, revision: result.state.revision }
+        : { type: "catalogSaveResult", ok: false, message: result.message });
+    } else if (request.type === "confirmDeleteProfile") {
+      if (typeof request.profileId !== "string" || !isHighlightProfileSelection(request.profileId)) return;
+      const id = request.profileId;
+      const state = readHighlightEditorState();
+      const savedName = state.catalog.profiles.find((profile) => profile.id === id)?.name;
+      const name = flattenProviderText(savedName ?? (typeof request.profileName === "string" ? request.profileName : "this profile")).slice(0, 100);
+      const counts = this.countReferences(id);
+      const confirm = await vscode.window.showWarningMessage(
+        `Delete highlight profile "${name}"? It is selected by ${counts.saved} saved connections and ${counts.live} live sessions. Their selection will become unavailable.`,
+        { modal: true }, "Delete"
+      );
+      if (confirm === "Delete") this.confirmedDeletions.set(id, { ...counts, revision: state.revision });
+      if (!this.disposed) void this.panel.webview.postMessage({ type: "confirmDeleteProfileResult", profileId: id, confirmed: confirm === "Delete" });
     }
   }
 }

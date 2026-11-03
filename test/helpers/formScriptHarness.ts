@@ -139,6 +139,18 @@ export class StubElement {
     return child;
   }
 
+  public remove(): void {
+    if (!this.parentElement) return;
+    const index = this.parentElement.children.indexOf(this);
+    if (index >= 0) this.parentElement.children.splice(index, 1);
+    this.parentElement = undefined;
+  }
+
+  public dispatchEvent(event: Event): boolean {
+    this.dispatch(event.type);
+    return true;
+  }
+
   public appendChild(child: StubElement): StubElement {
     return this.append(child);
   }

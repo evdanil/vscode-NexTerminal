@@ -113,6 +113,15 @@ function baseValues(): FormValues {
 }
 
 describe("formValuesToLocalServer", () => {
+  it("round-trips highlight selections without changing custom launch settings", () => {
+    const values = { ...baseValues(), args: "--port\n8080", env: "CUSTOM=keep", maxAutoRestarts: "0" };
+    const existing = { id: "local", highlightProfileId: "saved" };
+    expect(formValuesToLocalServer({ ...values, highlightProfileId: "__none__" }, existing)?.highlightProfileId).toBeNull();
+    expect(formValuesToLocalServer({ ...values, highlightProfileId: "" }, existing)?.highlightProfileId).toBeUndefined();
+    expect(formValuesToLocalServer({ ...values, highlightProfileId: "profile:deleted" }, existing)?.highlightProfileId).toBe("deleted");
+    expect(formValuesToLocalServer(values, existing)).toMatchObject({ highlightProfileId: "saved", args: ["--port", "8080"], env: { CUSTOM: "keep" }, maxAutoRestarts: 0 });
+  });
+
   it("returns a complete LocalServerConfig on the happy path", () => {
     const values: FormValues = {
       ...baseValues(),

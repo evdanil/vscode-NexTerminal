@@ -3,6 +3,8 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as vscode from "vscode";
+import { readHighlightCatalog } from "../services/terminal/highlightProfileSettings";
+import { parseHighlightProfileFormValue } from "../ui/highlightProfileForm";
 import { getMacros } from "../macroSettings";
 import type { LocalShellProfile } from "../models/config";
 import { LOCAL_SHELL_AUTOTRIGGER_WARNING_KEY } from "../storage/noticeKeys";
@@ -101,6 +103,7 @@ export function formValuesToLocalShell(values: FormValues, existing?: Partial<Lo
     cwd: cwd || undefined,
     env: existing?.env,
     startupCommand: startupCommand || undefined,
+    highlightProfileId: parseHighlightProfileFormValue(values.highlightProfileId, existing?.highlightProfileId),
     group: normalizedGroup
   };
 }
@@ -587,6 +590,7 @@ async function openLocalShell(
     sessionId,
     profile.id
   );
+  const highlight = ctx.highlightProfileService?.createSession({ kind: "localShell", id: profile.id }, profile.highlightProfileId);
   const pty = new LocalShellPty({
     sidecarPath: resolveLocalPtySidecarPath(ctx.extensionPath),
     shellPath: launchOptions.shellPath,
@@ -596,7 +600,7 @@ async function openLocalShell(
     terminalName,
     startupCommand: profile.startupCommand,
     outputChannel: ctx.localShellOutputChannel,
-    highlighter: ctx.highlighter
+    highlighter: highlight ?? ctx.highlighter
   });
   ptyRef = pty;
   pty.addOutputObserver(triggerObserver);
@@ -606,21 +610,28 @@ async function openLocalShell(
     ctx.localShellTerminals.delete(sessionId);
     ctx.core.unregisterLocalShellSession(sessionId);
   });
-  const terminal = vscode.window.createTerminal({
-    name: terminalName,
-    pty,
-    iconPath: new vscode.ThemeIcon("terminal"),
-    location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
-  });
+  let terminal: vscode.Terminal;
+  try {
+    terminal = vscode.window.createTerminal({
+      name: terminalName,
+      pty,
+      iconPath: new vscode.ThemeIcon("terminal"),
+      location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
+    });
+  } catch (error) {
+    highlight?.dispose();
+    throw error;
+  }
   terminalRef = terminal;
   if (terminatedEarly) {
+    highlight?.dispose();
     ctx.focusedTerminal = terminal;
     terminal.show();
     return undefined;
   }
   const entry: LocalShellTerminalEntry = { terminal, profileId: profile.id, pty };
   ctx.localShellTerminals.set(sessionId, entry);
-  ctx.terminalRegistry?.register(terminal, pty);
+  ctx.terminalRegistry?.register(terminal, pty, highlight);
   if (terminatedEarly) {
     ctx.localShellTerminals.delete(sessionId);
     ctx.core.unregisterLocalShellSession(sessionId);
@@ -702,7 +713,7 @@ export function registerLocalShellCommands(ctx: CommandContext): vscode.Disposab
       if (!existing) return;
       WebviewFormPanel.open("local-shell-edit", localShellFormDefinition(existing, collectGroups(ctx), {
         vscodeTerminalProfileNames: getConfiguredVscodeTerminalProfileNames()
-      }), {
+      }, readHighlightCatalog()), {
         onSubmit: async (values) => {
           if (normalizeOptionalFolderPath(values.group) === null) {
             throw new Error(INVALID_FOLDER_PATH_MESSAGE);

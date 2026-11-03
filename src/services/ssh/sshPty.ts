@@ -12,7 +12,7 @@ import { hasContextAwareConnect } from "./contracts";
 import { classifySshConnectionError } from "./connectionDiagnostics";
 import { findSshAgentUnavailable } from "./authErrors";
 import { OPEN_AGENT_SETTINGS, openAgentSettings } from "./sshAgentSettings";
-import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
+import type { TerminalOutputHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
 import { CLEAR_VISIBLE_SCREEN, RESET_INTERACTIVE_MODES } from "../terminal/terminalEscapes";
 import { PtyObserverHub } from "../terminal/ptyObserverHub";
@@ -89,7 +89,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
     private readonly callbacks: SshPtyCallbacks,
     private readonly logger: SessionLogger,
     private readonly transcript?: SessionTranscript,
-    private readonly highlighter?: TerminalHighlighter,
+    private readonly highlighter?: TerminalOutputHighlighter,
     outputObserver?: PtyOutputObserver,
     private readonly terminalType: string = "xterm-256color"
   ) {
