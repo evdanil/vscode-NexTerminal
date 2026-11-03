@@ -26,6 +26,8 @@ import { randomUUID } from "node:crypto";
 import type { FormDefinition, FormFieldDescriptor, FormValues, VisibleWhen, VisibleWhenCondition } from "./formTypes";
 import { tunnelIllustrationSvgs } from "./tunnelIllustrations";
 import { SSH_AGENT_FORM_NOTE } from "./settingsMetadata";
+import type { HighlightCatalog } from "../models/highlightProfile";
+import { highlightProfileSelectField } from "./highlightProfileForm";
 
 /** Default placement/wording of the shared Auth Profile select — the profile
  *  and serial/SSH profile forms treat it as a power-user shortcut tucked into
@@ -1083,7 +1085,8 @@ export function serverFormDefinition(
   defaultLogSession = true,
   servers?: ServerListEntry[],
   authProfiles?: AuthProfile[],
-  showInventoryProxyRouteChoice = false
+  showInventoryProxyRouteChoice = false,
+  highlightCatalog?: HighlightCatalog
 ): FormDefinition {
   const isEdit = Boolean(seed?.id);
   // Resolved the same way `authProfileSelectField` resolves the selected
@@ -1126,6 +1129,7 @@ export function serverFormDefinition(
           }]
         : []),
       openFileExplorerOnFirstConnectField(seed, sshOnly()),
+      highlightProfileSelectField(highlightCatalog, seed?.highlightProfileId),
       ...sharedTrailingFields(seed, existingGroups, defaultLogSession)
     ])
   };
@@ -1221,7 +1225,8 @@ export function tunnelFormDefinition(seed?: Partial<TunnelProfile>, options?: Tu
 export function serialFormDefinition(
   seed?: Partial<SerialProfile>,
   existingGroups?: string[],
-  defaultLogSession = true
+  defaultLogSession = true,
+  highlightCatalog?: HighlightCatalog
 ): FormDefinition {
   const isEdit = Boolean(seed?.id);
 
@@ -1230,6 +1235,7 @@ export function serialFormDefinition(
     fields: [
       { type: "text", key: "name", label: "Name", required: true, placeholder: "Arduino", value: seed?.name },
       ...serialFields(seed),
+      highlightProfileSelectField(highlightCatalog, seed?.highlightProfileId),
       ...sharedTrailingFields(seed, existingGroups, defaultLogSession)
     ]
   };
@@ -1238,7 +1244,8 @@ export function serialFormDefinition(
 export function localShellFormDefinition(
   seed?: Partial<LocalShellProfile>,
   existingGroups?: string[],
-  options?: LocalShellFormOptions
+  options?: LocalShellFormOptions,
+  highlightCatalog?: HighlightCatalog
 ): FormDefinition {
   const isEdit = Boolean(seed?.id);
 
@@ -1247,6 +1254,7 @@ export function localShellFormDefinition(
     fields: [
       { type: "text", key: "name", label: "Name", required: true, placeholder: "Local Shell Profile", value: seed?.name },
       ...localShellFields(seed, undefined, options),
+      highlightProfileSelectField(highlightCatalog, seed?.highlightProfileId),
       ...sharedTrailingFields(seed, existingGroups, false).filter((field) => !("key" in field) || field.key !== "logSession")
     ]
   };
@@ -1340,7 +1348,8 @@ function localServerFields(
 
 export function localServerFormDefinition(
   seed?: Partial<LocalServerConfig>,
-  existingGroups?: string[]
+  existingGroups?: string[],
+  highlightCatalog?: HighlightCatalog
 ): FormDefinition {
   const isEdit = Boolean(seed?.id);
   return {
@@ -1348,6 +1357,7 @@ export function localServerFormDefinition(
     fields: [
       { type: "text", key: "name", label: "Name", required: true, placeholder: "e.g. Backend Dev Server", value: seed?.name },
       ...localServerFields(seed),
+      highlightProfileSelectField(highlightCatalog, seed?.highlightProfileId),
       ...sharedTrailingFields(seed, existingGroups, false).filter((field) => !("key" in field) || field.key !== "logSession")
     ]
   };
@@ -1438,7 +1448,8 @@ export function unifiedProfileFormDefinition(
   defaultLogSession = true,
   servers?: ServerListEntry[],
   authProfiles?: AuthProfile[],
-  localShellOptions?: LocalShellFormOptions
+  localShellOptions?: LocalShellFormOptions,
+  highlightCatalog?: HighlightCatalog
 ): FormDefinition {
   const sshVw: VisibleWhenCondition = { field: "profileType", value: "ssh" };
   const serialVw: VisibleWhenCondition = { field: "profileType", value: "serial" };
@@ -1470,6 +1481,7 @@ export function unifiedProfileFormDefinition(
       ...serialFields(undefined, serialVw),
       ...localShellFields(undefined, localShellVw, localShellOptions),
       ...localServerFields(undefined, localServerVw),
+      highlightProfileSelectField(highlightCatalog),
       ...sharedFields
     ]
   };

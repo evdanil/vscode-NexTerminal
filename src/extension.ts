@@ -52,6 +52,8 @@ import { VscodePasswordPrompt } from "./services/ssh/vscodePasswordPrompt";
 import { VscodeSecretVault } from "./services/ssh/vscodeSecretVault";
 import { MacroAutoTrigger } from "./services/macroAutoTrigger";
 import { TerminalHighlighter } from "./services/terminalHighlighter";
+import { HighlightProfileService } from "./services/terminal/highlightProfileService";
+import { readHighlightCatalog } from "./services/terminal/highlightProfileSettings";
 import { VscodeMacroStore } from "./storage/vscodeMacroStore";
 import { setActiveMacroStore } from "./macroSettings";
 import { VscodeConfigRepository } from "./storage/vscodeConfigRepository";
@@ -620,6 +622,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const localServerTerminals: LocalServerTerminalMap = new Map();
 
   const highlighter = new TerminalHighlighter();
+  const highlightProfileService = new HighlightProfileService(readHighlightCatalog);
+  highlightProfileService.updateSavedSelections(core.getSnapshot());
   const macroAutoTrigger = new MacroAutoTrigger();
 
   const scriptOutputChannel = vscode.window.createOutputChannel("Nexus Scripts");
@@ -848,6 +852,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     localShellTerminals,
     localServerTerminals,
     highlighter,
+    highlightProfileService,
     macroAutoTrigger,
     sftpService,
     fileExplorerProvider,
@@ -925,6 +930,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     terminalRegistry,
     outputChannel: localShellOutputChannel,
     highlighter,
+    highlightProfileService,
     diagnostics: (line) => localShellOutputChannel.appendLine(`${new Date().toISOString()} [Local Server] ${line}`)
   });
   context.subscriptions.push(localServerManager);
@@ -1329,7 +1335,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const unsubscribeProviderRegistry = inventoryProviderRegistry.onDidChange(() => {
     syncViews();
   });
-  const unsubscribeCore = core.onDidChange(() => {
+  const unsubscribeCore = core.onDidChange((snapshot) => {
+    highlightProfileService.updateSavedSelections(snapshot);
     syncViews();
   });
   const unsubscribeTunnel = tunnelManager.onDidChange((event) => {
@@ -1423,6 +1430,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     }
     if (event.affectsConfiguration("nexus.terminal.highlighting")) {
       highlighter.reload();
+      highlightProfileService.reload();
     }
     if (event.affectsConfiguration("nexus.logging.terminalOutputTrace")) {
       // Applies to sessions that are already open — loggers read the flag per
@@ -1518,7 +1526,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // localServerCtx, not ctx: a folder's Delete contents stops the Local Servers
   // it deletes, exactly as Remove Local Server does.
   const profileDisposables = registerProfileCommands(localServerCtx);
-  const settingsDisposables = registerSettingsCommands(() => ctx.sessionLogDir);
+  const settingsDisposables = registerSettingsCommands(
+    () => ctx.sessionLogDir,
+    (id) => highlightProfileService.countProfileReferences(id)
+  );
   const authProfileDisposables = registerAuthProfileCommands(ctx);
   const externalCredentialDisposables = registerExternalCredentialCommands(ctx);
   const deviceTemplateDisposables = registerDeviceTemplateCommands(ctx, inventoryProviderRegistry);

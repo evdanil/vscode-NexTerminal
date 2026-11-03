@@ -364,28 +364,36 @@ function applyRulesToPlainText(text: string, rules: CompiledRule[]): string {
   return parts.join("");
 }
 
-export class TerminalHighlighter {
+export interface TerminalOutputHighlighter {
+  isEnabled(): boolean;
+  apply(text: string): string;
+  createStream(emit: (text: string) => void, flushDelayMs?: number): TerminalHighlighterStream;
+}
+
+export class TerminalHighlighter implements TerminalOutputHighlighter {
   private enabled = false;
   private rules: CompiledRule[] = [];
 
-  public constructor() {
-    this.reload();
+  public constructor(source?: { enabled: boolean; rules: readonly HighlightRule[] }) {
+    this.reload(source);
   }
 
-  public reload(): void {
-    const config = vscode.workspace.getConfiguration("nexus.terminal.highlighting");
-    this.enabled = config.get<boolean>("enabled", true);
-    const rawRules = config.get<unknown>("rules", []);
+  public reload(source?: { enabled: boolean; rules: readonly HighlightRule[] }): void {
+    const config = source ? undefined : vscode.workspace.getConfiguration("nexus.terminal.highlighting");
+    this.enabled = source ? source.enabled : config!.get<boolean>("enabled", true);
+    const rawRules: unknown = source ? source.rules : config!.get<unknown>("rules", []);
     const rawRulesArray = Array.isArray(rawRules) ? rawRules : [];
     const validated = rawRulesArray.flatMap((rule) => validateAndSanitizeHighlightRules([rule]) ?? []);
-    // Upgrade BEFORE compiling. A user who saved rules from the editor has a
+    // Upgrade legacy settings before compiling. Explicit profile rules have
+    // already been read from the catalog and must keep their chosen patterns.
+    // A user who saved rules from the editor has a
     // frozen snapshot in global settings that shadows the shipped defaults
     // entirely (VS Code never merges array settings), so a fixed default
     // pattern would otherwise never run for them — the one-shot activation
     // migration heals settings.json, but this is what makes the fix apply
     // even when that write never happens (workspace-scope override, read-only
     // settings.json, sync conflict).
-    const rules = upgradeHighlightRules(validated).rules;
+    const rules = source ? validated : upgradeHighlightRules(validated).rules;
     this.rules = [];
     for (const rule of rules) {
       if (!rule.pattern || !rule.color) { continue; }
@@ -483,7 +491,7 @@ export class TerminalHighlighterStream implements vscode.Disposable {
   private ceilingTimer?: ReturnType<typeof setTimeout>;
 
   public constructor(
-    private readonly highlighter: TerminalHighlighter,
+    private readonly highlighter: TerminalOutputHighlighter,
     private readonly emit: (text: string) => void,
     private readonly flushDelayMs: number
   ) {}

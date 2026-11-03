@@ -152,6 +152,7 @@ import {
 } from "../../src/commands/localShellCommands";
 import type { LocalShellProfile } from "../../src/models/config";
 import type { CommandContext } from "../../src/commands/types";
+import { HighlightProfileService } from "../../src/services/terminal/highlightProfileService";
 import { NexusCore } from "../../src/core/nexusCore";
 import { configMutationLock } from "../../src/services/configMutationLock";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
@@ -206,6 +207,15 @@ function makeCtx(profile = makeProfile()) {
 }
 
 describe("formValuesToLocalShell", () => {
+  it("round-trips highlight selections while carrying the live shell environment", () => {
+    const values = { name: "Shell", launchMode: "custom", shellPath: "/bin/sh", shellArgs: "-i", startupCommand: "pwd" };
+    const existing = { id: "shell", highlightProfileId: "saved", env: { CUSTOM: "keep" } };
+    expect(formValuesToLocalShell({ ...values, highlightProfileId: "__none__" }, existing)?.highlightProfileId).toBeNull();
+    expect(formValuesToLocalShell({ ...values, highlightProfileId: "" }, existing)?.highlightProfileId).toBeUndefined();
+    expect(formValuesToLocalShell({ ...values, highlightProfileId: "profile:deleted" }, existing)?.highlightProfileId).toBe("deleted");
+    expect(formValuesToLocalShell(values, existing)).toMatchObject({ highlightProfileId: "saved", env: { CUSTOM: "keep" }, shellArgs: ["-i"], startupCommand: "pwd" });
+  });
+
   it("normalizes group values and splits arguments one per line", () => {
     const profile = formValuesToLocalShell({
       name: "Dev Shell",
@@ -474,6 +484,31 @@ describe("registerLocalShellCommands", () => {
     expect(activeBeforeTerminal).toBe(false);
   });
 
+  it("uses the saved highlight profile for a Local Shell terminal", async () => {
+    const ctx = makeCtx(makeProfile({ highlightProfileId: "blue" }));
+    ctx.highlightProfileService = new HighlightProfileService(() => ({ enabled: true, legacy: false, defaultProfileId: null, profiles: [
+      { id: "blue", name: "Blue", rules: [{ pattern: "WARN", color: "blue" }] }
+    ] }));
+    registerLocalShellCommands(ctx);
+    await registeredCommands.get("nexus.localShell.connect")!("local-1");
+    const handle = ctx.terminalRegistry.register.mock.calls[0][2];
+    const pty = mockCreateTerminal.mock.calls[0][0].pty as { options: { highlighter: typeof handle } };
+    expect(pty.options.highlighter).toBe(handle);
+    expect(handle.apply("WARN")).toBe("\x1b[34mWARN\x1b[39m");
+    handle.dispose();
+  });
+
+  it("releases the session highlight handle if terminal creation fails", async () => {
+    const ctx = makeCtx(makeProfile({ highlightProfileId: "blue" }));
+    ctx.highlightProfileService = new HighlightProfileService(() => ({ enabled: true, legacy: false, defaultProfileId: null, profiles: [
+      { id: "blue", name: "Blue", rules: [{ pattern: "WARN", color: "blue" }] }
+    ] }));
+    mockCreateTerminal.mockImplementationOnce(() => { throw new Error("terminal creation failed"); });
+    registerLocalShellCommands(ctx);
+    await registeredCommands.get("nexus.localShell.connect")!("local-1");
+    expect(ctx.highlightProfileService.countProfileReferences("blue").live).toBe(0);
+  });
+
   it("opens a custom local shell with an extension-owned PTY", async () => {
     const terminal = { show: vi.fn(), sendText: vi.fn(), dispose: vi.fn(), name: "Nexus Local Shell: Dev" };
     mockCreateTerminal.mockReturnValueOnce(terminal);
@@ -501,7 +536,8 @@ describe("registerLocalShellCommands", () => {
     expect(ctx.focusedTerminal).toBe(terminal);
     expect(ctx.terminalRegistry.register).toHaveBeenCalledWith(
       terminal,
-      expect.objectContaining({ handleInput: expect.any(Function) })
+      expect.objectContaining({ handleInput: expect.any(Function) }),
+      undefined
     );
   });
 

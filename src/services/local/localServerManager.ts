@@ -40,6 +40,7 @@ import {
 import { LocalShellPty, resolveLocalPtySidecarPath, type LocalShellEarlyTerminationEvent, type LocalShellOutputChannel } from "./localShellPty";
 import type { TerminalRegistry } from "../terminal/terminalRegistry";
 import type { CommandContext, LocalServerTerminalEntry, LocalServerTerminalMap } from "../../commands/types";
+import type { HighlightProfileService } from "../terminal/highlightProfileService";
 import type { TerminalHighlighter } from "../terminalHighlighter";
 
 export const LOCAL_SERVER_STABLE_RUN_MS = 10_000;
@@ -305,6 +306,7 @@ export interface LocalServerManagerOptions {
   terminalRegistry?: TerminalRegistry;
   outputChannel?: LocalShellOutputChannel;
   highlighter?: TerminalHighlighter;
+  highlightProfileService?: HighlightProfileService;
   diagnostics?: (line: string) => void;
 }
 
@@ -441,6 +443,7 @@ export class LocalServerManager implements vscode.Disposable {
     const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
 
     let ptyRef: LocalShellPty | undefined;
+    const highlight = this.options.highlightProfileService?.createSession({ kind: "localServer", id: config.id }, config.highlightProfileId);
     const pty = new LocalShellPty({
       sidecarPath: resolveLocalPtySidecarPath(this.options.extensionPath),
       shellPath: launch.shellPath,
@@ -449,16 +452,22 @@ export class LocalServerManager implements vscode.Disposable {
       env: launch.env,
       terminalName,
       outputChannel: this.options.outputChannel,
-      highlighter: this.options.highlighter
+      highlighter: highlight ?? this.options.highlighter
     });
     ptyRef = pty;
 
-    const terminal = vscode.window.createTerminal({
-      name: terminalName,
-      pty,
-      iconPath: new vscode.ThemeIcon("server-environment"),
-      location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
-    });
+    let terminal: vscode.Terminal;
+    try {
+      terminal = vscode.window.createTerminal({
+        name: terminalName,
+        pty,
+        iconPath: new vscode.ThemeIcon("server-environment"),
+        location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
+      });
+    } catch (error) {
+      highlight?.dispose();
+      throw error;
+    }
 
     const entry: InternalRunningEntry = {
       sessionId,
@@ -487,7 +496,7 @@ export class LocalServerManager implements vscode.Disposable {
     const termEntry: LocalServerTerminalEntry = { terminal, configId: config.id, pty };
     this.options.terminals.set(sessionId, termEntry);
     this.lastTerminals.set(config.id, terminal);
-    this.options.terminalRegistry?.register(terminal, pty);
+    this.options.terminalRegistry?.register(terminal, pty, highlight);
 
     pty.onDidStartupComplete(() => {
       if (this.disposed) return;

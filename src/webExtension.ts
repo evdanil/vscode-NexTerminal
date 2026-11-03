@@ -178,6 +178,7 @@ const unsupportedCommands = [
   "nexus.serial.runWithScript",
   "nexus.server.testConnection",
   "nexus.serial.testConnection",
+  "nexus.terminal.selectHighlightProfile",
   "nexus.terminal.reset",
   "nexus.terminal.clearScrollback",
   "nexus.terminal.copyAll",

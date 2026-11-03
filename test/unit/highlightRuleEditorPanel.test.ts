@@ -5,7 +5,9 @@ const state = vi.hoisted(() => ({
   postedMessages: [] as Array<Record<string, unknown>>,
   html: "",
   configListener: undefined as ((event: { affectsConfiguration: (k: string) => boolean }) => void) | undefined,
-  disposeListener: undefined as (() => void) | undefined
+  disposeListener: undefined as (() => void) | undefined,
+  messageListener: undefined as ((message: Record<string, unknown>) => Promise<void>) | undefined,
+  warning: ""
 }));
 
 vi.mock("vscode", () => ({
@@ -14,6 +16,7 @@ vi.mock("vscode", () => ({
   workspace: {
     getConfiguration: vi.fn(() => ({
       get: vi.fn((key: string, defaultValue?: unknown) => (key === "rules" ? state.rules : defaultValue)),
+      inspect: vi.fn((key: string) => ({ globalValue: key === "rules" ? state.rules : undefined, defaultValue: key === "profiles" ? null : key === "defaultProfile" ? "default" : key === "enabled" ? true : [] })),
       update: vi.fn(async () => undefined)
     })),
     onDidChangeConfiguration: vi.fn((listener: (event: { affectsConfiguration: (k: string) => boolean }) => void) => {
@@ -30,7 +33,7 @@ vi.mock("vscode", () => ({
         get html() {
           return state.html;
         },
-        onDidReceiveMessage: vi.fn(() => ({ dispose: vi.fn() })),
+        onDidReceiveMessage: vi.fn((listener) => { state.messageListener = listener; return { dispose: vi.fn() }; }),
         postMessage: vi.fn((msg: Record<string, unknown>) => {
           state.postedMessages.push(msg);
           return Promise.resolve(true);
@@ -43,12 +46,13 @@ vi.mock("vscode", () => ({
       reveal: vi.fn(),
       dispose: vi.fn()
     })),
-    showWarningMessage: vi.fn()
+    showWarningMessage: vi.fn(async (message: string) => { state.warning = message; return "Delete"; })
   }
 }));
 
 import { HighlightRuleEditorPanel } from "../../src/ui/highlightRuleEditorPanel";
 import type { HighlightRule } from "../../src/utils/highlightRuleValidation";
+import { readHighlightEditorState } from "../../src/ui/highlightProfileEditorStore";
 
 const IPV6_V1 =
   "\\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){7}\\b|\\b(?:[0-9a-fA-F]{1,4}:){1,7}:[0-9a-fA-F]{1,4}\\b|::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}\\b";
@@ -59,9 +63,9 @@ function rulesShownByEditor(configured: unknown): HighlightRule[] {
   state.postedMessages = [];
   HighlightRuleEditorPanel.open();
   state.configListener?.({ affectsConfiguration: () => true });
-  const update = state.postedMessages.find((msg) => msg.type === "rulesUpdated");
+  const update = state.postedMessages.find((msg) => msg.type === "catalogUpdated");
   expect(update, "editor never pushed a rulesUpdated message").toBeDefined();
-  return update!.rules as HighlightRule[];
+  return (update!.state as import("../../src/ui/highlightProfileEditorStore").HighlightEditorState).catalog.profiles[0].rules;
 }
 
 describe("HighlightRuleEditorPanel.readRules — known-default upgrade", () => {
@@ -100,4 +104,22 @@ describe("HighlightRuleEditorPanel.readRules — known-default upgrade", () => {
     expect(shown[0]).toEqual({ pattern: "\\bDEPLOYING\\b", color: "cyan" });
     expect(shown[1].label).toBe("My errors");
   });
+});
+
+
+describe("HighlightRuleEditorPanel profile deletion", () => {
+  beforeEach(() => { state.disposeListener?.(); state.disposeListener = undefined; state.postedMessages = []; state.rules = []; state.warning = ""; });
+  it("confirms deletion with saved and live reference counts before staging it", async () => {
+    HighlightRuleEditorPanel.open(() => ({ saved: 3, live: 2 }));
+    await state.messageListener?.({ type: "confirmDeleteProfile", profileId: "default", profileName: "Default" });
+    expect(state.warning).toContain("3 saved");
+    expect(state.warning).toContain("2 live");
+    expect(state.postedMessages).toContainEqual({ type: "confirmDeleteProfileResult", profileId: "default", confirmed: true });
+  });
+  it("rejects an unconfirmed deletion sent directly as a webview message", async () => {
+    HighlightRuleEditorPanel.open();
+    await state.messageListener?.({ type: "saveCatalog", profiles: [], defaultProfileId: null, revision: readHighlightEditorState().revision });
+    expect(state.postedMessages).toContainEqual(expect.objectContaining({ type: "catalogSaveResult", ok: false, message: expect.stringContaining("confirm") }));
+  });
+
 });

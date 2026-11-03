@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import type { SerialDeviceHint, SerialProfile, SerialSessionStatus } from "../../models/config";
 import type { SessionLogger } from "../../logging/terminalLogger";
 import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
-import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
+import type { TerminalOutputHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
 import { CLEAR_VISIBLE_SCREEN, RESET_INTERACTIVE_MODES } from "../terminal/terminalEscapes";
 import { PtyObserverHub } from "../terminal/ptyObserverHub";
@@ -118,7 +118,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     private readonly callbacks: SmartSerialPtyCallbacks,
     private readonly logger: SessionLogger,
     private readonly transcript?: SessionTranscript,
-    private readonly highlighter?: TerminalHighlighter,
+    private readonly highlighter?: TerminalOutputHighlighter,
     outputObserver?: PtyOutputObserver
   ) {
     this.observerHub = new PtyObserverHub(outputObserver);

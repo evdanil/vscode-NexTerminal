@@ -46,7 +46,13 @@ const SCHEME: ColorScheme = {
 describe("webview document shell (byte-identity guard)", () => {
   it("highlight rule editor", () => {
     expect(
-      renderHighlightRuleEditorHtml([{ pattern: "err", color: "red", flags: "i" }], NONCE)
+      renderHighlightRuleEditorHtml([], NONCE, {
+        catalog: {
+          profiles: [{ id: "default", name: "Default", rules: [{ pattern: "err", color: "red", flags: "i" }] }],
+          defaultProfileId: "default", enabled: true, legacy: false
+        },
+        revision: "revision", shippedRules: [], workspaceCatalogOverrides: false
+      })
     ).toMatchSnapshot();
   });
 

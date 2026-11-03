@@ -120,6 +120,16 @@ describe("Reset All covers the highlighting rules array", () => {
     expect(clearedRulesKey()).toBe(true);
   });
 
+  it("terminal reset clears the highlight catalog and default, while SSH reset does not", async () => {
+    await sendPanelMessage({ type: "resetCategory", category: "terminal" });
+    for (const key of ["profiles", "defaultProfile"]) {
+      expect(state.updates).toContainEqual({ section: RULES_KEY.section, key, value: undefined, target: 1 });
+    }
+    state.updates = [];
+    await sendPanelMessage({ type: "resetCategory", category: "ssh" });
+    expect(state.updates.some((u) => u.section === RULES_KEY.section && ["profiles", "defaultProfile"].includes(u.key))).toBe(false);
+  });
+
   // ⊘ Discriminator against wiring the extra key into every category reset.
   it("a non-terminal category reset does NOT clear the rules", async () => {
     await sendPanelMessage({ type: "resetCategory", category: "ssh" });

@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "SSH, serial and Telnet terminals in VS Code—no remote agent required. Manage jump hosts, SFTP, tunnels, macros, JavaScript automation and network inventory from one sidebar.",
-  "version": "2.8.309",
+  "version": "2.8.310",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -1095,6 +1095,11 @@
         "category": "Nexus"
       },
       {
+        "command": "nexus.terminal.selectHighlightProfile",
+        "title": "Select Terminal Highlight Profile",
+        "category": "Nexus"
+      },
+      {
         "command": "nexus.terminal.reset",
         "title": "Reset Terminal",
         "category": "Nexus",
@@ -1398,6 +1403,11 @@
           "command": "nexus.server.disconnect",
           "when": "view == nexusCommandCenter && viewItem == nexus.sessionNode",
           "group": "inline"
+        },
+        {
+          "command": "nexus.terminal.selectHighlightProfile",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.sessionNode || viewItem == nexus.serialSessionNode || viewItem == nexus.localShellSessionNode || viewItem == nexus.localServerSessionNode)",
+          "group": "1_terminal@5"
         },
         {
           "command": "nexus.terminal.reset",
@@ -2740,6 +2750,10 @@
           "when": "true"
         },
         {
+          "command": "nexus.terminal.selectHighlightProfile",
+          "when": "nexus.isNexusTerminal"
+        },
+        {
           "command": "nexus.terminal.reset",
           "when": "nexus.isNexusTerminal"
         },
@@ -2798,6 +2812,10 @@
       ],
       "terminal/title/context": [
         {
+          "command": "nexus.terminal.selectHighlightProfile",
+          "group": "nexus@5"
+        },
+        {
           "command": "nexus.terminal.reset",
           "group": "nexus@1"
         },
@@ -2815,6 +2833,11 @@
         }
       ],
       "editor/title/context": [
+        {
+          "command": "nexus.terminal.selectHighlightProfile",
+          "when": "resourceScheme == 'vscode-terminal'",
+          "group": "nexus@5"
+        },
         {
           "command": "nexus.terminal.reset",
           "when": "resourceScheme == 'vscode-terminal'",
@@ -3974,9 +3997,61 @@
           "order": 10,
           "markdownDescription": "Enable regex-based pattern highlighting in SSH, telnet, serial, Local Shell and Local Server terminal output. Matches are coloured inline using ANSI SGR codes while respecting existing terminal colours."
         },
+        "nexus.terminal.highlighting.defaultProfile": {
+          "type": ["string", "null"],
+          "default": "default",
+          "minLength": 1,
+          "maxLength": 100,
+          "order": 11,
+          "markdownDescription": "ID of the highlight profile used by sessions that inherit the global default. Set to `null` for no default highlighting. Select profiles by name with Nexus: Edit Highlighting Rules. An explicit session selection overrides this default; a missing profile ID applies no rules."
+        },
+        "nexus.terminal.highlighting.profiles": {
+          "type": ["array", "null"],
+          "default": null,
+          "maxItems": 100,
+          "order": 12,
+          "items": {
+            "type": "object",
+            "required": ["id", "name", "rules"],
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100,
+                "description": "Stable profile identifier. Renaming a profile does not change this ID."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100,
+                "description": "Unique profile display name."
+              },
+              "rules": {
+                "type": "array",
+                "maxItems": 100,
+                "items": {
+                  "type": "object",
+                  "required": ["pattern", "color"],
+                  "properties": {
+                    "pattern": { "type": "string", "minLength": 1, "maxLength": 500 },
+                    "color": { "type": "string", "description": "Named foreground colour or SGR foreground code." },
+                    "flags": { "type": "string", "default": "gi", "pattern": "^(?:gi|ig|g|i)?$" },
+                    "bold": { "type": "boolean", "default": false },
+                    "underline": { "type": "boolean", "default": false },
+                    "label": { "type": "string", "maxLength": 100 },
+                    "description": { "type": "string", "maxLength": 500 },
+                    "enabled": { "type": "boolean", "default": true }
+                  }
+                }
+              }
+            }
+          },
+          "markdownDescription": "Named, ordered highlight rule collections managed with Nexus: Edit Highlighting Rules. Exactly one profile applies to a session. `null` preserves existing flat rules as a virtual Default profile; an empty array intentionally defines no profiles. Configuring a catalog supersedes the legacy rules setting without deleting it."
+        },
         "nexus.terminal.highlighting.rules": {
           "type": "array",
-          "order": 11,
+          "order": 13,
           "default": [
             {
               "pattern": "\\bCRITICAL\\b|\\bFATAL\\b|\\bPANIC\\b|\\bEMERG(?:ENCY)?\\b",
@@ -4189,7 +4264,7 @@
               }
             }
           },
-          "markdownDescription": "Highlighting rules applied to SSH, telnet, serial, Local Shell and Local Server terminal output. Each rule specifies a regex `pattern`, a `color` (named or SGR code), optional `flags`, and optional `bold`/`underline` styles. A rule can also carry an optional `label` and `description` for its own entry in the Highlighting Rules editor, and an optional `enabled` flag (omitted/`true` means enabled) to keep a rule saved without applying it. Text already coloured by the terminal program is never re-highlighted.\n\nThe IPv6 and UUID rules ship **disabled** by default: those two patterns cost more than every other rule combined, because they have to be tried at nearly every character of every line. Switch either one on with its per-rule enable checkbox in the Highlighting Rules editor — no need to retype the regex."
+          "markdownDescription": "Legacy rules used by the virtual Default highlight profile while `nexus.terminal.highlighting.profiles` is `null`. A configured profile catalog supersedes these rules without deleting them. Applies to SSH, telnet, serial, Local Shell and Local Server terminal output. Each rule specifies a regex `pattern`, a `color` (named or SGR code), optional `flags`, and optional `bold`/`underline` styles. A rule can also carry an optional `label` and `description` for its own entry in the Highlighting Rules editor, and an optional `enabled` flag (omitted/`true` means enabled) to keep a rule saved without applying it. Text already coloured by the terminal program is never re-highlighted.\n\nThe IPv6 and UUID rules ship **disabled** by default: those two patterns cost more than every other rule combined, because they have to be tried at nearly every character of every line. Switch either one on with its per-rule enable checkbox in the Highlighting Rules editor — no need to retype the regex."
         },
         "nexus.sftp.cacheTtlSeconds": {
           "type": "number",

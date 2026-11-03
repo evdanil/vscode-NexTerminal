@@ -5,7 +5,8 @@ import { SETTINGS_META } from "../ui/settingsMetadata";
 import { resetAllExtraKeys, resetSettings } from "../ui/settingsReset";
 
 export function registerSettingsCommands(
-  resolveLogDir: () => string
+  resolveLogDir: () => string,
+  countHighlightReferences?: (id: string) => { saved: number; live: number }
 ): vscode.Disposable[] {
   return [
     vscode.commands.registerCommand("nexus.settings.openPanel", (category?: string) => {
@@ -13,7 +14,7 @@ export function registerSettingsCommands(
     }),
 
     vscode.commands.registerCommand("nexus.openHighlightRuleEditor", () => {
-      HighlightRuleEditorPanel.open();
+      HighlightRuleEditorPanel.open(countHighlightReferences);
     }),
 
     vscode.commands.registerCommand("nexus.settings.openJson", () => {

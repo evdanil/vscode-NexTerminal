@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
+import { readHighlightCatalog } from "../services/terminal/highlightProfileSettings";
+import { parseHighlightProfileFormValue } from "../ui/highlightProfileForm";
 import { resolveSerialProfileMode, type SerialDataBits, type SerialDeviceHint, type SerialParity, type SerialProfile, type SerialSessionStatus, type SerialStopBits } from "../models/config";
 import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
@@ -388,7 +390,8 @@ export function formValuesToSerial(values: FormValues, existing?: Partial<Serial
     logSession: typeof values.logSession === "boolean" ? values.logSession : getDefaultSessionTranscriptsEnabled(),
     group: normalizedGroup,
     mode: rawMode === "smartFollow" ? "smartFollow" : "standard",
-    deviceHint: existing?.deviceHint
+    deviceHint: existing?.deviceHint,
+    highlightProfileId: parseHighlightProfileFormValue(values.highlightProfileId, existing?.highlightProfileId)
   };
 }
 
@@ -411,6 +414,7 @@ async function connectStandardSerialProfile(
     undefined,
     profile.id
   );
+  const highlight = ctx.highlightProfileService?.createSession({ kind: "serial", id: profile.id }, profile.highlightProfileId);
   const pty = new SerialPty(
     ctx.serialSidecar,
     {
@@ -498,21 +502,27 @@ async function connectStandardSerialProfile(
       profile.logSession ?? getDefaultSessionTranscriptsEnabled(),
       getTranscriptRotationOptions(ctx)
     ),
-    ctx.highlighter,
+    highlight ?? ctx.highlighter,
     triggerObserver
   );
   ptyRef = pty;
 
   const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
-  const terminal = vscode.window.createTerminal({
-    name: terminalName,
-    pty,
-    iconPath: new vscode.ThemeIcon("plug"),
-    color: new vscode.ThemeColor("terminal.ansiCyan"),
-    location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
-  });
+  let terminal: vscode.Terminal;
+  try {
+    terminal = vscode.window.createTerminal({
+      name: terminalName,
+      pty,
+      iconPath: new vscode.ThemeIcon("plug"),
+      color: new vscode.ThemeColor("terminal.ansiCyan"),
+      location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
+    });
+  } catch (error) {
+    highlight?.dispose();
+    throw error;
+  }
   terminalRef = terminal;
-  ctx.terminalRegistry?.register(terminal, pty);
+  ctx.terminalRegistry?.register(terminal, pty, highlight);
   ctx.focusedTerminal = terminal;
   terminal.show();
   return true;
@@ -536,6 +546,7 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
     profile.id
   );
 
+  const highlight = ctx.highlightProfileService?.createSession({ kind: "serial", id: profile.id }, profile.highlightProfileId);
   const pty = new SmartSerialPty(
     ctx.serialSidecar as SmartSerialTransport,
     profile,
@@ -596,21 +607,27 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
       profile.logSession ?? getDefaultSessionTranscriptsEnabled(),
       getTranscriptRotationOptions(ctx)
     ),
-    ctx.highlighter,
+    highlight ?? ctx.highlighter,
     triggerObserver
   );
   ptyRef = pty;
 
   const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
-  const terminal = vscode.window.createTerminal({
-    name: terminalName,
-    pty,
-    iconPath: new vscode.ThemeIcon("sync"),
-    color: new vscode.ThemeColor("terminal.ansiCyan"),
-    location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
-  });
+  let terminal: vscode.Terminal;
+  try {
+    terminal = vscode.window.createTerminal({
+      name: terminalName,
+      pty,
+      iconPath: new vscode.ThemeIcon("sync"),
+      color: new vscode.ThemeColor("terminal.ansiCyan"),
+      location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
+    });
+  } catch (error) {
+    highlight?.dispose();
+    throw error;
+  }
   terminalRef = terminal;
-  ctx.terminalRegistry?.register(terminal, pty);
+  ctx.terminalRegistry?.register(terminal, pty, highlight);
   ctx.serialTerminals.set(logicalSessionId, {
     terminal,
     profileId: profile.id,
@@ -706,7 +723,7 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
         return;
       }
       const existingGroups = collectGroups(ctx);
-      const definition = serialFormDefinition(existing, existingGroups, getDefaultSessionTranscriptsEnabled());
+      const definition = serialFormDefinition(existing, existingGroups, getDefaultSessionTranscriptsEnabled(), readHighlightCatalog());
       WebviewFormPanel.open("serial-edit", definition, {
         onScan: () => scanForPort(ctx),
         onSubmit: async (values) => {
@@ -746,7 +763,7 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
           });
           if (showConnectedNotice) {
             void vscode.window.showInformationMessage(
-              "Serial profile updated. Existing sessions keep current settings until reconnect."
+              "Serial profile updated. Highlight profile changes apply to future output unless the terminal has its own override. Other settings apply after reconnect."
             );
           }
         }

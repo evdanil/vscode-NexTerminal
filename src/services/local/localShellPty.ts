@@ -4,7 +4,7 @@ import type { Readable, Writable } from "node:stream";
 import * as vscode from "vscode";
 import type { SessionPtyHandle } from "../../models/config";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
-import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
+import type { TerminalOutputHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import { PtyObserverHub } from "../terminal/ptyObserverHub";
 import { CLEAR_VISIBLE_SCREEN } from "../terminal/terminalEscapes";
 import { OscContextFilter } from "../terminal/oscContextFilter";
@@ -45,7 +45,7 @@ export interface LocalShellPtyOptions {
   startupCommand?: string;
   spawnSidecar?: LocalPtySidecarSpawner;
   outputChannel?: LocalShellOutputChannel;
-  highlighter?: TerminalHighlighter;
+  highlighter?: TerminalOutputHighlighter;
 }
 
 export interface LocalShellEarlyTerminationEvent {

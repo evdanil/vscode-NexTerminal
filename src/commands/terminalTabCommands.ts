@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { readHighlightCatalog } from "../services/terminal/highlightProfileSettings";
 import type { RegistryEntry, TerminalRegistry } from "../services/terminal/terminalRegistry";
 import type { LocalShellTerminalMap, LocalServerTerminalMap, SessionTerminalMap, SerialTerminalMap } from "./types";
 
@@ -86,10 +87,72 @@ function resolveEntry(
   return terminal ? deps.registry.get(terminal) : undefined;
 }
 
+interface HighlightChoice extends vscode.QuickPickItem {
+  choice: "saved" | "global" | "none" | "profile" | "manage";
+  id?: string;
+}
+
+/** Explicit stale arguments never redirect a tab-specific choice to the active tab. */
+function resolveHighlightTarget(arg: unknown, deps: TerminalTabCommandsDeps): vscode.Terminal | undefined {
+  if (arg === undefined) return vscode.window.activeTerminal;
+  if (isTerminalArg(arg)) return arg;
+  if (!arg || typeof arg !== "object") return undefined;
+  const session = (arg as { session?: { id?: unknown } }).session;
+  if (!session || typeof session.id !== "string") return undefined;
+  return deps.sessionTerminals.get(session.id)
+    ?? deps.serialTerminals.get(session.id)?.terminal
+    ?? deps.localShellTerminals?.get(session.id)?.terminal
+    ?? deps.localServerTerminals?.get(session.id)?.terminal;
+}
+
+async function selectHighlightProfile(arg: unknown, deps: TerminalTabCommandsDeps): Promise<void> {
+  const terminal = resolveHighlightTarget(arg, deps);
+  const entry = terminal && deps.registry.get(terminal);
+  if (!terminal || !entry?.highlight) return;
+  const catalog = readHighlightCatalog();
+  const state = entry.highlight.getSelection();
+  const current = state.missingProfileId
+    ? `Missing profile: ${state.missingProfileId}`
+    : catalog.profiles.find(profile => profile.id === state.effectiveProfileId)?.name ?? "None";
+  const defaultName = catalog.defaultProfileId === null ? "None"
+    : catalog.profiles.find(profile => profile.id === catalog.defaultProfileId)?.name ?? `Missing: ${catalog.defaultProfileId}`;
+  const choices: HighlightChoice[] = [
+    { label: "Use saved connection setting", description: "Follow this connection's saved preference", choice: "saved" },
+    { label: "Use global default", description: defaultName, choice: "global" },
+    { label: "None", description: "Disable highlighting for this terminal", choice: "none" },
+    ...catalog.profiles.map(profile => ({ label: profile.name, description: "Highlight profile", choice: "profile" as const, id: profile.id })),
+    { label: "Manage Highlight Profiles…", choice: "manage" }
+  ];
+  const selected = await vscode.window.showQuickPick(choices, {
+    placeHolder: `Highlight profile for this terminal: ${current} (${state.origin}${state.enabled ? "" : ", highlighting disabled"})`
+  });
+  if (!selected || deps.registry.get(terminal) !== entry) return;
+  if (selected.choice === "manage") {
+    await vscode.commands.executeCommand("nexus.openHighlightRuleEditor");
+    return;
+  }
+  if (selected.choice === "profile") {
+    if (!readHighlightCatalog().profiles.some(profile => profile.id === selected.id)) {
+      const action = await vscode.window.showWarningMessage("The selected highlight profile is no longer available.", "Manage Highlight Profiles…");
+      if (action === "Manage Highlight Profiles…") await vscode.commands.executeCommand("nexus.openHighlightRuleEditor");
+      return;
+    }
+    entry.highlight.setOverride({ mode: "override", selection: selected.id });
+  } else if (selected.choice === "saved") {
+    entry.highlight.setOverride({ mode: "saved" });
+  } else {
+    entry.highlight.setOverride({ mode: "override", selection: selected.choice === "none" ? null : undefined });
+  }
+}
+
 export function registerTerminalTabCommands(
   context: vscode.ExtensionContext,
   deps: TerminalTabCommandsDeps
 ): void {
+  context.subscriptions.push(
+    vscode.commands.registerCommand("nexus.terminal.selectHighlightProfile", (arg?: unknown) => selectHighlightProfile(arg, deps))
+  );
+
   context.subscriptions.push(
     vscode.commands.registerCommand("nexus.terminal.reset", (arg?: unknown) => {
       const entry = resolveEntry(arg, deps);

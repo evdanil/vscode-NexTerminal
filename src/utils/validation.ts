@@ -15,6 +15,15 @@ import type { SavedFilterDefinition } from "../models/savedFilter";
 import type { DhcpConfigProfile, TftpConfigProfile } from "../models/networkServerProfile";
 import type { LocalServerConfig } from "../models/localServer";
 import { normalizeFolderPath } from "./folderPaths";
+import { isHighlightProfileSelection } from "./highlightProfileValidation";
+export { isHighlightProfileSelection } from "./highlightProfileValidation";
+
+/** Invalid explicit selections fail closed without discarding their connection record. */
+export function sanitizeHighlightProfileSelection(item: unknown): unknown {
+  if (typeof item !== "object" || item === null || Array.isArray(item)) return item;
+  const obj = item as Record<string, unknown>;
+  return isHighlightProfileSelection(obj.highlightProfileId) ? item : { ...obj, highlightProfileId: null };
+}
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
@@ -321,6 +330,7 @@ export function validateServerConfig(item: unknown): item is ServerConfig {
     return false;
   }
   const obj = item as Record<string, unknown>;
+  if (!isHighlightProfileSelection(obj.highlightProfileId)) return false;
   // TELNET (Phase 0) — a CLOSED ENUM, the `SerialProfile.mode` disposition
   // rather than `bmcWebProtocol`'s tolerant type check, and the difference is
   // deliberate. `bmcWebProtocol` only ever picks a URL scheme, and its read site
@@ -700,7 +710,8 @@ export function validateSerialProfile(item: unknown): item is SerialProfile {
     isNonEmptyString(obj.path) &&
     typeof obj.baudRate === "number" &&
     (obj.mode === undefined || obj.mode === "standard" || obj.mode === "smartFollow") &&
-    validateSerialDeviceHint(obj.deviceHint)
+    validateSerialDeviceHint(obj.deviceHint) &&
+    isHighlightProfileSelection(obj.highlightProfileId)
   );
 }
 
@@ -742,7 +753,8 @@ export function validateLocalShellProfile(item: unknown): item is LocalShellProf
     validateEnv(obj.env) &&
     isOptionalNonEmptyString(obj.group) &&
     isOptionalNonEmptyString(obj.cwd) &&
-    isOptionalNonEmptyString(obj.startupCommand)
+    isOptionalNonEmptyString(obj.startupCommand) &&
+    isHighlightProfileSelection(obj.highlightProfileId)
   );
 }
 
@@ -880,7 +892,8 @@ export function validateLocalServerConfig(item: unknown): item is LocalServerCon
     validateLocalServerEnv(obj.env) &&
     isOptionalNonEmptyString(obj.group) &&
     isOptionalNonEmptyString(obj.cwd) &&
-    isOptionalNonEmptyString(obj.description)
+    isOptionalNonEmptyString(obj.description) &&
+    isHighlightProfileSelection(obj.highlightProfileId)
   );
 }
 

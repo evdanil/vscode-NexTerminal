@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
-import type { TerminalHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
+import type { TerminalOutputHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 
 /**
  * One-shot banner echoed through the owning PTY's writeEmitter the first time a
@@ -87,7 +87,7 @@ export class PtyObserverHub {
   public notifyOutput(
     text: string,
     highlighterStream: TerminalHighlighterStream | undefined,
-    highlighter: TerminalHighlighter | undefined,
+    highlighter: TerminalOutputHighlighter | undefined,
     emit: (rendered: string) => void
   ): void {
     this.observers.forEach((o) => {

@@ -467,6 +467,180 @@ describe("config import command (legacy)", () => {
     await importCmd();
   }
 
+  it("merges colliding highlight profiles without changing existing connections or the default", async () => {
+    const key = "nexus.terminal.highlighting.";
+    const local = { id: "shared", name: "Local", rules: [] };
+    const incoming = { id: "shared", name: "Remote", rules: [] };
+    configStore.set(`${key}profiles`, [local]);
+    configStore.set(`${key}defaultProfile`, "shared");
+    await core.addOrUpdateServer(makeServer({ id: "existing", highlightProfileId: "shared" }));
+    await runImport(makeExportData({
+      servers: [makeServer({ id: "incoming", highlightProfileId: "shared" })],
+      settings: { [`${key}profiles`]: [incoming], [`${key}defaultProfile`]: "shared" }
+    }), "merge");
+    const profiles = configStore.get(`${key}profiles`) as Array<{ id: string; name: string }>;
+    expect(profiles).toContainEqual(local);
+    const imported = profiles.find((p) => p.name === "Remote")!;
+    expect(imported.id).not.toBe("shared");
+    expect(core.getSnapshot().servers.find((s) => s.id === "incoming")?.highlightProfileId).toBe(imported.id);
+    expect(core.getSnapshot().servers.find((s) => s.id === "existing")?.highlightProfileId).toBe("shared");
+    expect(configStore.get(`${key}defaultProfile`)).toBe("shared");
+  });
+
+  it("refuses a replace before deleting connections when its highlight catalog is malformed", async () => {
+    await core.addOrUpdateServer(makeServer({ id: "existing" }));
+    await runImport(makeExportData({
+      servers: [makeServer({ id: "incoming" })],
+      settings: { "nexus.terminal.highlighting.profiles": [{ id: "bad", name: "Bad", rules: "bad" }] }
+    }), "replace");
+    expect(core.getSnapshot().servers.map((s) => s.id)).toEqual(["existing"]);
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("highlight"));
+  });
+
+  it("preserves an old backup's rules in merge and selects them for imported connections", async () => {
+    const key = "nexus.terminal.highlighting.";
+    const rule = { pattern: "old", color: "red" };
+    configStore.set(`${key}profiles`, [{ id: "default", name: "Default", rules: [] }]);
+    configStore.set(`${key}defaultProfile`, "default");
+    await runImport(makeExportData({ servers: [makeServer({ id: "old" })], settings: { [`${key}rules`]: [rule] } }), "merge");
+    const profiles = configStore.get(`${key}profiles`) as Array<{ id: string; rules: unknown[] }>;
+    const imported = profiles.find((p) => p.rules.length > 0)!;
+    expect(imported.id).not.toBe("default");
+    expect(core.getSnapshot().servers.find((s) => s.id === "old")?.highlightProfileId).toBe(imported.id);
+    expect(configStore.get(`${key}defaultProfile`)).toBe("default");
+  });
+
+  it("replaces a configured catalog with legacy rules when restoring an old backup", async () => {
+    const key = "nexus.terminal.highlighting.";
+    configStore.set(`${key}profiles`, [{ id: "local", name: "Local", rules: [] }]);
+    configStore.set(`${key}defaultProfile`, "local");
+    const rule = { pattern: "old", color: "red" };
+    await runImport(makeExportData({ settings: { [`${key}rules`]: [rule] } }), "replace");
+    expect(configStore.get(`${key}profiles`)).toBeNull();
+    expect(configStore.get(`${key}defaultProfile`)).toBe("default");
+    expect(configStore.get(`${key}rules`)).toEqual([rule]);
+  });
+
+  it("merges a legacy catalog using shipped rules when no rules override was exported", async () => {
+    const key = "nexus.terminal.highlighting.";
+    configDefaults.set(`${key}rules`, [{ pattern: "SHIPPED", color: "red" }]);
+    configStore.set(`${key}profiles`, [{ id: "local", name: "Local", rules: [] }]);
+    configStore.set(`${key}defaultProfile`, "local");
+    await runImport(makeExportData({ servers: [makeServer({ id: "incoming" })], settings: { [`${key}profiles`]: null } }), "merge");
+    const selected = core.getSnapshot().servers.find((server) => server.id === "incoming")?.highlightProfileId;
+    const profiles = configStore.get(`${key}profiles`) as Array<{ id: string; rules: Array<{ pattern: string }> }>;
+    expect(profiles.find((profile) => profile.id === selected)?.rules[0]?.pattern).toBe("SHIPPED");
+  });
+
+  it("preserves an imported global none when only that non-default setting was exported", async () => {
+    const key = "nexus.terminal.highlighting.";
+    configStore.set(`${key}profiles`, [{ id: "local", name: "Local", rules: [] }]);
+    configStore.set(`${key}defaultProfile`, "local");
+    await runImport(makeExportData({ servers: [makeServer({ id: "incoming" })], settings: { [`${key}defaultProfile`]: null } }), "merge");
+    expect(core.getSnapshot().servers.find((server) => server.id === "incoming")?.highlightProfileId).toBeNull();
+    expect(configStore.get(`${key}defaultProfile`)).toBe("local");
+  });
+
+  it("keeps a missing reference visible when replacing with a catalog lacking that profile", async () => {
+    const key = "nexus.terminal.highlighting.";
+    await runImport(makeExportData({ servers: [makeServer({ id: "incoming", highlightProfileId: "missing-id" })], settings: { [`${key}profiles`]: [] } }), "replace");
+    expect(core.getSnapshot().servers.find((server) => server.id === "incoming")?.highlightProfileId).toBe("missing-id");
+  });
+
+  it("aborts Replace before deleting records when highlight settings fail, restoring earlier writes", async () => {
+    const key = "nexus.terminal.highlighting.";
+    const local = [{ id: "shared", name: "Local", rules: [] }];
+    configStore.set(`${key}profiles`, local);
+    configStore.set(`${key}defaultProfile`, "shared");
+    await core.addOrUpdateServer(makeServer({ id: "existing", highlightProfileId: "shared" }));
+    mockConfigUpdate.mockImplementationOnce(() => Promise.resolve()).mockImplementationOnce(() => Promise.reject(new Error("read only")));
+    await runImport(makeExportData({ servers: [makeServer({ id: "incoming", highlightProfileId: "remote" })], settings: {
+      [`${key}profiles`]: [{ id: "remote", name: "Remote", rules: [] }], [`${key}defaultProfile`]: "remote"
+    } }), "replace");
+    expect(core.getSnapshot().servers.map((server) => server.id)).toEqual(["existing"]);
+    expect(configStore.get(`${key}profiles`)).toEqual(local);
+    expect(configStore.get(`${key}defaultProfile`)).toBe("shared");
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("highlight"));
+  });
+
+  it("does not overwrite a concurrent catalog change while rolling back a failed import", async () => {
+    const key = "nexus.terminal.highlighting.";
+    configStore.set(`${key}profiles`, [{ id: "local", name: "Local", rules: [] }]);
+    configStore.set(`${key}defaultProfile`, "local");
+    await core.addOrUpdateServer(makeServer({ id: "existing" }));
+    const concurrent = [{ id: "other", name: "Other", rules: [] }];
+    mockConfigUpdate.mockImplementationOnce(() => Promise.resolve()).mockImplementationOnce(() => {
+      configStore.set(`${key}profiles`, concurrent);
+      return Promise.reject(new Error("write failed"));
+    });
+    await runImport(makeExportData({ servers: [makeServer({ id: "incoming" })], settings: {
+      [`${key}profiles`]: [{ id: "remote", name: "Remote", rules: [] }], [`${key}defaultProfile`]: "remote"
+    } }), "replace");
+    expect(configStore.get(`${key}profiles`)).toEqual(concurrent);
+    expect(core.getSnapshot().servers.map((server) => server.id)).toEqual(["existing"]);
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("fully restored"));
+  });
+
+  it("aborts if an earlier catalog write changes while a later setting is saved", async () => {
+    const key = "nexus.terminal.highlighting.";
+    configStore.set(`${key}profiles`, [{ id: "local", name: "Local", rules: [] }]);
+    configStore.set(`${key}defaultProfile`, "local");
+    await core.addOrUpdateServer(makeServer({ id: "existing" }));
+    const concurrent = [{ id: "other", name: "Other", rules: [] }];
+    mockConfigUpdate.mockImplementationOnce(() => Promise.resolve()).mockImplementationOnce(() => {
+      configStore.set(`${key}profiles`, concurrent);
+      return Promise.resolve();
+    });
+    await runImport(makeExportData({ servers: [makeServer({ id: "incoming" })], settings: {
+      [`${key}profiles`]: [{ id: "remote", name: "Remote", rules: [] }], [`${key}defaultProfile`]: "remote"
+    } }), "replace");
+    expect(core.getSnapshot().servers.map((server) => server.id)).toEqual(["existing"]);
+    expect(configStore.get(`${key}profiles`)).toEqual(concurrent);
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("fully restored"));
+  });
+
+  it("does not attach an absent incoming profile ID to a recipient's unrelated profile", async () => {
+    const key = "nexus.terminal.highlighting.";
+    configStore.set(`${key}profiles`, [{ id: "missing", name: "Local", rules: [] }]);
+    await runImport(makeExportData({ servers: [makeServer({ id: "incoming", highlightProfileId: "missing" })], settings: { [`${key}profiles`]: [] } }), "merge");
+    const selected = core.getSnapshot().servers.find((server) => server.id === "incoming")?.highlightProfileId;
+    const profiles = configStore.get(`${key}profiles`) as Array<{ id: string }>;
+    expect(typeof selected).toBe("string");
+    expect(selected).not.toBe("missing");
+    expect(profiles.some((profile) => profile.id === selected)).toBe(false);
+  });
+
+  it("restores shipped legacy rules on replace when the source had no rule override", async () => {
+    const key = "nexus.terminal.highlighting.";
+    configDefaults.set(`${key}rules`, [{ pattern: "SHIPPED", color: "red" }]);
+    configStore.set(`${key}profiles`, [{ id: "local", name: "Local", rules: [] }]);
+    configStore.set(`${key}rules`, [{ pattern: "LOCAL", color: "blue" }]);
+    await runImport(makeExportData({ settings: { [`${key}profiles`]: null } }), "replace");
+    expect(configStore.get(`${key}rules`)).toEqual([{ pattern: "SHIPPED", color: "red" }]);
+    expect(configStore.get(`${key}profiles`)).toBeNull();
+  });
+
+  it("keeps a connection with a malformed highlight reference and disables its highlighting", async () => {
+    await runImport(makeExportData({ servers: [{ ...makeServer({ id: "bad-selection" }), highlightProfileId: 7 }] }), "merge");
+    expect(core.getSnapshot().servers.find((s) => s.id === "bad-selection")?.highlightProfileId).toBeNull();
+  });
+
+  it("remaps a shared profile collision and leaves the recipient default intact", async () => {
+    const key = "nexus.terminal.highlighting.";
+    configStore.set(`${key}profiles`, [{ id: "same", name: "Local", rules: [] }]);
+    configStore.set(`${key}defaultProfile`, "same");
+    await runImport(makeExportData({
+      version: 2, exportType: "share", servers: [makeServer({ highlightProfileId: "same" })],
+      tunnels: [], serialProfiles: [],
+      settings: { [`${key}profiles`]: [{ id: "same", name: "Remote", rules: [] }], [`${key}defaultProfile`]: "same" }
+    }));
+    const profiles = configStore.get(`${key}profiles`) as Array<{ id: string; name: string }>;
+    const remote = profiles.find((p) => p.name === "Remote")!;
+    expect(remote.id).not.toBe("same");
+    expect(core.getSnapshot().servers[0].highlightProfileId).toBe(remote.id);
+    expect(configStore.get(`${key}defaultProfile`)).toBe("same");
+  });
+
   it("imports valid profiles into empty core", async () => {
     const exportData = makeExportData();
     await runImport(exportData);
@@ -1088,7 +1262,7 @@ describe("config import command (legacy)", () => {
     });
   });
 
-  it("skips unsafe imported highlighting rules", async () => {
+  it("rejects an import containing unsafe highlighting rules", async () => {
     const exportData = makeExportData({
       settings: {
         "nexus.terminal.highlighting.rules": [
@@ -1099,9 +1273,7 @@ describe("config import command (legacy)", () => {
     await runImport(exportData);
 
     expect(configStore.has("nexus.terminal.highlighting.rules")).toBe(false);
-    expect(mockShowWarningMessage).toHaveBeenCalledWith(
-      "1 imported Nexus setting had an invalid value and was skipped."
-    );
+    expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("invalid legacy highlight rules"));
   });
 
   it("imports old-format highlighting rules (no label/description/enabled) unchanged — no fields invented", async () => {
@@ -1113,7 +1285,7 @@ describe("config import command (legacy)", () => {
         ]
       }
     });
-    await runImport(exportData);
+    await runImport(exportData, "replace");
 
     expect(configStore.get("nexus.terminal.highlighting.rules")).toEqual([
       { pattern: "\\bERROR\\b", color: "red", flags: "gi", bold: true }
@@ -1142,7 +1314,7 @@ describe("config import command (legacy)", () => {
         ]
       }
     });
-    await runImport(exportData);
+    await runImport(exportData, "replace");
 
     expect(configStore.get("nexus.terminal.highlighting.rules")).toEqual([
       {
@@ -1184,7 +1356,7 @@ describe("config import command (legacy)", () => {
         ]
       }
     });
-    await runImport(exportData);
+    await runImport(exportData, "replace");
 
     const written = configStore.get("nexus.terminal.highlighting.rules") as Array<Record<string, unknown>>;
     expect(written[0].pattern).toBe(shippedIpv6.pattern);
@@ -6721,6 +6893,30 @@ Server=#109#0%host.test%22%user%%-1%
 });
 
 describe("sanitizeForSharing", () => {
+  it("includes the highlight catalog and default in portable settings", () => {
+    const profiles = [{ id: "routers", name: "Routers", rules: [{ pattern: "ERROR", color: "red" }] }];
+    const settings = {
+      "nexus.terminal.highlighting.profiles": profiles,
+      "nexus.terminal.highlighting.defaultProfile": "routers"
+    };
+    const keys = SETTINGS_KEYS.map(({ section, key }) => `${section}.${key}`);
+
+    expect(keys).toContain("nexus.terminal.highlighting.profiles");
+    expect(keys).toContain("nexus.terminal.highlighting.defaultProfile");
+    expect(sanitizeForSharing([], [], [], [], settings).settings).toEqual(settings);
+  });
+
+  it("retains named and disabled highlight selections when sharing connection profiles", () => {
+    const server = makeServer({ highlightProfileId: "routers" });
+    const serial = makeSerialProfile({ highlightProfileId: null });
+    const shell = makeLocalShellProfile({ launchMode: "vscodeProfile", highlightProfileId: "routers" });
+    const shared = sanitizeForSharing([server], [], [serial], [shell], {});
+
+    expect(shared.servers[0].highlightProfileId).toBe("routers");
+    expect(shared.serialProfiles[0].highlightProfileId).toBeNull();
+    expect(shared.localShellProfiles[0].highlightProfileId).toBe("routers");
+  });
+
   it("exports only explicitly share-safe settings and omits local, security and unknown values", () => {
     const result = sanitizeForSharing([], [], [], [], {
       "nexus.logging.maxFileSizeMb": 128,
