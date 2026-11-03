@@ -288,7 +288,7 @@ DEBUG: packet sent 1024 bytes</div>
     <div class="button-row" style="margin-top: 12px;">
       <button type="button" class="btn-primary" id="save-rule-btn">Stage Rule</button>
       <button type="button" class="btn-secondary" id="cancel-edit-btn">Cancel</button>
-      <button type="button" class="btn-danger" id="delete-rule-btn" style="margin-left: auto; display: none;">Delete</button>
+      <button type="button" class="btn-danger" id="delete-rule-btn" title="Delete this rule and discard its unfinished edit" style="margin-left: auto; display: none;">Delete Rule</button>
     </div>
   </div>
 `,
@@ -313,6 +313,8 @@ DEBUG: packet sent 1024 bytes</div>
       var rules = manager ? ((profiles.find(function(p) { return p.id === selectedProfileId; }) || {}).rules || []) : ${rulesJson};
       var originalRules = JSON.parse(JSON.stringify(rules));
       var editingIndex = -1;
+      var ruleGuardMessage = "Stage Rule to keep this rule edit, or use Cancel in the rule editor to discard it before continuing.";
+      var priorRuleGuardError = "";
       var previewTimer = null;
       var regexCache = {};
 
@@ -375,7 +377,9 @@ DEBUG: packet sent 1024 bytes</div>
       function currentProfile() { return profiles.find(function(p) { return p.id === selectedProfileId; }); }
       function finishRuleFirst() {
         if (!manager || !document.getElementById("editor-section").classList.contains("visible")) return true;
-        document.getElementById("save-error").textContent = "Stage Rule to keep this rule edit, or use Cancel in the rule editor to discard it before continuing.";
+        var error = document.getElementById("save-error");
+        if (error.textContent !== ruleGuardMessage) priorRuleGuardError = error.textContent;
+        error.textContent = ruleGuardMessage;
         return false;
       }
       function selectProfile(id) {
@@ -694,7 +698,6 @@ DEBUG: packet sent 1024 bytes</div>
       });
 
       document.getElementById("delete-rule-btn").addEventListener("click", function() {
-        if (!finishRuleFirst()) return;
         if (editingIndex >= 0 && editingIndex < rules.length) {
           rules.splice(editingIndex, 1);
           renderRulesList();
@@ -869,6 +872,9 @@ DEBUG: packet sent 1024 bytes</div>
       function closeEditor() {
         editingIndex = -1;
         document.getElementById("editor-section").classList.remove("visible");
+        var error = document.getElementById("save-error");
+        if (error.textContent === ruleGuardMessage) error.textContent = priorRuleGuardError;
+        priorRuleGuardError = "";
       }
 
       function saveRules() {

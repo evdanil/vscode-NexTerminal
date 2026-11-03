@@ -197,6 +197,7 @@ export interface HighlightRuleEditorHarness {
   clickDown: (index: number) => void;
   clickEdit: (index: number) => void;
   clickDelete: (index: number) => void;
+  deleteEditedRule: () => void;
   clickAdd: () => void;
   setLabel: (value: string) => void;
   setDescription: (value: string) => void;
@@ -312,6 +313,7 @@ export function openHighlightRuleEditor(rules: HighlightRule[], manager?: Highli
     clickDown: (index) => rowButton(index, ".rule-down-btn").bubble("click"),
     clickEdit: (index) => rowButton(index, ".rule-edit-btn").bubble("click"),
     clickDelete: (index) => rowButton(index, ".rule-delete-btn").bubble("click"),
+    deleteEditedRule: () => field("delete-rule-btn").bubble("click"),
     clickAdd: () => field("add-rule-btn").bubble("click"),
     setLabel: (value) => { field("edit-label").value = value; },
     setDescription: (value) => { field("edit-description").value = value; },

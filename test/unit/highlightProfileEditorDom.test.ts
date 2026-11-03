@@ -10,6 +10,60 @@ const state: HighlightEditorState = {
 };
 
 describe("highlight profile manager", () => {
+  it("deletes the rule being edited after a reorder and stages the deletion", () => {
+    const editor = openHighlightRuleEditor([], { ...state, catalog: { ...state.catalog, profiles: [
+      { id: "one", name: "One", rules: [{ pattern: "FIRST", color: "red" }, { pattern: "SECOND", color: "blue" }] }
+    ] } });
+    editor.clickEdit(0);
+    editor.setPattern("UNFINISHED");
+    editor.clickDown(0);
+    editor.deleteEditedRule();
+    expect(editor.editorVisible()).toBe(false);
+    expect(editor.rowCount()).toBe(1);
+    expect(editor.rowLabel(0)).toBe("SECOND");
+    expect(editor.isDirty()).toBe(true);
+    editor.clickApply();
+    const save = editor.posted.find((message) => message.type === "saveCatalog");
+    if (save?.type !== "saveCatalog") throw new Error("missing save");
+    expect(save.profiles[0].rules.map((rule) => rule.pattern)).toEqual(["SECOND"]);
+  });
+  it("preserves an unfinished edit if the same rule's row delete is clicked", () => {
+    const editor = openHighlightRuleEditor([], state);
+    editor.clickEdit(0); editor.setPattern("DRAFT");
+    editor.clickDelete(0);
+    expect(editor.editorVisible()).toBe(true);
+    expect(editor.patternValue()).toBe("DRAFT");
+    expect(editor.rowLabel(0)).toBe("ONE");
+    expect(editor.saveError()).toContain("Stage Rule");
+    editor.stageRule();
+    expect(editor.rowLabel(0)).toBe("DRAFT");
+  });
+  it.each(["stage", "cancel", "delete"] as const)("clears only the rule guard message after %s", (resolution) => {
+    const editor = openHighlightRuleEditor([], state);
+    editor.clickEdit(0); editor.setPattern("DRAFT"); editor.selectProfile("two");
+    expect(editor.saveError()).toContain("Stage Rule");
+    if (resolution === "stage") editor.stageRule();
+    if (resolution === "cancel") editor.cancelRuleEdit();
+    if (resolution === "delete") editor.deleteEditedRule();
+    expect(editor.editorVisible()).toBe(false);
+    expect(editor.saveError()).toBe("");
+  });
+  it("keeps a real save failure after closing a rule editor", () => {
+    const editor = openHighlightRuleEditor([], state);
+    editor.clickEdit(0); editor.setPattern("DRAFT");
+    editor.deliver({ type: "catalogSaveResult", ok: false, message: "Real save failure" });
+    editor.cancelRuleEdit();
+    expect(editor.saveError()).toBe("Real save failure");
+  });
+  it("restores a pre-existing save failure after a rule guard is resolved", () => {
+    const editor = openHighlightRuleEditor([], state);
+    editor.clickEdit(0); editor.setPattern("DRAFT");
+    editor.deliver({ type: "catalogSaveResult", ok: false, message: "Real save failure" });
+    editor.selectProfile("two");
+    expect(editor.saveError()).toContain("Stage Rule");
+    editor.cancelRuleEdit();
+    expect(editor.saveError()).toBe("Real save failure");
+  });
   it("updates the effective highlighting notice live, including while a rule draft is open", () => {
     const editor = openHighlightRuleEditor([], { ...state, effectiveEnabled: true });
     expect(editor.highlightingDisabledVisible()).toBe(false);

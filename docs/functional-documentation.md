@@ -746,7 +746,7 @@ Shared local and dynamic tunnels use one in-flight SSH login for their listener 
 
 Saved SSH/telnet, serial, Local Shell and Local Server connections may inherit the default, select a profile, or select none. A terminal tab or active-session action can override that selection for one running terminal and return to the saved choice. Profile and default changes propagate to live terminals. Deleting a profile warns about saved and live references; unresolved selections apply no highlighting. Configuration exports include profiles and defaults. Merge and share preserve the recipient's default and remap conflicting profile IDs; replacement restores the imported default. Terminal-category and Reset All settings resets clear the profile catalog, default and legacy rules.
 
-The manager requires an unfinished rule to be staged or cancelled before an action can discard it. If settings change while a draft is open, the draft remains visible for the user to record before closing the Highlight Profiles tab and running the editor command again; closing discards that draft.
+The manager requires an unfinished rule to be staged or cancelled before another action can discard it; the rule editor's Delete Rule action explicitly discards that edit and stages deletion of the rule. If settings change while a draft is open, the draft remains visible for the user to record before closing the Highlight Profiles tab and running the editor command again; closing discards that draft.
 
 When effective highlighting is disabled, the manager shows a live notice with a shortcut to the VS Code setting; workspace overrides are reflected in that notice.
 
