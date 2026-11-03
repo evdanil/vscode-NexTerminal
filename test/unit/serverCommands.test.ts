@@ -34,6 +34,7 @@ import { InMemoryTunnelRegistryStore } from "../../src/storage/inMemoryTunnelReg
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
 import type { CommandContext as CmdCtx } from "../../src/commands/types";
 import { registerProfileCommands } from "../../src/commands/profileCommands";
+import { createSessionTranscript } from "../../src/logging/sessionTranscriptLogger";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowWarningMessage = vi.fn();
@@ -159,6 +160,28 @@ function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
     ...overrides
   };
 }
+
+describe("session transcript timestamp configuration", () => {
+  it.each(["ssh", "telnet"] as const)("passes timestamp modes and rotation to %s transcripts", async (protocol) => {
+    const config = vi.mocked(vscode.workspace.getConfiguration);
+    const previous = config.getMockImplementation()!;
+    try {
+      for (const [setting, expected] of [["local", "local"], ["utc", "utc"], ["off", "off"], [undefined, "local"], ["invalid", "local"]]) {
+        vi.clearAllMocks();
+        config.mockReturnValue({ get: (key: string, fallback: unknown) => key === "sessionTranscriptTimestamps" ? setting : fallback } as any);
+        vi.mocked(vscode.window.withProgress as any).mockImplementation(async (_options: unknown, task: () => Promise<unknown>) => task());
+        const server = makeServer({ protocol });
+        const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+        const rotation = { maxFileSizeBytes: 12345, maxRotatedFiles: 2 };
+        (ctx.loggerFactory as any).getRotationOptions = () => rotation;
+        await connectServer(ctx, server.id);
+        expect(createSessionTranscript).toHaveBeenCalledWith("", server.name, true, { ...rotation, timestampMode: expected });
+      }
+    } finally {
+      config.mockImplementation(previous);
+    }
+  });
+});
 
 describe("connectServer — server removed while progress is pending", () => {
   beforeEach(() => {

@@ -389,6 +389,7 @@ describe("SETTINGS_KEYS", () => {
   it("includes logging settings", () => {
     const keys = SETTINGS_KEYS.map((k) => `${k.section}.${k.key}`);
     expect(keys).toContain("nexus.logging.sessionTranscripts");
+    expect(keys).toContain("nexus.logging.sessionTranscriptTimestamps");
     expect(keys).toContain("nexus.logging.sessionLogDirectory");
     expect(keys).toContain("nexus.logging.maxFileSizeMb");
     expect(keys).toContain("nexus.logging.maxRotatedFiles");
@@ -7080,6 +7081,7 @@ describe("sanitizeForSharing", () => {
       "nexus.terminal.macros.bufferLength": 16384,
       "nexus.terminal.highlighting.rules": [{ id: "rule-1", pattern: "warning" }],
       "nexus.logging.sessionTranscripts": true,
+      "nexus.logging.sessionTranscriptTimestamps": "utc",
       "nexus.logging.sessionLogDirectory": "/sender/logs",
       "nexus.logging.terminalOutputTrace": true,
       "nexus.ssh.trustNewHosts": true,
@@ -7774,6 +7776,8 @@ describe("backup export round-trip", () => {
     configStore.set("nexus.terminal.passthroughKeys", ["b", "q", "w"]);
     configStore.set("nexus.ui.showTreeDescriptions", false);
 
+    configStore.set("nexus.logging.sessionTranscriptTimestamps", "utc");
+
     registerConfigCommands(sourceCore, vault);
 
     mockShowInputBox
@@ -7793,6 +7797,7 @@ describe("backup export round-trip", () => {
     expect(exported.version).toBe(2);
     expect(exported.exportType).toBe("backup");
     expect(exported.settings).toEqual({
+      "nexus.logging.sessionTranscriptTimestamps": "utc",
       "nexus.ui.showTreeDescriptions": false,
       "nexus.terminal.passthroughKeys": ["b", "q", "w"],
       "nexus.terminal.highlighting.profiles": null,
@@ -7820,6 +7825,7 @@ describe("backup export round-trip", () => {
 
     expect(configStore.get("nexus.terminal.passthroughKeys")).toEqual(["b", "q", "w"]);
     expect(configStore.get("nexus.ui.showTreeDescriptions")).toBe(false);
+    expect(configStore.get("nexus.logging.sessionTranscriptTimestamps")).toBe("utc");
     expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
       "1 imported Nexus setting had an invalid value and was skipped."
     );

@@ -24,7 +24,8 @@ import {
 import { connectDescriptor, type ConnectDescriptorInputs } from "../models/startDescriptors";
 import { watchStartFence, type StartFence } from "../services/ssh/startFenceWatcher";
 import { flattenProviderText } from "../models/inventory";
-import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
+import { createSessionTranscript, type SessionTranscriptOptions } from "../logging/sessionTranscriptLogger";
+import { normalizeTranscriptTimestampMode } from "../logging/transcriptTimestamps";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SshPty } from "../services/ssh/sshPty";
 import { OPEN_AGENT_SETTINGS, openAgentSettings } from "../services/ssh/sshAgentSettings";
@@ -224,8 +225,13 @@ function getDefaultSessionTranscriptsEnabled(): boolean {
   return vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
 }
 
-function getTranscriptRotationOptions(ctx: CommandContext): Partial<LoggerRotationOptions> | undefined {
-  return (ctx.loggerFactory as { getRotationOptions?: () => LoggerRotationOptions }).getRotationOptions?.();
+function getTranscriptOptions(ctx: CommandContext): SessionTranscriptOptions {
+  return {
+    ...(ctx.loggerFactory as { getRotationOptions?: () => LoggerRotationOptions }).getRotationOptions?.(),
+    timestampMode: normalizeTranscriptTimestampMode(
+      vscode.workspace.getConfiguration("nexus.logging").get<unknown>("sessionTranscriptTimestamps", "local")
+    )
+  };
 }
 
 function isValidProxyPort(port: number): boolean {
@@ -1308,7 +1314,7 @@ async function connectTelnetServer(
             ctx.sessionLogDir,
             server.name,
             server.logSession ?? getDefaultSessionTranscriptsEnabled(),
-            getTranscriptRotationOptions(ctx)
+            getTranscriptOptions(ctx)
           ),
           highlighter: highlight ?? ctx.highlighter,
           outputObserver: triggerObserver,
@@ -1614,7 +1620,7 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
           ctx.sessionLogDir,
           server.name,
           server.logSession ?? getDefaultSessionTranscriptsEnabled(),
-          getTranscriptRotationOptions(ctx)
+          getTranscriptOptions(ctx)
         ),
         highlight ?? ctx.highlighter,
         triggerObserver,

@@ -418,6 +418,7 @@ const SETTINGS_KEY_SET = new Set(SETTINGS_KEYS.map(({ section, key }) => `${sect
 export const SHARE_SETTINGS_POLICY: Readonly<Record<string, "share" | "local">> = Object.freeze({
   // Capture, retention caps, and the destination are local privacy/disk policy.
   "nexus.logging.sessionTranscripts": "local",
+  "nexus.logging.sessionTranscriptTimestamps": "local",
   "nexus.logging.sessionLogDirectory": "local",
   "nexus.logging.maxFileSizeMb": "local",
   "nexus.logging.maxRotatedFiles": "local",

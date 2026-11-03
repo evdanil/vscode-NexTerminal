@@ -3,7 +3,8 @@ import * as vscode from "vscode";
 import { readHighlightCatalog } from "../services/terminal/highlightProfileSettings";
 import { parseHighlightProfileFormValue } from "../ui/highlightProfileForm";
 import { resolveSerialProfileMode, type SerialDataBits, type SerialDeviceHint, type SerialParity, type SerialProfile, type SerialSessionStatus, type SerialStopBits } from "../models/config";
-import { createSessionTranscript } from "../logging/sessionTranscriptLogger";
+import { createSessionTranscript, type SessionTranscriptOptions } from "../logging/sessionTranscriptLogger";
+import { normalizeTranscriptTimestampMode } from "../logging/transcriptTimestamps";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SerialPty } from "../services/serial/serialPty";
 import { isSerialRuntimeMissingError } from "../services/serial/errorMatchers";
@@ -256,8 +257,13 @@ function getDefaultSessionTranscriptsEnabled(): boolean {
   return vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
 }
 
-function getTranscriptRotationOptions(ctx: CommandContext): Partial<LoggerRotationOptions> | undefined {
-  return (ctx.loggerFactory as { getRotationOptions?: () => LoggerRotationOptions }).getRotationOptions?.();
+function getTranscriptOptions(ctx: CommandContext): SessionTranscriptOptions {
+  return {
+    ...(ctx.loggerFactory as { getRotationOptions?: () => LoggerRotationOptions }).getRotationOptions?.(),
+    timestampMode: normalizeTranscriptTimestampMode(
+      vscode.workspace.getConfiguration("nexus.logging").get<unknown>("sessionTranscriptTimestamps", "local")
+    )
+  };
 }
 
 function serialTerminalName(profile: SerialProfile): string {
@@ -500,7 +506,7 @@ async function connectStandardSerialProfile(
       ctx.sessionLogDir,
       profile.name,
       profile.logSession ?? getDefaultSessionTranscriptsEnabled(),
-      getTranscriptRotationOptions(ctx)
+      getTranscriptOptions(ctx)
     ),
     highlight ?? ctx.highlighter,
     triggerObserver
@@ -605,7 +611,7 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
       ctx.sessionLogDir,
       profile.name,
       profile.logSession ?? getDefaultSessionTranscriptsEnabled(),
-      getTranscriptRotationOptions(ctx)
+      getTranscriptOptions(ctx)
     ),
     highlight ?? ctx.highlighter,
     triggerObserver

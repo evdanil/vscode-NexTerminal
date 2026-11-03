@@ -49,6 +49,20 @@ export const SETTINGS_META: SettingMeta[] = [
     description: "Log session transcripts for SSH, telnet and serial connections by default."
   },
   {
+    key: "sessionTranscriptTimestamps",
+    section: "nexus.logging",
+    label: "Transcript Timestamps",
+    type: "enum",
+    category: "logging",
+    description: "Prefix each transcript line with its receive time, including milliseconds and timezone. Applies to newly opened SSH, telnet and serial sessions; does not change the live terminal or diagnostic trace.",
+    default: "local",
+    enumOptions: [
+      { label: "Local time", value: "local", description: "Local date and time with UTC offset.", recommended: true },
+      { label: "UTC", value: "utc", description: "UTC date and time with Z suffix." },
+      { label: "Off", value: "off", description: "Clean output without per-line timestamps." }
+    ]
+  },
+  {
     key: "sessionLogDirectory",
     section: "nexus.logging",
     label: "Session Log Directory",
