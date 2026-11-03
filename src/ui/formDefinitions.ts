@@ -485,6 +485,10 @@ function openFileExplorerOnFirstConnectField(seed?: Partial<ServerConfig>, vw?: 
 
 function serialFields(seed?: Partial<SerialProfile>, vw?: VisibleWhen): FormFieldDescriptor[] {
   const smartFollowVw = vw ? [...(Array.isArray(vw) ? vw : [vw]), { field: "mode", value: "smartFollow" }] : { field: "mode", value: "smartFollow" };
+  const customBaudVw = vw ? [...(Array.isArray(vw) ? vw : [vw]), { field: "baudRate", value: "custom" }] : { field: "baudRate", value: "custom" };
+  const baudRates = ["9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600"];
+  const baudRate = `${seed?.baudRate ?? 115200}`;
+  const customBaud = !baudRates.includes(baudRate);
   return [
     {
       type: "select",
@@ -513,19 +517,20 @@ function serialFields(seed?: Partial<SerialProfile>, vw?: VisibleWhen): FormFiel
       type: "select",
       key: "baudRate",
       label: "Baud Rate",
-      options: [
-        { label: "9600", value: "9600" },
-        { label: "19200", value: "19200" },
-        { label: "38400", value: "38400" },
-        { label: "57600", value: "57600" },
-        { label: "115200", value: "115200" },
-        { label: "230400", value: "230400" },
-        { label: "460800", value: "460800" },
-        { label: "921600", value: "921600" }
-      ],
-      value: `${seed?.baudRate ?? 115200}`,
-      hint: "Serial speed; 115200 is common for development boards.",
+      options: [...baudRates.map((rate) => ({ label: rate, value: rate })), { label: "Custom…", value: "custom" }],
+      value: customBaud ? "custom" : baudRate,
+      hint: "Choose a common speed or Custom. Supported speeds depend on the device and driver.",
       visibleWhen: vw
+    },
+    {
+      type: "text",
+      key: "customBaudRate",
+      label: "Custom Baud Rate",
+      requiredWhen: customBaudVw,
+      value: customBaud ? baudRate : "",
+      placeholder: "e.g. 31250",
+      hint: "Enter a whole number from 1 to 2147483647.",
+      visibleWhen: customBaudVw
     },
     {
       type: "select",

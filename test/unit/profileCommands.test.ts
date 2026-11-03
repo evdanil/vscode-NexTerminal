@@ -128,6 +128,25 @@ describe("openUnifiedForm test action", () => {
     mockFormValuesToLocalShell.mockReturnValue({ id: "draft-local" });
   });
 
+  it("saves a custom serial speed and rejects invalid speeds before saving or testing", async () => {
+    const serialCommands = await vi.importActual<typeof import("../../src/commands/serialCommands")>("../../src/commands/serialCommands");
+    mockFormValuesToSerial.mockImplementation(serialCommands.formValuesToSerial);
+    const ctx = makeCtx();
+    openUnifiedForm(ctx, { addMode: "serial", profileType: "serial" });
+    const { onSubmit, onTest } = latestFormOptions();
+    const values = { profileType: "serial", name: "Console", path: "COM3", baudRate: "custom", customBaudRate: "31250" };
+
+    await onSubmit(values);
+    expect(ctx.core.addOrUpdateSerialProfile).toHaveBeenCalledWith(expect.objectContaining({ baudRate: 31250 }));
+    await onTest(values);
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.serial.testConnection", { profile: expect.objectContaining({ baudRate: 31250 }) });
+    mockExecuteCommand.mockClear();
+    await expect(onSubmit({ ...values, customBaudRate: "0" })).rejects.toThrow(/baud rate.*whole number/i);
+    expect(ctx.core.addOrUpdateSerialProfile).toHaveBeenCalledTimes(1);
+    await expect(onTest({ ...values, customBaudRate: "" })).rejects.toThrow(/baud rate.*whole number/i);
+    expect(mockExecuteCommand).not.toHaveBeenCalledWith("nexus.serial.testConnection", expect.anything());
+  });
+
   it("does not open or register unsaved Local Shell drafts from the generic form test action", async () => {
     openUnifiedForm(makeCtx());
     const { definition, onTest } = latestFormOptions();
