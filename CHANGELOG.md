@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.311] — 2026-11-03
+
+### Fixed
+
+- Saving highlight profiles with **None** as the global default no longer reports a false settings conflict. Save errors show the underlying reason when available.
+
 ## [2.8.310] — 2026-11-03
 
 ### Added

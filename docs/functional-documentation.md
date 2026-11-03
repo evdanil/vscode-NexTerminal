@@ -748,6 +748,8 @@ Saved SSH/telnet, serial, Local Shell and Local Server connections may inherit t
 
 The manager requires an unfinished rule to be staged or cancelled before another action can discard it; the rule editor's Delete Rule action explicitly discards that edit and stages deletion of the rule. If settings change while a draft is open, the draft remains visible for the user to record before closing the Highlight Profiles tab and running the editor command again; closing discards that draft.
 
+When a save fails, the manager includes available error details. A multi-setting save may have changed some settings before failing, so the user must preserve needed draft changes before closing and reopening the manager. Error details can contain local paths and should be reviewed before sharing.
+
 When effective highlighting is disabled, the manager shows a live notice with a shortcut to the VS Code setting; workspace overrides are reflected in that notice.
 
 For an invalid catalog or default, or a default that names a missing profile, inspect and correct or remove the profile and default settings in the applicable User, Workspace, Folder or Remote Settings JSON. The manager links to User and Workspace Settings JSON.

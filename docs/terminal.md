@@ -14,6 +14,8 @@ Open **Nexus: Edit Highlighting Rules** to manage named highlight profiles. Crea
 
 Use **Stage Rule** or the rule editor's **Cancel** before switching profiles or taking an action that would discard the unfinished rule. **Delete Rule** discards the unfinished edit and stages deletion of the rule. If settings change elsewhere while you have a draft, record the changes you want to keep, close the Highlight Profiles tab (discarding that draft), and run **Nexus: Edit Highlighting Rules** again to load the current settings.
 
+If saving fails, the manager shows available error details. Some settings may already have changed; preserve any draft changes you need before closing the tab and reopening the manager. Remove private paths or other sensitive details before sharing an error message.
+
 The Highlight Profile field on saved SSH/telnet, serial, Local Shell and Local Server connections chooses the global default, a named profile, or no highlighting. Right-click a Nexus terminal tab or active session and choose **Select Terminal Highlight Profile** to change that terminal alone; **Use saved connection setting** returns it to the connection's preference. Changes to a profile or default apply to running terminals that follow it. Deleting a profile warns about saved connections and live terminals using it; a missing profile does not silently fall back to another set of rules.
 
 The manager saves global settings. If a workspace overrides the catalog or default, that workspace's setting takes precedence. Backups and sharing include highlight profiles; merging imports keeps the recipient's default and remaps colliding profile IDs. Terminal-category and Reset All settings resets clear the catalog, default and legacy rules.
