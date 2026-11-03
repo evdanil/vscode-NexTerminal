@@ -1606,6 +1606,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   ];
   const configDisposables = registerConfigCommands(core, secretVault, context, {
     revokeExternalCredentialApprovals: sshCredentialRuntime.revokeExternalCredentialApprovals,
+    getReferencedHighlightProfileIds: () => highlightProfileService.getReferencedProfileIds(),
     stopLocalServer: (configId) => stopLocalServerForRemoval(localServerCtx, configId),
     stopNetworkServices: () => stopRunningNetworkServices(core, networkServerManager),
     teardownServerRuntime: (serverId, shouldAbort) => teardownServerRuntime(ctx, serverId, shouldAbort),

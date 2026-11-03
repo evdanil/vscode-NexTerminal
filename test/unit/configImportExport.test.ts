@@ -467,6 +467,103 @@ describe("config import command (legacy)", () => {
     await importCmd();
   }
 
+  it.each([
+    ["backup", "merge"], ["backup", "replace"], ["share", "merge"]
+  ] as const)("round-trips a clean virtual Default profile through %s/%s", async (format, mode) => {
+    const key = "nexus.terminal.highlighting.";
+    configDefaults.set(`${key}profiles`, null);
+    configDefaults.set(`${key}defaultProfile`, "default");
+    configDefaults.set(`${key}rules`, [{ pattern: "SHIPPED", color: "red" }]);
+    await core.addOrUpdateServer(makeServer({ id: "source", highlightProfileId: "default" }));
+    await core.addOrUpdateSerialProfile(makeSerialProfile({ highlightProfileId: "default" }));
+    await core.addOrUpdateLocalShellProfile(makeLocalShellProfile({ launchMode: "vscodeProfile", vscodeProfileName: "bash", highlightProfileId: "default" }));
+    mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/export.json", scheme: "file" });
+    mockWriteFile.mockReset();
+    mockWriteFile.mockResolvedValue(undefined);
+    if (format === "backup") mockShowInputBox.mockResolvedValueOnce("masterpass1").mockResolvedValueOnce("masterpass1");
+    await registeredCommands.get(format === "backup" ? "nexus.config.export.backup" : "nexus.config.export")!();
+    const exportedText = Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8");
+    registeredCommands.clear();
+    configStore.clear();
+    configStore.set(`${key}profiles`, [{ id: "default", name: "Recipient", rules: [{ pattern: "LOCAL", color: "blue" }] }]);
+    configStore.set(`${key}defaultProfile`, "default");
+    const dest = new NexusCore(new InMemoryConfigRepository());
+    await dest.initialize();
+    registerConfigCommands(dest, vault);
+    if (format === "backup") mockShowInputBox.mockResolvedValueOnce("masterpass1");
+    await runImport(JSON.parse(exportedText), mode);
+    const snapshot = dest.getSnapshot();
+    expect(snapshot.servers).toHaveLength(1);
+    const id = snapshot.servers[0].highlightProfileId;
+    const catalog = configStore.get(`${key}profiles`);
+    const rules = catalog === null
+      ? configStore.get(`${key}rules`)
+      : (catalog as Array<{ id: string; rules: unknown[] }>).find((profile) => profile.id === id)?.rules;
+    expect(rules).toEqual([{ pattern: "SHIPPED", color: "red" }]);
+    expect(snapshot.serialProfiles[0].highlightProfileId).toBe(id);
+    expect(snapshot.localShellProfiles[0].highlightProfileId).toBe(id);
+  });
+
+  it("does not reactivate missing saved, default, or live selections when merging profiles", async () => {
+    const key = "nexus.terminal.highlighting.";
+    configStore.set(`${key}profiles`, []);
+    configStore.set(`${key}defaultProfile`, "default");
+    await core.addOrUpdateServer(makeServer({ id: "existing", highlightProfileId: "server-missing" }));
+    await core.addOrUpdateSerialProfile(makeSerialProfile({ id: "existing-serial", highlightProfileId: "serial-missing" }));
+    await core.addOrUpdateLocalShellProfile(makeLocalShellProfile({ id: "existing-shell", highlightProfileId: "shell-missing" }));
+    await core.addOrUpdateLocalServerConfig({ id: "existing-local", name: "Local", executable: "node", highlightProfileId: "local-missing" });
+    registerConfigCommands(core, vault, undefined, { getReferencedHighlightProfileIds: () => new Set(["live-missing"]) } as never);
+    const ids = ["server-missing", "serial-missing", "shell-missing", "local-missing", "default", "live-missing"];
+    await runImport(makeExportData({ servers: [makeServer({ id: "incoming", highlightProfileId: "live-missing" })],
+      settings: { [`${key}profiles`]: ids.map((id) => ({ id, name: id, rules: [] })) } }), "merge");
+    const profiles = configStore.get(`${key}profiles`) as Array<{ id: string; name: string }>;
+    for (const id of ids) {
+      const profile = profiles.find((item) => item.name === id);
+      expect(profile?.id, id).not.toBe(id);
+      expect(profile?.id, id).toBeTruthy();
+    }
+    expect(core.getServer("existing")?.highlightProfileId).toBe("server-missing");
+    expect(core.getSerialProfile("existing-serial")?.highlightProfileId).toBe("serial-missing");
+    expect(core.getLocalShellProfile("existing-shell")?.highlightProfileId).toBe("shell-missing");
+    expect(core.getLocalServer("existing-local")?.highlightProfileId).toBe("local-missing");
+    expect(core.getServer("incoming")?.highlightProfileId).toBe(profiles.find((profile) => profile.name === "live-missing")?.id);
+    expect(configStore.get(`${key}defaultProfile`)).toBe("default");
+  });
+
+  it("protects a live missing Default selection when replacing from a legacy backup", async () => {
+    const key = "nexus.terminal.highlighting.";
+    configStore.set(`${key}profiles`, []);
+    configStore.set(`${key}defaultProfile`, null);
+    registerConfigCommands(core, vault, undefined, { getReferencedHighlightProfileIds: () => new Set(["default"]) } as never);
+    await runImport(makeExportData({ servers: [makeServer({ id: "incoming", highlightProfileId: "default" })],
+      settings: { [`${key}profiles`]: null, [`${key}rules`]: [{ pattern: "SHIPPED", color: "red" }] } }), "replace");
+    const profiles = configStore.get(`${key}profiles`) as Array<{ id: string; rules: Array<{ pattern: string }> }>;
+    expect(Array.isArray(profiles)).toBe(true);
+    expect(profiles[0].id).not.toBe("default");
+    expect(profiles[0].rules[0].pattern).toBe("SHIPPED");
+    expect(core.getServer("incoming")?.highlightProfileId).toBe(profiles[0].id);
+    expect(configStore.get(`${key}defaultProfile`)).toBe(profiles[0].id);
+  });
+
+  it("does not allocate an imported profile ID already used by a dangling incoming reference", async () => {
+    const key = "nexus.terminal.highlighting.";
+    configStore.set(`${key}profiles`, [{ id: "local", name: "Local", rules: [] }]);
+    configStore.set(`${key}defaultProfile`, "local");
+    const crypto = await import("node:crypto");
+    const uuid = vi.spyOn(crypto, "randomUUID")
+      .mockReturnValueOnce("orphan" as ReturnType<typeof crypto.randomUUID>)
+      .mockReturnValueOnce("fresh-id" as ReturnType<typeof crypto.randomUUID>);
+    try {
+      await runImport(makeExportData({ servers: [makeServer({ id: "incoming", highlightProfileId: "orphan" })], settings: {
+        [`${key}profiles`]: [{ id: "local", name: "Remote", rules: [] }], [`${key}defaultProfile`]: "local"
+      } }), "merge");
+      const profiles = configStore.get(`${key}profiles`) as Array<{ id: string; name: string }>;
+      expect(profiles.find((profile) => profile.name === "Remote")?.id).toBe("fresh-id");
+      expect(core.getServer("incoming")?.highlightProfileId).toBe("orphan");
+      expect(profiles.some((profile) => profile.id === "orphan")).toBe(false);
+    } finally { uuid.mockRestore(); }
+  });
+
   it("merges colliding highlight profiles without changing existing connections or the default", async () => {
     const key = "nexus.terminal.highlighting.";
     const local = { id: "shared", name: "Local", rules: [] };
@@ -614,6 +711,7 @@ describe("config import command (legacy)", () => {
     const key = "nexus.terminal.highlighting.";
     configDefaults.set(`${key}rules`, [{ pattern: "SHIPPED", color: "red" }]);
     configStore.set(`${key}profiles`, [{ id: "local", name: "Local", rules: [] }]);
+    configStore.set(`${key}defaultProfile`, "local");
     configStore.set(`${key}rules`, [{ pattern: "LOCAL", color: "blue" }]);
     await runImport(makeExportData({ settings: { [`${key}profiles`]: null } }), "replace");
     expect(configStore.get(`${key}rules`)).toEqual([{ pattern: "SHIPPED", color: "red" }]);
@@ -2478,7 +2576,7 @@ describe("backup export command", () => {
     expect(fileBackups.find((b) => b.id === "scripts")?.files[0].relativePath).toBe("hello.js");
   });
 
-  it("exports only explicitly configured settings, not package defaults", async () => {
+  it("exports explicit settings plus the effective highlight catalog context", async () => {
     configDefaults.set("nexus.scripts.defaultTimeoutSeconds", 30);
     configDefaults.set("nexus.scripts.maxRuntimeSeconds", 1800);
     configDefaults.set("nexus.terminal.highlighting.enabled", true);
@@ -2496,7 +2594,10 @@ describe("backup export command", () => {
     const writtenData = JSON.parse(Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8"));
     expect(writtenData.settings).toEqual({
       "nexus.scripts.defaultTimeoutSeconds": 60,
-      "nexus.scripts.maxRuntimeMs": 0
+      "nexus.scripts.maxRuntimeMs": 0,
+      "nexus.terminal.highlighting.profiles": null,
+      "nexus.terminal.highlighting.defaultProfile": "default",
+      "nexus.terminal.highlighting.rules": []
     });
   });
 
@@ -7655,7 +7756,10 @@ describe("backup export round-trip", () => {
     expect(exported.exportType).toBe("backup");
     expect(exported.settings).toEqual({
       "nexus.ui.showTreeDescriptions": false,
-      "nexus.terminal.passthroughKeys": ["b", "q", "w"]
+      "nexus.terminal.passthroughKeys": ["b", "q", "w"],
+      "nexus.terminal.highlighting.profiles": null,
+      "nexus.terminal.highlighting.defaultProfile": "default",
+      "nexus.terminal.highlighting.rules": []
     });
 
     vi.clearAllMocks();

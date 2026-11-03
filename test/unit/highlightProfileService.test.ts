@@ -150,6 +150,22 @@ describe("HighlightProfileService", () => {
     expect(service.countProfileReferences("blue").saved).toBe(2);
   });
 
+  it("reports current missing live selections and retained saved IDs for import collision checks", () => {
+    let current = { ...catalog(), defaultProfileId: "missing-default" };
+    const service = new HighlightProfileService(() => current);
+    const session = service.createSession({ kind: "server", id: "deleted-owner" }, "missing-saved");
+    session.setOverride({ mode: "override", selection: "missing-override" });
+    service.updateSavedSelections({ servers: [{ id: "other", highlightProfileId: "saved-record" }], serialProfiles: [], localShellProfiles: [], localServers: [] });
+    expect([...service.getReferencedProfileIds()].sort()).toEqual(["missing-default", "missing-override", "missing-saved", "saved-record"]);
+    session.setOverride({ mode: "override", selection: null });
+    current = { ...current, defaultProfileId: "new-default" };
+    service.reload();
+    expect([...service.getReferencedProfileIds()].sort()).toEqual(["missing-saved", "new-default", "saved-record"]);
+    session.dispose();
+    service.updateSavedSelections({ servers: [], serialProfiles: [], localShellProfiles: [], localServers: [] });
+    expect([...service.getReferencedProfileIds()]).toEqual(["new-default"]);
+  });
+
   it("updates saved settings while retaining a deleted owner's last selection", () => {
     const service = new HighlightProfileService(() => catalog());
     const h = service.createSession({ kind: "server", id: "x" }, "red");

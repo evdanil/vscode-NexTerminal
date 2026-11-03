@@ -41,6 +41,14 @@ export class HighlightProfileService {
     return handle;
   }
 
+  /** IDs may remain referenced after their profiles or saved owners are removed. */
+  public getReferencedProfileIds(): ReadonlySet<string> {
+    const ids = new Set(this.savedReferenceCounts.keys());
+    if (this.catalog.defaultProfileId !== null) ids.add(this.catalog.defaultProfileId);
+    for (const session of this.sessions) session.collectReferencedProfileIds(ids);
+    return ids;
+  }
+
   public countProfileReferences(id: string): { saved: number; live: number } {
     let live = 0;
     for (const session of this.sessions) {
@@ -101,6 +109,10 @@ export class SessionHighlightHandle implements TerminalOutputHighlighter {
   private override: SessionHighlightOverride = { mode: "saved" };
   public constructor(private readonly service: HighlightProfileService, public readonly owner?: HighlightOwner, private savedSelection?: HighlightProfileSelection) {}
 
+  public collectReferencedProfileIds(ids: Set<string>): void {
+    if (typeof this.savedSelection === "string") ids.add(this.savedSelection);
+    if (this.override.mode === "override" && typeof this.override.selection === "string") ids.add(this.override.selection);
+  }
   public setOverride(override: SessionHighlightOverride): void { this.override = override; }
   public updateSavedSelection(selection: HighlightProfileSelection): void { this.savedSelection = selection; }
   public getSelection(): HighlightSelectionState {

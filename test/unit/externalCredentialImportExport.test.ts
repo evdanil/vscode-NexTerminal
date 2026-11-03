@@ -15,6 +15,7 @@ const mockStat = vi.fn();
 const mockCreateDirectory = vi.fn();
 const mockExecuteCommand = vi.fn();
 const mockConfigUpdate = vi.fn();
+const configValues = new Map<string, unknown>();
 const allMocks = [
   mockShowInformationMessage,
   mockShowErrorMessage,
@@ -62,9 +63,13 @@ vi.mock("vscode", () => ({
     },
     workspaceFolders: [{ uri: { fsPath: "/workspace", scheme: "file", path: "/workspace" }, name: "workspace", index: 0 }],
     getConfiguration: (section: string) => ({
-      get: (_key: string, fallback?: unknown) => fallback,
-      inspect: () => ({ defaultValue: undefined, globalValue: undefined, workspaceValue: undefined }),
-      update: (key: string, value: unknown) => mockConfigUpdate(section, key, value)
+      get: (key: string, fallback?: unknown) => configValues.has(`${section}.${key}`) ? configValues.get(`${section}.${key}`) : fallback,
+      inspect: (key: string) => ({ defaultValue: undefined, globalValue: configValues.get(`${section}.${key}`), workspaceValue: undefined }),
+      update: async (key: string, value: unknown) => {
+        await mockConfigUpdate(section, key, value);
+        if (value === undefined) configValues.delete(`${section}.${key}`);
+        else configValues.set(`${section}.${key}`, JSON.parse(JSON.stringify(value)));
+      }
     })
   },
   Uri: {
@@ -128,6 +133,7 @@ async function importData(m: Machine, text: string, mode = "replace", hooks?: Co
   await registeredCommands.get("nexus.config.import")!();
 }
 beforeEach(async () => {
+  configValues.clear();
   allMocks.forEach(mock => mock.mockReset()); registeredCommands.clear();
   mockShowInformationMessage.mockResolvedValue(undefined);
   const store = new InMemoryMacroStore(); await store.initialize(); setActiveMacroStore(store);

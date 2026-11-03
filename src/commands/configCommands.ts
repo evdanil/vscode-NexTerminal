@@ -230,6 +230,8 @@ interface NexusConfigExport {
  * hooks must resolve; failed connection teardown is reported to the user.
  */
 export interface ConfigRuntimeHooks {
+  /** IDs used by live highlight sessions, including missing selections. */
+  getReferencedHighlightProfileIds?(): ReadonlySet<string>;
   /** Synchronous authority fence before import writes; omitted ids revoke the whole session. */
   revokeExternalCredentialApprovals?(profileIds?: readonly string[]): void;
   /**
@@ -708,6 +710,13 @@ function readSettings(): Record<string, unknown> {
       }
     }
   }
+  // Sparse settings alone cannot describe a fresh install's virtual Default
+  // profile. Capture the effective catalog context so explicit and inherited
+  // selections still name the same rules on the receiving machine.
+  const highlighting = vscode.workspace.getConfiguration("nexus.terminal.highlighting");
+  result["nexus.terminal.highlighting.profiles"] = highlighting.get<unknown>("profiles", null);
+  result["nexus.terminal.highlighting.defaultProfile"] = highlighting.get<unknown>("defaultProfile", "default");
+  result["nexus.terminal.highlighting.rules"] = highlighting.get<unknown>("rules", []);
   return result;
 }
 
@@ -1164,7 +1173,7 @@ interface ImportTally {
 }
 
 /** Reconcile the catalog before importing records, while the file is still untrusted. */
-function prepareHighlightImport(data: NexusConfigExport, mode: "merge" | "replace"): string | undefined {
+function prepareHighlightImport(data: NexusConfigExport, mode: "merge" | "replace", referencedIds: ReadonlySet<string>): string | undefined {
   const prefix = "nexus.terminal.highlighting.";
   const profilesKey = `${prefix}profiles`;
   const defaultKey = `${prefix}defaultProfile`;
@@ -1174,13 +1183,32 @@ function prepareHighlightImport(data: NexusConfigExport, mode: "merge" | "replac
   const carriesCatalog = has(profilesKey) || has(rulesKey) || has(defaultKey);
   const remapped = new Map<string, string>();
   const unavailable = new Map<string, string>();
-  let destinationIds = new Set(readGlobalHighlightCatalogForEditing().profiles.map((profile) => profile.id));
+  const currentCatalog = readGlobalHighlightCatalogForEditing();
+  let destinationIds = new Set(currentCatalog.profiles.map((profile) => profile.id));
+  const reservedDanglingIds = new Set([...referencedIds].filter((id) => !destinationIds.has(id)));
+  if (currentCatalog.defaultProfileId && !destinationIds.has(currentCatalog.defaultProfileId)) reservedDanglingIds.add(currentCatalog.defaultProfileId);
+  const occupiedIds = new Set([...destinationIds, ...reservedDanglingIds, "default"]);
+  const incomingProfiles = settings?.[profilesKey];
+  if (Array.isArray(incomingProfiles)) {
+    for (const profile of incomingProfiles) if (isRecordValue(profile) && typeof profile.id === "string") occupiedIds.add(profile.id);
+  }
+  if (typeof settings?.[defaultKey] === "string") occupiedIds.add(settings[defaultKey] as string);
+  for (const key of ["servers", "serialProfiles", "localShellProfiles", "localServers"] as const) {
+    const rows = data[key];
+    if (Array.isArray(rows)) for (const row of rows as unknown[]) {
+      if (isRecordValue(row) && typeof row.highlightProfileId === "string") occupiedIds.add(row.highlightProfileId);
+    }
+  }
   const missingReference = (id: string): string => {
     const previous = unavailable.get(id);
     if (previous) return previous;
     // A dangling source ID must not accidentally resolve to a recipient's
     // unrelated profile. Retain the original ID whenever it is safe to do so.
-    const safeId = destinationIds.has(id) ? `missing-${randomUUID()}` : id;
+    let safeId = id;
+    if (destinationIds.has(id)) {
+      do { safeId = `missing-${randomUUID()}`; } while (occupiedIds.has(safeId));
+    }
+    occupiedIds.add(safeId);
     destinationIds.add(safeId);
     unavailable.set(id, safeId);
     return safeId;
@@ -1201,16 +1229,29 @@ function prepareHighlightImport(data: NexusConfigExport, mode: "merge" | "replac
     const legacyRules = legacy ? validateAndSanitizeHighlightRules(has(rulesKey) ? settings![rulesKey] : defaultRules) : [];
     if (legacy && !legacyRules) return "invalid legacy highlight rules";
     const incoming = checked.profiles ?? [{ id: "default", name: "Default", rules: upgradeHighlightRules(legacyRules!).rules }];
+    for (const profile of incoming) occupiedIds.add(profile.id);
+    const freshId = (): string => {
+      let id: string;
+      do { id = randomUUID(); } while (occupiedIds.has(id));
+      occupiedIds.add(id);
+      return id;
+    };
 
     if (mode === "replace") {
-      destinationIds = new Set(incoming.map((profile) => profile.id));
-      for (const profile of incoming) remapped.set(profile.id, profile.id);
-      if (!has(defaultKey)) settings![defaultKey] = importedDefault;
-      if (legacy) {
+      const remappedIncoming = incoming.map((profile) => {
+        const id = reservedDanglingIds.has(profile.id) ? freshId() : profile.id;
+        remapped.set(profile.id, id);
+        return { ...profile, id };
+      });
+      destinationIds = new Set(remappedIncoming.map((profile) => profile.id));
+      const remappedDefault = importedDefault === null ? null : remapped.get(importedDefault) ?? importedDefault;
+      settings![defaultKey] = remappedDefault;
+      if (legacy && remapped.get("default") === "default") {
         settings![profilesKey] = null;
-        settings![defaultKey] = importedDefault;
-        if (!has(rulesKey)) settings![rulesKey] = legacyRules;
+      } else {
+        settings![profilesKey] = remappedIncoming;
       }
+      if (legacy && !has(rulesKey)) settings![rulesKey] = legacyRules;
     } else {
       const existing = readGlobalHighlightCatalogForEditing();
       if (existing.validationError) return `existing highlight catalog is invalid: ${existing.validationError}`;
@@ -1222,7 +1263,7 @@ function prepareHighlightImport(data: NexusConfigExport, mode: "merge" | "replac
           remapped.set(profile.id, profile.id);
           continue;
         }
-        const id = sameId ? randomUUID() : profile.id;
+        const id = sameId || reservedDanglingIds.has(profile.id) ? freshId() : profile.id;
         let name = profile.name;
         let suffix = 2;
         while (names.has(name.toLowerCase())) {
@@ -3975,9 +4016,18 @@ export function registerConfigCommands(
     return true;
   }
 
+  function highlightReferences(): ReadonlySet<string> {
+    const snapshot = core.getSnapshot();
+    const referenced = new Set(runtime?.getReferencedHighlightProfileIds?.() ?? []);
+    for (const row of [...snapshot.servers, ...snapshot.serialProfiles, ...snapshot.localShellProfiles, ...snapshot.localServers]) {
+      if (typeof row.highlightProfileId === "string") referenced.add(row.highlightProfileId);
+    }
+    return referenced;
+  }
+
   async function importShareData(data: NexusConfigExport): Promise<void> {
     if (!preflightAuthImport(data, "share")) return;
-    const highlightError = prepareHighlightImport(data, "merge");
+    const highlightError = prepareHighlightImport(data, "merge", highlightReferences());
     if (highlightError) {
       void vscode.window.showErrorMessage(`Nothing was imported: ${highlightError}.`);
       return;
@@ -4660,7 +4710,7 @@ export function registerConfigCommands(
     removed: RemovedProfileIds
   ): Promise<void> {
     if (!preflightAuthImport(data, mode)) return;
-    const highlightError = prepareHighlightImport(data, mode);
+    const highlightError = prepareHighlightImport(data, mode, highlightReferences());
     if (highlightError) {
       void vscode.window.showErrorMessage(`Nothing was imported: ${highlightError}.`);
       return;

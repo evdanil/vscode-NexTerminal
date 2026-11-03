@@ -28,6 +28,7 @@ const mockWriteFile = vi.fn();
 const mockReadFile = vi.fn();
 const mockExecuteCommand = vi.fn();
 const mockConfigUpdate = vi.fn();
+const configValues = new Map<string, unknown>();
 
 vi.mock("vscode", () => ({
   commands: {
@@ -61,9 +62,13 @@ vi.mock("vscode", () => ({
     },
     workspaceFolders: [{ uri: { fsPath: "/workspace", scheme: "file", path: "/workspace" }, name: "workspace", index: 0 }],
     getConfiguration: (section: string) => ({
-      get: (_key: string, fallback?: unknown) => fallback,
-      inspect: () => ({ defaultValue: undefined, globalValue: undefined, workspaceValue: undefined }),
-      update: (key: string, value: unknown) => mockConfigUpdate(section, key, value)
+      get: (key: string, fallback?: unknown) => configValues.has(`${section}.${key}`) ? configValues.get(`${section}.${key}`) : fallback,
+      inspect: (key: string) => ({ defaultValue: undefined, globalValue: configValues.get(`${section}.${key}`), workspaceValue: undefined }),
+      update: async (key: string, value: unknown) => {
+        await mockConfigUpdate(section, key, value);
+        if (value === undefined) configValues.delete(`${section}.${key}`);
+        else configValues.set(`${section}.${key}`, JSON.parse(JSON.stringify(value)));
+      }
     })
   },
   Uri: {
@@ -231,6 +236,7 @@ function syncedRow(overrides: Partial<ServerConfig> = {}): ServerConfig {
 }
 
 beforeEach(async () => {
+  configValues.clear();
   vi.clearAllMocks();
   // VS Code always answers a notification with a Thenable; the share import
   // follows one up when it offers "Edit Inventory Source".
