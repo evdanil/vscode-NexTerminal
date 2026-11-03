@@ -6074,7 +6074,9 @@ exports[`webview document shell (byte-identity guard) > highlight rule editor 1`
     <label for="profile-select">Highlight profile</label>
     <select id="profile-select"></select>
     <label for="profile-name">Profile name</label>
-    <input id="profile-name" type="text" maxlength="100" />
+    <input id="profile-name" type="text" maxlength="100" aria-describedby="profile-name-help profile-name-error" />
+    <div id="profile-name-help" class="setting-desc">Press Enter or click away to finish renaming. Apply saves all changes.</div>
+    <div id="profile-name-error" class="editor-error" aria-live="polite"></div>
     <div class="button-row">
       <button type="button" class="btn-secondary" id="profile-create">Create empty</button>
       <button type="button" class="btn-secondary" id="profile-create-defaults">Create from defaults</button>
@@ -6597,7 +6599,7 @@ DEBUG: packet sent 1024 bytes</div>
 
       function recomputeDirty() {
         var changed = manager
-          ? JSON.stringify(normalizeProfilesForCompare(profiles)) !== JSON.stringify(normalizeProfilesForCompare(originalProfiles)) || defaultProfileId !== originalDefaultProfileId
+          ? JSON.stringify(normalizeProfilesForCompare(profiles)) !== JSON.stringify(normalizeProfilesForCompare(originalProfiles)) || defaultProfileId !== originalDefaultProfileId || hasProfileNameDraft()
           : JSON.stringify(normalizeRulesForCompare(rules)) !== JSON.stringify(normalizeRulesForCompare(originalRules));
         setDirty(changed);
       }
@@ -6607,6 +6609,38 @@ DEBUG: packet sent 1024 bytes</div>
       }
 
       function currentProfile() { return profiles.find(function(p) { return p.id === selectedProfileId; }); }
+      function hasProfileNameDraft() {
+        var profile = currentProfile();
+        return !!profile && document.getElementById("profile-name").value.trim() !== profile.name;
+      }
+      function showProfileNameError(message) {
+        document.getElementById("profile-name-error").textContent = message;
+        var input = document.getElementById("profile-name");
+        if (message) input.setAttribute("aria-invalid", "true"); else input.removeAttribute("aria-invalid");
+      }
+      function focusProfileName() {
+        var input = document.getElementById("profile-name");
+        input.focus(); input.select();
+      }
+      function commitProfileName(focusInvalid) {
+        var profile = currentProfile();
+        if (!profile) return true;
+        var input = document.getElementById("profile-name");
+        var name = input.value.trim();
+        var error = !name || name.length > 100 ? "Enter a profile name of 1–100 characters."
+          : profiles.some(function(p) { return p.id !== profile.id && p.name.toLowerCase() === name.toLowerCase(); })
+            ? "A profile with that name already exists. Choose a different name." : "";
+        showProfileNameError(error);
+        if (error) {
+          if (focusInvalid) focusProfileName();
+          return false;
+        }
+        profile.name = name;
+        input.value = name;
+        refreshProfileSelectors();
+        recomputeDirty();
+        return true;
+      }
       function finishRuleFirst() {
         if (!manager || !document.getElementById("editor-section").classList.contains("visible")) return true;
         var error = document.getElementById("save-error");
@@ -6618,9 +6652,13 @@ DEBUG: packet sent 1024 bytes</div>
         selectedProfileId = id;
         var profile = currentProfile();
         rules = profile ? profile.rules : [];
+        document.getElementById("profile-select").value = id || "";
         document.getElementById("add-rule-btn").disabled = !profile;
         document.getElementById("reset-defaults-btn").disabled = !profile;
         document.getElementById("profile-name").value = profile ? profile.name : "";
+        document.getElementById("profile-name").disabled = !profile;
+        ["profile-rename", "profile-duplicate", "profile-delete"].forEach(function(button) { document.getElementById(button).disabled = !profile; });
+        showProfileNameError("");
         closeEditor();
         renderRulesList();
       }
@@ -6639,11 +6677,6 @@ DEBUG: packet sent 1024 bytes</div>
         selector.value = selectedProfileId || "";
         defaults.value = defaultProfileId || "";
       }
-      function profileName() {
-        var name = document.getElementById("profile-name").value.trim();
-        if (!name || name.length > 100) { document.getElementById("save-error").textContent = "Enter a profile name of 1–100 characters."; return null; }
-        return name;
-      }
       function freshId() {
         var id;
         do { id = "profile-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2); }
@@ -6659,21 +6692,14 @@ DEBUG: packet sent 1024 bytes</div>
         return name;
       }
       function addProfile(sourceRules, duplicate) {
-        if (!finishRuleFirst()) return;
+        if (!finishRuleFirst() || !commitProfileName(true)) return;
         var current = currentProfile();
-        var input = document.getElementById("profile-name").value.trim();
-        var name = !input || (current && input === current.name)
-          ? uniqueProfileName(duplicate && current ? current.name.slice(0, 93) + " (copy)" : "New profile")
-          : profileName();
-        if (!name) return;
-        if (profiles.some(function(p) { return p.name.toLowerCase() === name.toLowerCase(); })) {
-          document.getElementById("save-error").textContent = "A profile with that name already exists. Choose a different name.";
-          return;
-        }
+        var name = uniqueProfileName(duplicate && current ? current.name.slice(0, 93) + " (copy)" : "New profile");
         if (profiles.length >= 100) { document.getElementById("save-error").textContent = "Maximum of 100 profiles reached."; return; }
         var profile = { id: freshId(), name: name, rules: JSON.parse(JSON.stringify(sourceRules)) };
         profiles.push(profile); selectedProfileId = profile.id;
         refreshProfileSelectors(); selectProfile(profile.id); recomputeDirty();
+        focusProfileName();
       }
       function updateScopeWarnings() {
         document.getElementById("profile-workspace-override").hidden = !manager.workspaceCatalogOverrides;
@@ -6703,14 +6729,31 @@ DEBUG: packet sent 1024 bytes</div>
         document.getElementById("profile-repair-user").addEventListener("click", function() { vscode.postMessage({ type: "openHighlightSettingsJson", scope: "user" }); });
         document.getElementById("profile-open-highlighting-settings").addEventListener("click", function() { vscode.postMessage({ type: "openHighlightingSettings" }); });
         document.getElementById("profile-repair-workspace").addEventListener("click", function() { vscode.postMessage({ type: "openHighlightSettingsJson", scope: "workspace" }); });
-        document.getElementById("profile-select").addEventListener("change", function(e) { if (!finishRuleFirst()) { e.target.value = selectedProfileId || ""; return; } selectProfile(e.target.value); });
+        var nameInput = document.getElementById("profile-name");
+        nameInput.addEventListener("input", function() { showProfileNameError(""); recomputeDirty(); });
+        nameInput.addEventListener("blur", function() { commitProfileName(false); });
+        nameInput.addEventListener("change", function() { commitProfileName(false); });
+        nameInput.addEventListener("keydown", function(event) {
+          if (event.isComposing) return;
+          if (event.key === "Enter") { event.preventDefault(); commitProfileName(true); }
+          if (event.key === "Escape") {
+            event.preventDefault();
+            nameInput.value = currentProfile() ? currentProfile().name : "";
+            showProfileNameError(""); recomputeDirty();
+          }
+        });
+        document.getElementById("profile-select").addEventListener("change", function(e) {
+          var nextId = e.target.value;
+          if (!finishRuleFirst() || !commitProfileName(true)) { e.target.value = selectedProfileId || ""; return; }
+          selectProfile(nextId);
+        });
         document.getElementById("profile-default").addEventListener("change", function(e) { defaultProfileId = e.target.value || null; recomputeDirty(); });
         document.getElementById("profile-create").addEventListener("click", function() { addProfile([]); });
         document.getElementById("profile-create-defaults").addEventListener("click", function() { addProfile(manager.shippedRules || []); });
-        document.getElementById("profile-rename").addEventListener("click", function() { var p = currentProfile(); var name = profileName(); if (!p || !name) return; p.name = name; refreshProfileSelectors(); recomputeDirty(); });
+        document.getElementById("profile-rename").addEventListener("click", function() { if (!currentProfile()) return; commitProfileName(false); focusProfileName(); });
         document.getElementById("profile-duplicate").addEventListener("click", function() { var p = currentProfile(); if (p) addProfile(p.rules, true); });
         document.getElementById("profile-delete").addEventListener("click", function() { if (!finishRuleFirst()) return; if (currentProfile()) vscode.postMessage({ type: "confirmDeleteProfile", profileId: selectedProfileId, profileName: currentProfile().name }); });
-        document.getElementById("profile-workspace-copy").addEventListener("click", function() { if (!finishRuleFirst()) return; var p = currentProfile(); if (!p || !manager.workspaceLegacyRules) return; p.rules = JSON.parse(JSON.stringify(manager.workspaceLegacyRules)); selectProfile(p.id); recomputeDirty(); });
+        document.getElementById("profile-workspace-copy").addEventListener("click", function() { if (!finishRuleFirst() || !commitProfileName(true)) return; var p = currentProfile(); if (!p || !manager.workspaceLegacyRules) return; p.rules = JSON.parse(JSON.stringify(manager.workspaceLegacyRules)); selectProfile(p.id); recomputeDirty(); });
       }
 
       function renderRulesList() {
@@ -6939,7 +6982,7 @@ DEBUG: packet sent 1024 bytes</div>
       });
 
       document.getElementById("apply-rules-btn").addEventListener("click", function() {
-        if (!finishRuleFirst()) return;
+        if (!finishRuleFirst() || (manager && !commitProfileName(true))) return;
         saveRules();
       });
 
@@ -6960,6 +7003,7 @@ DEBUG: packet sent 1024 bytes</div>
       document.getElementById("reset-defaults-btn").addEventListener("click", function() {
         if (!finishRuleFirst()) return;
         if (manager) {
+          if (!commitProfileName(true)) return;
           var profile = currentProfile(); if (!profile) return;
           profile.rules = JSON.parse(JSON.stringify(manager.shippedRules || [])); selectProfile(profile.id); recomputeDirty();
         } else { vscode.postMessage({ type: "resetDefaults" }); }

@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.312] — 2026-11-03
+
+### Fixed
+
+- **Highlight profile names are included when you click Apply**, with renames accepted on Enter or when leaving the name field. Rename and profile creation focus and select the name; invalid names show an inline error without losing edits.
+
 ## [2.8.311] — 2026-11-03
 
 ### Fixed
