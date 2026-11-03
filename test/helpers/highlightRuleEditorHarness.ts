@@ -22,6 +22,7 @@ import type { HighlightEditorState } from "../../src/ui/highlightProfileEditorSt
 
 export type PostedRuleEditorMessage =
   | { type: "saveRules"; rules: HighlightRule[] }
+  | { type: "openHighlightingSettings" }
   | { type: "openHighlightSettingsJson"; scope: "user" | "workspace" }
   | { type: "resetDefaults" }
   | { type: "saveCatalog"; profiles: Array<{ id: string; name: string; rules: HighlightRule[] }>; defaultProfileId: string | null; revision: string }
@@ -103,6 +104,8 @@ function buildDom(): {
   set("profile-workspace-copy", new StubElement("BUTTON"));
   set("profile-workspace-note", new StubElement("DIV"));
   set("profile-workspace-override", Object.assign(new StubElement("DIV"), { hidden: true }));
+  set("profile-highlighting-disabled", Object.assign(new StubElement("DIV"), { hidden: true }));
+  set("profile-open-highlighting-settings", new StubElement("BUTTON"));
   set("profile-validation-error", new StubElement("DIV"));
   set("profile-repair-actions", Object.assign(new StubElement("DIV"), { hidden: true }));
   set("profile-repair-user", new StubElement("BUTTON"));
@@ -164,11 +167,14 @@ function buildDom(): {
 export interface HighlightRuleEditorHarness {
   posted: PostedRuleEditorMessage[];
   selectProfile: (id: string) => void;
+  selectedProfile: () => string;
   setProfileName: (name: string) => void;
   createProfile: () => void;
   createFromDefaults: () => void;
   saveError: () => string;
   workspaceOverrideVisible: () => boolean;
+  highlightingDisabledVisible: () => boolean;
+  openHighlightingSettings: () => void;
   recoveryMessage: () => string;
   recoveryVisible: () => boolean;
   openUserSettings: () => void;
@@ -199,6 +205,8 @@ export interface HighlightRuleEditorHarness {
   descriptionValue: () => string;
   patternValue: () => string;
   stageRule: () => void;
+  cancelRuleEdit: () => void;
+  resetRules: () => void;
   clickApply: () => void;
   clickCancel: () => void;
   editorVisible: () => boolean;
@@ -273,11 +281,14 @@ export function openHighlightRuleEditor(rules: HighlightRule[], manager?: Highli
   return {
     posted,
     selectProfile: (id) => { field("profile-select").value = id; field("profile-select").bubble("change"); },
+    selectedProfile: () => field("profile-select").value,
     setProfileName: (name) => { field("profile-name").value = name; },
     createProfile: () => field("profile-create").bubble("click"),
     createFromDefaults: () => field("profile-create-defaults").bubble("click"),
     saveError: () => field("save-error").textContent,
     workspaceOverrideVisible: () => !(field("profile-workspace-override") as StubElement & { hidden: boolean }).hidden,
+    highlightingDisabledVisible: () => !(field("profile-highlighting-disabled") as StubElement & { hidden: boolean }).hidden,
+    openHighlightingSettings: () => field("profile-open-highlighting-settings").bubble("click"),
     recoveryMessage: () => field("profile-validation-error").textContent,
     recoveryVisible: () => !(field("profile-repair-actions") as StubElement & { hidden: boolean }).hidden,
     openUserSettings: () => field("profile-repair-user").bubble("click"),
@@ -309,6 +320,8 @@ export function openHighlightRuleEditor(rules: HighlightRule[], manager?: Highli
     descriptionValue: () => field("edit-description").value,
     patternValue: () => field("edit-pattern").value,
     stageRule: () => field("save-rule-btn").bubble("click"),
+    cancelRuleEdit: () => field("cancel-edit-btn").bubble("click"),
+    resetRules: () => field("reset-defaults-btn").bubble("click"),
     clickApply: () => field("apply-rules-btn").bubble("click"),
     clickCancel: () => field("cancel-rules-btn").bubble("click"),
     editorVisible: () => field("editor-section").classList.contains("visible"),

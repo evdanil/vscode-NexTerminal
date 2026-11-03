@@ -5,7 +5,7 @@ import { recordNexusConfigWrite } from "../services/terminal/settingsWriteRegist
 import { validateHighlightProfiles } from "../utils/highlightProfileValidation";
 import { validateAndSanitizeHighlightRules, type HighlightRule } from "../utils/highlightRuleValidation";
 import { upgradeHighlightRules } from "../utils/highlightRuleUpgrade";
-import { HIGHLIGHT_SETTINGS_REPAIR } from "./highlightProfileForm";
+import { HIGHLIGHT_CONFLICT_RECOVERY, HIGHLIGHT_SETTINGS_REPAIR } from "./highlightProfileForm";
 
 export interface HighlightEditorState {
   catalog: HighlightCatalog;
@@ -15,13 +15,14 @@ export interface HighlightEditorState {
   workspaceCatalogOverrides?: boolean;
   effectiveValidationError?: string;
   effectiveMissingDefaultId?: string;
+  effectiveEnabled?: boolean;
 }
 export type HighlightEditorSaveResult = { ok: true; state: HighlightEditorState } | { ok: false; message: string };
 
 export function readHighlightEditorState(): HighlightEditorState {
   const catalog = readGlobalHighlightCatalogForEditing();
   const effective = readHighlightCatalog();
-  const revision = JSON.stringify(catalog);
+  const revision = JSON.stringify({ ...catalog, enabled: undefined });
   const settings = vscode.workspace.getConfiguration(HIGHLIGHT_PROFILES_SECTION);
   const workspaceCatalogOverrides = [HIGHLIGHT_PROFILES_KEY, HIGHLIGHT_DEFAULT_PROFILE_KEY].some((key) => {
     const inspected = settings.inspect<unknown>(key);
@@ -32,7 +33,7 @@ export function readHighlightEditorState(): HighlightEditorState {
   const globalRules = catalog.profiles[0]?.rules;
   const effectiveRules = effective.profiles[0]?.rules;
   return {
-    catalog, revision, shippedRules, workspaceCatalogOverrides,
+    catalog, revision, shippedRules, workspaceCatalogOverrides, effectiveEnabled: effective.enabled,
     ...(effective.validationError ? { effectiveValidationError: effective.validationError } : {}),
     ...(!effective.validationError && typeof effective.defaultProfileId === "string" &&
       !effective.profiles.some((profile) => profile.id === effective.defaultProfileId)
@@ -48,7 +49,7 @@ let pendingSave: Promise<void> = Promise.resolve();
 export function saveHighlightEditorCatalog(profiles: unknown, defaultProfileId: unknown, expectedRevision: unknown): Promise<HighlightEditorSaveResult> {
   const save = async (): Promise<HighlightEditorSaveResult> => {
     const current = readHighlightEditorState();
-    if (current.revision !== expectedRevision) return { ok: false, message: "Highlight profiles changed elsewhere. Reopen the manager to review them before saving." };
+    if (current.revision !== expectedRevision) return { ok: false, message: `Highlight profiles changed elsewhere. ${HIGHLIGHT_CONFLICT_RECOVERY}` };
     if (current.catalog.validationError) return { ok: false, message: `Cannot save invalid highlight settings: ${current.catalog.validationError} ${HIGHLIGHT_SETTINGS_REPAIR}` };
     const validation = validateHighlightProfiles(profiles);
     if (!validation.ok) return { ok: false, message: validation.message };
@@ -72,16 +73,16 @@ export function saveHighlightEditorCatalog(profiles: unknown, defaultProfileId: 
       const afterProfiles = readHighlightEditorState();
       const expectedInterimDefault = clearFirst ? null : current.catalog.defaultProfileId;
       if (JSON.stringify(afterProfiles.catalog.profiles) !== JSON.stringify(validation.profiles) || afterProfiles.catalog.defaultProfileId !== expectedInterimDefault) {
-        return { ok: false, message: "Highlight settings changed during save. Your draft is preserved; reopen the manager to review them." };
+        return { ok: false, message: `Highlight settings changed during save. ${HIGHLIGHT_CONFLICT_RECOVERY}` };
       }
       if (defaultChanged && defaultProfileId !== null) await writeDefault(defaultProfileId);
       const saved = readHighlightEditorState();
       if (JSON.stringify(saved.catalog.profiles) !== JSON.stringify(validation.profiles) || saved.catalog.defaultProfileId !== defaultProfileId) {
-        return { ok: false, message: "Highlight settings changed during save. Your draft is preserved; reopen the manager to review them." };
+        return { ok: false, message: `Highlight settings changed during save. ${HIGHLIGHT_CONFLICT_RECOVERY}` };
       }
       return { ok: true, state: saved };
     } catch {
-      return { ok: false, message: "Could not save highlight profiles. Some settings may have changed; check settings permissions and reopen the manager before retrying." };
+      return { ok: false, message: `Could not save highlight profiles. Check settings permissions. Some settings may have changed. ${HIGHLIGHT_CONFLICT_RECOVERY}` };
     }
   };
   const result = pendingSave.then(save, save);

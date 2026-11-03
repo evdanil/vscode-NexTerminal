@@ -10,6 +10,109 @@ const state: HighlightEditorState = {
 };
 
 describe("highlight profile manager", () => {
+  it("updates the effective highlighting notice live, including while a rule draft is open", () => {
+    const editor = openHighlightRuleEditor([], { ...state, effectiveEnabled: true });
+    expect(editor.highlightingDisabledVisible()).toBe(false);
+    editor.clickEdit(0); editor.setPattern("DRAFT");
+    editor.deliver({ type: "catalogUpdated", state: { ...state, effectiveEnabled: false } });
+    expect(editor.highlightingDisabledVisible()).toBe(true);
+    expect(editor.patternValue()).toBe("DRAFT");
+    expect(editor.saveError()).not.toContain("changed elsewhere");
+    editor.openHighlightingSettings();
+    expect(editor.posted).toContainEqual({ type: "openHighlightingSettings" });
+    editor.deliver({ type: "catalogUpdated", state: { ...state, effectiveEnabled: true } });
+    expect(editor.highlightingDisabledVisible()).toBe(false);
+    expect(editor.patternValue()).toBe("DRAFT");
+  });
+  it("normalizes explicit enabled true when deriving catalog dirty state", () => {
+    const editor = openHighlightRuleEditor([], { ...state, catalog: { ...state.catalog, profiles: [
+      { id: "one", name: "One", rules: [{ pattern: "ONE", color: "red", enabled: true }] }
+    ] } });
+    expect(editor.isDirty()).toBe(false);
+    editor.toggleEnabled(0); expect(editor.isDirty()).toBe(true);
+    editor.toggleEnabled(0); expect(editor.isDirty()).toBe(false);
+    editor.clickEdit(0); editor.setPattern("CHANGE"); editor.stageRule();
+    expect(editor.isDirty()).toBe(true);
+  });
+  it.each(["create", "defaults", "duplicate"] as const)("creates a unique usable name by default for %s", (action) => {
+    const editor = openHighlightRuleEditor([], state);
+    if (action === "create") editor.createProfile();
+    if (action === "defaults") editor.createFromDefaults();
+    if (action === "duplicate") editor.duplicateProfile();
+    editor.clickApply();
+    const save = editor.posted.find((message) => message.type === "saveCatalog");
+    if (save?.type !== "saveCatalog") throw new Error("missing save");
+    const names = save.profiles.map((profile) => profile.name.toLowerCase());
+    expect(new Set(names).size).toBe(3);
+    expect(save.profiles[2].name).toContain(action === "duplicate" ? "One" : "New");
+  });
+
+  it("gives immediate feedback for explicitly chosen duplicate names", () => {
+    const editor = openHighlightRuleEditor([], state);
+    editor.setProfileName("Two"); editor.createProfile();
+    expect(editor.saveError()).toContain("already");
+    expect(editor.isDirty()).toBe(false);
+    expect(editor.posted.some((message) => message.type === "saveCatalog")).toBe(false);
+  });
+
+  it("keeps an unfinished rule on profile switch until explicitly staged or cancelled", () => {
+    const editor = openHighlightRuleEditor([], state);
+    editor.clickEdit(0); editor.setPattern("UNFINISHED"); editor.selectProfile("two");
+    expect(editor.selectedProfile()).toBe("one");
+    expect(editor.editorVisible()).toBe(true);
+    expect(editor.patternValue()).toBe("UNFINISHED");
+    expect(editor.saveError()).toContain("Stage Rule");
+    expect(editor.saveError()).toContain("Cancel");
+    editor.stageRule(); editor.selectProfile("two"); editor.selectProfile("one");
+    expect(editor.rowLabel(0)).toBe("UNFINISHED");
+    editor.clickEdit(0); editor.setPattern("DISCARD"); editor.cancelRuleEdit(); editor.selectProfile("two"); editor.selectProfile("one");
+    expect(editor.rowLabel(0)).toBe("UNFINISHED");
+  });
+
+  it.each(["create", "duplicate", "reset", "copy", "delete", "apply", "cancel", "edit", "add"] as const)(
+    "protects an unfinished rule from the %s action", (action) => {
+      const editor = openHighlightRuleEditor([], { ...state, workspaceLegacyRules: [{ pattern: "WORKSPACE", color: "green" }] });
+      editor.clickEdit(0); editor.setPattern("UNFINISHED");
+      if (action === "create") { editor.setProfileName("New"); editor.createProfile(); }
+      if (action === "duplicate") { editor.setProfileName("Copy"); editor.duplicateProfile(); }
+      if (action === "reset") editor.resetRules();
+      if (action === "copy") editor.copyWorkspaceRules();
+      if (action === "delete") editor.deleteProfile();
+      if (action === "apply") editor.clickApply();
+      if (action === "cancel") editor.clickCancel();
+      if (action === "edit") editor.clickEdit(0);
+      if (action === "add") editor.clickAdd();
+      expect(editor.editorVisible()).toBe(true);
+      expect(editor.patternValue()).toBe("UNFINISHED");
+      expect(editor.selectedProfile()).toBe("one");
+      expect(editor.saveError()).toContain("Stage Rule");
+      expect(editor.posted.some((msg) => msg.type === "saveCatalog" || msg.type === "confirmDeleteProfile")).toBe(false);
+    }
+  );
+
+  it("preserves an unfinished rule when external settings arrive and gives a real recovery path", () => {
+    const editor = openHighlightRuleEditor([], state);
+    editor.clickEdit(0); editor.setPattern("UNFINISHED");
+    editor.deliver({ type: "catalogUpdated", state: { ...state, revision: "remote" } });
+    expect(editor.editorVisible()).toBe(true);
+    expect(editor.patternValue()).toBe("UNFINISHED");
+    expect(editor.saveError()).toContain("close the Highlight Profiles tab");
+    expect(editor.saveError()).toContain("discard");
+    expect(editor.saveError()).toContain("Nexus: Edit Highlighting Rules");
+    expect(editor.saveError()).not.toContain("reopen to review");
+  });
+
+  it("preserves an unfinished rule if a deletion confirmation arrives late", () => {
+    const editor = openHighlightRuleEditor([], state);
+    editor.deleteProfile();
+    editor.clickEdit(0); editor.setPattern("UNFINISHED");
+    editor.deliver({ type: "confirmDeleteProfileResult", profileId: "one", confirmed: true });
+    expect(editor.editorVisible()).toBe(true);
+    expect(editor.patternValue()).toBe("UNFINISHED");
+    expect(editor.selectedProfile()).toBe("one");
+    expect(editor.rowLabel(0)).toBe("ONE");
+  });
+
   it("stages profile rename, duplication, default change, and independent rule edits", () => {
     const editor = openHighlightRuleEditor([], state);
     expect(editor.rowLabel(0)).toBe("ONE");

@@ -16,6 +16,21 @@ import { readHighlightEditorState, saveHighlightEditorCatalog } from "../../src/
 describe("highlight profile editor storage", () => {
   beforeEach(() => { state.global = {}; state.workspace = {}; state.writes = []; state.failKey = ""; state.overrideAfterProfiles = undefined; });
 
+  it("reports whether highlighting is enabled in the effective scope", () => {
+    state.global.enabled = false; state.workspace.enabled = true;
+    expect(readHighlightEditorState().effectiveEnabled).toBe(true);
+    state.global.enabled = true; state.workspace.enabled = false;
+    expect(readHighlightEditorState().effectiveEnabled).toBe(false);
+    delete state.workspace.enabled;
+    expect(readHighlightEditorState().effectiveEnabled).toBe(true);
+  });
+  it("allows a draft save after only the global enabled switch changes", async () => {
+    const initial = readHighlightEditorState();
+    state.global.enabled = false;
+    expect(readHighlightEditorState().revision).toBe(initial.revision);
+    expect((await saveHighlightEditorCatalog(initial.catalog.profiles, initial.catalog.defaultProfileId, initial.revision)).ok).toBe(true);
+  });
+
   it("does not promote workspace rules when materializing legacy global settings", async () => {
     state.global.rules = [{ pattern: "GLOBAL", color: "red" }];
     state.workspace.rules = [{ pattern: "WORKSPACE", color: "blue" }];
@@ -81,7 +96,14 @@ describe("highlight profile editor storage", () => {
   it("rejects stale revisions and malformed profile data without writing", async () => {
     const initial = readHighlightEditorState();
     state.global.rules = [{ pattern: "OTHER", color: "green" }];
-    expect((await saveHighlightEditorCatalog(initial.catalog.profiles, "default", initial.revision)).ok).toBe(false);
+    const stale = await saveHighlightEditorCatalog(initial.catalog.profiles, "default", initial.revision);
+    expect(stale.ok).toBe(false);
+    if (!stale.ok) {
+      expect(stale.message).toContain("close the Highlight Profiles tab");
+      expect(stale.message).toContain("discard");
+      expect(stale.message).toContain("Nexus: Edit Highlighting Rules");
+      expect(stale.message).not.toContain("Reopen the manager");
+    }
     const current = readHighlightEditorState();
     expect((await saveHighlightEditorCatalog([{ id: "x", name: "X", rules: [{ pattern: "(", color: "red" }] }], "x", current.revision)).ok).toBe(false);
     expect(state.writes).toEqual([]);

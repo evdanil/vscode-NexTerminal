@@ -8,11 +8,12 @@ const state = vi.hoisted(() => ({
   disposeListener: undefined as (() => void) | undefined,
   messageListener: undefined as ((message: Record<string, unknown>) => Promise<void>) | undefined,
   warning: "",
-  executedCommands: [] as string[]
+  executedCommands: [] as string[],
+  commandArgs: [] as unknown[][]
 }));
 
 vi.mock("vscode", () => ({
-  commands: { executeCommand: vi.fn(async (id: string) => { state.executedCommands.push(id); }) },
+  commands: { executeCommand: vi.fn(async (id: string, ...args: unknown[]) => { state.executedCommands.push(id); state.commandArgs.push(args); }) },
   ViewColumn: { Active: -1 },
   ConfigurationTarget: { Global: 1 },
   workspace: {
@@ -128,7 +129,13 @@ describe("HighlightRuleEditorPanel profile deletion", () => {
 
 
 describe("HighlightRuleEditorPanel settings repair", () => {
-  beforeEach(() => { state.disposeListener?.(); state.executedCommands = []; });
+  beforeEach(() => { state.disposeListener?.(); state.executedCommands = []; state.commandArgs = []; });
+  it("opens VS Code settings filtered to the highlighting enabled setting", async () => {
+    HighlightRuleEditorPanel.open();
+    await state.messageListener?.({ type: "openHighlightingSettings" });
+    expect(state.executedCommands).toEqual(["workbench.action.openSettings"]);
+    expect(state.commandArgs).toEqual([["@id:nexus.terminal.highlighting.enabled"]]);
+  });
   it("opens the chosen settings JSON scope without accepting arbitrary commands", async () => {
     HighlightRuleEditorPanel.open();
     await state.messageListener?.({ type: "openHighlightSettingsJson", scope: "user" });

@@ -47,7 +47,9 @@ export class HighlightRuleEditorPanel {
   private async handleMessage(msg: unknown): Promise<void> {
     if (typeof msg !== "object" || msg === null || Array.isArray(msg)) return;
     const request = msg as Record<string, unknown>;
-    if (request.type === "openHighlightSettingsJson") {
+    if (request.type === "openHighlightingSettings") {
+      await vscode.commands.executeCommand("workbench.action.openSettings", "@id:nexus.terminal.highlighting.enabled");
+    } else if (request.type === "openHighlightSettingsJson") {
       const command = request.scope === "user" ? "workbench.action.openSettingsJson"
         : request.scope === "workspace" ? "workbench.action.openWorkspaceSettingsFile" : undefined;
       if (command) await vscode.commands.executeCommand(command);

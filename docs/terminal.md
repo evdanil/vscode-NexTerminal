@@ -12,9 +12,13 @@ The IPv6 and UUID rules ship **disabled** — those two patterns cost more than 
 
 Open **Nexus: Edit Highlighting Rules** to manage named highlight profiles. Create, rename, duplicate or delete a profile and choose the global default. Each profile has its own ordered rules, with live preview, staged Apply/Cancel, custom SGR foreground codes, regex safety checks, and reset to the built-in rules. Existing highlighting rules remain available as the default profile.
 
+Use **Stage Rule** or the rule editor's **Cancel** before switching profiles or taking an action that would discard the unfinished rule. If settings change elsewhere while you have a draft, record the changes you want to keep, close the Highlight Profiles tab (discarding that draft), and run **Nexus: Edit Highlighting Rules** again to load the current settings.
+
 The Highlight Profile field on saved SSH/telnet, serial, Local Shell and Local Server connections chooses the global default, a named profile, or no highlighting. Right-click a Nexus terminal tab or active session and choose **Select Terminal Highlight Profile** to change that terminal alone; **Use saved connection setting** returns it to the connection's preference. Changes to a profile or default apply to running terminals that follow it. Deleting a profile warns about saved connections and live terminals using it; a missing profile does not silently fall back to another set of rules.
 
 The manager saves global settings. If a workspace overrides the catalog or default, that workspace's setting takes precedence. Backups and sharing include highlight profiles; merging imports keeps the recipient's default and remaps colliding profile IDs. Terminal-category and Reset All settings resets clear the catalog, default and legacy rules.
+
+When highlighting is disabled by the current settings, the manager offers a shortcut to the VS Code setting so you can enable it in the applicable scope.
 
 If the catalog or default is invalid or the default profile is missing, inspect `nexus.terminal.highlighting.profiles` and `nexus.terminal.highlighting.defaultProfile` in the applicable User, Workspace, Folder or Remote Settings JSON and correct or remove the affected settings. The manager provides shortcuts to User and Workspace Settings JSON.
 

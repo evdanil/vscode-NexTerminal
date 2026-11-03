@@ -267,6 +267,49 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
     ? `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';" />`
     : "";
   const nonceAttr = nonce ? ` nonce="${nonce}"` : "";
+  const hasHighlightProfile = definition.fields.some((field) => field.type === "select" && field.key === "highlightProfileId");
+  const highlightRefreshScript = hasHighlightProfile ? `
+        if (msg.type === "highlightProfilesChanged" && msg.revision > highlightRevision) {
+          highlightRevision = msg.revision;
+          var highlightWrapper = document.getElementById("field-highlightProfileId");
+          if (highlightWrapper && highlightWrapper.classList.contains("custom-select")) {
+            var highlightInput = highlightWrapper.querySelector('input[type="hidden"]');
+            var highlightDropdown = highlightWrapper.querySelector('.custom-select-dropdown');
+            var highlightText = highlightWrapper.querySelector('.custom-select-text');
+            if (highlightInput && highlightDropdown && highlightText) {
+              var selectedHighlight = highlightInput.value;
+              highlightDropdown.querySelectorAll('.custom-select-option').forEach(function(option) { option.remove(); });
+              var foundHighlight = false;
+              msg.options.forEach(function(option) {
+                var element = document.createElement('div');
+                element.className = 'custom-select-option';
+                element.dataset.value = option.value;
+                element.textContent = option.label;
+                if (option.value === selectedHighlight) {
+                  element.classList.add('selected');
+                  highlightText.textContent = option.label;
+                  foundHighlight = true;
+                }
+                highlightDropdown.appendChild(element);
+              });
+              if (!foundHighlight) {
+                var missing = document.createElement('div');
+                missing.className = 'custom-select-option selected';
+                missing.dataset.value = selectedHighlight;
+                missing.textContent = selectedHighlight.indexOf('profile:') === 0
+                  ? 'Missing profile: ' + selectedHighlight.slice(8) + ' (no highlighting)'
+                  : 'Unavailable selection';
+                highlightText.textContent = missing.textContent;
+                highlightDropdown.appendChild(missing);
+              }
+              var group = highlightWrapper.closest('.form-group');
+              var hint = group && group.querySelector('.field-hint');
+              if (hint) hint.textContent = msg.hint;
+              var filter = highlightWrapper.querySelector('.custom-select-filter');
+              if (filter) filter.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+          }
+        }` : "";
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -1495,8 +1538,8 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
       initCustomComboboxes();
       updateProfileManagedFields();
 
-      window.addEventListener("message", function(event) {
-        var msg = event.data;
+      ${hasHighlightProfile ? "var highlightRevision = 0;\n      " : ""}window.addEventListener("message", function(event) {
+        var msg = event.data;${highlightRefreshScript}
         if (msg.type === "browseResult") {
           var browseInput = document.getElementById("field-" + msg.key);
           if (browseInput) browseInput.value = msg.path;
@@ -1613,7 +1656,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
             if (errEl) errEl.textContent = errors[key];
           }
         }
-      });
+      });${hasHighlightProfile ? '\n      vscode.postMessage({ type: "highlightProfilesReady" });' : ""}
     })();
   </script>
 </body>

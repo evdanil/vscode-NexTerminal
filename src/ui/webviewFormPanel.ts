@@ -1,5 +1,7 @@
 import * as vscode from "vscode";
-import { renderFormHtml } from "./formHtml";
+import { readHighlightCatalog } from "../services/terminal/highlightProfileSettings";
+import { highlightProfileSelectField } from "./highlightProfileForm";
+import { sortFilterableOptions, renderFormHtml } from "./formHtml";
 import type { FormDefinition, FormMessage, FormValues } from "./formTypes";
 import { createWebviewNonce } from "./shared/webviewNonce";
 
@@ -33,10 +35,24 @@ export class WebviewFormPanel {
       { enableScripts: true, retainContextWhenHidden: true }
     );
 
+    const hasHighlightProfile = definition.fields.some((field) => field.type === "select" && field.key === "highlightProfileId");
+    let highlightRevision = 0;
+    const pushHighlightProfiles = (): void => {
+      if (this.disposed || !hasHighlightProfile) return;
+      const field = highlightProfileSelectField(readHighlightCatalog());
+      void this.panel.webview.postMessage({ type: "highlightProfilesChanged", revision: ++highlightRevision, options: sortFilterableOptions(field.options), hint: field.hint ?? "" });
+    };
+    const configListener = hasHighlightProfile ? vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration("nexus.terminal.highlighting")) pushHighlightProfiles();
+    }) : undefined;
     const nonce = createWebviewNonce();
     this.panel.webview.html = renderFormHtml(definition, nonce);
 
     this.panel.webview.onDidReceiveMessage(async (message: FormMessage) => {
+      if (message.type === "highlightProfilesReady") {
+        pushHighlightProfiles();
+        return;
+      }
       if (message.type === "submit") {
         if (this.submitInFlight || this.disposed) {
           return;
@@ -167,6 +183,7 @@ export class WebviewFormPanel {
 
     this.panel.onDidDispose(() => {
       this.disposed = true;
+      configListener?.dispose();
       for (const listener of this.disposeListeners) {
         try {
           listener();

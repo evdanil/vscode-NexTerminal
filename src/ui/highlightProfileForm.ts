@@ -7,6 +7,7 @@ export const HIGHLIGHT_SETTINGS_REPAIR =
   "Open Folder Settings (JSON), or Open Remote Settings (JSON), as applicable. " +
   "Inspect and correct or remove nexus.terminal.highlighting.profiles and " +
   "nexus.terminal.highlighting.defaultProfile in the applicable settings scopes.";
+export const HIGHLIGHT_CONFLICT_RECOVERY = "Your draft remains here. Record any changes you want to keep, then close the Highlight Profiles tab (this will discard the draft) and run Nexus: Edit Highlighting Rules to load the current settings.";
 
 const NONE_VALUE = "__none__";
 const PROFILE_PREFIX = "profile:";
@@ -53,7 +54,7 @@ export function highlightProfileSelectField(
   const stateHint = catalog?.validationError
     ? `${catalog.validationError} ${HIGHLIGHT_SETTINGS_REPAIR}`
     : missingDefault ? `The default highlight profile is missing. ${HIGHLIGHT_SETTINGS_REPAIR}`
-      : catalog?.enabled === false ? "Highlighting is off globally. Enable terminal highlighting in Nexus Settings." : "";
+      : catalog?.enabled === false ? "Highlighting is off in the current settings. Enable terminal highlighting in the applicable Settings scope." : "";
   return {
     type: "select",
     key: "highlightProfileId",

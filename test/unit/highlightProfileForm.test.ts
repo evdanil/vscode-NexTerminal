@@ -68,7 +68,9 @@ describe("saved highlight profile form values", () => {
     expect(missing.hint).toContain("nexus.terminal.highlighting.defaultProfile");
     expect(missing.hint).toContain("Workspace Settings (JSON)");
     expect(missing.hint).not.toContain("Nexus: Edit Highlighting Rules");
-    expect(highlightProfileSelectField({ ...catalog, enabled: false }).hint).toMatch(/off globally/i);
+    const offHint = highlightProfileSelectField({ ...catalog, enabled: false }).hint ?? "";
+    expect(offHint).toContain("current settings");
+    expect(offHint).not.toMatch(/off globally/i);
   });
 
   it("offers the manager when the catalog is valid", () => {
@@ -106,6 +108,20 @@ describe("highlight selection on every saved connection form", () => {
     expect(field.options.some((option) => option.value === "profile:linux")).toBe(true);
   });
 
+  it.each(factories)("selects a newly created highlight profile without losing the %s draft", (_name, build) => {
+    const form = openForm(build("linux"));
+    form.typeFocused("name", "Unsaved draft");
+    form.deliver({ type: "highlightProfilesChanged", revision: 1, options: [
+      { value: "", label: "Use global default (None)" },
+      { value: "__none__", label: "None" },
+      { value: "profile:new", label: "New profile" }
+    ], hint: "Updated" });
+    expect(form.value("name")).toBe("Unsaved draft");
+    expect(form.value("highlightProfileId")).toBe("profile:linux");
+    form.choose("highlightProfileId", "profile:new");
+    expect(form.attemptNativeSubmit()).toMatchObject({ name: "Unsaved draft", highlightProfileId: "profile:new" });
+  });
+
   it.each(factories)("submits explicit None for %s through the rendered script", (_name, build) => {
     const form = openForm(build("linux"));
     form.choose("highlightProfileId", "__none__");
@@ -121,6 +137,18 @@ describe("highlight selection on every saved connection form", () => {
       expect(field.options.some((option) => option.value === "profile:linux")).toBe(true);
     }
   );
+
+  it("refreshes the unified add form without losing an unsaved name", () => {
+    const form = openForm(unifiedProfileFormDefinition({ addMode: "serial" }, [], true, [], [], {}, catalog));
+    form.typeFocused("name", "New draft");
+    form.deliver({ type: "highlightProfilesChanged", revision: 2, options: [
+      { value: "", label: "Use global default (None)" }, { value: "__none__", label: "None" },
+      { value: "profile:new", label: "New profile" }
+    ], hint: "Updated" });
+    form.choose("highlightProfileId", "profile:new");
+    expect(form.value("name")).toBe("New draft");
+    expect(form.value("highlightProfileId")).toBe("profile:new");
+  });
 
   it("preserves custom serial baud and typed fields when switching highlight choices", () => {
     const form = openForm(serialFormDefinition({ name: "Console", path: "COM3", baudRate: 31250 }, [], true, catalog));

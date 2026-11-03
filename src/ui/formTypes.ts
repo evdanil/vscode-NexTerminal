@@ -140,6 +140,7 @@ export interface FormDefinition {
 export type FormValues = Record<string, string | number | boolean | undefined>;
 
 export type FormMessage =
+  | { type: "highlightProfilesReady" }
   | { type: "submit"; values: FormValues }
   | { type: "cancel" }
   | { type: "manageAuthProfile"; id: string }
@@ -211,6 +212,7 @@ export type FormMessage =
   | { type: "test"; values: FormValues };
 
 export type ExtensionMessage =
+  | { type: "highlightProfilesChanged"; revision: number; options: Array<{ label: string; value: string }>; hint: string }
   | { type: "browseResult"; key: string; path: string }
   | { type: "validationError"; errors: Record<string, string> }
   | { type: "addSelectOption"; key: string; value: string; label: string; description?: string; fillValue?: string }
