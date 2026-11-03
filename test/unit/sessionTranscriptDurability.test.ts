@@ -95,7 +95,9 @@ function open(
   const transcript = createSessionTranscript(dir, prefix, true, {
     maxFileSizeBytes,
     maxRotatedFiles,
-    maxRetainedBytes
+    maxRetainedBytes,
+    // These failure fixtures pin byte counts and retention independently of time.
+    timestampMode: "off"
   });
   openTranscripts.push(transcript);
   return transcript;

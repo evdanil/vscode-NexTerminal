@@ -9,6 +9,7 @@ Guide: [Terminal → Session Transcript Logging](terminal.md#session-transcript-
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `nexus.logging.sessionTranscripts` | `true` | Enable session transcript logging for SSH, telnet and serial sessions by default; each profile can override it |
+| `nexus.logging.sessionTranscriptTimestamps` | `"local"` | Per-line receive timestamps in new SSH, telnet and serial transcripts: `local` (milliseconds and UTC offset), `utc` (milliseconds and `Z`), or `off`. Existing terminals keep their format |
 | `nexus.logging.sessionLogDirectory` | `""` | Custom directory for session logs; leave empty for the extension's storage folder |
 | `nexus.logging.terminalOutputTrace` | `false` | Troubleshooting only: write every chunk of terminal output to the diagnostic log. Slows terminal output and stores session data — including anything echoed on screen, such as passwords — as plaintext on disk |
 | `nexus.logging.maxFileSizeMb` | `10` | Max log file size before rotation |

@@ -2,6 +2,14 @@ import { describe, expect, it } from "vitest";
 import { validateSettingUpdate } from "../../src/ui/settingsValidation";
 
 describe("validateSettingUpdate", () => {
+  it("accepts transcript timestamp choices and rejects unsupported values", () => {
+    for (const value of ["local", "utc", "off"]) {
+      expect(validateSettingUpdate("nexus.logging", "sessionTranscriptTimestamps", value)).toMatchObject({ ok: true, value });
+    }
+    for (const value of ["invalid", true, null]) {
+      expect(validateSettingUpdate("nexus.logging", "sessionTranscriptTimestamps", value).ok).toBe(false);
+    }
+  });
   it("rejects forged settings outside Nexus metadata", () => {
     expect(validateSettingUpdate("workbench", "colorTheme", "Default Dark+").ok).toBe(false);
   });

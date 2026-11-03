@@ -232,12 +232,13 @@ Reverse-bind reservations are separate files in `globalStorageUri`, outside the 
 1. Terminal and tunnel event logs are enabled automatically.
 2. Each log file rotates when it reaches configured max size.
 3. Rotation defaults: `10MB` file size and `1` rotated file.
-4. Session transcript logs record clean terminal output with ANSI escape sequences and control characters stripped. Transcript writes are queued in memory and flushed on an interval (250 ms) rather than written synchronously per chunk; every orderly exit — terminal closed, session disconnected, extension deactivated — flushes the queue explicitly, and rotation cuts the file at exactly the same byte boundaries as the synchronous writer did.
-5. The per-chunk terminal data trace (`nexus.logging.terminalOutputTrace`) is **off by default** and is a troubleshooting aid only. When on, every chunk a session receives is written to the diagnostic log synchronously as it arrives — measurable latency on the terminal's output path, and a verbatim plaintext record of session data including anything echoed on screen (passwords, keys). Lifecycle logging (connect, disconnect, errors) is unaffected and always on.
+4. Session transcript logs record clean SSH, telnet and serial terminal output with ANSI escape sequences and control characters stripped (CR, LF and tab are preserved). Each logical line, including empty lines, is prefixed with a local receive timestamp by default: `YYYY-MM-DD HH:mm:ss.SSS±HH:mm`. `nexus.logging.sessionTranscriptTimestamps` selects `local`, `utc` (`YYYY-MM-DD HH:mm:ss.SSSZ`) or `off` for new terminals; reconnecting an existing terminal retains its mode. The timestamp is captured at the first cleaned output on a line, before buffering; partial lines and split CRLF retain their boundaries without accumulating a whole line. Lines in one chunk share a receive time, not the device's execution time. Session start/end markers always retain their UTC timestamps. Live terminal output, Copy All, script and macro capture are unchanged. Transcript writes are queued in memory and flushed on an interval (250 ms) rather than written synchronously per chunk; every orderly exit — terminal closed, session disconnected, extension deactivated — flushes the queue explicitly. Rotation and retention count the timestamp bytes along with output bytes.
+5. The per-chunk terminal data trace (`nexus.logging.terminalOutputTrace`) is **off by default** and is a troubleshooting aid only. When on, every chunk a session receives is written to the diagnostic log synchronously as it arrives — measurable latency on the terminal's output path, and a verbatim plaintext record of session data including anything echoed on screen (passwords, keys). Each diagnostic entry already carries an ISO UTC timestamp, independently of the transcript timestamp setting. Lifecycle logging (connect, disconnect, errors) is unaffected and always on.
 6. Settings:
    - `nexus.logging.maxFileSizeMb`
    - `nexus.logging.maxRotatedFiles` (`0-99`)
    - `nexus.logging.sessionTranscripts` (enable/disable)
+   - `nexus.logging.sessionTranscriptTimestamps` (`local` by default; `utc` or `off`; new terminals)
    - `nexus.logging.sessionLogDirectory` (custom path)
    - `nexus.logging.terminalOutputTrace` (per-chunk data trace; default off)
 
@@ -761,6 +762,7 @@ For an invalid catalog or default, or a default that names a missing profile, in
 | Setting | Type | Default | Range | Description |
 |---------|------|---------|-------|-------------|
 | `nexus.logging.sessionTranscripts` | boolean | `true` | — | Enable session transcript logging |
+| `nexus.logging.sessionTranscriptTimestamps` | string | `"local"` | `local`, `utc`, `off` | Per-line receive timestamps with milliseconds and timezone; applies to new terminals |
 | `nexus.logging.sessionLogDirectory` | string | *(extension storage)* | — | Custom directory for session logs |
 | `nexus.logging.terminalOutputTrace` | boolean | `false` | — | Troubleshooting only: per-chunk trace of terminal output to the diagnostic log. Adds latency to terminal output and stores session data — including echoed passwords — as plaintext |
 | `nexus.logging.maxFileSizeMb` | number | `10` | 1–100 MB | Max log file size before rotation |
@@ -919,7 +921,7 @@ Implemented (~90% target):
 - Active tunnel counters and cross-window visibility in the Port Forwarding view.
 - Dedicated terminal/tunnel connection model.
 - Interactive serial terminal sessions through sidecar-managed ports.
-- Session transcript logging with ANSI stripping and rotation.
+- Session transcript logging with ANSI stripping, rotation and per-line receive timestamps on by default (local, UTC or off).
 - Configuration export/import.
 - Browser-host fallback entrypoint with safe "desktop required" UX instead of activation failure.
 - Build/test/packaging scripts.

@@ -43,7 +43,18 @@ After a session disconnects, Reset and Clear grey out; Copy All stays enabled so
 
 Automatically log clean terminal output (ANSI codes stripped) to files with configurable rotation, for SSH, telnet and serial sessions. Per-profile toggle (**Log session transcript** on the server and serial forms). Local Shell and Local Server output is not logged — use Copy All to capture a run.
 
-The default, the log directory and the rotation limits are under [Settings → Logging](settings.md#logging).
+Each output line has a **local receive timestamp by default**, including milliseconds and a numeric UTC offset:
+
+```text
+2025-01-15 09:00:12.345+10:00 [WARN] Connection interrupted
+2025-01-15 09:00:14.678+10:00 [INFO] Connected
+```
+
+Choose **Transcript Timestamps** under [Settings → Logging](settings.md#logging), or set `nexus.logging.sessionTranscriptTimestamps` to `local` (default), `utc` (for example, `2025-01-14 23:00:12.345Z`), or `off` for clean output without per-line timestamps. Changes apply to newly opened sessions; disconnecting and reconnecting an existing terminal keeps that terminal's format. The session start/end markers keep their UTC timestamps in every mode.
+
+The time records when Nexus receives the first output on a line, before the log's write buffer flushes; it is not the remote device's execution time. Lines split across chunks keep their first timestamp, and lines arriving together share a timestamp. Empty lines are timestamped too; CR/LF separators and partial lines are preserved. Commands appear only if the remote terminal echoes them. The live terminal and Copy All output are unchanged.
+
+The logging default, log directory and rotation limits are also under **Settings → Logging**. Timestamp prefixes count toward the file-size limit. **Terminal Output Trace** is a separate troubleshooting setting: it remains off by default and already records a UTC ISO timestamp on each diagnostic entry/chunk. Enable session transcripts for ordinary session records.
 
 ## Keyboard Passthrough
 

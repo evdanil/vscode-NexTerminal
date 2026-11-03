@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.313] — 2026-11-03
+
+### Added
+
+- **Session transcripts include per-line receive timestamps by default**, using local time with milliseconds and a UTC offset. Choose Local time, UTC or Off in Settings → Logging → Transcript Timestamps; the selection applies to new SSH, telnet and serial terminals.
+
 ## [2.8.312] — 2026-11-03
 
 ### Fixed

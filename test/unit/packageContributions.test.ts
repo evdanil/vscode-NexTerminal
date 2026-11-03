@@ -2308,6 +2308,18 @@ describe("#153 — setting descriptions name everything the setting governs", ()
   });
 });
 
+describe("session transcript timestamps", () => {
+  it("offers local timestamps by default with UTC and Off in both settings surfaces", async () => {
+    const setting = packageJson.contributes.configuration?.properties?.["nexus.logging.sessionTranscriptTimestamps"];
+    expect(setting).toMatchObject({ type: "string", default: "local", enum: ["local", "utc", "off"] });
+    const { SETTINGS_META } = await import("../../src/ui/settingsMetadata");
+    const meta = SETTINGS_META.find((item) => item.section === "nexus.logging" && item.key === "sessionTranscriptTimestamps");
+    expect(meta).toMatchObject({ type: "enum", default: "local" });
+    expect(meta?.enumOptions?.map((option) => option.value)).toEqual(["local", "utc", "off"]);
+    expect(meta?.badge).toBeUndefined();
+  });
+});
+
 /**
  * SSH AGENT — the agent every SSH Agent login uses is chosen per machine.
  * `scope: "machine"` is the security property, not a nicety: VS Code ignores a

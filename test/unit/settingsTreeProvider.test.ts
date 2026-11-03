@@ -124,6 +124,7 @@ function setupDefaultConfig(): void {
     get: (key: string) => {
       const defaults: Record<string, unknown> = {
         sessionTranscripts: true,
+        sessionTranscriptTimestamps: "local",
         sessionLogDirectory: "",
         maxFileSizeMb: 10,
         maxRotatedFiles: 5,
@@ -261,11 +262,11 @@ describe("SettingsTreeProvider", () => {
   });
 
   describe("category children", () => {
-    it("returns 5 children for logging category", () => {
+    it("returns 6 children for logging category including transcript timestamps", () => {
       const provider = createProvider();
       const category = new SettingsCategoryItem("logging");
       const children = provider.getChildren(category);
-      expect(children).toHaveLength(5);
+      expect(children).toHaveLength(6);
       expect(children.every((c) => c instanceof SettingsValueItem)).toBe(true);
     });
 
@@ -354,7 +355,10 @@ describe("SettingsTreeProvider", () => {
       const category = new SettingsCategoryItem("logging");
       const children = provider.getChildren(category) as SettingsValueItem[];
       expect(children[0].label).toContain("ON");
-      expect(children[2].label).toContain("10 MB");
+      expect(children.map((child) => String(child.label))).toEqual(expect.arrayContaining([
+        expect.stringContaining("Transcript Timestamps"),
+        expect.stringContaining("10 MB")
+      ]));
     });
 
     it("uses category descriptions as category tooltips", () => {

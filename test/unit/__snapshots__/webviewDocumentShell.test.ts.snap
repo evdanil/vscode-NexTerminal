@@ -11431,6 +11431,22 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
   <span class="save-indicator" aria-live="polite" data-for="nexus.logging.sessionTranscripts"></span>
 </div>
   <div class="form-group">
+  <label id="setting-nexus-logging-sessionTranscriptTimestamps-label">Transcript Timestamps</label>
+  <div class="setting-desc">Prefix each transcript line with its receive time, including milliseconds and timezone. Applies to newly opened SSH, telnet and serial sessions; does not change the live terminal or diagnostic trace.</div>
+  <div class="custom-select" data-section="nexus.logging" data-key="sessionTranscriptTimestamps">
+    <input type="hidden" id="setting-nexus-logging-sessionTranscriptTimestamps" value="local" />
+    <div class="custom-select-trigger" tabindex="0" role="combobox" aria-haspopup="listbox" aria-labelledby="setting-nexus-logging-sessionTranscriptTimestamps-label" aria-expanded="false">
+      <span class="custom-select-text">Local time</span>
+    </div>
+    <div class="custom-select-dropdown" role="listbox" aria-labelledby="setting-nexus-logging-sessionTranscriptTimestamps-label">
+      <div class="custom-select-option selected" data-value="local" role="option" aria-selected="true">Local time <span class="recommended-badge">recommended</span></div>
+        <div class="custom-select-option" data-value="utc" role="option" aria-selected="false">UTC</div>
+        <div class="custom-select-option" data-value="off" role="option" aria-selected="false">Off</div>
+    </div>
+  </div>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.logging.sessionTranscriptTimestamps"></span>
+</div>
+  <div class="form-group">
   <label for="setting-nexus-logging-sessionLogDirectory">Session Log Directory</label>
   <div class="setting-desc">Leave empty to use the default extension storage location.</div>
   <div class="file-input-row">

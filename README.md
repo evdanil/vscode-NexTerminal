@@ -122,7 +122,7 @@ Then open the **Nexus** sidebar (activity bar icon).
 
 - **Highlighting** — named profiles group regex rules for errors, warnings, addresses, and more; choose a default, assign profiles to connections, or override an individual terminal. → [Highlighting](docs/terminal.md#highlighting)
 - **Tab commands** — right-click a Nexus terminal tab to select its highlight profile, reset the terminal, clear scrollback, or copy its output. → [Tab Commands](docs/terminal.md#tab-commands)
-- **Session transcripts** — clean, ANSI-stripped output of SSH, telnet, and serial sessions logged to rotating files, per profile; **Open Log Directory** opens them. → [Session Transcript Logging](docs/terminal.md#session-transcript-logging)
+- **Session transcripts** — clean, ANSI-stripped output of SSH, telnet, and serial sessions logged to rotating files, with per-line timestamps on by default (local, UTC, or off); **Open Log Directory** opens them. → [Session Transcript Logging](docs/terminal.md#session-transcript-logging)
 - **Keyboard passthrough** — `Ctrl+` combinations go straight to vim, nano, or htop, configurable per key. → [Keyboard Passthrough](docs/terminal.md#keyboard-passthrough)
 - **Appearance** — terminal font and colour schemes, including schemes imported from MobaXterm. → [Appearance](docs/terminal.md#appearance)
 
