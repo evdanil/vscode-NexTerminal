@@ -1,20 +1,21 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const state = vi.hoisted(() => ({ global: {} as Record<string, unknown>, workspace: {} as Record<string, unknown>, writes: [] as Array<[string, unknown]>, failKey: "", overrideAfterProfiles: undefined as unknown }));
+const state = vi.hoisted(() => ({ global: {} as Record<string, unknown>, remote: {} as Record<string, unknown>, workspace: {} as Record<string, unknown>, writes: [] as Array<[string, unknown]>, failKey: "", overrideAfterProfiles: undefined as unknown }));
 vi.mock("vscode", () => ({
   ConfigurationTarget: { Global: 1 },
   workspace: { getConfiguration: () => ({
-    inspect: (key: string) => ({ globalValue: state.global[key], workspaceValue: state.workspace[key], defaultValue: key === "profiles" ? null : key === "defaultProfile" ? "default" : key === "enabled" ? true : [{ pattern: "SHIPPED", color: "red" }] }),
-    get: (key: string, fallback: unknown) => state.workspace[key] ?? state.global[key] ?? (key === "profiles" ? null : key === "defaultProfile" ? "default" : key === "enabled" ? true : fallback),
+    inspect: (key: string) => ({ globalValue: (state.remote[key] !== undefined ? state.remote[key] : state.global[key]) ?? undefined, globalLocalValue: state.global[key], globalRemoteValue: state.remote[key], workspaceValue: state.workspace[key], defaultValue: key === "profiles" ? null : key === "defaultProfile" ? "default" : key === "enabled" ? true : [{ pattern: "SHIPPED", color: "red" }] }),
+    get: (key: string, fallback: unknown) => state.workspace[key] !== undefined ? state.workspace[key] : state.remote[key] !== undefined ? state.remote[key] : state.global[key] !== undefined ? state.global[key] : (key === "profiles" ? null : key === "defaultProfile" ? "default" : key === "enabled" ? true : fallback),
     update: async (key: string, value: unknown) => { if (key === state.failKey) throw new Error("write failed"); state.writes.push([key, value]); state.global[key] = value; if (key === "profiles" && state.overrideAfterProfiles !== undefined) state.global.profiles = state.overrideAfterProfiles; }
   }) }
 }));
 
 import { FORMER_DEFAULT_PATTERNS } from "../../src/utils/highlightRuleUpgrade";
+import { readHighlightCatalog } from "../../src/services/terminal/highlightProfileSettings";
 import { readHighlightEditorState, saveHighlightEditorCatalog } from "../../src/ui/highlightProfileEditorStore";
 
 describe("highlight profile editor storage", () => {
-  beforeEach(() => { state.global = {}; state.workspace = {}; state.writes = []; state.failKey = ""; state.overrideAfterProfiles = undefined; });
+  beforeEach(() => { state.global = {}; state.remote = {}; state.workspace = {}; state.writes = []; state.failKey = ""; state.overrideAfterProfiles = undefined; });
 
   it("reports whether highlighting is enabled in the effective scope", () => {
     state.global.enabled = false; state.workspace.enabled = true;
@@ -117,6 +118,40 @@ describe("highlight profile editor storage", () => {
     expect(state.writes).toEqual([["defaultProfile", null], ["profiles", []]]);
   });
 
+  it("saves a new profile with no global default when VS Code reports a null user value", async () => {
+    const initial = readHighlightEditorState();
+    const profiles = [...initial.catalog.profiles, { id: "cisco", name: "Cisco", rules: [{ pattern: "\\bERROR\\b", color: "red", bold: true }] }];
+    const result = await saveHighlightEditorCatalog(profiles, null, initial.revision);
+    expect(result.ok).toBe(true);
+    expect(readHighlightEditorState().catalog.defaultProfileId).toBe(null);
+    expect(state.global.profiles).toEqual(profiles);
+  });
+
+  it("reads a null global default independently of a workspace override", () => {
+    state.global.defaultProfile = null;
+    state.workspace.defaultProfile = "workspace";
+    expect(readHighlightEditorState().catalog.defaultProfileId).toBe(null);
+  });
+
+  it.each([null, "cisco"])("saves global default %s without changing the workspace override", async (selection) => {
+    state.workspace.defaultProfile = "workspace";
+    const initial = readHighlightEditorState();
+    const profiles = [...initial.catalog.profiles, { id: "cisco", name: "Cisco", rules: [{ pattern: "\\bERROR\\b", color: "red", bold: true }] }];
+    const result = await saveHighlightEditorCatalog(profiles, selection, initial.revision);
+    expect(result.ok).toBe(true);
+    expect(readHighlightEditorState().catalog.defaultProfileId).toBe(selection);
+    expect(readHighlightCatalog().defaultProfileId).toBe("workspace");
+  });
+
+  it("respects the remote user default over the local user value", () => {
+    state.global.defaultProfile = null;
+    state.remote.defaultProfile = "remote";
+    expect(readHighlightEditorState().catalog.defaultProfileId).toBe("remote");
+    state.global.defaultProfile = "local";
+    state.remote.defaultProfile = null;
+    expect(readHighlightEditorState().catalog.defaultProfileId).toBe(null);
+  });
+
   it("clears a deleted default before switching to another profile", async () => {
     state.global.profiles = [{ id: "p", name: "P", rules: [] }, { id: "q", name: "Q", rules: [] }]; state.global.defaultProfile = "p";
     const initial = readHighlightEditorState();
@@ -137,7 +172,10 @@ describe("highlight profile editor storage", () => {
     state.failKey = "profiles";
     const result = await saveHighlightEditorCatalog(initial.catalog.profiles, initial.catalog.defaultProfileId, initial.revision);
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.message).toContain("save");
+    if (!result.ok) {
+      expect(result.message).toContain("write failed");
+      expect(result.message).not.toContain("Check settings permissions");
+    }
     expect(state.writes).toEqual([]);
   });
 });

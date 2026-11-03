@@ -81,8 +81,9 @@ export function saveHighlightEditorCatalog(profiles: unknown, defaultProfileId: 
         return { ok: false, message: `Highlight settings changed during save. ${HIGHLIGHT_CONFLICT_RECOVERY}` };
       }
       return { ok: true, state: saved };
-    } catch {
-      return { ok: false, message: `Could not save highlight profiles. Check settings permissions. Some settings may have changed. ${HIGHLIGHT_CONFLICT_RECOVERY}` };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message.replace(/[\x00-\x1f\x7f]+/g, " ").trim().slice(0, 300) : "";
+      return { ok: false, message: `Could not save highlight profiles.${detail ? ` ${detail}` : ""} Some settings may have changed. ${HIGHLIGHT_CONFLICT_RECOVERY}` };
     }
   };
   const result = pendingSave.then(save, save);

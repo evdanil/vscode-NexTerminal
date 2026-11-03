@@ -58,6 +58,11 @@ export function readGlobalHighlightCatalogForEditing(): HighlightCatalog {
   return readCatalog((key, fallback) => {
     const inspected = config.inspect<unknown>(key);
     if (inspected?.globalValue !== undefined) return inspected.globalValue;
+    // VS Code's merged globalValue uses nullish coalescing, so an explicit
+    // user null is omitted there even though the individual user layers retain it.
+    const layers = inspected as (typeof inspected & { globalLocalValue?: unknown; globalRemoteValue?: unknown });
+    if (layers?.globalRemoteValue === null ||
+        (layers?.globalRemoteValue === undefined && layers?.globalLocalValue === null)) return null;
     return inspected?.defaultValue !== undefined ? inspected.defaultValue : fallback;
   });
 }
