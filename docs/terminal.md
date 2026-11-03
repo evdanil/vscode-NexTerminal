@@ -56,6 +56,29 @@ The time records when Nexus receives the first output on a line, before the log'
 
 The logging default, log directory and rotation limits are also under **Settings → Logging**. Timestamp prefixes count toward the file-size limit. **Terminal Output Trace** is a separate troubleshooting setting: it remains off by default and already records a UTC ISO timestamp on each diagnostic entry/chunk. Enable session transcripts for ordinary session records.
 
+### Log folders and filenames
+
+Set **Settings → Logging → Session Log Path Template** (`nexus.logging.sessionLogPathTemplate`) to organize new SSH, telnet and serial logs. It is a relative path beneath **Session Log Directory**, with a filename ending in `.log`. Empty keeps automatic filenames. Both `/` and `\` create subfolders on every platform.
+
+For example, use root `D:\NexusLogs` on Windows or `/home/me/NexusLogs` on Linux and template `%G/%S/%S-%Y-%M-%D-%h-%m-%s-%t.log`. Profile **Switch1** in group **Canada/Core** could produce `Canada/Core/Switch1/Switch1-2026-11-03-09-08-07-006.log`. **Open Log Directory** opens the root.
+
+| Token | Value |
+| --- | --- |
+| `%S` | Saved session/profile name |
+| `%G` | Group/location hierarchy; omitted when empty |
+| `%H` | Configured hostname; `unknown-host` for serial |
+| `%P` | SSH/telnet port or configured serial device identifier; `auto` if unavailable |
+| `%Y`, `%M`, `%D` | Four-digit year, two-digit month and day |
+| `%h`, `%m`, `%s`, `%t` | Two-digit hour, minute and second; three-digit milliseconds |
+| `%%` | Literal percent sign |
+| `%ENVIRONMENT_VARIABLE%` | Variable from the machine running the extension |
+
+Date tokens use one **local session-creation time**, independently of per-line timestamp mode. The opening profile/group/endpoint and filename remain fixed through reconnects and Smart Follow reattachments. Adjacent tokens work (`%S%Y`); reserved one-character tokens take precedence over one-letter environment variables. Values expand once, so percent characters inside them stay literal.
+
+Environment variables also work in **Session Log Directory**: `%USERPROFILE%/NexusLogs` on Windows or `%HOME%/NexusLogs` on Linux/macOS. Put variables containing a root path there. Inside a relative template, environment values become a single safe filename component, like host/session/port values; group segments retain their hierarchy. Invalid filename characters are replaced, Windows device names protected and long substituted names shortened. Literal `.`/`..`, absolute paths, unsafe characters and symlink subfolders are refused.
+
+Sessions get separate files: an existing filename, rotated generation or active reservation causes a suffix such as `Switch1-2.log`. A hidden `.nexus-transcript-reservations` folder beside the logs holds internal records while they are open; normal close removes the records. An interrupted host can leave one, safely making later sessions choose another filename. If a runtime template or variable is unavailable, Nexus reports the setting in its diagnostic console and uses an automatic filename; an unavailable root variable uses the default directory. Nexus Settings and import validation catch malformed templates. Changes apply to newly opened terminals.
+
 ## Keyboard Passthrough
 
 Optionally pass `Ctrl+` key combinations (e.g. `Ctrl+B`, `Ctrl+N`) directly to the terminal for applications like vim, nano, and htop. Configurable per-key with 11 supported combinations.

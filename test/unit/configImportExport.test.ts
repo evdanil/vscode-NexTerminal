@@ -390,6 +390,7 @@ describe("SETTINGS_KEYS", () => {
     const keys = SETTINGS_KEYS.map((k) => `${k.section}.${k.key}`);
     expect(keys).toContain("nexus.logging.sessionTranscripts");
     expect(keys).toContain("nexus.logging.sessionTranscriptTimestamps");
+    expect(keys).toContain("nexus.logging.sessionLogPathTemplate");
     expect(keys).toContain("nexus.logging.sessionLogDirectory");
     expect(keys).toContain("nexus.logging.maxFileSizeMb");
     expect(keys).toContain("nexus.logging.maxRotatedFiles");
@@ -7082,6 +7083,7 @@ describe("sanitizeForSharing", () => {
       "nexus.terminal.highlighting.rules": [{ id: "rule-1", pattern: "warning" }],
       "nexus.logging.sessionTranscripts": true,
       "nexus.logging.sessionTranscriptTimestamps": "utc",
+      "nexus.logging.sessionLogPathTemplate": "%G/%S.log",
       "nexus.logging.sessionLogDirectory": "/sender/logs",
       "nexus.logging.terminalOutputTrace": true,
       "nexus.ssh.trustNewHosts": true,
@@ -7777,6 +7779,7 @@ describe("backup export round-trip", () => {
     configStore.set("nexus.ui.showTreeDescriptions", false);
 
     configStore.set("nexus.logging.sessionTranscriptTimestamps", "utc");
+    configStore.set("nexus.logging.sessionLogPathTemplate", "%G/%S.log");
 
     registerConfigCommands(sourceCore, vault);
 
@@ -7798,6 +7801,7 @@ describe("backup export round-trip", () => {
     expect(exported.exportType).toBe("backup");
     expect(exported.settings).toEqual({
       "nexus.logging.sessionTranscriptTimestamps": "utc",
+      "nexus.logging.sessionLogPathTemplate": "%G/%S.log",
       "nexus.ui.showTreeDescriptions": false,
       "nexus.terminal.passthroughKeys": ["b", "q", "w"],
       "nexus.terminal.highlighting.profiles": null,
@@ -7826,6 +7830,7 @@ describe("backup export round-trip", () => {
     expect(configStore.get("nexus.terminal.passthroughKeys")).toEqual(["b", "q", "w"]);
     expect(configStore.get("nexus.ui.showTreeDescriptions")).toBe(false);
     expect(configStore.get("nexus.logging.sessionTranscriptTimestamps")).toBe("utc");
+    expect(configStore.get("nexus.logging.sessionLogPathTemplate")).toBe("%G/%S.log");
     expect(mockShowWarningMessage).not.toHaveBeenCalledWith(
       "1 imported Nexus setting had an invalid value and was skipped."
     );

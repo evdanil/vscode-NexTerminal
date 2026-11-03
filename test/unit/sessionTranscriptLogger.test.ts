@@ -21,6 +21,62 @@ afterEach(() => {
 });
 
 describe("createSessionTranscript", () => {
+  it("releases a reserved filename if initialization fails", () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const dir = makeTempDir();
+    const transcript = createSessionTranscript(dir, "failed", true, {
+      pathTemplate: "failed.log",
+      get maxFileSizeBytes(): number { throw new Error("initialization failed"); }
+    });
+    transcript.write("discarded");
+    transcript.close();
+    expect(readdirSync(path.join(dir, ".nexus-transcript-reservations"))).toHaveLength(0);
+    expect(readFileSync(path.join(dir, "failed.log"), "utf8")).toBe("");
+  });
+
+  it("writes a nested template with endpoint context and releases its reservation on close", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(2026, 10, 3, 9, 8, 7, 6));
+    const dir = makeTempDir();
+    const transcript = createSessionTranscript(dir, "Switch1", true, {
+      pathTemplate: "%G/%S/%H-%P-%Y-%M-%D-%h-%m-%s-%t.log",
+      pathContext: { group: "Canada/Core", host: "switch.example", port: 22 }, timestampMode: "off"
+    });
+    const log = path.join(dir, "Canada/Core/Switch1/switch.example-22-2026-11-03-09-08-07-006.log");
+    const markerDir = path.join(path.dirname(log), ".nexus-transcript-reservations");
+    transcript.write("first\n");
+    transcript.flush?.();
+    expect(readFileSync(log, "utf8")).toContain("first\n");
+    expect(readdirSync(markerDir)).toHaveLength(1);
+    transcript.close();
+    expect(readdirSync(markerDir)).toHaveLength(0);
+  });
+
+  it("keeps simultaneous static-template sessions separate", () => {
+    const dir = makeTempDir();
+    const first = createSessionTranscript(dir, "one", true, { pathTemplate: "capture.log", timestampMode: "off" });
+    const second = createSessionTranscript(dir, "two", true, { pathTemplate: "capture.log", timestampMode: "off" });
+    first.write("FIRST ONLY\n");
+    second.write("SECOND ONLY\n");
+    first.close();
+    second.close();
+    expect(readFileSync(path.join(dir, "capture.log"), "utf8")).toContain("FIRST ONLY");
+    expect(readFileSync(path.join(dir, "capture.log"), "utf8")).not.toContain("SECOND ONLY");
+    expect(readFileSync(path.join(dir, "capture-2.log"), "utf8")).toContain("SECOND ONLY");
+    expect(readFileSync(path.join(dir, "capture-2.log"), "utf8")).not.toContain("FIRST ONLY");
+  });
+
+  it("falls back to automatic names for invalid runtime templates without losing output", () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const dir = makeTempDir();
+    const transcript = createSessionTranscript(dir, "fallback", true, { pathTemplate: "../escape.log" });
+    transcript.write("kept\n");
+    transcript.close();
+    const file = readdirSync(dir).find((name) => /^fallback_.*\.log$/.test(name))!;
+    expect(readFileSync(path.join(dir, file), "utf8")).toContain("kept\n");
+    expect(error).toHaveBeenCalledWith(expect.stringMatching(/nexus\.logging\.sessionLogPathTemplate.*automatic filename/));
+  });
+
   function recordedOutput(dir: string): string {
     const file = readdirSync(dir).find((name) => name.endsWith(".log"))!;
     const contents = readFileSync(path.join(dir, file), "utf8");

@@ -5,6 +5,7 @@
 ### Added
 
 - **Session transcripts include per-line receive timestamps by default**, using local time with milliseconds and a UTC offset. Choose Local time, UTC or Off in Settings → Logging → Transcript Timestamps; the selection applies to new SSH, telnet and serial terminals.
+- **Session log folders and filenames support templates** using session, hostname, port, group/location, date/time and environment-variable tokens. Existing files and active sessions keep separate log files; leave the template empty to retain automatic filenames.
 
 ## [2.8.312] — 2026-11-03
 

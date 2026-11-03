@@ -2309,6 +2309,13 @@ describe("#153 — setting descriptions name everything the setting governs", ()
 });
 
 describe("session transcript timestamps", () => {
+  it("contributes a path template disabled by default in both settings surfaces", async () => {
+    expect(packageJson.contributes.configuration?.properties?.["nexus.logging.sessionLogPathTemplate"])
+      .toMatchObject({ type: "string", default: "" });
+    const { SETTINGS_META } = await import("../../src/ui/settingsMetadata");
+    expect(SETTINGS_META.find((meta) => meta.section === "nexus.logging" && meta.key === "sessionLogPathTemplate"))
+      .toMatchObject({ type: "string", default: "" });
+  });
   it("offers local timestamps by default with UTC and Off in both settings surfaces", async () => {
     const setting = packageJson.contributes.configuration?.properties?.["nexus.logging.sessionTranscriptTimestamps"];
     expect(setting).toMatchObject({ type: "string", default: "local", enum: ["local", "utc", "off"] });

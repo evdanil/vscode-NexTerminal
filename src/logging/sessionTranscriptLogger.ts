@@ -1,8 +1,9 @@
-import { closeSync, existsSync, mkdirSync, openSync, renameSync, statSync, unlinkSync, write, writeSync } from "node:fs";
-import * as path from "node:path";
+import { closeSync, existsSync, openSync, renameSync, statSync, unlinkSync, write, writeSync } from "node:fs";
 import { normalizeLoggerRotationOptions, type LoggerRotationOptions } from "./terminalLogger";
 import { EMPTY_STRIP_CARRY, stripChunk, type StripCarry } from "../utils/ansi";
 import { normalizeTranscriptTimestampMode, TranscriptLineTimestamps, type TranscriptTimestampMode } from "./transcriptTimestamps";
+import { renderTranscriptPathTemplate, type TranscriptPathContext } from "./transcriptPathTemplate";
+import { reserveTranscriptFile, type ReservedTranscriptFile } from "./sessionLogPaths";
 
 // Control characters except \n, \r, \t
 const CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
@@ -287,11 +288,12 @@ class FileSessionTranscript implements SessionTranscript {
     private readonly rotation: LoggerRotationOptions,
     /** Retention cap — see {@link DEFAULT_MAX_RETAINED_BYTES} for the policy. */
     private readonly maxRetainedBytes: number,
-    private readonly timestamps: TranscriptLineTimestamps
+    private readonly timestamps: TranscriptLineTimestamps,
+    initialFd: number,
+    private readonly releaseReservation: () => void
   ) {
-    mkdirSync(path.dirname(filepath), { recursive: true });
-    this.currentSize = this.readCurrentSize();
-    this.openFd();
+    this.currentSize = 0;
+    this.fd = initialFd;
     const header = `--- Session started ${new Date().toISOString()} ---\n`;
     this.enqueue(header);
     liveTranscripts.add(this);
@@ -419,6 +421,7 @@ class FileSessionTranscript implements SessionTranscript {
     }
     this.releaseFd();
     liveTranscripts.delete(this);
+    this.releaseReservation();
   }
 
   private scheduleCloseRetry(): void {
@@ -456,6 +459,7 @@ class FileSessionTranscript implements SessionTranscript {
     this.pendingBytes = 0;
     this.releaseFd();
     liveTranscripts.delete(this);
+    this.releaseReservation();
     console.error(
       `[Nexus] Session transcript ${this.filepath}: the last ${lost} byte(s) could not be written and have been dropped.`
     );
@@ -1103,6 +1107,9 @@ export async function flushSessionTranscripts(
 }
 
 export interface SessionTranscriptOptions extends Partial<LoggerRotationOptions> {
+  /** Empty keeps the automatic filename; otherwise a relative .log path template. */
+  pathTemplate?: string;
+  pathContext?: Omit<TranscriptPathContext, "sessionName">;
   /** Per-line receive times, captured before buffering. Defaults to local time. */
   timestampMode?: TranscriptTimestampMode;
   /**
@@ -1131,20 +1138,45 @@ export function createSessionTranscript(
   if (!enabled) {
     return NOOP_TRANSCRIPT;
   }
+  let reserved: ReservedTranscriptFile | undefined;
   try {
-    const safeName = profileName.replace(/[^\w.-]/g, "_");
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const now = new Date();
+    const safeName = profileName.replace(/[^\w.-]/g, "_").slice(0, 180) || "session";
+    const timestamp = now.toISOString().replace(/[:.]/g, "-").slice(0, 19);
     const filename = `${safeName}_${timestamp}.log`;
-    const filepath = path.join(logDir, filename);
-    return new FileSessionTranscript(
-      filepath,
+    let relativePath = filename;
+    if (options?.pathTemplate) {
+      try {
+        relativePath = renderTranscriptPathTemplate(options.pathTemplate, { ...options.pathContext, sessionName: profileName }, now, process.env);
+      } catch (error) {
+        console.error(`[Nexus] nexus.logging.sessionLogPathTemplate: ${error instanceof Error ? error.message : String(error)} Using an automatic filename.`);
+      }
+    }
+    try {
+      reserved = reserveTranscriptFile(logDir, relativePath);
+    } catch (error) {
+      if (relativePath === filename) throw error;
+      // Filesystem errors can contain environment-expanded paths; report no values.
+      console.error("[Nexus] nexus.logging.sessionLogPathTemplate: Could not create the custom path. Check its subfolders and permissions. Using an automatic filename.");
+      reserved = reserveTranscriptFile(logDir, filename);
+    }
+    const transcript = new FileSessionTranscript(
+      reserved.filepath,
       normalizeLoggerRotationOptions(options),
       normalizeRetainedCap(options?.maxRetainedBytes),
-      new TranscriptLineTimestamps(normalizeTranscriptTimestampMode(options?.timestampMode))
+      new TranscriptLineTimestamps(normalizeTranscriptTimestampMode(options?.timestampMode)),
+      reserved.fd,
+      reserved.release
     );
+    reserved = undefined;
+    return transcript;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(`[Nexus] Failed to create session transcript in ${logDir}: ${message}`);
+    if (reserved) {
+      try { closeSync(reserved.fd); } catch { /* Descriptor may already be closed. */ }
+      reserved.release();
+    }
+    const code = (error as NodeJS.ErrnoException).code;
+    console.error(`[Nexus] Failed to create session transcript. Check nexus.logging.sessionLogDirectory and its permissions${code ? ` (${code})` : ""}.`);
     return NOOP_TRANSCRIPT;
   }
 }

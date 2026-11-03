@@ -63,12 +63,21 @@ export const SETTINGS_META: SettingMeta[] = [
     ]
   },
   {
+    key: "sessionLogPathTemplate",
+    section: "nexus.logging",
+    label: "Session Log Path Template",
+    type: "string",
+    category: "logging",
+    default: "",
+    description: "Relative folders and a .log filename under Session Log Directory, for example %G/%S/%S-%Y-%M-%D-%h-%m-%s-%t.log. %S is the session name, %G its group, %H host, %P port, %% a literal percent, and %ENVIRONMENT_VARIABLE% an environment value. Empty keeps automatic filenames. Applies to new sessions."
+  },
+  {
     key: "sessionLogDirectory",
     section: "nexus.logging",
     label: "Session Log Directory",
     type: "directory",
     category: "logging",
-    description: "Leave empty to use the default extension storage location."
+    description: "Root for session logs; supports %ENVIRONMENT_VARIABLE% and %% for a literal percent. Leave empty to use the default extension storage location."
   },
   {
     key: "maxFileSizeMb",

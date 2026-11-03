@@ -1,4 +1,5 @@
 import { SETTINGS_META, type SettingMeta } from "./settingsMetadata";
+import { validateTranscriptPathTemplate } from "../logging/transcriptPathTemplate";
 
 export interface SettingValidationOk {
   ok: true;
@@ -45,10 +46,14 @@ export function validateSettingUpdate(section: unknown, key: unknown, value: unk
       return { ok: true, meta, value };
     }
     case "string":
-    case "directory":
-      return typeof value === "string"
-        ? { ok: true, meta, value }
-        : { ok: false, message: "Expected a string value." };
+    case "directory": {
+      if (typeof value !== "string") return { ok: false, message: "Expected a string value." };
+      if (section === "nexus.logging" && key === "sessionLogPathTemplate") {
+        const message = validateTranscriptPathTemplate(value);
+        if (message) return { ok: false, message };
+      }
+      return { ok: true, meta, value };
+    }
     case "enum": {
       const allowed = new Set((meta.enumOptions ?? []).map((option) => option.value));
       return typeof value === "string" && allowed.has(value)

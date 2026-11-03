@@ -239,8 +239,11 @@ Reverse-bind reservations are separate files in `globalStorageUri`, outside the 
    - `nexus.logging.maxRotatedFiles` (`0-99`)
    - `nexus.logging.sessionTranscripts` (enable/disable)
    - `nexus.logging.sessionTranscriptTimestamps` (`local` by default; `utc` or `off`; new terminals)
+   - `nexus.logging.sessionLogPathTemplate` (empty by default; relative `.log` path for new terminals)
    - `nexus.logging.sessionLogDirectory` (custom path)
    - `nexus.logging.terminalOutputTrace` (per-chunk data trace; default off)
+
+7. Log path templates support `%S` saved profile name, `%G` group hierarchy, `%H` configured hostname (`unknown-host` for serial), `%P` port/configured serial identifier (`auto` if absent), `%Y/%M/%D/%h/%m/%s/%t` local creation date/time fields, `%%` and `%ENVIRONMENT_VARIABLE%`. Context/date values are captured when the terminal opens, independently of line timestamp mode. Session Log Directory separately expands environment variables and is also the root opened by Open Log Directory. Expansion is single-pass; host/session/port/env substitutions are safe filename components and group segments are sanitized separately. Root paths belong in the directory setting. Browser-safe grammar validation is shared with settings/import. Invalid runtime templates or unavailable variables produce a setting-specific diagnostic and automatic filename; invalid root variables consistently fall back to the default root. Relative paths cannot traverse, use Windows-invalid literal characters or enter symlink subfolders. Template basenames end in `.log`, separating them from rotation generations. An exclusive marker in `.nexus-transcript-reservations` owns a case/Unicode-normalized filename family through final close/retry/abandonment; an exclusive initial descriptor and numeric suffixes protect existing files and `.1`–`.99` generations. Stale markers are not automatically reclaimed. Backup/reset include this metadata setting; sharing keeps it local.
 
 ### 4.8 Group Management
 - Servers and serial profiles can be organized into named groups.
@@ -763,7 +766,8 @@ For an invalid catalog or default, or a default that names a missing profile, in
 |---------|------|---------|-------|-------------|
 | `nexus.logging.sessionTranscripts` | boolean | `true` | — | Enable session transcript logging |
 | `nexus.logging.sessionTranscriptTimestamps` | string | `"local"` | `local`, `utc`, `off` | Per-line receive timestamps with milliseconds and timezone; applies to new terminals |
-| `nexus.logging.sessionLogDirectory` | string | *(extension storage)* | — | Custom directory for session logs |
+| `nexus.logging.sessionLogPathTemplate` | string | `""` | Relative `.log` path | Session/host/port/group/date/environment template for new terminals; empty keeps automatic names |
+| `nexus.logging.sessionLogDirectory` | string | *(extension storage)* | — | Root directory for logs; supports environment variables and escaped percent |
 | `nexus.logging.terminalOutputTrace` | boolean | `false` | — | Troubleshooting only: per-chunk trace of terminal output to the diagnostic log. Adds latency to terminal output and stores session data — including echoed passwords — as plaintext |
 | `nexus.logging.maxFileSizeMb` | number | `10` | 1–100 MB | Max log file size before rotation |
 | `nexus.logging.maxRotatedFiles` | number | `1` | 0–99 | Number of rotated log files to keep |

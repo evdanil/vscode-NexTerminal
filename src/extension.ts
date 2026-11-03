@@ -1,3 +1,4 @@
+import { resolveSessionLogDirectory } from "./logging/sessionLogPaths";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { registerFileCommands } from "./commands/fileCommands";
@@ -844,7 +845,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     loggerFactory,
     get sessionLogDir() {
       const custom = vscode.workspace.getConfiguration("nexus.logging").get<string>("sessionLogDirectory", "");
-      return custom || defaultSessionLogDir;
+      return resolveSessionLogDirectory(custom, defaultSessionLogDir);
     },
     terminalsByServer,
     sessionTerminals,

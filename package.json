@@ -3884,16 +3884,22 @@
           "order": 4,
           "markdownDescription": "Prefix each session transcript line with its receive time, including milliseconds and timezone (for example, `2025-01-15 09:00:12.345+10:00`). Applies to newly opened SSH, telnet and serial sessions. Records when Nexus receives the first output on a line, not when the remote device produced it. Does not change the live terminal or diagnostic trace."
         },
-        "nexus.logging.sessionLogDirectory": {
+        "nexus.logging.sessionLogPathTemplate": {
           "type": "string",
           "default": "",
           "order": 5,
-          "markdownDescription": "Directory for session transcript logs. Leave empty to use the default extension storage location."
+          "markdownDescription": "Relative folders and a `.log` filename under Session Log Directory, for example `%G/%S/%S-%Y-%M-%D-%h-%m-%s-%t.log`. Empty keeps automatic filenames. Applies to new SSH, telnet and serial sessions. Tokens: `%S` session/profile name, `%G` group hierarchy, `%H` host, `%P` port, `%Y` year, `%M` month, `%D` day, `%h` hour, `%m` minute, `%s` second, `%t` milliseconds, `%%` literal percent, `%ENVIRONMENT_VARIABLE%` environment value. Date tokens use local session-creation time. Substituted values are safe filename components; use Session Log Directory for environment variables containing a root path."
+        },
+        "nexus.logging.sessionLogDirectory": {
+          "type": "string",
+          "default": "",
+          "order": 6,
+          "markdownDescription": "Root directory for session transcript logs. Supports `%ENVIRONMENT_VARIABLE%` and `%%` for a literal percent. Leave empty to use the default extension storage location."
         },
         "nexus.logging.terminalOutputTrace": {
           "type": "boolean",
           "default": false,
-          "order": 6,
+          "order": 7,
           "markdownDescription": "Troubleshooting only. Write every chunk of terminal output to the diagnostic log as it arrives.\n\nLeave this off unless support asks for it. It writes to disk once for every chunk a session receives, which adds latency to terminal output, and it records session data verbatim — including anything typed or echoed on screen, such as passwords and keys — as plaintext in the extension's log folder. Session transcripts (`#nexus.logging.sessionTranscripts#`) are the supported way to keep a record of a session."
         },
         "nexus.tunnel.defaultConnectionMode": {
