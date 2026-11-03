@@ -583,7 +583,7 @@ async function openLocalShell(
   let terminatedEarly = false;
   const triggerObserver = ctx.macroAutoTrigger.createObserver(
     (text) => ptyRef?.handleInput(text),
-    () => ctx.focusedTerminal === terminalRef,
+    () => terminalRef !== undefined && vscode.window.activeTerminal === terminalRef,
     sessionId,
     profile.id
   );

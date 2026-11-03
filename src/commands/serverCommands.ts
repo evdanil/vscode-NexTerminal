@@ -1238,7 +1238,7 @@ async function connectTelnetServer(
       let ptyRef: TelnetPty | undefined;
       const triggerObserver = ctx.macroAutoTrigger.createObserver(
         (text) => ptyRef?.handleInput(text),
-        () => ctx.focusedTerminal === terminalRef,
+        () => terminalRef !== undefined && vscode.window.activeTerminal === terminalRef,
         undefined,
         server.id
       );
@@ -1435,7 +1435,7 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
       let ptyRef: SshPty | undefined;
       const triggerObserver = ctx.macroAutoTrigger.createObserver(
         (text) => ptyRef?.handleInput(text),
-        () => ctx.focusedTerminal === terminalRef,
+        () => terminalRef !== undefined && vscode.window.activeTerminal === terminalRef,
         undefined,
         server.id
       );

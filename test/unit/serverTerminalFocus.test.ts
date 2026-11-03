@@ -1,10 +1,26 @@
 import { PassThrough } from "node:stream";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MacroAutoTrigger } from "../../src/services/macroAutoTrigger";
+import { InMemoryMacroStore } from "../../src/storage/inMemoryMacroStore";
+import { setActiveMacroStore } from "../../src/macroSettings";
+import { applyActiveEditorChange } from "../../src/utils/sessionTerminalFocus";
 import type { CommandContext } from "../../src/commands/types";
 import { registerServerCommands } from "../../src/commands/serverCommands";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockCreateTerminal = vi.fn();
+let mockActiveTerminal: unknown;
+let mockTelnetOutput: ((text: string) => void) | undefined;
+const mockTelnetWrite = vi.fn();
+vi.mock("../../src/services/telnet/telnetPty", () => ({
+  TelnetPty: class {
+    constructor(_server: unknown, _callbacks: unknown, _logger: unknown, options: { outputObserver: { onOutput(text: string): void } }) {
+      mockTelnetOutput = (text) => options.outputObserver.onOutput(text);
+    }
+    open(): void {}
+    handleInput(text: string): void { mockTelnetWrite(text); }
+  }
+}));
 const mockWithProgress = vi.fn(async (_options: unknown, task: () => Promise<unknown>) => task());
 
 function getGlobalStateValue<T>(_key: string): T | undefined;
@@ -26,6 +42,7 @@ vi.mock("vscode", () => ({
     executeCommand: vi.fn()
   },
   window: {
+    get activeTerminal() { return mockActiveTerminal; },
     showQuickPick: vi.fn(),
     showInformationMessage: vi.fn(),
     showWarningMessage: vi.fn(),
@@ -116,13 +133,18 @@ async function flushAsync(): Promise<void> {
 
 describe("server terminal focus tracking", () => {
   beforeEach(() => {
+    vi.useFakeTimers();
     vi.clearAllMocks();
     registeredCommands.clear();
+    mockActiveTerminal = undefined;
   });
 
-  it("treats a newly shown SSH terminal as focused before initial data arrives", async () => {
+  afterEach(() => vi.useRealTimers());
+
+  it.each(["ssh", "telnet"] as const)("keeps %s active-only macros working after editing without switching terminals", async (protocol) => {
     const server = {
       id: "srv-1",
+      protocol,
       name: "Server 1",
       host: "example.com",
       port: 22,
@@ -130,7 +152,15 @@ describe("server terminal focus tracking", () => {
       authType: "password" as const,
       isHidden: false
     };
+    const store = new InMemoryMacroStore();
+    setActiveMacroStore(store);
+    const macroAutoTrigger = new MacroAutoTrigger();
     const stream = new PassThrough();
+    const write = protocol === "ssh" ? vi.spyOn(stream, "write") : mockTelnetWrite;
+    const emitOutput = (text: string): void => {
+      if (protocol === "ssh") stream.push(text);
+      else mockTelnetOutput!(text);
+    };
     const connection = {
       openShell: vi.fn(async () => stream),
       getBanner: vi.fn(() => undefined),
@@ -153,6 +183,7 @@ describe("server terminal focus tracking", () => {
         focusedSessionId: undefined
       })),
       registerSession: vi.fn(),
+      setFocusedSession: vi.fn(),
       unregisterSession: vi.fn(),
       markSessionActivity: vi.fn(),
       clearSessionActivity: vi.fn(),
@@ -165,6 +196,7 @@ describe("server terminal focus tracking", () => {
     };
     mockCreateTerminal.mockImplementation(({ pty }: { pty: { open(): void } }) => {
       terminal.show.mockImplementation(() => {
+        mockActiveTerminal = terminal;
         pty.open();
       });
       return terminal;
@@ -184,7 +216,7 @@ describe("server terminal focus tracking", () => {
       localShellTerminals: new Map(),
       localServerTerminals: new Map(),
       highlighter: { apply: vi.fn((text: string) => text) } as any,
-      macroAutoTrigger: { createObserver: vi.fn(() => undefined) } as any,
+      macroAutoTrigger,
       sftpService: {} as any,
       fileExplorerProvider: {} as any,
       focusedTerminal: undefined,
@@ -210,5 +242,36 @@ describe("server terminal focus tracking", () => {
 
     expect(ctx.focusedTerminal).toBe(terminal as any);
     expect(core.markSessionActivity).not.toHaveBeenCalled();
+
+    // Editing clears the activity-focus hint, but VS Code keeps the selected
+    // terminal. Returning to that same terminal emits no active-terminal event.
+    applyActiveEditorChange({
+      core: { ...core, setFocusedSession: vi.fn() },
+      target: ctx,
+      activityIndicators: ctx.activityIndicators,
+      resolveSessionId: () => "session-1"
+    });
+    await store.save([{
+      id: "prompt", name: "Prompt", text: "answer", triggerPattern: "Password:",
+      triggerScope: "active-session", triggerCooldown: 0
+    }]);
+    macroAutoTrigger.reload();
+    write.mockClear();
+    emitOutput("Password:");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(write).toHaveBeenCalledWith("answer");
+
+    for (const selected of [{ name: "Another terminal" }, undefined]) {
+      mockActiveTerminal = selected;
+      write.mockClear();
+      emitOutput("Password:");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(write).not.toHaveBeenCalled();
+    }
+    mockActiveTerminal = terminal;
+    emitOutput("Password:");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(write).toHaveBeenCalledWith("answer");
+    macroAutoTrigger.dispose();
   });
 });

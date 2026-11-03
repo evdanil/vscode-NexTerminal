@@ -448,6 +448,28 @@ describe("serial terminal tab visual differentiation", () => {
     registeredCommands.clear();
   });
 
+  it.each(["standard", "smartFollow"])("keeps %s macro eligibility after editor focus changes", async (mode) => {
+    const ctx = makeSerialCtx();
+    ctx.core.getSerialProfile = vi.fn(() => ({ ...baseProfile, mode }));
+    let isActive!: () => boolean;
+    let activeBeforeTerminal: boolean | undefined;
+    ctx.macroAutoTrigger.createObserver.mockImplementation((_send: unknown, active: () => boolean) => {
+      isActive = active;
+      activeBeforeTerminal = isActive();
+      return {};
+    });
+    registerSerialCommands(ctx);
+    await registeredCommands.get("nexus.serial.connect")!("sp1");
+    const terminal = ctx.focusedTerminal;
+    expect(terminal).toBeDefined();
+    ctx.focusedTerminal = undefined; // The editor-focus listener clears this hint.
+    for (const [selected, expected] of [[terminal, true], [{ name: "other" }, false], [undefined, false]] as const) {
+      Object.defineProperty(vscode.window, "activeTerminal", { configurable: true, value: selected });
+      expect(isActive()).toBe(expected);
+    }
+    expect(activeBeforeTerminal).toBe(false);
+  });
+
   it("creates standard serial terminal with plug icon and cyan color", async () => {
     const ctx = makeSerialCtx();
     registerSerialCommands(ctx);
