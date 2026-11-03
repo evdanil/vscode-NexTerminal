@@ -63,17 +63,31 @@ describe("saved highlight profile form values", () => {
 
   it("distinguishes a None default from a missing default and explains the master switch", () => {
     expect(highlightProfileSelectField({ ...catalog, defaultProfileId: null }).options[0].label).toBe("Use global default (None)");
-    expect(highlightProfileSelectField({ ...catalog, defaultProfileId: "lost" }).options[0].label).toMatch(/missing.*lost/i);
+    const missing = highlightProfileSelectField({ ...catalog, defaultProfileId: "lost" });
+    expect(missing.options[0].label).toMatch(/missing.*lost/i);
+    expect(missing.hint).toContain("nexus.terminal.highlighting.defaultProfile");
+    expect(missing.hint).toContain("Workspace Settings (JSON)");
+    expect(missing.hint).not.toContain("Nexus: Edit Highlighting Rules");
     expect(highlightProfileSelectField({ ...catalog, enabled: false }).hint).toMatch(/off globally/i);
   });
 
-  it("points both normal and invalid-catalog hints to the registered editor command", () => {
-    for (const value of [catalog, { ...catalog, validationError: "Invalid catalog" }]) {
-      const hint = highlightProfileSelectField(value).hint;
-      expect(hint).toContain("Nexus: Edit Highlighting Rules");
-      expect(hint).not.toContain("Nexus: Manage Highlight Profiles");
-    }
+  it("offers the manager when the catalog is valid", () => {
+    const hint = highlightProfileSelectField(catalog).hint;
+    expect(hint).toContain("Nexus: Edit Highlighting Rules");
   });
+
+  it.each(["Invalid catalog", "The default highlight profile must be a profile ID or null."])(
+    "gives actionable settings JSON recovery for %s without advertising the manager", (error) => {
+      const hint = highlightProfileSelectField({ ...catalog, validationError: error }).hint;
+      expect(hint).toContain("nexus.terminal.highlighting.profiles");
+      expect(hint).toContain("nexus.terminal.highlighting.defaultProfile");
+      expect(hint).toContain("User Settings (JSON)");
+      expect(hint).toContain("Workspace Settings (JSON)");
+      expect(hint).toContain("Folder Settings (JSON)");
+      expect(hint).not.toContain("Nexus: Edit Highlighting Rules");
+    }
+  );
+
 });
 
 describe("highlight selection on every saved connection form", () => {

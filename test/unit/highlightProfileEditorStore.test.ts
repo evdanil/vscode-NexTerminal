@@ -48,6 +48,36 @@ describe("highlight profile editor storage", () => {
     expect(readHighlightEditorState().workspaceCatalogOverrides).toBe(true);
   });
 
+  it.each(["profiles", "defaultProfile"])("reports malformed global %s with a settings repair path", async (key) => {
+    state.global[key] = 42;
+    const initial = readHighlightEditorState();
+    expect(initial.catalog.validationError).toBeTruthy();
+    const result = await saveHighlightEditorCatalog([], null, initial.revision);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.message).toContain("User Settings (JSON)");
+      expect(result.message).toContain("nexus.terminal.highlighting.profiles");
+      expect(result.message).toContain("nexus.terminal.highlighting.defaultProfile");
+      expect(result.message).not.toContain("Nexus: Edit Highlighting Rules");
+    }
+    expect(state.writes).toEqual([]);
+  });
+
+  it.each(["profiles", "defaultProfile"])("surfaces malformed workspace %s to the global manager", (key) => {
+    state.workspace[key] = 42;
+    const initial = readHighlightEditorState();
+    expect(initial.catalog.validationError).toBeUndefined();
+    expect(initial.effectiveValidationError).toBeTruthy();
+  });
+
+  it("reports a missing effective default even when the global catalog is valid", () => {
+    state.workspace.defaultProfile = "lost";
+    const initial = readHighlightEditorState();
+    expect(initial.catalog.defaultProfileId).toBe("default");
+    expect(initial.effectiveValidationError).toBeUndefined();
+    expect(initial.effectiveMissingDefaultId).toBe("lost");
+  });
+
   it("rejects stale revisions and malformed profile data without writing", async () => {
     const initial = readHighlightEditorState();
     state.global.rules = [{ pattern: "OTHER", color: "green" }];

@@ -5,6 +5,7 @@ import { serializeForInlineScript } from "./shared/inlineScriptData";
 import { renderWebviewDocument } from "./shared/webviewDocument";
 import { regexSafetyWebviewJs } from "../utils/regexSafety";
 import type { HighlightRule } from "../utils/highlightRuleValidation";
+import { HIGHLIGHT_SETTINGS_REPAIR } from "./highlightProfileForm";
 
 const COLOR_NAMES = [
   "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
@@ -36,10 +37,14 @@ export function renderHighlightRuleEditorHtml(rules: HighlightRule[], nonce: str
   const colorCssJson = serializeForInlineScript(COLOR_CSS);
   const rulesJson = serializeForInlineScript(rules);
   const managerJson = serializeForInlineScript(manager ?? null);
+  const recoveryJson = serializeForInlineScript(HIGHLIGHT_SETTINGS_REPAIR);
 
   return renderWebviewDocument({
     nonce,
     css: `    ${baseWebviewCss()}
+    #profile-repair-actions[hidden] {
+      display: none;
+    }
     .rule-row {
       display: flex;
       align-items: center;
@@ -191,6 +196,10 @@ export function renderHighlightRuleEditorHtml(rules: HighlightRule[], nonce: str
     <div id="profile-workspace-note" class="setting-desc" hidden>Workspace legacy rules differ from global rules. Copy them explicitly to edit and save them globally.</div>
     <button type="button" id="profile-workspace-copy" hidden>Copy workspace rules to selected profile</button>
     <div id="profile-validation-error" class="editor-error" aria-live="polite"></div>
+    <div id="profile-repair-actions" class="button-row" hidden>
+      <button type="button" id="profile-repair-user">Open User Settings (JSON)</button>
+      <button type="button" id="profile-repair-workspace">Open Workspace Settings (JSON)</button>
+    </div>
   </section>
   <div class="setting-desc">Rules use first-match precedence. Move specific rules above broader rules. Untick a rule to keep it but stop applying it.</div>
 
@@ -271,6 +280,7 @@ DEBUG: packet sent 1024 bytes</div>
       ${regexSafetyWebviewJs()}
 
       var manager = ${managerJson};
+      var recoveryInstructions = ${recoveryJson};
       var profiles = manager ? JSON.parse(JSON.stringify(manager.catalog.profiles)) : null;
       var originalProfiles = profiles ? JSON.parse(JSON.stringify(profiles)) : null;
       var defaultProfileId = manager ? manager.catalog.defaultProfileId : null;
@@ -385,16 +395,24 @@ DEBUG: packet sent 1024 bytes</div>
         document.getElementById("profile-workspace-note").hidden = !manager.workspaceLegacyRules;
         document.getElementById("profile-workspace-copy").hidden = !manager.workspaceLegacyRules;
       }
+      function updateRecovery(state) {
+        var errors = [];
+        if (state.catalog.validationError) errors.push(state.catalog.validationError);
+        if (state.effectiveValidationError && errors.indexOf(state.effectiveValidationError) < 0) errors.push(state.effectiveValidationError);
+        if (state.effectiveMissingDefaultId) errors.push("Default highlight profile is missing: " + state.effectiveMissingDefaultId + ".");
+        document.getElementById("profile-validation-error").textContent = errors.length ? errors.join(" ") + " " + recoveryInstructions : "";
+        document.getElementById("profile-repair-actions").hidden = errors.length === 0;
+      }
       function initProfileManager() {
         updateScopeWarnings();
+        updateRecovery(manager);
         refreshProfileSelectors(); selectProfile(selectedProfileId);
-        var validationError = document.getElementById("profile-validation-error");
-        validationError.textContent = manager.catalog.validationError || "";
-        if (manager.catalog.validationError) document.getElementById("save-error").textContent = "Fix invalid highlight settings before saving.";
         if (manager.workspaceLegacyRules) {
           document.getElementById("profile-workspace-note").hidden = false;
           document.getElementById("profile-workspace-copy").hidden = false;
         }
+        document.getElementById("profile-repair-user").addEventListener("click", function() { vscode.postMessage({ type: "openHighlightSettingsJson", scope: "user" }); });
+        document.getElementById("profile-repair-workspace").addEventListener("click", function() { vscode.postMessage({ type: "openHighlightSettingsJson", scope: "workspace" }); });
         document.getElementById("profile-select").addEventListener("change", function(e) { selectProfile(e.target.value); });
         document.getElementById("profile-default").addEventListener("change", function(e) { defaultProfileId = e.target.value || null; recomputeDirty(); });
         document.getElementById("profile-create").addEventListener("click", function() { addProfile([]); });
@@ -811,6 +829,7 @@ DEBUG: packet sent 1024 bytes</div>
           refreshProfileSelectors(); selectProfile(selectedProfileId); recomputeDirty();
         }
         if (manager && msg.type === "catalogUpdated") {
+          updateRecovery(msg.state);
           if (document.getElementById("apply-rules-btn").disabled && !pendingSnapshot) {
             manager = msg.state; profiles = JSON.parse(JSON.stringify(manager.catalog.profiles)); originalProfiles = JSON.parse(JSON.stringify(profiles));
             defaultProfileId = manager.catalog.defaultProfileId; originalDefaultProfileId = defaultProfileId; revision = manager.revision;

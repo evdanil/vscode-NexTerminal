@@ -77,4 +77,28 @@ describe("highlight profile manager", () => {
     expect(editor.workspaceOverrideVisible()).toBe(true);
   });
 
+  it.each(["global", "workspace"] as const)("shows settings repair actions for an invalid %s catalog", (scope) => {
+    const invalid = scope === "global"
+      ? { ...state, catalog: { ...state.catalog, validationError: "Invalid global default" } }
+      : { ...state, effectiveValidationError: "Invalid workspace catalog" };
+    const editor = openHighlightRuleEditor([], invalid);
+    expect(editor.recoveryMessage()).toContain(scope === "global" ? "Invalid global default" : "Invalid workspace catalog");
+    expect(editor.recoveryMessage()).toContain("nexus.terminal.highlighting.profiles");
+    expect(editor.recoveryMessage()).toContain("nexus.terminal.highlighting.defaultProfile");
+    expect(editor.recoveryMessage()).toContain("Folder Settings (JSON)");
+    expect(editor.recoveryMessage()).not.toContain("Nexus: Edit Highlighting Rules");
+    expect(editor.recoveryVisible()).toBe(true);
+    editor.openUserSettings(); editor.openWorkspaceSettings();
+    expect(editor.posted).toContainEqual({ type: "openHighlightSettingsJson", scope: "user" });
+    expect(editor.posted).toContainEqual({ type: "openHighlightSettingsJson", scope: "workspace" });
+    editor.deliver({ type: "catalogUpdated", state });
+    expect(editor.recoveryVisible()).toBe(false);
+  });
+  it("explains a missing effective default from workspace settings", () => {
+    const editor = openHighlightRuleEditor([], { ...state, effectiveMissingDefaultId: "lost" });
+    expect(editor.recoveryMessage()).toContain("lost");
+    expect(editor.recoveryMessage()).toContain("nexus.terminal.highlighting.defaultProfile");
+    expect(editor.recoveryVisible()).toBe(true);
+  });
+
 });

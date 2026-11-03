@@ -594,6 +594,44 @@ describe("config import command (legacy)", () => {
     expect(mockShowErrorMessage).toHaveBeenCalledWith(expect.stringContaining("highlight"));
   });
 
+  it.each([
+    ["profiles", [{ id: "bad", name: "Bad", rules: "bad" }]],
+    ["defaultProfile", 42]
+  ])("explains how to repair the existing global %s when a merge is refused", async (setting, invalid) => {
+    const prefix = "nexus.terminal.highlighting.";
+    configStore.set(prefix + setting, invalid);
+    await core.addOrUpdateServer(makeServer({ id: "existing" }));
+    await runImport(makeExportData({
+      servers: [makeServer({ id: "incoming" })],
+      settings: { [prefix + "profiles"]: [{ id: "remote", name: "Remote", rules: [] }] }
+    }), "merge");
+    expect(core.getSnapshot().servers.map((server) => server.id)).toEqual(["existing"]);
+    const message = mockShowErrorMessage.mock.calls.at(-1)?.[0] as string;
+    expect(message).toContain("existing");
+    expect(message).toContain("User Settings (JSON)");
+    expect(message).toContain(prefix + setting);
+    expect(message).not.toContain("Repair the export");
+    expect(message).not.toContain("Nexus: Edit Highlighting Rules");
+  });
+
+  it.each([
+    ["profiles", [{ id: "bad", name: "Bad", rules: "bad" }]],
+    ["defaultProfile", 42],
+    ["rules", "bad"]
+  ])("directs an invalid incoming %s to file repair instead of local settings", async (setting, invalid) => {
+    const prefix = "nexus.terminal.highlighting.";
+    await core.addOrUpdateServer(makeServer({ id: "existing" }));
+    await runImport(makeExportData({
+      servers: [makeServer({ id: "incoming" })], settings: { [prefix + setting]: invalid }
+    }), "replace");
+    expect(core.getSnapshot().servers.map((server) => server.id)).toEqual(["existing"]);
+    const message = mockShowErrorMessage.mock.calls.at(-1)?.[0] as string;
+    expect(message).toContain("export file");
+    expect(message).toContain("another file");
+    expect(message).not.toContain("User Settings (JSON)");
+    expect(message).not.toContain("Nexus: Edit Highlighting Rules");
+  });
+
   it("preserves an old backup's rules in merge and selects them for imported connections", async () => {
     const key = "nexus.terminal.highlighting.";
     const rule = { pattern: "old", color: "red" };

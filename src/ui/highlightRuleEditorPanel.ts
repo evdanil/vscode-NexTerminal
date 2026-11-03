@@ -47,7 +47,11 @@ export class HighlightRuleEditorPanel {
   private async handleMessage(msg: unknown): Promise<void> {
     if (typeof msg !== "object" || msg === null || Array.isArray(msg)) return;
     const request = msg as Record<string, unknown>;
-    if (request.type === "cancelCatalogDraft") {
+    if (request.type === "openHighlightSettingsJson") {
+      const command = request.scope === "user" ? "workbench.action.openSettingsJson"
+        : request.scope === "workspace" ? "workbench.action.openWorkspaceSettingsFile" : undefined;
+      if (command) await vscode.commands.executeCommand(command);
+    } else if (request.type === "cancelCatalogDraft") {
       this.confirmedDeletions.clear();
     } else if (request.type === "saveCatalog") {
       const state = readHighlightEditorState();

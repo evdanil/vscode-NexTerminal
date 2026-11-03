@@ -746,6 +746,8 @@ Shared local and dynamic tunnels use one in-flight SSH login for their listener 
 
 Saved SSH/telnet, serial, Local Shell and Local Server connections may inherit the default, select a profile, or select none. A terminal tab or active-session action can override that selection for one running terminal and return to the saved choice. Profile and default changes propagate to live terminals. Deleting a profile warns about saved and live references; unresolved selections apply no highlighting. Configuration exports include profiles and defaults. Merge and share preserve the recipient's default and remap conflicting profile IDs; replacement restores the imported default. Terminal-category and Reset All settings resets clear the profile catalog, default and legacy rules.
 
+For an invalid catalog or default, or a default that names a missing profile, inspect and correct or remove the profile and default settings in the applicable User, Workspace, Folder or Remote Settings JSON. The manager links to User and Workspace Settings JSON.
+
 ### 5.5 Logging
 
 | Setting | Type | Default | Range | Description |

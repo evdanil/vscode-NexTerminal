@@ -22,6 +22,7 @@ import type { HighlightEditorState } from "../../src/ui/highlightProfileEditorSt
 
 export type PostedRuleEditorMessage =
   | { type: "saveRules"; rules: HighlightRule[] }
+  | { type: "openHighlightSettingsJson"; scope: "user" | "workspace" }
   | { type: "resetDefaults" }
   | { type: "saveCatalog"; profiles: Array<{ id: string; name: string; rules: HighlightRule[] }>; defaultProfileId: string | null; revision: string }
   | { type: "confirmDeleteProfile"; profileId: string };
@@ -103,6 +104,9 @@ function buildDom(): {
   set("profile-workspace-note", new StubElement("DIV"));
   set("profile-workspace-override", Object.assign(new StubElement("DIV"), { hidden: true }));
   set("profile-validation-error", new StubElement("DIV"));
+  set("profile-repair-actions", Object.assign(new StubElement("DIV"), { hidden: true }));
+  set("profile-repair-user", new StubElement("BUTTON"));
+  set("profile-repair-workspace", new StubElement("BUTTON"));
   set("rules-list", new StubElement("DIV"));
   set("rules-empty-state", new StubElement("DIV"));
   set("add-rule-btn", new StubElement("BUTTON"));
@@ -165,6 +169,10 @@ export interface HighlightRuleEditorHarness {
   createFromDefaults: () => void;
   saveError: () => string;
   workspaceOverrideVisible: () => boolean;
+  recoveryMessage: () => string;
+  recoveryVisible: () => boolean;
+  openUserSettings: () => void;
+  openWorkspaceSettings: () => void;
   renameProfile: () => void;
   duplicateProfile: () => void;
   deleteProfile: () => void;
@@ -270,6 +278,10 @@ export function openHighlightRuleEditor(rules: HighlightRule[], manager?: Highli
     createFromDefaults: () => field("profile-create-defaults").bubble("click"),
     saveError: () => field("save-error").textContent,
     workspaceOverrideVisible: () => !(field("profile-workspace-override") as StubElement & { hidden: boolean }).hidden,
+    recoveryMessage: () => field("profile-validation-error").textContent,
+    recoveryVisible: () => !(field("profile-repair-actions") as StubElement & { hidden: boolean }).hidden,
+    openUserSettings: () => field("profile-repair-user").bubble("click"),
+    openWorkspaceSettings: () => field("profile-repair-workspace").bubble("click"),
     renameProfile: () => field("profile-rename").bubble("click"),
     duplicateProfile: () => field("profile-duplicate").bubble("click"),
     deleteProfile: () => field("profile-delete").bubble("click"),

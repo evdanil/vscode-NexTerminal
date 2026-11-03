@@ -5,6 +5,7 @@ import { recordNexusConfigWrite } from "../services/terminal/settingsWriteRegist
 import { validateHighlightProfiles } from "../utils/highlightProfileValidation";
 import { validateAndSanitizeHighlightRules, type HighlightRule } from "../utils/highlightRuleValidation";
 import { upgradeHighlightRules } from "../utils/highlightRuleUpgrade";
+import { HIGHLIGHT_SETTINGS_REPAIR } from "./highlightProfileForm";
 
 export interface HighlightEditorState {
   catalog: HighlightCatalog;
@@ -12,6 +13,8 @@ export interface HighlightEditorState {
   workspaceLegacyRules?: HighlightRule[];
   shippedRules: HighlightRule[];
   workspaceCatalogOverrides?: boolean;
+  effectiveValidationError?: string;
+  effectiveMissingDefaultId?: string;
 }
 export type HighlightEditorSaveResult = { ok: true; state: HighlightEditorState } | { ok: false; message: string };
 
@@ -30,6 +33,10 @@ export function readHighlightEditorState(): HighlightEditorState {
   const effectiveRules = effective.profiles[0]?.rules;
   return {
     catalog, revision, shippedRules, workspaceCatalogOverrides,
+    ...(effective.validationError ? { effectiveValidationError: effective.validationError } : {}),
+    ...(!effective.validationError && typeof effective.defaultProfileId === "string" &&
+      !effective.profiles.some((profile) => profile.id === effective.defaultProfileId)
+      ? { effectiveMissingDefaultId: effective.defaultProfileId } : {}),
     ...(catalog.legacy && effective.legacy && JSON.stringify(globalRules) !== JSON.stringify(effectiveRules)
       ? { workspaceLegacyRules: effectiveRules ?? [] } : {})
   };
@@ -42,7 +49,7 @@ export function saveHighlightEditorCatalog(profiles: unknown, defaultProfileId: 
   const save = async (): Promise<HighlightEditorSaveResult> => {
     const current = readHighlightEditorState();
     if (current.revision !== expectedRevision) return { ok: false, message: "Highlight profiles changed elsewhere. Reopen the manager to review them before saving." };
-    if (current.catalog.validationError) return { ok: false, message: `Cannot save invalid highlight settings. Fix them in settings first: ${current.catalog.validationError}` };
+    if (current.catalog.validationError) return { ok: false, message: `Cannot save invalid highlight settings: ${current.catalog.validationError} ${HIGHLIGHT_SETTINGS_REPAIR}` };
     const validation = validateHighlightProfiles(profiles);
     if (!validation.ok) return { ok: false, message: validation.message };
     if (validation.profiles === null) return { ok: false, message: "A profile catalog is required." };

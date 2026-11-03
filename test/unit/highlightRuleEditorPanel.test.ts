@@ -7,10 +7,12 @@ const state = vi.hoisted(() => ({
   configListener: undefined as ((event: { affectsConfiguration: (k: string) => boolean }) => void) | undefined,
   disposeListener: undefined as (() => void) | undefined,
   messageListener: undefined as ((message: Record<string, unknown>) => Promise<void>) | undefined,
-  warning: ""
+  warning: "",
+  executedCommands: [] as string[]
 }));
 
 vi.mock("vscode", () => ({
+  commands: { executeCommand: vi.fn(async (id: string) => { state.executedCommands.push(id); }) },
   ViewColumn: { Active: -1 },
   ConfigurationTarget: { Global: 1 },
   workspace: {
@@ -122,4 +124,16 @@ describe("HighlightRuleEditorPanel profile deletion", () => {
     expect(state.postedMessages).toContainEqual(expect.objectContaining({ type: "catalogSaveResult", ok: false, message: expect.stringContaining("confirm") }));
   });
 
+});
+
+
+describe("HighlightRuleEditorPanel settings repair", () => {
+  beforeEach(() => { state.disposeListener?.(); state.executedCommands = []; });
+  it("opens the chosen settings JSON scope without accepting arbitrary commands", async () => {
+    HighlightRuleEditorPanel.open();
+    await state.messageListener?.({ type: "openHighlightSettingsJson", scope: "user" });
+    await state.messageListener?.({ type: "openHighlightSettingsJson", scope: "workspace" });
+    await state.messageListener?.({ type: "openHighlightSettingsJson", scope: "evil" });
+    expect(state.executedCommands).toEqual(["workbench.action.openSettingsJson", "workbench.action.openWorkspaceSettingsFile"]);
+  });
 });

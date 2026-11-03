@@ -16,6 +16,8 @@ The Highlight Profile field on saved SSH/telnet, serial, Local Shell and Local S
 
 The manager saves global settings. If a workspace overrides the catalog or default, that workspace's setting takes precedence. Backups and sharing include highlight profiles; merging imports keeps the recipient's default and remaps colliding profile IDs. Terminal-category and Reset All settings resets clear the catalog, default and legacy rules.
 
+If the catalog or default is invalid or the default profile is missing, inspect `nexus.terminal.highlighting.profiles` and `nexus.terminal.highlighting.defaultProfile` in the applicable User, Workspace, Folder or Remote Settings JSON and correct or remove the affected settings. The manager provides shortcuts to User and Workspace Settings JSON.
+
 ## Tab Commands
 
 Right-click any Nexus terminal tab for these commands (plus **Go to Terminal Directory**, covered under [File Explorer → Directory Sync](file-explorer.md#directory-sync)):

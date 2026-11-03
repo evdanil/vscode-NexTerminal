@@ -1214,20 +1214,21 @@ function prepareHighlightImport(data: NexusConfigExport, mode: "merge" | "replac
     return safeId;
   };
   let importedDefault: string | null = "default";
+  const incomingRepair = "Correct the highlight settings at the source and export again, or use another file";
 
   if (has(defaultKey)) {
     const value = settings![defaultKey];
-    if (value === undefined || !isHighlightProfileSelection(value)) return "invalid default highlight profile";
+    if (value === undefined || !isHighlightProfileSelection(value)) return `the export file has an invalid default highlight profile. ${incomingRepair}`;
     importedDefault = value as string | null;
   }
 
   if (carriesCatalog) {
     const checked = validateHighlightProfiles(has(profilesKey) ? settings![profilesKey] : null);
-    if (!checked.ok) return `invalid highlight catalog: ${checked.message}`;
+    if (!checked.ok) return `the export file has an invalid highlight catalog: ${checked.message} ${incomingRepair}`;
     const legacy = checked.profiles === null;
     const defaultRules = vscode.workspace.getConfiguration("nexus.terminal.highlighting").inspect<unknown>("rules")?.defaultValue ?? [];
     const legacyRules = legacy ? validateAndSanitizeHighlightRules(has(rulesKey) ? settings![rulesKey] : defaultRules) : [];
-    if (legacy && !legacyRules) return "invalid legacy highlight rules";
+    if (legacy && !legacyRules) return `the export file has invalid legacy highlight rules. ${incomingRepair}`;
     const incoming = checked.profiles ?? [{ id: "default", name: "Default", rules: upgradeHighlightRules(legacyRules!).rules }];
     for (const profile of incoming) occupiedIds.add(profile.id);
     const freshId = (): string => {
@@ -1254,7 +1255,7 @@ function prepareHighlightImport(data: NexusConfigExport, mode: "merge" | "replac
       if (legacy && !has(rulesKey)) settings![rulesKey] = legacyRules;
     } else {
       const existing = readGlobalHighlightCatalogForEditing();
-      if (existing.validationError) return `existing highlight catalog is invalid: ${existing.validationError}`;
+      if (existing.validationError) return `existing global highlight settings are invalid: ${existing.validationError} Open Preferences: Open User Settings (JSON) or Open Remote Settings (JSON), as applicable, and correct or remove nexus.terminal.highlighting.profiles and nexus.terminal.highlighting.defaultProfile`;
       const merged = [...existing.profiles];
       const names = new Set(merged.map((profile) => profile.name.toLowerCase()));
       for (const profile of incoming) {
