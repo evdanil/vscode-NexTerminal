@@ -11447,8 +11447,14 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
   <span class="save-indicator" aria-live="polite" data-for="nexus.logging.sessionTranscriptTimestamps"></span>
 </div>
   <div class="form-group">
+  <label for="setting-nexus-logging-sessionLogPathTemplate">Session Log Path Template</label>
+  <div class="setting-desc">Relative folders and a .log filename under Session Log Directory, for example %G/%S/%S-%Y-%M-%D-%h-%m-%s-%t.log. %S is the session name, %G its group, %H host, %P port, %% a literal percent, and %ENVIRONMENT_VARIABLE% an environment value. Empty keeps automatic filenames. Applies to new sessions.</div>
+  <input type="text" id="setting-nexus-logging-sessionLogPathTemplate" data-section="nexus.logging" data-key="sessionLogPathTemplate" value="" />
+  <span class="save-indicator" aria-live="polite" data-for="nexus.logging.sessionLogPathTemplate"></span>
+</div>
+  <div class="form-group">
   <label for="setting-nexus-logging-sessionLogDirectory">Session Log Directory</label>
-  <div class="setting-desc">Leave empty to use the default extension storage location.</div>
+  <div class="setting-desc">Root for session logs; supports %ENVIRONMENT_VARIABLE% and %% for a literal percent. Leave empty to use the default extension storage location.</div>
   <div class="file-input-row">
     <input type="text" id="setting-nexus-logging-sessionLogDirectory" data-section="nexus.logging" data-key="sessionLogDirectory" value="" />
     <button type="button" class="browse-btn" data-section="nexus.logging" data-key="sessionLogDirectory">Browse</button>

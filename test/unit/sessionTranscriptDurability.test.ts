@@ -588,6 +588,8 @@ describe("session transcript failure paths", () => {
     // Non-vacuous: the close really did fail to write, and nothing reached the
     // file — the tail only survives if something retries it after close().
     expect(failures).toBe(1);
+    // Closing must retain filename ownership until the failed tail is settled.
+    expect(readdirSync(path.join(dir, ".nexus-transcript-reservations"))).toHaveLength(1);
     const file = transcriptPath(dir, "closefail_");
     expect(readFileSync(file, "utf8")).toBe("");
 
@@ -603,6 +605,7 @@ describe("session transcript failure paths", () => {
     expect(text).toContain("tail line");
     expect(text).toContain("--- Session ended");
     expect(text.indexOf("tail line")).toBeLessThan(text.indexOf("--- Session ended"));
+    expect(readdirSync(path.join(dir, ".nexus-transcript-reservations"))).toHaveLength(0);
   });
 
   it("gives up the close-time retry on a bounded budget and says what was lost", async () => {

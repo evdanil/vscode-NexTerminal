@@ -1,4 +1,4 @@
-import { closeSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -65,6 +65,7 @@ describe("transcript path templates", () => {
   it("reports a missing environment variable by name", () => {
     expect(() => renderTranscriptPathTemplate("%MISSING%/%S.log", context, date, {})).toThrow(/MISSING/);
     expect(() => renderTranscriptPathTemplate("%EMPTY%/%S.log", context, date, { EMPTY: "" })).toThrow(/EMPTY/);
+    expect(() => renderTranscriptPathTemplate("%toString%/%S.log", context, date, {})).toThrow(/toString.*missing/);
   });
 
   it("bounds substituted names without cutting a Unicode code point", () => {
@@ -94,8 +95,8 @@ describe("transcript filename reservations", () => {
     const root = temp();
     const first = reserve(root, "Canada/Switch1/capture.log");
     const second = reserve(root, "Canada/Switch1/capture.log");
-    expect(first.filepath).toBe(path.join(root, "Canada/Switch1/capture.log"));
-    expect(second.filepath).toBe(path.join(root, "Canada/Switch1/capture-2.log"));
+    expect(first.filepath).toBe(path.join(realpathSync(root), "Canada/Switch1/capture.log"));
+    expect(second.filepath).toBe(path.join(realpathSync(root), "Canada/Switch1/capture-2.log"));
     writeFileSync(first.fd, "first");
     writeFileSync(second.fd, "second");
     expect(readFileSync(first.filepath, "utf8")).toBe("first");

@@ -482,14 +482,14 @@ describe("serial terminal tab visual differentiation", () => {
     try {
       for (const [setting, expected] of [["local", "local"], ["utc", "utc"], ["off", "off"], [undefined, "local"], ["invalid", "local"]]) {
         vi.clearAllMocks();
-        config.mockReturnValue({ get: (key: string, fallback: unknown) => key === "sessionTranscriptTimestamps" ? setting : fallback } as any);
+        config.mockReturnValue({ get: (key: string, fallback: unknown) => key === "sessionTranscriptTimestamps" ? setting : key === "sessionLogPathTemplate" ? "%G/%S/%P.log" : fallback } as any);
         const ctx = makeSerialCtx();
         ctx.core.getSerialProfile = vi.fn(() => ({ ...baseProfile, mode }));
         const rotation = { maxFileSizeBytes: 12345, maxRotatedFiles: 2 };
         ctx.loggerFactory.getRotationOptions = () => rotation;
         registerSerialCommands(ctx);
         await registeredCommands.get("nexus.serial.connect")!("sp1");
-        expect(createSessionTranscript).toHaveBeenCalledWith("", baseProfile.name, true, { ...rotation, timestampMode: expected });
+        expect(createSessionTranscript).toHaveBeenCalledWith("", baseProfile.name, true, { ...rotation, timestampMode: expected, pathTemplate: "%G/%S/%P.log", pathContext: { port: baseProfile.path, group: undefined } });
       }
     } finally {
       config.mockImplementation(previous);

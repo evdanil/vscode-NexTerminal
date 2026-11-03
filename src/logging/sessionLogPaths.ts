@@ -63,14 +63,14 @@ export function reserveTranscriptFile(root: string, relativePath: string): Reser
       released = true;
       try { unlinkSync(marker); } catch { /* A stale marker safely forces a different filename. */ }
     };
-    const existing = new Set(readdirSync(parent).map(identity));
-    const familyExists = existing.has(identity(name)) || Array.from({ length: 99 }, (_, i) => `${name}.${i + 1}`).some((entry) => existing.has(identity(entry)));
-    if (familyExists) {
-      release();
-      continue;
-    }
     const filepath = path.join(parent, name);
     try {
+      const existing = new Set(readdirSync(parent).map(identity));
+      const familyExists = existing.has(identity(name)) || Array.from({ length: 99 }, (_, i) => `${name}.${i + 1}`).some((entry) => existing.has(identity(entry)));
+      if (familyExists) {
+        release();
+        continue;
+      }
       return { filepath, fd: openSync(filepath, "ax"), release };
     } catch (error) {
       release();

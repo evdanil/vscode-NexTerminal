@@ -104,7 +104,7 @@ export function renderTranscriptPathTemplate(
   const result = parse(template).map((part) => {
     if ("literal" in part) return part.literal;
     if (!part.environment) return values[part.token];
-    const value = environment[part.token];
+    const value = Object.hasOwn(environment, part.token) ? environment[part.token] : undefined;
     if (!value) throw new Error(`Environment variable ${part.token} is missing or empty.`);
     return component(value);
   }).join("");
@@ -116,7 +116,7 @@ export function renderTranscriptPathTemplate(
 export function expandLogDirectoryEnvironment(value: string, environment: Readonly<Record<string, string | undefined>>): string {
   return value.replace(/%%|%([A-Za-z_][A-Za-z0-9_]*)%/g, (match, name: string | undefined) => {
     if (match === "%%") return "%";
-    const replacement = name === undefined ? undefined : environment[name];
+    const replacement = name !== undefined && Object.hasOwn(environment, name) ? environment[name] : undefined;
     if (!replacement) throw new Error(`Environment variable ${name} is missing or empty.`);
     return replacement;
   });

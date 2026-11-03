@@ -225,12 +225,14 @@ function getDefaultSessionTranscriptsEnabled(): boolean {
   return vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
 }
 
-function getTranscriptOptions(ctx: CommandContext): SessionTranscriptOptions {
+function getTranscriptOptions(ctx: CommandContext, profile: ServerConfig): SessionTranscriptOptions {
   return {
     ...(ctx.loggerFactory as { getRotationOptions?: () => LoggerRotationOptions }).getRotationOptions?.(),
     timestampMode: normalizeTranscriptTimestampMode(
       vscode.workspace.getConfiguration("nexus.logging").get<unknown>("sessionTranscriptTimestamps", "local")
-    )
+    ),
+    pathTemplate: vscode.workspace.getConfiguration("nexus.logging").get<string>("sessionLogPathTemplate", ""),
+    pathContext: { host: profile.host, port: profile.port, group: profile.group }
   };
 }
 
@@ -1314,7 +1316,7 @@ async function connectTelnetServer(
             ctx.sessionLogDir,
             server.name,
             server.logSession ?? getDefaultSessionTranscriptsEnabled(),
-            getTranscriptOptions(ctx)
+            getTranscriptOptions(ctx, server)
           ),
           highlighter: highlight ?? ctx.highlighter,
           outputObserver: triggerObserver,
@@ -1620,7 +1622,7 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
           ctx.sessionLogDir,
           server.name,
           server.logSession ?? getDefaultSessionTranscriptsEnabled(),
-          getTranscriptOptions(ctx)
+          getTranscriptOptions(ctx, server)
         ),
         highlight ?? ctx.highlighter,
         triggerObserver,

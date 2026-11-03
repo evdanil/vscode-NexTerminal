@@ -125,6 +125,7 @@ function setupDefaultConfig(): void {
       const defaults: Record<string, unknown> = {
         sessionTranscripts: true,
         sessionTranscriptTimestamps: "local",
+        sessionLogPathTemplate: "",
         sessionLogDirectory: "",
         maxFileSizeMb: 10,
         maxRotatedFiles: 5,
@@ -262,11 +263,11 @@ describe("SettingsTreeProvider", () => {
   });
 
   describe("category children", () => {
-    it("returns 6 children for logging category including transcript timestamps", () => {
+    it("returns 7 children for logging category including transcript format and path", () => {
       const provider = createProvider();
       const category = new SettingsCategoryItem("logging");
       const children = provider.getChildren(category);
-      expect(children).toHaveLength(6);
+      expect(children).toHaveLength(7);
       expect(children.every((c) => c instanceof SettingsValueItem)).toBe(true);
     });
 

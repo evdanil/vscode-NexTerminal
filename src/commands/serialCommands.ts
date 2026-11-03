@@ -257,12 +257,14 @@ function getDefaultSessionTranscriptsEnabled(): boolean {
   return vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
 }
 
-function getTranscriptOptions(ctx: CommandContext): SessionTranscriptOptions {
+function getTranscriptOptions(ctx: CommandContext, profile: SerialProfile): SessionTranscriptOptions {
   return {
     ...(ctx.loggerFactory as { getRotationOptions?: () => LoggerRotationOptions }).getRotationOptions?.(),
     timestampMode: normalizeTranscriptTimestampMode(
       vscode.workspace.getConfiguration("nexus.logging").get<unknown>("sessionTranscriptTimestamps", "local")
-    )
+    ),
+    pathTemplate: vscode.workspace.getConfiguration("nexus.logging").get<string>("sessionLogPathTemplate", ""),
+    pathContext: { port: profile.path, group: profile.group }
   };
 }
 
@@ -506,7 +508,7 @@ async function connectStandardSerialProfile(
       ctx.sessionLogDir,
       profile.name,
       profile.logSession ?? getDefaultSessionTranscriptsEnabled(),
-      getTranscriptOptions(ctx)
+      getTranscriptOptions(ctx, profile)
     ),
     highlight ?? ctx.highlighter,
     triggerObserver
@@ -611,7 +613,7 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
       ctx.sessionLogDir,
       profile.name,
       profile.logSession ?? getDefaultSessionTranscriptsEnabled(),
-      getTranscriptOptions(ctx)
+      getTranscriptOptions(ctx, profile)
     ),
     highlight ?? ctx.highlighter,
     triggerObserver
