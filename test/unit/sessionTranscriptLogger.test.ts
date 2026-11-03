@@ -42,8 +42,8 @@ describe("createSessionTranscript", () => {
       pathTemplate: "%G/%S/%H-%P-%Y-%M-%D-%h-%m-%s-%t.log",
       pathContext: { group: "Canada/Core", host: "switch.example", port: 22 }, timestampMode: "off"
     });
-    const markerDir = path.join(dir, ".nexus-transcript-reservations");
     const log = path.join(dir, "Canada/Core/Switch1/switch.example-22-2026-11-03-09-08-07-006.log");
+    const markerDir = path.join(path.dirname(log), ".nexus-transcript-reservations");
     transcript.write("first\n");
     transcript.flush?.();
     expect(readFileSync(log, "utf8")).toContain("first\n");

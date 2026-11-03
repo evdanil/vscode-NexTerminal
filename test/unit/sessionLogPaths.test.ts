@@ -123,6 +123,15 @@ describe("transcript filename reservations", () => {
     expect(readdirSync(path.join(root, ".nexus-transcript-reservations"))).toHaveLength(1);
   });
 
+  it("shares filename ownership across overlapping configured roots", () => {
+    const root = temp();
+    const first = reserve(root, "device/capture.log");
+    // Simulate the gap after rotation removes the live basename with no retained files.
+    rmSync(first.filepath);
+    const second = reserve(path.join(root, "device"), "capture.log");
+    expect(path.basename(second.filepath)).toBe("capture-2.log");
+  });
+
   it("treats case-equivalent names conservatively while a session is active", () => {
     const root = temp();
     reserve(root, "capture.log");

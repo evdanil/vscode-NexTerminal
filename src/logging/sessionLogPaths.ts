@@ -40,14 +40,15 @@ export function reserveTranscriptFile(root: string, relativePath: string): Reser
   const filename = parts.pop()!;
   let parent = canonicalRoot;
   for (const part of parts) parent = ensureChildDirectory(parent, part);
-  const reservationDir = ensureChildDirectory(canonicalRoot, ".nexus-transcript-reservations");
+  // Different configured roots may lead to the same target directory. Ownership
+  // belongs beside that target so all windows use the same reservation namespace.
+  const reservationDir = ensureChildDirectory(parent, ".nexus-transcript-reservations");
   const extension = path.extname(filename);
   const stem = filename.slice(0, -extension.length);
 
   for (let attempt = 1; attempt <= 1000; attempt += 1) {
     const name = attempt === 1 ? filename : `${stem}-${attempt}${extension}`;
-    const relativeCandidate = parts.concat(name).join("/");
-    const key = createHash("sha256").update(identity(relativeCandidate)).digest("hex");
+    const key = createHash("sha256").update(identity(name)).digest("hex");
     const marker = path.join(reservationDir, `${key}.lock`);
     let markerFd: number;
     try {
