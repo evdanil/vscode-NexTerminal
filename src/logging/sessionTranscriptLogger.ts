@@ -2,6 +2,7 @@ import { closeSync, existsSync, mkdirSync, openSync, renameSync, statSync, unlin
 import * as path from "node:path";
 import { normalizeLoggerRotationOptions, type LoggerRotationOptions } from "./terminalLogger";
 import { EMPTY_STRIP_CARRY, stripChunk, type StripCarry } from "../utils/ansi";
+import { normalizeTranscriptTimestampMode, TranscriptLineTimestamps, type TranscriptTimestampMode } from "./transcriptTimestamps";
 
 // Control characters except \n, \r, \t
 const CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
@@ -285,7 +286,8 @@ class FileSessionTranscript implements SessionTranscript {
     private readonly filepath: string,
     private readonly rotation: LoggerRotationOptions,
     /** Retention cap — see {@link DEFAULT_MAX_RETAINED_BYTES} for the policy. */
-    private readonly maxRetainedBytes: number
+    private readonly maxRetainedBytes: number,
+    private readonly timestamps: TranscriptLineTimestamps
   ) {
     mkdirSync(path.dirname(filepath), { recursive: true });
     this.currentSize = this.readCurrentSize();
@@ -310,7 +312,7 @@ class FileSessionTranscript implements SessionTranscript {
     this.escapeCarry = stripped.carry;
     const clean = stripped.text;
     if (clean) {
-      this.enqueue(clean);
+      this.enqueue(this.timestamps.format(clean));
     }
   }
 
@@ -1101,6 +1103,8 @@ export async function flushSessionTranscripts(
 }
 
 export interface SessionTranscriptOptions extends Partial<LoggerRotationOptions> {
+  /** Per-line receive times, captured before buffering. Defaults to local time. */
+  timestampMode?: TranscriptTimestampMode;
   /**
    * Retention cap override — see {@link DEFAULT_MAX_RETAINED_BYTES} for the
    * policy the value carries. Internal tuning knob, not a user-facing
@@ -1135,7 +1139,8 @@ export function createSessionTranscript(
     return new FileSessionTranscript(
       filepath,
       normalizeLoggerRotationOptions(options),
-      normalizeRetainedCap(options?.maxRetainedBytes)
+      normalizeRetainedCap(options?.maxRetainedBytes),
+      new TranscriptLineTimestamps(normalizeTranscriptTimestampMode(options?.timestampMode))
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

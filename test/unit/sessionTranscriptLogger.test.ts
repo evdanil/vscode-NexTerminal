@@ -13,12 +13,81 @@ function makeTempDir(): string {
 }
 
 afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
   for (const dir of tempDirs.splice(0, tempDirs.length)) {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
 describe("createSessionTranscript", () => {
+  function recordedOutput(dir: string): string {
+    const file = readdirSync(dir).find((name) => name.endsWith(".log"))!;
+    const contents = readFileSync(path.join(dir, file), "utf8");
+    return contents.slice(contents.indexOf("\n") + 1, contents.lastIndexOf("\n--- Session ended "));
+  }
+
+  it.each([
+    { offset: -330, suffix: "+05:30" },
+    { offset: 210, suffix: "-03:30" }
+  ])("defaults to local timestamps with a numeric $suffix offset", ({ offset, suffix }) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(2025, 0, 15, 9, 0, 12, 345));
+    vi.spyOn(Date.prototype, "getTimezoneOffset").mockReturnValue(offset);
+    const dir = makeTempDir();
+    const transcript = createSessionTranscript(dir, "local", true);
+    transcript.write("ERROR\n");
+    transcript.close();
+    expect(recordedOutput(dir)).toBe(`2025-01-15 09:00:12.345${suffix} ERROR\n`);
+  });
+
+  it("timestamps each logical line at receipt, preserving split lines, blank lines and CRLF", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2025-01-15T09:00:12.345Z"));
+    const dir = makeTempDir();
+    const transcript = createSessionTranscript(dir, "utc", true, { timestampMode: "utc" });
+    transcript.write("\x1b[31mfirst");
+    vi.setSystemTime(new Date("2025-01-15T09:00:13.000Z"));
+    transcript.flush?.();
+    transcript.write(" part\r");
+    vi.setSystemTime(new Date("2025-01-15T09:01:45.678Z"));
+    transcript.write("\n\nthird\rprogress\n\x1b[0m");
+    vi.setSystemTime(new Date("2025-01-15T10:00:00Z"));
+    transcript.close();
+    expect(recordedOutput(dir)).toBe(
+      "2025-01-15 09:00:12.345Z first part\r\n" +
+      "2025-01-15 09:01:45.678Z \n" +
+      "2025-01-15 09:01:45.678Z third\r" +
+      "2025-01-15 09:01:45.678Z progress\n"
+    );
+  });
+
+  it("waits for visible output after ANSI-only chunks and preserves line state across reconnect", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2025-01-15T09:00:00Z"));
+    const dir = makeTempDir();
+    const transcript = createSessionTranscript(dir, "ansi", true, { timestampMode: "utc" });
+    transcript.write("\x1b[31m");
+    vi.setSystemTime(new Date("2025-01-15T09:00:01Z"));
+    transcript.write("prompt\x1b]unfinished");
+    transcript.resetEscapeState?.();
+    vi.setSystemTime(new Date("2025-01-15T09:00:02Z"));
+    transcript.write(": \nnext");
+    transcript.close();
+    expect(recordedOutput(dir)).toBe(
+      "2025-01-15 09:00:01.000Z prompt: \n2025-01-15 09:00:02.000Z next"
+    );
+  });
+
+  it("Off preserves cleaned transcript bytes without per-line timestamps", () => {
+    const dir = makeTempDir();
+    const transcript = createSessionTranscript(dir, "off", true, { timestampMode: "off" });
+    transcript.write("\x1b[31mfirst\r");
+    transcript.write("\n\nsecond\rprogress\n\x1b[0m");
+    transcript.close();
+    expect(recordedOutput(dir)).toBe("first\r\n\nsecond\rprogress\n");
+  });
+
   it("rotates session transcripts using the configured size and file count", () => {
     const dir = makeTempDir();
     const transcript = createSessionTranscript(dir, "router", true, {
@@ -107,7 +176,8 @@ describe("createSessionTranscript", () => {
 
     it("writes the same bytes, in the same order, on the same side of a rotation boundary", async () => {
       const chunks = Array.from({ length: 40 }, (_, i) => `chunk-${String(i).padStart(3, "0")} payload\n`);
-      const rotation = { maxFileSizeBytes: 300, maxRotatedFiles: 3 };
+      // This fixture compares byte-for-byte rotation, independently of clock time.
+      const rotation = { maxFileSizeBytes: 300, maxRotatedFiles: 3, timestampMode: "off" as const };
 
       // Reference: force a drain after every single chunk, which is exactly
       // what the old synchronous writer did.
