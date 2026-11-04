@@ -470,6 +470,7 @@ function buildFormDom(definition: FormDefinition): FormDom {
         input.name = field.key;
         input.value = field.value ?? "";
         input.required = field.required === true;
+        if (field.type === "text") input.readOnly = field.readOnly === true;
         if (field.type === "text" && field.scannable) {
           const scan = group.append(new StubElement("BUTTON", ["scan-btn"]));
           scan.dataset.key = field.key;
@@ -576,6 +577,7 @@ function buildFormDom(definition: FormDefinition): FormDom {
 
 export interface FormHarness {
   posted: FormMessage[];
+  toggle: (key: string, checked: boolean) => void;
   /** Clicks an option in a custom select, exactly as the dropdown handler does. */
   choose: (key: string, value: string) => void;
   deliver: (msg: ExtensionMessage) => void;
@@ -779,11 +781,19 @@ export function openForm(definition: FormDefinition): FormHarness {
     if (el.readOnly) {
       throw new Error(`field ${key} is read-only — the user could not have typed this`);
     }
+    if (el.disabled) throw new Error(`field ${key} is disabled — the user could not have typed this`);
     return el;
   };
 
   return {
     posted,
+    toggle: (key, checked) => {
+      const el = control(key);
+      if (el.type !== "checkbox" || el.disabled) throw new Error(`field ${key} is not an enabled checkbox`);
+      el.checked = checked;
+      el.dispatch("change");
+      el.dispatch("input");
+    },
     choose: (key, value) => {
       const wrapper = dom.byId.get(`field-${key}`);
       if (!wrapper) {

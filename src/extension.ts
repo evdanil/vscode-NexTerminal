@@ -419,7 +419,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // what makes an addressless or unpolled guest manageable.
   //
   // ONE DEFINITION, TWO CONSUMERS — the tree's `.webConsole` marker (which gates
-  // the right-click entry and the Profile Actions entry) and the connect
+  // the right-click entry) and the connect
   // refusal's "Open Web Console" button. A second, hand-rolled copy of this
   // question is how the menu and the message start disagreeing about a row.
   const deviceOffersWebConsole = (providerId: string, externalId: string): boolean => {
@@ -1059,7 +1059,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const commandCenterView = vscode.window.createTreeView("nexusCommandCenter", {
     treeDataProvider: nexusTreeProvider,
     dragAndDropController: nexusTreeProvider,
-    showCollapseAll: true
+    showCollapseAll: true,
+    canSelectMany: true
   });
   // LIVE STATUS (Phase 2) — the running-lab highlight. Registered globally; it
   // decorates only the nexus-status: resourceUris the Command Center tree stamps

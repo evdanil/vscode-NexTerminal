@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "SSH, serial and Telnet terminals in VS Code—no remote agent required. Manage jump hosts, SFTP, tunnels, macros, JavaScript automation and network inventory from one sidebar.",
-  "version": "2.8.313",
+  "version": "2.8.314",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -646,6 +646,12 @@
         "command": "nexus.profile.actions",
         "title": "Profile Actions",
         "category": "Nexus"
+      },
+      {
+        "command": "nexus.profile.connectSelected",
+        "title": "Connect Selected Profiles",
+        "category": "Nexus",
+        "icon": "$(plug)"
       },
       {
         "command": "nexus.group.add",
@@ -1380,103 +1386,113 @@
       ],
       "view/item/context": [
         {
+          "command": "nexus.profile.connectSelected",
+          "when": "view == nexusCommandCenter && listMultiSelection && viewItem =~ /^nexus\\.(server(Connected)?(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?|serialProfile(Connected|Waiting)?|localShellProfile(Connected)?)$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "nexus.profile.connectSelected",
+          "when": "view == nexusCommandCenter && listMultiSelection && viewItem =~ /^nexus\\.(server(Connected)?(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?|serialProfile(Connected|Waiting)?|localShellProfile(Connected)?)$/",
+          "group": "0_connect@1"
+        },
+        {
           "command": "nexus.server.connect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
           "group": "inline"
         },
         {
           "command": "nexus.server.testConnection",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
           "group": "inline@2"
         },
         {
           "command": "nexus.server.connect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
           "group": "inline@1"
         },
         {
           "command": "nexus.server.disconnect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
           "group": "inline@2"
         },
         {
           "command": "nexus.server.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.sessionNode",
+          "when": "view == nexusCommandCenter && viewItem == nexus.sessionNode && !listMultiSelection",
           "group": "inline"
         },
         {
           "command": "nexus.terminal.selectHighlightProfile",
-          "when": "view == nexusCommandCenter && (viewItem == nexus.sessionNode || viewItem == nexus.serialSessionNode || viewItem == nexus.localShellSessionNode || viewItem == nexus.localServerSessionNode)",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.sessionNode || viewItem == nexus.serialSessionNode || viewItem == nexus.localShellSessionNode || viewItem == nexus.localServerSessionNode) && !listMultiSelection",
           "group": "1_terminal@5"
         },
         {
           "command": "nexus.terminal.reset",
-          "when": "view == nexusCommandCenter && viewItem == nexus.sessionNode",
+          "when": "view == nexusCommandCenter && viewItem == nexus.sessionNode && !listMultiSelection",
           "group": "1_terminal@1"
         },
         {
           "command": "nexus.terminal.clearScrollback",
-          "when": "view == nexusCommandCenter && viewItem == nexus.sessionNode",
+          "when": "view == nexusCommandCenter && viewItem == nexus.sessionNode && !listMultiSelection",
           "group": "1_terminal@2"
         },
         {
           "command": "nexus.terminal.copyAll",
-          "when": "view == nexusCommandCenter && viewItem == nexus.sessionNode",
+          "when": "view == nexusCommandCenter && viewItem == nexus.sessionNode && !listMultiSelection",
           "group": "1_terminal@3"
         },
         {
           "command": "nexus.server.connect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
           "group": "0_connect"
         },
         {
           "command": "nexus.server.runWithScript",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
           "group": "0_connect@3"
         },
         {
           "command": "nexus.server.runMacro",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && nexus.hasMacros",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && nexus.hasMacros && !listMultiSelection",
           "group": "0_connect@5"
         },
         {
           "command": "nexus.server.connectBmcSol",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?\\.ipmi(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?\\.ipmi(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
           "group": "0_connect@6"
         },
         {
           "command": "nexus.server.openBmcWebConsole",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?\\.ipmi(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?\\.ipmi(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
           "group": "0_connect@7"
         },
         {
           "command": "nexus.inventory.openWebConsole",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?\\.webConsole(\\.noKeyDeployment)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?\\.webConsole(\\.noKeyDeployment)?$/ && !listMultiSelection",
           "group": "0_connect@8"
         },
         {
           "command": "nexus.inventory.startNode",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?\\.nodeStopped(\\.webConsole)?(\\.noKeyDeployment)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?\\.nodeStopped(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
           "group": "00_power@1"
         },
         {
           "command": "nexus.inventory.stopNode",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?\\.nodeRunning(\\.webConsole)?(\\.noKeyDeployment)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?\\.nodeRunning(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
           "group": "00_power@2"
         },
         {
           "command": "nexus.server.testConnection",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
           "group": "0_connect@4"
         },
         {
           "command": "nexus.server.connect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
           "group": "0_connect@1"
         },
         {
           "command": "nexus.server.disconnect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
           "group": "0_connect@2"
         },
         {
@@ -1486,82 +1502,82 @@
         },
         {
           "command": "nexus.server.rename",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
           "group": "1_manage@2"
         },
         {
           "command": "nexus.server.duplicate",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
           "group": "1_manage@3"
         },
         {
           "command": "nexus.files.browse",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serverConnected(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
           "group": "1_manage@4"
         },
         {
           "command": "nexus.server.deployKey",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?$/ && !listMultiSelection",
           "group": "1_manage@5"
         },
         {
           "command": "nexus.authProfile.applyToServer",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
           "group": "1_manage@6"
         },
         {
           "command": "nexus.server.copyInfo",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
           "group": "2_clipboard"
         },
         {
           "command": "nexus.server.remove",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(Connected)?(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
           "group": "3_destructive"
         },
         {
           "command": "nexus.group.connect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folderWithServers(\\.syncSource)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folderWithServers(\\.syncSource)?$/ && !listMultiSelection",
           "group": "inline@1"
         },
         {
           "command": "nexus.group.disconnect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folderWithServers(\\.syncSource)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folderWithServers(\\.syncSource)?$/ && !listMultiSelection",
           "group": "inline@2"
         },
         {
           "command": "nexus.inventory.syncFolderSource",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?\\.syncSource$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?\\.syncSource$/ && !listMultiSelection",
           "group": "inline@3"
         },
         {
           "command": "nexus.group.connect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folderWithServers(\\.syncSource)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folderWithServers(\\.syncSource)?$/ && !listMultiSelection",
           "group": "0_connect@1"
         },
         {
           "command": "nexus.group.disconnect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folderWithServers(\\.syncSource)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folderWithServers(\\.syncSource)?$/ && !listMultiSelection",
           "group": "0_connect@2"
         },
         {
           "command": "nexus.group.rename",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/ && !listMultiSelection",
           "group": "1_manage@1"
         },
         {
           "command": "nexus.group.addToFolder",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/ && !listMultiSelection",
           "group": "1_manage@2"
         },
         {
           "command": "nexus.profile.addToFolder",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/ && !listMultiSelection",
           "group": "1_manage@3"
         },
         {
           "command": "nexus.authProfile.applyToFolder",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/ && !listMultiSelection",
           "group": "1_manage@4"
         },
         {
@@ -1586,147 +1602,147 @@
         },
         {
           "command": "nexus.deviceTemplate.applyToFolder",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/ && !listMultiSelection",
           "group": "1_manage@5"
         },
         {
           "command": "nexus.inventory.syncFolderSource",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?\\.syncSource$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?\\.syncSource$/ && !listMultiSelection",
           "group": "1_manage@6"
         },
         {
           "command": "nexus.group.remove",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.folder(WithServers)?(\\.syncSource)?$/ && !listMultiSelection",
           "group": "3_destructive"
         },
         {
           "command": "nexus.serial.connect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/ && !listMultiSelection",
           "group": "inline"
         },
         {
           "command": "nexus.serial.testConnection",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Waiting)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Waiting)?$/ && !listMultiSelection",
           "group": "inline@2"
         },
         {
           "command": "nexus.serial.disconnect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)$/ && !listMultiSelection",
           "group": "inline"
         },
         {
           "command": "nexus.serial.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.serialSessionNode",
+          "when": "view == nexusCommandCenter && viewItem == nexus.serialSessionNode && !listMultiSelection",
           "group": "inline"
         },
         {
           "command": "nexus.terminal.reset",
-          "when": "view == nexusCommandCenter && viewItem == nexus.serialProfileConnected",
+          "when": "view == nexusCommandCenter && viewItem == nexus.serialProfileConnected && !listMultiSelection",
           "group": "1_terminal@1"
         },
         {
           "command": "nexus.terminal.clearScrollback",
-          "when": "view == nexusCommandCenter && viewItem == nexus.serialProfileConnected",
+          "when": "view == nexusCommandCenter && viewItem == nexus.serialProfileConnected && !listMultiSelection",
           "group": "1_terminal@2"
         },
         {
           "command": "nexus.terminal.copyAll",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)$/ && !listMultiSelection",
           "group": "1_terminal@3"
         },
         {
           "command": "nexus.serial.connect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/ && !listMultiSelection",
           "group": "0_connect"
         },
         {
           "command": "nexus.serial.runWithScript",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/ && !listMultiSelection",
           "group": "0_connect@3"
         },
         {
           "command": "nexus.serial.testConnection",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Waiting)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Waiting)?$/ && !listMultiSelection",
           "group": "0_connect@4"
         },
         {
           "command": "nexus.serial.disconnect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)$/ && !listMultiSelection",
           "group": "0_connect"
         },
         {
           "command": "nexus.serial.edit",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/ && !listMultiSelection",
           "group": "1_manage@1"
         },
         {
           "command": "nexus.serial.rename",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/ && !listMultiSelection",
           "group": "1_manage@2"
         },
         {
           "command": "nexus.serial.duplicate",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/ && !listMultiSelection",
           "group": "1_manage@3"
         },
         {
           "command": "nexus.serial.copyInfo",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/ && !listMultiSelection",
           "group": "2_clipboard"
         },
         {
           "command": "nexus.serial.remove",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/ && !listMultiSelection",
           "group": "3_destructive"
         },
         {
           "command": "nexus.localShell.connect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/ && !listMultiSelection",
           "group": "inline@1"
         },
         {
           "command": "nexus.localShell.disconnect",
-          "when": "view == nexusCommandCenter && viewItem == nexus.localShellSessionNode",
+          "when": "view == nexusCommandCenter && viewItem == nexus.localShellSessionNode && !listMultiSelection",
           "group": "inline@2"
         },
         {
           "command": "nexus.localShell.connect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/ && !listMultiSelection",
           "group": "0_connect@1"
         },
         {
           "command": "nexus.localShell.disconnect",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)$/ && !listMultiSelection",
           "group": "0_connect@2"
         },
         {
           "command": "nexus.localShell.runWithScript",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/ && !listMultiSelection",
           "group": "0_connect@3"
         },
         {
           "command": "nexus.localShell.edit",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/ && !listMultiSelection",
           "group": "1_manage@1"
         },
         {
           "command": "nexus.localShell.rename",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/ && !listMultiSelection",
           "group": "1_manage@2"
         },
         {
           "command": "nexus.localShell.duplicate",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/ && !listMultiSelection",
           "group": "1_manage@3"
         },
         {
           "command": "nexus.localShell.copyInfo",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/ && !listMultiSelection",
           "group": "2_clipboard"
         },
         {
           "command": "nexus.localShell.remove",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/ && !listMultiSelection",
           "group": "3_destructive"
         },
         {
@@ -2071,97 +2087,97 @@
         },
         {
           "command": "nexus.localServer.start",
-          "when": "view == nexusCommandCenter && viewItem == nexus.localServer",
+          "when": "view == nexusCommandCenter && viewItem == nexus.localServer && !listMultiSelection",
           "group": "inline@1"
         },
         {
           "command": "nexus.localServer.stop",
-          "when": "view == nexusCommandCenter && viewItem == nexus.localServerRunning",
+          "when": "view == nexusCommandCenter && viewItem == nexus.localServerRunning && !listMultiSelection",
           "group": "inline@1"
         },
         {
           "command": "nexus.localServer.restart",
-          "when": "view == nexusCommandCenter && viewItem == nexus.localServerRunning",
+          "when": "view == nexusCommandCenter && viewItem == nexus.localServerRunning && !listMultiSelection",
           "group": "inline@2"
         },
         {
           "command": "nexus.localServer.stop",
-          "when": "view == nexusCommandCenter && viewItem == nexus.localServerSessionNode",
+          "when": "view == nexusCommandCenter && viewItem == nexus.localServerSessionNode && !listMultiSelection",
           "group": "inline@1"
         },
         {
           "command": "nexus.localServer.restart",
-          "when": "view == nexusCommandCenter && viewItem == nexus.localServerSessionNode",
+          "when": "view == nexusCommandCenter && viewItem == nexus.localServerSessionNode && !listMultiSelection",
           "group": "inline@2"
         },
         {
           "command": "nexus.localServer.inspectLogs",
-          "when": "view == nexusCommandCenter && viewItem == nexus.localServerSessionNode",
+          "when": "view == nexusCommandCenter && viewItem == nexus.localServerSessionNode && !listMultiSelection",
           "group": "inline@3"
         },
         {
           "command": "nexus.localServer.start",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/ && !listMultiSelection",
           "group": "0_connect@1"
         },
         {
           "command": "nexus.localServer.stop",
-          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode)",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode) && !listMultiSelection",
           "group": "0_connect@2"
         },
         {
           "command": "nexus.localServer.restart",
-          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode)",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode) && !listMultiSelection",
           "group": "0_connect@3"
         },
         {
           "command": "nexus.localServer.inspectLogs",
-          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode)",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode) && !listMultiSelection",
           "group": "1_terminal@1"
         },
         {
           "command": "nexus.terminal.reset",
-          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode)",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode) && !listMultiSelection",
           "group": "1_terminal@2"
         },
         {
           "command": "nexus.terminal.clearScrollback",
-          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode)",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode) && !listMultiSelection",
           "group": "1_terminal@3"
         },
         {
           "command": "nexus.terminal.copyAll",
-          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode)",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.localServerRunning || viewItem == nexus.localServerSessionNode) && !listMultiSelection",
           "group": "1_terminal@4"
         },
         {
           "command": "nexus.localServer.edit",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/ && !listMultiSelection",
           "group": "1_manage@1"
         },
         {
           "command": "nexus.localServer.rename",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/ && !listMultiSelection",
           "group": "1_manage@2"
         },
         {
           "command": "nexus.localServer.duplicate",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/ && !listMultiSelection",
           "group": "1_manage@3"
         },
         {
           "command": "nexus.localServer.moveToFolder",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/ && !listMultiSelection",
           "group": "1_manage@4"
         },
         {
           "command": "nexus.localServer.copyInfo",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/ && !listMultiSelection",
           "group": "2_clipboard"
         },
         {
           "command": "nexus.localServer.remove",
-          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/",
+          "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.localServer(Running)?$/ && !listMultiSelection",
           "group": "3_destructive"
         }
       ],
@@ -2435,6 +2451,10 @@
         },
         {
           "command": "nexus.profile.actions",
+          "when": "false"
+        },
+        {
+          "command": "nexus.profile.connectSelected",
           "when": "false"
         },
         {

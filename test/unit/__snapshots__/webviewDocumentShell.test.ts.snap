@@ -1653,6 +1653,7 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
     body.vscode-high-contrast .form-illustration .illustration-dark { display: block; }
     body.vscode-light .form-illustration .illustration-light,
     body.vscode-high-contrast-light .form-illustration .illustration-light { display: block; }
+    .bulk-readonly { color: var(--vscode-disabledForeground); }
     body { max-width: 700px; }
     .advanced-fields {
       margin: 6px 0 18px;
@@ -2449,9 +2450,10 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
           for (var ci = 0; ci < conditions.length; ci++) {
             var control = form.elements[conditions[ci].field];
             var expectedValue = conditions[ci].value;
+            var actualValue = control && control.type === "checkbox" ? String(control.checked) : control && control.value;
             var matches = Array.isArray(expectedValue)
-              ? expectedValue.indexOf(control && control.value) !== -1
-              : control && control.value === expectedValue;
+              ? expectedValue.indexOf(actualValue) !== -1
+              : actualValue === expectedValue;
             if (!matches) {
               visible = false;
               break;
@@ -2467,7 +2469,7 @@ exports[`webview document shell (byte-identity guard) > form with nonce 1`] = `
               if (inputs[ii].dataset.wasRequired === "true") inputs[ii].required = true;
               inputs[ii].disabled = false;
             } else {
-              inputs[ii].dataset.wasRequired = inputs[ii].required ? "true" : "false";
+              if (!inputs[ii].disabled) inputs[ii].dataset.wasRequired = inputs[ii].required ? "true" : "false";
               inputs[ii].required = false;
               inputs[ii].disabled = true;
             }
@@ -3782,6 +3784,7 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
     body.vscode-high-contrast .form-illustration .illustration-dark { display: block; }
     body.vscode-light .form-illustration .illustration-light,
     body.vscode-high-contrast-light .form-illustration .illustration-light { display: block; }
+    .bulk-readonly { color: var(--vscode-disabledForeground); }
     body { max-width: 700px; }
     .advanced-fields {
       margin: 6px 0 18px;
@@ -4578,9 +4581,10 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
           for (var ci = 0; ci < conditions.length; ci++) {
             var control = form.elements[conditions[ci].field];
             var expectedValue = conditions[ci].value;
+            var actualValue = control && control.type === "checkbox" ? String(control.checked) : control && control.value;
             var matches = Array.isArray(expectedValue)
-              ? expectedValue.indexOf(control && control.value) !== -1
-              : control && control.value === expectedValue;
+              ? expectedValue.indexOf(actualValue) !== -1
+              : actualValue === expectedValue;
             if (!matches) {
               visible = false;
               break;
@@ -4596,7 +4600,7 @@ exports[`webview document shell (byte-identity guard) > form without nonce 1`] =
               if (inputs[ii].dataset.wasRequired === "true") inputs[ii].required = true;
               inputs[ii].disabled = false;
             } else {
-              inputs[ii].dataset.wasRequired = inputs[ii].required ? "true" : "false";
+              if (!inputs[ii].disabled) inputs[ii].dataset.wasRequired = inputs[ii].required ? "true" : "false";
               inputs[ii].required = false;
               inputs[ii].disabled = true;
             }

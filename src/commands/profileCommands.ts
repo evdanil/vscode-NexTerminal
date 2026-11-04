@@ -10,6 +10,7 @@ import { FolderTreeItem, LocalShellProfileTreeItem, LocalServerConfigTreeItem, S
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import {
   authProfileCredentialMirror,
+  connectServer,
   formValuesToServer,
   browseForKey,
   collectGroups,
@@ -554,7 +555,7 @@ export function registerProfileCommands(ctx: ProfileCommandContext): vscode.Disp
   const showProfileActions = async (arg?: unknown): Promise<void> => {
     if (arg instanceof ServerTreeItem) {
       // NODE CONTROL (Phase 4, task #28 — M5) — node power is the headline EVE-row
-      // capability, but the click-path quick-pick only offered Connect/Test
+      // capability, but the profile-action quick-pick only offered Connect/Test
       // (futile on a stopped node) and left Start/Stop right-click-only. Reuse the
       // same origin+status resolution the row already ran: the node-state marker
       // is composed into contextValue, so read it back rather than re-resolving. Only
@@ -727,6 +728,24 @@ export function registerProfileCommands(ctx: ProfileCommandContext): vscode.Disp
     }),
 
     vscode.commands.registerCommand("nexus.profile.actions", showProfileActions),
+
+    vscode.commands.registerCommand("nexus.profile.connectSelected", async (arg?: unknown, selection?: unknown) => {
+      if (!Array.isArray(selection) || selection.length < 2 || !selection.includes(arg) || !selection.every((item) => item instanceof ServerTreeItem || item instanceof SerialProfileTreeItem || item instanceof LocalShellProfileTreeItem)) {
+        void vscode.window.showWarningMessage("Select network, serial, or local shell profiles to connect them together.");
+        return;
+      }
+      if (selection.some((item) => item instanceof ServerTreeItem ? !ctx.core.getServer(item.server.id) : item instanceof SerialProfileTreeItem ? !ctx.core.getSerialProfile(item.profile.id) : !ctx.core.getLocalShellProfile((item as LocalShellProfileTreeItem).profile.id))) {
+        void vscode.window.showWarningMessage("A selected profile no longer exists. Select the profiles again.");
+        return;
+      }
+      const results = await Promise.allSettled(selection.map(async (item) => {
+        if (item instanceof ServerTreeItem) return connectServer(ctx, item.server.id, { allowAutoFileExplorer: false, noPickerFallback: true });
+        if (item instanceof SerialProfileTreeItem) return vscode.commands.executeCommand("nexus.serial.connect", item.profile.id, { noPickerFallback: true });
+        return vscode.commands.executeCommand("nexus.localShell.connect", (item as LocalShellProfileTreeItem).profile.id, { noPickerFallback: true });
+      }));
+      const failed = results.filter((result) => result.status === "rejected").length;
+      if (failed > 0) void vscode.window.showWarningMessage(`${failed} ${failed === 1 ? "profile could" : "profiles could"} not be started. Connect the selected profiles individually to identify the problem.`);
+    }),
 
     vscode.commands.registerCommand("nexus.group.add", () => addFolder()),
 

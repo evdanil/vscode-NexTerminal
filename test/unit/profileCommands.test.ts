@@ -15,6 +15,7 @@ const mockCollectGroups = vi.fn(() => []);
 const mockSyncProxyPasswordSecret = vi.fn();
 const mockAuthProfileCredentialMirror = vi.fn(() => ({ username: "root", authType: "password" }));
 const mockBrowseForKey = vi.fn();
+const mockConnectServer = vi.fn(async (..._args: unknown[]) => {});
 const mockScanForPort = vi.fn();
 const mockInlineAuthProfile = {
   handleCreateInline: vi.fn(),
@@ -55,6 +56,7 @@ vi.mock("../../src/commands/serverCommands", () => ({
   authProfileCredentialMirror: (...args: unknown[]) => mockAuthProfileCredentialMirror(...(args as [])),
   browseForKey: (...args: unknown[]) => mockBrowseForKey(...args),
   collectGroups: () => mockCollectGroups(),
+  connectServer: (...args: unknown[]) => mockConnectServer(...args),
   formValuesToServer: (...args: unknown[]) => mockFormValuesToServer(...args),
   syncProxyPasswordSecret: (...args: unknown[]) => mockSyncProxyPasswordSecret(...args)
 }));
@@ -74,7 +76,7 @@ vi.mock("../../src/commands/inlineAuthProfileCreation", () => ({
 }));
 
 import { openUnifiedForm, registerProfileCommands } from "../../src/commands/profileCommands";
-import { FolderTreeItem, LocalShellProfileTreeItem, ServerTreeItem } from "../../src/ui/nexusTreeProvider";
+import { FolderTreeItem, LocalShellProfileTreeItem, SerialProfileTreeItem, ServerTreeItem } from "../../src/ui/nexusTreeProvider";
 import { AsyncMutex, configMutationLock } from "../../src/services/configMutationLock";
 import { proxyPasswordSecretKey } from "../../src/services/ssh/proxyPasswordKeys";
 
@@ -90,6 +92,9 @@ function makeCtx() {
         authProfiles: []
       })),
       getAuthProfile: vi.fn(),
+      getServer: vi.fn((id: string) => ({ id })),
+      getSerialProfile: vi.fn((id: string) => ({ id })),
+      getLocalShellProfile: vi.fn((id: string) => ({ id })),
       addOrUpdateServer: vi.fn(),
       addOrUpdateSerialProfile: vi.fn(),
       addOrUpdateLocalShellProfile: vi.fn()
@@ -114,6 +119,55 @@ function latestFormOptions(): {
     onTest: handlers.onTest
   };
 }
+
+describe("connect selected profiles", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetConfiguration.mockReturnValue({ get: vi.fn((_key: string, fallback: unknown) => fallback) });
+  });
+
+  it("refuses the whole selection if a profile has been removed", async () => {
+    const ctx = makeCtx();
+    ctx.core.getSerialProfile.mockReturnValue(undefined);
+    registerProfileCommands(ctx);
+    const server = new ServerTreeItem({ id: "server", name: "Server", host: "host", port: 22, username: "user", authType: "password", isHidden: false }, false);
+    const serial = new SerialProfileTreeItem({ id: "serial", name: "Serial", path: "COM1", baudRate: 9600, dataBits: 8, stopBits: 1, parity: "none", rtscts: false }, "disconnected");
+    const { commands } = await import("vscode");
+    const handler = vi.mocked(commands.registerCommand).mock.calls.find(([id]) => id === "nexus.profile.connectSelected")![1] as (arg: unknown, selection: unknown[]) => Promise<void>;
+    await handler(server, [server, serial]);
+    expect(mockConnectServer).not.toHaveBeenCalled();
+    expect(mockExecuteCommand).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("no longer exists"));
+  });
+
+  it("starts every selected network, serial and local-shell profile", async () => {
+    const ctx = makeCtx();
+    registerProfileCommands(ctx);
+    const server = new ServerTreeItem({ id: "server", name: "Server", host: "host", port: 22, username: "user", authType: "password", isHidden: false }, false);
+    const serial = new SerialProfileTreeItem({ id: "serial", name: "Serial", path: "COM1", baudRate: 9600, dataBits: 8, stopBits: 1, parity: "none", rtscts: false }, "disconnected");
+    const shell = new LocalShellProfileTreeItem({ id: "shell", name: "Shell", launchMode: "custom", shellPath: "/bin/sh" }, false);
+    const { commands } = await import("vscode");
+    const handler = vi.mocked(commands.registerCommand).mock.calls.find(([id]) => id === "nexus.profile.connectSelected")?.[1] as ((arg: unknown, selection: unknown[]) => Promise<void>) | undefined;
+    expect(handler).toBeDefined();
+    await handler!(server, [server, serial, shell]);
+    expect(mockConnectServer).toHaveBeenCalledWith(ctx, "server", { allowAutoFileExplorer: false, noPickerFallback: true });
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.serial.connect", "serial", { noPickerFallback: true });
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.localShell.connect", "shell", { noPickerFallback: true });
+  });
+
+  it("reports a failed start while still attempting the other selected profiles", async () => {
+    const ctx = makeCtx();
+    mockConnectServer.mockRejectedValueOnce(new Error("connection failed"));
+    registerProfileCommands(ctx);
+    const server = new ServerTreeItem({ id: "server", name: "Server", host: "host", port: 22, username: "user", authType: "password", isHidden: false }, false);
+    const serial = new SerialProfileTreeItem({ id: "serial", name: "Serial", path: "COM1", baudRate: 9600, dataBits: 8, stopBits: 1, parity: "none", rtscts: false }, "disconnected");
+    const { commands } = await import("vscode");
+    const handler = vi.mocked(commands.registerCommand).mock.calls.find(([id]) => id === "nexus.profile.connectSelected")![1] as (arg: unknown, selection: unknown[]) => Promise<void>;
+    await expect(handler(server, [server, serial])).resolves.toBeUndefined();
+    expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.serial.connect", "serial", { noPickerFallback: true });
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("1 profile"));
+  });
+});
 
 describe("openUnifiedForm test action", () => {
   beforeEach(() => {

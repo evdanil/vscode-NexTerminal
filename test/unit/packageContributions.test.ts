@@ -66,6 +66,36 @@ const userDoc = (name: string): string => {
 const readme = userDoc("README.md");
 
 describe("package contributions", () => {
+  it("does not direct users to the removed row-click Profile Actions picker", () => {
+    const prose = [...userDocs.map(([, text]) => text), functionalDocs].join("\n");
+    expect(prose).not.toContain("row-click **Profile Actions**");
+    expect(prose).not.toContain("click the row and pick it from **Profile Actions**");
+    expect(prose).not.toContain("list you get by clicking the server");
+    expect(prose).not.toContain("click a profile for Connect");
+  });
+  it("hides single-item hub actions during a multi-selection", () => {
+    const hubActions = packageJson.contributes.menus["view/item/context"].filter((entry) => entry.when?.includes("view == nexusCommandCenter"));
+    expect(hubActions.length).toBeGreaterThan(30);
+    for (const action of hubActions) {
+      if (action.command === "nexus.profile.connectSelected" || action.command === "nexus.server.edit") continue;
+      expect(action.when, action.command).toContain("!listMultiSelection");
+    }
+  });
+
+  it("offers Connect Selected on the row and context menu for every supported profile type", () => {
+    const command = packageJson.contributes.commands.find((item) => item.command === "nexus.profile.connectSelected");
+    expect(command?.title).toBe("Connect Selected Profiles");
+    const entries = packageJson.contributes.menus["view/item/context"].filter((entry) => entry.command === command?.command);
+    expect(entries.map((entry) => entry.group)).toEqual(expect.arrayContaining(["inline@1", "0_connect@1"]));
+    for (const entry of entries) {
+      expect(entry.when).toContain("listMultiSelection");
+      const source = entry.when?.match(/viewItem =~ \/(.*?)\//)?.[1];
+      expect(source).toBeDefined();
+      const pattern = new RegExp(source!);
+      for (const context of ["nexus.server", "nexus.serverConnected.ipmi.nodeRunning.webConsole.noKeyDeployment", "nexus.serialProfileWaiting", "nexus.localShellProfileConnected"]) expect(pattern.test(context), context).toBe(true);
+      for (const context of ["nexus.sessionNode", "nexus.folder", "nexus.localServer"]) expect(pattern.test(context), context).toBe(false);
+    }
+  });
   it("reads the README and every user guide into the doc corpus, and leaves the contributor references out (⊘ a glob that finds nothing turns every absence check in this file into a vacuous pass)", () => {
     const names = userDocs.map(([name]) => name);
     for (const expected of ["README.md", "docs/local-servers.md", "docs/settings.md", "docs/inventory/eve-ng.md", "docs/inventory/proxmox.md"]) {
@@ -310,22 +340,22 @@ describe("package contributions", () => {
     expect(menuItems).toEqual(expect.arrayContaining([
       expect.objectContaining({
         command: "nexus.server.testConnection",
-        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
         group: "inline@2"
       }),
       expect.objectContaining({
         command: "nexus.server.testConnection",
-        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.server(\\.ipmi)?(\\.nodeRunning|\\.nodeStopped)?(\\.webConsole)?(\\.noKeyDeployment)?$/ && !listMultiSelection",
         group: "0_connect@4"
       }),
       expect.objectContaining({
         command: "nexus.serial.testConnection",
-        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Waiting)?$/",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Waiting)?$/ && !listMultiSelection",
         group: "inline@2"
       }),
       expect.objectContaining({
         command: "nexus.serial.testConnection",
-        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Waiting)?$/",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Waiting)?$/ && !listMultiSelection",
         group: "0_connect@4"
       })
     ]));
@@ -350,7 +380,7 @@ describe("package contributions", () => {
     expect(menuItems).toEqual(expect.arrayContaining([
       expect.objectContaining({
         command: "nexus.localShell.runWithScript",
-        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/ && !listMultiSelection",
         group: "0_connect@3"
       })
     ]));
@@ -603,12 +633,12 @@ describe("package contributions", () => {
     expect(menuItems).toEqual(expect.arrayContaining([
       expect.objectContaining({
         command: "nexus.localShell.connect",
-        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/",
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/ && !listMultiSelection",
         group: "inline@1"
       }),
       expect.objectContaining({
         command: "nexus.localShell.edit",
-        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/"
+        when: "view == nexusCommandCenter && viewItem =~ /^nexus\\.localShellProfile(Connected)?$/ && !listMultiSelection"
       })
     ]));
     const terminalTabCommands = ["nexus.terminal.reset", "nexus.terminal.clearScrollback", "nexus.terminal.copyAll"];

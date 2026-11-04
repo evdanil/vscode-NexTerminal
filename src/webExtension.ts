@@ -75,6 +75,7 @@ const unsupportedCommands = [
   "nexus.profile.add",
   "nexus.profile.addToFolder",
   "nexus.profile.actions",
+  "nexus.profile.connectSelected",
   "nexus.group.add",
   "nexus.group.addToFolder",
   "nexus.group.remove",

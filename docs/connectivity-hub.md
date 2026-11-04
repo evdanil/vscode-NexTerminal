@@ -6,20 +6,28 @@ The Connectivity Hub is the sidebar tree view showing all servers, serial device
 
 **New Folder** in the Hub title bar's `...` menu always creates a top-level folder; to create one inside a folder, right-click that folder and choose **New Folder** there. Likewise the title bar's `+` opens **Add Profile** with no folder chosen, while a folder's own **Add Profile** fills that folder in.
 
-Drag a server, serial, Local Shell or Local Server profile — or a whole folder — onto another folder, or onto empty space for the top level, to move it there. There is no manual ordering: a folder lists its subfolders first, then its profiles, each in name order. Dropping a tunnel profile onto a server starts that tunnel through the server immediately — it does not change the tunnel's saved server (see [Port Forwarding](port-forwarding.md)).
+Drag a server, serial, Local Shell or Local Server profile — or a whole folder — onto another folder, or onto empty space for the top level, to move it there. Move one item at a time. There is no manual ordering: a folder lists its subfolders first, then its profiles, each in name order. Dropping a tunnel profile onto a server starts that tunnel through the server immediately — it does not change the tunnel's saved server (see [Port Forwarding](port-forwarding.md)).
 
 [Auth profiles](ssh-and-telnet.md#auth-profiles) can be applied to individual servers or entire folders in bulk.
 
 ## Profile Actions
 
-Click a profile in the Hub to open its **Profile Actions** list — the everyday actions for that profile in one pick. What it offers depends on the profile:
+Click a profile to select it. Use its row icon to connect or start it, or right-click it for actions. What the menu offers depends on the profile:
 
 - **Server (SSH or telnet)** — Connect, Test Connection, Connect and Run Script, Run Macro on Server…, Edit, Duplicate, Copy Connection Info and Delete. **Browse Files** joins them while the server is connected; a synced lab node or guest whose source can power it adds **Start Node** or **Stop Node** to match its state (see [Start and Stop Nodes](inventory/README.md#start-and-stop-nodes)); a Proxmox guest adds **Open Web Console**.
 - **Serial profile** — Connect, Test Connection, Connect and Run Script, Edit, Duplicate, Copy Port Info and Delete.
 - **Local Shell profile** — Open Local Shell, Open and Run Script, Edit, Duplicate, Copy Shell Info and Delete.
-- **Local Server** (the list is titled **Local Server Actions**) — Start, Stop, Restart, Inspect Logs, Edit, Duplicate, Copy Command Line and Delete.
+- **Local Server** — Start, Stop, Restart, Inspect Logs, Edit, Duplicate, Copy Command Line and Delete.
 
 The right-click menu has the less frequent ones too — Disconnect, Rename, Deploy SSH Key, Apply Auth Profile, and the BMC actions on a server with a BMC address.
+
+### Select and Edit Multiple Profiles
+
+Use Shift-click to select a range, or Ctrl-click (Cmd-click on macOS) to add or remove individual rows; VS Code's configured multi-select modifier also applies. Select network, serial and Local Shell profiles and use the **Connect Selected Profiles** row icon or right-click menu to start them. Folder and active-session rows are not part of this action.
+
+To edit several network device profiles, select them, right-click one of the selected rows and choose **Edit**. Name and Host are read-only. Check **Change** beside each setting to apply it to every selected device; unchecked settings and each device's credentials remain as they were. Proxy passwords you enter are saved for each selected device. Only one profile can own automatic File Explorer opening, so bulk editing can turn that option off but cannot turn it on for several profiles. If a selected profile changes while the editor is open, reopen the editor before saving. Edit serial and Local Shell profiles individually.
+
+Actions that operate on one item are hidden while several rows are selected; click a single row to use them. Moving several selected items at once is not supported.
 
 ### Test Connection
 

@@ -35,6 +35,9 @@ import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigReposi
 import type { CommandContext as CmdCtx } from "../../src/commands/types";
 import { registerProfileCommands } from "../../src/commands/profileCommands";
 import { createSessionTranscript } from "../../src/logging/sessionTranscriptLogger";
+import { openForm } from "../helpers/formScriptHarness";
+import { serverFormDefinition } from "../../src/ui/formDefinitions";
+import type { FormDefinition } from "../../src/ui/formTypes";
 
 const registeredCommands = new Map<string, (...args: unknown[]) => unknown>();
 const mockShowWarningMessage = vi.fn();
@@ -184,6 +187,12 @@ describe("session transcript timestamp configuration", () => {
 });
 
 describe("connectServer — server removed while progress is pending", () => {
+  it("does not open a picker when a selected profile disappears before connection", async () => {
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [makeServer()] });
+    vi.mocked(vscode.window.showQuickPick).mockClear();
+    await expect(connectServer(ctx, "deleted", { noPickerFallback: true })).rejects.toThrow(/no longer exists/i);
+    expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
+  });
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -2981,6 +2990,494 @@ describe("SSH File Explorer auto-open on manual connect", () => {
 
     expect(ctx.sftpService.connect).not.toHaveBeenCalled();
     expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("nexusFileExplorer.focus");
+  });
+
+  it("connects every selected server when Connect is invoked from the tree", async () => {
+    const servers = [makeServer({ id: "one", host: "one.example" }), makeServer({ id: "two", host: "two.example" })];
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    registerServerCommands(ctx);
+    const items = servers.map((server) => new ServerTreeItem(server, false));
+
+    await registeredCommands.get("nexus.server.connect")!(items[0], items);
+    await flushPromises();
+
+    expect(SshPty).toHaveBeenCalledTimes(2);
+  });
+
+  it("refuses a mixed selection rather than connecting only its server", async () => {
+    const server = makeServer({ id: "one" });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    registerServerCommands(ctx);
+    const row = new ServerTreeItem(server, false);
+
+    await registeredCommands.get("nexus.server.connect")!(row, [row, new FolderTreeItem("Other", "Other")]);
+
+    expect(SshPty).not.toHaveBeenCalled();
+    expect(mockShowWarningMessage).toHaveBeenCalledWith(expect.stringContaining("Select only network device profiles"));
+  });
+
+  it("bulk edits an explicitly selected field without changing either identity or untouched settings", async () => {
+    const servers = [
+      makeServer({ id: "one", name: "First", host: "one.example", port: 22, username: "alice" }),
+      makeServer({ id: "two", name: "Second", host: "two.example", port: 23, username: "bob" })
+    ];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const [formId, definition, handlers] = mockWebviewFormPanelOpen.mock.calls.at(-1) as [string, any, { onSubmit: (v: any) => Promise<void> }];
+    expect(formId).toMatch(/^server-bulk-edit-/);
+    expect(definition.fields.find((field: any) => field.key === "name").readOnly).toBe(true);
+    expect(definition.fields.find((field: any) => field.key === "host").readOnly).toBe(true);
+    expect(definition.fields.find((field: any) => field.key === "name").value).toBe("(Multiple values)");
+    expect(definition.fields.find((field: any) => field.key === "host").value).toBe("(Multiple values)");
+    await handlers.onSubmit({ __bulk_apply_port: true, port: 2222 });
+
+    expect(addOrUpdateServer).toHaveBeenCalledTimes(2);
+    expect(addOrUpdateServer.mock.calls.map(([server]) => server)).toEqual([
+      { ...servers[0], port: 2222 },
+      { ...servers[1], port: 2222 }
+    ]);
+  });
+
+  it("submits a bulk edit through the rendered form while keeping identity read-only", async () => {
+    const servers = [makeServer({ id: "one", name: "First", host: "one.example" }), makeServer({ id: "two", name: "Second", host: "two.example" })];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const [, definition, handlers] = mockWebviewFormPanelOpen.mock.calls.at(-1)! as [string, any, { onSubmit: (v: any) => Promise<void> }];
+    const form = openForm(definition);
+    expect(() => form.type("name", "Wrong")).toThrow(/read-only/);
+    expect(() => form.type("host", "wrong.example")).toThrow(/read-only/);
+    form.toggle("__bulk_apply_port", true);
+    form.type("port", "2222");
+    await handlers.onSubmit(form.submit());
+    expect(addOrUpdateServer.mock.calls.map(([server]) => server)).toEqual(servers.map((server) => ({ ...server, port: 2222 })));
+  });
+
+  it("offers every network profile field in the bulk editor", async () => {
+    const origin = { sourceId: "src", externalId: "device", syncedAt: 1 };
+    const servers = [makeServer({ id: "one", origin }), makeServer({ id: "two", origin: { ...origin, externalId: "other" } })];
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const definition = mockWebviewFormPanelOpen.mock.calls.at(-1)![1] as FormDefinition;
+    const singleFields = serverFormDefinition(servers[0], [], true, [], [], true).fields;
+    const keys = (fields: FormDefinition["fields"]) => fields.filter((field) => "key" in field).map((field) => (field as { key: string }).key);
+    expect(keys(definition.fields)).toEqual(expect.arrayContaining(keys(singleFields)));
+  });
+
+  it("does not offer inline auth profile creation in the bulk editor", async () => {
+    const servers = [makeServer({ id: "one" }), makeServer({ id: "two" })];
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const definition = mockWebviewFormPanelOpen.mock.calls.at(-1)![1] as FormDefinition;
+    for (const key of ["authProfileId", "ipmiAuthProfileId"]) {
+      const field = definition.fields.find((entry) => "key" in entry && entry.key === key);
+      expect(field?.type).toBe("select");
+      if (field?.type !== "select") throw new Error("Missing auth selector");
+      expect(field.options.some((option) => option.value.startsWith("__create__"))).toBe(false);
+    }
+  });
+
+  it("explains that automatic file explorer opening can only be disabled in bulk", async () => {
+    const servers = [makeServer({ id: "one" }), makeServer({ id: "two" })];
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const definition = mockWebviewFormPanelOpen.mock.calls.at(-1)![1] as FormDefinition;
+    const field = definition.fields.find((entry) => "key" in entry && entry.key === "openFileExplorerOnFirstConnect");
+    expect(field && "hint" in field && field.hint).toMatch(/only.*disable.*bulk/i);
+  });
+
+  it("does not reuse a bulk editor for a different selection", async () => {
+    const servers = [makeServer({ id: "one" }), makeServer({ id: "two" }), makeServer({ id: "three" })];
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], [rows[0], rows[1]]);
+    const firstId = mockWebviewFormPanelOpen.mock.calls.at(-1)![0];
+    await registeredCommands.get("nexus.server.edit")!(rows[1], [rows[1], rows[2]]);
+    expect(mockWebviewFormPanelOpen.mock.calls.at(-1)![0]).not.toBe(firstId);
+  });
+
+  it("applies several explicitly selected settings and retains each profile's other values", async () => {
+    const servers = [
+      makeServer({ id: "one", name: "First", host: "one.example", username: "alice", logSession: false, legacyAlgorithms: false }),
+      makeServer({ id: "two", name: "Second", host: "two.example", username: "bob", logSession: true, legacyAlgorithms: false })
+    ];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const [, definition, handlers] = mockWebviewFormPanelOpen.mock.calls.at(-1)! as [string, any, { onSubmit: (v: any) => Promise<void> }];
+    expect(definition.fields.find((field: any) => field.key === "legacyAlgorithms").visibleWhen).toEqual({ field: "__bulk_apply_legacyAlgorithms", value: "true" });
+    await handlers.onSubmit({ __bulk_apply_logSession: true, logSession: false, __bulk_apply_legacyAlgorithms: true, legacyAlgorithms: true });
+
+    expect(addOrUpdateServer.mock.calls.map(([server]) => server)).toEqual([
+      { ...servers[0], logSession: false, legacyAlgorithms: true },
+      { ...servers[1], logSession: false, legacyAlgorithms: true }
+    ]);
+  });
+
+  it("restores every selected profile if saving a bulk edit fails partway through", async () => {
+    const servers = [makeServer({ id: "one", name: "First" }), makeServer({ id: "two", name: "Second" })];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    const persist = addOrUpdateServer.getMockImplementation()!;
+    addOrUpdateServer.mockImplementationOnce(persist).mockImplementationOnce(async (server) => {
+      await persist(server);
+      throw new Error("disk failure");
+    });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+
+    await expect(handlers.onSubmit({ __bulk_apply_port: true, port: 2222 })).rejects.toThrow("disk failure");
+    expect(ctx.core.getServer("one")).toEqual(servers[0]);
+    expect(ctx.core.getServer("two")).toEqual(servers[1]);
+  });
+
+  it("preserves an in-place concurrent edit when rolling back a failed batch", async () => {
+    const servers = [makeServer({ id: "one" }), makeServer({ id: "two" })];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    const persist = addOrUpdateServer.getMockImplementation()!;
+    addOrUpdateServer.mockImplementationOnce(async (server) => {
+      await persist(server);
+      server.group = "Changed concurrently";
+    }).mockRejectedValueOnce(new Error("disk failure"));
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+    await expect(handlers.onSubmit({ __bulk_apply_port: true, port: 2222 })).rejects.toThrow("disk failure");
+    expect(ctx.core.getServer("one")).toEqual({ ...servers[0], group: "Changed concurrently" });
+  });
+
+  it("rejects a stale bulk edit if a selected profile changes while the form is open", async () => {
+    const servers = [makeServer({ id: "one", name: "First" }), makeServer({ id: "two", name: "Second" })];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+    await ctx.core.addOrUpdateServer({ ...servers[1], port: 8022 });
+    addOrUpdateServer.mockClear();
+
+    await expect(handlers.onSubmit({ __bulk_apply_port: true, port: 2222 })).rejects.toThrow(/changed/i);
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+    expect(ctx.core.getServer("two")?.port).toBe(8022);
+  });
+
+  it("does not overwrite a selected profile changed during an earlier bulk write", async () => {
+    const servers = [makeServer({ id: "one", name: "First" }), makeServer({ id: "two", name: "Second" })];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    const persist = addOrUpdateServer.getMockImplementation()!;
+    addOrUpdateServer.mockImplementationOnce(async (server) => {
+      await persist(server);
+      await persist({ ...servers[1], username: "new-user" });
+    });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+
+    await expect(handlers.onSubmit({ __bulk_apply_port: true, port: 2222 })).rejects.toThrow(/changed/i);
+    expect(ctx.core.getServer("one")).toEqual(servers[0]);
+    expect(ctx.core.getServer("two")).toEqual({ ...servers[1], username: "new-user" });
+  });
+
+  it("applies folder and management settings to each selected profile", async () => {
+    const servers = [makeServer({ id: "one", name: "First", host: "one.example" }), makeServer({ id: "two", name: "Second", host: "two.example" })];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+    await handlers.onSubmit({ __bulk_apply_group: true, group: "Lab", __bulk_apply_ipmiHost: true, ipmiHost: "bmc.example", __bulk_apply_bmcWebProtocol: true, bmcWebProtocol: "http" });
+
+    expect(addOrUpdateServer.mock.calls.map(([server]) => server)).toEqual(servers.map((server) => ({ ...server, group: "Lab", ipmiHost: "bmc.example", bmcWebProtocol: "http" })));
+  });
+
+  it("can disable highlighting for every selected profile", async () => {
+    const servers = [makeServer({ id: "one", highlightProfileId: "custom" }), makeServer({ id: "two" })];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+    await handlers.onSubmit({ __bulk_apply_highlightProfileId: true, highlightProfileId: "__none__" });
+    expect(addOrUpdateServer.mock.calls.map(([server]) => server)).toEqual(servers.map((server) => ({ ...server, highlightProfileId: null })));
+  });
+
+  it("does not silently assign the exclusive auto-open option to only one selected profile", async () => {
+    const servers = [makeServer({ id: "one" }), makeServer({ id: "two" })];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+    await expect(handlers.onSubmit({ __bulk_apply_openFileExplorerOnFirstConnect: true, openFileExplorerOnFirstConnect: true })).rejects.toThrow(/only one/i);
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+  });
+
+  it("changes usernames on selected profiles while preserving their other credentials", async () => {
+    const servers = [makeServer({ id: "one", username: "alice" }), makeServer({ id: "two", username: "bob", authType: "key", keyPath: "/tmp/key" })];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+    await handlers.onSubmit({ __bulk_apply_username: true, username: "operator" });
+    expect(addOrUpdateServer.mock.calls.map(([server]) => server)).toEqual(servers.map((server) => ({ ...server, username: "operator" })));
+  });
+
+  it("refuses a username edit if any selected profile gets its username from an auth profile", async () => {
+    const servers = [makeServer({ id: "one" }), makeServer({ id: "two", authProfileId: "ap1" })];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers, authProfiles: [makeAuthProfile()] });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+    await expect(handlers.onSubmit({ __bulk_apply_username: true, username: "operator" })).rejects.toThrow(/auth profile/i);
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+  });
+
+  it("applies transport and authentication settings without resetting each profile's other values", async () => {
+    const servers = [makeServer({ id: "one", username: "alice" }), makeServer({ id: "two", username: "bob", port: 2222 })];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+    await handlers.onSubmit({ __bulk_apply_authType: true, authType: "key", __bulk_apply_keyPath: true, keyPath: "/tmp/key" });
+    expect(addOrUpdateServer.mock.calls.map(([server]) => server)).toEqual(servers.map((server) => ({ ...server, authType: "key", keyPath: "/tmp/key" })));
+  });
+
+  it("rejects a transport change that would make any profile invalid before writing any profile", async () => {
+    const servers = [makeServer({ id: "one", protocol: "telnet", username: "alice" }), makeServer({ id: "two", protocol: "telnet", username: "" })];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+    await expect(handlers.onSubmit({ __bulk_apply_protocol: true, protocol: "ssh" })).rejects.toThrow(/invalid/i);
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+  });
+
+  it("links an auth profile without replacing stored usernames or keys", async () => {
+    const servers = [makeServer({ id: "one", username: "alice" }), makeServer({ id: "two", username: "bob", keyPath: "/tmp/key" })];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers, authProfiles: [makeAuthProfile()] });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+    await handlers.onSubmit({ __bulk_apply_authProfileId: true, authProfileId: "ap1" });
+    expect(addOrUpdateServer.mock.calls.map(([server]) => server)).toEqual(servers.map((server) => ({ ...server, authProfileId: "ap1" })));
+  });
+
+  it("refuses to write a username at the same time as linking an auth profile that owns it", async () => {
+    const servers = [makeServer({ id: "one" }), makeServer({ id: "two" })];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers, authProfiles: [makeAuthProfile()] });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+    await expect(handlers.onSubmit({ __bulk_apply_authProfileId: true, authProfileId: "ap1", __bulk_apply_username: true, username: "operator" })).rejects.toThrow(/auth profile/i);
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+  });
+
+  it("refuses a gateway that would point one of the selected servers to itself", async () => {
+    const servers = [makeServer({ id: "one" }), makeServer({ id: "two" })];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+    await expect(handlers.onSubmit({ __bulk_apply_ipmiGatewayServerId: true, ipmiGatewayServerId: "two" })).rejects.toThrow(/itself/i);
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+  });
+
+  it.each([{ protocol: "telnet" as const }, { addressless: true }])("refuses an unavailable gateway at save time: %j", async (change) => {
+    const servers = [makeServer({ id: "one" }), makeServer({ id: "two" }), makeServer({ id: "gateway" })];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    registerServerCommands(ctx);
+    const rows = servers.slice(0, 2).map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+    Object.assign(servers[2], change);
+    await expect(handlers.onSubmit({ __bulk_apply_ipmiGatewayServerId: true, ipmiGatewayServerId: "gateway" })).rejects.toThrow(/gateway.*unavailable/i);
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+  });
+
+  it("applies proxy settings and saves a separate endpoint secret for each selected server", async () => {
+    const servers = [makeServer({ id: "one" }), makeServer({ id: "two" })];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+    const proxy = { type: "socks5" as const, host: "proxy.example", port: 1080, username: "operator" };
+    await handlers.onSubmit({ __bulk_apply_proxyType: true, proxyType: "socks5", proxySocks5Host: proxy.host, proxySocks5Port: proxy.port, proxySocks5Username: proxy.username, proxySocks5Password: "secret" });
+
+    expect(addOrUpdateServer.mock.calls.map(([server]) => server)).toEqual(servers.map((server) => ({ ...server, proxy })));
+    for (const server of servers) expect(ctx.secretVault!.store).toHaveBeenCalledWith(proxyPasswordSecretKey(server.id, proxy), "secret");
+  });
+
+  it("submits proxy details from the bulk form only after the proxy change is selected", async () => {
+    const servers = [makeServer({ id: "one" }), makeServer({ id: "two" })];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const [, definition, handlers] = mockWebviewFormPanelOpen.mock.calls.at(-1)! as [string, FormDefinition, { onSubmit: (v: any) => Promise<void> }];
+    const form = openForm(definition);
+    expect(() => form.type("proxySocks5Host", "proxy.example")).toThrow(/disabled/);
+    form.toggle("__bulk_apply_proxyType", true);
+    form.choose("proxyType", "socks5");
+    form.type("proxySocks5Host", "proxy.example");
+    form.type("proxySocks5Port", "1080");
+    form.type("proxySocks5Username", "operator");
+    form.type("proxySocks5Password", "secret");
+    form.toggle("__bulk_apply_proxyType", false);
+    expect(() => form.type("proxySocks5Host", "other.example")).toThrow(/disabled/);
+    form.toggle("__bulk_apply_proxyType", true);
+    await handlers.onSubmit(form.submit());
+    expect(addOrUpdateServer).toHaveBeenCalledTimes(2);
+    expect(ctx.secretVault!.store).toHaveBeenCalledTimes(2);
+  });
+
+  it("refuses a proxy password without a username instead of silently discarding it", async () => {
+    const servers = [makeServer({ id: "one" }), makeServer({ id: "two" })];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+    await expect(handlers.onSubmit({ __bulk_apply_proxyType: true, proxyType: "socks5", proxySocks5Host: "proxy.example", proxySocks5Port: 1080, proxySocks5Username: "", proxySocks5Password: "secret" })).rejects.toThrow(/username/i);
+    expect(addOrUpdateServer).not.toHaveBeenCalled();
+    expect(ctx.secretVault!.store).not.toHaveBeenCalled();
+  });
+
+  it("honors the automatic inventory route choice when clearing proxies in bulk", async () => {
+    const servers = ["one", "two"].map((id) => makeServer({ id, origin: { sourceId: "src", externalId: id, syncedAt: 1, proxyOptOut: true }, proxy: { type: "socks5", host: "proxy.example", port: 1080 } }));
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const [, definition, handlers] = mockWebviewFormPanelOpen.mock.calls.at(-1)! as [string, any, { onSubmit: (v: any) => Promise<void> }];
+    expect(definition.fields.some((field: any) => field.key === "inventoryProxyRouteChoice")).toBe(true);
+    await handlers.onSubmit({ __bulk_apply_proxyType: true, proxyType: "none", inventoryProxyRouteChoice: "automatic" });
+    for (const [server] of addOrUpdateServer.mock.calls) {
+      expect(server.proxy).toBeUndefined();
+      expect(server.origin?.proxyOptOut).toBeUndefined();
+    }
+    expect(addOrUpdateServer).toHaveBeenCalledTimes(2);
+  });
+
+  it("restores prior endpoint secrets and profiles if a bulk proxy secret write fails", async () => {
+    const servers = [makeServer({ id: "one" }), makeServer({ id: "two" })];
+    const proxy = { type: "socks5" as const, host: "proxy.example", port: 1080, username: "operator" };
+    const firstKey = proxyPasswordSecretKey("one", proxy);
+    const secondKey = proxyPasswordSecretKey("two", proxy);
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers, initialSecrets: { [firstKey]: "old-one", [secondKey]: "old-two" } });
+    const store = vi.mocked(ctx.secretVault!.store);
+    const originalStore = store.getMockImplementation()!;
+    store.mockImplementationOnce(originalStore).mockImplementationOnce(async (key, value) => {
+      await originalStore(key, value);
+      throw new Error("vault failure");
+    });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+    await expect(handlers.onSubmit({ __bulk_apply_proxyType: true, proxyType: "socks5", proxySocks5Host: proxy.host, proxySocks5Port: proxy.port, proxySocks5Username: proxy.username, proxySocks5Password: "new" })).rejects.toThrow("vault failure");
+
+    expect(ctx.core.getServer("one")).toEqual(servers[0]);
+    expect(ctx.core.getServer("two")).toEqual(servers[1]);
+    expect(await ctx.secretVault!.get(firstKey)).toBe("old-one");
+    expect(await ctx.secretVault!.get(secondKey)).toBe("old-two");
+  });
+
+  it("does not touch proxy secrets if persisting the first profile fails", async () => {
+    const servers = [makeServer({ id: "one" }), makeServer({ id: "two" })];
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
+    addOrUpdateServer.mockRejectedValueOnce(new Error("disk failure"));
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+    await expect(handlers.onSubmit({ __bulk_apply_proxyType: true, proxyType: "socks5", proxySocks5Host: "proxy.example", proxySocks5Port: 1080, proxySocks5Username: "operator", proxySocks5Password: "new" })).rejects.toThrow("disk failure");
+    expect(ctx.secretVault!.store).not.toHaveBeenCalled();
+    expect(ctx.secretVault!.delete).not.toHaveBeenCalled();
+  });
+
+  it("does not restore an untouched proxy password when a later profile save fails", async () => {
+    const servers = [makeServer({ id: "one" }), makeServer({ id: "two" })];
+    const proxy = { type: "socks5" as const, host: "proxy.example", port: 1080, username: "operator" };
+    const key = proxyPasswordSecretKey("one", proxy);
+    const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers, initialSecrets: { [key]: "old" } });
+    const persist = addOrUpdateServer.getMockImplementation()!;
+    addOrUpdateServer.mockImplementationOnce(persist).mockRejectedValueOnce(new Error("disk failure"));
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+    await expect(handlers.onSubmit({ __bulk_apply_proxyType: true, proxyType: "socks5", proxySocks5Host: proxy.host, proxySocks5Port: proxy.port, proxySocks5Username: proxy.username, proxySocks5Password: "" })).rejects.toThrow("disk failure");
+    expect(ctx.secretVault!.store).not.toHaveBeenCalled();
+    expect(ctx.secretVault!.delete).not.toHaveBeenCalled();
+    expect(await ctx.secretVault!.get(key)).toBe("old");
+  });
+
+  it("does not restore a proxy secret for a profile removed during a failed save", async () => {
+    const servers = [makeServer({ id: "one" }), makeServer({ id: "two" })];
+    const proxy = { type: "socks5" as const, host: "proxy.example", port: 1080, username: "operator" };
+    const key = proxyPasswordSecretKey("one", proxy);
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers, initialSecrets: { [key]: "old" } });
+    vi.mocked(ctx.secretVault!.store).mockImplementationOnce(async () => {
+      await ctx.core.removeServer("one");
+      throw new Error("vault failure");
+    });
+    mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
+    registerServerCommands(ctx);
+    const rows = servers.map((server) => new ServerTreeItem(server, false));
+    await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
+    const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
+    await expect(handlers.onSubmit({ __bulk_apply_proxyType: true, proxyType: "socks5", proxySocks5Host: proxy.host, proxySocks5Port: proxy.port, proxySocks5Username: proxy.username, proxySocks5Password: "new" })).rejects.toThrow("vault failure");
+    expect(ctx.core.getServer("one")).toBeUndefined();
+    expect(await ctx.secretVault!.get(key)).toBeUndefined();
   });
 
   // P3-3 (Fable) — group connect swept every node through connectServer, which pops

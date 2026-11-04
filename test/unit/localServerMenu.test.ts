@@ -135,9 +135,13 @@ function isOneParenthesisedGroup(clause: string): boolean {
  * case, and a clause that mixes the two operators without grouping is exactly
  * the kind of thing that should be rewritten rather than interpreted.
  */
-function whenMatches(when: string, contextValue: string): boolean {
+function whenMatches(when: string, contextValue: string, multiSelection = false): boolean {
   expect(when.startsWith(VIEW_PREFIX), `unexpected when-clause shape: ${when}`).toBe(true);
-  const rest = when.slice(VIEW_PREFIX.length).trim();
+  let rest = when.slice(VIEW_PREFIX.length).trim();
+  if (rest.endsWith(" && !listMultiSelection")) {
+    if (multiSelection) return false;
+    rest = rest.slice(0, -" && !listMultiSelection".length);
+  }
   const grouped = isOneParenthesisedGroup(rest);
   const tokens = splitTopLevelOr(grouped ? rest.slice(1, -1) : rest);
 
@@ -252,6 +256,12 @@ describe("whenMatches models VS Code's when-clause precedence", () => {
 });
 
 describe("Local Servers view/item/context menu gating", () => {
+  it("hides individual local server actions during a multi-selection", () => {
+    for (const entry of localServerEntries) {
+      expect(entry.when, entry.command).toContain(" && !listMultiSelection");
+      expect(whenMatches(entry.when!, "nexus.localServer", true)).toBe(false);
+    }
+  });
   it("contributes no Move to Root command or menu entry at all", () => {
     const manifest = readFileSync(packageJsonPath, "utf8");
     expect(manifest).not.toContain("moveToRoot");

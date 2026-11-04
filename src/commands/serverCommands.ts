@@ -12,6 +12,7 @@ import { parseHighlightProfileFormValue } from "../ui/highlightProfileForm";
 import type { AuthProfile, AuthType, InventoryProxyOwnership, ProxyConfig, ServerConfig, ServerOrigin, SessionPtyHandle } from "../models/config";
 import {
   authProfileOwnedCredentials,
+  authProfileFieldOwnership,
   authProfileOwnershipSignature,
   cloneServerConfig,
   effectiveServerUsername,
@@ -36,7 +37,7 @@ import { Osc7Parser } from "../services/terminal/osc7Parser";
 import { deleteServerSecrets, passwordSecretKey } from "../services/ssh/silentAuth";
 import { currentProxyPasswordSecretKey } from "../services/ssh/proxyPasswordKeys";
 import { serverFormDefinition, toSshInfrastructureServerList } from "../ui/formDefinitions";
-import type { FormValues } from "../ui/formTypes";
+import type { FormFieldDescriptor, FormValues } from "../ui/formTypes";
 import { FolderTreeItem, ServerTreeItem, SessionTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
 import { defaultSshDir, deployPublicKeyToRemote, findLocalKeyPairs, generateKeyPair } from "../services/ssh/deploySshKey";
@@ -59,6 +60,7 @@ import { captureSessionOutput } from "../services/scripts/sessionOutputCapture";
 import type { ScriptRuntimeManager } from "../services/scripts/scriptRuntimeManager";
 import { configMutationLock } from "../services/configMutationLock";
 import { addresslessUnavailableMessage, telnetUnsupportedMessage } from "../utils/protocolGuards";
+import { validateServerConfig } from "../utils/validation";
 
 export async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<ServerConfig | undefined> {
   const servers = core.getSnapshot().servers.filter((server) => !server.isHidden);
@@ -1097,6 +1099,7 @@ function hasActiveTunnelsForServer(ctx: CommandContext, serverId: string): boole
 
 export interface ConnectServerOptions {
   allowAutoFileExplorer?: boolean;
+  noPickerFallback?: boolean;
   /**
    * REVIEW FINDING (P2) — the session this call created never came up: its
    * initial SSH connect failed (`SshPtyCallbacks.onConnectFailed`,
@@ -1386,8 +1389,9 @@ function offerWebConsoleForAddressless(message: string, serverId: string): void 
 }
 
 export async function connectServer(ctx: CommandContext, arg?: unknown, options: ConnectServerOptions = {}): Promise<void> {
-  const server = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
+  const server = toServerFromArg(ctx.core, arg) ?? (options.noPickerFallback ? undefined : await pickServer(ctx.core));
   if (!server) {
+    if (options.noPickerFallback) throw new Error("Selected profile no longer exists.");
     return;
   }
   // ADDRESSLESS (Codex P1) — refuse BEFORE any transport branch: a placeholder
@@ -1917,13 +1921,224 @@ export async function teardownServerRuntime(ctx: CommandContext, serverId: strin
   ctx.sshPool.disconnect(serverId);
 }
 
+function openBulkServerEdit(ctx: CommandContext, rows: readonly ServerTreeItem[]): void {
+  const snapshot = ctx.core.getSnapshot();
+  const originals = rows.map((row) => ctx.core.getServer(row.server.id));
+  if (originals.some((server) => server === undefined)) {
+    void vscode.window.showWarningMessage("A selected profile no longer exists. Select the profiles again.");
+    return;
+  }
+  const baseline = originals.map((server) => cloneServerConfig(server!));
+  const authSignatures = new Map(snapshot.authProfiles.map((profile) => [profile.id, authProfileOwnershipSignature(profile)]));
+  const first = baseline[0];
+  const hasInventoryProfile = baseline.some((server) => server.origin !== undefined || server.formerlySynced !== undefined);
+  const definition = serverFormDefinition({ ...first, authProfileId: undefined }, collectGroups(ctx), getDefaultSessionTranscriptsEnabled(), toSshInfrastructureServerList(snapshot.servers), snapshot.authProfiles, hasInventoryProfile, readHighlightCatalog());
+  definition.title = `Edit ${rows.length} Network Device Profiles`;
+  const editableFields = new Set(["protocol", "port", "username", "authType", "keyPath", "authProfileId", "ipmiAuthProfileId", "ipmiGatewayServerId", "logSession", "multiplexing", "legacyAlgorithms", "group", "ipmiHost", "altHost", "bmcWebProtocol", "highlightProfileId", "openFileExplorerOnFirstConnect"]);
+  definition.fields = definition.fields.flatMap<FormFieldDescriptor>((field) => {
+    if (!("key" in field)) return [];
+    if ((field.key === "name" || field.key === "host") && field.type === "text") {
+      const key = field.key;
+      return [{ ...field, readOnly: true, required: false, value: baseline.every((server) => server[key] === first[key]) ? first[key] : "(Multiple values)" }];
+    }
+    if (field.key.startsWith("proxy") && field.key !== "proxyType") {
+      const conditions = field.visibleWhen === undefined ? [] : Array.isArray(field.visibleWhen) ? field.visibleWhen : [field.visibleWhen];
+      const proxyConditions = conditions.filter((condition) => condition.field !== "protocol");
+      return [{ ...field, visibleWhen: [{ field: "__bulk_apply_proxyType", value: "true" }, ...proxyConditions] }];
+    }
+    if (field.key === "inventoryProxyRouteChoice") return [{ ...field, visibleWhen: [{ field: "__bulk_apply_proxyType", value: "true" }, { field: "proxyType", value: "none" }] }];
+    if ((!editableFields.has(field.key) && field.key !== "proxyType") || !("label" in field)) return [];
+    const applyWhen = { field: `__bulk_apply_${field.key}`, value: "true" };
+    const control = field.type === "select" && (field.key === "authProfileId" || field.key === "ipmiAuthProfileId")
+      ? { ...field, options: field.options.filter((option) => !option.value.startsWith("__create__")), autofill: false, visibleWhen: applyWhen }
+      : field.type === "checkbox" && field.key === "openFileExplorerOnFirstConnect"
+        ? { ...field, hint: "You can only disable this setting in bulk. To enable it, edit one SSH profile individually.", visibleWhen: applyWhen }
+        : { ...field, visibleWhen: applyWhen };
+    return [{ type: "checkbox" as const, key: `__bulk_apply_${field.key}`, label: `Change ${field.label} for all selected profiles`, advanced: field.advanced }, control];
+  });
+  WebviewFormPanel.open(`server-bulk-edit-${randomUUID()}`, definition, {
+    onSubmit: async (values) => {
+      const changePort = values.__bulk_apply_port === true;
+      const changeLog = values.__bulk_apply_logSession === true;
+      const changeMultiplexing = values.__bulk_apply_multiplexing === true;
+      const changeLegacy = values.__bulk_apply_legacyAlgorithms === true;
+      const changeGroup = values.__bulk_apply_group === true;
+      const changeIpmiHost = values.__bulk_apply_ipmiHost === true;
+      const changeAltHost = values.__bulk_apply_altHost === true;
+      const changeBmcWebProtocol = values.__bulk_apply_bmcWebProtocol === true;
+      const changeUsername = values.__bulk_apply_username === true;
+      const changeProtocol = values.__bulk_apply_protocol === true;
+      const changeAuthType = values.__bulk_apply_authType === true;
+      const changeKeyPath = values.__bulk_apply_keyPath === true;
+      const changeAuthProfile = values.__bulk_apply_authProfileId === true;
+      const changeIpmiAuth = values.__bulk_apply_ipmiAuthProfileId === true;
+      const changeIpmiGateway = values.__bulk_apply_ipmiGatewayServerId === true;
+      const changeProxy = values.__bulk_apply_proxyType === true;
+      const changeHighlight = values.__bulk_apply_highlightProfileId === true;
+      const changeAutoOpen = values.__bulk_apply_openFileExplorerOnFirstConnect === true;
+      if (!changePort && !changeLog && !changeMultiplexing && !changeLegacy && !changeGroup && !changeIpmiHost && !changeAltHost && !changeBmcWebProtocol && !changeUsername && !changeProtocol && !changeAuthType && !changeKeyPath && !changeAuthProfile && !changeIpmiAuth && !changeIpmiGateway && !changeProxy && !changeHighlight && !changeAutoOpen) return;
+      const port = values.port;
+      if (changePort && (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535)) throw new Error("Port must be between 1 and 65535.");
+      for (const [selected, key] of [[changeLog, "logSession"], [changeMultiplexing, "multiplexing"], [changeLegacy, "legacyAlgorithms"]] as const) {
+        if (selected && typeof values[key] !== "boolean") throw new Error(`Invalid ${key} value.`);
+      }
+      for (const [selected, key] of [[changeGroup, "group"], [changeIpmiHost, "ipmiHost"], [changeAltHost, "altHost"]] as const) {
+        if (selected && typeof values[key] !== "string") throw new Error(`Invalid ${key} value.`);
+      }
+      const group = changeGroup ? normalizeOptionalFolderPath(values.group) : undefined;
+      if (group === null) throw new Error(INVALID_FOLDER_PATH_MESSAGE);
+      if (changeBmcWebProtocol && values.bmcWebProtocol !== "http" && values.bmcWebProtocol !== "https") throw new Error("Invalid BMC web protocol.");
+      if (changeUsername && (typeof values.username !== "string" || !values.username.trim())) throw new Error("Username cannot be empty.");
+      if (changeProtocol && values.protocol !== "ssh" && values.protocol !== "telnet") throw new Error("Invalid protocol.");
+      if (changeAuthType && !isAuthType(values.authType)) throw new Error("Invalid authentication type.");
+      if (changeKeyPath && typeof values.keyPath !== "string") throw new Error("Invalid private key path.");
+      if (changeAutoOpen && typeof values.openFileExplorerOnFirstConnect !== "boolean") throw new Error("Invalid File Explorer auto-open setting.");
+      if (changeAutoOpen && values.openFileExplorerOnFirstConnect === true) throw new Error("Only one profile can open File Explorer automatically. Edit that profile individually.");
+      const selectedHighlight = changeHighlight ? parseHighlightProfileFormValue(values.highlightProfileId) : undefined;
+      if (changeHighlight && typeof selectedHighlight === "string" && !readHighlightCatalog().profiles.some((profile) => profile.id === selectedHighlight)) throw new Error("The highlight profile no longer exists. Reopen the editor and choose another.");
+      for (const [selected, key] of [[changeAuthProfile, "authProfileId"], [changeIpmiAuth, "ipmiAuthProfileId"], [changeIpmiGateway, "ipmiGatewayServerId"]] as const) {
+        if (selected && typeof values[key] !== "string") throw new Error(`Invalid ${key} value.`);
+      }
+      const selectedAuth = changeAuthProfile ? (values.authProfileId as string) || undefined : undefined;
+      const selectedIpmiAuth = changeIpmiAuth ? (values.ipmiAuthProfileId as string) || undefined : undefined;
+      const selectedGateway = changeIpmiGateway ? (values.ipmiGatewayServerId as string) || undefined : undefined;
+      if (changeProxy && !["none", "ssh", "socks5", "http"].includes(String(values.proxyType))) throw new Error("Invalid proxy type.");
+      if (changeProxy && values.proxyType === "none" && hasInventoryProfile && values.inventoryProxyRouteChoice !== "automatic" && values.inventoryProxyRouteChoice !== "direct") throw new Error("Choose how inventory should manage the proxy route.");
+      const selectedProxy = changeProxy ? formValuesToProxy(values) : undefined;
+      if (changeProxy && values.proxyType !== "none" && !selectedProxy) throw new Error("Enter a valid proxy and port.");
+      const passwordValue = selectedProxy?.type === "socks5" ? values.proxySocks5Password : selectedProxy?.type === "http" ? values.proxyHttpPassword : undefined;
+      if (selectedProxy && (selectedProxy.type === "socks5" || selectedProxy.type === "http") && !selectedProxy.username && typeof passwordValue === "string" && passwordValue.length > 0) throw new Error("Enter a proxy username before saving its password.");
+      const changeProxySecret = selectedProxy !== undefined && (selectedProxy.type === "socks5" || selectedProxy.type === "http") && (!selectedProxy.username || (typeof passwordValue === "string" && passwordValue.length > 0));
+      if (typeof passwordValue === "string" && passwordValue.length > 0 && !ctx.secretVault) throw new Error("Proxy password storage is unavailable. Try again after reloading the window.");
+      await configMutationLock.runExclusive(() => ctx.core.runServerBatch(async () => {
+        const targets = rows.map((row) => ctx.core.getServer(row.server.id));
+        if (targets.some((target) => !target || (changePort && target.addressless))) throw new Error("A selected profile is missing or has no address. Select addressed profiles and try again.");
+        if (targets.some((target, index) => !serverConfigsEqual(target!, baseline[index]))) throw new Error("A selected profile changed while the editor was open. Reopen the bulk editor and try again.");
+        if (changeUsername || changeAuthType || changeKeyPath) {
+          for (const target of targets) {
+            const effectiveId = changeAuthProfile ? selectedAuth : target!.authProfileId;
+            const profile = effectiveId ? ctx.core.getAuthProfile(effectiveId) : undefined;
+            const captured = effectiveId ? authSignatures.get(effectiveId) : authProfileOwnershipSignature(undefined);
+            if (authProfileOwnershipSignature(profile) !== captured) throw new Error("An auth profile changed while the editor was open. Reopen the bulk editor and try again.");
+            const ownership = authProfileFieldOwnership(profile);
+            if ((changeUsername && ownership.username) || (changeAuthType && ownership.authType) || (changeKeyPath && ownership.keyPath)) throw new Error("An auth profile manages a selected credential field. Change that auth profile or choose profiles without managed credentials.");
+          }
+        }
+        for (const id of [selectedAuth, selectedIpmiAuth]) {
+          if (!id) continue;
+          const live = ctx.core.getAuthProfile(id);
+          if (!live || !authSignatures.has(id) || authSignatures.get(id) !== authProfileOwnershipSignature(live)) throw new Error("An auth profile is missing or changed. Reopen the bulk editor and try again.");
+        }
+        const ipmiUnsupported = selectedIpmiAuth ? externalAuthProfileUnsupportedReason(ctx.core.getAuthProfile(selectedIpmiAuth), "ipmi") : undefined;
+        if (ipmiUnsupported) throw new Error(ipmiUnsupported);
+        const gateway = selectedGateway ? ctx.core.getServer(selectedGateway) : undefined;
+        if (selectedGateway && (!gateway || gateway.addressless || resolveServerProtocol(gateway) !== "ssh")) throw new Error("The selected gateway is unavailable. Choose an addressed SSH gateway.");
+        if (selectedGateway && targets.some((target) => target!.id === selectedGateway)) throw new Error("A selected server cannot use itself as its gateway.");
+        if (selectedProxy?.type === "ssh") {
+          const jump = ctx.core.getServer(selectedProxy.jumpHostId);
+          if (!jump || jump.addressless || resolveServerProtocol(jump) !== "ssh") throw new Error("The selected SSH jump host is unavailable. Choose another jump host.");
+          if (targets.some((target) => target!.id === selectedProxy.jumpHostId)) throw new Error("A selected server cannot use itself as its jump host.");
+        }
+        const writes = targets.map((target) => {
+          const next: ServerConfig = {
+            ...target!,
+            ...(changePort ? { port: port as number } : {}),
+            ...(changeUsername ? { username: (values.username as string).trim() } : {}),
+            ...(changeProtocol ? { protocol: values.protocol === "telnet" ? "telnet" as const : undefined } : {}),
+            ...(changeAuthType ? { authType: values.authType as AuthType } : {}),
+            ...(changeKeyPath ? { keyPath: (values.keyPath as string).trim() || undefined } : {}),
+            ...(changeAuthProfile ? { authProfileId: selectedAuth } : {}),
+            ...(changeIpmiAuth ? { ipmiAuthProfileId: selectedIpmiAuth } : {}),
+            ...(changeIpmiGateway ? { ipmiGatewayServerId: selectedGateway } : {}),
+            ...(changeHighlight ? { highlightProfileId: selectedHighlight } : {}),
+            ...(changeAutoOpen ? { openFileExplorerOnFirstConnect: undefined } : {}),
+            ...(changeProxy ? {
+              proxy: selectedProxy,
+              origin: selectedProxy ? target!.origin : applyInventoryProxyRouteChoice(target!.origin, values.inventoryProxyRouteChoice, target!.proxy !== undefined),
+              formerlySynced: selectedProxy ? target!.formerlySynced : applyInventoryProxyRouteChoice(target!.formerlySynced, values.inventoryProxyRouteChoice, target!.proxy !== undefined)
+            } : {}),
+            ...(changeLog ? { logSession: values.logSession === true } : {}),
+            ...(changeMultiplexing ? { multiplexing: values.multiplexing === true } : {}),
+            ...(changeLegacy ? { legacyAlgorithms: values.legacyAlgorithms === true } : {}),
+            ...(changeGroup ? { group } : {}),
+            ...(changeIpmiHost ? { ipmiHost: (values.ipmiHost as string).trim() || undefined } : {}),
+            ...(changeAltHost ? { altHost: (values.altHost as string).trim() || undefined } : {}),
+            ...(changeBmcWebProtocol ? { bmcWebProtocol: values.bmcWebProtocol === "http" ? "http" as const : undefined } : {})
+          };
+          return { prior: cloneServerConfig(target!), next, written: cloneServerConfig(next) };
+        });
+        if (writes.some((write) => !validateServerConfig(write.next))) throw new Error("The selected changes would leave a profile invalid. Check the settings or edit the profiles individually.");
+        const oldSecrets = new Map<string, string | undefined>();
+        if (changeProxySecret && ctx.secretVault) {
+          for (const write of writes) {
+            const key = currentProxyPasswordSecretKey(write.written);
+            if (key !== undefined) oldSecrets.set(key, await ctx.secretVault.get(key));
+          }
+        }
+        const attempted: typeof writes = [];
+        const secretsAttempted: typeof writes = [];
+        try {
+          for (const write of writes) {
+            const live = ctx.core.getServer(write.prior.id);
+            if (!live || !serverConfigsEqual(live, write.prior)) throw new Error("A selected profile changed while saving. Reopen the bulk editor and try again.");
+            attempted.push(write);
+            await ctx.core.addOrUpdateServer(write.next);
+            if (changeProxySecret) {
+              secretsAttempted.push(write);
+              await syncProxyPasswordSecret(ctx, write.next.id, values);
+            }
+          }
+        } catch (error) {
+          let rollbackFailed = false;
+          for (const write of attempted.reverse()) {
+            const live = ctx.core.getServer(write.prior.id);
+            if (!live) continue;
+            try {
+              await ctx.core.addOrUpdateServer(mergeServerConfigFields(write.prior, write.written, live));
+            } catch {
+              rollbackFailed = true;
+            }
+          }
+          if (changeProxy && ctx.secretVault) {
+            for (const write of secretsAttempted) {
+              const key = currentProxyPasswordSecretKey(write.written);
+              if (key === undefined) continue;
+              try {
+                const oldSecret = oldSecrets.get(key);
+                if (!ctx.core.getServer(write.prior.id) || oldSecret === undefined) await ctx.secretVault.delete(key);
+                else {
+                  await ctx.secretVault.store(key, oldSecret);
+                  if (!ctx.core.getServer(write.prior.id)) await ctx.secretVault.delete(key);
+                }
+              } catch {
+                rollbackFailed = true;
+              }
+            }
+          }
+          if (rollbackFailed) throw new Error(`Bulk edit failed and some changes could not be restored. Review the selected profiles. ${error instanceof Error ? error.message : String(error)}`);
+          throw error;
+        }
+      }));
+    },
+    onBrowse: browseForKey
+  });
+}
+
 export function registerServerCommands(ctx: CommandContext): vscode.Disposable[] {
   return [
     vscode.commands.registerCommand("nexus.server.add", () => {
       void vscode.commands.executeCommand("nexus.profile.add", { addMode: "ssh", profileType: "ssh" });
     }),
 
-    vscode.commands.registerCommand("nexus.server.edit", async (arg?: unknown) => {
+    vscode.commands.registerCommand("nexus.server.edit", async (arg?: unknown, selection?: unknown) => {
+      if (arg instanceof ServerTreeItem && Array.isArray(selection) && selection.length > 1 && selection.includes(arg)) {
+        if (!selection.every((item): item is ServerTreeItem => item instanceof ServerTreeItem)) {
+          void vscode.window.showWarningMessage("Select only network device profiles to edit them together.");
+          return;
+        }
+        openBulkServerEdit(ctx, selection);
+        return;
+      }
       const existing = toServerFromArg(ctx.core, arg) ?? (await pickServer(ctx.core));
       if (!existing) {
         return;
@@ -2626,7 +2841,21 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       });
     }),
 
-    vscode.commands.registerCommand("nexus.server.connect", (arg?: unknown) => connectServer(ctx, arg)),
+    vscode.commands.registerCommand("nexus.server.connect", async (arg?: unknown, selection?: unknown) => {
+      if (arg instanceof ServerTreeItem && Array.isArray(selection) && selection.length > 1 && selection.includes(arg)) {
+        if (!selection.every((item): item is ServerTreeItem => item instanceof ServerTreeItem)) {
+          void vscode.window.showWarningMessage("Select only network device profiles to connect them together.");
+          return;
+        }
+        if (selection.some((item) => !ctx.core.getServer(item.server.id))) {
+          void vscode.window.showWarningMessage("A selected profile no longer exists. Select the profiles again.");
+          return;
+        }
+        await Promise.all(selection.map((item) => connectServer(ctx, item.server.id, { allowAutoFileExplorer: false, noPickerFallback: true })));
+        return;
+      }
+      await connectServer(ctx, arg);
+    }),
     vscode.commands.registerCommand("nexus.server.testConnection", (arg?: unknown) => testServerConnection(ctx, arg)),
     vscode.commands.registerCommand("nexus.server.disconnect", (arg?: unknown) => disconnectServer(ctx, arg)),
     vscode.commands.registerCommand("nexus.server.runWithScript", (arg?: unknown) => connectAndRunScript(ctx, arg)),

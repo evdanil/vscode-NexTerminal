@@ -5,7 +5,7 @@ Browse, download, and manage remote files on connected servers over SFTP. The Fi
 ## Browse Remote Files
 
 1. Connect to an SSH server
-2. Right-click the connected server in the Connectivity Hub and choose **Browse Files** (it is also in the list you get by clicking the server — see [Profile Actions](connectivity-hub.md#profile-actions)), or click **Browse Files** in the **File Explorer** title bar and pick the connected server
+2. Right-click the connected server in the Connectivity Hub and choose **Browse Files**, or click **Browse Files** in the **File Explorer** title bar and pick the connected server
 3. The File Explorer opens at the server's home directory — browse, download, or drag files between remote directories
 
 **New File**, **New Directory** and **Upload File** in the File Explorer title bar act on the directory the explorer is showing (the `.` row), whichever row you clicked last; the same entries on a directory's right-click menu act on that directory.

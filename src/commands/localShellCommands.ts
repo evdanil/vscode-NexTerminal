@@ -676,8 +676,9 @@ export function registerLocalShellCommands(ctx: CommandContext): vscode.Disposab
     vscode.commands.registerCommand("nexus.localShell.add", () => {
       void vscode.commands.executeCommand("nexus.profile.add", { addMode: "localShell", profileType: "localShell" });
     }),
-    vscode.commands.registerCommand("nexus.localShell.connect", async (arg?: unknown) => {
-      const profile = toLocalShellProfileFromArg(ctx.core, arg) ?? (await pickLocalShellProfile(ctx.core));
+    vscode.commands.registerCommand("nexus.localShell.connect", async (arg?: unknown, options?: { noPickerFallback?: boolean }) => {
+      if (options?.noPickerFallback && (typeof arg !== "string" || !ctx.core.getLocalShellProfile(arg))) throw new Error("Selected profile no longer exists.");
+      const profile = toLocalShellProfileFromArg(ctx.core, arg) ?? (options?.noPickerFallback ? undefined : await pickLocalShellProfile(ctx.core));
       if (!profile) {
         return;
       }

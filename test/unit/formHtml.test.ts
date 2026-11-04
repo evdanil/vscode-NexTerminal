@@ -5,8 +5,41 @@ import type { FormDefinition } from "../../src/ui/formTypes";
 import { inventorySourceFormDefinition, serverFormDefinition, tunnelFormDefinition } from "../../src/ui/formDefinitions";
 import type { AuthProfile } from "../../src/models/config";
 import { authProfileOwnedCredentials } from "../../src/models/config";
+import { openForm } from "../helpers/formScriptHarness";
 
 describe("renderFormHtml", () => {
+  it("renders read-only text with a disabled appearance and leaves ordinary fields editable", () => {
+    const html = renderFormHtml({ title: "Bulk edit", fields: [
+      { type: "text", key: "name", label: "Name", value: "Multiple", readOnly: true },
+      { type: "text", key: "username", label: "Username" }
+    ] });
+    expect(html).toMatch(/<input[^>]*name="name"[^>]*readonly[^>]*class="bulk-readonly"/);
+    expect(html).not.toMatch(/<input[^>]*name="username"[^>]*readonly/);
+    expect(html).toContain("--vscode-disabledForeground");
+  });
+  it("shows a conditional field only while its controlling checkbox is checked", () => {
+    const form = openForm({ title: "Bulk edit", fields: [
+      { type: "checkbox", key: "apply", label: "Change port" },
+      { type: "number", key: "port", label: "Port", value: 22, visibleWhen: { field: "apply", value: "true" } }
+    ] });
+    expect(form.submit().port).toBeUndefined();
+    form.toggle("apply", true);
+    expect(form.submit().port).toBe(22);
+    form.toggle("apply", false);
+    expect(form.submit().port).toBeUndefined();
+  });
+
+  it("restores required validation after a conditional field is hidden and shown again", () => {
+    const form = openForm({ title: "Bulk edit", fields: [
+      { type: "checkbox", key: "apply", label: "Change port" },
+      { type: "number", key: "port", label: "Port", required: true, visibleWhen: { field: "apply", value: "true" } }
+    ] });
+    form.toggle("apply", true);
+    expect(form.attemptNativeSubmit()).toBeUndefined();
+    form.toggle("apply", false);
+    form.toggle("apply", true);
+    expect(form.attemptNativeSubmit()).toBeUndefined();
+  });
   it("renders text fields with labels", () => {
     const definition: FormDefinition = {
       title: "Test Form",

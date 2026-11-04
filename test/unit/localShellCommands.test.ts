@@ -462,6 +462,14 @@ describe("registerLocalShellCommands", () => {
     }));
   });
 
+  it("does not open a picker when a selected local shell profile disappears", async () => {
+    const ctx = makeCtx();
+    ctx.core.getLocalShellProfile.mockReturnValue(undefined);
+    registerLocalShellCommands(ctx);
+    await expect(registeredCommands.get("nexus.localShell.connect")!("deleted", { noPickerFallback: true })).rejects.toThrow(/no longer exists/i);
+    expect(mockShowQuickPick).not.toHaveBeenCalled();
+  });
+
   it("keeps Local Shell macro eligibility after editor focus changes", async () => {
     const ctx = makeCtx();
     let isActive!: () => boolean;

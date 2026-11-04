@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as vscode from "vscode";
-import { FolderTreeItem, LocalShellProfileTreeItem, LocalShellSessionTreeItem, NexusTreeProvider, NoMatchesTreeItem, SerialProfileTreeItem, SerialSessionTreeItem, ServerTreeItem, SessionTreeItem } from "../../src/ui/nexusTreeProvider";
+import { FolderTreeItem, LocalServerConfigTreeItem, LocalShellProfileTreeItem, LocalShellSessionTreeItem, NexusTreeProvider, NoMatchesTreeItem, SerialProfileTreeItem, SerialSessionTreeItem, ServerTreeItem, SessionTreeItem } from "../../src/ui/nexusTreeProvider";
 import { TUNNEL_DRAG_MIME } from "../../src/ui/dndMimeTypes";
 import type { LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile } from "../../src/models/config";
 import { InventoryProviderRegistry } from "../../src/services/inventory/providerRegistry";
@@ -62,6 +62,7 @@ vi.mock("vscode", () => ({
       toString: () => `${components.scheme}://${components.authority ?? ""}${components.path ?? ""}`
     })
   },
+  window: { showWarningMessage: vi.fn() },
   workspace: {
     getConfiguration: vi.fn(() => ({ get: () => undefined }))
   }
@@ -113,6 +114,18 @@ describe("NexusTreeProvider tunnel DnD extraction", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it("does not drag only the first of several selected items", async () => {
+    const provider = new NexusTreeProvider({ onTunnelDropped, onItemGroupChanged, onFolderMoved });
+    const transfer = { set: vi.fn() };
+    await provider.handleDrag([
+      new ServerTreeItem(makeServer({ id: "one" }), false),
+      new ServerTreeItem(makeServer({ id: "two" }), false)
+    ], transfer as unknown as vscode.DataTransfer);
+
+    expect(transfer.set).not.toHaveBeenCalled();
+    expect(vscode.window.showWarningMessage).toHaveBeenCalledWith(expect.stringContaining("one item at a time"));
   });
 
   it("accepts JSON payload and starts tunnel on target server", async () => {
@@ -598,6 +611,15 @@ function makeLocalShell(overrides: Partial<LocalShellProfile> = {}): LocalShellP
   };
 }
 
+describe("profile selection", () => {
+  it("selects a profile without opening actions or starting a connection", () => {
+    expect(new ServerTreeItem(makeServer(), false).command).toBeUndefined();
+    expect(new SerialProfileTreeItem(makeSerial(), "disconnected").command).toBeUndefined();
+    expect(new LocalShellProfileTreeItem(makeLocalShell(), false).command).toBeUndefined();
+    expect(new LocalServerConfigTreeItem({ id: "local-server", name: "Server", executable: "node" }, "stopped", false).command).toBeUndefined();
+  });
+});
+
 function emptySnapshot(): SessionSnapshot {
   return {
     servers: [],
@@ -751,37 +773,25 @@ describe("NexusTreeProvider stable IDs", () => {
     expect(disconnected.id).toBe(connected.id);
   });
 
-  it("ServerTreeItem opens profile quick actions on click", () => {
+  it("ServerTreeItem selection does not open profile actions", () => {
     const server = makeServer({ id: "s1" });
     const item = new ServerTreeItem(server, false);
 
-    expect(item.command).toEqual({
-      command: "nexus.profile.actions",
-      title: "Profile Actions",
-      arguments: [item]
-    });
+    expect(item.command).toBeUndefined();
   });
 
-  it("SerialProfileTreeItem opens profile quick actions on click", () => {
+  it("SerialProfileTreeItem selection does not open profile actions", () => {
     const profile = makeSerial({ id: "sp1" });
     const item = new SerialProfileTreeItem(profile, "connected");
 
-    expect(item.command).toEqual({
-      command: "nexus.profile.actions",
-      title: "Profile Actions",
-      arguments: [item]
-    });
+    expect(item.command).toBeUndefined();
   });
 
-  it("LocalShellProfileTreeItem opens profile quick actions on click", () => {
+  it("LocalShellProfileTreeItem selection does not open profile actions", () => {
     const profile = makeLocalShell({ id: "local-1" });
     const item = new LocalShellProfileTreeItem(profile, true);
 
-    expect(item.command).toEqual({
-      command: "nexus.profile.actions",
-      title: "Profile Actions",
-      arguments: [item]
-    });
+    expect(item.command).toBeUndefined();
     expect((item.iconPath as { id: string }).id).toBe("terminal");
     expect(item.description).toBe("/bin/bash");
   });
