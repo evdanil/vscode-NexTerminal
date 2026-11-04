@@ -87,6 +87,17 @@ beforeEach(() => {
   readTftpConfig.mockReturnValue({ port: 69, allowWrite: false });
 });
 
+describe("service root row selection", () => {
+  it("lets both service rows expand without opening Quick Settings", () => {
+    const rows = roots([]);
+    for (const kind of ["tftp", "dhcp"]) {
+      expect(rows[kind].collapsibleState).toBe(1);
+      expect(rows[kind].command).toBeUndefined();
+      expect(rows[kind].contextValue).toBe("nexus.networkServer.stopped");
+    }
+  });
+});
+
 describe("service root row — bound where clients will not look", () => {
   it("flags TFTP that fell back from 69 to 1069", () => {
     const tftp = roots([{ kind: "tftp", status: "running", boundPort: 1069 }]).tftp;
