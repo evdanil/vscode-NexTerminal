@@ -303,8 +303,8 @@ is never fatal, and the send confirmation says which token went out verbatim.
 
 ### Running a profile macro
 
-Right-click a server in the Connectivity Hub and choose **Run Macro on Server…**
-(also available from **Profile Actions**). The picker lists every macro, with
+Right-click a server in the Connectivity Hub and choose **Run Macro on Server…**.
+The picker lists every macro, with
 profile-token macros first. Tokens then resolve against **that server** — not
 against whatever terminal happens to be active.
 

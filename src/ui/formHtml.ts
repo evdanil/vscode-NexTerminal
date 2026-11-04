@@ -98,7 +98,7 @@ function renderField(field: FormFieldDescriptor): string {
       }
       return `<div class="form-group"${vw}${rw}>
   <label for="${id}">${escapeHtml(field.label)}${requiredLabel}</label>
-  <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req}${textAutofillAttr}${lookupAttrs} />${renderHint(field, ordinaryHintId)}${lookupMarkup}
+  <input type="text" id="${id}" name="${key}" value="${escapeHtml(field.value ?? "")}" placeholder="${escapeHtml(field.placeholder ?? "")}"${req}${textAutofillAttr}${lookupAttrs}${field.readOnly ? ' readonly class="bulk-readonly"' : ""} />${renderHint(field, ordinaryHintId)}${lookupMarkup}
   <div class="field-error" id="error-${key}"></div>
 </div>`;
     }
@@ -319,6 +319,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
   ${csp}
   <style${nonceAttr}>
     ${baseWebviewCss()}
+    .bulk-readonly { color: var(--vscode-disabledForeground); }
     body { max-width: 700px; }
     .advanced-fields {
       margin: 6px 0 18px;
@@ -785,9 +786,10 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
           for (var ci = 0; ci < conditions.length; ci++) {
             var control = form.elements[conditions[ci].field];
             var expectedValue = conditions[ci].value;
+            var actualValue = control && control.type === "checkbox" ? String(control.checked) : control && control.value;
             var matches = Array.isArray(expectedValue)
-              ? expectedValue.indexOf(control && control.value) !== -1
-              : control && control.value === expectedValue;
+              ? expectedValue.indexOf(actualValue) !== -1
+              : actualValue === expectedValue;
             if (!matches) {
               visible = false;
               break;
@@ -803,7 +805,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
               if (inputs[ii].dataset.wasRequired === "true") inputs[ii].required = true;
               inputs[ii].disabled = false;
             } else {
-              inputs[ii].dataset.wasRequired = inputs[ii].required ? "true" : "false";
+              if (!inputs[ii].disabled) inputs[ii].dataset.wasRequired = inputs[ii].required ? "true" : "false";
               inputs[ii].required = false;
               inputs[ii].disabled = true;
             }

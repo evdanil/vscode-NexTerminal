@@ -874,9 +874,10 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
       }
     }),
 
-    vscode.commands.registerCommand("nexus.serial.connect", async (arg?: unknown) => {
+    vscode.commands.registerCommand("nexus.serial.connect", async (arg?: unknown, options?: { noPickerFallback?: boolean }) => {
+      if (options?.noPickerFallback && (typeof arg !== "string" || !ctx.core.getSerialProfile(arg))) throw new Error("Selected profile no longer exists.");
       try {
-        const profile = toSerialProfileFromArg(ctx.core, arg) ?? (await pickSerialProfile(ctx.core));
+        const profile = toSerialProfileFromArg(ctx.core, arg) ?? (options?.noPickerFallback ? undefined : await pickSerialProfile(ctx.core));
         if (!profile) {
           return;
         }

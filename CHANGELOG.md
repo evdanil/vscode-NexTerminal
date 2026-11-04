@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.8.314] — 2026-11-04
+
+### Added
+
+- **Select several profiles in the Connectivity Hub** to connect them together, and bulk-edit chosen settings on network device profiles while keeping each name and host.
+
+### Changed
+
+- Selecting a profile no longer opens an actions menu; use its row icon or right-click menu instead.
+
 ## [2.8.313] — 2026-11-03
 
 ### Added

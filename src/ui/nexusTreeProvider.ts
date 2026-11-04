@@ -201,11 +201,6 @@ export class ServerTreeItem extends vscode.TreeItem {
     } else {
       this.iconPath = new vscode.ThemeIcon("debug-disconnect", new vscode.ThemeColor("testing.iconQueued"));
     }
-    this.command = {
-      command: "nexus.profile.actions",
-      title: "Profile Actions",
-      arguments: [this]
-    };
   }
 }
 
@@ -250,11 +245,6 @@ export class SerialProfileTreeItem extends vscode.TreeItem {
       smartFollow ? "sync" : connected ? "plug" : "debug-disconnect",
       new vscode.ThemeColor(connected ? "testing.iconPassed" : "testing.iconQueued")
     );
-    this.command = {
-      command: "nexus.profile.actions",
-      title: "Profile Actions",
-      arguments: [this]
-    };
   }
 }
 
@@ -290,11 +280,6 @@ export class LocalShellProfileTreeItem extends vscode.TreeItem {
     this.description = showDescription ? description : undefined;
     this.contextValue = connected ? "nexus.localShellProfileConnected" : "nexus.localShellProfile";
     this.iconPath = new vscode.ThemeIcon("terminal");
-    this.command = {
-      command: "nexus.profile.actions",
-      title: "Profile Actions",
-      arguments: [this]
-    };
   }
 }
 
@@ -355,11 +340,6 @@ export class LocalServerConfigTreeItem extends vscode.TreeItem {
     // this row sits in a folder.
     this.contextValue = running ? "nexus.localServerRunning" : "nexus.localServer";
     this.iconPath = new vscode.ThemeIcon(iconInfo.icon, iconInfo.color);
-    this.command = {
-      command: "nexus.profile.actions",
-      title: "Local Server Actions",
-      arguments: [this]
-    };
   }
 }
 
@@ -636,6 +616,10 @@ export class NexusTreeProvider
     source: readonly NexusTreeItem[],
     dataTransfer: vscode.DataTransfer
   ): Promise<void> {
+    if (source.length > 1) {
+      void vscode.window.showWarningMessage("Move one item at a time; multi-item dragging is not supported.");
+      return;
+    }
     const item = source[0];
     if (item instanceof ServerTreeItem) {
       dataTransfer.set(ITEM_DRAG_MIME, new vscode.DataTransferItem(JSON.stringify({ type: "server", id: item.server.id })));

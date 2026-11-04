@@ -58,7 +58,7 @@ export type FormFieldDescriptor =
    * Default false → today's markup, byte-for-byte. A field that does not set it
    * emits no `data-autofill` attribute and wires no listener.
    */
-  | ({ type: "text"; key: string; label: string; required?: boolean; placeholder?: string; value?: string; scannable?: boolean; autofill?: boolean } & FormFieldCommon)
+  | ({ type: "text"; key: string; label: string; required?: boolean; placeholder?: string; value?: string; scannable?: boolean; autofill?: boolean; readOnly?: boolean } & FormFieldCommon)
   | ({ type: "textarea"; key: string; label: string; required?: boolean; placeholder?: string; value?: string; rows?: number } & FormFieldCommon)
   | ({ type: "password"; key: string; label: string; required?: boolean; placeholder?: string; value?: string } & FormFieldCommon)
   | ({ type: "number"; key: string; label: string; required?: boolean; min?: number; max?: number; step?: number | "any"; placeholder?: string; value?: number; defaultsFrom?: FieldDefaultsFrom } & FormFieldCommon)

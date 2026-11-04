@@ -254,6 +254,14 @@ describe("registerSerialCommands port collision", () => {
     );
   });
 
+  it("does not open a picker when a selected serial profile disappears", async () => {
+    const ctx = { core: { getSerialProfile: vi.fn(() => undefined) } } as any;
+    registerSerialCommands(ctx);
+    vi.mocked(vscode.window.showQuickPick).mockClear();
+    await expect(registeredCommands.get("nexus.serial.connect")!("deleted", { noPickerFallback: true })).rejects.toThrow(/no longer exists/i);
+    expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
+  });
+
   it("refocuses the existing terminal when connecting a serial profile that already has a session", async () => {
     const profile = {
       id: "sp1",
