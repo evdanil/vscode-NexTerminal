@@ -367,7 +367,7 @@ export function registerNetworkServerCommands(
       }
     }),
 
-    // The per-item gear and a click on the service row. Fast path: the handful
+    // The per-item gear and context menu. Fast path: the handful
     // of settings that change between one lab and the next, with the full form
     // one item away for everything structured.
     vscode.commands.registerCommand("nexus.networkServer.quickAdjust", async (arg?: unknown) => {

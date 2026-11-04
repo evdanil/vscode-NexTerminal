@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.315] — 2026-11-04
+
+### Changed
+
+- Selecting a TFTP or DHCP row no longer opens Quick Settings; use its gear or right-click menu instead.
+
 ## [2.8.314] — 2026-11-04
 
 ### Added

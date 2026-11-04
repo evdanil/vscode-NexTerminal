@@ -2,7 +2,7 @@
 
 Serve firmware and configs to lab hardware, and hand it addresses, without installing a separate daemon or borrowing the office DHCP server.
 
-Both services live in the **Network Servers** view of the Nexus sidebar. Each one has **Quick Settings** for everyday changes and **Open Full Settings** for the full form.
+Both services live in the **Network Servers** view of the Nexus sidebar. Select a service row to expand or collapse its status details. Use the row's gear icon or right-click **Quick Settings** for everyday changes, and **Open Full Settings** for the full form.
 
 **Open Full Settings** on a service's right-click menu opens that service's form; the gear in the view's title bar asks whether to open TFTP or DHCP.
 
