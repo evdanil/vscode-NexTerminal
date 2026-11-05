@@ -2,6 +2,7 @@ import { authProfileConnectionIdentity, isExternalAuthProfile, type ExternalAuth
 import type { ExternalCredentialResolver } from "../credentials/contracts";
 import { CredentialProviderError } from "../credentials/credentialProviderError";
 import type { Duplex } from "node:stream";
+import { randomUUID } from "node:crypto";
 import type { AuthProfile, ProxyConfig, ServerConfig } from "../../models/config";
 import { applyAuthProfile } from "../../models/config";
 import { configMutationLock } from "../configMutationLock";
@@ -61,6 +62,13 @@ export function passphraseSecretKey(serverId: string): string {
   return `passphrase-${serverId}`;
 }
 
+export function agentFallbackPasswordSecretKey(serverId: string): string {
+  return `agent-fallback-password-${serverId}`;
+}
+
+// Jump-route identifiers describe live transports and can be reused after restart.
+const fallbackRouteSession = randomUUID();
+
 export { proxyPasswordSecretKey, legacyProxyPasswordSecretKey } from "./proxyPasswordKeys";
 
 /**
@@ -102,6 +110,7 @@ export async function deleteServerSecrets(
   }
   for (const key of [
     passwordSecretKey(serverId),
+    agentFallbackPasswordSecretKey(serverId),
     passphraseSecretKey(serverId),
     legacyProxyPasswordSecretKey(serverId),
     ...new Set(endpointKeys)
@@ -738,6 +747,10 @@ export class SilentAuthSshFactory implements SshFactory {
       const sock = await options?.sockFactory?.();
       let fallbackCalled = false;
       let savedFallback: string | undefined;
+      let savedFallbackEnvelope: string | undefined;
+      let fallbackIdentity: string | undefined;
+      let fallbackRoute: string | undefined;
+      const fallbackKey = agentFallbackPasswordSecretKey(server.id);
       let fallbackAccepted = false;
       let rejectedSavedFallback: string | undefined;
       let promptedFallback: Awaited<ReturnType<SilentAuthSshFactory["promptShared"]>> | undefined;
@@ -745,7 +758,7 @@ export class SilentAuthSshFactory implements SshFactory {
         const rejected = rejectedSavedFallback;
         if (!rejected) return;
         await this.mutateCredentialIfEndpointUnchanged(server.id, credentialRecord, credentialEndpointSignature, async () => {
-          if (await this.vault.get(passwordKey) === rejected) await this.vault.delete(passwordKey);
+          if (await this.vault.get(fallbackKey) === rejected) await this.vault.delete(fallbackKey);
         });
         rejectedSavedFallback = undefined;
       };
@@ -755,9 +768,31 @@ export class SilentAuthSshFactory implements SshFactory {
         this.assertCredentialRecordCurrent(promptProvenance);
         if (!fallbackCalled) {
           fallbackCalled = true;
-          savedFallback = await this.vault.get(passwordKey);
+          fallbackRoute = options?.route?.() ?? (resolved.proxy ? undefined : "direct");
+          if (fallbackRoute === undefined) {
+            throw new Error(`The route to ${server.name} could not be identified, so a fallback password cannot be used. Connect again.`);
+          }
+          fallbackIdentity = JSON.stringify([
+            credentialEndpointSignature, resolved.host, resolved.port, resolved.username,
+            fallbackRoute.startsWith("ssh:") ? [fallbackRouteSession, fallbackRoute] : fallbackRoute
+          ]);
+          savedFallbackEnvelope = fallbackIdentity === undefined ? undefined : await this.vault.get(fallbackKey);
           this.assertAttemptActive(active);
           this.assertCredentialRecordCurrent(promptProvenance);
+          if (options?.route && options.route() !== fallbackRoute) {
+            throw new Error(`The route to ${server.name} changed while connecting, so the password was not sent. Connect again.`);
+          }
+          if (savedFallbackEnvelope) {
+            try {
+              const envelope: unknown = JSON.parse(savedFallbackEnvelope);
+              if (envelope && typeof envelope === "object" &&
+                  (envelope as { version?: unknown }).version === 1 &&
+                  (envelope as { identity?: unknown }).identity === fallbackIdentity &&
+                  typeof (envelope as { password?: unknown }).password === "string") {
+                savedFallback = (envelope as { password: string }).password;
+              }
+            } catch { /* An invalid or older envelope is never sent. */ }
+          }
           if (savedFallback) return savedFallback;
         } else if (savedFallback) {
           savedFallback = undefined;
@@ -768,12 +803,12 @@ export class SilentAuthSshFactory implements SshFactory {
         if (interaction === "noninteractive") {
           return undefined;
         }
-        const route = options?.route?.() ?? (resolved.proxy ? undefined : "direct");
+        const route = fallbackRoute;
         const typedFor = route === undefined ? undefined : JSON.stringify([
           resolved.protocol ?? "ssh", resolved.username, resolved.host, resolved.altHost ?? null, resolved.port, route
         ]);
         promptedFallback = await this.promptShared(
-          passwordKey, typedFor,
+          fallbackKey, fallbackIdentity === undefined ? undefined : JSON.stringify([typedFor, fallbackIdentity]),
           (promptSignal) => this.prompt.prompt({ ...resolved, name: server.name }, promptSignal),
           `Password entry canceled for ${server.name}`, promptProvenance, active
         );
@@ -791,7 +826,7 @@ export class SilentAuthSshFactory implements SshFactory {
             onPasswordFallback,
             onPasswordFallbackResult: (accepted: boolean) => {
               fallbackAccepted = accepted;
-              if (!accepted && savedFallback) rejectedSavedFallback = savedFallback;
+              if (!accepted && savedFallback && savedFallbackEnvelope) rejectedSavedFallback = savedFallbackEnvelope;
             }
           }),
           ...(handler && { onKeyboardInteractive: handler }),
@@ -800,11 +835,12 @@ export class SilentAuthSshFactory implements SshFactory {
           ...(options?.interaction && { interaction: options.interaction }),
           ...(options?.signal && { signal: options.signal })
         });
-        if (promptedFallback && fallbackAccepted && promptedFallback.result.save) {
+        if (promptedFallback && fallbackAccepted && promptedFallback.result.save && fallbackIdentity !== undefined &&
+            (!options?.route || options.route() === fallbackRoute)) {
           const { result, provenance = promptProvenance } = promptedFallback;
           try {
             await this.mutateCredentialIfEndpointUnchanged(provenance.serverId, provenance.record, provenance.endpointSignature, () =>
-              this.vault.store(passwordKey, result.password)
+              this.vault.store(fallbackKey, JSON.stringify({ version: 1, identity: fallbackIdentity, password: result.password }))
             );
           } catch (vaultErr) {
             console.error(`[Nexus SSH] Could not save password for ${server.name}; the session is connected but credentials may not be persisted.`, vaultErr);

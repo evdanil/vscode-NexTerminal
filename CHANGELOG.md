@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- SSH Agent logins can fall back to a password when the server rejects the agent keys and offers password authentication, including on Aruba CX switches.
+- SSH Agent logins can fall back to a password when the server offers password authentication, including on Aruba CX switches that reject the agent keys.
 
 ## [2.8.315] — 2026-11-04
 

@@ -13,20 +13,21 @@ const agentKey = pem();
 const secondAgentKey = pem();
 const profile: ServerConfig = { id: "test", name: "Test", host: "example.com", port: 22, username: "user", authType: "agent", isHidden: false };
 
-function setup(onAuth: (ctx: AuthContext) => void, multipleKeys = false, readyTimeoutMs?: number) {
+function setup(onAuth: (ctx: AuthContext, disconnect: () => void) => void, multipleKeys = false, readyTimeoutMs?: number) {
   const identity = utils.parseKey(agentKey);
   if (identity instanceof Error || Array.isArray(identity)) throw new Error("Invalid test key");
   const second = multipleKeys ? utils.parseKey(secondAgentKey) : undefined;
   if (second instanceof Error || Array.isArray(second)) throw new Error("Invalid test key");
   vi.spyOn(OpenSSHAgent.prototype, "getIdentities").mockImplementation((callback) => callback(null, second ? [identity, second] : [identity]));
-  vi.spyOn(OpenSSHAgent.prototype, "sign").mockImplementation(((_key: unknown, data: Buffer, options: { hash?: string } | ((error: Error | null, signature: Buffer) => void), callback?: (error: Error | null, signature: Buffer) => void) => {
+  vi.spyOn(OpenSSHAgent.prototype, "sign").mockImplementation(((key: typeof identity, data: Buffer, options: { hash?: string } | ((error: Error | null, signature: Buffer) => void), callback?: (error: Error | null, signature: Buffer) => void) => {
     const done = typeof options === "function" ? options : callback!;
-    done(null, identity.sign(data, typeof options === "function" ? undefined : options.hash));
+    const signer = second && key.getPublicSSH().equals(second.getPublicSSH()) ? second : identity;
+    done(null, signer.sign(data, typeof options === "function" ? undefined : options.hash));
     return true;
   }) as OpenSSHAgent["sign"]);
   const server = new Server({ hostKeys: [hostKey] }, (client) => {
     client.on("error", () => {});
-    client.on("authentication", onAuth);
+    client.on("authentication", (ctx) => onAuth(ctx, () => client.end()));
   });
   const a = new PassThrough();
   const b = new PassThrough();
@@ -43,6 +44,59 @@ function setup(onAuth: (ctx: AuthContext) => void, multipleKeys = false, readyTi
 afterEach(() => vi.restoreAllMocks());
 
 describe("agent password fallback over SSH", () => {
+  it("offers a second agent key when the first is accepted as a factor and publickey remains offered", async () => {
+    const signedKeys: string[] = [];
+    const { connector, clientSock, cleanup } = setup((ctx) => {
+      if (ctx.method === "none") { ctx.reject(["publickey"]); return; }
+      if (ctx.method !== "publickey") { ctx.reject(["publickey"]); return; }
+      if (!ctx.signature || !ctx.blob) { ctx.accept(); return; }
+      const key = utils.parseKey(ctx.key.data);
+      if (key instanceof Error || Array.isArray(key)) throw new Error("Invalid offered key");
+      if (!key.verify(ctx.blob, ctx.signature, ctx.hashAlgo)) throw new Error("Invalid agent signature");
+      signedKeys.push(ctx.key.data.toString("base64"));
+      if (signedKeys.length === 1) ctx.reject(["publickey"], true);
+      else if (signedKeys[0] !== signedKeys[1]) ctx.accept();
+      else ctx.reject(["publickey"]);
+    }, true);
+    const onPasswordFallback = vi.fn(async () => "secret");
+    try {
+      const connection = await connector.connect(profile, { sock: clientSock, onPasswordFallback });
+      expect(signedKeys).toHaveLength(2);
+      expect(signedKeys[0]).not.toBe(signedKeys[1]);
+      expect(onPasswordFallback).not.toHaveBeenCalled();
+      connection.dispose();
+    } finally { cleanup(); }
+  });
+
+  it("uses password when the server initially offers no public-key method", async () => {
+    const methods: string[] = [];
+    const { connector, clientSock, cleanup } = setup((ctx, disconnect) => {
+      methods.push(ctx.method);
+      if (ctx.method === "publickey") disconnect();
+      else if (ctx.method === "password" && ctx.password === "correct") ctx.accept();
+      else ctx.reject(["password"]);
+    });
+    try {
+      const connection = await connector.connect(profile, { sock: clientSock, onPasswordFallback: async () => "correct" });
+      expect(methods).toEqual(["none", "password"]);
+      connection.dispose();
+    } finally { cleanup(); }
+  });
+
+  it("does not send a method after the server offers an empty list", async () => {
+    const methods: string[] = [];
+    const { connector, clientSock, cleanup } = setup((ctx) => {
+      methods.push(ctx.method);
+      ctx.reject([]);
+    });
+    const onPasswordFallback = vi.fn(async () => "secret");
+    try {
+      await expect(connector.connect(profile, { sock: clientSock, onPasswordFallback })).rejects.toThrow("All configured authentication methods failed");
+      expect(methods).toEqual(["none"]);
+      expect(onPasswordFallback).not.toHaveBeenCalled();
+    } finally { cleanup(); }
+  });
+
   it("never requests a password when an agent key succeeds", async () => {
     const methods: string[] = [];
     const { connector, clientSock, cleanup } = setup((ctx) => {

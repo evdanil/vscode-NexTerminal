@@ -123,7 +123,7 @@ import type { LocalServerConfig } from "../../src/models/localServer";
 import type { DhcpConfigProfile, TftpConfigProfile } from "../../src/models/networkServerProfile";
 import type { AuthProfile, LocalShellProfile, SerialProfile, ServerConfig, TunnelProfile } from "../../src/models/config";
 import { ProxySshFactory } from "../../src/services/ssh/proxySshFactory";
-import { SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
+import { agentFallbackPasswordSecretKey, SilentAuthSshFactory } from "../../src/services/ssh/silentAuth";
 import { SshConnectionPool } from "../../src/services/ssh/sshConnectionPool";
 import { currentProxyPasswordSecretKey, legacyProxyPasswordSecretKey, proxyPasswordSecretKey } from "../../src/services/ssh/proxyPasswordKeys";
 import { watchPoolInvalidationOnConfigMutation } from "../../src/services/ssh/poolConfigInvalidation";
@@ -2486,6 +2486,36 @@ describe("proxy passwords are keyed by endpoint through backup, restore and Dele
 
     expect(await machine.vault.get(PROXY_KEY_1)).toBeUndefined();
     expect(await machine.vault.get(legacyProxyPasswordSecretKey("srv-1"))).toBeUndefined();
+  });
+});
+
+describe("agent fallback passwords in encrypted backups", () => {
+  it("restores the bound password only to its original connection identity", async () => {
+    const source = await makeMachine();
+    await source.core.addOrUpdateServer(makeServer({ authType: "agent" }));
+    const offered: Array<string | undefined> = [];
+    const connector: SshConnector = { connect: vi.fn(async (_server, auth) => {
+      offered.push(await auth.onPasswordFallback?.());
+      auth.onPasswordFallbackResult?.(true);
+      return { dispose: vi.fn() } as unknown as SshConnection;
+    }) };
+    const sourceFactory = new SilentAuthSshFactory(connector, source.vault, { prompt: vi.fn(async () => ({ password: "fallback-secret", save: true })) }, undefined, undefined, (id) => source.core.getServer(id));
+    await sourceFactory.connect(source.core.getServer("srv-1")!);
+    const backup = await exportBackup(source);
+    expect(backup).not.toContain("fallback-secret");
+    expect(decryptedSecretsOf(backup).agentFallbackPasswords).toHaveProperty("srv-1");
+
+    const dest = await makeMachine();
+    await runImport(dest, backup, "replace");
+    expect(await dest.vault.get(agentFallbackPasswordSecretKey("srv-1"))).toBe(await source.vault.get(agentFallbackPasswordSecretKey("srv-1")));
+    const prompt = vi.fn(async () => ({ password: "new-secret", save: false }));
+    const destFactory = new SilentAuthSshFactory(connector, dest.vault, { prompt }, undefined, undefined, (id) => dest.core.getServer(id));
+    await destFactory.connect(dest.core.getServer("srv-1")!);
+    expect(prompt).not.toHaveBeenCalled();
+    await dest.core.addOrUpdateServer({ ...dest.core.getServer("srv-1")!, host: "other.example" });
+    await destFactory.connect(dest.core.getServer("srv-1")!);
+    expect(offered).toEqual(["fallback-secret", "fallback-secret", "new-secret"]);
+    expect(prompt).toHaveBeenCalledOnce();
   });
 });
 

@@ -765,7 +765,10 @@ export class Ssh2Connector implements SshConnector {
         let passwordNeedsInteraction = false;
         config!.authHandler = (methods, partialSuccess, next) => {
           if (!sentNone) { sentNone = true; next("none"); return; }
-          if (!sentAgent) { sentAgent = true; next("agent"); return; }
+          if (!sentAgent) {
+            sentAgent = true;
+            if (methods?.includes("publickey")) { next("agent"); return; }
+          }
           if (previousWasPassword) {
             // A partial success accepts this factor even though MFA remains.
             onPasswordFallbackResult?.(partialSuccess);
