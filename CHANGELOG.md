@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- SSH Agent logins can fall back to a password when the server offers password authentication, including on Aruba CX switches that reject the agent keys.
+- **SSH Agent logins can fall back to password authentication**, including on Aruba CX switches that reject the agent keys. Nexus follows the server's offered methods, keeps keyboard-interactive authentication available, and can save a successful fallback password for the effective account, endpoint and route. Existing standalone server passwords are not reused as agent fallbacks. For connections through an SSH jump host, the fallback must be entered again after the jump connection changes or VS Code restarts. This applies to terminals, SFTP, tunnels and jump hosts.
 
 ## [2.8.315] — 2026-11-04
 
