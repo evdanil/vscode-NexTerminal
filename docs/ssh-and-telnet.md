@@ -28,6 +28,8 @@ If the last connection waiting on an open server-password, proxy-password, or ke
 
 A server or auth profile set to **SSH Agent** signs in with a key held by an SSH agent — and so does a server synced from an inventory source without an auth profile. Which agent is one choice for the machine, not a field of each server: **SSH Agent** in the Nexus Settings panel's SSH section (`nexus.ssh.agent`). It applies to terminals, SFTP, tunnels and jump hosts alike, and a change takes effect at the next login. A connection that is already open keeps the login it has — including one [connection multiplexing](#connection-multiplexing) keeps open for a while after its last terminal closes (`nexus.ssh.multiplexing.idleTimeout`) — so run **Reload Window**, or wait out that idle time, to make the next connect log in afresh.
 
+If the server rejects the agent's keys and offers password authentication, Nexus tries the server's saved password or asks for one. When keyboard-interactive authentication is also offered, interactive connections try it first. You can save a successful password in the system keychain for that server; agent keys remain the first choice on later connections. The connection timeout continues while the password dialog is open. This also applies to SFTP, tunnels and jump hosts.
+
 With **Automatic** (the default), Nexus looks for the agent on every connection, in this order:
 
 1. `SSH_AUTH_SOCK`, when VS Code was started with it — on any operating system.

@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.316] — 2026-11-05
+
+### Fixed
+
+- SSH Agent logins can fall back to a password when the server rejects the agent keys and offers password authentication, including on Aruba CX switches.
+
 ## [2.8.315] — 2026-11-04
 
 ### Changed

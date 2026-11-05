@@ -1,0 +1,22 @@
+diff --git a/node_modules/ssh2/lib/client.js b/node_modules/ssh2/lib/client.js
+index b327ab1..31e32dd 100644
+--- a/node_modules/ssh2/lib/client.js
++++ b/node_modules/ssh2/lib/client.js
+@@ -370,6 +370,17 @@ class Client extends EventEmitter {
+           this.emit('ready');
+         },
+         USERAUTH_FAILURE: (p, authMethods, partialSuccess) => {
++          // Agent-key failures otherwise bypass the state update below. Keep
++          // the current server offer and stop trying keys when it has accepted
++          // a factor or withdrawn publickey authentication.
++          if (curAuth.type === 'agent') {
++            curPartial = partialSuccess;
++            curAuthsLeft = authMethods;
++            if (partialSuccess || !authMethods.includes('publickey')) {
++              curAuth.keyAlgos = undefined;
++              return tryNextAuth();
++            }
++          }
+           // For key-based authentication, check if we should retry the current
+           // key with a different algorithm first
+           if (curAuth.keyAlgos) {

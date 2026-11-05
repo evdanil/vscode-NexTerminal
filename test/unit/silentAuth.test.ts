@@ -64,6 +64,167 @@ function deferred<T>() {
 }
 
 describe("SilentAuthSshFactory", () => {
+  it("prompts for an agent fallback password and saves it only after login succeeds", async () => {
+    const server: ServerConfig = { ...baseServer, authType: "agent" };
+    const vault = createVault();
+    const prompt: PasswordPrompt = { prompt: vi.fn(async () => ({ password: "fallback", save: true })) };
+    const connector: SshConnector = { connect: vi.fn(async (_server, auth) => {
+      const fallback = auth as typeof auth & { onPasswordFallback?: () => Promise<string | undefined>; onPasswordFallbackResult?: (accepted: boolean) => void };
+      expect(await fallback.onPasswordFallback?.()).toBe("fallback");
+      expect(await vault.get(passwordSecretKey(server.id))).toBeUndefined();
+      fallback.onPasswordFallbackResult?.(true);
+      return fakeConnection;
+    }) };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, undefined, () => server);
+
+    expect(await factory.connect(server)).toBe(fakeConnection);
+    expect(await vault.get(passwordSecretKey(server.id))).toBe("fallback");
+  });
+
+  it("replaces a rejected saved agent fallback password with a prompted one", async () => {
+    const server: ServerConfig = { ...baseServer, authType: "agent" };
+    const vault = createVault({ [passwordSecretKey(server.id)]: "expired" });
+    const prompt: PasswordPrompt = { prompt: vi.fn(async () => ({ password: "fresh", save: true })) };
+    const connector: SshConnector = { connect: vi.fn(async (_server, auth) => {
+      const fallback = auth as typeof auth & { onPasswordFallback?: () => Promise<string | undefined>; onPasswordFallbackResult?: (accepted: boolean) => void };
+      expect(await fallback.onPasswordFallback?.()).toBe("expired");
+      fallback.onPasswordFallbackResult?.(false);
+      expect(await fallback.onPasswordFallback?.()).toBe("fresh");
+      fallback.onPasswordFallbackResult?.(true);
+      return fakeConnection;
+    }) };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, undefined, () => server);
+
+    expect(await factory.connect(server)).toBe(fakeConnection);
+    expect(await vault.get(passwordSecretKey(server.id))).toBe("fresh");
+  });
+
+  it("does not save a fallback password when authentication fails", async () => {
+    const server: ServerConfig = { ...baseServer, authType: "agent" };
+    const vault = createVault();
+    const connector: SshConnector = { connect: vi.fn(async (_server, auth) => {
+      const fallback = (auth as typeof auth & { onPasswordFallback?: () => Promise<string | undefined> }).onPasswordFallback;
+      expect(await fallback?.()).toBe("wrong");
+      throw new Error("authentication rejected");
+    }) };
+    const factory = new SilentAuthSshFactory(connector, vault, { prompt: vi.fn(async () => ({ password: "wrong", save: true })) });
+
+    await expect(factory.connect(server)).rejects.toThrow("authentication rejected");
+    expect(await vault.get(passwordSecretKey(server.id))).toBeUndefined();
+  });
+
+  it("does not save a rejected fallback password when another method succeeds", async () => {
+    const server: ServerConfig = { ...baseServer, authType: "agent" };
+    const vault = createVault();
+    const connector: SshConnector = { connect: vi.fn(async (_server, auth) => {
+      const fallback = auth as typeof auth & {
+        onPasswordFallback?: () => Promise<string | undefined>;
+        onPasswordFallbackResult?: (accepted: boolean) => void;
+      };
+      expect(await fallback.onPasswordFallback?.()).toBe("rejected");
+      fallback.onPasswordFallbackResult?.(false);
+      return fakeConnection;
+    }) };
+    const factory = new SilentAuthSshFactory(connector, vault, { prompt: vi.fn(async () => ({ password: "rejected", save: true })) }, undefined, undefined, () => server);
+
+    expect(await factory.connect(server)).toBe(fakeConnection);
+    expect(await vault.get(passwordSecretKey(server.id))).toBeUndefined();
+  });
+
+  it("clears a rejected saved fallback even when password is not offered again", async () => {
+    const server: ServerConfig = { ...baseServer, authType: "agent" };
+    const vault = createVault({ [passwordSecretKey(server.id)]: "expired" });
+    const connector: SshConnector = { connect: vi.fn(async (_server, auth) => {
+      const fallback = auth as typeof auth & { onPasswordFallback?: () => Promise<string | undefined>; onPasswordFallbackResult?: (accepted: boolean) => void };
+      expect(await fallback.onPasswordFallback?.()).toBe("expired");
+      fallback.onPasswordFallbackResult?.(false);
+      throw new Error("authentication rejected");
+    }) };
+    const factory = new SilentAuthSshFactory(connector, vault, { prompt: vi.fn() }, undefined, undefined, () => server);
+
+    await expect(factory.connect(server)).rejects.toThrow("authentication rejected");
+    expect(await vault.get(passwordSecretKey(server.id))).toBeUndefined();
+  });
+
+  it("keeps a saved fallback when the connection closes without a password verdict", async () => {
+    const server: ServerConfig = { ...baseServer, authType: "agent" };
+    const vault = createVault({ [passwordSecretKey(server.id)]: "saved" });
+    const connector: SshConnector = { connect: vi.fn(async (_server, auth) => {
+      expect(await auth.onPasswordFallback?.()).toBe("saved");
+      throw new Error("connection closed");
+    }) };
+    const factory = new SilentAuthSshFactory(connector, vault, { prompt: vi.fn() }, undefined, undefined, () => server);
+
+    await expect(factory.connect(server)).rejects.toThrow("connection closed");
+    expect(await vault.get(passwordSecretKey(server.id))).toBe("saved");
+  });
+
+  it("does not delete a newer password after a saved fallback is rejected", async () => {
+    const server: ServerConfig = { ...baseServer, authType: "agent" };
+    const key = passwordSecretKey(server.id);
+    const vault = createVault({ [key]: "expired" });
+    const connector: SshConnector = { connect: vi.fn(async (_server, auth) => {
+      expect(await auth.onPasswordFallback?.()).toBe("expired");
+      auth.onPasswordFallbackResult?.(false);
+      await vault.store(key, "newer");
+      throw new Error("authentication rejected");
+    }) };
+    const factory = new SilentAuthSshFactory(connector, vault, { prompt: vi.fn() }, undefined, undefined, () => server);
+
+    await expect(factory.connect(server)).rejects.toThrow("authentication rejected");
+    expect(await vault.get(key)).toBe("newer");
+  });
+
+  it("does not erase a password saved by another login when fallback saving is declined", async () => {
+    const server: ServerConfig = { ...baseServer, authType: "agent" };
+    const key = passwordSecretKey(server.id);
+    const vault = createVault();
+    const connector: SshConnector = { connect: vi.fn(async (_server, auth) => {
+      expect(await auth.onPasswordFallback?.()).toBe("one-time");
+      await vault.store(key, "newer");
+      auth.onPasswordFallbackResult?.(true);
+      return fakeConnection;
+    }) };
+    const factory = new SilentAuthSshFactory(connector, vault, { prompt: vi.fn(async () => ({ password: "one-time", save: false })) }, undefined, undefined, () => server);
+
+    expect(await factory.connect(server)).toBe(fakeConnection);
+    expect(await vault.get(key)).toBe("newer");
+  });
+
+  it("does not send or save an agent fallback typed for a replaced server", async () => {
+    const server: ServerConfig = { ...baseServer, authType: "agent" };
+    let live = server;
+    const answer = deferred<{ password: string; save: boolean } | undefined>();
+    const opened = deferred<void>();
+    const vault = createVault();
+    const connector: SshConnector = { connect: vi.fn(async (_server, auth) => {
+      await auth.onPasswordFallback?.();
+      return fakeConnection;
+    }) };
+    const prompt: PasswordPrompt = { prompt: vi.fn(() => { opened.resolve(); return answer.promise; }) };
+    const factory = new SilentAuthSshFactory(connector, vault, prompt, undefined, undefined, () => live);
+
+    const connecting = factory.connect(server);
+    await opened.promise;
+    live = { ...server, host: "other.example" };
+    answer.resolve({ password: "secret", save: true });
+    await expect(connecting).rejects.toThrow("configuration changed");
+    expect(await vault.get(passwordSecretKey(server.id))).toBeUndefined();
+  });
+
+  it("lets another authentication method proceed when noninteractive fallback has no saved password", async () => {
+    const server: ServerConfig = { ...baseServer, authType: "agent" };
+    const prompt: PasswordPrompt = { prompt: vi.fn() };
+    const connector: SshConnector = { connect: vi.fn(async (_server, auth) => {
+      const fallback = (auth as typeof auth & { onPasswordFallback?: () => Promise<string | undefined> }).onPasswordFallback;
+      expect(await fallback?.()).toBeUndefined();
+      return fakeConnection;
+    }) };
+    const factory = new SilentAuthSshFactory(connector, createVault(), prompt);
+
+    expect(await factory.connect(server, { interaction: "noninteractive" })).toBe(fakeConnection);
+    expect(prompt.prompt).not.toHaveBeenCalled();
+  });
   it("uses stored password without prompting", async () => {
     const connector: SshConnector = {
       connect: vi.fn(async () => fakeConnection)

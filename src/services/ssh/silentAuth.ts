@@ -736,18 +736,91 @@ export class SilentAuthSshFactory implements SshFactory {
     if (resolved.authType !== "password") {
       const handler = this.buildKeyboardInteractiveHandler(undefined, options?.onAuthMessage, promptProvenance, isAttemptActive, interaction);
       const sock = await options?.sockFactory?.();
+      let fallbackCalled = false;
+      let savedFallback: string | undefined;
+      let fallbackAccepted = false;
+      let rejectedSavedFallback: string | undefined;
+      let promptedFallback: Awaited<ReturnType<SilentAuthSshFactory["promptShared"]>> | undefined;
+      const clearRejectedFallback = async (): Promise<void> => {
+        const rejected = rejectedSavedFallback;
+        if (!rejected) return;
+        await this.mutateCredentialIfEndpointUnchanged(server.id, credentialRecord, credentialEndpointSignature, async () => {
+          if (await this.vault.get(passwordKey) === rejected) await this.vault.delete(passwordKey);
+        });
+        rejectedSavedFallback = undefined;
+      };
+      const onPasswordFallback = async (signal?: AbortSignal): Promise<string | undefined> => {
+        const active = (): boolean => isAttemptActive() && !signal?.aborted;
+        this.assertAttemptActive(active);
+        this.assertCredentialRecordCurrent(promptProvenance);
+        if (!fallbackCalled) {
+          fallbackCalled = true;
+          savedFallback = await this.vault.get(passwordKey);
+          this.assertAttemptActive(active);
+          this.assertCredentialRecordCurrent(promptProvenance);
+          if (savedFallback) return savedFallback;
+        } else if (savedFallback) {
+          savedFallback = undefined;
+          await clearRejectedFallback();
+        } else {
+          return undefined;
+        }
+        if (interaction === "noninteractive") {
+          return undefined;
+        }
+        const route = options?.route?.() ?? (resolved.proxy ? undefined : "direct");
+        const typedFor = route === undefined ? undefined : JSON.stringify([
+          resolved.protocol ?? "ssh", resolved.username, resolved.host, resolved.altHost ?? null, resolved.port, route
+        ]);
+        promptedFallback = await this.promptShared(
+          passwordKey, typedFor,
+          (promptSignal) => this.prompt.prompt({ ...resolved, name: server.name }, promptSignal),
+          `Password entry canceled for ${server.name}`, promptProvenance, active
+        );
+        this.assertAttemptActive(active);
+        this.assertCredentialRecordCurrent(promptProvenance);
+        if (options?.route && options.route() !== route) {
+          throw new Error(`The route to ${server.name} changed while its password was being entered, so the password was not sent. Connect again.`);
+        }
+        return promptedFallback.result.password;
+      };
       try {
         this.assertCredentialRecordCurrent(promptProvenance);
-        return await this.connector.connect(resolved, {
+        const connection = await this.connector.connect(resolved, {
+          ...(resolved.authType === "agent" && {
+            onPasswordFallback,
+            onPasswordFallbackResult: (accepted: boolean) => {
+              fallbackAccepted = accepted;
+              if (!accepted && savedFallback) rejectedSavedFallback = savedFallback;
+            }
+          }),
           ...(handler && { onKeyboardInteractive: handler }),
           ...(sock && { sock }),
           ...(options?.onAuthMessage && { onAuthMessage: options.onAuthMessage }),
           ...(options?.interaction && { interaction: options.interaction }),
           ...(options?.signal && { signal: options.signal })
         });
+        if (promptedFallback && fallbackAccepted && promptedFallback.result.save) {
+          const { result, provenance = promptProvenance } = promptedFallback;
+          try {
+            await this.mutateCredentialIfEndpointUnchanged(provenance.serverId, provenance.record, provenance.endpointSignature, () =>
+              this.vault.store(passwordKey, result.password)
+            );
+          } catch (vaultErr) {
+            console.error(`[Nexus SSH] Could not save password for ${server.name}; the session is connected but credentials may not be persisted.`, vaultErr);
+          }
+        }
+        return connection;
       } catch (error) {
         sock?.destroy();
         throw error;
+      } finally {
+        promptedFallback?.settle();
+        try {
+          await clearRejectedFallback();
+        } catch (vaultErr) {
+          console.error(`[Nexus SSH] Could not clear rejected password for ${server.name}.`, vaultErr);
+        }
       }
     }
 

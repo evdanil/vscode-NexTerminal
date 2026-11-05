@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "SSH, serial and Telnet terminals in VS Code—no remote agent required. Manage jump hosts, SFTP, tunnels, macros, JavaScript automation and network inventory from one sidebar.",
-  "version": "2.8.315",
+  "version": "2.8.316",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
