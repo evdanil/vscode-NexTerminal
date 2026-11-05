@@ -39,6 +39,7 @@ import { ORPHAN_FOLDER_NAME, type InventorySyncPlan } from "../../src/services/i
 import { configMutationLock } from "../../src/services/configMutationLock";
 import type { SshConnection, SshConnector } from "../../src/services/ssh/contracts";
 import {
+  agentFallbackPasswordSecretKey,
   authProfilePasswordSecretKey,
   passphraseSecretKey,
   passwordSecretKey,
@@ -4712,11 +4713,11 @@ describe("inventoryCommands", () => {
     // new guest — is re-added under the id its deleted server had. The prune
     // removes the record first and deletes its secrets only best-effort
     // afterwards, so a keyring that refuses the delete, or a window closed before
-    // the cleanup loop runs, leaves `password-`, `passphrase-` and
+    // the cleanup loop runs, leaves `password-`, `agent-fallback-password-`, `passphrase-` and
     // `proxy-password-{id}` behind for the next server under that id. --------
     describe("#200 — secrets left under a reused id", () => {
       const reusedId = deterministicServerId("src-1", "device:1");
-      const leftoverKeys = [passwordSecretKey(reusedId), passphraseSecretKey(reusedId), legacyProxyPasswordSecretKey(reusedId)];
+      const leftoverKeys = [passwordSecretKey(reusedId), agentFallbackPasswordSecretKey(reusedId), passphraseSecretKey(reusedId), legacyProxyPasswordSecretKey(reusedId)];
 
       function deviceAt(host: string): InventoryTree {
         return { contractVersion: 1 as const, devices: [{ externalId: "device:1", name: "vm-101", endpoints: [{ kind: "ssh" as const, host, port: 22 }] }] };
@@ -4762,6 +4763,7 @@ describe("inventoryCommands", () => {
         registry.register(makeProvider({ fetchInventory: vi.fn(async () => tree) }));
         const { vault, state } = lockableVault({
           [passwordSecretKey(reusedId)]: "old-pw",
+          [agentFallbackPasswordSecretKey(reusedId)]: "old-fallback-pw",
           [passphraseSecretKey(reusedId)]: "old-pp",
           [legacyProxyPasswordSecretKey(reusedId)]: "old-proxy-pw",
           [inventorySecretKey("src-1", "apiToken")]: "tok"
@@ -4881,7 +4883,7 @@ describe("inventoryCommands", () => {
         return { core, applySpy, done };
       }
 
-      it("clears the add-time secrets of a large sync with several deletes in flight, and applies only after every delete settled (kills the serial per-add loop that holds configMutationLock for 3 x adds round trips, and kills publishing without awaiting)", async () => {
+      it("clears the add-time secrets of a large sync with several deletes in flight, and applies only after every delete settled", async () => {
         const { vault, state, release } = gatedVault();
         const { core, applySpy, done } = await syncManyAdds(vault, 100);
 
@@ -4892,14 +4894,21 @@ describe("inventoryCommands", () => {
         await release();
         await done;
 
-        expect(state.started).toHaveLength(300);
-        expect(new Set(state.started).size).toBe(300);
+        const expectedKeys = Array.from({ length: 100 }, (_, i) => {
+          const id = deterministicServerId("src-1", `device:${i}`);
+          return [passwordSecretKey(id), agentFallbackPasswordSecretKey(id), passphraseSecretKey(id), legacyProxyPasswordSecretKey(id)];
+        }).flat();
+        expect(state.started).toHaveLength(400);
+        expect(new Set(state.started)).toEqual(new Set(expectedKeys));
         expect(applySpy).toHaveBeenCalledTimes(1);
         expect(core.getSnapshot().servers).toHaveLength(100);
       });
 
-      it("a single rejected delete in the concurrent clear still aborts with nothing applied (kills a pool that publishes adds whose own deletes succeeded)", async () => {
-        const failKey = passwordSecretKey(deterministicServerId("src-1", "device:37"));
+      it.each([
+        ["password", passwordSecretKey],
+        ["agent fallback", agentFallbackPasswordSecretKey]
+      ])("a rejected %s delete in the concurrent clear still aborts with nothing applied", async (_label, keyFor) => {
+        const failKey = keyFor(deterministicServerId("src-1", "device:37"));
         const { vault, state, release } = gatedVault(failKey);
         const { core, applySpy, done } = await syncManyAdds(vault, 100);
 
@@ -4910,7 +4919,7 @@ describe("inventoryCommands", () => {
         expect(applySpy).not.toHaveBeenCalled();
         expect(core.getSnapshot().servers).toHaveLength(0);
         // Fail closed also stops starting new clears once one has failed.
-        expect(state.started.length).toBeLessThan(300);
+        expect(state.started.length).toBeLessThan(400);
         expect(mockShowErrorMessage).toHaveBeenCalledWith(
           "Inventory sync failed: Could not clear old saved credentials for a server this sync adds from the system keychain — nothing was applied, try again."
         );
