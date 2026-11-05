@@ -28,6 +28,7 @@ import { sanitizeMacroFolderList, sanitizeMacroGroup } from "../services/macroFo
 import type { SecretVault } from "../services/ssh/contracts";
 import {
   deleteServerSecrets,
+  agentFallbackPasswordSecretKey,
   passwordSecretKey,
   passphraseSecretKey,
   authProfilePasswordSecretKey,
@@ -1794,6 +1795,7 @@ async function restoreSecrets(
  */
 const SERVER_SECRETS = [
   { key: (server: Pick<ServerConfig, "id" | "proxy">) => passwordSecretKey(server.id), bucket: "passwords" },
+  { key: (server: Pick<ServerConfig, "id" | "proxy">) => agentFallbackPasswordSecretKey(server.id), bucket: "agentFallbackPasswords" },
   { key: (server: Pick<ServerConfig, "id" | "proxy">) => passphraseSecretKey(server.id), bucket: "passphrases" },
   { key: (server: Pick<ServerConfig, "id" | "proxy">) => currentProxyPasswordSecretKey(server), bucket: "proxyPasswords" }
 ] as const;
@@ -3463,6 +3465,7 @@ export async function captureBackupStateForExport(
   servers: ServerConfig[];
   serverSecrets: {
     passwords: Record<string, string>;
+    agentFallbackPasswords: Record<string, string>;
     passphrases: Record<string, string>;
     proxyPasswords: Record<string, string>;
   };
@@ -3500,11 +3503,14 @@ export async function captureBackupStateForExport(
     const savedFilters = snapshot.savedFilters;
 
     const passwords: Record<string, string> = {};
+    const agentFallbackPasswords: Record<string, string> = {};
     const passphrases: Record<string, string> = {};
     const proxyPasswords: Record<string, string> = {};
     for (const server of servers) {
       const pw = await vault.get(passwordSecretKey(server.id));
       if (pw) passwords[server.id] = pw;
+      const fallbackPw = await vault.get(agentFallbackPasswordSecretKey(server.id));
+      if (fallbackPw) agentFallbackPasswords[server.id] = fallbackPw;
       const pp = await vault.get(passphraseSecretKey(server.id));
       if (pp) passphrases[server.id] = pp;
       const proxyKey = currentProxyPasswordSecretKey(server);
@@ -3538,7 +3544,7 @@ export async function captureBackupStateForExport(
 
     return {
       servers,
-      serverSecrets: { passwords, passphrases, proxyPasswords },
+      serverSecrets: { passwords, agentFallbackPasswords, passphrases, proxyPasswords },
       authProfiles,
       authProfileSecrets: { passwords: authProfilePasswords, passphrases: authProfilePassphrases },
       inventorySources,
@@ -3639,6 +3645,7 @@ export function registerConfigCommands(
         // Collect secrets
         const secrets: Record<string, unknown> = {
           passwords: captured.serverSecrets.passwords,
+          agentFallbackPasswords: captured.serverSecrets.agentFallbackPasswords,
           passphrases: captured.serverSecrets.passphrases,
           proxyPasswords: captured.serverSecrets.proxyPasswords,
           authProfilePasswords: captured.authProfileSecrets.passwords,

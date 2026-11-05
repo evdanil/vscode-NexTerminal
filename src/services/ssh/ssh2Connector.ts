@@ -685,12 +685,14 @@ export class Ssh2Connector implements SshConnector {
 
   public async connect(
     server: ServerConfig,
-    { externalCredential, password, passphrase, sock, onKeyboardInteractive, onAuthMessage, interaction, signal }: {
+    { externalCredential, password, passphrase, sock, onKeyboardInteractive, onPasswordFallback, onPasswordFallbackResult, onAuthMessage, interaction, signal }: {
       externalCredential?: ResolvedExternalCredential;
       password?: string;
       passphrase?: string;
       sock?: Duplex;
       onKeyboardInteractive?: KeyboardInteractiveHandler;
+      onPasswordFallback?: (signal?: AbortSignal) => Promise<string | undefined>;
+      onPasswordFallbackResult?: (accepted: boolean) => void;
       onAuthMessage?: (text: string) => boolean | void;
       interaction?: "interactive" | "noninteractive";
       signal?: AbortSignal;
@@ -751,6 +753,70 @@ export class Ssh2Connector implements SshConnector {
       // explainAgentShortfall: after that, a refusal is the answer's, not the
       // missing agent's.
       let answeredKeyboardInteractive = false;
+      let previousWasPassword = false;
+      if (!external && agent?.path && onPasswordFallback) {
+        // ssh2's default order puts a configured password before the agent.
+        // Keep the agent first and preserve keyboard-interactive priority for interactive logins.
+        let sentNone = false;
+        let sentAgent = false;
+        let sentKeyboard = false;
+        let passwordAttempts = 0;
+        let passwordAccepted = false;
+        let passwordNeedsInteraction = false;
+        config!.authHandler = (methods, partialSuccess, next) => {
+          if (!sentNone) { sentNone = true; next("none"); return; }
+          if (!sentAgent) {
+            sentAgent = true;
+            if (methods?.includes("publickey")) { next("agent"); return; }
+          }
+          if (previousWasPassword) {
+            // A partial success accepts this factor even though MFA remains.
+            onPasswordFallbackResult?.(partialSuccess);
+            if (partialSuccess) { passwordAccepted = true; sentKeyboard = false; }
+          }
+          previousWasPassword = false;
+          const continueWithoutPassword = (): void => {
+            if (!sentKeyboard && methods?.includes("keyboard-interactive")) { sentKeyboard = true; next("keyboard-interactive"); }
+            else if (passwordNeedsInteraction) {
+              if (!settled) {
+                settled = true;
+                reject(new SshInteractionRequiredError("SSH password authentication requires user interaction."));
+              }
+              cleanupAuthentication();
+              client.end();
+            }
+            else next(false as never);
+          };
+          if (!sentKeyboard && methods?.includes("keyboard-interactive") &&
+              (interaction !== "noninteractive" || passwordAttempts > 0 || !methods.includes("password") || passwordAccepted)) {
+            sentKeyboard = true;
+            next("keyboard-interactive");
+            return;
+          }
+          if (!passwordAccepted && passwordAttempts < 2 && methods?.includes("password") && onPasswordFallback) {
+            passwordAttempts++;
+            void Promise.resolve().then(() => onPasswordFallback?.(authAbort.signal)).then((value) => {
+              if (authAbort.signal.aborted) return;
+              if (value === undefined) {
+                passwordAccepted = true;
+                passwordNeedsInteraction = interaction === "noninteractive";
+                continueWithoutPassword();
+                return;
+              }
+              previousWasPassword = true;
+              answeredKeyboardInteractive = true;
+              next({ type: "password", username: server.username, password: value });
+            }, (error: unknown) => {
+              if (authAbort.signal.aborted) return;
+              if (!settled) { settled = true; reject(error); }
+              cleanupAuthentication();
+              client.end();
+            });
+            return;
+          }
+          continueWithoutPassword();
+        };
+      }
       const answer = (finish: (responses: string[]) => void, responses: string[]): void => {
         if (responses.some((response) => response !== "")) {
           answeredKeyboardInteractive = true;
@@ -809,6 +875,8 @@ export class Ssh2Connector implements SshConnector {
         external = undefined;
         password = undefined;
         onKeyboardInteractive = undefined;
+        onPasswordFallback = undefined;
+        onPasswordFallbackResult = undefined;
         failInteraction = undefined;
         config = undefined;
         client.removeListener("keyboard-interactive", handleKeyboard);
@@ -817,6 +885,7 @@ export class Ssh2Connector implements SshConnector {
       };
       const onReady = (): void => {
         if (settled) return;
+        if (previousWasPassword) onPasswordFallbackResult?.(true);
         cleanupAuthentication();
         settled = true;
         resolve(new Ssh2Connection(client, banner, label, this.diagnostics));

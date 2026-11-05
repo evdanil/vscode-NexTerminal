@@ -128,6 +128,8 @@ export interface SshConnector {
       passphrase?: string;
       sock?: Duplex;
       onKeyboardInteractive?: KeyboardInteractiveHandler;
+      onPasswordFallback?: (signal?: AbortSignal) => Promise<string | undefined>;
+      onPasswordFallbackResult?: (accepted: boolean) => void;
       onAuthMessage?: (text: string) => boolean | void;
       interaction?: SshInteractionPolicy;
       signal?: AbortSignal;
