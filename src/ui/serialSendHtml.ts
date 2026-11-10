@@ -26,7 +26,7 @@ export function renderSerialSendHtml(nonce: string): string {
         <label for="line-ending">Line ending</label>
         <select id="line-ending">
           <option value="none">None — preserve text</option>
-          <option value="cr">CR</option>
+          <option value="cr" selected>CR</option>
           <option value="lf">LF</option>
           <option value="crlf">CRLF</option>
         </select>

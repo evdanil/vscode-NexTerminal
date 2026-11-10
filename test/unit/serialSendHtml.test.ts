@@ -28,7 +28,9 @@ function browser() {
   const elements = new Map<string, Element>();
   for (const match of html.matchAll(/id="([^"]+)"/g)) elements.set(match[1], new Element());
   const el = (id: string) => elements.get(id)!;
-  el("line-ending").value = "none";
+  const options = [...html.match(/<select id="line-ending">([\s\S]*?)<\/select>/)![1].matchAll(/<option\b([^>]*)>/g)];
+  const defaultOption = options.find((option) => /\bselected(?:\s|=|$)/.test(option[1])) ?? options[0];
+  el("line-ending").value = defaultOption[1].match(/value="([^"]*)"/)![1];
   const messages: Record<string, unknown>[] = [];
   let receive!: (event: { data: unknown }) => void;
   const script = html.match(/<script[^>]*>([\s\S]*?)<\/script>/)![1];
@@ -63,7 +65,7 @@ describe("serial composer browser behavior", () => {
     b.input("commands");
     b.el("send").fire("click");
     b.el("send").fire("click");
-    expect(b.messages.at(-1)).toEqual({ type: "send", requestId: 1, connectionEpoch: 1, text: "commands", lineEnding: "none" });
+    expect(b.messages.at(-1)).toEqual({ type: "send", requestId: 1, connectionEpoch: 1, text: "commands", lineEnding: "cr" });
     expect(b.messages.filter((m) => m.type === "send")).toHaveLength(1);
     expect(b.el("send").disabled).toBe(true);
     expect(b.el("draft").disabled || b.el("draft").readOnly).toBe(false);
@@ -141,7 +143,7 @@ describe("serial composer browser behavior", () => {
     b.el("send").fire("click");
     if (change === "edit" || change === "edit-back") b.input("new draft");
     if (change === "edit-back") b.input("draft");
-    if (change === "ending") { b.el("line-ending").value = "cr"; b.el("line-ending").fire("change"); }
+    if (change === "ending") { b.el("line-ending").value = "lf"; b.el("line-ending").fire("change"); }
     if (change === "composition") b.el("draft").fire("compositionstart");
     if (change === "epoch") b.state({ connectionEpoch: 2 });
     b.result(1, true);
@@ -167,7 +169,8 @@ describe("serial composer browser behavior", () => {
 
   it("counts converted UTF-8 bytes and refuses overflow while allowing empty line endings", () => {
     const b = browser();
-    expect(b.el("send").disabled).toBe(true);
+    expect(b.el("byte-count").textContent).toContain("1 / 65,536");
+    expect(b.el("send").disabled).toBe(false);
     b.el("line-ending").value = "crlf";
     b.el("line-ending").fire("change");
     expect(b.el("send").disabled).toBe(false);
@@ -182,6 +185,8 @@ describe("serial composer browser behavior", () => {
     expect(b.el("send").disabled).toBe(false);
     expect(b.el("byte-count").textContent).toContain("65536 / 65,536");
     expect(b.el("ending-help").textContent).toMatch(/preserve/i);
+    b.input("");
+    expect(b.el("send").disabled).toBe(true);
   });
 
   it("focus/direct actions send only closed protocol messages", () => {
