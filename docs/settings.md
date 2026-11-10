@@ -10,6 +10,7 @@ Guide: [Terminal → Session Transcript Logging](terminal.md#session-transcript-
 |---------|---------|-------------|
 | `nexus.logging.sessionTranscripts` | `true` | Enable session transcript logging for SSH, telnet and serial sessions by default; each profile can override it |
 | `nexus.logging.sessionTranscriptTimestamps` | `"local"` | Per-line receive timestamps in new SSH, telnet and serial transcripts: `local` (milliseconds and UTC offset), `utc` (milliseconds and `Z`), or `off`. Existing terminals keep their format |
+| `nexus.logging.sessionTranscriptLineEndings` | `"preserve"` | `preserve` keeps received line endings; `lf` converts received CRLF pairs to LF in new SSH, telnet and serial transcript files. Standalone CR/LF and deliberate blank lines are preserved; existing terminals keep their format on reconnect |
 | `nexus.logging.sessionLogPathTemplate` | `""` | Relative subfolders and a `.log` filename for new sessions; session/host/port/group/date/environment tokens. Empty keeps automatic names. [Token reference](terminal.md#log-folders-and-filenames) |
 | `nexus.logging.sessionLogDirectory` | `""` | Root directory for logs; supports `%ENVIRONMENT_VARIABLE%` and `%%`. Empty uses the extension's storage folder |
 | `nexus.logging.terminalOutputTrace` | `false` | Troubleshooting only: write every chunk of terminal output to the diagnostic log. Slows terminal output and stores session data — including anything echoed on screen, such as passwords — as plaintext on disk |

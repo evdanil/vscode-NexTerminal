@@ -484,20 +484,20 @@ describe("serial terminal tab visual differentiation", () => {
     registeredCommands.clear();
   });
 
-  it.each(["standard", "smartFollow"] as const)("passes timestamp modes and rotation to %s transcripts", async (mode) => {
+  it.each(["standard", "smartFollow"] as const)("passes transcript formats and rotation to %s transcripts", async (mode) => {
     const config = vi.mocked(vscode.workspace.getConfiguration);
     const previous = config.getMockImplementation()!;
     try {
-      for (const [setting, expected] of [["local", "local"], ["utc", "utc"], ["off", "off"], [undefined, "local"], ["invalid", "local"]]) {
+      for (const [setting, expected, endings, expectedEndings] of [["local", "local", "preserve", "preserve"], ["utc", "utc", "lf", "lf"], ["off", "off", "lf", "lf"], [undefined, "local", undefined, "preserve"], ["invalid", "local", "invalid", "preserve"]]) {
         vi.clearAllMocks();
-        config.mockReturnValue({ get: (key: string, fallback: unknown) => key === "sessionTranscriptTimestamps" ? setting : key === "sessionLogPathTemplate" ? "%G/%S/%P.log" : fallback } as any);
+        config.mockReturnValue({ get: (key: string, fallback: unknown) => key === "sessionTranscriptTimestamps" ? setting : key === "sessionTranscriptLineEndings" ? endings : key === "sessionLogPathTemplate" ? "%G/%S/%P.log" : fallback } as any);
         const ctx = makeSerialCtx();
         ctx.core.getSerialProfile = vi.fn(() => ({ ...baseProfile, mode }));
         const rotation = { maxFileSizeBytes: 12345, maxRotatedFiles: 2 };
         ctx.loggerFactory.getRotationOptions = () => rotation;
         registerSerialCommands(ctx);
         await registeredCommands.get("nexus.serial.connect")!("sp1");
-        expect(createSessionTranscript).toHaveBeenCalledWith("", baseProfile.name, true, { ...rotation, timestampMode: expected, pathTemplate: "%G/%S/%P.log", pathContext: { port: baseProfile.path, group: undefined } });
+        expect(createSessionTranscript).toHaveBeenCalledWith("", baseProfile.name, true, { ...rotation, timestampMode: expected, lineEndingMode: expectedEndings, pathTemplate: "%G/%S/%P.log", pathContext: { port: baseProfile.path, group: undefined } });
       }
     } finally {
       config.mockImplementation(previous);

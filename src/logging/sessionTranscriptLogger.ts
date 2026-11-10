@@ -2,6 +2,7 @@ import { closeSync, existsSync, openSync, renameSync, statSync, unlinkSync, writ
 import { normalizeLoggerRotationOptions, type LoggerRotationOptions } from "./terminalLogger";
 import { EMPTY_STRIP_CARRY, stripChunk, type StripCarry } from "../utils/ansi";
 import { normalizeTranscriptTimestampMode, TranscriptLineTimestamps, type TranscriptTimestampMode } from "./transcriptTimestamps";
+import { normalizeTranscriptLineEndingMode, TranscriptLineEndings, type TranscriptLineEndingMode } from "./transcriptLineEndings";
 import { renderTranscriptPathTemplate, type TranscriptPathContext } from "./transcriptPathTemplate";
 import { reserveTranscriptFile, type ReservedTranscriptFile } from "./sessionLogPaths";
 
@@ -289,6 +290,7 @@ class FileSessionTranscript implements SessionTranscript {
     /** Retention cap — see {@link DEFAULT_MAX_RETAINED_BYTES} for the policy. */
     private readonly maxRetainedBytes: number,
     private readonly timestamps: TranscriptLineTimestamps,
+    private readonly lineEndings: TranscriptLineEndings,
     initialFd: number,
     private readonly releaseReservation: () => void
   ) {
@@ -303,6 +305,7 @@ class FileSessionTranscript implements SessionTranscript {
   private escapeCarry: StripCarry = EMPTY_STRIP_CARRY;
 
   public resetEscapeState(): void {
+    this.finishLineEndings();
     this.escapeCarry = EMPTY_STRIP_CARRY;
   }
 
@@ -314,7 +317,8 @@ class FileSessionTranscript implements SessionTranscript {
     this.escapeCarry = stripped.carry;
     const clean = stripped.text;
     if (clean) {
-      this.enqueue(this.timestamps.format(clean));
+      const formatted = this.lineEndings.format(this.timestamps.format(clean));
+      if (formatted) this.enqueue(formatted);
     }
   }
 
@@ -322,6 +326,8 @@ class FileSessionTranscript implements SessionTranscript {
     if (this.closed) {
       return;
     }
+    // An undecided CR belongs to the receive formatter, not this disk batch:
+    // draining must not prevent a later chunk's LF from completing its pair.
     this.clearFlushTimer();
     if (this.draining) {
       // A drain is mid-syscall on this fd. Writing from here would interleave
@@ -340,6 +346,9 @@ class FileSessionTranscript implements SessionTranscript {
    * falls into. Never rejects: a transcript must not fail a shutdown.
    */
   public async settle(): Promise<void> {
+    // Teardown ends the input stream; ordinary disk drains must leave a
+    // trailing CR undecided so a later LF can still complete the pair.
+    if (!this.closed) this.finishLineEndings();
     // The chain is reassigned by anything that queues work behind an in-flight
     // drain, so follow it until it stops moving. Bounded — a transcript that
     // keeps growing a chain is not worth blocking teardown for.
@@ -375,6 +384,7 @@ class FileSessionTranscript implements SessionTranscript {
     if (this.closed) {
       return;
     }
+    this.finishLineEndings();
     this.closed = true;
     this.clearFlushTimer();
     const footer = `\n--- Session ended ${new Date().toISOString()} ---\n`;
@@ -386,6 +396,11 @@ class FileSessionTranscript implements SessionTranscript {
       return;
     }
     this.finishClose();
+  }
+
+  private finishLineEndings(): void {
+    const tail = this.lineEndings.finish();
+    if (tail) this.enqueue(tail);
   }
 
   /**
@@ -1112,6 +1127,8 @@ export interface SessionTranscriptOptions extends Partial<LoggerRotationOptions>
   pathContext?: Omit<TranscriptPathContext, "sessionName">;
   /** Per-line receive times, captured before buffering. Defaults to local time. */
   timestampMode?: TranscriptTimestampMode;
+  /** Preserve received endings by default; LF converts only received CRLF pairs. */
+  lineEndingMode?: TranscriptLineEndingMode;
   /**
    * Retention cap override — see {@link DEFAULT_MAX_RETAINED_BYTES} for the
    * policy the value carries. Internal tuning knob, not a user-facing
@@ -1165,6 +1182,7 @@ export function createSessionTranscript(
       normalizeLoggerRotationOptions(options),
       normalizeRetainedCap(options?.maxRetainedBytes),
       new TranscriptLineTimestamps(normalizeTranscriptTimestampMode(options?.timestampMode)),
+      new TranscriptLineEndings(normalizeTranscriptLineEndingMode(options?.lineEndingMode)),
       reserved.fd,
       reserved.release
     );

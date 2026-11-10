@@ -165,20 +165,20 @@ function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
 }
 
 describe("session transcript timestamp configuration", () => {
-  it.each(["ssh", "telnet"] as const)("passes timestamp modes and rotation to %s transcripts", async (protocol) => {
+  it.each(["ssh", "telnet"] as const)("passes transcript formats and rotation to %s transcripts", async (protocol) => {
     const config = vi.mocked(vscode.workspace.getConfiguration);
     const previous = config.getMockImplementation()!;
     try {
-      for (const [setting, expected] of [["local", "local"], ["utc", "utc"], ["off", "off"], [undefined, "local"], ["invalid", "local"]]) {
+      for (const [setting, expected, endings, expectedEndings] of [["local", "local", "preserve", "preserve"], ["utc", "utc", "lf", "lf"], ["off", "off", "lf", "lf"], [undefined, "local", undefined, "preserve"], ["invalid", "local", "invalid", "preserve"]]) {
         vi.clearAllMocks();
-        config.mockReturnValue({ get: (key: string, fallback: unknown) => key === "sessionTranscriptTimestamps" ? setting : key === "sessionLogPathTemplate" ? "%G/%S/%P.log" : fallback } as any);
+        config.mockReturnValue({ get: (key: string, fallback: unknown) => key === "sessionTranscriptTimestamps" ? setting : key === "sessionTranscriptLineEndings" ? endings : key === "sessionLogPathTemplate" ? "%G/%S/%P.log" : fallback } as any);
         vi.mocked(vscode.window.withProgress as any).mockImplementation(async (_options: unknown, task: () => Promise<unknown>) => task());
         const server = makeServer({ protocol });
         const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
         const rotation = { maxFileSizeBytes: 12345, maxRotatedFiles: 2 };
         (ctx.loggerFactory as any).getRotationOptions = () => rotation;
         await connectServer(ctx, server.id);
-        expect(createSessionTranscript).toHaveBeenCalledWith("", server.name, true, { ...rotation, timestampMode: expected, pathTemplate: "%G/%S/%P.log", pathContext: { host: server.host, port: server.port, group: server.group } });
+        expect(createSessionTranscript).toHaveBeenCalledWith("", server.name, true, { ...rotation, timestampMode: expected, lineEndingMode: expectedEndings, pathTemplate: "%G/%S/%P.log", pathContext: { host: server.host, port: server.port, group: server.group } });
       }
     } finally {
       config.mockImplementation(previous);

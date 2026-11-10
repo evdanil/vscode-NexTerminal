@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.317] — 2026-11-10
+
+### Added
+
+- **Transcript Line Endings** in Settings → Logging offers optional CRLF-to-LF conversion for new SSH, telnet and serial log files. Preserve remains the default; live terminals, timestamps, standalone CR/LF and intentional blank lines are unchanged.
+
 ## [2.8.316] — 2026-11-05
 
 ### Fixed

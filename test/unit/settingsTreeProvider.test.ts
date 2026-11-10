@@ -263,12 +263,15 @@ describe("SettingsTreeProvider", () => {
   });
 
   describe("category children", () => {
-    it("returns 7 children for logging category including transcript format and path", () => {
+    it("lists transcript formatting and file settings in the logging category", () => {
       const provider = createProvider();
       const category = new SettingsCategoryItem("logging");
       const children = provider.getChildren(category);
-      expect(children).toHaveLength(7);
+      expect(children).toHaveLength(8);
       expect(children.every((c) => c instanceof SettingsValueItem)).toBe(true);
+      expect(children.map((child) => String(child.label))).toEqual(
+        expect.arrayContaining([expect.stringContaining("Transcript Line Endings")])
+      );
     });
 
     it("exposes the opt-in terminal output trace in the logging category", () => {

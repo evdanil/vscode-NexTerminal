@@ -2339,6 +2339,14 @@ describe("#153 — setting descriptions name everything the setting governs", ()
 });
 
 describe("session transcript timestamps", () => {
+  it("offers Preserve and LF transcript endings in both settings surfaces", async () => {
+    expect(packageJson.contributes.configuration?.properties?.["nexus.logging.sessionTranscriptLineEndings"])
+      .toMatchObject({ type: "string", default: "preserve", enum: ["preserve", "lf"] });
+    const { SETTINGS_META } = await import("../../src/ui/settingsMetadata");
+    const meta = SETTINGS_META.find((item) => item.section === "nexus.logging" && item.key === "sessionTranscriptLineEndings");
+    expect(meta).toMatchObject({ type: "enum", default: "preserve" });
+    expect(meta?.enumOptions?.map((option) => option.value)).toEqual(["preserve", "lf"]);
+  });
   it("contributes a path template disabled by default in both settings surfaces", async () => {
     expect(packageJson.contributes.configuration?.properties?.["nexus.logging.sessionLogPathTemplate"])
       .toMatchObject({ type: "string", default: "" });

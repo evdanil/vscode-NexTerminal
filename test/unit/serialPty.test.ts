@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SerialPty, type SerialTransport } from "../../src/services/serial/serialPty";
 import { CLEAR_VISIBLE_SCREEN, RESET_INTERACTIVE_MODES } from "../../src/services/terminal/terminalEscapes";
+import { TerminalHighlighter } from "../../src/services/terminalHighlighter";
 
 vi.mock("vscode", () => ({
   EventEmitter: class MockEventEmitter<T> {
@@ -95,6 +96,48 @@ async function flushAsync(): Promise<void> {
 describe("SerialPty", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it.each([
+    { highlighting: false, split: false },
+    { highlighting: false, split: true },
+    { highlighting: true, split: false },
+    { highlighting: true, split: true }
+  ])("preserves serial line endings (highlighting=$highlighting, split=$split)", async ({ highlighting, split }) => {
+    const { transport, emitData } = createTransport();
+    const writes: string[] = [];
+    const observed: string[] = [];
+    const transcript: string[] = [];
+    const pty = new SerialPty(
+      transport,
+      { path: "COM9", baudRate: 115200 },
+      { onSessionOpened() {}, onSessionClosed() {} },
+      { log() {}, close() {} },
+      { write: (text) => { transcript.push(text); }, close() {} },
+      new TerminalHighlighter({ enabled: highlighting, rules: [{ pattern: "ERROR", color: "red" }] }),
+      { onOutput: (text) => { observed.push(text); }, pauseIntervalMacros() {}, dispose() {} }
+    );
+    pty.onDidWrite((text) => writes.push(text));
+    try {
+      pty.open();
+      await flushAsync();
+      writes.length = 0;
+
+      // CRLF crosses a transport boundary; the empty line and standalone CR/LF are deliberate.
+      const chunks = split
+        ? ["ERROR first\r", "", "\n\r", "\nsecond\r", "progress\n"]
+        : ["ERROR first\r\n\r\nsecond\rprogress\n"];
+      for (const chunk of chunks) emitData("session-1", chunk);
+      pty.dispose();
+
+      expect(writes.join("")).toBe(highlighting
+        ? "\x1b[31mERROR\x1b[39m first\r\n\r\nsecond\rprogress\n"
+        : "ERROR first\r\n\r\nsecond\rprogress\n");
+      expect(observed.join("")).toBe("ERROR first\r\n\r\nsecond\rprogress\n");
+      expect(transcript.join("")).toBe("ERROR first\r\n\r\nsecond\rprogress\n");
+    } finally {
+      pty.dispose();
+    }
   });
 
   it("closes a port that finishes opening after its profile was removed, without registering a session", async () => {

@@ -11451,6 +11451,21 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
   <span class="save-indicator" aria-live="polite" data-for="nexus.logging.sessionTranscriptTimestamps"></span>
 </div>
   <div class="form-group">
+  <label id="setting-nexus-logging-sessionTranscriptLineEndings-label">Transcript Line Endings</label>
+  <div class="setting-desc">Preserve received line endings or convert CRLF pairs to LF in new SSH, telnet and serial transcript files. Standalone CR and LF and intentional blank lines are preserved. Existing terminals keep their format on reconnect.</div>
+  <div class="custom-select" data-section="nexus.logging" data-key="sessionTranscriptLineEndings">
+    <input type="hidden" id="setting-nexus-logging-sessionTranscriptLineEndings" value="preserve" />
+    <div class="custom-select-trigger" tabindex="0" role="combobox" aria-haspopup="listbox" aria-labelledby="setting-nexus-logging-sessionTranscriptLineEndings-label" aria-expanded="false">
+      <span class="custom-select-text">Preserve</span>
+    </div>
+    <div class="custom-select-dropdown" role="listbox" aria-labelledby="setting-nexus-logging-sessionTranscriptLineEndings-label">
+      <div class="custom-select-option selected" data-value="preserve" role="option" aria-selected="true">Preserve <span class="recommended-badge">recommended</span></div>
+        <div class="custom-select-option" data-value="lf" role="option" aria-selected="false">LF</div>
+    </div>
+  </div>
+  <span class="save-indicator" aria-live="polite" data-for="nexus.logging.sessionTranscriptLineEndings"></span>
+</div>
+  <div class="form-group">
   <label for="setting-nexus-logging-sessionLogPathTemplate">Session Log Path Template</label>
   <div class="setting-desc">Relative folders and a .log filename under Session Log Directory, for example %G/%S/%S-%Y-%M-%D-%h-%m-%s-%t.log. %S is the session name, %G its group, %H host, %P port, %% a literal percent, and %ENVIRONMENT_VARIABLE% an environment value. Empty keeps automatic filenames. Applies to new sessions.</div>
   <input type="text" id="setting-nexus-logging-sessionLogPathTemplate" data-section="nexus.logging" data-key="sessionLogPathTemplate" value="" />

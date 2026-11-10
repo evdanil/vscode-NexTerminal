@@ -27,6 +27,7 @@ import { watchStartFence, type StartFence } from "../services/ssh/startFenceWatc
 import { flattenProviderText } from "../models/inventory";
 import { createSessionTranscript, type SessionTranscriptOptions } from "../logging/sessionTranscriptLogger";
 import { normalizeTranscriptTimestampMode } from "../logging/transcriptTimestamps";
+import { normalizeTranscriptLineEndingMode } from "../logging/transcriptLineEndings";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SshPty } from "../services/ssh/sshPty";
 import { OPEN_AGENT_SETTINGS, openAgentSettings } from "../services/ssh/sshAgentSettings";
@@ -232,6 +233,9 @@ function getTranscriptOptions(ctx: CommandContext, profile: ServerConfig): Sessi
     ...(ctx.loggerFactory as { getRotationOptions?: () => LoggerRotationOptions }).getRotationOptions?.(),
     timestampMode: normalizeTranscriptTimestampMode(
       vscode.workspace.getConfiguration("nexus.logging").get<unknown>("sessionTranscriptTimestamps", "local")
+    ),
+    lineEndingMode: normalizeTranscriptLineEndingMode(
+      vscode.workspace.getConfiguration("nexus.logging").get<unknown>("sessionTranscriptLineEndings", "preserve")
     ),
     pathTemplate: vscode.workspace.getConfiguration("nexus.logging").get<string>("sessionLogPathTemplate", ""),
     pathContext: { host: profile.host, port: profile.port, group: profile.group }
