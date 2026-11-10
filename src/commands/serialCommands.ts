@@ -5,6 +5,7 @@ import { parseHighlightProfileFormValue } from "../ui/highlightProfileForm";
 import { resolveSerialProfileMode, type SerialDataBits, type SerialDeviceHint, type SerialParity, type SerialProfile, type SerialSessionStatus, type SerialStopBits } from "../models/config";
 import { createSessionTranscript, type SessionTranscriptOptions } from "../logging/sessionTranscriptLogger";
 import { normalizeTranscriptTimestampMode } from "../logging/transcriptTimestamps";
+import { normalizeTranscriptLineEndingMode } from "../logging/transcriptLineEndings";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SerialPty } from "../services/serial/serialPty";
 import { isSerialRuntimeMissingError } from "../services/serial/errorMatchers";
@@ -262,6 +263,9 @@ function getTranscriptOptions(ctx: CommandContext, profile: SerialProfile): Sess
     ...(ctx.loggerFactory as { getRotationOptions?: () => LoggerRotationOptions }).getRotationOptions?.(),
     timestampMode: normalizeTranscriptTimestampMode(
       vscode.workspace.getConfiguration("nexus.logging").get<unknown>("sessionTranscriptTimestamps", "local")
+    ),
+    lineEndingMode: normalizeTranscriptLineEndingMode(
+      vscode.workspace.getConfiguration("nexus.logging").get<unknown>("sessionTranscriptLineEndings", "preserve")
     ),
     pathTemplate: vscode.workspace.getConfiguration("nexus.logging").get<string>("sessionLogPathTemplate", ""),
     pathContext: { port: profile.path, group: profile.group }

@@ -11,6 +11,7 @@ import { outputBufferObserver } from "../../src/services/scripts/sessionOutputCa
 import type { SerialProfile } from "../../src/models/config";
 import type { OpenPortParams, SerialPortInfo } from "../../src/services/serial/protocol";
 import { CLEAR_VISIBLE_SCREEN, RESET_INTERACTIVE_MODES } from "../../src/services/terminal/terminalEscapes";
+import { TerminalHighlighter } from "../../src/services/terminalHighlighter";
 
 vi.mock("vscode", () => ({
   EventEmitter: class MockEventEmitter<T> {
@@ -193,6 +194,51 @@ describe("SmartSerialPty", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it.each([
+    { highlighting: false, split: false },
+    { highlighting: false, split: true },
+    { highlighting: true, split: false },
+    { highlighting: true, split: true }
+  ])("preserves serial line endings (highlighting=$highlighting, split=$split)", async ({ highlighting, split }) => {
+    const { transport, emitData } = createTransport({
+      listPorts: async () => [{ path: "COM5", serialNumber: "ABC123" }],
+      openPort: async () => "session-1"
+    });
+    const writes: string[] = [];
+    const observed: string[] = [];
+    const transcript: string[] = [];
+    const pty = new SmartSerialPty(
+      transport,
+      makeProfile(),
+      makeCallbacks().callbacks,
+      noopLogger(),
+      { write: (text) => { transcript.push(text); }, close() {} },
+      new TerminalHighlighter({ enabled: highlighting, rules: [{ pattern: "ERROR", color: "red" }] }),
+      { onOutput: (text) => { observed.push(text); }, pauseIntervalMacros() {}, dispose() {} }
+    );
+    pty.onDidWrite((text) => writes.push(text));
+    try {
+      pty.open();
+      await flushAsync();
+      writes.length = 0;
+
+      // CRLF crosses a transport boundary; the empty line and standalone CR/LF are deliberate.
+      const chunks = split
+        ? ["ERROR first\r", "", "\n\r", "\nsecond\r", "progress\n"]
+        : ["ERROR first\r\n\r\nsecond\rprogress\n"];
+      for (const chunk of chunks) emitData("session-1", chunk);
+      pty.dispose();
+
+      expect(writes.join("")).toBe(highlighting
+        ? "\x1b[31mERROR\x1b[39m first\r\n\r\nsecond\rprogress\n"
+        : "ERROR first\r\n\r\nsecond\rprogress\n");
+      expect(observed.join("")).toBe("ERROR first\r\n\r\nsecond\rprogress\n");
+      expect(transcript.join("")).toBe("ERROR first\r\n\r\nsecond\rprogress\n");
+    } finally {
+      pty.dispose();
+    }
   });
 
   it("connects silently when the preferred port is present and not busy", async () => {

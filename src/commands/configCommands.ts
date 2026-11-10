@@ -420,6 +420,7 @@ export const SHARE_SETTINGS_POLICY: Readonly<Record<string, "share" | "local">> 
   // Capture, retention caps, and the destination are local privacy/disk policy.
   "nexus.logging.sessionTranscripts": "local",
   "nexus.logging.sessionTranscriptTimestamps": "local",
+  "nexus.logging.sessionTranscriptLineEndings": "local",
   "nexus.logging.sessionLogPathTemplate": "local",
   "nexus.logging.sessionLogDirectory": "local",
   "nexus.logging.maxFileSizeMb": "local",

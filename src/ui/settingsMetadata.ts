@@ -63,6 +63,19 @@ export const SETTINGS_META: SettingMeta[] = [
     ]
   },
   {
+    key: "sessionTranscriptLineEndings",
+    section: "nexus.logging",
+    label: "Transcript Line Endings",
+    type: "enum",
+    category: "logging",
+    description: "Preserve received line endings or convert CRLF pairs to LF in new SSH, telnet and serial transcript files. Standalone CR and LF and intentional blank lines are preserved. Existing terminals keep their format on reconnect.",
+    default: "preserve",
+    enumOptions: [
+      { label: "Preserve", value: "preserve", description: "Keep received line endings.", recommended: true },
+      { label: "LF", value: "lf", description: "Convert CRLF pairs to LF in saved transcripts." }
+    ]
+  },
+  {
     key: "sessionLogPathTemplate",
     section: "nexus.logging",
     label: "Session Log Path Template",

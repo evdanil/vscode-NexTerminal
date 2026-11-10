@@ -83,6 +83,74 @@ describe("createSessionTranscript", () => {
     return contents.slice(contents.indexOf("\n") + 1, contents.lastIndexOf("\n--- Session ended "));
   }
 
+  it.each([false, true])("normalizes only received CRLF pairs in LF mode (split=$0)", (split) => {
+    const dir = makeTempDir();
+    const transcript = createSessionTranscript(dir, "lf", true, { timestampMode: "off", lineEndingMode: "lf" });
+    const chunks = split
+      ? ["first\r", "", "\x1b[31m", "\n\r", "\nsecond\r", "progress\nlast\r"]
+      : ["first\r\n\r\nsecond\rprogress\nlast\r"];
+    for (const chunk of chunks) {
+      transcript.write(chunk);
+      transcript.flush?.();
+    }
+    transcript.close();
+    expect(recordedOutput(dir)).toBe("first\n\nsecond\rprogress\nlast\r");
+  });
+
+  it.each([undefined, "preserve", "invalid"])("preserves received line endings for mode %s", (lineEndingMode) => {
+    const dir = makeTempDir();
+    const transcript = createSessionTranscript(dir, "preserve", true, { timestampMode: "off", lineEndingMode: lineEndingMode as "preserve" });
+    transcript.write("first\r");
+    transcript.flush?.();
+    transcript.write("\n\r\nsecond\rprogress\nlast\r");
+    transcript.close();
+    expect(recordedOutput(dir)).toBe("first\r\n\r\nsecond\rprogress\nlast\r");
+  });
+
+  it("normalizes CRLF after capturing receive timestamps without changing blank lines", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2025-01-15T09:00:00Z"));
+    const dir = makeTempDir();
+    const transcript = createSessionTranscript(dir, "utc-lf", true, { timestampMode: "utc", lineEndingMode: "lf" });
+    transcript.write("first\r");
+    transcript.flush?.();
+    vi.setSystemTime(new Date("2025-01-15T09:00:01Z"));
+    transcript.write("\n\r\nsecond\r");
+    vi.setSystemTime(new Date("2025-01-15T09:00:02Z"));
+    transcript.write("progress\n");
+    transcript.close();
+    expect(recordedOutput(dir)).toBe(
+      "2025-01-15 09:00:00.000Z first\n" +
+      "2025-01-15 09:00:01.000Z \n" +
+      "2025-01-15 09:00:01.000Z second\r" +
+      "2025-01-15 09:00:02.000Z progress\n"
+    );
+  });
+
+  it("preserves a standalone CR at transport reset instead of pairing it with the new device", () => {
+    const dir = makeTempDir();
+    const transcript = createSessionTranscript(dir, "reset-lf", true, { timestampMode: "off", lineEndingMode: "lf" });
+    transcript.write("old\r");
+    transcript.resetEscapeState?.();
+    transcript.write("\nnew\r\n");
+    transcript.close();
+    expect(recordedOutput(dir)).toBe("old\r\nnew\n");
+  });
+
+  it("writes a pending standalone CR during extension teardown", async () => {
+    const { flushSessionTranscripts } = await import("../../src/logging/sessionTranscriptLogger");
+    const dir = makeTempDir();
+    const transcript = createSessionTranscript(dir, "teardown-lf", true, { timestampMode: "off", lineEndingMode: "lf" });
+    try {
+      transcript.write("last\r");
+      await flushSessionTranscripts();
+      const file = readdirSync(dir).find((name) => name.endsWith(".log"))!;
+      expect(readFileSync(path.join(dir, file), "utf8")).toMatch(/last\r$/);
+    } finally {
+      transcript.close();
+    }
+  });
+
   it.each([
     { offset: -330, suffix: "+05:30" },
     { offset: 210, suffix: "-03:30" }

@@ -2,6 +2,14 @@ import { describe, expect, it } from "vitest";
 import { validateSettingUpdate } from "../../src/ui/settingsValidation";
 
 describe("validateSettingUpdate", () => {
+  it("accepts transcript line-ending choices and rejects unsupported values", () => {
+    for (const value of ["preserve", "lf"]) {
+      expect(validateSettingUpdate("nexus.logging", "sessionTranscriptLineEndings", value)).toMatchObject({ ok: true, value });
+    }
+    for (const value of ["crlf", "invalid", true, null]) {
+      expect(validateSettingUpdate("nexus.logging", "sessionTranscriptLineEndings", value).ok).toBe(false);
+    }
+  });
   it("accepts valid log path templates and returns actionable syntax errors", () => {
     for (const value of ["", "%G/%S/%S-%Y-%M-%D.log", "%COMPUTERNAME%/%S.log"]) {
       expect(validateSettingUpdate("nexus.logging", "sessionLogPathTemplate", value).ok).toBe(true);
