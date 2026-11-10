@@ -33,7 +33,7 @@ function browser() {
   el("line-ending").value = defaultOption[1].match(/value="([^"]*)"/)![1];
   const messages: Record<string, unknown>[] = [];
   let receive!: (event: { data: unknown }) => void;
-  const script = html.match(/<script[^>]*>([\s\S]*?)<\/script>/)![1];
+  const script = html.match(/<script[^>]*>([\s\S]*?)<\/script>/i)![1];
   runInNewContext(script, {
     document: { getElementById: el },
     window: { addEventListener: (_: string, listener: typeof receive) => { receive = listener; } },
