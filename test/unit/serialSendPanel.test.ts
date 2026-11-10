@@ -102,6 +102,20 @@ describe("serial send panel host boundary", () => {
     expect(first.input.getInputState().dedicatedInputEnabled).toBe(true);
   });
 
+  it("identifies differently named sessions in plain tab titles without putting names in HTML", () => {
+    const first = binding();
+    const second = binding("session-2");
+    second.profileName = "Router Console";
+    registry.openOrReveal(first);
+    registry.openOrReveal(second);
+    expect(host.create.mock.calls.map(call => call[1])).toEqual([
+      `Serial Send: ${first.profileName}`,
+      "Serial Send: Router Console"
+    ]);
+    expect(panels[0].webview.html).not.toContain(first.profileName);
+    expect(panels[1].webview.html).not.toContain(second.profileName);
+  });
+
   it("cannot replace the input owner or terminal behind an existing logical session", async () => {
     const first = binding();
     const forged = binding();

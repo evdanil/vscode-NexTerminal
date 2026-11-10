@@ -54,7 +54,7 @@ export class SerialSendPanel implements vscode.Disposable {
     }
     const previous = binding.input.getInputState();
     if (previous.status === "closed") throw new Error("Serial session is closed.");
-    const panel = vscode.window.createWebviewPanel("nexus.serialSend", "Serial Send Box", vscode.ViewColumn.Beside, {
+    const panel = vscode.window.createWebviewPanel("nexus.serialSend", `Serial Send: ${binding.profileName}`, vscode.ViewColumn.Beside, {
       enableScripts: true,
       retainContextWhenHidden: true,
       localResourceRoots: []

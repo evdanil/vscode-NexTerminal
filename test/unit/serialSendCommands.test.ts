@@ -3,7 +3,7 @@ import type * as VSCode from "vscode";
 import type { SerialInputState, SerialUserInput } from "../../src/services/serial/serialUserInput";
 import type { SerialTerminalEntry } from "../../src/commands/types";
 
-const handlers = new Map<string, (arg?: unknown) => Promise<void>>();
+const handlers = new Map<string, (...args: unknown[]) => Promise<void>>();
 const closeListeners = new Set<(terminal: VSCode.Terminal) => void>();
 const pick = vi.fn(); const info = vi.fn(); const warning = vi.fn(); const execute = vi.fn();
 vi.mock("vscode", () => ({
@@ -35,7 +35,11 @@ function fixture(status: SerialInputState["status"] = "connected") {
   const refresh = vi.fn(); const registry = { get: vi.fn() };
   const service = new SerialSendCommands({ core: core as never, serialTerminals: entries, panel, terminalRegistry: registry as never, onDedicatedSessionsChanged: refresh });
   Object.assign(vscode.window, { activeTerminal: a });
-  const run = (arg?: unknown, direct = false) => handlers.get(direct ? "nexus.serial.useDirectInput" : "nexus.serial.openSendBox")!(arg);
+  const run = (...args: [arg?: unknown, direct?: boolean]) => {
+    const [arg, direct = false] = args;
+    const handler = handlers.get(direct ? "nexus.serial.useDirectInput" : "nexus.serial.openSendBox")!;
+    return args.length === 0 ? handler() : handler(arg);
+  };
   const changed = () => { for (const fn of listeners) fn(); };
   return { a, b, ia, ib, entries, panel, refresh, registry, service, run, changed, listeners, removeProfiles: () => { profiles = []; changed(); }, removeSessions: () => { sessions = []; changed(); } };
 }
@@ -109,4 +113,48 @@ describe("Standard opening binding", () => {
     const f = fixture("opening"); f.entries.get("sb")!.smartFollow = true; await f.run(f.b);
     expect(f.panel.openOrReveal).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "sb" })); expect(f.ib.owner.getInputState().connected).toBe(false);
   });
+});
+
+
+describe("native command invocation metadata", () => {
+  for (const command of ["nexus.serial.openSendBox", "nexus.serial.useDirectInput"]) {
+    it.each(["closed-only", "closed-and-active", "active-selection", "explicit-undefined"])(`${command} refuses missing clicked target with %s context`, async shape => {
+      const f = fixture();
+      f.ia.change({ dedicatedInputEnabled: true });
+      const handler = handlers.get(command)!;
+      if (shape === "explicit-undefined") await handler(undefined);
+      else {
+        const selection = shape === "closed-only" ? [undefined] : shape === "closed-and-active" ? [undefined, f.a] : [f.a];
+        await handler(undefined, selection);
+      }
+      expect(warning).toHaveBeenCalledWith("This serial session is no longer available. Reconnect the profile to use its send box.");
+      expect(f.panel.openOrReveal).not.toHaveBeenCalled();
+      expect(f.panel.disposeForSession).not.toHaveBeenCalled();
+      expect(pick).not.toHaveBeenCalled();
+      expect(info).not.toHaveBeenCalled();
+      expect(execute).not.toHaveBeenCalled();
+      expect(f.ia.owner.setDedicatedInputEnabled).not.toHaveBeenCalled();
+      expect(f.ia.owner.getInputState().dedicatedInputEnabled).toBe(true);
+      expect(f.a.show).not.toHaveBeenCalled();
+    });
+
+    it(`${command} preserves genuine no-argument palette invocation`, async () => {
+      const f = fixture();
+      f.ia.change({ dedicatedInputEnabled: true });
+      await handlers.get(command)!();
+      if (command === "nexus.serial.openSendBox") expect(f.panel.openOrReveal).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "sa", terminal: f.a }));
+      else expect(f.ia.owner.setDedicatedInputEnabled).toHaveBeenCalledWith(false);
+      expect(pick).not.toHaveBeenCalled(); expect(warning).not.toHaveBeenCalled();
+    });
+
+    it(`${command} honors valid clicked B over active A and selection`, async () => {
+      const f = fixture();
+      f.ia.change({ dedicatedInputEnabled: true }); f.ib.change({ dedicatedInputEnabled: true });
+      await handlers.get(command)!(f.b, [f.b, f.a]);
+      if (command === "nexus.serial.openSendBox") expect(f.panel.openOrReveal).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "sb", terminal: f.b }));
+      else expect(f.ib.owner.setDedicatedInputEnabled).toHaveBeenCalledWith(false);
+      expect(f.ia.owner.setDedicatedInputEnabled).not.toHaveBeenCalled();
+      expect(pick).not.toHaveBeenCalled(); expect(warning).not.toHaveBeenCalled();
+    });
+  }
 });

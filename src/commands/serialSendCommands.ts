@@ -26,8 +26,8 @@ export class SerialSendCommands implements vscode.Disposable {
 
   public constructor(private readonly deps: SerialSendCommandDependencies) {
     this.subscriptions.push(
-      vscode.commands.registerCommand("nexus.serial.openSendBox", (arg?: unknown) => this.run(arg, false)),
-      vscode.commands.registerCommand("nexus.serial.useDirectInput", (arg?: unknown) => this.run(arg, true)),
+      vscode.commands.registerCommand("nexus.serial.openSendBox", (...args: unknown[]) => this.run(args, false)),
+      vscode.commands.registerCommand("nexus.serial.useDirectInput", (...args: unknown[]) => this.run(args, true)),
       { dispose: deps.core.onDidChange(() => this.reconcile()) },
       vscode.window.onDidCloseTerminal(terminal => {
         this.closedTerminals.add(terminal);
@@ -152,8 +152,14 @@ export class SerialSendCommands implements vscode.Disposable {
     return (await vscode.window.showQuickPick(choices, { title: "Select Serial Send Box Session" }))?.target;
   }
 
-  private async run(arg: unknown, direct: boolean): Promise<void> {
-    const target = await this.select(arg);
+  private async run(args: readonly unknown[], direct: boolean): Promise<void> {
+    // Native terminal menus can marshal a closed clicked terminal to undefined.
+    // Retain invocation arity so that target cannot become a palette fallback.
+    if (args.length > 0 && args[0] === undefined) {
+      this.refuseExplicit(undefined);
+      return;
+    }
+    const target = await this.select(args[0]);
     if (!target) return;
     await this.apply(target, direct);
   }
