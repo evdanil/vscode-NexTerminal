@@ -60,7 +60,7 @@ Then open the **Nexus** sidebar (activity bar icon).
 - **Connection multiplexing** — terminals, tunnels, and SFTP to one server share an SSH connection, with a per-server opt-out. → [Connection Multiplexing](docs/ssh-and-telnet.md#connection-multiplexing)
 - **Dropped-session diagnostics** — faults after a session is up are recorded in the **Nexus SSH** output channel, so a dropped terminal leaves a cause behind. → [When a Session Drops](docs/ssh-and-telnet.md#when-a-session-drops)
 - **Telnet** — a per-server protocol switch for console servers, lab consoles, and gear that offers nothing else. → [Telnet](docs/ssh-and-telnet.md#telnet)
-- **Serial consoles** — COM/ttyUSB ports with full line settings, a port scan, break signal, and an optional separate send box for composing text during continuous logs, in an isolated sidecar process. → [Serial Consoles](docs/serial.md)
+- **Serial consoles** — COM/ttyUSB ports in an isolated sidecar process, with full line settings, a port scan and break signal. The optional **Serial Send Box** keeps drafts separate from continuous logs, with explicit Send and selectable line endings. → [Serial Consoles](docs/serial.md)
 - **Smart Follow** — a serial session rides through Windows COM-port renumbering, reconnecting only to the device you approved. → [Smart Follow](docs/serial.md#smart-follow)
 - **Local shells** — saved local terminal profiles (a VS Code terminal profile or a custom shell), several sessions per profile. → [Local Shells](docs/local-shells.md)
 
@@ -122,7 +122,7 @@ Then open the **Nexus** sidebar (activity bar icon).
 
 - **Highlighting** — named profiles group regex rules for errors, warnings, addresses, and more; choose a default, assign profiles to connections, or override an individual terminal. → [Highlighting](docs/terminal.md#highlighting)
 - **Tab commands** — right-click a Nexus terminal tab to select its highlight profile, reset the terminal, clear scrollback, or copy its output. → [Tab Commands](docs/terminal.md#tab-commands)
-- **Session transcripts** — clean, ANSI-stripped SSH, telnet, and serial logs with per-line timestamps on by default (local, UTC, or off), plus folder/filename templates using session, host, group and date tokens; **Open Log Directory** opens the log root. → [Session Transcript Logging](docs/terminal.md#session-transcript-logging)
+- **Session transcripts** — clean, ANSI-stripped SSH, telnet, and serial logs with per-line timestamps on by default (local, UTC, or off), optional CRLF-to-LF line-ending conversion, and folder/filename templates using session, host, group and date tokens; **Open Log Directory** opens the log root. → [Session Transcript Logging](docs/terminal.md#session-transcript-logging)
 - **Keyboard passthrough** — `Ctrl+` combinations go straight to vim, nano, or htop, configurable per key. → [Keyboard Passthrough](docs/terminal.md#keyboard-passthrough)
 - **Appearance** — terminal font and colour schemes, including schemes imported from MobaXterm. → [Appearance](docs/terminal.md#appearance)
 
