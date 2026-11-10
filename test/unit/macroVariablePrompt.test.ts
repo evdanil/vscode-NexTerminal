@@ -131,6 +131,25 @@ beforeEach(() => {
 });
 
 describe("resolveMacroText — prompt sequencing", () => {
+  it("captures the optional serial target before prompts and awaits its send result", async () => {
+    const terminal = makeTerminal("Serial A");
+    const other = makeTerminal("Terminal B");
+    mockWindow.terminals = [terminal, other]; mockWindow.activeTerminal = terminal;
+    const box = queueInputBox();
+    let finish!: (ok: boolean) => void;
+    const send = vi.fn(() => new Promise<boolean>((resolve) => { finish = resolve; }));
+    const resolver = vi.fn(() => ({ description: "Serial A", isStillValid: () => true, send }));
+    const pending = runMacro(makeMacro({ text: "$host\r", variables: [{ name: "host" }] }), resolver);
+    expect(resolver).toHaveBeenCalledExactlyOnceWith(terminal);
+    mockWindow.activeTerminal = other;
+    box.value = "bytes"; box.fireAccept(); await tick();
+    expect(send).toHaveBeenCalledExactlyOnceWith("bytes\r");
+    expect(mockSetStatusBarMessage).not.toHaveBeenCalled();
+    finish(false); await pending;
+    expect(mockSetStatusBarMessage).not.toHaveBeenCalled();
+    expect(terminal.sendText).not.toHaveBeenCalled(); expect(other.sendText).not.toHaveBeenCalled();
+  });
+
   it("returns macro.text unchanged (identity) when there is nothing to resolve", async () => {
     const macro: TerminalMacro = { name: "plain", text: "show version\n" };
     const result = await resolveMacroText(macro);

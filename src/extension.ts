@@ -85,6 +85,7 @@ import { registerSettingsCommands } from "./commands/settingsCommands";
 import { SettingsPanel } from "./ui/settingsPanel";
 import { registerConfigCommands } from "./commands/configCommands";
 import { registerMacroCommands, updateMacroContext } from "./commands/macroCommands";
+import { createSerialMacroTargetResolver } from "./commands/serialMacroTarget";
 import { registerProfileCommands } from "./commands/profileCommands";
 import { registerAuthProfileCommands } from "./commands/authProfileCommands";
 import { registerDeviceTemplateCommands } from "./commands/deviceTemplateCommands";
@@ -1645,7 +1646,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   void maybeOfferSshConfigImport(context, core);
   const macroDisposables = registerMacroCommands(() => {
     return buildMacroProfileInputsFromSnapshot(core.getSnapshot());
-  });
+  }, createSerialMacroTargetResolver(terminalRegistry));
   const disableTriggerCmd = vscode.commands.registerCommand("nexus.macro.disableTrigger", (item?: MacroTreeItem) => {
     if (item?.macro.triggerPattern) {
       macroAutoTrigger.setDisabled(item.macro, true);

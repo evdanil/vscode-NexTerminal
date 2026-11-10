@@ -94,6 +94,110 @@ async function flushAsync(): Promise<void> {
 }
 
 describe("SerialPty", () => {
+  it.each(["disconnect", "close"])("rejects a delayed acknowledgement after %s without retrying", async (loss) => {
+    const { transport, writePort, emitDisconnect } = createTransport();
+    const pty = new SerialPty(transport, { path: "COM9", baudRate: 115200 },
+      { onSessionOpened() {}, onSessionClosed() {} }, { log() {}, close() {} });
+    pty.open(); await flushAsync();
+    let complete!: () => void;
+    writePort.mockImplementationOnce(() => new Promise<void>((resolve) => { complete = resolve; }));
+    const sending = pty.sendUserInput("pending", pty.getInputState().connectionEpoch);
+    const refused = expect(sending).rejects.toThrow(/connection changed|delivery/i);
+    if (loss === "disconnect") emitDisconnect("session-1", "removed"); else pty.dispose();
+    complete(); await refused;
+    expect(writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("pending"));
+    pty.dispose();
+  });
+
+  it.each(["shutdown", "close"])("never announces a late open as connected after %s", async (loss) => {
+    const { transport, writePort } = createTransport();
+    let opened!: (id: string) => void;
+    transport.openPort = () => new Promise<string>((resolve) => { opened = resolve; });
+    const onSessionOpened = vi.fn();
+    const pty = new SerialPty(transport, { path: "COM9", baudRate: 115200 },
+      { onSessionOpened, onSessionClosed() {} }, { log() {}, close() {} });
+    const states: string[] = []; pty.onDidChangeInputState((state) => states.push(state.status));
+    pty.open();
+    if (loss === "shutdown") pty.markShuttingDown("shutdown"); else pty.dispose();
+    opened("late"); await flushAsync();
+    expect(states).not.toContain("connected"); expect(onSessionOpened).not.toHaveBeenCalled();
+    await expect(pty.sendUserInput("no", pty.getInputState().connectionEpoch)).rejects.toThrow();
+    expect(writePort).not.toHaveBeenCalled(); pty.dispose();
+  });
+
+  it("guards dedicated and locked input while preserving raw and script bytes", async () => {
+    const { transport, writePort, emitDisconnect } = createTransport();
+    const onDedicatedInput = vi.fn();
+    const pty = new SerialPty(transport, { path: "COM9", baudRate: 115200 },
+      { onSessionOpened() {}, onSessionClosed() {}, onDedicatedInput }, { log() {}, close() {} });
+    const states: ReturnType<typeof pty.getInputState>[] = [];
+    pty.onDidChangeInputState((state) => states.push(state));
+    expect(pty.getInputState().status).toBe("opening");
+    pty.open();
+    await flushAsync();
+    const epoch = pty.getInputState().connectionEpoch;
+    expect(pty.getInputState()).toMatchObject({ connected: true, dedicatedInputEnabled: false, path: "COM9" });
+    pty.handleInput("x\r");
+    expect(writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("x\r"));
+    writePort.mockClear();
+    pty.setDedicatedInputEnabled(true);
+    pty.handleInput("\x1b[I");
+    expect(onDedicatedInput).not.toHaveBeenCalled();
+    pty.handleInput("x"); pty.handleInput("y");
+    expect(onDedicatedInput).toHaveBeenCalledTimes(1);
+    expect(writePort).not.toHaveBeenCalled();
+    pty.handleInput("macro\r\n", "macro");
+    expect(writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("macro\r\n"));
+    writePort.mockClear();
+    pty.setInputBlocked(true);
+    pty.handleInput("x"); pty.handleInput("macro", "macro");
+    await expect(pty.sendUserInput("composer", epoch)).rejects.toThrow(/lock/i);
+    expect(writePort).not.toHaveBeenCalled();
+    pty.writeProgrammatic("script\r");
+    expect(writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("script\r"));
+    writePort.mockClear();
+    pty.setInputBlocked(false);
+    pty.setDedicatedInputEnabled(false); pty.setDedicatedInputEnabled(true); pty.handleInput("z");
+    expect(onDedicatedInput).toHaveBeenCalledTimes(2);
+    emitDisconnect("session-1", "removed");
+    expect(pty.getInputState().connectionEpoch).not.toBe(epoch);
+    expect(pty.getInputState().status).toBe("disconnected");
+    await expect(pty.sendUserInput("stale", epoch)).rejects.toThrow();
+    expect(writePort).not.toHaveBeenCalled();
+    expect(states.some((s) => s.inputLocked)).toBe(true);
+    pty.dispose();
+    expect(pty.getInputState().status).toBe("closed");
+  });
+
+  it("acknowledges only the driver result and refuses shutdown/disposal", async () => {
+    const { transport, writePort } = createTransport();
+    const pty = new SerialPty(transport, { path: "COM9", baudRate: 115200 },
+      { onSessionOpened() {}, onSessionClosed() {} }, { log() {}, close() {} });
+    await expect(pty.sendUserInput("early", 0)).rejects.toThrow();
+    pty.onDidChangeInputState((state) => {
+      if (state.connected) void pty.sendUserInput("ready", state.connectionEpoch);
+    });
+    pty.open(); await flushAsync();
+    expect(writePort).toHaveBeenCalledWith("session-1", Buffer.from("ready"));
+    writePort.mockClear();
+    let complete!: () => void;
+    writePort.mockImplementationOnce(() => new Promise<void>((resolve) => { complete = resolve; }));
+    let acknowledged = false;
+    const sending = pty.sendUserInput("é\r", pty.getInputState().connectionEpoch).then(() => { acknowledged = true; });
+    await flushAsync();
+    expect(acknowledged).toBe(false);
+    expect(writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("é\r"));
+    complete(); await sending;
+    writePort.mockRejectedValueOnce(new Error("driver failed"));
+    await expect(pty.sendUserInput("x", pty.getInputState().connectionEpoch)).rejects.toThrow("driver failed");
+    writePort.mockClear();
+    pty.markShuttingDown("shutdown");
+    await expect(pty.sendUserInput("x", pty.getInputState().connectionEpoch)).rejects.toThrow();
+    pty.dispose(); pty.setDedicatedInputEnabled(true);
+    await expect(pty.sendUserInput("x", pty.getInputState().connectionEpoch)).rejects.toThrow();
+    expect(writePort).not.toHaveBeenCalled();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
   });

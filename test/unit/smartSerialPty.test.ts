@@ -188,6 +188,102 @@ async function flushAsync(): Promise<void> {
 const noopLogger = () => ({ log: vi.fn(), close: vi.fn() }) as any;
 
 describe("SmartSerialPty", () => {
+  it("rejects acknowledgement after reconnecting to the same port without retrying", async () => {
+    vi.useFakeTimers();
+    let next = 0;
+    const { transport, emitDisconnect } = createTransport({ listPorts: async () => [{ path: "COM5" }], openPort: async () => `physical-${++next}` });
+    const pty = new SmartSerialPty(transport, makeProfile(), makeCallbacks().callbacks, noopLogger());
+    pty.open(); await flushAsync();
+    let complete!: () => void;
+    vi.mocked(transport.writePort).mockImplementationOnce(() => new Promise<void>((resolve) => { complete = resolve; }));
+    const sending = pty.sendUserInput("pending", pty.getInputState().connectionEpoch);
+    const refused = expect(sending).rejects.toThrow(/connection changed|delivery/i);
+    emitDisconnect("physical-1", "removed"); await vi.advanceTimersByTimeAsync(2000); await flushAsync();
+    expect(pty.getInputState().connected).toBe(true);
+    complete(); await refused;
+    expect(transport.writePort).toHaveBeenCalledExactlyOnceWith("physical-1", Buffer.from("pending"));
+    pty.dispose();
+  });
+
+  it("announces connection only with a live transport and cannot revive disposed profile-resolution work", async () => {
+    const { transport } = createTransport({ listPorts: async () => [{ path: "COM5" }], openPort: async () => "physical" });
+    const { callbacks, spies } = makeCallbacks();
+    let resolved!: () => void;
+    callbacks.onResolvedPort = () => new Promise<void>((resolve) => { resolved = resolve; });
+    const pty = new SmartSerialPty(transport, makeProfile(), callbacks, noopLogger());
+    const states: string[] = [];
+    pty.onDidChangeInputState((state) => {
+      states.push(state.status);
+      if (state.connected) void pty.sendUserInput("ready", state.connectionEpoch);
+    });
+    pty.open(); await flushAsync();
+    expect(transport.writePort).toHaveBeenCalledExactlyOnceWith("physical", Buffer.from("ready"));
+    pty.dispose(); const closedAt = states.length;
+    resolved(); await flushAsync();
+    expect(states.slice(closedAt)).not.toContain("connected");
+    expect(spies.onStateChanged).not.toHaveBeenCalledWith("connected");
+    expect(pty.getInputState().status).toBe("closed");
+  });
+
+  it("guards composer/native/macro input and invalidates epochs across the same port", async () => {
+    vi.useFakeTimers();
+    let next = 0;
+    const { transport, emitDisconnect } = createTransport({ listPorts: async () => [{ path: "COM5" }], openPort: async () => `session-${++next}` });
+    const { callbacks } = makeCallbacks();
+    const onDedicatedInput = vi.fn();
+    callbacks.onDedicatedInput = onDedicatedInput;
+    const pty = new SmartSerialPty(transport, makeProfile(), callbacks, noopLogger());
+    const states: ReturnType<typeof pty.getInputState>[] = [];
+    pty.onDidChangeInputState((state) => { states.push(state); });
+    pty.open(); await flushAsync();
+    const epoch = pty.getInputState().connectionEpoch;
+    expect(pty.getInputState()).toMatchObject({ connected: true, status: "connected", path: "COM5", dedicatedInputEnabled: false });
+    pty.handleInput("x\r");
+    expect(transport.writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("x\r"));
+    vi.mocked(transport.writePort).mockClear();
+    pty.setDedicatedInputEnabled(true);
+    pty.handleInput("\x1b[I"); expect(onDedicatedInput).not.toHaveBeenCalled();
+    pty.handleInput("x"); pty.handleInput("y");
+    expect(onDedicatedInput).toHaveBeenCalledTimes(1);
+    expect(transport.writePort).not.toHaveBeenCalled();
+    pty.handleInput("macro\r\n", "macro");
+    expect(transport.writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("macro\r\n"));
+    vi.mocked(transport.writePort).mockClear();
+    pty.setInputBlocked(true);
+    pty.handleInput("x"); pty.handleInput("macro", "macro");
+    await expect(pty.sendUserInput("composer", epoch)).rejects.toThrow(/lock/i);
+    expect(transport.writePort).not.toHaveBeenCalled();
+    pty.writeProgrammatic("script");
+    expect(transport.writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("script"));
+    vi.mocked(transport.writePort).mockClear();
+    pty.setInputBlocked(false);
+    emitDisconnect("session-1", "unplug");
+    expect(pty.getInputState().status).toBe("waiting");
+    await expect(pty.sendUserInput("waiting", pty.getInputState().connectionEpoch)).rejects.toThrow();
+    await vi.advanceTimersByTimeAsync(2000); await flushAsync();
+    expect(pty.getInputState().connected).toBe(true);
+    expect(pty.getInputState().connectionEpoch).not.toBe(epoch);
+    await expect(pty.sendUserInput("stale", epoch)).rejects.toThrow();
+    expect(transport.writePort).not.toHaveBeenCalled();
+    let complete!: () => void;
+    vi.mocked(transport.writePort).mockImplementationOnce(() => new Promise<void>((resolve) => { complete = resolve; }));
+    let acknowledged = false;
+    const sending = pty.sendUserInput("ack", pty.getInputState().connectionEpoch).then(() => { acknowledged = true; });
+    await flushAsync(); expect(acknowledged).toBe(false);
+    complete(); await sending;
+    vi.mocked(transport.writePort).mockRejectedValueOnce(new Error("driver failed"));
+    await expect(pty.sendUserInput("fail", pty.getInputState().connectionEpoch)).rejects.toThrow("driver failed");
+    vi.mocked(transport.writePort).mockClear();
+    pty.markShuttingDown("shutdown");
+    expect(pty.getInputState().status).toBe("stopped");
+    await expect(pty.sendUserInput("stopped", pty.getInputState().connectionEpoch)).rejects.toThrow();
+    pty.dispose();
+    expect(pty.getInputState().status).toBe("closed");
+    await expect(pty.sendUserInput("closed", pty.getInputState().connectionEpoch)).rejects.toThrow();
+    expect(transport.writePort).not.toHaveBeenCalled();
+    expect(states.some((state) => state.inputLocked)).toBe(true);
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
   });

@@ -21,6 +21,7 @@ import type { CwdSyncCoordinator } from "../services/sftp/cwdSyncCoordinator";
 export type ServerTerminalMap = Map<string, Set<vscode.Terminal>>;
 export type SessionTerminalMap = Map<string, vscode.Terminal>;
 export interface SerialTerminalEntry {
+  input?: import("../services/serial/serialUserInput").SerialUserInput;
   terminal: vscode.Terminal;
   profileId: string;
   transportSessionId?: string;

@@ -421,7 +421,7 @@ async function connectStandardSerialProfile(
   let terminalRef: vscode.Terminal | undefined;
   let ptyRef: SerialPty | undefined;
   const triggerObserver = ctx.macroAutoTrigger.createObserver(
-    (text) => ptyRef?.handleInput(text),
+    (text) => ptyRef?.handleInput(text, "macro"),
     () => terminalRef !== undefined && vscode.window.activeTerminal === terminalRef,
     undefined,
     profile.id
@@ -478,6 +478,7 @@ async function connectStandardSerialProfile(
         if (terminalRef) {
           ctx.serialTerminals.set(sessionId, {
             terminal: terminalRef,
+            input: ptyRef,
             profileId: profile.id,
             transportSessionId: sessionId,
             activePath: profile.path
@@ -552,7 +553,7 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
   let ptyRef: SmartSerialPty | undefined;
   let currentProfile = profile;
   const triggerObserver = ctx.macroAutoTrigger.createObserver(
-    (text) => ptyRef?.handleInput(text),
+    (text) => ptyRef?.handleInput(text, "macro"),
     () => terminalRef !== undefined && vscode.window.activeTerminal === terminalRef,
     logicalSessionId,
     profile.id
@@ -642,6 +643,7 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
   ctx.terminalRegistry?.register(terminal, pty, highlight);
   ctx.serialTerminals.set(logicalSessionId, {
     terminal,
+    input: pty,
     profileId: profile.id,
     smartFollow: true,
     activePath: undefined
