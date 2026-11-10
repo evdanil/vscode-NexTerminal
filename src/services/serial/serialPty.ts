@@ -203,6 +203,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable, Seri
     this.shuttingDown = true;
     this.connectionEpoch++;
     this.fireInputState();
+    if (this.disposed) return;
     this.disconnected = true;
     this.observerHub.pauseIntervalMacros();
     this.highlighterStream?.flush();
@@ -272,6 +273,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable, Seri
     this.disconnected = true;
     this.connectionEpoch++;
     this.fireInputState();
+    if (this.disposed) return;
     this.highlighterStream?.flush();
     this.transcript?.flush?.();
 
@@ -328,22 +330,29 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable, Seri
         }
         return;
       }
+      if (this.disposed || this.shuttingDown) {
+        await this.transport.closePort(sessionId);
+        return;
+      }
       this.sidecarSessionId = sessionId;
       this.connectionEpoch++;
-      this.fireInputState();
       this.callbacks.onSessionOpened(sessionId);
+      if (!this.isCurrentTransport(sessionId)) return;
       this.logger.log(
         `serial connected path=${this.options.path} baud=${this.options.baudRate} parity=${this.options.parity ?? "none"} dataBits=${this.options.dataBits ?? 8} stopBits=${this.options.stopBits ?? 1} rtscts=${this.options.rtscts ? "on" : "off"}`
       );
       this.writeEmitter.fire(
         `\r\n[Nexus Serial] Connected ${this.options.path} @ ${this.options.baudRate} (${this.options.dataBits ?? 8}${toParityCode(this.options.parity)}${this.options.stopBits ?? 1})\r\n`
       );
+      if (!this.isCurrentTransport(sessionId)) return;
 
       this.openingPort = false;
       this.openingSessionId = undefined;
       for (const data of this.openingData.takeFor(sessionId)) {
+        if (!this.isCurrentTransport(sessionId)) return;
         this.handleData(sessionId, data);
       }
+      if (!this.isCurrentTransport(sessionId)) return;
       this.errorSubscription = this.transport.onDidReceiveError((eventSessionId, errorMessage) => {
         if (eventSessionId !== this.sidecarSessionId) {
           return;
@@ -358,6 +367,8 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable, Seri
         }
         this.handleDisconnect(reason);
       });
+      // State listeners may close the terminal synchronously; publish only after setup owns no further work.
+      this.fireInputState();
     } catch (error) {
       this.releaseSubscriptions();
       const message = error instanceof Error ? error.message : "unknown serial connection error";
@@ -366,6 +377,10 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable, Seri
       this.failed = true;
       if (!this.disposed) this.fireInputState();
     }
+  }
+
+  private isCurrentTransport(sessionId: string): boolean {
+    return this.getInputState().connected && this.sidecarSessionId === sessionId;
   }
 
   private handleData(eventSessionId: string, data: Buffer): void {

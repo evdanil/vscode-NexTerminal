@@ -188,6 +188,75 @@ async function flushAsync(): Promise<void> {
 const noopLogger = () => ({ log: vi.fn(), close: vi.fn() }) as any;
 
 describe("SmartSerialPty", () => {
+  it.each(["inputState", "transportChanged", "name", "activePort", "resolvedPort", "stateChanged", "openingData"].flatMap((trigger) =>
+    ["dispose", "shutdown"].map((loss) => ({ trigger, loss }))))(
+    "does not restore Smart Follow registration after $trigger requests $loss", async ({ trigger, loss }) => {
+      const events: string[] = [];
+      let stopped = false;
+      let physical = "physical";
+      const fixture = createTransport({ listPorts: async () => [{ path: "COM5" }], openPort: async () => "physical" });
+      const interrupt = (): void => {
+        if (stopped) return;
+        stopped = true;
+        events.push("stop");
+        if (loss === "dispose") pty.dispose(); else pty.markShuttingDown("shutdown");
+      };
+      const { callbacks } = makeCallbacks();
+      callbacks.onTransportSessionChanged = (id) => { if (id) { events.push("transport"); if (trigger === "transportChanged") interrupt(); } };
+      callbacks.onActivePortChanged = (path) => { if (path) { events.push("path"); if (trigger === "activePort") interrupt(); } };
+      callbacks.onResolvedPort = () => { events.push("resolved"); if (trigger === "resolvedPort") interrupt(); };
+      callbacks.onStateChanged = (state) => { events.push(`registered:${state}`); if (trigger === "stateChanged") interrupt(); };
+      callbacks.onClosed = () => { events.push("unregistered"); };
+      callbacks.onDataReceived = () => { events.push("data"); if (trigger === "openingData") interrupt(); };
+      const pty = new SmartSerialPty(fixture.transport, makeProfile(), callbacks, noopLogger());
+      fixture.transport.openPort = vi.fn(async (_options, openingId) => {
+        if (trigger === "openingData") { physical = openingId!; fixture.emitData(physical, "buffered"); }
+        return physical;
+      });
+      pty.onDidChangeInputState((state) => {
+        events.push(state.status);
+        if (state.connected && trigger === "inputState") interrupt();
+      });
+      pty.onDidChangeName(() => { if (trigger === "name" && pty.getInputState().connected) interrupt(); });
+      pty.open(); await flushAsync();
+      expect(stopped).toBe(true);
+      const afterStop = events.slice(events.indexOf("stop") + 1);
+      for (const positive of ["transport", "path", "resolved", "registered:connected", "registered:waiting", "connected"]) expect(afterStop).not.toContain(positive);
+      expect(pty.getInputState().status).toBe(loss === "dispose" ? "closed" : "stopped");
+      expect(fixture.closePort).toHaveBeenCalledTimes(loss === "dispose" ? 1 : 0);
+      if (loss === "dispose") expect(fixture.closePort).toHaveBeenCalledWith(physical);
+      pty.dispose();
+    });
+
+  it("does not register a waiting session or restart polling after a waiting listener disposes it", async () => {
+    vi.useFakeTimers();
+    const { transport } = createTransport({ listPorts: async () => [], openPort: async () => "physical" });
+    const { callbacks, spies } = makeCallbacks();
+    const pty = new SmartSerialPty(transport, makeProfile(), callbacks, noopLogger());
+    pty.onDidChangeInputState((state) => { if (state.status === "waiting") pty.dispose(); });
+    pty.open(); await flushAsync();
+    expect(spies.onClosed).toHaveBeenCalledOnce();
+    expect(spies.onStateChanged).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(pty.getInputState().status).toBe("closed");
+  });
+
+  it("does not publish stopped-session callbacks after a stopped listener disposes it", async () => {
+    const { transport, closePort } = createTransport({
+      listPorts: async () => { throw new Error("serialport module not installed"); },
+      openPort: async () => "physical"
+    });
+    const { callbacks, spies } = makeCallbacks();
+    const pty = new SmartSerialPty(transport, makeProfile(), callbacks, noopLogger());
+    pty.onDidChangeInputState((state) => { if (state.status === "stopped") pty.dispose(); });
+    pty.open(); await flushAsync();
+    expect(spies.onClosed).toHaveBeenCalledOnce();
+    expect(spies.onStateChanged).not.toHaveBeenCalled();
+    expect(spies.onFatalError).not.toHaveBeenCalled();
+    expect(closePort).not.toHaveBeenCalled();
+    expect(pty.getInputState().status).toBe("closed");
+  });
+
   it("rejects acknowledgement after reconnecting to the same port without retrying", async () => {
     vi.useFakeTimers();
     let next = 0;

@@ -307,6 +307,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable,
     this.stopped = true;
     this.connectionEpoch++;
     this.fireInputState();
+    if (this.disposed) return;
     this.stopPolling();
     this.observerHub.pauseIntervalMacros();
     this.highlighterStream?.flush();
@@ -614,19 +615,24 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable,
       this.transportSessionId = sessionId;
       this.currentPath = path;
       this.connectionEpoch++;
-      this.fireInputState();
       this.openingSessionId = undefined;
       this.openingPort = false;
       this.callbacks.onTransportSessionChanged?.(sessionId);
+      if (!this.isCurrentTransport(sessionId)) return { type: "failed", message: "serial connection changed" };
       // A new device is now the transport (Smart Follow reattaches inside this
       // one PTY, keeping the observers and the transcript). Drop the ANSI
       // stripper carries the lost device left behind before its replacement's
       // first output, replayed or live, can be swallowed by them.
       this.observerHub.notifyTransportReset();
+      if (!this.isCurrentTransport(sessionId)) return { type: "failed", message: "serial connection changed" };
       this.transcript?.resetEscapeState?.();
       for (const data of this.openingData.takeFor(sessionId)) {
+        if (!this.isCurrentTransport(sessionId)) return { type: "failed", message: "serial connection changed" };
         this.handleData(data);
       }
+      if (!this.isCurrentTransport(sessionId)) return { type: "failed", message: "serial connection changed" };
+      // Complete transport setup before notifying listeners that can synchronously close the owner.
+      this.fireInputState();
       return { type: "connected", path, port: knownPort };
     } catch (error: unknown) {
       this.openingSessionId = undefined;
@@ -636,6 +642,10 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable,
       this.logger.log(`smart serial open failed path=${path} ${message}`);
       return { type: "failed", message };
     }
+  }
+
+  private isCurrentTransport(sessionId: string): boolean {
+    return this.getInputState().connected && this.transportSessionId === sessionId;
   }
 
   private handleData(data: Buffer): void {
@@ -655,7 +665,8 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable,
     reason: "initial" | "poll" | "disconnect",
     note?: string
   ): Promise<void> {
-    if (this.disposed || this.stopped || !this.transportSessionId) return;
+    const sessionId = this.transportSessionId;
+    if (!sessionId || !this.isCurrentTransport(sessionId)) return;
     this.stopPolling();
     this.waiting = false;
     this.stopped = false;
@@ -667,15 +678,18 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable,
     const firstConnection = !this.hasEverConnected;
     this.hasEverConnected = true;
     this.nameEmitter.fire(this.buildDisplayName());
+    if (!this.isCurrentTransport(sessionId)) return;
     this.callbacks.onActivePortChanged?.(path);
+    if (!this.isCurrentTransport(sessionId)) return;
     try {
       await Promise.resolve(this.callbacks.onResolvedPort?.(path, this.deviceHint));
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : "unknown profile update error";
       this.logger.log(`smart serial profile update failed ${message}`);
     }
-    if (this.disposed || this.stopped || !this.transportSessionId) return;
+    if (!this.isCurrentTransport(sessionId)) return;
     this.callbacks.onStateChanged?.("connected");
+    if (!this.isCurrentTransport(sessionId)) return;
 
     if (path !== previousPreferredPath) {
       this.writeBanner(
@@ -727,6 +741,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable,
     this.stopped = true;
     this.connectionEpoch++;
     this.fireInputState();
+    if (this.disposed) return;
     this.stopPolling();
     this.highlighterStream?.flush();
     this.transcript?.flush?.();
@@ -740,6 +755,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable,
     this.writeEmitter.fire(RESET_INTERACTIVE_MODES);
     this.writeBanner(`${message} Close this terminal to exit.`);
     this.callbacks.onStateChanged?.("waiting");
+    if (this.disposed) return;
     this.callbacks.onFatalError?.(message);
     // CRITICAL: do NOT call this.dispose() — the tab must persist per user requirement.
   }
@@ -750,9 +766,12 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable,
     }
     this.waiting = true;
     this.fireInputState();
+    if (this.disposed || this.stopped) return;
     this.currentPath = undefined;
     this.nameEmitter.fire(this.buildDisplayName());
+    if (this.disposed || this.stopped) return;
     this.callbacks.onStateChanged?.("waiting");
+    if (this.disposed || this.stopped) return;
     this.startPolling();
     if (this.lastWaitingKey === key) {
       return;

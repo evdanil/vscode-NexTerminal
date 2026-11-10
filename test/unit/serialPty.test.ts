@@ -40,6 +40,8 @@ function createTransport(): {
   writePort: ReturnType<typeof vi.fn>;
   closePort: ReturnType<typeof vi.fn>;
   dataListenerCount: () => number;
+  errorListenerCount: () => number;
+  disconnectListenerCount: () => number;
 } {
   const dataListeners = new Set<DataListener>();
   const errorListeners = new Set<ErrorListener>();
@@ -84,7 +86,9 @@ function createTransport(): {
     },
     writePort,
     closePort,
-    dataListenerCount: () => dataListeners.size
+    dataListenerCount: () => dataListeners.size,
+    errorListenerCount: () => errorListeners.size,
+    disconnectListenerCount: () => disconnectListeners.size
   };
 }
 
@@ -94,6 +98,49 @@ async function flushAsync(): Promise<void> {
 }
 
 describe("SerialPty", () => {
+  it.each(["inputState", "sessionOpened", "banner", "openingData", "profileCurrent"].flatMap((trigger) =>
+    ["dispose", "shutdown"].map((loss) => ({ trigger, loss }))))(
+    "does not resume setup after $trigger synchronously requests $loss", async ({ trigger, loss }) => {
+      const fixture = createTransport();
+      const events: string[] = [];
+      let stopped = false;
+      let physical = "physical";
+      const interrupt = (): void => {
+        if (stopped) return;
+        stopped = true;
+        events.push("stop");
+        if (loss === "dispose") pty.dispose(); else pty.markShuttingDown("shutdown");
+      };
+      const pty = new SerialPty(fixture.transport, { path: "COM9", baudRate: 115200 }, {
+        isProfileCurrent: () => { if (trigger === "profileCurrent") interrupt(); return true; },
+        onSessionOpened: () => { events.push("opened"); if (trigger === "sessionOpened") interrupt(); },
+        onSessionClosed: () => { events.push("unregistered"); },
+        onDataReceived: () => { events.push("data"); if (trigger === "openingData") interrupt(); }
+      }, { log() {}, close() {} });
+      fixture.transport.openPort = vi.fn(async (_options, openingId) => {
+        if (trigger === "openingData") { physical = openingId!; fixture.emitData(physical, "buffered"); }
+        return physical;
+      });
+      pty.onDidChangeInputState((state) => {
+        events.push(state.status);
+        if (state.connected && trigger === "inputState") interrupt();
+      });
+      pty.onDidWrite((text) => { if (trigger === "banner" && text.includes("Connected")) interrupt(); });
+      pty.open(); await flushAsync();
+      expect(stopped).toBe(true);
+      expect(events.slice(events.indexOf("stop") + 1)).not.toContain("opened");
+      expect(events.slice(events.indexOf("stop") + 1)).not.toContain("connected");
+      expect(pty.getInputState().status).toBe(loss === "dispose" ? "closed" : "stopped");
+      expect(fixture.dataListenerCount()).toBe(0);
+      expect(fixture.errorListenerCount()).toBe(0);
+      expect(fixture.disconnectListenerCount()).toBe(0);
+      // Shutdown releases ownership to manager teardown; an unbound late open must close itself.
+      const expectedCloses = loss === "dispose" || trigger === "profileCurrent" ? 1 : 0;
+      expect(fixture.closePort).toHaveBeenCalledTimes(expectedCloses);
+      if (expectedCloses) expect(fixture.closePort).toHaveBeenCalledWith(physical);
+      pty.dispose();
+    });
+
   it.each(["disconnect", "close"])("rejects a delayed acknowledgement after %s without retrying", async (loss) => {
     const { transport, writePort, emitDisconnect } = createTransport();
     const pty = new SerialPty(transport, { path: "COM9", baudRate: 115200 },
