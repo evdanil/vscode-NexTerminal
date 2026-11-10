@@ -230,6 +230,17 @@ Reverse-bind reservations are separate files in `globalStorageUri`, outside the 
 9. Use `Nexus: Disconnect Serial Session` from profile/session context menu or command.
 10. `Nexus: List Serial Ports` reports detected ports and manufacturers for diagnostics.
 
+#### Dedicated serial send box
+
+- `nexus.serial.openSendBox` opens or reveals **Serial Send: <profile name>**, a companion editor bound to one Standard or Smart Follow session. Direct input is the default for every new session. Opening enables dedicated input; closing or **Use Direct Terminal Input** (`nexus.serial.useDirectInput`) restores direct input and discards the draft. Hiding the editor retains both. Drafts and send history are never persisted.
+- Entry points include live profile/session menus, Profile Actions, terminal body/tab context menus and the Command Palette. Terminal editors use their terminal-body context menu. Editor-header menus are omitted because their URI arguments cannot be bound to an exact terminal through the stable API; explicit unknown URI targets are refused without an active-terminal fallback.
+- The native terminal remains the receive renderer and transport owner. Receive output does not reach or rerender the composer. Native typing/paste and third-party terminal-send commands are blocked while dedicated input is enabled; real input produces at most one actionable reminder per enable cycle. Device echo remains normal RX. Nexus manual/automatic macros and script writes preserve their existing bytes; script input locks block manual macros and composer submissions.
+- Plain Enter inserts a newline. Send or Ctrl/Cmd+Enter submits, except during IME composition. UTF-8 text is limited to 65,536 bytes after conversion. None sends verbatim; CR (default), LF and CRLF normalize draft separators and append exactly one selected ending. No trimming, escape interpretation or binary mode. An empty draft sends an ending; empty None is refused.
+- Host validation checks message shape, current binding, connection generation and input lock immediately before one acknowledged transport write. A pending request prevents another send; duplicate/stale requests cannot replay it. Success means **Written to serial driver**, not device acknowledgement, and clears only the unchanged submitted draft. Failure retains the draft while its composer remains open and reports possible partial/unknown delivery. No automatic retries.
+- Waiting, stopped, disconnected and locked states disable sending. Smart Follow retains the draft and displays the current port after reconnect; a stale generation is refused. Session/terminal closure and extension disposal release the panel and subscriptions. Explicit stale command targets never fall back to another active terminal; no-argument commands may resolve the active serial terminal or offer a live-session picker. Browser VS Code reports that desktop serial support is required.
+
+See [Serial Consoles](serial.md#dedicated-send-box) for the user workflow.
+
 ### 4.7 Logging and Rotation
 1. Terminal and tunnel event logs are enabled automatically.
 2. Each log file rotates when it reaches configured max size.
@@ -829,6 +840,7 @@ No settings. The lab status poll interval used to live here as `nexus.inventory.
 - `nexus.serial.runWithScript`
 - `nexus.serial.copyInfo`, `nexus.serial.duplicate`, `nexus.serial.rename`
 - `nexus.serial.listPorts`, `nexus.serial.sendBreak`
+- `nexus.serial.openSendBox`, `nexus.serial.useDirectInput`
 
 **Local Shell:**
 - `nexus.localShell.add`, `nexus.localShell.edit`, `nexus.localShell.remove`

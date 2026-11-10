@@ -421,7 +421,7 @@ async function connectStandardSerialProfile(
   let terminalRef: vscode.Terminal | undefined;
   let ptyRef: SerialPty | undefined;
   const triggerObserver = ctx.macroAutoTrigger.createObserver(
-    (text) => ptyRef?.handleInput(text),
+    (text) => ptyRef?.handleInput(text, "macro"),
     () => terminalRef !== undefined && vscode.window.activeTerminal === terminalRef,
     undefined,
     profile.id
@@ -438,6 +438,9 @@ async function connectStandardSerialProfile(
       rtscts: profile.rtscts
     },
     {
+      onDedicatedInput: () => {
+        if (terminalRef && ptyRef) void ctx.serialSendCommands?.remindNativeInput(terminalRef, ptyRef);
+      },
       isProfileCurrent: () => {
         const current = ctx.core.getSerialProfile(profile.id);
         return current !== undefined && JSON.stringify(current) === profileAtStart;
@@ -478,6 +481,7 @@ async function connectStandardSerialProfile(
         if (terminalRef) {
           ctx.serialTerminals.set(sessionId, {
             terminal: terminalRef,
+            input: ptyRef,
             profileId: profile.id,
             transportSessionId: sessionId,
             activePath: profile.path
@@ -535,6 +539,7 @@ async function connectStandardSerialProfile(
   }
   terminalRef = terminal;
   ctx.terminalRegistry?.register(terminal, pty, highlight);
+  ctx.serialSendCommands?.trackOpening(profile.id, terminal, pty);
   ctx.focusedTerminal = terminal;
   terminal.show();
   return true;
@@ -552,7 +557,7 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
   let ptyRef: SmartSerialPty | undefined;
   let currentProfile = profile;
   const triggerObserver = ctx.macroAutoTrigger.createObserver(
-    (text) => ptyRef?.handleInput(text),
+    (text) => ptyRef?.handleInput(text, "macro"),
     () => terminalRef !== undefined && vscode.window.activeTerminal === terminalRef,
     logicalSessionId,
     profile.id
@@ -563,6 +568,9 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
     ctx.serialSidecar as SmartSerialTransport,
     profile,
     {
+      onDedicatedInput: () => {
+        if (terminalRef && ptyRef) void ctx.serialSendCommands?.remindNativeInput(terminalRef, ptyRef);
+      },
       onClosed: () => {
         ctx.serialTerminals.delete(logicalSessionId);
         ctx.activityIndicators.delete(logicalSessionId);
@@ -642,6 +650,7 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
   ctx.terminalRegistry?.register(terminal, pty, highlight);
   ctx.serialTerminals.set(logicalSessionId, {
     terminal,
+    input: pty,
     profileId: profile.id,
     smartFollow: true,
     activePath: undefined

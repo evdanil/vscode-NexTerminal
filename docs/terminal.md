@@ -87,6 +87,8 @@ Optionally pass `Ctrl+` key combinations (e.g. `Ctrl+B`, `Ctrl+N`) directly to t
 
 Turn it on or off, and choose the keys, under [Settings → Terminal](settings.md#terminal).
 
+Serial sessions can use an optional [dedicated send box](serial.md#dedicated-send-box). While it is enabled, the native serial terminal displays received output and blocks direct typing and terminal-send keybindings; **Use Direct Terminal Input** restores them.
+
 ## Appearance
 
 Customize terminal font family, size, and weight. Import color schemes from MobaXterm INI files or configure custom themes with live preview. Open it with **Nexus: Terminal Appearance**.

@@ -44,7 +44,7 @@ import {
   INVALID_FOLDER_PATH_MESSAGE,
   MAX_FOLDER_PATH_LENGTH
 } from "../utils/folderPaths";
-import { runMacro } from "./macroVariablePrompt";
+import { runMacro, type SerialMacroTargetResolver } from "./macroVariablePrompt";
 // NOT imported from "../ui/macroTreeProvider": that module's `class MacroTreeItem
 // extends vscode.TreeItem` executes at load time, and a plain value import from
 // it would force this module (and every test that imports it) to load `vscode`
@@ -235,17 +235,23 @@ export function macroWillPrompt(macro: TerminalMacro): boolean {
   return scanPlaceholders(macro.text, declaredNames).used.length > 0;
 }
 
-function sendMacroText(text: string): void {
+async function sendMacroText(text: string, resolveSerialTarget?: SerialMacroTargetResolver): Promise<void> {
+  const active = vscode.window.activeTerminal;
+  const serialTarget = active && resolveSerialTarget?.(active);
+  if (serialTarget) {
+    await serialTarget.send(text);
+    return;
+  }
   void vscode.commands.executeCommand("workbench.action.terminal.sendSequence", { text });
 }
 
 /**
  * Routes a macro run through `runMacro()` (target-pinned prompt-and-send) when it
- * declares variables (§8.5), or through the unchanged `sendMacroText()` same-tick
- * path otherwise — §8.1's "scope of the change": a macro with no variables must
- * see zero behavior change (§4.1).
+ * declares variables (§8.5), or same-tick `sendMacroText()` otherwise. Both
+ * paths override delivery only for serial PTYs; ordinary terminal delivery
+ * retains its existing sendText/sendSequence behavior.
  */
-async function runOrSendMacro(macro: TerminalMacro): Promise<void> {
+async function runOrSendMacro(macro: TerminalMacro, resolveSerialTarget?: SerialMacroTargetResolver): Promise<void> {
   // A macro that names a server profile (`${profile.…}`) or runs somewhere
   // other than a session cannot be resolved from these entry points: they know
   // which macro the user picked, not which SERVER it is aimed at. Sending
@@ -284,9 +290,9 @@ async function runOrSendMacro(macro: TerminalMacro): Promise<void> {
   // name+text, and a needless copy is a needless difference.
   const toRun = text === macro.text ? macro : { ...macro, text };
   if (hasMacroVariables(macro)) {
-    await runMacro(toRun);
+    await (resolveSerialTarget ? runMacro(toRun, resolveSerialTarget) : runMacro(toRun));
   } else {
-    sendMacroText(text);
+    await sendMacroText(text, resolveSerialTarget);
   }
 }
 
@@ -763,7 +769,7 @@ function resolveOrExplain(macros: TerminalMacro[], ref: MacroRef): number {
   return target.kind === "resolved" ? target.index : -1;
 }
 
-export function registerMacroCommands(profileProvider?: () => MacroProfileOptionInput[]): vscode.Disposable[] {
+export function registerMacroCommands(profileProvider?: () => MacroProfileOptionInput[], resolveSerialTarget?: SerialMacroTargetResolver): vscode.Disposable[] {
   if (profileProvider) {
     MacroEditorPanel.setProfileProvider(profileProvider);
   }
@@ -926,7 +932,7 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       if (!pick) {
         return;
       }
-      await runOrSendMacro(macros[pick.index]);
+      await runOrSendMacro(macros[pick.index], resolveSerialTarget);
     }),
 
     vscode.commands.registerCommand("nexus.macro.runBinding", async (arg?: unknown) => {
@@ -938,7 +944,7 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       const macros = getMacros();
       const macro = macros.find((m) => getAssignedBinding(m) === binding);
       if (macro) {
-        await runOrSendMacro(macro);
+        await runOrSendMacro(macro, resolveSerialTarget);
       }
     }),
 
@@ -955,20 +961,20 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       // First try new keybinding system
       const bindingMacro = macros.find((m) => getAssignedBinding(m) === targetBinding);
       if (bindingMacro) {
-        await runOrSendMacro(bindingMacro);
+        await runOrSendMacro(bindingMacro, resolveSerialTarget);
         return;
       }
 
       const slotMacro = macros.find((m) => m.slot === targetSlot);
       if (slotMacro) {
-        await runOrSendMacro(slotMacro);
+        await runOrSendMacro(slotMacro, resolveSerialTarget);
       }
     }),
 
     vscode.commands.registerCommand("nexus.macro.runItem", async (arg?: unknown) => {
       const item = arg instanceof Object && "macro" in arg ? (arg as MacroTreeItem) : undefined;
       if (item) {
-        await runOrSendMacro(item.macro);
+        await runOrSendMacro(item.macro, resolveSerialTarget);
       }
     }),
 

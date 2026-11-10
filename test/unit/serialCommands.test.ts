@@ -479,6 +479,43 @@ describe("serial terminal tab visual differentiation", () => {
     } as any;
   }
 
+  it.each(["standard", "smartFollow"] as const)("keeps %s automatic macro delivery through the real dedicated input gate", async (mode) => {
+    const actual = mode === "standard"
+      ? await vi.importActual<typeof import("../../src/services/serial/serialPty")>("../../src/services/serial/serialPty")
+      : await vi.importActual<typeof import("../../src/services/serial/smartSerialPty")>("../../src/services/serial/smartSerialPty");
+    const ctx = makeSerialCtx();
+    const profile = { ...baseProfile, mode };
+    ctx.core.getSerialProfile = vi.fn(() => profile);
+    ctx.serialSidecar = {
+      listPorts: async () => [{ path: profile.path }], openPort: async () => "physical",
+      writePort: vi.fn(async () => {}), closePort: async () => {},
+      onDidReceiveData: () => () => {}, onDidReceiveError: () => () => {}, onDidDisconnect: () => () => {}
+    };
+    ctx.loggerFactory.create = () => ({ log() {}, close() {} });
+    let send!: (text: string) => void;
+    ctx.macroAutoTrigger.createObserver.mockImplementation((write: (text: string) => void) => { send = write; return {}; });
+    if ("SerialPty" in actual) vi.mocked(SerialPty).mockImplementationOnce(function (...args) { return new actual.SerialPty(...args); });
+    else vi.mocked(SmartSerialPty).mockImplementationOnce(function (...args) { return new actual.SmartSerialPty(...args); });
+    registerSerialCommands(ctx);
+    await registeredCommands.get("nexus.serial.connect")!(profile.id);
+    const calls = vi.mocked(vscode.window.createTerminal).mock.calls;
+    const pty = (calls[calls.length - 1][0] as unknown as { pty: SerialPty | SmartSerialPty }).pty;
+    try {
+      pty.open(); for (let i = 0; i < 16; i++) await Promise.resolve();
+      expect([...ctx.serialTerminals.values()][0]).toHaveProperty("input", pty);
+      pty.setDedicatedInputEnabled(true);
+      pty.handleInput("native"); expect(ctx.serialSidecar.writePort).not.toHaveBeenCalled();
+      send("macro\r\n");
+      expect(ctx.serialSidecar.writePort).toHaveBeenCalledExactlyOnceWith("physical", Buffer.from("macro\r\n"));
+      ctx.serialSidecar.writePort.mockClear();
+      pty.setInputBlocked(true); send("blocked");
+      expect(ctx.serialSidecar.writePort).not.toHaveBeenCalled();
+    } finally {
+      ctx.core.unregisterSerialSession = vi.fn();
+      pty.dispose();
+    }
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     registeredCommands.clear();
@@ -1112,5 +1149,26 @@ describe("nexus.serial.remove — the disclosure is re-checked under the lock (R
 
       expect(core.getSerialProfile("sp1")).toBeUndefined();
     });
+  });
+});
+
+
+describe("serial native-input reminder binding", () => {
+  beforeEach(() => { vi.clearAllMocks(); registeredCommands.clear(); });
+  it.each(["standard", "smartFollow"] as const)("binds %s callback to created terminal and input owner", async mode => {
+    const profile = makeSerialProfile({ mode });
+    const core = new NexusCore(new InMemoryConfigRepository([], [], [profile])); await core.initialize();
+    const reminder = vi.fn();
+    const ctx = { core, serialTerminals: new Map(), activityIndicators: new Map(), loggerFactory: { create: vi.fn() }, macroAutoTrigger: { createObserver: vi.fn(), bindObserverToSession: vi.fn() }, serialSidecar: {}, highlighter: {}, sessionLogDir: "", serialSendCommands: { remindNativeInput: reminder, trackOpening: vi.fn() } } as unknown as CommandContext;
+    registerSerialCommands(ctx); await registeredCommands.get("nexus.serial.connect")!(profile.id);
+    const constructor = mode === "standard" ? vi.mocked(SerialPty) : vi.mocked(SmartSerialPty);
+    const callbacks = constructor.mock.calls[0][2] as { onDedicatedInput?: () => void; onSessionOpened?: (id: string) => void };
+    const owner = constructor.mock.results[0].value;
+    const terminal = vi.mocked(vscode.window.createTerminal).mock.results[0].value;
+    callbacks.onSessionOpened?.("session");
+    expect(callbacks.onDedicatedInput).toBeTypeOf("function"); callbacks.onDedicatedInput!();
+    expect(reminder).toHaveBeenCalledWith(terminal, owner);
+    if (mode === "standard") expect(ctx.serialSendCommands!.trackOpening).toHaveBeenCalledWith(profile.id, terminal, owner);
+    expect([...ctx.serialTerminals.values()][0].input).toBe(owner);
   });
 });

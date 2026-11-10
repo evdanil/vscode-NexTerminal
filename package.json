@@ -445,6 +445,17 @@
         "icon": "$(edit)"
       },
       {
+        "command": "nexus.serial.openSendBox",
+        "title": "Open Serial Send Box",
+        "category": "Nexus",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "nexus.serial.useDirectInput",
+        "title": "Use Direct Serial Terminal Input",
+        "category": "Nexus"
+      },
+      {
         "command": "nexus.serial.sendBreak",
         "title": "Send Break",
         "category": "Nexus",
@@ -1616,6 +1627,16 @@
           "group": "3_destructive"
         },
         {
+          "command": "nexus.serial.openSendBox",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.serialProfileConnected || viewItem == nexus.serialProfileWaiting || viewItem == nexus.serialSessionNode) && !listMultiSelection",
+          "group": "1_terminal@4"
+        },
+        {
+          "command": "nexus.serial.useDirectInput",
+          "when": "view == nexusCommandCenter && (viewItem == nexus.serialProfileConnected || viewItem == nexus.serialProfileWaiting || viewItem == nexus.serialSessionNode) && !listMultiSelection",
+          "group": "1_terminal@5"
+        },
+        {
           "command": "nexus.serial.connect",
           "when": "view == nexusCommandCenter && viewItem =~ /^nexus\\.serialProfile(Connected|Waiting)?$/ && !listMultiSelection",
           "group": "inline"
@@ -2182,6 +2203,8 @@
         }
       ],
       "commandPalette": [
+        { "command": "nexus.serial.openSendBox", "when": "true" },
+        { "command": "nexus.serial.useDirectInput", "when": "true" },
         {"command": "nexus.authProfile.revokeExternalApprovals"},
         {"command": "nexus.authProfile.continueExternalApproval", "when": "resourceScheme == nexus-credential-invocation"},
         {"command": "nexus.authProfile.cancelExternalApproval", "when": "resourceScheme == nexus-credential-invocation"},
@@ -2830,7 +2853,11 @@
           "when": "false"
         }
       ],
+      "terminal/context": [
+        { "command": "nexus.serial.openSendBox", "group": "nexus@6" }
+      ],
       "terminal/title/context": [
+        { "command": "nexus.serial.openSendBox", "group": "nexus@6" },
         {
           "command": "nexus.terminal.selectHighlightProfile",
           "group": "nexus@5"

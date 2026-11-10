@@ -77,6 +77,8 @@ export interface MacroSendTarget {
   send(text: string): boolean | Promise<boolean>;
 }
 
+export type SerialMacroTargetResolver = (terminal: vscode.Terminal) => MacroSendTarget | undefined;
+
 /** The ordinary target: an existing terminal, pinned by reference. */
 export function terminalSendTarget(terminal: vscode.Terminal): MacroSendTarget {
   return {
@@ -224,16 +226,17 @@ export async function resolveMacroText(macro: TerminalMacro): Promise<string | u
  * The one entry point for running a macro that declares variables (§8.5) — the
  * four manual run paths in macroCommands.ts route here instead of
  * `sendMacroText()` whenever `hasMacroVariables(macro)` is true. Variable-free
- * macros never reach this module.
+ * macros never reach this module. Serial targets use the guarded PTY capability;
+ * ordinary terminals retain their pinned sendText delivery.
  */
-export async function runMacro(macro: TerminalMacro): Promise<void> {
+export async function runMacro(macro: TerminalMacro, resolveSerialTarget?: SerialMacroTargetResolver): Promise<void> {
   // §8.1 — captured BEFORE the first await, and never re-derived afterward.
   const active = vscode.window.activeTerminal;
   if (!active) {
     vscode.window.setStatusBarMessage("No active terminal — nothing was sent.", 4000);
     return;
   }
-  await runMacroWithTarget(macro, terminalSendTarget(active));
+  await runMacroWithTarget(macro, resolveSerialTarget?.(active) ?? terminalSendTarget(active));
 }
 
 export interface RunMacroOptions {

@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as vscode from "vscode";
 import type { StoredAuthProfile, AuthProfile, ServerConfig } from "../../src/models/config";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 import type { CommandContext } from "../../src/commands/types";
@@ -148,6 +149,7 @@ beforeEach(async () => {
   connectServer.mockReset();
   createdTerminals.length = 0;
   openTerminals = [];
+  (vscode.window as unknown as { activeTerminal: unknown }).activeTerminal = undefined;
   setActiveMacroStore(store);
   await store.clearAll();
 });
@@ -2262,5 +2264,54 @@ describe("macro picker credential relink races", () => {
     expect(get).not.toHaveBeenCalled();
     expect(resolve).not.toHaveBeenCalled();
     expect(showErrorMessage.mock.calls[0][0]).toContain("changed");
+  });
+});
+
+describe("server macro routes stay independent of an active serial composer", () => {
+  it.each(["session", "localTerminal", "browser", "gateway"] as const)("keeps %s delivery on its owned target", async (route) => {
+    const serialSend = vi.fn();
+    const guardedSerialSend = vi.fn();
+    const serial = { name: "Nexus Serial: fixture", sendText: serialSend };
+    const sshSend = vi.fn();
+    const gatewaySend = vi.fn();
+    const ssh = { name: "Nexus SSH: target", sendText: sshSend };
+    const gatewayTerminal = { name: "Nexus SSH: gateway", sendText: gatewaySend };
+    openTerminals = [serial, ssh, gatewayTerminal];
+    (vscode.window as unknown as { activeTerminal: unknown }).activeTerminal = serial;
+    const target = server({ ipmiHost: "10.0.0.9", ipmiGatewayServerId: "gateway" });
+    const gateway = server({ id: "gateway", name: "Gateway" });
+    const ctx = context({
+      core: {
+        getSnapshot: () => ({
+          servers: [target, gateway],
+          activeSessions: [{ id: "ssh", serverId: target.id }, { id: "gateway-ssh", serverId: gateway.id }],
+          activeSerialSessions: [{ id: "serial", profileId: "serial-profile" }]
+        }),
+        getAuthProfile: () => undefined,
+        onDidChange: () => () => {}
+      },
+      sessionTerminals: new Map([["ssh", ssh], ["gateway-ssh", gatewayTerminal]]),
+      serialTerminals: new Map([["serial", { terminal: serial, profileId: "serial-profile", input: {
+        sendUserInput: guardedSerialSend,
+        getInputState: () => ({ dedicatedInputEnabled: true })
+      } }]])
+    } as unknown as Partial<CommandContext>);
+    const text = route === "browser" ? "https://example.invalid/console" : " show status\r\n";
+    await setMacros([{
+      id: "route-check", name: "Owned route", text,
+      runIn: route === "gateway" ? "localTerminal" : route,
+      ...(route === "gateway" ? { route: "ipmiGateway" as const } : {})
+    }]);
+    showQuickPick.mockImplementation(async (items: Array<{ macro: TerminalMacro }>) => items[0]);
+
+    await runMacroOnServer(ctx, { server: target });
+
+    expect(serialSend).not.toHaveBeenCalled();
+    expect(guardedSerialSend).not.toHaveBeenCalled();
+    expect(executeCommand).not.toHaveBeenCalledWith("workbench.action.terminal.sendSequence", expect.anything());
+    expect(sshSend.mock.calls).toEqual(route === "session" ? [[text, false]] : []);
+    expect(gatewaySend.mock.calls).toEqual(route === "gateway" ? [[text, false]] : []);
+    expect(createdTerminals.map((terminal) => terminal.sent)).toEqual(route === "localTerminal" ? [[text]] : []);
+    expect(openExternal).toHaveBeenCalledTimes(route === "browser" ? 1 : 0);
   });
 });

@@ -4,13 +4,14 @@ import type { SessionLogger } from "../../logging/terminalLogger";
 import type { SessionTranscript } from "../../logging/sessionTranscriptLogger";
 import type { TerminalOutputHighlighter, TerminalHighlighterStream } from "../terminalHighlighter";
 import type { PtyOutputObserver } from "../macroAutoTrigger";
-import { CLEAR_VISIBLE_SCREEN, RESET_INTERACTIVE_MODES } from "../terminal/terminalEscapes";
+import { CLEAR_VISIBLE_SCREEN, RESET_INTERACTIVE_MODES, isTerminalGeneratedReport } from "../terminal/terminalEscapes";
 import { PtyObserverHub } from "../terminal/ptyObserverHub";
 import { toParityCode } from "../../utils/helpers";
 import type { SerialTransport } from "./serialPty";
 import { isSerialRuntimeMissingError } from "./errorMatchers";
 import type { OpenPortParams, SerialPortInfo } from "./protocol";
 import { SerialOpeningDataBuffer } from "./serialOpeningDataBuffer";
+import type { SerialInputState, SerialUserInput } from "./serialUserInput";
 
 const SMART_FOLLOW_POLL_MS = 2000;
 const STOPPED_INPUT_HINT_INTERVAL_MS = 1000;
@@ -39,6 +40,8 @@ export type SmartFollowPromptResult =
   | { kind: "wait" };
 
 export interface SmartSerialPtyCallbacks {
+  /** One reminder per dedicated-input enable cycle, for genuine native terminal input only. */
+  onDedicatedInput?(): void;
   onClosed(): void;
   onDataReceived?(): void;
   onTransportSessionChanged?(sessionId?: string): void;
@@ -79,7 +82,12 @@ function matchesDeviceHint(port: SerialPortInfo, hint: SerialDeviceHint | undefi
   );
 }
 
-export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable {
+export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable, SerialUserInput {
+  private readonly inputStateEmitter = new vscode.EventEmitter<SerialInputState>();
+  private connectionEpoch = 0;
+  private dedicatedInputEnabled = false;
+  private dedicatedInputNotified = false;
+  public readonly onDidChangeInputState: vscode.Event<SerialInputState> = this.inputStateEmitter.event;
   private readonly writeEmitter = new vscode.EventEmitter<string>();
   private readonly closeEmitter = new vscode.EventEmitter<void>();
   private readonly nameEmitter = new vscode.EventEmitter<string>();
@@ -157,12 +165,61 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
   public readonly onDidClose: vscode.Event<void> = this.closeEmitter.event;
   public readonly onDidChangeName: vscode.Event<string> = this.nameEmitter.event;
 
+  public getInputState(): SerialInputState {
+    const status = this.disposed ? "closed" : this.stopped ? "stopped" : this.transportSessionId ? "connected" : this.waiting ? "waiting" : "opening";
+    return {
+      connectionEpoch: this.connectionEpoch,
+      connected: status === "connected",
+      status,
+      inputLocked: this.observerHub.isInputBlocked,
+      dedicatedInputEnabled: this.dedicatedInputEnabled,
+      path: this.currentPath
+    };
+  }
+
+  private fireInputState(): void {
+    this.inputStateEmitter.fire(this.getInputState());
+  }
+
+  public setDedicatedInputEnabled(enabled: boolean): void {
+    if (this.disposed || this.dedicatedInputEnabled === enabled) return;
+    this.dedicatedInputEnabled = enabled;
+    this.dedicatedInputNotified = false;
+    this.fireInputState();
+  }
+
+  public async sendUserInput(data: string, expectedConnectionEpoch: number): Promise<void> {
+    const state = this.getInputState();
+    if (!state.connected) throw new Error(`Serial session is ${state.status}. Nothing was sent.`);
+    if (state.connectionEpoch !== expectedConnectionEpoch) throw new Error("Serial connection changed. Run the send again. Nothing was sent.");
+    if (state.inputLocked) throw new Error("Serial input is locked by a script. Nothing was sent.");
+    // Select the transport synchronously with validation: reconnect cannot retarget this write.
+    const sessionId = this.transportSessionId;
+    if (!sessionId) throw new Error("Serial session is disconnected. Nothing was sent.");
+    try {
+      await this.transport.writePort(sessionId, Buffer.from(data, "utf8"));
+    } catch (error) {
+      // A restarted sidecar can lose this session without a disconnect event. An old
+      // write must never mark a replacement connection lost, even if its ID is reused.
+      if (this.connectionEpoch === expectedConnectionEpoch && this.isCurrentTransport(sessionId) &&
+        error instanceof Error && error.message.includes("unknown serial session")) {
+        this.handleTransportDisconnect("Port no longer available");
+      }
+      throw error;
+    }
+    // A delayed driver acknowledgement cannot confirm delivery for a replacement connection.
+    if (!this.getInputState().connected || this.connectionEpoch !== expectedConnectionEpoch) {
+      throw new Error("Serial connection changed during send. Delivery could not be confirmed.");
+    }
+  }
+
   public addOutputObserver(observer: PtyOutputObserver): vscode.Disposable {
     return this.observerHub.addOutputObserver(observer);
   }
 
   public setInputBlocked(blocked: boolean): void {
     this.observerHub.setInputBlocked(blocked);
+    if (!this.disposed) this.fireInputState();
   }
 
   public writeProgrammatic(data: string): void {
@@ -210,7 +267,15 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     this.dispose();
   }
 
-  public handleInput(data: string): void {
+  public handleInput(data: string, source: "terminal" | "macro" = "terminal"): void {
+    if (this.disposed) return;
+    if (source === "terminal" && this.dedicatedInputEnabled) {
+      if (!isTerminalGeneratedReport(data) && !this.dedicatedInputNotified) {
+        this.dedicatedInputNotified = true;
+        this.callbacks.onDedicatedInput?.();
+      }
+      return;
+    }
     if (this.observerHub.isInputBlocked) {
       const notice = this.observerHub.consumeLockedNotice();
       if (notice) this.writeEmitter.fire(notice);
@@ -250,6 +315,9 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
       return;
     }
     this.stopped = true;
+    this.connectionEpoch++;
+    this.fireInputState();
+    if (this.disposed) return;
     this.stopPolling();
     this.observerHub.pauseIntervalMacros();
     this.highlighterStream?.flush();
@@ -274,6 +342,9 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
       return;
     }
     this.disposed = true;
+    this.connectionEpoch++;
+    this.fireInputState();
+    this.inputStateEmitter.dispose();
     this.openingSessionId = undefined;
     this.openingPort = false;
     this.openingData.clear();
@@ -544,7 +615,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
         ...this.openPortOptions,
         path
       }, openingSessionId);
-      if (this.disposed) {
+      if (this.disposed || this.stopped) {
         this.openingSessionId = undefined;
         this.openingPort = false;
         this.openingData.clear();
@@ -552,18 +623,26 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
         return { type: "failed", message: "terminal disposed" };
       }
       this.transportSessionId = sessionId;
+      this.currentPath = path;
+      this.connectionEpoch++;
       this.openingSessionId = undefined;
       this.openingPort = false;
       this.callbacks.onTransportSessionChanged?.(sessionId);
+      if (!this.isCurrentTransport(sessionId)) return { type: "failed", message: "serial connection changed" };
       // A new device is now the transport (Smart Follow reattaches inside this
       // one PTY, keeping the observers and the transcript). Drop the ANSI
       // stripper carries the lost device left behind before its replacement's
       // first output, replayed or live, can be swallowed by them.
       this.observerHub.notifyTransportReset();
+      if (!this.isCurrentTransport(sessionId)) return { type: "failed", message: "serial connection changed" };
       this.transcript?.resetEscapeState?.();
       for (const data of this.openingData.takeFor(sessionId)) {
+        if (!this.isCurrentTransport(sessionId)) return { type: "failed", message: "serial connection changed" };
         this.handleData(data);
       }
+      if (!this.isCurrentTransport(sessionId)) return { type: "failed", message: "serial connection changed" };
+      // Complete transport setup before notifying listeners that can synchronously close the owner.
+      this.fireInputState();
       return { type: "connected", path, port: knownPort };
     } catch (error: unknown) {
       this.openingSessionId = undefined;
@@ -573,6 +652,10 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
       this.logger.log(`smart serial open failed path=${path} ${message}`);
       return { type: "failed", message };
     }
+  }
+
+  private isCurrentTransport(sessionId: string): boolean {
+    return this.getInputState().connected && this.transportSessionId === sessionId;
   }
 
   private handleData(data: Buffer): void {
@@ -592,6 +675,8 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     reason: "initial" | "poll" | "disconnect",
     note?: string
   ): Promise<void> {
+    const sessionId = this.transportSessionId;
+    if (!sessionId || !this.isCurrentTransport(sessionId)) return;
     this.stopPolling();
     this.waiting = false;
     this.stopped = false;
@@ -603,14 +688,18 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     const firstConnection = !this.hasEverConnected;
     this.hasEverConnected = true;
     this.nameEmitter.fire(this.buildDisplayName());
+    if (!this.isCurrentTransport(sessionId)) return;
     this.callbacks.onActivePortChanged?.(path);
+    if (!this.isCurrentTransport(sessionId)) return;
     try {
       await Promise.resolve(this.callbacks.onResolvedPort?.(path, this.deviceHint));
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : "unknown profile update error";
       this.logger.log(`smart serial profile update failed ${message}`);
     }
+    if (!this.isCurrentTransport(sessionId)) return;
     this.callbacks.onStateChanged?.("connected");
+    if (!this.isCurrentTransport(sessionId)) return;
 
     if (path !== previousPreferredPath) {
       this.writeBanner(
@@ -638,6 +727,7 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     // (possibly different) device must not inherit this one's modes.
     this.writeEmitter.fire(RESET_INTERACTIVE_MODES);
     this.transportSessionId = undefined;
+    this.connectionEpoch++;
     this.currentPath = undefined;
     this.callbacks.onTransportSessionChanged?.(undefined);
     this.callbacks.onActivePortChanged?.(undefined);
@@ -659,6 +749,9 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
       return;
     }
     this.stopped = true;
+    this.connectionEpoch++;
+    this.fireInputState();
+    if (this.disposed) return;
     this.stopPolling();
     this.highlighterStream?.flush();
     this.transcript?.flush?.();
@@ -672,18 +765,23 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable 
     this.writeEmitter.fire(RESET_INTERACTIVE_MODES);
     this.writeBanner(`${message} Close this terminal to exit.`);
     this.callbacks.onStateChanged?.("waiting");
+    if (this.disposed) return;
     this.callbacks.onFatalError?.(message);
     // CRITICAL: do NOT call this.dispose() — the tab must persist per user requirement.
   }
 
   private enterWaiting(message: string, key: string): void {
-    if (this.stopped) {
+    if (this.disposed || this.stopped) {
       return;
     }
     this.waiting = true;
+    this.fireInputState();
+    if (this.disposed || this.stopped) return;
     this.currentPath = undefined;
     this.nameEmitter.fire(this.buildDisplayName());
+    if (this.disposed || this.stopped) return;
     this.callbacks.onStateChanged?.("waiting");
+    if (this.disposed || this.stopped) return;
     this.startPolling();
     if (this.lastWaitingKey === key) {
       return;

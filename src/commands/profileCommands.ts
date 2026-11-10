@@ -613,6 +613,9 @@ export function registerProfileCommands(ctx: ProfileCommandContext): vscode.Disp
 
     if (arg instanceof SerialProfileTreeItem) {
       const picks: ProfileActionPick[] = [
+        ...(["nexus.serialProfileConnected", "nexus.serialProfileWaiting"].includes(arg.contextValue ?? "")
+          ? [{ label: "Open Send Box", command: "nexus.serial.openSendBox" }, { label: "Use Direct Input", command: "nexus.serial.useDirectInput" }]
+          : []),
         { label: "Connect", command: "nexus.serial.connect" },
         { label: "Test Connection", command: "nexus.serial.testConnection" },
         { label: "Connect and Run Script", command: "nexus.serial.runWithScript" },

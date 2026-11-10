@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as vscode from "vscode";
 import type { StoredAuthProfile, AuthProfile, ServerConfig } from "../../src/models/config";
 import type { CommandContext } from "../../src/commands/types";
 
@@ -129,12 +130,19 @@ beforeEach(() => {
   pickServer.mockReset();
   createdTerminals.length = 0;
   openTerminals = [];
+  (vscode.window as unknown as { activeTerminal: unknown }).activeTerminal = undefined;
 });
 
 describe("nexus.server.connectBmcSol", () => {
   it("spawns a terminal with the credential env and the -E SOL line, WITHOUT showing a macro picker", async () => {
+    const serialSend = vi.fn();
+    const serial = { name: "Nexus Serial: fixture", sendText: serialSend };
+    openTerminals = [serial];
+    (vscode.window as unknown as { activeTerminal: unknown }).activeTerminal = serial;
     await connectBmcSol(context(VAULTED), { server: server() });
 
+    expect(serialSend).not.toHaveBeenCalled();
+    expect(executeCommand).not.toHaveBeenCalledWith("workbench.action.terminal.sendSequence", expect.anything());
     expect(createdTerminals).toHaveLength(1);
     expect(createdTerminals[0].env).toEqual({
       IPMITOOL_PASSWORD: "s3cr3t-bmc",

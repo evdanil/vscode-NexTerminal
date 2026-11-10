@@ -5,6 +5,8 @@ import { registerFileCommands } from "./commands/fileCommands";
 import { registerCwdSyncCommands, FOLLOW_TERMINAL_STATE_KEY } from "./commands/cwdSyncCommands";
 import { registerScriptCommands } from "./commands/scriptCommands";
 import { closeSerialProfileTerminals, registerSerialCommands } from "./commands/serialCommands";
+import { SerialSendCommands } from "./commands/serialSendCommands";
+import { SerialSendPanel } from "./ui/serialSendPanel";
 import { closeLocalShellProfileTerminals, registerLocalShellCommands } from "./commands/localShellCommands";
 import { registerNetworkServerCommands, stopRunningNetworkServices } from "./commands/networkServerCommands";
 import { registerNetworkServerProfileCommands } from "./commands/networkServerProfileCommands";
@@ -85,6 +87,7 @@ import { registerSettingsCommands } from "./commands/settingsCommands";
 import { SettingsPanel } from "./ui/settingsPanel";
 import { registerConfigCommands } from "./commands/configCommands";
 import { registerMacroCommands, updateMacroContext } from "./commands/macroCommands";
+import { createSerialMacroTargetResolver } from "./commands/serialMacroTarget";
 import { registerProfileCommands } from "./commands/profileCommands";
 import { registerAuthProfileCommands } from "./commands/authProfileCommands";
 import { registerDeviceTemplateCommands } from "./commands/deviceTemplateCommands";
@@ -1506,6 +1509,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const serverMacroDisposables = registerServerMacroCommands(ctx);
   const bmcDisposables = registerBmcCommands(ctx);
   const tunnelDisposables = registerTunnelCommands(ctx);
+  const serialSendCommands = new SerialSendCommands({
+    core,
+    serialTerminals,
+    terminalRegistry,
+    panel: new SerialSendPanel(),
+    onDedicatedSessionsChanged: sessionIds => nexusTreeProvider.setDedicatedSerialSessions(sessionIds)
+  });
+  ctx.serialSendCommands = serialSendCommands;
   const serialDisposables = registerSerialCommands(ctx);
   const localShellDisposables = registerLocalShellCommands(ctx);
   const networkServerDisposables = registerNetworkServerCommands({ ...ctx, networkServerManager });
@@ -1645,7 +1656,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   void maybeOfferSshConfigImport(context, core);
   const macroDisposables = registerMacroCommands(() => {
     return buildMacroProfileInputsFromSnapshot(core.getSnapshot());
-  });
+  }, createSerialMacroTargetResolver(terminalRegistry));
   const disableTriggerCmd = vscode.commands.registerCommand("nexus.macro.disableTrigger", (item?: MacroTreeItem) => {
     if (item?.macro.triggerPattern) {
       macroAutoTrigger.setDisabled(item.macro, true);
@@ -1724,6 +1735,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     ...serverMacroDisposables,
     ...bmcDisposables,
     ...tunnelDisposables,
+    serialSendCommands,
     ...serialDisposables,
     ...localShellDisposables,
     ...networkServerDisposables,

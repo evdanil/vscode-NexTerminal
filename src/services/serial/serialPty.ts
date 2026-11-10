@@ -8,6 +8,7 @@ import { PtyObserverHub } from "../terminal/ptyObserverHub";
 import { toParityCode } from "../../utils/helpers";
 import type { OpenPortParams } from "./protocol";
 import { SerialOpeningDataBuffer } from "./serialOpeningDataBuffer";
+import type { SerialInputState, SerialUserInput } from "./serialUserInput";
 
 export interface SerialTransport {
   openPort(options: OpenPortParams, sessionId?: string): Promise<string>;
@@ -21,6 +22,8 @@ export interface SerialTransport {
 export type SerialPtyOptions = OpenPortParams;
 
 export interface SerialPtyCallbacks {
+  /** One reminder per dedicated-input enable cycle, for genuine native terminal input only. */
+  onDedicatedInput?(): void;
   /** A late open must not register a session for a profile removed during openPort. */
   isProfileCurrent?(): boolean;
   onStartRejected?(): void;
@@ -30,7 +33,12 @@ export interface SerialPtyCallbacks {
   onDataReceived?(sessionId: string): void;
 }
 
-export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
+export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable, SerialUserInput {
+  private readonly inputStateEmitter = new vscode.EventEmitter<SerialInputState>();
+  private connectionEpoch = 0;
+  private dedicatedInputEnabled = false;
+  private dedicatedInputNotified = false;
+  public readonly onDidChangeInputState: vscode.Event<SerialInputState> = this.inputStateEmitter.event;
   private readonly writeEmitter = new vscode.EventEmitter<string>();
   private readonly closeEmitter = new vscode.EventEmitter<void>();
   private readonly nameEmitter = new vscode.EventEmitter<string>();
@@ -66,12 +74,61 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.observerHub = new PtyObserverHub(outputObserver);
   }
 
+  public getInputState(): SerialInputState {
+    const status = this.disposed ? "closed" : this.shuttingDown ? "stopped" : this.failed || this.disconnected ? "disconnected" : this.sidecarSessionId ? "connected" : "opening";
+    return {
+      connectionEpoch: this.connectionEpoch,
+      connected: status === "connected",
+      status,
+      inputLocked: this.observerHub.isInputBlocked,
+      dedicatedInputEnabled: this.dedicatedInputEnabled,
+      path: this.options.path
+    };
+  }
+
+  private fireInputState(): void {
+    this.inputStateEmitter.fire(this.getInputState());
+  }
+
+  public setDedicatedInputEnabled(enabled: boolean): void {
+    if (this.disposed || this.dedicatedInputEnabled === enabled) return;
+    this.dedicatedInputEnabled = enabled;
+    this.dedicatedInputNotified = false;
+    this.fireInputState();
+  }
+
+  public async sendUserInput(data: string, expectedConnectionEpoch: number): Promise<void> {
+    const state = this.getInputState();
+    if (!state.connected) throw new Error(`Serial session is ${state.status}. Nothing was sent.`);
+    if (state.connectionEpoch !== expectedConnectionEpoch) throw new Error("Serial connection changed. Run the send again. Nothing was sent.");
+    if (state.inputLocked) throw new Error("Serial input is locked by a script. Nothing was sent.");
+    // Select the transport synchronously with validation: reconnect cannot retarget this write.
+    const sessionId = this.sidecarSessionId;
+    if (!sessionId) throw new Error("Serial session is disconnected. Nothing was sent.");
+    try {
+      await this.transport.writePort(sessionId, Buffer.from(data, "utf8"));
+    } catch (error) {
+      // A restarted sidecar can lose this session without a disconnect event. An old
+      // write must never mark a replacement connection lost, even if its ID is reused.
+      if (this.connectionEpoch === expectedConnectionEpoch && this.isCurrentTransport(sessionId) &&
+        error instanceof Error && error.message.includes("unknown serial session")) {
+        this.handleDisconnect("Port no longer available");
+      }
+      throw error;
+    }
+    // A delayed driver acknowledgement cannot confirm delivery for a replacement connection.
+    if (!this.getInputState().connected || this.connectionEpoch !== expectedConnectionEpoch) {
+      throw new Error("Serial connection changed during send. Delivery could not be confirmed.");
+    }
+  }
+
   public addOutputObserver(observer: PtyOutputObserver): vscode.Disposable {
     return this.observerHub.addOutputObserver(observer);
   }
 
   public setInputBlocked(blocked: boolean): void {
     this.observerHub.setInputBlocked(blocked);
+    if (!this.disposed) this.fireInputState();
   }
 
   public writeProgrammatic(data: string): void {
@@ -110,7 +167,15 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.dispose();
   }
 
-  public handleInput(data: string): void {
+  public handleInput(data: string, source: "terminal" | "macro" = "terminal"): void {
+    if (this.disposed) return;
+    if (source === "terminal" && this.dedicatedInputEnabled) {
+      if (!isTerminalGeneratedReport(data) && !this.dedicatedInputNotified) {
+        this.dedicatedInputNotified = true;
+        this.callbacks.onDedicatedInput?.();
+      }
+      return;
+    }
     if (this.shuttingDown) {
       return;
     }
@@ -146,6 +211,9 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
       return;
     }
     this.shuttingDown = true;
+    this.connectionEpoch++;
+    this.fireInputState();
+    if (this.disposed) return;
     this.disconnected = true;
     this.observerHub.pauseIntervalMacros();
     this.highlighterStream?.flush();
@@ -166,6 +234,9 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
       return;
     }
     this.disposed = true;
+    this.connectionEpoch++;
+    this.fireInputState();
+    this.inputStateEmitter.dispose();
     this.highlighterStream?.dispose();
     this.observerHub.disposeAll();
 
@@ -210,6 +281,9 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
     }
     this.observerHub.pauseIntervalMacros();
     this.disconnected = true;
+    this.connectionEpoch++;
+    this.fireInputState();
+    if (this.disposed) return;
     this.highlighterStream?.flush();
     this.transcript?.flush?.();
 
@@ -246,7 +320,7 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
       });
 
       const sessionId = await this.transport.openPort(this.options, openingSessionId);
-      if (this.disposed) {
+      if (this.disposed || this.shuttingDown) {
         this.openingPort = false;
         this.openingData.clear();
         await this.transport.closePort(sessionId);
@@ -266,20 +340,29 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
         }
         return;
       }
+      if (this.disposed || this.shuttingDown) {
+        await this.transport.closePort(sessionId);
+        return;
+      }
       this.sidecarSessionId = sessionId;
+      this.connectionEpoch++;
       this.callbacks.onSessionOpened(sessionId);
+      if (!this.isCurrentTransport(sessionId)) return;
       this.logger.log(
         `serial connected path=${this.options.path} baud=${this.options.baudRate} parity=${this.options.parity ?? "none"} dataBits=${this.options.dataBits ?? 8} stopBits=${this.options.stopBits ?? 1} rtscts=${this.options.rtscts ? "on" : "off"}`
       );
       this.writeEmitter.fire(
         `\r\n[Nexus Serial] Connected ${this.options.path} @ ${this.options.baudRate} (${this.options.dataBits ?? 8}${toParityCode(this.options.parity)}${this.options.stopBits ?? 1})\r\n`
       );
+      if (!this.isCurrentTransport(sessionId)) return;
 
       this.openingPort = false;
       this.openingSessionId = undefined;
       for (const data of this.openingData.takeFor(sessionId)) {
+        if (!this.isCurrentTransport(sessionId)) return;
         this.handleData(sessionId, data);
       }
+      if (!this.isCurrentTransport(sessionId)) return;
       this.errorSubscription = this.transport.onDidReceiveError((eventSessionId, errorMessage) => {
         if (eventSessionId !== this.sidecarSessionId) {
           return;
@@ -294,13 +377,20 @@ export class SerialPty implements vscode.Pseudoterminal, vscode.Disposable {
         }
         this.handleDisconnect(reason);
       });
+      // State listeners may close the terminal synchronously; publish only after setup owns no further work.
+      this.fireInputState();
     } catch (error) {
       this.releaseSubscriptions();
       const message = error instanceof Error ? error.message : "unknown serial connection error";
       this.logger.log(`serial connect failed ${message}`);
       this.writeEmitter.fire(`\r\n[Nexus Serial] Connection failed: ${message}\r\n\r\nPress any key to close.\r\n`);
       this.failed = true;
+      if (!this.disposed) this.fireInputState();
     }
+  }
+
+  private isCurrentTransport(sessionId: string): boolean {
+    return this.getInputState().connected && this.sidecarSessionId === sessionId;
   }
 
   private handleData(eventSessionId: string, data: Buffer): void {

@@ -78,6 +78,15 @@ vi.mock("../../src/commands/macroVariablePrompt", () => ({
 }));
 
 describe("macroCommands clipboard actions", () => {
+  it("threads the serial resolver into prompted macro runs", async () => {
+    const macro = { name: "Prompt", text: "$value", variables: [{ name: "value" }] };
+    const resolver = vi.fn();
+    mockGetMacros.mockReturnValue([macro]);
+    registerMacroCommands(undefined, resolver);
+    await registeredCommands.get("nexus.macro.runItem")!({ macro });
+    expect(mockRunMacro).toHaveBeenCalledWith(macro, resolver);
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     registeredCommands.clear();

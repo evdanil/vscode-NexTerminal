@@ -225,7 +225,7 @@ export class SessionTreeItem extends vscode.TreeItem {
 type SerialProfileState = "disconnected" | "waiting" | "connected";
 
 export class SerialProfileTreeItem extends vscode.TreeItem {
-  public constructor(public readonly profile: SerialProfile, state: SerialProfileState, showDescription = true) {
+  public constructor(public readonly profile: SerialProfile, state: SerialProfileState, showDescription = true, dedicatedInputEnabled = false) {
     super(profile.name, state === "disconnected" ? vscode.TreeItemCollapsibleState.None : vscode.TreeItemCollapsibleState.Expanded);
     const smartFollow = resolveSerialProfileMode(profile) === "smartFollow";
     const connectionText = `${profile.path} @ ${profile.baudRate} (${profile.dataBits}${toParityCode(profile.parity)}${profile.stopBits})`;
@@ -235,6 +235,7 @@ export class SerialProfileTreeItem extends vscode.TreeItem {
     this.tooltip = smartFollow
       ? `Smart Follow${waiting ? "\nWaiting for port" : ""}\n${connectionText}`
       : `${profile.path} @ ${profile.baudRate}`;
+    if (dedicatedInputEnabled) this.tooltip += "\nDedicated send box — use Open Send Box to edit input.";
     this.description = showDescription
       ? (smartFollow
           ? `${waiting ? "Smart Follow | Waiting for port | " : "Smart Follow | "}${connectionText}`
@@ -249,10 +250,11 @@ export class SerialProfileTreeItem extends vscode.TreeItem {
 }
 
 export class SerialSessionTreeItem extends vscode.TreeItem {
-  public constructor(public readonly session: ActiveSerialSession, hasActivity = false, isFocused = false) {
+  public constructor(public readonly session: ActiveSerialSession, hasActivity = false, isFocused = false, dedicatedInputEnabled = false) {
     super(session.terminalName, vscode.TreeItemCollapsibleState.None);
     const status: SerialSessionStatus = session.status ?? "connected";
     this.id = `serial-session:${session.id}`;
+    if (dedicatedInputEnabled) this.tooltip = "Dedicated send box — use Open Send Box to edit input.";
     this.contextValue = "nexus.serialSessionNode";
     this.description = status === "waiting"
       ? (isFocused ? "▶ waiting for port" : "waiting for port")
@@ -400,6 +402,7 @@ export class NexusTreeProvider
 {
   private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<NexusTreeItem | undefined>();
   private readonly collapsedFolders = new Set<string>();
+  private dedicatedSerialSessionIds = new Set<string>();
   private authProfileById = new Map<string, AuthProfile>();
   private cachedChildFolderMap = new Map<string | undefined, string[]>();
   private filterText: string = "";
@@ -454,6 +457,12 @@ export class NexusTreeProvider
 
   public readonly onDidChangeTreeData: vscode.Event<NexusTreeItem | undefined> =
     this.onDidChangeTreeDataEmitter.event;
+
+  public setDedicatedSerialSessions(sessionIds: ReadonlySet<string>): void {
+    if (sessionIds.size === this.dedicatedSerialSessionIds.size && [...sessionIds].every(id => this.dedicatedSerialSessionIds.has(id))) return;
+    this.dedicatedSerialSessionIds = new Set(sessionIds);
+    this.refresh();
+  }
 
   public setSnapshot(snapshot: SessionSnapshot): void {
     this.snapshot = {
@@ -597,7 +606,7 @@ export class NexusTreeProvider
     if (element instanceof SerialProfileTreeItem) {
       return this.snapshot.activeSerialSessions
         .filter((session) => session.profileId === element.profile.id)
-        .map((session) => new SerialSessionTreeItem(session, this.snapshot.activitySessionIds.has(session.id), this.snapshot.focusedSessionId === session.id));
+        .map((session) => new SerialSessionTreeItem(session, this.snapshot.activitySessionIds.has(session.id), this.snapshot.focusedSessionId === session.id, this.dedicatedSerialSessionIds.has(session.id)));
     }
     if (element instanceof LocalShellProfileTreeItem) {
       return this.snapshot.activeLocalShellSessions
@@ -1017,7 +1026,7 @@ export class NexusTreeProvider
           ? "waiting"
           : "disconnected";
     const showDesc = vscode.workspace.getConfiguration("nexus.ui").get<boolean>("showTreeDescriptions", true);
-    return new SerialProfileTreeItem(profile, state, showDesc);
+    return new SerialProfileTreeItem(profile, state, showDesc, sessions.some(session => this.dedicatedSerialSessionIds.has(session.id)));
   }
 
   private toLocalShellProfileItem(profile: LocalShellProfile): LocalShellProfileTreeItem {

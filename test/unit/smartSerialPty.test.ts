@@ -188,6 +188,230 @@ async function flushAsync(): Promise<void> {
 const noopLogger = () => ({ log: vi.fn(), close: vi.fn() }) as any;
 
 describe("SmartSerialPty", () => {
+  it("resumes Smart Follow after a guarded missing-session failure without retrying the payload", async () => {
+    vi.useFakeTimers();
+    let connection = 0;
+    const { transport, openPort } = createTransport({ listPorts: async () => [{ path: "COM5" }], openPort: async () => `physical-${++connection}` });
+    const { callbacks, spies } = makeCallbacks();
+    const pty = new SmartSerialPty(transport, makeProfile(), callbacks, noopLogger());
+    try {
+      pty.open(); await flushAsync(); pty.setDedicatedInputEnabled(true);
+      const epoch = pty.getInputState().connectionEpoch;
+      const states: string[] = [];
+      pty.onDidChangeInputState((state) => states.push(state.status));
+      const error = new Error("unknown serial session physical-1");
+      vi.mocked(transport.writePort).mockRejectedValueOnce(error);
+      await expect(pty.sendUserInput("retained draft\r", epoch)).rejects.toBe(error);
+      expect(pty.getInputState()).toMatchObject({ connected: false, status: "waiting" });
+      expect(states).toEqual(["waiting"]);
+      expect(spies.onTransportSessionChanged).toHaveBeenLastCalledWith(undefined);
+      expect(spies.onStateChanged).toHaveBeenLastCalledWith("waiting");
+      expect(pty.getInputState().connectionEpoch).not.toBe(epoch);
+      expect(transport.writePort).toHaveBeenCalledExactlyOnceWith("physical-1", Buffer.from("retained draft\r"));
+      await expect(pty.sendUserInput("waiting", pty.getInputState().connectionEpoch)).rejects.toThrow(/waiting/i);
+      await vi.advanceTimersByTimeAsync(2000); await flushAsync();
+      expect(openPort).toHaveBeenCalledTimes(2);
+      expect(pty.getInputState()).toMatchObject({ connected: true, dedicatedInputEnabled: true });
+      expect(transport.writePort).toHaveBeenCalledTimes(1);
+      await expect(pty.sendUserInput("stale draft", epoch)).rejects.toThrow(/connection changed/i);
+      await pty.sendUserInput("reviewed send\r", pty.getInputState().connectionEpoch);
+      expect(transport.writePort).toHaveBeenLastCalledWith("physical-2", Buffer.from("reviewed send\r"));
+      expect(transport.writePort).toHaveBeenCalledTimes(2);
+    } finally { pty.dispose(); }
+  });
+
+  it("does not disconnect a replacement generation when an old guarded write rejects for the same session ID", async () => {
+    vi.useFakeTimers();
+    const { transport, openPort, emitDisconnect } = createTransport({ listPorts: async () => [{ path: "COM5" }], openPort: async () => "physical" });
+    const pty = new SmartSerialPty(transport, makeProfile(), makeCallbacks().callbacks, noopLogger());
+    try {
+      pty.open(); await flushAsync();
+      let rejectWrite!: (error: Error) => void;
+      vi.mocked(transport.writePort).mockImplementationOnce(() => new Promise<void>((_resolve, reject) => { rejectWrite = reject; }));
+      const pending = pty.sendUserInput("old payload", pty.getInputState().connectionEpoch);
+      const oldError = new Error("unknown serial session physical");
+      const refused = expect(pending).rejects.toBe(oldError);
+      emitDisconnect("physical", "worker restarted");
+      await vi.advanceTimersByTimeAsync(2000); await flushAsync();
+      expect(openPort).toHaveBeenCalledTimes(2);
+      const replacement = pty.getInputState();
+      expect(replacement.connected).toBe(true);
+      const changes = vi.fn(); pty.onDidChangeInputState(changes);
+      rejectWrite(oldError); await refused;
+      expect(pty.getInputState()).toEqual(replacement);
+      expect(changes).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+      expect(transport.writePort).toHaveBeenCalledExactlyOnceWith("physical", Buffer.from("old payload"));
+      await pty.sendUserInput("new payload", replacement.connectionEpoch);
+      expect(transport.writePort).toHaveBeenLastCalledWith("physical", Buffer.from("new payload"));
+    } finally { pty.dispose(); }
+  });
+
+  it.each(["inputState", "transportChanged", "name", "activePort", "resolvedPort", "stateChanged", "openingData"].flatMap((trigger) =>
+    ["dispose", "shutdown"].map((loss) => ({ trigger, loss }))))(
+    "does not restore Smart Follow registration after $trigger requests $loss", async ({ trigger, loss }) => {
+      const events: string[] = [];
+      let stopped = false;
+      let physical = "physical";
+      const fixture = createTransport({ listPorts: async () => [{ path: "COM5" }], openPort: async () => "physical" });
+      const interrupt = (): void => {
+        if (stopped) return;
+        stopped = true;
+        events.push("stop");
+        if (loss === "dispose") pty.dispose(); else pty.markShuttingDown("shutdown");
+      };
+      const { callbacks } = makeCallbacks();
+      callbacks.onTransportSessionChanged = (id) => { if (id) { events.push("transport"); if (trigger === "transportChanged") interrupt(); } };
+      callbacks.onActivePortChanged = (path) => { if (path) { events.push("path"); if (trigger === "activePort") interrupt(); } };
+      callbacks.onResolvedPort = () => { events.push("resolved"); if (trigger === "resolvedPort") interrupt(); };
+      callbacks.onStateChanged = (state) => { events.push(`registered:${state}`); if (trigger === "stateChanged") interrupt(); };
+      callbacks.onClosed = () => { events.push("unregistered"); };
+      callbacks.onDataReceived = () => { events.push("data"); if (trigger === "openingData") interrupt(); };
+      const pty = new SmartSerialPty(fixture.transport, makeProfile(), callbacks, noopLogger());
+      fixture.transport.openPort = vi.fn(async (_options, openingId) => {
+        if (trigger === "openingData") { physical = openingId!; fixture.emitData(physical, "buffered"); }
+        return physical;
+      });
+      pty.onDidChangeInputState((state) => {
+        events.push(state.status);
+        if (state.connected && trigger === "inputState") interrupt();
+      });
+      pty.onDidChangeName(() => { if (trigger === "name" && pty.getInputState().connected) interrupt(); });
+      pty.open(); await flushAsync();
+      expect(stopped).toBe(true);
+      const afterStop = events.slice(events.indexOf("stop") + 1);
+      for (const positive of ["transport", "path", "resolved", "registered:connected", "registered:waiting", "connected"]) expect(afterStop).not.toContain(positive);
+      expect(pty.getInputState().status).toBe(loss === "dispose" ? "closed" : "stopped");
+      expect(fixture.closePort).toHaveBeenCalledTimes(loss === "dispose" ? 1 : 0);
+      if (loss === "dispose") expect(fixture.closePort).toHaveBeenCalledWith(physical);
+      pty.dispose();
+    });
+
+  it("does not register a waiting session or restart polling after a waiting listener disposes it", async () => {
+    vi.useFakeTimers();
+    const { transport } = createTransport({ listPorts: async () => [], openPort: async () => "physical" });
+    const { callbacks, spies } = makeCallbacks();
+    const pty = new SmartSerialPty(transport, makeProfile(), callbacks, noopLogger());
+    pty.onDidChangeInputState((state) => { if (state.status === "waiting") pty.dispose(); });
+    pty.open(); await flushAsync();
+    expect(spies.onClosed).toHaveBeenCalledOnce();
+    expect(spies.onStateChanged).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(pty.getInputState().status).toBe("closed");
+  });
+
+  it("does not publish stopped-session callbacks after a stopped listener disposes it", async () => {
+    const { transport, closePort } = createTransport({
+      listPorts: async () => { throw new Error("serialport module not installed"); },
+      openPort: async () => "physical"
+    });
+    const { callbacks, spies } = makeCallbacks();
+    const pty = new SmartSerialPty(transport, makeProfile(), callbacks, noopLogger());
+    pty.onDidChangeInputState((state) => { if (state.status === "stopped") pty.dispose(); });
+    pty.open(); await flushAsync();
+    expect(spies.onClosed).toHaveBeenCalledOnce();
+    expect(spies.onStateChanged).not.toHaveBeenCalled();
+    expect(spies.onFatalError).not.toHaveBeenCalled();
+    expect(closePort).not.toHaveBeenCalled();
+    expect(pty.getInputState().status).toBe("closed");
+  });
+
+  it("rejects acknowledgement after reconnecting to the same port without retrying", async () => {
+    vi.useFakeTimers();
+    let next = 0;
+    const { transport, emitDisconnect } = createTransport({ listPorts: async () => [{ path: "COM5" }], openPort: async () => `physical-${++next}` });
+    const pty = new SmartSerialPty(transport, makeProfile(), makeCallbacks().callbacks, noopLogger());
+    pty.open(); await flushAsync();
+    let complete!: () => void;
+    vi.mocked(transport.writePort).mockImplementationOnce(() => new Promise<void>((resolve) => { complete = resolve; }));
+    const sending = pty.sendUserInput("pending", pty.getInputState().connectionEpoch);
+    const refused = expect(sending).rejects.toThrow(/connection changed|delivery/i);
+    emitDisconnect("physical-1", "removed"); await vi.advanceTimersByTimeAsync(2000); await flushAsync();
+    expect(pty.getInputState().connected).toBe(true);
+    complete(); await refused;
+    expect(transport.writePort).toHaveBeenCalledExactlyOnceWith("physical-1", Buffer.from("pending"));
+    pty.dispose();
+  });
+
+  it("announces connection only with a live transport and cannot revive disposed profile-resolution work", async () => {
+    const { transport } = createTransport({ listPorts: async () => [{ path: "COM5" }], openPort: async () => "physical" });
+    const { callbacks, spies } = makeCallbacks();
+    let resolved!: () => void;
+    callbacks.onResolvedPort = () => new Promise<void>((resolve) => { resolved = resolve; });
+    const pty = new SmartSerialPty(transport, makeProfile(), callbacks, noopLogger());
+    const states: string[] = [];
+    pty.onDidChangeInputState((state) => {
+      states.push(state.status);
+      if (state.connected) void pty.sendUserInput("ready", state.connectionEpoch);
+    });
+    pty.open(); await flushAsync();
+    expect(transport.writePort).toHaveBeenCalledExactlyOnceWith("physical", Buffer.from("ready"));
+    pty.dispose(); const closedAt = states.length;
+    resolved(); await flushAsync();
+    expect(states.slice(closedAt)).not.toContain("connected");
+    expect(spies.onStateChanged).not.toHaveBeenCalledWith("connected");
+    expect(pty.getInputState().status).toBe("closed");
+  });
+
+  it("guards composer/native/macro input and invalidates epochs across the same port", async () => {
+    vi.useFakeTimers();
+    let next = 0;
+    const { transport, emitDisconnect } = createTransport({ listPorts: async () => [{ path: "COM5" }], openPort: async () => `session-${++next}` });
+    const { callbacks } = makeCallbacks();
+    const onDedicatedInput = vi.fn();
+    callbacks.onDedicatedInput = onDedicatedInput;
+    const pty = new SmartSerialPty(transport, makeProfile(), callbacks, noopLogger());
+    const states: ReturnType<typeof pty.getInputState>[] = [];
+    pty.onDidChangeInputState((state) => { states.push(state); });
+    pty.open(); await flushAsync();
+    const epoch = pty.getInputState().connectionEpoch;
+    expect(pty.getInputState()).toMatchObject({ connected: true, status: "connected", path: "COM5", dedicatedInputEnabled: false });
+    pty.handleInput("x\r");
+    expect(transport.writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("x\r"));
+    vi.mocked(transport.writePort).mockClear();
+    pty.setDedicatedInputEnabled(true);
+    pty.handleInput("\x1b[I"); expect(onDedicatedInput).not.toHaveBeenCalled();
+    pty.handleInput("x"); pty.handleInput("y");
+    expect(onDedicatedInput).toHaveBeenCalledTimes(1);
+    expect(transport.writePort).not.toHaveBeenCalled();
+    pty.handleInput("macro\r\n", "macro");
+    expect(transport.writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("macro\r\n"));
+    vi.mocked(transport.writePort).mockClear();
+    pty.setInputBlocked(true);
+    pty.handleInput("x"); pty.handleInput("macro", "macro");
+    await expect(pty.sendUserInput("composer", epoch)).rejects.toThrow(/lock/i);
+    expect(transport.writePort).not.toHaveBeenCalled();
+    pty.writeProgrammatic("script");
+    expect(transport.writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("script"));
+    vi.mocked(transport.writePort).mockClear();
+    pty.setInputBlocked(false);
+    emitDisconnect("session-1", "unplug");
+    expect(pty.getInputState().status).toBe("waiting");
+    await expect(pty.sendUserInput("waiting", pty.getInputState().connectionEpoch)).rejects.toThrow();
+    await vi.advanceTimersByTimeAsync(2000); await flushAsync();
+    expect(pty.getInputState().connected).toBe(true);
+    expect(pty.getInputState().connectionEpoch).not.toBe(epoch);
+    await expect(pty.sendUserInput("stale", epoch)).rejects.toThrow();
+    expect(transport.writePort).not.toHaveBeenCalled();
+    let complete!: () => void;
+    vi.mocked(transport.writePort).mockImplementationOnce(() => new Promise<void>((resolve) => { complete = resolve; }));
+    let acknowledged = false;
+    const sending = pty.sendUserInput("ack", pty.getInputState().connectionEpoch).then(() => { acknowledged = true; });
+    await flushAsync(); expect(acknowledged).toBe(false);
+    complete(); await sending;
+    vi.mocked(transport.writePort).mockRejectedValueOnce(new Error("driver failed"));
+    await expect(pty.sendUserInput("fail", pty.getInputState().connectionEpoch)).rejects.toThrow("driver failed");
+    vi.mocked(transport.writePort).mockClear();
+    pty.markShuttingDown("shutdown");
+    expect(pty.getInputState().status).toBe("stopped");
+    await expect(pty.sendUserInput("stopped", pty.getInputState().connectionEpoch)).rejects.toThrow();
+    pty.dispose();
+    expect(pty.getInputState().status).toBe("closed");
+    await expect(pty.sendUserInput("closed", pty.getInputState().connectionEpoch)).rejects.toThrow();
+    expect(transport.writePort).not.toHaveBeenCalled();
+    expect(states.some((state) => state.inputLocked)).toBe(true);
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -201,7 +425,7 @@ describe("SmartSerialPty", () => {
     { highlighting: false, split: true },
     { highlighting: true, split: false },
     { highlighting: true, split: true }
-  ])("preserves serial line endings (highlighting=$highlighting, split=$split)", async ({ highlighting, split }) => {
+  ].flatMap((sample) => [false, true].map((dedicated) => ({ ...sample, dedicated }))))("preserves serial line endings (highlighting=$highlighting, split=$split, dedicated=$dedicated)", async ({ highlighting, split, dedicated }) => {
     const { transport, emitData } = createTransport({
       listPorts: async () => [{ path: "COM5", serialNumber: "ABC123" }],
       openPort: async () => "session-1"
@@ -223,6 +447,9 @@ describe("SmartSerialPty", () => {
       pty.open();
       await flushAsync();
       writes.length = 0;
+      pty.setDedicatedInputEnabled(dedicated);
+      await pty.sendUserInput("composer-TX\r", pty.getInputState().connectionEpoch);
+      expect(transport.writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("composer-TX\r"));
 
       // CRLF crosses a transport boundary; the empty line and standalone CR/LF are deliberate.
       const chunks = split

@@ -40,6 +40,8 @@ function createTransport(): {
   writePort: ReturnType<typeof vi.fn>;
   closePort: ReturnType<typeof vi.fn>;
   dataListenerCount: () => number;
+  errorListenerCount: () => number;
+  disconnectListenerCount: () => number;
 } {
   const dataListeners = new Set<DataListener>();
   const errorListeners = new Set<ErrorListener>();
@@ -84,7 +86,9 @@ function createTransport(): {
     },
     writePort,
     closePort,
-    dataListenerCount: () => dataListeners.size
+    dataListenerCount: () => dataListeners.size,
+    errorListenerCount: () => errorListeners.size,
+    disconnectListenerCount: () => disconnectListeners.size
   };
 }
 
@@ -94,6 +98,182 @@ async function flushAsync(): Promise<void> {
 }
 
 describe("SerialPty", () => {
+  it.each(["unknown serial session physical", "driver write failed"])(
+    "updates Standard connection state only for a current missing-session write error: %s", async (message) => {
+      const { transport, writePort } = createTransport();
+      const onSessionClosed = vi.fn();
+      const pty = new SerialPty(transport, { path: "COM9", baudRate: 115200 },
+        { onSessionOpened() {}, onSessionClosed }, { log() {}, close() {} });
+      try {
+        pty.open(); await flushAsync(); pty.setDedicatedInputEnabled(true);
+        const epoch = pty.getInputState().connectionEpoch;
+        const states: string[] = [];
+        pty.onDidChangeInputState((state) => states.push(state.status));
+        const error = new Error(message);
+        writePort.mockRejectedValueOnce(error);
+        await expect(pty.sendUserInput("retained draft\r", epoch)).rejects.toBe(error);
+        expect(writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("retained draft\r"));
+        if (message.startsWith("unknown serial session")) {
+          expect(pty.getInputState()).toMatchObject({ connected: false, status: "disconnected" });
+          expect(pty.getInputState().connectionEpoch).not.toBe(epoch);
+          expect(states).toEqual(["disconnected"]);
+          expect(onSessionClosed).toHaveBeenCalledExactlyOnceWith("session-1");
+          await expect(pty.sendUserInput("must not retry", pty.getInputState().connectionEpoch)).rejects.toThrow(/disconnected/i);
+          expect(writePort).toHaveBeenCalledTimes(1);
+        } else {
+          expect(pty.getInputState()).toMatchObject({ connected: true, connectionEpoch: epoch });
+          expect(states).toEqual([]); expect(onSessionClosed).not.toHaveBeenCalled();
+        }
+      } finally { pty.dispose(); }
+    });
+
+  it.each(["inputState", "sessionOpened", "banner", "openingData", "profileCurrent"].flatMap((trigger) =>
+    ["dispose", "shutdown"].map((loss) => ({ trigger, loss }))))(
+    "does not resume setup after $trigger synchronously requests $loss", async ({ trigger, loss }) => {
+      const fixture = createTransport();
+      const events: string[] = [];
+      let stopped = false;
+      let physical = "physical";
+      const interrupt = (): void => {
+        if (stopped) return;
+        stopped = true;
+        events.push("stop");
+        if (loss === "dispose") pty.dispose(); else pty.markShuttingDown("shutdown");
+      };
+      const pty = new SerialPty(fixture.transport, { path: "COM9", baudRate: 115200 }, {
+        isProfileCurrent: () => { if (trigger === "profileCurrent") interrupt(); return true; },
+        onSessionOpened: () => { events.push("opened"); if (trigger === "sessionOpened") interrupt(); },
+        onSessionClosed: () => { events.push("unregistered"); },
+        onDataReceived: () => { events.push("data"); if (trigger === "openingData") interrupt(); }
+      }, { log() {}, close() {} });
+      fixture.transport.openPort = vi.fn(async (_options, openingId) => {
+        if (trigger === "openingData") { physical = openingId!; fixture.emitData(physical, "buffered"); }
+        return physical;
+      });
+      pty.onDidChangeInputState((state) => {
+        events.push(state.status);
+        if (state.connected && trigger === "inputState") interrupt();
+      });
+      pty.onDidWrite((text) => { if (trigger === "banner" && text.includes("Connected")) interrupt(); });
+      pty.open(); await flushAsync();
+      expect(stopped).toBe(true);
+      expect(events.slice(events.indexOf("stop") + 1)).not.toContain("opened");
+      expect(events.slice(events.indexOf("stop") + 1)).not.toContain("connected");
+      expect(pty.getInputState().status).toBe(loss === "dispose" ? "closed" : "stopped");
+      expect(fixture.dataListenerCount()).toBe(0);
+      expect(fixture.errorListenerCount()).toBe(0);
+      expect(fixture.disconnectListenerCount()).toBe(0);
+      // Shutdown releases ownership to manager teardown; an unbound late open must close itself.
+      const expectedCloses = loss === "dispose" || trigger === "profileCurrent" ? 1 : 0;
+      expect(fixture.closePort).toHaveBeenCalledTimes(expectedCloses);
+      if (expectedCloses) expect(fixture.closePort).toHaveBeenCalledWith(physical);
+      pty.dispose();
+    });
+
+  it.each(["disconnect", "close"])("rejects a delayed acknowledgement after %s without retrying", async (loss) => {
+    const { transport, writePort, emitDisconnect } = createTransport();
+    const pty = new SerialPty(transport, { path: "COM9", baudRate: 115200 },
+      { onSessionOpened() {}, onSessionClosed() {} }, { log() {}, close() {} });
+    pty.open(); await flushAsync();
+    let complete!: () => void;
+    writePort.mockImplementationOnce(() => new Promise<void>((resolve) => { complete = resolve; }));
+    const sending = pty.sendUserInput("pending", pty.getInputState().connectionEpoch);
+    const refused = expect(sending).rejects.toThrow(/connection changed|delivery/i);
+    if (loss === "disconnect") emitDisconnect("session-1", "removed"); else pty.dispose();
+    complete(); await refused;
+    expect(writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("pending"));
+    pty.dispose();
+  });
+
+  it.each(["shutdown", "close"])("never announces a late open as connected after %s", async (loss) => {
+    const { transport, writePort } = createTransport();
+    let opened!: (id: string) => void;
+    transport.openPort = () => new Promise<string>((resolve) => { opened = resolve; });
+    const onSessionOpened = vi.fn();
+    const pty = new SerialPty(transport, { path: "COM9", baudRate: 115200 },
+      { onSessionOpened, onSessionClosed() {} }, { log() {}, close() {} });
+    const states: string[] = []; pty.onDidChangeInputState((state) => states.push(state.status));
+    pty.open();
+    if (loss === "shutdown") pty.markShuttingDown("shutdown"); else pty.dispose();
+    opened("late"); await flushAsync();
+    expect(states).not.toContain("connected"); expect(onSessionOpened).not.toHaveBeenCalled();
+    await expect(pty.sendUserInput("no", pty.getInputState().connectionEpoch)).rejects.toThrow();
+    expect(writePort).not.toHaveBeenCalled(); pty.dispose();
+  });
+
+  it("guards dedicated and locked input while preserving raw and script bytes", async () => {
+    const { transport, writePort, emitDisconnect } = createTransport();
+    const onDedicatedInput = vi.fn();
+    const pty = new SerialPty(transport, { path: "COM9", baudRate: 115200 },
+      { onSessionOpened() {}, onSessionClosed() {}, onDedicatedInput }, { log() {}, close() {} });
+    const states: ReturnType<typeof pty.getInputState>[] = [];
+    pty.onDidChangeInputState((state) => states.push(state));
+    expect(pty.getInputState().status).toBe("opening");
+    pty.open();
+    await flushAsync();
+    const epoch = pty.getInputState().connectionEpoch;
+    expect(pty.getInputState()).toMatchObject({ connected: true, dedicatedInputEnabled: false, path: "COM9" });
+    pty.handleInput("x\r");
+    expect(writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("x\r"));
+    writePort.mockClear();
+    pty.setDedicatedInputEnabled(true);
+    pty.handleInput("\x1b[I");
+    expect(onDedicatedInput).not.toHaveBeenCalled();
+    pty.handleInput("x"); pty.handleInput("y");
+    expect(onDedicatedInput).toHaveBeenCalledTimes(1);
+    expect(writePort).not.toHaveBeenCalled();
+    pty.handleInput("macro\r\n", "macro");
+    expect(writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("macro\r\n"));
+    writePort.mockClear();
+    pty.setInputBlocked(true);
+    pty.handleInput("x"); pty.handleInput("macro", "macro");
+    await expect(pty.sendUserInput("composer", epoch)).rejects.toThrow(/lock/i);
+    expect(writePort).not.toHaveBeenCalled();
+    pty.writeProgrammatic("script\r");
+    expect(writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("script\r"));
+    writePort.mockClear();
+    pty.setInputBlocked(false);
+    pty.setDedicatedInputEnabled(false); pty.setDedicatedInputEnabled(true); pty.handleInput("z");
+    expect(onDedicatedInput).toHaveBeenCalledTimes(2);
+    emitDisconnect("session-1", "removed");
+    expect(pty.getInputState().connectionEpoch).not.toBe(epoch);
+    expect(pty.getInputState().status).toBe("disconnected");
+    await expect(pty.sendUserInput("stale", epoch)).rejects.toThrow();
+    expect(writePort).not.toHaveBeenCalled();
+    expect(states.some((s) => s.inputLocked)).toBe(true);
+    pty.dispose();
+    expect(pty.getInputState().status).toBe("closed");
+  });
+
+  it("acknowledges only the driver result and refuses shutdown/disposal", async () => {
+    const { transport, writePort } = createTransport();
+    const pty = new SerialPty(transport, { path: "COM9", baudRate: 115200 },
+      { onSessionOpened() {}, onSessionClosed() {} }, { log() {}, close() {} });
+    await expect(pty.sendUserInput("early", 0)).rejects.toThrow();
+    pty.onDidChangeInputState((state) => {
+      if (state.connected) void pty.sendUserInput("ready", state.connectionEpoch);
+    });
+    pty.open(); await flushAsync();
+    expect(writePort).toHaveBeenCalledWith("session-1", Buffer.from("ready"));
+    writePort.mockClear();
+    let complete!: () => void;
+    writePort.mockImplementationOnce(() => new Promise<void>((resolve) => { complete = resolve; }));
+    let acknowledged = false;
+    const sending = pty.sendUserInput("é\r", pty.getInputState().connectionEpoch).then(() => { acknowledged = true; });
+    await flushAsync();
+    expect(acknowledged).toBe(false);
+    expect(writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("é\r"));
+    complete(); await sending;
+    writePort.mockRejectedValueOnce(new Error("driver failed"));
+    await expect(pty.sendUserInput("x", pty.getInputState().connectionEpoch)).rejects.toThrow("driver failed");
+    writePort.mockClear();
+    pty.markShuttingDown("shutdown");
+    await expect(pty.sendUserInput("x", pty.getInputState().connectionEpoch)).rejects.toThrow();
+    pty.dispose(); pty.setDedicatedInputEnabled(true);
+    await expect(pty.sendUserInput("x", pty.getInputState().connectionEpoch)).rejects.toThrow();
+    expect(writePort).not.toHaveBeenCalled();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -103,7 +283,7 @@ describe("SerialPty", () => {
     { highlighting: false, split: true },
     { highlighting: true, split: false },
     { highlighting: true, split: true }
-  ])("preserves serial line endings (highlighting=$highlighting, split=$split)", async ({ highlighting, split }) => {
+  ].flatMap((sample) => [false, true].map((dedicated) => ({ ...sample, dedicated }))))("preserves serial line endings (highlighting=$highlighting, split=$split, dedicated=$dedicated)", async ({ highlighting, split, dedicated }) => {
     const { transport, emitData } = createTransport();
     const writes: string[] = [];
     const observed: string[] = [];
@@ -122,6 +302,9 @@ describe("SerialPty", () => {
       pty.open();
       await flushAsync();
       writes.length = 0;
+      pty.setDedicatedInputEnabled(dedicated);
+      await pty.sendUserInput("composer-TX\r", pty.getInputState().connectionEpoch);
+      expect(transport.writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("composer-TX\r"));
 
       // CRLF crosses a transport boundary; the empty line and standalone CR/LF are deliberate.
       const chunks = split

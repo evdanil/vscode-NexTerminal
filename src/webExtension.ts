@@ -52,6 +52,8 @@ const unsupportedCommands = [
   "nexus.serial.duplicate",
   "nexus.serial.rename",
   "nexus.serial.sendBreak",
+  "nexus.serial.openSendBox",
+  "nexus.serial.useDirectInput",
   "nexus.localShell.add",
   "nexus.localShell.edit",
   "nexus.localShell.remove",
