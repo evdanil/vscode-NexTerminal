@@ -43,7 +43,7 @@ Type multiline text in the editor. **Enter** inserts a newline; **Send** or **Ct
 
 Whitespace is preserved. A newline at the end of the draft therefore sends an additional line. An empty draft with CR, LF or CRLF sends Enter; empty **None** is refused. Text uses UTF-8, with a maximum of 65,536 bytes including the appended ending. Backslash escapes such as `\n` are literal text.
 
-Only one send can be pending. You can keep editing; a successful write clears the draft only if you have not changed it since sending. **Written to serial driver** confirms the local write, not a response from the device. A failed write keeps the draft; delivery may be partial or unknown, so check received output before deliberately retrying. Nexus never resends automatically.
+Only one send can be pending. You can keep editing; a successful write clears the draft only if you have not changed it since sending. **Written to serial driver** confirms the local write, not a response from the device. A failed write keeps the draft while its send box remains open; delivery may be partial or unknown, so check received output before deliberately retrying. Nexus never resends automatically.
 
 While the send box is enabled, typing or pasting into its native serial terminal sends nothing. Nexus macros and scripts continue to work; a script's input lock also blocks the send box and manual macros. Other extensions or keybindings that send through the terminal are blocked while this mode is enabled. Choose **Use Direct Terminal Input**, or close the send-box tab, to restore direct input. Switching to another editor or hiding the tab keeps the mode and draft. Closing it discards the draft; there is no saved history or restoration after restart.
 
