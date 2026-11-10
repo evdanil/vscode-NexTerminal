@@ -28,6 +28,27 @@ If a Standard serial profile is removed or changed while its port is still openi
 An open that takes longer than **Serial RPC Timeout** shows "Connection failed" and is cancelled: when the port's native open finally finishes, the sidecar closes it, so a later Connect (or a Smart Follow poll) is not blocked as "busy". A close that fails is retried in the background for about 30 seconds. If the port still cannot be released, a warning names it and offers **Reload Window** (which restarts the sidecar); unplugging and replugging the device also helps. A rejected open that reuses a session ID already in use never closes the live session that owns it.
 For **Connect and Run Script**, cancellation also ends the pending script request, and **Retry** reopens the script picker for the current profile.
 
+## Dedicated send box
+
+For a device that prints continuous logs, choose **Open Serial Send Box** from its live profile/session context menu or the terminal’s own context menu, or run **Nexus: Open Serial Send Box**. In terminal editors, use the context menu inside the terminal; the editor-tab header has no send-box action. A companion editor, **Serial Send: _profile name_**, keeps your draft separate from the native terminal's received output. Each session starts with direct terminal input enabled; opening its send box changes only that session.
+
+Type multiline text in the editor. **Enter** inserts a newline; **Send** or **Ctrl+Enter** (**Cmd+Enter** on macOS) transmits it. The header identifies the profile and current port. Incoming logs stay in the native terminal and do not change the draft. **Focus Terminal** returns to received output.
+
+**Line ending** defaults to **CR**, like an ordinary terminal Enter:
+
+| Choice | Sent text |
+| --- | --- |
+| None | The draft verbatim, with nothing appended |
+| CR / LF / CRLF | Convert every draft line separator to that ending, then append one more ending |
+
+Whitespace is preserved. A newline at the end of the draft therefore sends an additional line. An empty draft with CR, LF or CRLF sends Enter; empty **None** is refused. Text uses UTF-8, with a maximum of 65,536 bytes including the appended ending. Backslash escapes such as `\n` are literal text.
+
+Only one send can be pending. You can keep editing; a successful write clears the draft only if you have not changed it since sending. **Written to serial driver** confirms the local write, not a response from the device. A failed write keeps the draft; delivery may be partial or unknown, so check received output before deliberately retrying. Nexus never resends automatically.
+
+While the send box is enabled, typing or pasting into its native serial terminal sends nothing. Nexus macros and scripts continue to work; a script's input lock also blocks the send box and manual macros. Other extensions or keybindings that send through the terminal are blocked while this mode is enabled. Choose **Use Direct Terminal Input**, or close the send-box tab, to restore direct input. Switching to another editor or hiding the tab keeps the mode and draft. Closing it discards the draft; there is no saved history or restoration after restart.
+
+Smart Follow keeps the draft while waiting for a device or stopped. Sending is disabled until connected and unlocked. If the connection changes before a send is processed, Nexus refuses that send; review the current port and send again deliberately. Each send box stays bound to its own session, even when another terminal becomes active. Device-generated echoes still appear in received output and can enter transcripts, just like any other device output.
+
 ## Transcript line endings
 
 For serial log files, **Settings → Logging → Transcript Line Endings** offers **Preserve** (default) or **LF**, which converts received CRLF pairs to LF. This setting applies to newly opened Standard and Smart Follow sessions; an existing Smart Follow terminal keeps its format when it reattaches. Standalone CR/LF and intentional empty lines are preserved. Live terminal output is unchanged. See [Session Transcript Logging](terminal.md#session-transcript-logging).

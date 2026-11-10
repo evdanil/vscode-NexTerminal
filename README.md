@@ -60,7 +60,7 @@ Then open the **Nexus** sidebar (activity bar icon).
 - **Connection multiplexing** — terminals, tunnels, and SFTP to one server share an SSH connection, with a per-server opt-out. → [Connection Multiplexing](docs/ssh-and-telnet.md#connection-multiplexing)
 - **Dropped-session diagnostics** — faults after a session is up are recorded in the **Nexus SSH** output channel, so a dropped terminal leaves a cause behind. → [When a Session Drops](docs/ssh-and-telnet.md#when-a-session-drops)
 - **Telnet** — a per-server protocol switch for console servers, lab consoles, and gear that offers nothing else. → [Telnet](docs/ssh-and-telnet.md#telnet)
-- **Serial consoles** — COM/ttyUSB ports with full line settings, a port scan, and break signal, in an isolated sidecar process. → [Serial Consoles](docs/serial.md)
+- **Serial consoles** — COM/ttyUSB ports with full line settings, a port scan, break signal, and an optional separate send box for composing text during continuous logs, in an isolated sidecar process. → [Serial Consoles](docs/serial.md)
 - **Smart Follow** — a serial session rides through Windows COM-port renumbering, reconnecting only to the device you approved. → [Smart Follow](docs/serial.md#smart-follow)
 - **Local shells** — saved local terminal profiles (a VS Code terminal profile or a custom shell), several sessions per profile. → [Local Shells](docs/local-shells.md)
 

@@ -254,7 +254,7 @@ describe("SerialPty", () => {
     { highlighting: false, split: true },
     { highlighting: true, split: false },
     { highlighting: true, split: true }
-  ])("preserves serial line endings (highlighting=$highlighting, split=$split)", async ({ highlighting, split }) => {
+  ].flatMap((sample) => [false, true].map((dedicated) => ({ ...sample, dedicated }))))("preserves serial line endings (highlighting=$highlighting, split=$split, dedicated=$dedicated)", async ({ highlighting, split, dedicated }) => {
     const { transport, emitData } = createTransport();
     const writes: string[] = [];
     const observed: string[] = [];
@@ -273,6 +273,9 @@ describe("SerialPty", () => {
       pty.open();
       await flushAsync();
       writes.length = 0;
+      pty.setDedicatedInputEnabled(dedicated);
+      await pty.sendUserInput("composer-TX\r", pty.getInputState().connectionEpoch);
+      expect(transport.writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("composer-TX\r"));
 
       // CRLF crosses a transport boundary; the empty line and standalone CR/LF are deliberate.
       const chunks = split

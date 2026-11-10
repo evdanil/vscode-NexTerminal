@@ -4,6 +4,7 @@
 
 ### Added
 
+- **Serial Send Box** provides an optional per-session companion editor for composing text during continuous device logs, with explicit Send, selectable line endings and Smart Follow draft retention. Closing it restores direct terminal input.
 - **Transcript Line Endings** in Settings → Logging offers optional CRLF-to-LF conversion for new SSH, telnet and serial log files. Preserve remains the default; live terminals, timestamps, standalone CR/LF and intentional blank lines are unchanged.
 
 ## [2.8.316] — 2026-11-05

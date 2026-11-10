@@ -366,7 +366,7 @@ describe("SmartSerialPty", () => {
     { highlighting: false, split: true },
     { highlighting: true, split: false },
     { highlighting: true, split: true }
-  ])("preserves serial line endings (highlighting=$highlighting, split=$split)", async ({ highlighting, split }) => {
+  ].flatMap((sample) => [false, true].map((dedicated) => ({ ...sample, dedicated }))))("preserves serial line endings (highlighting=$highlighting, split=$split, dedicated=$dedicated)", async ({ highlighting, split, dedicated }) => {
     const { transport, emitData } = createTransport({
       listPorts: async () => [{ path: "COM5", serialNumber: "ABC123" }],
       openPort: async () => "session-1"
@@ -388,6 +388,9 @@ describe("SmartSerialPty", () => {
       pty.open();
       await flushAsync();
       writes.length = 0;
+      pty.setDedicatedInputEnabled(dedicated);
+      await pty.sendUserInput("composer-TX\r", pty.getInputState().connectionEpoch);
+      expect(transport.writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("composer-TX\r"));
 
       // CRLF crosses a transport boundary; the empty line and standalone CR/LF are deliberate.
       const chunks = split
