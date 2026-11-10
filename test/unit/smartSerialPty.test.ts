@@ -188,6 +188,65 @@ async function flushAsync(): Promise<void> {
 const noopLogger = () => ({ log: vi.fn(), close: vi.fn() }) as any;
 
 describe("SmartSerialPty", () => {
+  it("resumes Smart Follow after a guarded missing-session failure without retrying the payload", async () => {
+    vi.useFakeTimers();
+    let connection = 0;
+    const { transport, openPort } = createTransport({ listPorts: async () => [{ path: "COM5" }], openPort: async () => `physical-${++connection}` });
+    const { callbacks, spies } = makeCallbacks();
+    const pty = new SmartSerialPty(transport, makeProfile(), callbacks, noopLogger());
+    try {
+      pty.open(); await flushAsync(); pty.setDedicatedInputEnabled(true);
+      const epoch = pty.getInputState().connectionEpoch;
+      const states: string[] = [];
+      pty.onDidChangeInputState((state) => states.push(state.status));
+      const error = new Error("unknown serial session physical-1");
+      vi.mocked(transport.writePort).mockRejectedValueOnce(error);
+      await expect(pty.sendUserInput("retained draft\r", epoch)).rejects.toBe(error);
+      expect(pty.getInputState()).toMatchObject({ connected: false, status: "waiting" });
+      expect(states).toEqual(["waiting"]);
+      expect(spies.onTransportSessionChanged).toHaveBeenLastCalledWith(undefined);
+      expect(spies.onStateChanged).toHaveBeenLastCalledWith("waiting");
+      expect(pty.getInputState().connectionEpoch).not.toBe(epoch);
+      expect(transport.writePort).toHaveBeenCalledExactlyOnceWith("physical-1", Buffer.from("retained draft\r"));
+      await expect(pty.sendUserInput("waiting", pty.getInputState().connectionEpoch)).rejects.toThrow(/waiting/i);
+      await vi.advanceTimersByTimeAsync(2000); await flushAsync();
+      expect(openPort).toHaveBeenCalledTimes(2);
+      expect(pty.getInputState()).toMatchObject({ connected: true, dedicatedInputEnabled: true });
+      expect(transport.writePort).toHaveBeenCalledTimes(1);
+      await expect(pty.sendUserInput("stale draft", epoch)).rejects.toThrow(/connection changed/i);
+      await pty.sendUserInput("reviewed send\r", pty.getInputState().connectionEpoch);
+      expect(transport.writePort).toHaveBeenLastCalledWith("physical-2", Buffer.from("reviewed send\r"));
+      expect(transport.writePort).toHaveBeenCalledTimes(2);
+    } finally { pty.dispose(); }
+  });
+
+  it("does not disconnect a replacement generation when an old guarded write rejects for the same session ID", async () => {
+    vi.useFakeTimers();
+    const { transport, openPort, emitDisconnect } = createTransport({ listPorts: async () => [{ path: "COM5" }], openPort: async () => "physical" });
+    const pty = new SmartSerialPty(transport, makeProfile(), makeCallbacks().callbacks, noopLogger());
+    try {
+      pty.open(); await flushAsync();
+      let rejectWrite!: (error: Error) => void;
+      vi.mocked(transport.writePort).mockImplementationOnce(() => new Promise<void>((_resolve, reject) => { rejectWrite = reject; }));
+      const pending = pty.sendUserInput("old payload", pty.getInputState().connectionEpoch);
+      const oldError = new Error("unknown serial session physical");
+      const refused = expect(pending).rejects.toBe(oldError);
+      emitDisconnect("physical", "worker restarted");
+      await vi.advanceTimersByTimeAsync(2000); await flushAsync();
+      expect(openPort).toHaveBeenCalledTimes(2);
+      const replacement = pty.getInputState();
+      expect(replacement.connected).toBe(true);
+      const changes = vi.fn(); pty.onDidChangeInputState(changes);
+      rejectWrite(oldError); await refused;
+      expect(pty.getInputState()).toEqual(replacement);
+      expect(changes).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+      expect(transport.writePort).toHaveBeenCalledExactlyOnceWith("physical", Buffer.from("old payload"));
+      await pty.sendUserInput("new payload", replacement.connectionEpoch);
+      expect(transport.writePort).toHaveBeenLastCalledWith("physical", Buffer.from("new payload"));
+    } finally { pty.dispose(); }
+  });
+
   it.each(["inputState", "transportChanged", "name", "activePort", "resolvedPort", "stateChanged", "openingData"].flatMap((trigger) =>
     ["dispose", "shutdown"].map((loss) => ({ trigger, loss }))))(
     "does not restore Smart Follow registration after $trigger requests $loss", async ({ trigger, loss }) => {

@@ -98,6 +98,35 @@ async function flushAsync(): Promise<void> {
 }
 
 describe("SerialPty", () => {
+  it.each(["unknown serial session physical", "driver write failed"])(
+    "updates Standard connection state only for a current missing-session write error: %s", async (message) => {
+      const { transport, writePort } = createTransport();
+      const onSessionClosed = vi.fn();
+      const pty = new SerialPty(transport, { path: "COM9", baudRate: 115200 },
+        { onSessionOpened() {}, onSessionClosed }, { log() {}, close() {} });
+      try {
+        pty.open(); await flushAsync(); pty.setDedicatedInputEnabled(true);
+        const epoch = pty.getInputState().connectionEpoch;
+        const states: string[] = [];
+        pty.onDidChangeInputState((state) => states.push(state.status));
+        const error = new Error(message);
+        writePort.mockRejectedValueOnce(error);
+        await expect(pty.sendUserInput("retained draft\r", epoch)).rejects.toBe(error);
+        expect(writePort).toHaveBeenCalledExactlyOnceWith("session-1", Buffer.from("retained draft\r"));
+        if (message.startsWith("unknown serial session")) {
+          expect(pty.getInputState()).toMatchObject({ connected: false, status: "disconnected" });
+          expect(pty.getInputState().connectionEpoch).not.toBe(epoch);
+          expect(states).toEqual(["disconnected"]);
+          expect(onSessionClosed).toHaveBeenCalledExactlyOnceWith("session-1");
+          await expect(pty.sendUserInput("must not retry", pty.getInputState().connectionEpoch)).rejects.toThrow(/disconnected/i);
+          expect(writePort).toHaveBeenCalledTimes(1);
+        } else {
+          expect(pty.getInputState()).toMatchObject({ connected: true, connectionEpoch: epoch });
+          expect(states).toEqual([]); expect(onSessionClosed).not.toHaveBeenCalled();
+        }
+      } finally { pty.dispose(); }
+    });
+
   it.each(["inputState", "sessionOpened", "banner", "openingData", "profileCurrent"].flatMap((trigger) =>
     ["dispose", "shutdown"].map((loss) => ({ trigger, loss }))))(
     "does not resume setup after $trigger synchronously requests $loss", async ({ trigger, loss }) => {

@@ -196,7 +196,17 @@ export class SmartSerialPty implements vscode.Pseudoterminal, vscode.Disposable,
     // Select the transport synchronously with validation: reconnect cannot retarget this write.
     const sessionId = this.transportSessionId;
     if (!sessionId) throw new Error("Serial session is disconnected. Nothing was sent.");
-    await this.transport.writePort(sessionId, Buffer.from(data, "utf8"));
+    try {
+      await this.transport.writePort(sessionId, Buffer.from(data, "utf8"));
+    } catch (error) {
+      // A restarted sidecar can lose this session without a disconnect event. An old
+      // write must never mark a replacement connection lost, even if its ID is reused.
+      if (this.connectionEpoch === expectedConnectionEpoch && this.isCurrentTransport(sessionId) &&
+        error instanceof Error && error.message.includes("unknown serial session")) {
+        this.handleTransportDisconnect("Port no longer available");
+      }
+      throw error;
+    }
     // A delayed driver acknowledgement cannot confirm delivery for a replacement connection.
     if (!this.getInputState().connected || this.connectionEpoch !== expectedConnectionEpoch) {
       throw new Error("Serial connection changed during send. Delivery could not be confirmed.");
