@@ -438,6 +438,9 @@ async function connectStandardSerialProfile(
       rtscts: profile.rtscts
     },
     {
+      onDedicatedInput: () => {
+        if (terminalRef && ptyRef) void ctx.serialSendCommands?.remindNativeInput(terminalRef, ptyRef);
+      },
       isProfileCurrent: () => {
         const current = ctx.core.getSerialProfile(profile.id);
         return current !== undefined && JSON.stringify(current) === profileAtStart;
@@ -536,6 +539,7 @@ async function connectStandardSerialProfile(
   }
   terminalRef = terminal;
   ctx.terminalRegistry?.register(terminal, pty, highlight);
+  ctx.serialSendCommands?.trackOpening(profile.id, terminal, pty);
   ctx.focusedTerminal = terminal;
   terminal.show();
   return true;
@@ -564,6 +568,9 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
     ctx.serialSidecar as SmartSerialTransport,
     profile,
     {
+      onDedicatedInput: () => {
+        if (terminalRef && ptyRef) void ctx.serialSendCommands?.remindNativeInput(terminalRef, ptyRef);
+      },
       onClosed: () => {
         ctx.serialTerminals.delete(logicalSessionId);
         ctx.activityIndicators.delete(logicalSessionId);

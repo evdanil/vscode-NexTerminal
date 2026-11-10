@@ -2455,3 +2455,33 @@ describe("SSH agent settings (nexus.ssh.agent, nexus.ssh.agentPath)", () => {
     expect(functionalDocs).toContain("`buildConnectConfig` no longer reads `SSH_AUTH_SOCK`");
   });
 });
+
+
+describe("serial send box contributions", () => {
+  it.each([["nexus.serial.openSendBox", "Open Serial Send Box"], ["nexus.serial.useDirectInput", "Use Direct Serial Terminal Input"]])("exposes %s across serial profiles, sessions and palette", (command, title) => {
+    expect(packageJson.contributes.commands.find(item => item.command === command)).toMatchObject({ title, category: "Nexus" });
+    expect(packageJson.contributes.menus.commandPalette.find(item => item.command === command)?.when).toBe("true");
+    const entries = packageJson.contributes.menus["view/item/context"].filter(item => item.command === command);
+    for (const context of ["nexus.serialProfileConnected", "nexus.serialProfileWaiting", "nexus.serialSessionNode"]) {
+      expect(entries.some(item => item.when?.includes(context) || (item.when?.includes("serialProfile") && new RegExp(item.when.match(/viewItem =~ \/(.*?)\//)?.[1] ?? "(?!)").test(context)))).toBe(true);
+    }
+    expect(entries.some(item => item.when?.includes("serialProfile(Connected|Waiting)?"))).toBe(false);
+    for (const item of entries) expect(item.when).not.toMatch(/viewItem == nexus\.serialProfile(?:\s|\)|$)/);
+  });
+  it("offers supported terminal context/tab surfaces and excludes unresolvable editor chrome", () => {
+    expect((packageJson.contributes.menus["terminal/title"] ?? []).some(item => item.command === "nexus.serial.openSendBox" || item.command === "nexus.serial.useDirectInput")).toBe(false);
+    for (const surface of ["editor/title", "editor/title/context"]) {
+      expect(packageJson.contributes.menus[surface].some(item => item.command === "nexus.serial.openSendBox" || item.command === "nexus.serial.useDirectInput")).toBe(false);
+    }
+    for (const surface of ["terminal/context", "terminal/title/context"]) {
+      const item = packageJson.contributes.menus[surface]?.find(item => item.command === "nexus.serial.openSendBox");
+      expect(item, surface).toBeDefined();
+      expect(item?.when ?? "").not.toMatch(/nexus\.isNexus|terminalName/);
+
+    }
+  });
+  it("registers both browser unavailable stubs without the desktop composer import", () => {
+    const web = readDoc("src/webExtension.ts");
+    expect(web).toContain('"nexus.serial.openSendBox"'); expect(web).toContain('"nexus.serial.useDirectInput"'); expect(web).not.toContain('from "./ui/serialSendPanel"');
+  });
+});

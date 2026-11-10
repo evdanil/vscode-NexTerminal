@@ -49,6 +49,7 @@ export interface LocalServerTerminalEntry {
 export type LocalServerTerminalMap = Map<string, LocalServerTerminalEntry>;
 
 export interface CommandContext {
+  serialSendCommands?: Pick<import("./serialSendCommands").SerialSendCommands, "remindNativeInput" | "trackOpening">;
   core: NexusCore;
   tunnelManager: TunnelManager;
   serialSidecar: SerialSidecarManager;

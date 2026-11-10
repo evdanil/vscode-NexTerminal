@@ -2144,3 +2144,30 @@ describe("external credential deployment menu availability", () => {
     expect(new RegExp(deploy.when.match(/viewItem =~ \/(.*?)\//)![1]).test(item.contextValue!)).toBe(false);
   });
 });
+
+
+describe("serial dedicated input tooltip state", () => {
+  it("describes enabled profile/session input without persisting it", () => {
+    const profile = { id: "serial", name: "Serial", path: "COM1", baudRate: 9600, dataBits: 8 as const, stopBits: 1 as const, parity: "none" as const, rtscts: false };
+    const session = { id: "s", profileId: profile.id, terminalName: "Serial", startedAt: 0 };
+    expect(new SerialProfileTreeItem(profile, "connected", true, true).tooltip).toContain("Dedicated send box");
+    expect(new SerialSessionTreeItem(session, false, false, true).tooltip).toContain("Open Send Box");
+    expect(new SerialProfileTreeItem(profile, "connected").tooltip).not.toContain("Dedicated send box");
+    expect(profile).not.toHaveProperty("dedicatedInputEnabled");
+  });
+});
+
+
+it("refreshes both serial tooltips from transient session state and clears them on restore", () => {
+  const provider = new NexusTreeProvider(noopCallbacks);
+  const profile = makeSerial(); const session = { id: "send-session", profileId: profile.id, terminalName: "Serial", startedAt: 0 };
+  provider.setSnapshot({ ...emptySnapshot(), serialProfiles: [profile], activeSerialSessions: [session] });
+  const original = JSON.stringify(profile); const refresh = vi.fn(); provider.onDidChangeTreeData(refresh);
+  const supplied = new Set([session.id]); provider.setDedicatedSerialSessions(supplied); supplied.clear();
+  const row = getTestChildren(provider).find(item => item instanceof SerialProfileTreeItem) as SerialProfileTreeItem;
+  expect(row.tooltip).toContain("Dedicated send box"); expect(getTestChildren(provider, row)[0].tooltip).toContain("Open Send Box");
+  provider.setDedicatedSerialSessions(new Set([session.id])); expect(refresh).toHaveBeenCalledOnce();
+  provider.setDedicatedSerialSessions(new Set());
+  const restored = getTestChildren(provider).find(item => item instanceof SerialProfileTreeItem) as SerialProfileTreeItem;
+  expect(restored.tooltip).not.toContain("Dedicated send box"); expect(getTestChildren(provider, restored)[0].tooltip).toBeUndefined(); expect(JSON.stringify(profile)).toBe(original);
+});

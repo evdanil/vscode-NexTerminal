@@ -1151,3 +1151,24 @@ describe("nexus.serial.remove — the disclosure is re-checked under the lock (R
     });
   });
 });
+
+
+describe("serial native-input reminder binding", () => {
+  beforeEach(() => { vi.clearAllMocks(); registeredCommands.clear(); });
+  it.each(["standard", "smartFollow"] as const)("binds %s callback to created terminal and input owner", async mode => {
+    const profile = makeSerialProfile({ mode });
+    const core = new NexusCore(new InMemoryConfigRepository([], [], [profile])); await core.initialize();
+    const reminder = vi.fn();
+    const ctx = { core, serialTerminals: new Map(), activityIndicators: new Map(), loggerFactory: { create: vi.fn() }, macroAutoTrigger: { createObserver: vi.fn(), bindObserverToSession: vi.fn() }, serialSidecar: {}, highlighter: {}, sessionLogDir: "", serialSendCommands: { remindNativeInput: reminder, trackOpening: vi.fn() } } as unknown as CommandContext;
+    registerSerialCommands(ctx); await registeredCommands.get("nexus.serial.connect")!(profile.id);
+    const constructor = mode === "standard" ? vi.mocked(SerialPty) : vi.mocked(SmartSerialPty);
+    const callbacks = constructor.mock.calls[0][2] as { onDedicatedInput?: () => void; onSessionOpened?: (id: string) => void };
+    const owner = constructor.mock.results[0].value;
+    const terminal = vi.mocked(vscode.window.createTerminal).mock.results[0].value;
+    callbacks.onSessionOpened?.("session");
+    expect(callbacks.onDedicatedInput).toBeTypeOf("function"); callbacks.onDedicatedInput!();
+    expect(reminder).toHaveBeenCalledWith(terminal, owner);
+    if (mode === "standard") expect(ctx.serialSendCommands!.trackOpening).toHaveBeenCalledWith(profile.id, terminal, owner);
+    expect([...ctx.serialTerminals.values()][0].input).toBe(owner);
+  });
+});

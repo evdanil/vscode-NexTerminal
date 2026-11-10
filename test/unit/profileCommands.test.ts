@@ -1697,3 +1697,18 @@ describe("Hub toolbar vs folder right-click — the toolbar ids ignore the focus
     expect(groupFieldValue()).toBe("");
   });
 });
+
+
+describe("serial Profile Actions send box discovery", () => {
+  beforeEach(() => { vi.clearAllMocks(); mockShowQuickPick.mockReset(); });
+  it.each(["connected", "waiting", "disconnected"] as const)("offers send controls only for live %s serial profiles", async state => {
+    const item = new SerialProfileTreeItem({ id: "serial", name: "Serial", path: "COM1", baudRate: 9600, dataBits: 8, stopBits: 1, parity: "none", rtscts: false }, state);
+    registerProfileCommands(makeCtx());
+    const handler = vi.mocked((await import("vscode")).commands.registerCommand).mock.calls.find(([id]) => id === "nexus.profile.actions")![1];
+    mockShowQuickPick.mockImplementationOnce((items: Array<{ command: string }>) => items.find(p => p.command === "nexus.serial.openSendBox"));
+    await handler(item);
+    const labels = (mockShowQuickPick.mock.calls[0][0] as Array<{ label: string }>).map(p => p.label);
+    if (state === "disconnected") { expect(labels).not.toContain("Open Send Box"); expect(labels).not.toContain("Use Direct Input"); expect(labels).toContain("Connect"); }
+    else { expect(labels).toContain("Open Send Box"); expect(labels).toContain("Use Direct Input"); expect(mockExecuteCommand).toHaveBeenCalledWith("nexus.serial.openSendBox", item); }
+  });
+});
