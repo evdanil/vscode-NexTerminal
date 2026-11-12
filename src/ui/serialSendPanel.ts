@@ -39,7 +39,8 @@ export const SERIAL_SEND_KEEP_TEXT_KEY = "nexus.serialSendBox.keepText";
 
 /**
  * True while keyboard focus is inside a Serial Send Box. The send-box twins of
- * the macro keybindings use it, together with
+ * the macro keybindings use it, together with `!terminalFocus` (it is cleared
+ * asynchronously after the page reports blur) and
  * `activeWebviewPanelId == 'nexus.serialSend'`. That built-in key alone is not
  * enough: VS Code derives it from the active editor of the active editor group
  * (webviewWorkbenchService.ts registers it as an editor-group context-key
@@ -78,7 +79,6 @@ const DELIVERY_UNKNOWN = "Serial write failed. Delivery may be partial or unknow
 const isId = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
 const isEpoch = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
 const isEnding = (value: unknown): value is SerialLineEnding => value === "none" || value === "cr" || value === "lf" || value === "crlf";
-const SHORTCUT_PATTERN = /^(?:alt|alt\+shift|ctrl\+shift)\+[a-z0-9]$/;
 const hasOnlyKeys = (value: Record<string, unknown>, keys: readonly string[]): boolean =>
   Object.keys(value).length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
 
@@ -95,7 +95,8 @@ export class SerialSendPanel implements vscode.Disposable {
 
   public constructor(private readonly options: SerialSendPanelOptions = {}) {
     this.setContext = options.setContext ?? ((key, value) => { void vscode.commands.executeCommand("setContext", key, value); });
-    // Read on every use rather than cached, so Delete All Data's clear reaches open boxes too.
+    // Never cached here: each push reads the store, so refreshPreferences() after
+    // Delete All Data shows open boxes the cleared value.
     this.preferences = options.preferences ?? inMemoryPreferences();
     this.terminalListener = vscode.window.onDidCloseTerminal((terminal) => {
       for (const entry of this.panels.values()) {
@@ -105,6 +106,15 @@ export class SerialSendPanel implements vscode.Disposable {
     this.shortcutListener = options.macroShortcuts?.onDidChange(() => {
       for (const entry of this.panels.values()) this.pushShortcuts(entry);
     });
+  }
+
+  /**
+   * Re-posts the stored keep-text choice to every open box. A retained webview
+   * sends `ready` only once, so a store change made elsewhere (Delete All Data)
+   * reaches open boxes only through this.
+   */
+  public refreshPreferences(): void {
+    for (const entry of this.panels.values()) this.pushPreferences(entry);
   }
 
   /** The binding of the send box that has keyboard focus, if any. */
@@ -220,8 +230,9 @@ export class SerialSendPanel implements vscode.Disposable {
 
   private pushShortcuts(entry: OpenComposer): void {
     if (entry.disposed) return;
-    const shortcuts = (this.options.macroShortcuts?.getBoundShortcuts() ?? []).filter((combo) => SHORTCUT_PATTERN.test(combo));
-    void entry.panel.webview.postMessage({ type: "macroShortcuts", shortcuts: [...new Set(shortcuts)] });
+    // getBoundMacroShortcuts() already validates against the binding grammar; the page re-validates at its trust boundary.
+    const shortcuts = [...(this.options.macroShortcuts?.getBoundShortcuts() ?? [])];
+    void entry.panel.webview.postMessage({ type: "macroShortcuts", shortcuts });
   }
 
   private result(entry: OpenComposer, requestId: number, error?: string): void {

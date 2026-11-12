@@ -463,13 +463,19 @@ describe("serial send panel focus, preferences and shortcut list", () => {
     expect(posted(panels[2], "preferences")).toEqual([{ type: "preferences", keepText: false }]);
   });
 
-  it("re-reads the stored preference, so clearing it (Delete All Data) reaches an open box", async () => {
+  it("refreshPreferences (Delete All Data) shows the cleared value in open boxes without a new ready", async () => {
     stored.set(SERIAL_SEND_KEEP_TEXT_KEY, true);
     registry.openOrReveal(binding());
+    registry.openOrReveal(binding("session-2"));
     await panels[0].message({ type: "ready" });
+    await panels[1].message({ type: "ready" });
+    // The reset clears the store; a retained webview sends no further ready.
     stored.delete(SERIAL_SEND_KEEP_TEXT_KEY);
-    await panels[0].message({ type: "ready" });
-    expect(posted(panels[0], "preferences")).toEqual([{ type: "preferences", keepText: true }, { type: "preferences", keepText: false }]);
+    registry.refreshPreferences();
+    for (const p of panels) expect(posted(p, "preferences")).toEqual([{ type: "preferences", keepText: true }, { type: "preferences", keepText: false }]);
+    // ...and a later toggle compares against the cleared store, so re-checking it persists again.
+    await panels[0].message({ type: "setKeepText", keepText: true });
+    expect(stored.get(SERIAL_SEND_KEEP_TEXT_KEY)).toBe(true);
   });
 
   it("defaults keep-text off when nothing (or a non-boolean) is stored", async () => {
@@ -481,11 +487,10 @@ describe("serial send panel focus, preferences and shortcut list", () => {
     expect(posted(panels[0], "preferences")).toEqual([{ type: "preferences", keepText: false }]);
   });
 
-  it("posts only well-formed combo identifiers and refreshes them when bindings change", async () => {
+  it("posts the bound combo list and refreshes it when bindings change", async () => {
     registry.openOrReveal(binding());
-    bound = ["alt+a", "alt+s", "alt+a", "Run Backup", "ctrl+alt+a", "alt+shift+1"];
     await panels[0].message({ type: "ready" });
-    expect(posted(panels[0], "macroShortcuts")).toEqual([{ type: "macroShortcuts", shortcuts: ["alt+a", "alt+s", "alt+shift+1"] }]);
+    expect(posted(panels[0], "macroShortcuts")).toEqual([{ type: "macroShortcuts", shortcuts: ["alt+a", "alt+s"] }]);
     bound = ["ctrl+shift+z"];
     shortcutsChanged.fire();
     expect(posted(panels[0], "macroShortcuts").at(-1)).toEqual({ type: "macroShortcuts", shortcuts: ["ctrl+shift+z"] });

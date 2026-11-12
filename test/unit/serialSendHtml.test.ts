@@ -1,6 +1,7 @@
 import { runInNewContext } from "node:vm";
 import { describe, expect, it, vi } from "vitest";
 import { renderSerialSendHtml } from "../../src/ui/serialSendHtml";
+import { ALL_BINDINGS } from "../../src/macroBindings";
 
 // The real rendered JS runs here; browser layout/selection and native IME still need Chromium/EHD acceptance.
 class Element {
@@ -312,6 +313,29 @@ describe("serial composer browser behavior", () => {
 
   it("tells the user where macro shortcuts go from this box", () => {
     expect(browser().html).toContain("Macro shortcuts, including Alt+S, send to this session while this box has focus.");
+  });
+
+  // The page's grammar is a copy at the trust boundary; if src/macroBindings.ts gains a
+  // binding the page rejects, that macro would fire and still type its character.
+  const eventFor = (binding: string) => {
+    const parts = binding.split("+");
+    const key = parts.at(-1)!;
+    const code = /[a-z]/.test(key) ? `Key${key.toUpperCase()}` : `Digit${key}`;
+    return { code, keyCode: key.toUpperCase().charCodeAt(0), key: "å", altKey: parts.includes("alt"), shiftKey: parts.includes("shift"),
+      ctrlKey: parts.includes("ctrl"), metaKey: false };
+  };
+  it("accepts every binding src/macroBindings.ts can produce, plus alt+s, and blocks each when bound", () => {
+    expect(ALL_BINDINGS).toHaveLength(108);
+    const b = browser();
+    b.receive({ data: { type: "macroShortcuts", shortcuts: [...ALL_BINDINGS, "alt+s"] } });
+    for (const binding of ALL_BINDINGS) expect(b.keydown(eventFor(binding)).preventDefault, binding).toHaveBeenCalledOnce();
+    for (const binding of ALL_BINDINGS) {
+      const single = browser();
+      single.receive({ data: { type: "macroShortcuts", shortcuts: [binding] } });
+      expect(single.keydown(eventFor(binding)).preventDefault, binding).toHaveBeenCalledOnce();
+      const other = ALL_BINDINGS.find((candidate) => candidate !== binding && candidate.endsWith(binding.slice(-2)))!;
+      expect(single.keydown(eventFor(other)).preventDefault, `${binding} vs ${other}`).not.toHaveBeenCalled();
+    }
   });
 
   it("blocks nothing before the host sends a shortcut list", () => {

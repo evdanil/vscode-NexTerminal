@@ -258,6 +258,12 @@ export interface ConfigRuntimeHooks {
    */
   resetTerminalAppearance?(): Promise<void>;
   /**
+   * Delete All Data: show the cleared Serial Send Box keep-text choice in every
+   * open send box. Called after the stored keys are cleared; a retained send box
+   * webview never asks for its preferences again on its own.
+   */
+  refreshSerialSendPreferences?(): void;
+  /**
    * Delete All Data: empty the collapsed-folder sets the tree providers hold in
    * memory, drop their pending writes and turn Follow Terminal Directory off.
    * Called BEFORE the stored keys are cleared, and leaves the collapsed-folder
@@ -5892,6 +5898,7 @@ export function registerConfigCommands(
         }
         // The running service caches those values and an open panel shows them.
         await runtime?.resetTerminalAppearance?.();
+        runtime?.refreshSerialSendPreferences?.();
         // AFTER everything above is cleared: other windows keep collapsed-folder
         // sets and the appearance cache in memory, and on their next action they
         // see this counter move and reload from the (now empty) store instead of

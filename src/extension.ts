@@ -1636,7 +1636,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     resetTerminalAppearance: async () => {
       await colorSchemeService.reset();
       TerminalAppearancePanel.refreshOpen();
-    }
+    },
+    refreshSerialSendPreferences: () => serialSendPanel.refreshPreferences()
   });
 
   // One-time offer to import ~/.ssh/config, shown at most once ever. Strictly

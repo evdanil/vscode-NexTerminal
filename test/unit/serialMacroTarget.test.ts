@@ -26,6 +26,7 @@ vi.mock("vscode", () => ({
     onDidChangeActiveTerminal: () => ({ dispose() {} }),
     onDidCloseTerminal: () => ({ dispose() {} }),
     showQuickPick: vi.fn(async () => ({ index: 0 })),
+    showInformationMessage: vi.fn(async () => undefined),
     setStatusBarMessage: vi.fn(),
     createInputBox: () => {
       const accept = new Set<() => void>();
@@ -261,10 +262,28 @@ describe("macro shortcuts from a focused Serial Send Box", () => {
     await run("nexus.macro.runBinding", { binding: "alt+1", ...sendBox });
     await run("nexus.macro.run", sendBox);
     expectNothingSent(h);
-    // A closed but still-registered owner resolves to a target that refuses at delivery, like the terminal path.
-    if (change !== "closed") expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
-    expect(vi.mocked(vscode.window.setStatusBarMessage).mock.calls.map(([m]) => m).join("\n")).toMatch(/nothing was sent/i);
+    const statuses = vi.mocked(vscode.window.setStatusBarMessage).mock.calls.map(([m]) => String(m));
+    // A closed but still-registered owner resolves to a target that refuses at delivery, like the terminal path;
+    // the others are captured as unavailable and refused once the macro is bound for a session.
+    if (change === "closed") expect(statuses.join("\n")).toMatch(/nothing was sent/i);
+    else expect(statuses.filter((m) => m === "The serial send box's session is no longer available. Nothing was sent.")).toHaveLength(2);
+    expect(vscode.window.showInformationMessage).not.toHaveBeenCalled();
   });
+
+  const profileMacros: Array<[string, TerminalMacro]> = [
+    ["profile token", { id: "prof", name: "Prof", text: "ssh ${profile.host}\r", keybinding: "alt+1" }],
+    ["non-session target", { id: "web", name: "Web", text: "https://example.test", keybinding: "alt+1", runIn: "browser" } as TerminalMacro]
+  ];
+  it.each(profileMacros.flatMap(([label, macro]) => (["runBinding", "run"] as const).map((route) => ({ label, macro, route }))))(
+    "$route: a $label macro from a send box whose session is gone is still offered Run Macro on Server, not refused", async ({ macro, route }) => {
+      const h = await sendBoxHarness();
+      fixture.macros = [macro];
+      h.registry.unregister(h.a.terminal);
+      await run(`nexus.macro.${route}`, route === "run" ? sendBox : { binding: "alt+1", ...sendBox });
+      expect(vscode.window.showInformationMessage).toHaveBeenCalledExactlyOnceWith(`"${macro.name}" runs against a server profile. Pick the server to run it on.`, "Run Macro on Server…");
+      expect(vi.mocked(vscode.window.setStatusBarMessage).mock.calls.map(([m]) => String(m)).join("\n")).not.toMatch(/no longer available/);
+      expectNothingSent(h);
+    });
 
   it("a script lock on the box's session still blocks the shortcut", async () => {
     const h = await sendBoxHarness();

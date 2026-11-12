@@ -2460,7 +2460,7 @@ describe("SSH agent settings (nexus.ssh.agent, nexus.ssh.agentPath)", () => {
 
 describe("serial send box contributions", () => {
   describe("macro shortcuts from a focused send box", () => {
-    const SEND_BOX_FOCUS = "nexus.serialSendBoxFocused && activeWebviewPanelId == 'nexus.serialSend'";
+    const SEND_BOX_FOCUS = "nexus.serialSendBoxFocused && !terminalFocus && activeWebviewPanelId == 'nexus.serialSend'";
     const keybindings = packageJson.contributes.keybindings ?? [];
     const macroEntries = keybindings.filter((item) => item.command === "nexus.macro.run" || item.command === "nexus.macro.runBinding");
     const terminalEntries = macroEntries.filter((item) => item.when?.startsWith("terminalFocus"));
@@ -2482,7 +2482,11 @@ describe("serial send box contributions", () => {
         expect(twin[0].mac).toBe(entry.mac);
         expect(Object.keys(twin[0].args ?? {}).sort()).toEqual([...Object.keys(entry.args ?? {}), "source"].sort());
       }
-      for (const twin of twins) expect(twin.when).not.toContain("terminalFocus");
+      // A twin never matches while a terminal has focus: the focus key clears only after the page's blur report arrives.
+      for (const twin of twins) {
+        expect(twin.when).toContain("!terminalFocus");
+        expect(twin.when).not.toMatch(/(?:^|[^!])terminalFocus/);
+      }
     });
 
     it("keeps the per-binding twin after the picker twin, as in the terminal, so a macro on Alt+S still wins", () => {

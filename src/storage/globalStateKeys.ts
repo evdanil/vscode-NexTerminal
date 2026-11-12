@@ -22,7 +22,7 @@ export const RESET_CLEARED_GLOBAL_STATE_KEYS: readonly string[] = [
   "nexus.ui.followTerminalDirectory",
   "nexus.files.followTerminalNudgeShown",
   "nexus.macros.keybindingBlockerHintDismissed",
-  // A remembered UI choice. Open send boxes re-read it on every use, so a live window follows the reset.
+  // A remembered UI choice. completeReset then calls ConfigRuntimeHooks.refreshSerialSendPreferences so open send boxes show the cleared value.
   "nexus.serialSendBox.keepText"
 ];
 

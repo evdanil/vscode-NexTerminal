@@ -255,19 +255,24 @@ function isSendBoxInvocation(arg: unknown): boolean {
 }
 
 /**
- * Pins the focused send box's own session, synchronously, at invocation (§8.1).
- * The send box and `activeTerminal` can name different serial sessions, and the
- * Alt+S picker or a variable prompt takes focus away from the send box, so
- * nothing may re-derive the target later. No send box, or one whose session can
- * no longer be resolved, refuses: falling back to `activeTerminal` would send the
- * macro to a session the user was not typing into.
+ * What a send-box invocation captured, synchronously, at invocation (§8.1): the
+ * focused box's own session, or `undefined` when there was no box or its session
+ * could no longer be resolved. The send box and `activeTerminal` can name
+ * different serial sessions, and the Alt+S picker or a variable prompt takes
+ * focus away from the box, so nothing may re-derive the target later.
+ *
+ * An unavailable session is a captured state rather than an immediate refusal:
+ * a server-profile or non-session macro is redirected to Run Macro on Server…
+ * exactly as from a terminal, and only a macro that would actually be sent to a
+ * session is refused. It never falls back to `activeTerminal`, which would send
+ * the macro to a session the user was not typing into.
  */
-function pinSendBoxTarget(capture: FocusedSendBoxMacroTarget | undefined): MacroSendTarget | undefined {
-  const target = capture?.();
-  if (!target) {
-    vscode.window.setStatusBarMessage("The serial send box's session is no longer available. Nothing was sent.", 4000);
-  }
-  return target;
+interface SendBoxCapture {
+  readonly target: MacroSendTarget | undefined;
+}
+
+function captureSendBox(arg: unknown, capture: FocusedSendBoxMacroTarget | undefined): SendBoxCapture | undefined {
+  return isSendBoxInvocation(arg) ? { target: capture?.() } : undefined;
 }
 
 async function sendMacroText(text: string, resolveSerialTarget?: SerialMacroTargetResolver): Promise<void> {
@@ -289,7 +294,7 @@ async function sendMacroText(text: string, resolveSerialTarget?: SerialMacroTarg
 async function runOrSendMacro(
   macro: TerminalMacro,
   resolveSerialTarget?: SerialMacroTargetResolver,
-  pinned?: MacroSendTarget
+  sendBox?: SendBoxCapture
 ): Promise<void> {
   // A macro that names a server profile (`${profile.…}`) or runs somewhere
   // other than a session cannot be resolved from these entry points: they know
@@ -328,9 +333,14 @@ async function runOrSendMacro(
   // common case): `runMacro`'s re-entrancy guard keys id-less macros on
   // name+text, and a needless copy is a needless difference.
   const toRun = text === macro.text ? macro : { ...macro, text };
-  if (pinned) {
-    // Send-box shortcut: the caller already pinned the session. Delivery is the
-    // guarded serial path (epoch, script lock); macro bytes are never converted.
+  if (sendBox) {
+    // Send-box shortcut: the caller captured the session at invocation. Delivery
+    // is the guarded serial path (epoch, script lock); macro bytes are never converted.
+    const pinned = sendBox.target;
+    if (!pinned) {
+      vscode.window.setStatusBarMessage("The serial send box's session is no longer available. Nothing was sent.", 4000);
+      return;
+    }
     if (hasMacroVariables(macro)) await runMacroWithTarget(toRun, pinned);
     else await pinned.send(text);
     return;
@@ -979,11 +989,7 @@ export function registerMacroCommands(
     vscode.commands.registerCommand("nexus.macro.run", async (arg?: unknown) => {
       // Before the picker opens: it takes focus from the send box, and the
       // session the user was typing into must not change while they choose.
-      let pinned: MacroSendTarget | undefined;
-      if (isSendBoxInvocation(arg)) {
-        pinned = pinSendBoxTarget(captureSendBoxTarget);
-        if (!pinned) return;
-      }
+      const sendBox = captureSendBox(arg, captureSendBoxTarget);
       const macros = getMacros();
       if (macros.length === 0) {
         const action = await vscode.window.showInformationMessage(
@@ -1020,7 +1026,7 @@ export function registerMacroCommands(
       if (!pick) {
         return;
       }
-      await runOrSendMacro(macros[pick.index], resolveSerialTarget, pinned);
+      await runOrSendMacro(macros[pick.index], resolveSerialTarget, sendBox);
     }),
 
     vscode.commands.registerCommand("nexus.macro.runBinding", async (arg?: unknown) => {
@@ -1029,17 +1035,12 @@ export function registerMacroCommands(
       if (!binding) {
         return;
       }
+      const sendBox = captureSendBox(arg, captureSendBoxTarget);
       const macros = getMacros();
       const macro = macros.find((m) => getAssignedBinding(m) === binding);
-      if (!macro) {
-        return;
+      if (macro) {
+        await runOrSendMacro(macro, resolveSerialTarget, sendBox);
       }
-      if (isSendBoxInvocation(arg)) {
-        const pinned = pinSendBoxTarget(captureSendBoxTarget);
-        if (pinned) await runOrSendMacro(macro, resolveSerialTarget, pinned);
-        return;
-      }
-      await runOrSendMacro(macro, resolveSerialTarget);
     }),
 
     vscode.commands.registerCommand("nexus.macro.slot", async (arg?: unknown) => {

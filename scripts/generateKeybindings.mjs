@@ -45,7 +45,10 @@ function bindingToContextKey(binding) {
   return `nexus.macro.alt.${binding.slice(4)}`;
 }
 
-export const SEND_BOX_FOCUS_WHEN = "nexus.serialSendBoxFocused && activeWebviewPanelId == 'nexus.serialSend'";
+// `!terminalFocus`: the focus key is cleared asynchronously after the page reports
+// blur, and twins come after the terminal entries, so without it a terminal
+// shortcut pressed in that gap would resolve to the twin and be refused.
+const SEND_BOX_FOCUS_WHEN = "nexus.serialSendBoxFocused && !terminalFocus && activeWebviewPanelId == 'nexus.serialSend'";
 
 const entries = [];
 const twins = [];
