@@ -46,8 +46,9 @@ import * as vscode from "vscode";
 import { SerialPty, type SerialTransport } from "../../src/services/serial/serialPty";
 import { SmartSerialPty } from "../../src/services/serial/smartSerialPty";
 import { TerminalRegistry } from "../../src/services/terminal/terminalRegistry";
-import { registerMacroCommands } from "../../src/commands/macroCommands";
-import { createSerialMacroTargetResolver } from "../../src/commands/serialMacroTarget";
+import { registerMacroCommands, SERIAL_SEND_BOX_MACRO_SOURCE } from "../../src/commands/macroCommands";
+import { createFocusedSendBoxMacroTarget, createSerialMacroTargetResolver } from "../../src/commands/serialMacroTarget";
+import type { SerialSendBinding } from "../../src/ui/serialSendPanel";
 
 async function flush(): Promise<void> { for (let i = 0; i < 16; i++) await Promise.resolve(); }
 const owners: Array<{ dispose(): void }> = [];
@@ -173,5 +174,113 @@ describe("serial adapter", () => {
     await pending;
     const prompted = invoke("runBinding", macroFor("runBinding", true)); await flush(); fixture.box!.value = "é"; fixture.box!.accept(); await prompted;
     expect(h.other.sendText).toHaveBeenCalledExactlyOnceWith(" \té\r\n\n", false); expect(h.transport.writePort).not.toHaveBeenCalled();
+  });
+});
+
+describe("macro shortcuts from a focused Serial Send Box", () => {
+  async function serialSession(name: string) {
+    let count = 0;
+    const transport: SerialTransport = {
+      openPort: vi.fn(async () => `${name}-physical-${++count}`), writePort: vi.fn(async () => {}), closePort: vi.fn(async () => {}),
+      onDidReceiveData: () => () => {}, onDidReceiveError: () => () => {}, onDidDisconnect: () => () => {}
+    };
+    const profile = { id: name, name, path: `/dev/${name}`, baudRate: 115200, dataBits: 8 as const, stopBits: 1 as const, parity: "none" as const, rtscts: false };
+    const pty = new SerialPty(transport, profile, { onSessionOpened() {}, onSessionClosed() {} }, { log() {}, close() {} });
+    owners.push(pty);
+    const terminal = { name, sendText: vi.fn(), exitStatus: undefined } as unknown as VSCode.Terminal;
+    return { pty, transport, terminal };
+  }
+
+  async function sendBoxHarness() {
+    const a = await serialSession("A");
+    const b = await serialSession("B");
+    Object.assign(vscode.window, { activeTerminal: b.terminal, terminals: [a.terminal, b.terminal] });
+    const registry = new TerminalRegistry({ onDidChange: () => () => {}, getSnapshot: () => ({ activeSessions: [], activeLocalShellSessions: [], activeLocalServerSessions: [], activeSerialSessions: [] }) });
+    owners.push(registry);
+    registry.register(a.terminal, a.pty);
+    registry.register(b.terminal, b.pty);
+    a.pty.open(); b.pty.open();
+    await flush();
+    // Dedicated input on A, as a send box would set it.
+    a.pty.setDedicatedInputEnabled(true);
+    const panel = { focused: { sessionId: "A", profileName: "A", terminal: a.terminal, input: a.pty } as SerialSendBinding | undefined,
+      getFocusedBinding() { return this.focused; } };
+    const resolver = createSerialMacroTargetResolver(registry);
+    registerMacroCommands(undefined, resolver, createFocusedSendBoxMacroTarget(panel, registry, resolver));
+    vi.mocked(vscode.commands.executeCommand).mockClear();
+    vi.mocked(vscode.commands.executeCommand).mockResolvedValue(undefined);
+    return { a, b, registry, panel };
+  }
+  const sendBox = { source: SERIAL_SEND_BOX_MACRO_SOURCE };
+  const plain: TerminalMacro = { id: "plain", name: "Plain", text: "show run\r", keybinding: "alt+1" };
+  const prompted: TerminalMacro = { id: "prompted", name: "Prompted", text: "ping $host\r", keybinding: "alt+1", variables: [{ name: "host" }] };
+  const run = (command: string, args: unknown) => Promise.resolve(fixture.commands.get(command)!(args));
+  function expectNothingSent(h: Awaited<ReturnType<typeof sendBoxHarness>>) {
+    expect(h.a.transport.writePort).not.toHaveBeenCalled(); expect(h.b.transport.writePort).not.toHaveBeenCalled();
+    expect(h.a.terminal.sendText).not.toHaveBeenCalled(); expect(h.b.terminal.sendText).not.toHaveBeenCalled();
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("workbench.action.terminal.sendSequence", expect.anything());
+  }
+
+  it.each([false, true])("runBinding targets the focused box's session, not activeTerminal (prompted=%s)", async (withVariables) => {
+    const h = await sendBoxHarness();
+    fixture.macros = [withVariables ? prompted : plain];
+    const pending = run("nexus.macro.runBinding", { binding: "alt+1", ...sendBox });
+    await flush();
+    if (withVariables) {
+      // The prompt takes focus from the box; the pinned session must not change.
+      h.panel.focused = undefined;
+      fixture.box!.value = "10.0.0.1"; fixture.box!.accept();
+    }
+    await pending;
+    expect(h.a.transport.writePort).toHaveBeenCalledExactlyOnceWith("A-physical-1", Buffer.from(withVariables ? "ping 10.0.0.1\r" : "show run\r"));
+    expect(h.b.transport.writePort).not.toHaveBeenCalled(); expect(h.b.terminal.sendText).not.toHaveBeenCalled();
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("workbench.action.terminal.sendSequence", expect.anything());
+  });
+
+  it("the Alt+S picker pins the focused box before the pick resolves", async () => {
+    const h = await sendBoxHarness();
+    fixture.macros = [plain];
+    let choose!: (value: { index: number }) => void;
+    vi.mocked(vscode.window.showQuickPick).mockImplementationOnce(() => new Promise((resolve) => { choose = resolve as typeof choose; }) as never);
+    const pending = run("nexus.macro.run", sendBox);
+    await flush();
+    h.panel.focused = { sessionId: "B", profileName: "B", terminal: h.b.terminal, input: h.b.pty };
+    choose({ index: 0 });
+    await pending;
+    expect(h.a.transport.writePort).toHaveBeenCalledExactlyOnceWith("A-physical-1", Buffer.from("show run\r"));
+    expect(h.b.transport.writePort).not.toHaveBeenCalled();
+  });
+
+  it.each(["unfocused", "unregistered", "replaced", "closed"] as const)("refuses with no fallback when the box's session is %s", async (change) => {
+    const h = await sendBoxHarness();
+    fixture.macros = [plain];
+    if (change === "unfocused") h.panel.focused = undefined;
+    if (change === "unregistered") h.registry.unregister(h.a.terminal);
+    if (change === "replaced") { h.registry.unregister(h.a.terminal); h.registry.register(h.a.terminal, h.b.pty); }
+    if (change === "closed") h.a.pty.dispose();
+    await run("nexus.macro.runBinding", { binding: "alt+1", ...sendBox });
+    await run("nexus.macro.run", sendBox);
+    expectNothingSent(h);
+    // A closed but still-registered owner resolves to a target that refuses at delivery, like the terminal path.
+    if (change !== "closed") expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
+    expect(vi.mocked(vscode.window.setStatusBarMessage).mock.calls.map(([m]) => m).join("\n")).toMatch(/nothing was sent/i);
+  });
+
+  it("a script lock on the box's session still blocks the shortcut", async () => {
+    const h = await sendBoxHarness();
+    fixture.macros = [plain];
+    h.a.pty.setInputBlocked(true);
+    await run("nexus.macro.runBinding", { binding: "alt+1", ...sendBox });
+    expectNothingSent(h);
+  });
+
+  it.each([undefined, {}, { source: "serialsendbox" }, { source: ["serialSendBox"] }])("invocations without the send-box source keep resolving activeTerminal: %j", async (extra) => {
+    const h = await sendBoxHarness();
+    fixture.macros = [plain];
+    await run("nexus.macro.runBinding", { binding: "alt+1", ...(extra ?? {}) });
+    await run("nexus.macro.run", extra);
+    await run("nexus.macro.runItem", { macro: plain });
+    expect(h.b.transport.writePort).toHaveBeenCalledTimes(3);
+    expect(h.a.transport.writePort).not.toHaveBeenCalled();
   });
 });

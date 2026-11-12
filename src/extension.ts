@@ -6,7 +6,7 @@ import { registerCwdSyncCommands, FOLLOW_TERMINAL_STATE_KEY } from "./commands/c
 import { registerScriptCommands } from "./commands/scriptCommands";
 import { closeSerialProfileTerminals, registerSerialCommands } from "./commands/serialCommands";
 import { SerialSendCommands } from "./commands/serialSendCommands";
-import { SerialSendPanel } from "./ui/serialSendPanel";
+import { SerialSendPanel, createSerialSendPreferences } from "./ui/serialSendPanel";
 import { closeLocalShellProfileTerminals, registerLocalShellCommands } from "./commands/localShellCommands";
 import { registerNetworkServerCommands, stopRunningNetworkServices } from "./commands/networkServerCommands";
 import { registerNetworkServerProfileCommands } from "./commands/networkServerProfileCommands";
@@ -86,8 +86,8 @@ import { resolveScriptSessionForTerminal, resolveSessionForTerminal } from "./ut
 import { registerSettingsCommands } from "./commands/settingsCommands";
 import { SettingsPanel } from "./ui/settingsPanel";
 import { registerConfigCommands } from "./commands/configCommands";
-import { registerMacroCommands, updateMacroContext } from "./commands/macroCommands";
-import { createSerialMacroTargetResolver } from "./commands/serialMacroTarget";
+import { getBoundMacroShortcuts, onDidChangeMacroShortcuts, registerMacroCommands, updateMacroContext } from "./commands/macroCommands";
+import { createFocusedSendBoxMacroTarget, createSerialMacroTargetResolver } from "./commands/serialMacroTarget";
 import { registerProfileCommands } from "./commands/profileCommands";
 import { registerAuthProfileCommands } from "./commands/authProfileCommands";
 import { registerDeviceTemplateCommands } from "./commands/deviceTemplateCommands";
@@ -1509,11 +1509,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const serverMacroDisposables = registerServerMacroCommands(ctx);
   const bmcDisposables = registerBmcCommands(ctx);
   const tunnelDisposables = registerTunnelCommands(ctx);
+  const serialSendPanel = new SerialSendPanel({
+    preferences: createSerialSendPreferences(context.globalState),
+    macroShortcuts: { getBoundShortcuts: getBoundMacroShortcuts, onDidChange: onDidChangeMacroShortcuts }
+  });
   const serialSendCommands = new SerialSendCommands({
     core,
     serialTerminals,
     terminalRegistry,
-    panel: new SerialSendPanel(),
+    panel: serialSendPanel,
     onDedicatedSessionsChanged: sessionIds => nexusTreeProvider.setDedicatedSerialSessions(sessionIds)
   });
   ctx.serialSendCommands = serialSendCommands;
@@ -1654,9 +1658,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   //    it — but dispatching a command that is already there needs no argument
   //    about who awaits whom.
   void maybeOfferSshConfigImport(context, core);
+  const serialMacroTargetResolver = createSerialMacroTargetResolver(terminalRegistry);
   const macroDisposables = registerMacroCommands(() => {
     return buildMacroProfileInputsFromSnapshot(core.getSnapshot());
-  }, createSerialMacroTargetResolver(terminalRegistry));
+  }, serialMacroTargetResolver, createFocusedSendBoxMacroTarget(serialSendPanel, terminalRegistry, serialMacroTargetResolver));
   const disableTriggerCmd = vscode.commands.registerCommand("nexus.macro.disableTrigger", (item?: MacroTreeItem) => {
     if (item?.macro.triggerPattern) {
       macroAutoTrigger.setDisabled(item.macro, true);

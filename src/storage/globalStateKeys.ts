@@ -21,7 +21,9 @@ export const RESET_CLEARED_GLOBAL_STATE_KEYS: readonly string[] = [
   "nexus.macros.ui.collapsedFolders",
   "nexus.ui.followTerminalDirectory",
   "nexus.files.followTerminalNudgeShown",
-  "nexus.macros.keybindingBlockerHintDismissed"
+  "nexus.macros.keybindingBlockerHintDismissed",
+  // A remembered UI choice. Open send boxes re-read it on every use, so a live window follows the reset.
+  "nexus.serialSendBox.keepText"
 ];
 
 /** Cleared by the reset through the store that owns them (`NexusCore` collections, the macro store). */

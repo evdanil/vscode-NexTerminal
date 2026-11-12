@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -18,7 +19,7 @@ const packageJson = JSON.parse(readDoc("package.json")) as {
     menus: Record<string, Array<{ command: string; when?: string; group?: string }>>;
     configuration?: { properties?: Record<string, any> };
     viewsWelcome?: Array<{ view: string; contents: string }>;
-    keybindings?: Array<{ command: string; key: string; mac?: string; when?: string }>;
+    keybindings?: Array<{ command: string; key: string; mac?: string; when?: string; args?: Record<string, unknown> }>;
   };
 };
 const functionalDocs = readDoc("docs/functional-documentation.md");
@@ -2458,6 +2459,62 @@ describe("SSH agent settings (nexus.ssh.agent, nexus.ssh.agentPath)", () => {
 
 
 describe("serial send box contributions", () => {
+  describe("macro shortcuts from a focused send box", () => {
+    const SEND_BOX_FOCUS = "nexus.serialSendBoxFocused && activeWebviewPanelId == 'nexus.serialSend'";
+    const keybindings = packageJson.contributes.keybindings ?? [];
+    const macroEntries = keybindings.filter((item) => item.command === "nexus.macro.run" || item.command === "nexus.macro.runBinding");
+    const terminalEntries = macroEntries.filter((item) => item.when?.startsWith("terminalFocus"));
+    const twins = macroEntries.filter((item) => item.args?.source === "serialSendBox");
+    const gate = (item: { when?: string }, prefix: string) => (item.when ?? "").slice(prefix.length);
+
+    it("gives every terminal-focused macro keybinding a send-box twin with the same key and per-combo gate", () => {
+      expect(terminalEntries).toHaveLength(109);
+      expect(twins).toHaveLength(109);
+      expect(macroEntries).toHaveLength(218);
+      for (const entry of terminalEntries) {
+        // The terminal entries themselves are untouched: same clause, no source.
+        expect(entry.args?.source).toBeUndefined();
+        expect(entry.when).toBe(entry.command === "nexus.macro.run" ? "terminalFocus" : `terminalFocus && ${String(entry.when).split(" && ")[1]}`);
+        if (entry.command === "nexus.macro.runBinding") expect(gate(entry, "terminalFocus")).toMatch(/^ && nexus\.macro\.(alt|altShift|ctrlShift)\.[a-z0-9]$/);
+        const twin = twins.filter((item) => item.command === entry.command && item.key === entry.key && item.args?.binding === entry.args?.binding);
+        expect(twin, `${entry.command} ${entry.key}`).toHaveLength(1);
+        expect(twin[0].when).toBe(`${SEND_BOX_FOCUS}${gate(entry, "terminalFocus")}`);
+        expect(twin[0].mac).toBe(entry.mac);
+        expect(Object.keys(twin[0].args ?? {}).sort()).toEqual([...Object.keys(entry.args ?? {}), "source"].sort());
+      }
+      for (const twin of twins) expect(twin.when).not.toContain("terminalFocus");
+    });
+
+    it("keeps the per-binding twin after the picker twin, as in the terminal, so a macro on Alt+S still wins", () => {
+      const index = (command: string, source?: string) => keybindings.findIndex((item) => item.command === command && item.key === "alt+s" && item.args?.source === source);
+      expect(index("nexus.macro.run", "serialSendBox")).toBeGreaterThan(index("nexus.macro.run"));
+      expect(index("nexus.macro.runBinding", "serialSendBox")).toBeGreaterThan(index("nexus.macro.run", "serialSendBox"));
+      expect(index("nexus.macro.runBinding")).toBeGreaterThan(index("nexus.macro.run"));
+    });
+
+    it("matches scripts/generateKeybindings.mjs exactly", () => {
+      const generated = JSON.parse(execFileSync(process.execPath, [path.join(repoRoot, "scripts", "generateKeybindings.mjs")], { encoding: "utf8" }));
+      expect(keybindings.filter((item) => item.command === "nexus.macro.runBinding")).toEqual(generated);
+    });
+
+    it("documents where send-box macros go and drops the blanket 'continue to work' claim", () => {
+      const prose = [...userDocs.map(([, text]) => text), functionalDocs].join("\n");
+      expect(prose).not.toContain("Nexus macros and scripts continue to work");
+      const serial = userDoc("docs/serial.md");
+      expect(serial).toContain("send to that send box's own session even when another terminal is active");
+      expect(serial).toContain("**The Macros view and Nexus: Run Macro** send to the active terminal");
+      expect(serial).toContain("**Auto-trigger macros** keep responding");
+      expect(serial).toContain("A script's input lock blocks the send box and every manual macro, including shortcuts.");
+      expect(serial).toContain("**Keep text after sending**");
+      expect(serial).toContain("Choose LF or CRLF only when the device expects it.");
+      expect(userDoc("docs/macros.md")).toContain("[Serial Send Box](serial.md#dedicated-send-box) has keyboard focus");
+    });
+
+    it("uses the send-box source only on macro twins", () => {
+      expect(keybindings.filter((item) => item.args?.source !== undefined).every((item) => twins.includes(item))).toBe(true);
+    });
+  });
+
   it.each([["nexus.serial.openSendBox", "Open Serial Send Box"], ["nexus.serial.useDirectInput", "Use Direct Serial Terminal Input"]])("exposes %s across serial profiles, sessions and palette", (command, title) => {
     expect(packageJson.contributes.commands.find(item => item.command === command)).toMatchObject({ title, category: "Nexus" });
     expect(packageJson.contributes.menus.commandPalette.find(item => item.command === command)?.when).toBe("true");

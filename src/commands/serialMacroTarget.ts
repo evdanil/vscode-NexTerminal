@@ -1,7 +1,8 @@
 import * as vscode from "vscode";
 import type { TerminalRegistry } from "../services/terminal/terminalRegistry";
 import { isSerialUserInput } from "../services/serial/serialUserInput";
-import type { SerialMacroTargetResolver } from "./macroVariablePrompt";
+import type { FocusedSendBoxMacroTarget, SerialMacroTargetResolver } from "./macroVariablePrompt";
+import type { SerialSendBinding } from "../ui/serialSendPanel";
 
 /** The registry retains serial ownership after disconnect, until the native tab closes. */
 export function createSerialMacroTargetResolver(registry: TerminalRegistry): SerialMacroTargetResolver {
@@ -35,5 +36,24 @@ export function createSerialMacroTargetResolver(registry: TerminalRegistry): Ser
         }
       }
     };
+  };
+}
+
+/**
+ * Resolves a macro shortcut pressed inside a Serial Send Box to THAT box's
+ * session, never to `activeTerminal`. The box must still own its terminal's
+ * registered PTY: a closed or replaced session refuses rather than letting the
+ * registry hand back whatever now occupies the terminal.
+ */
+export function createFocusedSendBoxMacroTarget(
+  panel: { getFocusedBinding(): SerialSendBinding | undefined },
+  registry: Pick<TerminalRegistry, "get">,
+  resolve: SerialMacroTargetResolver
+): FocusedSendBoxMacroTarget {
+  return () => {
+    const binding = panel.getFocusedBinding();
+    const pty: unknown = registry.get(binding?.terminal)?.pty;
+    if (!binding || pty !== binding.input) return undefined;
+    return resolve(binding.terminal);
   };
 }
