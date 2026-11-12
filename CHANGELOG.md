@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.8.318] — 2026-11-12
+
+### Added
+
+- **Keep text after sending** in the Serial Send Box leaves the draft in place after a successful send, so a command can be repeated. The choice is remembered for all send boxes and is off by default.
+
+### Changed
+
+- **The Serial Send Box explains its line endings.** CR matches pressing Enter and is what most device consoles run commands on; choose LF or CRLF only when the device expects it, since a console that runs commands on CR may only echo LF-terminated text, or show an extra blank line with CRLF. The bytes sent are unchanged.
+
+### Fixed
+
+- **Macro shortcuts work while the Serial Send Box has keyboard focus.** `Alt+S` and assigned macro shortcuts previously did nothing there, although the serial guide said macros continued to work. They now send to that send box's own serial session, even when another terminal is active. On macOS, the Option character is no longer typed into the draft for a bound shortcut whose key is in its US-layout position. If that session is no longer available, nothing is sent. The Macros view and Nexus: Run Macro still send to the active terminal.
+
 ## [2.8.317] — 2026-11-10
 
 ### Added

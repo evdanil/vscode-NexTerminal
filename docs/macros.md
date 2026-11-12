@@ -212,7 +212,9 @@ easy to miss:
   example**, above).
 
 Both apply to a macro you run from the Macros view, the `Alt+S` picker or a
-keyboard shortcut. A macro that uses a `${profile.…}` token, or whose **Run in**
+keyboard shortcut. The one exception is a shortcut or `Alt+S` pressed inside a
+Serial Send Box: its target is that send box's session, captured when you press
+the key (see [Keybindings](#keybindings)). A macro that uses a `${profile.…}` token, or whose **Run in**
 is not *Session terminal*, is never sent from there, whichever way you started
 it: Nexus offers to hand it to **Run Macro on Server…** instead, because only
 that command knows which server the macro is aimed at.
@@ -651,6 +653,11 @@ another macro, Nexus moves the shortcut to the new macro.
 
 Macros without shortcuts are still available from the macro picker with
 `Alt+S`.
+
+Shortcuts and `Alt+S` work while a terminal has keyboard focus, and also while
+a [Serial Send Box](serial.md#dedicated-send-box) has keyboard focus. From a
+send box, the macro goes to that send box's own serial session rather than the
+active terminal; if that session is no longer available, nothing is sent.
 
 If VS Code or the integrated terminal intercepts macro shortcuts, run
 **Nexus: Fix Macro Keybindings** from the Command Palette.

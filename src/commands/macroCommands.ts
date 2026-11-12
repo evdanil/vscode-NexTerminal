@@ -44,7 +44,14 @@ import {
   INVALID_FOLDER_PATH_MESSAGE,
   MAX_FOLDER_PATH_LENGTH
 } from "../utils/folderPaths";
-import { runMacro, type SerialMacroTargetResolver } from "./macroVariablePrompt";
+import {
+  runMacro,
+  runMacroWithTarget,
+  type FocusedSendBoxCapture,
+  type FocusedSendBoxMacroTarget,
+  type MacroSendTarget,
+  type SerialMacroTargetResolver
+} from "./macroVariablePrompt";
 // NOT imported from "../ui/macroTreeProvider": that module's `class MacroTreeItem
 // extends vscode.TreeItem` executes at load time, and a plain value import from
 // it would force this module (and every test that imports it) to load `vscode`
@@ -235,6 +242,44 @@ export function macroWillPrompt(macro: TerminalMacro): boolean {
   return scanPlaceholders(macro.text, declaredNames).used.length > 0;
 }
 
+/**
+ * Marks a keybinding invocation made while a Serial Send Box webview had keyboard
+ * focus. Only the send-box twins of the macro keybindings in package.json pass it
+ * (see scripts/generateKeybindings.mjs); sidebar clicks, the Command Palette and
+ * terminal-focused shortcuts never do, so their routing is untouched.
+ */
+export const SERIAL_SEND_BOX_MACRO_SOURCE = "serialSendBox";
+
+function isSendBoxInvocation(arg: unknown): boolean {
+  return !!arg && typeof arg === "object" && !Array.isArray(arg) &&
+    (arg as { source?: unknown }).source === SERIAL_SEND_BOX_MACRO_SOURCE;
+}
+
+/**
+ * What an invocation captured, synchronously, at invocation (§8.1). The send
+ * box and `activeTerminal` can name different serial sessions, and the Alt+S
+ * picker or a variable prompt takes focus away from the box, so nothing may
+ * re-derive the target later.
+ *
+ * The unavailable states are captured rather than refused at once: a
+ * server-profile or non-session macro is redirected to Run Macro on Server…
+ * exactly as from a terminal, and only a macro that would actually be sent to a
+ * session is refused, with the message for its state. None of them falls back
+ * to `activeTerminal`, which would send the macro to a session the user was not
+ * typing into.
+ */
+type SendBoxCapture = { readonly kind: "notSendBox" } | FocusedSendBoxCapture;
+
+const SEND_BOX_REFUSALS = {
+  noFocusedBox: "Click into the serial send box, then press the shortcut again. Nothing was sent.",
+  sessionGone: "The serial send box's session is no longer available. Nothing was sent."
+} as const;
+
+function captureSendBox(arg: unknown, capture: FocusedSendBoxMacroTarget | undefined): SendBoxCapture {
+  if (!isSendBoxInvocation(arg)) return { kind: "notSendBox" };
+  return capture ? capture() : { kind: "noFocusedBox" };
+}
+
 async function sendMacroText(text: string, resolveSerialTarget?: SerialMacroTargetResolver): Promise<void> {
   const active = vscode.window.activeTerminal;
   const serialTarget = active && resolveSerialTarget?.(active);
@@ -251,7 +296,11 @@ async function sendMacroText(text: string, resolveSerialTarget?: SerialMacroTarg
  * paths override delivery only for serial PTYs; ordinary terminal delivery
  * retains its existing sendText/sendSequence behavior.
  */
-async function runOrSendMacro(macro: TerminalMacro, resolveSerialTarget?: SerialMacroTargetResolver): Promise<void> {
+async function runOrSendMacro(
+  macro: TerminalMacro,
+  resolveSerialTarget?: SerialMacroTargetResolver,
+  sendBox: SendBoxCapture = { kind: "notSendBox" }
+): Promise<void> {
   // A macro that names a server profile (`${profile.…}`) or runs somewhere
   // other than a session cannot be resolved from these entry points: they know
   // which macro the user picked, not which SERVER it is aimed at. Sending
@@ -289,6 +338,17 @@ async function runOrSendMacro(macro: TerminalMacro, resolveSerialTarget?: Serial
   // common case): `runMacro`'s re-entrancy guard keys id-less macros on
   // name+text, and a needless copy is a needless difference.
   const toRun = text === macro.text ? macro : { ...macro, text };
+  if (sendBox.kind !== "notSendBox") {
+    // Send-box shortcut: the caller captured the session at invocation. Delivery
+    // is the guarded serial path (epoch, script lock); macro bytes are never converted.
+    if (sendBox.kind !== "target") {
+      vscode.window.setStatusBarMessage(SEND_BOX_REFUSALS[sendBox.kind], 4000);
+      return;
+    }
+    if (hasMacroVariables(macro)) await runMacroWithTarget(toRun, sendBox.target);
+    else await sendBox.target.send(text);
+    return;
+  }
   if (hasMacroVariables(macro)) {
     await (resolveSerialTarget ? runMacro(toRun, resolveSerialTarget) : runMacro(toRun));
   } else {
@@ -348,16 +408,43 @@ async function addMacroFromTemplate(): Promise<void> {
 /** Track which context keys are currently set to true, so we only update the delta. */
 const activeContextKeys = new Set<string>();
 
-function updateBindingContextKeys(): void {
-  const macros = getMacros();
-  const assignedBindings = new Set(
+function assignedBindings(macros: readonly TerminalMacro[]): Set<string> {
+  return new Set(
     macros.map((macro) => getAssignedBinding(macro)).filter((binding): binding is string => binding !== undefined)
   );
+}
+
+const shortcutListeners = new Set<() => void>();
+
+/**
+ * The macro key combos VS Code currently dispatches: every assigned binding that
+ * has a contributed keybinding (the same assignments `nexus.macro.<combo>` context
+ * keys are derived from), plus `alt+s`, which always opens the macro picker. A
+ * Serial Send Box uses this list only to suppress the character such a combo
+ * would also type into its draft; it carries combo identifiers, never macro
+ * names or text.
+ */
+export function getBoundMacroShortcuts(): string[] {
+  const bound = [...assignedBindings(getMacros())].filter((binding) => isValidBinding(binding));
+  return [...new Set(["alt+s", ...bound])].sort();
+}
+
+/** Fires after the `nexus.macro.<combo>` context keys change. */
+export function onDidChangeMacroShortcuts(listener: () => void): vscode.Disposable {
+  shortcutListeners.add(listener);
+  return { dispose: () => { shortcutListeners.delete(listener); } };
+}
+
+function updateBindingContextKeys(): void {
+  const macros = getMacros();
+  const assigned = assignedBindings(macros);
+  let changed = false;
 
   // Set true for newly assigned bindings
-  for (const binding of assignedBindings) {
+  for (const binding of assigned) {
     const key = bindingToContextKey(binding);
     if (!activeContextKeys.has(key)) {
+      changed = true;
       activeContextKeys.add(key);
       void vscode.commands.executeCommand("setContext", key, true);
     }
@@ -365,13 +452,17 @@ function updateBindingContextKeys(): void {
 
   // Set false for previously active bindings that are no longer assigned
   const newActiveKeys = new Set(
-    [...assignedBindings].map((b) => bindingToContextKey(b))
+    [...assigned].map((b) => bindingToContextKey(b))
   );
   for (const key of activeContextKeys) {
     if (!newActiveKeys.has(key)) {
+      changed = true;
       activeContextKeys.delete(key);
       void vscode.commands.executeCommand("setContext", key, false);
     }
+  }
+  if (changed) {
+    for (const listener of [...shortcutListeners]) listener();
   }
 }
 
@@ -769,7 +860,11 @@ function resolveOrExplain(macros: TerminalMacro[], ref: MacroRef): number {
   return target.kind === "resolved" ? target.index : -1;
 }
 
-export function registerMacroCommands(profileProvider?: () => MacroProfileOptionInput[], resolveSerialTarget?: SerialMacroTargetResolver): vscode.Disposable[] {
+export function registerMacroCommands(
+  profileProvider?: () => MacroProfileOptionInput[],
+  resolveSerialTarget?: SerialMacroTargetResolver,
+  captureSendBoxTarget?: FocusedSendBoxMacroTarget
+): vscode.Disposable[] {
   if (profileProvider) {
     MacroEditorPanel.setProfileProvider(profileProvider);
   }
@@ -895,7 +990,10 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       }
     }),
 
-    vscode.commands.registerCommand("nexus.macro.run", async () => {
+    vscode.commands.registerCommand("nexus.macro.run", async (arg?: unknown) => {
+      // Before the picker opens: it takes focus from the send box, and the
+      // session the user was typing into must not change while they choose.
+      const sendBox = captureSendBox(arg, captureSendBoxTarget);
       const macros = getMacros();
       if (macros.length === 0) {
         const action = await vscode.window.showInformationMessage(
@@ -932,7 +1030,7 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       if (!pick) {
         return;
       }
-      await runOrSendMacro(macros[pick.index], resolveSerialTarget);
+      await runOrSendMacro(macros[pick.index], resolveSerialTarget, sendBox);
     }),
 
     vscode.commands.registerCommand("nexus.macro.runBinding", async (arg?: unknown) => {
@@ -941,10 +1039,11 @@ export function registerMacroCommands(profileProvider?: () => MacroProfileOption
       if (!binding) {
         return;
       }
+      const sendBox = captureSendBox(arg, captureSendBoxTarget);
       const macros = getMacros();
       const macro = macros.find((m) => getAssignedBinding(m) === binding);
       if (macro) {
-        await runOrSendMacro(macro, resolveSerialTarget);
+        await runOrSendMacro(macro, resolveSerialTarget, sendBox);
       }
     }),
 

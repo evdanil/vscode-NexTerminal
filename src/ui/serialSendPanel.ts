@@ -2,12 +2,56 @@ import * as vscode from "vscode";
 import { prepareSerialText, type SerialInputState, type SerialLineEnding, type SerialUserInput } from "../services/serial/serialUserInput";
 import { createWebviewNonce } from "./shared/webviewNonce";
 import { renderSerialSendHtml } from "./serialSendHtml";
+import { SERIAL_SEND_FOCUS_CONTEXT, SERIAL_SEND_KEEP_TEXT_KEY, SERIAL_SEND_VIEW_TYPE } from "./serialSendConstants";
 
 export interface SerialSendBinding {
   readonly sessionId: string;
   readonly profileName: string;
   readonly terminal: vscode.Terminal;
   readonly input: SerialUserInput;
+}
+
+/**
+ * The "Keep text after sending" choice, remembered per user. It is one scalar UI
+ * preference in `globalState`, not a `ConfigRepository` collection: windows that
+ * toggle it concurrently resolve last-writer-wins (see the doc comment atop
+ * storage/vscodeConfigRepository.ts), which is acceptable because the only
+ * possible loss is a checkbox default that the user can see and change.
+ */
+export interface SerialSendPreferences {
+  getKeepText(): boolean;
+  setKeepText(keepText: boolean): void;
+}
+
+/** Combo identifiers ("alt+a") that currently run a macro or the macro picker. */
+export interface SerialSendMacroShortcuts {
+  getBoundShortcuts(): readonly string[];
+  onDidChange(listener: () => void): vscode.Disposable;
+}
+
+export interface SerialSendPanelOptions {
+  readonly preferences?: SerialSendPreferences;
+  readonly macroShortcuts?: SerialSendMacroShortcuts;
+  /** Defaults to the `setContext` command; injectable for tests. */
+  readonly setContext?: (key: string, value: boolean) => void;
+}
+
+
+export { SERIAL_SEND_FOCUS_CONTEXT, SERIAL_SEND_KEEP_TEXT_KEY, SERIAL_SEND_VIEW_TYPE };
+
+export function createSerialSendPreferences(memento: Pick<vscode.Memento, "get" | "update">): SerialSendPreferences {
+  return {
+    getKeepText: () => memento.get<unknown>(SERIAL_SEND_KEEP_TEXT_KEY) === true,
+    setKeepText: (keepText) => {
+      // A failed write only loses the remembered default; never surface it as a send error.
+      Promise.resolve(memento.update(SERIAL_SEND_KEEP_TEXT_KEY, keepText)).catch(() => undefined);
+    }
+  };
+}
+
+function inMemoryPreferences(): SerialSendPreferences {
+  let keepText = false;
+  return { getKeepText: () => keepText, setKeepText: (value) => { keepText = value; } };
 }
 
 interface OpenComposer {
@@ -31,14 +75,47 @@ const hasOnlyKeys = (value: Record<string, unknown>, keys: readonly string[]): b
 export class SerialSendPanel implements vscode.Disposable {
   private readonly panels = new Map<string, OpenComposer>();
   private readonly terminalListener: vscode.Disposable;
+  private readonly shortcutListener: vscode.Disposable | undefined;
+  private readonly setContext: (key: string, value: boolean) => void;
+  private readonly preferences: SerialSendPreferences;
+  private focused: OpenComposer | undefined;
+  private focusContext = false;
   private disposed = false;
 
-  public constructor() {
+  public constructor(private readonly options: SerialSendPanelOptions = {}) {
+    this.setContext = options.setContext ?? ((key, value) => { void vscode.commands.executeCommand("setContext", key, value); });
+    // Never cached here: each push reads the store, so refreshPreferences() after
+    // Delete All Data shows open boxes the cleared value.
+    this.preferences = options.preferences ?? inMemoryPreferences();
     this.terminalListener = vscode.window.onDidCloseTerminal((terminal) => {
       for (const entry of this.panels.values()) {
         if (entry.binding.terminal === terminal) this.close(entry);
       }
     });
+    this.shortcutListener = options.macroShortcuts?.onDidChange(() => {
+      const shortcuts = this.boundShortcuts();
+      for (const entry of this.panels.values()) this.pushShortcuts(entry, shortcuts);
+    });
+  }
+
+  /**
+   * Re-posts the stored keep-text choice to every open box. A retained webview
+   * sends `ready` only once, so a store change made elsewhere (Delete All Data)
+   * reaches open boxes only through this.
+   */
+  public refreshPreferences(): void {
+    for (const entry of this.panels.values()) this.pushPreferences(entry);
+  }
+
+  /** The binding of the send box that has keyboard focus, if any. */
+  public getFocusedBinding(): SerialSendBinding | undefined {
+    const entry = this.focused;
+    // `panel.active` as well: view-state changes are ordered main-thread events,
+    // but focus reports come from separate webviews. Switching from box A to box B
+    // makes A inactive before (or with) B becoming active, while A's blur and B's
+    // focus may still be in flight; without this, a shortcut pressed in B in that
+    // gap would go to A's session.
+    return entry && !entry.disposed && entry.panel.active && this.panels.get(entry.binding.sessionId) === entry ? entry.binding : undefined;
   }
 
   public openOrReveal(binding: SerialSendBinding): void {
@@ -54,7 +131,7 @@ export class SerialSendPanel implements vscode.Disposable {
     }
     const previous = binding.input.getInputState();
     if (previous.status === "closed") throw new Error("Serial session is closed.");
-    const panel = vscode.window.createWebviewPanel("nexus.serialSend", `Serial Send: ${binding.profileName}`, vscode.ViewColumn.Beside, {
+    const panel = vscode.window.createWebviewPanel(SERIAL_SEND_VIEW_TYPE, `Serial Send: ${binding.profileName}`, vscode.ViewColumn.Beside, {
       enableScripts: true,
       retainContextWhenHidden: true,
       localResourceRoots: []
@@ -64,6 +141,13 @@ export class SerialSendPanel implements vscode.Disposable {
     try {
       entry.listeners.push(panel.onDidDispose(() => this.release(entry)));
       entry.listeners.push(panel.webview.onDidReceiveMessage((message: unknown) => this.receive(entry, message)));
+      // Another editor becoming active means focus has left this box, even if its blur report is late or lost.
+      entry.listeners.push(panel.onDidChangeViewState((event) => {
+        // Returning to a box resyncs it with the stored keep-text choice (another window may have changed it).
+        // The focus report may have arrived before the panel turned active.
+        if (event.webviewPanel.active) { this.pushPreferences(entry); this.updateFocusContext(); }
+        else this.setFocused(entry, false);
+      }));
       entry.listeners.push(binding.input.onDidChangeInputState((state) => {
         if (state.status === "closed") this.close(entry);
         else this.pushState(entry);
@@ -88,7 +172,28 @@ export class SerialSendPanel implements vscode.Disposable {
     if (this.disposed) return;
     this.disposed = true;
     this.terminalListener.dispose();
+    this.shortcutListener?.dispose();
     for (const entry of [...this.panels.values()]) this.close(entry);
+    this.updateFocusContext();
+  }
+
+  /**
+   * Focus belongs to one entry at a time. A blur clears only the entry that
+   * reported it: moving between two send boxes delivers A's blur and B's focus
+   * from separate webviews in no guaranteed order, and A's late blur must not
+   * clear B.
+   */
+  private setFocused(entry: OpenComposer, focused: boolean): void {
+    if (focused && !entry.disposed) this.focused = entry;
+    else if (this.focused === entry) this.focused = undefined;
+    this.updateFocusContext();
+  }
+
+  private updateFocusContext(): void {
+    const value = !this.disposed && this.getFocusedBinding() !== undefined;
+    if (value === this.focusContext) return;
+    this.focusContext = value;
+    this.setContext(SERIAL_SEND_FOCUS_CONTEXT, value);
   }
 
   private close(entry: OpenComposer, restoreMode = false): void {
@@ -102,6 +207,7 @@ export class SerialSendPanel implements vscode.Disposable {
     entry.disposed = true;
     entry.pendingRequestId = undefined;
     this.panels.delete(entry.binding.sessionId);
+    this.setFocused(entry, false);
     for (const listener of entry.listeners) listener.dispose();
     entry.listeners.length = 0;
     if (entry.ownsGate) {
@@ -113,6 +219,21 @@ export class SerialSendPanel implements vscode.Disposable {
   private pushState(entry: OpenComposer): void {
     if (entry.disposed) return;
     void entry.panel.webview.postMessage({ type: "state", profileName: entry.binding.profileName, ...entry.binding.input.getInputState() });
+  }
+
+  private pushPreferences(entry: OpenComposer): void {
+    if (entry.disposed) return;
+    void entry.panel.webview.postMessage({ type: "preferences", keepText: this.preferences.getKeepText() === true });
+  }
+
+  /** getBoundMacroShortcuts() already validates against the binding grammar; the page re-validates at its trust boundary. */
+  private boundShortcuts(): string[] {
+    return [...(this.options.macroShortcuts?.getBoundShortcuts() ?? [])];
+  }
+
+  private pushShortcuts(entry: OpenComposer, shortcuts = this.boundShortcuts()): void {
+    if (entry.disposed) return;
+    void entry.panel.webview.postMessage({ type: "macroShortcuts", shortcuts });
   }
 
   private result(entry: OpenComposer, requestId: number, error?: string): void {
@@ -132,7 +253,25 @@ export class SerialSendPanel implements vscode.Disposable {
   private async receive(entry: OpenComposer, message: unknown): Promise<void> {
     if (entry.disposed || !message || typeof message !== "object" || Array.isArray(message)) return;
     const value = message as Record<string, unknown>;
-    if (value.type === "ready" && hasOnlyKeys(value, ["type"])) { this.pushState(entry); return; }
+    if (value.type === "ready" && hasOnlyKeys(value, ["type"])) {
+      this.pushState(entry);
+      this.pushPreferences(entry);
+      this.pushShortcuts(entry);
+      return;
+    }
+    if (value.type === "focusChanged" && hasOnlyKeys(value, ["type", "focused"]) && typeof value.focused === "boolean") {
+      this.setFocused(entry, value.focused);
+      return;
+    }
+    if (value.type === "setKeepText" && hasOnlyKeys(value, ["type", "keepText"]) && typeof value.keepText === "boolean") {
+      // No "unchanged" shortcut: the shared key may hold another window's value,
+      // so always persist this box's choice and resync the other open boxes to it.
+      // Never echo it to the sender: after a quick tick-untick, the echo of the
+      // tick could land after the untick and re-check the box.
+      this.preferences.setKeepText(value.keepText);
+      for (const other of this.panels.values()) if (other !== entry) this.pushPreferences(other);
+      return;
+    }
     if (value.type === "focusTerminal" && hasOnlyKeys(value, ["type"])) { entry.binding.terminal.show(false); return; }
     if (value.type === "useDirectInput" && hasOnlyKeys(value, ["type"])) {
       this.close(entry);

@@ -2336,7 +2336,7 @@ describe("Delete All Data (nexus.config.completeReset) covers Local Servers and 
     const cleared = [
       "nexus.colorSchemes", "nexus.activeColorScheme", "nexus.terminalFont", "nexus.localShell.autoTriggerWarningShown",
       "nexus.ui.collapsedFolders", "nexus.macros.ui.collapsedFolders", "nexus.ui.followTerminalDirectory",
-      "nexus.files.followTerminalNudgeShown", "nexus.macros.keybindingBlockerHintDismissed"
+      "nexus.files.followTerminalNudgeShown", "nexus.macros.keybindingBlockerHintDismissed", "nexus.serialSendBox.keepText"
     ];
     for (const key of cleared) {
       machine.ctx.state.set(key, key === "nexus.colorSchemes" ? [{ id: "moba-1" }] : "seeded");
@@ -2353,7 +2353,10 @@ describe("Delete All Data (nexus.config.completeReset) covers Local Servers and 
     const resumeViewState = vi.fn(() => {
       keysWhenViewStateResumed = !machine.ctx.state.has("nexus.ui.collapsedFolders") && machine.ctx.state.has("nexus.resetGeneration") ? 1 : 0;
     });
-    const runtime = { ...recordingRuntime(machine.core), resetTerminalAppearance, resetViewState, resumeViewState };
+    // A retained send box never asks again, so it must be told after the keep-text key is gone.
+    let keepTextWhenSendBoxesRefreshed: unknown = "not called";
+    const refreshSerialSendPreferences = vi.fn(() => { keepTextWhenSendBoxesRefreshed = machine.ctx.state.get("nexus.serialSendBox.keepText"); });
+    const runtime = { ...recordingRuntime(machine.core), resetTerminalAppearance, resetViewState, resumeViewState, refreshSerialSendPreferences };
 
     await runReset(machine, runtime);
 
@@ -2361,6 +2364,8 @@ describe("Delete All Data (nexus.config.completeReset) covers Local Servers and 
       expect(machine.ctx.state.has(key)).toBe(false);
     }
     expect(resetTerminalAppearance).toHaveBeenCalledTimes(1);
+    expect(refreshSerialSendPreferences).toHaveBeenCalledTimes(1);
+    expect(keepTextWhenSendBoxesRefreshed).toBeUndefined();
     // Before the stored keys are cleared, so no queued write can land after them.
     expect(resetViewState).toHaveBeenCalledTimes(1);
     expect(keysWhenViewStateReset).toBe(1);

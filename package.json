@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "SSH, serial and Telnet terminals in VS Code—no remote agent required. Manage jump hosts, SFTP, tunnels, macros, JavaScript automation and network inventory from one sidebar.",
-  "version": "2.8.317",
+  "version": "2.8.318",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -3018,6 +3018,14 @@
         "when": "terminalFocus"
       },
       {
+        "command": "nexus.macro.run",
+        "args": {
+          "source": "serialSendBox"
+        },
+        "key": "alt+s",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend'"
+      },
+      {
         "command": "nexus.macro.runBinding",
         "args": {
           "binding": "alt+a"
@@ -3880,6 +3888,978 @@
         },
         "key": "ctrl+shift+9",
         "when": "terminalFocus && nexus.macro.ctrlShift.9"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+a",
+          "source": "serialSendBox"
+        },
+        "key": "alt+a",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.a"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+b",
+          "source": "serialSendBox"
+        },
+        "key": "alt+b",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.b"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+c",
+          "source": "serialSendBox"
+        },
+        "key": "alt+c",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.c"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+d",
+          "source": "serialSendBox"
+        },
+        "key": "alt+d",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.d"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+e",
+          "source": "serialSendBox"
+        },
+        "key": "alt+e",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.e"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+f",
+          "source": "serialSendBox"
+        },
+        "key": "alt+f",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.f"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+g",
+          "source": "serialSendBox"
+        },
+        "key": "alt+g",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.g"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+h",
+          "source": "serialSendBox"
+        },
+        "key": "alt+h",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.h"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+i",
+          "source": "serialSendBox"
+        },
+        "key": "alt+i",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.i"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+j",
+          "source": "serialSendBox"
+        },
+        "key": "alt+j",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.j"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+k",
+          "source": "serialSendBox"
+        },
+        "key": "alt+k",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.k"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+l",
+          "source": "serialSendBox"
+        },
+        "key": "alt+l",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.l"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+m",
+          "source": "serialSendBox"
+        },
+        "key": "alt+m",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.m"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+n",
+          "source": "serialSendBox"
+        },
+        "key": "alt+n",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.n"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+o",
+          "source": "serialSendBox"
+        },
+        "key": "alt+o",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.o"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+p",
+          "source": "serialSendBox"
+        },
+        "key": "alt+p",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.p"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+q",
+          "source": "serialSendBox"
+        },
+        "key": "alt+q",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.q"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+r",
+          "source": "serialSendBox"
+        },
+        "key": "alt+r",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.r"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+s",
+          "source": "serialSendBox"
+        },
+        "key": "alt+s",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.s"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+t",
+          "source": "serialSendBox"
+        },
+        "key": "alt+t",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.t"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+u",
+          "source": "serialSendBox"
+        },
+        "key": "alt+u",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.u"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+v",
+          "source": "serialSendBox"
+        },
+        "key": "alt+v",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.v"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+w",
+          "source": "serialSendBox"
+        },
+        "key": "alt+w",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.w"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+x",
+          "source": "serialSendBox"
+        },
+        "key": "alt+x",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.x"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+y",
+          "source": "serialSendBox"
+        },
+        "key": "alt+y",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.y"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+z",
+          "source": "serialSendBox"
+        },
+        "key": "alt+z",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.z"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+0",
+          "source": "serialSendBox"
+        },
+        "key": "alt+0",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.0"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+1",
+          "source": "serialSendBox"
+        },
+        "key": "alt+1",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.1"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+2",
+          "source": "serialSendBox"
+        },
+        "key": "alt+2",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.2"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+3",
+          "source": "serialSendBox"
+        },
+        "key": "alt+3",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.3"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+4",
+          "source": "serialSendBox"
+        },
+        "key": "alt+4",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.4"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+5",
+          "source": "serialSendBox"
+        },
+        "key": "alt+5",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.5"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+6",
+          "source": "serialSendBox"
+        },
+        "key": "alt+6",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.6"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+7",
+          "source": "serialSendBox"
+        },
+        "key": "alt+7",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.7"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+8",
+          "source": "serialSendBox"
+        },
+        "key": "alt+8",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.8"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+9",
+          "source": "serialSendBox"
+        },
+        "key": "alt+9",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.alt.9"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+a",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+a",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.a"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+b",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+b",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.b"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+c",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+c",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.c"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+d",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+d",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.d"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+e",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+e",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.e"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+f",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+f",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.f"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+g",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+g",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.g"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+h",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+h",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.h"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+i",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+i",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.i"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+j",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+j",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.j"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+k",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+k",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.k"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+l",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+l",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.l"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+m",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+m",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.m"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+n",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+n",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.n"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+o",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+o",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.o"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+p",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+p",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.p"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+q",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+q",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.q"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+r",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+r",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.r"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+s",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+s",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.s"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+t",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+t",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.t"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+u",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+u",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.u"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+v",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+v",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.v"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+w",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+w",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.w"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+x",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+x",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.x"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+y",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+y",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.y"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+z",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+z",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.z"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+0",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+0",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.0"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+1",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+1",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.1"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+2",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+2",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.2"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+3",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+3",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.3"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+4",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+4",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.4"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+5",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+5",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.5"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+6",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+6",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.6"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+7",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+7",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.7"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+8",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+8",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.8"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "alt+shift+9",
+          "source": "serialSendBox"
+        },
+        "key": "shift+alt+9",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.altShift.9"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+a",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+a",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.a"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+b",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+b",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.b"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+c",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+c",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.c"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+d",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+d",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.d"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+e",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+e",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.e"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+f",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+f",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.f"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+g",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+g",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.g"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+h",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+h",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.h"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+i",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+i",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.i"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+j",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+j",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.j"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+k",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+k",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.k"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+l",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+l",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.l"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+m",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+m",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.m"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+n",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+n",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.n"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+o",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+o",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.o"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+p",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+p",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.p"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+q",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+q",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.q"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+r",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+r",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.r"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+s",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+s",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.s"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+t",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+t",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.t"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+u",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+u",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.u"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+v",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+v",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.v"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+w",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+w",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.w"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+x",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+x",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.x"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+y",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+y",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.y"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+z",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+z",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.z"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+0",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+0",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.0"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+1",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+1",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.1"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+2",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+2",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.2"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+3",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+3",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.3"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+4",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+4",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.4"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+5",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+5",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.5"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+6",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+6",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.6"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+7",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+7",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.7"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+8",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+8",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.8"
+      },
+      {
+        "command": "nexus.macro.runBinding",
+        "args": {
+          "binding": "ctrl+shift+9",
+          "source": "serialSendBox"
+        },
+        "key": "ctrl+shift+9",
+        "when": "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend' && nexus.macro.ctrlShift.9"
       },
       {
         "command": "nexus.script.run",
