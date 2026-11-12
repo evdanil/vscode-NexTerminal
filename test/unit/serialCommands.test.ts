@@ -87,6 +87,7 @@ vi.mock("../../src/ui/webviewFormPanel", () => ({
 import * as vscode from "vscode";
 import { closeSerialProfileTerminals, formValuesToSerial, registerSerialCommands } from "../../src/commands/serialCommands";
 import { createSerialMacroNewlineLookup } from "../../src/commands/serialMacroTarget";
+import { lineEndingCharacters } from "../../src/services/serial/serialUserInput";
 import type { CommandContext } from "../../src/commands/types";
 import { NexusCore } from "../../src/core/nexusCore";
 import type { SerialProfile } from "../../src/models/config";
@@ -563,10 +564,10 @@ describe("serial terminal tab visual differentiation", () => {
         saved = newline === "deleted" ? undefined : { ...opened, macroNewline: newline };
         send("a\nb\r\n\rc");
         expect(ctx.serialSidecar.writePort).toHaveBeenCalledExactlyOnceWith("physical", Buffer.from(bytes));
-        // The manual route finds this same PTY among the sessions the connect path registered.
-        const registered = ctx.core.registerSerialSession.mock.calls.map((call: unknown[]) => call[0]);
-        const lookup = createSerialMacroNewlineLookup({ getSnapshot: () => ({ activeSerialSessions: registered }), getSerialProfile: () => saved });
-        expect(lookup(pty)).toBe(newline === "deleted" ? undefined : newline);
+        // The manual route finds this same PTY in the serialTerminals entry the connect path wrote and,
+        // through the one shared policy, resolves exactly what the auto-trigger just sent.
+        const lookup = createSerialMacroNewlineLookup(ctx.serialTerminals, ctx.core);
+        expect(lineEndingCharacters(lookup(pty))).toBe(bytes.slice(1, bytes.indexOf("b")));
       } finally {
         ctx.core.unregisterSerialSession = vi.fn();
         pty.dispose();

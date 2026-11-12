@@ -1,26 +1,39 @@
 import * as vscode from "vscode";
-import type { ActiveSerialSession, SerialProfile } from "../models/config";
+import type { SerialMacroNewline, SerialProfile } from "../models/config";
 import type { TerminalRegistry } from "../services/terminal/terminalRegistry";
-import { applySerialMacroNewline, isSerialUserInput, type SerialUserInput } from "../services/serial/serialUserInput";
+import {
+  applySerialMacroNewline,
+  isSerialUserInput,
+  resolveSessionMacroNewline,
+  type SerialMacroSession,
+  type SerialUserInput
+} from "../services/serial/serialUserInput";
 import type { FocusedSendBoxMacroTarget, SerialMacroTargetResolver } from "./macroVariablePrompt";
 import type { SerialSendBinding } from "../ui/serialSendPanel";
 
 /**
- * The saved Macro Newline of the serial profile a live PTY belongs to, or
- * `undefined` (which means CR) when no live session owns it. Asked at each
- * send, not when the macro starts, so a profile edited while a variable prompt
- * is open, or since the session connected, applies to that very send.
+ * The Macro Newline for a send to a live serial PTY. Asked at each send, not
+ * when the macro starts, so a profile edited while a variable prompt is open,
+ * or since the session connected, applies to that very send.
  */
-export type SerialMacroNewlineLookup = (pty: SerialUserInput) => unknown;
+export type SerialMacroNewlineLookup = (pty: SerialUserInput) => SerialMacroNewline;
 
-/** Finds the PTY's session among the live serial sessions and reads its profile's current Macro Newline. */
-export function createSerialMacroNewlineLookup(core: {
-  getSnapshot(): { readonly activeSerialSessions: readonly Pick<ActiveSerialSession, "profileId" | "pty">[] };
-  getSerialProfile(id: string): Pick<SerialProfile, "macroNewline"> | undefined;
-}): SerialMacroNewlineLookup {
+/**
+ * Finds the session whose `serialTerminals` entry owns this exact PTY (identity,
+ * not terminal or profile, so a replaced session never lends its setting) and
+ * resolves its Macro Newline with the policy the auto-trigger observers use. A
+ * few live entries are walked in place: no snapshot of the whole configuration
+ * is copied per send. A PTY no session owns gets CR.
+ */
+export function createSerialMacroNewlineLookup(
+  serialTerminals: ReadonlyMap<string, SerialMacroSession & { readonly input?: SerialUserInput }>,
+  profiles: { getSerialProfile(id: string): Pick<SerialProfile, "macroNewline"> | undefined }
+): SerialMacroNewlineLookup {
   return (pty) => {
-    const session = core.getSnapshot().activeSerialSessions.find((candidate) => (candidate.pty as unknown) === pty);
-    return session ? core.getSerialProfile(session.profileId)?.macroNewline : undefined;
+    for (const entry of serialTerminals.values()) {
+      if (entry.input === pty) return resolveSessionMacroNewline(profiles, entry);
+    }
+    return resolveSessionMacroNewline(profiles, undefined);
   };
 }
 

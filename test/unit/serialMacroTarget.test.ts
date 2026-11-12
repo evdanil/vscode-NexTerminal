@@ -69,12 +69,14 @@ import { SerialSendPanel, type SerialSendBinding } from "../../src/ui/serialSend
 async function flush(): Promise<void> { for (let i = 0; i < 16; i++) await Promise.resolve(); }
 const owners: Array<{ dispose(): void }> = [];
 
-/** A core stand-in whose live serial sessions and saved profiles the test controls. */
-function fakeCore(sessions: Array<{ profileId: string; pty: unknown }>, profiles: Record<string, { macroNewline?: unknown }>) {
-  return {
-    getSnapshot: () => ({ activeSerialSessions: sessions as never }),
-    getSerialProfile: (id: string) => profiles[id] as never
-  };
+/**
+ * The production lookup over a `serialTerminals`-shaped map and saved profiles the test controls.
+ * Its `getSerialProfile` is the only core member the lookup may use: a lookup that copied a whole
+ * snapshot per send has nothing to call.
+ */
+function lookupOver(sessions: Array<{ profileId: string; pty: unknown; openedWith?: { macroNewline?: unknown } }>, profiles: Record<string, { macroNewline?: unknown }>) {
+  const serialTerminals = new Map(sessions.map((session, index) => [`session-${index}`, { profileId: session.profileId, input: session.pty, openedWith: session.openedWith }] as const));
+  return createSerialMacroNewlineLookup(serialTerminals as never, { getSerialProfile: (id: string) => profiles[id] as never });
 }
 
 async function harness(smart: boolean, enabled: boolean, connect = true, macroNewline?: SerialMacroNewline) {
@@ -101,7 +103,7 @@ async function harness(smart: boolean, enabled: boolean, connect = true, macroNe
   if (connect || smart) pty.open();
   await flush();
   pty.setDedicatedInputEnabled(enabled);
-  const resolver = createSerialMacroTargetResolver(registry, createSerialMacroNewlineLookup(fakeCore([{ profileId: "serial", pty }], { serial: profile })));
+  const resolver = createSerialMacroTargetResolver(registry, lookupOver([{ profileId: "serial", pty }], { serial: profile }));
   registerMacroCommands(undefined, resolver);
   vi.mocked(vscode.commands.executeCommand).mockClear();
   vi.mocked(vscode.commands.executeCommand).mockImplementation(async (command, args) => {
@@ -184,17 +186,24 @@ describe("manual serial macro command-to-PTY routes", () => {
 });
 
 describe("createSerialMacroNewlineLookup", () => {
-  it("reads the saved setting of the profile whose live session owns the PTY, and nothing for an unknown PTY", () => {
+  it("reads the saved setting of the profile whose session owns the PTY; else the profile it opened with; else CR", () => {
     const ptyA = {}; const ptyB = {}; const stranger = {};
     const profiles: Record<string, { macroNewline?: unknown }> = { a: { macroNewline: "lf" }, b: { macroNewline: "crlf" } };
-    const lookup = createSerialMacroNewlineLookup(fakeCore([{ profileId: "b", pty: ptyB }, { profileId: "a", pty: ptyA }], profiles));
+    const lookup = lookupOver([{ profileId: "b", pty: ptyB }, { profileId: "a", pty: ptyA, openedWith: { macroNewline: "lf" } }], profiles);
     expect(lookup(ptyA as never)).toBe("lf");
     expect(lookup(ptyB as never)).toBe("crlf");
-    expect(lookup(stranger as never)).toBeUndefined();
+    expect(lookup(stranger as never)).toBe("cr");
     profiles.a = { macroNewline: "crlf" };
     expect(lookup(ptyA as never)).toBe("crlf");
+    // A stored value from a newer release is CR, not the opened-with value: the saved profile still exists.
+    profiles.a = { macroNewline: "none" };
+    expect(lookup(ptyA as never)).toBe("cr");
+    // Deleted while connected: the profile the session opened with (LF), as auto-trigger macros do.
     delete profiles.a;
-    expect(lookup(ptyA as never)).toBeUndefined();
+    expect(lookup(ptyA as never)).toBe("lf");
+    // Deleted and no opened-with record: CR.
+    delete profiles.b;
+    expect(lookup(ptyB as never)).toBe("cr");
   });
 });
 
@@ -272,12 +281,12 @@ describe("macro shortcuts from a focused Serial Send Box", () => {
     const panel = { focused: { sessionId: "A", profileName: "A", terminal: a.terminal, input: a.pty } as SerialSendBinding | undefined,
       getFocusedBinding() { return this.focused; } };
     // B is listed first, so a lookup that ignored PTY identity would read B's setting for A's box.
-    const core = fakeCore([{ profileId: "B", pty: b.pty }, { profileId: "A", pty: a.pty }], { A: a.saved, B: b.saved });
-    const resolver = createSerialMacroTargetResolver(registry, createSerialMacroNewlineLookup(core));
+    const lookup = lookupOver([{ profileId: "B", pty: b.pty }, { profileId: "A", pty: a.pty }], { A: a.saved, B: b.saved });
+    const resolver = createSerialMacroTargetResolver(registry, lookup);
     registerMacroCommands(undefined, resolver, createFocusedSendBoxMacroTarget(panel, registry, resolver));
     vi.mocked(vscode.commands.executeCommand).mockClear();
     vi.mocked(vscode.commands.executeCommand).mockResolvedValue(undefined);
-    return { a, b, registry, panel, core };
+    return { a, b, registry, panel, lookup };
   }
   const sendBox = { source: SERIAL_SEND_BOX_MACRO_SOURCE };
   const NO_FOCUSED_BOX = "Click into the serial send box, then press the shortcut again. Nothing was sent.";
@@ -362,7 +371,7 @@ describe("macro shortcuts from a focused Serial Send Box", () => {
     panel.openOrReveal({ sessionId: "B", profileName: "B", terminal: h.b.terminal, input: h.b.pty });
     const [boxA, boxB] = fixture.webviewPanels;
     await boxA.receive!({ type: "focusChanged", focused: true });
-    const resolver = createSerialMacroTargetResolver(h.registry, createSerialMacroNewlineLookup(h.core));
+    const resolver = createSerialMacroTargetResolver(h.registry, h.lookup);
     registerMacroCommands(undefined, resolver, createFocusedSendBoxMacroTarget(panel, h.registry, resolver));
     // The user switches to B: VS Code has updated active state, but neither A's blur
     // nor B's focus report (nor A's view-state listener) has run yet.

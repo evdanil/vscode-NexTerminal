@@ -27,12 +27,12 @@ export function sanitizeHighlightProfileSelection(item: unknown): unknown {
 }
 
 /**
- * A serial profile's Macro Newline is a preference, not part of the record's
- * identity: a value this build does not know (a newer release's, or a
- * hand-edited file's) is removed so the profile falls back to CR, instead of
- * dropping the whole profile the way an unknown `mode` does. Every read
- * boundary (storage, backup import, share import) runs this before
- * `validateSerialProfile`, which rejects a value that skipped it.
+ * IMPORT boundary only (backup and share files are external input): a serial
+ * profile's Macro Newline this build does not know is removed, so the profile
+ * lands with CR instead of carrying an unchecked value, and the profile itself
+ * is kept rather than dropped the way an unknown `mode` drops it. Storage reads
+ * do NOT run this — see `SerialProfile.macroNewline` for why a stored unknown
+ * value must survive.
  */
 export function sanitizeSerialMacroNewline(item: unknown): unknown {
   if (typeof item !== "object" || item === null || Array.isArray(item)) return item;
@@ -727,7 +727,8 @@ export function validateSerialProfile(item: unknown): item is SerialProfile {
     isNonEmptyString(obj.path) &&
     typeof obj.baudRate === "number" &&
     (obj.mode === undefined || obj.mode === "standard" || obj.mode === "smartFollow") &&
-    (obj.macroNewline === undefined || isSerialMacroNewline(obj.macroNewline)) &&
+    // `macroNewline` is not checked: a stored value from a newer release must
+    // not cost the profile, and every send resolves it (unknown means CR).
     validateSerialDeviceHint(obj.deviceHint) &&
     isHighlightProfileSelection(obj.highlightProfileId)
   );

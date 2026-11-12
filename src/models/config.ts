@@ -13,8 +13,10 @@ export type SerialParity = "none" | "even" | "odd" | "mark" | "space";
 export type SerialDataBits = 5 | 6 | 7 | 8;
 export type SerialStopBits = 1 | 2;
 export type SerialProfileMode = "standard" | "smartFollow";
-/** How each newline in a macro reaches a serial device (`SerialProfile.macroNewline`). */
-export type SerialMacroNewline = "cr" | "lf" | "crlf";
+/** A serial line ending: nothing, or CR / LF / CRLF. The Serial Send Box offers all four. */
+export type SerialLineEnding = "none" | "cr" | "lf" | "crlf";
+/** How each newline in a macro reaches a serial device (`SerialProfile.macroNewline`): any ending but none. */
+export type SerialMacroNewline = Exclude<SerialLineEnding, "none">;
 export type SerialSessionStatus = "connected" | "waiting";
 export type LocalShellLaunchMode = "vscodeProfile" | "custom";
 
@@ -1313,11 +1315,17 @@ export interface SerialProfile {
   deviceHint?: SerialDeviceHint;
   /**
    * What each newline in a macro becomes on this profile's sessions, manual and
-   * auto-trigger alike. Absent (or any value outside the three literals) means
-   * CR, the byte VS Code's own terminal input sends for Enter. Read through
-   * `resolveSerialMacroNewline`, never directly.
+   * auto-trigger alike. Absent means CR, the byte VS Code's own terminal input
+   * sends for Enter.
+   *
+   * A STORED record may hold a value this build does not know — one a newer
+   * release wrote, in another window or before a downgrade — and storage keeps
+   * it as it is, because every save writes the whole collection back and
+   * normalizing on read would erase it for good. Such a value means CR here.
+   * Read through `resolveSerialMacroNewline`, never directly. (Import paths are
+   * external input and do strip unknown values: `sanitizeSerialMacroNewline`.)
    */
-  macroNewline?: SerialMacroNewline;
+  macroNewline?: SerialMacroNewline | (string & {});
 }
 
 export interface LocalShellProfile {
@@ -1671,9 +1679,9 @@ export function isSerialMacroNewline(value: unknown): value is SerialMacroNewlin
 /**
  * The Macro Newline a serial session ACTUALLY uses, applied at every send (the
  * untrusted-field discipline `resolveBmcWebProtocol` sets): absent, a
- * non-string or an unknown value resolves to `"cr"`, so a record that slipped
- * past the storage and import sanitizers still cannot choose bytes outside the
- * three endings.
+ * non-string or an unknown value resolves to `"cr"`, so a stored value from a
+ * newer release, or a corrupted one, cannot choose bytes outside the three
+ * endings.
  */
 export function resolveSerialMacroNewline(value: unknown): SerialMacroNewline {
   return isSerialMacroNewline(value) ? value : "cr";

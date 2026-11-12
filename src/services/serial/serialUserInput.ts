@@ -1,7 +1,7 @@
 import type * as vscode from "vscode";
-import { resolveSerialMacroNewline } from "../../models/config";
+import { resolveSerialMacroNewline, type SerialLineEnding, type SerialMacroNewline, type SerialProfile } from "../../models/config";
 
-export type SerialLineEnding = "none" | "cr" | "lf" | "crlf";
+export type { SerialLineEnding } from "../../models/config";
 
 export interface SerialInputState {
   readonly connectionEpoch: number;
@@ -26,6 +26,11 @@ export function isSerialUserInput(value: unknown): value is SerialUserInput {
     typeof candidate.setDedicatedInputEnabled === "function" && typeof candidate.sendUserInput === "function";
 }
 
+/** The characters one CR, LF or CRLF ending stands for: the one mapping the send box and macros share. */
+export function lineEndingCharacters(ending: SerialMacroNewline): string {
+  return ending === "lf" ? "\n" : ending === "crlf" ? "\r\n" : "\r";
+}
+
 /**
  * Convert outbound composer text only. Macros convert their newlines with
  * `applySerialMacroNewline` instead, and scripts preserve their own bytes.
@@ -34,7 +39,7 @@ export function prepareSerialText(text: string, ending: SerialLineEnding): strin
   if (ending !== "none" && ending !== "cr" && ending !== "lf" && ending !== "crlf") {
     throw new Error("Invalid serial line ending.");
   }
-  const eol = ending === "cr" ? "\r" : ending === "lf" ? "\n" : ending === "crlf" ? "\r\n" : "";
+  const eol = ending === "none" ? "" : lineEndingCharacters(ending);
   const payload = ending === "none" ? text : text.replace(/\r\n|\r|\n/g, eol) + eol;
   if (!payload) throw new Error("Enter text or choose a line ending to send.");
   if (Buffer.byteLength(payload, "utf8") > 65536) throw new Error("Serial send exceeds 65,536 UTF-8 bytes.");
@@ -61,7 +66,27 @@ export function prepareSerialText(text: string, ending: SerialLineEnding): strin
  * a variable value is converted too, as VS Code converted it.
  */
 export function applySerialMacroNewline(text: string, newline: unknown): string {
-  const resolved = resolveSerialMacroNewline(newline);
-  const ending = resolved === "lf" ? "\n" : resolved === "crlf" ? "\r\n" : "\r";
-  return text.replace(/\r?\n/g, ending);
+  return text.replace(/\r?\n/g, lineEndingCharacters(resolveSerialMacroNewline(newline)));
+}
+
+/** The serial session a macro is sent to: its profile id, and the profile as it was when the session opened. */
+export interface SerialMacroSession {
+  readonly profileId: string;
+  readonly openedWith?: Pick<SerialProfile, "macroNewline">;
+}
+
+/**
+ * The Macro Newline for a send to a live serial session — THE ONE POLICY both
+ * delivery routes use (manual macros through `createSerialMacroNewlineLookup`,
+ * auto-trigger macros through the connect paths' observers), so they cannot
+ * disagree about a session's bytes: the saved profile as it is now, so an edit
+ * applies to the next macro without a reconnect; else, if it was deleted while
+ * the session ran, the profile the session opened with; else CR.
+ */
+export function resolveSessionMacroNewline(
+  profiles: { getSerialProfile(id: string): Pick<SerialProfile, "macroNewline"> | undefined },
+  session: SerialMacroSession | undefined
+): SerialMacroNewline {
+  if (!session) return "cr";
+  return resolveSerialMacroNewline((profiles.getSerialProfile(session.profileId) ?? session.openedWith)?.macroNewline);
 }

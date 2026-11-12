@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applySerialMacroNewline, isSerialUserInput, prepareSerialText } from "../../src/services/serial/serialUserInput";
+import { applySerialMacroNewline, isSerialUserInput, lineEndingCharacters, prepareSerialText, resolveSessionMacroNewline } from "../../src/services/serial/serialUserInput";
 import { resolveSerialMacroNewline } from "../../src/models/config";
 
 describe("prepareSerialText", () => {
@@ -68,5 +68,30 @@ describe("applySerialMacroNewline (issue #339)", () => {
     for (const text of ["\r\n\r", "\n\r\n\r\r\n", "x\r\n\ny\rz", "\u2028\r\n"]) {
       expect(applySerialMacroNewline(text, undefined)).toBe(text.replace(/\r?\n/g, "\r"));
     }
+  });
+});
+
+describe("lineEndingCharacters", () => {
+  it("is the one CR / LF / CRLF mapping, shared by the send box and macros", () => {
+    expect(lineEndingCharacters("cr")).toBe("\r");
+    expect(lineEndingCharacters("lf")).toBe("\n");
+    expect(lineEndingCharacters("crlf")).toBe("\r\n");
+    for (const ending of ["cr", "lf", "crlf"] as const) {
+      expect(prepareSerialText("x", ending)).toBe(`x${lineEndingCharacters(ending)}`);
+      expect(applySerialMacroNewline("x\n", ending)).toBe(`x${lineEndingCharacters(ending)}`);
+    }
+  });
+});
+
+describe("resolveSessionMacroNewline", () => {
+  const profiles = (saved: Record<string, { macroNewline?: unknown }>) => ({ getSerialProfile: (id: string) => saved[id] as never });
+  it("uses the saved profile, else the profile the session opened with, else CR", () => {
+    expect(resolveSessionMacroNewline(profiles({ p: { macroNewline: "crlf" } }), { profileId: "p", openedWith: { macroNewline: "lf" } })).toBe("crlf");
+    // Saved without the field (CR) wins over the opened-with value: the user changed it back to CR.
+    expect(resolveSessionMacroNewline(profiles({ p: {} }), { profileId: "p", openedWith: { macroNewline: "lf" } })).toBe("cr");
+    expect(resolveSessionMacroNewline(profiles({ p: { macroNewline: "future" } }), { profileId: "p", openedWith: { macroNewline: "lf" } })).toBe("cr");
+    expect(resolveSessionMacroNewline(profiles({}), { profileId: "p", openedWith: { macroNewline: "lf" } })).toBe("lf");
+    expect(resolveSessionMacroNewline(profiles({}), { profileId: "p" })).toBe("cr");
+    expect(resolveSessionMacroNewline(profiles({ p: { macroNewline: "lf" } }), undefined)).toBe("cr");
   });
 });

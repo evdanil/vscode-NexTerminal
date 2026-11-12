@@ -8,7 +8,7 @@ import { normalizeTranscriptTimestampMode } from "../logging/transcriptTimestamp
 import { normalizeTranscriptLineEndingMode } from "../logging/transcriptLineEndings";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SerialPty } from "../services/serial/serialPty";
-import { applySerialMacroNewline } from "../services/serial/serialUserInput";
+import { applySerialMacroNewline, resolveSessionMacroNewline } from "../services/serial/serialUserInput";
 import { isSerialRuntimeMissingError } from "../services/serial/errorMatchers";
 import {
   SmartSerialPty,
@@ -274,14 +274,13 @@ function getTranscriptOptions(ctx: CommandContext, profile: SerialProfile): Sess
 }
 
 /**
- * Auto-trigger macro text with its newlines converted to the profile's Macro
- * Newline (see `applySerialMacroNewline`). The setting is read from the saved
- * profile at each send, so an edit applies to the next trigger without a
- * reconnect, as it does for macros run by hand; the profile the session opened
- * with stands in only if the saved one was deleted while the session ran.
+ * Auto-trigger macro text with its newlines converted to the session's Macro
+ * Newline, resolved at each send by the policy manual macros use too
+ * (`resolveSessionMacroNewline`), from the same profile the session's
+ * `serialTerminals` entry records as `openedWith`.
  */
 function macroTextForSerialProfile(ctx: CommandContext, opened: SerialProfile, text: string): string {
-  return applySerialMacroNewline(text, (ctx.core.getSerialProfile(opened.id) ?? opened).macroNewline);
+  return applySerialMacroNewline(text, resolveSessionMacroNewline(ctx.core, { profileId: opened.id, openedWith: opened }));
 }
 
 function serialTerminalName(profile: SerialProfile): string {
@@ -498,6 +497,7 @@ async function connectStandardSerialProfile(
             terminal: terminalRef,
             input: ptyRef,
             profileId: profile.id,
+            openedWith: profile,
             transportSessionId: sessionId,
             activePath: profile.path
           });
@@ -572,7 +572,7 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
   let ptyRef: SmartSerialPty | undefined;
   let currentProfile = profile;
   const triggerObserver = ctx.macroAutoTrigger.createObserver(
-    (text) => ptyRef?.handleInput(macroTextForSerialProfile(ctx, currentProfile, text), "macro"),
+    (text) => ptyRef?.handleInput(macroTextForSerialProfile(ctx, profile, text), "macro"),
     () => terminalRef !== undefined && vscode.window.activeTerminal === terminalRef,
     logicalSessionId,
     profile.id
@@ -667,6 +667,7 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
     terminal,
     input: pty,
     profileId: profile.id,
+    openedWith: profile,
     smartFollow: true,
     activePath: undefined
   });
