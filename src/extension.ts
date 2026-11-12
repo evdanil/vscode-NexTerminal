@@ -87,7 +87,7 @@ import { registerSettingsCommands } from "./commands/settingsCommands";
 import { SettingsPanel } from "./ui/settingsPanel";
 import { registerConfigCommands } from "./commands/configCommands";
 import { getBoundMacroShortcuts, onDidChangeMacroShortcuts, registerMacroCommands, updateMacroContext } from "./commands/macroCommands";
-import { createFocusedSendBoxMacroTarget, createSerialMacroTargetResolver } from "./commands/serialMacroTarget";
+import { createFocusedSendBoxMacroTarget, createSerialMacroNewlineLookup, createSerialMacroTargetResolver } from "./commands/serialMacroTarget";
 import { registerProfileCommands } from "./commands/profileCommands";
 import { registerAuthProfileCommands } from "./commands/authProfileCommands";
 import { registerDeviceTemplateCommands } from "./commands/deviceTemplateCommands";
@@ -1659,7 +1659,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   //    it — but dispatching a command that is already there needs no argument
   //    about who awaits whom.
   void maybeOfferSshConfigImport(context, core);
-  const serialMacroTargetResolver = createSerialMacroTargetResolver(terminalRegistry);
+  const serialMacroTargetResolver = createSerialMacroTargetResolver(terminalRegistry, createSerialMacroNewlineLookup(serialTerminals, core));
   const macroDisposables = registerMacroCommands(() => {
     return buildMacroProfileInputsFromSnapshot(core.getSnapshot());
   }, serialMacroTargetResolver, createFocusedSendBoxMacroTarget(serialSendPanel, terminalRegistry, serialMacroTargetResolver));

@@ -362,6 +362,7 @@ export class VscodeConfigRepository implements ConfigRepository {
   }
 
   public async getSerialProfiles(): Promise<SerialProfile[]> {
+    // `macroNewline` is deliberately NOT normalized here: see SerialProfile.macroNewline.
     const raw = asArray<unknown>(this.readRaw(SERIAL_PROFILES_KEY)).map(sanitizeHighlightProfileSelection);
     return raw.filter((item): item is SerialProfile => {
       if (validateSerialProfile(item)) {

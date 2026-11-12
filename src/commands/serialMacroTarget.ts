@@ -1,11 +1,46 @@
 import * as vscode from "vscode";
+import type { SerialMacroNewline, SerialProfile } from "../models/config";
 import type { TerminalRegistry } from "../services/terminal/terminalRegistry";
-import { isSerialUserInput } from "../services/serial/serialUserInput";
+import {
+  applySerialMacroNewline,
+  isSerialUserInput,
+  resolveSessionMacroNewline,
+  type SerialMacroSession,
+  type SerialUserInput
+} from "../services/serial/serialUserInput";
 import type { FocusedSendBoxMacroTarget, SerialMacroTargetResolver } from "./macroVariablePrompt";
 import type { SerialSendBinding } from "../ui/serialSendPanel";
 
+/**
+ * The Macro Newline for a send to a live serial PTY. Asked at each send, not
+ * when the macro starts, so a profile edited while a variable prompt is open,
+ * or since the session connected, applies to that very send.
+ */
+export type SerialMacroNewlineLookup = (pty: SerialUserInput) => SerialMacroNewline;
+
+/**
+ * THE lookup both serial macro routes call — the manual target resolver and
+ * the Standard and Smart Follow auto-trigger observers: finds the session whose
+ * `serialTerminals` entry owns this exact PTY (identity, not terminal or
+ * profile, so a replaced session never lends its setting) and resolves its
+ * Macro Newline with `resolveSessionMacroNewline`, which also keeps the entry's
+ * last-known value. A few live entries are walked in place: no snapshot of the
+ * whole configuration is copied per send. A PTY no session owns gets CR.
+ */
+export function createSerialMacroNewlineLookup(
+  serialTerminals: ReadonlyMap<string, SerialMacroSession & { readonly input?: SerialUserInput }> | undefined,
+  profiles: { getSerialProfile(id: string): Pick<SerialProfile, "macroNewline"> | undefined }
+): SerialMacroNewlineLookup {
+  return (pty) => {
+    for (const entry of serialTerminals?.values() ?? []) {
+      if (entry.input === pty) return resolveSessionMacroNewline(profiles, entry);
+    }
+    return resolveSessionMacroNewline(profiles, undefined);
+  };
+}
+
 /** The registry retains serial ownership after disconnect, until the native tab closes. */
-export function createSerialMacroTargetResolver(registry: TerminalRegistry): SerialMacroTargetResolver {
+export function createSerialMacroTargetResolver(registry: TerminalRegistry, macroNewlineFor: SerialMacroNewlineLookup): SerialMacroTargetResolver {
   return (terminal) => {
     const pty = registry.get(terminal)?.pty;
     if (!isSerialUserInput(pty)) return undefined;
@@ -26,8 +61,9 @@ export function createSerialMacroTargetResolver(registry: TerminalRegistry): Ser
         if (state.connectionEpoch !== epoch) return refuse("Serial connection changed. Run the macro again.");
         if (state.inputLocked) return refuse("Serial input is locked by a script.");
         try {
-          // Macro text already owns its byte/line-ending contract; composer conversion does not apply.
-          await pty.sendUserInput(text, epoch);
+          // The send box's own line-ending selector does not apply to macros; the profile's Macro
+          // Newline does, on the final text so newlines inside variable values convert too.
+          await pty.sendUserInput(applySerialMacroNewline(text, macroNewlineFor(pty)), epoch);
           return true;
         } catch {
           // Driver errors may contain device text or macro values. Never echo them into status UI.

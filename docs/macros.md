@@ -60,9 +60,22 @@ Built-in templates include:
 
 ## Sending Text and Newlines
 
-Macro text is sent exactly as saved. In examples, `\n` means an actual newline.
-In the Macro Editor, press Enter to create that newline; typing `\n` sends
-those two characters.
+In examples, `\n` means an actual newline. In the Macro Editor, press Enter to
+create that newline; typing `\n` sends those two characters. Macro text is not
+trimmed, and no Enter is added at the end. The newlines it contains are sent as
+follows:
+
+- **Serial sessions** (Standard and Smart Follow): each newline is sent as the
+  serial profile's [**Macro Newline**](serial.md#macro-newline), CR by default
+  (the same byte pressing Enter sends), or LF or CRLF for a device that expects
+  it. This applies to macros you run and to auto-trigger macros, and to
+  newlines inside [variable](#variables) values. A CRLF pair counts as one
+  newline; a CR on its own is sent as it is.
+- **Other sessions**: macros you run go through VS Code's terminal input, which
+  sends each newline as Enter. Auto-trigger macros there pass their text to
+  the session without converting newlines.
+
+For example:
 
 - `show version` followed by a new line sends `show version` and presses Enter.
 - `configure terminal` followed by a new line and then `interface gi0/1` sends

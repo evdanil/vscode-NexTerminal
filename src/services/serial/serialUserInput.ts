@@ -1,6 +1,7 @@
 import type * as vscode from "vscode";
+import { isSerialMacroNewline, resolveSerialMacroNewline, type SerialLineEnding, type SerialMacroNewline, type SerialProfile } from "../../models/config";
 
-export type SerialLineEnding = "none" | "cr" | "lf" | "crlf";
+export type { SerialLineEnding } from "../../models/config";
 
 export interface SerialInputState {
   readonly connectionEpoch: number;
@@ -25,14 +26,85 @@ export function isSerialUserInput(value: unknown): value is SerialUserInput {
     typeof candidate.setDedicatedInputEnabled === "function" && typeof candidate.sendUserInput === "function";
 }
 
-/** Convert outbound composer text only; macros and scripts preserve their own bytes. */
+/** The characters one CR, LF or CRLF ending stands for: the one mapping the send box and macros share. */
+export function lineEndingCharacters(ending: SerialMacroNewline): string {
+  return ending === "lf" ? "\n" : ending === "crlf" ? "\r\n" : "\r";
+}
+
+/**
+ * Convert outbound composer text only. Macros convert their newlines with
+ * `applySerialMacroNewline` instead, and scripts preserve their own bytes.
+ */
 export function prepareSerialText(text: string, ending: SerialLineEnding): string {
   if (ending !== "none" && ending !== "cr" && ending !== "lf" && ending !== "crlf") {
     throw new Error("Invalid serial line ending.");
   }
-  const eol = ending === "cr" ? "\r" : ending === "lf" ? "\n" : ending === "crlf" ? "\r\n" : "";
+  const eol = ending === "none" ? "" : lineEndingCharacters(ending);
   const payload = ending === "none" ? text : text.replace(/\r\n|\r|\n/g, eol) + eol;
   if (!payload) throw new Error("Enter text or choose a line ending to send.");
   if (Buffer.byteLength(payload, "utf8") > 65536) throw new Error("Serial send exceeds 65,536 UTF-8 bytes.");
   return payload;
+}
+
+/**
+ * Turns each newline in macro text into the serial profile's Macro Newline
+ * (`SerialProfile.macroNewline`; absent or unknown means CR).
+ *
+ * WHY THIS EXISTS: manual macros used to reach every terminal through VS
+ * Code's `TerminalInstance.sendText`, which normalizes line endings to an Enter
+ * press with `text.replace(/\r?\n/g, '\r')`. Manual serial macros now write to
+ * the PTY directly (the guarded route that pins the session and honours script
+ * locks), which skips that normalization, so a saved newline reached the device
+ * as a bare LF (issue #339). Auto-trigger macros always wrote to the PTY, and
+ * so always sent LF; they share this conversion so one profile setting decides
+ * what the device receives. The pattern here is VS Code's own: with CR (the
+ * default) the bytes are exactly what VS Code sent. A CRLF pair is one newline,
+ * not two; a standalone CR is already Enter and stays as it is; nothing is
+ * appended.
+ *
+ * Applied to the final text, after variable substitution, so a newline inside
+ * a variable value is converted too, as VS Code converted it.
+ */
+export function applySerialMacroNewline(text: string, newline: unknown): string {
+  return text.replace(/\r?\n/g, lineEndingCharacters(resolveSerialMacroNewline(newline)));
+}
+
+/**
+ * The part of a `serialTerminals` entry the Macro Newline policy reads and
+ * writes: the session's profile id, and the last known Macro Newline that took
+ * effect on it (seeded at connect, updated on every send that resolved one).
+ */
+export interface SerialMacroSession {
+  readonly profileId: string;
+  lastMacroNewline?: SerialMacroNewline;
+}
+
+/** The last-known seed for a session opened with `profile`: its Macro Newline if known (absent is CR), else none. */
+export function knownMacroNewline(profile: Pick<SerialProfile, "macroNewline">): SerialMacroNewline | undefined {
+  const value = profile.macroNewline;
+  return value === undefined ? "cr" : isSerialMacroNewline(value) ? value : undefined;
+}
+
+/**
+ * The Macro Newline for a send to a live serial session — THE ONE POLICY both
+ * delivery routes reach through `createSerialMacroNewlineLookup` over the same
+ * `serialTerminals` entry, so they cannot disagree about a session's bytes:
+ *  1. the saved profile as it is now, so an edit applies to the next macro
+ *     without a reconnect — and, when it holds a known value, that value is
+ *     recorded on the entry as the last one that took effect;
+ *  2. if the profile was deleted while the session ran, that last-known value,
+ *     so a mid-session edit is not reverted by the deletion;
+ *  3. else CR. A saved value this build does not know (a newer release's) is
+ *     CR as well, and is not recorded, so it never becomes a fallback.
+ */
+export function resolveSessionMacroNewline(
+  profiles: { getSerialProfile(id: string): Pick<SerialProfile, "macroNewline"> | undefined },
+  session: SerialMacroSession | undefined
+): SerialMacroNewline {
+  if (!session) return "cr";
+  const saved = profiles.getSerialProfile(session.profileId);
+  if (!saved) return session.lastMacroNewline ?? "cr";
+  const known = knownMacroNewline(saved);
+  if (known) session.lastMacroNewline = known;
+  return known ?? "cr";
 }

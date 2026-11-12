@@ -9,6 +9,7 @@ import type {
   ProxyConfig,
   LocalShellProfile
 } from "../models/config";
+import { storedSerialMacroNewline } from "../models/config";
 import type { InventorySourceConfig } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
@@ -23,6 +24,25 @@ export function sanitizeHighlightProfileSelection(item: unknown): unknown {
   if (typeof item !== "object" || item === null || Array.isArray(item)) return item;
   const obj = item as Record<string, unknown>;
   return isHighlightProfileSelection(obj.highlightProfileId) ? item : { ...obj, highlightProfileId: null };
+}
+
+/**
+ * IMPORT boundary only (backup and share files are external input): a serial
+ * profile's Macro Newline this build does not know is removed, so the profile
+ * lands with CR instead of carrying an unchecked value, and the profile itself
+ * is kept rather than dropped the way an unknown `mode` drops it. An explicit
+ * `"cr"` is removed too, so CR has one stored form (`storedSerialMacroNewline`). Storage reads
+ * do NOT run this — see `SerialProfile.macroNewline` for why a stored unknown
+ * value must survive.
+ */
+export function sanitizeSerialMacroNewline(item: unknown): unknown {
+  if (typeof item !== "object" || item === null || Array.isArray(item)) return item;
+  const obj = item as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(obj, "macroNewline")) return item;
+  const stored = storedSerialMacroNewline(obj.macroNewline);
+  if (stored === obj.macroNewline) return item;
+  const { macroNewline: _dropped, ...rest } = obj;
+  return stored === undefined ? rest : { ...rest, macroNewline: stored };
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -710,6 +730,8 @@ export function validateSerialProfile(item: unknown): item is SerialProfile {
     isNonEmptyString(obj.path) &&
     typeof obj.baudRate === "number" &&
     (obj.mode === undefined || obj.mode === "standard" || obj.mode === "smartFollow") &&
+    // `macroNewline` is not checked: a stored value from a newer release must
+    // not cost the profile, and every send resolves it (unknown means CR).
     validateSerialDeviceHint(obj.deviceHint) &&
     isHighlightProfileSelection(obj.highlightProfileId)
   );

@@ -5,7 +5,9 @@ vi.mock("vscode", () => ({}));
 import { VscodeConfigRepository } from "../../src/storage/vscodeConfigRepository";
 import type { ServerConfig } from "../../src/models/config";
 import { computeSyncPlan } from "../../src/services/inventory/syncEngine";
-import { validateServerConfig } from "../../src/utils/validation";
+import { sanitizeSerialMacroNewline, validateSerialProfile, validateServerConfig } from "../../src/utils/validation";
+import { NexusCore } from "../../src/core/nexusCore";
+import { applySerialMacroNewline, resolveSessionMacroNewline } from "../../src/services/serial/serialUserInput";
 
 /**
  * A fake ExtensionContext whose globalState mirrors VS Code semantics: the
@@ -1048,5 +1050,56 @@ describe("VscodeConfigRepository overwrite detection precision (E1/E2/E3)", () =
     } finally {
       warnSpy.mockRestore();
     }
+  });
+});
+
+describe("serial profile Macro Newline at the storage boundary (issue #339)", () => {
+  const serial = { id: "sp1", name: "Console", path: "COM3", baudRate: 115200, dataBits: 8 as const, stopBits: 1 as const, parity: "none" as const, rtscts: false };
+
+  it("keeps every stored value as it is, unknown ones included, and never drops the profile for it", async () => {
+    const repo = new VscodeConfigRepository(makeContext({
+      "nexus.serialProfiles": [
+        { ...serial, id: "lf", macroNewline: "lf" },
+        { ...serial, id: "absent" },
+        { ...serial, id: "future", macroNewline: "none" },
+        { ...serial, id: "wrong-type", macroNewline: 10 }
+      ]
+    }));
+    const byId = new Map((await repo.getSerialProfiles()).map((profile) => [profile.id, profile]));
+    expect([...byId.keys()]).toEqual(["lf", "absent", "future", "wrong-type"]);
+    expect(byId.get("lf")?.macroNewline).toBe("lf");
+    expect(byId.get("absent")).not.toHaveProperty("macroNewline");
+    expect(byId.get("future")?.macroNewline).toBe("none");
+    expect(byId.get("wrong-type")?.macroNewline).toBe(10);
+  });
+
+  it("validateSerialProfile does not judge the field; the import sanitizer strips what it does not know", () => {
+    for (const value of [undefined, "lf", "none", 10]) expect(validateSerialProfile({ ...serial, macroNewline: value }), String(value)).toBe(true);
+    expect(sanitizeSerialMacroNewline({ ...serial, macroNewline: "none" })).toEqual(serial);
+    expect(sanitizeSerialMacroNewline({ ...serial, macroNewline: "crlf" })).toEqual({ ...serial, macroNewline: "crlf" });
+    expect(sanitizeSerialMacroNewline({ ...serial, macroNewline: "cr" })).toEqual(serial);
+    for (const junk of [null, 5, "text", ["x"]]) expect(sanitizeSerialMacroNewline(junk)).toBe(junk);
+  });
+
+  it("a newer release's value on profile A survives an edit of profile B, while sends on A use CR", async () => {
+    const state: Record<string, unknown> = {
+      "nexus.serialProfiles": [
+        { ...serial, id: "A", name: "A", macroNewline: "none" },
+        { ...serial, id: "B", name: "B", path: "COM4" }
+      ]
+    };
+    const core = new NexusCore(new VscodeConfigRepository(makeContext(state)));
+    await core.initialize();
+    // What nexus.serial.edit does after building the record from the form.
+    await core.addOrUpdateSerialProfile({ ...core.getSerialProfile("B")!, baudRate: 9600, macroNewline: "crlf" });
+    const stored = state["nexus.serialProfiles"] as Array<Record<string, unknown>>;
+    expect(stored.find((profile) => profile.id === "A")?.macroNewline).toBe("none");
+    expect(stored.find((profile) => profile.id === "B")).toMatchObject({ baudRate: 9600, macroNewline: "crlf" });
+    // A fresh window reading the same storage still has it.
+    const reloaded = new NexusCore(new VscodeConfigRepository(makeContext(state)));
+    await reloaded.initialize();
+    expect(reloaded.getSerialProfile("A")?.macroNewline).toBe("none");
+    expect(applySerialMacroNewline("show run\n", resolveSessionMacroNewline(reloaded, { profileId: "A" }))).toBe("show run\r");
+    expect(applySerialMacroNewline("show run\n", resolveSessionMacroNewline(reloaded, { profileId: "B" }))).toBe("show run\r\n");
   });
 });

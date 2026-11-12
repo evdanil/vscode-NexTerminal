@@ -468,10 +468,13 @@ describe("renderMacroEditorHtml", () => {
     expect(html).not.toContain("without new terminal output");
   });
 
-  it("describes macro text as exact saved text", () => {
+  it("describes macro text as saved text whose newlines follow a serial profile's Macro Newline", () => {
     const html = render([], null);
-    expect(html).toContain("Text is sent exactly as saved");
+    expect(html).toContain("Text is sent as saved, with no Enter added");
     expect(html).toContain("Press Enter in the textarea to include a newline");
+    expect(html).toContain("serial sessions send each newline as the profile's Macro Newline (CR by default)");
+    // Issue #339: a newline does not reach a serial device as typed, so the absolute claim is gone.
+    expect(html).not.toContain("Text is sent exactly as saved");
     expect(html).not.toContain("Each line is sent as a separate command");
   });
 

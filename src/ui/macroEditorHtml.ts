@@ -26,7 +26,7 @@ import {
  * convenience" (HTML Standard, "in body" insertion mode). Rendering the text
  * bare therefore hands the form a macro whose leading blank line is already
  * gone, and `MacroEditorPanel` saves `msg.text` verbatim (no trim, by design —
- * §4.9 "Text is sent exactly as saved"), so merely opening the editor on such a
+ * §4.9 "Text is sent as saved"), so merely opening the editor on such a
  * macro and pressing Save rewrites it one line shorter with nothing reported.
  * Giving the parser a newline of our own to drop makes the strip land on a
  * character the macro does not own. Exactly one is dropped whatever follows, so
@@ -391,7 +391,7 @@ export function renderMacroEditorHtml(
   <div class="form-group">
     <label for="macro-text">Text</label>
     <textarea id="macro-text" class="editor-textarea" rows="6" placeholder="echo hello&#10;ls -la">${TEXTAREA_LEADING_NEWLINE}${escapeHtml(textValue)}</textarea>
-    <div class="hint">Text is sent exactly as saved. Press Enter in the textarea to include a newline. \${profile.host}, \${profile.ipmiHost}, \${profile.ipmiUsername}, \${profile.port}, \${profile.username} and \${profile.name} are filled in from the server the macro is run against (right-click a server in the Connectivity Hub → Run Macro on Server…).</div>
+    <div class="hint">Text is sent as saved, with no Enter added. Press Enter in the textarea to include a newline; serial sessions send each newline as the profile's Macro Newline (CR by default). \${profile.host}, \${profile.ipmiHost}, \${profile.ipmiUsername}, \${profile.port}, \${profile.username} and \${profile.name} are filled in from the server the macro is run against (right-click a server in the Connectivity Hub → Run Macro on Server…).</div>
     <div class="field-error" id="error-text"></div>
     <div class="variables-diagnostics" id="variables-diagnostics" aria-live="polite"></div>
   </div>

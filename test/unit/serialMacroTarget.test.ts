@@ -62,13 +62,26 @@ import { SerialPty, type SerialTransport } from "../../src/services/serial/seria
 import { SmartSerialPty } from "../../src/services/serial/smartSerialPty";
 import { TerminalRegistry } from "../../src/services/terminal/terminalRegistry";
 import { registerMacroCommands, SERIAL_SEND_BOX_MACRO_SOURCE } from "../../src/commands/macroCommands";
-import { createFocusedSendBoxMacroTarget, createSerialMacroTargetResolver } from "../../src/commands/serialMacroTarget";
+import { createFocusedSendBoxMacroTarget, createSerialMacroNewlineLookup, createSerialMacroTargetResolver } from "../../src/commands/serialMacroTarget";
+import type { SerialMacroNewline } from "../../src/models/config";
 import { SerialSendPanel, type SerialSendBinding } from "../../src/ui/serialSendPanel";
 
 async function flush(): Promise<void> { for (let i = 0; i < 16; i++) await Promise.resolve(); }
 const owners: Array<{ dispose(): void }> = [];
 
-async function harness(smart: boolean, enabled: boolean, connect = true) {
+/**
+ * The production lookup over a `serialTerminals`-shaped map and saved profiles the test controls.
+ * Its `getSerialProfile` is the only core member the lookup may use: a lookup that copied a whole
+ * snapshot per send has nothing to call.
+ */
+function lookupOver(sessions: Array<{ profileId: string; pty: unknown; lastMacroNewline?: SerialMacroNewline }>, profiles: Record<string, { macroNewline?: unknown }>) {
+  const entries = sessions.map((session) => ({ profileId: session.profileId, input: session.pty, lastMacroNewline: session.lastMacroNewline }));
+  const serialTerminals = new Map(entries.map((entry, index) => [`session-${index}`, entry] as const));
+  const lookup = createSerialMacroNewlineLookup(serialTerminals as never, { getSerialProfile: (id: string) => profiles[id] as never });
+  return Object.assign(lookup, { entries });
+}
+
+async function harness(smart: boolean, enabled: boolean, connect = true, macroNewline?: SerialMacroNewline) {
   let count = 0;
   let disconnect: ((id: string, reason: string) => void) | undefined;
   const transport: SerialTransport & { listPorts(): Promise<{ path: string }[]> } = {
@@ -77,7 +90,8 @@ async function harness(smart: boolean, enabled: boolean, connect = true) {
     onDidReceiveData: () => () => {}, onDidReceiveError: () => () => {},
     onDidDisconnect: (cb) => { disconnect = cb; return () => { disconnect = undefined; }; }
   };
-  const profile = { id: "serial", name: "Console", path: "COM5", baudRate: 115200, dataBits: 8 as const, stopBits: 1 as const, parity: "none" as const, rtscts: false };
+  const profile: { id: string; name: string; path: string; baudRate: number; dataBits: 8; stopBits: 1; parity: "none"; rtscts: boolean; macroNewline?: SerialMacroNewline } =
+    { id: "serial", name: "Console", path: "COM5", baudRate: 115200, dataBits: 8, stopBits: 1, parity: "none", rtscts: false, ...(macroNewline ? { macroNewline } : {}) };
   const pty = smart
     ? new SmartSerialPty(transport, profile, { onClosed() {}, getBusyPaths: () => new Set(), promptPortChoice: async () => ({ kind: "wait" }) }, { log() {}, close() {} })
     : new SerialPty(transport, profile, { onSessionOpened() {}, onSessionClosed() {} }, { log() {}, close() {} });
@@ -91,13 +105,13 @@ async function harness(smart: boolean, enabled: boolean, connect = true) {
   if (connect || smart) pty.open();
   await flush();
   pty.setDedicatedInputEnabled(enabled);
-  const resolver = createSerialMacroTargetResolver(registry);
+  const resolver = createSerialMacroTargetResolver(registry, lookupOver([{ profileId: "serial", pty }], { serial: profile }));
   registerMacroCommands(undefined, resolver);
   vi.mocked(vscode.commands.executeCommand).mockClear();
   vi.mocked(vscode.commands.executeCommand).mockImplementation(async (command, args) => {
     if (command === "workbench.action.terminal.sendSequence") pty.handleInput((args as { text: string }).text);
   });
-  return { pty, transport, terminal, other, registry, resolver, disconnect: () => disconnect?.("physical-1", "removed") };
+  return { pty, transport, terminal, other, registry, resolver, profile, disconnect: () => disconnect?.("physical-1", "removed") };
 }
 
 beforeEach(() => { vi.clearAllMocks(); fixture.commands.clear(); fixture.macros = []; fixture.box = undefined; });
@@ -117,7 +131,8 @@ function macroFor(route: typeof routes[number], prompted: boolean): TerminalMacr
 
 describe("manual serial macro command-to-PTY routes", () => {
   const cases = routes.flatMap((route) => [false, true].flatMap((smart) => [false, true].flatMap((enabled) => [false, true].map((prompted) => ({ route, smart, enabled, prompted })))));
-  it.each(cases)("$route smart=$smart dedicated=$enabled prompted=$prompted preserves bytes once", async ({ route, smart, enabled, prompted }) => {
+  // Issue #339: VS Code's sendText turned each \r?\n into CR; the direct PTY route must too, by default.
+  it.each(cases)("$route smart=$smart dedicated=$enabled prompted=$prompted sends each newline as CR, once", async ({ route, smart, enabled, prompted }) => {
     const h = await harness(smart, enabled);
     const pending = invoke(route, macroFor(route, prompted));
     await flush();
@@ -127,9 +142,33 @@ describe("manual serial macro command-to-PTY routes", () => {
       fixture.box!.value = "é"; fixture.box!.accept();
     }
     await pending;
-    expect(h.transport.writePort).toHaveBeenCalledExactlyOnceWith("physical-1", Buffer.from(" \té\r\n\n"));
+    expect(h.transport.writePort).toHaveBeenCalledExactlyOnceWith("physical-1", Buffer.from(" \té\r\r"));
     expect(h.terminal.sendText).not.toHaveBeenCalled(); expect(h.other.sendText).not.toHaveBeenCalled();
     expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("workbench.action.terminal.sendSequence", expect.anything());
+  });
+
+  const expected = { lf: " \té\n\n", crlf: " \té\r\n\r\n" } as const;
+  it.each(routes.flatMap((route) => [false, true].flatMap((smart) => [false, true].flatMap((prompted) =>
+    (["lf", "crlf"] as const).map((newline) => ({ route, smart, prompted, newline }))))))(
+    "$route smart=$smart prompted=$prompted follows the profile's Macro Newline ($newline)", async ({ route, smart, prompted, newline }) => {
+      const h = await harness(smart, true, true, newline);
+      const pending = invoke(route, macroFor(route, prompted));
+      await flush();
+      if (prompted) { fixture.box!.value = "é"; fixture.box!.accept(); }
+      await pending;
+      expect(h.transport.writePort).toHaveBeenCalledExactlyOnceWith("physical-1", Buffer.from(expected[newline]));
+    });
+
+  it.each([false, true])("converts newlines inside variable values and reads the profile at send time (smart=%s)", async (smart) => {
+    const h = await harness(smart, true);
+    const macro: TerminalMacro = { id: "macro", name: "Bytes", text: "set $value\n", keybinding: "alt+1", variables: [{ name: "value" }] };
+    const pending = invoke("runBinding", macro);
+    await flush();
+    // Edited while the prompt is open: the send uses the profile as saved now.
+    h.profile.macroNewline = "crlf";
+    fixture.box!.value = "a\nb\r\nc\rd"; fixture.box!.accept();
+    await pending;
+    expect(h.transport.writePort).toHaveBeenCalledExactlyOnceWith("physical-1", Buffer.from("set a\r\nb\r\nc\rd\r\n"));
   });
 
   it.each(routes.flatMap((route) => [false, true].flatMap((smart) => ["lock", "close", "reconnect"].map((change) => ({ route, smart, change })))))(
@@ -146,6 +185,33 @@ describe("manual serial macro command-to-PTY routes", () => {
       const messages = vi.mocked(vscode.window.setStatusBarMessage).mock.calls.map(([message]) => message).join("\n");
       expect(messages).toMatch(/nothing was sent|send failed/i); expect(messages).not.toContain('Macro "Bytes" sent'); expect(messages).not.toContain("secret-value");
     });
+});
+
+describe("createSerialMacroNewlineLookup", () => {
+  it("reads the saved setting of the profile whose session owns the PTY; else the last value that took effect; else CR", () => {
+    const ptyA = {}; const ptyB = {}; const ptyC = {}; const stranger = {};
+    const profiles: Record<string, { macroNewline?: unknown }> = { a: {}, b: { macroNewline: "crlf" }, c: { macroNewline: "none" } };
+    // A was opened with CR (seeded "cr"); C was opened with a newer release's value, so nothing is seeded.
+    const lookup = lookupOver([{ profileId: "b", pty: ptyB }, { profileId: "a", pty: ptyA, lastMacroNewline: "cr" }, { profileId: "c", pty: ptyC }], profiles);
+    expect(lookup(ptyA as never)).toBe("cr");
+    expect(lookup(ptyB as never)).toBe("crlf");
+    expect(lookup(stranger as never)).toBe("cr");
+    // Edited CR -> LF mid-session: the next send uses it, and it becomes the last value that took effect.
+    profiles.a = { macroNewline: "lf" };
+    expect(lookup(ptyA as never)).toBe("lf");
+    expect(lookup.entries[1].lastMacroNewline).toBe("lf");
+    // A newer release's value is CR, and is not recorded.
+    profiles.a = { macroNewline: "none" };
+    expect(lookup(ptyA as never)).toBe("cr");
+    expect(lookup.entries[1].lastMacroNewline).toBe("lf");
+    // Deleted while connected: the mid-session LF, not the CR it opened with.
+    delete profiles.a;
+    expect(lookup(ptyA as never)).toBe("lf");
+    // C only ever saw an unknown value: deleted, it is CR.
+    expect(lookup(ptyC as never)).toBe("cr");
+    delete profiles.c;
+    expect(lookup(ptyC as never)).toBe("cr");
+  });
 });
 
 describe("serial adapter", () => {
@@ -167,7 +233,7 @@ describe("serial adapter", () => {
     const payload = " "+"é".repeat(65536)+"\r\n";
     const sending = h.resolver(h.terminal)!.send(payload) as Promise<boolean>;
     void sending.then(() => { done = true; }); await flush();
-    expect(done).toBe(false); expect(h.transport.writePort).toHaveBeenCalledExactlyOnceWith("physical-1", Buffer.from(payload));
+    expect(done).toBe(false); expect(h.transport.writePort).toHaveBeenCalledExactlyOnceWith("physical-1", Buffer.from(payload.replace("\r\n", "\r")));
     complete(); expect(await sending).toBe(true);
     vi.mocked(h.transport.writePort).mockRejectedValueOnce(new Error("driver error with secret-value"));
     expect(await h.resolver(h.terminal)!.send("secret-value")).toBe(false);
@@ -181,7 +247,8 @@ describe("serial adapter", () => {
     expect(await target.send("no")).toBe(false); expect(h.transport.writePort).not.toHaveBeenCalled();
   });
   it("retains the nonserial same-tick sendSequence and prompted sendText delivery", async () => {
-    const h = await harness(false, true);
+    // A serial profile set to CRLF must not reach a nonserial terminal: its text goes to VS Code unchanged.
+    const h = await harness(false, true, true, "crlf");
     Object.assign(vscode.window, { activeTerminal: h.other });
     vi.mocked(vscode.commands.executeCommand).mockResolvedValue(undefined);
     const pending = invoke("runBinding", macroFor("runBinding", false));
@@ -203,7 +270,7 @@ describe("macro shortcuts from a focused Serial Send Box", () => {
     const pty = new SerialPty(transport, profile, { onSessionOpened() {}, onSessionClosed() {} }, { log() {}, close() {} });
     owners.push(pty);
     const terminal = { name, sendText: vi.fn(), exitStatus: undefined } as unknown as VSCode.Terminal;
-    return { pty, transport, terminal };
+    return { pty, transport, terminal, saved: { macroNewline: undefined as SerialMacroNewline | undefined } };
   }
 
   async function sendBoxHarness() {
@@ -220,11 +287,13 @@ describe("macro shortcuts from a focused Serial Send Box", () => {
     a.pty.setDedicatedInputEnabled(true);
     const panel = { focused: { sessionId: "A", profileName: "A", terminal: a.terminal, input: a.pty } as SerialSendBinding | undefined,
       getFocusedBinding() { return this.focused; } };
-    const resolver = createSerialMacroTargetResolver(registry);
+    // B is listed first, so a lookup that ignored PTY identity would read B's setting for A's box.
+    const lookup = lookupOver([{ profileId: "B", pty: b.pty }, { profileId: "A", pty: a.pty }], { A: a.saved, B: b.saved });
+    const resolver = createSerialMacroTargetResolver(registry, lookup);
     registerMacroCommands(undefined, resolver, createFocusedSendBoxMacroTarget(panel, registry, resolver));
     vi.mocked(vscode.commands.executeCommand).mockClear();
     vi.mocked(vscode.commands.executeCommand).mockResolvedValue(undefined);
-    return { a, b, registry, panel };
+    return { a, b, registry, panel, lookup };
   }
   const sendBox = { source: SERIAL_SEND_BOX_MACRO_SOURCE };
   const NO_FOCUSED_BOX = "Click into the serial send box, then press the shortcut again. Nothing was sent.";
@@ -253,6 +322,18 @@ describe("macro shortcuts from a focused Serial Send Box", () => {
     expect(h.b.transport.writePort).not.toHaveBeenCalled(); expect(h.b.terminal.sendText).not.toHaveBeenCalled();
     expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("workbench.action.terminal.sendSequence", expect.anything());
   });
+
+  it.each([[undefined, "show run\r"], ["lf", "show run\n"], ["crlf", "show run\r\n"]] as const)(
+    "a shortcut from the box sends newlines as its own profile's Macro Newline (%s), not the active terminal's", async (newline, bytes) => {
+      const h = await sendBoxHarness();
+      h.a.saved.macroNewline = newline;
+      // The active terminal's profile differs, so reading the wrong session's setting shows up.
+      h.b.saved.macroNewline = newline === "lf" ? "crlf" : "lf";
+      fixture.macros = [{ id: "nl", name: "Newline", text: "show run\n", keybinding: "alt+1" }];
+      await run("nexus.macro.runBinding", { binding: "alt+1", ...sendBox });
+      expect(h.a.transport.writePort).toHaveBeenCalledExactlyOnceWith("A-physical-1", Buffer.from(bytes));
+      expect(h.b.transport.writePort).not.toHaveBeenCalled();
+    });
 
   it("the Alt+S picker pins the focused box before the pick resolves", async () => {
     const h = await sendBoxHarness();
@@ -297,7 +378,7 @@ describe("macro shortcuts from a focused Serial Send Box", () => {
     panel.openOrReveal({ sessionId: "B", profileName: "B", terminal: h.b.terminal, input: h.b.pty });
     const [boxA, boxB] = fixture.webviewPanels;
     await boxA.receive!({ type: "focusChanged", focused: true });
-    const resolver = createSerialMacroTargetResolver(h.registry);
+    const resolver = createSerialMacroTargetResolver(h.registry, h.lookup);
     registerMacroCommands(undefined, resolver, createFocusedSendBoxMacroTarget(panel, h.registry, resolver));
     // The user switches to B: VS Code has updated active state, but neither A's blur
     // nor B's focus report (nor A's view-state listener) has run yet.

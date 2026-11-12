@@ -1,5 +1,5 @@
 import type { AuthProfile, AuthProfileOwnedCredentials, LocalShellProfile, ProxyConfig, SerialProfile, ServerConfig, ServerProtocol, TunnelProfile, TunnelType } from "../models/config";
-import { authProfileFieldOwnership, isExternalAuthProfile, authProfileOwnedCredentials, resolveServerProtocol, resolveTunnelType } from "../models/config";
+import { authProfileFieldOwnership, isExternalAuthProfile, authProfileOwnedCredentials, resolveSerialMacroNewline, resolveServerProtocol, resolveTunnelType } from "../models/config";
 import type { NetworkServerKind } from "../models/networkServer";
 import type { DhcpAdapterConfig, TftpAdapterConfig } from "../services/networkServers/core/index";
 import { DEFAULTS as DHCP_DEFAULTS } from "../services/networkServers/dhcp/engine/dhcpConstants";
@@ -575,7 +575,21 @@ function serialFields(seed?: Partial<SerialProfile>, vw?: VisibleWhen): FormFiel
       advanced: true,
       visibleWhen: vw
     },
-    { type: "checkbox", key: "rtscts", label: "Enable RTS/CTS hardware flow control", value: seed?.rtscts ?? false, advanced: true, visibleWhen: vw }
+    { type: "checkbox", key: "rtscts", label: "Enable RTS/CTS hardware flow control", value: seed?.rtscts ?? false, advanced: true, visibleWhen: vw },
+    {
+      type: "select",
+      key: "macroNewline",
+      label: "Macro Newline",
+      options: [
+        { label: "CR (default)", value: "cr" },
+        { label: "LF", value: "lf" },
+        { label: "CRLF", value: "crlf" }
+      ],
+      value: resolveSerialMacroNewline(seed?.macroNewline),
+      hint: "What each line break in a macro sends to this device, whether you run the macro or a trigger does. CR matches pressing Enter; choose LF or CRLF only when the device expects it. The Serial Send Box has its own line-ending choice.",
+      advanced: true,
+      visibleWhen: vw
+    }
   ];
 }
 

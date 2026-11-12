@@ -2532,6 +2532,21 @@ describe("serial send box contributions", () => {
       expect(changelog).toContain("for a bound shortcut whose key is in its US-layout position");
     });
 
+    it("documents the serial Macro Newline and drops the claim that macros, or serial macros, go out byte for byte (issue #339)", () => {
+      const prose = [...userDocs.map(([, text]) => text), functionalDocs].join("\n");
+      expect(prose).not.toContain("Macro text is sent exactly as saved");
+      expect(prose).not.toContain("Nexus manual/automatic macros and script writes preserve their existing bytes");
+      expect(prose).not.toContain("a macro's text is sent to the terminal exactly as stored");
+      const macros = userDoc("docs/macros.md");
+      expect(macros).toContain("serial profile's [**Macro Newline**](serial.md#macro-newline), CR by default");
+      expect(macros).toContain("macros you run go through VS Code's terminal input, which\n  sends each newline as Enter");
+      const serial = userDoc("docs/serial.md");
+      expect(serial).toContain("## Macro Newline");
+      expect(serial).toContain("set the profile to **LF**");
+      expect(serial).toContain("the send box's **Line ending** applies only to text sent from the send box");
+      expect(functionalDocs).toContain("**Macro Newline** (advanced; `SerialProfile.macroNewline`");
+    });
+
     it("keeps the restore-direct-input steps out of the scripts bullet", () => {
       const serial = userDoc("docs/serial.md");
       const scriptsBullet = serial.split("\n").find((line) => line.startsWith("- **Scripts**"));

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { isSerialUserInput, prepareSerialText } from "../../src/services/serial/serialUserInput";
+import { applySerialMacroNewline, isSerialUserInput, knownMacroNewline, lineEndingCharacters, prepareSerialText, resolveSessionMacroNewline } from "../../src/services/serial/serialUserInput";
+import { resolveSerialMacroNewline } from "../../src/models/config";
 
 describe("prepareSerialText", () => {
   it.each([
@@ -35,5 +36,74 @@ describe("isSerialUserInput", () => {
       expect(isSerialUserInput({ ...input, [key]: undefined })).toBe(false);
     }
     for (const value of [null, undefined, {}, "serial"]) expect(isSerialUserInput(value)).toBe(false);
+  });
+});
+
+describe("applySerialMacroNewline (issue #339)", () => {
+  it.each([
+    // Each \r?\n becomes exactly one ending: a CRLF pair is one newline, never two.
+    ["a\nb\r\nc", "cr", "a\rb\rc"],
+    ["a\nb\r\nc", "lf", "a\nb\nc"],
+    ["a\nb\r\nc", "crlf", "a\r\nb\r\nc"],
+    // A standalone CR is already Enter and is left alone, under every ending.
+    ["a\rb\n", "lf", "a\rb\n"],
+    ["a\rb\n", "crlf", "a\rb\r\n"],
+    ["a\r\r\nb", "cr", "a\r\rb"],
+    // Nothing is appended, and text with no newline is untouched.
+    ["show run", "crlf", "show run"],
+    ["", "crlf", ""],
+    ["\n\n", "crlf", "\r\n\r\n"],
+    [" \té\r\n\n", "cr", " \té\r\r"]
+  ] as const)("converts %j with %s", (text, newline, expected) => {
+    expect(applySerialMacroNewline(text, newline)).toBe(expected);
+  });
+
+  it.each([undefined, null, "", "CR", "Lf", "none", "\n", 1, {}, ["lf"]])("treats %j as CR", (setting) => {
+    expect(applySerialMacroNewline("a\nb\r\n", setting)).toBe("a\rb\r");
+    expect(resolveSerialMacroNewline(setting)).toBe("cr");
+  });
+
+  it("mirrors VS Code's sendText normalization when CR", () => {
+    // terminalInstance.ts: text.replace(/\r?\n/g, '\r'). Any input must give the same bytes.
+    for (const text of ["\r\n\r", "\n\r\n\r\r\n", "x\r\n\ny\rz", "\u2028\r\n"]) {
+      expect(applySerialMacroNewline(text, undefined)).toBe(text.replace(/\r?\n/g, "\r"));
+    }
+  });
+});
+
+describe("lineEndingCharacters", () => {
+  it("is the one CR / LF / CRLF mapping, shared by the send box and macros", () => {
+    expect(lineEndingCharacters("cr")).toBe("\r");
+    expect(lineEndingCharacters("lf")).toBe("\n");
+    expect(lineEndingCharacters("crlf")).toBe("\r\n");
+    for (const ending of ["cr", "lf", "crlf"] as const) {
+      expect(prepareSerialText("x", ending)).toBe(`x${lineEndingCharacters(ending)}`);
+      expect(applySerialMacroNewline("x\n", ending)).toBe(`x${lineEndingCharacters(ending)}`);
+    }
+  });
+});
+
+describe("resolveSessionMacroNewline", () => {
+  const profiles = (saved: Record<string, { macroNewline?: unknown }>) => ({ getSerialProfile: (id: string) => saved[id] as never });
+  it("uses the saved profile and records it, else the last value that took effect, else CR", () => {
+    const session: { profileId: string; lastMacroNewline?: "cr" | "lf" | "crlf" } = { profileId: "p", lastMacroNewline: "lf" };
+    expect(resolveSessionMacroNewline(profiles({ p: { macroNewline: "crlf" } }), session)).toBe("crlf");
+    expect(session.lastMacroNewline).toBe("crlf");
+    // Saved without the field is CR, a known value: it wins and is recorded.
+    expect(resolveSessionMacroNewline(profiles({ p: {} }), session)).toBe("cr");
+    expect(session.lastMacroNewline).toBe("cr");
+    session.lastMacroNewline = "lf";
+    // A newer release's value is CR and is not recorded.
+    expect(resolveSessionMacroNewline(profiles({ p: { macroNewline: "future" } }), session)).toBe("cr");
+    expect(session.lastMacroNewline).toBe("lf");
+    expect(resolveSessionMacroNewline(profiles({}), session)).toBe("lf");
+    expect(resolveSessionMacroNewline(profiles({}), { profileId: "p" })).toBe("cr");
+    expect(resolveSessionMacroNewline(profiles({ p: { macroNewline: "lf" } }), undefined)).toBe("cr");
+  });
+
+  it("seeds the last-known value from a known opened profile only", () => {
+    expect(knownMacroNewline({})).toBe("cr");
+    expect(knownMacroNewline({ macroNewline: "crlf" })).toBe("crlf");
+    expect(knownMacroNewline({ macroNewline: "none" })).toBeUndefined();
   });
 });

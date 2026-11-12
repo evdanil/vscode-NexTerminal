@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.8.319] — 2026-11-12
+
+### Added
+
+- **Macro Newline for serial profiles** chooses what each newline in a macro sends to the device: **CR** (default, what pressing Enter sends), **LF** or **CRLF**. It is in the advanced settings of the serial profile form, applies to Standard and Smart Follow sessions, and covers macros run from the Macros view, Nexus: Run Macro, shortcuts (including from the Serial Send Box) and auto-trigger macros. Newlines inside variable values are converted too; a CRLF pair counts as one newline, a CR on its own is sent as is, and nothing is added at the end. A change applies to the next macro without reconnecting. It travels in backups and in Export for Sharing; an unrecognised value in an imported or stored profile is read as CR. The Serial Send Box keeps its own line-ending choice. Addresses #339.
+
+### Changed
+
+- **Serial auto-trigger macros now send each newline as CR by default.** They have always sent the macro's newlines as LF. They now follow the profile's Macro Newline, which defaults to CR, like manual macros. If a device relied on the old LF bytes, set its serial profile's **Macro Newline** to **LF**.
+
+### Fixed
+
+- **Macros run manually on serial sessions send Enter again.** Since 2.8.317, a newline in a macro run from the Macros view, Nexus: Run Macro or a shortcut reached a serial device as LF instead of the CR that pressing Enter sends, so a console that runs commands on CR could ignore them. Each newline is CR again, or the profile's Macro Newline when you choose another.
+
 ## [2.8.318] — 2026-11-12
 
 ### Added

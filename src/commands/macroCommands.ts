@@ -340,7 +340,9 @@ async function runOrSendMacro(
   const toRun = text === macro.text ? macro : { ...macro, text };
   if (sendBox.kind !== "notSendBox") {
     // Send-box shortcut: the caller captured the session at invocation. Delivery
-    // is the guarded serial path (epoch, script lock); macro bytes are never converted.
+    // is the guarded serial path (epoch, script lock), which converts the macro's
+    // newlines to the session profile's Macro Newline; the send box's own
+    // line-ending selector never applies to macros.
     if (sendBox.kind !== "target") {
       vscode.window.setStatusBarMessage(SEND_BOX_REFUSALS[sendBox.kind], 4000);
       return;
