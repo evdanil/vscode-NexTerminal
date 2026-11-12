@@ -2,12 +2,13 @@ import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { readHighlightCatalog } from "../services/terminal/highlightProfileSettings";
 import { parseHighlightProfileFormValue } from "../ui/highlightProfileForm";
-import { resolveSerialProfileMode, type SerialDataBits, type SerialDeviceHint, type SerialParity, type SerialProfile, type SerialSessionStatus, type SerialStopBits } from "../models/config";
+import { resolveSerialMacroNewline, resolveSerialProfileMode, type SerialDataBits, type SerialDeviceHint, type SerialParity, type SerialProfile, type SerialSessionStatus, type SerialStopBits } from "../models/config";
 import { createSessionTranscript, type SessionTranscriptOptions } from "../logging/sessionTranscriptLogger";
 import { normalizeTranscriptTimestampMode } from "../logging/transcriptTimestamps";
 import { normalizeTranscriptLineEndingMode } from "../logging/transcriptLineEndings";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SerialPty } from "../services/serial/serialPty";
+import { applySerialMacroNewline } from "../services/serial/serialUserInput";
 import { isSerialRuntimeMissingError } from "../services/serial/errorMatchers";
 import {
   SmartSerialPty,
@@ -272,6 +273,17 @@ function getTranscriptOptions(ctx: CommandContext, profile: SerialProfile): Sess
   };
 }
 
+/**
+ * Auto-trigger macro text with its newlines converted to the profile's Macro
+ * Newline (see `applySerialMacroNewline`). The setting is read from the saved
+ * profile at each send, so an edit applies to the next trigger without a
+ * reconnect, as it does for macros run by hand; the profile the session opened
+ * with stands in only if the saved one was deleted while the session ran.
+ */
+function macroTextForSerialProfile(ctx: CommandContext, opened: SerialProfile, text: string): string {
+  return applySerialMacroNewline(text, (ctx.core.getSerialProfile(opened.id) ?? opened).macroNewline);
+}
+
 function serialTerminalName(profile: SerialProfile): string {
   return resolveSerialProfileMode(profile) === "smartFollow"
     ? `Nexus Serial: ${profile.name} [Smart Follow]`
@@ -390,6 +402,8 @@ export function formValuesToSerial(values: FormValues, existing?: Partial<Serial
   const stopBits = typeof values.stopBits === "string" ? Number(values.stopBits) : 1;
   const parity = typeof values.parity === "string" ? values.parity : "none";
   const rawMode = typeof values.mode === "string" ? values.mode : existing?.mode;
+  // CR is stored as absence (the default every record without the field already means).
+  const macroNewline = resolveSerialMacroNewline(typeof values.macroNewline === "string" ? values.macroNewline : existing?.macroNewline);
   return {
     id: existing?.id ?? randomUUID(),
     name,
@@ -403,6 +417,7 @@ export function formValuesToSerial(values: FormValues, existing?: Partial<Serial
     group: normalizedGroup,
     mode: rawMode === "smartFollow" ? "smartFollow" : "standard",
     deviceHint: existing?.deviceHint,
+    ...(macroNewline === "cr" ? {} : { macroNewline }),
     highlightProfileId: parseHighlightProfileFormValue(values.highlightProfileId, existing?.highlightProfileId)
   };
 }
@@ -421,7 +436,7 @@ async function connectStandardSerialProfile(
   let terminalRef: vscode.Terminal | undefined;
   let ptyRef: SerialPty | undefined;
   const triggerObserver = ctx.macroAutoTrigger.createObserver(
-    (text) => ptyRef?.handleInput(text, "macro"),
+    (text) => ptyRef?.handleInput(macroTextForSerialProfile(ctx, profile, text), "macro"),
     () => terminalRef !== undefined && vscode.window.activeTerminal === terminalRef,
     undefined,
     profile.id
@@ -557,7 +572,7 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
   let ptyRef: SmartSerialPty | undefined;
   let currentProfile = profile;
   const triggerObserver = ctx.macroAutoTrigger.createObserver(
-    (text) => ptyRef?.handleInput(text, "macro"),
+    (text) => ptyRef?.handleInput(macroTextForSerialProfile(ctx, currentProfile, text), "macro"),
     () => terminalRef !== undefined && vscode.window.activeTerminal === terminalRef,
     logicalSessionId,
     profile.id
@@ -784,7 +799,7 @@ export function registerSerialCommands(ctx: CommandContext): vscode.Disposable[]
           });
           if (showConnectedNotice) {
             void vscode.window.showInformationMessage(
-              "Serial profile updated. Highlight profile changes apply to future output unless the terminal has its own override. Other settings apply after reconnect."
+              "Serial profile updated. Highlight profile changes apply to future output unless the terminal has its own override. Macro Newline applies to the next macro. Other settings apply after reconnect."
             );
           }
         }

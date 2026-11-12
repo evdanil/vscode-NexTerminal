@@ -9,6 +9,7 @@ import type {
   ProxyConfig,
   LocalShellProfile
 } from "../models/config";
+import { isSerialMacroNewline } from "../models/config";
 import type { InventorySourceConfig } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
@@ -23,6 +24,22 @@ export function sanitizeHighlightProfileSelection(item: unknown): unknown {
   if (typeof item !== "object" || item === null || Array.isArray(item)) return item;
   const obj = item as Record<string, unknown>;
   return isHighlightProfileSelection(obj.highlightProfileId) ? item : { ...obj, highlightProfileId: null };
+}
+
+/**
+ * A serial profile's Macro Newline is a preference, not part of the record's
+ * identity: a value this build does not know (a newer release's, or a
+ * hand-edited file's) is removed so the profile falls back to CR, instead of
+ * dropping the whole profile the way an unknown `mode` does. Every read
+ * boundary (storage, backup import, share import) runs this before
+ * `validateSerialProfile`, which rejects a value that skipped it.
+ */
+export function sanitizeSerialMacroNewline(item: unknown): unknown {
+  if (typeof item !== "object" || item === null || Array.isArray(item)) return item;
+  const obj = item as Record<string, unknown>;
+  if (obj.macroNewline === undefined || isSerialMacroNewline(obj.macroNewline)) return item;
+  const { macroNewline: _unknown, ...rest } = obj;
+  return rest;
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -710,6 +727,7 @@ export function validateSerialProfile(item: unknown): item is SerialProfile {
     isNonEmptyString(obj.path) &&
     typeof obj.baudRate === "number" &&
     (obj.mode === undefined || obj.mode === "standard" || obj.mode === "smartFollow") &&
+    (obj.macroNewline === undefined || isSerialMacroNewline(obj.macroNewline)) &&
     validateSerialDeviceHint(obj.deviceHint) &&
     isHighlightProfileSelection(obj.highlightProfileId)
   );

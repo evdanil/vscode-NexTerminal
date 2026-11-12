@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { isSerialUserInput, prepareSerialText } from "../../src/services/serial/serialUserInput";
+import { applySerialMacroNewline, isSerialUserInput, prepareSerialText } from "../../src/services/serial/serialUserInput";
+import { resolveSerialMacroNewline } from "../../src/models/config";
 
 describe("prepareSerialText", () => {
   it.each([
@@ -35,5 +36,37 @@ describe("isSerialUserInput", () => {
       expect(isSerialUserInput({ ...input, [key]: undefined })).toBe(false);
     }
     for (const value of [null, undefined, {}, "serial"]) expect(isSerialUserInput(value)).toBe(false);
+  });
+});
+
+describe("applySerialMacroNewline (issue #339)", () => {
+  it.each([
+    // Each \r?\n becomes exactly one ending: a CRLF pair is one newline, never two.
+    ["a\nb\r\nc", "cr", "a\rb\rc"],
+    ["a\nb\r\nc", "lf", "a\nb\nc"],
+    ["a\nb\r\nc", "crlf", "a\r\nb\r\nc"],
+    // A standalone CR is already Enter and is left alone, under every ending.
+    ["a\rb\n", "lf", "a\rb\n"],
+    ["a\rb\n", "crlf", "a\rb\r\n"],
+    ["a\r\r\nb", "cr", "a\r\rb"],
+    // Nothing is appended, and text with no newline is untouched.
+    ["show run", "crlf", "show run"],
+    ["", "crlf", ""],
+    ["\n\n", "crlf", "\r\n\r\n"],
+    [" \té\r\n\n", "cr", " \té\r\r"]
+  ] as const)("converts %j with %s", (text, newline, expected) => {
+    expect(applySerialMacroNewline(text, newline)).toBe(expected);
+  });
+
+  it.each([undefined, null, "", "CR", "Lf", "none", "\n", 1, {}, ["lf"]])("treats %j as CR", (setting) => {
+    expect(applySerialMacroNewline("a\nb\r\n", setting)).toBe("a\rb\r");
+    expect(resolveSerialMacroNewline(setting)).toBe("cr");
+  });
+
+  it("mirrors VS Code's sendText normalization when CR", () => {
+    // terminalInstance.ts: text.replace(/\r?\n/g, '\r'). Any input must give the same bytes.
+    for (const text of ["\r\n\r", "\n\r\n\r\r\n", "x\r\n\ny\rz", "\u2028\r\n"]) {
+      expect(applySerialMacroNewline(text, undefined)).toBe(text.replace(/\r?\n/g, "\r"));
+    }
   });
 });

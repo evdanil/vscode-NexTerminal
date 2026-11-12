@@ -86,6 +86,7 @@ vi.mock("../../src/ui/webviewFormPanel", () => ({
 
 import * as vscode from "vscode";
 import { closeSerialProfileTerminals, formValuesToSerial, registerSerialCommands } from "../../src/commands/serialCommands";
+import { createSerialMacroNewlineLookup } from "../../src/commands/serialMacroTarget";
 import type { CommandContext } from "../../src/commands/types";
 import { NexusCore } from "../../src/core/nexusCore";
 import type { SerialProfile } from "../../src/models/config";
@@ -110,6 +111,18 @@ describe("formValuesToSerial", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     registeredCommands.clear();
+  });
+
+  it("saves LF and CRLF, stores CR as absence, and keeps the saved value when the form omits the field", () => {
+    const values = { name: "Console", path: "COM3", baudRate: "115200" };
+    expect(formValuesToSerial({ ...values, macroNewline: "lf" })?.macroNewline).toBe("lf");
+    expect(formValuesToSerial({ ...values, macroNewline: "crlf" }, { macroNewline: "lf" })?.macroNewline).toBe("crlf");
+    const cr = formValuesToSerial({ ...values, macroNewline: "cr" }, { macroNewline: "lf" })!;
+    expect(cr).not.toHaveProperty("macroNewline");
+    // A posted value outside the three endings is never stored.
+    expect(formValuesToSerial({ ...values, macroNewline: "\n" }, { macroNewline: "crlf" })).not.toHaveProperty("macroNewline");
+    expect(formValuesToSerial(values, { macroNewline: "crlf" })?.macroNewline).toBe("crlf");
+    expect(formValuesToSerial(values)).not.toHaveProperty("macroNewline");
   });
 
   it("preserves custom and preset baud rates as numbers", () => {
@@ -505,8 +518,9 @@ describe("serial terminal tab visual differentiation", () => {
       expect([...ctx.serialTerminals.values()][0]).toHaveProperty("input", pty);
       pty.setDedicatedInputEnabled(true);
       pty.handleInput("native"); expect(ctx.serialSidecar.writePort).not.toHaveBeenCalled();
+      // Issue #339: an auto-trigger newline goes out as Enter (CR) by default, not as the LF it always was.
       send("macro\r\n");
-      expect(ctx.serialSidecar.writePort).toHaveBeenCalledExactlyOnceWith("physical", Buffer.from("macro\r\n"));
+      expect(ctx.serialSidecar.writePort).toHaveBeenCalledExactlyOnceWith("physical", Buffer.from("macro\r"));
       ctx.serialSidecar.writePort.mockClear();
       pty.setInputBlocked(true); send("blocked");
       expect(ctx.serialSidecar.writePort).not.toHaveBeenCalled();
@@ -515,6 +529,49 @@ describe("serial terminal tab visual differentiation", () => {
       pty.dispose();
     }
   });
+
+  it.each((["standard", "smartFollow"] as const).flatMap((mode) => ([
+    [undefined, "a\rb\r\rc"], ["cr", "a\rb\r\rc"], ["lf", "a\nb\n\rc"], ["crlf", "a\r\nb\r\n\rc"], ["bogus", "a\rb\r\rc"],
+    // Deleted while connected: the profile the session opened with (LF) stands in.
+    ["deleted", "a\nb\n\rc"]
+  ] as const).map(([newline, bytes]) => ({ mode, newline, bytes }))))(
+    "$mode auto-trigger macros follow the saved Macro Newline ($newline), read at each send", async ({ mode, newline, bytes }) => {
+      const actual = mode === "standard"
+        ? await vi.importActual<typeof import("../../src/services/serial/serialPty")>("../../src/services/serial/serialPty")
+        : await vi.importActual<typeof import("../../src/services/serial/smartSerialPty")>("../../src/services/serial/smartSerialPty");
+      const ctx = makeSerialCtx();
+      // Connected with LF; the saved profile is then edited, and the next trigger must use the edit.
+      const opened = { ...baseProfile, mode, macroNewline: "lf" };
+      let saved: Record<string, unknown> | undefined = opened;
+      ctx.core.getSerialProfile = vi.fn(() => saved);
+      ctx.serialSidecar = {
+        listPorts: async () => [{ path: opened.path }], openPort: async () => "physical",
+        writePort: vi.fn(async () => {}), closePort: async () => {},
+        onDidReceiveData: () => () => {}, onDidReceiveError: () => () => {}, onDidDisconnect: () => () => {}
+      };
+      ctx.loggerFactory.create = () => ({ log() {}, close() {} });
+      let send!: (text: string) => void;
+      ctx.macroAutoTrigger.createObserver.mockImplementation((write: (text: string) => void) => { send = write; return {}; });
+      if ("SerialPty" in actual) vi.mocked(SerialPty).mockImplementationOnce(function (...args) { return new actual.SerialPty(...args); });
+      else vi.mocked(SmartSerialPty).mockImplementationOnce(function (...args) { return new actual.SmartSerialPty(...args); });
+      registerSerialCommands(ctx);
+      await registeredCommands.get("nexus.serial.connect")!(opened.id);
+      const calls = vi.mocked(vscode.window.createTerminal).mock.calls;
+      const pty = (calls[calls.length - 1][0] as unknown as { pty: SerialPty | SmartSerialPty }).pty;
+      try {
+        pty.open(); for (let i = 0; i < 16; i++) await Promise.resolve();
+        saved = newline === "deleted" ? undefined : { ...opened, macroNewline: newline };
+        send("a\nb\r\n\rc");
+        expect(ctx.serialSidecar.writePort).toHaveBeenCalledExactlyOnceWith("physical", Buffer.from(bytes));
+        // The manual route finds this same PTY among the sessions the connect path registered.
+        const registered = ctx.core.registerSerialSession.mock.calls.map((call: unknown[]) => call[0]);
+        const lookup = createSerialMacroNewlineLookup({ getSnapshot: () => ({ activeSerialSessions: registered }), getSerialProfile: () => saved });
+        expect(lookup(pty)).toBe(newline === "deleted" ? undefined : newline);
+      } finally {
+        ctx.core.unregisterSerialSession = vi.fn();
+        pty.dispose();
+      }
+    });
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -1081,6 +1138,7 @@ describe("nexus.serial.remove — the disclosure is re-checked under the lock (R
       expect(notice).toContain("Highlight profile changes apply to future output");
       expect(notice).toContain("terminal has its own override");
       expect(notice).toContain("Other settings apply after reconnect");
+      expect(notice).toContain("Macro Newline applies to the next macro.");
       expect(notice).not.toContain("Existing sessions keep current settings until reconnect");
     });
 

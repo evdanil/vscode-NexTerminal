@@ -92,6 +92,25 @@ describe("serial baud rate form", () => {
   });
 });
 
+describe("serial Macro Newline field (issue #339)", () => {
+  it("offers CR (default), LF and CRLF on the edit form and on the add form's serial branch", () => {
+    for (const definition of [serialFormDefinition(), unifiedProfileFormDefinition({ addMode: "serial", profileType: "serial" })]) {
+      const field = keyedField(definition, "macroNewline");
+      expect(field).toMatchObject({ type: "select", label: "Macro Newline", value: "cr", advanced: true });
+      expect((field as { options: unknown }).options).toEqual([
+        { label: "CR (default)", value: "cr" }, { label: "LF", value: "lf" }, { label: "CRLF", value: "crlf" }
+      ]);
+      expect(field.hint).toContain("Serial Send Box has its own");
+    }
+  });
+
+  it.each([[undefined, "cr"], ["lf", "lf"], ["crlf", "crlf"], ["bogus", "cr"]] as const)("seeds a saved %j as %s", (saved, shown) => {
+    const form = openForm(serialFormDefinition({ name: "Console", path: "COM3", macroNewline: saved as never }));
+    expect(form.value("macroNewline")).toBe(shown);
+    expect(form.submit()).toMatchObject({ macroNewline: shown });
+  });
+});
+
 describe("networkServerFormDefinition — DHCP lease duration", () => {
   // ⊘ Restoring the former clamping claim misstates the form contract: invalid
   // submissions are rejected and invalid persisted settings default to 24h.

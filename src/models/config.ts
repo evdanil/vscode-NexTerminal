@@ -13,6 +13,8 @@ export type SerialParity = "none" | "even" | "odd" | "mark" | "space";
 export type SerialDataBits = 5 | 6 | 7 | 8;
 export type SerialStopBits = 1 | 2;
 export type SerialProfileMode = "standard" | "smartFollow";
+/** How each newline in a macro reaches a serial device (`SerialProfile.macroNewline`). */
+export type SerialMacroNewline = "cr" | "lf" | "crlf";
 export type SerialSessionStatus = "connected" | "waiting";
 export type LocalShellLaunchMode = "vscodeProfile" | "custom";
 
@@ -1309,6 +1311,13 @@ export interface SerialProfile {
   logSession?: boolean;
   mode?: SerialProfileMode;
   deviceHint?: SerialDeviceHint;
+  /**
+   * What each newline in a macro becomes on this profile's sessions, manual and
+   * auto-trigger alike. Absent (or any value outside the three literals) means
+   * CR, the byte VS Code's own terminal input sends for Enter. Read through
+   * `resolveSerialMacroNewline`, never directly.
+   */
+  macroNewline?: SerialMacroNewline;
 }
 
 export interface LocalShellProfile {
@@ -1653,4 +1662,19 @@ export function resolveTunnelType(profile: TunnelProfile): TunnelType {
 
 export function resolveSerialProfileMode(profile: Pick<SerialProfile, "mode">): SerialProfileMode {
   return profile.mode ?? "standard";
+}
+
+export function isSerialMacroNewline(value: unknown): value is SerialMacroNewline {
+  return value === "cr" || value === "lf" || value === "crlf";
+}
+
+/**
+ * The Macro Newline a serial session ACTUALLY uses, applied at every send (the
+ * untrusted-field discipline `resolveBmcWebProtocol` sets): absent, a
+ * non-string or an unknown value resolves to `"cr"`, so a record that slipped
+ * past the storage and import sanitizers still cannot choose bytes outside the
+ * three endings.
+ */
+export function resolveSerialMacroNewline(value: unknown): SerialMacroNewline {
+  return isSerialMacroNewline(value) ? value : "cr";
 }

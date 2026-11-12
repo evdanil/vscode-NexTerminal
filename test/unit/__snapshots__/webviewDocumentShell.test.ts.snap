@@ -7754,7 +7754,7 @@ exports[`webview document shell (byte-identity guard) > macro editor 1`] = `
     <label for="macro-text">Text</label>
     <textarea id="macro-text" class="editor-textarea" rows="6" placeholder="echo hello&#10;ls -la">
 echo hi</textarea>
-    <div class="hint">Text is sent exactly as saved. Press Enter in the textarea to include a newline. \${profile.host}, \${profile.ipmiHost}, \${profile.ipmiUsername}, \${profile.port}, \${profile.username} and \${profile.name} are filled in from the server the macro is run against (right-click a server in the Connectivity Hub → Run Macro on Server…).</div>
+    <div class="hint">Text is sent as saved, with no Enter added. Press Enter in the textarea to include a newline; serial sessions send each newline as the profile's Macro Newline (CR by default). \${profile.host}, \${profile.ipmiHost}, \${profile.ipmiUsername}, \${profile.port}, \${profile.username} and \${profile.name} are filled in from the server the macro is run against (right-click a server in the Connectivity Hub → Run Macro on Server…).</div>
     <div class="field-error" id="error-text"></div>
     <div class="variables-diagnostics" id="variables-diagnostics" aria-live="polite"></div>
   </div>

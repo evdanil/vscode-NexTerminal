@@ -1,4 +1,5 @@
 import type * as vscode from "vscode";
+import { resolveSerialMacroNewline } from "../../models/config";
 
 export type SerialLineEnding = "none" | "cr" | "lf" | "crlf";
 
@@ -25,7 +26,10 @@ export function isSerialUserInput(value: unknown): value is SerialUserInput {
     typeof candidate.setDedicatedInputEnabled === "function" && typeof candidate.sendUserInput === "function";
 }
 
-/** Convert outbound composer text only; macros and scripts preserve their own bytes. */
+/**
+ * Convert outbound composer text only. Macros convert their newlines with
+ * `applySerialMacroNewline` instead, and scripts preserve their own bytes.
+ */
 export function prepareSerialText(text: string, ending: SerialLineEnding): string {
   if (ending !== "none" && ending !== "cr" && ending !== "lf" && ending !== "crlf") {
     throw new Error("Invalid serial line ending.");
@@ -35,4 +39,29 @@ export function prepareSerialText(text: string, ending: SerialLineEnding): strin
   if (!payload) throw new Error("Enter text or choose a line ending to send.");
   if (Buffer.byteLength(payload, "utf8") > 65536) throw new Error("Serial send exceeds 65,536 UTF-8 bytes.");
   return payload;
+}
+
+/**
+ * Turns each newline in macro text into the serial profile's Macro Newline
+ * (`SerialProfile.macroNewline`; absent or unknown means CR).
+ *
+ * WHY THIS EXISTS: manual macros used to reach every terminal through VS
+ * Code's `TerminalInstance.sendText`, which normalizes line endings to an Enter
+ * press with `text.replace(/\r?\n/g, '\r')`. Manual serial macros now write to
+ * the PTY directly (the guarded route that pins the session and honours script
+ * locks), which skips that normalization, so a saved newline reached the device
+ * as a bare LF (issue #339). Auto-trigger macros always wrote to the PTY, and
+ * so always sent LF; they share this conversion so one profile setting decides
+ * what the device receives. The pattern here is VS Code's own: with CR (the
+ * default) the bytes are exactly what VS Code sent. A CRLF pair is one newline,
+ * not two; a standalone CR is already Enter and stays as it is; nothing is
+ * appended.
+ *
+ * Applied to the final text, after variable substitution, so a newline inside
+ * a variable value is converted too, as VS Code converted it.
+ */
+export function applySerialMacroNewline(text: string, newline: unknown): string {
+  const resolved = resolveSerialMacroNewline(newline);
+  const ending = resolved === "lf" ? "\n" : resolved === "crlf" ? "\r\n" : "\r";
+  return text.replace(/\r?\n/g, ending);
 }

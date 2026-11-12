@@ -13,6 +13,20 @@ Built for embedded and firmware developers on serial consoles — Smart Follow r
 
 For **Baud Rate**, choose a suggested speed or select **Custom…** and enter a whole number from 1 to 2,147,483,647. Whether a speed works depends on the serial adapter, operating system, and device; a driver may reject it or use an approximate speed. **Test Connection** checks port availability, not baud-rate compatibility.
 
+## Macro Newline
+
+**Macro Newline** (under the profile form's advanced settings) chooses what each newline in a [macro](macros.md#sending-text-and-newlines) sends to this device:
+
+| Choice | Each newline is sent as |
+| --- | --- |
+| CR (default) | CR, the byte pressing Enter sends |
+| LF | LF |
+| CRLF | CR followed by LF |
+
+It applies to every macro sent to a Standard or Smart Follow session of the profile: macros run from the Macros view, Nexus: Run Macro or a shortcut, including a shortcut pressed in the [send box](#dedicated-send-box), and auto-trigger macros. Newlines inside variable values are converted too. A CRLF pair in the macro counts as one newline, a CR on its own is sent as it is, and nothing is added at the end of the text. A change applies to the next macro without reconnecting. Most device consoles run a command on CR; choose LF or CRLF only when the device expects it.
+
+Before version 2.8.319, auto-trigger macros on serial sessions sent each newline as LF. To keep that behaviour, set the profile to **LF**.
+
 ## Smart Follow
 
 **Smart Follow** mode is for Windows COM-port renumbering: it retries the preferred port, silently reconnects only to the previously approved device when metadata matches, prompts before switching to unfamiliar replacement ports, updates the saved preferred port after a successful move, and keeps the terminal open while waiting or stopped instead of tearing the tab down on serial errors.
@@ -54,6 +68,7 @@ Nexus macros still reach the session:
 - **Macro shortcuts** (`Alt+S` and the shortcuts you assign) work while the send box has keyboard focus, and send to that send box's own session even when another terminal is active. If that session is no longer available, nothing is sent. On macOS, the character Option would type is suppressed for a bound shortcut whose key is in its US-layout position; on layouts such as QWERTZ or AZERTY it can still appear in the draft.
 - **The Macros view and Nexus: Run Macro** send to the active terminal, as they do everywhere else.
 - **Auto-trigger macros** keep responding to the session's output.
+- Macros send their newlines as the profile's [Macro Newline](#macro-newline); the send box's **Line ending** applies only to text sent from the send box.
 - **Scripts** keep running. A script's input lock blocks the send box and every manual macro, including shortcuts.
 
 Choose **Use Direct Terminal Input**, or close the send-box tab, to restore direct input. Switching to another editor or hiding the tab keeps the mode and draft. Closing it discards the draft; there is no saved history or restoration after restart.

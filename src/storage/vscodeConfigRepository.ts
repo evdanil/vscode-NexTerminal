@@ -22,7 +22,8 @@ import {
   isValidServerOrigin,
   isValidDetachedServerOrigin,
   stripAddresslessOriginAddressStamps,
-  sanitizeHighlightProfileSelection
+  sanitizeHighlightProfileSelection,
+  sanitizeSerialMacroNewline
 } from "../utils/validation";
 import { asArray } from "../utils/helpers";
 
@@ -362,7 +363,9 @@ export class VscodeConfigRepository implements ConfigRepository {
   }
 
   public async getSerialProfiles(): Promise<SerialProfile[]> {
-    const raw = asArray<unknown>(this.readRaw(SERIAL_PROFILES_KEY)).map(sanitizeHighlightProfileSelection);
+    const raw = asArray<unknown>(this.readRaw(SERIAL_PROFILES_KEY))
+      .map(sanitizeHighlightProfileSelection)
+      .map(sanitizeSerialMacroNewline);
     return raw.filter((item): item is SerialProfile => {
       if (validateSerialProfile(item)) {
         return true;

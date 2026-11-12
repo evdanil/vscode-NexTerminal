@@ -5,7 +5,7 @@ vi.mock("vscode", () => ({}));
 import { VscodeConfigRepository } from "../../src/storage/vscodeConfigRepository";
 import type { ServerConfig } from "../../src/models/config";
 import { computeSyncPlan } from "../../src/services/inventory/syncEngine";
-import { validateServerConfig } from "../../src/utils/validation";
+import { sanitizeSerialMacroNewline, validateSerialProfile, validateServerConfig } from "../../src/utils/validation";
 
 /**
  * A fake ExtensionContext whose globalState mirrors VS Code semantics: the
@@ -1048,5 +1048,37 @@ describe("VscodeConfigRepository overwrite detection precision (E1/E2/E3)", () =
     } finally {
       warnSpy.mockRestore();
     }
+  });
+});
+
+describe("serial profile Macro Newline at the storage boundary (issue #339)", () => {
+  const serial = { id: "sp1", name: "Console", path: "COM3", baudRate: 115200, dataBits: 8, stopBits: 1, parity: "none", rtscts: false };
+
+  it("keeps known endings and reads an unknown one as CR without dropping the profile", async () => {
+    const repo = new VscodeConfigRepository(makeContext({
+      "nexus.serialProfiles": [
+        { ...serial, id: "cr", macroNewline: "cr" },
+        { ...serial, id: "lf", macroNewline: "lf" },
+        { ...serial, id: "crlf", macroNewline: "crlf" },
+        { ...serial, id: "absent" },
+        { ...serial, id: "future", macroNewline: "none" },
+        { ...serial, id: "wrong-type", macroNewline: 10 }
+      ]
+    }));
+    const byId = new Map((await repo.getSerialProfiles()).map((profile) => [profile.id, profile]));
+    expect([...byId.keys()]).toEqual(["cr", "lf", "crlf", "absent", "future", "wrong-type"]);
+    expect(byId.get("cr")?.macroNewline).toBe("cr");
+    expect(byId.get("lf")?.macroNewline).toBe("lf");
+    expect(byId.get("crlf")?.macroNewline).toBe("crlf");
+    for (const id of ["absent", "future", "wrong-type"]) expect(byId.get(id), id).not.toHaveProperty("macroNewline");
+  });
+
+  it("validateSerialProfile rejects an unknown value that skipped the sanitizer", () => {
+    expect(validateSerialProfile({ ...serial, macroNewline: "lf" })).toBe(true);
+    expect(validateSerialProfile(serial)).toBe(true);
+    expect(validateSerialProfile({ ...serial, macroNewline: "none" })).toBe(false);
+    expect(validateSerialProfile(sanitizeSerialMacroNewline({ ...serial, macroNewline: "none" }))).toBe(true);
+    expect(sanitizeSerialMacroNewline({ ...serial, macroNewline: "crlf" })).toEqual({ ...serial, macroNewline: "crlf" });
+    for (const junk of [null, 5, "text", ["x"]]) expect(sanitizeSerialMacroNewline(junk)).toBe(junk);
   });
 });

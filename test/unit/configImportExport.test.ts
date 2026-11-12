@@ -506,6 +506,44 @@ describe("config import command (legacy)", () => {
     expect(snapshot.localShellProfiles[0].highlightProfileId).toBe(id);
   });
 
+  it.each([
+    ["backup", "merge"], ["backup", "replace"], ["share", "merge"]
+  ] as const)("round-trips a serial profile's Macro Newline through %s/%s (issue #339)", async (format, mode) => {
+    await core.addOrUpdateSerialProfile(makeSerialProfile({ id: "crlf", name: "CRLF", macroNewline: "crlf" }));
+    await core.addOrUpdateSerialProfile(makeSerialProfile({ id: "lf", name: "LF", path: "COM5", macroNewline: "lf" }));
+    await core.addOrUpdateSerialProfile(makeSerialProfile({ id: "default", name: "Default", path: "COM6" }));
+    mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/export.json", scheme: "file" });
+    mockWriteFile.mockReset();
+    mockWriteFile.mockResolvedValue(undefined);
+    if (format === "backup") mockShowInputBox.mockResolvedValueOnce("masterpass1").mockResolvedValueOnce("masterpass1");
+    await registeredCommands.get(format === "backup" ? "nexus.config.export.backup" : "nexus.config.export")!();
+    const exportedText = Buffer.from(mockWriteFile.mock.calls[0][1]).toString("utf8");
+    registeredCommands.clear();
+    const dest = new NexusCore(new InMemoryConfigRepository());
+    await dest.initialize();
+    registerConfigCommands(dest, vault);
+    if (format === "backup") mockShowInputBox.mockResolvedValueOnce("masterpass1");
+    await runImport(JSON.parse(exportedText), mode);
+    const byName = new Map(dest.getSnapshot().serialProfiles.map((profile) => [profile.name, profile]));
+    expect(byName.get("CRLF")?.macroNewline).toBe("crlf");
+    expect(byName.get("LF")?.macroNewline).toBe("lf");
+    expect(byName.get("Default")).toBeDefined();
+    expect(byName.get("Default")).not.toHaveProperty("macroNewline");
+  });
+
+  it.each([
+    ["backup", "merge"], ["backup", "replace"], ["share", "merge"]
+  ] as const)("imports a profile with an unknown Macro Newline through %s/%s as CR instead of dropping it or keeping the value", async (format, mode) => {
+    const unknown = makeSerialProfile({ macroNewline: "none" as never });
+    const valid = makeSerialProfile({ id: "sp2", name: "Valid", path: "COM9", macroNewline: "lf" });
+    await runImport(makeExportData({ ...(format === "share" ? { version: 2, exportType: "share" } : {}),
+      servers: [], tunnels: [], serialProfiles: [unknown, valid] }), mode);
+    const byName = new Map(core.getSnapshot().serialProfiles.map((profile) => [profile.name, profile]));
+    expect(byName.get("Lab UART")).toBeDefined();
+    expect(byName.get("Lab UART")).not.toHaveProperty("macroNewline");
+    expect(byName.get("Valid")?.macroNewline).toBe("lf");
+  });
+
   it("does not reactivate missing saved, default, or live selections when merging profiles", async () => {
     const key = "nexus.terminal.highlighting.";
     configStore.set(`${key}profiles`, []);

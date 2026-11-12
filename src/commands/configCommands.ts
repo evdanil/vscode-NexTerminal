@@ -11,6 +11,7 @@ import {
   authProfileOwnedCredentials,
   cloneInventoryProxyOwnership,
   cloneTemplatedStamps,
+  isSerialMacroNewline,
   templatedHasAnyStamp
 } from "../models/config";
 import type { InventorySourceConfig, InventorySourceValues, TemplateRule } from "../models/inventory";
@@ -71,7 +72,8 @@ import {
   isValidServerOrigin,
   isValidDetachedServerOrigin,
   stripAddresslessOriginAddressStamps,
-  sanitizeHighlightProfileSelection
+  sanitizeHighlightProfileSelection,
+  sanitizeSerialMacroNewline
 } from "../utils/validation";
 import { isValidBinding } from "../macroBindings";
 import {
@@ -2430,7 +2432,11 @@ const SHARED_TUNNEL_RULES = {
   browserUrl: stripBrowserUrlUserinfo
 } satisfies ShareRules<TunnelProfile>;
 
-/** A serial profile: `deviceHint`, the identity of the sender's USB adapter that Smart Follow learned, never travels. */
+/**
+ * A serial profile: `deviceHint`, the identity of the sender's USB adapter that Smart Follow learned, never travels.
+ * `macroNewline` travels (it describes the device, like the baud rate) only when it is one of the known endings;
+ * anything else is left out, so the recipient's profile falls back to CR.
+ */
 const SHARED_SERIAL_PROFILE_RULES = {
   id: "link",
   name: "keep",
@@ -2444,7 +2450,8 @@ const SHARED_SERIAL_PROFILE_RULES = {
   logSession: "keep",
   highlightProfileId: "keep",
   mode: "keep",
-  deviceHint: "drop"
+  deviceHint: "drop",
+  macroNewline: (value) => (isSerialMacroNewline(value) ? value : undefined)
 } satisfies ShareRules<SerialProfile>;
 
 /** Whether a Local Shell profile may cross a share: only one that names a VS Code terminal profile of the recipient's own. */
@@ -4930,7 +4937,9 @@ export function registerConfigCommands(
       awaitingVerdict.delete(id);
     }
     const tunnelTally = await importPreservingIds(data.tunnels, existingIds, validateTunnelProfile, (e) => core.addOrUpdateTunnel(e));
-    const serialTally = await importPreservingIds(data.serialProfiles, existingIds, validateSerialProfile, (e) => core.addOrUpdateSerialProfile(e));
+    // An unknown Macro Newline falls back to CR rather than costing the profile (see sanitizeSerialMacroNewline).
+    const serialProfiles = data.serialProfiles?.map((profile) => sanitizeSerialMacroNewline(profile) as SerialProfile);
+    const serialTally = await importPreservingIds(serialProfiles, existingIds, validateSerialProfile, (e) => core.addOrUpdateSerialProfile(e));
     // Kept in its own variable (not folded into the array below) because the inventory-secret
     // restore loop further down needs to know exactly which source ids this run imported — see
     // the comment there.
