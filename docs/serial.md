@@ -51,10 +51,12 @@ While the send box is enabled, typing or pasting into its native serial terminal
 
 Nexus macros still reach the session:
 
-- **Macro shortcuts** (`Alt+S` and the shortcuts you assign) work while the send box has keyboard focus, and send to that send box's own session even when another terminal is active. If that session is no longer available, nothing is sent. The shortcut keys do not type a character into the draft.
+- **Macro shortcuts** (`Alt+S` and the shortcuts you assign) work while the send box has keyboard focus, and send to that send box's own session even when another terminal is active. If that session is no longer available, nothing is sent. On macOS, the character Option would type is suppressed for a bound shortcut whose key is in its US-layout position; on layouts such as QWERTZ or AZERTY it can still appear in the draft.
 - **The Macros view and Nexus: Run Macro** send to the active terminal, as they do everywhere else.
 - **Auto-trigger macros** keep responding to the session's output.
-- **Scripts** keep running. A script's input lock blocks the send box and every manual macro, including shortcuts. Choose **Use Direct Terminal Input**, or close the send-box tab, to restore direct input. Switching to another editor or hiding the tab keeps the mode and draft. Closing it discards the draft; there is no saved history or restoration after restart.
+- **Scripts** keep running. A script's input lock blocks the send box and every manual macro, including shortcuts.
+
+Choose **Use Direct Terminal Input**, or close the send-box tab, to restore direct input. Switching to another editor or hiding the tab keeps the mode and draft. Closing it discards the draft; there is no saved history or restoration after restart.
 
 Smart Follow keeps the draft while waiting for a device or stopped. Sending is disabled until connected and unlocked. If the connection changes before a send is processed, Nexus refuses that send; review the current port and send again deliberately. Each send box stays bound to its own session, even when another terminal becomes active. Device-generated echoes still appear in received output and can enter transcripts, just like any other device output.
 

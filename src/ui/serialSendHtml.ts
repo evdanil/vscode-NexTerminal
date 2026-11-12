@@ -82,7 +82,9 @@ export function renderSerialSendHtml(nonce: string): string {
       // and never stop propagation: the forwarded keydown is what runs the macro.
       // The physical key (event.code) and the layout-mapped key code must both
       // name the combo's key, so a layout where they disagree is never blocked
-      // from typing; AltGr (Ctrl+Alt) never matches an Alt or Ctrl+Shift combo.
+      // from typing. The cost: on such layouts (QWERTZ, AZERTY) a moved key's
+      // macro still runs and its character can still be typed; the docs say so.
+      // AltGr (Ctrl+Alt) never matches an Alt or Ctrl+Shift combo.
       function shortcutOf(event) {
         if (event.isComposing || event.keyCode === 229 || event.metaKey) return undefined;
         const match = /^(?:Key([A-Z])|Digit([0-9]))$/.exec(typeof event.code === 'string' ? event.code : '');

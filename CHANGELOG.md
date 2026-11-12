@@ -12,7 +12,7 @@
 
 ### Fixed
 
-- **Macro shortcuts work while the Serial Send Box has keyboard focus.** `Alt+S` and assigned macro shortcuts previously did nothing there, although the serial guide said macros continued to work. They now send to that send box's own serial session, even when another terminal is active, and no longer type a stray character into the draft. If that session is no longer available, nothing is sent. The Macros view and Nexus: Run Macro still send to the active terminal.
+- **Macro shortcuts work while the Serial Send Box has keyboard focus.** `Alt+S` and assigned macro shortcuts previously did nothing there, although the serial guide said macros continued to work. They now send to that send box's own serial session, even when another terminal is active. On macOS, the Option character is no longer typed into the draft for a bound shortcut whose key is in its US-layout position. If that session is no longer available, nothing is sent. The Macros view and Nexus: Run Macro still send to the active terminal.
 
 ## [2.8.317] — 2026-11-10
 

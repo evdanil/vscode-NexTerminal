@@ -2523,6 +2523,23 @@ describe("serial send box contributions", () => {
       expect(userDoc("docs/macros.md")).toContain("[Serial Send Box](serial.md#dedicated-send-box) has keyboard focus");
     });
 
+    it("states the Option-character suppression only as far as it goes (US-layout key positions)", () => {
+      const changelog = readDoc("CHANGELOG.md");
+      const prose = [...userDocs.map(([, text]) => text), functionalDocs, changelog].join("\n");
+      expect(prose).not.toContain("The shortcut keys do not type a character into the draft.");
+      expect(prose).not.toContain("no longer type a stray character into the draft");
+      expect(userDoc("docs/serial.md")).toContain("whose key is in its US-layout position; on layouts such as QWERTZ or AZERTY it can still appear in the draft.");
+      expect(changelog).toContain("for a bound shortcut whose key is in its US-layout position");
+    });
+
+    it("keeps the restore-direct-input steps out of the scripts bullet", () => {
+      const serial = userDoc("docs/serial.md");
+      const scriptsBullet = serial.split("\n").find((line) => line.startsWith("- **Scripts**"));
+      expect(scriptsBullet).toBeDefined();
+      expect(scriptsBullet).not.toMatch(/Use Direct Terminal Input|close the send-box tab|discards the draft/);
+      expect(serial).toMatch(/\n\nChoose \*\*Use Direct Terminal Input\*\*, or close the send-box tab, to restore direct input\./);
+    });
+
     it("uses the send-box source only on macro twins", () => {
       expect(keybindings.filter((item) => item.args?.source !== undefined).every((item) => twins.includes(item))).toBe(true);
     });

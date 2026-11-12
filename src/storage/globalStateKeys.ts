@@ -1,6 +1,7 @@
 import { ACTIVE_SCHEME_KEY, FONT_KEY, SCHEMES_KEY } from "./vscodeColorSchemeStorage";
 import { LOCAL_SHELL_AUTOTRIGGER_WARNING_KEY } from "./noticeKeys";
 import { CONTAINERLAB_APPROVAL_STATE_KEY } from "./vscodeContainerlabApprovalStore";
+import { SERIAL_SEND_KEEP_TEXT_KEY } from "../ui/serialSendConstants";
 
 /**
  * Every Nexus-owned `globalState` key, sorted by what Delete All Data does with
@@ -22,8 +23,8 @@ export const RESET_CLEARED_GLOBAL_STATE_KEYS: readonly string[] = [
   "nexus.ui.followTerminalDirectory",
   "nexus.files.followTerminalNudgeShown",
   "nexus.macros.keybindingBlockerHintDismissed",
-  // A remembered UI choice. completeReset then calls ConfigRuntimeHooks.refreshSerialSendPreferences so open send boxes show the cleared value.
-  "nexus.serialSendBox.keepText"
+  // A remembered UI choice. completeReset then calls ConfigRuntimeHooks.refreshSerialSendPreferences so this window's open send boxes show the cleared value.
+  SERIAL_SEND_KEEP_TEXT_KEY
 ];
 
 /** Cleared by the reset through the store that owns them (`NexusCore` collections, the macro store). */

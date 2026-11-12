@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { prepareSerialText, type SerialInputState, type SerialLineEnding, type SerialUserInput } from "../services/serial/serialUserInput";
 import { createWebviewNonce } from "./shared/webviewNonce";
 import { renderSerialSendHtml } from "./serialSendHtml";
-import { SERIAL_SEND_FOCUS_CONTEXT, SERIAL_SEND_VIEW_TYPE } from "./serialSendConstants";
+import { SERIAL_SEND_FOCUS_CONTEXT, SERIAL_SEND_KEEP_TEXT_KEY, SERIAL_SEND_VIEW_TYPE } from "./serialSendConstants";
 
 export interface SerialSendBinding {
   readonly sessionId: string;
@@ -36,9 +36,8 @@ export interface SerialSendPanelOptions {
   readonly setContext?: (key: string, value: boolean) => void;
 }
 
-export const SERIAL_SEND_KEEP_TEXT_KEY = "nexus.serialSendBox.keepText";
 
-export { SERIAL_SEND_FOCUS_CONTEXT, SERIAL_SEND_VIEW_TYPE };
+export { SERIAL_SEND_FOCUS_CONTEXT, SERIAL_SEND_KEEP_TEXT_KEY, SERIAL_SEND_VIEW_TYPE };
 
 export function createSerialSendPreferences(memento: Pick<vscode.Memento, "get" | "update">): SerialSendPreferences {
   return {
@@ -266,9 +265,11 @@ export class SerialSendPanel implements vscode.Disposable {
     }
     if (value.type === "setKeepText" && hasOnlyKeys(value, ["type", "keepText"]) && typeof value.keepText === "boolean") {
       // No "unchanged" shortcut: the shared key may hold another window's value,
-      // so always persist this box's choice and resync every open box to it.
+      // so always persist this box's choice and resync the other open boxes to it.
+      // Never echo it to the sender: after a quick tick-untick, the echo of the
+      // tick could land after the untick and re-check the box.
       this.preferences.setKeepText(value.keepText);
-      for (const other of this.panels.values()) this.pushPreferences(other);
+      for (const other of this.panels.values()) if (other !== entry) this.pushPreferences(other);
       return;
     }
     if (value.type === "focusTerminal" && hasOnlyKeys(value, ["type"])) { entry.binding.terminal.show(false); return; }

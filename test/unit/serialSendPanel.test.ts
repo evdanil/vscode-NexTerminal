@@ -467,11 +467,11 @@ describe("serial send panel focus, preferences and shortcut list", () => {
     expect(focusContext()).toBe(true);
   });
 
-  it("a toggle always persists and resyncs every box, even when the store already holds that value", async () => {
+  it("a toggle always persists and resyncs the other boxes, even when the store already holds that value", async () => {
     registry.openOrReveal(binding());
     registry.openOrReveal(binding("session-2"));
-    await panels[0].message({ type: "ready" });
-    await panels[1].message({ type: "ready" });
+    registry.openOrReveal(binding("session-3"));
+    for (const p of panels) await p.message({ type: "ready" });
     // Another window wrote true; box 0 still shows false and the user checks it.
     stored.set(SERIAL_SEND_KEEP_TEXT_KEY, true);
     const writes = vi.fn();
@@ -479,7 +479,19 @@ describe("serial send panel focus, preferences and shortcut list", () => {
     stored.set = ((key: string, value: unknown) => { writes(key, value); return original(key, value); }) as typeof stored.set;
     await panels[0].message({ type: "setKeepText", keepText: true });
     expect(writes).toHaveBeenCalledWith(SERIAL_SEND_KEEP_TEXT_KEY, true);
-    for (const p of panels) expect(posted(p, "preferences").at(-1)).toEqual({ type: "preferences", keepText: true });
+    for (const p of panels.slice(1)) expect(posted(p, "preferences").at(-1)).toEqual({ type: "preferences", keepText: true });
+  });
+
+  it("never echoes a toggle back to the box that sent it, so a quick tick-untick cannot re-tick it", async () => {
+    registry.openOrReveal(binding());
+    registry.openOrReveal(binding("session-2"));
+    for (const p of panels) await p.message({ type: "ready" });
+    const before = posted(panels[0], "preferences").length;
+    await panels[0].message({ type: "setKeepText", keepText: true });
+    await panels[0].message({ type: "setKeepText", keepText: false });
+    expect(posted(panels[0], "preferences")).toHaveLength(before);
+    expect(posted(panels[1], "preferences").slice(-2)).toEqual([{ type: "preferences", keepText: true }, { type: "preferences", keepText: false }]);
+    expect(stored.get(SERIAL_SEND_KEEP_TEXT_KEY)).toBe(false);
   });
 
   it("re-sends the stored keep-text value whenever a box becomes active, not when it goes inactive", async () => {
