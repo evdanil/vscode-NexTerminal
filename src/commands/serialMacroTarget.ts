@@ -19,18 +19,20 @@ import type { SerialSendBinding } from "../ui/serialSendPanel";
 export type SerialMacroNewlineLookup = (pty: SerialUserInput) => SerialMacroNewline;
 
 /**
- * Finds the session whose `serialTerminals` entry owns this exact PTY (identity,
- * not terminal or profile, so a replaced session never lends its setting) and
- * resolves its Macro Newline with the policy the auto-trigger observers use. A
- * few live entries are walked in place: no snapshot of the whole configuration
- * is copied per send. A PTY no session owns gets CR.
+ * THE lookup both serial macro routes call — the manual target resolver and
+ * the Standard and Smart Follow auto-trigger observers: finds the session whose
+ * `serialTerminals` entry owns this exact PTY (identity, not terminal or
+ * profile, so a replaced session never lends its setting) and resolves its
+ * Macro Newline with `resolveSessionMacroNewline`, which also keeps the entry's
+ * last-known value. A few live entries are walked in place: no snapshot of the
+ * whole configuration is copied per send. A PTY no session owns gets CR.
  */
 export function createSerialMacroNewlineLookup(
-  serialTerminals: ReadonlyMap<string, SerialMacroSession & { readonly input?: SerialUserInput }>,
+  serialTerminals: ReadonlyMap<string, SerialMacroSession & { readonly input?: SerialUserInput }> | undefined,
   profiles: { getSerialProfile(id: string): Pick<SerialProfile, "macroNewline"> | undefined }
 ): SerialMacroNewlineLookup {
   return (pty) => {
-    for (const entry of serialTerminals.values()) {
+    for (const entry of serialTerminals?.values() ?? []) {
       if (entry.input === pty) return resolveSessionMacroNewline(profiles, entry);
     }
     return resolveSessionMacroNewline(profiles, undefined);

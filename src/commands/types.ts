@@ -26,8 +26,8 @@ export interface SerialTerminalEntry {
   profileId: string;
   transportSessionId?: string;
   smartFollow?: boolean;
-  /** The profile as it was when the session opened: the Macro Newline fallback if the saved one is deleted (`resolveSessionMacroNewline`). */
-  openedWith?: import("../models/config").SerialProfile;
+  /** The last Macro Newline that took effect on this session: the fallback if its profile is deleted (`resolveSessionMacroNewline`). */
+  lastMacroNewline?: import("../models/config").SerialMacroNewline;
   /**
    * Path of the COM port currently held by this session. Set on connect, cleared
    * while waiting/disconnected. Used by Smart Follow to filter out ports already

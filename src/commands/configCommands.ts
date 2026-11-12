@@ -11,7 +11,7 @@ import {
   authProfileOwnedCredentials,
   cloneInventoryProxyOwnership,
   cloneTemplatedStamps,
-  isSerialMacroNewline,
+  storedSerialMacroNewline,
   templatedHasAnyStamp
 } from "../models/config";
 import type { InventorySourceConfig, InventorySourceValues, TemplateRule } from "../models/inventory";
@@ -2434,8 +2434,8 @@ const SHARED_TUNNEL_RULES = {
 
 /**
  * A serial profile: `deviceHint`, the identity of the sender's USB adapter that Smart Follow learned, never travels.
- * `macroNewline` travels (it describes the device, like the baud rate) only when it is one of the known endings;
- * anything else is left out, so the recipient's profile falls back to CR.
+ * `macroNewline` travels (it describes the device, like the baud rate) in its one stored form: LF or CRLF, while CR
+ * and anything unknown are left out, so the recipient's profile reads CR.
  */
 const SHARED_SERIAL_PROFILE_RULES = {
   id: "link",
@@ -2451,7 +2451,7 @@ const SHARED_SERIAL_PROFILE_RULES = {
   highlightProfileId: "keep",
   mode: "keep",
   deviceHint: "drop",
-  macroNewline: (value) => (isSerialMacroNewline(value) ? value : undefined)
+  macroNewline: storedSerialMacroNewline
 } satisfies ShareRules<SerialProfile>;
 
 /** Whether a Local Shell profile may cross a share: only one that names a VS Code terminal profile of the recipient's own. */

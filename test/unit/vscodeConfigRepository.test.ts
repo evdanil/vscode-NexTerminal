@@ -1077,6 +1077,7 @@ describe("serial profile Macro Newline at the storage boundary (issue #339)", ()
     for (const value of [undefined, "lf", "none", 10]) expect(validateSerialProfile({ ...serial, macroNewline: value }), String(value)).toBe(true);
     expect(sanitizeSerialMacroNewline({ ...serial, macroNewline: "none" })).toEqual(serial);
     expect(sanitizeSerialMacroNewline({ ...serial, macroNewline: "crlf" })).toEqual({ ...serial, macroNewline: "crlf" });
+    expect(sanitizeSerialMacroNewline({ ...serial, macroNewline: "cr" })).toEqual(serial);
     for (const junk of [null, 5, "text", ["x"]]) expect(sanitizeSerialMacroNewline(junk)).toBe(junk);
   });
 

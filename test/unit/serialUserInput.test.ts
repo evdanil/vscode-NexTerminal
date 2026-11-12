@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applySerialMacroNewline, isSerialUserInput, lineEndingCharacters, prepareSerialText, resolveSessionMacroNewline } from "../../src/services/serial/serialUserInput";
+import { applySerialMacroNewline, isSerialUserInput, knownMacroNewline, lineEndingCharacters, prepareSerialText, resolveSessionMacroNewline } from "../../src/services/serial/serialUserInput";
 import { resolveSerialMacroNewline } from "../../src/models/config";
 
 describe("prepareSerialText", () => {
@@ -85,13 +85,25 @@ describe("lineEndingCharacters", () => {
 
 describe("resolveSessionMacroNewline", () => {
   const profiles = (saved: Record<string, { macroNewline?: unknown }>) => ({ getSerialProfile: (id: string) => saved[id] as never });
-  it("uses the saved profile, else the profile the session opened with, else CR", () => {
-    expect(resolveSessionMacroNewline(profiles({ p: { macroNewline: "crlf" } }), { profileId: "p", openedWith: { macroNewline: "lf" } })).toBe("crlf");
-    // Saved without the field (CR) wins over the opened-with value: the user changed it back to CR.
-    expect(resolveSessionMacroNewline(profiles({ p: {} }), { profileId: "p", openedWith: { macroNewline: "lf" } })).toBe("cr");
-    expect(resolveSessionMacroNewline(profiles({ p: { macroNewline: "future" } }), { profileId: "p", openedWith: { macroNewline: "lf" } })).toBe("cr");
-    expect(resolveSessionMacroNewline(profiles({}), { profileId: "p", openedWith: { macroNewline: "lf" } })).toBe("lf");
+  it("uses the saved profile and records it, else the last value that took effect, else CR", () => {
+    const session: { profileId: string; lastMacroNewline?: "cr" | "lf" | "crlf" } = { profileId: "p", lastMacroNewline: "lf" };
+    expect(resolveSessionMacroNewline(profiles({ p: { macroNewline: "crlf" } }), session)).toBe("crlf");
+    expect(session.lastMacroNewline).toBe("crlf");
+    // Saved without the field is CR, a known value: it wins and is recorded.
+    expect(resolveSessionMacroNewline(profiles({ p: {} }), session)).toBe("cr");
+    expect(session.lastMacroNewline).toBe("cr");
+    session.lastMacroNewline = "lf";
+    // A newer release's value is CR and is not recorded.
+    expect(resolveSessionMacroNewline(profiles({ p: { macroNewline: "future" } }), session)).toBe("cr");
+    expect(session.lastMacroNewline).toBe("lf");
+    expect(resolveSessionMacroNewline(profiles({}), session)).toBe("lf");
     expect(resolveSessionMacroNewline(profiles({}), { profileId: "p" })).toBe("cr");
     expect(resolveSessionMacroNewline(profiles({ p: { macroNewline: "lf" } }), undefined)).toBe("cr");
+  });
+
+  it("seeds the last-known value from a known opened profile only", () => {
+    expect(knownMacroNewline({})).toBe("cr");
+    expect(knownMacroNewline({ macroNewline: "crlf" })).toBe("crlf");
+    expect(knownMacroNewline({ macroNewline: "none" })).toBeUndefined();
   });
 });

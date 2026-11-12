@@ -74,9 +74,11 @@ const owners: Array<{ dispose(): void }> = [];
  * Its `getSerialProfile` is the only core member the lookup may use: a lookup that copied a whole
  * snapshot per send has nothing to call.
  */
-function lookupOver(sessions: Array<{ profileId: string; pty: unknown; openedWith?: { macroNewline?: unknown } }>, profiles: Record<string, { macroNewline?: unknown }>) {
-  const serialTerminals = new Map(sessions.map((session, index) => [`session-${index}`, { profileId: session.profileId, input: session.pty, openedWith: session.openedWith }] as const));
-  return createSerialMacroNewlineLookup(serialTerminals as never, { getSerialProfile: (id: string) => profiles[id] as never });
+function lookupOver(sessions: Array<{ profileId: string; pty: unknown; lastMacroNewline?: SerialMacroNewline }>, profiles: Record<string, { macroNewline?: unknown }>) {
+  const entries = sessions.map((session) => ({ profileId: session.profileId, input: session.pty, lastMacroNewline: session.lastMacroNewline }));
+  const serialTerminals = new Map(entries.map((entry, index) => [`session-${index}`, entry] as const));
+  const lookup = createSerialMacroNewlineLookup(serialTerminals as never, { getSerialProfile: (id: string) => profiles[id] as never });
+  return Object.assign(lookup, { entries });
 }
 
 async function harness(smart: boolean, enabled: boolean, connect = true, macroNewline?: SerialMacroNewline) {
@@ -186,24 +188,29 @@ describe("manual serial macro command-to-PTY routes", () => {
 });
 
 describe("createSerialMacroNewlineLookup", () => {
-  it("reads the saved setting of the profile whose session owns the PTY; else the profile it opened with; else CR", () => {
-    const ptyA = {}; const ptyB = {}; const stranger = {};
-    const profiles: Record<string, { macroNewline?: unknown }> = { a: { macroNewline: "lf" }, b: { macroNewline: "crlf" } };
-    const lookup = lookupOver([{ profileId: "b", pty: ptyB }, { profileId: "a", pty: ptyA, openedWith: { macroNewline: "lf" } }], profiles);
-    expect(lookup(ptyA as never)).toBe("lf");
+  it("reads the saved setting of the profile whose session owns the PTY; else the last value that took effect; else CR", () => {
+    const ptyA = {}; const ptyB = {}; const ptyC = {}; const stranger = {};
+    const profiles: Record<string, { macroNewline?: unknown }> = { a: {}, b: { macroNewline: "crlf" }, c: { macroNewline: "none" } };
+    // A was opened with CR (seeded "cr"); C was opened with a newer release's value, so nothing is seeded.
+    const lookup = lookupOver([{ profileId: "b", pty: ptyB }, { profileId: "a", pty: ptyA, lastMacroNewline: "cr" }, { profileId: "c", pty: ptyC }], profiles);
+    expect(lookup(ptyA as never)).toBe("cr");
     expect(lookup(ptyB as never)).toBe("crlf");
     expect(lookup(stranger as never)).toBe("cr");
-    profiles.a = { macroNewline: "crlf" };
-    expect(lookup(ptyA as never)).toBe("crlf");
-    // A stored value from a newer release is CR, not the opened-with value: the saved profile still exists.
+    // Edited CR -> LF mid-session: the next send uses it, and it becomes the last value that took effect.
+    profiles.a = { macroNewline: "lf" };
+    expect(lookup(ptyA as never)).toBe("lf");
+    expect(lookup.entries[1].lastMacroNewline).toBe("lf");
+    // A newer release's value is CR, and is not recorded.
     profiles.a = { macroNewline: "none" };
     expect(lookup(ptyA as never)).toBe("cr");
-    // Deleted while connected: the profile the session opened with (LF), as auto-trigger macros do.
+    expect(lookup.entries[1].lastMacroNewline).toBe("lf");
+    // Deleted while connected: the mid-session LF, not the CR it opened with.
     delete profiles.a;
     expect(lookup(ptyA as never)).toBe("lf");
-    // Deleted and no opened-with record: CR.
-    delete profiles.b;
-    expect(lookup(ptyB as never)).toBe("cr");
+    // C only ever saw an unknown value: deleted, it is CR.
+    expect(lookup(ptyC as never)).toBe("cr");
+    delete profiles.c;
+    expect(lookup(ptyC as never)).toBe("cr");
   });
 });
 

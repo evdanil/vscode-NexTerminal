@@ -1686,3 +1686,13 @@ export function isSerialMacroNewline(value: unknown): value is SerialMacroNewlin
 export function resolveSerialMacroNewline(value: unknown): SerialMacroNewline {
   return isSerialMacroNewline(value) ? value : "cr";
 }
+
+/**
+ * The ONE stored form of a known Macro Newline: `"lf"` or `"crlf"`, or absent
+ * (`undefined`) for CR, so CR is never stored two ways. An unknown value also
+ * maps to absent, which is what the import paths and the share rule want; a
+ * caller that must preserve an unknown stored value checks for it first.
+ */
+export function storedSerialMacroNewline(value: unknown): "lf" | "crlf" | undefined {
+  return value === "lf" || value === "crlf" ? value : undefined;
+}

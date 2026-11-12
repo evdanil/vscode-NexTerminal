@@ -126,6 +126,17 @@ describe("formValuesToSerial", () => {
     expect(formValuesToSerial(values)).not.toHaveProperty("macroNewline");
   });
 
+  it("keeps a newer release's stored value when the user leaves the select alone, and replaces it only when they change it", () => {
+    const values = { name: "Console", path: "COM3", baudRate: "9600" };
+    // The form showed CR for "none"; the user changed only the baud rate.
+    expect(formValuesToSerial({ ...values, macroNewline: "cr" }, { macroNewline: "none" })?.macroNewline).toBe("none");
+    expect(formValuesToSerial(values, { macroNewline: "none" })?.macroNewline).toBe("none");
+    expect(formValuesToSerial({ ...values, macroNewline: "lf" }, { macroNewline: "none" })?.macroNewline).toBe("lf");
+    expect(formValuesToSerial({ ...values, macroNewline: "crlf" }, { macroNewline: "none" })?.macroNewline).toBe("crlf");
+    // A known explicit "cr" left alone is stored in its one form: absent.
+    expect(formValuesToSerial({ ...values, macroNewline: "cr" }, { macroNewline: "cr" })).not.toHaveProperty("macroNewline");
+  });
+
   it("preserves custom and preset baud rates as numbers", () => {
     expect(formValuesToSerial({ name: "Console", path: "COM3", baudRate: "custom", customBaudRate: "31250" })?.baudRate).toBe(31250);
     expect(formValuesToSerial({ name: "Console", path: "COM3", baudRate: "115200" })?.baudRate).toBe(115200);
@@ -533,7 +544,7 @@ describe("serial terminal tab visual differentiation", () => {
 
   it.each((["standard", "smartFollow"] as const).flatMap((mode) => ([
     [undefined, "a\rb\r\rc"], ["cr", "a\rb\r\rc"], ["lf", "a\nb\n\rc"], ["crlf", "a\r\nb\r\n\rc"], ["bogus", "a\rb\r\rc"],
-    // Deleted while connected: the profile the session opened with (LF) stands in.
+    // Deleted right after connecting: the last value that took effect, the LF it opened with.
     ["deleted", "a\nb\n\rc"]
   ] as const).map(([newline, bytes]) => ({ mode, newline, bytes }))))(
     "$mode auto-trigger macros follow the saved Macro Newline ($newline), read at each send", async ({ mode, newline, bytes }) => {
@@ -568,6 +579,53 @@ describe("serial terminal tab visual differentiation", () => {
         // through the one shared policy, resolves exactly what the auto-trigger just sent.
         const lookup = createSerialMacroNewlineLookup(ctx.serialTerminals, ctx.core);
         expect(lineEndingCharacters(lookup(pty))).toBe(bytes.slice(1, bytes.indexOf("b")));
+      } finally {
+        ctx.core.unregisterSerialSession = vi.fn();
+        pty.dispose();
+      }
+    });
+
+  it.each(["standard", "smartFollow"] as const)(
+    "%s: an edit made mid-session survives deleting the profile, and auto-trigger and manual macros read the same entry", async (mode) => {
+      const actual = mode === "standard"
+        ? await vi.importActual<typeof import("../../src/services/serial/serialPty")>("../../src/services/serial/serialPty")
+        : await vi.importActual<typeof import("../../src/services/serial/smartSerialPty")>("../../src/services/serial/smartSerialPty");
+      const ctx = makeSerialCtx();
+      const opened = { ...baseProfile, mode };
+      let saved: Record<string, unknown> | undefined = opened;
+      ctx.core.getSerialProfile = vi.fn(() => saved);
+      ctx.serialSidecar = {
+        listPorts: async () => [{ path: opened.path }], openPort: async () => "physical",
+        writePort: vi.fn(async () => {}), closePort: async () => {},
+        onDidReceiveData: () => () => {}, onDidReceiveError: () => () => {}, onDidDisconnect: () => () => {}
+      };
+      ctx.loggerFactory.create = () => ({ log() {}, close() {} });
+      let send!: (text: string) => void;
+      ctx.macroAutoTrigger.createObserver.mockImplementation((write: (text: string) => void) => { send = write; return {}; });
+      if ("SerialPty" in actual) vi.mocked(SerialPty).mockImplementationOnce(function (...args) { return new actual.SerialPty(...args); });
+      else vi.mocked(SmartSerialPty).mockImplementationOnce(function (...args) { return new actual.SmartSerialPty(...args); });
+      registerSerialCommands(ctx);
+      await registeredCommands.get("nexus.serial.connect")!(opened.id);
+      const calls = vi.mocked(vscode.window.createTerminal).mock.calls;
+      const pty = (calls[calls.length - 1][0] as unknown as { pty: SerialPty | SmartSerialPty }).pty;
+      const manual = createSerialMacroNewlineLookup(ctx.serialTerminals, ctx.core);
+      const sent = () => ctx.serialSidecar.writePort.mock.calls.map((call: unknown[]) => String(call[1]));
+      try {
+        pty.open(); for (let i = 0; i < 16; i++) await Promise.resolve();
+        const [entry] = [...ctx.serialTerminals.values()] as Array<{ lastMacroNewline?: string }>;
+        expect(entry.lastMacroNewline).toBe("cr");
+        send("x\n");
+        saved = { ...opened, macroNewline: "lf" };
+        send("x\n");
+        saved = undefined;
+        send("x\n");
+        expect(sent()).toEqual(["x\r", "x\n", "x\n"]);
+        expect(manual(pty)).toBe("lf");
+        // Both routes answer from that one entry, not from anything captured at connect.
+        entry.lastMacroNewline = "crlf";
+        send("x\n");
+        expect(sent().at(-1)).toBe("x\r\n");
+        expect(manual(pty)).toBe("crlf");
       } finally {
         ctx.core.unregisterSerialSession = vi.fn();
         pty.dispose();

@@ -9,7 +9,7 @@ import type {
   ProxyConfig,
   LocalShellProfile
 } from "../models/config";
-import { isSerialMacroNewline } from "../models/config";
+import { storedSerialMacroNewline } from "../models/config";
 import type { InventorySourceConfig } from "../models/inventory";
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
@@ -30,16 +30,19 @@ export function sanitizeHighlightProfileSelection(item: unknown): unknown {
  * IMPORT boundary only (backup and share files are external input): a serial
  * profile's Macro Newline this build does not know is removed, so the profile
  * lands with CR instead of carrying an unchecked value, and the profile itself
- * is kept rather than dropped the way an unknown `mode` drops it. Storage reads
+ * is kept rather than dropped the way an unknown `mode` drops it. An explicit
+ * `"cr"` is removed too, so CR has one stored form (`storedSerialMacroNewline`). Storage reads
  * do NOT run this — see `SerialProfile.macroNewline` for why a stored unknown
  * value must survive.
  */
 export function sanitizeSerialMacroNewline(item: unknown): unknown {
   if (typeof item !== "object" || item === null || Array.isArray(item)) return item;
   const obj = item as Record<string, unknown>;
-  if (obj.macroNewline === undefined || isSerialMacroNewline(obj.macroNewline)) return item;
-  const { macroNewline: _unknown, ...rest } = obj;
-  return rest;
+  if (!Object.prototype.hasOwnProperty.call(obj, "macroNewline")) return item;
+  const stored = storedSerialMacroNewline(obj.macroNewline);
+  if (stored === obj.macroNewline) return item;
+  const { macroNewline: _dropped, ...rest } = obj;
+  return stored === undefined ? rest : { ...rest, macroNewline: stored };
 }
 
 function isNonEmptyString(value: unknown): value is string {

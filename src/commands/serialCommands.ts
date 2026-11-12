@@ -2,13 +2,14 @@ import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { readHighlightCatalog } from "../services/terminal/highlightProfileSettings";
 import { parseHighlightProfileFormValue } from "../ui/highlightProfileForm";
-import { resolveSerialMacroNewline, resolveSerialProfileMode, type SerialDataBits, type SerialDeviceHint, type SerialParity, type SerialProfile, type SerialSessionStatus, type SerialStopBits } from "../models/config";
+import { isSerialMacroNewline, resolveSerialMacroNewline, resolveSerialProfileMode, storedSerialMacroNewline, type SerialDataBits, type SerialDeviceHint, type SerialParity, type SerialProfile, type SerialSessionStatus, type SerialStopBits } from "../models/config";
 import { createSessionTranscript, type SessionTranscriptOptions } from "../logging/sessionTranscriptLogger";
 import { normalizeTranscriptTimestampMode } from "../logging/transcriptTimestamps";
 import { normalizeTranscriptLineEndingMode } from "../logging/transcriptLineEndings";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
 import { SerialPty } from "../services/serial/serialPty";
-import { applySerialMacroNewline, resolveSessionMacroNewline } from "../services/serial/serialUserInput";
+import { applySerialMacroNewline, knownMacroNewline } from "../services/serial/serialUserInput";
+import { createSerialMacroNewlineLookup } from "./serialMacroTarget";
 import { isSerialRuntimeMissingError } from "../services/serial/errorMatchers";
 import {
   SmartSerialPty,
@@ -274,13 +275,16 @@ function getTranscriptOptions(ctx: CommandContext, profile: SerialProfile): Sess
 }
 
 /**
- * Auto-trigger macro text with its newlines converted to the session's Macro
- * Newline, resolved at each send by the policy manual macros use too
- * (`resolveSessionMacroNewline`), from the same profile the session's
- * `serialTerminals` entry records as `openedWith`.
+ * Delivers an auto-trigger macro to a serial PTY, its newlines converted with
+ * the same lookup, over the same `serialTerminals` entry, that manual macros
+ * use (`createSerialMacroNewlineLookup`). The entry exists whenever output can
+ * reach the observer: Standard writes it in `onSessionOpened`, before any data;
+ * Smart Follow writes it at connect and keeps it across port moves. Without one,
+ * the lookup answers CR, exactly as it does for a manual macro.
  */
-function macroTextForSerialProfile(ctx: CommandContext, opened: SerialProfile, text: string): string {
-  return applySerialMacroNewline(text, resolveSessionMacroNewline(ctx.core, { profileId: opened.id, openedWith: opened }));
+function sendAutoTriggerMacro(ctx: CommandContext, pty: SerialPty | SmartSerialPty | undefined, text: string): void {
+  if (!pty) return;
+  pty.handleInput(applySerialMacroNewline(text, createSerialMacroNewlineLookup(ctx.serialTerminals, ctx.core)(pty)), "macro");
 }
 
 function serialTerminalName(profile: SerialProfile): string {
@@ -380,6 +384,20 @@ function enforceSerialConnectPreconditions(
   return true;
 }
 
+/**
+ * The Macro Newline a form save stores. The select can show only the three
+ * endings, so a stored value this build does not know (a newer release's) is
+ * shown as CR. Unless the user moved the select off what it showed, the stored
+ * value is kept exactly — saving an edit of the baud rate must not erase it.
+ * A chosen value is stored in its one form (`storedSerialMacroNewline`: CR as
+ * absence).
+ */
+function formMacroNewline(submitted: unknown, stored: SerialProfile["macroNewline"] | undefined): SerialProfile["macroNewline"] | undefined {
+  const unchanged = typeof submitted !== "string" || submitted === resolveSerialMacroNewline(stored);
+  if (unchanged && stored !== undefined && !isSerialMacroNewline(stored)) return stored;
+  return storedSerialMacroNewline(unchanged ? stored : submitted);
+}
+
 export function formValuesToSerial(values: FormValues, existing?: Partial<SerialProfile>): SerialProfile | undefined {
   const name = typeof values.name === "string" ? values.name.trim() : "";
   const portPath = typeof values.path === "string" ? values.path.trim() : "";
@@ -401,8 +419,7 @@ export function formValuesToSerial(values: FormValues, existing?: Partial<Serial
   const stopBits = typeof values.stopBits === "string" ? Number(values.stopBits) : 1;
   const parity = typeof values.parity === "string" ? values.parity : "none";
   const rawMode = typeof values.mode === "string" ? values.mode : existing?.mode;
-  // CR is stored as absence (the default every record without the field already means).
-  const macroNewline = resolveSerialMacroNewline(typeof values.macroNewline === "string" ? values.macroNewline : existing?.macroNewline);
+  const macroNewline = formMacroNewline(values.macroNewline, existing?.macroNewline);
   return {
     id: existing?.id ?? randomUUID(),
     name,
@@ -416,7 +433,7 @@ export function formValuesToSerial(values: FormValues, existing?: Partial<Serial
     group: normalizedGroup,
     mode: rawMode === "smartFollow" ? "smartFollow" : "standard",
     deviceHint: existing?.deviceHint,
-    ...(macroNewline === "cr" ? {} : { macroNewline }),
+    ...(macroNewline === undefined ? {} : { macroNewline }),
     highlightProfileId: parseHighlightProfileFormValue(values.highlightProfileId, existing?.highlightProfileId)
   };
 }
@@ -435,7 +452,7 @@ async function connectStandardSerialProfile(
   let terminalRef: vscode.Terminal | undefined;
   let ptyRef: SerialPty | undefined;
   const triggerObserver = ctx.macroAutoTrigger.createObserver(
-    (text) => ptyRef?.handleInput(macroTextForSerialProfile(ctx, profile, text), "macro"),
+    (text) => sendAutoTriggerMacro(ctx, ptyRef, text),
     () => terminalRef !== undefined && vscode.window.activeTerminal === terminalRef,
     undefined,
     profile.id
@@ -497,7 +514,7 @@ async function connectStandardSerialProfile(
             terminal: terminalRef,
             input: ptyRef,
             profileId: profile.id,
-            openedWith: profile,
+            lastMacroNewline: knownMacroNewline(profile),
             transportSessionId: sessionId,
             activePath: profile.path
           });
@@ -572,7 +589,7 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
   let ptyRef: SmartSerialPty | undefined;
   let currentProfile = profile;
   const triggerObserver = ctx.macroAutoTrigger.createObserver(
-    (text) => ptyRef?.handleInput(macroTextForSerialProfile(ctx, profile, text), "macro"),
+    (text) => sendAutoTriggerMacro(ctx, ptyRef, text),
     () => terminalRef !== undefined && vscode.window.activeTerminal === terminalRef,
     logicalSessionId,
     profile.id
@@ -667,7 +684,7 @@ async function connectSmartSerialProfile(ctx: CommandContext, profile: SerialPro
     terminal,
     input: pty,
     profileId: profile.id,
-    openedWith: profile,
+    lastMacroNewline: knownMacroNewline(profile),
     smartFollow: true,
     activePath: undefined
   });

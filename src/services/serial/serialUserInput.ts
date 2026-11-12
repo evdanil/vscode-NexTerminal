@@ -1,5 +1,5 @@
 import type * as vscode from "vscode";
-import { resolveSerialMacroNewline, type SerialLineEnding, type SerialMacroNewline, type SerialProfile } from "../../models/config";
+import { isSerialMacroNewline, resolveSerialMacroNewline, type SerialLineEnding, type SerialMacroNewline, type SerialProfile } from "../../models/config";
 
 export type { SerialLineEnding } from "../../models/config";
 
@@ -69,24 +69,42 @@ export function applySerialMacroNewline(text: string, newline: unknown): string 
   return text.replace(/\r?\n/g, lineEndingCharacters(resolveSerialMacroNewline(newline)));
 }
 
-/** The serial session a macro is sent to: its profile id, and the profile as it was when the session opened. */
+/**
+ * The part of a `serialTerminals` entry the Macro Newline policy reads and
+ * writes: the session's profile id, and the last known Macro Newline that took
+ * effect on it (seeded at connect, updated on every send that resolved one).
+ */
 export interface SerialMacroSession {
   readonly profileId: string;
-  readonly openedWith?: Pick<SerialProfile, "macroNewline">;
+  lastMacroNewline?: SerialMacroNewline;
+}
+
+/** The last-known seed for a session opened with `profile`: its Macro Newline if known (absent is CR), else none. */
+export function knownMacroNewline(profile: Pick<SerialProfile, "macroNewline">): SerialMacroNewline | undefined {
+  const value = profile.macroNewline;
+  return value === undefined ? "cr" : isSerialMacroNewline(value) ? value : undefined;
 }
 
 /**
  * The Macro Newline for a send to a live serial session — THE ONE POLICY both
- * delivery routes use (manual macros through `createSerialMacroNewlineLookup`,
- * auto-trigger macros through the connect paths' observers), so they cannot
- * disagree about a session's bytes: the saved profile as it is now, so an edit
- * applies to the next macro without a reconnect; else, if it was deleted while
- * the session ran, the profile the session opened with; else CR.
+ * delivery routes reach through `createSerialMacroNewlineLookup` over the same
+ * `serialTerminals` entry, so they cannot disagree about a session's bytes:
+ *  1. the saved profile as it is now, so an edit applies to the next macro
+ *     without a reconnect — and, when it holds a known value, that value is
+ *     recorded on the entry as the last one that took effect;
+ *  2. if the profile was deleted while the session ran, that last-known value,
+ *     so a mid-session edit is not reverted by the deletion;
+ *  3. else CR. A saved value this build does not know (a newer release's) is
+ *     CR as well, and is not recorded, so it never becomes a fallback.
  */
 export function resolveSessionMacroNewline(
   profiles: { getSerialProfile(id: string): Pick<SerialProfile, "macroNewline"> | undefined },
   session: SerialMacroSession | undefined
 ): SerialMacroNewline {
   if (!session) return "cr";
-  return resolveSerialMacroNewline((profiles.getSerialProfile(session.profileId) ?? session.openedWith)?.macroNewline);
+  const saved = profiles.getSerialProfile(session.profileId);
+  if (!saved) return session.lastMacroNewline ?? "cr";
+  const known = knownMacroNewline(saved);
+  if (known) session.lastMacroNewline = known;
+  return known ?? "cr";
 }

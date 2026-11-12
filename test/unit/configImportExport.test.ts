@@ -512,6 +512,8 @@ describe("config import command (legacy)", () => {
     await core.addOrUpdateSerialProfile(makeSerialProfile({ id: "crlf", name: "CRLF", macroNewline: "crlf" }));
     await core.addOrUpdateSerialProfile(makeSerialProfile({ id: "lf", name: "LF", path: "COM5", macroNewline: "lf" }));
     await core.addOrUpdateSerialProfile(makeSerialProfile({ id: "default", name: "Default", path: "COM6" }));
+    // An explicit "cr" (as an earlier build could store it) lands in the one stored form: absent.
+    await core.addOrUpdateSerialProfile(makeSerialProfile({ id: "explicit-cr", name: "Explicit CR", path: "COM7", macroNewline: "cr" }));
     mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/export.json", scheme: "file" });
     mockWriteFile.mockReset();
     mockWriteFile.mockResolvedValue(undefined);
@@ -529,6 +531,8 @@ describe("config import command (legacy)", () => {
     expect(byName.get("LF")?.macroNewline).toBe("lf");
     expect(byName.get("Default")).toBeDefined();
     expect(byName.get("Default")).not.toHaveProperty("macroNewline");
+    expect(byName.get("Explicit CR")).toBeDefined();
+    expect(byName.get("Explicit CR")).not.toHaveProperty("macroNewline");
   });
 
   it.each([
@@ -536,12 +540,15 @@ describe("config import command (legacy)", () => {
   ] as const)("imports a profile with an unknown Macro Newline through %s/%s as CR instead of dropping it or keeping the value", async (format, mode) => {
     const unknown = makeSerialProfile({ macroNewline: "none" as never });
     const valid = makeSerialProfile({ id: "sp2", name: "Valid", path: "COM9", macroNewline: "lf" });
+    const explicitCr = makeSerialProfile({ id: "sp3", name: "Explicit CR", path: "COM10", macroNewline: "cr" });
     await runImport(makeExportData({ ...(format === "share" ? { version: 2, exportType: "share" } : {}),
-      servers: [], tunnels: [], serialProfiles: [unknown, valid] }), mode);
+      servers: [], tunnels: [], serialProfiles: [unknown, valid, explicitCr] }), mode);
     const byName = new Map(core.getSnapshot().serialProfiles.map((profile) => [profile.name, profile]));
     expect(byName.get("Lab UART")).toBeDefined();
     expect(byName.get("Lab UART")).not.toHaveProperty("macroNewline");
     expect(byName.get("Valid")?.macroNewline).toBe("lf");
+    expect(byName.get("Explicit CR")).toBeDefined();
+    expect(byName.get("Explicit CR")).not.toHaveProperty("macroNewline");
   });
 
   it("does not reactivate missing saved, default, or live selections when merging profiles", async () => {
