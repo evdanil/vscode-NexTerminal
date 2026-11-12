@@ -3,6 +3,7 @@ import type * as VSCode from "vscode";
 import type { TerminalMacro } from "../../src/models/terminalMacro";
 
 const fixture = vi.hoisted(() => ({
+  webviewPanels: [] as Array<{ active: boolean; receive?: (message: unknown) => unknown; viewState?: (event: { webviewPanel: { active: boolean } }) => void }>,
   commands: new Map<string, (...args: unknown[]) => unknown>(),
   macros: [] as TerminalMacro[],
   box: undefined as undefined | { value: string; accept(): void }
@@ -25,6 +26,18 @@ vi.mock("vscode", () => ({
     terminals: [],
     onDidChangeActiveTerminal: () => ({ dispose() {} }),
     onDidCloseTerminal: () => ({ dispose() {} }),
+    // Just enough of a webview panel for the real SerialSendPanel.
+    createWebviewPanel: () => {
+      const record: (typeof fixture.webviewPanels)[number] = { active: true };
+      fixture.webviewPanels.push(record);
+      return {
+        get active() { return record.active; },
+        webview: { html: "", postMessage: async () => true, onDidReceiveMessage: (cb: (m: unknown) => unknown) => { record.receive = cb; return { dispose() {} }; } },
+        onDidDispose: () => ({ dispose() {} }),
+        onDidChangeViewState: (cb: (event: { webviewPanel: { active: boolean } }) => void) => { record.viewState = cb; return { dispose() {} }; },
+        reveal() {}, dispose() {}
+      };
+    },
     showQuickPick: vi.fn(async () => ({ index: 0 })),
     showInformationMessage: vi.fn(async () => undefined),
     setStatusBarMessage: vi.fn(),
@@ -38,7 +51,8 @@ vi.mock("vscode", () => ({
     }
   },
   workspace: { getConfiguration: () => ({ get: () => 1000 }), onDidChangeConfiguration: () => ({ dispose() {} }) },
-  QuickInputButtons: { Back: {} }
+  QuickInputButtons: { Back: {} },
+  ViewColumn: { Beside: 2 }
 }));
 vi.mock("../../src/macroSettings", () => ({ getMacros: () => fixture.macros }));
 vi.mock("../../src/ui/macroEditorPanel", () => ({ MacroEditorPanel: {} }));
@@ -49,7 +63,7 @@ import { SmartSerialPty } from "../../src/services/serial/smartSerialPty";
 import { TerminalRegistry } from "../../src/services/terminal/terminalRegistry";
 import { registerMacroCommands, SERIAL_SEND_BOX_MACRO_SOURCE } from "../../src/commands/macroCommands";
 import { createFocusedSendBoxMacroTarget, createSerialMacroTargetResolver } from "../../src/commands/serialMacroTarget";
-import type { SerialSendBinding } from "../../src/ui/serialSendPanel";
+import { SerialSendPanel, type SerialSendBinding } from "../../src/ui/serialSendPanel";
 
 async function flush(): Promise<void> { for (let i = 0; i < 16; i++) await Promise.resolve(); }
 const owners: Array<{ dispose(): void }> = [];
@@ -213,6 +227,8 @@ describe("macro shortcuts from a focused Serial Send Box", () => {
     return { a, b, registry, panel };
   }
   const sendBox = { source: SERIAL_SEND_BOX_MACRO_SOURCE };
+  const NO_FOCUSED_BOX = "Click into the serial send box, then press the shortcut again. Nothing was sent.";
+  const SESSION_GONE = "The serial send box's session is no longer available. Nothing was sent.";
   const plain: TerminalMacro = { id: "plain", name: "Plain", text: "show run\r", keybinding: "alt+1" };
   const prompted: TerminalMacro = { id: "prompted", name: "Prompted", text: "ping $host\r", keybinding: "alt+1", variables: [{ name: "host" }] };
   const run = (command: string, args: unknown) => Promise.resolve(fixture.commands.get(command)!(args));
@@ -266,22 +282,52 @@ describe("macro shortcuts from a focused Serial Send Box", () => {
     // A closed but still-registered owner resolves to a target that refuses at delivery, like the terminal path;
     // the others are captured as unavailable and refused once the macro is bound for a session.
     if (change === "closed") expect(statuses.join("\n")).toMatch(/nothing was sent/i);
-    else expect(statuses.filter((m) => m === "The serial send box's session is no longer available. Nothing was sent.")).toHaveLength(2);
+    else expect(statuses.filter((m) => m === (change === "unfocused" ? NO_FOCUSED_BOX : SESSION_GONE))).toHaveLength(2);
+    // Each state has its own message; the other one never appears.
+    expect(statuses).not.toContain(change === "unfocused" ? SESSION_GONE : NO_FOCUSED_BOX);
     expect(vscode.window.showInformationMessage).not.toHaveBeenCalled();
+  });
+
+  it("a stale focus pointer on an inactive box sends nothing to it (switching boxes)", async () => {
+    const h = await sendBoxHarness();
+    fixture.webviewPanels = [];
+    const panel = new SerialSendPanel({ setContext: () => {} });
+    owners.push(panel);
+    panel.openOrReveal({ sessionId: "A", profileName: "A", terminal: h.a.terminal, input: h.a.pty });
+    panel.openOrReveal({ sessionId: "B", profileName: "B", terminal: h.b.terminal, input: h.b.pty });
+    const [boxA, boxB] = fixture.webviewPanels;
+    await boxA.receive!({ type: "focusChanged", focused: true });
+    const resolver = createSerialMacroTargetResolver(h.registry);
+    registerMacroCommands(undefined, resolver, createFocusedSendBoxMacroTarget(panel, h.registry, resolver));
+    // The user switches to B: VS Code has updated active state, but neither A's blur
+    // nor B's focus report (nor A's view-state listener) has run yet.
+    boxA.active = false;
+    boxB.active = true;
+    fixture.macros = [plain];
+    await run("nexus.macro.runBinding", { binding: "alt+1", ...sendBox });
+    expectNothingSent(h);
+    expect(vi.mocked(vscode.window.setStatusBarMessage)).toHaveBeenCalledWith(NO_FOCUSED_BOX, 4000);
+    // Once B's own focus report lands, its shortcut goes to B.
+    await boxB.receive!({ type: "focusChanged", focused: true });
+    await run("nexus.macro.runBinding", { binding: "alt+1", ...sendBox });
+    expect(h.b.transport.writePort).toHaveBeenCalledExactlyOnceWith("B-physical-1", Buffer.from("show run\r"));
+    expect(h.a.transport.writePort).not.toHaveBeenCalled();
   });
 
   const profileMacros: Array<[string, TerminalMacro]> = [
     ["profile token", { id: "prof", name: "Prof", text: "ssh ${profile.host}\r", keybinding: "alt+1" }],
     ["non-session target", { id: "web", name: "Web", text: "https://example.test", keybinding: "alt+1", runIn: "browser" } as TerminalMacro]
   ];
-  it.each(profileMacros.flatMap(([label, macro]) => (["runBinding", "run"] as const).map((route) => ({ label, macro, route }))))(
-    "$route: a $label macro from a send box whose session is gone is still offered Run Macro on Server, not refused", async ({ macro, route }) => {
+  it.each(profileMacros.flatMap(([label, macro]) => (["runBinding", "run"] as const).flatMap((route) =>
+    (["unfocused", "sessionGone", "live"] as const).map((state) => ({ label, macro, route, state })))))(
+    "$route: a $label macro from a send box ($state) is offered Run Macro on Server, not refused", async ({ macro, route, state }) => {
       const h = await sendBoxHarness();
       fixture.macros = [macro];
-      h.registry.unregister(h.a.terminal);
+      if (state === "unfocused") h.panel.focused = undefined;
+      if (state === "sessionGone") h.registry.unregister(h.a.terminal);
       await run(`nexus.macro.${route}`, route === "run" ? sendBox : { binding: "alt+1", ...sendBox });
       expect(vscode.window.showInformationMessage).toHaveBeenCalledExactlyOnceWith(`"${macro.name}" runs against a server profile. Pick the server to run it on.`, "Run Macro on Server…");
-      expect(vi.mocked(vscode.window.setStatusBarMessage).mock.calls.map(([m]) => String(m)).join("\n")).not.toMatch(/no longer available/);
+      expect(vi.mocked(vscode.window.setStatusBarMessage).mock.calls.map(([m]) => String(m)).join("\n")).not.toMatch(/no longer available|Click into/);
       expectNothingSent(h);
     });
 

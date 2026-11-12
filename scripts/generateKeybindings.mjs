@@ -14,7 +14,7 @@
  * `nexus.serialSendBoxFocused` is reported by the page itself (VS Code exposes no
  * webview-focus key); `activeWebviewPanelId` alone would stay true while focus is
  * in the sidebar, because VS Code derives it from the active editor. See
- * SERIAL_SEND_FOCUS_CONTEXT in src/ui/serialSendPanel.ts.
+ * SERIAL_SEND_FOCUS_CONTEXT in src/ui/serialSendConstants.ts.
  *
  * SYNC: The constants and mapping functions below must match src/macroBindings.ts.
  * If you change one, update the other. Verified by test/unit/macroBindings.test.ts;
@@ -45,10 +45,16 @@ function bindingToContextKey(binding) {
   return `nexus.macro.alt.${binding.slice(4)}`;
 }
 
-// `!terminalFocus`: the focus key is cleared asynchronously after the page reports
-// blur, and twins come after the terminal entries, so without it a terminal
-// shortcut pressed in that gap would resolve to the twin and be refused.
-const SEND_BOX_FOCUS_WHEN = "nexus.serialSendBoxFocused && !terminalFocus && activeWebviewPanelId == 'nexus.serialSend'";
+// `nexus.serialSendBoxFocused` is cleared asynchronously, only after the page
+// reports blur. The negated keys are set synchronously by the workbench when
+// focus moves (VS Code 1.105: workbench/common/contextkeys.ts and
+// browser/quickaccess.ts), so in that gap a twin cannot outrank the binding of
+// whatever now has focus: a terminal (including a terminal editor, which lives in
+// the editor area), the sidebar, the panel, the auxiliary bar or quick input.
+// The focus key and `'nexus.serialSend'` are SERIAL_SEND_FOCUS_CONTEXT and
+// SERIAL_SEND_VIEW_TYPE in src/ui/serialSendConstants.ts (pinned by a test).
+const SEND_BOX_FOCUS_WHEN = "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && " +
+  "!auxiliaryBarFocus && !inQuickOpen && activeWebviewPanelId == 'nexus.serialSend'";
 
 const entries = [];
 const twins = [];

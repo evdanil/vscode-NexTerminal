@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { prepareSerialText, type SerialInputState, type SerialLineEnding, type SerialUserInput } from "../services/serial/serialUserInput";
 import { createWebviewNonce } from "./shared/webviewNonce";
 import { renderSerialSendHtml } from "./serialSendHtml";
+import { SERIAL_SEND_FOCUS_CONTEXT, SERIAL_SEND_VIEW_TYPE } from "./serialSendConstants";
 
 export interface SerialSendBinding {
   readonly sessionId: string;
@@ -37,18 +38,7 @@ export interface SerialSendPanelOptions {
 
 export const SERIAL_SEND_KEEP_TEXT_KEY = "nexus.serialSendBox.keepText";
 
-/**
- * True while keyboard focus is inside a Serial Send Box. The send-box twins of
- * the macro keybindings use it, together with `!terminalFocus` (it is cleared
- * asynchronously after the page reports blur) and
- * `activeWebviewPanelId == 'nexus.serialSend'`. That built-in key alone is not
- * enough: VS Code derives it from the active editor of the active editor group
- * (webviewWorkbenchService.ts registers it as an editor-group context-key
- * provider), so it stays set while focus is in the sidebar, a panel or quick
- * input. VS Code exposes no webview-focus key to extensions, so the page reports
- * its own window focus/blur and this class keeps the key in step.
- */
-export const SERIAL_SEND_FOCUS_CONTEXT = "nexus.serialSendBoxFocused";
+export { SERIAL_SEND_FOCUS_CONTEXT, SERIAL_SEND_VIEW_TYPE };
 
 export function createSerialSendPreferences(memento: Pick<vscode.Memento, "get" | "update">): SerialSendPreferences {
   return {
@@ -104,7 +94,8 @@ export class SerialSendPanel implements vscode.Disposable {
       }
     });
     this.shortcutListener = options.macroShortcuts?.onDidChange(() => {
-      for (const entry of this.panels.values()) this.pushShortcuts(entry);
+      const shortcuts = this.boundShortcuts();
+      for (const entry of this.panels.values()) this.pushShortcuts(entry, shortcuts);
     });
   }
 
@@ -120,7 +111,12 @@ export class SerialSendPanel implements vscode.Disposable {
   /** The binding of the send box that has keyboard focus, if any. */
   public getFocusedBinding(): SerialSendBinding | undefined {
     const entry = this.focused;
-    return entry && !entry.disposed && this.panels.get(entry.binding.sessionId) === entry ? entry.binding : undefined;
+    // `panel.active` as well: view-state changes are ordered main-thread events,
+    // but focus reports come from separate webviews. Switching from box A to box B
+    // makes A inactive before (or with) B becoming active, while A's blur and B's
+    // focus may still be in flight; without this, a shortcut pressed in B in that
+    // gap would go to A's session.
+    return entry && !entry.disposed && entry.panel.active && this.panels.get(entry.binding.sessionId) === entry ? entry.binding : undefined;
   }
 
   public openOrReveal(binding: SerialSendBinding): void {
@@ -136,7 +132,7 @@ export class SerialSendPanel implements vscode.Disposable {
     }
     const previous = binding.input.getInputState();
     if (previous.status === "closed") throw new Error("Serial session is closed.");
-    const panel = vscode.window.createWebviewPanel("nexus.serialSend", `Serial Send: ${binding.profileName}`, vscode.ViewColumn.Beside, {
+    const panel = vscode.window.createWebviewPanel(SERIAL_SEND_VIEW_TYPE, `Serial Send: ${binding.profileName}`, vscode.ViewColumn.Beside, {
       enableScripts: true,
       retainContextWhenHidden: true,
       localResourceRoots: []
@@ -148,7 +144,10 @@ export class SerialSendPanel implements vscode.Disposable {
       entry.listeners.push(panel.webview.onDidReceiveMessage((message: unknown) => this.receive(entry, message)));
       // Another editor becoming active means focus has left this box, even if its blur report is late or lost.
       entry.listeners.push(panel.onDidChangeViewState((event) => {
-        if (!event.webviewPanel.active) this.setFocused(entry, false);
+        // Returning to a box resyncs it with the stored keep-text choice (another window may have changed it).
+        // The focus report may have arrived before the panel turned active.
+        if (event.webviewPanel.active) { this.pushPreferences(entry); this.updateFocusContext(); }
+        else this.setFocused(entry, false);
       }));
       entry.listeners.push(binding.input.onDidChangeInputState((state) => {
         if (state.status === "closed") this.close(entry);
@@ -228,10 +227,13 @@ export class SerialSendPanel implements vscode.Disposable {
     void entry.panel.webview.postMessage({ type: "preferences", keepText: this.preferences.getKeepText() === true });
   }
 
-  private pushShortcuts(entry: OpenComposer): void {
+  /** getBoundMacroShortcuts() already validates against the binding grammar; the page re-validates at its trust boundary. */
+  private boundShortcuts(): string[] {
+    return [...(this.options.macroShortcuts?.getBoundShortcuts() ?? [])];
+  }
+
+  private pushShortcuts(entry: OpenComposer, shortcuts = this.boundShortcuts()): void {
     if (entry.disposed) return;
-    // getBoundMacroShortcuts() already validates against the binding grammar; the page re-validates at its trust boundary.
-    const shortcuts = [...(this.options.macroShortcuts?.getBoundShortcuts() ?? [])];
     void entry.panel.webview.postMessage({ type: "macroShortcuts", shortcuts });
   }
 
@@ -263,9 +265,9 @@ export class SerialSendPanel implements vscode.Disposable {
       return;
     }
     if (value.type === "setKeepText" && hasOnlyKeys(value, ["type", "keepText"]) && typeof value.keepText === "boolean") {
-      if (value.keepText === (this.preferences.getKeepText() === true)) return;
+      // No "unchanged" shortcut: the shared key may hold another window's value,
+      // so always persist this box's choice and resync every open box to it.
       this.preferences.setKeepText(value.keepText);
-      // Every open box shows the same remembered choice.
       for (const other of this.panels.values()) this.pushPreferences(other);
       return;
     }

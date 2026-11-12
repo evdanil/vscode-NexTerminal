@@ -4,6 +4,7 @@ import type { SerialInputState, SerialUserInput } from "../../src/services/seria
 import {
   SERIAL_SEND_FOCUS_CONTEXT,
   SERIAL_SEND_KEEP_TEXT_KEY,
+  SERIAL_SEND_VIEW_TYPE,
   SerialSendPanel,
   createSerialSendPreferences
 } from "../../src/ui/serialSendPanel";
@@ -21,6 +22,8 @@ function events<T>() {
 }
 
 interface FakePanel {
+  active: boolean;
+  setActive: (active: boolean) => void;
   webview: { html: string; postMessage: ReturnType<typeof vi.fn>; onDidReceiveMessage: vscode.Event<unknown> };
   receive: ReturnType<typeof events<unknown>>;
   closed: ReturnType<typeof events<void>>;
@@ -42,7 +45,9 @@ function panel(): FakePanel {
   const receive = events<unknown>();
   const closed = events<void>();
   const viewState = events<{ webviewPanel: { active: boolean } }>();
-  return {
+  const fake: FakePanel = {
+    active: true,
+    setActive: (active) => { fake.active = active; viewState.fire({ webviewPanel: { active } }); },
     receive, closed, viewState,
     webview: { html: "", postMessage: vi.fn(async () => true), onDidReceiveMessage: receive.event },
     onDidDispose: closed.event,
@@ -51,6 +56,7 @@ function panel(): FakePanel {
     dispose: vi.fn(() => closed.fire()),
     message: async (value) => { await Promise.all([...receive.listeners].map((listener) => listener(value))); }
   };
+  return fake;
 }
 
 function binding(sessionId = "session-1") {
@@ -416,7 +422,7 @@ describe("serial send panel focus, preferences and shortcut list", () => {
     await panels[0].message({ type: "focusChanged", focused: false });
     expect(registry.getFocusedBinding()?.terminal).toBe(b.terminal);
     expect(focusContext()).toBe(true);
-    panels[0].viewState.fire({ webviewPanel: { active: false } });
+    panels[0].setActive(false);
     expect(registry.getFocusedBinding()?.terminal).toBe(b.terminal);
   });
 
@@ -424,7 +430,7 @@ describe("serial send panel focus, preferences and shortcut list", () => {
     const a = binding();
     registry.openOrReveal(a);
     await panels[0].message({ type: "focusChanged", focused: true });
-    if (change === "inactive") panels[0].viewState.fire({ webviewPanel: { active: false } });
+    if (change === "inactive") panels[0].setActive(false);
     if (change === "dispose") panels[0].dispose();
     if (change === "terminal-close") terminalClosed.fire(a.terminal);
     if (change === "session") registry.disposeForSession(a.sessionId);
@@ -435,9 +441,74 @@ describe("serial send panel focus, preferences and shortcut list", () => {
 
   it("an active view-state change does not invent focus", async () => {
     registry.openOrReveal(binding());
-    panels[0].viewState.fire({ webviewPanel: { active: true } });
+    panels[0].setActive(true);
     expect(registry.getFocusedBinding()).toBeUndefined();
     expect(setContext).not.toHaveBeenCalled();
+  });
+
+  it("a stale focus pointer on a box that is no longer the active editor is not a focused box", async () => {
+    const a = binding();
+    registry.openOrReveal(a);
+    registry.openOrReveal(binding("session-2"));
+    await panels[0].message({ type: "focusChanged", focused: true });
+    expect(registry.getFocusedBinding()?.terminal).toBe(a.terminal);
+    // VS Code has already made A inactive; its blur and its view-state listener have not run yet.
+    panels[0].active = false;
+    panels[1].active = true;
+    expect(registry.getFocusedBinding()).toBeUndefined();
+  });
+
+  it("a focus report that lands before the box turns active sets the context key once it does", async () => {
+    registry.openOrReveal(binding());
+    panels[0].active = false;
+    await panels[0].message({ type: "focusChanged", focused: true });
+    expect(focusContext()).toBe(false);
+    panels[0].setActive(true);
+    expect(focusContext()).toBe(true);
+  });
+
+  it("a toggle always persists and resyncs every box, even when the store already holds that value", async () => {
+    registry.openOrReveal(binding());
+    registry.openOrReveal(binding("session-2"));
+    await panels[0].message({ type: "ready" });
+    await panels[1].message({ type: "ready" });
+    // Another window wrote true; box 0 still shows false and the user checks it.
+    stored.set(SERIAL_SEND_KEEP_TEXT_KEY, true);
+    const writes = vi.fn();
+    const original = stored.set.bind(stored);
+    stored.set = ((key: string, value: unknown) => { writes(key, value); return original(key, value); }) as typeof stored.set;
+    await panels[0].message({ type: "setKeepText", keepText: true });
+    expect(writes).toHaveBeenCalledWith(SERIAL_SEND_KEEP_TEXT_KEY, true);
+    for (const p of panels) expect(posted(p, "preferences").at(-1)).toEqual({ type: "preferences", keepText: true });
+  });
+
+  it("re-sends the stored keep-text value whenever a box becomes active, not when it goes inactive", async () => {
+    registry.openOrReveal(binding());
+    await panels[0].message({ type: "ready" });
+    stored.set(SERIAL_SEND_KEEP_TEXT_KEY, true);
+    panels[0].setActive(false);
+    expect(posted(panels[0], "preferences")).toEqual([{ type: "preferences", keepText: false }]);
+    panels[0].setActive(true);
+    expect(posted(panels[0], "preferences")).toEqual([{ type: "preferences", keepText: false }, { type: "preferences", keepText: true }]);
+  });
+
+  it("computes the combo list once per change and posts it to every box", async () => {
+    const get = vi.fn(() => bound);
+    registry.dispose();
+    registry = new SerialSendPanel({ setContext, macroShortcuts: { getBoundShortcuts: get, onDidChange: (l) => shortcutsChanged.event(l) as vscode.Disposable } });
+    registry.openOrReveal(binding());
+    registry.openOrReveal(binding("session-2"));
+    registry.openOrReveal(binding("session-3"));
+    get.mockClear();
+    bound = ["alt+q"];
+    shortcutsChanged.fire();
+    expect(get).toHaveBeenCalledOnce();
+    for (const p of panels) expect(posted(p, "macroShortcuts").at(-1)).toEqual({ type: "macroShortcuts", shortcuts: ["alt+q"] });
+  });
+
+  it("creates its panel with the exported view type", () => {
+    registry.openOrReveal(binding());
+    expect(host.create.mock.calls[0][0]).toBe(SERIAL_SEND_VIEW_TYPE);
   });
 
   it("restores, persists and broadcasts the keep-text preference; rejects malformed updates", async () => {

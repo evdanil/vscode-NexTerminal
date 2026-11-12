@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { createEveNgProvider, readEveNgStatusPollSeconds } from "../../src/services/inventory/providers/eveNgProvider";
 import { createBuiltInProviders } from "../../src/services/inventory/builtInProviders";
 import { SHIPPED_IMPORTER_NAMES } from "../../src/utils/shippedImporters";
+import { SERIAL_SEND_FOCUS_CONTEXT, SERIAL_SEND_VIEW_TYPE } from "../../src/ui/serialSendConstants";
 
 const repoRoot = path.resolve(__dirname, "..", "..");
 const readDoc = (relativePath: string) => readFileSync(path.join(repoRoot, relativePath), "utf8");
@@ -2460,7 +2461,8 @@ describe("SSH agent settings (nexus.ssh.agent, nexus.ssh.agentPath)", () => {
 
 describe("serial send box contributions", () => {
   describe("macro shortcuts from a focused send box", () => {
-    const SEND_BOX_FOCUS = "nexus.serialSendBoxFocused && !terminalFocus && activeWebviewPanelId == 'nexus.serialSend'";
+    const SEND_BOX_FOCUS = "nexus.serialSendBoxFocused && !terminalFocus && !sideBarFocus && !panelFocus && !auxiliaryBarFocus && " +
+      "!inQuickOpen && activeWebviewPanelId == 'nexus.serialSend'";
     const keybindings = packageJson.contributes.keybindings ?? [];
     const macroEntries = keybindings.filter((item) => item.command === "nexus.macro.run" || item.command === "nexus.macro.runBinding");
     const terminalEntries = macroEntries.filter((item) => item.when?.startsWith("terminalFocus"));
@@ -2482,10 +2484,17 @@ describe("serial send box contributions", () => {
         expect(twin[0].mac).toBe(entry.mac);
         expect(Object.keys(twin[0].args ?? {}).sort()).toEqual([...Object.keys(entry.args ?? {}), "source"].sort());
       }
-      // A twin never matches while a terminal has focus: the focus key clears only after the page's blur report arrives.
+      // A twin never matches while focus is in a terminal, the sidebar, panel, auxiliary bar or quick input:
+      // the focus key clears only after the page's blur report arrives, those keys are synchronous.
+      const clauses = (when = "") => when.split(" && ");
       for (const twin of twins) {
-        expect(twin.when).toContain("!terminalFocus");
-        expect(twin.when).not.toMatch(/(?:^|[^!])terminalFocus/);
+        for (const key of ["terminalFocus", "sideBarFocus", "panelFocus", "auxiliaryBarFocus", "inQuickOpen"]) {
+          expect(clauses(twin.when), key).toContain(`!${key}`);
+          expect(clauses(twin.when), key).not.toContain(key);
+        }
+        // Tied to the identifiers the panel actually uses, not to a copy of them.
+        expect(clauses(twin.when)[0]).toBe(SERIAL_SEND_FOCUS_CONTEXT);
+        expect(clauses(twin.when)).toContain(`activeWebviewPanelId == '${SERIAL_SEND_VIEW_TYPE}'`);
       }
     });
 

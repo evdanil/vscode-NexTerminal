@@ -47,6 +47,7 @@ import {
 import {
   runMacro,
   runMacroWithTarget,
+  type FocusedSendBoxCapture,
   type FocusedSendBoxMacroTarget,
   type MacroSendTarget,
   type SerialMacroTargetResolver
@@ -255,24 +256,28 @@ function isSendBoxInvocation(arg: unknown): boolean {
 }
 
 /**
- * What a send-box invocation captured, synchronously, at invocation (§8.1): the
- * focused box's own session, or `undefined` when there was no box or its session
- * could no longer be resolved. The send box and `activeTerminal` can name
- * different serial sessions, and the Alt+S picker or a variable prompt takes
- * focus away from the box, so nothing may re-derive the target later.
+ * What an invocation captured, synchronously, at invocation (§8.1). The send
+ * box and `activeTerminal` can name different serial sessions, and the Alt+S
+ * picker or a variable prompt takes focus away from the box, so nothing may
+ * re-derive the target later.
  *
- * An unavailable session is a captured state rather than an immediate refusal:
- * a server-profile or non-session macro is redirected to Run Macro on Server…
+ * The unavailable states are captured rather than refused at once: a
+ * server-profile or non-session macro is redirected to Run Macro on Server…
  * exactly as from a terminal, and only a macro that would actually be sent to a
- * session is refused. It never falls back to `activeTerminal`, which would send
- * the macro to a session the user was not typing into.
+ * session is refused, with the message for its state. None of them falls back
+ * to `activeTerminal`, which would send the macro to a session the user was not
+ * typing into.
  */
-interface SendBoxCapture {
-  readonly target: MacroSendTarget | undefined;
-}
+type SendBoxCapture = { readonly kind: "notSendBox" } | FocusedSendBoxCapture;
 
-function captureSendBox(arg: unknown, capture: FocusedSendBoxMacroTarget | undefined): SendBoxCapture | undefined {
-  return isSendBoxInvocation(arg) ? { target: capture?.() } : undefined;
+const SEND_BOX_REFUSALS = {
+  noFocusedBox: "Click into the serial send box, then press the shortcut again. Nothing was sent.",
+  sessionGone: "The serial send box's session is no longer available. Nothing was sent."
+} as const;
+
+function captureSendBox(arg: unknown, capture: FocusedSendBoxMacroTarget | undefined): SendBoxCapture {
+  if (!isSendBoxInvocation(arg)) return { kind: "notSendBox" };
+  return capture ? capture() : { kind: "noFocusedBox" };
 }
 
 async function sendMacroText(text: string, resolveSerialTarget?: SerialMacroTargetResolver): Promise<void> {
@@ -294,7 +299,7 @@ async function sendMacroText(text: string, resolveSerialTarget?: SerialMacroTarg
 async function runOrSendMacro(
   macro: TerminalMacro,
   resolveSerialTarget?: SerialMacroTargetResolver,
-  sendBox?: SendBoxCapture
+  sendBox: SendBoxCapture = { kind: "notSendBox" }
 ): Promise<void> {
   // A macro that names a server profile (`${profile.…}`) or runs somewhere
   // other than a session cannot be resolved from these entry points: they know
@@ -333,16 +338,15 @@ async function runOrSendMacro(
   // common case): `runMacro`'s re-entrancy guard keys id-less macros on
   // name+text, and a needless copy is a needless difference.
   const toRun = text === macro.text ? macro : { ...macro, text };
-  if (sendBox) {
+  if (sendBox.kind !== "notSendBox") {
     // Send-box shortcut: the caller captured the session at invocation. Delivery
     // is the guarded serial path (epoch, script lock); macro bytes are never converted.
-    const pinned = sendBox.target;
-    if (!pinned) {
-      vscode.window.setStatusBarMessage("The serial send box's session is no longer available. Nothing was sent.", 4000);
+    if (sendBox.kind !== "target") {
+      vscode.window.setStatusBarMessage(SEND_BOX_REFUSALS[sendBox.kind], 4000);
       return;
     }
-    if (hasMacroVariables(macro)) await runMacroWithTarget(toRun, pinned);
-    else await pinned.send(text);
+    if (hasMacroVariables(macro)) await runMacroWithTarget(toRun, sendBox.target);
+    else await sendBox.target.send(text);
     return;
   }
   if (hasMacroVariables(macro)) {

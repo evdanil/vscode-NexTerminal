@@ -52,8 +52,9 @@ export function createFocusedSendBoxMacroTarget(
 ): FocusedSendBoxMacroTarget {
   return () => {
     const binding = panel.getFocusedBinding();
-    const pty: unknown = registry.get(binding?.terminal)?.pty;
-    if (!binding || pty !== binding.input) return undefined;
-    return resolve(binding.terminal);
+    if (!binding) return { kind: "noFocusedBox" };
+    const pty: unknown = registry.get(binding.terminal)?.pty;
+    const target = pty === binding.input ? resolve(binding.terminal) : undefined;
+    return target ? { kind: "target", target } : { kind: "sessionGone" };
   };
 }

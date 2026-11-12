@@ -80,11 +80,17 @@ export interface MacroSendTarget {
 export type SerialMacroTargetResolver = (terminal: vscode.Terminal) => MacroSendTarget | undefined;
 
 /**
- * Pins the session of the Serial Send Box that has keyboard focus, or returns
- * `undefined` when there is none or its session can no longer be resolved.
- * Called synchronously at command invocation, before any await.
+ * What a send-box shortcut found at invocation: no send box that is both
+ * focused and the active editor, a focused box whose session closed or was
+ * replaced, or that box's own session.
  */
-export type FocusedSendBoxMacroTarget = () => MacroSendTarget | undefined;
+export type FocusedSendBoxCapture =
+  | { readonly kind: "noFocusedBox" }
+  | { readonly kind: "sessionGone" }
+  | { readonly kind: "target"; readonly target: MacroSendTarget };
+
+/** Called synchronously at command invocation, before any await. */
+export type FocusedSendBoxMacroTarget = () => FocusedSendBoxCapture;
 
 /** The ordinary target: an existing terminal, pinned by reference. */
 export function terminalSendTarget(terminal: vscode.Terminal): MacroSendTarget {
