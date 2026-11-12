@@ -14,6 +14,10 @@
 
 - **Macro shortcuts work while the Serial Send Box has keyboard focus.** `Alt+S` and assigned macro shortcuts previously did nothing there, although the serial guide said macros continued to work. They now send to that send box's own serial session, even when another terminal is active. On macOS, the Option character is no longer typed into the draft for a bound shortcut whose key is in its US-layout position. If that session is no longer available, nothing is sent. The Macros view and Nexus: Run Macro still send to the active terminal.
 
+### Security
+
+- **Dependency updates close one advisory in the SecureCRT importer and one in the packaging toolchain.** `fast-xml-parser` (5.10.1 → 5.12.0), which reads SecureCRT session files during import, fixes a low-severity quadratic CPU cost when scanning unterminated stop-node tags (GHSA-474x-hrwr-fgx4). The importer configures no stop nodes, so that path was not reachable; the extension now carries the fixed copy all the same, and the update also replaces the validator's attribute regex with a linear scanner. `@azure/msal-node` (5.3.0 → 7.2.1, via `@azure/identity` 4.14.1) fixes a high-severity issue in which the authorization-code flow could disclose parameters to an attacker-controlled endpoint (GHSA-xcx6-jx8p-x3h5). It reaches this repository only through `@vscode/vsce`, whose publishing uses a personal access token rather than that flow — build-time only, never shipped in the VSIX. `npm audit --omit=dev`, which covers every JavaScript dependency the extension ships, now reports no vulnerabilities.
+
 ## [2.8.317] — 2026-11-10
 
 ### Added
