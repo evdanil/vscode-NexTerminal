@@ -596,7 +596,20 @@ describe("Ssh2Connector.connect banner handling", () => {
     expect(connection).toBeDefined();
   });
 
-  it("T11 — a pre-ready error still rejects the connect promise and is NOT logged instead", async () => {
+  it("reports an unavailable Diffie–Hellman group before rejecting the connection", async () => {
+    const sink = vi.fn();
+    const connector = new Ssh2Connector(undefined, undefined, sink);
+    const connectPromise = connector.connect(makeServer(), { password: "pw" });
+    await flushMicrotasks();
+
+    const error = Object.assign(new Error("Unknown DH group"), { code: "ERR_CRYPTO_UNKNOWN_DH_GROUP" });
+    mockClients.at(-1).emit("error", error);
+
+    await expect(connectPromise).rejects.toBe(error);
+    expect(sink).toHaveBeenCalledWith(expect.stringContaining("SSH key exchange failed: Unknown DH group"));
+  });
+
+  it("T11 — a pre-ready authentication error rejects the connect promise without logging", async () => {
     const sink = vi.fn();
     const connector = new Ssh2Connector(undefined, undefined, sink);
 

@@ -236,7 +236,7 @@ From NetBox, this fills itself in — see [Primary IP Family and Alternate Host]
 
 ## Legacy Devices
 
-A per-server legacy algorithm toggle is there for older devices (Cisco IOS, embedded systems) — including devices that only speak the 1024-bit `diffie-hellman-group1-sha1` key exchange, which VS Code's Electron crypto otherwise refuses to build ("Unknown DH group"). Together with multi-hop jump-host chaining (A → B → C), this per-server legacy KEX/cipher toggle keeps you connected to old IOS boxes that modern clients refuse.
+Select **Enable legacy SSH algorithms** on the server profile for older devices that require legacy key exchange or ciphers. This includes Cisco IOS devices that offer only the 1024-bit `diffie-hellman-group1-sha1` key exchange. Nexus supplies the standard group parameters if VS Code's Electron runtime cannot load that group by name. Each server in a multi-hop jump-host chain has its own setting.
 
 ## Connection Multiplexing
 
@@ -255,6 +255,8 @@ If the server is removed or its connection settings (address, port, protocol, us
 ## When a Session Drops
 
 Faults that arrive *after* a session is up — a keepalive timeout, a protocol error, the connection closing — are recorded in the **Nexus SSH** output channel, so a terminal that drops on its own leaves a cause behind instead of only "Connection lost".
+
+If the runtime cannot load a Diffie–Hellman group during the initial key exchange, the **Nexus SSH** output channel records the failure alongside the connection error shown in the terminal.
 
 When an SSH session drops, Nexus disables terminal mouse-tracking, focus-reporting, color-scheme notification, alternate-scroll, bracketed-paste, application-cursor-key and application-keypad modes, shows the cursor, and resets the active screen's Kitty keyboard-mode stack and flags before showing the disconnect banner. Telnet, Serial and Smart Follow terminals get the same reset, and a disconnected Telnet or Serial tab closes only on a real key press, not on focus, mouse or color-scheme reports or up/down arrow sequences (wheel scrolling). Press **R** to reconnect an SSH session in the same tab; your visible output and scrollback stay available, and late output from the old connection is ignored even after reconnect.
 

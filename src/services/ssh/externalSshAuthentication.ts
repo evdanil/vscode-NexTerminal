@@ -1,4 +1,5 @@
-import { utils, type AnyAuthMethod, type ConnectConfig, type KeyboardInteractiveAuthMethod } from "ssh2";
+import type { AnyAuthMethod, ConnectConfig, KeyboardInteractiveAuthMethod } from "ssh2";
+import { utils } from "./ssh2Runtime";
 import type { ResolvedExternalCredential } from "../credentials/contracts";
 import { CredentialProviderError } from "../credentials/credentialProviderError";
 

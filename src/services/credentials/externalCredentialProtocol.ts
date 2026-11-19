@@ -1,4 +1,4 @@
-import { utils } from "ssh2";
+import { utils } from "../ssh/ssh2Runtime";
 import {
   EXTERNAL_CREDENTIAL_PASSWORD_MAX_BYTES,
   EXTERNAL_CREDENTIAL_PRIVATE_KEY_MAX_BYTES,

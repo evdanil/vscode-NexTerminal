@@ -14,7 +14,7 @@ const cryptoCjs = require("node:crypto") as typeof import("node:crypto");
 // crypto.createDiffieHellmanGroup("modp2"). VS Code's Electron crypto cannot
 // resolve that 1024-bit group BY NAME and throws ERR_CRYPTO_UNKNOWN_DH_GROUP
 // before a single handshake byte is sent. The fix is a compat shim — installed
-// by the connector module BEFORE ssh2 loads — that falls back to
+// by the shared ssh2 runtime module BEFORE ssh2 loads — that falls back to
 // createDiffieHellman() with the well-known RFC 2409 group-2 prime when (and
 // only when) the named lookup fails.
 
@@ -66,14 +66,14 @@ function makeServer(overrides: Partial<ServerConfig> = {}): ServerConfig {
 }
 
 describe("SSH diffie-hellman-group1-sha1 on an Electron-like runtime", () => {
-  it("completes a handshake against a group1-sha1-only server even though the runtime refuses modp2 by name", async () => {
-    // Dynamic imports: the connector module's FIRST import is the compat shim,
-    // which must self-install before ssh2 evaluates. Importing ssh2 statically
-    // at file top would evaluate it before the patch above.
+  it("completes a group1-sha1 handshake when credential parsing loads before the connector", async () => {
+    // Match desktop activation order. Credential parsing imports ssh2 to
+    // validate private keys, and can make it capture the broken lookup first.
+    await import("../../src/services/credentials/externalCredentialProtocol");
     const connectorModule = await import("../../src/services/ssh/ssh2Connector");
     const ssh2 = await import("ssh2");
 
-    // The connector body must restore the shared crypto export once ssh2 has
+    // The runtime loader must restore the shared crypto export once ssh2 has
     // captured the wrapper: the extension-host process is shared with other
     // extensions, and a permanent monkey-patch would change behavior for every
     // consumer that comes after us. The handshake below must STILL work — ssh2

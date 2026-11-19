@@ -481,7 +481,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   // is populated. Does not block activation.
   void maybeWarnMacroKeybindingsBlocked(context);
 
-  // Post-ready SSH client errors, connection closes, SFTP channel faults, UNC
+  // DH lookup failures, post-ready SSH client errors, connection closes, SFTP channel faults, UNC
   // blocks and per-transfer byte counts all land here. Always on and free — an
   // output channel is inert until someone opens it — because the failure modes
   // this fixes (a keepalive timeout dropping every tab, a transfer that moved
