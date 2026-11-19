@@ -19,7 +19,7 @@
 //
 // IMPORTANT: ssh2 destructures `createDiffieHellmanGroup` from `require
 // ("crypto")` at module load, so this module must be imported BEFORE ssh2 —
-// ssh2Connector.ts imports it first for exactly that reason.
+// ssh2Runtime.ts wraps and restores the lookup around ssh2's initial load.
 
 type DiffieHellmanGroupFn = (name: string) => unknown;
 

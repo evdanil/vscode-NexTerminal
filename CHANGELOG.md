@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.320] — 2026-11-19
+
+### Fixed
+
+- Restored SSH connections to older Cisco IOS devices that require `diffie-hellman-group1-sha1` with **Enable legacy SSH algorithms** selected. The credential parser could load the SSH library before its Diffie–Hellman compatibility code, causing `Unknown DH group` before login. If a Diffie–Hellman group still cannot be loaded, the failure is now recorded in the **Nexus SSH** output channel.
+
 ## [2.8.319] — 2026-11-12
 
 ### Added

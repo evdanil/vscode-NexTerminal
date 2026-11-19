@@ -1,20 +1,8 @@
 import { readFile } from "node:fs/promises";
 import type { Duplex } from "node:stream";
 
-// MUST stay above the ssh2 import: ssh2 destructures
-// createDiffieHellmanGroup from node:crypto at module load, and this shim
-// (needed for diffie-hellman-group1-sha1 on Electron) has to wrap it first.
-// See sshDhGroupCompat.ts for the full story.
-import { uninstallSshDhGroupCompat } from "./sshDhGroupCompat";
-
-import { Client, createAgent, type Algorithms, type ConnectConfig, type SFTPWrapper, type VerifyCallback } from "ssh2";
-
-// ssh2 captured the shim-wrapped function in its own module closure during the
-// import above, so the wrapper keeps serving our connections — restore the
-// shared crypto export now so other extensions in this extension-host process
-// are not left with a permanent monkey-patch on node:crypto.
-uninstallSshDhGroupCompat();
-
+import type { Algorithms, ConnectConfig, SFTPWrapper, VerifyCallback } from "ssh2";
+import { Client, createAgent } from "./ssh2Runtime";
 import { createExternalSshAuthentication, type ExternalSshAuthentication } from "./externalSshAuthentication";
 import type { ResolvedExternalCredential } from "../credentials/contracts";
 import type { ServerConfig } from "../../models/config";
@@ -894,10 +882,12 @@ export class Ssh2Connector implements SshConnector {
         cleanupAuthentication();
         if (!settled) {
           settled = true;
-          // Pre-ready errors are the caller's to handle and MUST stay a plain
-          // rejection — the connect flow (auth retry, host-key prompts) reads
-          // them. Nothing is logged here on purpose.
+          // Keep the original rejection for auth retry and host-key handling.
           reject(hostKeyError instanceof Error ? hostKeyError : explainAgentShortfall(agent, error, answeredKeyboardInteractive));
+          // Node's named-group lookup throws before ssh2 can attach a level.
+          if ((error as NodeJS.ErrnoException).code === "ERR_CRYPTO_UNKNOWN_DH_GROUP") {
+            this.diagnostics?.(`[ssh] ${label}: SSH key exchange failed: Unknown DH group`);
+          }
           return;
         }
         // Post-ready these used to be dropped on the floor, which is why a
