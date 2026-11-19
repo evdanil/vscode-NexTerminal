@@ -121,7 +121,7 @@ Then open the **Nexus** sidebar (activity bar icon).
 
 ### Terminal
 
-- **Highlighting** — named profiles group regex rules for errors, warnings, addresses, and more; choose a default, assign profiles to connections, or override an individual terminal. → [Highlighting](docs/terminal.md#highlighting)
+- **Highlighting** — named profiles group regex rules for errors, warnings, and addresses. Start with a Cisco IOS / IOS XE, Juniper Junos, or Arista EOS preset and assign the profile to a connection or terminal. → [Highlighting](docs/terminal.md#highlighting)
 - **Tab commands** — right-click a Nexus tab in the Terminal panel to select its highlight profile, reset the terminal, clear scrollback, or copy its output. → [Tab Commands](docs/terminal.md#tab-commands)
 - **Session transcripts** — clean, ANSI-stripped SSH, telnet, and serial logs with per-line timestamps on by default (local, UTC, or off), optional CRLF-to-LF line-ending conversion, and folder/filename templates using session, host, group and date tokens; **Open Log Directory** opens the log root. → [Session Transcript Logging](docs/terminal.md#session-transcript-logging)
 - **Keyboard passthrough** — `Ctrl+` combinations go straight to vim, nano, or htop, configurable per key. → [Keyboard Passthrough](docs/terminal.md#keyboard-passthrough)

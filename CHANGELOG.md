@@ -5,6 +5,7 @@
 ### Added
 
 - **Quick Connect** opens a direct SSH or Telnet terminal from an address without creating a profile. Start it from the Connectivity Hub or the Command Palette. Use **Save as Profile…** from an opened terminal to create a regular network device profile with its connection settings.
+- **Terminal highlighting presets** for Cisco IOS / IOS XE, Juniper Junos, and Arista EOS. Choose a preset in **Edit Highlighting Rules** to create an editable profile for interface states, prompts, routing status, and addresses.
 
 ### Fixed
 

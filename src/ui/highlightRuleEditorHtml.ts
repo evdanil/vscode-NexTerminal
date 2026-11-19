@@ -6,6 +6,7 @@ import { renderWebviewDocument } from "./shared/webviewDocument";
 import { regexSafetyWebviewJs } from "../utils/regexSafety";
 import type { HighlightRule } from "../utils/highlightRuleValidation";
 import { HIGHLIGHT_CONFLICT_RECOVERY, HIGHLIGHT_SETTINGS_REPAIR } from "./highlightProfileForm";
+import { HIGHLIGHT_PROFILE_PRESETS } from "./highlightProfilePresets";
 
 const COLOR_NAMES = [
   "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
@@ -37,6 +38,10 @@ export function renderHighlightRuleEditorHtml(rules: HighlightRule[], nonce: str
   const colorCssJson = serializeForInlineScript(COLOR_CSS);
   const rulesJson = serializeForInlineScript(rules);
   const managerJson = serializeForInlineScript(manager ?? null);
+  const presetsJson = serializeForInlineScript(manager ? HIGHLIGHT_PROFILE_PRESETS : []);
+  const presetOptions = HIGHLIGHT_PROFILE_PRESETS.map((preset, index) =>
+    `<option value="${index}">${escapeHtml(preset.name)}</option>`
+  ).join("");
   const recoveryJson = serializeForInlineScript(HIGHLIGHT_SETTINGS_REPAIR);
   const conflictRecoveryJson = serializeForInlineScript(HIGHLIGHT_CONFLICT_RECOVERY);
 
@@ -213,6 +218,12 @@ export function renderHighlightRuleEditorHtml(rules: HighlightRule[], nonce: str
       <button type="button" class="btn-secondary" id="profile-duplicate">Duplicate</button>
       <button type="button" class="btn-secondary" id="profile-delete">Delete</button>
     </div>
+    <label for="profile-preset">Profile preset</label>
+    <select id="profile-preset">
+      <option value="">Choose a preset</option>
+      ${presetOptions}
+    </select>
+    <button type="button" class="btn-secondary" id="profile-create-preset" disabled>Create from preset</button>
     <label for="profile-default">Global default</label>
     <select id="profile-default"></select>
     <div id="profile-workspace-override" class="setting-desc" hidden>Workspace settings override the global profile catalog or default. Changes here are saved globally and may not affect this workspace until its override is changed.</div>
@@ -303,6 +314,7 @@ DEBUG: packet sent 1024 bytes</div>
       ${regexSafetyWebviewJs()}
 
       var manager = ${managerJson};
+      var presets = ${presetsJson};
       var recoveryInstructions = ${recoveryJson};
       var conflictRecovery = ${conflictRecoveryJson};
       var profiles = manager ? JSON.parse(JSON.stringify(manager.catalog.profiles)) : null;
@@ -459,10 +471,11 @@ DEBUG: packet sent 1024 bytes</div>
         }
         return name;
       }
-      function addProfile(sourceRules, duplicate) {
+      function addProfile(sourceRules, options = {}) {
         if (!finishRuleFirst() || !commitProfileName(true)) return;
         var current = currentProfile();
-        var name = uniqueProfileName(duplicate && current ? current.name.slice(0, 93) + " (copy)" : "New profile");
+        var preferredName = options.duplicate && current ? current.name.slice(0, 93) + " (copy)" : options.name || "New profile";
+        var name = uniqueProfileName(preferredName);
         if (profiles.length >= 100) { document.getElementById("save-error").textContent = "Maximum of 100 profiles reached."; return; }
         var profile = { id: freshId(), name: name, rules: JSON.parse(JSON.stringify(sourceRules)) };
         profiles.push(profile); selectedProfileId = profile.id;
@@ -518,8 +531,15 @@ DEBUG: packet sent 1024 bytes</div>
         document.getElementById("profile-default").addEventListener("change", function(e) { defaultProfileId = e.target.value || null; recomputeDirty(); });
         document.getElementById("profile-create").addEventListener("click", function() { addProfile([]); });
         document.getElementById("profile-create-defaults").addEventListener("click", function() { addProfile(manager.shippedRules || []); });
+        var presetSelect = document.getElementById("profile-preset");
+        var presetButton = document.getElementById("profile-create-preset");
+        presetSelect.addEventListener("change", function() { presetButton.disabled = presetSelect.value === ""; });
+        presetButton.addEventListener("click", function() {
+          var preset = presetSelect.value === "" ? null : presets[Number(presetSelect.value)];
+          if (preset) addProfile(preset.rules, { name: preset.name });
+        });
         document.getElementById("profile-rename").addEventListener("click", function() { if (!currentProfile()) return; commitProfileName(false); focusProfileName(); });
-        document.getElementById("profile-duplicate").addEventListener("click", function() { var p = currentProfile(); if (p) addProfile(p.rules, true); });
+        document.getElementById("profile-duplicate").addEventListener("click", function() { var p = currentProfile(); if (p) addProfile(p.rules, { duplicate: true }); });
         document.getElementById("profile-delete").addEventListener("click", function() { if (!finishRuleFirst()) return; if (currentProfile()) vscode.postMessage({ type: "confirmDeleteProfile", profileId: selectedProfileId, profileName: currentProfile().name }); });
         document.getElementById("profile-workspace-copy").addEventListener("click", function() { if (!finishRuleFirst() || !commitProfileName(true)) return; var p = currentProfile(); if (!p || !manager.workspaceLegacyRules) return; p.rules = JSON.parse(JSON.stringify(manager.workspaceLegacyRules)); selectProfile(p.id); recomputeDirty(); });
       }

@@ -32,6 +32,18 @@ When highlighting is disabled by the current settings, the manager offers a shor
 
 If the catalog or default is invalid or the default profile is missing, inspect `nexus.terminal.highlighting.profiles` and `nexus.terminal.highlighting.defaultProfile` in the applicable User, Workspace, Folder or Remote Settings JSON and correct or remove the affected settings. The manager provides shortcuts to User and Workspace Settings JSON.
 
+### Network device presets
+
+In **Nexus: Edit Highlighting Rules**, choose a **Profile preset**, then click **Create from preset**. The editor creates an editable copy. Give it a name or adjust the rules, then click **Apply**. Pick the saved copy in a connection's **Highlight Profile** field or with **Select Terminal Highlight Profile**. Choose **Global default** separately if you want other connections to inherit it.
+
+| Preset | Highlights |
+| --- | --- |
+| Cisco IOS / IOS XE | CLI prompts and input errors, syslog severity, interface and line protocol states, and explicit BGP neighbor states. |
+| Juniper Junos | Operational and configuration prompts, CLI errors, Admin/Link columns in `show interfaces terse`, and established BGP peers. |
+| Arista EOS | CLI prompts and errors, syslog severity, port status in `show interfaces status`, and line protocol state. |
+
+All three recognize interface names, IPv4 addresses and prefixes, and common MAC address formats. Green marks healthy links or established peers, yellow calls out administrative state or warnings, and red marks operational failures and errors. Rules are based on documented command output, so output layouts from other device families or command variants can need adjustments. [Cisco IOS XE command reference](https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/iproute_bgp/command/iproute_bgp-xe-3se-3650-cr-book.pdf) · [Junos interface reference](https://www.juniper.net/documentation/us/en/software/junos/cli-reference/topics/ref/command/show-interfaces-terse.html) · [Arista EOS Ethernet Ports](https://www.arista.com/en/um-eos/eos-ethernet-ports)
+
 ## Tab Commands
 
 Right-click a Nexus terminal tab in the Terminal panel for these commands (plus **Go to Terminal Directory**, covered under [File Explorer → Directory Sync](file-explorer.md#directory-sync)):
