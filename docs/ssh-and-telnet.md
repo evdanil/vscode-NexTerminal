@@ -4,6 +4,14 @@ Connect to remote servers over SSH from the Connectivity Hub, or set a server to
 
 **Unlike Remote-SSH, nothing is installed on the remote.** It's a pure client: no `vscode-server` unpacked into the target, no node process running on the far end. That matters when the far end is a Cisco switch, a bastion you only get a shell on, or a change-controlled box where you can't drop an agent.
 
+## Quick Connect
+
+Choose **Quick Connect** in the Connectivity Hub toolbar, the **Connect** picker, or the Command Palette. Enter an address such as `operator@switch.example`, `operator@[2001:db8::1]:2222`, or `telnet://console.example`. A bare host uses SSH and asks for a username. SSH defaults to port 22 and Telnet to port 23. Use brackets to specify an IPv6 address with a port. If the connection fails, **Edit Address…** reopens the address and connection options so you can try again.
+
+For an older SSH device, use the **Enable legacy SSH algorithms** button in the address prompt. Enter SSH passwords and keyboard-interactive responses in the login prompts. Quick Connect applies the usual host-key and transcript settings. It does not save login responses or reuse stored profile credentials.
+
+After the connection succeeds, right-click inside the terminal or right-click its tab in the Terminal panel and choose **Save as Profile…**. You can also focus the terminal and run **Nexus: Save as Profile…** from the Command Palette. The Network Device Profile form starts with the connection details and the legacy SSH setting you chose. Give it a name and optional folder to use it again from the Connectivity Hub. The original terminal stays open, and you can still save it after the connection drops while its tab remains open.
+
 ## Add a Server
 
 1. Click `+` (**Add Profile**) in the Connectivity Hub title bar and keep **Network Device Profile** as the profile type, or run `Nexus: Add Network Device Profile (SSH / Telnet)` from the command palette

@@ -3,8 +3,8 @@ import { externalServerFormValues } from "../ui/externalCredentialForm";
 import { isExternalAuthProfile, authProfileConnectionIdentity } from "../models/authProfile";
 import * as vscode from "vscode";
 import { readHighlightCatalog } from "../services/terminal/highlightProfileSettings";
-import type { UnifiedProfileSeed } from "../ui/formDefinitions";
-import { unifiedProfileFormDefinition, unifiedProfileFormId , toSshInfrastructureServerList } from "../ui/formDefinitions";
+import type { NetworkDeviceProfileSeed, UnifiedProfileSeed } from "../ui/formDefinitions";
+import { unifiedProfileFormDefinition, unifiedProfileFormId, toSshInfrastructureServerList } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, LocalShellProfileTreeItem, LocalServerConfigTreeItem, SerialProfileTreeItem, ServerTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
@@ -81,6 +81,33 @@ function isUnifiedProfileSeed(arg: unknown): arg is UnifiedProfileSeed {
 }
 
 export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed): void {
+  openProfileForm(ctx, seed);
+}
+
+interface QuickConnectProfileForm {
+  terminalId: string;
+  networkDevice: NetworkDeviceProfileSeed;
+  isAvailable: () => boolean;
+  onSaved: () => void;
+}
+
+export function openQuickConnectProfileForm(
+  ctx: CommandContext,
+  server: ServerConfig,
+  isAvailable: () => boolean,
+  onSaved: () => void
+): void {
+  if (!isAvailable()) return;
+  const { name, protocol, host, port, username, legacyAlgorithms } = server;
+  openProfileForm(ctx, { addMode: "ssh", profileType: "ssh" }, {
+    terminalId: server.id,
+    networkDevice: { name, protocol, host, port, username, legacyAlgorithms },
+    isAvailable,
+    onSaved
+  });
+}
+
+function openProfileForm(ctx: CommandContext, seed?: UnifiedProfileSeed, quickConnect?: QuickConnectProfileForm): void {
   const existingGroups = collectGroups(ctx);
   const defaultLogSession = vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true);
   const snapshot = ctx.core.getSnapshot();
@@ -89,7 +116,7 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
   const serverList = toSshInfrastructureServerList(snapshot.servers);
   const definition = unifiedProfileFormDefinition(seed, existingGroups, defaultLogSession, serverList, snapshot.authProfiles, {
     vscodeTerminalProfileNames: getConfiguredVscodeTerminalProfileNames()
-  }, readHighlightCatalog());
+  }, readHighlightCatalog(), quickConnect?.networkDevice);
   const addMode = seed?.addMode ?? "profile";
   definition.testable = addMode !== "localShell" && addMode !== "localServer";
   if (addMode === "profile") {
@@ -97,12 +124,16 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
   }
   const inlineAuthProfile = createInlineAuthProfileCreation(ctx);
   let renderedExternalIdentity: { id: string; identity: string } | undefined;
-  const panel = WebviewFormPanel.open(unifiedProfileFormId(seed), definition, {
+  let quickConnectProfileId: string | undefined;
+  let quickConnectSaved = false;
+  const formId = quickConnect ? `server-add-${quickConnect.terminalId}` : unifiedProfileFormId(seed);
+  const panel = WebviewFormPanel.open(formId, definition, {
     onSubmit: async (values: FormValues) => {
       if (normalizeOptionalFolderPath(values.group) === null) {
         throw new Error(INVALID_FOLDER_PATH_MESSAGE);
       }
-      if (values.profileType === "serial") {
+      const profileType = quickConnect ? "ssh" : values.profileType;
+      if (profileType === "serial") {
         const profile = formValuesToSerial(values);
         if (!profile) {
           return;
@@ -122,14 +153,14 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
         // this path only ever creates — making this a plain serialization
         // wrap, not a re-resolve fix, the same shape as nexus.serial.duplicate.
         await configMutationLock.runExclusive(() => ctx.core.addOrUpdateSerialProfile(profile));
-      } else if (values.profileType === "localShell") {
+      } else if (profileType === "localShell") {
         const profile = formValuesToLocalShell(values);
         if (!profile) {
           throw new Error("Fill in the required local shell fields before saving.");
         }
         // Same reasoning, and the same create-only shape, as the serial branch above.
         await configMutationLock.runExclusive(() => ctx.core.addOrUpdateLocalShellProfile(profile));
-      } else if (values.profileType === "localServer") {
+      } else if (profileType === "localServer") {
         const config = formValuesToLocalServer(values);
         if (!config) {
           throw new Error("Fill in the required local server fields (Name, Executable) before saving.");
@@ -138,10 +169,12 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
         await configMutationLock.runExclusive(() => ctx.core.addOrUpdateLocalServerConfig(config));
       } else {
         const selectedProfile = typeof values.authProfileId === "string" ? ctx.core.getAuthProfile(values.authProfileId) : undefined;
-        const builtServer = formValuesToServer(externalServerFormValues(values, selectedProfile));
+        const builtServer = formValuesToServer(externalServerFormValues(values, selectedProfile), quickConnectProfileId);
         if (!builtServer) {
+          if (quickConnect) throw new Error("Fill in the required connection fields before saving.");
           return;
         }
+        if (quickConnect) quickConnectProfileId ??= builtServer.id;
         let server: ServerConfig = builtServer;
         // FINDING 2 (P2, edit-race review, sibling) — same record+secret
         // pairing as nexus.server.edit (serverCommands.ts), for the
@@ -151,7 +184,8 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
         // under this SAME configMutationLock — see the edit-path comment in
         // serverCommands.ts for the full torn-pair scenario. No UI runs
         // inside this span.
-        await configMutationLock.runExclusive(async () => {
+        const savedQuickConnect = await configMutationLock.runExclusive(async () => {
+          if (quickConnectSaved) return;
           // REVIEW FINDING — the Add form mirrors a chosen auth profile's
           // credentials into its fields (`onAutofill` below), and can then sit
           // open indefinitely while auth profile add/edit/delete run as
@@ -213,6 +247,35 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
           // there is no self-reference concern here.
           if (server.ipmiGatewayServerId !== undefined && ctx.core.getServer(server.ipmiGatewayServerId) === undefined) {
             server = { ...server, ipmiGatewayServerId: undefined };
+          }
+          if (quickConnect) {
+            const ensureAvailable = () => {
+              if (!quickConnect.isAvailable()) {
+                throw new Error("This Quick Connect terminal has closed. Open a new Quick Connect terminal to save its connection as a profile.");
+              }
+            };
+            ensureAvailable();
+            // This profile has a fresh identity. Any proxy password the user
+            // enters in this form can be staged before publishing the profile.
+            const proxySecretKey = currentProxyPasswordSecretKey(server);
+            try {
+              if (proxySecretKey !== undefined) {
+                await syncProxyPasswordSecret(ctx, server.id, values);
+                ensureAvailable();
+              }
+              await ctx.core.addOrUpdateServer(server, { publishAfterSave: true });
+            } catch (error) {
+              if (ctx.secretVault && proxySecretKey !== undefined) {
+                try {
+                  await ctx.secretVault.delete(proxySecretKey);
+                } catch {
+                  // Keep the original save failure visible on this attempt.
+                }
+              }
+              throw error;
+            }
+            quickConnectSaved = true;
+            return true;
           }
           // FINDINGS 2+3 (P2, create-rollback review, sibling) — same
           // single-owner displacement as the nexus.server.edit rollback
@@ -321,6 +384,7 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
             throw new Error(`Could not store proxy credentials for "${server.name}" — the server was not created.`);
           }
         });
+        if (savedQuickConnect) quickConnect?.onSaved();
       }
     },
     onBrowse: browseForKey,
@@ -332,14 +396,15 @@ export function openUnifiedForm(ctx: CommandContext, seed?: UnifiedProfileSeed):
       return authProfileCredentialMirror(profile);
     },
     onTest: async (values: FormValues) => {
-      if (values.profileType === "serial") {
+      const profileType = quickConnect ? "ssh" : values.profileType;
+      if (profileType === "serial") {
         const draft = formValuesToSerial(values);
         if (!draft) {
           void vscode.window.showWarningMessage("Fill in the required serial fields (Name, Port) before testing.");
           return;
         }
         await vscode.commands.executeCommand("nexus.serial.testConnection", { profile: draft });
-      } else if (values.profileType === "localShell" || values.profileType === "localServer") {
+      } else if (profileType === "localShell" || profileType === "localServer") {
         return;
       } else {
         const linkedProfile = typeof values.authProfileId === "string" ? ctx.core.getAuthProfile(values.authProfileId) : undefined;

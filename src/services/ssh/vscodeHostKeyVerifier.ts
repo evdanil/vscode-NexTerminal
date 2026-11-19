@@ -126,8 +126,14 @@ export async function restoreKnownHostFingerprints(
   return { conflicts };
 }
 
+interface PendingHostDecision {
+  fingerprint: string;
+  owners: Set<AbortSignal | undefined>;
+  result: Promise<boolean>;
+}
+
 export class VscodeHostKeyVerifier implements HostKeyVerifier {
-  private readonly pendingByHost = new Map<string, Promise<boolean>>();
+  private readonly pendingByHost = new Map<string, PendingHostDecision>();
 
   public constructor(private readonly state: vscode.Memento) {}
 
@@ -136,42 +142,51 @@ export class VscodeHostKeyVerifier implements HostKeyVerifier {
     hostKey: Buffer,
     context?: Pick<SshConnectContext, "interaction" | "signal">
   ): Promise<boolean> {
-    const identity = hostIdentity(server);
-    const interaction = context?.interaction ?? "interactive";
-    const pendingKey = `${identity}\u0000${interaction}`;
-    const existing = this.pendingByHost.get(pendingKey);
-    if (existing) {
-      return existing;
-    }
-    const task = this.verifyInternal(server, hostKey, context).finally(() => {
-      this.pendingByHost.delete(pendingKey);
-    });
-    this.pendingByHost.set(pendingKey, task);
-    return task;
-  }
-
-  private async verifyInternal(
-    server: ServerConfig,
-    hostKey: Buffer,
-    context?: Pick<SshConnectContext, "interaction" | "signal">
-  ): Promise<boolean> {
+    const signal = context?.signal;
+    signal?.throwIfAborted();
     const identity = hostIdentity(server);
     const fingerprint = toFingerprint(hostKey);
-    const knownHosts = this.readKnownHosts();
-    const knownFingerprint = knownHosts[identity];
 
-    if (context?.signal?.aborted) {
-      throw context.signal.reason ?? new AuthNotJudgedError("SSH host-key verification was canceled");
+    // Background connections can use recorded trust without joining an
+    // interactive decision or learning a new fingerprint.
+    if (context?.interaction === "noninteractive") {
+      if (this.readKnownHosts()[identity] === fingerprint) return true;
+      throw new SshInteractionRequiredError("SSH host-key verification requires an interactive decision.");
     }
 
-    // A background connection may use a previously trusted identity, but it
-    // cannot learn or replace trust, even when the interactive auto-trust
-    // setting is enabled. This check precedes every trust write and prompt.
+    let pending = this.pendingByHost.get(identity);
+    // A decision authenticates one exact key. Concurrent incompatible keys
+    // must fail closed until the current decision has finished.
+    if (pending && pending.fingerprint !== fingerprint) return false;
+    if (pending) {
+      pending.owners.add(signal);
+    } else {
+      const owners = new Set([signal]);
+      const assertActiveOwner = (): void => {
+        if ([...owners].every((owner) => owner?.aborted)) {
+          throw new AuthNotJudgedError("SSH host-key verification was canceled");
+        }
+      };
+      const result = this.verifyInteractive(server, identity, fingerprint, assertActiveOwner).finally(() => {
+        this.pendingByHost.delete(identity);
+      });
+      pending = { fingerprint, owners, result };
+      this.pendingByHost.set(identity, pending);
+    }
+    const allowed = await pending.result;
+    signal?.throwIfAborted();
+    return allowed;
+  }
+
+  private async verifyInteractive(
+    server: ServerConfig,
+    identity: string,
+    fingerprint: string,
+    assertActiveOwner: () => void
+  ): Promise<boolean> {
+    const knownFingerprint = this.readKnownHosts()[identity];
     if (knownFingerprint === fingerprint) {
       return true;
-    }
-    if (context?.interaction === "noninteractive") {
-      throw new SshInteractionRequiredError("SSH host-key verification requires an interactive decision.");
     }
     if (!knownFingerprint) {
       const trustNewHosts = vscode.workspace.getConfiguration("nexus.ssh").get<boolean>("trustNewHosts", true);
@@ -187,14 +202,8 @@ export class VscodeHostKeyVerifier implements HostKeyVerifier {
       if (choice !== TRUST_NEW_LABEL) {
         return false;
       }
-    if (context?.signal?.aborted) {
-      throw context.signal.reason ?? new AuthNotJudgedError("SSH host-key verification was canceled");
-    }
+      assertActiveOwner();
       await this.trust(identity, fingerprint);
-      return true;
-    }
-
-    if (knownFingerprint === fingerprint) {
       return true;
     }
 
@@ -212,17 +221,14 @@ export class VscodeHostKeyVerifier implements HostKeyVerifier {
       return false;
     }
 
-    if (context?.signal?.aborted) {
-      throw context.signal.reason ?? new AuthNotJudgedError("SSH host-key verification was canceled");
-    }
-
+    assertActiveOwner();
     await this.trust(identity, fingerprint);
     return true;
   }
 
   /**
    * Records one trust decision against the store as it is NOW, not as it was
-   * when `verifyInternal` read it: the modals above can stay open for minutes,
+   * when `verifyInteractive` read it: the modals above can stay open for minutes,
    * and a backup restore may rewrite the store meanwhile. Writing back the
    * earlier copy would silently undo that restore.
    */

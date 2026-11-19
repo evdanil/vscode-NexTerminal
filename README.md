@@ -50,6 +50,7 @@ Then open the **Nexus** sidebar (activity bar icon).
 
 ### Connect
 
+- **Quick Connect** — open an SSH or Telnet terminal from an address and save it as a profile when you want to use it again. → [Quick Connect](docs/ssh-and-telnet.md#quick-connect)
 - **SSH sessions** — stored password/key/SSH agent authentication with keyboard-interactive 2FA, or External Program credentials retrieved per authentication with session approval. Windows agents include Pageant and OpenSSH. → [Authentication](docs/ssh-and-telnet.md#authentication)
 - **Legacy devices** — a per-server legacy-algorithm toggle for older gear, including devices that only speak 1024-bit `diffie-hellman-group1-sha1`. → [Legacy Devices](docs/ssh-and-telnet.md#legacy-devices)
 - **Alternate host** — a second SSH address for a server (e.g. the IPv6 to its IPv4), retried once when the primary can't be reached at the connection level; NetBox and Proxmox syncs fill it from the device's other address family. → [Alternate Host](docs/ssh-and-telnet.md#alternate-host)
@@ -121,7 +122,7 @@ Then open the **Nexus** sidebar (activity bar icon).
 ### Terminal
 
 - **Highlighting** — named profiles group regex rules for errors, warnings, addresses, and more; choose a default, assign profiles to connections, or override an individual terminal. → [Highlighting](docs/terminal.md#highlighting)
-- **Tab commands** — right-click a Nexus terminal tab to select its highlight profile, reset the terminal, clear scrollback, or copy its output. → [Tab Commands](docs/terminal.md#tab-commands)
+- **Tab commands** — right-click a Nexus tab in the Terminal panel to select its highlight profile, reset the terminal, clear scrollback, or copy its output. → [Tab Commands](docs/terminal.md#tab-commands)
 - **Session transcripts** — clean, ANSI-stripped SSH, telnet, and serial logs with per-line timestamps on by default (local, UTC, or off), optional CRLF-to-LF line-ending conversion, and folder/filename templates using session, host, group and date tokens; **Open Log Directory** opens the log root. → [Session Transcript Logging](docs/terminal.md#session-transcript-logging)
 - **Keyboard passthrough** — `Ctrl+` combinations go straight to vim, nano, or htop, configurable per key. → [Keyboard Passthrough](docs/terminal.md#keyboard-passthrough)
 - **Appearance** — terminal font and colour schemes, including schemes imported from MobaXterm. → [Appearance](docs/terminal.md#appearance)

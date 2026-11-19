@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.8.321] — 2026-11-19
+
+### Added
+
+- **Quick Connect** opens a direct SSH or Telnet terminal from an address without creating a profile. Start it from the Connectivity Hub or the Command Palette. Use **Save as Profile…** from an opened terminal to create a regular network device profile with its connection settings.
+
+### Fixed
+
+- **Select Terminal Highlight Profile** now works from inside terminals in both the panel and the editor. The Terminal panel tab menu also targets the clicked terminal. Commands for a closed or multiply selected tab leave other terminals alone.
+- Concurrent SSH connections to one address require trust for the exact host-key fingerprint each connection presents.
+
 ## [2.8.320] — 2026-11-19
 
 ### Fixed

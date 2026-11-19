@@ -11,6 +11,7 @@ import type {
   PasswordPrompt,
   PasswordPromptResult,
   SecretVault,
+  SshConnectContext,
   SshConnection,
   SshConnector,
   SshFactory,
@@ -310,6 +311,58 @@ export class SilentAuthSshFactory implements SshFactory {
       externalIdentity,
       externalProfile?.external.invocation?.argumentExpansion === true ? server.name : null
     ]);
+  }
+
+  public async connectUnsaved(server: ServerConfig, context?: SshConnectContext): Promise<SshConnection> {
+    // Copy only the target fields so this path cannot inherit a saved login's
+    // route, key, agent, or authentication profile.
+    const { id, name, host, port, username, legacyAlgorithms } = server;
+    const target: ServerConfig = {
+      id, name, host, port, username, authType: "password", isHidden: false,
+      ...(legacyAlgorithms === true && { legacyAlgorithms })
+    };
+    const ownerAbort = context?.isActive ? new AbortController() : undefined;
+    const signal = context?.signal && ownerAbort
+      ? AbortSignal.any([context.signal, ownerAbort.signal])
+      : context?.signal ?? ownerAbort?.signal;
+    const isActive = (): boolean => !signal?.aborted && context?.isActive?.() !== false;
+    this.assertAttemptActive(isActive);
+
+    // The PTY also exposes a generation fence through isActive. A stale
+    // generation must release its socket and any auth dialog it owns.
+    const watchOwner = ownerAbort && setInterval(() => {
+      if (!isActive()) ownerAbort.abort(new AuthNotJudgedError("SSH connection attempt ended before authentication completed"));
+    }, 50);
+    try {
+      const interaction = context?.interaction ?? "interactive";
+      const connection = await this.connector.connect(target, {
+        interaction,
+        signal,
+        onAuthMessage: context?.onAuthMessage,
+        onKeyboardInteractive: this.buildKeyboardInteractiveHandler(undefined, context?.onAuthMessage, undefined, isActive, interaction),
+        onPasswordFallback: async (promptSignal) => {
+          if (interaction === "noninteractive") return undefined;
+          return this.promptExclusively(async () => {
+            this.assertAttemptActive(isActive);
+            const answer = await this.prompt.prompt(target, promptSignal, { allowSave: false });
+            this.assertAttemptActive(isActive);
+            if (promptSignal?.aborted || answer === undefined) {
+              throw new AuthNotJudgedError(`Password entry canceled for ${target.name}`);
+            }
+            return answer.password;
+          }, promptSignal);
+        }
+      });
+      try {
+        this.assertAttemptActive(isActive);
+        return connection;
+      } catch (error) {
+        connection.dispose();
+        throw error;
+      }
+    } finally {
+      clearInterval(watchOwner);
+    }
   }
 
   private async mutateCredentialIfEndpointUnchanged(

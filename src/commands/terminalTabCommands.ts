@@ -12,12 +12,9 @@ export interface TerminalTabCommandsDeps {
 }
 
 /**
- * Duck-types VS Code's `terminal/title/context` / `editor/title/context`
- * command argument — the clicked `vscode.Terminal` itself, distinguishing it
- * from the `{ session: { id } }` / `{ profile: { id } }` tree-item shapes
- * used elsewhere in this module and from a bare `FileTreeItem`-style arg
- * (e.g. the File Explorer's `.` row, which carries neither `creationOptions`
- * nor `session`/`profile`).
+ * Recognizes the `vscode.Terminal` supplied by VS Code's `terminal/context`
+ * and `terminal/title/context` menus. The editor tab's `editor/title/context`
+ * menu supplies a resource URI with no public mapping to a Terminal.
  *
  * Exported so any other command module resolving the same terminal-tab
  * argument shape (`cwdSyncCommands.ts`'s `nexus.files.syncFromTerminal`)
@@ -93,9 +90,15 @@ interface HighlightChoice extends vscode.QuickPickItem {
 }
 
 /** Explicit stale arguments never redirect a tab-specific choice to the active tab. */
-function resolveHighlightTarget(arg: unknown, deps: TerminalTabCommandsDeps): vscode.Terminal | undefined {
-  if (arg === undefined) return vscode.window.activeTerminal;
-  if (isTerminalArg(arg)) return arg;
+function resolveHighlightTarget(args: readonly unknown[], deps: TerminalTabCommandsDeps): vscode.Terminal | undefined {
+  // A closed clicked terminal deserializes to undefined. Only a call without
+  // arguments is the palette action, and a terminal menu must target one tab.
+  if (args.length === 0) return vscode.window.activeTerminal;
+  const [arg, selection] = args;
+  if (isTerminalArg(arg)) {
+    if (selection === undefined || (Array.isArray(selection) && selection.length === 1 && selection[0] === arg)) return arg;
+    return undefined;
+  }
   if (!arg || typeof arg !== "object") return undefined;
   const session = (arg as { session?: { id?: unknown } }).session;
   if (!session || typeof session.id !== "string") return undefined;
@@ -105,10 +108,13 @@ function resolveHighlightTarget(arg: unknown, deps: TerminalTabCommandsDeps): vs
     ?? deps.localServerTerminals?.get(session.id)?.terminal;
 }
 
-async function selectHighlightProfile(arg: unknown, deps: TerminalTabCommandsDeps): Promise<void> {
-  const terminal = resolveHighlightTarget(arg, deps);
+async function selectHighlightProfile(args: readonly unknown[], deps: TerminalTabCommandsDeps): Promise<void> {
+  const terminal = resolveHighlightTarget(args, deps);
   const entry = terminal && deps.registry.get(terminal);
-  if (!terminal || !entry?.highlight) return;
+  if (!terminal || !entry?.highlight) {
+    void vscode.window.showInformationMessage("Select a single Nexus terminal to change its highlight profile.");
+    return;
+  }
   const catalog = readHighlightCatalog();
   const state = entry.highlight.getSelection();
   const current = state.missingProfileId
@@ -116,13 +122,16 @@ async function selectHighlightProfile(arg: unknown, deps: TerminalTabCommandsDep
     : catalog.profiles.find(profile => profile.id === state.effectiveProfileId)?.name ?? "None";
   const defaultName = catalog.defaultProfileId === null ? "None"
     : catalog.profiles.find(profile => profile.id === catalog.defaultProfileId)?.name ?? `Missing: ${catalog.defaultProfileId}`;
-  const choices: HighlightChoice[] = [
-    { label: "Use saved connection setting", description: "Follow this connection's saved preference", choice: "saved" },
+  const choices: HighlightChoice[] = [];
+  if (entry.highlight.owner) {
+    choices.push({ label: "Use saved connection setting", description: "Follow this connection's saved preference", choice: "saved" });
+  }
+  choices.push(
     { label: "Use global default", description: defaultName, choice: "global" },
     { label: "None", description: "Disable highlighting for this terminal", choice: "none" },
     ...catalog.profiles.map(profile => ({ label: profile.name, description: "Highlight profile", choice: "profile" as const, id: profile.id })),
     { label: "Manage Highlight Profiles…", choice: "manage" }
-  ];
+  );
   const selected = await vscode.window.showQuickPick(choices, {
     placeHolder: `Highlight profile for this terminal: ${current} (${state.origin}${state.enabled ? "" : ", highlighting disabled"})`
   });
@@ -150,7 +159,7 @@ export function registerTerminalTabCommands(
   deps: TerminalTabCommandsDeps
 ): void {
   context.subscriptions.push(
-    vscode.commands.registerCommand("nexus.terminal.selectHighlightProfile", (arg?: unknown) => selectHighlightProfile(arg, deps))
+    vscode.commands.registerCommand("nexus.terminal.selectHighlightProfile", (...args: unknown[]) => selectHighlightProfile(args, deps))
   );
 
   context.subscriptions.push(

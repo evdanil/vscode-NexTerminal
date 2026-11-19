@@ -17,6 +17,7 @@ export interface RegistryEntry {
 
 interface InternalEntry extends RegistryEntry {
   observerDisposable: vscode.Disposable;
+  isConnected?: () => boolean;
 }
 
 interface CoreSnapshotLike {
@@ -50,7 +51,12 @@ export class TerminalRegistry implements vscode.Disposable {
     this.refreshContextKeys();
   }
 
-  public register(terminal: vscode.Terminal, pty: SessionPtyHandle, highlight?: SessionHighlightHandle): void {
+  public register(
+    terminal: vscode.Terminal,
+    pty: SessionPtyHandle,
+    highlight?: SessionHighlightHandle,
+    isConnected?: () => boolean
+  ): void {
     if (this.disposed || this.entries.has(terminal)) {
       highlight?.dispose();
       return;
@@ -63,7 +69,7 @@ export class TerminalRegistry implements vscode.Disposable {
       dispose: () => {}
     };
     const observerDisposable = pty.addOutputObserver(observer);
-    this.entries.set(terminal, { terminal, pty, buffer, observerDisposable, highlight });
+    this.entries.set(terminal, { terminal, pty, buffer, observerDisposable, highlight, isConnected });
     this.refreshContextKeys();
   }
 
@@ -86,6 +92,8 @@ export class TerminalRegistry implements vscode.Disposable {
   }
 
   public isConnected(entry: RegistryEntry): boolean {
+    const registered = this.entries.get(entry.terminal);
+    if (registered === entry && registered.isConnected) return registered.isConnected();
     const snap = this.core.getSnapshot();
     for (const s of snap.activeSessions) {
       if (s.pty === entry.pty) return true;

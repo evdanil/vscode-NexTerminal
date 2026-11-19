@@ -15,6 +15,7 @@ import { NetworkServerManager } from "./services/networkServers/networkServerMan
 import { NetworkServerTreeProvider } from "./ui/networkServerTreeProvider";
 import { registerLocalServerCommands, stopLocalServerForRemoval } from "./commands/localServerCommands";
 import { registerServerCommands, teardownServerRuntime } from "./commands/serverCommands";
+import { QuickConnectCommands } from "./commands/quickConnectCommands";
 import { registerServerMacroCommands } from "./commands/serverMacroCommands";
 import { registerBmcCommands } from "./commands/bmcCommands";
 import { registerTunnelCommands } from "./commands/tunnelCommands";
@@ -1506,6 +1507,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   });
 
   const serverDisposables = registerServerCommands(ctx);
+  const quickConnect = new QuickConnectCommands(ctx, sshCredentialRuntime.quickConnectFactory);
+  context.subscriptions.push(quickConnect);
   const serverMacroDisposables = registerServerMacroCommands(ctx);
   const bmcDisposables = registerBmcCommands(ctx);
   const tunnelDisposables = registerTunnelCommands(ctx);
@@ -1631,6 +1634,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
     activeTunnelIdForProfile: (profileId) => ctx.tunnelManager.getActiveTunnelId(profileId),
     closeSerialProfileTerminals: (profileId) => closeSerialProfileTerminals(ctx, profileId),
     closeLocalShellProfileTerminals: (profileId) => closeLocalShellProfileTerminals(ctx, profileId),
+    closeQuickConnectTerminals: () => quickConnect.closeAll(),
     resetViewState: () => resetLiveViewState({ trees: liveViewTrees(), cwdSync: cwdSyncCoordinator }),
     resumeViewState: () => resumeLiveViewState(liveViewTrees()),
     resetTerminalAppearance: async () => {

@@ -18,7 +18,13 @@ Use **Stage Rule** or the rule editor's **Cancel** before switching profiles or 
 
 If saving fails, the manager shows available error details. Some settings may already have changed; preserve any draft changes you need before closing the tab and reopening the manager. Remove private paths or other sensitive details before sharing an error message.
 
-The Highlight Profile field on saved SSH/telnet, serial, Local Shell and Local Server connections chooses the global default, a named profile, or no highlighting. Right-click a Nexus terminal tab or active session and choose **Select Terminal Highlight Profile** to change that terminal alone; **Use saved connection setting** returns it to the connection's preference. Changes to a profile or default apply to running terminals that follow it. Deleting a profile warns about saved connections and live terminals using it; a missing profile does not silently fall back to another set of rules.
+The Highlight Profile field on saved SSH/Telnet, serial, Local Shell, and Local Server connections chooses the global default, a named profile, or no highlighting.
+
+Choose **Select Terminal Highlight Profile** from the context menu inside the terminal (including terminals open in the editor) or its tab in the Terminal panel.
+
+The same action is on connected rows in the Connectivity Hub. To use the Command Palette, focus the terminal you want to change.
+
+**Use saved connection setting** returns a saved connection to its profile preference. Changes to a highlight profile or default apply to terminals that follow it. Deleting a profile warns about saved connections and live terminals using it. A missing profile applies no highlighting.
 
 The manager saves global settings. If a workspace overrides the catalog or default, that workspace's setting takes precedence. Backups and sharing include highlight profiles; merging imports keeps the recipient's default and remaps colliding profile IDs. Terminal-category and Reset All settings resets clear the catalog, default and legacy rules.
 
@@ -28,7 +34,7 @@ If the catalog or default is invalid or the default profile is missing, inspect 
 
 ## Tab Commands
 
-Right-click any Nexus terminal tab for these commands (plus **Go to Terminal Directory**, covered under [File Explorer → Directory Sync](file-explorer.md#directory-sync)):
+Right-click a Nexus terminal tab in the Terminal panel for these commands (plus **Go to Terminal Directory**, covered under [File Explorer → Directory Sync](file-explorer.md#directory-sync)):
 
 - *Reset Terminal* — clears the visible screen while preserving scrollback
 - *Clear Scrollback* — clears visible and captured transcript together

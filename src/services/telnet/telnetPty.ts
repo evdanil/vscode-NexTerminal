@@ -38,8 +38,8 @@ export interface TelnetPtyCallbacks {
   /** Preferred over `onSessionClosed` on a LOST connection; see SshPtyCallbacks. */
   onDisconnected?(sessionId: string): void;
   onDataReceived?(sessionId: string): void;
-  /** The INITIAL connect attempt failed; the tab stays open on the press-any-key notice. */
-  onConnectFailed?(sessionId: string, message: string): void;
+  /** The initial connect failed. Return true if the callback provides the notification. */
+  onConnectFailed?(sessionId: string, message: string): boolean | void;
 }
 
 export interface TelnetPtyOptions {
@@ -337,7 +337,7 @@ export class TelnetPty implements vscode.Pseudoterminal, vscode.Disposable {
     this.logger.log(`telnet connect failed ${message}`);
     this.writeEmitter.fire(`\r\n[Nexus Telnet] Connection failed: ${message}\r\n`);
     this.writeEmitter.fire("\r\n[Nexus Telnet] Press any key to close this terminal.\r\n");
-    this.callbacks.onConnectFailed?.(this.sessionId, message);
+    if (this.callbacks.onConnectFailed?.(this.sessionId, message) === true) return;
     void vscode.window.showErrorMessage(
       `Nexus Telnet connection failed for ${this.serverConfig.name}: ${message}`
     );

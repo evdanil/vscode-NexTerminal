@@ -46,4 +46,14 @@ describe("VscodePasswordPrompt", () => {
     await expect(answer).resolves.toBeUndefined();
     expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
   });
+
+  it("skips the keychain question when password saving is disabled", async () => {
+    vi.clearAllMocks();
+    vi.mocked(vscode.window.showInputBox).mockResolvedValueOnce("once");
+    vi.mocked(vscode.window.showQuickPick).mockResolvedValueOnce("Yes" as never);
+
+    await expect(new VscodePasswordPrompt().prompt(server, undefined, { allowSave: false }))
+      .resolves.toEqual({ password: "once", save: false });
+    expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
+  });
 });

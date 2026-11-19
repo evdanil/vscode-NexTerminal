@@ -1385,6 +1385,8 @@ export interface UnifiedProfileSeed {
   addMode?: UnifiedProfileAddMode;
 }
 
+export type NetworkDeviceProfileSeed = Pick<ServerConfig, "name" | "protocol" | "host" | "port" | "username" | "legacyAlgorithms">;
+
 function normalizedUnifiedProfileMode(seed?: UnifiedProfileSeed): UnifiedProfileAddMode {
   return seed?.addMode ?? "profile";
 }
@@ -1463,7 +1465,8 @@ export function unifiedProfileFormDefinition(
   servers?: ServerListEntry[],
   authProfiles?: AuthProfile[],
   localShellOptions?: LocalShellFormOptions,
-  highlightCatalog?: HighlightCatalog
+  highlightCatalog?: HighlightCatalog,
+  networkDevice?: NetworkDeviceProfileSeed
 ): FormDefinition {
   const sshVw: VisibleWhenCondition = { field: "profileType", value: "ssh" };
   const serialVw: VisibleWhenCondition = { field: "profileType", value: "serial" };
@@ -1484,12 +1487,12 @@ export function unifiedProfileFormDefinition(
     title: unifiedProfileFormTitle(seed),
     fields: [
       unifiedProfileTypeField(seed),
-      { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server, Console, or Project Shell" },
+      { type: "text", key: "name", label: "Name", required: true, placeholder: "My Server, Console, or Project Shell", value: networkDevice?.name },
       // TELNET (Phase 0) — compounded, never replaced: the SSH-only gate ANDs
       // onto the profile-type gate, so these controls stay hidden on the Serial
       // and Local Shell branches as well.
       authProfileSelectField(authProfiles, sshOnly(sshVw)),
-      ...sshFields(undefined, sshVw, authProfiles, servers),
+      ...sshFields(networkDevice, sshVw, authProfiles, servers),
       ...proxyFields(undefined, servers, sshOnly(sshVw)),
       openFileExplorerOnFirstConnectField(undefined, sshOnly(sshVw)),
       ...serialFields(undefined, serialVw),

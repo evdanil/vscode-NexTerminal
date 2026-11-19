@@ -127,6 +127,47 @@ describe("VscodeHostKeyVerifier TOFU", () => {
     expect(result).toBe(false);
   });
 
+  it("requires a separate decision for a different fingerprint arriving during a trust prompt", async () => {
+    mockTrustNewHosts(false);
+    let answer!: (choice: string) => void;
+    vi.mocked(vscode.window.showWarningMessage).mockImplementationOnce(
+      () => new Promise((resolve) => { answer = resolve as (choice: string) => void; }) as any
+    );
+    const verifier = new VscodeHostKeyVerifier(memento);
+    const first = verifier.verify(makeServer(), DUMMY_KEY);
+    const conflicting = verifier.verify(makeServer({ id: "other-profile" }), DIFFERENT_KEY);
+    answer("Trust and Continue");
+
+    await expect(first).resolves.toBe(true);
+    await expect(conflicting).resolves.toBe(false);
+    expect(vscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
+
+    vi.mocked(vscode.window.showWarningMessage).mockResolvedValueOnce(undefined);
+    await expect(verifier.verify(makeServer(), DIFFERENT_KEY)).resolves.toBe(false);
+    expect(vscode.window.showWarningMessage).toHaveBeenLastCalledWith(
+      expect.stringContaining("CHANGED"), { modal: true }, "Accept New Key"
+    );
+  });
+
+  it("keeps one same-key trust prompt active when another owner aborts", async () => {
+    mockTrustNewHosts(false);
+    const controller = new AbortController();
+    let answer!: (choice: string) => void;
+    vi.mocked(vscode.window.showWarningMessage).mockImplementationOnce(
+      () => new Promise((resolve) => { answer = resolve as (choice: string) => void; }) as any
+    );
+    const verifier = new VscodeHostKeyVerifier(memento);
+    const first = verifier.verify(makeServer(), DUMMY_KEY, { signal: controller.signal });
+    const second = verifier.verify(makeServer({ id: "other-profile" }), DUMMY_KEY);
+    const canceled = expect(first).rejects.toThrow();
+    controller.abort();
+    answer("Trust and Continue");
+
+    await canceled;
+    await expect(second).resolves.toBe(true);
+    expect(vscode.window.showWarningMessage).toHaveBeenCalledTimes(1);
+  });
+
   it("always prompts when fingerprint changes (MITM warning)", async () => {
     mockTrustNewHosts(true);
     const verifier = new VscodeHostKeyVerifier(memento);

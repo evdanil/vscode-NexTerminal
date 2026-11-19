@@ -27,6 +27,8 @@ const unsupportedCommands = [
   "nexus.server.edit",
   "nexus.server.remove",
   "nexus.server.connect",
+  "nexus.server.quickConnect",
+  "nexus.server.saveQuickConnectProfile",
   "nexus.server.disconnect",
   "nexus.server.copyInfo",
   "nexus.server.duplicate",
