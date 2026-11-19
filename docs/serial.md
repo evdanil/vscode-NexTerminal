@@ -4,6 +4,10 @@ Connect to serial ports (COM/ttyUSB) with configurable baud rate, data bits, par
 
 Built for embedded and firmware developers on serial consoles — Smart Follow rides through Windows COM-port renumbering, reconnecting only to the device you already approved instead of dropping the session.
 
+## Quick Connect over Serial
+
+Choose **Quick Connect**, then **Serial**. Enter the port path or use **Scan** to select a detected device. Set the baud rate and line parameters, then click **Connect** to open the port directly. After it connects, use **Nexus: Save Quick Connect as Profile…** to open a prefilled Serial Profile form and save it to the Connectivity Hub. The open terminal stays connected while you save.
+
 ## Add a Serial Device
 
 1. Click `+` (**Add Profile**) in the Connectivity Hub title bar and choose **Serial Profile** as the profile type, or run `Nexus: Add Serial Profile`
@@ -44,7 +48,7 @@ For **Connect and Run Script**, cancellation also ends the pending script reques
 
 ## Dedicated send box
 
-For a device that prints continuous logs, choose **Open Serial Send Box** from its live profile/session context menu or the terminal’s own context menu, or run **Nexus: Open Serial Send Box**. In terminal editors, use the context menu inside the terminal; the editor-tab header has no send-box action. A companion editor, **Serial Send: _profile name_**, keeps your draft separate from the native terminal's received output. Each session starts with direct terminal input enabled; opening its send box changes only that session.
+For a session opened from a saved Serial Profile, choose **Open Serial Send Box** from its live profile/session context menu or the terminal’s own context menu, or run **Nexus: Open Serial Send Box**. In terminal editors, use the context menu inside the terminal. A companion editor, **Serial Send: _profile name_**, keeps your draft separate from the native terminal's received output. Each session starts with direct terminal input enabled. Opening the send box changes only that session.
 
 Type multiline text in the editor. **Enter** inserts a newline; **Send** or **Ctrl+Enter** (**Cmd+Enter** on macOS) transmits it. The header identifies the profile and current port. Incoming logs stay in the native terminal and do not change the draft. **Focus Terminal** returns to received output.
 

@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "SSH, serial and Telnet terminals in VS Code—no remote agent required. Manage jump hosts, SFTP, tunnels, macros, JavaScript automation and network inventory from one sidebar.",
-  "version": "2.8.321",
+  "version": "2.8.322",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -141,7 +141,7 @@
     "viewsWelcome": [
       {
         "view": "nexusCommandCenter",
-        "contents": "Connect to an address, add a profile, or import the servers you already have.\n[Quick Connect](command:nexus.server.quickConnect)\n[Add Profile](command:nexus.profile.add)\n[Import Servers (CSV, MobaXterm, SecureCRT, SSH Config…)](command:nexus.config.import)\n[Add Inventory Source (NetBox, EVE-NG, Proxmox, GNS3, Containerlab…)](command:nexus.inventory.addSource)\n[Add Network Device Profile (SSH / Telnet)](command:nexus.server.add)\n[Add Serial Profile](command:nexus.serial.add)\n[Add Local Shell Profile](command:nexus.localShell.add)\n[Add Local Server Profile](command:nexus.localServer.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)"
+        "contents": "Open a quick connection, add a profile, or import the servers you already have.\n[Quick Connect](command:nexus.server.quickConnect)\n[Add Profile](command:nexus.profile.add)\n[Import Servers (CSV, MobaXterm, SecureCRT, SSH Config…)](command:nexus.config.import)\n[Add Inventory Source (NetBox, EVE-NG, Proxmox, GNS3, Containerlab…)](command:nexus.inventory.addSource)\n[Add Network Device Profile (SSH / Telnet)](command:nexus.server.add)\n[Add Serial Profile](command:nexus.serial.add)\n[Add Local Shell Profile](command:nexus.localShell.add)\n[Add Local Server Profile](command:nexus.localServer.add)\n[Scan Serial Ports](command:nexus.serial.listPorts)"
       },
       {
         "view": "nexusTunnels",
@@ -200,7 +200,7 @@
       },
       {
         "command": "nexus.server.saveQuickConnectProfile",
-        "title": "Save as Profile…",
+        "title": "Save Quick Connect as Profile…",
         "category": "Nexus",
         "icon": "$(save)"
       },
@@ -578,7 +578,7 @@
       },
       {
         "command": "nexus.networkServer.profile.saveCurrent",
-        "title": "Save Current Settings as Profile",
+        "title": "Save DHCP/TFTP Settings as Profile…",
         "category": "Nexus",
         "icon": "$(save)"
       },
@@ -2247,8 +2247,7 @@
           "when": "true"
         },
         {
-          "command": "nexus.server.saveQuickConnectProfile",
-          "when": "nexus.quickConnectCanSave"
+          "command": "nexus.server.saveQuickConnectProfile"
         },
         {
           "command": "nexus.server.disconnect",

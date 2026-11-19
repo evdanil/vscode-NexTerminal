@@ -2,10 +2,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { openQuickConnectProfileForm } from "../../src/commands/profileCommands";
 import type { CommandContext } from "../../src/commands/types";
 import { NexusCore } from "../../src/core/nexusCore";
-import type { ServerConfig } from "../../src/models/config";
+import type { SerialProfile, ServerConfig } from "../../src/models/config";
 import { configMutationLock } from "../../src/services/configMutationLock";
 import { currentProxyPasswordSecretKey } from "../../src/services/ssh/proxyPasswordKeys";
 import { InMemoryConfigRepository } from "../../src/storage/inMemoryConfigRepository";
+import { quickConnectSerialFormDefinition } from "../../src/ui/formDefinitions";
+import { renderFormHtml } from "../../src/ui/formHtml";
 import type { FormDefinition, FormValues } from "../../src/ui/formTypes";
 
 const { openForm } = vi.hoisted(() => ({
@@ -36,6 +38,16 @@ const formValues: FormValues = {
   username: "ops", group: "Lab/Console", authType: "password", legacyAlgorithms: true
 };
 
+const quickSerial: SerialProfile = {
+  id: "quick-serial-tab", name: "COM4", path: "COM4", baudRate: 31250, dataBits: 7,
+  stopBits: 2, parity: "even", rtscts: true, mode: "standard"
+};
+
+const serialValues: FormValues = {
+  name: "Saved serial console", path: "COM4", baudRate: "custom", customBaudRate: "31250",
+  dataBits: "7", stopBits: "2", parity: "even", rtscts: true, group: "Lab/Console"
+};
+
 async function makeContext(repository = new InMemoryConfigRepository()) {
   const core = new NexusCore(repository);
   await core.initialize();
@@ -56,6 +68,70 @@ function latestForm() {
 
 describe("Save Quick Connect as a profile", () => {
   beforeEach(() => { openForm.mockClear(); });
+
+  it("uses the normal serial form to save the connected port settings as a fresh profile", async () => {
+    const { ctx, repository } = await makeContext();
+    const onSaved = vi.fn();
+    openQuickConnectProfileForm(ctx, quickSerial, () => true, onSaved);
+    const serial = latestForm();
+    expect(serial.definition.title).toBe("Add Serial Profile");
+    expect([
+      "name", "path", "baudRate", "customBaudRate", "dataBits", "stopBits", "parity", "rtscts"
+    ].map(serial.valueOf)).toEqual(["COM4", "COM4", "custom", "31250", "7", "2", "even", true]);
+    expect(serial.definition.fields).not.toContainEqual(expect.objectContaining({ key: "host" }));
+
+    await serial.submit(serialValues);
+    const [stored] = await repository.getSerialProfiles();
+    expect(stored.id).not.toBe(quickSerial.id);
+    expect(stored).toMatchObject({
+      name: "Saved serial console", path: "COM4", baudRate: 31250, dataBits: 7,
+      stopBits: 2, parity: "even", rtscts: true, group: "Lab/Console", mode: "standard"
+    });
+    expect(await repository.getServers()).toEqual([]);
+    expect(onSaved).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a serial save if its terminal closes while waiting for the config lock", async () => {
+    const { ctx, repository } = await makeContext();
+    let available = true;
+    const onSaved = vi.fn();
+    openQuickConnectProfileForm(ctx, quickSerial, () => available, onSaved);
+
+    let release!: () => void;
+    const pendingCommit = new Promise<void>((resolve) => { release = resolve; });
+    const lock = configMutationLock.runExclusive(() => pendingCommit);
+    const saving = latestForm().submit(serialValues);
+    available = false;
+    release();
+    await lock;
+
+    await expect(saving).rejects.toThrow(/Quick Connect terminal/);
+    expect(await repository.getSerialProfiles()).toEqual([]);
+    expect(onSaved).not.toHaveBeenCalled();
+  });
+
+  it("keeps a failed serial write out of core and reuses its ID on a single successful retry", async () => {
+    const { ctx, core, repository } = await makeContext();
+    const saveSerialProfiles = vi.spyOn(repository, "saveSerialProfiles")
+      .mockRejectedValueOnce(new Error("serial repository unavailable"));
+    const onSaved = vi.fn();
+    openQuickConnectProfileForm(ctx, quickSerial, () => true, onSaved);
+    const { submit } = latestForm();
+
+    await expect(submit(serialValues)).rejects.toThrow("serial repository unavailable");
+    expect(core.getSnapshot().serialProfiles).toEqual([]);
+    expect(await repository.getSerialProfiles()).toEqual([]);
+    expect(onSaved).not.toHaveBeenCalled();
+
+    await Promise.all([submit(serialValues), submit({ ...serialValues, name: "Duplicate" })]);
+    const stored = await repository.getSerialProfiles();
+    expect(stored).toHaveLength(1);
+    expect(stored[0].name).toBe("Saved serial console");
+    expect(stored[0].id).toBe(saveSerialProfiles.mock.calls[0][0][0].id);
+    expect(core.getSnapshot().serialProfiles).toEqual(stored);
+    expect(saveSerialProfiles).toHaveBeenCalledTimes(2);
+    expect(onSaved).toHaveBeenCalledTimes(1);
+  });
 
   it("prefills only the reusable connection details and scopes the editor to its terminal", async () => {
     const { ctx, repository, secretVault } = await makeContext();
@@ -177,5 +253,19 @@ describe("Save Quick Connect as a profile", () => {
     expect(key).not.toBe(currentProxyPasswordSecretKey(quickServer));
     expect(secretVault.delete).toHaveBeenCalledExactlyOnceWith(key);
     expect(onSaved).not.toHaveBeenCalled();
+  });
+});
+
+describe("Quick Connect Serial form", () => {
+  it("shows physical serial settings and labels the action Connect", () => {
+    const definition = quickConnectSerialFormDefinition();
+    expect(definition.fields.filter((field) => "key" in field).map((field) => field.key)).toEqual([
+      "path", "baudRate", "customBaudRate", "dataBits", "stopBits", "parity", "rtscts"
+    ]);
+    expect(definition.fields[0]).toMatchObject({ key: "path", required: true, scannable: true });
+    expect(definition.expandAdvanced).toBe(true);
+    const html = renderFormHtml(definition);
+    expect(html).toContain('id="save-btn">Connect</button>');
+    expect(html).not.toContain('id="save-btn">Save</button>');
   });
 });

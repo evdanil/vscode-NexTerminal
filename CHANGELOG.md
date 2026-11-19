@@ -1,5 +1,15 @@
 # Changelog
 
+## [2.8.322] — 2026-11-19
+
+### Added
+
+- **Quick Connect** now asks you to choose SSH, Telnet, or Serial. For a serial connection, select or enter a port and set its line parameters, then save it as a serial profile if you want to keep it.
+
+### Fixed
+
+- **Save Quick Connect as Profile…** is always searchable in the Command Palette. It saves the focused Quick Connect terminal or lets you choose one, and uses a distinct name from **Save DHCP/TFTP Settings as Profile…**.
+
 ## [2.8.321] — 2026-11-19
 
 ### Added

@@ -381,7 +381,7 @@ export function renderFormHtml(definition: FormDefinition, nonce?: string): stri
   <form id="nexus-form">
     ${fieldsHtml}
     <div class="actions">
-      <button type="submit" class="btn-primary" id="save-btn">Save</button>
+      <button type="submit" class="btn-primary" id="save-btn">${escapeHtml(definition.submitLabel ?? "Save")}</button>
       ${definition.testable ? `<button type="button" class="btn-secondary" id="test-btn"${visibleWhenDataAttr(definition.testableWhen)}>Test Connection</button>` : ""}
       <button type="button" class="btn-secondary" id="cancel-btn">Cancel</button>
     </div>

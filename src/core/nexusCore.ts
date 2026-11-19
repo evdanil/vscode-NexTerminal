@@ -2738,9 +2738,17 @@ export class NexusCore {
     this.emitChanged();
   }
 
-  public async addOrUpdateSerialProfile(profile: SerialProfile): Promise<void> {
-    this.serialProfiles.set(profile.id, profile);
-    await this.repository.saveSerialProfiles([...this.serialProfiles.values()]);
+  public async addOrUpdateSerialProfile(profile: SerialProfile, options?: { publishAfterSave?: boolean }): Promise<void> {
+    if (options?.publishAfterSave) {
+      // A failed Quick Connect save must not expose a tentative profile to runtime observers.
+      const staged = new Map(this.serialProfiles);
+      staged.set(profile.id, profile);
+      await this.repository.saveSerialProfiles([...staged.values()]);
+      this.serialProfiles.set(profile.id, profile);
+    } else {
+      this.serialProfiles.set(profile.id, profile);
+      await this.repository.saveSerialProfiles([...this.serialProfiles.values()]);
+    }
     this.emitChanged();
   }
 

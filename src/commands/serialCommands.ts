@@ -7,7 +7,9 @@ import { createSessionTranscript, type SessionTranscriptOptions } from "../loggi
 import { normalizeTranscriptTimestampMode } from "../logging/transcriptTimestamps";
 import { normalizeTranscriptLineEndingMode } from "../logging/transcriptLineEndings";
 import type { LoggerRotationOptions } from "../logging/terminalLogger";
-import { SerialPty } from "../services/serial/serialPty";
+import { SerialPty, type SerialPtyCallbacks } from "../services/serial/serialPty";
+import type { PtyOutputObserver } from "../services/macroAutoTrigger";
+import type { SessionHighlightHandle } from "../services/terminal/highlightProfileService";
 import { applySerialMacroNewline, knownMacroNewline } from "../services/serial/serialUserInput";
 import { createSerialMacroNewlineLookup } from "./serialMacroTarget";
 import { isSerialRuntimeMissingError } from "../services/serial/errorMatchers";
@@ -183,6 +185,9 @@ function collectBusySerialPaths(
       busy.add(normalizePortPath(entry.activePath));
     }
   }
+  for (const owner of ctx.listQuickSerialPortOwners?.() ?? []) {
+    busy.add(normalizePortPath(owner.path));
+  }
   return busy;
 }
 
@@ -293,6 +298,17 @@ function serialTerminalName(profile: SerialProfile): string {
     : `Nexus Serial: ${profile.name}`;
 }
 
+export function createSerialTerminal(profile: SerialProfile, pty: vscode.Pseudoterminal): vscode.Terminal {
+  const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
+  return vscode.window.createTerminal({
+    name: serialTerminalName(profile),
+    pty,
+    iconPath: new vscode.ThemeIcon("plug"),
+    color: new vscode.ThemeColor("terminal.ansiCyan"),
+    location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
+  });
+}
+
 function sameDeviceHint(left: SerialDeviceHint | undefined, right: SerialDeviceHint | undefined): boolean {
   return (
     left?.manufacturer === right?.manufacturer &&
@@ -359,6 +375,15 @@ function findSerialSessionHoldingPath(
   return undefined;
 }
 
+export function serialPortInUseMessage(ctx: CommandContext, path: string): string | undefined {
+  const normalized = normalizePortPath(path);
+  const owner = findSerialSessionHoldingPath(ctx, path)?.terminal ??
+    ctx.listQuickSerialPortOwners?.().find(candidate => normalizePortPath(candidate.path) === normalized)?.terminal;
+  return owner
+    ? `Serial port ${path} is already in use by "${owner.name}". Close that session or pick a different port.`
+    : undefined;
+}
+
 /**
  * Apply the "same profile → refocus" and "port already held by another session →
  * warn and bail" rules. Returns `true` if the connect should proceed; `false` if
@@ -374,11 +399,9 @@ function enforceSerialConnectPreconditions(
     existing.terminal.show();
     return false;
   }
-  const conflict = findSerialSessionHoldingPath(ctx, profile.path);
+  const conflict = serialPortInUseMessage(ctx, profile.path);
   if (conflict) {
-    void vscode.window.showWarningMessage(
-      `Serial port ${profile.path} is already in use by "${conflict.terminal.name}". Close that session or pick a different port.`
-    );
+    void vscode.window.showWarningMessage(conflict);
     return false;
   }
   return true;
@@ -438,6 +461,30 @@ export function formValuesToSerial(values: FormValues, existing?: Partial<Serial
   };
 }
 
+export function createStandardSerialPty(
+  ctx: CommandContext,
+  profile: SerialProfile,
+  callbacks: SerialPtyCallbacks,
+  highlight?: SessionHighlightHandle,
+  observer?: PtyOutputObserver
+): SerialPty {
+  const { path, baudRate, dataBits, stopBits, parity, rtscts } = profile;
+  return new SerialPty(
+    ctx.serialSidecar,
+    { path, baudRate, dataBits, stopBits, parity, rtscts },
+    callbacks,
+    ctx.loggerFactory.create("terminal", `serial-${profile.id}`),
+    createSessionTranscript(
+      ctx.sessionLogDir,
+      profile.name,
+      profile.logSession ?? getDefaultSessionTranscriptsEnabled(),
+      getTranscriptOptions(ctx, profile)
+    ),
+    highlight ?? ctx.highlighter,
+    observer
+  );
+}
+
 async function connectStandardSerialProfile(
   ctx: CommandContext,
   profile: SerialProfile,
@@ -458,16 +505,9 @@ async function connectStandardSerialProfile(
     profile.id
   );
   const highlight = ctx.highlightProfileService?.createSession({ kind: "serial", id: profile.id }, profile.highlightProfileId);
-  const pty = new SerialPty(
-    ctx.serialSidecar,
-    {
-      path: profile.path,
-      baudRate: profile.baudRate,
-      dataBits: profile.dataBits,
-      stopBits: profile.stopBits,
-      parity: profile.parity,
-      rtscts: profile.rtscts
-    },
+  const pty = createStandardSerialPty(
+    ctx,
+    profile,
     {
       onDedicatedInput: () => {
         if (terminalRef && ptyRef) void ctx.serialSendCommands?.remindNativeInput(terminalRef, ptyRef);
@@ -543,28 +583,14 @@ async function connectStandardSerialProfile(
         }
       }
     },
-    ctx.loggerFactory.create("terminal", `serial-${profile.id}`),
-    createSessionTranscript(
-      ctx.sessionLogDir,
-      profile.name,
-      profile.logSession ?? getDefaultSessionTranscriptsEnabled(),
-      getTranscriptOptions(ctx, profile)
-    ),
-    highlight ?? ctx.highlighter,
+    highlight,
     triggerObserver
   );
   ptyRef = pty;
 
-  const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
   let terminal: vscode.Terminal;
   try {
-    terminal = vscode.window.createTerminal({
-      name: terminalName,
-      pty,
-      iconPath: new vscode.ThemeIcon("plug"),
-      color: new vscode.ThemeColor("terminal.ansiCyan"),
-      location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
-    });
+    terminal = createSerialTerminal(profile, pty);
   } catch (error) {
     highlight?.dispose();
     throw error;

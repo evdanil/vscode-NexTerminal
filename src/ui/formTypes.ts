@@ -124,6 +124,8 @@ export type FormFieldDescriptor =
 export interface FormDefinition {
   title: string;
   fields: FormFieldDescriptor[];
+  /** Submit button label when the form performs an action other than saving. */
+  submitLabel?: string;
   /** When true, a "Test Connection" button is rendered in the form footer. */
   testable?: boolean;
   /** Optional visibility rule for the "Test Connection" button. */

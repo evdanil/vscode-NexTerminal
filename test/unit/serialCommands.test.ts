@@ -231,7 +231,7 @@ describe("registerSerialCommands port collision", () => {
     });
   });
 
-  it("blocks a new serial session when the target port is already held by another session", async () => {
+  it.each(["saved", "Quick Connect"])("blocks a new serial session when a %s session holds the port", async (ownerType) => {
     const profile = {
       id: "sp1",
       name: "USB Console",
@@ -245,12 +245,14 @@ describe("registerSerialCommands port collision", () => {
     };
     const existingTerminal = { name: "Nexus Serial: Other", show: vi.fn(), dispose: vi.fn() } as any;
     const serialTerminals = new Map();
-    serialTerminals.set("existing-session", {
-      terminal: existingTerminal,
-      profileId: "other-profile",
-      transportSessionId: "tsid-1",
-      activePath: "COM3"
-    });
+    if (ownerType === "saved") {
+      serialTerminals.set("existing-session", {
+        terminal: existingTerminal,
+        profileId: "other-profile",
+        transportSessionId: "tsid-1",
+        activePath: "COM3"
+      });
+    }
     const ctx = {
       core: {
         getSerialProfile: vi.fn(() => profile)
@@ -260,6 +262,7 @@ describe("registerSerialCommands port collision", () => {
       macroAutoTrigger: { createObserver: vi.fn() } as any,
       sessionLogDir: "",
       serialTerminals,
+      listQuickSerialPortOwners: () => ownerType === "Quick Connect" ? [{ terminal: existingTerminal, path: "COM3" }] : [],
       highlighter: {} as any,
       focusedTerminal: undefined,
       activityIndicators: new Map()
