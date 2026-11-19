@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 import type { CommandContext } from "../../src/commands/types";
+import type { SerialPtyCallbacks } from "../../src/services/serial/serialPty";
+import type { FormValues } from "../../src/ui/formTypes";
 
 const ui = vi.hoisted(() => ({
   activeTerminal: undefined as object | undefined,
@@ -8,9 +11,18 @@ const ui = vi.hoisted(() => ({
   createTerminal: vi.fn(),
   executeCommand: vi.fn(),
   saveProfile: vi.fn(),
+  showInformationMessage: vi.fn(),
   showErrorMessage: vi.fn(),
+  showQuickPick: vi.fn(),
   sshPtys: [] as Array<FakePty>,
-  telnetPtys: [] as Array<FakePty>
+  telnetPtys: [] as Array<FakePty>,
+  serialPtys: [] as Array<{
+    callbacks: SerialPtyCallbacks; dispose: ReturnType<typeof vi.fn>; getInputState: ReturnType<typeof vi.fn>
+  }>,
+  openForm: vi.fn(),
+  serialValuesToProfile: vi.fn(),
+  serialPortConflict: vi.fn(),
+  scanForPort: vi.fn()
 }));
 
 interface FakePty {
@@ -27,6 +39,11 @@ interface FakePty {
 vi.mock("vscode", () => ({
   ThemeIcon: class { public constructor(readonly id: string) {} },
   QuickInputButtons: { Back: { tooltip: "Back" } },
+  CancellationTokenSource: class {
+    readonly token = {};
+    cancel() {}
+    dispose() {}
+  },
   commands: {
     registerCommand(id: string, callback: (...args: unknown[]) => unknown) {
       ui.commands.set(id, callback);
@@ -39,7 +56,8 @@ vi.mock("vscode", () => ({
     onDidChangeActiveTerminal: () => ({ dispose() {} }),
     onDidCloseTerminal: () => ({ dispose() {} }),
     createInputBox: ui.createInputBox,
-    showInformationMessage: vi.fn(),
+    showQuickPick: ui.showQuickPick,
+    showInformationMessage: ui.showInformationMessage,
     showErrorMessage: ui.showErrorMessage,
     createTerminal: ui.createTerminal
   },
@@ -47,6 +65,18 @@ vi.mock("vscode", () => ({
 }));
 
 vi.mock("../../src/commands/profileCommands", () => ({ openQuickConnectProfileForm: ui.saveProfile }));
+vi.mock("../../src/commands/serialCommands", () => ({
+  createStandardSerialPty(_ctx: unknown, _profile: unknown, callbacks: SerialPtyCallbacks) {
+    const pty = { callbacks, dispose: vi.fn(), getInputState: vi.fn(() => ({ status: "opening" })) };
+    ui.serialPtys.push(pty);
+    return pty;
+  },
+  createSerialTerminal: (_profile: unknown, pty: unknown) => ui.createTerminal(pty),
+  formValuesToSerial: ui.serialValuesToProfile,
+  scanForPort: ui.scanForPort,
+  serialPortInUseMessage: ui.serialPortConflict
+}));
+vi.mock("../../src/ui/webviewFormPanel", () => ({ WebviewFormPanel: { open: ui.openForm } }));
 vi.mock("../../src/commands/serverCommands", () => ({
   createServerSessionTranscript: () => undefined,
   createNetworkDeviceTerminal: (_name: string, pty: FakePty) => ui.createTerminal(pty)
@@ -100,8 +130,12 @@ beforeEach(() => {
   ui.commands.clear();
   ui.sshPtys.length = 0;
   ui.telnetPtys.length = 0;
+  ui.serialPtys.length = 0;
   ui.activeTerminal = undefined;
   ui.createTerminal.mockImplementation(() => ({ creationOptions: {}, show: vi.fn() }));
+  ui.showQuickPick.mockReset();
+  ui.showQuickPick.mockImplementation(async items => items[0]);
+  ui.openForm.mockReturnValue({ dispose: vi.fn() });
 });
 
 describe("Quick Connect address", () => {
@@ -114,6 +148,9 @@ describe("Quick Connect address", () => {
     });
     expect(parseQuickConnectAddress("telnet://2001:db8::1")).toEqual({
       protocol: "telnet", host: "2001:db8::1", port: 23
+    });
+    expect(parseQuickConnectAddress("switch.example", "telnet")).toEqual({
+      protocol: "telnet", host: "switch.example", port: 23
     });
   });
 
@@ -140,10 +177,12 @@ describe("Quick Connect terminal ownership", () => {
     };
     const factory = { connect: vi.fn(), connectWithContext: vi.fn() };
     const quick = new QuickConnectCommands(ctx as unknown as CommandContext, factory);
-    async function open(value: string) {
+    async function open(value: string, type: "ssh" | "telnet" = "ssh") {
       const input = makeInput();
       ui.createInputBox.mockReturnValueOnce(input);
+      ui.showQuickPick.mockImplementationOnce(async items => items.find((item: { type: string }) => item.type === type));
       const result = invoke("nexus.server.quickConnect");
+      await vi.waitFor(() => expect(input.show).toHaveBeenCalled());
       input.enter(value);
       await result;
       return ui.createTerminal.mock.results.at(-1)!.value;
@@ -151,16 +190,106 @@ describe("Quick Connect terminal ownership", () => {
     return { ctx, quick, factory, open };
   }
 
+  it("asks for SSH, Telnet, or Serial before opening a connection", async () => {
+    const h = harness();
+    ui.showQuickPick.mockResolvedValueOnce(undefined);
+    await invoke("nexus.server.quickConnect");
+    expect(ui.showQuickPick.mock.calls[0]?.[0].map((item: { label: string }) => item.label)).toEqual([
+      "SSH", "Telnet", "Serial"
+    ]);
+    expect(ui.createInputBox).not.toHaveBeenCalled();
+    h.quick.dispose();
+  });
+
+  it("cancels a pending protocol choice across a session reset", async () => {
+    const h = harness();
+    let chooseSerial!: () => void;
+    ui.showQuickPick.mockImplementationOnce(items => new Promise(resolve => {
+      chooseSerial = () => resolve(items[2]);
+    }));
+    const result = invoke("nexus.server.quickConnect");
+    h.quick.closeAll();
+    chooseSerial();
+    await result;
+    expect(ui.openForm).not.toHaveBeenCalled();
+    expect(ui.createInputBox).not.toHaveBeenCalled();
+    h.quick.dispose();
+  });
+
+  it("keeps the chosen protocol until the user goes Back to change it", async () => {
+    const h = harness();
+    const ssh = makeInput();
+    const telnet = makeInput();
+    ui.createInputBox.mockReturnValueOnce(ssh).mockReturnValueOnce(telnet);
+    ui.showQuickPick.mockImplementationOnce(async items => items[0]).mockImplementationOnce(async items => items[1]);
+    const result = invoke("nexus.server.quickConnect");
+    await vi.waitFor(() => expect(ssh.show).toHaveBeenCalled());
+    ssh.enter("telnet://switch.example");
+    expect(ssh.validationMessage).toContain("Use Back");
+    expect(ui.createTerminal).not.toHaveBeenCalled();
+    ssh.trigger(0);
+    await vi.waitFor(() => expect(telnet.show).toHaveBeenCalled());
+    telnet.enter("telnet://switch.example");
+    await result;
+    expect(ui.telnetPtys[0]).toMatchObject({ server: { protocol: "telnet", port: 23 } });
+    h.quick.dispose();
+  });
+
+  it("offers a selection of savable Quick Connect terminals when another tab is active", async () => {
+    const h = harness();
+    await h.open("one@switch.example");
+    await h.open("two@switch.example");
+    ui.sshPtys[0].callbacks.onSessionOpened();
+    ui.sshPtys[1].callbacks.onSessionOpened();
+    ui.activeTerminal = { creationOptions: {} };
+    ui.showQuickPick.mockImplementationOnce(async (items) => items[1]);
+    await invoke("nexus.server.saveQuickConnectProfile");
+    expect(ui.saveProfile).toHaveBeenCalledWith(
+      h.ctx, expect.objectContaining({ username: "two" }), expect.any(Function), expect.any(Function)
+    );
+    h.quick.dispose();
+  });
+
   it("opens a direct Telnet tab without SSH authentication or a stored profile", async () => {
     const h = harness();
-    await h.open("telnet://switch.example");
+    await h.open("switch.example", "telnet");
     ui.telnetPtys[0].callbacks.onSessionOpened();
     expect(ui.telnetPtys).toHaveLength(1);
+    expect(ui.telnetPtys[0]).toMatchObject({ server: { protocol: "telnet", port: 23 } });
     expect(ui.sshPtys).toHaveLength(0);
     expect(h.factory.connect).not.toHaveBeenCalled();
     expect(h.ctx.core.addOrUpdateServer).not.toHaveBeenCalled();
     expect(h.ctx.core.registerSession).not.toHaveBeenCalled();
     h.quick.dispose();
+  });
+
+  it("uses scanned settings for an unsaved Serial terminal and lets the exact tab save after a disconnect", async () => {
+    const h = harness();
+    ui.showQuickPick.mockImplementationOnce(async items => items[2]);
+    await invoke("nexus.server.quickConnect");
+    const [, , handlers] = ui.openForm.mock.calls[0] as [
+      string, unknown, { onScan(): Promise<string>; onSubmit(values: FormValues): void }
+    ];
+    ui.scanForPort.mockResolvedValueOnce("/dev/ttyUSB0");
+    await expect(handlers.onScan()).resolves.toBe("/dev/ttyUSB0");
+    const baudRate = "9600";
+    const profile = { name: "/dev/ttyUSB0", path: "/dev/ttyUSB0", baudRate: 9600, dataBits: 7, stopBits: 2, parity: "even" };
+    ui.serialValuesToProfile.mockReturnValueOnce(profile);
+    handlers.onSubmit({ path: profile.path, baudRate, dataBits: "7", stopBits: "2", parity: "even" });
+    expect(ui.serialValuesToProfile).toHaveBeenCalledWith(expect.objectContaining({ path: profile.path, baudRate, mode: "standard" }));
+    const terminal = ui.createTerminal.mock.results[0].value;
+    expect(h.quick.listSerialPortOwners()).toEqual([{ path: profile.path, terminal }]);
+    await invoke("nexus.server.saveQuickConnectProfile", terminal);
+    expect(ui.saveProfile).not.toHaveBeenCalled();
+    ui.serialPtys[0].callbacks.onSessionOpened("serial-id");
+    ui.serialPtys[0].callbacks.onSessionClosed("serial-id");
+    ui.serialPtys[0].getInputState.mockReturnValue({ status: "disconnected" });
+    expect(h.quick.listSerialPortOwners()).toEqual([]);
+    await invoke("nexus.server.saveQuickConnectProfile", terminal);
+    expect(ui.saveProfile).toHaveBeenCalledWith(h.ctx, profile, expect.any(Function), expect.any(Function));
+    expect(h.ctx.core.registerSession).not.toHaveBeenCalled();
+    h.quick.dispose();
+    expect(ui.serialPtys[0].dispose).toHaveBeenCalledOnce();
   });
 
   it("saves the exact successful tab after disconnect and refuses stale or explicit undefined targets", async () => {
@@ -182,7 +311,7 @@ describe("Quick Connect terminal ownership", () => {
     const [,, isAvailable, onSaved] = ui.saveProfile.mock.calls[0];
     onSaved();
     expect(isAvailable()).toBe(false);
-    invoke("nexus.server.saveQuickConnectProfile");
+    await invoke("nexus.server.saveQuickConnectProfile");
     expect(ui.saveProfile).toHaveBeenLastCalledWith(
       h.ctx, expect.objectContaining({ username: "two" }), expect.any(Function), expect.any(Function)
     );
@@ -195,10 +324,11 @@ describe("Quick Connect terminal ownership", () => {
     const input = makeInput();
     ui.createInputBox.mockReturnValueOnce(input);
     const result = invoke("nexus.server.quickConnect");
+    await vi.waitFor(() => expect(input.show).toHaveBeenCalled());
     input.enter("switch.example");
     input.trigger(0);
     expect(input.value).toBe("switch.example");
-    input.trigger(0);
+    input.trigger(1);
     input.enter("switch.example");
     input.enter("operator");
     await result;
@@ -210,7 +340,7 @@ describe("Quick Connect terminal ownership", () => {
 
   it("offers to reopen the failed address for editing", async () => {
     const h = harness();
-    await h.open("telnet://switch.example:2001");
+    await h.open("telnet://switch.example:2001", "telnet");
     const retry = makeInput();
     ui.showErrorMessage.mockResolvedValueOnce("Edit Address…");
     ui.createInputBox.mockReturnValueOnce(retry);
@@ -221,4 +351,17 @@ describe("Quick Connect terminal ownership", () => {
     retry.hide();
     h.quick.dispose();
   });
+});
+
+it("contributes a distinct save command in the Command Palette and on supported terminal surfaces", () => {
+  const { contributes } = JSON.parse(readFileSync("package.json", "utf8"));
+  const save = "nexus.server.saveQuickConnectProfile";
+  const find = (entries: Array<{ command: string; when?: string }>, command: string) => entries.find(entry => entry.command === command);
+  expect(find(contributes.commands, save)).toMatchObject({ title: "Save Quick Connect as Profile…" });
+  expect(find(contributes.commands, "nexus.networkServer.profile.saveCurrent")).toMatchObject({ title: "Save DHCP/TFTP Settings as Profile…" });
+  expect(find(contributes.menus.commandPalette, save)).toEqual({ command: save });
+  for (const menu of ["terminal/context", "terminal/title/context"]) {
+    expect(find(contributes.menus[menu], save)).toMatchObject({ when: "nexus.quickConnectHasSavableTerminal" });
+  }
+  expect(find(contributes.menus["editor/title/context"], save)).toBeUndefined();
 });

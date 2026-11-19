@@ -1,10 +1,11 @@
+import { randomUUID } from "node:crypto";
 import { externalAuthProfileUnsupportedReason } from "../models/authProfile";
 import { externalServerFormValues } from "../ui/externalCredentialForm";
 import { isExternalAuthProfile, authProfileConnectionIdentity } from "../models/authProfile";
 import * as vscode from "vscode";
 import { readHighlightCatalog } from "../services/terminal/highlightProfileSettings";
 import type { NetworkDeviceProfileSeed, UnifiedProfileSeed } from "../ui/formDefinitions";
-import { unifiedProfileFormDefinition, unifiedProfileFormId, toSshInfrastructureServerList } from "../ui/formDefinitions";
+import { serialFormDefinition, unifiedProfileFormDefinition, unifiedProfileFormId, toSshInfrastructureServerList } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { FolderTreeItem, LocalShellProfileTreeItem, LocalServerConfigTreeItem, SerialProfileTreeItem, ServerTreeItem } from "../ui/nexusTreeProvider";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
@@ -18,7 +19,7 @@ import {
   teardownServerRuntime
 } from "./serverCommands";
 import { FolderCascadeSaveError } from "../core/nexusCore";
-import { serverConfigsEqual, type ServerConfig } from "../models/config";
+import { serverConfigsEqual, type SerialProfile, type ServerConfig } from "../models/config";
 import { configMutationLock } from "../services/configMutationLock";
 import type { LocalServerManager } from "../services/local/localServerManager";
 import { deleteServerSecrets } from "../services/ssh/silentAuth";
@@ -91,16 +92,54 @@ interface QuickConnectProfileForm {
   onSaved: () => void;
 }
 
+const QUICK_CONNECT_TERMINAL_CLOSED =
+  "This Quick Connect terminal has closed. Open a new Quick Connect terminal to save its connection as a profile.";
+
+function openQuickConnectSerialProfileForm(
+  ctx: CommandContext, profile: SerialProfile, isAvailable: () => boolean, onSaved: () => void
+): void {
+  const definition = serialFormDefinition(
+    { ...profile, id: undefined },
+    collectGroups(ctx),
+    vscode.workspace.getConfiguration("nexus.logging").get<boolean>("sessionTranscripts", true),
+    readHighlightCatalog()
+  );
+  const profileId = randomUUID();
+  let saved = false;
+  WebviewFormPanel.open(`serial-add-${profile.id}`, definition, {
+    onScan: () => scanForPort(ctx),
+    onSubmit: async (values) => {
+      if (normalizeOptionalFolderPath(values.group) === null) {
+        throw new Error(INVALID_FOLDER_PATH_MESSAGE);
+      }
+      const draft = formValuesToSerial(values, { id: profileId });
+      if (!draft) throw new Error("Fill in the required serial fields before saving.");
+      const savedNow = await configMutationLock.runExclusive(async () => {
+        if (saved) return false;
+        if (!isAvailable()) throw new Error(QUICK_CONNECT_TERMINAL_CLOSED);
+        await ctx.core.addOrUpdateSerialProfile(draft, { publishAfterSave: true });
+        saved = true;
+        return true;
+      });
+      if (savedNow) onSaved();
+    }
+  });
+}
+
 export function openQuickConnectProfileForm(
   ctx: CommandContext,
-  server: ServerConfig,
+  profile: ServerConfig | SerialProfile,
   isAvailable: () => boolean,
   onSaved: () => void
 ): void {
   if (!isAvailable()) return;
-  const { name, protocol, host, port, username, legacyAlgorithms } = server;
+  if ("path" in profile) {
+    openQuickConnectSerialProfileForm(ctx, profile, isAvailable, onSaved);
+    return;
+  }
+  const { name, protocol, host, port, username, legacyAlgorithms } = profile;
   openProfileForm(ctx, { addMode: "ssh", profileType: "ssh" }, {
-    terminalId: server.id,
+    terminalId: profile.id,
     networkDevice: { name, protocol, host, port, username, legacyAlgorithms },
     isAvailable,
     onSaved
@@ -251,7 +290,7 @@ function openProfileForm(ctx: CommandContext, seed?: UnifiedProfileSeed, quickCo
           if (quickConnect) {
             const ensureAvailable = () => {
               if (!quickConnect.isAvailable()) {
-                throw new Error("This Quick Connect terminal has closed. Open a new Quick Connect terminal to save its connection as a profile.");
+                throw new Error(QUICK_CONNECT_TERMINAL_CLOSED);
               }
             };
             ensureAvailable();

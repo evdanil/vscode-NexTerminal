@@ -312,7 +312,7 @@ export function registerNetworkServerProfileCommands(
 
   return [
     vscode.commands.registerCommand("nexus.networkServer.profile.saveCurrent", async (arg?: unknown) => {
-      const kind = toKindFromArg(arg) ?? (await pickProfileKind(ctx.core, "Save Current Settings As Profile"));
+      const kind = toKindFromArg(arg) ?? (await pickProfileKind(ctx.core, "Save DHCP/TFTP Settings as Profile"));
       if (!kind) return;
       await saveCurrentNetworkServerProfile(ctx.core, kind);
     }),

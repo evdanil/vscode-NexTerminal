@@ -104,9 +104,9 @@ Provider results are not persisted or shared across authentications. Owned byte 
 
 ### 4.4 SSH Terminal Session
 
-**Quick Connect.** Launch direct SSH or Telnet by address from the Connectivity Hub toolbar or welcome view, the Command Palette, or the Connect picker.
+**Quick Connect.** Choose SSH, Telnet, or Serial from the Connectivity Hub toolbar or welcome view, the Command Palette, or the Connect picker. SSH and Telnet prompt for an address. Serial opens a connection form with manual or scanned port selection and the usual baud rate and line parameters.
 
-Each tab follows the normal terminal placement, highlighting, transcript, and SSH host-key behavior. SSH prompts for authentication on each attempt and accepts a per-connection legacy algorithm opt-in. Once connected, **Save as Profile…** opens a prefilled Network Device Profile form for the selected tab. Saving creates a profile and leaves the original connection open. Closing the tab cancels pending authentication and discards its unsaved settings.
+Each tab follows the normal terminal placement, highlighting, and transcript behavior. SSH uses the usual host-key verification, prompts for authentication on each attempt, and accepts a per-connection legacy algorithm opt-in. After a terminal connects, **Save Quick Connect as Profile…** opens a prefilled Network Device or Serial Profile form. When you invoke it from the Command Palette, the command asks which connection to save if there is no eligible connection in focus. Saving creates a regular Connectivity Hub profile and leaves the original connection open. Closing the tab cancels pending authentication or serial opens and discards its unsaved settings.
 
 1. Run `Nexus: Connect Server` (or context action).
 2. A custom PTY terminal is created (`Nexus SSH: <server>`).

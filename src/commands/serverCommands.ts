@@ -82,7 +82,7 @@ export async function pickServer(
         description: server.addressless === true ? "(no address)" : `${serverAccountPrefixForDisplay(server, server.authProfileId ? core.getAuthProfile(server.authProfileId) : undefined)}${server.host}:${server.port}`,
         server
       }));
-  const quick = { label: "$(zap) Quick Connect…", description: "Connect to an SSH or Telnet address", server: undefined };
+  const quick = { label: "$(zap) Quick Connect…", description: "Connect over SSH, Telnet, or Serial", server: undefined };
   const pick = await vscode.window.showQuickPick(
     offerQuickConnect ? [quick, ...saved] : saved,
     { title: "Select Nexus Server" }

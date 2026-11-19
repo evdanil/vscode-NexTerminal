@@ -62,6 +62,7 @@ export interface CommandContext {
   terminalsByServer: ServerTerminalMap;
   sessionTerminals: SessionTerminalMap;
   serialTerminals: SerialTerminalMap;
+  listQuickSerialPortOwners?: () => Array<{ path: string; terminal: vscode.Terminal }>;
   localShellTerminals: LocalShellTerminalMap;
   localServerTerminals: LocalServerTerminalMap;
   highlighter: TerminalHighlighter;

@@ -487,10 +487,6 @@ function openFileExplorerOnFirstConnectField(seed?: Partial<ServerConfig>, vw?: 
 
 function serialFields(seed?: Partial<SerialProfile>, vw?: VisibleWhen): FormFieldDescriptor[] {
   const smartFollowVw = vw ? [...(Array.isArray(vw) ? vw : [vw]), { field: "mode", value: "smartFollow" }] : { field: "mode", value: "smartFollow" };
-  const customBaudVw = vw ? [...(Array.isArray(vw) ? vw : [vw]), { field: "baudRate", value: "custom" }] : { field: "baudRate", value: "custom" };
-  const baudRates = ["9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600"];
-  const baudRate = `${seed?.baudRate ?? 115200}`;
-  const customBaud = !baudRates.includes(baudRate);
   return [
     {
       type: "select",
@@ -514,6 +510,30 @@ function serialFields(seed?: Partial<SerialProfile>, vw?: VisibleWhen): FormFiel
       ].join(""),
       visibleWhen: smartFollowVw
     },
+    ...serialConnectionFields(seed, vw),
+    {
+      type: "select",
+      key: "macroNewline",
+      label: "Macro Newline",
+      options: [
+        { label: "CR (default)", value: "cr" },
+        { label: "LF", value: "lf" },
+        { label: "CRLF", value: "crlf" }
+      ],
+      value: resolveSerialMacroNewline(seed?.macroNewline),
+      hint: "What each line break in a macro sends to this device, whether you run the macro or a trigger does. CR matches pressing Enter; choose LF or CRLF only when the device expects it. The Serial Send Box has its own line-ending choice.",
+      advanced: true,
+      visibleWhen: vw
+    }
+  ];
+}
+
+function serialConnectionFields(seed?: Partial<SerialProfile>, vw?: VisibleWhen): FormFieldDescriptor[] {
+  const customBaudVw = vw ? [...(Array.isArray(vw) ? vw : [vw]), { field: "baudRate", value: "custom" }] : { field: "baudRate", value: "custom" };
+  const baudRates = ["9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600"];
+  const baudRate = `${seed?.baudRate ?? 115200}`;
+  const customBaud = !baudRates.includes(baudRate);
+  return [
     { type: "text", key: "path", label: "Port Path", required: true, placeholder: "COM3 or /dev/ttyUSB0", value: seed?.path, scannable: true, hint: "Serial device path such as COM3 or /dev/ttyUSB0.", visibleWhen: vw },
     {
       type: "select",
@@ -575,21 +595,7 @@ function serialFields(seed?: Partial<SerialProfile>, vw?: VisibleWhen): FormFiel
       advanced: true,
       visibleWhen: vw
     },
-    { type: "checkbox", key: "rtscts", label: "Enable RTS/CTS hardware flow control", value: seed?.rtscts ?? false, advanced: true, visibleWhen: vw },
-    {
-      type: "select",
-      key: "macroNewline",
-      label: "Macro Newline",
-      options: [
-        { label: "CR (default)", value: "cr" },
-        { label: "LF", value: "lf" },
-        { label: "CRLF", value: "crlf" }
-      ],
-      value: resolveSerialMacroNewline(seed?.macroNewline),
-      hint: "What each line break in a macro sends to this device, whether you run the macro or a trigger does. CR matches pressing Enter; choose LF or CRLF only when the device expects it. The Serial Send Box has its own line-ending choice.",
-      advanced: true,
-      visibleWhen: vw
-    }
+    { type: "checkbox", key: "rtscts", label: "Enable RTS/CTS hardware flow control", value: seed?.rtscts ?? false, advanced: true, visibleWhen: vw }
   ];
 }
 
@@ -1252,6 +1258,15 @@ export function serialFormDefinition(
       highlightProfileSelectField(highlightCatalog, seed?.highlightProfileId),
       ...sharedTrailingFields(seed, existingGroups, defaultLogSession)
     ]
+  };
+}
+
+export function quickConnectSerialFormDefinition(): FormDefinition {
+  return {
+    title: "Quick Connect — Serial",
+    fields: serialConnectionFields(),
+    expandAdvanced: true,
+    submitLabel: "Connect"
   };
 }
 

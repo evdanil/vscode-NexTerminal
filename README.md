@@ -50,7 +50,7 @@ Then open the **Nexus** sidebar (activity bar icon).
 
 ### Connect
 
-- **Quick Connect** — open an SSH or Telnet terminal from an address and save it as a profile when you want to use it again. → [Quick Connect](docs/ssh-and-telnet.md#quick-connect)
+- **Quick Connect** — start an SSH, Telnet, or Serial terminal and save it as a profile when you want to use it again. → [Quick Connect](docs/ssh-and-telnet.md#quick-connect)
 - **SSH sessions** — stored password/key/SSH agent authentication with keyboard-interactive 2FA, or External Program credentials retrieved per authentication with session approval. Windows agents include Pageant and OpenSSH. → [Authentication](docs/ssh-and-telnet.md#authentication)
 - **Legacy devices** — a per-server legacy-algorithm toggle for older gear, including devices that only speak 1024-bit `diffie-hellman-group1-sha1`. → [Legacy Devices](docs/ssh-and-telnet.md#legacy-devices)
 - **Alternate host** — a second SSH address for a server (e.g. the IPv6 to its IPv4), retried once when the primary can't be reached at the connection level; NetBox and Proxmox syncs fill it from the device's other address family. → [Alternate Host](docs/ssh-and-telnet.md#alternate-host)

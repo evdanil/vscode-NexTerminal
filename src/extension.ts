@@ -1508,6 +1508,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
 
   const serverDisposables = registerServerCommands(ctx);
   const quickConnect = new QuickConnectCommands(ctx, sshCredentialRuntime.quickConnectFactory);
+  ctx.listQuickSerialPortOwners = () => quickConnect.listSerialPortOwners();
   context.subscriptions.push(quickConnect);
   const serverMacroDisposables = registerServerMacroCommands(ctx);
   const bmcDisposables = registerBmcCommands(ctx);

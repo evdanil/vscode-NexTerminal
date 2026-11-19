@@ -6,11 +6,11 @@ Connect to remote servers over SSH from the Connectivity Hub, or set a server to
 
 ## Quick Connect
 
-Choose **Quick Connect** in the Connectivity Hub toolbar, the **Connect** picker, or the Command Palette. Enter an address such as `operator@switch.example`, `operator@[2001:db8::1]:2222`, or `telnet://console.example`. A bare host uses SSH and asks for a username. SSH defaults to port 22 and Telnet to port 23. Use brackets to specify an IPv6 address with a port. If the connection fails, **Edit Address…** reopens the address and connection options so you can try again.
+Choose **Quick Connect** in the Connectivity Hub toolbar, the **Connect** picker, or the Command Palette, then choose **SSH**, **Telnet**, or **Serial**. For SSH or Telnet, enter a host and optional port. SSH also accepts `operator@switch.example` and prompts for a username if you omit it. SSH defaults to port 22 and Telnet to port 23. You can paste an address with the matching `ssh://` or `telnet://` prefix. Use brackets to specify an IPv6 address with a port. If the connection fails, **Edit Address…** reopens the address and connection options so you can try again. [Quick Connect over Serial](serial.md#quick-connect-over-serial)
 
 For an older SSH device, use the **Enable legacy SSH algorithms** button in the address prompt. Enter SSH passwords and keyboard-interactive responses in the login prompts. Quick Connect applies the usual host-key and transcript settings. It does not save login responses or reuse stored profile credentials.
 
-After the connection succeeds, right-click inside the terminal or right-click its tab in the Terminal panel and choose **Save as Profile…**. You can also focus the terminal and run **Nexus: Save as Profile…** from the Command Palette. The Network Device Profile form starts with the connection details and the legacy SSH setting you chose. Give it a name and optional folder to use it again from the Connectivity Hub. The original terminal stays open, and you can still save it after the connection drops while its tab remains open.
+After the connection succeeds, run **Nexus: Save Quick Connect as Profile…** from the Command Palette. If a different terminal is active, choose the Quick Connect tab to save. You can also use **Save Quick Connect as Profile…** from the terminal's context menu or its tab menu in the Terminal panel. The Network Device Profile form starts with the connection details and the legacy SSH setting you chose. Give it a name and optional folder to use it again from the Connectivity Hub. You can save after a disconnect while the tab remains open.
 
 ## Add a Server
 

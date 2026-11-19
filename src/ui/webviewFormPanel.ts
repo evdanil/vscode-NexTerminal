@@ -63,7 +63,7 @@ export class WebviewFormPanel {
           this.dispose();
         } catch (error) {
           const msg = error instanceof Error ? error.message : String(error);
-          void vscode.window.showErrorMessage(`Save failed: ${msg}`);
+          void vscode.window.showErrorMessage(`${definition.submitLabel ?? "Save"} failed: ${msg}`);
         } finally {
           this.submitInFlight = false;
         }
