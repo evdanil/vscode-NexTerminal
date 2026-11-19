@@ -781,6 +781,8 @@ Profile and default changes propagate to live terminals. Deleting a profile warn
 
 The manager requires an unfinished rule to be staged or cancelled before another action can discard it; the rule editor's Delete Rule action explicitly discards that edit and stages deletion of the rule. If settings change while a draft is open, the draft remains visible for the user to record before closing the Highlight Profiles tab and running the editor command again; closing discards that draft.
 
+**Create from preset** stages an editable Cisco IOS / IOS XE, Juniper Junos, or Arista EOS profile with a new ID. **Apply** adds the copy to the ordinary profile catalog. It is available in connection forms and terminal selectors after saving, subject to workspace overrides. **Cancel** discards the draft copy.
+
 Creating or duplicating a profile focuses and selects its generated name. The name field edits the selected profile; Rename focuses and selects it, Enter or leaving the field accepts a rename, and Escape restores the last accepted name. Apply includes pending name text. Name validation rejects blanks and case-insensitive duplicates without discarding the text or rule edits; Cancel restores the catalog draft.
 
 When a save fails, the manager includes available error details. A multi-setting save may have changed some settings before failing, so the user must preserve needed draft changes before closing and reopening the manager. Error details can contain local paths and should be reviewed before sharing.

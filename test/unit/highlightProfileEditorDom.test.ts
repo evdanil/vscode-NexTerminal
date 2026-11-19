@@ -10,6 +10,34 @@ const state: HighlightEditorState = {
 };
 
 describe("highlight profile manager", () => {
+  it("copies a vendor preset into a new draft and preserves the existing default on apply", () => {
+    const editor = openHighlightRuleEditor([], state);
+    editor.createFromPreset(0);
+    expect(editor.profileNames()).toEqual(["One", "Two", "Cisco IOS / IOS XE"]);
+    expect(editor.profileName()).toBe("Cisco IOS / IOS XE");
+    expect(editor.profileNameFocused()).toBe(true);
+    expect(editor.rowLabel(0)).toBe("Configuration prompt");
+    expect(editor.posted).toEqual([]);
+    editor.createFromPreset(0);
+    expect(editor.profileName()).toBe("Cisco IOS / IOS XE (2)");
+    editor.clickApply();
+    const save = editor.posted.find(message => message.type === "saveCatalog");
+    if (save?.type !== "saveCatalog") throw new Error("missing save");
+    expect(save.defaultProfileId).toBe("one");
+    expect(save.profiles.slice(0, 2)).toEqual(state.catalog.profiles);
+    expect(new Set(save.profiles.map(profile => profile.id)).size).toBe(4);
+  });
+
+  it("discards an uncommitted preset with Cancel", () => {
+    const editor = openHighlightRuleEditor([], state);
+    editor.createFromPreset(1);
+    expect(editor.profileName()).toBe("Juniper Junos");
+    expect(editor.isDirty()).toBe(true);
+    editor.clickCancel();
+    expect(editor.profileNames()).toEqual(["One", "Two"]);
+    expect(editor.isDirty()).toBe(false);
+  });
+
   it("includes a typed profile name in Apply without a separate Rename click", () => {
     const editor = openHighlightRuleEditor([], state);
     editor.setProfileName("Cisco");
@@ -74,12 +102,13 @@ describe("highlight profile manager", () => {
     expect(editor.profileName()).toBe("Cisco");
   });
 
-  it.each(["switch", "create", "defaults", "duplicate", "reset", "copy"])("does not discard an invalid name on %s", (action) => {
+  it.each(["switch", "create", "defaults", "preset", "duplicate", "reset", "copy"])("does not discard an invalid name on %s", (action) => {
     const editor = openHighlightRuleEditor([], { ...state, workspaceLegacyRules: [{ pattern: "WORKSPACE", color: "green" }] });
     editor.setProfileName("Two");
     if (action === "switch") editor.selectProfile("two");
     if (action === "create") editor.createProfile();
     if (action === "defaults") editor.createFromDefaults();
+    if (action === "preset") editor.createFromPreset(0);
     if (action === "duplicate") editor.duplicateProfile();
     if (action === "reset") editor.resetRules();
     if (action === "copy") editor.copyWorkspaceRules();
@@ -219,6 +248,13 @@ describe("highlight profile manager", () => {
     expect(save.profiles[2].name).toContain(action === "duplicate" ? "One" : "New");
   });
 
+  it("uses the pending profile name when duplicating", () => {
+    const editor = openHighlightRuleEditor([], state);
+    editor.setProfileName("Renamed");
+    editor.duplicateProfile();
+    expect(editor.profileNames()).toEqual(["Renamed", "Two", "Renamed (copy)"]);
+  });
+
   it("gives immediate feedback for explicitly chosen duplicate names", () => {
     const editor = openHighlightRuleEditor([], state);
     editor.setProfileName("Two"); editor.createProfile();
@@ -242,11 +278,12 @@ describe("highlight profile manager", () => {
     expect(editor.rowLabel(0)).toBe("UNFINISHED");
   });
 
-  it.each(["create", "duplicate", "reset", "copy", "delete", "apply", "cancel", "edit", "add"] as const)(
+  it.each(["create", "preset", "duplicate", "reset", "copy", "delete", "apply", "cancel", "edit", "add"] as const)(
     "protects an unfinished rule from the %s action", (action) => {
       const editor = openHighlightRuleEditor([], { ...state, workspaceLegacyRules: [{ pattern: "WORKSPACE", color: "green" }] });
       editor.clickEdit(0); editor.setPattern("UNFINISHED");
       if (action === "create") { editor.setProfileName("New"); editor.createProfile(); }
+      if (action === "preset") editor.createFromPreset(0);
       if (action === "duplicate") { editor.setProfileName("Copy"); editor.duplicateProfile(); }
       if (action === "reset") editor.resetRules();
       if (action === "copy") editor.copyWorkspaceRules();

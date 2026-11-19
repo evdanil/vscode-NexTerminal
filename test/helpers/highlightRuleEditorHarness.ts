@@ -106,6 +106,8 @@ function buildDom(): {
   set("profile-name-help", new StubElement("DIV"));
   set("profile-create", new StubElement("BUTTON"));
   set("profile-create-defaults", new StubElement("BUTTON"));
+  set("profile-preset", new StubElement("SELECT"));
+  set("profile-create-preset", new StubElement("BUTTON"));
   set("profile-rename", new StubElement("BUTTON"));
   set("profile-duplicate", new StubElement("BUTTON"));
   set("profile-delete", new StubElement("BUTTON"));
@@ -188,6 +190,7 @@ export interface HighlightRuleEditorHarness {
   profileNames: () => string[];
   createProfile: () => void;
   createFromDefaults: () => void;
+  createFromPreset: (index: number) => void;
   saveError: () => string;
   workspaceOverrideVisible: () => boolean;
   highlightingDisabledVisible: () => boolean;
@@ -310,6 +313,12 @@ export function openHighlightRuleEditor(rules: HighlightRule[], manager?: Highli
     profileNames: () => field("profile-select").children.map((option) => option.textContent),
     createProfile: () => field("profile-create").bubble("click"),
     createFromDefaults: () => field("profile-create-defaults").bubble("click"),
+    createFromPreset: (index) => {
+      const select = field("profile-preset");
+      select.value = String(index);
+      select.dispatch("change");
+      field("profile-create-preset").bubble("click");
+    },
     saveError: () => field("save-error").textContent,
     workspaceOverrideVisible: () => !(field("profile-workspace-override") as StubElement & { hidden: boolean }).hidden,
     highlightingDisabledVisible: () => !(field("profile-highlighting-disabled") as StubElement & { hidden: boolean }).hidden,
