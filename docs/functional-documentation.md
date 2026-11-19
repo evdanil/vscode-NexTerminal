@@ -103,6 +103,11 @@ The profile editor removes old profile secret slots when switching sources and r
 Provider results are not persisted or shared across authentications. Owned byte buffers are wiped and references released; JavaScript strings, dependency-owned parsed keys, OS buffers and crash dumps cannot be guaranteed erased. Trusted mutable programs and deliberately escaped descendants are outside process containment guarantees.
 
 ### 4.4 SSH Terminal Session
+
+**Quick Connect.** Launch direct SSH or Telnet by address from the Connectivity Hub toolbar or welcome view, the Command Palette, or the Connect picker.
+
+Each tab follows the normal terminal placement, highlighting, transcript, and SSH host-key behavior. SSH prompts for authentication on each attempt and accepts a per-connection legacy algorithm opt-in. Once connected, **Save as Profile…** opens a prefilled Network Device Profile form for the selected tab. Saving creates a profile and leaves the original connection open. Closing the tab cancels pending authentication and discards its unsaved settings.
+
 1. Run `Nexus: Connect Server` (or context action).
 2. A custom PTY terminal is created (`Nexus SSH: <server>`).
 3. Terminal opens in an editor tab by default, or in the terminal panel when `nexus.terminal.openLocation` is set to `panel`.
@@ -766,7 +771,13 @@ Shared local and dynamic tunnels use one in-flight SSH login for their listener 
 | `nexus.terminal.highlighting.defaultProfile` | string or null | `default` | — | Profile used when a connection inherits the global default; `null` selects no highlighting. A missing ID does not fall back to a different profile. |
 | `nexus.terminal.highlighting.rules` | array | 22 built-in rules | — | Legacy rules used when the profiles catalog is `null`. The manager materializes them into a default profile when saved. Each rule can have a label, description and enabled flag; IPv6 and UUID ship disabled because they are relatively expensive. Existing built-in rule upgrades preserve user styling and do not add or remove rules. |
 
-Saved SSH/telnet, serial, Local Shell and Local Server connections may inherit the default, select a profile, or select none. A terminal tab or active-session action can override that selection for one running terminal and return to the saved choice. Profile and default changes propagate to live terminals. Deleting a profile warns about saved and live references; unresolved selections apply no highlighting. Configuration exports include profiles and defaults. Merge and share preserve the recipient's default and remap conflicting profile IDs; replacement restores the imported default. Terminal-category and Reset All settings resets clear the profile catalog, default and legacy rules.
+Saved SSH/Telnet, serial, Local Shell, and Local Server connections may inherit the default, select a profile, or select none. **Select Terminal Highlight Profile** is available inside either terminal location and on a tab in the Terminal panel.
+
+The Connectivity Hub offers the same action on its connected rows. Each menu requires one identifiable destination.
+
+To use the Command Palette, focus the terminal you want to change.
+
+Profile and default changes propagate to live terminals. Deleting a profile warns about saved and live references. Unresolved selections apply no highlighting. Configuration exports include profiles and defaults. Merge and share preserve the recipient's default and remap conflicting profile IDs. Replacement restores the imported default. Terminal-category and Reset All settings resets clear the profile catalog, default and legacy rules.
 
 The manager requires an unfinished rule to be staged or cancelled before another action can discard it; the rule editor's Delete Rule action explicitly discards that edit and stages deletion of the rule. If settings change while a draft is open, the draft remains visible for the user to record before closing the Highlight Profiles tab and running the editor command again; closing discards that draft.
 

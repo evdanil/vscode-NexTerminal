@@ -742,11 +742,11 @@ export class Ssh2Connector implements SshConnector {
       // missing agent's.
       let answeredKeyboardInteractive = false;
       let previousWasPassword = false;
-      if (!external && agent?.path && onPasswordFallback) {
-        // ssh2's default order puts a configured password before the agent.
-        // Keep the agent first and preserve keyboard-interactive priority for interactive logins.
+      if (!external && onPasswordFallback && (agent?.path || (server.authType === "password" && password === undefined))) {
+        // Keep the agent first when configured. Ask for a fresh password only
+        // if the verified peer offers password authentication.
         let sentNone = false;
-        let sentAgent = false;
+        let sentAgent = !agent?.path;
         let sentKeyboard = false;
         let passwordAttempts = 0;
         let passwordAccepted = false;

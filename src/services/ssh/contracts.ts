@@ -9,7 +9,7 @@ export interface PasswordPromptResult {
 }
 
 export interface PasswordPrompt {
-  prompt(server: ServerConfig, signal?: AbortSignal): Promise<PasswordPromptResult | undefined>;
+  prompt(server: ServerConfig, signal?: AbortSignal, options?: { allowSave?: boolean }): Promise<PasswordPromptResult | undefined>;
 }
 
 export type SshInteractionPolicy = "interactive" | "noninteractive";

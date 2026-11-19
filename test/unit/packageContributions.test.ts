@@ -885,15 +885,22 @@ describe("package contributions", () => {
     const bodyMenu = packageJson.contributes.menus["terminal/context"] ?? [];
     const editorTitleMenu = packageJson.contributes.menus["editor/title/context"] ?? [];
 
-    it("offers the live highlight selector from terminal tabs, session rows and the palette", () => {
+    it("offers the live highlight selector from terminal menus, session rows and the palette", () => {
       const id = "nexus.terminal.selectHighlightProfile";
       expect(packageJson.contributes.commands.find(c => c.command === id)).toBeDefined();
       expect(titleMenu.find(m => m.command === id)).toBeDefined();
-      expect(editorTitleMenu.find(m => m.command === id)?.when).toBe("resourceScheme == 'vscode-terminal'");
+      expect(bodyMenu.find(m => m.command === id)).toBeDefined();
       expect(paletteMenu.find(m => m.command === id)?.when).toBe("nexus.isNexusTerminal");
       const row = (packageJson.contributes.menus["view/item/context"] ?? []).find(m => m.command === id);
       for (const kind of ["nexus.sessionNode", "nexus.serialSessionNode", "nexus.localShellSessionNode", "nexus.localServerSessionNode"]) expect(row?.when).toContain(kind);
       expect(row?.when).not.toContain("nexus.serialProfile");
+    });
+
+    it("omits the live highlight selector from menus that cannot identify the clicked terminal", () => {
+      const id = "nexus.terminal.selectHighlightProfile";
+      for (const menu of [editorTitleMenu, packageJson.contributes.menus["editor/title"], packageJson.contributes.menus["terminal/title"]]) {
+        expect((menu ?? []).some(item => item.command === id)).toBe(false);
+      }
     });
 
     it("bumps extension version to at least 2.8.9", () => {
@@ -955,9 +962,9 @@ describe("package contributions", () => {
       }
     });
 
-    it("does NOT contribute terminal/context entries for these commands", () => {
-      const bodyHits = bodyMenu.filter((m) => m.command?.startsWith("nexus.terminal."));
-      expect(bodyHits).toEqual([]);
+    it("keeps Reset, Clear Scrollback and Copy All out of the terminal body menu", () => {
+      const ids = terminalCommands.map(command => command.command);
+      expect(bodyMenu.some(item => ids.includes(item.command))).toBe(false);
     });
 
     it("contributes editor/title/context entries for editor-tab right-click with vscode-terminal scheme gate", () => {

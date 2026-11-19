@@ -2549,19 +2549,32 @@ export class NexusCore {
     return false;
   }
 
-  public async addOrUpdateServer(server: ServerConfig): Promise<void> {
+  public async addOrUpdateServer(server: ServerConfig, options?: { publishAfterSave?: boolean }): Promise<void> {
     const next = server.openFileExplorerOnFirstConnect
       ? server
       : { ...server, openFileExplorerOnFirstConnect: undefined };
+    const updates = new Map<string, ServerConfig>();
     if (next.openFileExplorerOnFirstConnect) {
       for (const [id, existing] of this.servers.entries()) {
         if (id !== next.id && existing.openFileExplorerOnFirstConnect) {
-          this.servers.set(id, { ...existing, openFileExplorerOnFirstConnect: undefined });
+          updates.set(id, { ...existing, openFileExplorerOnFirstConnect: undefined });
         }
       }
     }
-    this.servers.set(next.id, next);
-    await this.persistServers([...this.servers.values()]);
+    updates.set(next.id, next);
+    const publish = () => {
+      for (const [id, record] of updates) this.servers.set(id, record);
+    };
+    if (options?.publishAfterSave) {
+      // A Quick Connect form may retry a failed create. Publish only a durable
+      // profile so runtime observers cannot expose a tentative new record.
+      const staged = new Map(this.servers.entries());
+      for (const [id, record] of updates) staged.set(id, record);
+      await this.persistServers([...staged.values()], publish);
+    } else {
+      publish();
+      await this.persistServers([...this.servers.values()]);
+    }
     this.emitChanged();
   }
 
@@ -3622,8 +3635,9 @@ export class NexusCore {
    * `repository.saveServers` resolved, never for runtime-only change events
    * (sessions, tunnels, focus) and never for a save that rejected.
    */
-  private async persistServers(servers: ServerConfig[]): Promise<void> {
+  private async persistServers(servers: ServerConfig[], publish?: () => void): Promise<void> {
     await this.repository.saveServers(servers);
+    publish?.();
     this.emitServersPersisted(servers);
   }
 

@@ -253,6 +253,7 @@ export interface ConfigRuntimeHooks {
   activeTunnelIdForProfile(profileId: string): string | undefined;
   closeSerialProfileTerminals(profileId: string): void;
   closeLocalShellProfileTerminals(profileId: string): void;
+  closeQuickConnectTerminals?(): void;
   /**
    * Delete All Data: forget the Terminal Appearance colour schemes, the active
    * selection and the font choice held by the running `ColorSchemeService`, and
@@ -5755,6 +5756,7 @@ export function registerConfigCommands(
     // inventoryCommands' critical sections.
     const removed = emptyRemovedProfileIds();
     const resetMutation = async (): Promise<void> => {
+      runtime?.closeQuickConnectTerminals?.();
       runtime?.revokeExternalCredentialApprovals?.();
       const snapshot = core.getSnapshot();
       const unvalidatedOwners = context

@@ -130,7 +130,7 @@ describe("terminalTabCommands", () => {
     it("updates the clicked tab, independently of the active tab", async () => {
       const { a, ha, hb, handler } = setup();
       state.pick.mockImplementation((items: Array<{ label: string }>) => Promise.resolve(items.find(i => i.label === "Blue")));
-      await handler(a);
+      await handler(a, [a]);
       expect(ha.apply("ERROR WARN")).toBe("ERROR \x1b[34mWARN\x1b[39m");
       expect(hb.apply("ERROR WARN")).toBe("\x1b[31mERROR\x1b[39m WARN");
     });
@@ -144,6 +144,15 @@ describe("terminalTabCommands", () => {
         await handler();
         expect(hb.apply("ERROR WARN")).toBe(expected);
       }
+    });
+
+    it("offers only applicable highlight choices for an unsaved connection", async () => {
+      const { a, entries, handler, service } = setup();
+      entries.get(a)!.highlight = service.createSession();
+      await handler(a);
+      const [items] = state.pick.mock.calls[0];
+      expect(items).toEqual(expect.arrayContaining([expect.objectContaining({ label: "Use global default" })]));
+      expect(items).not.toEqual(expect.arrayContaining([expect.objectContaining({ label: "Use saved connection setting" })]));
     });
 
     it("resolves the clicked session row and offers the profile manager", async () => {
@@ -164,8 +173,26 @@ describe("terminalTabCommands", () => {
       const { hb, handler } = setup();
       await handler({ session: { id: "gone" } });
       await handler(fakeTerminal());
+      await handler({ scheme: "vscode-terminal", path: "/1/2", fragment: "Nexus SSH: router" });
       expect(state.pick).not.toHaveBeenCalled();
       expect(hb.apply("ERROR")).toBe("\x1b[31mERROR\x1b[39m");
+    });
+
+    it("does not target the active terminal when VS Code cannot deserialize a closed tab", async () => {
+      const { hb, handler } = setup();
+      state.pick.mockImplementation((items: Array<{ label: string }>) => Promise.resolve(items.find(i => i.label === "Blue")));
+      await handler(undefined, [undefined]);
+      expect(hb.apply("ERROR")).toBe("\x1b[31mERROR\x1b[39m");
+      expect(state.pick).not.toHaveBeenCalled();
+    });
+
+    it("requires a single terminal selection when invoked from a VS Code terminal menu", async () => {
+      const { a, b, ha, hb, handler } = setup();
+      state.pick.mockImplementation((items: Array<{ label: string }>) => Promise.resolve(items.find(i => i.label === "Blue")));
+      await handler(a, [a, b]);
+      expect(ha.apply("ERROR")).toBe("\x1b[31mERROR\x1b[39m");
+      expect(hb.apply("ERROR")).toBe("\x1b[31mERROR\x1b[39m");
+      expect(state.pick).not.toHaveBeenCalled();
     });
 
     it("does not apply a choice after its terminal closes", async () => {

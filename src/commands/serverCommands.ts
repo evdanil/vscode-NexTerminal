@@ -63,14 +63,16 @@ import { configMutationLock } from "../services/configMutationLock";
 import { addresslessUnavailableMessage, telnetUnsupportedMessage } from "../utils/protocolGuards";
 import { validateServerConfig } from "../utils/validation";
 
-export async function pickServer(core: import("../core/nexusCore").NexusCore): Promise<ServerConfig | undefined> {
+export async function pickServer(
+  core: import("../core/nexusCore").NexusCore,
+  offerQuickConnect = false
+): Promise<ServerConfig | undefined> {
   const servers = core.getSnapshot().servers.filter((server) => !server.isHidden);
-  if (servers.length === 0) {
+  if (servers.length === 0 && !offerQuickConnect) {
     vscode.window.showWarningMessage("No Nexus servers configured");
     return undefined;
   }
-  const pick = await vscode.window.showQuickPick(
-    servers
+  const saved = servers
       .slice()
       .sort((a, b) => naturalCompare(a.name, b.name))
       .map((server) => ({
@@ -79,9 +81,13 @@ export async function pickServer(core: import("../core/nexusCore").NexusCore): P
         // "(no address)" rather than the nonsense "user@:0".
         description: server.addressless === true ? "(no address)" : `${serverAccountPrefixForDisplay(server, server.authProfileId ? core.getAuthProfile(server.authProfileId) : undefined)}${server.host}:${server.port}`,
         server
-      })),
+      }));
+  const quick = { label: "$(zap) Quick Connect…", description: "Connect to an SSH or Telnet address", server: undefined };
+  const pick = await vscode.window.showQuickPick(
+    offerQuickConnect ? [quick, ...saved] : saved,
     { title: "Select Nexus Server" }
   );
+  if (pick === quick) await vscode.commands.executeCommand("nexus.server.quickConnect");
   return pick?.server;
 }
 
@@ -240,6 +246,26 @@ function getTranscriptOptions(ctx: CommandContext, profile: ServerConfig): Sessi
     pathTemplate: vscode.workspace.getConfiguration("nexus.logging").get<string>("sessionLogPathTemplate", ""),
     pathContext: { host: profile.host, port: profile.port, group: profile.group }
   };
+}
+
+export function createServerSessionTranscript(ctx: CommandContext, server: ServerConfig) {
+  return createSessionTranscript(
+    ctx.sessionLogDir,
+    server.name,
+    server.logSession ?? getDefaultSessionTranscriptsEnabled(),
+    getTranscriptOptions(ctx, server)
+  );
+}
+
+export function createNetworkDeviceTerminal(name: string, pty: vscode.Pseudoterminal): vscode.Terminal {
+  const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
+  return vscode.window.createTerminal({
+    name,
+    pty,
+    iconPath: new vscode.ThemeIcon("server"),
+    color: new vscode.ThemeColor("terminal.ansiCyan"),
+    location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
+  });
 }
 
 function isValidProxyPort(port: number): boolean {
@@ -1104,6 +1130,7 @@ function hasActiveTunnelsForServer(ctx: CommandContext, serverId: string): boole
 export interface ConnectServerOptions {
   allowAutoFileExplorer?: boolean;
   noPickerFallback?: boolean;
+  offerQuickConnect?: boolean;
   /**
    * REVIEW FINDING (P2) — the session this call created never came up: its
    * initial SSH connect failed (`SshPtyCallbacks.onConnectFailed`,
@@ -1319,28 +1346,16 @@ async function connectTelnetServer(
         },
         ctx.loggerFactory.create("terminal", server.id),
         {
-          transcript: createSessionTranscript(
-            ctx.sessionLogDir,
-            server.name,
-            server.logSession ?? getDefaultSessionTranscriptsEnabled(),
-            getTranscriptOptions(ctx, server)
-          ),
+          transcript: createServerSessionTranscript(ctx, server),
           highlighter: highlight ?? ctx.highlighter,
           outputObserver: triggerObserver,
           terminalType
         }
       );
       ptyRef = pty;
-      const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
       let terminal: vscode.Terminal;
       try {
-        terminal = vscode.window.createTerminal({
-          name: terminalName,
-          pty,
-          iconPath: new vscode.ThemeIcon("server"),
-          color: new vscode.ThemeColor("terminal.ansiCyan"),
-          location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
-        });
+        terminal = createNetworkDeviceTerminal(terminalName, pty);
       } catch (error) {
         highlight?.dispose();
         throw error;
@@ -1393,7 +1408,7 @@ function offerWebConsoleForAddressless(message: string, serverId: string): void 
 }
 
 export async function connectServer(ctx: CommandContext, arg?: unknown, options: ConnectServerOptions = {}): Promise<void> {
-  const server = toServerFromArg(ctx.core, arg) ?? (options.noPickerFallback ? undefined : await pickServer(ctx.core));
+  const server = toServerFromArg(ctx.core, arg) ?? (options.noPickerFallback ? undefined : await pickServer(ctx.core, options.offerQuickConnect));
   if (!server) {
     if (options.noPickerFallback) throw new Error("Selected profile no longer exists.");
     return;
@@ -1626,28 +1641,16 @@ export async function connectServer(ctx: CommandContext, arg?: unknown, options:
           }
         },
         ctx.loggerFactory.create("terminal", server.id),
-        createSessionTranscript(
-          ctx.sessionLogDir,
-          server.name,
-          server.logSession ?? getDefaultSessionTranscriptsEnabled(),
-          getTranscriptOptions(ctx, server)
-        ),
+        createServerSessionTranscript(ctx, server),
         highlight ?? ctx.highlighter,
         triggerObserver,
         terminalType
       );
       ptyRef = pty;
       pty.addOutputObserver(osc7Observer);
-      const openInEditor = vscode.workspace.getConfiguration("nexus.terminal").get("openLocation") === "editor";
       let terminal: vscode.Terminal;
       try {
-        terminal = vscode.window.createTerminal({
-          name: terminalName,
-          pty,
-          iconPath: new vscode.ThemeIcon("server"),
-          color: new vscode.ThemeColor("terminal.ansiCyan"),
-          location: openInEditor ? vscode.TerminalLocation.Editor : vscode.TerminalLocation.Panel
-        });
+        terminal = createNetworkDeviceTerminal(terminalName, pty);
       } catch (error) {
         highlight?.dispose();
         throw error;
@@ -2845,7 +2848,8 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
       });
     }),
 
-    vscode.commands.registerCommand("nexus.server.connect", async (arg?: unknown, selection?: unknown) => {
+    vscode.commands.registerCommand("nexus.server.connect", async (...args: unknown[]) => {
+      const [arg, selection] = args;
       if (arg instanceof ServerTreeItem && Array.isArray(selection) && selection.length > 1 && selection.includes(arg)) {
         if (!selection.every((item): item is ServerTreeItem => item instanceof ServerTreeItem)) {
           void vscode.window.showWarningMessage("Select only network device profiles to connect them together.");
@@ -2858,7 +2862,7 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
         await Promise.all(selection.map((item) => connectServer(ctx, item.server.id, { allowAutoFileExplorer: false, noPickerFallback: true })));
         return;
       }
-      await connectServer(ctx, arg);
+      await connectServer(ctx, arg, { offerQuickConnect: args.length === 0 });
     }),
     vscode.commands.registerCommand("nexus.server.testConnection", (arg?: unknown) => testServerConnection(ctx, arg)),
     vscode.commands.registerCommand("nexus.server.disconnect", (arg?: unknown) => disconnectServer(ctx, arg)),

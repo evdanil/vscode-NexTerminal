@@ -3,7 +3,7 @@ import { createVscodeExternalCredentialApproval } from "../credentials/vscodeExt
 import { createExternalCredentialResolver } from "../credentials/externalCredentialResolver";
 import { createExternalCredentialProcessRunner } from "../credentials/externalCredentialProcess";
 import { parseExternalCredentialResponse } from "../credentials/externalCredentialProtocol";
-import type { PasswordPrompt, SecretVault, SshConnector } from "./contracts";
+import type { ContextAwareSshFactory, PasswordPrompt, SecretVault, SshConnector } from "./contracts";
 import { SilentAuthSshFactory, type InputPromptFn } from "./silentAuth";
 import { watchPoolInvalidationOnConfigMutation } from "./poolConfigInvalidation";
 import { createSshTransportStack, type SshTransportStackOptions } from "./sshTransportStack";
@@ -28,6 +28,10 @@ export function createSshCredentialRuntime(options: {
     options.connector, vault, options.passwordPrompt, options.inputPrompt,
     (id) => core.getAuthProfile(id), (id) => core.getServer(id), externalCredentialResolver
   );
+  const quickConnectFactory: ContextAwareSshFactory = {
+    connect: (server) => authFactory.connectUnsaved(server),
+    connectWithContext: (server, context) => authFactory.connectUnsaved(server, context)
+  };
   const transport = createSshTransportStack(authFactory, {
     ...options.transport, serverLookup: (id) => core.getServer(id), vault
   });
@@ -36,6 +40,7 @@ export function createSshCredentialRuntime(options: {
   const stopWatching = watchPoolInvalidationOnConfigMutation(core, transport.pool, options.proxySecrets, externalCredentialResolver);
   return {
     ...transport,
+    quickConnectFactory,
     externalCredentialResolver,
     revokeExternalCredentialApprovals: (ids?: readonly string[]): void => externalCredentialResolver.revoke(ids),
     dispose(): void {

@@ -37,10 +37,9 @@ export interface SshPtyCallbacks {
   /**
    * REVIEW FINDING (P2) — the INITIAL connect attempt failed (auth refused,
    * host unreachable, proxy error). Optional and purely additive: the
-   * error-handling contract around it is unchanged — the failure is still
-   * swallowed here, the terminal is still left open holding the "Press any key
-   * to close" notice, and `showErrorMessage` below still names the cause. This
-   * exists because that is ALL that happens: no session is ever registered, the
+   * failure leaves the terminal open holding the "Press any key to close"
+   * notice. Return true if the callback provides the failure notification.
+   * The watcher needs this signal because no session is ever registered, the
    * pty is not disposed, and `closeEmitter` never fires, so a caller waiting on
    * "a session for this server appeared" has nothing else to observe and sits
    * out its whole watchdog (see `connectAndAwaitSessionTerminal`,
@@ -49,7 +48,7 @@ export interface SshPtyCallbacks {
    * Fires at most once per pty, and NEVER for a failed *reconnect* — that path
    * rethrows to `reconnect()` above, which owns its own reporting.
    */
-  onConnectFailed?(sessionId: string, message: string): void;
+  onConnectFailed?(sessionId: string, message: string): boolean | void;
   /**
    * Captures the effective connection descriptor (see models/startDescriptors)
    * for THIS connect attempt. Called at the very start of every attempt, the
@@ -496,7 +495,7 @@ export class SshPty implements vscode.Pseudoterminal, vscode.Disposable {
       this.connectFailed = true;
       this.writeEmitter.fire(`\r\n[Nexus SSH] Connection failed: ${message}\r\n`);
       this.writeEmitter.fire("\r\n[Nexus SSH] Press any key to close this terminal.\r\n");
-      this.callbacks.onConnectFailed?.(this.sessionId, message);
+      if (this.callbacks.onConnectFailed?.(this.sessionId, message) === true) return;
       const notice = `Nexus SSH connection failed for ${this.serverConfig.name}: ${message}`;
       if (providerError) {
         void showExternalCredentialError(providerError, this.serverConfig.id);

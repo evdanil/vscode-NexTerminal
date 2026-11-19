@@ -3,7 +3,9 @@ import type { ServerConfig } from "../../models/config";
 import type { PasswordPrompt, PasswordPromptResult } from "./contracts";
 
 export class VscodePasswordPrompt implements PasswordPrompt {
-  public async prompt(server: ServerConfig, signal?: AbortSignal): Promise<PasswordPromptResult | undefined> {
+  public async prompt(
+    server: ServerConfig, signal?: AbortSignal, options?: { allowSave?: boolean }
+  ): Promise<PasswordPromptResult | undefined> {
     const cancellation = new vscode.CancellationTokenSource();
     const onAbort = (): void => cancellation.cancel();
     signal?.addEventListener("abort", onAbort, { once: true });
@@ -17,6 +19,9 @@ export class VscodePasswordPrompt implements PasswordPrompt {
       }, cancellation.token);
       if (!password || cancellation.token.isCancellationRequested) {
         return undefined;
+      }
+      if (options?.allowSave === false) {
+        return { password, save: false };
       }
       const saveChoice = await vscode.window.showQuickPick(["Yes", "No"], {
         title: "Save password in system keychain?",
