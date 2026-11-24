@@ -19,7 +19,7 @@ import {
 import type { DeviceTemplateProfile } from "../models/deviceTemplate";
 import type { SavedFilterDefinition } from "../models/savedFilter";
 import type { LocalServerConfig } from "../models/localServer";
-import { isCatchAllFilter, templateAppliedFields, type TemplatableField } from "../services/inventory/templateApply";
+import { isCatchAllFilter, templateAppliedFields, TEMPLATE_APPLIED_FIELD_HINT, type TemplatableField } from "../services/inventory/templateApply";
 import { ORPHAN_FOLDER_NAME } from "../services/inventory/syncEngine";
 import { formatAuthProfileLabel } from "../utils/authProfileLabel";
 import { randomUUID } from "node:crypto";
@@ -876,15 +876,7 @@ function proxyFields(
 // adopted verbatim from §7.1. No new webview machinery.
 // ---------------------------------------------------------------------------
 
-/** The v1 templatable fields, in editor order. */
-export type TemplatableFormField =
-  | "proxy"
-  | "authProfileId"
-  | "multiplexing"
-  | "legacyAlgorithms"
-  | "logSession"
-  | "ipmiAuthProfileId"
-  | "ipmiGatewayServerId";
+type TemplatableFormField = TemplatableField;
 
 /** The form key of a field's companion mode select (`mode_proxy`, …). */
 export function deviceTemplateModeKey(field: TemplatableFormField): string {
@@ -918,6 +910,7 @@ const TEMPLATE_MODE_FIELD_LABELS: Record<TemplatableFormField, string> = {
   multiplexing: "Connection multiplexing",
   legacyAlgorithms: "Legacy SSH algorithms",
   logSession: "Session Logging",
+  highlightProfileId: "Highlight Profile",
   ipmiAuthProfileId: "IPMI Auth Profile",
   ipmiGatewayServerId: "IPMI Gateway"
 };
@@ -955,7 +948,8 @@ function templateValueVisibleWhen(field: TemplatableFormField): VisibleWhen {
 export function deviceTemplateFormDefinition(
   seed?: DeviceTemplateProfile,
   servers?: ServerListEntry[],
-  authProfiles?: AuthProfile[]
+  authProfiles?: AuthProfile[],
+  highlightCatalog?: HighlightCatalog
 ): FormDefinition {
   const isEdit = Boolean(seed?.id);
   const modeOf = (field: TemplatableFormField): string => seed?.fields[field]?.mode ?? "none";
@@ -1014,6 +1008,13 @@ export function deviceTemplateFormDefinition(
       { type: "checkbox", key: "logSession", label: "Log session transcript", value: seed?.fields.logSession?.value ?? true, visibleWhen: logVw },
       templateOverridePreemption("logSession"),
 
+      templateModeSelect("highlightProfileId", modeOf("highlightProfileId")),
+      {
+        ...highlightProfileSelectField(highlightCatalog, seed?.fields.highlightProfileId?.value, true),
+        visibleWhen: templateValueVisibleWhen("highlightProfileId")
+      },
+      templateOverridePreemption("highlightProfileId"),
+
       // IPMI Auth Profile (PR-T3) — the BMC's own login link. Reuses the SSH
       // filterable auth-profile select (autofill off, no inline-create), keyed to
       // the template's ipmi field and labelled for the IPMI row.
@@ -1051,17 +1052,13 @@ export function deviceTemplateFormDefinition(
   };
 }
 
-// §7.3 (UX-S5) — VERBATIM hint appended to a field that is currently
-// template-applied on the server being edited.
-const TEMPLATE_APPLIED_FIELD_HINT =
-  "This value was applied by a device template. Changing it here makes your value permanent — future syncs and template edits will leave it alone.";
-
 /** The Edit Server form key each templatable field's control carries. */
 const TEMPLATE_FIELD_FORM_KEY: Record<Exclude<TemplatableField, "authProfileId">, string> = {
   proxy: "proxyType",
   multiplexing: "multiplexing",
   legacyAlgorithms: "legacyAlgorithms",
   logSession: "logSession",
+  highlightProfileId: "highlightProfileId",
   // PR-T3 — the Edit Server form controls these two IPMI id references submit
   // under, so §7.3's template-applied hint lands on them when the server carries
   // a template-owned IPMI value.

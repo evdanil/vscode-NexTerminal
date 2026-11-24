@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { readHighlightCatalog } from "../services/terminal/highlightProfileSettings";
+import { TEMPLATE_APPLIED_FIELD_HINT } from "../services/inventory/templateApply";
 import { highlightProfileSelectField } from "./highlightProfileForm";
 import { sortFilterableOptions, renderFormHtml } from "./formHtml";
 import type { FormDefinition, FormMessage, FormValues } from "./formTypes";
@@ -35,14 +36,19 @@ export class WebviewFormPanel {
       { enableScripts: true, retainContextWhenHidden: true }
     );
 
-    const hasHighlightProfile = definition.fields.some((field) => field.type === "select" && field.key === "highlightProfileId");
+    const highlightField = definition.fields.find((field) => field.type === "select" && field.key === "highlightProfileId");
     let highlightRevision = 0;
     const pushHighlightProfiles = (): void => {
-      if (this.disposed || !hasHighlightProfile) return;
-      const field = highlightProfileSelectField(readHighlightCatalog());
-      void this.panel.webview.postMessage({ type: "highlightProfilesChanged", revision: ++highlightRevision, options: sortFilterableOptions(field.options), hint: field.hint ?? "" });
+      if (this.disposed || highlightField?.type !== "select") return;
+      const forTemplate = definition.fields.some((field) => field.type === "select" && field.key === "mode_highlightProfileId");
+      const field = highlightProfileSelectField(readHighlightCatalog(), undefined, forTemplate);
+      const ownershipHint = highlightField.hint?.endsWith(TEMPLATE_APPLIED_FIELD_HINT) ? ` ${TEMPLATE_APPLIED_FIELD_HINT}` : "";
+      void this.panel.webview.postMessage({
+        type: "highlightProfilesChanged", revision: ++highlightRevision, options: sortFilterableOptions(field.options),
+        hint: `${field.hint ?? ""}${ownershipHint}`
+      });
     };
-    const configListener = hasHighlightProfile ? vscode.workspace.onDidChangeConfiguration((event) => {
+    const configListener = highlightField ? vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration("nexus.terminal.highlighting")) pushHighlightProfiles();
     }) : undefined;
     const nonce = createWebviewNonce();

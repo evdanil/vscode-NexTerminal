@@ -18,6 +18,9 @@ const mockExecuteCommand = vi.fn();
 const formPanelOpens: Array<{ formId: string; options: { onSubmit: (v: FormValues) => Promise<void> | void } }> = [];
 
 vi.mock("vscode", () => ({
+  workspace: {
+    getConfiguration: () => ({ get: (_key: string, fallback: unknown) => fallback })
+  },
   commands: {
     registerCommand: vi.fn((id: string, handler: (...args: unknown[]) => unknown) => {
       registeredCommands.set(id, handler);
@@ -158,6 +161,15 @@ beforeEach(() => {
 });
 
 describe("parseDeviceTemplateFormValues (§7.1 tri-state → model)", () => {
+  it("stores a highlight profile ID or explicit None when the template sets highlighting", () => {
+    const values = { name: "Switches", mode_highlightProfileId: "fill", highlightProfileId: "profile:cisco" };
+    expect(parseDeviceTemplateFormValues(values).fields.highlightProfileId).toEqual({ mode: "fill", value: "cisco" });
+    expect(parseDeviceTemplateFormValues({ ...values, highlightProfileId: "__none__" }).fields.highlightProfileId)
+      .toEqual({ mode: "fill", value: null });
+    expect(parseDeviceTemplateFormValues({ ...values, mode_highlightProfileId: "none" }).fields).not.toHaveProperty("highlightProfileId");
+    expect(() => parseDeviceTemplateFormValues({ ...values, highlightProfileId: "" })).toThrow(/Highlight Profile mode is set to Fill/);
+  });
+
   it("reads only fields whose mode is fill/override, dropping 'none'", () => {
     const values: FormValues = {
       name: "Branch defaults",
@@ -924,6 +936,24 @@ describe("Fix B (PR #62 Codex round 2) — edit save re-resolves the seeded temp
     const editOpen = formPanelOpens.find((o) => o.formId.startsWith("device-template-edit-"))!;
     return editOpen.options;
   }
+
+  it("rejects a newly selected highlight profile missing from the active catalog", async () => {
+    const core = makeCore();
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Core", fields: {} });
+    const edit = await openEdit(core);
+    await expect(edit.onSubmit({ name: "Core", mode_highlightProfileId: "fill", highlightProfileId: "profile:deleted" }))
+      .rejects.toThrow(/highlight profile.*no longer available/i);
+    expect(core.getDeviceTemplate("t1")?.fields).not.toHaveProperty("highlightProfileId");
+  });
+
+  it("retains an existing highlight profile link when it is missing in the current workspace", async () => {
+    const core = makeCore();
+    const fields = { highlightProfileId: { mode: "fill" as const, value: "elsewhere" } };
+    await core.addOrUpdateDeviceTemplate({ id: "t1", name: "Core", fields });
+    const edit = await openEdit(core);
+    await edit.onSubmit({ name: "Renamed", mode_highlightProfileId: "fill", highlightProfileId: "profile:elsewhere" });
+    expect(core.getDeviceTemplate("t1")).toMatchObject({ name: "Renamed", fields });
+  });
 
   it("DELETED while the editor was open → Save rejected, template NOT resurrected", async () => {
     const core = makeCore();
@@ -1797,6 +1827,25 @@ describe("applyPlanWrites — reference revalidation (PR-T3, PR #66 Codex round 
 // only `live.origin` and leaves the detached stamp intact.
 // ============================================================================
 describe("applyPlanWrites — detached receipt stamp clear (PR-T3, PR #66 Codex round 9)", () => {
+  it("sets the folder's highlight selection and clears the sync ownership stamp", async () => {
+    const core = makeCore();
+    const server = keptServer({ ipmiAuthProfileId: "bmc" }, { highlightProfileId: "old" });
+    server.formerlySynced!.templated!.highlightProfileId = "old";
+    await core.addOrUpdateServer(server);
+
+    const plan = planManualTemplateApply({
+      template: { id: "t", name: "T", fields: { highlightProfileId: { mode: "override", value: null } } },
+      servers: [core.getServer(server.id)!],
+      sourceDefaultUsername: () => undefined,
+      authProfile: () => undefined,
+      hasServer: () => true
+    });
+    expect(plan.highlightProfileId).toEqual({ mode: "override", willSet: 1, skipped: 0 });
+    expect(await applyPlanWrites(ctxFor(core), plan)).toBe(1);
+    expect(core.getServer(server.id)?.highlightProfileId).toBeNull();
+    expect(core.getServer(server.id)?.formerlySynced?.templated).toEqual({ ipmiAuthProfileId: "bmc" });
+  });
+
   /** A server KEPT from a removed source: no `origin`, a `formerlySynced` receipt whose `templated` stamps the two IPMI ids the sync last wrote. */
   function keptServer(templated: { ipmiGatewayServerId?: string; ipmiAuthProfileId?: string }, live: Partial<ServerConfig> = {}): ServerConfig {
     return {

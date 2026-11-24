@@ -1707,6 +1707,53 @@ describe("formValuesToServer — highlight profile", () => {
     await options.onSubmit({ name: server.name, host: server.host, port: server.port, protocol: "telnet", highlightProfileId: "" });
     expect(ctx.core.getServer(server.id)?.highlightProfileId).toBeUndefined();
   });
+
+  it.each([
+    ["cisco", "cisco"],
+    ["cisco", "junos"],
+    [null, null]
+  ] as const)("releases template ownership of %j when the device chooses %j", async (previous, selected) => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewFormPanelOpen.mockReturnValue({ dispose: vi.fn(), onDidDispose: vi.fn() });
+    const server = makeServer({ protocol: "telnet", highlightProfileId: "manual",
+      origin: { sourceId: "src", externalId: "d", syncedAt: 1, templated: { highlightProfileId: previous, logSession: false } }
+    });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.edit")!(server.id);
+    const options = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as {
+      onSubmit: (values: Record<string, unknown>) => Promise<void>;
+    };
+    await options.onSubmit({ name: server.name, host: server.host, port: server.port, protocol: "telnet",
+      highlightProfileId: selected === null ? "__none__" : `profile:${selected}`
+    });
+    const saved = ctx.core.getServer(server.id);
+    expect(saved?.highlightProfileId).toBe(selected);
+    expect(saved?.origin?.templated).toEqual({ logSession: false });
+  });
+
+  it("keeps an inventory sync’s newer highlight choice when the open editor submits an unchanged selection", async () => {
+    vi.clearAllMocks();
+    registeredCommands.clear();
+    mockWebviewFormPanelOpen.mockReturnValue({ dispose: vi.fn(), onDidDispose: vi.fn() });
+    const server = makeServer({ protocol: "telnet", highlightProfileId: "cisco",
+      origin: { sourceId: "src", externalId: "d", syncedAt: 1, templated: { highlightProfileId: "cisco" } }
+    });
+    const { ctx } = setupHarness({ profiles: [], activeTunnels: [], servers: [server] });
+    registerServerCommands(ctx);
+    await registeredCommands.get("nexus.server.edit")!(server.id);
+    const options = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as {
+      onSubmit: (values: Record<string, unknown>) => Promise<void>;
+    };
+    await ctx.core.addOrUpdateServer({
+      ...server, highlightProfileId: "junos", origin: { ...server.origin!, templated: { highlightProfileId: "junos" } }
+    });
+    await options.onSubmit({ name: "New name", host: server.host, port: server.port, protocol: "telnet", highlightProfileId: "profile:cisco" });
+    expect(ctx.core.getServer(server.id)).toMatchObject({
+      name: "New name", highlightProfileId: "junos", origin: { templated: { highlightProfileId: "junos" } }
+    });
+  });
 });
 
 describe("formValuesToServer — BMC fields (issue #48 PR-B)", () => {
@@ -3216,7 +3263,8 @@ describe("SSH File Explorer auto-open on manual connect", () => {
   });
 
   it("can disable highlighting for every selected profile", async () => {
-    const servers = [makeServer({ id: "one", highlightProfileId: "custom" }), makeServer({ id: "two" })];
+    const origin = { sourceId: "src", externalId: "d", syncedAt: 1, templated: { highlightProfileId: null, logSession: false } };
+    const servers = [makeServer({ id: "one", highlightProfileId: null, origin }), makeServer({ id: "two" })];
     const { ctx, addOrUpdateServer } = setupHarness({ profiles: [], activeTunnels: [], servers });
     mockWebviewFormPanelOpen.mockReturnValue({ onDidDispose: vi.fn() });
     registerServerCommands(ctx);
@@ -3224,7 +3272,10 @@ describe("SSH File Explorer auto-open on manual connect", () => {
     await registeredCommands.get("nexus.server.edit")!(rows[0], rows);
     const handlers = mockWebviewFormPanelOpen.mock.calls.at(-1)![2] as { onSubmit: (v: any) => Promise<void> };
     await handlers.onSubmit({ __bulk_apply_highlightProfileId: true, highlightProfileId: "__none__" });
-    expect(addOrUpdateServer.mock.calls.map(([server]) => server)).toEqual(servers.map((server) => ({ ...server, highlightProfileId: null })));
+    expect(addOrUpdateServer.mock.calls.map(([server]) => server)).toEqual([
+      { ...servers[0], highlightProfileId: null, origin: { ...origin, templated: { logSession: false } } },
+      { ...servers[1], highlightProfileId: null }
+    ]);
   });
 
   it("does not silently assign the exclusive auto-open option to only one selected profile", async () => {

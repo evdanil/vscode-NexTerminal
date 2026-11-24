@@ -1206,10 +1206,34 @@ function prepareHighlightImport(data: NexusConfigExport, mode: "merge" | "replac
     for (const profile of incomingProfiles) if (isRecordValue(profile) && typeof profile.id === "string") occupiedIds.add(profile.id);
   }
   if (typeof settings?.[defaultKey] === "string") occupiedIds.add(settings[defaultKey] as string);
+  const templateReferences: Array<{ record: Record<string, unknown>; key: string; id: string }> = [];
+  const collectTemplateReference = (record: unknown, key: string): void => {
+    if (!isRecordValue(record)) return;
+    const id = record[key];
+    if (typeof id === "string" && isHighlightProfileSelection(id)) {
+      occupiedIds.add(id);
+      templateReferences.push({ record, key, id });
+    }
+  };
+  if (Array.isArray(data.deviceTemplates)) {
+    for (const template of data.deviceTemplates) {
+      if (isRecordValue(template) && isRecordValue(template.fields)) {
+        collectTemplateReference(template.fields.highlightProfileId, "value");
+      }
+    }
+  }
   for (const key of ["servers", "serialProfiles", "localShellProfiles", "localServers"] as const) {
     const rows = data[key];
     if (Array.isArray(rows)) for (const row of rows as unknown[]) {
       if (isRecordValue(row) && typeof row.highlightProfileId === "string") occupiedIds.add(row.highlightProfileId);
+    }
+  }
+  if (Array.isArray(data.servers)) {
+    for (const server of data.servers) {
+      if (!isRecordValue(server)) continue;
+      for (const origin of [server.origin, server.formerlySynced]) {
+        if (isRecordValue(origin)) collectTemplateReference(origin.templated, "highlightProfileId");
+      }
     }
   }
   const missingReference = (id: string): string => {
@@ -1300,6 +1324,11 @@ function prepareHighlightImport(data: NexusConfigExport, mode: "merge" | "replac
     delete settings[defaultKey];
   }
 
+  const mapSelection = (selection: string): string =>
+    (carriesCatalog ? remapped.get(selection) : undefined) ?? missingReference(selection);
+  for (const { record, key, id } of templateReferences) {
+    record[key] = mapSelection(id);
+  }
   for (const key of ["servers", "serialProfiles", "localShellProfiles", "localServers"] as const) {
     const rows = data[key];
     if (!Array.isArray(rows)) continue;
@@ -1308,9 +1337,21 @@ function prepareHighlightImport(data: NexusConfigExport, mode: "merge" | "replac
       Object.assign(raw, sanitizeHighlightProfileSelection(raw));
       const selection = raw.highlightProfileId;
       if (typeof selection === "string") {
-        raw.highlightProfileId = (carriesCatalog ? remapped.get(selection) : undefined) ?? missingReference(selection);
+        raw.highlightProfileId = mapSelection(selection);
       } else if (selection === undefined && mode === "merge" && carriesCatalog) {
-        raw.highlightProfileId = importedDefault === null ? null : remapped.get(importedDefault) ?? missingReference(importedDefault);
+        const pinnedDefault = importedDefault === null ? null : mapSelection(importedDefault);
+        raw.highlightProfileId = pinnedDefault;
+        if (key === "servers") {
+          // A device that cleared a template value has opted out. Pinning its
+          // imported default can match the old stamp and inadvertently give
+          // the template ownership again. The pinned value should stay manual.
+          for (const origin of [raw.origin, raw.formerlySynced]) {
+            if (isRecordValue(origin) && isRecordValue(origin.templated) && origin.templated.highlightProfileId === pinnedDefault) {
+              delete origin.templated.highlightProfileId;
+              if (Object.keys(origin.templated).length === 0) delete origin.templated;
+            }
+          }
+        }
       }
     }
   }
@@ -2211,6 +2252,7 @@ const SHARED_TEMPLATED_STAMP_RULES = {
   multiplexing: "keep",
   legacyAlgorithms: "keep",
   logSession: "keep",
+  highlightProfileId: "keep",
   ipmiAuthProfileId: "link",
   ipmiGatewayServerId: "link"
 } satisfies ShareRules<NonNullable<ServerOrigin["templated"]>>;
@@ -2237,6 +2279,7 @@ const SHARED_TEMPLATE_FIELD_RULES = {
   multiplexing: shareTemplateFlag,
   legacyAlgorithms: shareTemplateFlag,
   logSession: shareTemplateFlag,
+  highlightProfileId: (field) => shareTemplateField(field, (value) => value),
   ipmiAuthProfileId: "link",
   ipmiGatewayServerId: "link"
 } satisfies ShareRules<DeviceTemplateProfile["fields"]>;
@@ -4046,6 +4089,16 @@ export function registerConfigCommands(
     const referenced = new Set(runtime?.getReferencedHighlightProfileIds?.() ?? []);
     for (const row of [...snapshot.servers, ...snapshot.serialProfiles, ...snapshot.localShellProfiles, ...snapshot.localServers]) {
       if (typeof row.highlightProfileId === "string") referenced.add(row.highlightProfileId);
+    }
+    for (const template of snapshot.deviceTemplates) {
+      const id = template.fields.highlightProfileId?.value;
+      if (typeof id === "string") referenced.add(id);
+    }
+    for (const server of snapshot.servers) {
+      for (const origin of [server.origin, server.formerlySynced]) {
+        const id = origin?.templated?.highlightProfileId;
+        if (typeof id === "string") referenced.add(id);
+      }
     }
     return referenced;
   }

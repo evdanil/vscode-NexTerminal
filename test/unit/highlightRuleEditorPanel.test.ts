@@ -112,10 +112,11 @@ describe("HighlightRuleEditorPanel.readRules — known-default upgrade", () => {
 
 describe("HighlightRuleEditorPanel profile deletion", () => {
   beforeEach(() => { state.disposeListener?.(); state.disposeListener = undefined; state.postedMessages = []; state.rules = []; state.warning = ""; });
-  it("confirms deletion with saved and live reference counts before staging it", async () => {
-    HighlightRuleEditorPanel.open(() => ({ saved: 3, live: 2 }));
+  it("shows connections, templates and live sessions when confirming deletion", async () => {
+    HighlightRuleEditorPanel.open(() => ({ saved: 3, templates: 1, live: 2 }));
     await state.messageListener?.({ type: "confirmDeleteProfile", profileId: "default", profileName: "Default" });
     expect(state.warning).toContain("3 saved");
+    expect(state.warning).toContain("1 device template");
     expect(state.warning).toContain("2 live");
     expect(state.postedMessages).toContainEqual({ type: "confirmDeleteProfileResult", profileId: "default", confirmed: true });
   });

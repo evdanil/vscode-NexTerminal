@@ -119,6 +119,51 @@ function plan(opts: PlanOpts): InventorySyncPlan {
   });
 }
 
+describe("device template highlight profiles", () => {
+  const source = makeSource({ templateRules: [rule("tmpl-1")] });
+  const devices = [makeDevice()];
+
+  it.each(["ssh", "telnet"] as const)("assigns and reports a highlight profile on new %s devices", (kind) => {
+    const result = plan({
+      source, devices: [makeDevice({ endpoints: [{ kind, host: "10.0.0.1" }] })],
+      templates: [template({ highlightProfileId: { mode: "fill", value: "cisco" } })]
+    });
+    expect(result.adds[0]?.highlightProfileId).toBe("cisco");
+    expect(result.adds[0]?.origin?.templated?.highlightProfileId).toBe("cisco");
+    expect(result.warnings.some((line) => line.includes('Highlight Profile ← "T"'))).toBe(true);
+  });
+
+  it("applies Fill to an existing device with no selection", () => {
+    const result = plan({
+      source, devices, servers: [ownedServer()],
+      templates: [template({ highlightProfileId: { mode: "fill", value: "cisco" } })]
+    });
+    expect(result.updates[0]?.after.highlightProfileId).toBe("cisco");
+  });
+
+  it("updates a still-owned selection in Override mode and recognizes None as a stamped value", () => {
+    const result = plan({
+      source, devices, servers: [ownedServer({ highlightProfileId: "cisco" }, { templated: { highlightProfileId: "cisco" } })],
+      templates: [template({ highlightProfileId: { mode: "override", value: null } })]
+    });
+    expect(result.updates[0]?.after.highlightProfileId).toBeNull();
+    expect(result.updates[0]?.after.origin?.templated?.highlightProfileId).toBeNull();
+  });
+
+  it.each([
+    ["fill", "cisco", "cisco"],
+    ["override", "manual", "cisco"],
+    ["override", undefined, "cisco"],
+    ["override", null, undefined]
+  ] as const)("preserves selection %j / %j / %j when the matrix forbids a write", (mode, selection, stamp) => {
+    const result = plan({
+      source, devices, servers: [ownedServer({ highlightProfileId: selection }, stamp === undefined ? {} : { templated: { highlightProfileId: stamp } })],
+      templates: [template({ highlightProfileId: { mode, value: "junos" } })]
+    });
+    expect(result.updates).toEqual([]);
+  });
+});
+
 /** DEVICE_INSTANCE — the NetBox deployment the Fix 1 adoption fixtures record and sync against. */
 const DEVICE_INSTANCE = "https://netbox.example.com";
 

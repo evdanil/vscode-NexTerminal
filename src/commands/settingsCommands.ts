@@ -1,12 +1,12 @@
 import * as vscode from "vscode";
 import { SettingsPanel } from "../ui/settingsPanel";
-import { HighlightRuleEditorPanel } from "../ui/highlightRuleEditorPanel";
+import { HighlightRuleEditorPanel, type HighlightReferenceCounts } from "../ui/highlightRuleEditorPanel";
 import { SETTINGS_META } from "../ui/settingsMetadata";
 import { resetAllExtraKeys, resetSettings } from "../ui/settingsReset";
 
 export function registerSettingsCommands(
   resolveLogDir: () => string,
-  countHighlightReferences?: (id: string) => { saved: number; live: number }
+  countHighlightReferences?: (id: string) => HighlightReferenceCounts
 ): vscode.Disposable[] {
   return [
     vscode.commands.registerCommand("nexus.settings.openPanel", (category?: string) => {

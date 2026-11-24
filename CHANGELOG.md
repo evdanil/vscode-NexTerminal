@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.323] — 2026-11-24
+
+### Added
+
+- **Device templates can set a Highlight Profile** for matched SSH and Telnet devices. Choose any saved profile, including your own rules or a customized preset, or choose **None** to turn off highlighting. Apply the template through inventory sync or use **Apply Device Template** on an existing folder.
+
 ## [2.8.322] — 2026-11-19
 
 ### Added

@@ -341,6 +341,7 @@ export interface ServerOrigin {
     multiplexing?: boolean;
     legacyAlgorithms?: boolean;
     logSession?: boolean;
+    highlightProfileId?: string | null;
     // DEVICE TEMPLATES (issue #48 PR-T3, §14) — VALUE stamps for the two IPMI id
     // references, following the `proxy` value-stamp pattern (present-when-set;
     // presence checks are `!== undefined`, never truthiness). A present member is
@@ -945,6 +946,7 @@ export function templatedStampsEqual(a: ServerOrigin["templated"], b: ServerOrig
     ap.multiplexing === bp.multiplexing &&
     ap.legacyAlgorithms === bp.legacyAlgorithms &&
     ap.logSession === bp.logSession &&
+    ap.highlightProfileId === bp.highlightProfileId &&
     // DEVICE TEMPLATES (PR-T3) — the two IPMI id-reference stamps join the same
     // `===` comparison the booleans use: present-vs-absent is a DIFFERENCE (a
     // stamp cleared to absent must read as changed so the rollback merge sees it).
@@ -978,6 +980,7 @@ export function templatedHasAnyStamp(templated: ServerOrigin["templated"]): bool
     templated.multiplexing !== undefined ||
     templated.legacyAlgorithms !== undefined ||
     templated.logSession !== undefined ||
+    templated.highlightProfileId !== undefined ||
     templated.ipmiAuthProfileId !== undefined ||
     templated.ipmiGatewayServerId !== undefined
   );

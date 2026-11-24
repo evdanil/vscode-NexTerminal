@@ -5,14 +5,25 @@ import { renderHighlightRuleEditorHtml } from "./highlightRuleEditorHtml";
 import { createWebviewNonce } from "./shared/webviewNonce";
 import { readHighlightEditorState, saveHighlightEditorCatalog } from "./highlightProfileEditorStore";
 
+export interface HighlightReferenceCounts {
+  saved: number;
+  templates: number;
+  live: number;
+}
+
+function describeReferences(counts: HighlightReferenceCounts): string {
+  const templates = counts.templates === 1 ? "1 device template" : `${counts.templates} device templates`;
+  return `${counts.saved} saved connections, ${templates}, and ${counts.live} live sessions`;
+}
+
 export class HighlightRuleEditorPanel {
   private static instance: HighlightRuleEditorPanel | undefined;
   private readonly panel: vscode.WebviewPanel;
   private disposed = false;
   private readonly configListener: vscode.Disposable;
-  private readonly confirmedDeletions = new Map<string, { saved: number; live: number; revision: string }>();
+  private readonly confirmedDeletions = new Map<string, HighlightReferenceCounts & { revision: string }>();
 
-  private constructor(private readonly countReferences: (id: string) => { saved: number; live: number }) {
+  private constructor(private readonly countReferences: (id: string) => HighlightReferenceCounts) {
     this.panel = vscode.window.createWebviewPanel(
       "nexus.highlightRuleEditor", "Highlight Profiles", vscode.ViewColumn.Active,
       { enableScripts: true, retainContextWhenHidden: true }
@@ -31,7 +42,7 @@ export class HighlightRuleEditorPanel {
     });
   }
 
-  public static open(countReferences: (id: string) => { saved: number; live: number } = () => ({ saved: 0, live: 0 })): void {
+  public static open(countReferences: (id: string) => HighlightReferenceCounts = () => ({ saved: 0, templates: 0, live: 0 })): void {
     if (HighlightRuleEditorPanel.instance) {
       HighlightRuleEditorPanel.instance.panel.reveal();
       return;
@@ -67,10 +78,10 @@ export class HighlightRuleEditorPanel {
             return;
           }
           const counts = this.countReferences(profile.id);
-          if (counts.saved !== approved.saved || counts.live !== approved.live) {
+          if (counts.saved !== approved.saved || counts.templates !== approved.templates || counts.live !== approved.live) {
             const name = flattenProviderText(profile.name).slice(0, 100);
             const confirm = await vscode.window.showWarningMessage(
-              `References to "${name}" changed: ${counts.saved} saved connections and ${counts.live} live sessions. Delete this profile?`,
+              `"${name}" is now selected by ${describeReferences(counts)}. Delete this profile?`,
               { modal: true }, "Delete"
             );
             if (confirm !== "Delete") {
@@ -94,7 +105,7 @@ export class HighlightRuleEditorPanel {
       const name = flattenProviderText(savedName ?? (typeof request.profileName === "string" ? request.profileName : "this profile")).slice(0, 100);
       const counts = this.countReferences(id);
       const confirm = await vscode.window.showWarningMessage(
-        `Delete highlight profile "${name}"? It is selected by ${counts.saved} saved connections and ${counts.live} live sessions. Their selection will become unavailable.`,
+        `Delete highlight profile "${name}"? It is selected by ${describeReferences(counts)}. Their selection will become unavailable.`,
         { modal: true }, "Delete"
       );
       if (confirm === "Delete") this.confirmedDeletions.set(id, { ...counts, revision: state.revision });

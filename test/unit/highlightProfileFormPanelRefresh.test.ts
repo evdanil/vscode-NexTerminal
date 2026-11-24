@@ -26,6 +26,7 @@ vi.mock("vscode", () => ({
 
 import { WebviewFormPanel } from "../../src/ui/webviewFormPanel";
 import { highlightProfileSelectField } from "../../src/ui/highlightProfileForm";
+import { deviceTemplateFormDefinition, serverFormDefinition } from "../../src/ui/formDefinitions";
 
 describe("open connection form profile settings updates", () => {
   beforeEach(() => { state.listeners.clear(); state.messages = []; state.profiles = [{ id: "old", name: "Old", rules: [] }]; });
@@ -56,6 +57,29 @@ describe("open connection form profile settings updates", () => {
   it("does not subscribe unrelated forms to highlighting settings", () => {
     const panel = WebviewFormPanel.open("unrelated-refresh-test", { title: "Other", fields: [{ type: "text", key: "name", label: "Name" }] }, { onSubmit: () => {} });
     expect(state.listeners.size).toBe(0);
+    panel.dispose();
+  });
+
+  it("keeps the template picker’s own placeholder and help on catalog refresh", () => {
+    const panel = WebviewFormPanel.open("template-highlight-refresh", deviceTemplateFormDefinition(), { onSubmit: () => {} });
+    state.receive?.({ type: "highlightProfilesReady" });
+    expect(state.messages[0]).toMatchObject({
+      options: expect.arrayContaining([{ label: "Choose a highlight profile", value: "" }, { label: "Old", value: "profile:old" }]),
+      hint: expect.stringContaining("devices this template applies to")
+    });
+    expect(state.messages[0]).not.toMatchObject({ options: expect.arrayContaining([{ label: "Use global default (Old)", value: "" }]) });
+    panel.dispose();
+  });
+
+  it("keeps the ownership hint on a server form when the catalog refreshes", () => {
+    const panel = WebviewFormPanel.open("server-highlight-refresh", serverFormDefinition({
+      highlightProfileId: "old",
+      origin: { sourceId: "src", externalId: "switch", syncedAt: 1, templated: { highlightProfileId: "old" } }
+    }), { onSubmit: () => {} });
+    state.receive?.({ type: "highlightProfilesReady" });
+    expect(state.messages[0]).toMatchObject({
+      hint: expect.stringContaining("This value was applied by a device template.")
+    });
     panel.dispose();
   });
 });

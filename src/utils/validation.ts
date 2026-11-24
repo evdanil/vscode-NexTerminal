@@ -130,6 +130,7 @@ function isValidTemplatedStamps(value: unknown): boolean {
     (obj.multiplexing === undefined || typeof obj.multiplexing === "boolean") &&
     (obj.legacyAlgorithms === undefined || typeof obj.legacyAlgorithms === "boolean") &&
     (obj.logSession === undefined || typeof obj.logSession === "boolean") &&
+    isHighlightProfileSelection(obj.highlightProfileId) &&
     // DEVICE TEMPLATES (PR-T3) — the two IPMI value stamps are id references:
     // non-empty strings when present (an empty string is a link to nothing and
     // could not have come from a sync write). Malformed ⇒ the whole origin is
@@ -663,6 +664,7 @@ export function validateDeviceTemplate(item: unknown): item is DeviceTemplatePro
     validField(fields.multiplexing, (v) => typeof v === "boolean") &&
     validField(fields.legacyAlgorithms, (v) => typeof v === "boolean") &&
     validField(fields.logSession, (v) => typeof v === "boolean") &&
+    validField(fields.highlightProfileId, (v) => v !== undefined && isHighlightProfileSelection(v)) &&
     // DEVICE TEMPLATES (PR-T3) — the two IPMI id-reference fields carry a
     // non-empty string value, mirroring the `authProfileId` clause above; a
     // malformed `{mode, value: 42}` drops the whole template at the load boundary.

@@ -35,26 +35,30 @@ export function parseHighlightProfileFormValue(
 
 export function highlightProfileSelectField(
   catalog?: HighlightCatalog,
-  selectedId?: HighlightProfileSelection
+  selectedId?: HighlightProfileSelection,
+  forTemplate = false
 ): Extract<FormFieldDescriptor, { type: "select" }> {
   const profiles = catalog?.profiles ?? [];
   const defaultProfile = profiles.find((profile) => profile.id === catalog?.defaultProfileId);
   const defaultName = catalog?.validationError ? "Unavailable" : catalog?.defaultProfileId === null ? "None"
     : defaultProfile?.name ?? (catalog ? `Missing: ${catalog.defaultProfileId}` : undefined);
   const options = [
-    { label: defaultName === undefined ? "Use global default" : `Use global default (${defaultName})`, value: "" },
+    { label: forTemplate ? "Choose a highlight profile" : defaultName === undefined ? "Use global default" : `Use global default (${defaultName})`, value: "" },
     { label: "None", value: NONE_VALUE },
     ...profiles.map((profile) => ({ label: profile.name, value: encodeHighlightProfileSelection(profile.id) }))
   ];
   if (typeof selectedId === "string" && !profiles.some((profile) => profile.id === selectedId)) {
     options.push({ label: `Missing profile: ${selectedId} (no highlighting)`, value: encodeHighlightProfileSelection(selectedId) });
   }
-  const missingDefault = !!catalog && typeof catalog.defaultProfileId === "string" && !defaultProfile;
+  const missingDefault = !forTemplate && !!catalog && typeof catalog.defaultProfileId === "string" && !defaultProfile;
   const recoveryRequired = !!catalog?.validationError || missingDefault;
   const stateHint = catalog?.validationError
     ? `${catalog.validationError} ${HIGHLIGHT_SETTINGS_REPAIR}`
     : missingDefault ? `The default highlight profile is missing. ${HIGHLIGHT_SETTINGS_REPAIR}`
       : catalog?.enabled === false ? "Highlighting is off in the current settings. Enable terminal highlighting in the applicable Settings scope." : "";
+  const scopeHint = forTemplate
+    ? "Sets terminal highlighting on devices this template applies to. Choose None to turn highlighting off for those devices."
+    : "Applies to this saved connection. A terminal's own highlight override takes precedence.";
   return {
     type: "select",
     key: "highlightProfileId",
@@ -62,6 +66,6 @@ export function highlightProfileSelectField(
     filterable: true,
     options,
     value: encodeHighlightProfileSelection(selectedId),
-    hint: `${stateHint ? `${stateHint} ` : ""}Applies to this saved connection. A terminal's own highlight override takes precedence.${recoveryRequired ? "" : " Manage profiles with Nexus: Edit Highlighting Rules."}`
+    hint: `${stateHint ? `${stateHint} ` : ""}${scopeHint}${recoveryRequired ? "" : " Manage profiles with Nexus: Edit Highlighting Rules."}`
   };
 }

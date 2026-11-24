@@ -52,19 +52,15 @@ import type { DeviceTemplateProfile, TemplateField, TemplateFieldMode } from "..
  */
 
 /**
- * The v1 templatable fields. All EXCEPT `authProfileId` stamp `origin.templated`
+ * Templatable fields. All EXCEPT `authProfileId` stamp `origin.templated`
  * (the auth link reuses the shared `syncedAuthProfileId`). The two IPMI id
  * references (PR-T3, §14) are `origin.templated`-value-stamped like proxy/booleans
  * and additionally reference-validated skip-and-warn (§5.3).
  */
-export type TemplatableField =
-  | "proxy"
-  | "authProfileId"
-  | "multiplexing"
-  | "legacyAlgorithms"
-  | "logSession"
-  | "ipmiAuthProfileId"
-  | "ipmiGatewayServerId";
+export type TemplatableField = keyof DeviceTemplateProfile["fields"];
+
+export const TEMPLATE_APPLIED_FIELD_HINT =
+  "This value was applied by a device template. Changing it here makes your value permanent — future syncs and template edits will leave it alone.";
 
 /**
  * §7.3 / §7.4 — the ONE short-label map for templatable field display names,
@@ -79,6 +75,7 @@ export const TEMPLATE_FIELD_SHORT_LABELS: Record<TemplatableField, string> = {
   multiplexing: "Multiplexing",
   legacyAlgorithms: "Legacy Algorithms",
   logSession: "Session Logging",
+  highlightProfileId: "Highlight Profile",
   ipmiAuthProfileId: "IPMI Auth Profile",
   ipmiGatewayServerId: "IPMI Gateway"
 };
@@ -100,6 +97,7 @@ export const TEMPLATABLE_FIELD_ORDER: readonly TemplatableField[] = [
   "multiplexing",
   "legacyAlgorithms",
   "logSession",
+  "highlightProfileId",
   "ipmiAuthProfileId",
   "ipmiGatewayServerId"
 ];
@@ -116,6 +114,7 @@ const NON_AUTH_TEMPLATABLE_FIELDS = [
   "multiplexing",
   "legacyAlgorithms",
   "logSession",
+  "highlightProfileId",
   "ipmiAuthProfileId",
   "ipmiGatewayServerId"
 ] as const;
@@ -133,7 +132,7 @@ const NON_AUTH_TEMPLATABLE_FIELDS = [
  * SSH auth link already surfaces on its own `[auth: …]` tooltip suffix.
  */
 export function templateAppliedFields(
-  server: Pick<ServerConfig, "proxy" | "multiplexing" | "legacyAlgorithms" | "logSession" | "ipmiAuthProfileId" | "ipmiGatewayServerId" | "origin">
+  server: Pick<ServerConfig, (typeof NON_AUTH_TEMPLATABLE_FIELDS)[number] | "origin">
 ): TemplatableField[] {
   const origin = server.origin;
   const stamps = origin?.templated;
@@ -459,15 +458,7 @@ export function unknownFilterKeys(parsed: ParsedFilter, attributeKeys: readonly 
 }
 
 /** The per-field winners of the cascade — the {mode, value} each field resolves to. */
-export interface CascadeWinners {
-  proxy?: TemplateField<ProxyConfig | null>;
-  authProfileId?: TemplateField<string>;
-  multiplexing?: TemplateField<boolean>;
-  legacyAlgorithms?: TemplateField<boolean>;
-  logSession?: TemplateField<boolean>;
-  ipmiAuthProfileId?: TemplateField<string>;
-  ipmiGatewayServerId?: TemplateField<string>;
-}
+export type CascadeWinners = DeviceTemplateProfile["fields"];
 
 /** §3.4 — where one field's applied value came from, for the plan-report provenance lines. */
 export interface FieldProvenance {
@@ -636,6 +627,10 @@ export function selectFieldWinners(
   if (logWin !== undefined) {
     winners.logSession = logWin.field;
   }
+  const highlightWin = resolveField<string | null>("highlightProfileId", (t) => t.fields.highlightProfileId, (a, b) => a === b);
+  if (highlightWin !== undefined) {
+    winners.highlightProfileId = highlightWin.field;
+  }
   // PR-T3 (§14) — the two IPMI id references resolve through the identical
   // per-field cascade (string equality); tie-break, specificity, mode-gate and
   // provenance are all inherited from the generic path, no special-casing.
@@ -679,6 +674,7 @@ export interface DesiredNonAuthFields {
   multiplexing?: DesiredField<boolean>;
   legacyAlgorithms?: DesiredField<boolean>;
   logSession?: DesiredField<boolean>;
+  highlightProfileId?: DesiredField<string | null>;
   ipmiAuthProfileId?: DesiredField<string>;
   ipmiGatewayServerId?: DesiredField<string>;
 }
@@ -770,6 +766,11 @@ export function composeDesiredFields(
   if (winners.logSession !== undefined) {
     desired.logSession = { value: winners.logSession.value, mode: winners.logSession.mode };
   }
+  // Settings are scoped to the VS Code window. Retain the ID even when this
+  // window cannot resolve it, just as an individually saved device does.
+  if (winners.highlightProfileId !== undefined) {
+    desired.highlightProfileId = winners.highlightProfileId;
+  }
   // PR-T3 (§5.3 / §14) — reference-validation skip-and-warn for the two IPMI id
   // fields. A dangling reference drops the field to "desired none" (left UNSET so
   // the matrix carries an existing sync-owned value forward, row 5 — never a
@@ -850,7 +851,7 @@ function matrixWrites<T>(
 
 export interface TemplateMatrixResult {
   /** Field values to assign onto the record. */
-  values: Partial<Pick<ServerConfig, "proxy" | "multiplexing" | "legacyAlgorithms" | "logSession" | "ipmiAuthProfileId" | "ipmiGatewayServerId">>;
+  values: Pick<ServerConfig, (typeof NON_AUTH_TEMPLATABLE_FIELDS)[number]>;
   /** The full new `origin.templated` record — carried-forward stamps with the written fields updated. */
   templated: ServerOrigin["templated"];
   /** Canonical route owner after migration and this run's matrix decision. */
@@ -1031,6 +1032,16 @@ export function applyTemplateMatrix(
   applyBool("multiplexing");
   applyBool("legacyAlgorithms");
   applyBool("logSession");
+
+  const highlight = desired.highlightProfileId;
+  if (highlight !== undefined) {
+    const current = ownedServer?.highlightProfileId;
+    const stamp = carried?.highlightProfileId;
+    if (matrixWrites(current !== undefined, current, stamp !== undefined, stamp, highlight, (a, b) => a === b)) {
+      values.highlightProfileId = highlight.value;
+      templated.highlightProfileId = highlight.value;
+    }
+  }
 
   // PR-T3 (§14) — the two IPMI id references ride the SAME §4.3 matrix as the
   // booleans, with string equality. No provider/device supply (srcX empty), so
@@ -1293,6 +1304,7 @@ export interface ManualApplyServerWrite {
   multiplexing?: boolean;
   legacyAlgorithms?: boolean;
   logSession?: boolean;
+  highlightProfileId?: string | null;
   authProfileId?: string;
   ipmiAuthProfileId?: string;
   ipmiGatewayServerId?: string;
@@ -1328,6 +1340,7 @@ export interface ManualApplyPlan {
   multiplexing?: ValueFieldPlan;
   legacyAlgorithms?: ValueFieldPlan;
   logSession?: ValueFieldPlan;
+  highlightProfileId?: ValueFieldPlan;
   ipmiAuthProfileId?: ValueFieldPlan;
   ipmiGatewayServerId?: ValueFieldPlan;
   auth?: AuthFieldPlan;
@@ -1421,9 +1434,9 @@ export function planManualTemplateApply(ctx: ManualApplyContext): ManualApplyPla
     }
   }
 
-  // ---- Boolean value fields -------------------------------------------------
-  const applyBool = (field: "multiplexing" | "legacyAlgorithms" | "logSession"): ValueFieldPlan | undefined => {
-    const tf = template.fields[field];
+  const applyValue = <K extends "multiplexing" | "legacyAlgorithms" | "logSession" | "highlightProfileId">(
+    field: K, tf: TemplateField<ManualApplyServerWrite[K]> | undefined
+  ): ValueFieldPlan | undefined => {
     if (tf === undefined) {
       return undefined;
     }
@@ -1441,9 +1454,10 @@ export function planManualTemplateApply(ctx: ManualApplyContext): ManualApplyPla
     }
     return stats;
   };
-  plan.multiplexing = applyBool("multiplexing");
-  plan.legacyAlgorithms = applyBool("legacyAlgorithms");
-  plan.logSession = applyBool("logSession");
+  plan.multiplexing = applyValue("multiplexing", template.fields.multiplexing);
+  plan.legacyAlgorithms = applyValue("legacyAlgorithms", template.fields.legacyAlgorithms);
+  plan.logSession = applyValue("logSession", template.fields.logSession);
+  plan.highlightProfileId = applyValue("highlightProfileId", template.fields.highlightProfileId);
 
   // ---- IPMI id-reference value fields (PR-T3) -------------------------------
   // Plain value-field semantics (fill = write where unset, override = write over)
@@ -1607,14 +1621,7 @@ function clearStampMembers(source: StampBearer, target: StampBearer, writtenFiel
   }
   if (templated !== undefined) {
     for (const field of writtenFields) {
-      if (
-        field === "proxy" ||
-        field === "multiplexing" ||
-        field === "legacyAlgorithms" ||
-        field === "logSession" ||
-        field === "ipmiAuthProfileId" ||
-        field === "ipmiGatewayServerId"
-      ) {
+      if (field !== "authProfileId") {
         delete templated[field];
       }
     }
