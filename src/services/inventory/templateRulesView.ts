@@ -7,6 +7,7 @@ import {
   filterSpecificity,
   parseTemplateFilter,
   TEMPLATE_FIELD_SHORT_LABELS,
+  TEMPLATABLE_FIELD_ORDER,
   knownKeysList,
   unknownFilterKeys,
   type TemplatableField
@@ -22,15 +23,7 @@ import {
  */
 
 /** The templatable fields, alphabetically by short label — the order §7.2's `Sets:` detail shows. */
-const FIELDS_BY_LABEL: TemplatableField[] = ([
-  "proxy",
-  "authProfileId",
-  "multiplexing",
-  "legacyAlgorithms",
-  "logSession",
-  "ipmiAuthProfileId",
-  "ipmiGatewayServerId"
-] as TemplatableField[]).sort(
+const FIELDS_BY_LABEL = [...TEMPLATABLE_FIELD_ORDER].sort(
   (a, b) => TEMPLATE_FIELD_SHORT_LABELS[a].localeCompare(TEMPLATE_FIELD_SHORT_LABELS[b])
 );
 

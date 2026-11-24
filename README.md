@@ -91,7 +91,7 @@ Then open the **Nexus** sidebar (activity bar icon).
 - **Start and stop nodes** — **Start Node** / **Stop Node** on EVE-NG and GNS3 lab nodes and Proxmox guests. Containerlab remains read-only. → [Start and Stop Nodes](docs/inventory/README.md#start-and-stop-nodes)
 - **Proxmox web console** — **Open Web Console** opens a guest's console in your browser, with no guest address needed. → [Open the Guest Console](docs/inventory/proxmox.md#open-the-guest-console-in-your-browser)
 - **Servers with no address yet** — a device the source has no address for still arrives, as a placeholder row that says why it can't connect. → [Servers with No Address Yet](docs/inventory/README.md#servers-with-no-address-yet)
-- **Device templates** — reusable bundles of connection settings applied to the servers a sync creates, or to a folder on demand. → [Device Templates](docs/inventory/device-templates.md)
+- **Device templates** — apply reusable connection settings to synced SSH and Telnet devices or to a folder on demand. Choose any saved highlight profile, including custom profiles and edited presets. → [Device Templates](docs/inventory/device-templates.md)
 - **Import from an SSH config** — `~/.ssh/config` hosts arrive with their `IdentityFile` keys, `Include`s followed; offered once on first run when you have one. → [Import from an SSH Config](docs/import-export.md#import-from-an-ssh-config)
 - **Import from MobaXterm or SecureCRT** — SSH sessions arrive with their folder hierarchy. → [Import from MobaXterm or SecureCRT](docs/import-export.md#import-from-mobaxterm-or-securecrt)
 - **Import a device list** — paste or load a CSV or host list, confirmed in one summary before anything is written. → [Import a Device List](docs/import-export.md#import-a-device-list)
@@ -121,7 +121,7 @@ Then open the **Nexus** sidebar (activity bar icon).
 
 ### Terminal
 
-- **Highlighting** — named profiles group regex rules for errors, warnings, and addresses. Start with a Cisco IOS / IOS XE, Juniper Junos, or Arista EOS preset and assign the profile to a connection or terminal. → [Highlighting](docs/terminal.md#highlighting)
+- **Highlighting** — create your own regex rules or start with a Cisco IOS / IOS XE, Juniper Junos, or Arista EOS preset. Assign a saved profile to a connection, terminal, or device template. → [Highlighting](docs/terminal.md#highlighting)
 - **Tab commands** — right-click a Nexus tab in the Terminal panel to select its highlight profile, reset the terminal, clear scrollback, or copy its output. → [Tab Commands](docs/terminal.md#tab-commands)
 - **Session transcripts** — clean, ANSI-stripped SSH, telnet, and serial logs with per-line timestamps on by default (local, UTC, or off), optional CRLF-to-LF line-ending conversion, and folder/filename templates using session, host, group and date tokens; **Open Log Directory** opens the log root. → [Session Transcript Logging](docs/terminal.md#session-transcript-logging)
 - **Keyboard passthrough** — `Ctrl+` combinations go straight to vim, nano, or htop, configurable per key. → [Keyboard Passthrough](docs/terminal.md#keyboard-passthrough)

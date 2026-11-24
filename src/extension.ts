@@ -1549,7 +1549,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<NexusE
   const profileDisposables = registerProfileCommands(localServerCtx);
   const settingsDisposables = registerSettingsCommands(
     () => ctx.sessionLogDir,
-    (id) => highlightProfileService.countProfileReferences(id)
+    (id) => ({
+      ...highlightProfileService.countProfileReferences(id),
+      templates: core.getSnapshot().deviceTemplates.filter((template) => template.fields.highlightProfileId?.value === id).length
+    })
   );
   const authProfileDisposables = registerAuthProfileCommands(ctx);
   const externalCredentialDisposables = registerExternalCredentialCommands(ctx);

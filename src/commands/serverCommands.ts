@@ -37,6 +37,7 @@ import type { PtyOutputObserver } from "../services/macroAutoTrigger";
 import { Osc7Parser } from "../services/terminal/osc7Parser";
 import { deleteServerSecrets, passwordSecretKey } from "../services/ssh/silentAuth";
 import { currentProxyPasswordSecretKey } from "../services/ssh/proxyPasswordKeys";
+import { clearDetachedTemplatedStamps, clearTemplatedStamps } from "../services/inventory/templateApply";
 import { serverFormDefinition, toSshInfrastructureServerList } from "../ui/formDefinitions";
 import type { FormFieldDescriptor, FormValues } from "../ui/formTypes";
 import { FolderTreeItem, ServerTreeItem, SessionTreeItem } from "../ui/nexusTreeProvider";
@@ -774,6 +775,18 @@ function applyInventoryProxyRouteChoice<T extends InventoryProxyRouteMarker>(
     return updated;
   }
   return marker;
+}
+
+function keepManualHighlightSelection(server: ServerConfig): void {
+  // Clearing a template-applied value to the global default keeps its stamp
+  // as an opt-out. An explicit profile or None releases template ownership.
+  if (server.highlightProfileId === undefined) return;
+  if (server.origin?.templated?.highlightProfileId !== undefined) {
+    server.origin = clearTemplatedStamps(server.origin, ["highlightProfileId"]);
+  }
+  if (server.formerlySynced?.templated?.highlightProfileId !== undefined) {
+    server.formerlySynced = clearDetachedTemplatedStamps(server.formerlySynced, ["highlightProfileId"]);
+  }
 }
 
 export function formValuesToServer(
@@ -2072,6 +2085,7 @@ function openBulkServerEdit(ctx: CommandContext, rows: readonly ServerTreeItem[]
             ...(changeAltHost ? { altHost: (values.altHost as string).trim() || undefined } : {}),
             ...(changeBmcWebProtocol ? { bmcWebProtocol: values.bmcWebProtocol === "http" ? "http" as const : undefined } : {})
           };
+          if (changeHighlight) keepManualHighlightSelection(next);
           return { prior: cloneServerConfig(target!), next, written: cloneServerConfig(next) };
         });
         if (writes.some((write) => !validateServerConfig(write.next))) throw new Error("The selected changes would leave a profile invalid. Check the settings or edit the profiles individually.");
@@ -2439,14 +2453,17 @@ export function registerServerCommands(ctx: CommandContext): vscode.Disposable[]
               routeChoice,
               removedConcreteRoute
             );
+            const changesHighlight = values.highlightProfileId !== undefined &&
+              candidate.highlightProfileId !== existing.highlightProfileId;
             const updated: ServerConfig = {
               ...preserveDormantSshConfig(liveRecord ?? existing, linked),
-              // An older open form may omit the new control; absence expresses
-              // no preference and must preserve the live record's selection.
-              highlightProfileId: parseHighlightProfileFormValue(values.highlightProfileId, liveRecord?.highlightProfileId),
+              // An untouched picker should not restore its form-open selection
+              // after a template changed the live record during the edit.
+              highlightProfileId: changesHighlight ? candidate.highlightProfileId : liveRecord?.highlightProfileId,
               ...(liveOrigin !== undefined ? { origin: liveOrigin } : {}),
               ...(liveFormerlySynced !== undefined ? { formerlySynced: liveFormerlySynced } : {})
             };
+            if (changesHighlight) keepManualHighlightSelection(updated);
             // FINDINGS 2+3 (P2, edit-rollback review) — addOrUpdateServer
             // enforces single ownership of openFileExplorerOnFirstConnect:
             // if `updated` enables the flag, it clears it from whichever

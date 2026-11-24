@@ -476,7 +476,17 @@ describe("config import command (legacy)", () => {
     configDefaults.set(`${key}profiles`, null);
     configDefaults.set(`${key}defaultProfile`, "default");
     configDefaults.set(`${key}rules`, [{ pattern: "SHIPPED", color: "red" }]);
-    await core.addOrUpdateServer(makeServer({ id: "source", highlightProfileId: "default" }));
+    mockShowInformationMessage.mockResolvedValue(undefined);
+    await core.addOrUpdateInventorySource(makeInventorySource({ templateRules: [{ id: "r1", templateId: "template" }] }));
+    await core.addOrUpdateDeviceTemplate({ id: "template", name: "Switches", fields: { highlightProfileId: { mode: "override", value: "default" } } });
+    await core.addOrUpdateServer(makeServer({
+      id: "source", name: "Template-managed", highlightProfileId: "default",
+      origin: { sourceId: "src1", externalId: "switch", syncedAt: 1, templated: { highlightProfileId: "default" } }
+    }));
+    await core.addOrUpdateServer(makeServer({
+      id: "opted-out", name: "Template opt-out",
+      origin: { sourceId: "src1", externalId: "opted-out", syncedAt: 1, templated: { highlightProfileId: "default" } }
+    }));
     await core.addOrUpdateSerialProfile(makeSerialProfile({ highlightProfileId: "default" }));
     await core.addOrUpdateLocalShellProfile(makeLocalShellProfile({ launchMode: "vscodeProfile", vscodeProfileName: "bash", highlightProfileId: "default" }));
     mockShowSaveDialog.mockResolvedValue({ fsPath: "/fake/export.json", scheme: "file" });
@@ -495,8 +505,10 @@ describe("config import command (legacy)", () => {
     if (format === "backup") mockShowInputBox.mockResolvedValueOnce("masterpass1");
     await runImport(JSON.parse(exportedText), mode);
     const snapshot = dest.getSnapshot();
-    expect(snapshot.servers).toHaveLength(1);
-    const id = snapshot.servers[0].highlightProfileId;
+    expect(snapshot.servers).toHaveLength(2);
+    const managed = snapshot.servers.find((server) => server.name === "Template-managed");
+    const optedOut = snapshot.servers.find((server) => server.name === "Template opt-out");
+    const id = managed?.highlightProfileId;
     const catalog = configStore.get(`${key}profiles`);
     const rules = catalog === null
       ? configStore.get(`${key}rules`)
@@ -504,6 +516,16 @@ describe("config import command (legacy)", () => {
     expect(rules).toEqual([{ pattern: "SHIPPED", color: "red" }]);
     expect(snapshot.serialProfiles[0].highlightProfileId).toBe(id);
     expect(snapshot.localShellProfiles[0].highlightProfileId).toBe(id);
+    expect(snapshot.deviceTemplates[0]?.fields.highlightProfileId).toEqual({ mode: "override", value: id });
+    expect(managed?.origin?.templated?.highlightProfileId).toBe(id);
+    expect(optedOut?.origin).toBeDefined();
+    if (mode === "merge") {
+      expect(optedOut?.highlightProfileId).toBe(id);
+      expect(optedOut?.origin?.templated?.highlightProfileId).toBeUndefined();
+    } else {
+      expect(optedOut?.highlightProfileId).toBeUndefined();
+      expect(optedOut?.origin?.templated?.highlightProfileId).toBe(id);
+    }
   });
 
   it.each([
@@ -551,7 +573,7 @@ describe("config import command (legacy)", () => {
     expect(byName.get("Explicit CR")).not.toHaveProperty("macroNewline");
   });
 
-  it("does not reactivate missing saved, default, or live selections when merging profiles", async () => {
+  it("does not reactivate missing saved, template, default, or live selections when merging profiles", async () => {
     const key = "nexus.terminal.highlighting.";
     configStore.set(`${key}profiles`, []);
     configStore.set(`${key}defaultProfile`, "default");
@@ -559,8 +581,11 @@ describe("config import command (legacy)", () => {
     await core.addOrUpdateSerialProfile(makeSerialProfile({ id: "existing-serial", highlightProfileId: "serial-missing" }));
     await core.addOrUpdateLocalShellProfile(makeLocalShellProfile({ id: "existing-shell", highlightProfileId: "shell-missing" }));
     await core.addOrUpdateLocalServerConfig({ id: "existing-local", name: "Local", executable: "node", highlightProfileId: "local-missing" });
+    await core.addOrUpdateDeviceTemplate({
+      id: "existing-template", name: "Switches", fields: { highlightProfileId: { mode: "fill", value: "template-missing" } }
+    });
     registerConfigCommands(core, vault, undefined, { getReferencedHighlightProfileIds: () => new Set(["live-missing"]) } as never);
-    const ids = ["server-missing", "serial-missing", "shell-missing", "local-missing", "default", "live-missing"];
+    const ids = ["server-missing", "serial-missing", "shell-missing", "local-missing", "template-missing", "default", "live-missing"];
     await runImport(makeExportData({ servers: [makeServer({ id: "incoming", highlightProfileId: "live-missing" })],
       settings: { [`${key}profiles`]: ids.map((id) => ({ id, name: id, rules: [] })) } }), "merge");
     const profiles = configStore.get(`${key}profiles`) as Array<{ id: string; name: string }>;

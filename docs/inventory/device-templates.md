@@ -2,13 +2,17 @@
 
 Apply a named, reusable bundle of connection settings to the servers a sync creates and maintains, instead of hand-editing each one.
 
-A source's auth profile is one setting shared across every server it creates. A **device template** can link a different one to the devices it matches, and carries the rest: a proxy, a multiplexing choice, a legacy-algorithm toggle, session logging, and a BMC login (its own **IPMI Auth Profile** and **IPMI Gateway**) — a reusable bundle applied to matched devices so you don't set them on each synced server by hand.
+A source's auth profile is shared across every server it creates. A **device template** can link a different one to the devices it matches and set other connection preferences, including terminal highlighting.
 
 An SSH **Auth Profile** may use [External Program](../ssh-and-telnet.md#external-program-credentials), including a dynamically supplied private key. Applying or previewing the template carries only the link and never runs the program. **IPMI Auth Profile** excludes external profiles; a previously selected incompatible profile stays marked unavailable until you choose a supported one.
 
 ## What a Template Can Set
 
-A device template can set **Proxy**, **Auth Profile** (SSH), **Multiplexing**, **Legacy Algorithms**, **Session Logging**, **IPMI Auth Profile**, and **IPMI Gateway**. The non-proxy fields use *Not set*, *Fill* (only where nothing is set), or *Override* (replace source and earlier-synced values). Proxy rules also choose a route: *Not set* means no opinion, an SSH proxy selects a jump host, and *Direct* explicitly selects no proxy. Fill and Override apply that route according to the same ownership rules; a route you set by hand stays yours. Templates never store secrets, so a templated proxy may prompt for credentials on first connect.
+A device template can set **Proxy**, **Auth Profile** (SSH), **Multiplexing**, **Legacy Algorithms**, **Session Logging**, **Highlight Profile**, **IPMI Auth Profile**, and **IPMI Gateway**. The non-proxy fields use *Not set*, *Fill* (only where nothing is set), or *Override* (replace source and earlier-synced values). Proxy rules also choose a route: *Not set* means no opinion, an SSH proxy selects a jump host, and *Direct* explicitly selects no proxy. Fill and Override apply that route according to the same ownership rules; a route you set by hand stays yours. Templates never store secrets, so a templated proxy may prompt for credentials on first connect.
+
+Set **Highlight Profile — Template mode** to **Fill** or **Override**, then choose a saved profile or **None** to turn highlighting off. In **Nexus: Edit Highlighting Rules**, create a profile from scratch or customize a Cisco IOS / IOS XE, Juniper Junos, or Arista EOS preset. Click **Apply**, then choose the profile by name in the device template. Inventory sync keeps profiles chosen on individual devices. **Not set** lets other matching rules supply the field. [Terminal highlighting](../terminal.md#highlighting)
+
+On a device with a template-applied highlight profile, choosing **Use global default** opts it out of future template writes for highlighting. If you clear a manually assigned profile with **Use global default**, the next matching sync can supply a profile again.
 
 ## Create and Bind a Template
 

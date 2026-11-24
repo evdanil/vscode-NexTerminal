@@ -20,6 +20,23 @@ function field(def: FormDefinition, key: string): FormFieldDescriptor | undefine
 const P: ProxyConfig = { type: "socks5", host: "10.0.0.9", port: 1080 };
 
 describe("deviceTemplateFormDefinition — tri-state wiring (§7.1)", () => {
+  it("offers existing highlight profiles and explicit None in the template value picker", () => {
+    const definition = deviceTemplateFormDefinition({
+      id: "t1", name: "Switches", fields: { highlightProfileId: { mode: "fill", value: "cisco" } }
+    }, [], [], { enabled: true, legacy: false, defaultProfileId: "cisco", profiles: [{ id: "cisco", name: "Cisco IOS / IOS XE", rules: [] }] });
+    expect(field(definition, "mode_highlightProfileId")).toMatchObject({ value: "fill" });
+    expect(field(definition, "highlightProfileId")).toMatchObject({
+      type: "select",
+      visibleWhen: { field: "mode_highlightProfileId", value: ["fill", "override"] },
+      value: "profile:cisco",
+      options: [
+        { label: "Choose a highlight profile", value: "" },
+        { label: "None", value: "__none__" },
+        { label: "Cisco IOS / IOS XE", value: "profile:cisco" }
+      ]
+    });
+  });
+
   it("each field's value control is gated on its companion mode select (fill|override)", () => {
     const def = deviceTemplateFormDefinition();
     // The proxy control block is gated on mode_proxy.
@@ -230,6 +247,7 @@ describe("shared short-label map (§7.3/§7.4)", () => {
       multiplexing: "Multiplexing",
       legacyAlgorithms: "Legacy Algorithms",
       logSession: "Session Logging",
+      highlightProfileId: "Highlight Profile",
       ipmiAuthProfileId: "IPMI Auth Profile",
       ipmiGatewayServerId: "IPMI Gateway"
     });

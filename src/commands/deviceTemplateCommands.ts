@@ -29,6 +29,8 @@ import { legacyProxyPasswordSecretKey } from "../services/ssh/silentAuth";
 import { deviceTemplateFormDefinition, type ServerListEntry , toSshInfrastructureServerList } from "../ui/formDefinitions";
 import type { FormValues } from "../ui/formTypes";
 import { WebviewFormPanel } from "../ui/webviewFormPanel";
+import { parseHighlightProfileFormValue } from "../ui/highlightProfileForm";
+import { readHighlightCatalog } from "../services/terminal/highlightProfileSettings";
 import { ManagementListPanel, type ManagementListDescriptor } from "../ui/managementListPanel";
 import { FolderTreeItem } from "../ui/nexusTreeProvider";
 import { formValuesToProxy } from "./serverCommands";
@@ -113,6 +115,10 @@ export function parseDeviceTemplateFormValues(values: FormValues, existingId?: s
   if (log) {
     fields.logSession = log;
   }
+  const highlight = readTemplateField(values, "highlightProfileId", () => parseHighlightProfileFormValue(values.highlightProfileId));
+  if (highlight) {
+    fields.highlightProfileId = highlight;
+  }
   // PR-T3 — the two IPMI id references. Both submit under their own key from a
   // filterable select; a "(None)"/empty pick or the `__create__` sentinel reads
   // as "no value" (throws if a mode was chosen — same as the SSH auth row).
@@ -158,7 +164,7 @@ function sameSourceIdSet(a: readonly { id: string }[], b: readonly { id: string 
  * panel so the rules flow's inline-create (UX-M5) can await its outcome. */
 function openDeviceTemplateEditor(ctx: CommandContext, seed?: DeviceTemplateProfile): WebviewFormPanel {
   const snapshot = ctx.core.getSnapshot();
-  const definition = deviceTemplateFormDefinition(seed, serverListEntries(ctx), snapshot.authProfiles);
+  const definition = deviceTemplateFormDefinition(seed, serverListEntries(ctx), snapshot.authProfiles, readHighlightCatalog());
   const formId = seed?.id ? `device-template-edit-${seed.id}` : "device-template-add";
   // FIX B (issue #48 PR-T1b / PR #62 Codex review round 2) — the revision of the
   // record this Edit editor is seeded from, captured before the (unbounded) time
@@ -259,6 +265,15 @@ function openDeviceTemplateEditor(ctx: CommandContext, seed?: DeviceTemplateProf
         }
         const unsupportedIpmi = externalAuthProfileUnsupportedReason(linkedIpmiAuthProfileId ? ctx.core.getAuthProfile(linkedIpmiAuthProfileId) : undefined, "ipmi");
         if (unsupportedIpmi) throw new Error(unsupportedIpmi);
+        const highlightId = template.fields.highlightProfileId?.value;
+        // A settings scope can hide a profile used in another workspace. Let
+        // an existing template retain its link while this editor is open.
+        if (
+          typeof highlightId === "string" && highlightId !== seed?.fields.highlightProfileId?.value &&
+          !readHighlightCatalog().profiles.some((profile) => profile.id === highlightId)
+        ) {
+          throw new Error('The selected highlight profile is no longer available. Choose another profile or set its template mode to "Not set".');
+        }
         await ctx.core.addOrUpdateDeviceTemplate(template);
       });
       // U1 (§6.1 UX-S8) — the VERBATIM save toast (single "saved." wording, not a
@@ -509,6 +524,7 @@ function buildConsentModalDetail(plan: ManualApplyPlan): string {
   valueLine("multiplexing", plan.multiplexing);
   valueLine("legacyAlgorithms", plan.legacyAlgorithms);
   valueLine("logSession", plan.logSession);
+  valueLine("highlightProfileId", plan.highlightProfileId);
   valueLine("ipmiAuthProfileId", plan.ipmiAuthProfileId);
   valueLine("ipmiGatewayServerId", plan.ipmiGatewayServerId);
   if (plan.auth) {
@@ -606,6 +622,9 @@ export async function applyPlanWrites(ctx: CommandContext, plan: ManualApplyPlan
     }
     if (write.logSession !== undefined) {
       next.logSession = write.logSession;
+    }
+    if (write.highlightProfileId !== undefined) {
+      next.highlightProfileId = write.highlightProfileId;
     }
     if (write.authProfileId !== undefined) {
       if (ctx.core.getAuthProfile(write.authProfileId) !== undefined) {

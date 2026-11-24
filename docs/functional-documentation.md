@@ -773,15 +773,19 @@ Shared local and dynamic tunnels use one in-flight SSH login for their listener 
 
 Saved SSH/Telnet, serial, Local Shell, and Local Server connections may inherit the default, select a profile, or select none. **Select Terminal Highlight Profile** is available inside either terminal location and on a tab in the Terminal panel.
 
+Device templates can set any saved highlight profile, including a user-created profile or a customized preset, on SSH and Telnet devices. **None** turns highlighting off. Inventory sync applies the per-field Fill/Override rules and tracks template ownership so device-level edits take precedence. **Apply Device Template** on a folder writes the setting as a manual choice.
+
 The Connectivity Hub offers the same action on its connected rows. Each menu requires one identifiable destination.
 
 To use the Command Palette, focus the terminal you want to change.
 
-Profile and default changes propagate to live terminals. Deleting a profile warns about saved and live references. Unresolved selections apply no highlighting. Configuration exports include profiles and defaults. Merge and share preserve the recipient's default and remap conflicting profile IDs. Replacement restores the imported default. Terminal-category and Reset All settings resets clear the profile catalog, default and legacy rules.
+Profile and default changes propagate to live terminals. Before deletion, the editor shows how many connections, device templates, and open terminals use the selected profile. Unresolved selections apply no highlighting.
+
+Configuration exports include profiles and defaults. Merge and share preserve the recipient's default and remap conflicting profile IDs in connection selections, template selections, and their sync ownership stamps. Replacement restores the imported default. Terminal-category and Reset All settings resets clear the profile catalog, default and legacy rules.
 
 The manager requires an unfinished rule to be staged or cancelled before another action can discard it; the rule editor's Delete Rule action explicitly discards that edit and stages deletion of the rule. If settings change while a draft is open, the draft remains visible for the user to record before closing the Highlight Profiles tab and running the editor command again; closing discards that draft.
 
-**Create from preset** stages an editable Cisco IOS / IOS XE, Juniper Junos, or Arista EOS profile with a new ID. **Apply** adds the copy to the ordinary profile catalog. It is available in connection forms and terminal selectors after saving, subject to workspace overrides. **Cancel** discards the draft copy.
+**Create from preset** stages an editable Cisco IOS / IOS XE, Juniper Junos, or Arista EOS profile with a new ID. **Apply** adds the copy to the ordinary profile catalog. It is available in connection forms, device templates, and terminal selectors after saving, subject to workspace overrides. **Cancel** discards the draft copy.
 
 Creating or duplicating a profile focuses and selects its generated name. The name field edits the selected profile; Rename focuses and selects it, Enter or leaving the field accepts a rename, and Escape restores the last accepted name. Apply includes pending name text. Name validation rejects blanks and case-insensitive duplicates without discarding the text or rule edits; Cancel restores the catalog draft.
 

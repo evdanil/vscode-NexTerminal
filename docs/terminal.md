@@ -20,11 +20,13 @@ If saving fails, the manager shows available error details. Some settings may al
 
 The Highlight Profile field on saved SSH/Telnet, serial, Local Shell, and Local Server connections chooses the global default, a named profile, or no highlighting.
 
+Use a [device template](inventory/device-templates.md#what-a-template-can-set) to set highlighting on multiple SSH or Telnet devices through inventory sync or **Apply Device Template** on a folder.
+
 Choose **Select Terminal Highlight Profile** from the context menu inside the terminal (including terminals open in the editor) or its tab in the Terminal panel.
 
 The same action is on connected rows in the Connectivity Hub. To use the Command Palette, focus the terminal you want to change.
 
-**Use saved connection setting** returns a saved connection to its profile preference. Changes to a highlight profile or default apply to terminals that follow it. Deleting a profile warns about saved connections and live terminals using it. A missing profile applies no highlighting.
+**Use saved connection setting** returns a saved connection to its profile preference. Changes to a highlight profile or default apply to terminals that follow it. Deleting a profile warns about saved connections, device templates, and live terminals using it. A missing profile applies no highlighting.
 
 The manager saves global settings. If a workspace overrides the catalog or default, that workspace's setting takes precedence. Backups and sharing include highlight profiles; merging imports keeps the recipient's default and remaps colliding profile IDs. Terminal-category and Reset All settings resets clear the catalog, default and legacy rules.
 
@@ -34,7 +36,7 @@ If the catalog or default is invalid or the default profile is missing, inspect 
 
 ### Network device presets
 
-In **Nexus: Edit Highlighting Rules**, choose a **Profile preset**, then click **Create from preset**. The editor creates an editable copy. Give it a name or adjust the rules, then click **Apply**. Pick the saved copy in a connection's **Highlight Profile** field or with **Select Terminal Highlight Profile**. Choose **Global default** separately if you want other connections to inherit it.
+In **Nexus: Edit Highlighting Rules**, choose a **Profile preset**, then click **Create from preset**. The editor creates an editable copy. Give it a name or adjust the rules, then click **Apply**. Pick the saved copy in a connection or device template's **Highlight Profile** field, or with **Select Terminal Highlight Profile**. Choose **Global default** separately if you want other connections to inherit it.
 
 | Preset | Highlights |
 | --- | --- |

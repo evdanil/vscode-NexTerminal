@@ -45,7 +45,7 @@ export interface DeviceTemplateProfile {
    * cascade falls through it to the next-most-specific rule. There is no
    * "clear" mode in v1 (see §11 open question 3), so absence is unambiguous.
    *
-   * These seven v1 fields are templatable. `host`/`name`/`ipmiHost`
+   * `host`/`name`/`ipmiHost`
    * (identity), `group` (folder placement), `username`/`authType`/`keyPath`
    * (auth-profile machinery), and `port` (deferred, §4.6) are deliberately
    * excluded. `authProfileId` is a LINK only — never copied credentials — and
@@ -71,6 +71,8 @@ export interface DeviceTemplateProfile {
     multiplexing?: TemplateField<boolean>;
     legacyAlgorithms?: TemplateField<boolean>;
     logSession?: TemplateField<boolean>;
+    /** A settings profile ID, or null for explicit None. */
+    highlightProfileId?: TemplateField<string | null>;
     ipmiAuthProfileId?: TemplateField<string>; // AuthProfile.id — the BMC's own login (PR-T3)
     ipmiGatewayServerId?: TemplateField<string>; // ServerConfig.id — the IPMI gateway (PR-T3)
   };

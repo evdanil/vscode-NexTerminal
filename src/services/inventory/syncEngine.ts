@@ -38,6 +38,7 @@ import {
   type FieldProvenance,
   type PreparedRule,
   type ProfilesNeedingServerKey,
+  type TemplateMatrixResult,
   type TemplatableField
 } from "./templateApply";
 
@@ -1809,6 +1810,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
           ownedForAddressless.multiplexing !== after.multiplexing ||
           ownedForAddressless.legacyAlgorithms !== after.legacyAlgorithms ||
           ownedForAddressless.logSession !== after.logSession ||
+          ownedForAddressless.highlightProfileId !== after.highlightProfileId ||
           ownedForAddressless.ipmiAuthProfileId !== after.ipmiAuthProfileId ||
           ownedForAddressless.ipmiGatewayServerId !== after.ipmiGatewayServerId ||
           !serverOriginStampsEqual(ownedForAddressless.origin, after.origin);
@@ -2041,21 +2043,14 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     const recordWrittenProvenance = (
       serverId: string,
       serverName: string,
-      matrixValues: Partial<Pick<ServerConfig, "proxy" | "multiplexing" | "legacyAlgorithms" | "logSession" | "ipmiAuthProfileId" | "ipmiGatewayServerId">>,
+      matrixValues: TemplateMatrixResult["values"],
       authWritten: boolean,
       proxyWritten: boolean,
       proxyOwner: "source-default" | "template" | undefined
     ): void => {
       const provenance: Partial<Record<TemplatableField, FieldProvenance>> = {};
-      const nonAuthFields: Array<"proxy" | "multiplexing" | "legacyAlgorithms" | "logSession" | "ipmiAuthProfileId" | "ipmiGatewayServerId"> = [
-        "proxy",
-        "multiplexing",
-        "legacyAlgorithms",
-        "logSession",
-        "ipmiAuthProfileId",
-        "ipmiGatewayServerId"
-      ];
-      for (const f of nonAuthFields) {
+      for (const f of TEMPLATABLE_FIELD_ORDER) {
+        if (f === "authProfileId") continue;
         if (f === "proxy" ? proxyWritten : matrixValues[f] !== undefined) {
           if (f === "proxy" && proxyOwner === "source-default") {
             provenance.proxy = { sourceDefault: true };
@@ -2765,6 +2760,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
         ownedServer.multiplexing !== after.multiplexing ||
         ownedServer.legacyAlgorithms !== after.legacyAlgorithms ||
         ownedServer.logSession !== after.logSession ||
+        ownedServer.highlightProfileId !== after.highlightProfileId ||
         // PR-T3 — the two IPMI id-reference value fields join the value half; the
         // origin half (their `templated` stamps) rides in on serverOriginStampsEqual.
         ownedServer.ipmiAuthProfileId !== after.ipmiAuthProfileId ||
@@ -4256,6 +4252,7 @@ export function computeSyncPlan(input: ComputeSyncPlanInput): InventorySyncPlan 
     before.multiplexing !== after.multiplexing ||
     before.legacyAlgorithms !== after.legacyAlgorithms ||
     before.logSession !== after.logSession ||
+    before.highlightProfileId !== after.highlightProfileId ||
     // PR-T3 review FIX 4 — symmetry with the mainline `changed` comparator (which
     // lists both IPMI value fields). Unexploitable today (every matrix ipmi write
     // also rewrites its stamp, and `serverOriginStampsEqual` below covers stamps),
