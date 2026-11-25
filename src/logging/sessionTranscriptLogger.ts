@@ -116,7 +116,8 @@ export interface SessionTranscript {
   /**
    * Drop the ANSI stripper's carry: the PTY is starting a new transport (an SSH
    * reconnect or Smart Follow reattach), so an escape the old one left unfinished must not swallow the
-   * new one's output. Optional for the same reason as {@link flush}.
+   * new one's output, nor a CR run it left open absorb the new one's first line ending.
+   * Optional for the same reason as {@link flush}.
    */
   resetEscapeState?(): void;
   close(): void;
@@ -306,6 +307,7 @@ class FileSessionTranscript implements SessionTranscript {
 
   public resetEscapeState(): void {
     this.finishLineEndings();
+    this.timestamps.endCarriageReturnRun();
     this.escapeCarry = EMPTY_STRIP_CARRY;
   }
 
@@ -326,8 +328,8 @@ class FileSessionTranscript implements SessionTranscript {
     if (this.closed) {
       return;
     }
-    // An undecided CR belongs to the receive formatter, not this disk batch:
-    // draining must not prevent a later chunk's LF from completing its pair.
+    // Undecided CRs belong to the receive formatter, not this disk batch:
+    // draining must not prevent a later chunk's LF from completing the ending.
     this.clearFlushTimer();
     if (this.draining) {
       // A drain is mid-syscall on this fd. Writing from here would interleave
@@ -346,8 +348,8 @@ class FileSessionTranscript implements SessionTranscript {
    * falls into. Never rejects: a transcript must not fail a shutdown.
    */
   public async settle(): Promise<void> {
-    // Teardown ends the input stream; ordinary disk drains must leave a
-    // trailing CR undecided so a later LF can still complete the pair.
+    // Teardown ends the input stream; ordinary disk drains must leave
+    // trailing CRs undecided so a later LF can still complete the ending.
     if (!this.closed) this.finishLineEndings();
     // The chain is reassigned by anything that queues work behind an in-flight
     // drain, so follow it until it stops moving. Bounded — a transcript that
@@ -1127,7 +1129,7 @@ export interface SessionTranscriptOptions extends Partial<LoggerRotationOptions>
   pathContext?: Omit<TranscriptPathContext, "sessionName">;
   /** Per-line receive times, captured before buffering. Defaults to local time. */
   timestampMode?: TranscriptTimestampMode;
-  /** Preserve received endings by default; LF converts only received CRLF pairs. */
+  /** Preserve received endings by default; LF converts only received CRLF, repeated CRs (CR CR LF) included. */
   lineEndingMode?: TranscriptLineEndingMode;
   /**
    * Retention cap override — see {@link DEFAULT_MAX_RETAINED_BYTES} for the

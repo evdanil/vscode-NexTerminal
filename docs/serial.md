@@ -81,7 +81,7 @@ Smart Follow keeps the draft while waiting for a device or stopped. Sending is d
 
 ## Transcript line endings
 
-For serial log files, **Settings → Logging → Transcript Line Endings** offers **Preserve** (default) or **LF**, which converts received CRLF pairs to LF. This setting applies to newly opened Standard and Smart Follow sessions; an existing Smart Follow terminal keeps its format when it reattaches. Standalone CR/LF and intentional empty lines are preserved. Live terminal output is unchanged. See [Session Transcript Logging](terminal.md#session-transcript-logging).
+For serial log files, **Settings → Logging → Transcript Line Endings** offers **Preserve** (default) or **LF**, which converts received CRLF to LF, including when the device repeats the CR before the LF (CR CR LF). This setting applies to newly opened Standard and Smart Follow sessions; an existing Smart Follow terminal keeps its format when it reattaches. Standalone CR/LF and intentional empty lines are preserved. Live terminal output is unchanged. See [Session Transcript Logging](terminal.md#session-transcript-logging).
 
 ## Crash Isolation
 

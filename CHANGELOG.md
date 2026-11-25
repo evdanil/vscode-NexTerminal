@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.8.324] — 2026-11-25
+
+### Fixed
+
+- **Session transcripts treat a CR repeated before the LF (CR CR LF) as one line ending.** With timestamps on (the default), a second timestamp was written between the CRs, doubling each line even with **Transcript Line Endings** set to **LF**. With timestamps off, LF still left a CRLF in the file. No timestamp is written inside such an ending now, and LF saves it as a single LF. **Preserve** still keeps the received bytes, so an editor that breaks lines at a lone CR can still show an extra empty line. CRs not followed by LF and blank lines are kept. Applies to new SSH, telnet and serial sessions. Addresses #338.
+
 ## [2.8.323] — 2026-11-24
 
 ### Added

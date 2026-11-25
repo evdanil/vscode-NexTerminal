@@ -68,11 +68,11 @@ export const SETTINGS_META: SettingMeta[] = [
     label: "Transcript Line Endings",
     type: "enum",
     category: "logging",
-    description: "Preserve received line endings or convert CRLF pairs to LF in new SSH, telnet and serial transcript files. Standalone CR and LF and intentional blank lines are preserved. Existing terminals keep their format on reconnect.",
+    description: "Preserve received line endings or convert CRLF to LF, including when the device repeats the CR before the LF (CR CR LF), in new SSH, telnet and serial transcript files. Standalone CR and LF and intentional blank lines are preserved. Existing terminals keep their format on reconnect.",
     default: "preserve",
     enumOptions: [
       { label: "Preserve", value: "preserve", description: "Keep received line endings.", recommended: true },
-      { label: "LF", value: "lf", description: "Convert CRLF pairs to LF in saved transcripts." }
+      { label: "LF", value: "lf", description: "Convert CRLF, including CR CR LF, to LF in saved transcripts." }
     ]
   },
   {

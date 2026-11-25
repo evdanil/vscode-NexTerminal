@@ -11467,7 +11467,7 @@ exports[`webview document shell (byte-identity guard) > settings (all categories
 </div>
   <div class="form-group">
   <label id="setting-nexus-logging-sessionTranscriptLineEndings-label">Transcript Line Endings</label>
-  <div class="setting-desc">Preserve received line endings or convert CRLF pairs to LF in new SSH, telnet and serial transcript files. Standalone CR and LF and intentional blank lines are preserved. Existing terminals keep their format on reconnect.</div>
+  <div class="setting-desc">Preserve received line endings or convert CRLF to LF, including when the device repeats the CR before the LF (CR CR LF), in new SSH, telnet and serial transcript files. Standalone CR and LF and intentional blank lines are preserved. Existing terminals keep their format on reconnect.</div>
   <div class="custom-select" data-section="nexus.logging" data-key="sessionTranscriptLineEndings">
     <input type="hidden" id="setting-nexus-logging-sessionTranscriptLineEndings" value="preserve" />
     <div class="custom-select-trigger" tabindex="0" role="combobox" aria-haspopup="listbox" aria-labelledby="setting-nexus-logging-sessionTranscriptLineEndings-label" aria-expanded="false">
