@@ -83,7 +83,7 @@ describe("createSessionTranscript", () => {
     return contents.slice(contents.indexOf("\n") + 1, contents.lastIndexOf("\n--- Session ended "));
   }
 
-  it.each([false, true])("normalizes only received CRLF pairs in LF mode (split=$0)", (split) => {
+  it.each([false, true])("normalizes only received CRLF in LF mode (split=$0)", (split) => {
     const dir = makeTempDir();
     const transcript = createSessionTranscript(dir, "lf", true, { timestampMode: "off", lineEndingMode: "lf" });
     const chunks = split
@@ -149,6 +149,121 @@ describe("createSessionTranscript", () => {
     } finally {
       transcript.close();
     }
+  });
+
+  // Segments are the lines a reader should see, each one with the ending it arrived with and the
+  // ending LF mode must save: the received stream is their concatenation, and a stamp opens each.
+  const crRunCases = [
+    { name: "CR CR LF", received: ["AAA\r\r\n", "BBB\r\r\n"], lf: ["AAA\n", "BBB\n"] },
+    { name: "a longer CR run", received: ["AAA\r\r\r\r\n", "BBB"], lf: ["AAA\n", "BBB"] },
+    {
+      name: "blank lines",
+      received: ["AAA\r\n", "\r\n", "\r\r\n", "\r\r\n", "\n", "\n", "BBB"],
+      lf: ["AAA\n", "\n", "\n", "\n", "\n", "\n", "BBB"]
+    },
+    { name: "CR progress", received: ["10%\r", "20%\r", "done\r\r\n"], lf: ["10%\r", "20%\r", "done\n"] },
+    { name: "CR runs without LF", received: ["10%\r\r", "20%\r\r\r"], lf: ["10%\r\r", "20%\r\r\r"] }
+  ];
+  const chunkings: Record<string, (stream: string) => string[]> = {
+    whole: (stream) => [stream],
+    "between CRs": (stream) => stream.split(/(?<=\r)(?=\r)/),
+    "before LF": (stream) => stream.split(/(?=\n)/),
+    bytewise: (stream) => [...stream],
+    "escape between bytes": (stream) => [[...stream].join("\x1b[0m")]
+  };
+
+  it.each(crRunCases.flatMap((testCase) => (["off", "utc"] as const).flatMap((timestampMode) =>
+    (["preserve", "lf"] as const).map((lineEndingMode) => ({ ...testCase, timestampMode, lineEndingMode }))
+  )))("keeps one boundary per line for $name (timestamps=$timestampMode, endings=$lineEndingMode)", (testCase) => {
+    const { received, lf, timestampMode, lineEndingMode } = testCase;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2025-01-15T09:00:00Z"));
+    const stamp = timestampMode === "utc" ? "2025-01-15 09:00:00.000Z " : "";
+    const expected = (lineEndingMode === "lf" ? lf : received).map((segment) => stamp + segment).join("");
+    for (const [chunking, split] of Object.entries(chunkings)) {
+      const dir = makeTempDir();
+      const transcript = createSessionTranscript(dir, "cr-run", true, { timestampMode, lineEndingMode });
+      for (const chunk of split(received.join(""))) {
+        transcript.write(chunk);
+        transcript.flush?.();
+      }
+      transcript.close();
+      expect(recordedOutput(dir), chunking).toBe(expected);
+    }
+  });
+
+  it.each([
+    { lineEndingMode: "preserve", blank: "\r\n" },
+    { lineEndingMode: "lf", blank: "\n" }
+  ] as const)("ends a CR run at transport reset so the new device's blank line keeps its stamp ($lineEndingMode)", ({ lineEndingMode, blank }) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2025-01-15T09:00:00Z"));
+    const dir = makeTempDir();
+    const transcript = createSessionTranscript(dir, "reset-run", true, { timestampMode: "utc", lineEndingMode });
+    transcript.write("old\r\r");
+    transcript.resetEscapeState?.();
+    vi.setSystemTime(new Date("2025-01-15T09:00:01Z"));
+    transcript.write("\r\nnew");
+    transcript.close();
+    expect(recordedOutput(dir)).toBe(
+      "2025-01-15 09:00:00.000Z old\r\r" +
+      `2025-01-15 09:00:01.000Z ${blank}` +
+      "2025-01-15 09:00:01.000Z new"
+    );
+  });
+
+  it("writes a whole pending CR run during extension teardown", async () => {
+    const { flushSessionTranscripts } = await import("../../src/logging/sessionTranscriptLogger");
+    const dir = makeTempDir();
+    const transcript = createSessionTranscript(dir, "teardown-run", true, { timestampMode: "off", lineEndingMode: "lf" });
+    try {
+      transcript.write("last\r");
+      transcript.write("\r\r");
+      await flushSessionTranscripts();
+      const file = readdirSync(dir).find((name) => name.endsWith(".log"))!;
+      expect(readFileSync(path.join(dir, file), "utf8")).toMatch(/last\r\r\r$/);
+    } finally {
+      transcript.close();
+    }
+  });
+
+  describe.each([
+    { name: "in one chunk", writes: ["x" + "\r".repeat(3000)] },
+    { name: "across writes", writes: ["x" + "\r".repeat(1000), "\r".repeat(1000), "\r".repeat(1000)] }
+  ])("a CR run longer than LF mode holds, received $name", ({ writes }) => {
+    const spilled = "x" + "\r".repeat(3000 - 1024);
+
+    function writeRun(dir: string): SessionTranscript {
+      const transcript = createSessionTranscript(dir, "long-run", true, { timestampMode: "off", lineEndingMode: "lf" });
+      for (const chunk of writes) transcript.write(chunk);
+      return transcript;
+    }
+
+    it("keeps every CR when no LF follows", () => {
+      const dir = makeTempDir();
+      const transcript = writeRun(dir);
+      transcript.write("y");
+      transcript.close();
+      expect(recordedOutput(dir)).toBe("x" + "\r".repeat(3000) + "y");
+    });
+
+    it("keeps the CRs past the hold and saves the rest with its LF as one LF", () => {
+      const dir = makeTempDir();
+      const transcript = writeRun(dir);
+      transcript.write("\ny");
+      transcript.close();
+      expect(recordedOutput(dir)).toBe(spilled + "\ny");
+    });
+
+    it("writes the CRs past the hold before the run resolves", () => {
+      const dir = makeTempDir();
+      const transcript = writeRun(dir);
+      transcript.flush?.();
+      const file = readdirSync(dir).find((name) => name.endsWith(".log"))!;
+      const contents = readFileSync(path.join(dir, file), "utf8");
+      expect(contents.slice(contents.indexOf("\n") + 1)).toBe(spilled);
+      transcript.close();
+    });
   });
 
   it.each([

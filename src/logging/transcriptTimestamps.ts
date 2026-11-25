@@ -21,7 +21,9 @@ function timestampPrefix(mode: "local" | "utc"): string {
 /**
  * Prefix at receipt rather than drain time. Only line-boundary state is kept:
  * a prompt or an arbitrarily long unterminated line must never wait in memory
- * for a newline. CRLF remains one boundary even when split between writes.
+ * for a newline. A run of CRs with an optional LF is one boundary even when
+ * split between writes: firmware that prints CRLF through a driver that expands
+ * LF again sends CR CR LF, and a stamp inside the run would add a false line.
  */
 export class TranscriptLineTimestamps {
   private atLineStart = true;
@@ -35,14 +37,13 @@ export class TranscriptLineTimestamps {
     let prefix: string | undefined;
     const stamp = (): string => prefix ??= timestampPrefix(mode);
     const parts: string[] = [];
-    let start = 0;
-    if (this.afterCarriageReturn && text.startsWith("\n")) {
-      parts.push("\n");
-      start = 1;
-    }
-    this.afterCarriageReturn = false;
+    let start = this.afterCarriageReturn ? /^\r*\n?/.exec(text)![0].length : 0;
+    if (start > 0) parts.push(text.slice(0, start));
+    this.afterCarriageReturn = text.endsWith("\r");
 
-    const endings = /\r\n|\r|\n/g;
+    // Output is untrusted: the LF must stay optional, because a required one
+    // (`\r+\n`) makes a long run without it retry from every CR.
+    const endings = /\r+\n?|\n/g;
     endings.lastIndex = start;
     let match: RegExpExecArray | null;
     while ((match = endings.exec(text)) !== null) {
@@ -50,15 +51,18 @@ export class TranscriptLineTimestamps {
       if (this.atLineStart) parts.push(stamp());
       parts.push(text.slice(start, end));
       this.atLineStart = true;
-      this.afterCarriageReturn = match[0] === "\r";
       start = end;
     }
     if (start < text.length) {
       if (this.atLineStart) parts.push(stamp());
       parts.push(text.slice(start));
       this.atLineStart = false;
-      this.afterCarriageReturn = false;
     }
     return parts.join("");
+  }
+
+  /** A new transport cannot continue the old one's CR run, but an open line stays open. */
+  public endCarriageReturnRun(): void {
+    this.afterCarriageReturn = false;
   }
 }

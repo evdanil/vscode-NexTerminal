@@ -2,7 +2,7 @@
   "name": "vscode-nexterminal",
   "displayName": "Nexus Terminal",
   "description": "SSH, serial and Telnet terminals in VS Code—no remote agent required. Manage jump hosts, SFTP, tunnels, macros, JavaScript automation and network inventory from one sidebar.",
-  "version": "2.8.323",
+  "version": "2.8.324",
   "publisher": "sentriflow",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -4939,11 +4939,11 @@
           "enum": ["preserve", "lf"],
           "enumDescriptions": [
             "Keep received line endings.",
-            "Convert received CRLF pairs to LF in saved transcripts."
+            "Convert received CRLF to LF in saved transcripts, including when the device repeats the CR before the LF (CR CR LF)."
           ],
           "default": "preserve",
           "order": 4.5,
-          "markdownDescription": "Line endings in newly opened SSH, telnet and serial transcript files. Preserve keeps received line endings; LF converts CRLF pairs to LF, including pairs split across received chunks. Standalone CR and LF and intentional blank lines are preserved. Existing terminals keep their format when reconnecting. Does not change the live terminal, script/macro capture or diagnostic trace."
+          "markdownDescription": "Line endings in newly opened SSH, telnet and serial transcript files. Preserve keeps received line endings; LF converts CRLF to LF, including when the device repeats the CR before the LF (CR CR LF) and when the ending is split across received chunks. Standalone CR and LF and intentional blank lines are preserved. Existing terminals keep their format when reconnecting. Does not change the live terminal, script/macro capture or diagnostic trace."
         },
         "nexus.logging.sessionLogPathTemplate": {
           "type": "string",
